@@ -1,73 +1,96 @@
 # VitaBrowser
 
-Modern web browsing + downloading on a jailbroken PS Vita (enso/Henkaku).
+A native, modern-ish web browser for a jailbroken PS Vita (enso/Henkaku).
+No server, no VPS — the Vita browses directly.
 
-## Status: RESEARCH COMPLETE (2026-09-20)
+## Status: PLAN v2 (2026-09-20) — native engine port, no VPS
 
-## The problem
+## Why this is buildable (the two proofs)
 
-- Vita: 4x Cortex-A9 @ ~533 MHz max (3 usable cores), 512 MB RAM (no paging,
-  app budget ~200–330 MB), PowerVR SGX543MP4+ (GLES 2.0 only), 960x544 LCD.
-- Stock browser: WebKit 531 (2010). Dead on the modern web.
-- No modern browser has ever been ported to Vita (or 3DS/Switch) by anyone.
+1. **netsurf-3ds** (github.com/coderman64/netsurf-3ds, 197★, releases Dec 2025)
+   A *working* homebrew browser for the 3DS: full NetSurf core (libparserutils,
+   libhubbub, libdom, libcss, libnsbmp/gif/svgtiny, libwapcaplet), framebuffer
+   frontend, HTTPS via libcurl, on a console *weaker* than the Vita (ARM11).
+   It is effectively a template: same architecture, same porting shape.
+   3DS devkitPro → Vita vitaSDK, 3DS framebuffer → libvita2d.
 
-## Prior art
+2. **MacSurf** (macsurf.org, github.com/mplsllc/macsurf, 2026)
+   Runs the NetSurf 5-lib core + **QuickJS (ES2023)** + custom TLS 1.3 on a
+   1998 Power Mac G3 (G4 @ ~400 MHz, 192 MB RAM) — hardware in the same class
+   as the Vita. Proven working: WordPress + jQuery 3.7, flexbox, CSS Grid (V1),
+   modern JS (classes, async/await) executing natively on-device. Much of it
+   was built with Claude — the exact workflow we'd use.
 
-| Project | What it is | Relevance |
-|---|---|---|
-| [DownloadEnabler](https://github.com/XCage15/DownloadEnabler) | taiHEN plugin, 2017 | Enables arbitrary file downloads from stock browser to `ux0:download`. The download half is solved for stock browser. |
-| [UserAgentSpoofer](https://github.com/GrapheneCt/UserAgentSpoofer) | taiHEN plugin, 2022 | Proves homebrew can hook system WebKit (`webcore`/`mini webcore`). |
-| NetSurf 3DS / NetSurf PSP port | WIP native ports | Proof that small native engines work on this hardware class. |
-| tenox/WRP, browservice | Web rendering proxies (headless Chromium → images + link maps) | The engine for the remote-render path. |
+## Target capability (honest, not marketing)
 
-## Feasibility verdict
+| Works | Doesn't work |
+|---|---|
+| HTML5, flexbox, grid (libcss), most CSS layout | `<canvas>`, WebGL, `<video>`/`<audio>` (NetSurf core has no media) |
+| QuickJS: ES2023 (let/const, classes, async/await, fetch-style XHR) | CSS animations/transitions, canvas JS APIs |
+| HTTPS 1.2/1.3 (curl+openssl from vita-sdk, real CAs) | SPA frameworks needing full DOM API (React etc. — NetSurf DOM API is partial) |
+| Downloads to memory card (libcurl → `ux0:/download`) | Service workers, WebRTC |
+| jQuery/WordPress/wikis/forums/news/text-heavy modern sites | — |
 
-- **Port WebKit WPE**: 12–24 months, ~25% success. Killers: WebKit2 multi-process
-  on no-fork/no-AF_UNIX kernel, ~70 MB engine in a 200 MB budget, no paging.
-- **Port Servo**: dead (WebRender needs GLES 3.0).
-- **Plugin on stock WebKit 531**: 2–8 weeks, high success, 2010 ceiling.
-- **Remote rendering (chosen)**: server drives headless Chromium, Vita is a thin
-  client. Only honest path to *real* modern web (JS, video, everything).
-- **NetSurf-fb native port**: 2–4 months, fast for simple/offline sites.
+Performance expectation: 533 MHz A9 + NEON. Simple pages ~1–3 s, heavy pages
+~5–15 s. Slow compared to a phone, **a universe** compared to the stock
+WebKit-531 browser which is functionally dead on the modern web.
 
-### vita-sdk has what we need
+## Architecture
 
-curl, openssl, ffmpeg, freetype, harfbuzz, pixman, libpng, libjpeg-turbo,
-libwebp, sdl2, vitaGL (GLES), expat, libxml2, jansson.
-Missing (matters only for full WebKit port): glib/gio, cairo, pango, ICU, sqlite.
+```
+VitaBrowser (NPXS homebrew app, vitaSDK, C)
+├── frontend          Vita frontend (new, modeled on libnsfb from netsurf-3ds)
+│   ├── libvita2d framebuffer (960x544) for layout/paint
+│   ├── sceLibKernel threads for fetch; front/rear touch + sticks for input
+│   ├── freetype + harfbuzz (vita-sdk packages) for text
+│   └── download manager → ux0:/download
+├── QuickJS           JS engine (port: plain C99, has ARM/NEON paths)
+└── NetSurf core libs (port, mostly as netsurf-3ds did)
+    libparserutils, libhubbub, libdom, libcss, libnsbmp, libnsgif,
+    libsvgtiny, libutf8proc, libnsutils, libnslog, libpencil (SVG)
+    + images via vita-sdk libpng/libwebp/libjpeg-turbo
+    + network via vita-sdk curl + openssl (replaces netsurf-3ds's homebrew curl)
+```
 
 ## Plan
 
-### Phase 0 — 1-day prototype (de-risk everything)
-1. Stand up WRP/browservice (headless Chromium) on a VPS or localhost.
-2. Point the *stock* Vita browser at it via network proxy settings
-   (plain-HTTP-from-proxy trick dodges custom root CA).
-3. Judge: is image-based browsing on 960x544 pleasant?
-   **Kill criteria: >400 ms input-to-photon, or text unreadable at native res.**
+### Phase 0 — De-risk spike (1–2 weeks)
+1. Set up vitaSDK toolchain (vdpm), hello-world NPXS app on the Vita.
+2. Cross-compile **libparserutils + libhubbub + libdom** for Vita.
+3. Render a fetched page's text (no CSS yet) to the framebuffer.
+   *Milestone: a real URL loads and its text appears on the Vita.*
 
-### Phase 1 — Native thin client (6–10 weeks, if Phase 0 passes)
-- vitaSDK app (C/C++, SDL2 + vitaGL).
-- Server: headless Chromium over CDP (Chrome DevTools Protocol).
-- Video: H.264 960x544 stream → hardware decode via SGX/`sceAvcdec`.
-- Structure over pixels: CDP returns link rects, scroll extents, focus state →
-  real touch targets (dual sticks + front/rear touch), local scroll of
-  pre-rendered tall bitmap, OSK text echo.
-- Downloads: proxy serves files over plain HTTP → write to `ux0:download`
-  (or any path). No DownloadEnabler needed for the new browser.
+### Phase 1 — Core browser (weeks 3–8)
+4. libcss + layout + paint (port the libnsfb layout/plotters approach).
+5. Images: png/webp/gif/jpg decoding.
+6. QuickJS wired in (follow MacSurf's integration).
+7. Downloads: libcurl to memory card + UI.
+8. Chrome: URL bar, back/forward, bookmarks, OSK keyboard.
+   *Milestone: daily-driver-able for wikis, forums, news, WordPress.*
 
-### Phase 2 (parallel, optional) — NetSurf-fb port
-- Offline, no-server, fast on wikis/docs/forums/manga.
-- Same approach as the 3DS/PSP NetSurf ports.
+### Phase 2 — Polish (ongoing)
+9. CSS gaps (grid V2 details, transforms), font subsetting, memory budgeting,
+   tab management, UA string, cookie jar.
 
-## Key risks
+## Effort
 
-- Wi-Fi 802.11b/g (~20 Mbit real) on Vita — image/video stream must be small.
-  H.264 at 544p is the right call; test actual round-trip latency on user's network.
-- Privacy: everything flows through our server (it's ours — fine, but a fact).
-- Vita debug tooling is printf-over-UDP: multiply dev-time estimates by ~1.5.
+- One competent dev + AI: **~1–2 months to a solid v1** (much of it
+  mechanical — netsurf-3ds did 90% of the porting work already, on a harder
+  target). Vita's toolchain is *better* (curl/openssl/freetype/harfbuzz are
+  off-the-shelf vita-sdk packages) and its framebuffer API is simpler.
+- This is the "NetSurf on Vita" no one has shipped. First one gets the name.
+
+## Risks
+
+- NetSurf DOM API coverage limits heavy JS SPAs (accepted trade-off).
+- No media/canvas (accepted; stock browser can't do modern web at all).
+- Vita debug tooling = printf-over-UDP: budget ~1.5x on dev time.
+- Memory: budget ~200–330 MB, no paging — profile early, keep page caches small.
 
 ## Conventions
 
 - One item → one branch → one PR.
-- Vita code: C/C++ via vitaSDK toolchain (Linux). Server code: Go/Python.
-- Folder: `server/` (rendering proxy), `client/` (vitaSDK app), `docs/`.
+- C, vitaSDK toolchain (Linux). Reference codebases: netsurf-3ds (frontend
+  patterns), macsurf (QuickJS + modern CSS integration), NetSurf upstream.
+- Folders: `app/` (frontend + app), `libs/` (ported NetSurf libs, submodule'd
+  where possible), `docs/`.
