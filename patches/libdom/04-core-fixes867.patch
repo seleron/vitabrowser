@@ -1,0 +1,152 @@
+# libdom: core [fixes867]
+# 1 files, 77 changed lines
+# MacSurf fix ids: fixes867
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libdom/src/core/node.c browser/libdom/src/core/node.c
+--- upstream/libdom/src/core/node.c	2026-09-20 23:27:12.695343544 +0100
++++ browser/libdom/src/core/node.c	2026-09-20 23:19:17.308663855 +0100
+@@ -7,7 +7,7 @@
+  */
+ 
+ #include <assert.h>
+-#include <stdbool.h>
++/* stdbool removed for CW8 -- prefix provides bool */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -19,24 +19,25 @@
+ #include <dom/core/nodelist.h>
+ #include <dom/core/implementation.h>
+ #include <dom/core/document_type.h>
+-#include <dom/events/events.h>
++#include <dom/events/events.h>
+ 
+-#include "core/string.h"
+-#include "core/namednodemap.h"
+-#include "core/attr.h"
+-#include "core/cdatasection.h"
+-#include "core/comment.h"
+-#include "core/document.h"
+-#include "core/document_type.h"
+-#include "core/doc_fragment.h"
+-#include "core/element.h"
+-#include "core/entity_ref.h"
+-#include "core/node.h"
+-#include "core/pi.h"
+-#include "core/text.h"
+-#include "utils/utils.h"
+-#include "utils/validate.h"
+-#include "events/mutation_event.h"
++#include "core/string.h"
++#include "core/namednodemap.h"
++#include "core/attr.h"
++#include "core/cdatasection.h"
++#include "core/comment.h"
++#include "core/document.h"
++#include "core/document_type.h"
++#include "core/doc_fragment.h"
++#include "core/element.h"
++#include "core/entity_ref.h"
++#include "core/node.h"
++#include "core/pi.h"
++#include "core/text.h"
++#include "utils/utils.h"
++#include "utils/validate.h"
++#include "events/mutation_event.h"
++#include "events/dispatch.h"
+ 
+ static bool _dom_node_permitted_child(const dom_node_internal *parent, 
+ 		const dom_node_internal *child);
+@@ -996,7 +997,8 @@
+ 	*result = (dom_node_internal *) dom_node_ref(old_child);
+ 
+ 	success = true;
+-	err = _dom_dispatch_subtree_modified_event(node->owner, node,
++	err = __dom_dispatch_subtree_modified_event(node->owner,
++			(dom_event_target *)node,
+ 			&success);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -2046,6 +2048,26 @@
+ 	return false;
+ }
+ 
++/* fixes867 (#293) - read-only accessor for the mutation semaphore above.
++ *
++ * Diagnostic ONLY; it changes no behaviour.  The macos9 JS binding needs it to
++ * tell apart the three silent rejections in _dom_node_insert_before, which all
++ * look identical from JS:
++ *   NO_MODIFICATION_ALLOWED_ERR + dispatching_mutation>0  -> this semaphore
++ *   WRONG_DOCUMENT_ERR          + childOwner!=nodeOwner   -> document identity
++ *   HIERARCHY_REQUEST_ERR                                 -> neither
++ * Without it the binding can log the exception code but not WHY, and the
++ * difference decides an architectural fix (defer script execution out of the
++ * mutation default action) vs a state fix (per-heap document).
++ *
++ * Lives here because node.c already includes document_i.h, where the field is
++ * declared; exposing it from the frontend would otherwise need libdom/src/core
++ * on the CW8 access paths.  Returns 0 for NULL, so callers need no guard. */
++uint32_t _dom_document_dispatching_mutation(dom_document *doc)
++{
++	return (doc != NULL) ? doc->dispatching_mutation : 0;
++}
++
+ /**
+  * Determine if a node is read only
+  *
+@@ -2155,7 +2177,8 @@
+ 	}
+ 
+ 	success = true;
+-	err = _dom_dispatch_subtree_modified_event(parent->owner, parent,
++	err = __dom_dispatch_subtree_modified_event(parent->owner,
++			(dom_event_target *)parent,
+ 			&success);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -2199,7 +2222,8 @@
+ 	}
+ 
+ 	success = true;
+-	_dom_dispatch_subtree_modified_event(parent->owner, parent,
++	__dom_dispatch_subtree_modified_event(parent->owner,
++			(dom_event_target *)parent,
+ 			&success);
+ 
+ 	first->previous = NULL;
+@@ -2625,10 +2649,10 @@
+ 
+ 	if (dei->actions != NULL) {
+ 		dom_default_action_phase phase = DOM_DEFAULT_ACTION_END;
++		dom_default_action_callback cb;
+ 		if (evt->prevent_default == true)
+ 			phase = DOM_DEFAULT_ACTION_PREVENTED;
+-		dom_default_action_callback cb = dei->actions(
+-				evt->type, phase, &pw);
++		cb = dei->actions(evt->type, phase, &pw);
+ 		if (cb != NULL) {
+ 			cb(evt, pw);
+ 		}
+@@ -2669,7 +2693,9 @@
+ 	dom_exception err;
+ 
+ 	/* Fire change event at immediate target */
+-	err = _dom_dispatch_node_change_event(doc, node, related, 
++	err = __dom_dispatch_node_change_event(doc,
++			(dom_event_target *)node,
++			(dom_event_target *)related,
+ 			change, success);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -2677,7 +2703,8 @@
+ 	/* Fire document change event at subtree */
+ 	target = node->first_child;
+ 	while (target != NULL) {
+-		err = _dom_dispatch_node_change_document_event(doc, target, 
++		err = __dom_dispatch_node_change_document_event(doc,
++				(dom_event_target *)target,
+ 				change, success);
+ 		if (err != DOM_NO_ERR)
+ 			return err;

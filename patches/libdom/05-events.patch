@@ -1,0 +1,285 @@
+# libdom: events
+# 14 files, 123 changed lines
+# MacSurf fix ids: fixes1005 fixes989
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN upstream/libdom/src/events/custom_event.h browser/libdom/src/events/custom_event.h
+--- upstream/libdom/src/events/custom_event.h
++++ browser/libdom/src/events/custom_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/custom_event.h>
+ 
+-#include "events/event.h"
++#include "events/event.h"
+ 
+ struct dom_custom_event {
+ 	struct dom_event base;
+diff -urN upstream/libdom/src/events/dispatch.c browser/libdom/src/events/dispatch.c
+--- upstream/libdom/src/events/dispatch.c
++++ browser/libdom/src/events/dispatch.c
+@@ -7,11 +7,11 @@
+ 
+ #include <assert.h>
+ 
+-#include "core/document.h"
+-#include "events/dispatch.h"
+-#include "events/mutation_event.h"
+-
+-#include "utils/utils.h"
++#include "core/document.h"
++#include "events/dispatch.h"
++#include "events/mutation_event.h"
++
++#include "utils/utils.h"
+ 
+ /**
+  * Dispatch a DOMNodeInserted/DOMNodeRemoved event
+diff -urN upstream/libdom/src/events/event.h browser/libdom/src/events/event.h
+--- upstream/libdom/src/events/event.h
++++ browser/libdom/src/events/event.h
+@@ -13,8 +13,6 @@
+ #include <dom/core/document.h>
+ #include <dom/events/event_target.h>
+ #include <dom/events/event.h>
+-
+-#include "utils/list.h"
+ 
+ /* The private virtual table */
+ struct dom_event_private_vtable {
+@@ -62,11 +60,9 @@
+ void _dom_event_finalise(dom_event *evt);
+ 
+ 
+-static inline void dom_event_destroy(dom_event *evt)
+-{
+-	evt->vtable->destroy(evt);
+-}
+-#define dom_event_destroy(e) dom_event_destroy((dom_event *) (e))
++/* MacSurf: body in libdom_c89_helpers.c */
++extern void dom_event_destroy_impl(dom_event *evt);
++#define dom_event_destroy(e) dom_event_destroy_impl((dom_event *) (e))
+ 
+ #endif
+ 
+diff -urN upstream/libdom/src/events/event_listener.h browser/libdom/src/events/event_listener.h
+--- upstream/libdom/src/events/event_listener.h
++++ browser/libdom/src/events/event_listener.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/event_listener.h>
+ 
+-#include "utils/list.h"
++#include "utils/list.h"
+ 
+ /**
+  * The EventListener class
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libdom/src/events/event_target.c browser/libdom/src/events/event_target.c
+--- upstream/libdom/src/events/event_target.c	2026-09-20 23:27:12.697328182 +0100
++++ browser/libdom/src/events/event_target.c	2026-09-20 23:19:17.312480391 +0100
+@@ -8,16 +8,16 @@
+ #include <assert.h>
+ #include <stdlib.h>
+ 
+-#include "events/event.h"
+-#include "events/event_listener.h"
+-#include "events/event_target.h"
+-
+-#include "core/document.h"
+-#include "core/node.h"
+-#include "core/string.h"
++#include "events/event.h"
++#include "events/event_listener.h"
++#include "events/event_target.h"
++
++#include "core/document.h"
++#include "core/node.h"
++#include "core/string.h"
+ 
+-#include "utils/utils.h"
+-#include "utils/validate.h"
++#include "utils/utils.h"
++#include "utils/validate.h"
+ 
+ static void event_target_destroy_listener(struct listener_entry *e)
+ {
+@@ -227,11 +227,62 @@
+ 			if (dom_string_isequal(le->type, evt->type)) {
+ 				assert(le->listener->handler != NULL);
+ 
+-				if ((le->capture && 
+-						phase == DOM_CAPTURING_PHASE) ||
+-				    (le->capture == false && 
+-						phase == DOM_BUBBLING_PHASE) ||
+-				    (evt->target == evt->current && 
++				/* ==== MACSURF LOCAL PATCH (fixes1005) ============
++				 * grep MACSURF LOCAL PATCH before updating vendored
++				 * libdom -- this is not upstream and a vendor bump
++				 * will silently revert it.
++				 *
++				 * THE TARGET WAS VISITED TWICE, IN BOTH DIRECTIONS.
++				 *
++				 * node.c's path walk builds targets[] starting AT the
++				 * target (`for (; target != NULL; target =
++				 * target->parent)`), so targets[0] IS the target. The
++				 * capture loop then runs targets[ntargets-1]..targets[0]
++				 * and the bubble loop runs targets[0]..targets[ntargets-1]
++				 * -- both include the target -- and the AT_TARGET call
++				 * visits it a third time. Net effect before this patch:
++				 *   non-capture listener on target: AT_TARGET + BUBBLING
++				 *   capture     listener on target: CAPTURING + AT_TARGET
++				 * i.e. EVERY listener on the target fired exactly twice.
++				 *
++				 * Per DOM spec the capture and bubble passes cover
++				 * ANCESTORS ONLY; the target is visited exactly once, in
++				 * AT_TARGET, where capture and non-capture listeners both
++				 * run in registration order. So both the capture and the
++				 * bubble clause gain `evt->target != evt->current`. It is
++				 * deliberately fixed HERE rather than by trimming
++				 * targets[] in node.c: the capture pass legitimately needs
++				 * the target in the array (a descendant's dispatch must
++				 * still see it as an ancestor), and the phase filter is
++				 * the single place that decides what a phase means.
++				 *
++				 * Why MacSurf and not upstream: nothing in this tree ever
++				 * called dom_event_target_add_event_listener until
++				 * fixes989 wired JS addEventListener to libdom, so the
++				 * double-visit was inert for the whole life of the port.
++				 * Since fixes989 it has been live on hardware -- double
++				 * form submits, double toggles, double counters, on every
++				 * click, submit and keydown (interaction.c:1785/1857/2024).
++				 *
++				 * Found by harness Test 38, the Phase 0 control, which is
++				 * also its regression test (parts 1b/1c/1d). Every prior
++				 * event test dispatched through el.dispatchEvent -- the
++				 * JS-local path -- and asserted a boolean, so none of them
++				 * could observe a count of 2.
++				 *
++				 * NOT YET reported upstream to NetSurf -- it is a
++				 * genuine spec bug in their tree and worth one message
++				 * to netsurf-dev / bugs.netsurf-browser.org. If they
++				 * take it, this patch can be dropped on the next vendor
++				 * bump instead of being carried forever.
++				 * ================================================= */
++				if ((le->capture &&
++						phase == DOM_CAPTURING_PHASE &&
++						evt->target != evt->current) ||
++				    (le->capture == false &&
++						phase == DOM_BUBBLING_PHASE &&
++						evt->target != evt->current) ||
++				    (evt->target == evt->current &&
+ 						phase == DOM_AT_TARGET)) {
+ 					le->listener->handler(evt, 
+ 							le->listener->pw);
+diff -urN upstream/libdom/src/events/event_target.h browser/libdom/src/events/event_target.h
+--- upstream/libdom/src/events/event_target.h
++++ browser/libdom/src/events/event_target.h
+@@ -14,9 +14,9 @@
+ #include <dom/events/event_target.h>
+ #include <dom/events/event_listener.h>
+ 
+-#include "events/dispatch.h"
++#include "events/dispatch.h"
+ 
+-#include "utils/list.h"
++#include "utils/list.h"
+ 
+ /**
+  * Listener Entry
+diff -urN upstream/libdom/src/events/keyboard_event.h browser/libdom/src/events/keyboard_event.h
+--- upstream/libdom/src/events/keyboard_event.h
++++ browser/libdom/src/events/keyboard_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/keyboard_event.h>
+ 
+-#include "events/ui_event.h"
++#include "events/ui_event.h"
+ 
+ /**
+  * The keyboard event
+diff -urN upstream/libdom/src/events/mouse_event.h browser/libdom/src/events/mouse_event.h
+--- upstream/libdom/src/events/mouse_event.h
++++ browser/libdom/src/events/mouse_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/mouse_event.h>
+ 
+-#include "events/ui_event.h"
++#include "events/ui_event.h"
+ 
+ /**
+  * The mouse event
+diff -urN upstream/libdom/src/events/mouse_multi_wheel_event.h browser/libdom/src/events/mouse_multi_wheel_event.h
+--- upstream/libdom/src/events/mouse_multi_wheel_event.h
++++ browser/libdom/src/events/mouse_multi_wheel_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/mouse_multi_wheel_event.h>
+ 
+-#include "events/mouse_event.h"
++#include "events/mouse_event.h"
+ 
+ /**
+  * The MouseMultiWheelEvent
+diff -urN upstream/libdom/src/events/mouse_wheel_event.h browser/libdom/src/events/mouse_wheel_event.h
+--- upstream/libdom/src/events/mouse_wheel_event.h
++++ browser/libdom/src/events/mouse_wheel_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/mouse_wheel_event.h>
+ 
+-#include "events/mouse_event.h"
++#include "events/mouse_event.h"
+ 
+ /**
+  * The MouseWheelEvent
+diff -urN upstream/libdom/src/events/mutation_event.h browser/libdom/src/events/mutation_event.h
+--- upstream/libdom/src/events/mutation_event.h
++++ browser/libdom/src/events/mutation_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/mutation_event.h>
+ 
+-#include "events/event.h"
++#include "events/event.h"
+ 
+ /**
+  * The MutationEvent
+diff -urN upstream/libdom/src/events/mutation_name_event.h browser/libdom/src/events/mutation_name_event.h
+--- upstream/libdom/src/events/mutation_name_event.h
++++ browser/libdom/src/events/mutation_name_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/mutation_name_event.h>
+ 
+-#include "events/mutation_event.h"
++#include "events/mutation_event.h"
+ 
+ /**
+  * The MutationName event 
+diff -urN upstream/libdom/src/events/text_event.h browser/libdom/src/events/text_event.h
+--- upstream/libdom/src/events/text_event.h
++++ browser/libdom/src/events/text_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/text_event.h>
+ 
+-#include "events/ui_event.h"
++#include "events/ui_event.h"
+ 
+ /**
+  * The TextEvent
+diff -urN upstream/libdom/src/events/ui_event.h browser/libdom/src/events/ui_event.h
+--- upstream/libdom/src/events/ui_event.h
++++ browser/libdom/src/events/ui_event.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/events/ui_event.h>
+ 
+-#include "events/event.h"
++#include "events/event.h"
+ 
+ /**
+  * The modifier key state

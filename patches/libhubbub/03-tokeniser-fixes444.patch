@@ -1,0 +1,155 @@
+# libhubbub: tokeniser [fixes444]
+# 1 files, 80 changed lines
+# MacSurf fix ids: fixes444
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libhubbub/src/tokeniser/tokeniser.c browser/libhubbub/src/tokeniser/tokeniser.c
+--- upstream/libhubbub/src/tokeniser/tokeniser.c	2026-09-20 23:27:11.701961901 +0100
++++ browser/libhubbub/src/tokeniser/tokeniser.c	2026-09-20 23:19:17.813871508 +0100
+@@ -13,7 +13,7 @@
+ 
+ #include <parserutils/charset/utf8.h>
+ 
+-#include "utils/parserutilserror.h"
++#include "utils/parserutilserror.h"
+ #include "utils/utils.h"
+ 
+ #include "hubbub/errors.h"
+@@ -285,7 +285,7 @@
+ hubbub_error hubbub_tokeniser_create(parserutils_inputstream *input,
+ 		hubbub_tokeniser **tokeniser)
+ {
+-	parserutils_error perror;
++	parserutils_error pu_error;
+ 	hubbub_tokeniser *tok;
+ 
+ 	if (input == NULL || tokeniser == NULL)
+@@ -295,17 +295,17 @@
+ 	if (tok == NULL)
+ 		return HUBBUB_NOMEM;
+ 
+-	perror = parserutils_buffer_create(&tok->buffer);
+-	if (perror != PARSERUTILS_OK) {
++	pu_error = parserutils_buffer_create(&tok->buffer);
++	if (pu_error != PARSERUTILS_OK) {
+ 		free(tok);
+-		return hubbub_error_from_parserutils_error(perror);
++		return hubbub_error_from_parserutils_error(pu_error);
+ 	}
+ 
+-	perror = parserutils_buffer_create(&tok->insert_buf);
+-	if (perror != PARSERUTILS_OK) {
++	pu_error = parserutils_buffer_create(&tok->insert_buf);
++	if (pu_error != PARSERUTILS_OK) {
+ 		parserutils_buffer_destroy(tok->buffer);
+ 		free(tok);
+-		return hubbub_error_from_parserutils_error(perror);
++		return hubbub_error_from_parserutils_error(pu_error);
+ 	}
+ 
+ 	tok->state = STATE_DATA;
+@@ -433,14 +433,14 @@
+ hubbub_error hubbub_tokeniser_insert_chunk(hubbub_tokeniser *tokeniser,
+ 		const uint8_t *data, size_t len)
+ {
+-	parserutils_error perror;
++	parserutils_error pu_error;
+ 
+ 	if (tokeniser == NULL || data == NULL)
+ 		return HUBBUB_BADPARM;
+ 
+-	perror = parserutils_buffer_append(tokeniser->insert_buf, data, len);
+-	if (perror != PARSERUTILS_OK)
+-		return hubbub_error_from_parserutils_error(perror);
++	pu_error = parserutils_buffer_append(tokeniser->insert_buf, data, len);
++	if (pu_error != PARSERUTILS_OK)
++		return hubbub_error_from_parserutils_error(pu_error);
+ 
+ 	return HUBBUB_OK;
+ }
+@@ -644,32 +644,32 @@
+ 
+ #define START_BUF(str, cptr, length) \
+ 	do { \
+-		parserutils_error perror; \
+-		perror = parserutils_buffer_append(tokeniser->buffer, \
++		parserutils_error pu_error; \
++		pu_error = parserutils_buffer_append(tokeniser->buffer, \
+ 				(uint8_t *) (cptr), (length)); \
+-		if (perror != PARSERUTILS_OK) \
+-			return hubbub_error_from_parserutils_error(perror); \
++		if (pu_error != PARSERUTILS_OK) \
++			return hubbub_error_from_parserutils_error(pu_error); \
+ 		(str).len = (length); \
+ 	} while (0)
+ 
+ #define COLLECT(str, cptr, length) \
+ 	do { \
+-		parserutils_error perror; \
++		parserutils_error pu_error; \
+ 		assert(str.len != 0); \
+-		perror = parserutils_buffer_append(tokeniser->buffer, \
++		pu_error = parserutils_buffer_append(tokeniser->buffer, \
+ 				(uint8_t *) (cptr), (length)); \
+-		if (perror != PARSERUTILS_OK) \
+-			return hubbub_error_from_parserutils_error(perror); \
++		if (pu_error != PARSERUTILS_OK) \
++			return hubbub_error_from_parserutils_error(pu_error); \
+ 		(str).len += (length); \
+ 	} while (0)
+ 
+ #define COLLECT_MS(str, cptr, length) \
+ 	do { \
+-		parserutils_error perror; \
+-		perror = parserutils_buffer_append(tokeniser->buffer, \
++		parserutils_error pu_error; \
++		pu_error = parserutils_buffer_append(tokeniser->buffer, \
+ 				(uint8_t *) (cptr), (length)); \
+-		if (perror != PARSERUTILS_OK) \
+-			return hubbub_error_from_parserutils_error(perror); \
++		if (pu_error != PARSERUTILS_OK) \
++			return hubbub_error_from_parserutils_error(pu_error); \
+ 		(str).len += (length); \
+ 	} while (0)
+ 
+@@ -3234,13 +3234,33 @@
+ 	/* Set pointers correctly... */
+ 	ptr = tokeniser->buffer->data;
+ 	token.data.tag.name.ptr = tokeniser->buffer->data;
+-	ptr += token.data.tag.name.len;
+ 
+-	for (i = 0; i < n_attributes; i++) {
+-		attrs[i].name.ptr = ptr;
+-		ptr += attrs[i].name.len;
+-		attrs[i].value.ptr = ptr;
+-		ptr += attrs[i].value.len;
++	/* fixes444: guard corrupt attribute lengths. On a heavy page (18+ MB,
++	 * 144+ subresources) heap fragmentation can corrupt n_attributes or
++	 * individual .name.len/.value.len fields. Without this check, ptr walks
++	 * past buffer->data+buffer->length and the strncmp dedup loop below
++	 * reads from unmapped memory -> crash. Clamp to buffer bounds. */
++	{
++		const uint8_t *buf_end = tokeniser->buffer->data +
++				tokeniser->buffer->length;
++		if (token.data.tag.name.len > tokeniser->buffer->length) {
++			token.data.tag.name.len = 0;
++			n_attributes = 0;
++		}
++		ptr += token.data.tag.name.len;
++
++		for (i = 0; i < n_attributes; i++) {
++			if (ptr + attrs[i].name.len > buf_end ||
++					ptr + attrs[i].name.len +
++					attrs[i].value.len > buf_end) {
++				n_attributes = i;
++				break;
++			}
++			attrs[i].name.ptr = ptr;
++			ptr += attrs[i].name.len;
++			attrs[i].value.ptr = ptr;
++			ptr += attrs[i].value.len;
++		}
+ 	}
+ 
+ 

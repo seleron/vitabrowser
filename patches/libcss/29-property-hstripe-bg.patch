@@ -1,0 +1,209 @@
+# libcss: property-hstripe-bg
+# 2 files, 195 changed lines
+# MacSurf fix ids: fixes151b fixes281 fixes364
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/properties/p_macsurf_hstripe_bg.c browser/libcss/src/parse/properties/p_macsurf_hstripe_bg.c
+--- upstream/libcss/src/parse/properties/p_macsurf_hstripe_bg.c	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/parse/properties/p_macsurf_hstripe_bg.c	2026-09-20 23:19:17.216236416 +0100
+@@ -0,0 +1,83 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 MacSurf (fixes364)
++ *
++ * Parse -macsurf-hstripe-bg.
++ *
++ * The cssh_css.c preprocessor rewrites Platinum-style
++ * `background: repeating-linear-gradient(to bottom, c1, c1 1px,
++ *                                        c2, c2 2px, ...);` into:
++ *     `background: #cccccc; -macsurf-hstripe-bg: <c1> <c2>;`
++ * giving the plotter a real two-color alternating-row stripe paint
++ * for mactrove's Platinum window title bars (instead of the fixes281
++ * solid-colour fallback that vanishes against the page background).
++ *
++ * Accepted form:
++ *   -macsurf-hstripe-bg: <color> <color>
++ *
++ * Bytecode payload after appendOPV(SET): two css_color words.
++ * Storage in css_computed_style_i.macsurf_hstripe_bg (int32_t),
++ * packed as: bit 31 = set flag, bits 15..29 = c2 RGB555,
++ * bits 0..14 = c1 RGB555. 0 = unset.
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++css_error css__parse_macsurf_hstripe_bg(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	css_error error;
++	uint16_t value_a = 0;
++	uint16_t value_b = 0;
++	uint32_t color_a = 0;
++	uint32_t color_b = 0;
++
++	/* First color. */
++	error = css__parse_colour_specifier(c, vector, ctx,
++			&value_a, &color_a);
++	if (error != CSS_OK || value_a != COLOR_SET) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	consumeWhitespace(vector, ctx);
++
++	/* Second color. */
++	error = css__parse_colour_specifier(c, vector, ctx,
++			&value_b, &color_b);
++	if (error != CSS_OK || value_b != COLOR_SET) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	error = css__stylesheet_style_appendOPV(result,
++			CSS_PROP_MACSURF_HSTRIPE_BG, 0, 0x0080 /* SET */);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++
++	error = css__stylesheet_style_append(result, color_a);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++
++	error = css__stylesheet_style_append(result, color_b);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++
++	return CSS_OK;
++}
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/select/properties/s_macsurf_hstripe_bg.c browser/libcss/src/select/properties/s_macsurf_hstripe_bg.c
+--- upstream/libcss/src/select/properties/s_macsurf_hstripe_bg.c	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/select/properties/s_macsurf_hstripe_bg.c	2026-09-20 23:19:17.249544133 +0100
+@@ -0,0 +1,112 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 MacSurf (fixes364)
++ *
++ * Cascade -macsurf-hstripe-bg. Reads two css_color words from the
++ * bytecode and packs them into a single int32_t for storage in the
++ * inner _i struct.
++ *
++ * Packed format (storage int32_t):
++ *   bit 31      = set flag (1 = stripe pattern present)
++ *   bits 15..29 = color2 RGB555  (R5 G5 B5, from low to high)
++ *   bits 0..14  = color1 RGB555
++ *
++ * 0 = unset. Per-container, NOT inherited; compose returns the child
++ * value verbatim. Self-aligning int32_t per fixes151b discipline.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++static int32_t pack_hstripe(uint32_t c1, uint32_t c2)
++{
++	/* css_color is 0xAARRGGBB. Extract RGB and quantise to 5 bits. */
++	uint32_t r1 = (c1 >> 16) & 0xff;
++	uint32_t g1 = (c1 >> 8)  & 0xff;
++	uint32_t b1 =  c1        & 0xff;
++	uint32_t r2 = (c2 >> 16) & 0xff;
++	uint32_t g2 = (c2 >> 8)  & 0xff;
++	uint32_t b2 =  c2        & 0xff;
++	uint32_t rgb1 = ((r1 >> 3) << 10) | ((g1 >> 3) << 5) | (b1 >> 3);
++	uint32_t rgb2 = ((r2 >> 3) << 10) | ((g2 >> 3) << 5) | (b2 >> 3);
++	uint32_t packed = (uint32_t)0x80000000 |
++			((rgb2 & 0x7fff) << 15) |
++			 (rgb1 & 0x7fff);
++	return (int32_t)packed;
++}
++
++css_error css__cascade_macsurf_hstripe_bg(uint32_t opv,
++		css_style *style, css_select_state *state)
++{
++	int32_t packed = 0;
++	bool is_set = false;
++
++	if (hasFlagValue(opv) == false) {
++		if (getValue(opv) == 0x0080) { /* SET */
++			uint32_t c1, c2;
++			c1 = *((uint32_t *) style->bytecode);
++			advance_bytecode(style, sizeof(uint32_t));
++			c2 = *((uint32_t *) style->bytecode);
++			advance_bytecode(style, sizeof(uint32_t));
++			packed = pack_hstripe(c1, c2);
++			is_set = true;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		state->computed->i.macsurf_hstripe_bg = is_set ? packed : 0;
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_macsurf_hstripe_bg_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	(void)hint;
++	style->i.macsurf_hstripe_bg = 0;
++	return CSS_OK;
++}
++
++css_error css__initial_macsurf_hstripe_bg(css_select_state *state)
++{
++	state->computed->i.macsurf_hstripe_bg = 0;
++	return CSS_OK;
++}
++
++css_error css__copy_macsurf_hstripe_bg(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from == to) return CSS_OK;
++	to->i.macsurf_hstripe_bg = from->i.macsurf_hstripe_bg;
++	return CSS_OK;
++}
++
++css_error css__compose_macsurf_hstripe_bg(
++		const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	(void)parent;
++	result->i.macsurf_hstripe_bg = child->i.macsurf_hstripe_bg;
++	return CSS_OK;
++}
++
++uint32_t destroy_macsurf_hstripe_bg(void *bytecode)
++{
++	(void)bytecode;
++	return 0;
++}

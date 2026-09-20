@@ -21,10 +21,13 @@ OUT="${OUT:-$WORK/patches}"
 mkdir -p "$OUT"
 printf '%-16s %8s %7s %s\n' LIBRARY LINES FILES "NEW macsurf_* FILES"
 for l in libwapcaplet libparserutils libhubbub libcss libdom; do
-	diff -urN \
+	# Run from $WORK with relative operands so the diff headers carry
+	# "upstream/<lib>/..." and "browser/<lib>/..." rather than absolute paths.
+	# Patches are then portable and apply with -p2 inside a library tree.
+	( cd "$WORK" && diff -urN \
 		-x '.git' -x 'build-*' -x 'test' \
 		-x '*.o' -x '*.a' -x '*.d' -x '*.pc' \
-		"$UPSTREAM/$l" "$MACSURF/$l" > "$OUT/$l.patch" 2>/dev/null || true
+		"upstream/$l" "browser/$l" ) > "$OUT/$l.patch" 2>/dev/null || true
 	lines=$(wc -l < "$OUT/$l.patch")
 	files=$(grep -c '^diff ' "$OUT/$l.patch" || true)
 	newf=$(grep '^diff ' "$OUT/$l.patch" | awk '{print $NF}' | grep -c macsurf || true)

@@ -1,0 +1,578 @@
+# libdom: core
+# 11 files, 321 changed lines
+# MacSurf fix ids: fixes1005 fixes1042 fixes446 fixes446b fixes446f fixes446g fixes489 fixes490 fixes569
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN upstream/libdom/src/core/characterdata.h browser/libdom/src/core/characterdata.h
+--- upstream/libdom/src/core/characterdata.h
++++ browser/libdom/src/core/characterdata.h
+@@ -10,7 +10,7 @@
+ 
+ #include <dom/core/characterdata.h>
+ 
+-#include "core/node.h"
++#include "core/node.h"
+ 
+ /**
+  * DOM character data node
+diff -urN upstream/libdom/src/core/document.h browser/libdom/src/core/document.h
+--- upstream/libdom/src/core/document.h
++++ browser/libdom/src/core/document.h
+@@ -24,14 +24,14 @@
+ #include <dom/core/text.h>
+ #include <dom/core/implementation.h>
+ 
+-#include "core/string.h"
+-#include "core/node.h"
+-#include "core/nodelist.h"
+-
+-#include "utils/hashtable.h"
+-#include "utils/list.h"
+-
+-#include "events/document_event.h"
++#include "core/string.h"
++#include "core/node.h"
++#include "core/nodelist.h"
++
++#include "utils/hashtable.h"
++#include "utils/list.h"
++
++#include "events/document_event.h"
+ 
+ struct dom_doc_nl;
+ 
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libdom/src/core/element.c browser/libdom/src/core/element.c
+--- upstream/libdom/src/core/element.c	2026-09-20 23:27:12.695343544 +0100
++++ browser/libdom/src/core/element.c	2026-09-20 23:19:17.307393598 +0100
+@@ -19,18 +19,19 @@
+ #include <dom/core/node.h>
+ #include <dom/core/string.h>
+ #include <dom/core/document.h>
+-#include <dom/events/events.h>
++#include <dom/events/events.h>
+ 
+-#include "core/attr.h"
+-#include "core/document.h"
+-#include "core/element.h"
+-#include "core/node.h"
+-#include "core/namednodemap.h"
+-#include "utils/validate.h"
+-#include "utils/namespace.h"
+-#include "utils/utils.h"
+-#include "utils/list.h"
+-#include "events/mutation_event.h"
++#include "core/attr.h"
++#include "core/document.h"
++#include "core/element.h"
++#include "core/node.h"
++#include "core/namednodemap.h"
++#include "utils/validate.h"
++#include "utils/namespace.h"
++#include "utils/utils.h"
++#include "utils/list.h"
++#include "events/mutation_event.h"
++#include "events/dispatch.h"
+ 
+ const struct dom_element_vtable _dom_element_vtable = {
+ 	{
+@@ -1676,6 +1677,52 @@
+ 		if (err != DOM_NO_ERR)
+ 			return err;
+ 
++		/* ==== MACSURF LOCAL PATCH (fixes1042, #310) ==================
++		 * grep MACSURF LOCAL PATCH before updating vendored libdom --
++		 * this is not upstream and a vendor bump will silently revert it.
++		 *
++		 * REFRESH THE CACHED CLASS LIST ON AN ATTRIBUTE *UPDATE*.
++		 *
++		 * dom_element caches the parsed class list in ele->classes, and
++		 * the selector engine matches against THAT, not against the
++		 * attribute string. Upstream calls _dom_element_create_classes
++		 * from exactly one place -- _dom_element_attr_list_node_create
++		 * -- which runs only when the class attribute node is FIRST
++		 * created. This branch (attribute exists, replace its value)
++		 * never refreshed it, so every class change after the first was
++		 * invisible to selector matching, while getAttribute('class')
++		 * kept returning the new value correctly.
++		 *
++		 * Hardware signature: el.className='a' restyles; el.className='b'
++		 * then does nothing. That is every classList.add/remove toggle
++		 * after the first one -- the dominant way real sites express
++		 * visual state (is-open, active, selected, has-js).
++		 *
++		 * Latent for the entire life of the port: nothing re-set class at
++		 * runtime until JS became real. Same shape as the fixes1005
++		 * double-fire -- an upstream bug that only activates once we
++		 * become its first real caller.
++		 *
++		 * Reads the value back off the attr (rather than using `value`
++		 * directly) to mirror the upstream call site exactly, including
++		 * its NUL-termination assumption. A NULL value clears the cache
++		 * via the "" path rather than dereferencing NULL, which
++		 * _dom_element_create_classes would do on its first loop.
++		 * ============================================================= */
++		if (namespace == NULL && doc != NULL &&
++				dom_string_isequal(name, doc->class_string)) {
++			dom_string *cls = NULL;
++			err = dom_attr_get_value(match->attr, &cls);
++			if (err == DOM_NO_ERR) {
++				err = _dom_element_create_classes(element,
++					(cls != NULL) ? dom_string_data(cls) : "");
++				if (cls != NULL)
++					dom_string_unref(cls);
++				if (err != DOM_NO_ERR)
++					return err;
++			}
++		}
++
+ 		success = true;
+ 		err = _dom_dispatch_subtree_modified_event(doc,
+ 				(dom_event_target *) e, &success);
+diff -urN upstream/libdom/src/core/element.h browser/libdom/src/core/element.h
+--- upstream/libdom/src/core/element.h
++++ browser/libdom/src/core/element.h
+@@ -8,11 +8,11 @@
+ #ifndef dom_internal_core_element_h_
+ #define dom_internal_core_element_h_
+ 
+-#include <stdbool.h>
++/* stdbool.h removed for CW8 C89 - prefix provides bool */
+ 
+ #include <dom/core/element.h>
+ 
+-#include "core/node.h"
++#include "core/node.h"
+ 
+ struct dom_document;
+ struct dom_element;
+@@ -201,16 +201,10 @@
+ 
+ typedef struct dom_element_protected_vtable dom_element_protected_vtable;
+ 
+-/* Parse the attribute's value */
+-static inline dom_exception dom_element_parse_attribute(dom_element *ele,
+-		dom_string *name, dom_string *value,
+-		dom_string **parsed)
+-{
+-	struct dom_node_internal *node = (struct dom_node_internal *) ele;
+-	return ((dom_element_protected_vtable *) node->vtable)->
+-			dom_element_parse_attribute(ele, name, value, parsed);
+-}
+-#define dom_element_parse_attribute(e, n, v, p) dom_element_parse_attribute( \
++/* MacSurf: body in libdom_c89_helpers.c */
++extern dom_exception dom_element_parse_attribute_impl(dom_element *ele,
++		dom_string *name, dom_string *value, dom_string **parsed);
++#define dom_element_parse_attribute(e, n, v, p) dom_element_parse_attribute_impl( \
+ 		(dom_element *) (e), (dom_string *) (n), \
+ 		(dom_string *) (v), (dom_string **) (p))
+ 
+diff -urN upstream/libdom/src/core/namednodemap.h browser/libdom/src/core/namednodemap.h
+--- upstream/libdom/src/core/namednodemap.h
++++ browser/libdom/src/core/namednodemap.h
+@@ -8,7 +8,7 @@
+ #ifndef dom_internal_core_namednodemap_h_
+ #define dom_internal_core_namednodemap_h_
+ 
+-#include <stdbool.h>
++/* stdbool removed for CW8 -- prefix provides bool */
+ 
+ #include <dom/core/namednodemap.h>
+ #include <dom/core/node.h>
+diff -urN upstream/libdom/src/core/node.h browser/libdom/src/core/node.h
+--- upstream/libdom/src/core/node.h
++++ browser/libdom/src/core/node.h
+@@ -8,17 +8,15 @@
+ #ifndef dom_internal_core_node_h_
+ #define dom_internal_core_node_h_
+ 
+-#include <stdbool.h>
+-
+ #include <libwapcaplet/libwapcaplet.h>
+ 
+ #include <dom/core/node.h>
+ #include <dom/functypes.h>
+ 
+-#include "events/event_target.h"
+-#include "events/mutation_event.h"
+-
+-#include "utils/list.h"
++#include "events/event_target.h"
++#include "events/mutation_event.h"
++
++#include "utils/list.h"
+ 
+ /**
+  * User data context attached to a DOM node
+@@ -244,20 +242,12 @@
+ 	_dom_node_copy
+ 
+ 
+-/* The destroy API should be used inside DOM module */
+-static inline void dom_node_destroy(struct dom_node_internal *node)
+-{
+-	((dom_node_protect_vtable *) node->vtable)->destroy(node);
+-}
+-#define dom_node_destroy(n) dom_node_destroy((dom_node_internal *) (n))
+-
+-/* Copy the Node old to new */
+-static inline dom_exception dom_node_copy(struct dom_node_internal *old, 
+-		struct dom_node_internal **copy)
+-{
+-	return ((dom_node_protect_vtable *) old->vtable)->copy(old, copy);
+-}
+-#define dom_node_copy(o,c) dom_node_copy((dom_node_internal *) (o), \
++/* MacSurf: bodies in libdom_c89_helpers.c */
++extern void dom_node_destroy_impl(struct dom_node_internal *node);
++extern dom_exception dom_node_copy_impl(struct dom_node_internal *old,
++		struct dom_node_internal **copy);
++#define dom_node_destroy(n) dom_node_destroy_impl((dom_node_internal *) (n))
++#define dom_node_copy(o,c) dom_node_copy_impl((dom_node_internal *) (o), \
+ 		(dom_node_internal **) (c))
+ 
+ /* Following are some helper functions */
+diff -urN upstream/libdom/src/core/nodelist.h browser/libdom/src/core/nodelist.h
+--- upstream/libdom/src/core/nodelist.h
++++ browser/libdom/src/core/nodelist.h
+@@ -8,7 +8,7 @@
+ #ifndef dom_internal_core_nodelist_h_
+ #define dom_internal_core_nodelist_h_
+ 
+-#include <stdbool.h>
++/* stdbool.h removed for CW8 C89 -- prefix provides bool */
+ 
+ #include <dom/core/nodelist.h>
+ 
+diff -urN upstream/libdom/src/core/string.c browser/libdom/src/core/string.c
+--- upstream/libdom/src/core/string.c
++++ browser/libdom/src/core/string.c
+@@ -14,9 +14,11 @@
+ 
+ #include <parserutils/charset/utf8.h>
+ 
+-#include "core/string.h"
+-#include "core/document.h"
+-#include "utils/utils.h"
++#include "core/string.h"
++#include "core/document.h"
++#include "utils/utils.h"
++
++extern int macsurf_ptr_is_heap(const void *);
+ 
+ /**
+  * Type of a DOM string
+@@ -178,8 +180,24 @@
+ 	if (istr->type != DOM_STRING_INTERNED) {
+ 		lwc_string *ret;
+ 		lwc_error lerr;
+-
+-		lerr = lwc_intern_string((const char *) istr->data.cdata.ptr, 
++		/* fixes446f: guard against insane length only. Pointer check
++		 * (pa_ >= 0x28000000) removed: PEF string literals live at
++		 * 0x3E... (code space on OS 9) and are valid CDATA sources.
++		 * The corrupt-sched_entry case has sched_entry.p (~0x07000000
++		 * = 117 MB) aliased as cdata.len, which the length check
++		 * catches cleanly. */
++		if (istr->data.cdata.len > 1048576UL) {
++			extern void macsurf_debug_log_writef(
++				const char *fmt, ...);
++			macsurf_debug_log_writef(
++				"fixes446f INTERN: bad len=%ld ptr=%p "
++				"str=%p",
++				(long)istr->data.cdata.len,
++				(void *)istr->data.cdata.ptr,
++				(void *)istr);
++			return DOM_NO_MEM_ERR;
++		}
++		lerr = lwc_intern_string((const char *) istr->data.cdata.ptr,
+ 				istr->data.cdata.len, &ret);
+ 		if (lerr != lwc_error_ok) {
+ 			return _dom_exception_from_lwc_error(lerr);
+@@ -218,7 +236,7 @@
+ 
+ 	if (is1->type == DOM_STRING_INTERNED && 
+ 			is2->type == DOM_STRING_INTERNED) {
+-		bool match;
++		unsigned char match;   /* shim isequal takes unsigned char * */
+ 
+ 		(void) lwc_string_isequal(is1->data.intern, is2->data.intern,
+ 			&match);
+@@ -267,7 +285,7 @@
+ 
+ 	if (is1->type == DOM_STRING_INTERNED && 
+ 			is2->type == DOM_STRING_INTERNED) {
+-		bool match;
++		unsigned char match;   /* shim isequal takes unsigned char * */
+ 
+ 		if (lwc_string_caseless_isequal(is1->data.intern,
+ 				is2->data.intern, &match) != lwc_error_ok)
+@@ -315,7 +333,7 @@
+ 		return false;
+ 
+ 	if (is1->type == DOM_STRING_INTERNED) {
+-		bool match;
++		unsigned char match;   /* shim isequal takes unsigned char * */
+ 
+ 		(void) lwc_string_isequal(is1->data.intern, s2, &match);
+ 
+@@ -352,7 +370,7 @@
+ 		return false;
+ 
+ 	if (is1->type == DOM_STRING_INTERNED) {
+-		bool match;
++		unsigned char match;   /* shim isequal takes unsigned char * */
+ 
+ 		if (lwc_string_caseless_isequal(is1->data.intern, s2, &match) != lwc_error_ok)
+ 			return false;
+@@ -896,23 +914,116 @@
+ const char *dom_string_data(const dom_string *str)
+ {
+ 	dom_string_internal *istr = (void *) str;
++	/* fixes490 - NULL guard. A NULL dom_string here dereferences
++	 * address 0: istr->type reads low memory, and if it happens to be
++	 * DOM_STRING_CDATA (== 0) the code reads data.cdata.ptr at struct
++	 * offset 4 - a low-memory global that, on this G3, points into the
++	 * intern table and renders an unrelated interned string (the
++	 * "data-xf-init" attribute name) as page text. The fixes446g log
++	 * showed exactly this: ptr=3E0006B8 str=00000000. Return "" so a
++	 * NULL string yields empty text instead of garbage. */
++	if (istr == NULL)
++		return "";
+ 	if (istr->type == DOM_STRING_CDATA) {
++		/* fixes446g: guard against corrupt CDATA ptr from sched_entry
++		 * UAF (sched_entry.callback, a code-space fn-ptr at 0x3E...,
++		 * aliases data.cdata.ptr at struct offset 4).  A legitimate
++		 * CDATA ptr is always malloc'd heap (< 0x28000000).  Return ""
++		 * so callers get an empty string rather than a strlen crash. */
++		{
++			unsigned long pa_ =
++				(unsigned long)istr->data.cdata.ptr;
++			/* fixes489 (Option A) - widen the recycled-struct
++			 * guard. The original check only rejected a
++			 * code-space pointer. A freed dom_string struct that
++			 * the scheduler reused can also leave data.cdata.ptr
++			 * pointing at heap (passing the range test) while
++			 * data.cdata.len holds garbage. A legitimate CDATA
++			 * length is bounded (text nodes here never exceed the
++			 * 1 MB intern cap used a few lines down); a recycled
++			 * struct's len is typically a huge or wrapped value.
++			 * Reject both an out-of-range ptr and an absurd len so
++			 * the caller gets "" instead of reading recycled
++			 * memory as text. */
++			if (!macsurf_ptr_is_heap((const void *)istr->data.cdata.ptr) ||
++			    istr->data.cdata.len > 1048576UL) {
++				extern void macsurf_debug_log_writef(
++					const char *fmt, ...);
++				macsurf_debug_log_writef(
++					"fixes446g DATA: bad cdata ptr=%p "
++					"len=%ld str=%p",
++					(void *)pa_,
++					(long)istr->data.cdata.len,
++					(void *)str);
++				return "";
++			}
++		}
+ 		return (const char *) istr->data.cdata.ptr;
+ 	} else {
++		/* fixes446b: same guard as dom_string_tolower - a corrupt
++		 * intern pointer (UAF or write-past) causes lwc_string_data
++		 * to return garbage_ptr+24, which then crashes in memcpy /
++		 * duk_push_lstring / strlen.  Return "" on bad pointer. */
++		{
++			unsigned long ia_ = (unsigned long)istr->data.intern;
++			if (!macsurf_ptr_is_heap((const void *)istr->data.intern)) {
++				extern void macsurf_debug_log_writef(
++					const char *fmt, ...);
++				macsurf_debug_log_writef(
++					"fixes446b DATA: corrupt intern=%p "
++					"str=%p type=%d",
++					(void *)ia_,
++					(void *)str,
++					(int)istr->type);
++				return "";
++			}
++		}
+ 		return lwc_string_data(istr->data.intern);
+ 	}
+ }
+ 
+-/** Get the byte length of this dom_string 
++/** Get the byte length of this dom_string
+  *
+  * \param str	The dom_string object
+  */
+ size_t dom_string_byte_length(const dom_string *str)
+ {
+ 	dom_string_internal *istr = (void *) str;
++	/* fixes490 - NULL guard, paired with dom_string_data. A NULL string
++	 * here would read low memory as the length and render garbage. */
++	if (istr == NULL)
++		return 0;
+ 	if (istr->type == DOM_STRING_CDATA) {
++		/* fixes569: same recycled-struct guard as dom_string_data's
++		 * CDATA branch (fixes446g/489). A dom_string_internal freed and
++		 * reused by the scheduler leaves data.cdata.ptr in code space
++		 * (>= 0x28000000) or data.cdata.len garbage. Consumers that size
++		 * a memcpy/scan by this length (box_construct_text box_construct.c
++		 * :1819, forms.c, css_fetcher.c) then read wild memory and crash
++		 * in a strlen-style loop (68kmla box_image path, r4 wild).
++		 * dom_string_data already returns "" for these; return 0 here so
++		 * the paired (data, len) agree and no overrun happens. */
++		{
++			unsigned long pa_ = (unsigned long)istr->data.cdata.ptr;
++			if (!macsurf_ptr_is_heap((const void *)istr->data.cdata.ptr) ||
++			    istr->data.cdata.len > 1048576UL) {
++				extern void macsurf_debug_log_writef(
++					const char *fmt, ...);
++				macsurf_debug_log_writef(
++					"fixes569 LEN: bad cdata ptr=%p len=%ld",
++					(void *)pa_,
++					(long)istr->data.cdata.len);
++				return 0;
++			}
++		}
+ 		return istr->data.cdata.len;
+ 	} else {
++		/* fixes446b: paired guard - same corrupt intern crashes here
++		 * via lwc_string_length reading str->len at bad_ptr+8. */
++		{
++			if (!macsurf_ptr_is_heap((const void *)istr->data.intern))
++				return 0;
++		}
+ 		return lwc_string_length(istr->data.intern);
+ 	}
+ }
+@@ -1008,7 +1119,28 @@
+ 		bool equal;
+ 		lwc_error err;
+ 		lwc_string *l;
+-
++		/* fixes446: guard against heap-corrupt lwc_string pointer.
++		 * Crash signature: lbzu r0,0x0001(r4) with r4 in kernel
++		 * address space (>0x28000000 on 640MB Mac OS 9), because
++		 * CSTR_OF(bad_intern) = bad_intern+24 is unmapped.
++		 * Root cause is a UAF that writes garbage to
++		 * dom_string_internal.data.intern; this guard returns before
++		 * lwc__intern_caseless_string dereferences the bad pointer. */
++		{
++			unsigned long intern_addr_ =
++				(unsigned long)isource->data.intern;
++			if (!macsurf_ptr_is_heap((const void *)isource->data.intern)) {
++				extern void macsurf_debug_log_writef(
++					const char *fmt, ...);
++				macsurf_debug_log_writef(
++					"fixes446 GUARD: corrupt intern=%p "
++					"in dom_string_tolower source=%p type=%d",
++					(void *)intern_addr_,
++					(void *)source,
++					(int)isource->type);
++				return DOM_NO_MEM_ERR;
++			}
++		}
+ 		err = lwc_string_tolower(isource->data.intern, &l);
+ 		if (err != lwc_error_ok) {
+ 			return DOM_NO_MEM_ERR;
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libdom/src/core/text.c browser/libdom/src/core/text.c
+--- upstream/libdom/src/core/text.c	2026-09-20 23:27:12.695343544 +0100
++++ browser/libdom/src/core/text.c	2026-09-20 23:19:17.309590290 +0100
+@@ -14,10 +14,10 @@
+ 
+ #include <libwapcaplet/libwapcaplet.h>
+ 
+-#include "core/characterdata.h"
+-#include "core/document.h"
+-#include "core/text.h"
+-#include "utils/utils.h"
++#include "core/characterdata.h"
++#include "core/document.h"
++#include "core/text.h"
++#include "utils/utils.h"
+ 
+ /* The virtual table for dom_text */
+ const struct dom_text_vtable text_vtable = {
+@@ -43,8 +43,8 @@
+ 	DELETE
+ } walk_operation;
+ typedef enum walk_order {
+-	LEFT,
+-	RIGHT
++	WALK_LEFT,
++	WALK_RIGHT
+ } walk_order;
+ 
+ /* Walk the logic-adjacent text in document order */
+@@ -386,7 +386,7 @@
+ 					return err;
+ 
+ 				tmp = *ret;
+-				if (order == LEFT) {
++				if (order == WALK_LEFT) {
+ 					if (tmp != NULL) {
+ 						err = dom_string_concat(data, tmp, ret);
+ 						if (err != DOM_NO_ERR)
+@@ -395,7 +395,7 @@
+ 						dom_string_ref(data);
+ 						*ret = data;
+ 					}
+-				} else if (order == RIGHT) {
++				} else if (order == WALK_RIGHT) {
+ 					if (tmp != NULL) {
+ 						err = dom_string_concat(tmp, data, ret);
+ 						if (err != DOM_NO_ERR)
+@@ -428,7 +428,7 @@
+ 		}
+ 
+ 		p = dom_node_get_parent(node);
+-		if (order == LEFT) {
++		if (order == WALK_LEFT) {
+ 			if (node->last_child != NULL) {
+ 				node = node->last_child;
+ 			} else if (node->previous != NULL) {
+@@ -485,7 +485,7 @@
+ 	*ret = NULL;
+ 
+ 	/* Firstly, we look our left */
+-	err = walk_logic_adjacent_text_in_order(left, opt, LEFT, ret, &cont);
++	err = walk_logic_adjacent_text_in_order(left, opt, WALK_LEFT, ret, &cont);
+ 	if (err != DOM_NO_ERR) {
+ 		if (opt == COLLECT) {
+ 			dom_string_unref(*ret);
+@@ -525,7 +525,7 @@
+ 	}
+ 
+ 	/* Now, look right */
+-	err = walk_logic_adjacent_text_in_order(right, opt, RIGHT, ret, &cont);
++	err = walk_logic_adjacent_text_in_order(right, opt, WALK_RIGHT, ret, &cont);
+ 	if (err != DOM_NO_ERR) {
+ 		if (opt == COLLECT) {
+ 			dom_string_unref(*ret);
+diff -urN upstream/libdom/src/core/text.h browser/libdom/src/core/text.h
+--- upstream/libdom/src/core/text.h
++++ browser/libdom/src/core/text.h
+@@ -8,12 +8,12 @@
+ #ifndef dom_internal_core_text_h_
+ #define dom_internal_core_text_h_
+ 
+-#include <stdbool.h>
++/* stdbool removed for CW8 -- prefix provides bool */
+ 
+ #include <dom/core/exceptions.h>
+ #include <dom/core/text.h>
+ 
+-#include "core/characterdata.h"
++#include "core/characterdata.h"
+ 
+ struct dom_document;
+ 
+diff -urN upstream/libdom/src/core/tokenlist.h browser/libdom/src/core/tokenlist.h
+--- upstream/libdom/src/core/tokenlist.h
++++ browser/libdom/src/core/tokenlist.h
+@@ -8,7 +8,7 @@
+ #ifndef dom_internal_core_tokenlist_h_
+ #define dom_internal_core_tokenlist_h_
+ 
+-#include <stdbool.h>
++/* stdbool removed for CW8 -- prefix provides bool */
+ 
+ #include <dom/core/tokenlist.h>
+ 

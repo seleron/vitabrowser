@@ -1,0 +1,3232 @@
+# libcss: parse-core
+# 11 files, 2966 changed lines
+# MacSurf fix ids: fixes1056 fixes1267 fixes1268a fixes1268b fixes1268c fixes1268e fixes1269 fixes139 fixes161a fixes264 fixes267 fixes347d fixes347f fixes358 fixes359 fixes360b fixes361 fixes63
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/css_internal_parse_font_face.h browser/libcss/src/parse/css_internal_parse_font_face.h
+--- upstream/libcss/src/parse/css_internal_parse_font_face.h	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/parse/css_internal_parse_font_face.h	2026-09-20 23:19:17.180267843 +0100
+@@ -0,0 +1,27 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2011 Things Made Out Of Other Things Ltd.
++ * Written by James Montgomerie <jamie@th.ingsmadeoutofotherthin.gs>
++ */
++
++#ifndef css_parse_font_face_h_
++#define css_parse_font_face_h_
++
++/* Defensive empty define for CW8 - see notes in stylesheet.h. */
++#ifndef _ALIGNED
++#define _ALIGNED
++#endif
++
++#include <parserutils/utils/vector.h>
++
++#include "stylesheet.h"
++#include "lex/lex.h"
++#include "parse/language.h"
++
++css_error css__parse_font_descriptor(css_language *c,
++		const css_token *descriptor, const parserutils_vector *vector,
++		int32_t *ctx, struct css_rule_font_face *rule);
++
++#endif
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/custom_properties.c browser/libcss/src/parse/custom_properties.c
+--- upstream/libcss/src/parse/custom_properties.c	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/parse/custom_properties.c	2026-09-20 23:19:17.180837128 +0100
+@@ -0,0 +1,1594 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The MacSurf Project.
++ *
++ * CSS Custom Properties and var() deferred resolution. See the header
++ * for the architectural summary.
++ */
++
++#include <assert.h>
++#include <ctype.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <libcss/select.h>
++
++#include "stylesheet.h"
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "lex/lex.h"
++#include "parse/custom_properties.h"
++#include "parse/important.h"
++#include "parse/language.h"
++#include "parse/propstrings.h"
++#include "parse/properties/properties.h"
++#include "select/dispatch.h"
++#include "select/select.h"
++
++/* MacSurf-only debug title-bar logging. Header provides no-op macros
++ * when MACSURF_DEBUG is undefined, so the instrumentation costs
++ * nothing on non-debug builds and does not pull in the frontend. */
++#include "macsurf_debug.h"
++
++#define MAX_VAR_DEPTH 10
++
++/* One-shot probe gates: confirm that the two sides of the var()
++ * pipeline reach execution at least once per process lifetime. */
++static int g_cp_def_logged = 0;
++static int g_cp_res_logged = 0;
++
++/* Compare two custom-property names ignoring their leading dashes.
++ * libcss's lexer tokenizes "--foo" as CHAR('-') + IDENT('-foo'), so
++ * definitions and var() references both end up carrying names with a
++ * single leading '-' today. A future lexer fix would produce single
++ * IDENT('--foo') tokens; normalizing up to two leading dashes on each
++ * side keeps the pipeline correct for either tokenization. */
++static bool cp_name_equal(lwc_string *a, lwc_string *b)
++{
++	const char *ad;
++	const char *bd;
++	size_t al;
++	size_t bl;
++
++	if (a == NULL || b == NULL)
++		return false;
++
++	ad = lwc_string_data(a);
++	al = lwc_string_length(a);
++	bd = lwc_string_data(b);
++	bl = lwc_string_length(b);
++
++	if (al >= 2 && ad[0] == '-' && ad[1] == '-') {
++		ad += 2;
++		al -= 2;
++	} else if (al >= 1 && ad[0] == '-') {
++		ad += 1;
++		al -= 1;
++	}
++
++	if (bl >= 2 && bd[0] == '-' && bd[1] == '-') {
++		bd += 2;
++		bl -= 2;
++	} else if (bl >= 1 && bd[0] == '-') {
++		bd += 1;
++		bl -= 1;
++	}
++
++	if (al != bl)
++		return false;
++	if (al == 0)
++		return true;
++	return memcmp(ad, bd, al) == 0;
++}
++
++
++/* ------------------------------------------------------------------ */
++/* Token list helpers                                                 */
++/* ------------------------------------------------------------------ */
++
++css_error css__cp_tokens_from_vector(const parserutils_vector *vec,
++		int32_t start, int32_t end,
++		css_cp_token **out_tokens, uint32_t *out_n)
++{
++	int32_t i;
++	uint32_t count;
++	css_cp_token *arr;
++
++	if (out_tokens == NULL || out_n == NULL)
++		return CSS_BADPARM;
++
++	*out_tokens = NULL;
++	*out_n = 0;
++
++	if (end <= start)
++		return CSS_OK;
++
++	count = (uint32_t)(end - start);
++	arr = (css_cp_token *)calloc(count, sizeof(css_cp_token));
++	if (arr == NULL)
++		return CSS_NOMEM;
++
++	for (i = 0; i < (int32_t)count; i++) {
++		const css_token *t;
++
++		t = (const css_token *)parserutils_vector_peek(vec, start + i);
++		if (t == NULL) {
++			arr[i].type = CSS_TOKEN_EOF;
++			arr[i].idata = NULL;
++			continue;
++		}
++
++		arr[i].type = (uint16_t)t->type;
++		arr[i].col = t->col;
++		arr[i].line = t->line;
++		if (t->idata != NULL)
++			arr[i].idata = lwc_string_ref(t->idata);
++		else
++			arr[i].idata = NULL;
++	}
++
++	*out_tokens = arr;
++	*out_n = count;
++	return CSS_OK;
++}
++
++void css__cp_tokens_destroy(css_cp_token *tokens, uint32_t n)
++{
++	uint32_t i;
++
++	if (tokens == NULL)
++		return;
++
++	for (i = 0; i < n; i++) {
++		if (tokens[i].idata != NULL)
++			lwc_string_unref(tokens[i].idata);
++	}
++	free(tokens);
++}
++
++
++/* ------------------------------------------------------------------ */
++/* Custom-property list (per stylesheet)                              */
++/* ------------------------------------------------------------------ */
++
++/* fixes1268b (#167) - the custom-property capture path takes the value
++ * tokens verbatim, so a trailing "!important" is still in the run. Detect
++ * it and report the value length excluding it (plus any whitespace
++ * between the value and the bang).
++ *
++ * \param out_n Receives the token count of the value proper.
++ * \return true if the run ended in !important.
++ */
++static bool cp_tokens_trailing_important(const css_cp_token *toks, uint32_t n,
++		uint32_t *out_n)
++{
++	uint32_t i = n;
++	bool seen_important = false;
++
++	*out_n = n;
++	if (toks == NULL || n == 0)
++		return false;
++
++	/* Walk back over trailing whitespace */
++	while (i > 0 && toks[i - 1].type == CSS_TOKEN_S)
++		i--;
++
++	/* IDENT("important") */
++	if (i == 0 || toks[i - 1].type != CSS_TOKEN_IDENT ||
++			toks[i - 1].idata == NULL)
++		return false;
++	{
++		const char *d = lwc_string_data(toks[i - 1].idata);
++		size_t len = lwc_string_length(toks[i - 1].idata);
++		size_t k;
++		static const char imp[9] = { 'i','m','p','o','r','t','a','n','t' };
++
++		if (d == NULL || len != 9)
++			return false;
++		for (k = 0; k < 9; k++) {
++			if (tolower((unsigned char) d[k]) != imp[k])
++				return false;
++		}
++	}
++	i--;
++
++	while (i > 0 && toks[i - 1].type == CSS_TOKEN_S)
++		i--;
++
++	/* CHAR('!') */
++	if (i == 0 || toks[i - 1].type != CSS_TOKEN_CHAR ||
++			toks[i - 1].idata == NULL ||
++			lwc_string_length(toks[i - 1].idata) != 1 ||
++			lwc_string_data(toks[i - 1].idata)[0] != '!')
++		return false;
++	i--;
++	seen_important = true;
++
++	/* Trim whitespace before the bang too */
++	while (i > 0 && toks[i - 1].type == CSS_TOKEN_S)
++		i--;
++
++	*out_n = i;
++	return seen_important;
++}
++
++/* ------------------------------------------------------------------ */
++/* Per-element custom-property environment (fixes1268b, #167)         */
++/* ------------------------------------------------------------------ */
++
++/* Does a definition at (origin, important, specificity) replace the one
++ * already bound? This mirrors css__outranks_existing in select.c for
++ * ordinary properties; custom properties cascade by exactly the same
++ * rules, so the two must agree. Kept as a separate function rather than
++ * calling that one because it decides against a css_cp_binding, not
++ * against the prop_state table it indexes by opcode. */
++static bool cp_binding_outranked(const css_cp_binding *existing,
++		uint8_t origin, uint8_t important, uint32_t specificity)
++{
++	if (existing->origin < origin) {
++		/* New origin carries more weight, except against USER,i */
++		return (existing->important == 0 ||
++				existing->origin != CSS_ORIGIN_USER);
++	}
++
++	if (existing->origin == origin) {
++		if (origin == CSS_ORIGIN_UA) {
++			/* Importance is meaningless in the UA sheet */
++			return specificity >= existing->specificity;
++		}
++		if (existing->important == 0 && important != 0)
++			return true;
++		if (existing->important != 0 && important == 0)
++			return false;
++		/* Equal importance: higher specificity wins, and equal
++		 * specificity means the later rule wins - hence >=, as
++		 * rules arrive in ascending specificity then source
++		 * order. */
++		return specificity >= existing->specificity;
++	}
++
++	/* Existing origin outweighs the new one, except for USER,i */
++	return (origin == CSS_ORIGIN_USER && important != 0);
++}
++
++css_error css__cp_env_add(css_cp_env **env, lwc_string *name,
++		const css_cp_token *tokens, uint32_t n,
++		uint32_t specificity, uint8_t origin, uint8_t important)
++{
++	css_cp_env *e;
++	uint32_t i;
++
++	if (env == NULL || name == NULL)
++		return CSS_BADPARM;
++
++	if (*env == NULL) {
++		*env = (css_cp_env *)calloc(1, sizeof(css_cp_env));
++		if (*env == NULL)
++			return CSS_NOMEM;
++		(*env)->refcount = 1;
++	}
++	e = *env;
++
++	for (i = 0; i < e->used; i++) {
++		if (!cp_name_equal(e->items[i].entry.name, name))
++			continue;
++		if (cp_binding_outranked(&e->items[i], origin, important,
++				specificity)) {
++			e->items[i].entry.name = name;
++			e->items[i].entry.tokens = (css_cp_token *)tokens;
++			e->items[i].entry.n_tokens = n;
++			e->items[i].specificity = specificity;
++			e->items[i].origin = origin;
++			e->items[i].important = important;
++		}
++		return CSS_OK;
++	}
++
++	if (e->used == e->allocated) {
++		uint32_t newcap = (e->allocated == 0) ? 16 : e->allocated * 2;
++		css_cp_binding *ni = (css_cp_binding *)realloc(e->items,
++				newcap * sizeof(css_cp_binding));
++		if (ni == NULL)
++			return CSS_NOMEM;
++		e->items = ni;
++		e->allocated = newcap;
++	}
++
++	memset(&e->items[e->used], 0, sizeof(css_cp_binding));
++	e->items[e->used].entry.name = name;
++	e->items[e->used].entry.tokens = (css_cp_token *)tokens;
++	e->items[e->used].entry.n_tokens = n;
++	e->items[e->used].entry.next = NULL;
++	e->items[e->used].specificity = specificity;
++	e->items[e->used].origin = origin;
++	e->items[e->used].important = important;
++	e->used++;
++
++	return CSS_OK;
++}
++
++const css_cp_entry *css__cp_env_find(const css_cp_env *env, lwc_string *name)
++{
++	if (name == NULL)
++		return NULL;
++
++	/* fixes1268c - walk the inheritance chain. The element's own
++	 * bindings shadow the parent's, which is what makes a local
++	 * redefinition override an inherited one. */
++	for (; env != NULL; env = env->inherited) {
++		uint32_t i;
++
++		for (i = 0; i < env->used; i++) {
++			if (!cp_name_equal(env->items[i].entry.name, name))
++				continue;
++			/* fixes1269 - an invalid definition reads as absent
++			 * so the consumer's var() fallback applies. It still
++			 * SHADOWS an inherited binding of the same name, per
++			 * "invalid at computed-value time". */
++			if (env->items[i].invalid)
++				return NULL;
++			return &env->items[i].entry;
++		}
++	}
++
++	return NULL;
++}
++
++css_cp_env *css__cp_env_ref(css_cp_env *env)
++{
++	if (env != NULL)
++		env->refcount++;
++	return env;
++}
++
++void css__cp_env_unref(css_cp_env *env)
++{
++	while (env != NULL) {
++		css_cp_env *up;
++		uint32_t i;
++
++		if (env->refcount > 1) {
++			env->refcount--;
++			return;
++		}
++
++		/* Raw bindings borrow their names and tokens from the
++		 * stylesheet; finalised ones own a substituted run built
++		 * here, whose idata references must be released. */
++		for (i = 0; i < env->used; i++) {
++			if (env->items[i].owns_tokens) {
++				css__cp_tokens_destroy(
++						env->items[i].entry.tokens,
++						env->items[i].entry.n_tokens);
++			}
++		}
++
++		up = env->inherited;
++		free(env->items);
++		free(env);
++
++		/* Iterate rather than recurse: an inheritance chain is as
++		 * deep as the document tree, and OS 9 stacks are small. */
++		env = up;
++	}
++}
++
++css_error css__cp_env_set_inherited(css_cp_env **env, css_cp_env *parent)
++{
++	if (env == NULL)
++		return CSS_BADPARM;
++	if (parent == NULL)
++		return CSS_OK;
++
++	if (*env == NULL) {
++		*env = (css_cp_env *)calloc(1, sizeof(css_cp_env));
++		if (*env == NULL)
++			return CSS_NOMEM;
++		(*env)->refcount = 1;
++	}
++
++	if ((*env)->inherited != NULL)
++		css__cp_env_unref((*env)->inherited);
++	(*env)->inherited = css__cp_env_ref(parent);
++
++	return CSS_OK;
++}
++
++/* fixes1269 (#167) - a definition is a deferred entry whose property name
++ * begins with "--". No ordinary CSS property can, so the test is exact. */
++bool css__cp_decl_is_definition(const css_deferred_decl *dd)
++{
++	const char *d;
++
++	if (dd == NULL || dd->property == NULL)
++		return false;
++
++	d = lwc_string_data(dd->property);
++	if (d == NULL || lwc_string_length(dd->property) < 2)
++		return false;
++
++	return (d[0] == '-' && d[1] == '-');
++}
++
++css_error css__cp_env_add_style(css_cp_env **env, const css_style *style,
++		uint32_t specificity, uint8_t origin)
++{
++	const css_deferred_decl *dd;
++
++	if (style == NULL)
++		return CSS_OK;
++
++	for (dd = style->deferred; dd != NULL; dd = dd->next) {
++		css_error error;
++		uint8_t important = 0;
++		uint32_t n;
++
++		if (!css__cp_decl_is_definition(dd))
++			continue;   /* an ordinary var() consumer */
++
++		n = dd->n_tokens;
++
++		/* A trailing "!important" is still sitting in the captured
++		 * token run - the custom-property capture path takes the
++		 * value verbatim. Strip it here so it neither reaches
++		 * substitution nor is mistaken for part of the value. */
++		if (cp_tokens_trailing_important(dd->tokens, dd->n_tokens,
++				&n)) {
++			important = 1;
++		}
++		if (dd->important)
++			important = 1;
++
++		error = css__cp_env_add(env, dd->property, dd->tokens, n,
++				specificity, origin, important);
++		if (error != CSS_OK)
++			return error;
++	}
++
++	return CSS_OK;
++}
++
++css_error css__sheet_add_custom_property(css_stylesheet *sheet,
++		lwc_string *name, css_cp_token *tokens, uint32_t n)
++{
++	css_cp_entry *entry;
++	css_cp_entry *cur;
++
++	if (sheet == NULL || name == NULL) {
++		if (tokens != NULL)
++			css__cp_tokens_destroy(tokens, n);
++		if (name != NULL)
++			lwc_string_unref(name);
++		return CSS_BADPARM;
++	}
++
++	/* Replace if an earlier entry has the same name (normalized
++	 * dash-count comparison). */
++	for (cur = sheet->custom_properties; cur != NULL; cur = cur->next) {
++		if (cp_name_equal(cur->name, name)) {
++			css__cp_tokens_destroy(cur->tokens, cur->n_tokens);
++			cur->tokens = tokens;
++			cur->n_tokens = n;
++			lwc_string_unref(name);
++			if (!g_cp_def_logged) {
++				g_cp_def_logged = 1;
++				/* MS_LOG_STICKY removed (fixes63) */
++			}
++			return CSS_OK;
++		}
++	}
++
++	entry = (css_cp_entry *)calloc(1, sizeof(css_cp_entry));
++	if (entry == NULL) {
++		css__cp_tokens_destroy(tokens, n);
++		lwc_string_unref(name);
++		return CSS_NOMEM;
++	}
++
++	entry->name = name;
++	entry->tokens = tokens;
++	entry->n_tokens = n;
++	entry->next = NULL;
++
++	/* Append at tail so in-sheet source order is preserved. */
++	if (sheet->custom_properties == NULL) {
++		sheet->custom_properties = entry;
++	} else {
++		cur = sheet->custom_properties;
++		while (cur->next != NULL)
++			cur = cur->next;
++		cur->next = entry;
++	}
++
++	if (!g_cp_def_logged) {
++		g_cp_def_logged = 1;
++		/* MS_LOG_STICKY removed (fixes63) */
++	}
++	return CSS_OK;
++}
++
++const css_cp_entry *css__sheet_find_custom_property(
++		const css_stylesheet *sheet, lwc_string *name)
++{
++	const css_cp_entry *cur;
++
++	if (sheet == NULL || name == NULL)
++		return NULL;
++
++	for (cur = sheet->custom_properties; cur != NULL; cur = cur->next) {
++		if (cp_name_equal(cur->name, name))
++			return cur;
++	}
++	return NULL;
++}
++
++void css__cp_entry_list_destroy(css_cp_entry *head)
++{
++	css_cp_entry *cur;
++	css_cp_entry *next;
++
++	cur = head;
++	while (cur != NULL) {
++		next = cur->next;
++		css__cp_tokens_destroy(cur->tokens, cur->n_tokens);
++		if (cur->name != NULL)
++			lwc_string_unref(cur->name);
++		free(cur);
++		cur = next;
++	}
++}
++
++
++/* ------------------------------------------------------------------ */
++/* fixes267 - Document-global inline-extras custom-property table     */
++/* ------------------------------------------------------------------ */
++/*
++ * Aggregates custom-property declarations harvested from EVERY inline
++ * style="..." attribute parsed by nscss_create_inline_style. This is the
++ * pragmatic V1 of element-scoped custom properties: when an element
++ * defines `style="--header-tile: url(...)"` and the property is
++ * referenced from author CSS that matches a DIFFERENT element (typically
++ * a descendant), libcss's per-sheet custom_properties lists don't see
++ * it. The CSS spec answer is inheritance, but our cascade implements
++ * custom props as parse-time-captured tokens, not computed style
++ * inheritance, so we route around the gap by aggregating all inline
++ * custom props into a doc-global table that lookup_var() consults.
++ *
++ * Trade-off (acknowledged): if two different elements declare the same
++ * `--name` inline with different values, the last writer wins for both.
++ * Spec-correct behaviour would scope per element. For mactrove's
++ * single-`--header-tile`-element case this works exactly right.
++ *
++ * Cleanup: DONE (fixes267) - css_inline_extras_clear() is called from
++ * html_create() in content/handlers/html/html.c, so the table no longer
++ * accumulates across page loads. Last-writer-wins inside a single page
++ * remains the intended semantics.
++ *
++ * KNOWN SCOPING DEFECT (fixes1056, #305): html_create runs for EVERY html
++ * content, and an iframe is an html content. So loading an iframe clears the
++ * PARENT document's inline custom properties, and any later re-cascade of the
++ * parent resolves those var() references against nothing. The clear belongs on
++ * top-level navigation, not on every document create -- the frontend already
++ * has that exact signal in macos9_http_mark_next_as_document() (fixes161a).
++ * Not moved yet because that marker's call sites need auditing first: if any
++ * navigation path does not go through it, moving the clear there would let the
++ * table accumulate again, which is the bug fixes267 fixed.
++ */
++static css_cp_entry *g_inline_extras_head = NULL;
++
++static css_error clone_cp_tokens(const css_cp_token *src, uint32_t n,
++		css_cp_token **out)
++{
++	css_cp_token *dst;
++	uint32_t i;
++
++	if (n == 0) {
++		*out = NULL;
++		return CSS_OK;
++	}
++	dst = (css_cp_token *)calloc(n, sizeof(css_cp_token));
++	if (dst == NULL)
++		return CSS_NOMEM;
++	for (i = 0; i < n; i++) {
++		dst[i] = src[i];
++		if (src[i].idata != NULL)
++			dst[i].idata = lwc_string_ref(src[i].idata);
++	}
++	*out = dst;
++	return CSS_OK;
++}
++
++css_error css_inline_extras_register_sheet(const css_stylesheet *sh)
++{
++	const css_cp_entry *src;
++	css_cp_entry *cur;
++	css_cp_entry *new_entry;
++	css_cp_token *cloned;
++	css_error err;
++
++	if (sh == NULL)
++		return CSS_BADPARM;
++
++	for (src = sh->custom_properties; src != NULL; src = src->next) {
++		/* Search for existing entry with same normalized name. */
++		for (cur = g_inline_extras_head; cur != NULL; cur = cur->next) {
++			if (cp_name_equal(cur->name, src->name))
++				break;
++		}
++		err = clone_cp_tokens(src->tokens, src->n_tokens, &cloned);
++		if (err != CSS_OK)
++			return err;
++
++		if (cur != NULL) {
++			/* Replace existing entry's tokens
++			 * (last-writer-wins). */
++			css__cp_tokens_destroy(cur->tokens, cur->n_tokens);
++			cur->tokens = cloned;
++			cur->n_tokens = src->n_tokens;
++#ifdef MACSURF_DEBUG
++			{
++				extern void macsurf_debug_log_tracef(
++					const char *fmt, ...);
++				int t0 = -1;
++				int t1 = -1;
++				if (src->n_tokens > 0)
++					t0 = (int)src->tokens[0].type;
++				if (src->n_tokens > 1)
++					t1 = (int)src->tokens[1].type;
++				macsurf_debug_log_tracef(
++					"fixes347d extras REPLACE: name=%s ntok=%ld t0=%d t1=%d",
++					(src->name != NULL) ?
++						lwc_string_data(src->name) :
++						"(null)",
++					(long)src->n_tokens, t0, t1);
++			}
++#endif
++		} else {
++			new_entry = (css_cp_entry *)calloc(1,
++					sizeof(css_cp_entry));
++			if (new_entry == NULL) {
++				css__cp_tokens_destroy(cloned, src->n_tokens);
++				return CSS_NOMEM;
++			}
++			new_entry->name = lwc_string_ref(src->name);
++			new_entry->tokens = cloned;
++			new_entry->n_tokens = src->n_tokens;
++			new_entry->next = NULL;
++			if (g_inline_extras_head == NULL) {
++				g_inline_extras_head = new_entry;
++			} else {
++				cur = g_inline_extras_head;
++				while (cur->next != NULL)
++					cur = cur->next;
++				cur->next = new_entry;
++			}
++#ifdef MACSURF_DEBUG
++			{
++				extern void macsurf_debug_log_tracef(
++					const char *fmt, ...);
++				int t0 = -1;
++				int t1 = -1;
++				int t2 = -1;
++				if (src->n_tokens > 0)
++					t0 = (int)src->tokens[0].type;
++				if (src->n_tokens > 1)
++					t1 = (int)src->tokens[1].type;
++				if (src->n_tokens > 2)
++					t2 = (int)src->tokens[2].type;
++				macsurf_debug_log_tracef(
++					"fixes347d extras ADD: name=%s ntok=%ld t0=%d t1=%d t2=%d",
++					(src->name != NULL) ?
++						lwc_string_data(src->name) :
++						"(null)",
++					(long)src->n_tokens,
++					t0, t1, t2);
++			}
++#endif
++		}
++	}
++	return CSS_OK;
++}
++
++void css_inline_extras_clear(void)
++{
++	css__cp_entry_list_destroy(g_inline_extras_head);
++	g_inline_extras_head = NULL;
++}
++
++static const css_cp_entry *find_inline_extras(lwc_string *name)
++{
++	const css_cp_entry *cur;
++	for (cur = g_inline_extras_head; cur != NULL; cur = cur->next) {
++		if (cp_name_equal(cur->name, name))
++			return cur;
++	}
++	return NULL;
++}
++
++
++/* ------------------------------------------------------------------ */
++/* Deferred declaration list (per css_style)                          */
++/* ------------------------------------------------------------------ */
++
++css_error css__deferred_decl_create(lwc_string *property,
++		css_cp_token *tokens, uint32_t n, bool important,
++		css_deferred_decl **out)
++{
++	css_deferred_decl *dd;
++
++	if (out == NULL || property == NULL) {
++		if (tokens != NULL)
++			css__cp_tokens_destroy(tokens, n);
++		if (property != NULL)
++			lwc_string_unref(property);
++		return CSS_BADPARM;
++	}
++
++	dd = (css_deferred_decl *)calloc(1, sizeof(css_deferred_decl));
++	if (dd == NULL) {
++		css__cp_tokens_destroy(tokens, n);
++		lwc_string_unref(property);
++		return CSS_NOMEM;
++	}
++
++	dd->property = property;
++	dd->tokens = tokens;
++	dd->n_tokens = n;
++	dd->important = important ? 1 : 0;
++	dd->next = NULL;
++
++	*out = dd;
++	return CSS_OK;
++}
++
++void css__deferred_decl_attach(css_style *style, css_deferred_decl *dd)
++{
++	css_deferred_decl *tail;
++
++	if (style == NULL || dd == NULL)
++		return;
++
++	if (style->deferred == NULL) {
++		style->deferred = dd;
++		return;
++	}
++	tail = style->deferred;
++	while (tail->next != NULL)
++		tail = tail->next;
++	tail->next = dd;
++}
++
++void css__deferred_decl_list_destroy(css_deferred_decl *head)
++{
++	css_deferred_decl *cur;
++	css_deferred_decl *next;
++
++	cur = head;
++	while (cur != NULL) {
++		next = cur->next;
++		css__cp_tokens_destroy(cur->tokens, cur->n_tokens);
++		if (cur->property != NULL)
++			lwc_string_unref(cur->property);
++		free(cur);
++		cur = next;
++	}
++}
++
++
++/* ------------------------------------------------------------------ */
++/* var() detection                                                    */
++/* ------------------------------------------------------------------ */
++
++static bool token_is_var_function(const css_token *t)
++{
++	const char *s;
++	size_t len;
++
++	if (t == NULL || t->type != CSS_TOKEN_FUNCTION || t->idata == NULL)
++		return false;
++
++	len = lwc_string_length(t->idata);
++	if (len != 3)
++		return false;
++
++	s = lwc_string_data(t->idata);
++	return ((s[0] == 'v' || s[0] == 'V') &&
++		(s[1] == 'a' || s[1] == 'A') &&
++		(s[2] == 'r' || s[2] == 'R'));
++}
++
++static bool token_is_char(const css_token *t, char ch)
++{
++	if (t == NULL || t->type != CSS_TOKEN_CHAR || t->idata == NULL)
++		return false;
++	if (lwc_string_length(t->idata) != 1)
++		return false;
++	return lwc_string_data(t->idata)[0] == ch;
++}
++
++bool css__value_contains_var(const parserutils_vector *vec, int32_t start)
++{
++	int32_t i;
++	const css_token *t;
++
++	i = start;
++	for (;;) {
++		t = (const css_token *)parserutils_vector_peek(vec, i);
++		if (t == NULL)
++			return false;
++		if (token_is_var_function(t))
++			return true;
++		i++;
++	}
++}
++
++bool css__is_custom_property_ident(const css_token *ident)
++{
++	const char *s;
++	size_t len;
++
++	if (ident == NULL || ident->type != CSS_TOKEN_IDENT ||
++			ident->idata == NULL)
++		return false;
++	len = lwc_string_length(ident->idata);
++	if (len < 2)
++		return false;
++	s = lwc_string_data(ident->idata);
++	return (s[0] == '-' && s[1] == '-');
++}
++
++
++/* ------------------------------------------------------------------ */
++/* var() substitution                                                 */
++/* ------------------------------------------------------------------ */
++
++/* A scratch array of css_cp_token pointers used while substituting.
++ * We accumulate output as an array-of-pointers to source tokens, then
++ * copy to a flat css_cp_token[] for replay. This avoids having to
++ * ref/unref lwc_strings during substitution. */
++typedef struct cp_scratch {
++	const css_cp_token **items;
++	uint32_t used;
++	uint32_t allocated;
++} cp_scratch;
++
++static css_error scratch_grow(cp_scratch *s, uint32_t need)
++{
++	uint32_t newcap;
++	const css_cp_token **newitems;
++
++	if (s->used + need <= s->allocated)
++		return CSS_OK;
++
++	newcap = (s->allocated == 0) ? 16 : s->allocated * 2;
++	while (newcap < s->used + need)
++		newcap *= 2;
++
++	newitems = (const css_cp_token **)realloc(s->items,
++			newcap * sizeof(const css_cp_token *));
++	if (newitems == NULL)
++		return CSS_NOMEM;
++
++	s->items = newitems;
++	s->allocated = newcap;
++	return CSS_OK;
++}
++
++static css_error scratch_append(cp_scratch *s, const css_cp_token *t)
++{
++	css_error error;
++
++	error = scratch_grow(s, 1);
++	if (error != CSS_OK)
++		return error;
++	s->items[s->used++] = t;
++	return CSS_OK;
++}
++
++/* Find the matching close-paren for an open function/paren at index i
++ * within a cp_token array. Returns the index of the close CHAR, or -1
++ * if unbalanced. Assumes arr[i] is FUNCTION (already opens a paren
++ * implicitly) OR CHAR('('). For FUNCTION we start depth at 1 since the
++ * function itself counts as one open paren. */
++static int32_t find_paren_close(const css_cp_token *arr, uint32_t n,
++		uint32_t i, bool is_function_open)
++{
++	int32_t depth;
++	uint32_t j;
++
++	depth = is_function_open ? 1 : 0;
++	for (j = i + (is_function_open ? 1 : 0); j < n; j++) {
++		if (arr[j].type == CSS_TOKEN_FUNCTION) {
++			depth++;
++		} else if (arr[j].type == CSS_TOKEN_CHAR &&
++				arr[j].idata != NULL &&
++				lwc_string_length(arr[j].idata) == 1) {
++			char ch = lwc_string_data(arr[j].idata)[0];
++			if (ch == '(')
++				depth++;
++			else if (ch == ')') {
++				depth--;
++				if (depth == 0)
++					return (int32_t)j;
++			}
++		}
++	}
++	return -1;
++}
++
++/* Within a var(...) body, locate the name token and (optionally) the
++ * fallback-token range [fb_start, fb_end).
++ *  - body_start points at the first token after the FUNCTION token.
++ *  - body_end points at the index of the closing ')' (exclusive).
++ *  - On success, *name_out is the IDENT token pointer and fb_start/end
++ *    are populated (fb_start == fb_end when no fallback present).
++ */
++static bool parse_var_body(const css_cp_token *arr,
++		uint32_t body_start, uint32_t body_end,
++		const css_cp_token **name_out,
++		uint32_t *fb_start, uint32_t *fb_end)
++{
++	uint32_t j;
++	const css_cp_token *name;
++
++	*name_out = NULL;
++	*fb_start = body_end;
++	*fb_end = body_end;
++	name = NULL;
++
++	/* Skip leading whitespace */
++	j = body_start;
++	while (j < body_end && arr[j].type == CSS_TOKEN_S)
++		j++;
++	if (j >= body_end)
++		return false;
++
++	/* Name: accept either the CSS-3-style single IDENT('--foo')
++	 * (which libcss's current lexer does not emit but which a future
++	 * lexer update would), or the CSS-2.1 lexer split sequence
++	 * CHAR('-') + IDENT('-foo'). */
++	if (arr[j].type == CSS_TOKEN_CHAR &&
++			arr[j].idata != NULL &&
++			lwc_string_length(arr[j].idata) == 1 &&
++			lwc_string_data(arr[j].idata)[0] == '-') {
++		if (j + 1 >= body_end)
++			return false;
++		if (arr[j + 1].type != CSS_TOKEN_IDENT ||
++				arr[j + 1].idata == NULL ||
++				lwc_string_length(arr[j + 1].idata) < 1 ||
++				lwc_string_data(arr[j + 1].idata)[0] != '-')
++			return false;
++		name = &arr[j + 1];
++		j += 2;
++	} else if (arr[j].type == CSS_TOKEN_IDENT &&
++			arr[j].idata != NULL &&
++			lwc_string_length(arr[j].idata) >= 2 &&
++			lwc_string_data(arr[j].idata)[0] == '-' &&
++			lwc_string_data(arr[j].idata)[1] == '-') {
++		name = &arr[j];
++		j++;
++	} else {
++		return false;
++	}
++
++	/* Skip whitespace */
++	while (j < body_end && arr[j].type == CSS_TOKEN_S)
++		j++;
++
++	if (j < body_end) {
++		/* Expect a ',' to introduce fallback */
++		if (arr[j].type != CSS_TOKEN_CHAR || arr[j].idata == NULL ||
++				lwc_string_length(arr[j].idata) != 1 ||
++				lwc_string_data(arr[j].idata)[0] != ',') {
++			return false;
++		}
++		j++;
++		*fb_start = j;
++		*fb_end = body_end;
++	}
++
++	*name_out = name;
++	return true;
++}
++
++/* Count/get-sheet hooks implemented in select.c so we don't have to
++ * expose struct css_select_ctx's layout here. */
++extern uint32_t css__select_ctx_count_sheets(const css_select_ctx *ctx);
++extern const css_stylesheet *css__select_ctx_sheet_at(
++		const css_select_ctx *ctx, uint32_t index);
++
++/* Look up a name across all stylesheets in the select context. Later
++ * sheets override earlier (matches source-order author cascade). When
++ * ctx is NULL we fall back to origin_sheet only.
++ *
++ * fixes264 - also consult the per-element inline_style sheet (when
++ * provided). Highest priority (CSS spec puts inline-style declarations
++ * above author cascade), so checked last - found = hit overwrites any
++ * earlier match. Lets `background-image: var(--header-tile)` in an
++ * author stylesheet resolve against `style="--header-tile: url(...)"`
++ * set inline on the matched element (mactrove's random-header bg). */
++static const css_cp_entry *lookup_var(lwc_string *name,
++		const css_stylesheet *origin_sheet,
++		const css_select_ctx *ctx,
++		const css_stylesheet *inline_sheet,
++		const css_cp_env *env)
++{
++	const css_cp_entry *found;
++	const css_cp_entry *hit;
++
++	found = NULL;
++
++	/* fixes1268e (#167) - the element's environment is now the ONLY
++	 * source for author-level custom properties.
++	 *
++	 * The per-stylesheet last-write-wins scan that used to follow this
++	 * is gone rather than demoted to a fallback. Left in place it would
++	 * answer for any name the environment legitimately does NOT have -
++	 * i.e. precisely when the property is out of scope - handing an
++	 * element a value declared by a rule that never matched it, which
++	 * is the whole defect this series removes. A miss must stay a miss
++	 * so the var() fallback value is used.
++	 *
++	 * Correctness for the cases the fallback used to paper over now
++	 * comes from the mechanisms that replaced it: an ancestor's
++	 * definition arrives by inheritance (1268c), and a definition made
++	 * by a rule that cascades later is visible because var() resolution
++	 * runs as a second pass (1268d).
++	 *
++	 * UNUSED: origin_sheet is retained in the signature for the inline
++	 * paths below and for callers, not for a sheet-wide scan. */
++	if (env != NULL) {
++		found = css__cp_env_find(env, name);
++		if (found != NULL)
++			return found;
++	}
++
++	UNUSED(ctx);
++	UNUSED(origin_sheet);
++
++	if (inline_sheet != NULL) {
++		hit = css__sheet_find_custom_property(inline_sheet, name);
++		if (hit != NULL)
++			found = hit;   /* inline wins over author cascade */
++	}
++
++	/* fixes267 - doc-global inline-extras table. Aggregates custom
++	 * properties from EVERY element's inline style="..." so a parent's
++	 * `style="--header-tile: url(...)"` resolves for child elements
++	 * whose author CSS references `var(--header-tile)`. Highest
++	 * priority overall (last write wins) to match CSS spec's
++	 * inline-style cascade level. */
++	hit = find_inline_extras(name);
++	if (hit != NULL)
++		found = hit;
++
++#ifdef MACSURF_DEBUG
++	{
++		extern void macsurf_debug_log_tracef(
++			const char *fmt, ...);
++		macsurf_debug_log_tracef(
++			"fixes347d lookup_var: name=%s extras_hit=%d found=%d",
++			(name != NULL) ? lwc_string_data(name) : "(null)",
++			(find_inline_extras(name) != NULL) ? 1 : 0,
++			(found != NULL) ? 1 : 0);
++	}
++#endif
++
++	return found;
++}
++
++static css_error substitute_tokens(const css_cp_token *arr, uint32_t n,
++		const css_stylesheet *origin_sheet,
++		const css_select_ctx *ctx,
++		const css_stylesheet *inline_sheet,
++		const css_cp_env *env,
++		int depth, cp_scratch *out, bool *ok)
++{
++	uint32_t i;
++	css_error error;
++
++	if (depth > MAX_VAR_DEPTH) {
++		*ok = false;
++		return CSS_OK;
++	}
++
++	i = 0;
++	while (i < n) {
++		bool is_var;
++		const char *s;
++
++		is_var = false;
++		if (arr[i].type == CSS_TOKEN_FUNCTION &&
++				arr[i].idata != NULL &&
++				lwc_string_length(arr[i].idata) == 3) {
++			s = lwc_string_data(arr[i].idata);
++			if ((s[0] == 'v' || s[0] == 'V') &&
++					(s[1] == 'a' || s[1] == 'A') &&
++					(s[2] == 'r' || s[2] == 'R')) {
++				is_var = true;
++			}
++		}
++
++		if (is_var) {
++			int32_t close;
++			const css_cp_token *name_tok;
++			uint32_t fb_s;
++			uint32_t fb_e;
++			const css_cp_entry *entry;
++
++			close = find_paren_close(arr, n, i, true);
++			if (close < 0) {
++				*ok = false;
++				return CSS_OK;
++			}
++
++			if (!parse_var_body(arr, i + 1, (uint32_t)close,
++					&name_tok, &fb_s, &fb_e)) {
++				*ok = false;
++				return CSS_OK;
++			}
++
++			entry = lookup_var(name_tok->idata,
++					origin_sheet, ctx, inline_sheet,
++					env);
++			if (entry != NULL) {
++				error = substitute_tokens(
++						entry->tokens,
++						entry->n_tokens,
++						origin_sheet, ctx,
++						inline_sheet, env,
++						depth + 1, out, ok);
++				if (error != CSS_OK || !*ok)
++					return error;
++			} else if (fb_s < fb_e) {
++				error = substitute_tokens(
++						arr + fb_s, fb_e - fb_s,
++						origin_sheet, ctx,
++						inline_sheet, env,
++						depth + 1, out, ok);
++				if (error != CSS_OK || !*ok)
++					return error;
++			} else {
++				*ok = false;
++				return CSS_OK;
++			}
++
++			i = (uint32_t)close + 1;
++			continue;
++		}
++
++		error = scratch_append(out, &arr[i]);
++		if (error != CSS_OK)
++			return error;
++		i++;
++	}
++
++	return CSS_OK;
++}
++
++
++/* ------------------------------------------------------------------ */
++/* Replay: rebuild a parserutils_vector<css_token> from cp_tokens     */
++/* ------------------------------------------------------------------ */
++
++static css_error build_replay_vector(const css_cp_token **ptrs,
++		uint32_t n, parserutils_vector **out)
++{
++	parserutils_vector *v;
++	parserutils_error perr;
++	uint32_t i;
++
++	perr = parserutils_vector_create(sizeof(css_token), 16, &v);
++	if (perr != PARSERUTILS_OK)
++		return CSS_NOMEM;
++
++	for (i = 0; i < n; i++) {
++		css_token t;
++		const css_cp_token *cp = ptrs[i];
++
++		memset(&t, 0, sizeof(t));
++		t.type = (css_token_type)cp->type;
++		t.idata = cp->idata;
++		t.col = cp->col;
++		t.line = cp->line;
++
++		if (cp->idata != NULL) {
++			t.data.data = (uint8_t *)lwc_string_data(cp->idata);
++			t.data.len = lwc_string_length(cp->idata);
++		} else {
++			t.data.data = NULL;
++			t.data.len = 0;
++		}
++
++		perr = parserutils_vector_append(v, &t);
++		if (perr != PARSERUTILS_OK) {
++			parserutils_vector_destroy(v);
++			return CSS_NOMEM;
++		}
++	}
++
++	*out = v;
++	return CSS_OK;
++}
++
++
++/* fixes1268c (#167) - turn an element's raw bindings into COMPUTED ones.
++ *
++ * CSS Variables 1: "the computed value of a custom property is its
++ * specified value with variables substituted". Substitution therefore
++ * happens on the element that DECLARED the property, and children
++ * inherit the already-substituted result. Verified against Chrome:
++ *
++ *   .p { --a: red; --b: var(--a) }
++ *   .c { --a: blue; color: var(--b) }    =>  .c color is RED, not blue
++ *
++ * Keeping raw tokens and substituting lazily at each consumer would give
++ * blue, because the child's own --a would shadow the parent's during the
++ * recursive lookup. That is the trap: it looks like a harmless
++ * optimisation and silently changes the semantics.
++ *
++ * Substituting per element also makes the result independent of
++ * declaration order inside a rule, which Chrome likewise confirms
++ * (".q { --b: var(--a); --a: green }" resolves to green).
++ */
++css_error css__cp_env_finalise(css_cp_env *env,
++		const css_stylesheet *origin_sheet,
++		const css_select_ctx *ctx,
++		const css_stylesheet *inline_sheet)
++{
++	uint32_t i;
++
++	if (env == NULL || env->finalised)
++		return CSS_OK;
++
++	for (i = 0; i < env->used; i++) {
++		cp_scratch scratch;
++		bool ok = true;
++		css_error error;
++		css_cp_token *flat;
++		uint32_t j;
++
++		memset(&scratch, 0, sizeof(scratch));
++
++		error = substitute_tokens(env->items[i].entry.tokens,
++				env->items[i].entry.n_tokens,
++				origin_sheet, ctx, inline_sheet, env,
++				0, &scratch, &ok);
++		if (error != CSS_OK) {
++			free(scratch.items);
++			return error;
++		}
++		if (!ok) {
++			/* fixes1269 - unresolvable: a missing name, or a
++			 * var() cycle that hit the depth cap. The property
++			 * is invalid at computed-value time, so mark it and
++			 * let consumers fall back. Leaving the raw run in
++			 * place would re-enter the cycle at every consumer
++			 * and drop their declarations outright. */
++			free(scratch.items);
++			env->items[i].invalid = 1;
++			continue;
++		}
++
++		flat = (css_cp_token *)calloc(
++				(scratch.used > 0) ? scratch.used : 1,
++				sizeof(css_cp_token));
++		if (flat == NULL) {
++			free(scratch.items);
++			return CSS_NOMEM;
++		}
++
++		for (j = 0; j < scratch.used; j++) {
++			flat[j] = *scratch.items[j];
++			if (flat[j].idata != NULL)
++				(void)lwc_string_ref(flat[j].idata);
++		}
++		free(scratch.items);
++
++		if (env->items[i].owns_tokens) {
++			css__cp_tokens_destroy(env->items[i].entry.tokens,
++					env->items[i].entry.n_tokens);
++		}
++		env->items[i].entry.tokens = flat;
++		env->items[i].entry.n_tokens = scratch.used;
++		env->items[i].owns_tokens = 1;
++	}
++
++	env->finalised = 1;
++
++	return CSS_OK;
++}
++
++/* ------------------------------------------------------------------ */
++/* Resolve a deferred declaration                                     */
++/* ------------------------------------------------------------------ */
++
++/* fixes1267 (#167) - local copy of the <body> element test. The one in
++ * select/properties/helpers.c is static to that TU; a shared symbol is not
++ * worth adding for a diagnostic. Direct byte compare, no interning and no
++ * POSIX strcasecmp (see the C89/CW8 port audit checklist). */
++static int cp__qname_is_body(const css_qname *el)
++{
++	const char *d;
++	size_t len;
++	size_t i;
++	static const char body[4] = { 'b', 'o', 'd', 'y' };
++
++	if (el == NULL || el->name == NULL)
++		return 0;
++
++	d = lwc_string_data(el->name);
++	len = lwc_string_length(el->name);
++	if (d == NULL || len != 4)
++		return 0;
++
++	for (i = 0; i < 4; i++) {
++		if (tolower((unsigned char) d[i]) != body[i])
++			return 0;
++	}
++	return 1;
++}
++
++/* fixes1267 (#167) - flatten a token run into a printable buffer. Truncates
++ * rather than allocating; diagnostics must never be able to fail the
++ * cascade. buf is always NUL-terminated. */
++static void cp__tokens_to_text(const css_cp_token *const *items, uint32_t n,
++		const css_cp_token *flat, uint32_t nflat,
++		char *buf, size_t buflen)
++{
++	size_t out = 0;
++	uint32_t i;
++
++	if (buf == NULL || buflen == 0)
++		return;
++	buf[0] = '\0';
++
++	for (i = 0; i < (items != NULL ? n : nflat); i++) {
++		const css_cp_token *t = (items != NULL) ? items[i] : &flat[i];
++		const char *d;
++		size_t len;
++		size_t k;
++
++		if (t == NULL || t->idata == NULL) {
++			d = " ";
++			len = 1;
++		} else {
++			d = lwc_string_data(t->idata);
++			len = lwc_string_length(t->idata);
++			if (d == NULL)
++				continue;
++		}
++
++		for (k = 0; k < len; k++) {
++			if (out + 1 >= buflen) {
++				buf[out] = '\0';
++				return;
++			}
++			buf[out++] = d[k];
++		}
++	}
++	buf[out] = '\0';
++}
++
++/* Linear-search for property ID matching the ident's idata. */
++static int find_property_id(css_language *c, lwc_string *name)
++{
++	int i;
++	bool match;
++
++	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
++		match = false;
++		if (lwc_string_caseless_isequal(name, c->strings[i],
++					&match) == lwc_error_ok && match)
++			return i;
++	}
++	return -1;
++}
++
++css_error css__deferred_decl_resolve(const css_deferred_decl *dd,
++		const css_stylesheet *origin_sheet,
++		css_select_ctx *ctx,
++		css_select_state *state)
++{
++	cp_scratch scratch;
++	bool ok;
++	css_error error;
++	parserutils_vector *replay;
++	int32_t ctx_idx;
++	css_style *scratch_style;
++	css_language stub_lang;
++	int prop_id;
++	css_prop_handler handler;
++	uint8_t important_flag;
++	css_style cascade_walker;
++
++	if (dd == NULL || origin_sheet == NULL || state == NULL)
++		return CSS_BADPARM;
++
++#ifdef MACSURF_DEBUG
++	{
++		extern void macsurf_debug_log_tracef(
++			const char *fmt, ...);
++		macsurf_debug_log_tracef(
++			"fixes347d deferred ENTER: prop=%s ntok=%ld",
++			(dd->property != NULL) ?
++				lwc_string_data(dd->property) :
++				"(null)",
++			(long)dd->n_tokens);
++	}
++#endif
++
++	memset(&scratch, 0, sizeof(scratch));
++	ok = true;
++
++	error = substitute_tokens(dd->tokens, dd->n_tokens,
++			origin_sheet, ctx, state->inline_style,
++			state->custom_env, 0, &scratch, &ok);
++#ifdef MACSURF_DEBUG
++	{
++		extern void macsurf_debug_log_tracef(
++			const char *fmt, ...);
++		macsurf_debug_log_tracef(
++			"fixes347d deferred SUBST: prop=%s err=%d ok=%d used=%ld",
++			(dd->property != NULL) ?
++				lwc_string_data(dd->property) :
++				"(null)",
++			(int)error, (int)ok, (long)scratch.used);
++	}
++#endif
++	if (error != CSS_OK) {
++		free(scratch.items);
++		return error;
++	}
++	if (!ok) {
++		/* Unresolvable var() - silently drop declaration. */
++		free(scratch.items);
++		return CSS_OK;
++	}
++
++	if (state->element.name != NULL && cp__qname_is_body(&state->element)) {
++		char rawbuf[160];
++		char outbuf[160];
++		cp__tokens_to_text(NULL, 0, dd->tokens, dd->n_tokens,
++				rawbuf, sizeof(rawbuf));
++		cp__tokens_to_text(scratch.items, scratch.used, NULL, 0,
++				outbuf, sizeof(outbuf));
++		macsurf_debug_log_writef(
++			"LIFE FBVAR prop=%s spec=%ld raw=%s -> out=%s",
++			(dd->property != NULL) ?
++				lwc_string_data(dd->property) : "(null)",
++			(long) state->current_specificity,
++			rawbuf, outbuf);
++	}
++
++	error = build_replay_vector(scratch.items, scratch.used, &replay);
++	if (error != CSS_OK) {
++		free(scratch.items);
++		return error;
++	}
++	free(scratch.items);
++	scratch.items = NULL;
++
++	/* Minimal css_language stub: property handlers only touch sheet
++	 * and strings. Namespaces / context stack are unused during
++	 * property parsing. */
++	memset(&stub_lang, 0, sizeof(stub_lang));
++	/* cast away const: property handlers don't mutate the sheet in
++	 * a way that matters here; css__stylesheet_style_create uses
++	 * sheet->cached_style, which is fine at resolve time. */
++	stub_lang.sheet = (css_stylesheet *)origin_sheet;
++	stub_lang.strings = origin_sheet->propstrings;
++
++	prop_id = find_property_id(&stub_lang, dd->property);
++	if (prop_id < 0) {
++		parserutils_vector_destroy(replay);
++		return CSS_OK;
++	}
++
++	handler = property_handlers[prop_id - FIRST_PROP];
++	if (handler == NULL) {
++		parserutils_vector_destroy(replay);
++		return CSS_OK;
++	}
++
++	error = css__stylesheet_style_create(stub_lang.sheet, &scratch_style);
++	if (error != CSS_OK) {
++		parserutils_vector_destroy(replay);
++		return error;
++	}
++
++	ctx_idx = 0;
++	error = handler(&stub_lang, replay, &ctx_idx, scratch_style);
++#ifdef MACSURF_DEBUG
++	{
++		extern void macsurf_debug_log_tracef(
++			const char *fmt, ...);
++		macsurf_debug_log_tracef(
++			"fixes347d deferred HANDLER: prop=%s err=%d prop_id=%d",
++			(dd->property != NULL) ?
++				lwc_string_data(dd->property) :
++				"(null)",
++			(int)error, (int)prop_id);
++	}
++#endif
++	if (error != CSS_OK) {
++		css__stylesheet_style_destroy(scratch_style);
++		parserutils_vector_destroy(replay);
++		/* Invalid value post-substitution - drop silently. */
++		return CSS_OK;
++	}
++
++	important_flag = 0;
++	if (dd->important) {
++		css__make_style_important(scratch_style);
++		important_flag = 1;
++	} else {
++		/* Also honour a trailing !important captured in tokens,
++		 * in case the capture path left it in. */
++		error = css__parse_important(&stub_lang, replay, &ctx_idx,
++				&important_flag);
++		if (error == CSS_OK && important_flag != 0)
++			css__make_style_important(scratch_style);
++	}
++
++	/* fixes1267 (#167) - apply the resolved bytecode through the normal
++	 * cascade dispatch at the REFERENCING RULE'S OWN SPECIFICITY.
++	 *
++	 * fixes347f used to bump state->current_specificity to 0x7fffffff
++	 * across this walk, as a "defensive cover" against a var()-resolved
++	 * write losing to a placeholder written earlier (the example given
++	 * was a UA `background-image: none`). That reasoning was wrong on
++	 * both counts, and the sentinel poisoned the cascade:
++	 *
++	 *  - A UA-origin placeholder is already beaten by an author-origin
++	 *    write in css__outranks_existing purely on origin, before
++	 *    specificity is ever consulted. The bump bought nothing there.
++	 *  - cascade_style() walks this rule's deferred list from inside the
++	 *    same call in which match_selector_chain() set
++	 *    state->current_specificity = selector->specificity, so the
++	 *    correct value is already in place on entry. Within the rule,
++	 *    deferred decls run after the bytecode decls at equal
++	 *    specificity, and css__outranks_existing uses >=, so source
++	 *    order still resolves them correctly.
++	 *
++	 * What the bump actually did was make EVERY var()-resolved
++	 * declaration unbeatable by any real selector (max real specificity
++	 * is far below 0x7fffffff), inverting the cascade for the whole
++	 * page. On facebook.com this is why `body { background-color:
++	 * var(...) }` (dark) outranked a plain light-mode background: the
++	 * FBBG trace showed the two competing decls from the same sheet at
++	 * spec=1 and spec=2147483647. Per CSS Variables 1 sec 3, a var()
++	 * substitution is a textual replacement whose result belongs to the
++	 * referencing declaration - it inherits that rule's specificity and
++	 * nothing more. */
++	cascade_walker = *scratch_style;
++	while (cascade_walker.used > 0) {
++		opcode_t op;
++		css_code_t opv;
++
++		opv = *cascade_walker.bytecode;
++		cascade_walker.used -= 1;
++		cascade_walker.bytecode = cascade_walker.bytecode + 1;
++
++		op = getOpcode(opv);
++
++		error = prop_dispatch[op].cascade(opv, &cascade_walker, state);
++		if (error != CSS_OK) {
++			css__stylesheet_style_destroy(scratch_style);
++			parserutils_vector_destroy(replay);
++			return error;
++		}
++	}
++
++	css__stylesheet_style_destroy(scratch_style);
++	parserutils_vector_destroy(replay);
++
++	if (!g_cp_res_logged) {
++		g_cp_res_logged = 1;
++		/* MS_LOG_STICKY removed (fixes63) */
++	}
++
++	return CSS_OK;
++}
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/custom_properties.h browser/libcss/src/parse/custom_properties.h
+--- upstream/libcss/src/parse/custom_properties.h	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/parse/custom_properties.h	2026-09-20 23:19:17.181054557 +0100
+@@ -0,0 +1,378 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The MacSurf Project.
++ *
++ * CSS Custom Properties ("--name") and var() deferred resolution.
++ *
++ * The cascade stays bytecode-driven for every declaration whose value
++ * does not reference var(). Declarations that do reference var() cannot
++ * be resolved at parse time because custom-property definitions may
++ * live in any stylesheet that is part of the same select context; the
++ * value tokens are therefore captured verbatim and attached to the
++ * rule's css_style as a css_deferred_decl list. At selection time,
++ * cascade_style walks that list, substitutes var() against the
++ * select_ctx's aggregate custom-property table, calls the usual
++ * per-property parser on the resolved tokens to obtain bytecode, and
++ * applies it via the normal prop_dispatch path.
++ *
++ * Custom-property definitions themselves (e.g. ":root { --platinum-bg:
++ * #ddd; }") are captured during parse into each stylesheet's
++ * custom_properties list regardless of which selector scope they
++ * appeared in (a conscious simplification - treat every --name as
++ * globally scoped for the owning stylesheet).
++ */
++
++#ifndef css_css__parse_custom_properties_h_
++#define css_css__parse_custom_properties_h_
++
++#include <libwapcaplet/libwapcaplet.h>
++#include <parserutils/utils/vector.h>
++
++#include <libcss/errors.h>
++#include <libcss/functypes.h>
++#include <libcss/types.h>
++
++#include "lex/lex.h"
++
++/* Forward declarations to avoid circular includes. */
++struct css_stylesheet;
++struct css_style;
++struct css_language;
++struct css_select_ctx;
++struct css_select_state;
++
++/**
++ * Preserved token. We keep only the fields that survive beyond the
++ * parser's token-buffer lifetime:
++ *  - type, so replay through property handlers dispatches correctly;
++ *  - idata, the interned text (ref-owned by this struct);
++ *  - col / line, for diagnostics.
++ *
++ * The css_token.data byte-buffer pointer is recomputed from idata at
++ * replay time (lwc_string_data / lwc_string_length).
++ */
++typedef struct css_cp_token {
++	uint16_t type;           /**< css_token_type */
++	uint16_t pad;            /**< Alignment */
++	lwc_string *idata;       /**< Interned text, ref-owned, or NULL */
++	uint32_t col;
++	uint32_t line;
++} css_cp_token;
++
++/**
++ * A custom-property definition: "--name" -> value tokens.
++ */
++struct css_cp_entry {
++	lwc_string *name;        /**< "--platinum-bg" etc. (ref-owned) */
++	css_cp_token *tokens;    /**< Value tokens (owned) */
++	uint32_t n_tokens;
++	struct css_cp_entry *next;
++};
++typedef struct css_cp_entry css_cp_entry;
++
++/**
++ * A declaration whose value contains var() and therefore cannot be
++ * compiled to bytecode at parse time.
++ */
++struct css_deferred_decl {
++	lwc_string *property;    /**< Property name as lexed (e.g.
++				  *   "background-color", ref-owned) */
++	css_cp_token *tokens;    /**< Raw value tokens inc. var() calls
++				  *   (owned) */
++	uint32_t n_tokens;
++	uint8_t important;       /**< Non-zero => !important */
++	uint8_t pad[3];
++	struct css_deferred_decl *next;
++};
++typedef struct css_deferred_decl css_deferred_decl;
++
++
++/* --- Token list helpers --- */
++
++/**
++ * Deep-copy tokens [start, end) from a parserutils_vector into a
++ * freshly allocated css_cp_token[] array. Tokens below
++ * CSS_TOKEN_LAST_INTERN that carry idata get their lwc_string ref'd;
++ * whitespace tokens with NULL idata copy cleanly.
++ *
++ * \param vec   Source vector.
++ * \param start Inclusive start index.
++ * \param end   Exclusive end index.
++ * \param out_tokens Receives malloc'd array (NULL on count == 0).
++ * \param out_n Receives count.
++ * \return CSS_OK, CSS_NOMEM, CSS_BADPARM.
++ */
++css_error css__cp_tokens_from_vector(const parserutils_vector *vec,
++		int32_t start, int32_t end,
++		css_cp_token **out_tokens, uint32_t *out_n);
++
++/**
++ * Free a css_cp_token[] array (unrefs each idata, frees the array).
++ */
++void css__cp_tokens_destroy(css_cp_token *tokens, uint32_t n);
++
++
++/* --- Custom-property list (per stylesheet) --- */
++
++/**
++ * Append a custom-property entry to a stylesheet's list. If the sheet
++ * already defines a property with the same name, the existing entry's
++ * tokens are replaced (last-write-wins, matching CSS cascade source
++ * order within a sheet). The function takes ownership of tokens on
++ * success; on failure it destroys them.
++ *
++ * \param sheet Target stylesheet (field custom_properties is updated).
++ * \param name  Custom property name, already ref'd for storage.
++ * \param tokens Owned token array.
++ * \param n      Token count.
++ */
++css_error css__sheet_add_custom_property(struct css_stylesheet *sheet,
++		lwc_string *name, css_cp_token *tokens, uint32_t n);
++
++/**
++ * Look up a custom property by name within one stylesheet's list.
++ *
++ * \return Non-NULL pointer to the entry on hit, NULL on miss.
++ */
++const css_cp_entry *css__sheet_find_custom_property(
++		const struct css_stylesheet *sheet, lwc_string *name);
++
++/**
++ * Free an entire cp_entry linked list.
++ */
++void css__cp_entry_list_destroy(css_cp_entry *head);
++
++/* fixes1269 (#167) - rule-scoped custom-property definitions.
++ *
++ * css__sheet_add_custom_property above stores "--name" definitions in a
++ * single per-STYLESHEET list, discarding the selector and @media context
++ * they were written under. That is wrong: a sheet may define the same
++ * name several times under mutually exclusive scopes (facebook.com's
++ * theme tokens define --web-wash four times, once per theme class, the
++ * last inside @media (prefers-color-scheme: dark)), and last-write-wins
++ * across the whole sheet then hands every consumer the wrong value.
++ *
++ * Definitions are therefore attached to the owning rule, on the css_style
++ * DEFERRED list - the same list var()-referencing declarations already
++ * use. A css_style only cascades when its rule matches, and rules inside
++ * a non-matching @media are already filtered by mq_rule_good_for_media
++ * during selection, so both scoping dimensions come along for free.
++ *
++ * fixes1268a used a separate css_style field for this and had to be
++ * withdrawn: it grew sizeof(css_style), and any translation unit that
++ * allocated or copied one without agreeing on the new size caused the
++ * field to be read past the end of the allocation, yielding adjacent
++ * stylesheet text as a pointer that the first cascade dereferenced.
++ * Sharing the deferred list needs no size change at all.
++ */
++
++/**
++ * Is this deferred entry a custom-property DEFINITION (property name
++ * starts with "--") rather than an ordinary declaration referencing
++ * var()? No ordinary CSS property name can start with two dashes, so the
++ * test is exact.
++ */
++bool css__cp_decl_is_definition(const struct css_deferred_decl *dd);
++
++/* --- Per-element custom-property environment (fixes1268b, #167) --- */
++
++/*
++ * The environment is the set of custom properties in force for ONE
++ * element, built during selection by cascade_style as each matching rule
++ * contributes its rule-scoped definitions. Because a css_style only
++ * cascades when its rule matches, and rules inside a non-matching @media
++ * are already filtered out by mq_rule_good_for_media, both the selector
++ * scoping and the media scoping that the per-sheet store threw away are
++ * restored here for free.
++ *
++ * Bindings BORROW their name and tokens from the stylesheet, which
++ * outlives selection. Destroying an environment frees only its array.
++ */
++
++/**
++ * One custom property in force for the element being selected, with the
++ * cascade metadata needed to decide whether a later definition replaces
++ * it.
++ */
++typedef struct css_cp_binding {
++	css_cp_entry entry;      /**< name/tokens; see owns_tokens */
++	uint32_t specificity;    /**< Specificity of the defining rule */
++	uint8_t origin;          /**< css_origin of the defining sheet */
++	uint8_t important;       /**< Non-zero => !important */
++	/* fixes1268c - before finalisation tokens are borrowed from the
++	 * stylesheet; after it they are a freshly built substituted run
++	 * this binding owns and must free (each idata ref'd). */
++	uint8_t owns_tokens;
++	/* fixes1269 (#167) - the definition could not be resolved: it
++	 * referenced a name nothing defines, or it took part in a var()
++	 * cycle. CSS Variables 1 makes such a custom property invalid at
++	 * computed-value time, so it must read as ABSENT and let consumers
++	 * take their var() fallback. Chrome agrees:
++	 *
++	 *   .cy { --x: var(--y); --y: var(--x); color: var(--x, green) }
++	 *
++	 * paints green, and --x computes to the empty string. Leaving the
++	 * raw tokens in place instead would re-enter the cycle at every
++	 * consumer and drop the declaration entirely, painting black. */
++	uint8_t invalid;
++} css_cp_binding;
++
++struct css_cp_env {
++	css_cp_binding *items;
++	uint32_t used;
++	uint32_t allocated;
++
++	/* fixes1268c (#167) - the parent element's FINALISED environment,
++	 * or NULL at the root. Custom properties inherit, and a chain of
++	 * references costs nothing per element, where copying the parent's
++	 * bindings would cost O(properties x elements) - facebook.com
++	 * defines several hundred tokens on one ancestor.
++	 *
++	 * Reference-counted rather than borrowed: correctness must not
++	 * depend on any particular destruction order between a parent
++	 * style and a child's. */
++	struct css_cp_env *inherited;
++	uint32_t refcount;
++
++	/* Non-zero once css__cp_env_finalise has substituted every own
++	 * binding's var() references, making the bindings COMPUTED values
++	 * that children may inherit directly. Before that the bindings
++	 * hold raw, borrowed token runs. */
++	uint8_t finalised;
++	uint8_t pad2[3];
++};
++typedef struct css_cp_env css_cp_env;
++
++/**
++ * Offer a definition to an element's environment, applying the same
++ * origin / importance / specificity precedence as ordinary properties
++ * (see css__outranks_existing). Creates the environment on first use.
++ *
++ * name and tokens are BORROWED, not owned - they must outlive the
++ * environment, which they do, being owned by the stylesheet.
++ *
++ * \param env  Environment pointer-to-pointer; *env may be NULL.
++ * \return CSS_OK or CSS_NOMEM.
++ */
++css_error css__cp_env_add(css_cp_env **env, lwc_string *name,
++		const css_cp_token *tokens, uint32_t n,
++		uint32_t specificity, uint8_t origin, uint8_t important);
++
++/**
++ * Look up the winning definition of `name` in an element's environment.
++ *
++ * \return Borrowed entry on hit, NULL on miss.
++ */
++const css_cp_entry *css__cp_env_find(const css_cp_env *env,
++		lwc_string *name);
++
++/**
++ * Release a reference to an environment, freeing it (and releasing its
++ * reference to the inherited one) when the last goes.
++ */
++void css__cp_env_unref(css_cp_env *env);
++
++/**
++ * Take an additional reference. Returns env for convenience.
++ */
++css_cp_env *css__cp_env_ref(css_cp_env *env);
++
++/**
++ * Point a (possibly not-yet-created) environment at the parent
++ * element's finalised environment, taking a reference.
++ */
++css_error css__cp_env_set_inherited(css_cp_env **env, css_cp_env *parent);
++
++/**
++ * Substitute every own binding's var() references, turning the
++ * environment's raw token runs into COMPUTED values that children can
++ * inherit directly.
++ *
++ * This is required by CSS Variables 1: the computed value of a custom
++ * property is its specified value with variables substituted, so a
++ * child inheriting "--b: var(--a)" from its parent receives the
++ * PARENT's --a, not its own. Verified against Chrome:
++ *
++ *   .p { --a: red; --b: var(--a) }
++ *   .c { --a: blue; color: var(--b) }   =>  .c color is RED
++ *
++ * Substituting per element rather than per lookup also makes the result
++ * independent of declaration order within a rule, which Chrome also
++ * confirms (".q { --b: var(--a); --a: green }" resolves to green).
++ */
++css_error css__cp_env_finalise(css_cp_env *env,
++		const struct css_stylesheet *origin_sheet,
++		const struct css_select_ctx *ctx,
++		const struct css_stylesheet *inline_sheet);
++
++/**
++ * Contribute every rule-scoped definition attached to `style` to `env`,
++ * in source order, at the given cascade position. Called by cascade_style
++ * for each matching rule.
++ */
++css_error css__cp_env_add_style(css_cp_env **env,
++		const struct css_style *style,
++		uint32_t specificity, uint8_t origin);
++
++/* --- Deferred declaration list (per css_style) --- */
++
++/**
++ * Create a new deferred declaration. Takes ownership of property (must
++ * already be ref'd) and tokens. On failure, ownership is released.
++ */
++css_error css__deferred_decl_create(lwc_string *property,
++		css_cp_token *tokens, uint32_t n, bool important,
++		css_deferred_decl **out);
++
++/**
++ * Append a deferred decl onto a css_style's deferred list (preserves
++ * source order).
++ */
++void css__deferred_decl_attach(struct css_style *style,
++		css_deferred_decl *dd);
++
++/**
++ * Free an entire deferred_decl list.
++ */
++void css__deferred_decl_list_destroy(css_deferred_decl *head);
++
++
++/* --- Var() detection / resolution --- */
++
++/**
++ * Scan a token vector from *ctx forward and return true if any top-level
++ * token is a FUNCTION named "var" (case-insensitive).
++ *
++ * The CSS custom-properties spec also flags var() occurring nested
++ * inside other functions (e.g. calc(var(--x))); the scan descends into
++ * any FUNCTION/paren pair to catch those.
++ */
++bool css__value_contains_var(const parserutils_vector *vec, int32_t ctx);
++
++/**
++ * Resolve a deferred declaration against the select_ctx's aggregate
++ * custom-property table and apply the resulting bytecode through
++ * prop_dispatch. On successful resolution and apply, returns CSS_OK.
++ * On unresolvable var() (no definition, no fallback), the declaration
++ * is silently discarded and CSS_OK is returned.
++ *
++ * \param dd         The deferred declaration.
++ * \param origin_sheet The stylesheet that owns the declaration (used
++ *                     for propstrings and as first lookup scope).
++ * \param ctx        Select context (provides other sheets).
++ * \param state      Current select state - cascade writes into it.
++ */
++css_error css__deferred_decl_resolve(const css_deferred_decl *dd,
++		const struct css_stylesheet *origin_sheet,
++		struct css_select_ctx *ctx,
++		struct css_select_state *state);
++
++/**
++ * Helper: is a freshly lexed IDENT a CSS custom-property name?
++ * True when idata's first two characters are both '-'.
++ */
++bool css__is_custom_property_ident(const css_token *ident);
++
++#endif
+diff -urN upstream/libcss/src/parse/font_face.c browser/libcss/src/parse/font_face.c
+--- upstream/libcss/src/parse/font_face.c
++++ browser/libcss/src/parse/font_face.c
+@@ -6,14 +6,14 @@
+  * Written by James Montgomerie <jamie@th.ingsmadeoutofotherthin.gs>
+  */
+ 
+-#include "parse/font_face.h"
++#include "parse/font_face.h"
+ 
+ #include <assert.h>
+ #include <string.h>
+ 
+ #include "parse/propstrings.h"
+ #include "parse/properties/utils.h"
+-#include "select/font_face.h"
++#include "select/font_face.h"
+ 
+ static bool font_rule_font_family_reserved(css_language *c,
+ 		const css_token *ident)
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/important.c browser/libcss/src/parse/important.c
+--- upstream/libcss/src/parse/important.c	2026-09-20 23:27:15.833635906 +0100
++++ browser/libcss/src/parse/important.c	2026-09-20 23:19:17.181385710 +0100
+@@ -59,6 +59,7 @@
+ 	return CSS_OK;
+ }
+ 
++
+ /**
+  * Make a style important
+  *
+@@ -202,6 +203,31 @@
+ 					offset++; /* colour */
+ 				break;
+ 
++			case CSS_PROP_FILL:
++				if (value == FILL_SET)
++					offset++; /* colour */
++				break;
++
++			case CSS_PROP_TRANSITION_PROPERTY:
++				if (value == CSS_TRANSITION_PROPERTY_SET)
++					offset += 1 + bytecode[offset] * 3;
++				break;
++
++			case CSS_PROP_TRANSITION_DURATION:
++				if (value == CSS_TRANSITION_DURATION_SET)
++					offset += 1 + bytecode[offset];
++				break;
++
++			case CSS_PROP_TRANSITION_TIMING_FUNCTION:
++				if (value == CSS_TRANSITION_TIMING_FUNCTION_SET)
++					offset += 1 + bytecode[offset] * 7;
++				break;
++
++			case CSS_PROP_TRANSITION_DELAY:
++				if (value == CSS_TRANSITION_DELAY_SET)
++					offset += 1 + bytecode[offset];
++				break;
++
+ 			case CSS_PROP_COLUMN_COUNT:
+ 				if (value == COLUMN_COUNT_SET)
+ 					offset++; /* colour */
+@@ -450,4 +476,3 @@
+ 	}
+ 
+ }
+-
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/language.c browser/libcss/src/parse/language.c
+--- upstream/libcss/src/parse/language.c	2026-09-20 23:27:15.833635906 +0100
++++ browser/libcss/src/parse/language.c	2026-09-20 23:19:17.181748438 +0100
+@@ -10,18 +10,27 @@
+ 
+ #include <parserutils/utils/stack.h>
+ 
+-#include "stylesheet.h"
++#include "stylesheet.h"
+ #include "lex/lex.h"
+-#include "parse/font_face.h"
++#include "parse/font_face.h"
+ #include "parse/important.h"
+ #include "parse/language.h"
+ #include "parse/mq.h"
+ #include "parse/parse.h"
+ #include "parse/propstrings.h"
++#include "parse/custom_properties.h"
++
++/* fixes1268a (#167) - defined below, but used by the declaration-block
++ * custom-property path far earlier in this file. */
++static css_error css__style_add_custom_property_to_rule(css_language *c,
++		css_rule *rule, lwc_string *name,
++		css_cp_token *tokens, uint32_t n);
+ #include "parse/properties/properties.h"
+ #include "parse/properties/utils.h"
+ 
+ #include "utils/parserutilserror.h"
++
++#include "macsurf_debug.h"
+ #include "utils/utils.h"
+ 
+ typedef struct context_entry {
+@@ -809,6 +818,81 @@
+ 	/* Strip any leading whitespace (can happen if in nested block) */
+ 	consumeWhitespace(vector, &ctx);
+ 
++	/* CSS Custom Property definitions start with "--". The lexer fix in
++	 * fixes139 now emits "--foo" as a single IDENT token whose idata
++	 * starts with two dashes. Detect that and route the whole
++	 * declaration into the custom-property capture path. */
++	{
++		const css_token *t1 = parserutils_vector_peek(vector, ctx);
++
++		if (t1 != NULL && t1->type == CSS_TOKEN_IDENT &&
++				t1->idata != NULL &&
++				lwc_string_length(t1->idata) >= 3 &&
++				lwc_string_data(t1->idata)[0] == '-' &&
++				lwc_string_data(t1->idata)[1] == '-') {
++			css_cp_token *cp_tokens = NULL;
++			uint32_t cp_n = 0;
++			int32_t value_start;
++			lwc_string *name_ref;
++			const css_token *colon;
++
++			/* MS_LOG_STICKY removed (fixes63) */
++
++			/* Skip IDENT('--foo'). */
++			(void)parserutils_vector_iterate(vector, &ctx);
++
++			consumeWhitespace(vector, &ctx);
++
++			colon = parserutils_vector_iterate(vector, &ctx);
++			if (colon == NULL || tokenIsChar(colon, ':') == false)
++				return CSS_INVALID;
++
++			consumeWhitespace(vector, &ctx);
++
++			value_start = ctx;
++			while (parserutils_vector_iterate(vector, &ctx) != NULL)
++				;
++
++			error = css__cp_tokens_from_vector(vector,
++					value_start, ctx, &cp_tokens, &cp_n);
++			if (error != CSS_OK)
++				return error;
++
++			name_ref = lwc_string_ref(t1->idata);
++
++			/* fixes1268a (#167) - dual-write: rule-scoped copy
++			 * first (keeps the selector/@media context), then
++			 * the legacy sheet-global one that resolution still
++			 * reads until 1268b/1268e. */
++			{
++				css_cp_token *rule_tokens = NULL;
++				uint32_t rule_n = 0;
++
++				error = css__cp_tokens_from_vector(vector,
++						value_start, ctx,
++						&rule_tokens, &rule_n);
++				if (error != CSS_OK) {
++					css__cp_tokens_destroy(cp_tokens, cp_n);
++					lwc_string_unref(name_ref);
++					return error;
++				}
++
++				error = css__style_add_custom_property_to_rule(
++						c, rule,
++						lwc_string_ref(t1->idata),
++						rule_tokens, rule_n);
++				if (error != CSS_OK) {
++					css__cp_tokens_destroy(cp_tokens, cp_n);
++					lwc_string_unref(name_ref);
++					return error;
++				}
++			}
++
++			return css__sheet_add_custom_property(c->sheet,
++					name_ref, cp_tokens, cp_n);
++		}
++	}
++
+ 	/* IDENT ws ':' ws value
+ 	 *
+ 	 * In CSS 2.1, value is any1, so '{' or ATKEYWORD => parse error
+@@ -1306,11 +1390,17 @@
+ 		{ DISABLED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ CHECKED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ NOT, CSS_SELECTOR_PSEUDO_CLASS },
++		{ IS_FN, CSS_SELECTOR_PSEUDO_CLASS },     /* fixes359 (#68) */
++		{ WHERE_FN, CSS_SELECTOR_PSEUDO_CLASS },  /* fixes359 (#68) */
++		{ HAS_FN, CSS_SELECTOR_PSEUDO_CLASS },    /* fixes361 (#67) */
+ 
+ 		{ FIRST_LINE, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ FIRST_LETTER, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ BEFORE, CSS_SELECTOR_PSEUDO_ELEMENT },
+-		{ AFTER, CSS_SELECTOR_PSEUDO_ELEMENT }
++		{ AFTER, CSS_SELECTOR_PSEUDO_ELEMENT },
++		{ MARKER, CSS_SELECTOR_PSEUDO_ELEMENT },              /* fixes358 (#70) */
++		{ PLACEHOLDER, CSS_SELECTOR_PSEUDO_ELEMENT },         /* fixes359 (#71) */
++		{ FILE_SELECTOR_BUTTON, CSS_SELECTOR_PSEUDO_ELEMENT } /* fixes359 (#71) */
+ 	};
+ 	css_selector_detail_value detail_value;
+ 	css_selector_detail_value_type value_type =
+@@ -1371,6 +1461,23 @@
+ 			pseudo_lut[lut_idx].index == NOT))
+ 		return CSS_INVALID;
+ 
++	/* fixes360b - reject :is() / :where() / :has() inside :not().
++	 * Our V1 parsers for these accept the tokens but the matcher
++	 * returns silent-no-match. When wrapped in :not(), the false-
++	 * match flips to true, causing rules like
++	 *   .page__main:not(:has(> aside.sidebar)) {
++	 *       grid-template-columns: 1fr;
++	 *   }
++	 * (mactrove's platinum.css line 354) to fire on EVERY element,
++	 * collapsing the 2-column grid to 1-column and hiding the main
++	 * content panel. Returning CSS_INVALID here drops the entire
++	 * rule at parse time - matching pre-fixes359 behaviour, since
++	 * before this round these selectors errored the rule anyway. */
++	if (in_not && (pseudo_lut[lut_idx].index == IS_FN ||
++			pseudo_lut[lut_idx].index == WHERE_FN ||
++			pseudo_lut[lut_idx].index == HAS_FN))
++		return CSS_INVALID;
++
+ 	if (token->type == CSS_TOKEN_FUNCTION) {
+ 		int fun_type = pseudo_lut[lut_idx].index;
+ 
+@@ -1396,6 +1503,35 @@
+ 				return error;
+ 
+ 			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
++		} else if (fun_type == IS_FN || fun_type == WHERE_FN ||
++				fun_type == HAS_FN) {
++			/* fixes359 (#68) / fixes361 (#67) V1: consume tokens
++			 * up to the closing `)` and discard them. The
++			 * selector itself parses as a known pseudo-class so
++			 * author CSS does not error; at match time the
++			 * matcher silently returns no-match (until V2 lands
++			 * a comma-separated selector-list with proper match
++			 * semantics). :where() gets zero specificity per
++			 * spec; :is() / :has() take the highest specificity
++			 * of their arguments (deferred). For V1, specificity
++			 * is simply 0 (treated as :where) for all three. */
++			int depth = 1;
++			while (depth > 0) {
++				token = parserutils_vector_iterate(vector, ctx);
++				if (token == NULL) return CSS_INVALID;
++				if (tokenIsChar(token, '(')) depth++;
++				else if (tokenIsChar(token, ')')) depth--;
++			}
++			/* Already consumed the matching ')'; tag this
++			 * selector with the function-name keyword so the
++			 * matcher can recognise it and short-circuit. */
++			qname.name = c->strings[
++					fun_type == IS_FN ? IS_FN :
++					fun_type == WHERE_FN ? WHERE_FN : HAS_FN];
++			return css__stylesheet_selector_detail_init(c->sheet,
++					CSS_SELECTOR_PSEUDO_CLASS, &qname,
++					detail_value, value_type,
++					false, specific);
+ 		} else if (fun_type == NOT) {
+ 			/* type_selector | specific */
+ 			token = parserutils_vector_peek(vector, *ctx);
+@@ -1836,6 +1972,61 @@
+ 	return CSS_OK;
+ }
+ 
++/* fixes1269 (#167) - attach one "--name" definition to the rule that wrote
++ * it, as an entry on the rule style's DEFERRED list.
++ *
++ * fixes1268a gave css_style its own custom_props field for this. That grew
++ * sizeof(css_style), which every translation unit that allocates or copies
++ * one must agree on; where any did not, the field was read past the end of
++ * the allocation and returned adjacent stylesheet text as a pointer, which
++ * the first cascade then dereferenced - crashing on pages containing no
++ * custom properties whatsoever. The deferred list already exists, already
++ * has the create / merge / destroy semantics a definition needs, and costs
++ * no size change. Definitions are told from var() consumers by the leading
++ * "--" on the property name, which no ordinary property can have.
++ *
++ * Takes ownership of name and tokens; releases them on failure. */
++static css_error css__style_add_custom_property_to_rule(css_language *c,
++		css_rule *rule, lwc_string *name,
++		css_cp_token *tokens, uint32_t n)
++{
++	css_style *style = NULL;
++	css_deferred_decl *dd = NULL;
++	css_error error;
++
++	/* css__stylesheet_rule_append_style asserts SELECTOR or PAGE; with
++	 * assertions compiled out it would cast a css_rule_font_face to a
++	 * css_rule_selector and overwrite its font_face pointer. A "--name"
++	 * inside @font-face is meaningless anyway, so drop it rather than
++	 * corrupt the rule. */
++	if (rule == NULL || (rule->type != CSS_RULE_SELECTOR &&
++			rule->type != CSS_RULE_PAGE)) {
++		css__cp_tokens_destroy(tokens, n);
++		lwc_string_unref(name);
++		return CSS_OK;
++	}
++
++	error = css__deferred_decl_create(name, tokens, n, false, &dd);
++	if (error != CSS_OK)
++		return error;   /* callee released name/tokens */
++
++	error = css__stylesheet_style_create(c->sheet, &style);
++	if (error != CSS_OK) {
++		css__deferred_decl_list_destroy(dd);
++		return error;
++	}
++
++	css__deferred_decl_attach(style, dd);
++
++	error = css__stylesheet_rule_append_style(c->sheet, rule, style);
++	if (error != CSS_OK) {
++		css__stylesheet_style_destroy(style);
++		return error;
++	}
++
++	return CSS_OK;
++}
++
+ /******************************************************************************
+  * Property parsing functions						      *
+  ******************************************************************************/
+@@ -1850,6 +2041,62 @@
+ 	css_style *style = NULL;
+ 	const css_token *token;
+ 
++	/* CSS Custom Properties: if the property name begins with "--",
++	 * capture the raw value tokens and store them on the stylesheet's
++	 * custom-property table. We do not dispatch to any property
++	 * handler - the value is opaque until var() resolution time. */
++	if (css__is_custom_property_ident(property)) {
++		css_cp_token *cp_tokens = NULL;
++		uint32_t cp_n = 0;
++		int32_t start_ctx;
++		lwc_string *name_ref;
++
++		start_ctx = *ctx;
++		/* Advance to end of vector to compute token range and keep
++		 * the caller's trailing-junk check happy. */
++		while (parserutils_vector_iterate(vector, ctx) != NULL)
++			;
++
++		error = css__cp_tokens_from_vector(vector, start_ctx, *ctx,
++				&cp_tokens, &cp_n);
++		if (error != CSS_OK)
++			return error;
++
++		name_ref = lwc_string_ref(property->idata);
++
++		/* fixes1268a (#167) - ALSO attach the definition to the
++		 * owning rule, so the selector and @media scope it was
++		 * written under survive to select time. The sheet-global
++		 * copy below is still what resolution reads today; 1268b
++		 * switches over and 1268e deletes it. Tokens are re-read
++		 * from the vector rather than shared, because both stores
++		 * take ownership of what they are handed. */
++		{
++			css_cp_token *rule_tokens = NULL;
++			uint32_t rule_n = 0;
++
++			error = css__cp_tokens_from_vector(vector, start_ctx,
++					*ctx, &rule_tokens, &rule_n);
++			if (error != CSS_OK) {
++				css__cp_tokens_destroy(cp_tokens, cp_n);
++				lwc_string_unref(name_ref);
++				return error;
++			}
++
++			error = css__style_add_custom_property_to_rule(c, rule,
++					lwc_string_ref(property->idata),
++					rule_tokens, rule_n);
++			if (error != CSS_OK) {
++				css__cp_tokens_destroy(cp_tokens, cp_n);
++				lwc_string_unref(name_ref);
++				return error;
++			}
++		}
++
++		return css__sheet_add_custom_property(c->sheet, name_ref,
++				cp_tokens, cp_n);
++	}
++
+ 	/* Find property index */
+ 	/** \todo improve on this linear search */
+ 	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
+@@ -1862,6 +2109,50 @@
+ 	if (i == LAST_PROP + 1)
+ 		return CSS_INVALID;
+ 
++	/* If the value references var(), we cannot compile to bytecode now
++	 * (the referenced custom property may live in a later stylesheet,
++	 * or be overridden at the select-context level). Capture the raw
++	 * value tokens and defer resolution until cascade_style. */
++	if (css__value_contains_var(vector, *ctx)) {
++		css_cp_token *dv_tokens = NULL;
++		uint32_t dv_n = 0;
++		css_deferred_decl *dd = NULL;
++		int32_t start_ctx;
++		lwc_string *prop_ref;
++
++		start_ctx = *ctx;
++		while (parserutils_vector_iterate(vector, ctx) != NULL)
++			;
++
++		error = css__cp_tokens_from_vector(vector, start_ctx, *ctx,
++				&dv_tokens, &dv_n);
++		if (error != CSS_OK)
++			return error;
++
++		prop_ref = lwc_string_ref(property->idata);
++		error = css__deferred_decl_create(prop_ref, dv_tokens, dv_n,
++				false, &dd);
++		if (error != CSS_OK)
++			return error;
++
++		/* Allocate a style carrier for the deferred decl so it hangs
++		 * off the rule via the normal rule_append_style path. */
++		error = css__stylesheet_style_create(c->sheet, &style);
++		if (error != CSS_OK) {
++			css__deferred_decl_list_destroy(dd);
++			return error;
++		}
++		css__deferred_decl_attach(style, dd);
++
++		error = css__stylesheet_rule_append_style(c->sheet, rule,
++				style);
++		if (error != CSS_OK) {
++			css__stylesheet_style_destroy(style);
++			return error;
++		}
++		return CSS_OK;
++	}
++
+ 	/* Get handler */
+ 	handler = property_handlers[i - FIRST_PROP];
+ 	assert(handler != NULL);
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/mq.c browser/libcss/src/parse/mq.c
+--- upstream/libcss/src/parse/mq.c	2026-09-20 23:27:15.833635906 +0100
++++ browser/libcss/src/parse/mq.c	2026-09-20 23:19:17.182104454 +0100
+@@ -11,7 +11,7 @@
+ 
+ #include <libcss/fpmath.h>
+ 
+-#include "stylesheet.h"
++#include "stylesheet.h"
+ #include "bytecode/bytecode.h"
+ #include "parse/mq.h"
+ #include "parse/properties/utils.h"
+@@ -42,9 +42,10 @@
+ static void css__mq_cond_destroy(css_mq_cond *cond)
+ {
+ 	if (cond != NULL) {
+-		for (uint32_t i = 0; i < cond->nparts; i++) {
++		{ uint32_t i;
++		for (i = 0; i < cond->nparts; i++) {
+ 			css__mq_cond_or_feature_destroy(cond->parts[i]);
+-		}
++		} }
+ 		free(cond->parts);
+ 		free(cond);
+ 	}
+@@ -683,9 +684,9 @@
+ 	/* <media-in-parens> = ( <media-condition> ) | <media-feature> | <general-enclosed>
+ 	 */
+ 
+-	//LPAREN -> condition-or-feature
+-	//	  "not" or LPAREN -> condition
+-	//	  IDENT | NUMBER | DIMENSION | RATIO -> feature
++	/* LPAREN -> condition-or-feature */
++	/* "not" or LPAREN -> condition */
++	/* IDENT | NUMBER | DIMENSION | RATIO -> feature */
+ 
+ 	token = parserutils_vector_iterate(vector, ctx);
+ 	if (token == NULL || tokenIsChar(token, '(') == false) {
+@@ -972,8 +973,8 @@
+ 	 * <media-type> = <ident> (except "not", "and", "or", "only")
+ 	 */
+ 
+-	// LPAREN -> media-condition
+-	//    not LPAREN -> media-condition
++	/* LPAREN -> media-condition */
++	/* not LPAREN -> media-condition */
+ 
+ 	consumeWhitespace(vector, ctx);
+ 
+@@ -1196,18 +1197,16 @@
+ {
+ 	css_error err;
+ 	css_parser *parser;
+-	css_mq_parse_ctx ctx = {
+-		.strings = strings,
+-	};
+-	css_parser_optparams params_quirks = {
+-		.quirks = false,
+-	};
+-	css_parser_optparams params_handler = {
+-		.event_handler = {
+-			.handler = css_parse_media_query_handle_event,
+-			.pw = &ctx,
+-		},
+-	};
++	css_mq_parse_ctx ctx;
++	css_parser_optparams params_quirks;
++	css_parser_optparams params_handler;
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.strings = strings;
++	memset(&params_quirks, 0, sizeof(params_quirks));
++	params_quirks.quirks = false;
++	memset(&params_handler, 0, sizeof(params_handler));
++	params_handler.event_handler.handler = css_parse_media_query_handle_event;
++	params_handler.event_handler.pw = &ctx;
+ 
+ 	if (mq == NULL || len == 0) {
+ 		return CSS_BADPARM;
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/p_font_face.c browser/libcss/src/parse/p_font_face.c
+--- upstream/libcss/src/parse/p_font_face.c	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/parse/p_font_face.c	2026-09-20 23:19:17.182396281 +0100
+@@ -0,0 +1,411 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2011 Things Made Out Of Other Things Ltd.
++ * Written by James Montgomerie <jamie@th.ingsmadeoutofotherthin.gs>
++ */
++
++#include "parse/font_face.h"
++
++#include <assert.h>
++#include <string.h>
++
++#include "parse/propstrings.h"
++#include "parse/properties/utils.h"
++#include "select/font_face.h"
++
++static bool font_rule_font_family_reserved(css_language *c,
++		const css_token *ident)
++{
++	bool match;
++
++	return (lwc_string_caseless_isequal(ident->idata, c->strings[SERIF],
++			&match) == lwc_error_ok && match) ||
++		(lwc_string_caseless_isequal(ident->idata,
++			c->strings[SANS_SERIF], &match) == lwc_error_ok &&
++			match) ||
++		(lwc_string_caseless_isequal(ident->idata, c->strings[CURSIVE],
++			&match) == lwc_error_ok && match) ||
++		(lwc_string_caseless_isequal(ident->idata, c->strings[FANTASY],
++			&match) == lwc_error_ok && match) ||
++		(lwc_string_caseless_isequal(ident->idata,
++			c->strings[MONOSPACE], &match) == lwc_error_ok &&
++			match) ||
++		(lwc_string_caseless_isequal(ident->idata, c->strings[INHERIT],
++			&match) == lwc_error_ok && match) ||
++		(lwc_string_caseless_isequal(ident->idata, c->strings[INITIAL],
++			&match) == lwc_error_ok && match) ||
++		(lwc_string_caseless_isequal(ident->idata, c->strings[DEFAULT],
++			&match) == lwc_error_ok && match);
++}
++
++static css_error font_face_parse_font_family(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_font_face *font_face)
++{
++	css_error error;
++	lwc_string *string;
++
++	error = css__ident_list_or_string_to_string(c, vector, ctx,
++				font_rule_font_family_reserved, &string);
++	if (error != CSS_OK)
++		return error;
++
++	css__font_face_set_font_family(font_face, string);
++
++	lwc_string_unref(string);
++
++	return CSS_OK;
++}
++
++static css_error font_face_src_parse_format(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_font_face_format *format)
++{
++	bool match;
++	const css_token *token;
++
++	*format = CSS_FONT_FACE_FORMAT_UNSPECIFIED;
++
++	/* 'format(' STRING [ ',' STRING ]* ')'
++	 *
++	 * 'format(' already consumed
++	 */
++
++	do {
++		consumeWhitespace(vector, ctx);
++
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL || token->type != CSS_TOKEN_STRING)
++			return CSS_INVALID;
++
++		if (lwc_string_isequal(token->idata,
++				c->strings[WOFF], &match) == lwc_error_ok &&
++				match) {
++		    	*format |= CSS_FONT_FACE_FORMAT_WOFF;
++		} else if ((lwc_string_isequal(token->idata,
++				c->strings[TRUETYPE], &match) == lwc_error_ok &&
++				match) ||
++			(lwc_string_isequal(token->idata,
++				c->strings[OPENTYPE], &match) == lwc_error_ok &&
++				match)) {
++			*format |= CSS_FONT_FACE_FORMAT_OPENTYPE;
++		} else if (lwc_string_isequal(token->idata,
++				c->strings[EMBEDDED_OPENTYPE],
++				&match) == lwc_error_ok && match) {
++			*format |= CSS_FONT_FACE_FORMAT_EMBEDDED_OPENTYPE;
++		} else if (lwc_string_isequal(token->idata,
++				c->strings[SVG], &match) == lwc_error_ok &&
++				match) {
++			*format |= CSS_FONT_FACE_FORMAT_SVG;
++		} else {
++			/* The spec gives a list of possible strings, which
++			 * hints that unknown strings should be parse errors,
++			 * but it also talks about "unknown font formats",
++			 * so we treat any string we don't know not as a parse
++			 * error, but as indicating an "unknown font format".
++			 */
++			*format |= CSS_FONT_FACE_FORMAT_UNKNOWN;
++		}
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++	} while (token != NULL && tokenIsChar(token, ','));
++
++	if (token == NULL || tokenIsChar(token, ')') == false)
++		return CSS_INVALID;
++
++	return CSS_OK;
++}
++
++static css_error font_face_src_parse_spec_or_name(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		lwc_string **location,
++		css_font_face_location_type *location_type,
++		css_font_face_format *format)
++{
++	const css_token *token;
++	css_error error;
++	bool match;
++
++ 	/* spec-or-name    ::= font-face-spec | font-face-name
++ 	 * font-face-spec  ::= URI [ 'format(' STRING [ ',' STRING ]* ')' ]?
++ 	 * font-face-name  ::= 'local(' ident-list-or-string ')'
++ 	 * ident-list-or-string ::= IDENT IDENT* | STRING
++ 	 */
++
++	consumeWhitespace(vector, ctx);
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL)
++		return CSS_INVALID;
++
++	if (token->type == CSS_TOKEN_URI) {
++		error = c->sheet->resolve(c->sheet->resolve_pw,
++				c->sheet->url, token->idata,
++				location);
++		if (error != CSS_OK)
++			return error;
++
++		*location_type = CSS_FONT_FACE_LOCATION_TYPE_URI;
++
++		consumeWhitespace(vector, ctx);
++
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token != NULL && token->type == CSS_TOKEN_FUNCTION &&
++				lwc_string_caseless_isequal(token->idata,
++				c->strings[FORMAT], &match) == lwc_error_ok &&
++				match) {
++			parserutils_vector_iterate(vector, ctx);
++
++			error = font_face_src_parse_format(c, vector, ctx,
++					format);
++			if (error != CSS_OK) {
++				lwc_string_unref(*location);
++				return error;
++			}
++		}
++	} else if (token->type == CSS_TOKEN_FUNCTION &&
++			lwc_string_caseless_isequal(token->idata,
++					c->strings[LOCAL],
++					&match) == lwc_error_ok && match) {
++		consumeWhitespace(vector, ctx);
++
++		error = css__ident_list_or_string_to_string(
++				c, vector, ctx, NULL, location);
++		if (error != CSS_OK)
++			return error;
++
++		consumeWhitespace(vector, ctx);
++
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL || tokenIsChar(token, ')') == false) {
++			lwc_string_unref(*location);
++			return CSS_INVALID;
++		}
++
++		*location_type = CSS_FONT_FACE_LOCATION_TYPE_LOCAL;
++	} else {
++		return CSS_INVALID;
++	}
++
++	return CSS_OK;
++}
++
++static css_error font_face_parse_src(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++	     	css_font_face *font_face)
++{
++	int32_t orig_ctx = *ctx;
++	css_error error = CSS_OK;
++	const css_token *token;
++	css_font_face_src *srcs = NULL, *new_srcs = NULL;
++	uint32_t n_srcs = 0;
++
++	/* src             ::= spec-or-name [ ',' spec-or-name ]*
++ 	 * spec-or-name    ::= font-face-spec | font-face-name
++ 	 * font-face-spec  ::= URI [ 'format(' STRING [ ',' STRING ]* ')' ]?
++ 	 * font-face-name  ::= 'local(' ident-list-or-string ')'
++ 	 * ident-list-or-string ::= IDENT IDENT* | STRING
++ 	 */
++
++	/* Create one css_font_face_src for each consecutive location and
++	 * [potentially] type pair in the comma-separated list
++	 */
++	do {
++		lwc_string *location;
++		css_font_face_location_type location_type =
++				CSS_FONT_FACE_LOCATION_TYPE_UNSPECIFIED;
++		css_font_face_format format =
++				CSS_FONT_FACE_FORMAT_UNSPECIFIED;
++
++		error = font_face_src_parse_spec_or_name(c, vector, ctx,
++				&location, &location_type, &format);
++		if (error != CSS_OK)
++			goto cleanup;
++
++		/* This will be inefficient if there are a lot of locations -
++		 * probably not a problem in practice.
++		 */
++		new_srcs = realloc(srcs,
++				(n_srcs + 1) * sizeof(css_font_face_src));
++		if (new_srcs == NULL) {
++			error = CSS_NOMEM;
++			goto cleanup;
++		}
++		srcs = new_srcs;
++
++		srcs[n_srcs].location = location;
++		srcs[n_srcs].bits[0] = format << 2 | location_type;
++
++		++n_srcs;
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++	} while (token != NULL && tokenIsChar(token, ','));
++
++	error = css__font_face_set_srcs(font_face, srcs, n_srcs);
++
++cleanup:
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		if (srcs != NULL)
++			free(srcs);
++	}
++
++	return error;
++}
++
++static css_error font_face_parse_font_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_font_face *font_face)
++{
++	int32_t orig_ctx = *ctx;
++	css_error error = CSS_OK;
++	const css_token *token;
++	enum css_font_style_e style = 0;
++	bool match;
++
++	/* IDENT(normal, italic, oblique) */
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if ((token == NULL) || ((token->type != CSS_TOKEN_IDENT))) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[NORMAL], &match) == lwc_error_ok && match)) {
++		style = CSS_FONT_STYLE_NORMAL;
++	} else if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[ITALIC], &match) == lwc_error_ok && match)) {
++		style = CSS_FONT_STYLE_ITALIC;
++	} else if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[OBLIQUE], &match) == lwc_error_ok &&
++			match)) {
++		style = CSS_FONT_STYLE_OBLIQUE;
++	} else {
++		error = CSS_INVALID;
++	}
++
++	if (error == CSS_OK) {
++		font_face->bits[0] = (font_face->bits[0] & 0xfc) | style;
++	} else {
++		*ctx = orig_ctx;
++	}
++
++	return error;
++}
++
++static css_error font_face_parse_font_weight(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_font_face *font_face)
++{
++	int32_t orig_ctx = *ctx;
++	css_error error = CSS_OK;
++	const css_token *token;
++	enum css_font_weight_e weight = 0;
++	bool match;
++
++	/* NUMBER (100, 200, 300, 400, 500, 600, 700, 800, 900) |
++	 * IDENT (normal, bold) */
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL || (token->type != CSS_TOKEN_IDENT &&
++			token->type != CSS_TOKEN_NUMBER)) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	if (token->type == CSS_TOKEN_NUMBER) {
++		size_t consumed = 0;
++		css_fixed num = css__number_from_lwc_string(token->idata,
++				true, &consumed);
++		/* Invalid if there are trailing characters */
++		if (consumed != lwc_string_length(token->idata)) {
++			*ctx = orig_ctx;
++			return CSS_INVALID;
++		}
++
++		switch (FIXTOINT(num)) {
++		case 100: weight = CSS_FONT_WEIGHT_100; break;
++		case 200: weight = CSS_FONT_WEIGHT_200; break;
++		case 300: weight = CSS_FONT_WEIGHT_300; break;
++		case 400: weight = CSS_FONT_WEIGHT_400; break;
++		case 500: weight = CSS_FONT_WEIGHT_500; break;
++		case 600: weight = CSS_FONT_WEIGHT_600; break;
++		case 700: weight = CSS_FONT_WEIGHT_700; break;
++		case 800: weight = CSS_FONT_WEIGHT_800; break;
++		case 900: weight = CSS_FONT_WEIGHT_900; break;
++		default: error = CSS_INVALID;
++		}
++	} else if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[NORMAL], &match) == lwc_error_ok && match)) {
++		weight = CSS_FONT_WEIGHT_NORMAL;
++	} else if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[BOLD], &match) == lwc_error_ok && match)) {
++		weight = CSS_FONT_WEIGHT_BOLD;
++	} else {
++		error = CSS_INVALID;
++	}
++
++	if (error == CSS_OK) {
++		font_face->bits[0] = (font_face->bits[0] & 0xc3) |
++				(weight << 2);
++	} else {
++		*ctx = orig_ctx;
++	}
++
++	return error;
++}
++
++/**
++ * Parse a descriptor in an @font-face rule
++ *
++ * \param c           Parsing context
++ * \param descriptor  Token for this descriptor
++ * \param vector      Vector of tokens to process
++ * \param ctx	      Pointer to vector iteration context
++ * \param rule	      Rule to process descriptor into
++ * \return CSS_OK on success,
++ *         CSS_BADPARM on bad parameters,
++ *         CSS_INVALID on invalid syntax,
++ *         CSS_NOMEM on memory exhaustion
++ */
++css_error css__parse_font_descriptor(css_language *c,
++		const css_token *descriptor, const parserutils_vector *vector,
++		int32_t *ctx, css_rule_font_face *rule)
++{
++	css_font_face *font_face = rule->font_face;
++	css_error error;
++	bool match;
++
++	if (font_face == NULL) {
++		error = css__font_face_create(&font_face);
++		if (error != CSS_OK) {
++			return error;
++		}
++
++		rule->font_face = font_face;
++	}
++
++	if (lwc_string_caseless_isequal(descriptor->idata,
++			c->strings[FONT_FAMILY], &match) == lwc_error_ok &&
++			match) {
++		return font_face_parse_font_family(c, vector, ctx, font_face);
++	} else if (lwc_string_caseless_isequal(descriptor->idata,
++			c->strings[SRC], &match) == lwc_error_ok && match) {
++		return font_face_parse_src(c, vector, ctx, font_face);
++	} else if (lwc_string_caseless_isequal(descriptor->idata,
++			c->strings[FONT_STYLE], &match) == lwc_error_ok &&
++			match) {
++		return font_face_parse_font_style(c, vector, ctx, font_face);
++	} else if (lwc_string_caseless_isequal(descriptor->idata,
++			c->strings[FONT_WEIGHT], &match) == lwc_error_ok &&
++			match) {
++		return font_face_parse_font_weight(c, vector, ctx, font_face);
++	}
++
++	return CSS_INVALID;
++}
++
+diff -urN upstream/libcss/src/parse/parse.c browser/libcss/src/parse/parse.c
+--- upstream/libcss/src/parse/parse.c
++++ browser/libcss/src/parse/parse.c
+@@ -16,6 +16,10 @@
+ #include <parserutils/utils/vector.h>
+ 
+ #include "charset/detect.h"
++/* MacSurf: CW8 access paths may resolve "charset/detect.h" to libhubbub's
++ * homonymous header first; forward-declare explicitly so parse.c links. */
++extern parserutils_error css__charset_extract(const uint8_t *data, size_t len,
++		uint16_t *mibenum, uint32_t *source);
+ #include "lex/lex.h"
+ #include "parse/parse.h"
+ #include "utils/parserutilserror.h"
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/propstrings.c browser/libcss/src/parse/propstrings.c
+--- upstream/libcss/src/parse/propstrings.c	2026-09-20 23:27:15.834693962 +0100
++++ browser/libcss/src/parse/propstrings.c	2026-09-20 23:19:17.222098011 +0100
+@@ -6,7 +6,7 @@
+  */
+ 
+ #include "parse/propstrings.h"
+-#include "stylesheet.h"
++#include "stylesheet.h"
+ 
+ #include <assert.h>
+ 
+@@ -163,6 +163,7 @@
+ 	SMAP("font-style"),
+ 	SMAP("font-variant"),
+ 	SMAP("font-weight"),
++	SMAP("gap"),
+ 	SMAP("height"),
+ 	SMAP("justify-content"),
+ 	SMAP("left"),
+@@ -209,6 +210,7 @@
+ 	SMAP("quotes"),
+ 	SMAP("richness"),
+ 	SMAP("right"),
++	SMAP("row-gap"),
+ 	SMAP("speak-header"),
+ 	SMAP("speak-numeral"),
+ 	SMAP("speak-punctuation"),
+@@ -233,7 +235,52 @@
+ 	SMAP("word-spacing"),
+ 	SMAP("writing-mode"),
+ 	SMAP("z-index"),
+-
++	SMAP("border-radius"),
++	SMAP("box-shadow"),
++	SMAP("-macsurf-gradient"),
++	SMAP("-macsurf-text-shadow"),
++	SMAP("-macsurf-transform"),
++	SMAP("-macsurf-grid"),
++	SMAP("-macsurf-animation-opacity"),
++	SMAP("-macsurf-animation-rotate"),
++	SMAP("object-fit"),
++	SMAP("-macsurf-object-position"),
++	SMAP("text-overflow"),
++	SMAP("word-break"),
++	SMAP("overflow-wrap"),
++	SMAP("word-wrap"),
++	SMAP("-macsurf-grid-rows"),
++	SMAP("-macsurf-grid-col-span"),
++	SMAP("aspect-ratio"),
++	SMAP("background-size"),
++	SMAP("pointer-events"),
++	SMAP("-macsurf-grid-flow"),
++	SMAP("accent-color"),
++	SMAP("caret-color"),
++	SMAP("box-decoration-break"),
++	SMAP("tab-size"),
++	SMAP("image-rendering"),
++	SMAP("text-decoration-color"),
++	SMAP("text-decoration-style"),
++	SMAP("text-decoration-thickness"),
++	SMAP("-macsurf-hstripe-bg"),
++	SMAP("-macsurf-dotgrid"),
++	SMAP("text-align-last"),
++	SMAP("hyphens"),
++	SMAP("text-justify"),
++	SMAP("hanging-punctuation"),
++	SMAP("background-clip"),   /* #255 */
++	SMAP("justify-items"),   /* #279 */
++	SMAP("appearance"),   /* #80 */
++	SMAP("justify-self"),   /* #279 follow-up */
++	SMAP("background-origin"),
++	SMAP("background-blend-mode"),
++	SMAP("fill"),
++	SMAP("transition"),
++	SMAP("transition-property"),
++	SMAP("transition-duration"),
++	SMAP("transition-timing-function"),
++	SMAP("transition-delay"),
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+ 	SMAP("important"),
+@@ -473,6 +520,7 @@
+ 	SMAP("vertical-lr"),
+ 	SMAP("content-box"),
+ 	SMAP("border-box"),
++	SMAP("padding-box"),   /* #255 */
+ 	SMAP("stretch"),
+ 	SMAP("inline-flex"),
+ 	SMAP("flex-start"),
+@@ -491,8 +539,66 @@
+ 	SMAP("infinite"),
+ 	SMAP("grid"),
+ 	SMAP("inline-grid"),
++	SMAP("contents"),
+ 	SMAP("sticky"),
+ 	SMAP("calc"),
++	SMAP("min"),
++	SMAP("max"),
++	SMAP("clamp"),
++	SMAP("linear-gradient"),
++	SMAP("radial-gradient"),
++	SMAP("repeating-linear-gradient"),
++	SMAP("repeating-radial-gradient"),
++	SMAP("to"),
++	SMAP("contain"),
++	SMAP("cover"),
++	SMAP("fill"),
++	SMAP("scale-down"),
++	SMAP("ellipsis"),
++	SMAP("break-all"),
++	SMAP("keep-all"),
++	SMAP("break-word"),
++	SMAP("anywhere"),
++	SMAP("slice"),
++	SMAP("clone"),
++	SMAP("smooth"),
++	SMAP("high-quality"),
++	SMAP("crisp-edges"),
++	SMAP("pixelated"),
++	SMAP("wavy"),
++	SMAP("from-font"),
++	SMAP("marker"),
++	SMAP("placeholder"),
++	SMAP("file-selector-button"),
++	SMAP("is"),
++	SMAP("where"),
++	SMAP("has"),
++	SMAP("start"),
++	SMAP("end"),
++	SMAP("manual"),
++	SMAP("inter-word"),
++	SMAP("inter-character"),
++	SMAP("last"),
++	SMAP("force-end"),
++	SMAP("allow-end"),
++	SMAP("min-content"),
++	SMAP("max-content"),
++	SMAP("fit-content"),
++	SMAP("multiply"),
++	SMAP("screen"),
++	SMAP("overlay"),
++	SMAP("darken"),
++	SMAP("lighten"),
++	SMAP("color-dodge"),
++	SMAP("color-burn"),
++	SMAP("hard-light"),
++	SMAP("soft-light"),
++	SMAP("difference"),
++	SMAP("exclusion"),
++	SMAP("hue"),
++	SMAP("saturation"),
++	SMAP("color"),
++	SMAP("luminosity"),
+ 
+ 	/* Named colours */
+ 	SMAP("aliceblue"),
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/propstrings.h browser/libcss/src/parse/propstrings.h
+--- upstream/libcss/src/parse/propstrings.h	2026-09-20 23:27:15.834693962 +0100
++++ browser/libcss/src/parse/propstrings.h	2026-09-20 23:19:17.222285188 +0100
+@@ -8,6 +8,14 @@
+ #ifndef css_css__parse_propstrings_h_
+ #define css_css__parse_propstrings_h_
+ 
++/* Defensive empty define for CW8: prevent stray _ALIGNED tokens from
++ * being read as global variable declarations. */
++#ifndef _ALIGNED
++#define _ALIGNED
++#endif
++
++#include <libwapcaplet/libwapcaplet.h>
++#include <libcss/errors.h>
+ #include "utils/utils.h"
+ 
+ enum {
+@@ -54,7 +62,7 @@
+ 	CURSOR, DIRECTION, DISPLAY, ELEVATION, EMPTY_CELLS, FILL_OPACITY, FLEX,
+ 	FLEX_BASIS, FLEX_DIRECTION, FLEX_FLOW, FLEX_GROW, FLEX_SHRINK,
+ 	FLEX_WRAP, LIBCSS_FLOAT, FONT, FONT_FAMILY, FONT_SIZE, FONT_STYLE,
+-	FONT_VARIANT, FONT_WEIGHT, HEIGHT, JUSTIFY_CONTENT, LEFT,
++	FONT_VARIANT, FONT_WEIGHT, GAP, HEIGHT, JUSTIFY_CONTENT, LEFT,
+ 	LETTER_SPACING, LINE_HEIGHT, LIST_STYLE, LIST_STYLE_IMAGE,
+ 	LIST_STYLE_POSITION, LIST_STYLE_TYPE, MARGIN, MARGIN_BOTTOM,
+ 	MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MAX_HEIGHT, MAX_WIDTH,
+@@ -63,14 +71,50 @@
+ 	PADDING_BOTTOM, PADDING_LEFT, PADDING_RIGHT, PADDING_TOP,
+ 	PAGE_BREAK_AFTER, PAGE_BREAK_BEFORE, PAGE_BREAK_INSIDE, PAUSE,
+ 	PAUSE_AFTER, PAUSE_BEFORE, PITCH_RANGE, PITCH, PLAY_DURING, POSITION,
+-	QUOTES, RICHNESS, RIGHT, SPEAK_HEADER, SPEAK_NUMERAL, SPEAK_PUNCTUATION,
++	QUOTES, RICHNESS, RIGHT, ROW_GAP, SPEAK_HEADER, SPEAK_NUMERAL, SPEAK_PUNCTUATION,
+ 	SPEAK, SPEECH_RATE, STRESS, STROKE_OPACITY, TABLE_LAYOUT, TEXT_ALIGN,
+ 	TEXT_DECORATION, TEXT_INDENT, TEXT_TRANSFORM, TOP, UNICODE_BIDI,
+ 	VERTICAL_ALIGN, VISIBILITY, VOICE_FAMILY, VOLUME, WHITE_SPACE, WIDOWS,
+ 	WIDTH, WORD_SPACING, WRITING_MODE, Z_INDEX,
++	BORDER_RADIUS, BOX_SHADOW, MACSURF_GRADIENT, MACSURF_TEXT_SHADOW,
++	MACSURF_TRANSFORM, MACSURF_GRID, MACSURF_ANIMATION_OPACITY,
++	MACSURF_ANIMATION_ROTATE, OBJECT_FIT, MACSURF_OBJECT_POSITION,
++	TEXT_OVERFLOW,
++	WORD_BREAK, OVERFLOW_WRAP, WORD_WRAP,
++	MACSURF_GRID_ROWS,
++	MACSURF_GRID_COL_SPAN,
++	ASPECT_RATIO,
++	BACKGROUND_SIZE,
++	POINTER_EVENTS,
++	MACSURF_GRID_FLOW,
++	ACCENT_COLOR,
++	CARET_COLOR,
++	BOX_DECORATION_BREAK,
++	TAB_SIZE,
++	IMAGE_RENDERING,
++	TEXT_DECORATION_COLOR,
++	TEXT_DECORATION_STYLE,
++	TEXT_DECORATION_THICKNESS,
++	MACSURF_HSTRIPE_BG,
++	MACSURF_DOTGRID,
++	TEXT_ALIGN_LAST,
++	HYPHENS,
++	TEXT_JUSTIFY,
++	HANGING_PUNCTUATION,
++	BACKGROUND_CLIP,   /* #255 */
++	JUSTIFY_ITEMS,     /* #279 */
++	APPEARANCE,        /* #80 */
++	JUSTIFY_SELF,      /* #279 follow-up */
++	BACKGROUND_ORIGIN,
++	BACKGROUND_BLEND_MODE,
++	SVG_FILL,
++	TRANSITION,
++	TRANSITION_PROPERTY,
++	TRANSITION_DURATION,
++	TRANSITION_TIMING_FUNCTION,
++	TRANSITION_DELAY,
+ 
+-	LAST_PROP = Z_INDEX,
+-
++	LAST_PROP = TRANSITION_DELAY,
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+ 	NO_REPEAT, REPEAT_X, REPEAT_Y, REPEAT, HIDDEN, DOTTED, DASHED,
+@@ -107,10 +151,29 @@
+ 	LIBCSS_CENTER, LIBCSS_RIGHT, CURRENTCOLOR, ODD, EVEN, SRC, LOCAL,
+ 	INITIAL, REVERT, FORMAT, WOFF, TRUETYPE, OPENTYPE, EMBEDDED_OPENTYPE,
+ 	SVG, COLUMN, AVOID_PAGE, AVOID_COLUMN, BALANCE, HORIZONTAL_TB,
+-	VERTICAL_RL, VERTICAL_LR, CONTENT_BOX, BORDER_BOX, STRETCH, INLINE_FLEX,
++	VERTICAL_RL, VERTICAL_LR, CONTENT_BOX, BORDER_BOX, PADDING_BOX, STRETCH, INLINE_FLEX,
+ 	FLEX_START, FLEX_END, SPACE_BETWEEN, SPACE_AROUND, SPACE_EVENLY, ROW,
+ 	ROW_REVERSE, COLUMN_REVERSE, WRAP_STRING, WRAP_REVERSE, AND, OR, ONLY,
+-	INFINITE, GRID, INLINE_GRID, STICKY, CALC,
++	INFINITE, GRID, INLINE_GRID, CONTENTS, STICKY, CALC,
++	MIN, MAX, CLAMP,
++	LINEAR_GRADIENT, RADIAL_GRADIENT,
++	REPEATING_LINEAR_GRADIENT, REPEATING_RADIAL_GRADIENT,
++	TO,
++	CONTAIN, COVER, FILL, SCALE_DOWN, ELLIPSIS,
++	BREAK_ALL, KEEP_ALL, BREAK_WORD, ANYWHERE,
++	SLICE, CLONE,
++	SMOOTH, HIGH_QUALITY, CRISP_EDGES, PIXELATED,
++	WAVY, FROM_FONT,
++	MARKER, PLACEHOLDER, FILE_SELECTOR_BUTTON,
++	IS_FN, WHERE_FN, HAS_FN,
++	START, END,
++	MANUAL, INTER_WORD, INTER_CHARACTER, LAST, FORCE_END, ALLOW_END,
++	MIN_CONTENT, MAX_CONTENT, FIT_CONTENT,
++	BLEND_MULTIPLY, BLEND_SCREEN, BLEND_OVERLAY, BLEND_DARKEN,
++	BLEND_LIGHTEN, BLEND_COLOR_DODGE, BLEND_COLOR_BURN,
++	BLEND_HARD_LIGHT, BLEND_SOFT_LIGHT, BLEND_DIFFERENCE,
++	BLEND_EXCLUSION, BLEND_HUE, BLEND_SATURATION, BLEND_COLOR,
++	BLEND_LUMINOSITY,
+ 
+ 	/* Named colours */
+ 	FIRST_COLOUR,

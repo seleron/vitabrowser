@@ -1,0 +1,235 @@
+# libcss: property-text-shadow [fixes50]
+# 2 files, 221 changed lines
+# MacSurf fix ids: fixes50
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/parse/properties/p_macsurf_text_shadow.c browser/libcss/src/parse/properties/p_macsurf_text_shadow.c
+--- upstream/libcss/src/parse/properties/p_macsurf_text_shadow.c	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/parse/properties/p_macsurf_text_shadow.c	2026-09-20 23:19:17.216520964 +0100
+@@ -0,0 +1,88 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2025 MacSurf (fixes50)
++ *
++ * Parse -macsurf-text-shadow.
++ *
++ * Accepted form:
++ *   -macsurf-text-shadow: <hoff> <voff> <colour>
++ *
++ * hoff/voff are integer pixel values (negative allowed).
++ * colour is any css colour specifier (hex, named, rgb()...).
++ *
++ * Storage layout (matches the renderer in plotters.c):
++ *   bits 31..24: h-offset (int8 signed)
++ *   bits 23..16: v-offset (int8 signed)
++ *   bits 15..0:  RGB565 colour
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++css_error css__parse_macsurf_text_shadow(css_language *c,
++                const parserutils_vector *vector, int32_t *ctx,
++                css_style *result)
++{
++        int32_t orig_ctx = *ctx;
++        css_error error;
++        const css_token *token;
++        css_fixed hoff = 0, voff = 0, blur = 0;
++        uint32_t hoff_u = 0, voff_u = 0, blur_u = 0;
++        css_color color = 0;
++        uint16_t color_type = 0;
++        enum flag_value flag_value;
++
++        token = parserutils_vector_peek(vector, *ctx);
++        if (token == NULL) return CSS_INVALID;
++
++        flag_value = get_css_flag_value(c, token);
++        if (flag_value != FLAG_VALUE__NONE) {
++                parserutils_vector_iterate(vector, ctx);
++                return css_stylesheet_style_flag_value(result, flag_value,
++                                CSS_PROP_MACSURF_TEXT_SHADOW);
++        }
++
++        consumeWhitespace(vector, ctx);
++
++        /* h-offset */
++        error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++                        &hoff, &hoff_u);
++        if (error != CSS_OK) { *ctx = orig_ctx; return error; }
++
++        consumeWhitespace(vector, ctx);
++
++        /* v-offset */
++        error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++                        &voff, &voff_u);
++        if (error != CSS_OK) { *ctx = orig_ctx; return error; }
++
++        consumeWhitespace(vector, ctx);
++
++        /* Optional blur or required colour */
++        token = parserutils_vector_peek(vector, *ctx);
++        if (token != NULL && (token->type == CSS_TOKEN_DIMENSION ||
++                        token->type == CSS_TOKEN_NUMBER)) {
++                error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++                                &blur, &blur_u);
++                if (error != CSS_OK) { *ctx = orig_ctx; return error; }
++                consumeWhitespace(vector, ctx);
++        }
++
++        /* colour (required) */
++        error = css__parse_colour_specifier(c, vector, ctx, &color_type, &color);
++        if (error != CSS_OK) { *ctx = orig_ctx; return error; }
++
++        error = css__stylesheet_style_appendOPV(result,
++                        CSS_PROP_MACSURF_TEXT_SHADOW, 0, 0x0080 /* SET */);
++        if (error != CSS_OK) return error;
++
++        return css__stylesheet_style_vappend(result, 4,
++                        (css_fixed)hoff, (css_fixed)voff, (css_fixed)blur, (css_fixed)color);
++}
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/select/properties/s_macsurf_text_shadow.c browser/libcss/src/select/properties/s_macsurf_text_shadow.c
+--- upstream/libcss/src/select/properties/s_macsurf_text_shadow.c	1970-01-01 01:00:00.000000000 +0100
++++ browser/libcss/src/select/properties/s_macsurf_text_shadow.c	2026-09-20 23:19:17.249814785 +0100
+@@ -0,0 +1,133 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2025 MacSurf (fixes50)
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++/* fixes50/200 -- pack h-offset, v-offset, blur, and RGB565 colour into the
++ * single int32_t storage slot reserved for macsurf_text_shadow.
++ *   bits 31..26 h-offset px (6-bit signed, -32..31)
++ *   bits 25..20 v-offset px (6-bit signed, -32..31)
++ *   bits 19..16 blur radius px (4-bit unsigned, 0..15)
++ *   bits 15..0  RGB565 colour
++ */
++static int32_t macsurf_text_shadow_pack(css_fixed h, css_fixed v,
++		css_fixed blur, css_color color)
++{
++	int32_t h_px = (int32_t)(h >> 10);
++	int32_t v_px = (int32_t)(v >> 10);
++	int32_t b_px = (int32_t)(blur >> 10);
++	uint8_t r = (uint8_t)((color >> 16) & 0xff);
++	uint8_t g = (uint8_t)((color >>  8) & 0xff);
++	uint8_t b = (uint8_t)((color >>  0) & 0xff);
++	uint16_t rgb565;
++	uint32_t out;
++
++	if (h_px > 31) h_px = 31;
++	if (h_px < -32) h_px = -32;
++	if (v_px > 31) v_px = 31;
++	if (v_px < -32) v_px = -32;
++	if (b_px > 15) b_px = 15;
++	if (b_px < 0) b_px = 0;
++
++	rgb565 = (uint16_t)((((uint32_t)r >> 3) << 11) |
++			(((uint32_t)g >> 2) <<  5) |
++			 ((uint32_t)b >> 3));
++
++	out = (((uint32_t)((uint8_t)h_px & 0x3f)) << 26) |
++	      (((uint32_t)((uint8_t)v_px & 0x3f)) << 20) |
++	      (((uint32_t)((uint8_t)b_px & 0x0f)) << 16) |
++	       (uint32_t)rgb565;
++
++	return (int32_t)out;
++}
++
++css_error css__cascade_macsurf_text_shadow(uint32_t opv, css_style *style,
++                css_select_state *state)
++{
++        uint16_t value = CSS_MACSURF_TEXT_SHADOW_INHERIT;
++        css_fixed h = 0, v = 0, blur = 0;
++        css_color color = 0;
++        int32_t packed = 0;
++
++        if (hasFlagValue(opv) == false) {
++                switch (getValue(opv)) {
++                case 0x0000: /* NONE */
++                        value = CSS_MACSURF_TEXT_SHADOW_NONE;
++                        break;
++                case 0x0080: /* SET */
++                        value = CSS_MACSURF_TEXT_SHADOW_SET;
++                        h = *((css_fixed *) style->bytecode);
++                        advance_bytecode(style, sizeof(css_fixed));
++                        v = *((css_fixed *) style->bytecode);
++                        advance_bytecode(style, sizeof(css_fixed));
++                        blur = *((css_fixed *) style->bytecode);
++                        advance_bytecode(style, sizeof(css_fixed));
++                        color = *((css_color *) style->bytecode);
++                        advance_bytecode(style, sizeof(css_color));
++                        packed = macsurf_text_shadow_pack(h, v, blur, color);
++                        break;
++                }
++        }
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_macsurf_text_shadow(state->computed, value, packed);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_macsurf_text_shadow_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_macsurf_text_shadow(style, hint->status,
++			hint->data.integer);
++}
++
++css_error css__initial_macsurf_text_shadow(css_select_state *state)
++{
++	return set_macsurf_text_shadow(state->computed,
++			CSS_MACSURF_TEXT_SHADOW_NONE, 0);
++}
++
++css_error css__copy_macsurf_text_shadow(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	int32_t integer = 0;
++	uint8_t type = get_macsurf_text_shadow(from, &integer);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_macsurf_text_shadow(to, type, integer);
++}
++
++css_error css__compose_macsurf_text_shadow(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	int32_t integer = 0;
++	uint8_t type = get_macsurf_text_shadow(child, &integer);
++
++	return css__copy_macsurf_text_shadow(
++			type == CSS_MACSURF_TEXT_SHADOW_INHERIT ? parent : child,
++			result);
++}
++
++uint32_t destroy_macsurf_text_shadow(void *bytecode)
++{
++	(void)bytecode;
++	return 0;
++}

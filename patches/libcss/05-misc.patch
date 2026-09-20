@@ -1,0 +1,95 @@
+# libcss: misc
+# 1 files, 39 changed lines
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/src/stylesheet.c browser/libcss/src/stylesheet.c
+--- upstream/libcss/src/stylesheet.c	2026-09-20 23:27:15.838921227 +0100
++++ browser/libcss/src/stylesheet.c	2026-09-20 23:19:17.258547857 +0100
+@@ -9,14 +9,17 @@
+ #include <string.h>
+ #include <stdarg.h>
+ 
+-#include "stylesheet.h"
++#include "stylesheet.h"
+ #include "bytecode/bytecode.h"
+ #include "parse/language.h"
+ #include "parse/mq.h"
++#include "parse/custom_properties.h"
+ #include "utils/parserutilserror.h"
+ #include "utils/utils.h"
++
++#include "macsurf_debug.h"
+ #include "select/dispatch.h"
+-#include "select/font_face.h"
++#include "select/font_face.h"
+ 
+ static css_error _add_selectors(css_stylesheet *sheet, css_rule *rule);
+ static css_error _remove_selectors(css_stylesheet *sheet, css_rule *rule);
+@@ -288,6 +291,13 @@
+ 	if (sheet->cached_style != NULL)
+ 		css__stylesheet_style_destroy(sheet->cached_style);
+ 
++	/* Custom properties hold interned name references and token
++	 * vectors; drop them before we unref the string vector. */
++	if (sheet->custom_properties != NULL) {
++		css__cp_entry_list_destroy(sheet->custom_properties);
++		sheet->custom_properties = NULL;
++	}
++
+ 	/* destroy string vector */
+ 	for (index = 0; index < sheet->string_vector_c; index++) {
+ 		lwc_string_unref(sheet->string_vector[index]);
+@@ -648,6 +658,8 @@
+ 	if (sheet->cached_style != NULL) {
+ 		*style = sheet->cached_style;
+ 		sheet->cached_style = NULL;
++		/* Cached styles are reset on destroy; defensive clear. */
++		(*style)->deferred = NULL;
+ 		return CSS_OK;
+ 	}
+ 
+@@ -665,6 +677,7 @@
+ 	s->allocated = CSS_STYLE_DEFAULT_SIZE;
+ 	s->used = 0;
+ 	s->sheet = sheet;
++	s->deferred = NULL;
+ 
+ 	*style = s;
+ 
+@@ -699,6 +712,21 @@
+ 
+ 	target->used += style->used;
+ 
++	/* Move any deferred (var()) declarations from source to target,
++	 * appending source's list at the tail of target's so cascade
++	 * source-order is preserved. */
++	if (style->deferred != NULL) {
++		if (target->deferred == NULL) {
++			target->deferred = style->deferred;
++		} else {
++			css_deferred_decl *tail = target->deferred;
++			while (tail->next != NULL)
++				tail = tail->next;
++			tail->next = style->deferred;
++		}
++		style->deferred = NULL;
++	}
++
+ 	return CSS_OK;
+ 
+ }
+@@ -762,6 +790,13 @@
+ 
+ 	sheet = style->sheet;
+ 
++	/* Always free any attached deferred declarations up front - they are
++	 * never part of the cache. */
++	if (style->deferred != NULL) {
++		css__deferred_decl_list_destroy(style->deferred);
++		style->deferred = NULL;
++	}
++
+ 	if (sheet->cached_style == NULL) {
+ 		sheet->cached_style = style;
+ 		style->used = 0;

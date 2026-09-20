@@ -1,0 +1,630 @@
+# libcss: public-headers
+# 3 files, 520 changed lines
+# MacSurf fix ids: fixes1052 fixes113 fixes1309 fixes275 fixes353 fixes354 fixes356 fixes357 fixes77
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/include/libcss/fpmath.h browser/libcss/include/libcss/fpmath.h
+--- upstream/libcss/include/libcss/fpmath.h	2026-09-20 23:27:15.830724404 +0100
++++ browser/libcss/include/libcss/fpmath.h	2026-09-20 23:19:17.174407950 +0100
+@@ -28,12 +28,31 @@
+ 	int32_t uy = y;
+ 	int32_t res = ux + uy;
+ 
+-	/* Calculate overflowed result. (Don't change the sign bit of ux) */
+-	ux = (ux >> 31) + INT_MAX;
+-
+-	/* Force compiler to use cmovns instruction */
+-	if ((int32_t) ((ux ^ uy) | ~(uy ^ res)) >= 0) {
+-		res = ux;
++	/* Calculate overflowed result. (Don't change the sign bit of ux)
++	 *
++	 * fixes1309 (#167, C0) - this branchless idiom needs ux>>31 to be
++	 * an UNSIGNED (logical) shift, landing on 0 or 1 so the line below
++	 * saturates to INT_MAX or INT_MIN respectively. `ux` is int32_t
++	 * here, so `ux >> 31` on a negative operand is an ARITHMETIC
++	 * (sign-extending) shift -- it lands on -1, not 1, making the
++	 * saturation candidate INT_MAX-1 instead of INT_MIN. That flips
++	 * the overflow test below into a false positive for a whole class
++	 * of perfectly valid negative sums: confirmed directly,
++	 * css_add_fixed(INTTOFIX(-609), INTTOFIX(0)) returned 2147483646
++	 * instead of -623616 -- a real Facebook `margin-bottom:calc(-100vh
++	 * + var(--header-height))` (real ~-609px) corrupted into +21845px,
++	 * the exact hardware symptom this fix closes. Cast through
++	 * uint32_t for the shift only; every other operation here still
++	 * needs ux as signed for the XOR/OR overflow test that follows. */
++	ux = (int32_t)((uint32_t)ux >> 31) + INT_MAX;
++
++	/* Force compiler to use cmovns instruction.
++	 * Split to avoid CW8 internal compiler error on complex expression. */
++	{
++		int32_t temp_ice = (ux ^ uy) | ~(uy ^ res);
++		if (temp_ice >= 0) {
++			res = ux;
++		}
+ 	}
+ 
+ 	return res;
+@@ -45,16 +64,71 @@
+ 	int32_t uy = y;
+ 	int32_t res = ux - uy;
+ 
+-	ux = (ux >> 31) + INT_MAX;
+-
+-	/* Force compiler to use cmovns instruction */
+-	if ((int32_t)((ux ^ uy) & (ux ^ res)) < 0) {
+-		res = ux;
++	/* fixes1309 (#167, C0) - same unsigned-shift correction as
++	 * css_add_fixed above, and the same class of bug: an
++	 * ARITHMETIC shift here corrupts the INT_MIN saturation
++	 * candidate for a negative x into INT_MAX-1, false-positiving
++	 * the overflow test below on valid results. */
++	ux = (int32_t)((uint32_t)ux >> 31) + INT_MAX;
++
++	/* Split to avoid CW8 internal compiler error. */
++	{
++		int32_t temp_ice = (ux ^ uy) & (ux ^ res);
++		if (temp_ice < 0) {
++			res = ux;
++		}
+ 	}
+ 
+ 	return res;
+ }
+ 
++#ifdef __MWERKS__
++/* CW8 PPC miscompiles `(int64_t)a * small_const`: the 64-bit
++ * multiply-by-constant codegen writes `a >> log2(const)` into
++ * the high word instead of the correct `(a*const) >> 32`.
++ * Confirmed via probe G (fixes113) showing `(long long)131072
++ * * 1024LL` produces hi=128, lo=134217728 - full product
++ * 549,890,031,616 instead of 134,217,728. Route the three
++ * fpmath operations that rely on int64 intermediates through
++ * `double` instead - PPC's FPU handles this natively, and 52
++ * bits of mantissa comfortably covers every int32 product we
++ * need. */
++static inline css_fixed
++css_divide_fixed(const css_fixed x, const css_fixed y) {
++	double dd = ((double)x * 1024.0) / (double)y;
++
++	if (dd < (double)INT_MIN)
++		return INT_MIN;
++	if (dd > (double)INT_MAX)
++		return INT_MAX;
++
++	return (css_fixed)dd;
++}
++
++static inline css_fixed
++css_multiply_fixed(const css_fixed x, const css_fixed y) {
++	double dd = ((double)x * (double)y) / 1024.0;
++
++	if (dd < (double)INT_MIN)
++		return INT_MIN;
++	if (dd > (double)INT_MAX)
++		return INT_MAX;
++
++	return (css_fixed)dd;
++}
++
++static inline css_fixed
++css_int_to_fixed(const int a) {
++	double dd = (double)a * 1024.0;
++
++	if (dd < (double)INT_MIN)
++		return INT_MIN;
++	if (dd > (double)INT_MAX)
++		return INT_MAX;
++
++	return (css_fixed)dd;
++}
++#else
+ static inline css_fixed
+ css_divide_fixed(const css_fixed x, const css_fixed y) {
+ 	int64_t xx = ((int64_t)x * (1 << CSS_RADIX_POINT)) / y;
+@@ -93,6 +167,7 @@
+ 
+ 	return xx;
+ }
++#endif
+ 
+ static inline css_fixed
+ css_float_to_fixed(const float a) {
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/include/libcss/properties.h browser/libcss/include/libcss/properties.h
+--- upstream/libcss/include/libcss/properties.h	2026-09-20 23:27:15.830724404 +0100
++++ browser/libcss/include/libcss/properties.h	2026-09-20 23:19:17.175414550 +0100
+@@ -120,30 +120,217 @@
+ 	CSS_PROP_COLUMN_COUNT			= 0x067,
+ 	CSS_PROP_COLUMN_FILL			= 0x068,
+ 	CSS_PROP_COLUMN_GAP			= 0x069,
+-	CSS_PROP_COLUMN_RULE_COLOR		= 0x06a,
+-	CSS_PROP_COLUMN_RULE_STYLE		= 0x06b,
+-	CSS_PROP_COLUMN_RULE_WIDTH		= 0x06c,
+-	CSS_PROP_COLUMN_SPAN			= 0x06d,
+-	CSS_PROP_COLUMN_WIDTH			= 0x06e,
+-	CSS_PROP_WRITING_MODE			= 0x06f,
+-	CSS_PROP_OVERFLOW_Y			= 0x070,
+-	CSS_PROP_BOX_SIZING			= 0x071,
+-	CSS_PROP_ALIGN_CONTENT			= 0x072,
+-	CSS_PROP_ALIGN_ITEMS			= 0x073,
+-	CSS_PROP_ALIGN_SELF			= 0x074,
+-	CSS_PROP_FLEX_BASIS			= 0x075,
+-	CSS_PROP_FLEX_DIRECTION			= 0x076,
+-	CSS_PROP_FLEX_GROW			= 0x077,
+-	CSS_PROP_FLEX_SHRINK			= 0x078,
+-	CSS_PROP_FLEX_WRAP			= 0x079,
+-	CSS_PROP_JUSTIFY_CONTENT		= 0x07a,
+-	CSS_PROP_ORDER				= 0x07b,
+-	CSS_PROP_FILL_OPACITY			= 0x07c,
+-	CSS_PROP_STROKE_OPACITY			= 0x07d,
+-
++	CSS_PROP_ROW_GAP			= 0x06a,
++	CSS_PROP_COLUMN_RULE_COLOR		= 0x06b,
++	CSS_PROP_COLUMN_RULE_STYLE		= 0x06c,
++	CSS_PROP_COLUMN_RULE_WIDTH		= 0x06d,
++	CSS_PROP_COLUMN_SPAN			= 0x06e,
++	CSS_PROP_COLUMN_WIDTH			= 0x06f,
++	CSS_PROP_WRITING_MODE			= 0x070,
++	CSS_PROP_OVERFLOW_Y			= 0x071,
++	CSS_PROP_BOX_SIZING			= 0x072,
++	CSS_PROP_ALIGN_CONTENT			= 0x073,
++	CSS_PROP_ALIGN_ITEMS			= 0x074,
++	CSS_PROP_ALIGN_SELF			= 0x075,
++	CSS_PROP_FLEX_BASIS			= 0x076,
++	CSS_PROP_FLEX_DIRECTION			= 0x077,
++	CSS_PROP_FLEX_GROW			= 0x078,
++	CSS_PROP_FLEX_SHRINK			= 0x079,
++	CSS_PROP_FLEX_WRAP			= 0x07a,
++	CSS_PROP_JUSTIFY_CONTENT		= 0x07b,
++	CSS_PROP_ORDER				= 0x07c,
++	CSS_PROP_FILL_OPACITY			= 0x07d,
++	CSS_PROP_STROKE_OPACITY			= 0x07e,
++	CSS_PROP_BORDER_RADIUS			= 0x07f,
++	CSS_PROP_BOX_SHADOW			= 0x080,
++	CSS_PROP_MACSURF_GRADIENT		= 0x081,
++	CSS_PROP_MACSURF_TEXT_SHADOW		= 0x082,
++	CSS_PROP_MACSURF_TRANSFORM		= 0x083,
++	CSS_PROP_MACSURF_GRID			= 0x084,
++	CSS_PROP_MACSURF_ANIMATION_OPACITY	= 0x085,
++	CSS_PROP_MACSURF_ANIMATION_ROTATE	= 0x086,
++	CSS_PROP_OBJECT_FIT			= 0x087,
++	CSS_PROP_MACSURF_OBJECT_POSITION	= 0x088,
++	CSS_PROP_TEXT_OVERFLOW			= 0x089,
++	CSS_PROP_WORD_BREAK			= 0x08a,
++	CSS_PROP_OVERFLOW_WRAP			= 0x08b,
++	CSS_PROP_MACSURF_GRID_ROWS		= 0x08c,
++	CSS_PROP_MACSURF_GRID_COL_SPAN		= 0x08d,
++	CSS_PROP_ASPECT_RATIO			= 0x08e,
++	CSS_PROP_BACKGROUND_SIZE                = 0x08f,
++	CSS_PROP_POINTER_EVENTS                 = 0x090,
++	CSS_PROP_MACSURF_GRID_FLOW              = 0x091,
++	CSS_PROP_ACCENT_COLOR                   = 0x092,
++	CSS_PROP_CARET_COLOR                    = 0x093,
++	CSS_PROP_BOX_DECORATION_BREAK           = 0x094,
++	CSS_PROP_TAB_SIZE                       = 0x095,
++	CSS_PROP_IMAGE_RENDERING                = 0x096,
++	CSS_PROP_TEXT_DECORATION_COLOR          = 0x097,
++	CSS_PROP_TEXT_DECORATION_STYLE          = 0x098,
++	CSS_PROP_TEXT_DECORATION_THICKNESS      = 0x099,
++	CSS_PROP_MACSURF_HSTRIPE_BG             = 0x09a,
++	CSS_PROP_MACSURF_DOTGRID                = 0x09b,
++	CSS_PROP_TEXT_ALIGN_LAST                = 0x09c,
++	CSS_PROP_HYPHENS                        = 0x09d,
++	CSS_PROP_TEXT_JUSTIFY                   = 0x09e,
++	CSS_PROP_HANGING_PUNCTUATION            = 0x09f,
++	CSS_PROP_BACKGROUND_CLIP                = 0x0a0,
++	CSS_PROP_JUSTIFY_ITEMS                  = 0x0a1,
++	CSS_PROP_APPEARANCE                     = 0x0a2,
++	CSS_PROP_JUSTIFY_SELF                   = 0x0a3,
++	CSS_PROP_BACKGROUND_ORIGIN              = 0x0a4,
++	CSS_PROP_BACKGROUND_BLEND_MODE          = 0x0a5,
++	CSS_PROP_FILL                           = 0x0a6,
++	CSS_PROP_TRANSITION_PROPERTY            = 0x0a7,
++	CSS_PROP_TRANSITION_DURATION            = 0x0a8,
++	CSS_PROP_TRANSITION_TIMING_FUNCTION     = 0x0a9,
++	CSS_PROP_TRANSITION_DELAY               = 0x0aa,
+ 	CSS_N_PROPERTIES
+ };
+ 
++enum css_border_radius_e {
++	CSS_BORDER_RADIUS_INHERIT		= 0x0,
++	CSS_BORDER_RADIUS_SET			= 0x1
++};
++
++enum css_box_shadow_e {
++	CSS_BOX_SHADOW_INHERIT			= 0x0,
++	CSS_BOX_SHADOW_NONE			= 0x1,
++	CSS_BOX_SHADOW_SET			= 0x2
++};
++
++enum css_pointer_events_e {
++	CSS_POINTER_EVENTS_INHERIT              = 0x0,
++	CSS_POINTER_EVENTS_AUTO                 = 0x1,
++	CSS_POINTER_EVENTS_NONE                 = 0x2
++};
++
++/* fixes353 (#73): accent-color. Inherited; initial = auto. */
++enum css_accent_color_e {
++	CSS_ACCENT_COLOR_INHERIT                = 0x0,
++	CSS_ACCENT_COLOR_AUTO                   = 0x1,
++	CSS_ACCENT_COLOR_CURRENT_COLOR          = 0x2,
++	CSS_ACCENT_COLOR_COLOR                  = 0x3
++};
++
++/* fixes353 (#73): caret-color. Inherited; initial = auto. */
++enum css_caret_color_e {
++	CSS_CARET_COLOR_INHERIT                 = 0x0,
++	CSS_CARET_COLOR_AUTO                    = 0x1,
++	CSS_CARET_COLOR_CURRENT_COLOR           = 0x2,
++	CSS_CARET_COLOR_COLOR                   = 0x3
++};
++
++/* fixes354 (#82): box-decoration-break. Not inherited; initial = slice. */
++enum css_box_decoration_break_e {
++	CSS_BOX_DECORATION_BREAK_INHERIT        = 0x0,
++	CSS_BOX_DECORATION_BREAK_SLICE          = 0x1,
++	CSS_BOX_DECORATION_BREAK_CLONE          = 0x2
++};
++
++/* fixes356 (#78): image-rendering. Inherits; initial = auto. */
++/* fixes1052 (#80): appearance. Only the two values that matter for
++ * rendering -- `none` suppresses the built-in widget painting so the
++ * element is drawn from its own CSS box (background/border/radius). */
++enum css_appearance_e {
++	CSS_APPEARANCE_INHERIT                  = 0x0,
++	CSS_APPEARANCE_AUTO                     = 0x1,
++	CSS_APPEARANCE_NONE                     = 0x2
++};
++
++enum css_image_rendering_e {
++	CSS_IMAGE_RENDERING_INHERIT             = 0x0,
++	CSS_IMAGE_RENDERING_AUTO                = 0x1,
++	CSS_IMAGE_RENDERING_CRISP_EDGES         = 0x2,
++	CSS_IMAGE_RENDERING_PIXELATED           = 0x3
++};
++
++/* fixes357 (#44): text-decoration-color. Not inherited; initial = currentcolor. */
++enum css_text_decoration_color_e {
++	CSS_TEXT_DECORATION_COLOR_INHERIT       = 0x0,
++	CSS_TEXT_DECORATION_COLOR_CURRENT_COLOR = 0x1,
++	CSS_TEXT_DECORATION_COLOR_COLOR         = 0x2
++};
++
++/* SVG fill V1. Inherited; initial = black. */
++enum css_fill_e {
++	CSS_FILL_INHERIT                       = 0x0,
++	CSS_FILL_NONE                          = 0x1,
++	CSS_FILL_CURRENT_COLOR                 = 0x2,
++	CSS_FILL_COLOR                         = 0x3
++};
++
++/* fixes357 (#44): text-decoration-style. Not inherited; initial = solid. */
++enum css_text_decoration_style_e {
++	CSS_TEXT_DECORATION_STYLE_INHERIT       = 0x0,
++	CSS_TEXT_DECORATION_STYLE_SOLID         = 0x1,
++	CSS_TEXT_DECORATION_STYLE_DOUBLE        = 0x2,
++	CSS_TEXT_DECORATION_STYLE_DOTTED        = 0x3,
++	CSS_TEXT_DECORATION_STYLE_DASHED        = 0x4,
++	CSS_TEXT_DECORATION_STYLE_WAVY          = 0x5
++};
++
++/* fixes357 (#44): text-decoration-thickness packed int32.
++ *   0 = auto / from-font (consumer picks platform default)
++ *   N>0 = explicit integer pixels (1..1000)
++ * V2 will reserve negative sentinels for percent / length-with-unit. */
++
++/* fixes275 (#65) - -macsurf-grid-flow: encodes grid-auto-flow.
++ * row = default sparse row-major auto-placement
++ * column = column-major placement
++ * row_dense = row-major with backfill (dense packing)
++ * column_dense = column-major with backfill */
++enum css_macsurf_grid_flow_e {
++	CSS_MACSURF_GRID_FLOW_INHERIT           = 0x0,
++	CSS_MACSURF_GRID_FLOW_ROW               = 0x1,
++	CSS_MACSURF_GRID_FLOW_COLUMN            = 0x2,
++	CSS_MACSURF_GRID_FLOW_ROW_DENSE         = 0x3,
++	CSS_MACSURF_GRID_FLOW_COLUMN_DENSE      = 0x4
++};
++
++enum css_macsurf_gradient_e {
++	CSS_MACSURF_GRADIENT_INHERIT		= 0x0,
++	CSS_MACSURF_GRADIENT_NONE		= 0x1,
++	CSS_MACSURF_GRADIENT_SET		= 0x2
++};
++
++enum css_macsurf_text_shadow_e {
++	CSS_MACSURF_TEXT_SHADOW_INHERIT		= 0x0,
++	CSS_MACSURF_TEXT_SHADOW_NONE		= 0x1,
++	CSS_MACSURF_TEXT_SHADOW_SET		= 0x2
++};
++
++enum css_macsurf_transform_e {
++	CSS_MACSURF_TRANSFORM_INHERIT		= 0x0,
++	CSS_MACSURF_TRANSFORM_NONE		= 0x1,
++	CSS_MACSURF_TRANSFORM_SET		= 0x2
++};
++
++enum css_macsurf_grid_e {
++	/* 1-bit storage at bit 4 of word 14. NONE and INHERIT collapse to
++	 * 0 since author-side inheritance of grid layout isn't useful. */
++	CSS_MACSURF_GRID_INHERIT		= 0x0,
++	CSS_MACSURF_GRID_NONE			= 0x0,
++	CSS_MACSURF_GRID_SET			= 0x1
++};
++
++enum css_macsurf_animation_opacity_e {
++	/* 1-bit storage at bit 0 of word 15 (newly added word).
++	 * Companion int32 packs from(8) | to(8) | duration_ms(16). */
++	CSS_MACSURF_ANIMATION_OPACITY_INHERIT	= 0x0,
++	CSS_MACSURF_ANIMATION_OPACITY_NONE	= 0x0,
++	CSS_MACSURF_ANIMATION_OPACITY_SET	= 0x1
++};
++
++enum css_macsurf_animation_rotate_e {
++	/* fixes77: 1-bit storage at bit 1 of word 15. Companion int32
++	 * packs from_deg_byte(8) | to_deg_byte(8) | duration_ms(16).
++	 * deg_byte = (deg * 256 / 360). */
++	CSS_MACSURF_ANIMATION_ROTATE_INHERIT	= 0x0,
++	CSS_MACSURF_ANIMATION_ROTATE_NONE	= 0x0,
++	CSS_MACSURF_ANIMATION_ROTATE_SET	= 0x1
++};
++
+ enum css_align_content_e {
+ 	CSS_ALIGN_CONTENT_INHERIT		= 0x0,
+ 	CSS_ALIGN_CONTENT_STRETCH		= 0x1,
+@@ -257,6 +444,140 @@
+ 	CSS_BOX_SIZING_BORDER_BOX		= 0x2
+ };
+ 
++enum css_object_fit_e {
++	CSS_OBJECT_FIT_INHERIT			= 0x0,
++	CSS_OBJECT_FIT_FILL			= 0x1,
++	CSS_OBJECT_FIT_CONTAIN			= 0x2,
++	CSS_OBJECT_FIT_COVER			= 0x3,
++	CSS_OBJECT_FIT_NONE			= 0x4,
++	CSS_OBJECT_FIT_SCALE_DOWN		= 0x5
++};
++
++enum css_macsurf_object_position_e {
++	CSS_MACSURF_OBJECT_POSITION_INHERIT	= 0x0,
++	CSS_MACSURF_OBJECT_POSITION_START	= 0x1,
++	CSS_MACSURF_OBJECT_POSITION_CENTER	= 0x2,
++	CSS_MACSURF_OBJECT_POSITION_END		= 0x3
++};
++
++enum css_text_overflow_e {
++	CSS_TEXT_OVERFLOW_INHERIT		= 0x0,
++	CSS_TEXT_OVERFLOW_CLIP			= 0x1,
++	CSS_TEXT_OVERFLOW_ELLIPSIS		= 0x2
++};
++
++enum css_word_break_e {
++	CSS_WORD_BREAK_INHERIT			= 0x0,
++	CSS_WORD_BREAK_NORMAL			= 0x1,
++	CSS_WORD_BREAK_BREAK_ALL		= 0x2,
++	CSS_WORD_BREAK_KEEP_ALL			= 0x3
++};
++
++/* #251 - text-align-last. start/end are logical; layout maps them to
++ * left/right for horizontal-tb LTR. */
++enum css_text_align_last_e {
++	CSS_TEXT_ALIGN_LAST_INHERIT		= 0x0,
++	CSS_TEXT_ALIGN_LAST_AUTO		= 0x1,
++	CSS_TEXT_ALIGN_LAST_LEFT		= 0x2,
++	CSS_TEXT_ALIGN_LAST_RIGHT		= 0x3,
++	CSS_TEXT_ALIGN_LAST_CENTER		= 0x4,
++	CSS_TEXT_ALIGN_LAST_JUSTIFY		= 0x5,
++	CSS_TEXT_ALIGN_LAST_START		= 0x6,
++	CSS_TEXT_ALIGN_LAST_END			= 0x7
++};
++
++/* #251 - hyphens. auto is treated as manual (no dictionary). */
++enum css_hyphens_e {
++	CSS_HYPHENS_INHERIT			= 0x0,
++	CSS_HYPHENS_NONE			= 0x1,
++	CSS_HYPHENS_MANUAL			= 0x2,
++	CSS_HYPHENS_AUTO			= 0x3
++};
++
++/* #251 - text-justify. */
++enum css_text_justify_e {
++	CSS_TEXT_JUSTIFY_INHERIT		= 0x0,
++	CSS_TEXT_JUSTIFY_AUTO			= 0x1,
++	CSS_TEXT_JUSTIFY_NONE			= 0x2,
++	CSS_TEXT_JUSTIFY_INTER_WORD		= 0x3,
++	CSS_TEXT_JUSTIFY_INTER_CHARACTER	= 0x4
++};
++
++/* #251 - hanging-punctuation (single-value V1; combos collapse to the
++ * strongest single value). */
++enum css_hanging_punctuation_e {
++	CSS_HANGING_PUNCTUATION_INHERIT		= 0x0,
++	CSS_HANGING_PUNCTUATION_NONE		= 0x1,
++	CSS_HANGING_PUNCTUATION_FIRST		= 0x2,
++	CSS_HANGING_PUNCTUATION_LAST		= 0x3,
++	CSS_HANGING_PUNCTUATION_FORCE_END	= 0x4,
++	CSS_HANGING_PUNCTUATION_ALLOW_END	= 0x5
++};
++
++/* #255 - background-clip. Layout/redraw insets box-model values to the named
++ * box and routes `text` through the frontend glyph-mask painter. */
++enum css_background_clip_e {
++	CSS_BACKGROUND_CLIP_INHERIT		= 0x0,
++	CSS_BACKGROUND_CLIP_BORDER_BOX		= 0x1,
++	CSS_BACKGROUND_CLIP_PADDING_BOX		= 0x2,
++	CSS_BACKGROUND_CLIP_CONTENT_BOX		= 0x3,
++	CSS_BACKGROUND_CLIP_TEXT		= 0x4
++};
++
++enum css_background_origin_e {
++	CSS_BACKGROUND_ORIGIN_INHERIT		= 0x0,
++	CSS_BACKGROUND_ORIGIN_PADDING_BOX		= 0x1,
++	CSS_BACKGROUND_ORIGIN_BORDER_BOX		= 0x2,
++	CSS_BACKGROUND_ORIGIN_CONTENT_BOX		= 0x3
++};
++
++enum css_background_blend_mode_e {
++	CSS_BACKGROUND_BLEND_MODE_INHERIT       = 0x0,
++	CSS_BACKGROUND_BLEND_MODE_NORMAL        = 0x1,
++	CSS_BACKGROUND_BLEND_MODE_MULTIPLY      = 0x2,
++	CSS_BACKGROUND_BLEND_MODE_SCREEN        = 0x3,
++	CSS_BACKGROUND_BLEND_MODE_OVERLAY       = 0x4,
++	CSS_BACKGROUND_BLEND_MODE_DARKEN        = 0x5,
++	CSS_BACKGROUND_BLEND_MODE_LIGHTEN       = 0x6,
++	CSS_BACKGROUND_BLEND_MODE_COLOR_DODGE   = 0x7,
++	CSS_BACKGROUND_BLEND_MODE_COLOR_BURN    = 0x8,
++	CSS_BACKGROUND_BLEND_MODE_HARD_LIGHT    = 0x9,
++	CSS_BACKGROUND_BLEND_MODE_SOFT_LIGHT    = 0xa,
++	CSS_BACKGROUND_BLEND_MODE_DIFFERENCE    = 0xb,
++	CSS_BACKGROUND_BLEND_MODE_EXCLUSION     = 0xc,
++	CSS_BACKGROUND_BLEND_MODE_HUE           = 0xd,
++	CSS_BACKGROUND_BLEND_MODE_SATURATION    = 0xe,
++	CSS_BACKGROUND_BLEND_MODE_COLOR         = 0xf,
++	CSS_BACKGROUND_BLEND_MODE_LUMINOSITY    = 0x10
++};
++
++/* #279 - justify-items (grid inline-axis item alignment). V1 = 2-bit slot:
++ * stretch (default) / start / center. 'end' + 'normal'/'baseline' deferred
++ * (center is the common case). 'normal' and 'legacy' map to STRETCH. */
++enum css_justify_items_e {
++	CSS_JUSTIFY_ITEMS_INHERIT		= 0x0,
++	CSS_JUSTIFY_ITEMS_STRETCH		= 0x1,
++	CSS_JUSTIFY_ITEMS_START			= 0x2,
++	CSS_JUSTIFY_ITEMS_CENTER		= 0x3
++};
++
++/* #279 follow-up - justify-self. Scalar-tail property: the bits[] array is
++ * full, so this must not consume another packed bit slot. */
++enum css_justify_self_e {
++	CSS_JUSTIFY_SELF_INHERIT		= 0x0,
++	CSS_JUSTIFY_SELF_AUTO			= 0x1,
++	CSS_JUSTIFY_SELF_STRETCH		= 0x2,
++	CSS_JUSTIFY_SELF_START			= 0x3,
++	CSS_JUSTIFY_SELF_CENTER			= 0x4
++};
++
++enum css_overflow_wrap_e {
++	CSS_OVERFLOW_WRAP_INHERIT		= 0x0,
++	CSS_OVERFLOW_WRAP_NORMAL		= 0x1,
++	CSS_OVERFLOW_WRAP_BREAK_WORD		= 0x2,
++	CSS_OVERFLOW_WRAP_ANYWHERE		= 0x3
++};
++
+ enum css_break_after_e {
+ 	CSS_BREAK_AFTER_INHERIT			= 0x0,
+ 	CSS_BREAK_AFTER_AUTO			= 0x1,
+@@ -444,7 +765,8 @@
+ 	CSS_DISPLAY_FLEX			= 0x11,
+ 	CSS_DISPLAY_INLINE_FLEX			= 0x12,
+ 	CSS_DISPLAY_GRID			= 0x13,
+-	CSS_DISPLAY_INLINE_GRID			= 0x14
++	CSS_DISPLAY_INLINE_GRID			= 0x14,
++	CSS_DISPLAY_CONTENTS			= 0x15
+ };
+ 
+ enum css_empty_cells_e {
+@@ -670,7 +992,8 @@
+ enum css_max_width_e {
+ 	CSS_MAX_WIDTH_INHERIT			= 0x0,
+ 	CSS_MAX_WIDTH_SET			= 0x1,
+-	CSS_MAX_WIDTH_NONE			= 0x2
++	CSS_MAX_WIDTH_NONE			= 0x2,
++	CSS_MAX_WIDTH_INTRINSIC			= 0x3
+ };
+ 
+ enum css_min_height_e {
+@@ -682,7 +1005,8 @@
+ enum css_min_width_e {
+ 	CSS_MIN_WIDTH_INHERIT			= 0x0,
+ 	CSS_MIN_WIDTH_SET			= 0x1,
+-	CSS_MIN_WIDTH_AUTO			= 0x2
++	CSS_MIN_WIDTH_AUTO			= 0x2,
++	CSS_MIN_WIDTH_INTRINSIC			= 0x3
+ };
+ 
+ enum css_opacity_e {
+@@ -728,7 +1052,8 @@
+ 	CSS_OVERFLOW_VISIBLE			= 0x1,
+ 	CSS_OVERFLOW_HIDDEN			= 0x2,
+ 	CSS_OVERFLOW_SCROLL			= 0x3,
+-	CSS_OVERFLOW_AUTO			= 0x4
++	CSS_OVERFLOW_AUTO			= 0x4,
++	CSS_OVERFLOW_CLIP			= 0x5
+ };
+ 
+ enum css_orphans_e {
+@@ -880,10 +1205,25 @@
+ 	CSS_WIDOWS_SET				= 0x1
+ };
+ 
++/* Shared "which intrinsic-sizing keyword" selector for width/min-width/
++ * max-width's CSS_*_INTRINSIC type value (fixes: intrinsic-sizing round 1).
++ * Stored in the otherwise-unused unit sub-field of each property's packed
++ * bits[] slot when type == *_INTRINSIC (that sub-field only carries a
++ * css_unit when type == *_SET) -- see set_width/get_width in
++ * autogenerated_propset.h/autogenerated_propget.h. Deliberately NOT part of
++ * the global css_unit enum: css_unit is shared across unrelated properties
++ * and only has 2 free codes left (0x13/0x14), not enough for 3 keywords. */
++enum css_intrinsic_kind_e {
++	CSS_INTRINSIC_MIN_CONTENT		= 0x0,
++	CSS_INTRINSIC_MAX_CONTENT		= 0x1,
++	CSS_INTRINSIC_FIT_CONTENT		= 0x2
++};
++
+ enum css_width_e {
+ 	CSS_WIDTH_INHERIT			= 0x0,
+ 	CSS_WIDTH_SET				= 0x1,
+-	CSS_WIDTH_AUTO				= 0x2
++	CSS_WIDTH_AUTO				= 0x2,
++	CSS_WIDTH_INTRINSIC			= 0x3
+ };
+ 
+ enum css_word_spacing_e {
+@@ -905,6 +1245,26 @@
+ 	CSS_Z_INDEX_AUTO			= 0x2
+ };
+ 
++enum css_transition_property_e {
++	CSS_TRANSITION_PROPERTY_INHERIT		= 0x0,
++	CSS_TRANSITION_PROPERTY_SET		= 0x1
++};
++
++enum css_transition_duration_e {
++	CSS_TRANSITION_DURATION_INHERIT		= 0x0,
++	CSS_TRANSITION_DURATION_SET		= 0x1
++};
++
++enum css_transition_timing_function_e {
++	CSS_TRANSITION_TIMING_FUNCTION_INHERIT	= 0x0,
++	CSS_TRANSITION_TIMING_FUNCTION_SET	= 0x1
++};
++
++enum css_transition_delay_e {
++	CSS_TRANSITION_DELAY_INHERIT		= 0x0,
++	CSS_TRANSITION_DELAY_SET		= 0x1
++};
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -urN upstream/libcss/include/libcss/types.h browser/libcss/include/libcss/types.h
+--- upstream/libcss/include/libcss/types.h
++++ browser/libcss/include/libcss/types.h
+@@ -111,7 +111,16 @@
+ 	CSS_UNIT_HZ                 = 0x1b,
+ 	CSS_UNIT_KHZ                = 0x1c,
+ 
+-	CSS_UNIT_CALC               = 0x1d  /**< Un-resolved calc() */
++	CSS_UNIT_CALC               = 0x1d, /**< Un-resolved calc() */
++
++	CSS_UNIT_MIN                = 0x1e, /**< Un-resolved min() */
++	CSS_UNIT_MAX                = 0x1f, /**< Un-resolved max() */
++
++	/* CSS_UNIT_CLAMP sits in the free middle slot (0x12): the computed
++	 * style packs units into 5 bits (max value 31), and 0x1e/0x1f are
++	 * the only free slots after CSS_UNIT_CALC.  0x12/0x13/0x14 are the
++	 * free middle slots (0x15 is PCT). */
++	CSS_UNIT_CLAMP              = 0x12  /**< Un-resolved clamp() */
+ } css_unit;
+ 
+ /**
