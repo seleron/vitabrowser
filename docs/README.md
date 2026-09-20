@@ -9,6 +9,7 @@ and a findings document disagree, **the findings document is newer and wins**.
 | [`north-star.md`](north-star.md) | The end goal (`claude.ai/code` on the Vita), an evidence-based capability audit, the remaining blockers, and the v1 decisions that protect the goal |
 | [`phase-0/pre-phase-0-findings.md`](phase-0/pre-phase-0-findings.md) | Brief §14.11 checklist items 1–5: memory budget, source audit, licensing, environment |
 | [`phase-0/01-toolchain-and-desktop-build.md`](phase-0/01-toolchain-and-desktop-build.md) | Phase 0 steps 1–2: vitaSDK install, NetSurf buildsystem, desktop build status, and MacSurf's own Linux-port roadmap |
+| [`phase-0/02-upstream-pivot.md`](phase-0/02-upstream-pivot.md) | The §14.4 pivot to upstream NetSurf, the measured MacSurf divergence, and headless `monkey` |
 
 ## Conventions
 
