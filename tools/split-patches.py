@@ -167,6 +167,7 @@ def rewrite_includes(lines, index, basename_map):
     p_border_radius.c, a rename we deliberately did not port.
     """
     lines, _ = drop_instrumentation_hunks(lines)
+    lines = keep_inline_defs(lines)
     lines = renumber_hunks(drop_nested_externs(
         keep_standard_includes(keep_bool_decls(lines)), COMPAT_NAMES))
     out = []
@@ -550,6 +551,39 @@ HAND_PORTED = {
 }
 
 
+INLINE_PAIR = re.compile(r'^-(\s*)static\s+inline\s+(.*)$')
+
+
+def keep_inline_defs(lines):
+    """Refuse to port CW8's `static inline` -> `static` downgrade.
+
+    CodeWarrior 8 has no `inline`, so MacSurf drops the keyword in headers.
+    On GCC that turns a header helper into a plain static, and every file that
+    includes it but does not call the helper gets "defined but not used".
+
+    This used to be handled by skipping any file whose `static inline` count
+    dropped to zero -- which is how include/netsurf/plot_style.h was silently
+    discarded along with the ten struct members MacSurf added to it
+    (box_shadow_*, opacity, transform*, radial_*). A file-level rule cannot
+    tell a pure C89 workaround from a file that has one AND real work; doing it
+    per line can.
+    """
+    out = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else ''
+        m = INLINE_PAIR.match(cur.rstrip('\n'))
+        if (m and nxt.startswith('+') and not nxt.startswith('+++')
+                and nxt[1:].strip() == ('static ' + m.group(2)).strip()):
+            out.append(' ' + cur[1:])
+            i += 2
+            continue
+        out.append(cur)
+        i += 1
+    return out
+
+
 def is_pure_deletion(lines):
     """True if this file-diff only removes an upstream file.
 
@@ -733,11 +767,12 @@ def renamed_and_modified(lib, up_root, ms_root, index, already):
             if [x.split() for x in a] == [x.split() for x in b]:
                 continue                      # pure rename, nothing to carry
             at, bt = ''.join(a), ''.join(b)
-            if de_inlined(at, bt):
-                # CW8 C89 has no `inline`, so MacSurf turned these definitions
-                # into extern declarations and moved the bodies to a helper .c.
-                # Porting that leaves the declarations without definitions --
-                # `undefined reference to list_del` at link time.
+            if de_inlined(at, bt) and 'c89_helpers' in ''.join(
+                    os.listdir(os.path.dirname(ms_path)) or []):
+                # Only skip when MacSurf moved the bodies OUT to a helper .c --
+                # that leaves declarations with no definitions (undefined
+                # reference to list_del). A header that merely loses the
+                # `inline` keyword is handled per line by keep_inline_defs.
                 continue
             up_rel = os.path.relpath(up_path, up_root)
             if up_rel in already:
@@ -922,17 +957,6 @@ def main():
             if is_pure_deletion(lines):
                 skipped['deletion'] += churn
                 continue
-            up_file = os.path.join(up_root, rel)
-            ms_file = os.path.join(ms_root, rel)
-            if os.path.exists(up_file) and os.path.exists(ms_file):
-                try:
-                    at = open(up_file, errors='replace').read()
-                    bt = open(ms_file, errors='replace').read()
-                except OSError:
-                    at = bt = ''
-                if de_inlined(at, bt):
-                    skipped['c89-workaround'] += churn
-                    continue
             if is_shim_file(os.path.join(ms_root, rel)):
                 skipped['shim'] += churn
                 continue
