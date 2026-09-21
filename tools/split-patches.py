@@ -166,7 +166,8 @@ def rewrite_includes(lines, index, basename_map):
     particular -- gets a plain basename swap, or the build would reference
     p_border_radius.c, a rename we deliberately did not port.
     """
-    lines = renumber_hunks(keep_standard_includes(keep_bool_decls(lines)))
+    lines = renumber_hunks(drop_nested_externs(
+        keep_standard_includes(keep_bool_decls(lines)), COMPAT_NAMES))
     out = []
     for line in lines:
         m = INCLUDE_LINE.match(line)
@@ -390,6 +391,54 @@ def keep_bool_decls(lines):
             continue
         out.append(cur)
         i += 1
+    return out
+
+
+# Greedy up to the last identifier before the semicolon: a non-greedy match
+# captures the first word after `extern` (the storage/type keyword), not the
+# name being declared.
+NESTED_EXTERN = re.compile(
+    r'^\+(\s+)extern\s+.*?(\w+)\s*(?:\([^;]*\)|\[[^\]]*\])?\s*;\s*$')
+
+
+def compat_symbols(compat_dir):
+    """Names declared at file scope by our compat headers."""
+    names = set()
+    decl = re.compile(r'\b(\w+)\s*[;(\[]')
+    try:
+        for fn in os.listdir(compat_dir):
+            if not fn.endswith('.h'):
+                continue
+            for line in open(os.path.join(compat_dir, fn), errors='replace'):
+                line = line.strip()
+                if (line.startswith(('#', '*', '/*', '//')) or not line
+                        or line.endswith('{')):
+                    continue
+                if ';' in line:
+                    for m in decl.finditer(line):
+                        names.add(m.group(1))
+    except OSError:
+        pass
+    return names
+
+
+def drop_nested_externs(lines, names):
+    """Drop nested `extern` declarations for symbols compat declares.
+
+    MacSurf declares its helpers inside the functions that call them. Upstream
+    builds with -Wnested-externs, which fires on the declaration itself no
+    matter what else is in scope -- so providing a header does not help, it
+    just adds -Wredundant-decls on top. Removing the nested declaration fixes
+    both, and is safe precisely for the symbols we declare at file scope.
+    """
+    if not names:
+        return lines
+    out = []
+    for line in lines:
+        m = NESTED_EXTERN.match(line)
+        if m and m.group(2) in names:
+            continue
+        out.append(line)
     return out
 
 
@@ -649,11 +698,18 @@ def topic_for(lib, rel):
     return 'misc'
 
 
+COMPAT_NAMES = set()
+
+
 def main():
+    global COMPAT_NAMES
     ap = argparse.ArgumentParser()
     ap.add_argument('--work', default=os.path.expanduser('<WORK>/vitabrowser-work'))
     ap.add_argument('--out', default='patches')
     args = ap.parse_args()
+
+    COMPAT_NAMES = compat_symbols(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'compat'))
 
     src = os.path.join(args.work, 'patches')
     if not os.path.isdir(src):

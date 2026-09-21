@@ -27,13 +27,12 @@ void macos9_deathrow_add(void *ptr, void (*teardown)(void *ptr),
 		struct content *pin_key);
 void macos9_deathrow_drain(void);
 
-/* Liveness registry. MacSurf tracks which content objects are still valid so
- * a stale pointer can be detected; upstream has no such concept and simply
- * trusts its own lifetimes. The shim answers "live" and "valid", which is the
- * upstream assumption. */
-int macos9_content_is_live(struct content *c);
-unsigned long macos9_content_token(struct content *c);
-int macos9_content_token_valid(struct content *c, unsigned long token);
+/* NOTE: the content-liveness trio (macos9_content_is_live, _token,
+ * _token_valid) is deliberately NOT declared here. MacSurf's own sources guard
+ * them with #ifdef __MACOS9__ and provide macro fallbacks in the #else branch,
+ * which is the branch we compile. Declaring them as functions as well makes
+ * the macro expand inside the declaration -- "expected identifier or '(' before
+ * numeric constant". Let their fallbacks stand. */
 
 /*
  * Re-entrancy depth. MacSurf increments this while a walk, convert, redraw or
