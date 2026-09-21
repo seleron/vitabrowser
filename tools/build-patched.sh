@@ -21,6 +21,11 @@
 #                             declarations instead made the build oscillate --
 #                             see docs/phase-0/07-netsurf-port.md §9.3 -- so the
 #                             style rule is demoted and the declarations stay.
+#   -Wno-error=redundant-decls  MacSurf declares some helpers BOTH in a header
+#                             (content_protected.h) and at file scope in the .c
+#                             that uses them. Valid C, and the same style-rule
+#                             situation as nested-externs above; removing one
+#                             side is what made the build oscillate.
 #   -Wno-error=comment        html/form.c has a comment reading "Sets *min/*max
 #                             to", and `/*` inside a comment is what -Wcomment
 #                             is for. Nothing to fix in the code.
@@ -78,7 +83,7 @@ done
 echo "== building netsurf + nsmonkey =="
 export PREFIX="$P"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
--include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs"
+-include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls"
 ( cd "$WORK/applytest/upstream/netsurf" && \
   make TARGET=monkey -j4 > "$WORK/applytest/build-netsurf.log" 2>&1 ) \
   && echo "  netsurf ok" \

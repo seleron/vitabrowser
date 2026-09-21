@@ -17,6 +17,8 @@
 
 #include <stdarg.h>
 
-void macsurf_debug_log_writef(const char *fmt, ...);
+/* Nothing declared here any more: the splitter no longer strips MacSurf's
+ * own nested externs, so every caller carries its own declaration. The
+ * header is kept as the force-include anchor and for <stdarg.h>. */
 
 #endif /* VITABROWSER_MACSURF_LIB_DECLS_H */

@@ -36,7 +36,7 @@ void macsurf_box_freed_note(void *box, const char *ctx);
 /* utils/talloc.c -- name of the context currently being freed, for the same
  * double-free hunt. Defined in talloc.c; callers declare it inline, which
  * -Wnested-externs rejects. */
-extern const char *macsurf_talloc_free_ctx;
+/* macsurf_talloc_free_ctx: declared at its call sites by MacSurf. */
 
 /* html/object.c -- re-evaluate lazy-loaded images after a viewport change. */
 void macsurf_lazyimg_viewport_changed(int scroll_y, int viewport_h);
@@ -107,8 +107,7 @@ int macsurf_html_has_droppable_inflight(struct content *c);
 void *macsurf_reconvert_node_ref(void *n);
 void macsurf_reconvert_node_unref(void *n);
 
-/* Frontend-side plain-string log entry point, distinct from the printf-style
- * one. Weak no-op in macsurf_compat.c, same as its sibling. */
-void macsurf_debug_log_write(const char *s);
+/* macsurf_debug_log_write is NOT declared here: MacSurf declares it at the
+ * call sites, and those declarations are kept now (see §9.3). */
 
 #endif /* VITABROWSER_MACSURF_CORE_DECLS_H */
