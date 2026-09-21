@@ -78,37 +78,32 @@ int js_thread_valid_for_content(struct jsthread *thread,
 
 /* Ordinary engine calls MacSurf routes through the frontend. */
 void browser_window_set_status(struct browser_window *bw, const char *text);
-void css_inline_extras_clear(void);
+/* css_inline_extras_clear is NOT declared here: it is libcss's own API,
+ * declared in libcss/select.h, and MacSurf only added a nested extern for it.
+ * Declaring it again trips -Werror=redundant-decls. */
 nserror macos9_schedule(int t, void (*callback)(void *p), void *p);
 extern struct gui_window *macos9_paint_gw;
 
-/* ---- core-defined diagnostics ------------------------------------------
+/* ---- prototypes MacSurf genuinely omitted -------------------------------
  *
- * These look like scaffolding but are DEFINED in the netsurf files we port,
- * not in the Mac OS 9 frontend -- so they are not stripped. They only ever
- * lacked a visible prototype, because MacSurf declared them in the frontend
- * header. Same situation as fetch_pump.
- *
- * Checked per symbol rather than assumed: the frontend-only families
- * (macsurf__site_*, macsurf_profile_*, macos9_heap_*, macos9_font_measure_*,
- * macsurf_debug_log_int) are stripped by the splitter; everything below is
- * defined in core and kept.
+ * Defined in the netsurf files we port, with no declaration anywhere. Note
+ * what is NOT here: the _stats family, macsurf_reconvert_seq and friends.
+ * MacSurf writes a self-prototype immediately above those definitions, which
+ * already satisfies -Wmissing-prototypes -- declaring them again here trips
+ * -Wredundant-decls instead. Only the genuinely undeclared ones belong.
  */
-void macsurf_obj_fetch_stats(long *fetch, long *spec, long *bg,
-		long *adopt, long *renode, long *specdup);
-void macsurf_llcache_stats(long *fresh, long *reval, long *miss,
-		long *notmod, long *cond);
-void macsurf_img_ctor_stats(long *total, long *eager, long *lazy,
-		long *rdim, long *dropobj);
-void macsurf_img_object_stats(long *done_ok, long *done_zero,
-		long *set, long *nulled);
-void macsurf_imgdims_stats(int *stored, int *hit, int *miss);
+struct nsurl;
+struct lwc_string_s;
+typedef struct lwc_string_s lwc_string;
+struct html_content;
 
-extern int macsurf_reconvert_in_progress;
-extern unsigned long macsurf_reconvert_seq;
-extern void *macsurf_reconvert_last_layout;
-extern unsigned long macsurf_box_backlink_cleared;
-extern int macsurf__cascade_probe_armed;
+nserror html_reconvert(struct html_content *c);
+int html_reconvert_content(struct content *c);
+struct nsurl *html_macsurf_font_face_url(struct content *c,
+		lwc_string *family);
+int macsurf_html_has_droppable_inflight(struct content *c);
+void *macsurf_reconvert_node_ref(void *n);
+void macsurf_reconvert_node_unref(void *n);
 
 /* Frontend-side plain-string log entry point, distinct from the printf-style
  * one. Weak no-op in macsurf_compat.c, same as its sibling. */
