@@ -250,6 +250,69 @@ except `-Wno-error=unused-variable`, for MacSurf's debug leftovers (`ua`, `na`
 in `content_broadcast`) which are assigned and never read. One demoted warning,
 still printed, rather than the blanket `-Wno-error` this started with.
 
-## 8. Outcome
+## 8. Outcome — substantially advanced, not finished
 
-*(Recorded in the commit that follows.)*
+**All 90 patches apply. All five libraries build. netsurf core compiles 263 of
+its ~266 objects.** Three files do not: `content/handlers/html/box_construct.c`,
+`form.c` and `html.c`.
+
+Progress across this session, measured by where the build stopped:
+
+| | |
+|---|---|
+| Start | netsurf did not compile at all (vendored headers shadowing the real ones) |
+| End | **263 objects; 3 files remaining** |
+
+### 8.1 What is left is one problem, not a tail
+
+The three remaining files produce ~85 errors across **53 distinct symbols**, and
+they are not 53 distinct problems. They are MacSurf's instrumentation surface,
+which is far denser in these files than anywhere else in the tree:
+
+| Category | Symbols |
+|---|---:|
+| Per-site statistics counters (`macsurf__site_*`) | 23 |
+| Other diagnostics (logging, object stats, reconvert tracking) | 13 |
+| Profiling / timing (`macsurf_profile_*`) | 5 |
+| **JS bridge hooks** (`js_fire_dom_ready`, `js_thread_valid_for_content`, …) | **5** |
+| **Genuine engine** (`browser_window_set_status`, `macos9_schedule`, …) | **5** |
+| Mac heap and font probes (`macos9_heap_*`) | 4 |
+
+**45 of the 53 are debug scaffolding** — counters and timers MacSurf added to
+hunt a use-after-free on their own hardware. They have no bearing on rendering.
+
+### 8.2 The decision this needs
+
+Continuing by stubbing all 53 in `compat/` would work but is the wrong shape:
+it imports 45 symbols' worth of someone else's debugging apparatus into our
+engine, permanently.
+
+The better split, and the next task:
+
+- **Strip the instrumentation.** `macsurf__site_*`, `macsurf_profile_*`,
+  `macos9_heap_*`, `macsurf_debug_log_int`, the `_stats` family. These are
+  observation-only; the brief's own §8 lesson about logging every defensive
+  clamp is served by `VITABROWSER_ENGINE_TRACE`, not by 23 site counters.
+- **Keep and declare the 10 that matter.** The five JS bridge hooks are real
+  behaviour — they are how the DOM signals the script thread — and the five
+  engine calls are ordinary netsurf API that only needs the right header.
+
+That is a content decision about what we are porting, not another rescue pass,
+which is why this document stops here rather than pressing on.
+
+### 8.3 Two warnings still demoted
+
+- `-Wno-error=unused-variable` — MacSurf's `ua`/`na` in `content_broadcast`,
+  assigned and never read.
+- `-Werror=comment` will need demoting or patching: `form.c` has a comment
+  reading `Sets *min/*max to`, and `*max` after `/` reads as a nested `/*`.
+
+Everything else is at full `-Werror`, including `-Wredundant-decls`,
+`-Wnested-externs` and `-Wmissing-prototypes`, which took the §6.4 split to
+achieve.
+
+### 8.4 Correction to the task premise
+
+`-Werror=switch` on `dump.c` was expected to be unblocked by this port. It was
+not — see §6.6. That fix was ours to make, and it is made
+(`patches/vitabrowser/03`).
