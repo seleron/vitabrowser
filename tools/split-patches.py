@@ -404,6 +404,7 @@ def keep_bool_decls(lines):
 # declares, so both go.
 NESTED_EXTERN = re.compile(
     r'^\+(\s*)extern\s+.*?(\w+)\s*(?:\([^;]*\)|\[[^\]]*\])?\s*;\s*$')
+EXTERN_START = re.compile(r'^\+\s*extern\b')
 
 
 def compat_symbols(compat_dir):
@@ -439,11 +440,31 @@ def drop_nested_externs(lines, names):
     if not names:
         return lines
     out = []
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         m = NESTED_EXTERN.match(line)
         if m and m.group(2) in names:
+            i += 1
             continue
+        # Multi-line form: MacSurf wraps long declarations, so the name and the
+        # semicolon land on later lines and the single-line pattern never
+        # matches. Gather the continuation before deciding.
+        if (line.startswith('+') and EXTERN_START.match(line)
+                and not line.rstrip().endswith(';')):
+            j, joined = i, line.rstrip('\n')
+            while j + 1 < len(lines) and not joined.rstrip().endswith(';'):
+                j += 1
+                nxt = lines[j]
+                if not nxt.startswith('+'):
+                    break
+                joined += ' ' + nxt[1:].strip()
+            m2 = NESTED_EXTERN.match(joined + '\n')
+            if m2 and m2.group(2) in names:
+                i = j + 1
+                continue
         out.append(line)
+        i += 1
     return out
 
 
