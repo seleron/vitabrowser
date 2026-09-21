@@ -110,4 +110,17 @@ void macsurf_reconvert_node_unref(void *n);
 /* macsurf_debug_log_write is NOT declared here: MacSurf declares it at the
  * call sites, and those declarations are kept now (see §9.3). */
 
+/* Ordinary netsurf API that MacSurf's edits call from files which do not pull
+ * in the owning header. Declared here rather than adding includes to each
+ * file; -Wredundant-decls is demoted, so repeating a declaration the real
+ * header also provides is harmless. */
+struct hlcache_handle;
+int content_get_width(struct hlcache_handle *h);
+int content_get_height(struct hlcache_handle *h);
+
+/* html/object.c -- defer an object callback until the walk unwinds, the
+ * sibling of box_construct_sched_pins. */
+bool html_object_sched_pins(void (*cb)(void *), void *p,
+		struct content *target);
+
 #endif /* VITABROWSER_MACSURF_CORE_DECLS_H */
