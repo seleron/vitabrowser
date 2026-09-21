@@ -29,6 +29,13 @@ P="$WORK/applytest/prefix"
 LIBS="libwapcaplet libparserutils libhubbub libcss libdom"
 SUPPORT="libnsutils libutf8proc libnsgif libnsbmp libnspsl libsvgtiny nsgenbind"
 
+# The splitter strips extern declarations for whatever compat/*.h declares, so
+# the patch set is a function of the compat headers. Editing a header without
+# regenerating leaves stale patches, which fail as redundant-declaration or
+# undeclared-identifier errors that look like code problems. Regenerate first.
+echo "== regenerating the patch stack =="
+python3 "$ROOT/tools/split-patches.py" | tail -1
+
 echo "== staging clean upstream trees =="
 rm -rf "$WORK/applytest/upstream"
 mkdir -p "$WORK/applytest/upstream"

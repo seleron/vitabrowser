@@ -316,3 +316,101 @@ achieve.
 `-Werror=switch` on `dump.c` was expected to be unblocked by this port. It was
 not — see §6.6. That fix was ours to make, and it is made
 (`patches/vitabrowser/03`).
+
+
+---
+
+## 9. Stripping the scaffolding (2026-09-21, second session)
+
+### 9.1 The split was not what the symbol names suggested
+
+The plan was "strip 45, declare 10". Checking each symbol's **definition site**
+rather than inferring from its name changed that materially:
+
+| Defined in | Treatment | Examples |
+|---|---|---|
+| MacSurf's Mac OS 9 frontend | **strip** | `macsurf__site_*` (23), `macsurf_profile_*`, `macos9_heap_*`, `macos9_font_measure_*`, `macsurf_debug_log_int` |
+| The netsurf files we port | **leave alone** | `macsurf_obj_fetch_stats`, `macsurf_llcache_stats`, `macsurf_img_ctor_stats`, `macsurf_imgdims_stats`, `macsurf_reconvert_seq`, `macsurf_box_backlink_cleared`, `macsurf__cascade_probe_armed` |
+| libcss | **leave alone** | `css_inline_extras_clear` |
+
+The middle row is the important one: those look like scaffolding, but they are
+defined in core and **MacSurf writes a self-prototype immediately above each
+definition** — `box_special.c:1794` declares `macsurf_imgdims_stats` one line
+before defining it. Declaring them in compat turns a missing-prototype error
+into a redundant-declaration error.
+
+Only six functions were genuinely undeclared anywhere and needed compat
+prototypes: `html_reconvert`, `html_reconvert_content`,
+`html_macsurf_font_face_url`, `macsurf_html_has_droppable_inflight`,
+`macsurf_reconvert_node_ref`, `macsurf_reconvert_node_unref`.
+
+### 9.2 Stripping is at hunk granularity, all-or-nothing
+
+MacSurf's site counters appear inside `if` conditions and a `switch`, so
+dropping individual lines leaves dangling control flow. A hunk whose added
+lines are *entirely* scaffolding is dropped, leaving upstream's code; a hunk
+mixing scaffolding with real change is kept intact.
+
+That is correct but not sufficient, which is the finding below.
+
+### 9.3 ⚠️ The finding: mechanical classification does not converge
+
+**The build oscillates.** `tools/split-patches.py` strips `extern`
+declarations for whatever `compat/*.h` declares, so the patch set is a
+function of the compat headers — and each compat change flips a set of symbols
+between two failure modes:
+
+- **Declared in compat** → its declaration is stripped from the tree → but
+  MacSurf's own self-prototype or another header still declares it →
+  `-Werror=redundant-decls`.
+- **Not declared in compat** → its declaration survives → but it is a nested
+  `extern` → `-Werror=nested-externs`; or its declaration was in a
+  pure-scaffolding hunk that got dropped, while a *use* survived in a mixed
+  hunk → `undeclared (first use in this function)`.
+
+Both directions were tried. Neither state is clean, because **the correct
+treatment differs per call site, not per symbol**: the same counter is
+scaffolding in one hunk and interleaved with real layout work in another.
+
+**Conclusion: the last four files need hand porting, not better rules.**
+`content/handlers/html/html.c`, `layout.c`, `form.c` and `interaction.c` should
+be ported by taking MacSurf's version, removing the instrumentation by hand,
+and keeping the real change. That is a few hours of careful work on four files,
+and it is the honest remaining cost — further rescue passes will keep trading
+one error class for another.
+
+### 9.4 Where the build stands
+
+**264 of ~266 objects.** Four files fail. Two real code issues surfaced behind
+the scaffolding and will need attention during the hand port:
+
+- `comparison between 'css_unit' and 'enum css_intrinsic_kind_e'` — a genuine
+  type confusion in MacSurf's layout changes.
+- `comparison of integer expressions of different signedness` in the same area.
+
+Several `defined but not used` warnings (`layout_dim_clamp`,
+`layout_dim_sanitize_width`, `html_post_render_queue`) are functions whose only
+callers were inside stripped scaffolding — they should be removed along with it
+during the hand port, not silenced.
+
+### 9.5 Task status
+
+| Task | Status |
+|---|---|
+| (a) strip scaffolding, declare the ten | **done**, with the corrected split in §9.1 |
+| (b) reach 266/266 | **not reached** — 264/266; §9.3 explains why and what it needs |
+| (c) grid and flex probes | **already done** (commit `4d685c3`; `L3-grid`, `L4-flex`) |
+| (d) re-run `compare-engines.sh` | **blocked on (b)** — needs a patched `nsmonkey`, which needs the netsurf build |
+
+### 9.6 Not blocked by sudo
+
+Nothing in this session needed root. The two demoted warnings
+(`-Wno-error=unused-variable`, `-Wno-error=comment`) are build flags, not
+package installs.
+
+### 9.7 Workflow coupling worth knowing
+
+The splitter strips `extern` declarations for whatever `compat/*.h` declares,
+so **editing a compat header invalidates the patch set**. Two failures this
+session were stale patches rather than bad code.
+`tools/build-patched.sh` now regenerates the stack before building.
