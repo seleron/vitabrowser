@@ -13,6 +13,7 @@ and a findings document disagree, **the findings document is newer and wins**.
 | [`phase-0/03-golden-plotstream.md`](phase-0/03-golden-plotstream.md) | Headless `nsmonkey` fetching live HTTPS, and the golden-plotstream test mechanism that replaces §14.3's golden images |
 | [`phase-0/04-patch-stack.md`](phase-0/04-patch-stack.md) | Splitting MacSurf's divergence into 62 applying patches, and what turned out to be noise |
 | [`phase-0/05-capability-reaudit.md`](phase-0/05-capability-reaudit.md) | §6 re-audited against the stack: 44 added CSS properties, `min()`/`max()`/`clamp()`, and eight stale claims |
+| [`phase-0/06-engine-comparison.md`](phase-0/06-engine-comparison.md) | Both engines built and compared by plot stream: what the stack demonstrably changes, and what still waits on the netsurf-side port |
 
 ## Conventions
 

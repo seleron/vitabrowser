@@ -32,16 +32,21 @@ for lib in libwapcaplet libparserutils libhubbub libcss libdom; do
 		rm -f /tmp/patchlog.$$
 	done
 done
-# Drop the runtime compat object into libcss and list it, so the two MacSurf
-# helpers that ported code still calls have definitions at link time. Several
-# callers declare them with a nested extern instead of including a header, so
-# they cannot be macro'd away -- see compat/macsurf_compat.c.
-if [ -d "$WORK/upstream/libcss/src/utils" ] && [ -z "$DRY" ]; then
-	cp "$ROOT/compat/macsurf_compat.c" "$WORK/upstream/libcss/src/utils/"
-	mk="$WORK/upstream/libcss/src/utils/Makefile"
-	if [ -f "$mk" ] && ! grep -q macsurf_compat "$mk"; then
-		sed -i 's/^\(DIR_SOURCES := .*\)$/\1 macsurf_compat.c/' "$mk"
-	fi
+# Drop the runtime compat object into BOTH libcss and libdom, and list it.
+# Static archives are searched in link order, so a definition only in libcss is
+# already past when libdom's references come up. The symbols are weak, so
+# carrying it twice is not a duplicate-definition error. See
+# compat/macsurf_compat.c.
+if [ -z "$DRY" ]; then
+	for lib in libcss libdom; do
+		dst="$WORK/upstream/$lib/src/utils"
+		[ -d "$dst" ] || continue
+		cp "$ROOT/compat/macsurf_compat.c" "$dst/"
+		mk="$dst/Makefile"
+		if [ -f "$mk" ] && ! grep -q macsurf_compat "$mk"; then
+			sed -i 's/^\(DIR_SOURCES := .*\)$/\1 macsurf_compat.c/' "$mk"
+		fi
+	done
 fi
 
 # Our own port fixes, applied after the generated MacSurf stack. Named
