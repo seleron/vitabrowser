@@ -10,11 +10,8 @@
 
 #include "macsurf_debug.h"
 
-/* Reconvert position tracking. Pure diagnostics: MacSurf used these to narrow
- * a use-after-free during content reconversion by recording how far the walk
- * had got. No effect on rendering, so the shim discards them. */
-void macsurf_reconv_pos_set(const char *phase, long seq, long node_ix,
-		const char *tag);
-void macsurf_reconv_pos_flush(void);
+/* The reconvert position helpers are declared in macsurf_core_decls.h, which
+ * is force-included into the whole netsurf build. Declaring them here too
+ * would trip -Werror=redundant-decls wherever both headers are reached. */
 
 #endif /* VITABROWSER_MACSURF_DEBUG_LOG_H */

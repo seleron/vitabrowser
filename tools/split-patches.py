@@ -397,8 +397,13 @@ def keep_bool_decls(lines):
 # Greedy up to the last identifier before the semicolon: a non-greedy match
 # captures the first word after `extern` (the storage/type keyword), not the
 # name being declared.
+# Indentation optional: MacSurf declares these both inside functions (which
+# -Wnested-externs rejects) and at file scope in .c files (which duplicates the
+# declaration their own content_protected.h already carries, tripping
+# -Wredundant-decls). Both forms are redundant for symbols something else
+# declares, so both go.
 NESTED_EXTERN = re.compile(
-    r'^\+(\s+)extern\s+.*?(\w+)\s*(?:\([^;]*\)|\[[^\]]*\])?\s*;\s*$')
+    r'^\+(\s*)extern\s+.*?(\w+)\s*(?:\([^;]*\)|\[[^\]]*\])?\s*;\s*$')
 
 
 def compat_symbols(compat_dir):
@@ -423,7 +428,7 @@ def compat_symbols(compat_dir):
 
 
 def drop_nested_externs(lines, names):
-    """Drop nested `extern` declarations for symbols compat declares.
+    """Drop redundant `extern` declarations for symbols declared elsewhere.
 
     MacSurf declares its helpers inside the functions that call them. Upstream
     builds with -Wnested-externs, which fires on the declaration itself no
@@ -539,7 +544,7 @@ def strip_candidates(base):
             yield alt
 
 
-def is_rename_pair(rel, all_bases, ms_paths):
+def is_rename_pair(rel, all_bases, ms_paths, up_root=None, ms_root=None):
     """True if this path is either half of a prefix/suffix rename pair.
 
     Checked in both directions: the renamed file (event_i.h, ns_errors.h) and
@@ -558,8 +563,17 @@ def is_rename_pair(rel, all_bases, ms_paths):
     # repeatedly: MacSurf stacks them (css_ + internal_ = css_internal_select.h
     # from select.h), and removing only the first leaves a name that matches
     # nothing, so the rename is missed and the file ships as a spurious new one.
+    # Same directory only. A flat basename set makes
+    # content/handlers/html/dom_event.c look like a rename of some event.c
+    # elsewhere in the tree, and the file is silently dropped -- taking with it
+    # the uses of a struct member the ported private.h renames.
+    d = os.path.dirname(rel)
     for stem in strip_candidates(base):
-        if stem in all_bases:
+        if up_root is not None and ms_root is not None:
+            if (os.path.exists(os.path.join(up_root, d, stem))
+                    or os.path.exists(os.path.join(ms_root, d, stem))):
+                return True
+        elif stem in all_bases:
             return True
 
     if rel in ms_paths:
@@ -792,7 +806,8 @@ def main():
                     and not rel.startswith('include/netsurf/'):
                 skipped['vendored-headers'] += churn
                 continue
-            if is_rename_pair(rel, rename_bases, ms_paths):
+            if is_rename_pair(rel, rename_bases, ms_paths,
+                              up_root, ms_root):
                 skipped['rename'] += churn
                 continue
             if is_include_churn(lines):

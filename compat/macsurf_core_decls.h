@@ -38,4 +38,11 @@ extern const char *macsurf_talloc_free_ctx;
 /* html/object.c -- re-evaluate lazy-loaded images after a viewport change. */
 void macsurf_lazyimg_viewport_changed(int scroll_y, int viewport_h);
 
+/* Reconvert position tracking. Declared here as well as in
+ * macsurf_debug_log.h: the splitter strips the nested externs, and not every
+ * caller includes that header. Diagnostics only; see macsurf_debug_log.h. */
+void macsurf_reconv_pos_set(const char *phase, long seq, long node_ix,
+		const char *tag);
+void macsurf_reconv_pos_flush(void);
+
 #endif /* VITABROWSER_MACSURF_CORE_DECLS_H */

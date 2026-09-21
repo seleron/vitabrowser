@@ -128,6 +128,128 @@ is the condition `06-engine-comparison.md` §6 recorded as blocked. Whether it
 holds is the open question at the time of writing; §6 of this document records
 the outcome.
 
-## 6. Outcome
+## 6. Six more workaround classes, found by building
 
-*(Filled in below once the build settles — see the commit that follows.)*
+§3 listed three classes found while wiring netsurf into the splitter. Getting
+the core to actually compile surfaced six more. Each one failed in a way that
+pointed at the wrong file, so they are recorded with the symptom as well as the
+cause.
+
+### 6.1 Escaped-quote corruption in MacSurf's own tree
+
+```c
+const char *d; d = headers[i] + SLEN(\"If-None-Match:\");
+```
+
+An opening paren followed by an escaped quote is never valid C. Three files
+carry it — `content/fetchers/file/file.c`, `content/fetchers/resource.c`,
+`content/handlers/css/dump.c` — evidently a botched sed during MacSurf's own
+C89 declaration-splitting pass. **They never noticed because their CodeWarrior
+project does not compile those files.**
+
+*Symptom:* `missing terminating " character`, `unterminated argument list
+invoking macro "SLEN"`, `expected declaration or statement at end of input`.
+
+The rescue keeps the upstream line, and is deliberately narrow: an escaped
+quote *inside* a string literal is legitimate, and `dump.c` has a real one —
+`fprintf(stream, "uri(\"%.*s\")", ...)`. The first pattern I wrote matched that
+too.
+
+### 6.2 `bool` → `unsigned char`
+
+CW8 C89 has no `bool`, so MacSurf rewrote declarations throughout. On GCC this
+is worse than unnecessary: libwapcaplet's public API still takes `bool *`.
+
+*Symptom:* `initialization of '_Bool *' from incompatible pointer type
+'unsigned char *'` — reported against libwapcaplet's header, which is
+byte-identical to upstream.
+
+Two forms needed handling. Paired (`-bool x = false;` / `+unsigned char x = 0;`)
+required normalising the literal as well as the type. Unpaired — where MacSurf
+rewrote a whole function so the declaration arrives as a pure addition —
+required rewriting `unsigned char <name> = 0;` directly. Only that exact scalar
+form; `unsigned char` is a legitimate type here for byte buffers.
+
+### 6.3 Core additions declared only in the frontend
+
+MacSurf added real functions to netsurf's core — `fetch_pump`,
+`box_construct_sched_pins`, `macos9_box_walk_owns_content`,
+`macsurf_box_freed_lookup`/`_note`, `macsurf_lazyimg_viewport_changed` — but
+declared them in their Mac OS 9 frontend, which we do not port.
+
+*Symptom:* `-Werror=missing-prototypes`.
+
+`compat/macsurf_core_decls.h` supplies them, force-included into the netsurf
+build. `fetch_pump` is worth keeping deliberately: it drives the fetch state
+machine each event-loop iteration so queued jobs start, which is exactly the
+shape brief §4's single-threaded `curl_multi` loop needs.
+
+### 6.4 `extern` declarations that are redundant one way and required the other
+
+MacSurf declares its helpers where it calls them. Upstream builds with **both**
+`-Wnested-externs` and `-Wredundant-decls`, which cannot both be satisfied by
+adding a header — without one you get the first, with one you get the second.
+
+The splitter now strips `extern` declarations, at function scope *and* file
+scope, for symbols declared elsewhere. That keeps both warnings at error level
+rather than demoting a third.
+
+**But the treatment has to differ by consumer**, which cost two rounds:
+
+- **netsurf** already declares these in `content_protected.h`, so stripping the
+  duplicates in `.c` files is exactly right.
+- **the libraries** had the nested `extern` as their *only* declaration.
+  Stripping it gave `incompatible implicit declaration of
+  macsurf_debug_log_writef`.
+
+So `compat/macsurf_debug.h` is now the `MS_LOG` macro only, and
+`compat/macsurf_lib_decls.h` carries the declaration and is force-included into
+the libraries alone. Putting it in the shared header instead trips
+`-Werror=redundant-decls` in netsurf, because `content.c` includes that header
+by name.
+
+### 6.5 Frontend coupling in core
+
+Core sources include `macsurf_debug.h` (17), `macos9_deathrow.h` (6),
+`macsurf_debug_log.h` (2) and `macsurf_diag.h` (1), and call ~8 frontend
+symbols. `compat/` supplies all of them; the reasoning for each behaviour is in
+the headers, and the substantive one is the deathrow queue — MacSurf defers
+teardown because Mac OS 9's cooperative scheduler can re-enter the core from a
+callback, ours cannot, and upstream frees directly at those call sites, so the
+shim runs the teardown immediately.
+
+One collision to note: `macos9_content_is_live` and friends are guarded by
+`#ifdef __MACOS9__` with macro fallbacks in the `#else` branch we compile.
+Declaring them in compat as well made the macro expand inside the declaration —
+`expected identifier or '(' before numeric constant`.
+
+### 6.6 `-Werror=switch` was NOT unblocked by this port
+
+`06-engine-comparison.md` §6 recorded the `dump.c` switch failure as something
+the netsurf-side port would fix. **It does not.** MacSurf's `dump.c` has no more
+knowledge of `CSS_UNIT_MIN`/`MAX`/`CLAMP` than upstream's does — zero
+occurrences in both trees — because their CodeWarrior project does not build
+with `-Werror=switch`.
+
+The fix is ours: `patches/vitabrowser/03-netsurf-dump-new-units.patch`.
+
+This is worth remembering as a pattern: **MacSurf's tree only compiles cleanly
+under the warning set CodeWarrior applies.** Anything upstream's `-Werror`
+catches that theirs does not, they will not have fixed.
+
+## 7. Build recipe
+
+`tools/build-patched.sh` stages clean upstream trees, applies the stack and
+builds through to `nsmonkey`. The flags are load-bearing and documented in its
+header; the two force-includes differ by consumer per §6.4, and
+`C_INCLUDE_PATH` is used rather than `CFLAGS` because a `CFLAGS` on the make
+command line replaces the buildsystem's own `-Isrc`.
+
+Current `-Werror` position: libraries at `-Wall`; netsurf at full `-Werror`
+except `-Wno-error=unused-variable`, for MacSurf's debug leftovers (`ua`, `na`
+in `content_broadcast`) which are assigned and never read. One demoted warning,
+still printed, rather than the blanket `-Wno-error` this started with.
+
+## 8. Outcome
+
+*(Recorded in the commit that follows.)*
