@@ -132,3 +132,77 @@ int macsurf_qjs_event_type_live(const char *type)
  */
 __attribute__((weak))
 int macos9_op_depth = 0;
+
+/* ---- frontend hooks the Vita frontend will eventually own ----------------
+ *
+ * Weak, so the real Vita frontend overrides them simply by defining them.
+ * Each returns the value that keeps the caller on upstream NetSurf's path.
+ */
+
+struct jsthread;
+struct dom_document;
+struct browser_window;
+struct gui_window;
+
+/* No script thread here, so DOMContentLoaded cannot fire: report "not
+ * fired", which is what upstream does when JS is disabled. */
+__attribute__((weak))
+unsigned char js_fire_dom_ready(struct jsthread *thread,
+		struct dom_document *doc)
+{
+	(void) thread; (void) doc;
+	return 0;
+}
+
+__attribute__((weak))
+void js_fire_mutation_batch(struct jsthread *thread)
+{
+	(void) thread;
+}
+
+/*
+ * Generation counters. MacSurf uses these so a late callback can tell whether
+ * the thread and realm it was queued against are still current. With a single
+ * generation there is nothing to distinguish, so both report 0 and
+ * js_thread_valid_for_content answers "valid" -- the upstream behaviour, which
+ * is to run the callback.
+ */
+__attribute__((weak))
+unsigned long js_realm_generation(struct jsthread *thread)
+{
+	(void) thread;
+	return 0;
+}
+
+__attribute__((weak))
+unsigned long js_thread_generation(struct jsthread *thread)
+{
+	(void) thread;
+	return 0;
+}
+
+__attribute__((weak))
+int js_thread_valid_for_content(struct jsthread *thread,
+		unsigned long thread_gen, struct content *c,
+		unsigned long realm_gen)
+{
+	(void) thread; (void) thread_gen; (void) c; (void) realm_gen;
+	return 1;
+}
+
+/* Frontend scheduler and paint target. The Vita frontend supplies both; until
+ * then scheduling is a no-op, which means a deferred callback never runs --
+ * acceptable for headless monkey builds, NOT acceptable on device. */
+__attribute__((weak))
+struct gui_window *macos9_paint_gw = NULL;
+
+__attribute__((weak))
+void macsurf_debug_log_write(const char *s)
+{
+#ifdef VITABROWSER_ENGINE_TRACE
+	if (s != NULL)
+		fprintf(stderr, "%s\n", s);
+#else
+	(void) s;
+#endif
+}

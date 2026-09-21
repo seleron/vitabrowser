@@ -15,6 +15,9 @@
 #   -Wno-error=unused-variable      MacSurf's debug leftovers (`ua`, `na` in
 #                             content_broadcast) are assigned and never read.
 #                             Demoted, not silenced: the warnings still print.
+#   -Wno-error=comment        html/form.c has a comment reading "Sets *min/*max
+#                             to", and `/*` inside a comment is what -Wcomment
+#                             is for. Nothing to fix in the code.
 #   C_INCLUDE_PATH not CFLAGS for the buildsystem's own -Isrc to survive; a
 #                             CFLAGS on the make command line replaces it.
 #
@@ -62,7 +65,7 @@ done
 echo "== building netsurf + nsmonkey =="
 export PREFIX="$P"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
--include macsurf_core_decls.h -Wno-error=unused-variable"
+-include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment"
 ( cd "$WORK/applytest/upstream/netsurf" && \
   make TARGET=monkey -j4 > "$WORK/applytest/build-netsurf.log" 2>&1 ) \
   && echo "  netsurf ok" \

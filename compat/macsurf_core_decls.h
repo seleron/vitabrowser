@@ -15,6 +15,9 @@
 
 #include <stdbool.h>
 
+#include "utils/errors.h"   /* nserror */
+#include "macsurf_config.h"
+
 struct content;
 
 /* box_construct.c -- defer a callback until the box walk unwinds, the same
@@ -44,5 +47,71 @@ void macsurf_lazyimg_viewport_changed(int scroll_y, int viewport_h);
 void macsurf_reconv_pos_set(const char *phase, long seq, long node_ix,
 		const char *tag);
 void macsurf_reconv_pos_flush(void);
+
+/* ---- the ten that matter ------------------------------------------------
+ *
+ * MacSurf's debug scaffolding is stripped from the stack rather than stubbed
+ * (docs/phase-0/07-netsurf-port.md §8.2), but ten of its frontend-declared
+ * symbols are real behaviour and are kept. They are declared here because
+ * their definitions live in the Mac OS 9 frontend we do not port; weak
+ * definitions in macsurf_compat.c stand in until the Vita frontend supplies
+ * the real ones.
+ */
+
+struct dom_document;
+struct jsthread;
+struct browser_window;
+struct gui_window;
+
+/* JS bridge hooks. These are how the DOM signals the script thread, so they
+ * are behaviour, not diagnostics. The generation counters exist so a late
+ * callback can tell whether the thread and realm it was queued against are
+ * still the current ones -- a stale-callback guard. */
+unsigned char js_fire_dom_ready(struct jsthread *thread,
+		struct dom_document *doc);
+void js_fire_mutation_batch(struct jsthread *thread);
+unsigned long js_realm_generation(struct jsthread *thread);
+unsigned long js_thread_generation(struct jsthread *thread);
+int js_thread_valid_for_content(struct jsthread *thread,
+		unsigned long thread_gen, struct content *c,
+		unsigned long realm_gen);
+
+/* Ordinary engine calls MacSurf routes through the frontend. */
+void browser_window_set_status(struct browser_window *bw, const char *text);
+void css_inline_extras_clear(void);
+nserror macos9_schedule(int t, void (*callback)(void *p), void *p);
+extern struct gui_window *macos9_paint_gw;
+
+/* ---- core-defined diagnostics ------------------------------------------
+ *
+ * These look like scaffolding but are DEFINED in the netsurf files we port,
+ * not in the Mac OS 9 frontend -- so they are not stripped. They only ever
+ * lacked a visible prototype, because MacSurf declared them in the frontend
+ * header. Same situation as fetch_pump.
+ *
+ * Checked per symbol rather than assumed: the frontend-only families
+ * (macsurf__site_*, macsurf_profile_*, macos9_heap_*, macos9_font_measure_*,
+ * macsurf_debug_log_int) are stripped by the splitter; everything below is
+ * defined in core and kept.
+ */
+void macsurf_obj_fetch_stats(long *fetch, long *spec, long *bg,
+		long *adopt, long *renode, long *specdup);
+void macsurf_llcache_stats(long *fresh, long *reval, long *miss,
+		long *notmod, long *cond);
+void macsurf_img_ctor_stats(long *total, long *eager, long *lazy,
+		long *rdim, long *dropobj);
+void macsurf_img_object_stats(long *done_ok, long *done_zero,
+		long *set, long *nulled);
+void macsurf_imgdims_stats(int *stored, int *hit, int *miss);
+
+extern int macsurf_reconvert_in_progress;
+extern unsigned long macsurf_reconvert_seq;
+extern void *macsurf_reconvert_last_layout;
+extern unsigned long macsurf_box_backlink_cleared;
+extern int macsurf__cascade_probe_armed;
+
+/* Frontend-side plain-string log entry point, distinct from the printf-style
+ * one. Weak no-op in macsurf_compat.c, same as its sibling. */
+void macsurf_debug_log_write(const char *s);
 
 #endif /* VITABROWSER_MACSURF_CORE_DECLS_H */

@@ -166,6 +166,7 @@ def rewrite_includes(lines, index, basename_map):
     particular -- gets a plain basename swap, or the build would reference
     p_border_radius.c, a rename we deliberately did not port.
     """
+    lines, _ = drop_instrumentation_hunks(lines)
     lines = renumber_hunks(drop_nested_externs(
         keep_standard_includes(keep_bool_decls(lines)), COMPAT_NAMES))
     out = []
@@ -444,7 +445,10 @@ def drop_nested_externs(lines, names):
     while i < len(lines):
         line = lines[i]
         m = NESTED_EXTERN.match(line)
-        if m and m.group(2) in names:
+        # Instrumentation declarations go regardless of the compat list: the
+        # symbols are stripped, not stubbed, so a surviving declaration would
+        # only produce -Wnested-externs for something that no longer exists.
+        if m and (m.group(2) in names or INSTRUMENTATION.search(m.group(2))):
             i += 1
             continue
         # Multi-line form: MacSurf wraps long declarations, so the name and the
@@ -460,12 +464,68 @@ def drop_nested_externs(lines, names):
                     break
                 joined += ' ' + nxt[1:].strip()
             m2 = NESTED_EXTERN.match(joined + '\n')
-            if m2 and m2.group(2) in names:
+            if m2 and (m2.group(2) in names
+                       or INSTRUMENTATION.search(m2.group(2))):
                 i = j + 1
                 continue
         out.append(line)
         i += 1
     return out
+
+
+# MacSurf's debug scaffolding: counters, timers and heap probes added to hunt a
+# use-after-free on their own hardware. Observation-only -- none of it affects
+# layout or paint -- and it is the bulk of what still fails to compile. See
+# docs/phase-0/07-netsurf-port.md §8.
+INSTRUMENTATION = re.compile(
+    r'\b(macsurf__site_\w+|macsurf__decoded_img_bytes_current'
+    r'|macsurf_profile_\w+|macsurf_debug_log_int'
+    r'|macos9_heap_\w+|macos9_font_measure_\w+)\b')
+
+# Lines that may accompany instrumentation inside an otherwise-pure block.
+FILLER = re.compile(r'^\+\s*([{}]|/\*|\*|//|$|else\b|\}\s*else\b)')
+
+
+def hunk_is_instrumentation(body):
+    """True if every added line in this hunk is debug scaffolding.
+
+    Deliberately all-or-nothing. MacSurf's site counters appear inside `if`
+    conditions and switch statements, so dropping individual lines would leave
+    dangling control flow; dropping the whole hunk leaves upstream's code in
+    place, which is what we want. A hunk mixing instrumentation with real
+    change is kept intact and dealt with by hand.
+    """
+    added = [l for l in body if l.startswith('+') and not l.startswith('+++')]
+    if not added:
+        return False
+    if not any(INSTRUMENTATION.search(l) for l in added):
+        return False
+    return all(INSTRUMENTATION.search(l) or FILLER.match(l) for l in added)
+
+
+def drop_instrumentation_hunks(lines):
+    out, i, dropped = [], 0, 0
+    while i < len(lines):
+        m = HUNK.match(lines[i].rstrip('\n'))
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        body, j = [], i + 1
+        while j < len(lines):
+            l = lines[j]
+            if HUNK.match(l.rstrip('\n')) or l.startswith(('diff ', '--- ', '+++ ')):
+                break
+            body.append(l)
+            j += 1
+        if hunk_is_instrumentation(body):
+            dropped += 1
+            i = j
+            continue
+        out.append(lines[i])
+        out.extend(body)
+        i = j
+    return out, dropped
 
 
 def is_pure_deletion(lines):
