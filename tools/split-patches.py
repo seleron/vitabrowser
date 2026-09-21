@@ -528,6 +528,23 @@ def drop_instrumentation_hunks(lines):
     return out, dropped
 
 
+# Files ported by hand instead of by the splitter. MacSurf's instrumentation in
+# these is interleaved with real layout work at a granularity finer than hunks,
+# and the correct treatment differs per call site rather than per symbol, so
+# mechanical classification oscillates between redundant-declaration and
+# undeclared-identifier failures (docs/phase-0/07-netsurf-port.md §9.3).
+# Their diffs live in patches/vitabrowser/ and are maintained by hand.
+HAND_PORTED = {
+    'netsurf': {
+        'content/handlers/html/html.c',
+        'content/handlers/html/layout.c',
+        'content/handlers/html/form.c',
+        'content/handlers/html/interaction.c',
+        'content/handlers/html/layout_safe.h',
+    },
+}
+
+
 def is_pure_deletion(lines):
     """True if this file-diff only removes an upstream file.
 
@@ -873,6 +890,9 @@ def main():
             if rel in renamed:
                 skipped['rename'] += churn
                 continue
+            if rel in HAND_PORTED.get(lib, ()):
+                skipped['hand-ported'] += churn
+                continue
             if is_generated(rel, tracked):
                 skipped['generated'] += churn
                 continue
@@ -1011,6 +1031,8 @@ def main():
         fh.write(f'- **{totals["c89-workaround"]} lines** of CodeWarrior C89 '
                  f'workarounds (function bodies moved out of headers that GCC '
                  f'compiles as-is)\n')
+        fh.write(f'- **{totals["hand-ported"]} lines** in files ported by hand '
+                 f'(see patches/vitabrowser/)\n')
         fh.write(f'- **{totals["vendored-headers"]} lines** of library public '
                  f'headers vendored into netsurf/include, which shadow the '
                  f'real installed ones\n')
