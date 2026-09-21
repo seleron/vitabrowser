@@ -537,3 +537,75 @@ Nothing needed sudo.
    entire gradient/shadow/transform path.
 2. Finish `redraw.c` and `script.c` — the same declaration work as before.
 3. Then task 5, with §10.6 resolved so the comparison means something.
+
+
+---
+
+## 11. The `plot_style.h` classifier bug (2026-09-21, fourth session)
+
+### 11.1 Root cause
+
+§10.6 recorded that `include/netsurf/plot_style.h` was in the raw diff with 85
+lines of churn, survived every rescue pass, was rejected by none of the
+exclusion rules, and still appeared in no generated patch.
+
+The skip was happening in the main loop, **between** those two checks — the one
+place not instrumented.
+
+The C89 de-inlining rule worked at **file level**: if a file's `static inline`
+count dropped to zero between upstream and MacSurf, the whole diff was skipped
+as a CodeWarrior workaround. `plot_style.h` has exactly one `static inline`
+helper upstream, which MacSurf de-inlined, so the entire file went — along with
+the ten struct members it adds.
+
+**A file-level test cannot distinguish a pure C89 workaround from a file that
+has one *and* real work.**
+
+### 11.2 What it was gating
+
+```
+box_shadow_y   box_shadow_color   opacity
+transform      transform_b        radial_set
+radial_sx      radial_sy          radial_px   radial_py
+```
+
+That is the entire gradient / shadow / opacity / transform plotter extension —
+exactly what `compare-engines.sh` is meant to measure. Its absence is also why
+`redraw.c` failed with `excess elements in struct initializer`: MacSurf
+initialises `plot_style_t` positionally with seven elements against a
+five-member struct.
+
+### 11.3 The fix
+
+The rule now works **per line**: where a removal is `static inline X` and the
+following addition is the same line as `static X`, the original is kept and
+everything else in the file ports normally.
+
+The file-level skip survives only for the case it was actually written for —
+MacSurf moving function bodies out to a `c89_helpers` `.c`, which genuinely
+leaves declarations without definitions (`undefined reference to list_del`).
+
+### 11.4 Seven files, not one
+
+The same rule was discarding whole files across three libraries:
+
+| File |
+|---|
+| `netsurf/desktop/bitmap.c` |
+| `netsurf/include/netsurf/plot_style.h` |
+| `libcss/src/utils/utils.h` |
+| `libcss/src/utils/parserutilserror.h` |
+| `libcss/src/select/select.h` |
+| `libcss/src/select/computed.h` |
+| `libwapcaplet/include/libwapcaplet/libwapcaplet.h` |
+
+`libcss/src/select/computed.h` and `select.h` are not incidental — they are the
+cascade's core headers. Whatever MacSurf changed in them had been silently
+absent from every build in this project so far.
+
+### 11.5 Lesson
+
+Every single-rule test I ran against `plot_style.h` said "not excluded", and the
+file survived all rescues with its churn intact. The failure was in code that
+sat between the two things being checked. **When a classifier drops something
+and no rule admits to it, instrument the loop, not the rules.**
