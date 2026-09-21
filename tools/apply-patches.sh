@@ -32,6 +32,18 @@ for lib in libwapcaplet libparserutils libhubbub libcss libdom; do
 		rm -f /tmp/patchlog.$$
 	done
 done
+# Drop the runtime compat object into libcss and list it, so the two MacSurf
+# helpers that ported code still calls have definitions at link time. Several
+# callers declare them with a nested extern instead of including a header, so
+# they cannot be macro'd away -- see compat/macsurf_compat.c.
+if [ -d "$WORK/upstream/libcss/src/utils" ] && [ -z "$DRY" ]; then
+	cp "$ROOT/compat/macsurf_compat.c" "$WORK/upstream/libcss/src/utils/"
+	mk="$WORK/upstream/libcss/src/utils/Makefile"
+	if [ -f "$mk" ] && ! grep -q macsurf_compat "$mk"; then
+		sed -i 's/^\(DIR_SOURCES := .*\)$/\1 macsurf_compat.c/' "$mk"
+	fi
+fi
+
 # Our own port fixes, applied after the generated MacSurf stack. Named
 # NN-<lib>-<what>.patch and routed to <lib> by that middle field. These use
 # a/ b/ prefixes, so -p1.

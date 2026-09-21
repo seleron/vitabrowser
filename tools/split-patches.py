@@ -249,6 +249,20 @@ def is_shim_file(path, limit=20):
     return all(l.startswith('#') for l in code)
 
 
+INLINE_DEF = re.compile(r'^[ \t]*static[ \t]+inline\b', re.M)
+
+
+def de_inlined(upstream_text, macsurf_text):
+    """True if MacSurf removed this header's `static inline` definitions.
+
+    Counts definitions at line start, not the substring: MacSurf leaves a
+    comment reading "static inline bodies extracted to libdom_c89_helpers.c",
+    and a naive `in` test sees that and concludes nothing was removed.
+    """
+    return (len(INLINE_DEF.findall(upstream_text)) > 0
+            and len(INLINE_DEF.findall(macsurf_text)) == 0)
+
+
 def is_pure_deletion(lines):
     """True if this file-diff only removes an upstream file.
 
@@ -419,7 +433,7 @@ def renamed_and_modified(lib, up_root, ms_root, index, already):
             if [x.split() for x in a] == [x.split() for x in b]:
                 continue                      # pure rename, nothing to carry
             at, bt = ''.join(a), ''.join(b)
-            if 'static inline' in at and 'static inline' not in bt:
+            if de_inlined(at, bt):
                 # CW8 C89 has no `inline`, so MacSurf turned these definitions
                 # into extern declarations and moved the bodies to a helper .c.
                 # Porting that leaves the declarations without definitions --
@@ -582,7 +596,7 @@ def main():
                     bt = open(ms_file, errors='replace').read()
                 except OSError:
                     at = bt = ''
-                if 'static inline' in at and 'static inline' not in bt:
+                if de_inlined(at, bt):
                     skipped['c89-workaround'] += churn
                     continue
             if is_shim_file(os.path.join(ms_root, rel)):
@@ -629,7 +643,15 @@ def main():
                 (rel, rewrite_includes(lines, index, basename_map), churn))
             totals['carried'] += churn
 
+        # Clear only this library's generated patches. Never wipe args.out
+        # wholesale: patches/vitabrowser/ is hand-maintained port work that
+        # the splitter cannot reproduce, and losing it silently un-fixes the
+        # build (the cascade symbols come back undefined).
         libdir = os.path.join(args.out, lib)
+        if os.path.isdir(libdir):
+            for stale in os.listdir(libdir):
+                if stale.endswith('.patch'):
+                    os.unlink(os.path.join(libdir, stale))
         os.makedirs(libdir, exist_ok=True)
         def order(k):
             return (k[0], k[1] or '')
