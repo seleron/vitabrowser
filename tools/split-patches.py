@@ -277,6 +277,22 @@ def de_inlined(upstream_text, macsurf_text):
 
 
 BOOL_SUB = re.compile(r'\bunsigned char\b')
+LONE_BOOL = re.compile(r'^\+(\s*)unsigned char (\w+) = ([01]);\s*$')
+TRUE_SUB = re.compile(r'\btrue\b')
+FALSE_SUB = re.compile(r'\bfalse\b')
+
+
+def _bool_norm(text):
+    """Normalise a declaration so the C89 and C99 spellings compare equal.
+
+    MacSurf rewrites `bool x = false;` as `unsigned char x = 0;` -- the type
+    AND the literal. Comparing only the type misses those, and one such line
+    surviving is enough to fail the build.
+    """
+    text = BOOL_SUB.sub('bool', text)
+    text = TRUE_SUB.sub('1', text)
+    text = FALSE_SUB.sub('0', text)
+    return text
 
 
 def renumber_hunks(lines):
@@ -338,9 +354,21 @@ def keep_bool_decls(lines):
         if (cur.startswith('-') and nxt.startswith('+')
                 and not cur.startswith('---') and not nxt.startswith('+++')
                 and 'bool' in cur and 'unsigned char' in nxt
-                and BOOL_SUB.sub('bool', nxt[1:]) == cur[1:]):
+                and _bool_norm(nxt[1:]) == _bool_norm(cur[1:])):
             out.append(' ' + cur[1:])
             i += 2
+            continue
+        # Unpaired case: MacSurf rewrote a whole function, so the C89
+        # declaration arrives as a pure addition with no removal to pair with.
+        # Only the exact scalar-initialised-to-0/1 idiom is rewritten; anything
+        # with pointer or array syntax is left alone, since `unsigned char` is
+        # a legitimate type in this codebase for byte buffers.
+        m = LONE_BOOL.match(cur)
+        if m:
+            indent, name, val = m.groups()
+            lit = 'true' if val == '1' else 'false'
+            out.append(f'+{indent}bool {name} = {lit};\n')
+            i += 1
             continue
         out.append(cur)
         i += 1
