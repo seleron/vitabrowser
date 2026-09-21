@@ -166,7 +166,7 @@ def rewrite_includes(lines, index, basename_map):
     particular -- gets a plain basename swap, or the build would reference
     p_border_radius.c, a rename we deliberately did not port.
     """
-    lines = keep_standard_includes(lines)
+    lines = renumber_hunks(keep_standard_includes(keep_bool_decls(lines)))
     out = []
     for line in lines:
         m = INCLUDE_LINE.match(line)
@@ -274,6 +274,77 @@ def de_inlined(upstream_text, macsurf_text):
     """
     return (len(INLINE_DEF.findall(upstream_text)) > 0
             and len(INLINE_DEF.findall(macsurf_text)) == 0)
+
+
+BOOL_SUB = re.compile(r'\bunsigned char\b')
+
+
+def renumber_hunks(lines):
+    """Recompute every @@ header from the body that follows it.
+
+    Both rescue passes rewrite hunk bodies -- dropping a replacement line, or
+    turning a removal into context -- and hand-reasoning about the resulting
+    old/new counts is how you get "malformed patch" from GNU patch. Counting
+    the body after the fact cannot drift.
+    """
+    out = []
+    i = 0
+    while i < len(lines):
+        m = HUNK.match(lines[i].rstrip('\n'))
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        old_start, _, new_start, _, tail = m.groups()
+        body, j = [], i + 1
+        while j < len(lines):
+            l = lines[j]
+            if HUNK.match(l.rstrip('\n')) or l.startswith(('diff ', '--- ', '+++ ')):
+                break
+            body.append(l)
+            j += 1
+        # A hunk whose every change was rescued is now pure context. GNU
+        # patch rejects a no-op hunk as malformed, so drop it entirely.
+        if not any(l[:1] in '+-' and not l.startswith(('+++', '---'))
+                   for l in body):
+            i = j
+            continue
+        o = sum(1 for l in body if l[:1] in (' ', '-') or l == '\n')
+        n = sum(1 for l in body if l[:1] in (' ', '+') or l == '\n')
+        out.append(f'@@ -{old_start},{o} +{new_start},{n} @@{tail}\n')
+        out.extend(body)
+        i = j
+    return out
+
+
+def keep_bool_decls(lines):
+    """Refuse to port `bool` -> `unsigned char` substitutions.
+
+    CodeWarrior 8 in C89 mode has no `bool`, so MacSurf rewrote declarations to
+    `unsigned char` throughout -- the same workaround as removing <stdbool.h>,
+    but in the type rather than the include. On GCC it is worse than
+    unnecessary: libwapcaplet's public API still takes `bool *`, so a caller
+    with `unsigned char match;` fails with "initialization of '_Bool *' from
+    incompatible pointer type".
+
+    Where a removed line and the following added line differ only by that
+    substitution, keep the original and drop the replacement.
+    """
+    out = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else ''
+        if (cur.startswith('-') and nxt.startswith('+')
+                and not cur.startswith('---') and not nxt.startswith('+++')
+                and 'bool' in cur and 'unsigned char' in nxt
+                and BOOL_SUB.sub('bool', nxt[1:]) == cur[1:]):
+            out.append(' ' + cur[1:])
+            i += 2
+            continue
+        out.append(cur)
+        i += 1
+    return out
 
 
 def is_pure_deletion(lines):

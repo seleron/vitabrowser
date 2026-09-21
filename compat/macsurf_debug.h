@@ -34,12 +34,15 @@ void macsurf_debug_log_writef(const char *fmt, ...);
 
 #else
 
-/* Compiled out, but the arguments are still parsed and type-checked, so a
- * trace call cannot rot into something that fails to build once enabled. */
-static void macsurf_debug_log_writef(const char *fmt, ...)
-{
-	(void) fmt;
-}
+/* Declared, never defined here. compat/macsurf_compat.c supplies a weak no-op.
+ *
+ * It must NOT be `static`: netsurf's ported sources declare this symbol with a
+ * nested `extern` before calling it, and a file-scope static declaration after
+ * a non-static one is an error ("static declaration follows non-static
+ * declaration"). A real external definition is the only form that works with
+ * both calling conventions in the tree.
+ */
+void macsurf_debug_log_writef(const char *fmt, ...);
 #define MS_LOG(...) ((void) 0)
 
 #endif /* VITABROWSER_ENGINE_TRACE */
