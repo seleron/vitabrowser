@@ -26,26 +26,24 @@
 extern "C" {
 #endif
 
-#ifdef VITABROWSER_ENGINE_TRACE
-
-#include <stdarg.h>
-void macsurf_debug_log_writef(const char *fmt, ...);
-#define MS_LOG(...) macsurf_debug_log_writef(__VA_ARGS__)
-
-#else
-
-/* Declared, never defined here. compat/macsurf_compat.c supplies a weak no-op.
+/*
+ * NO declaration of macsurf_debug_log_writef here.
  *
- * It must NOT be `static`: netsurf's ported sources declare this symbol with a
- * nested `extern` before calling it, and a file-scope static declaration after
- * a non-static one is an error ("static declaration follows non-static
- * declaration"). A real external definition is the only form that works with
- * both calling conventions in the tree.
+ * netsurf's ported sources already declare it at file scope --
+ * content/content_protected.h, html/redraw.c, html/box_construct.c,
+ * desktop/textarea.c -- and content.c includes THIS header as well, so
+ * declaring it here too trips -Werror=redundant-decls.
+ *
+ * The libraries are the opposite case: the splitter strips their nested
+ * externs, leaving no declaration at all, so they force-include
+ * compat/macsurf_lib_decls.h instead. See tools/build-patched.sh.
  */
-void macsurf_debug_log_writef(const char *fmt, ...);
-#define MS_LOG(...) ((void) 0)
 
-#endif /* VITABROWSER_ENGINE_TRACE */
+#ifdef VITABROWSER_ENGINE_TRACE
+#define MS_LOG(...) macsurf_debug_log_writef(__VA_ARGS__)
+#else
+#define MS_LOG(...) ((void) 0)
+#endif
 
 #ifdef __cplusplus
 }
