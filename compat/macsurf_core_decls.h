@@ -62,6 +62,7 @@ void macsurf_lazyimg_viewport_changed(int scroll_y, int viewport_h);
 
 struct dom_document;
 struct jsthread;
+struct dom_node;
 struct browser_window;
 struct gui_window;
 
@@ -74,6 +75,12 @@ unsigned char js_fire_dom_ready(struct jsthread *thread,
 void js_fire_mutation_batch(struct jsthread *thread);
 unsigned long js_realm_generation(struct jsthread *thread);
 unsigned long js_thread_generation(struct jsthread *thread);
+/* Fired when a <script> element finishes loading, and the setter for
+ * document.currentScript. Both are bridge behaviour, not diagnostics. */
+void js_fire_script_load(struct jsthread *thread, struct dom_node *node,
+		int success);
+void js_set_current_script(struct jsthread *thread, struct dom_node *node);
+
 int js_thread_valid_for_content(struct jsthread *thread,
 		unsigned long thread_gen, struct content *c,
 		unsigned long realm_gen);

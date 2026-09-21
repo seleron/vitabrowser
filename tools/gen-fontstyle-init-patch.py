@@ -43,6 +43,7 @@ FILES = [
     'desktop/page-info.c',
     'desktop/local_history.c',
     'content/handlers/html/box_textarea.c',
+    'content/handlers/html/redraw_border.c',
 ]
 
 TYPES = {'plot_font_style_t': 'plot_font_style',

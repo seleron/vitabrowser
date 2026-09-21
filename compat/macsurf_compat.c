@@ -206,3 +206,24 @@ void macsurf_debug_log_write(const char *s)
 	(void) s;
 #endif
 }
+
+/*
+ * <script> load notification and document.currentScript. Bridge behaviour
+ * rather than diagnostics, so they are declared and stubbed rather than
+ * stripped -- the real implementations live in macsurf_qjs.c, which is part of
+ * the Mac OS 9 frontend. With no script thread there is nothing to notify.
+ */
+struct dom_node;
+
+__attribute__((weak))
+void js_fire_script_load(struct jsthread *thread, struct dom_node *node,
+		int success)
+{
+	(void) thread; (void) node; (void) success;
+}
+
+__attribute__((weak))
+void js_set_current_script(struct jsthread *thread, struct dom_node *node)
+{
+	(void) thread; (void) node;
+}
