@@ -23,7 +23,8 @@ UP = os.path.join(W, 'upstream', 'netsurf')
 OUT = os.path.join(ROOT, 'patches', 'vitabrowser')
 REL = 'content/handlers/html'
 
-FILES = ['form.c', 'layout.c', 'interaction.c', 'html.c', 'layout_safe.h']
+FILES = ['form.c', 'layout.c', 'interaction.c', 'html.c', 'layout_safe.h',
+         'redraw.c', 'script.c']
 START = 10          # patch numbers 10+ so the hand ports sort after the fixes
 
 

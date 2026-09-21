@@ -547,6 +547,8 @@ HAND_PORTED = {
         'content/handlers/html/form.c',
         'content/handlers/html/interaction.c',
         'content/handlers/html/layout_safe.h',
+        'content/handlers/html/redraw.c',
+        'content/handlers/html/script.c',
     },
 }
 
