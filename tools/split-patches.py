@@ -448,7 +448,13 @@ def drop_nested_externs(lines, names):
         # Instrumentation declarations go regardless of the compat list: the
         # symbols are stripped, not stubbed, so a surviving declaration would
         # only produce -Wnested-externs for something that no longer exists.
-        if m and (m.group(2) in names or INSTRUMENTATION.search(m.group(2))):
+        # Only instrumentation declarations are stripped now. Stripping them
+        # for every compat symbol was the source of the oscillation recorded in
+        # docs/phase-0/07-netsurf-port.md §9.3: whichever way it was set, some
+        # file ended up with a declaration it did not want or without one it
+        # needed. MacSurf's inline declarations are valid C, so they stay and
+        # -Wnested-externs is demoted for the netsurf build instead.
+        if m and INSTRUMENTATION.search(m.group(2)):
             i += 1
             continue
         # Multi-line form: MacSurf wraps long declarations, so the name and the
@@ -464,8 +470,7 @@ def drop_nested_externs(lines, names):
                     break
                 joined += ' ' + nxt[1:].strip()
             m2 = NESTED_EXTERN.match(joined + '\n')
-            if m2 and (m2.group(2) in names
-                       or INSTRUMENTATION.search(m2.group(2))):
+            if m2 and INSTRUMENTATION.search(m2.group(2)):
                 i = j + 1
                 continue
         out.append(line)

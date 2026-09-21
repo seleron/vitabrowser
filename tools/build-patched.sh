@@ -15,6 +15,12 @@
 #   -Wno-error=unused-variable      MacSurf's debug leftovers (`ua`, `na` in
 #                             content_broadcast) are assigned and never read.
 #                             Demoted, not silenced: the warnings still print.
+#   -Wno-error=nested-externs MacSurf declares its helpers inside the functions
+#                             that call them. That is valid C and upstream only
+#                             objects on style. Trying to strip those
+#                             declarations instead made the build oscillate --
+#                             see docs/phase-0/07-netsurf-port.md §9.3 -- so the
+#                             style rule is demoted and the declarations stay.
 #   -Wno-error=comment        html/form.c has a comment reading "Sets *min/*max
 #                             to", and `/*` inside a comment is what -Wcomment
 #                             is for. Nothing to fix in the code.
@@ -72,7 +78,7 @@ done
 echo "== building netsurf + nsmonkey =="
 export PREFIX="$P"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
--include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment"
+-include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs"
 ( cd "$WORK/applytest/upstream/netsurf" && \
   make TARGET=monkey -j4 > "$WORK/applytest/build-netsurf.log" 2>&1 ) \
   && echo "  netsurf ok" \
