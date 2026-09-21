@@ -34,7 +34,8 @@ import os
 import re
 import sys
 
-LIBS = ['libwapcaplet', 'libparserutils', 'libhubbub', 'libcss', 'libdom']
+LIBS = ['libwapcaplet', 'libparserutils', 'libhubbub', 'libcss', 'libdom',
+        'netsurf']
 FIX_RE = re.compile(r'fixes[0-9]+[a-z]*', re.I)
 
 # Files the build regenerates. Patch the generator input, never the output.
@@ -109,13 +110,25 @@ def build_include_index(upstream):
             if not fn.endswith(('.h', '.c', '.inc')):
                 continue
             rel = os.path.relpath(os.path.join(dirpath, fn), upstream)
+            # Two include conventions to cover. The libraries put sources under
+            # src/ and include/ and include relative to those. netsurf has no
+            # src/ at all -- it is content/, desktop/, utils/ -- and includes
+            # relative to the tree root. Index both forms, or every
+            # #include "utils/errors.h" in netsurf resolves to nothing.
+            # Stripped form first: index.setdefault keeps the first mapping,
+            # and a library's own sources say #include "stylesheet.h", not
+            # "src/stylesheet.h". The raw path is the fallback that covers
+            # netsurf.
+            forms = []
             for root in ('src/', 'include/'):
                 if rel.startswith(root):
-                    inner = rel[len(root):]
-                    index.setdefault(inner, inner)
-                    index.setdefault(os.path.basename(inner), inner)
-                    index.setdefault(inner.replace('/', '_'), inner)
+                    forms.append(rel[len(root):])
                     break
+            forms.append(rel)
+            for inner in forms:
+                index.setdefault(inner, inner)
+                index.setdefault(os.path.basename(inner), inner)
+                index.setdefault(inner.replace('/', '_'), inner)
     return index
 
 
@@ -318,8 +331,12 @@ RENAME_PREFIX = re.compile(
     r'internal_|utils_|core_)')
 RENAME_SUFFIX = re.compile(r'_i\.h$')
 
-INCLUDE_ONLY = re.compile(
-    r'^[+-]\s*(#\s*(include|ifndef|define|endif)\b|/\*|\*|//|$)')
+# Only #include directives, blanks and comments. Guard macros are NOT noise:
+# MacSurf adds `#ifndef MACSURF_CONTENT_DEBUG_ENUM` to content_type.h so the
+# duplicate copy in browser_window.h compiles out. Treating that as include
+# churn dropped it, the guard never got defined, and both definitions landed --
+# "redeclaration of enum content_debug".
+INCLUDE_ONLY = re.compile(r'^[+-]\s*(#\s*include\b|/\*|\*|//|$)')
 
 
 def is_include_churn(lines):
@@ -481,6 +498,18 @@ def topic_for(lib, rel):
         return 'generator-input'
     d = os.path.dirname(rel)
     for prefix, topic in (
+        # netsurf core: the layout engine and plotters are the point of the
+        # port, so they get their own topics rather than landing in 'misc'.
+        ('content/handlers/html', 'html-layout'),
+        ('content/handlers/css', 'css-handler'),
+        ('content/handlers/image', 'image-handlers'),
+        ('content/handlers/javascript', 'javascript'),
+        ('content/handlers/text', 'text-handler'),
+        ('content/fetchers', 'fetchers'),
+        ('content', 'content-core'),
+        ('desktop', 'desktop'),
+        ('include/netsurf', 'public-headers'),
+        ('utils', 'utils'),
         ('src/select/properties', 'select-properties'),
         ('src/select', 'select-cascade'),
         ('src/parse/properties', 'parse-properties'),
@@ -578,6 +607,17 @@ def main():
                 continue
             if is_generated(rel, tracked):
                 skipped['generated'] += churn
+                continue
+            # MacSurf vendors CodeWarrior-flattened copies of the library
+            # public headers into netsurf/include/{dom,hubbub,parserutils,...}
+            # so the CW project can find them. Upstream netsurf only has
+            # include/netsurf. We install the real headers into a prefix, and
+            # these copies SHADOW them -- netsurf/include/dom/dom.h includes
+            # dom/events/dom_events.h, a name that only exists in MacSurf's
+            # flattened world. Never port them.
+            if lib == 'netsurf' and rel.startswith('include/') \
+                    and not rel.startswith('include/netsurf/'):
+                skipped['vendored-headers'] += churn
                 continue
             if is_rename_pair(rel, rename_bases, ms_paths):
                 skipped['rename'] += churn
@@ -702,6 +742,9 @@ def main():
         fh.write(f'- **{totals["c89-workaround"]} lines** of CodeWarrior C89 '
                  f'workarounds (function bodies moved out of headers that GCC '
                  f'compiles as-is)\n')
+        fh.write(f'- **{totals["vendored-headers"]} lines** of library public '
+                 f'headers vendored into netsurf/include, which shadow the '
+                 f'real installed ones\n')
         fh.write(f'\nOf the ported total, **{totals["carried"]} lines** were '
                  f'recovered from files MacSurf both renamed and modified, and '
                  f're-targeted at the upstream filename.\n')

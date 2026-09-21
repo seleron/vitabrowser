@@ -1,0 +1,1893 @@
+# netsurf: desktop
+# 10 files, 1108 changed lines
+# MacSurf fix ids: fixes1003 fixes1034 fixes1037 fixes1064 fixes1070 fixes1072 fixes161c fixes240 fixes268 fixes367 fixes458 fixes458b fixes464 fixes499f fixes501 fixes501x fixes510 fixes513 fixes551 fixes572 fixes576 fixes577 fixes640 fixes749 fixes758 fixes829 fixes830 fixes859 fixes890 fixes917
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/browser.c browser/netsurf/desktop/browser.c
+--- upstream/netsurf/desktop/browser.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/browser.c	2026-09-20 23:19:20.756392280 +0100
+@@ -22,7 +22,7 @@
+  * Browser core functionality
+  */
+ 
+-#include "utils/errors.h"
++#include "utils/errors.h"
+ #include "utils/log.h"
+ #include "utils/utils.h"
+ #include "netsurf/browser.h"
+@@ -33,8 +33,10 @@
+ {
+ 	if (dpi < 72 || dpi > 250) {
+ 		int bad = dpi;
+-		dpi = min(max(dpi, 72), 250);
+-		NSLOG(netsurf, INFO, "Clamping invalid DPI %d to %d", bad, dpi);
++		if (dpi < 72) dpi = 72;
++		if (dpi > 250) dpi = 250;
++		nslog_log(__FILE__, "", __LINE__,
++			 "Clamping invalid DPI %d to %d", bad, dpi);
+ 	}
+ 	nscss_screen_dpi = INTTOFIX(dpi);
+ 
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/browser_window.c browser/netsurf/desktop/browser_window.c
+--- upstream/netsurf/desktop/browser_window.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/browser_window.c	2026-09-20 23:19:20.757137379 +0100
+@@ -31,7 +31,7 @@
+ #include <math.h>
+ #include <nsutils/time.h>
+ 
+-#include "utils/errors.h"
++#include "utils/errors.h"
+ #include "utils/log.h"
+ #include "utils/corestrings.h"
+ #include "utils/messages.h"
+@@ -53,6 +53,11 @@
+ #include "javascript/js.h"
+ 
+ #include "desktop/browser_private.h"
++
++/* fixes161c - Apple post-READY crash probes. MS_LOG comes from the
++ * macos9 frontend's debug header; included here so scheduled_reformat
++ * and browser_window_schedule_reformat can mark their entry points. */
++#include "macsurf_debug.h"
+ #include "desktop/scrollbar.h"
+ #include "desktop/gui_internal.h"
+ #include "desktop/download.h"
+@@ -68,6 +73,8 @@
+ #include "desktop/theme.h"
+ #endif
+ 
++extern int macsurf_ptr_is_heap(const void *);
++
+ /**
+  * smallest scale that can be applied to a browser window
+  */
+@@ -342,12 +349,11 @@
+ 		/* no internal handler for this type, call out to frontend */
+ 		error = guit->misc->launch_url(url);
+ 	} else if (error != NSERROR_OK) {
+-		NSLOG(netsurf, INFO, "Failed to fetch download: %d", error);
++		nslog_log(__FILE__, "", __LINE__, "Failed to fetch download: %d", error);
+ 	} else {
+ 		error = download_context_create(l, root->window);
+ 		if (error != NSERROR_OK) {
+-			NSLOG(netsurf, INFO,
+-			      "Failed creating download context: %d", error);
++			nslog_log(__FILE__, "", __LINE__, "Failed creating download context: %d", error);
+ 			llcache_handle_abort(l);
+ 			llcache_handle_release(l);
+ 		}
+@@ -445,7 +451,11 @@
+ 	case CONTENT_MSG_DONE:
+ 		if (bw->favicon.current != NULL) {
+ 			content_close(bw->favicon.current);
+-			hlcache_handle_release(bw->favicon.current);
++			/* fixes458/501x: null BEFORE release (via safe wrapper) so
++			 * any synchronous callback fired during the release - or
++			 * from bw->favicon.current = c below - cannot see the
++			 * released handle. */
++			safe_hlcache_handle_release(&bw->favicon.current);
+ 		}
+ 
+ 		bw->favicon.current = c;
+@@ -545,7 +555,7 @@
+ 	if (link == NULL) {
+ 		lwc_string *scheme;
+ 		bool speculative_default = false;
+-		bool match;
++		unsigned char match;
+ 
+ 		nsurl = hlcache_handle_get_url(c);
+ 
+@@ -583,14 +593,14 @@
+ 	}
+ 
+ 	if (link == NULL) {
+-		NSLOG(netsurf, INFO,
+-		      "fetching general favicon from '%s'",
+-		      nsurl_access(nsurl));
++		nslog_log(__FILE__, "", __LINE__,
++			      "fetching general favicon from '%s'",
++			      nsurl_access(nsurl));
+ 	} else {
+-		NSLOG(netsurf, INFO,
+-		      "fetching favicon rel:%s '%s'",
+-		      lwc_string_data(link->rel),
+-		      nsurl_access(nsurl));
++		nslog_log(__FILE__, "", __LINE__,
++			      "fetching favicon rel:%s '%s'",
++			      lwc_string_data(link->rel),
++			      nsurl_access(nsurl));
+ 	}
+ 
+ 	res = hlcache_handle_retrieve(nsurl,
+@@ -685,8 +695,8 @@
+ 	}
+ 
+ 	/* remove content from browser window */
+-	hlcache_handle_release(bw->loading_content);
+-	bw->loading_content = NULL;
++	safe_hlcache_handle_release(&bw->loading_content); /* fixes501x */
++	macsurf_debug_log_writef("bw: loading_content->NULL bw=%p", (void*)bw);
+ 
+ 	browser_window_stop_throbber(bw);
+ }
+@@ -816,6 +826,35 @@
+ }
+ 
+ 
++#ifdef __MACOS9__
++/* Schedule llcache_clean(true) as a deferred callback so it never
++ * fires synchronously inside an active llcache_catch_up_all_users
++ * iteration.  Calling it synchronously from within a notify callback
++ * can free the next object in the iteration before we reach it. */
++static void macos9_deferred_llcache_purge(void *ignored)
++{
++	extern void llcache_clean(bool purge);
++	llcache_clean(true);
++}
++
++/* fixes577: close+release the OLD page content off the re-entrant
++ * READY-broadcast stack. browser_window_content_ready runs from
++ * CONTENT_MSG_READY (inside the new content's convert->broadcast); closing
++ * the old content there tears down ~25 object handles and frees many
++ * content_user nodes re-entrantly -- the window the recent teardown crashes
++ * (fixes572 script handles, fixes576 reaped entry, the MSL free() heap
++ * corruption) all land in. Running it from a scheduled tick means the
++ * teardown happens quiescent, when nothing is mid-broadcast/convert. */
++static void browser_window_deferred_close(void *p)
++{
++	struct hlcache_handle *old = (struct hlcache_handle *) p;
++	if (old != NULL) {
++		content_close(old);
++		hlcache_handle_release(old);
++	}
++}
++#endif
++
+ /**
+  * handle message for content ready on browser window
+  */
+@@ -825,13 +864,74 @@
+ 	nserror res = NSERROR_OK;
+ 
+ 	/* close and release the current window content */
++	{
++		/* fixes551 - log the URLs of the content being replaced and the one
++		 * taking over, so a switch TO about:query/fetcherror (or any wrong
++		 * page) is visible in the trace, not just opaque pointers. */
++		nsurl *ou = (bw->current_content != NULL) ?
++			hlcache_handle_get_url(bw->current_content) : NULL;
++		nsurl *nu = (bw->loading_content != NULL) ?
++			hlcache_handle_get_url(bw->loading_content) : NULL;
++		macsurf_debug_log_writef("NAV: content_ready bw=%p old=%s new=%s",
++			(void*)bw,
++			(ou != NULL) ? nsurl_access(ou) : "(none)",
++			(nu != NULL) ? nsurl_access(nu) : "(none)");
++	}
+ 	if (bw->current_content != NULL) {
++#ifdef __MACOS9__
++		/* fixes577: defer the old content's close+release to the next
++		 * event-loop tick (mirrors the fixes268 deferred llcache purge
++		 * below). We are inside the new content's convert->broadcast here;
++		 * a synchronous close tears the old page down re-entrantly, which
++		 * is where the recent teardown crashes land. NULL current_content
++		 * now so the transition below proceeds normally; the captured old
++		 * handle is torn down quiescent at the tick. */
++		{
++			struct hlcache_handle *old = bw->current_content;
++			bw->current_content = NULL;
++			guit->misc->schedule(0, browser_window_deferred_close, old);
++			macsurf_debug_log_writef("bw: DEFERRED close old=%p", (void*)old);
++		}
++#else
+ 		content_close(bw->current_content);
+-		hlcache_handle_release(bw->current_content);
++		/* fixes501x: NULL before release.  content_close ->
++		 * html_close -> html_object_close_objects -> content_close ->
++		 * content_textsearch_destroy can re-enter and read
++		 * bw->current_content; nulling first means the re-entrant read
++		 * sees NULL.  This is the exact path of the free_matches crash. */
++		safe_hlcache_handle_release(&bw->current_content);
++		macsurf_debug_log_writef("bw: current_content->NULL bw=%p", (void*)bw);
++#endif
++	}
++
++#ifdef __MACOS9__
++	/* fixes268 (#10) - on top-level non-frame navigation, evict the
++	 * decoded-image LRU and schedule an llcache purge for the next
++	 * event-loop tick (after the current llcache iteration unwinds). */
++	if (bw->parent == NULL) {
++		extern void macos9_purge_decoded_images(void);
++		macos9_purge_decoded_images();
++		guit->misc->schedule(0, macos9_deferred_llcache_purge, NULL);
+ 	}
++#endif
+ 
+ 	bw->current_content = bw->loading_content;
+ 	bw->loading_content = NULL;
++	macsurf_debug_log_writef("bw: loading_content->NULL bw=%p", (void*)bw);
++
++	/* fixes513: reentrant content_broadcast can fire a second call to
++	 * browser_window_content_ready for the same bw before the first
++	 * returns.  The first call already nulled loading_content (above),
++	 * so the second call sees current_content=NULL here.
++	 * content_reformat(NULL,...) -> content__reformat(NULL,...) -> stw
++	 * through r3=0 at +005C.  Bail early; the first invocation is still
++	 * live on the stack and will complete the transition. */
++	if (bw->current_content == NULL) {
++		macsurf_debug_log_writef(
++			"bw_content_ready: REENTRANT NULL current bw=%p, skip",
++			(void *)bw);
++		return NSERROR_OK;
++	}
+ 
+ 	if (!bw->internal_nav) {
+ 		/* Transfer the fetch parameters */
+@@ -950,9 +1050,10 @@
+ 		rect.x0 = rect.x1 = scrollx;
+ 		rect.y0 = rect.y1 = scrolly;
+ 		if (browser_window_set_scroll(bw, &rect) != NSERROR_OK) {
+-			NSLOG(netsurf, WARNING,
+-			      "Unable to set browser scroll offsets to %d by %d",
+-			      scrollx, scrolly);
++			nslog_log(__FILE__, "", __LINE__,
++				      "Unable to set browser scroll offsets to %d by %d",
++				      scrollx,
++				      scrolly);
+ 		}
+ 	}
+ 
+@@ -1382,6 +1483,18 @@
+ 	nserror res;
+ 	nsurl *url = hlcache_handle_get_url(c);
+ 
++	/* fixes551 - log WHY a content errored BEFORE we replace it with the
++	 * error page.  This is the single line that explains a page which fetched
++	 * fine (even from cache) yet still shows about:query/fetcherror: it names
++	 * the failing URL, the nserror code, the raw fetch message, and whether the
++	 * erroring content was the in-flight nav (loading) or the displayed one. */
++	macsurf_debug_log_writef(
++		"NAV: ERROR url=%s code=%d msg=%s loading=%d current=%d -> error page",
++		(url != NULL) ? nsurl_access(url) : "(null)",
++		(int)code, (message != NULL) ? message : "(null)",
++		(c == bw->loading_content) ? 1 : 0,
++		(c == bw->current_content) ? 1 : 0);
++
+ 	/* Unexpected OK? */
+ 	assert(code != NSERROR_OK);
+ 
+@@ -1393,8 +1506,10 @@
+ 
+ 	if (c == bw->loading_content) {
+ 		bw->loading_content = NULL;
++		macsurf_debug_log_writef("bw: loading_content->NULL bw=%p", (void*)bw);
+ 	} else if (c == bw->current_content) {
+ 		bw->current_content = NULL;
++		macsurf_debug_log_writef("bw: current_content->NULL bw=%p", (void*)bw);
+ 		browser_window_remove_caret(bw, false);
+ 	}
+ 
+@@ -1502,7 +1617,56 @@
+ 
+ 	case CONTENT_MSG_DONE:
+ 		assert(bw->current_content == c);
+-
++		{
++			nsurl *du = hlcache_handle_get_url(c);
++			macsurf_debug_log_writef("NAV: DONE url=%s",
++				(du != NULL) ? nsurl_access(du) : "(null)");
++			/* fixes1034 - emit the phase breakdown HERE.
++			 *
++			 * The PERFACC accumulators (tls/net/parse/cascade/
++			 * layout/paint/js, fixes640) are all still summing
++			 * correctly and the log gate whitelists the line, but
++			 * the emit hangs off a poll-loop latch keyed on
++			 * browser_window_stop_available going true->false, and
++			 * the hardware logs contain ZERO PERFACC lines -- so
++			 * the one instrument that could say where 46 seconds
++			 * go has been dark. NAV: DONE fires on every load in
++			 * every log, which makes it the honest hook.
++			 *
++			 * Deliberately NOT deleting the poll-loop emit: it is
++			 * armed at nav-start and guarded by
++			 * perf_summary_emitted, so whichever fires first wins
++			 * and the accumulators are zeroed by the emit itself.
++			 * Fixing the latch is a separate question from being
++			 * able to measure at all. */
++			{
++				extern void macsurf_profile_emit_phases(
++						const char *url);
++				extern void macsurf_qjs_emit_timer_profile(void);
++				extern void macsurf_qjs_emit_js_profile(void);
++				macsurf_profile_emit_phases(
++					(du != NULL) ? nsurl_access(du) : "?");
++				/* fixes1037 - split the JS total: how much of it is
++				 * timer callbacks, and how many fired. */
++				macsurf_qjs_emit_timer_profile();
++				/* fixes1070 - and split the REST of the JS total:
++				 * compile vs run vs GC, plus the top-N scripts by
++				 * cost. js has measured 96% of the accounted load
++				 * with no way to see which script or which half of
++				 * the engine was responsible. */
++				macsurf_qjs_emit_js_profile();
++
++				/* DIAG-GAP-002: freeze gap census and nav summary at NAV: DONE */
++				{
++					extern void macsurf_gap_emit_summary(unsigned long nav_id);
++					extern void macsurf_diag_nav_done(unsigned long nav_id);
++					extern unsigned long ms_diag_cur_nav(void);
++					unsigned long cur_nav = ms_diag_cur_nav();
++					macsurf_gap_emit_summary(cur_nav);
++					macsurf_diag_nav_done(cur_nav);
++				}
++			}
++		}
+ 		res = browser_window_content_done(bw);
+ 		break;
+ 
+@@ -1578,7 +1742,7 @@
+ 
+ 	case CONTENT_MSG_LINK: /* content has an rfc5988 link element */
+ 		{
+-			bool match;
++			unsigned char match;
+ 
+ 			/* Handle "icon" and "shortcut icon" */
+ 			if ((lwc_string_caseless_isequal(
+@@ -1822,9 +1986,17 @@
+ 	int height;
+ 	nserror res;
+ 
++	MS_LOG("scheduled_reformat: entry");
+ 	res = guit->window->get_dimensions(bw->window, &width, &height);
+ 	if (res == NSERROR_OK) {
++		macsurf_debug_log_writef(
++			"scheduled_reformat: dims w=%d h=%d -> browser_window_reformat",
++			width, height);
+ 		browser_window_reformat(bw, false, width, height);
++		MS_LOG("scheduled_reformat: return from browser_window_reformat");
++	} else {
++		macsurf_debug_log_writef(
++			"scheduled_reformat: get_dimensions FAIL res=%d", (int)res);
+ 	}
+ }
+ 
+@@ -1832,6 +2004,10 @@
+ nserror browser_window_destroy_internal(struct browser_window *bw)
+ {
+ 	assert(bw);
++	{
++		extern void ms_diag_frame_close(void *);
++		ms_diag_frame_close(bw);
++	}
+ 
+ 	browser_window_destroy_children(bw);
+ 	browser_window_destroy_iframes(bw);
+@@ -1847,8 +2023,9 @@
+ 
+ 	/* clear any pending callbacks */
+ 	guit->misc->schedule(-1, browser_window_refresh, bw);
+-	NSLOG(netsurf, INFO,
+-	      "Clearing reformat schedule for browser window %p", bw);
++	nslog_log(__FILE__, "", __LINE__,
++		      "Clearing reformat schedule for browser window %p",
++		      bw);
+ 	guit->misc->schedule(-1, scheduled_reformat, bw);
+ 
+ 	/* If this brower window is not the root window, and has focus, unset
+@@ -1876,26 +2053,25 @@
+ 
+ 	if (bw->loading_content != NULL) {
+ 		hlcache_handle_abort(bw->loading_content);
+-		hlcache_handle_release(bw->loading_content);
+-		bw->loading_content = NULL;
++		/* fixes501x: NULL before release via safe wrapper. */
++		safe_hlcache_handle_release(&bw->loading_content);
++		macsurf_debug_log_writef("bw: loading_content->NULL bw=%p", (void*)bw);
+ 	}
+ 
+ 	if (bw->current_content != NULL) {
+ 		content_close(bw->current_content);
+-		hlcache_handle_release(bw->current_content);
+-		bw->current_content = NULL;
++		safe_hlcache_handle_release(&bw->current_content);
++		macsurf_debug_log_writef("bw: current_content->NULL bw=%p", (void*)bw);
+ 	}
+ 
+ 	if (bw->favicon.loading != NULL) {
+ 		hlcache_handle_abort(bw->favicon.loading);
+-		hlcache_handle_release(bw->favicon.loading);
+-		bw->favicon.loading = NULL;
++		safe_hlcache_handle_release(&bw->favicon.loading);
+ 	}
+ 
+ 	if (bw->favicon.current != NULL) {
+ 		content_close(bw->favicon.current);
+-		hlcache_handle_release(bw->favicon.current);
+-		bw->favicon.current = NULL;
++		safe_hlcache_handle_release(&bw->favicon.current);
+ 	}
+ 
+ 	if (bw->jsheap != NULL) {
+@@ -1919,8 +2095,10 @@
+ 	bw->status.text = NULL;
+ 	browser_window__free_fetch_parameters(&bw->current_parameters);
+ 	browser_window__free_fetch_parameters(&bw->loading_parameters);
+-	NSLOG(netsurf, INFO, "Status text cache match:miss %d:%d",
+-	      bw->status.match, bw->status.miss);
++	nslog_log(__FILE__, "", __LINE__,
++		      "Status text cache match:miss %d:%d",
++		      bw->status.match,
++		      bw->status.miss);
+ 
+ 	return NSERROR_OK;
+ }
+@@ -2102,6 +2280,37 @@
+ 	hlcache_handle *c = bw->current_content;
+ 	const char *status = NULL;
+ 	browser_pointer_shape pointer = BROWSER_POINTER_DEFAULT;
++	{ extern void macsurf_debug_log_writef(const char *fmt, ...);
++	macsurf_debug_log_writef("LIFE BWCLICK c=%p", (void *)c); }
++
++	/* fixes501: guard against stale current_content handle.
++	 * On navigation the old hlcache_handle is released and freed, but
++	 * cooperative multitasking means a mouse event can still arrive
++	 * before the browser_window field is updated.  A freed handle whose
++	 * heap memory was reused for string data has a non-NULL entry field
++	 * (the first bytes of the string) so hlcache_handle_get_content
++	 * returns non-NULL garbage, the assert passes, and we crash
++	 * dereferencing the garbage content pointer.
++	 * The OS 9 malloc heap lives in ~0x01000000–0x20000000; anything
++	 * outside that range is a recycled/wild pointer. Bail early. */
++	if (c != NULL) {
++		unsigned long ca = (unsigned long)(void *)c;
++		if (!macsurf_ptr_is_heap((const void *)(c))) {
++			macsurf_debug_log_writef(
++				"bw_mouse_click: SKIP wild c_content=%p", (void *)c);
++			return;
++		}
++		/* also skip if entry pointer looks uninitialized/wild */
++		{
++			struct hlcache_entry **ep = (struct hlcache_entry **)c;
++			unsigned long ea = (unsigned long)(void *)(*ep);
++			if (ea != 0 && !macsurf_ptr_is_heap((const void *)(*ep))) {
++				macsurf_debug_log_writef(
++					"bw_mouse_click: SKIP wild entry=%p", (void *)(*ep));
++				return;
++			}
++		}
++	}
+ 
+ 	if (bw->children) {
+ 		/* Browser window has children (frames) */
+@@ -2199,6 +2408,9 @@
+ 			}
+ 
+ 			/* Pass mouse action to content */
++			{ extern void macsurf_debug_log_writef(const char *fmt, ...);
++			macsurf_debug_log_writef("LIFE CONTENT_MOUSE c=%p type=%d x=%d y=%d",
++				(void *)c, (int)content_get_type(c), x, y); }
+ 			content_mouse_action(c, bw, mouse, x, y);
+ 		}
+ 		break;
+@@ -2238,6 +2450,21 @@
+ 	const char *status = NULL;
+ 	browser_pointer_shape pointer = BROWSER_POINTER_DEFAULT;
+ 
++	/* fixes501: same stale-handle guard as browser_window_mouse_click_internal */
++	if (c != NULL) {
++		unsigned long ca = (unsigned long)(void *)c;
++		if (!macsurf_ptr_is_heap((const void *)(c))) {
++			return;
++		}
++		{
++			struct hlcache_entry **ep = (struct hlcache_entry **)c;
++			unsigned long ea = (unsigned long)(void *)(*ep);
++			if (ea != 0 && !macsurf_ptr_is_heap((const void *)(*ep))) {
++				return;
++			}
++		}
++	}
++
+ 	if (bw->window != NULL && bw->drag.window && bw != bw->drag.window) {
+ 		/* This is the root browser window and there's an active drag
+ 		 * in a sub window.
+@@ -2701,6 +2928,8 @@
+ 	data.scale = bw->scale;
+ 	data.repeat_x = false;
+ 	data.repeat_y = false;
++	data.nearest = false;  /* fixes829 (#256) */
++	data.background_blend_mode = 0;
+ 
+ 	content_clip = *clip;
+ 
+@@ -2728,6 +2957,8 @@
+ 	if (!bw->window) {
+ 		/* Render scrollbars */
+ 		int off_x, off_y;
++	{ extern void macsurf_debug_log_writef(const char *fmt, ...);
++	macsurf_debug_log_writef("LIFE SCROLLCHK scroll_x=%p scroll_y=%p", (void *)bw->scroll_x, (void *)bw->scroll_y); }
+ 		if (bw->scroll_x != NULL) {
+ 			browser_window_get_scrollbar_pos(bw, true,
+ 							 &off_x, &off_y);
+@@ -2766,6 +2997,18 @@
+ 		NSLOG(netsurf, INFO, "NULL browser window");
+ 		return false;
+ 	} else if (bw->current_content != NULL) {
++		/* fixes458b: block redraw while box tree is absent or partially
++		 * built (LOADING/CONVERTING).  READY means conversion is done and
++		 * all hlcache handles are registered; images may still be
++		 * fetching but image rendering handles NULL decode gracefully
++		 * ("deferred to redraw").  DONE means all subresources finished.
++		 * fixes464: allow READY so the page paints as soon as layout
++		 * completes rather than waiting for every image to download. */
++		{
++			content_status st = content_get_status(bw->current_content);
++			if (st != CONTENT_STATUS_READY && st != CONTENT_STATUS_DONE)
++				return false;
++		}
+ 		/* Can't render locked contents */
+ 		return !content_is_locked(bw->current_content);
+ 	}
+@@ -2880,7 +3123,11 @@
+ 			break;
+ 		}
+ 
+-		guit->window->drag_start(top_bw->window, gtype, rect);
++		/* fixes510: macos9 has no drag_start implementation (NULL slot).
++		 * Calling through NULL crashes at the instruction in low memory.
++		 * Guard before dispatch; drag state is already set above. */
++		if (guit->window->drag_start != NULL)
++			guit->window->drag_start(top_bw->window, gtype, rect);
+ 	}
+ }
+ 
+@@ -3179,6 +3426,10 @@
+ {
+ 	nserror err;
+ 	assert(bw);
++	{
++		extern void ms_diag_frame_open(void *);
++		ms_diag_frame_open(bw);
++	}
+ 
+ 	/* new javascript context for each window/(i)frame */
+ 	err = js_newheap(nsoption_int(script_timeout), &bw->jsheap);
+@@ -3308,7 +3559,7 @@
+ 	assert(bw);
+ 	assert(url);
+ 
+-	NSLOG(netsurf, INFO, "bw %p, url %s", bw, nsurl_access(url));
++	nslog_log(__FILE__, "", __LINE__, "bw %p, url %s", bw, nsurl_access(url));
+ 
+ 	/*
+ 	 * determine if navigation is internal url, if so, we do not
+@@ -3512,7 +3763,7 @@
+ 	nserror res;
+ 	hlcache_handle *c;
+ 
+-	NSLOG(netsurf, INFO, "Loading '%s'", nsurl_access(params->url));
++	nslog_log(__FILE__, "", __LINE__, "Loading '%s'", nsurl_access(params->url));
+ 
+ 	fetch_is_post = (params->post_urlenc != NULL || params->post_multipart != NULL);
+ 
+@@ -3715,7 +3966,7 @@
+ {
+ 	bool is_retry = false, is_back = false;
+ 
+-	NSLOG(netsurf, INFO, "bw:%p params:%p", bw, params);
++	nslog_log(__FILE__, "", __LINE__, "bw:%p params:%p", bw, params);
+ 
+ 	assert(params->post_multipart != NULL);
+ 
+@@ -3751,7 +4002,7 @@
+ {
+ 	bool is_retry = false, is_back = false;
+ 
+-	NSLOG(netsurf, INFO, "bw:%p params:%p", bw, params);
++	nslog_log(__FILE__, "", __LINE__, "bw:%p params:%p", bw, params);
+ 
+ 	assert(params->post_multipart != NULL);
+ 
+@@ -3791,6 +4042,55 @@
+ {
+ 	lwc_string *scheme, *path;
+ 
++	/* fixes551 - start of every navigation (real pages, internal redirects,
++	 * and the about:query/* error/login/cert pages), so the NAV trace reads
++	 * START -> (ERROR why | DONE) -> content_ready switch. */
++	macsurf_debug_log_writef("NAV: START url=%s",
++		((params != NULL) && (params->url != NULL)) ?
++			nsurl_access(params->url) : "(null)");
++
++	/* fixes1072 - anchor the wall clock HERE, beside the line that already
++	 * marks every navigation.
++	 *
++	 * fixes1070's PERFWALL read g_profile_t0, which is stamped by
++	 * macsurf_profile_reset() at window.c:716 -- the URL-BAR path only. A
++	 * link click reaches browser_window_navigate directly from core and
++	 * never touches it, so t0 was left over from the PREVIOUS load and
++	 * `wall` measured time-since-the-last-navigation-ended, idle included.
++	 * Hardware: a whats-new load that took 680 ticks (~11.3s) reported
++	 * wall=483s and unacct=97%, because the machine had sat idle for eight
++	 * minutes beforehand. The first load of a session matched, which is
++	 * precisely why it looked correct.
++	 *
++	 * This is its own clock rather than a macsurf_profile_reset() call:
++	 * macsurf_profile_stamp() auto-resets g_profile_t0 whenever the flag is
++	 * clear, so any stamp firing between navigations could move it again.
++	 * A dedicated t0 written only here cannot be perturbed by anything
++	 * else. This comment is the whole contract -- if a future round wants
++	 * to know what `wall` spans, it spans this line to the emit. */
++	{
++		extern void macsurf_profile_nav_begin(void);
++		macsurf_profile_nav_begin();
++	}
++
++	/* fixes1003 - a top-level navigation IS a retry: clear the TLS
++	 * fetcher's dead-host and terminal-URL sets. Those exist to collapse a
++	 * subresource storm within one page load; carried ACROSS navigations
++	 * they made a single transient timeout permanent, so reloading a site
++	 * that failed once could never recover it (68kmla, hardware). Skipped
++	 * for about: URLs so navigating to the error page itself does not clear
++	 * the state that produced it. See macos9_https_clear_fail_sets. */
++#ifdef __MACOS9__
++	if ((params != NULL) && (params->url != NULL)) {
++		lwc_string *sch = nsurl_get_component(params->url, NSURL_SCHEME);
++		if (sch != corestring_lwc_about) {
++			extern void macos9_https_clear_fail_sets(void);
++			macos9_https_clear_fail_sets();
++		}
++		if (sch != NULL) lwc_string_unref(sch);
++	}
++#endif
++
+ 	/* All our special URIs are in the about: scheme */
+ 	scheme = nsurl_get_component(params->url, NSURL_SCHEME);
+ 	if (scheme != corestring_lwc_about) {
+@@ -4076,8 +4376,8 @@
+ 
+ 	if (bw->loading_content != NULL) {
+ 		hlcache_handle_abort(bw->loading_content);
+-		hlcache_handle_release(bw->loading_content);
+-		bw->loading_content = NULL;
++		safe_hlcache_handle_release(&bw->loading_content); /* fixes501x */
++		macsurf_debug_log_writef("bw: loading_content->NULL bw=%p", (void*)bw);
+ 	}
+ 
+ 	if (bw->current_content != NULL &&
+@@ -4242,7 +4542,21 @@
+ 		return NSERROR_BAD_PARAMETER;
+ 	}
+ 
+-	return guit->misc->schedule(0, scheduled_reformat, bw);
++	MS_LOG("browser_window_schedule_reformat: entry");
++	/* fixes240 - 50ms coalescing delay (was 0). The scheduler dedups
++	 * pending entries with the same callback+param, but at delay=0 each
++	 * entry fires within one poll cycle, so resource-arrival bursts
++	 * during page load produce one reformat per resource. A short
++	 * delay lets bursts coalesce into a single reformat at the burst
++	 * tail. Measured: ~44 reformats * 250 ms = ~11 s of redundant box-
++	 * tree walks on a cold mactrove load. Pre-fixes240 perceived speed
++	 * was bottlenecked here. 50 ms is short enough that interactive
++	 * actions (hover, click) still feel immediate.
++	 *
++	 * Cross-platform note: this change is generic NetSurf core but
++	 * benefits any frontend whose scheduler dedups. RISC OS, Atari,
++	 * Amiga all use the same dedup-on-insert pattern. */
++	return guit->misc->schedule(50, scheduled_reformat, bw);
+ }
+ 
+ 
+@@ -4581,28 +4895,29 @@
+ 
+ 	/* bw is the target of the log, but root is where we log it */
+ 
+-	NSLOG(netsurf, DEEPDEBUG, "Logging message in %p targetted at %p", root, bw);
+-	NSLOG(netsurf, DEEPDEBUG, "Log came from %s",
+-	      ((src == BW_CS_INPUT) ? "user input" :
++	nslog_log(__FILE__, "", __LINE__, "Logging message in %p targetted at %p", root, bw);
++	nslog_log(__FILE__, "", __LINE__,
++		      "Log came from %s",
++		      ((src == BW_CS_INPUT) ? "user input" :
+ 	       (src == BW_CS_SCRIPT_ERROR) ? "script error" :
+ 	       (src == BW_CS_SCRIPT_CONSOLE) ? "script console" :
+ 	       "unknown input location"));
+ 
+ 	switch (log_level) {
+ 	case BW_CS_FLAG_LEVEL_DEBUG:
+-		NSLOG(netsurf, DEBUG, "%.*s", (int)msglen, msg);
++		nslog_log(__FILE__, "", __LINE__, "%.*s", (int)msglen, msg);
+ 		break;
+ 	case BW_CS_FLAG_LEVEL_LOG:
+-		NSLOG(netsurf, VERBOSE, "%.*s", (int)msglen, msg);
++		nslog_log(__FILE__, "", __LINE__, "%.*s", (int)msglen, msg);
+ 		break;
+ 	case BW_CS_FLAG_LEVEL_INFO:
+-		NSLOG(netsurf, INFO, "%.*s", (int)msglen, msg);
++		nslog_log(__FILE__, "", __LINE__, "%.*s", (int)msglen, msg);
+ 		break;
+ 	case BW_CS_FLAG_LEVEL_WARN:
+-		NSLOG(netsurf, WARNING, "%.*s", (int)msglen, msg);
++		nslog_log(__FILE__, "", __LINE__, "%.*s", (int)msglen, msg);
+ 		break;
+ 	case BW_CS_FLAG_LEVEL_ERROR:
+-		NSLOG(netsurf, ERROR, "%.*s", (int)msglen, msg);
++		nslog_log(__FILE__, "", __LINE__, "%.*s", (int)msglen, msg);
+ 		break;
+ 	default:
+ 		/* Unreachable */
+@@ -4650,7 +4965,7 @@
+ 		const struct browser_window *bw)
+ {
+ 	lwc_string *scheme;
+-	bool match;
++	unsigned char match;
+ 
+ 	assert(bw != NULL);
+ 
+@@ -4735,9 +5050,12 @@
+ 		return 0;
+ 	}
+ 
+-	for (char *c = cookies; *c != '\0'; c++) {
+-		if (*c == ';')
+-			count++;
++	{
++		char *c;
++		for (c = cookies; *c != '\0'; c++) {
++			if (*c == ';')
++				count++;
++		}
+ 	}
+ 
+ 	free(cookies);
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/download.c browser/netsurf/desktop/download.c
+--- upstream/netsurf/desktop/download.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/download.c	2026-09-20 23:19:20.757931709 +0100
+@@ -72,6 +72,35 @@
+  * \param url  URL of item being fetched
+  * \return Default filename, or NULL on memory exhaustion
+  */
++/* fixes1064 (#114) - suggested filename from <a download="name">.
++ *
++ * A one-shot set at click time and consumed by the next context creation,
++ * mirroring macos9_http_mark_next_as_document / macsurf_http_skip_next_cache.
++ * Done this way because the alternative is widening
++ * browser_window_navigate -> browser_window_download -> download_context_create
++ * to carry a filename, and every declaration of an exported symbol has to move
++ * in lockstep under CW8's flat namespace -- see the fixes917/918/919 revert.
++ *
++ * Cleared on read so a suggestion can never leak onto an unrelated later
++ * download.
++ */
++static char *download_next_suggested = NULL;
++
++void download_set_next_filename(const char *name)
++{
++	free(download_next_suggested);
++	download_next_suggested = NULL;
++	if (name != NULL && name[0] != '\0')
++		download_next_suggested = strdup(name);
++}
++
++static char *download_take_suggested(void)
++{
++	char *n = download_next_suggested;
++	download_next_suggested = NULL;
++	return n;
++}
++
+ static char *download_default_filename(nsurl *url)
+ {
+ 	char *nice;
+@@ -142,6 +171,12 @@
+ 	ctx->mime_type = lwc_string_ref(content_type->media_type);
+ 	ctx->total_length = length;
+ 	if (ctx->filename == NULL) {
++		/* fixes1064 (#114) - <a download="name"> is a SUGGESTION, so a
++		 * server-supplied Content-Disposition still wins; this only
++		 * beats the URL-derived default. */
++		ctx->filename = download_take_suggested();
++	}
++	if (ctx->filename == NULL) {
+ 		ctx->filename = download_default_filename(
+ 				llcache_handle_get_url(ctx->llcache));
+ 	}
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/gui_factory.c browser/netsurf/desktop/gui_factory.c
+--- upstream/netsurf/desktop/gui_factory.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/gui_factory.c	2026-09-20 23:19:20.759115536 +0100
+@@ -23,7 +23,7 @@
+ #include <unistd.h>
+ 
+ #include "utils/config.h"
+-#include "utils/errors.h"
++#include "utils/errors.h"
+ #include "utils/file.h"
+ #include "utils/inet.h"
+ #include "netsurf/bitmap.h"
+@@ -236,12 +236,12 @@
+ }
+ 
+ static struct core_window_table default_corewindow_table = {
+-	.invalidate = gui_default_corewindow_invalidate,
+-	.set_extent = gui_default_corewindow_set_extent,
+-	.set_scroll = gui_default_corewindow_set_scroll,
+-	.get_scroll = gui_default_corewindow_get_scroll,
+-	.get_dimensions = gui_default_corewindow_get_dimensions,
+-	.drag_status = gui_default_corewindow_dragstatus,
++	gui_default_corewindow_invalidate,
++	gui_default_corewindow_set_extent,
++	gui_default_corewindow_set_scroll,
++	gui_default_corewindow_get_scroll,
++	gui_default_corewindow_get_dimensions,
++	gui_default_corewindow_dragstatus
+ };
+ 
+ /** verify corewindow window table is valid */
+@@ -297,10 +297,10 @@
+ }
+ 
+ static struct gui_download_table default_download_table = {
+-	.create = gui_default_download_create,
+-	.data = gui_default_download_data,
+-	.error = gui_default_download_error,
+-	.done = gui_default_download_done,
++	gui_default_download_create,
++	gui_default_download_data,
++	gui_default_download_error,
++	gui_default_download_done
+ };
+ 
+ /** verify download window table is valid */
+@@ -340,8 +340,8 @@
+ }
+ 
+ static struct gui_clipboard_table default_clipboard_table = {
+-	.get = gui_default_get_clipboard,
+-	.set = gui_default_set_clipboard,
++	gui_default_get_clipboard,
++	gui_default_set_clipboard
+ };
+ 
+ /** verify clipboard table is valid */
+@@ -388,8 +388,8 @@
+ }
+ 
+ static struct gui_utf8_table default_utf8_table = {
+-	.utf8_to_local = gui_default_utf8,
+-	.local_to_utf8 = gui_default_utf8,
++	gui_default_utf8,
++	gui_default_utf8
+ };
+ 
+ /** verify clipboard table is valid */
+@@ -431,11 +431,11 @@
+ }
+ 
+ static struct gui_search_table default_search_table = {
+-	.status = gui_default_status,
+-	.hourglass = gui_default_hourglass,
+-	.add_recent = gui_default_add_recent,
+-	.forward_state = gui_default_forward_state,
+-	.back_state = gui_default_back_state,
++	gui_default_status,
++	gui_default_hourglass,
++	gui_default_add_recent,
++	gui_default_forward_state,
++	gui_default_back_state
+ };
+ 
+ /** verify search table is valid */
+@@ -474,7 +474,7 @@
+ }
+ 
+ static struct gui_search_web_table default_search_web_table = {
+-	.provider_update = gui_default_provider_update,
++	gui_default_provider_update
+ };
+ 
+ /** verify search table is valid */
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/netsurf.c browser/netsurf/desktop/netsurf.c
+--- upstream/netsurf/desktop/netsurf.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/netsurf.c	2026-09-20 23:19:20.760552432 +0100
+@@ -28,7 +28,7 @@
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/config.h"
+-#include "utils/errors.h"
++#include "utils/errors.h"
+ #include "utils/nscolour.h"
+ #include "utils/nsoption.h"
+ #include "utils/corestrings.h"
+@@ -50,6 +50,7 @@
+ #include "text/textplain.h"
+ 
+ #include "netsurf/browser_window.h"
++#include "macsurf_debug.h"
+ #include "desktop/system_colour.h"
+ #include "desktop/page-info.h"
+ #include "desktop/searchweb.h"
+@@ -99,27 +100,30 @@
+ 
+ static void netsurf_lwc_iterator(lwc_string *str, void *pw)
+ {
+-	NSLOG(netsurf, WARNING, "[%3"PRIu32"] %.*s", str->refcnt,
+-	      (int)lwc_string_length(str), lwc_string_data(str));
++	nslog_log(__FILE__, "", __LINE__,
++		      "[%3"PRIu32"] %.*s",
++		      str->refcnt,
++		      (int)lwc_string_length(str),
++		      lwc_string_data(str));
+ }
+ 
+ /* exported interface documented in netsurf/netsurf.h */
+ nserror netsurf_init(const char *store_path)
+ {
+ 	nserror ret;
+-	struct hlcache_parameters hlcache_parameters = {
+-		.bg_clean_time = HL_CACHE_CLEAN_TIME,
+-		.llcache = {
+-			.minimum_lifetime = LLCACHE_STORE_MIN_LIFETIME,
+-			.minimum_bandwidth = LLCACHE_STORE_MIN_BANDWIDTH,
+-			.maximum_bandwidth = LLCACHE_STORE_MAX_BANDWIDTH,
+-			.time_quantum = LLCACHE_STORE_TIME_QUANTUM,
+-		}
+-	}; 
+-	struct image_cache_parameters image_cache_parameters = {
+-		.bg_clean_time = IMAGE_CACHE_CLEAN_TIME,
+-		.speculative_small = SPECULATE_SMALL
+-	};
++	struct hlcache_parameters hlcache_parameters;
++	struct image_cache_parameters image_cache_parameters;
++
++	memset(&hlcache_parameters, 0, sizeof(hlcache_parameters));
++	hlcache_parameters.bg_clean_time = HL_CACHE_CLEAN_TIME;
++	hlcache_parameters.llcache.minimum_lifetime = LLCACHE_STORE_MIN_LIFETIME;
++	hlcache_parameters.llcache.minimum_bandwidth = LLCACHE_STORE_MIN_BANDWIDTH;
++	hlcache_parameters.llcache.maximum_bandwidth = LLCACHE_STORE_MAX_BANDWIDTH;
++	hlcache_parameters.llcache.time_quantum = LLCACHE_STORE_TIME_QUANTUM;
++
++	memset(&image_cache_parameters, 0, sizeof(image_cache_parameters));
++	image_cache_parameters.bg_clean_time = IMAGE_CACHE_CLEAN_TIME;
++	image_cache_parameters.speculative_small = SPECULATE_SMALL;
+ 	
+ #ifdef HAVE_SIGPIPE
+ 	/* Ignore SIGPIPE - this is necessary as OpenSSL can generate these
+@@ -146,9 +150,9 @@
+ 
+ 	if (hlcache_parameters.llcache.limit < MINIMUM_MEMORY_CACHE_SIZE) {
+ 		hlcache_parameters.llcache.limit = MINIMUM_MEMORY_CACHE_SIZE;
+-		NSLOG(netsurf, INFO,
+-		      "Setting minimum memory cache size %"PRIsizet,
+-		      hlcache_parameters.llcache.limit);
++		nslog_log(__FILE__, "", __LINE__,
++			      "Setting minimum memory cache size %"PRIsizet,
++			      hlcache_parameters.llcache.limit);
+ 	} 
+ 
+ 	/* Set up the max attempts made to fetch a timing out resource */
+@@ -181,7 +185,15 @@
+ 		return ret;
+ 
+ 	/* content handler initialisation */
+-	ret = nscss_init();
++	{
++		nserror css_init_err = nscss_init();
++		if (css_init_err != NSERROR_OK) {
++			MS_LOG("FATAL: nscss_init failed");
++		} else {
++			MS_LOG("nscss_init OK");
++		}
++		ret = css_init_err;
++	}
+ 	if (ret != NSERROR_OK)
+ 		return ret;
+ 
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/options.h browser/netsurf/desktop/options.h
+--- upstream/netsurf/desktop/options.h	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/options.h	2026-09-20 23:19:20.760681191 +0100
+@@ -64,7 +64,26 @@
+ NSOPTION_INTEGER(treeview_font_size, 110)
+ 
+ /** Default font size (unit: 0.1pt) */
+-NSOPTION_INTEGER(font_size, 128)
++/* fixes859 (#287): 160 (16pt) -> 120 (12pt).  MUST land together with the
++ * css_unit_len2device_px switch in html_font.c -- neither is correct alone.
++ *
++ * This option is in 0.1pt, and html.c:593 converts it to the CSS-px default:
++ * 96*(N/10)/72.  fixes830 set 160 aiming at "the mainstream-browser 16px
++ * baseline", but 16pt is 21.33 CSS px, not 16 -- because the real problem was
++ * downstream (font_plot_style_from_css went through points, so QuickDraw's
++ * 72dpi TextSize rendered every CSS px at 0.75x), and inflating the default by
++ * 1.33x hid it for the DEFAULT size only.  The cost was everything that reads
++ * the default in CSS px: 1rem and media-query 1em became 21.33px instead of
++ * 16px, so hackaday's `@media (min-width:59.5em)` demanded 1269px of viewport
++ * instead of 952 and its entire desktop branch (nav, 86px logo, 7rem title)
++ * never applied.
++ *
++ * 120 = 12pt = 96*12/72 = exactly 16.00 CSS px -- Chrome's default, so em/rem/
++ * @media now agree with every other browser.  On screen the default is
++ * UNCHANGED: html_font.c now converts CSS px -> device px (96dpi, 1:1) rather
++ * than to points, so medium is still size=16.  Do not "fix" this back to 160
++ * without also reverting html_font.c -- see the note there. */
++NSOPTION_INTEGER(font_size, 120)
+ 
+ /** Minimum font size. */
+ NSOPTION_INTEGER(font_min_size, 85)
+@@ -114,6 +133,12 @@
+ /** Whether to send the referer HTTP header */
+ NSOPTION_BOOL(send_referer, true)
+ 
++/** Whether to store and send cookies. The macos9 fetchers check this
++ * before reading the jar into Cookie: and before forwarding Set-Cookie
++ * into urldb (the jar itself is always wired - fixes367). NetSurf core
++ * has no cookie on/off switch of its own. */
++NSOPTION_BOOL(accept_cookies, true)
++
+ /** Whether to fetch foreground images */
+ NSOPTION_BOOL(foreground_images, true)
+ 
+@@ -153,6 +178,9 @@
+ /** Home page location */
+ NSOPTION_STRING(homepage_url, NULL)
+ 
++/** Custom download folder path (MacSurf-specific) */
++NSOPTION_STRING(download_folder_path, NULL)
++
+ /** search web from url bar */
+ NSOPTION_BOOL(search_url_bar, false)
+ 
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/page-info.c browser/netsurf/desktop/page-info.c
+--- upstream/netsurf/desktop/page-info.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/page-info.c	2026-09-20 23:19:20.760827182 +0100
+@@ -45,92 +45,48 @@
+  * Plot style for heading font.
+  */
+ static plot_font_style_t pi__heading[PAGE_STATE__COUNT] = {
+-	[PAGE_STATE_UNKNOWN] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
+-	[PAGE_STATE_INTERNAL] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
+-	[PAGE_STATE_LOCAL] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
+-	[PAGE_STATE_INSECURE] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
+-	[PAGE_STATE_SECURE_OVERRIDE] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
+-	[PAGE_STATE_SECURE_ISSUES] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
+-	[PAGE_STATE_SECURE] = {
+-		.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-		.size = 14 * PLOT_STYLE_SCALE,
+-		.flags = FONTF_NONE,
+-		.weight = 400,
+-	},
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 },
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 },
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 },
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 },
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 },
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 },
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0 }
+ };
+ 
+ /**
+  * Plot style for domain font.
+  */
+ static plot_font_style_t pi__domain = {
+-	.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-	.size = 8 * PLOT_STYLE_SCALE,
+-	.flags = FONTF_NONE,
+-	.weight = 700,
++	NULL, PLOT_FONT_FAMILY_SANS_SERIF, 8 * PLOT_STYLE_SCALE, 700, FONTF_NONE, 0, 0
+ };
+ 
+ /**
+  * Plot style for item font.
+  */
+ static plot_font_style_t pi__item = {
+-	.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-	.size = 11 * PLOT_STYLE_SCALE,
+-	.flags = FONTF_NONE,
+-	.weight = 400,
++	NULL, PLOT_FONT_FAMILY_SANS_SERIF, 11 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0
+ };
+ 
+ /**
+  * Plot style for item detail font.
+  */
+ static plot_font_style_t pi__item_detail = {
+-	.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-	.size = 11 * PLOT_STYLE_SCALE,
+-	.flags = FONTF_NONE,
+-	.weight = 400,
++	NULL, PLOT_FONT_FAMILY_SANS_SERIF, 11 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0
+ };
+ 
+ /**
+  * Plot style for window background.
+  */
+ static plot_style_t pi__bg = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
++	PLOT_OP_TYPE_NONE, 0, 0, PLOT_OP_TYPE_SOLID, 0, 0, 0
+ };
+ 
+ /**
+  * Plot style for hover background.
+  */
+ static plot_style_t pi__hover = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
++	PLOT_OP_TYPE_NONE, 0, 0, PLOT_OP_TYPE_SOLID, 0, 0, 0
+ };
+ 
+ /**
+@@ -168,19 +124,18 @@
+ };
+ 
+ /**
++ * List of page info entry types.
++ */
++enum page_info_entry_type {
++	PAGE_INFO_ENTRY_TYPE_TEXT,
++	PAGE_INFO_ENTRY_TYPE_ITEM,
++};
++
++/**
+  * An entry on a page info window.
+  */
+ struct page_info_entry {
+-	/**
+-	 * List of page info entry types.
+-	 */
+-	enum page_info_entry_type {
+-		PAGE_INFO_ENTRY_TYPE_TEXT,
+-		PAGE_INFO_ENTRY_TYPE_ITEM,
+-	} type;
+-	/**
+-	 * Type-specific page info entry data.
+-	 */
++	enum page_info_entry_type type;
+ 	union {
+ 		struct page_info_text text;
+ 		struct page_info_item item;
+@@ -189,48 +144,9 @@
+ 
+ /**
+  * The default page info window data.
++ * Non-zero fields and pointer fields are set at runtime in page_info_init().
+  */
+-struct page_info_entry pi__entries[PI_ENTRY__COUNT] = {
+-	[PI_ENTRY_HEADER] = {
+-		.type = PAGE_INFO_ENTRY_TYPE_TEXT,
+-	},
+-	[PI_ENTRY_DOMAIN] = {
+-		.type = PAGE_INFO_ENTRY_TYPE_TEXT,
+-		.u = {
+-			.text = {
+-				.style = &pi__domain,
+-			},
+-		},
+-	},
+-	[PI_ENTRY_CERT] = {
+-		.type = PAGE_INFO_ENTRY_TYPE_ITEM,
+-		.u = {
+-			.item = {
+-				.item = {
+-					.style = &pi__item,
+-				},
+-				.detail = {
+-					.style = &pi__item_detail,
+-				},
+-				.hover_bg = &pi__hover,
+-			},
+-		},
+-	},
+-	[PI_ENTRY_COOKIES] = {
+-		.type = PAGE_INFO_ENTRY_TYPE_ITEM,
+-		.u = {
+-			.item = {
+-				.item = {
+-					.style = &pi__item,
+-				},
+-				.detail = {
+-					.style = &pi__item_detail,
+-				},
+-				.hover_bg = &pi__hover,
+-			},
+-		},
+-	},
+-};
++struct page_info_entry pi__entries[PI_ENTRY__COUNT];
+ 
+ /**
+  * The page info window structure.
+@@ -257,6 +173,18 @@
+ /* Exported interface documented in desktop/page_info.h */
+ nserror page_info_init(void)
+ {
++	pi__entries[PI_ENTRY_HEADER].type = PAGE_INFO_ENTRY_TYPE_TEXT;
++	pi__entries[PI_ENTRY_DOMAIN].type = PAGE_INFO_ENTRY_TYPE_TEXT;
++	pi__entries[PI_ENTRY_DOMAIN].u.text.style = &pi__domain;
++	pi__entries[PI_ENTRY_CERT].type = PAGE_INFO_ENTRY_TYPE_ITEM;
++	pi__entries[PI_ENTRY_CERT].u.item.item.style = &pi__item;
++	pi__entries[PI_ENTRY_CERT].u.item.detail.style = &pi__item_detail;
++	pi__entries[PI_ENTRY_CERT].u.item.hover_bg = &pi__hover;
++	pi__entries[PI_ENTRY_COOKIES].type = PAGE_INFO_ENTRY_TYPE_ITEM;
++	pi__entries[PI_ENTRY_COOKIES].u.item.item.style = &pi__item;
++	pi__entries[PI_ENTRY_COOKIES].u.item.detail.style = &pi__item_detail;
++	pi__entries[PI_ENTRY_COOKIES].u.item.hover_bg = &pi__hover;
++
+ 	pi__bg.fill_colour = nscolours[NSCOLOUR_WIN_EVEN_BG];
+ 	pi__hover.fill_colour = nscolours[NSCOLOUR_WIN_EVEN_BG_HOVER];
+ 
+@@ -331,8 +259,9 @@
+ 		struct page_info *pi)
+ {
+ 	nserror err;
++	unsigned i;
+ 
+-	for (unsigned i = 0; i < PI_ENTRY__COUNT; i++) {
++	for (i = 0; i < PI_ENTRY__COUNT; i++) {
+ 		struct page_info_entry *entry = pi->entries + i;
+ 		int padding;
+ 
+@@ -387,22 +316,22 @@
+ {
+ 	int printed;
+ 	static const char *header[PAGE_STATE__COUNT] = {
+-		[PAGE_STATE_UNKNOWN]         = "Provenance unknown",
+-		[PAGE_STATE_INTERNAL]        = "NetSurf data",
+-		[PAGE_STATE_LOCAL]           = "Local data",
+-		[PAGE_STATE_INSECURE]        = "Connection not secure",
+-		[PAGE_STATE_SECURE_OVERRIDE] = "Connection not secure",
+-		[PAGE_STATE_SECURE_ISSUES]   = "Connection not secure",
+-		[PAGE_STATE_SECURE]          = "Connection is secure",
++		"Provenance unknown",
++		"NetSurf data",
++		"Local data",
++		"Connection not secure",
++		"Connection not secure",
++		"Connection not secure",
++		"Connection is secure"
+ 	};
+ 	static const char *certificate[PAGE_STATE__COUNT] = {
+-		[PAGE_STATE_UNKNOWN]         = "Missing",
+-		[PAGE_STATE_INTERNAL]        = "None",
+-		[PAGE_STATE_LOCAL]           = "None",
+-		[PAGE_STATE_INSECURE]        = "Not valid",
+-		[PAGE_STATE_SECURE_OVERRIDE] = "Not valid",
+-		[PAGE_STATE_SECURE_ISSUES]   = "Not valid",
+-		[PAGE_STATE_SECURE]          = "Valid",
++		"Missing",
++		"None",
++		"None",
++		"Not valid",
++		"Not valid",
++		"Not valid",
++		"Valid"
+ 	};
+ 
+ 	assert(pi != NULL);
+@@ -493,9 +422,10 @@
+ {
+ 	int cur_y = 0;
+ 	int max_x = 0;
++	unsigned i;
+ 
+ 	cur_y += pi->window_padding;
+-	for (unsigned i = 0; i < PI_ENTRY__COUNT; i++) {
++	for (i = 0; i < PI_ENTRY__COUNT; i++) {
+ 		struct page_info_entry *entry = pi->entries + i;
+ 
+ 		if (page_info__hide_entry(i, pi->scheme)) {
+@@ -621,14 +551,14 @@
+ 		const struct redraw_context *ctx)
+ {
+ 	struct redraw_context new_ctx = *ctx;
+-	struct rect r = {
+-		.x0 = clip->x0 + x,
+-		.y0 = clip->y0 + y,
+-		.x1 = clip->x1 + x,
+-		.y1 = clip->y1 + y,
+-	};
++	struct rect r;
+ 	int cur_y = y;
+ 	nserror err;
++	unsigned i;
++	r.x0 = clip->x0 + x;
++	r.y0 = clip->y0 + y;
++	r.x1 = clip->x1 + x;
++	r.y1 = clip->y1 + y;
+ 
+ 	/* Start knockout rendering if it's available for this plotter. */
+ 	if (ctx->plot->option_knockout) {
+@@ -643,7 +573,7 @@
+ 	new_ctx.plot->rectangle(&new_ctx, &pi__bg, &r);
+ 
+ 	cur_y += pi->window_padding;
+-	for (unsigned i = 0; i < PI_ENTRY__COUNT; i++) {
++	for (i = 0; i < PI_ENTRY__COUNT; i++) {
+ 		const struct page_info_entry *entry = pi->entries + i;
+ 		int cur_x = x + pi->window_padding;
+ 
+@@ -755,9 +685,10 @@
+ {
+ 	int cur_y = 0;
+ 	nserror err;
++	unsigned i;
+ 
+ 	cur_y += pi->window_padding;
+-	for (unsigned i = 0; i < PI_ENTRY__COUNT; i++) {
++	for (i = 0; i < PI_ENTRY__COUNT; i++) {
+ 		struct page_info_entry *entry = pi->entries + i;
+ 		bool hovering = false;
+ 		int height;
+@@ -786,12 +717,11 @@
+ 				}
+ 			}
+ 			if (entry->u.item.hover != hovering) {
++				struct rect r;
+ 				int w, h;
+-				struct rect r = {
+-					.x0 = 0,
+-					.y0 = cur_y,
+-					.y1 = cur_y + height,
+-				};
++				r.x0 = 0;
++				r.y0 = cur_y;
++				r.y1 = cur_y + height;
+ 				guit->corewindow->get_dimensions(pi->cw_h, &w, &h);
+ 				r.x1 = (pi->width > w) ? pi->width : w;
+ 
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/plot_style.c browser/netsurf/desktop/plot_style.c
+--- upstream/netsurf/desktop/plot_style.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/plot_style.c	2026-09-20 23:19:20.761135068 +0100
+@@ -26,74 +26,91 @@
+ #include "netsurf/plot_style.h"
+ 
+ static plot_style_t plot_style_fill_white_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = 0xffffff,
++        PLOT_OP_TYPE_NONE, 0, 0,           /* stroke_type, stroke_width, stroke_colour */
++        PLOT_OP_TYPE_SOLID,                 /* fill_type */
++        0xffffff,                           /* fill_colour */
++        0, 0                                /* border_radius, box_shadow */
+ };
+ plot_style_t *plot_style_fill_white = &plot_style_fill_white_static;
+ 
+ static plot_style_t plot_style_fill_black_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = 0x0,
++        PLOT_OP_TYPE_NONE, 0, 0,
++        PLOT_OP_TYPE_SOLID,
++        0x0,
++        0, 0
+ };
+ plot_style_t *plot_style_fill_black = &plot_style_fill_black_static;
+ 
+ static plot_style_t plot_style_fill_red_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = 0x000000ff,
++        PLOT_OP_TYPE_NONE, 0, 0,
++        PLOT_OP_TYPE_SOLID,
++        0x000000ff,
++        0, 0
+ };
+ plot_style_t *plot_style_fill_red = &plot_style_fill_red_static;
+ 
+ /* Box model debug outline styles for content, padding and margin edges */
+ static const plot_style_t plot_style_content_edge_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = 0x00ff0000,
+-	.stroke_width = plot_style_int_to_fixed(1),
++        PLOT_OP_TYPE_SOLID,                 /* stroke_type */
++        plot_style_int_to_fixed(1),         /* stroke_width */
++        0x00ff0000,                         /* stroke_colour */
++        PLOT_OP_TYPE_NONE, 0,               /* fill_type, fill_colour */
++        0, 0
+ };
+ plot_style_t const * const plot_style_content_edge =
+-		&plot_style_content_edge_static;
++                &plot_style_content_edge_static;
+ 
+ static const plot_style_t plot_style_padding_edge_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = 0x000000ff,
+-	.stroke_width = plot_style_int_to_fixed(1),
++        PLOT_OP_TYPE_SOLID,
++        plot_style_int_to_fixed(1),
++        0x000000ff,
++        PLOT_OP_TYPE_NONE, 0,
++        0, 0
+ };
+ plot_style_t const * const plot_style_padding_edge =
+-		&plot_style_padding_edge_static;
++                &plot_style_padding_edge_static;
+ 
+ static const plot_style_t plot_style_margin_edge_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = 0x0000ffff,
+-	.stroke_width = plot_style_int_to_fixed(1),
++        PLOT_OP_TYPE_SOLID,
++        plot_style_int_to_fixed(1),
++        0x0000ffff,
++        PLOT_OP_TYPE_NONE, 0,
++        0, 0
+ };
+ plot_style_t const * const plot_style_margin_edge =
+-		&plot_style_margin_edge_static;
++                &plot_style_margin_edge_static;
+ 
+ /* Broken object replacement styles */
+ static const plot_style_t plot_style_broken_object_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = 0x008888ff,
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = 0x000000ff,
+-	.stroke_width = plot_style_int_to_fixed(1),
++        PLOT_OP_TYPE_SOLID,                 /* stroke_type */
++        plot_style_int_to_fixed(1),         /* stroke_width */
++        0x000000ff,                         /* stroke_colour */
++        PLOT_OP_TYPE_SOLID,                 /* fill_type */
++        0x008888ff,                         /* fill_colour */
++        0, 0
+ };
+ plot_style_t const * const plot_style_broken_object =
+-		&plot_style_broken_object_static;
++                &plot_style_broken_object_static;
+ 
+ static const plot_font_style_t plot_fstyle_broken_object_static = {
+-	.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-	.size = 16 * PLOT_STYLE_SCALE,
+-	.weight = 400,
+-	.flags = FONTF_NONE,
+-	.background = 0x8888ff,
+-	.foreground = 0x000044,
++        NULL,                               /* families */
++        PLOT_FONT_FAMILY_SANS_SERIF,        /* family */
++        16 * PLOT_STYLE_SCALE,              /* size */
++        400,                                /* weight */
++        FONTF_NONE,                         /* flags */
++        0x8888ff,                           /* background */
++        0x000044                            /* foreground */
+ };
+ plot_font_style_t const * const plot_fstyle_broken_object =
+-		&plot_fstyle_broken_object_static;
++                &plot_fstyle_broken_object_static;
+ 
+ /* caret style used in html_redraw_caret */
+ static plot_style_t plot_style_caret_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = 0x0000ff,  /* todo - choose a proper colour */
++        PLOT_OP_TYPE_SOLID,                 /* stroke_type */
++        0,                                  /* stroke_width */
++        0x0000ff,                           /* stroke_colour */
++        PLOT_OP_TYPE_NONE, 0,               /* fill_type, fill_colour */
++        0, 0
+ };
+ plot_style_t *plot_style_caret = &plot_style_caret_static;
+ 
+@@ -103,64 +120,80 @@
+ 
+ /** plot style for filled widget base colour. */
+ static plot_style_t plot_style_fill_wbasec_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = WIDGET_BASEC,
++        PLOT_OP_TYPE_NONE, 0, 0,
++        PLOT_OP_TYPE_SOLID,
++        WIDGET_BASEC,
++        0, 0
+ };
+ plot_style_t *plot_style_fill_wbasec = &plot_style_fill_wbasec_static;
+ 
+ /** plot style for dark filled widget base colour . */
+ static plot_style_t plot_style_fill_darkwbasec_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = double_darken_colour(WIDGET_BASEC),
++        PLOT_OP_TYPE_NONE, 0, 0,
++        PLOT_OP_TYPE_SOLID,
++        double_darken_colour(WIDGET_BASEC),
++        0, 0
+ };
+ plot_style_t *plot_style_fill_darkwbasec = &plot_style_fill_darkwbasec_static;
+ 
+ /** plot style for light filled widget base colour. */
+ static plot_style_t plot_style_fill_lightwbasec_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = double_lighten_colour(WIDGET_BASEC),
++        PLOT_OP_TYPE_NONE, 0, 0,
++        PLOT_OP_TYPE_SOLID,
++        double_lighten_colour(WIDGET_BASEC),
++        0, 0
+ };
+ plot_style_t *plot_style_fill_lightwbasec = &plot_style_fill_lightwbasec_static;
+ 
+ 
+ /** plot style for widget background. */
+ static plot_style_t plot_style_fill_wblobc_static = {
+-	.fill_type = PLOT_OP_TYPE_SOLID,
+-	.fill_colour = WIDGET_BLOBC,
++        PLOT_OP_TYPE_NONE, 0, 0,
++        PLOT_OP_TYPE_SOLID,
++        WIDGET_BLOBC,
++        0, 0
+ };
+ plot_style_t *plot_style_fill_wblobc = &plot_style_fill_wblobc_static;
+ 
+ /** plot style for checkbox cross. */
+ static plot_style_t plot_style_stroke_wblobc_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = WIDGET_BLOBC,
+-	.stroke_width = plot_style_int_to_fixed(2),
++        PLOT_OP_TYPE_SOLID,
++        plot_style_int_to_fixed(2),
++        WIDGET_BLOBC,
++        PLOT_OP_TYPE_NONE, 0,
++        0, 0
+ };
+ plot_style_t *plot_style_stroke_wblobc = &plot_style_stroke_wblobc_static;
+ 
+ /** stroke style for widget double dark colour. */
+ static plot_style_t plot_style_stroke_darkwbasec_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = double_darken_colour(WIDGET_BASEC),
++        PLOT_OP_TYPE_SOLID,
++        0,
++        double_darken_colour(WIDGET_BASEC),
++        PLOT_OP_TYPE_NONE, 0,
++        0, 0
+ };
+ plot_style_t *plot_style_stroke_darkwbasec = &plot_style_stroke_darkwbasec_static;
+ 
+ /** stroke style for widget double light colour. */
+ static plot_style_t plot_style_stroke_lightwbasec_static = {
+-	.stroke_type = PLOT_OP_TYPE_SOLID,
+-	.stroke_colour = double_lighten_colour(WIDGET_BASEC),
++        PLOT_OP_TYPE_SOLID,
++        0,
++        double_lighten_colour(WIDGET_BASEC),
++        PLOT_OP_TYPE_NONE, 0,
++        0, 0
+ };
+ plot_style_t *plot_style_stroke_lightwbasec = &plot_style_stroke_lightwbasec_static;
+ 
+ 
+ /* Generic font style */
+ static const plot_font_style_t plot_style_font_static = {
+-	.family = PLOT_FONT_FAMILY_SANS_SERIF,
+-	.size = 8 * PLOT_STYLE_SCALE,
+-	.weight = 400,
+-	.flags = FONTF_NONE,
+-	.background = 0xffffff,
+-	.foreground = 0x000000,
++        NULL,                               /* families */
++        PLOT_FONT_FAMILY_SANS_SERIF,        /* family */
++        8 * PLOT_STYLE_SCALE,               /* size */
++        400,                                /* weight */
++        FONTF_NONE,                         /* flags */
++        0xffffff,                           /* background */
++        0x000000                            /* foreground */
+ };
+-plot_font_style_t const * const plot_style_font = &plot_style_font_static;
+-
++plot_font_style_t const * const plot_style_font = &plot_style_font_static;
+\ No newline at end of file
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/scrollbar.c browser/netsurf/desktop/scrollbar.c
+--- upstream/netsurf/desktop/scrollbar.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/scrollbar.c	2026-09-20 23:19:20.762950383 +0100
+@@ -28,6 +28,7 @@
+ 
+ #include "utils/log.h"
+ #include "utils/messages.h"
++#include "macsurf_debug_log.h"     /* fixes890 - WORK channel */
+ #include "utils/utils.h"
+ #include "utils/nscolour.h"
+ #include "utils/nsoption.h"
+@@ -89,6 +90,73 @@
+ /*
+  * Exported interface.  Documented in desktop/scrollbar.h
+  */
++/* fixes890 - LIVE-SCROLLBAR REGISTRY.
++ *
++ * Hardware crash, on hover (not click):
++ *   macos9_poll_mouse_hover -> browser_window_mouse_track -> html_mouse_action
++ *   -> get_mouse_action_node -> box_at_point -> scrollbar_get_offset
++ *   -> `return s->offset;` with s = 0xEC7D8381
++ * The debugger showed every field of *s as "Invalid pointer": s is a WILD
++ * pointer, not NULL (so the existing `s == NULL` guard sails past it) and not
++ * a poison fill (so it is not simply freed-and-poisoned memory -- that block
++ * has been reused). box_at_point calls scrollbar_get_offset(box->scroll_x) on
++ * EVERY box containing the pointer, so one box in the live tree is carrying a
++ * stale/garbage scrollbar and every hover over it is fatal.
++ *
++ * WHY A REGISTRY AND NOT A MAGIC FIELD: a magic word inside the struct would
++ * have to be READ through the very pointer we distrust -- `s->magic` faults on
++ * 0xEC7D8381 exactly like `s->offset` does. Validity has to be decided WITHOUT
++ * dereferencing, so membership of a set we control is the only test that works.
++ *
++ * This does not pretend to find the owner of the stale pointer -- it makes the
++ * crash impossible and makes it REPORT ITSELF, which is what the log has never
++ * been able to do. `WORK scrollbar: STALE ...` in a user log names the bad
++ * pointer and proves the use-after-free is real, without taking the machine
++ * down first.
++ *
++ * Cost: a linear scan of at most SB_MAX_LIVE on each call. Scrollbars per page
++ * are a handful; box_at_point touches a few boxes per hover. Negligible, and a
++ * hover that no longer crashes is worth more than the cycles. */
++#define SB_MAX_LIVE 256
++static struct scrollbar *s_sb_live[SB_MAX_LIVE];
++static int s_sb_live_n = 0;
++static unsigned long s_sb_stale_hits = 0;
++
++static void scrollbar_live_add(struct scrollbar *s)
++{
++	if (s_sb_live_n < SB_MAX_LIVE) {
++		s_sb_live[s_sb_live_n++] = s;
++	} else {
++		/* Full: we can no longer vouch for new bars. Report it rather
++		 * than silently degrade to "everything looks stale". */
++		macsurf_debug_log_writef(
++			"WORK scrollbar: live registry FULL (%d) -- validity "
++			"checking is now incomplete for new scrollbars",
++			SB_MAX_LIVE);
++	}
++}
++
++static void scrollbar_live_remove(struct scrollbar *s)
++{
++	int i;
++	for (i = 0; i < s_sb_live_n; i++) {
++		if (s_sb_live[i] == s) {
++			s_sb_live[i] = s_sb_live[--s_sb_live_n];
++			return;
++		}
++	}
++}
++
++/* 1 = this pointer is a scrollbar we created and have not destroyed. */
++static int scrollbar_is_live(struct scrollbar *s)
++{
++	int i;
++	for (i = 0; i < s_sb_live_n; i++) {
++		if (s_sb_live[i] == s) return 1;
++	}
++	return 0;
++}
++
+ nserror
+ scrollbar_create(bool horizontal,
+ 		 int length,
+@@ -106,6 +174,7 @@
+ 		*s = NULL;
+ 		return NSERROR_NOMEM;
+ 	}
++	scrollbar_live_add(scrollbar);   /* fixes890 */
+ 
+ 	scrollbar->horizontal = horizontal;
+ 	scrollbar->length = length;
+@@ -137,6 +206,30 @@
+  */
+ void scrollbar_destroy(struct scrollbar *s)
+ {
++	/* fixes499f - NULL guard. scrollbar_destroy must be a no-op on a NULL
++	 * scrollbar: it is reached during content teardown
++	 * (content_remove_user -> scrollbar_destroy) where a box's scrollbar
++	 * pointer can legitimately be NULL (never created) or already freed by
++	 * a prior teardown pass. Without this, `s->pair` dereferences NULL and
++	 * the `s->pair->pair = NULL` store writes through a near-NULL address.
++	 * Crash signature: unmapped-memory exception, stw r0,0(r5) with r5~0,
++	 * stack scrollbar_destroy <- content_remove_user <-
++	 * hlcache_handle_release <- html_script_free <- ... <- hlcache_clean. */
++	if (s == NULL) {
++		return;
++	}
++	/* fixes890 - refuse to destroy a pointer we never handed out (or already
++	 * destroyed). Same reasoning as scrollbar_get_offset: `s->pair` below is
++	 * a dereference, and on a stale pointer it is the crash, not a diagnosis. */
++	if (!scrollbar_is_live(s)) {
++		s_sb_stale_hits++;
++		macsurf_debug_log_writef(
++			"WORK scrollbar: STALE destroy s=%p -- not a live scrollbar "
++			"(double-destroy or wild pointer); ignoring, hits=%ld",
++			(void *) s, (long) s_sb_stale_hits);
++		return;
++	}
++	scrollbar_live_remove(s);
+ 	if (s->pair != NULL) {
+ 		s->pair->pair = NULL;
+ 	}
+@@ -630,6 +723,29 @@
+ 	if (s == NULL) {
+ 		return 0;
+ 	}
++	/* fixes890 - THE HARDWARE CRASH SITE.
++	 *
++	 *   box_at_point -> scrollbar_get_offset -> `return s->offset;`
++	 *   with s = 0xEC7D8381 (every field "Invalid pointer" in the debugger)
++	 *
++	 * The NULL guard above passes a wild pointer straight through to the
++	 * dereference. box_at_point calls this for box->scroll_x AND box->scroll_y
++	 * on every box under the cursor, so a single box carrying a stale
++	 * scrollbar makes every hover over it fatal -- no click required, which is
++	 * why this fires from macos9_poll_mouse_hover.
++	 *
++	 * Returning 0 for an unknown pointer is exactly what the NULL case already
++	 * does, and 0 is the right answer for "no scroll offset". The page loses a
++	 * scroll adjustment on one box; it does not lose the machine. */
++	if (!scrollbar_is_live(s)) {
++		s_sb_stale_hits++;
++		macsurf_debug_log_writef(
++			"WORK scrollbar: STALE get_offset s=%p -- box_at_point is "
++			"holding a scrollbar that was never created or is already "
++			"freed (THE hover crash); returning 0, hits=%ld",
++			(void *) s, (long) s_sb_stale_hits);
++		return 0;
++	}
+ 	return s->offset;
+ }
+ 
+@@ -1003,5 +1119,21 @@
+  */
+ void *scrollbar_get_data(struct scrollbar *s)
+ {
++	/* fixes890 - box_talloc_destructor calls this on box->scroll_x and then
++	 * free()s the result. On a stale pointer that is a read of freed memory
++	 * followed by free() of whatever garbage came back -- a wild free, which
++	 * corrupts the heap and surfaces later as the allocator blowup seen in
++	 * the teardown trace (_dom_element_finalise). NULL is safe: free(NULL) is
++	 * a no-op. */
++	if (s == NULL || !scrollbar_is_live(s)) {
++		if (s != NULL) {
++			s_sb_stale_hits++;
++			macsurf_debug_log_writef(
++				"WORK scrollbar: STALE get_data s=%p -- caller would have "
++				"free()d a garbage client_data; returning NULL, hits=%ld",
++				(void *) s, (long) s_sb_stale_hits);
++		}
++		return NULL;
++	}
+ 	return s->client_data;
+ }
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/desktop/textarea.c browser/netsurf/desktop/textarea.c
+--- upstream/netsurf/desktop/textarea.c	2026-09-20 23:29:00.081705787 +0100
++++ browser/netsurf/desktop/textarea.c	2026-09-20 23:19:20.764701981 +0100
+@@ -913,6 +913,14 @@
+  * \param r		Modified/reduced to area where redraw is required
+  * \return true on success false otherwise
+  */
++#ifdef __MACOS9__
++/* fixes758 (#212) - DIAGNOSTIC ONLY: per-reflow timing + scope, to find why
++ * typing in a big multiline textarea crawls. Externs kept local so no Mac
++ * headers leak into core textarea.c. Remove with the log lines once diagnosed. */
++extern void macsurf_debug_log_writef(const char *fmt, ...);
++extern void Microseconds(UnsignedWide *microTickCount);
++#endif
++
+ static bool textarea_reflow_multiline(struct textarea *ta,
+ 		const size_t b_start, const int b_length, struct rect *r)
+ {
+@@ -930,6 +938,10 @@
+ 	int v_extent; /* vertical extent */
+ 	bool restart = false;
+ 	bool skip_line = false;
++#ifdef __MACOS9__
++	UnsignedWide _rt0, _rt1; int _restart_n = 0; unsigned int _start0 = 0;
++	Microseconds(&_rt0);
++#endif
+ 
+ 	assert(ta->flags & TEXTAREA_MULTILINE);
+ 
+@@ -962,6 +974,9 @@
+ 
+ 	/* Record original end pos of start line */
+ 	b_start_line_end = ta->lines[start].b_start + ta->lines[start].b_length;
++#ifdef __MACOS9__
++	_start0 = start;
++#endif
+ 
+ 	/* During layout we may decide we need to restart again from the
+ 	 * textarea's first line. */
+@@ -1132,6 +1147,9 @@
+ 						ta->bar_y);
+ 			ta->pad_right += SCROLLBAR_WIDTH;
+ 			restart = true;
++#ifdef __MACOS9__
++			_restart_n++;
++#endif
+ 
+ 		} else if (line <= scroll_lines && ta->bar_y != NULL) {
+ 			/* Remove vertical scrollbar */
+@@ -1139,6 +1157,9 @@
+ 			ta->bar_y = NULL;
+ 			ta->pad_right -= SCROLLBAR_WIDTH;
+ 			restart = true;
++#ifdef __MACOS9__
++			_restart_n++;
++#endif
+ 		}
+ 	} while (restart);
+ 
+@@ -1166,6 +1187,13 @@
+ 	ta->h_extent = h_extent;
+ 	ta->v_extent = v_extent;
+ 	ta->line_count = line;
++#ifdef __MACOS9__
++	Microseconds(&_rt1);
++	macsurf_debug_log_writef(
++		"RECON TAref len=%ld start=%ld lines=%ld restart=%d dt=%ldus",
++		(long)ta->text.len, (long)_start0, (long)line, _restart_n,
++		(long)(_rt1.lo - _rt0.lo));
++#endif
+ 
+ 	/* Update start line end byte pos, if it's increased */
+ 	if (ta->lines[start].b_start + ta->lines[start].b_length >
+@@ -2460,8 +2488,8 @@
+ 	int x, y;
+ 	bool redraw = false;
+ 	bool readonly;
+-	bool bar_x = ta->bar_x;
+-	bool bar_y = ta->bar_y;
++	bool bar_x = (ta->bar_x != NULL);
++	bool bar_y = (ta->bar_y != NULL);
+ 
+ 	/* Word separators */
+ 	static const char *sep = " .\n";
+@@ -2503,7 +2531,11 @@
+ 						NULL, 0, true, &byte_delta, &r))
+ 					return false;
+ 			}
+-			break;
++			/* fixes749 (#217): copy doesn't move the caret or change
++			 * text - return before the common textarea_set_caret_internal
++			 * tail, which would scroll the view to the (possibly
++			 * off-screen) caret. Mirrors NS_KEY_SELECT_ALL above. */
++			return true;
+ 		case NS_KEY_DELETE_LEFT:
+ 			if (readonly)
+ 				break;

@@ -12,7 +12,7 @@ DRY=""
 [ "$1" = "--dry-run" ] && DRY="--dry-run"
 
 ok=0; bad=0
-for lib in libwapcaplet libparserutils libhubbub libcss libdom; do
+for lib in libwapcaplet libparserutils libhubbub libcss libdom netsurf; do
 	dir="$ROOT/patches/$lib"
 	[ -d "$dir" ] || continue
 	tree="$WORK/upstream/$lib"

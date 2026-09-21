@@ -1,0 +1,189 @@
+# netsurf: css-handler [fixes130]
+# 1 files, 119 changed lines
+# MacSurf fix ids: fixes130
+#
+# Regenerate: tools/regen-patches.sh && tools/split-patches.py
+#
+diff -urN -x .git -x 'build-*' -x test -x frontends -x '*.o' -x '*.a' -x '*.d' -x '*.pc' -x build upstream/netsurf/content/handlers/css/select.c browser/netsurf/content/handlers/css/select.c
+--- upstream/netsurf/content/handlers/css/select.c	2026-09-20 23:29:00.054291976 +0100
++++ browser/netsurf/content/handlers/css/select.c	2026-09-20 23:19:20.734077081 +0100
+@@ -31,6 +31,12 @@
+ #include "css/internal.h"
+ #include "css/hints.h"
+ #include "css/select.h"
++#include "dom/html/html_input_element.h"
++#include "dom/html/html_button_element.h"
++#include "dom/html/html_select_element.h"
++#include "dom/html/html_text_area_element.h"
++#include "dom/html/html_option_element.h"
++#include "dom/html/html_opt_group_element.h"
+ 
+ static css_error node_name(void *pw, void *node, css_qname *qname);
+ static css_error node_classes(void *pw, void *node,
+@@ -1537,12 +1543,43 @@
+  *
+  * \post \a match will contain true if the node matches and false otherwise.
+  */
++/* fixes130: shared helper for :hover/:active/:focus.
++ * Returns true if `node` is `target` or any of its ancestors,
++ * so that `.parent:hover .child` matches when child is the deepest
++ * hit (CSS spec: :hover applies to the element and all ancestors).
++ *
++ * The starting `node` is a borrowed reference. Each parent fetched
++ * via dom_node_get_parent_node is refed by libdom; we unref it
++ * after we either match or step to its parent. */
++static bool dyn_node_matches(dom_node *node, dom_node *target)
++{
++	dom_node *cursor = node;
++	bool own_cursor = false;
++	while (cursor != NULL) {
++		dom_node *parent = NULL;
++		if (cursor == target) {
++			if (own_cursor) dom_node_unref(cursor);
++			return true;
++		}
++		if (dom_node_get_parent_node(cursor, &parent) != DOM_NO_ERR) {
++			if (own_cursor) dom_node_unref(cursor);
++			return false;
++		}
++		if (own_cursor) dom_node_unref(cursor);
++		cursor = parent;
++		own_cursor = (parent != NULL);
++	}
++	return false;
++}
++
+ css_error node_is_hover(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support hovering */
+-
++	nscss_select_ctx *ctx = (nscss_select_ctx *)pw;
+ 	*match = false;
+-
++	if (ctx == NULL || ctx->dyn_hover_node == NULL || node == NULL)
++		return CSS_OK;
++	*match = dyn_node_matches((dom_node *)node,
++			(dom_node *)ctx->dyn_hover_node);
+ 	return CSS_OK;
+ }
+ 
+@@ -1558,10 +1595,13 @@
+  */
+ css_error node_is_active(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support active nodes */
+-
++	/* fixes130: mirror of node_is_hover for :active. */
++	nscss_select_ctx *ctx = (nscss_select_ctx *)pw;
+ 	*match = false;
+-
++	if (ctx == NULL || ctx->dyn_active_node == NULL || node == NULL)
++		return CSS_OK;
++	*match = dyn_node_matches((dom_node *)node,
++			(dom_node *)ctx->dyn_active_node);
+ 	return CSS_OK;
+ }
+ 
+@@ -1577,10 +1617,13 @@
+  */
+ css_error node_is_focus(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support focussed nodes */
+-
++	/* fixes130: mirror of node_is_hover for :focus. */
++	nscss_select_ctx *ctx = (nscss_select_ctx *)pw;
+ 	*match = false;
+-
++	if (ctx == NULL || ctx->dyn_focus_node == NULL || node == NULL)
++		return CSS_OK;
++	*match = dyn_node_matches((dom_node *)node,
++			(dom_node *)ctx->dyn_focus_node);
+ 	return CSS_OK;
+ }
+ 
+@@ -1596,10 +1639,42 @@
+  */
+ css_error node_is_enabled(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support enabled nodes */
++	bool disabled = false;
++	dom_node *n = node;
++	dom_string *s = NULL;
++	dom_exception exc;
+ 
+ 	*match = false;
+ 
++	exc = dom_node_get_node_name(n, &s);
++	if (exc != DOM_NO_ERR || s == NULL)
++		return CSS_OK;
++
++	if (dom_string_caseless_lwc_isequal(s, corestring_lwc_input)) {
++		dom_html_input_element_get_disabled((dom_html_input_element *)n, &disabled);
++		*match = !disabled;
++	} else if (dom_string_caseless_lwc_isequal(s, corestring_lwc_button)) {
++		dom_html_button_element_get_disabled((dom_html_button_element *)n, &disabled);
++		*match = !disabled;
++	} else if (dom_string_caseless_lwc_isequal(s, corestring_lwc_select)) {
++		dom_html_select_element_get_disabled((dom_html_select_element *)n, &disabled);
++		*match = !disabled;
++	} else if (dom_string_caseless_lwc_isequal(s, corestring_lwc_textarea)) {
++		dom_html_text_area_element_get_disabled((dom_html_text_area_element *)n, &disabled);
++		*match = !disabled;
++	} else if (dom_string_caseless_lwc_isequal(s, corestring_lwc_option)) {
++		dom_html_option_element_get_disabled((dom_html_option_element *)n, &disabled);
++		*match = !disabled;
++	} else if (dom_string_caseless_lwc_isequal(s, corestring_lwc_optgroup)) {
++		dom_html_opt_group_element_get_disabled((dom_html_opt_group_element *)n, &disabled);
++		*match = !disabled;
++	} else {
++		/* Non-form elements are always enabled */
++		*match = true;
++	}
++
++	dom_string_unref(s);
++
+ 	return CSS_OK;
+ }
+ 
+@@ -1615,9 +1690,13 @@
+  */
+ css_error node_is_disabled(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support disabled nodes */
++	css_error error;
+ 
+-	*match = false;
++	error = node_is_enabled(pw, node, match);
++	if (error != CSS_OK)
++		return error;
++
++	*match = !*match;
+ 
+ 	return CSS_OK;
+ }
+@@ -1634,10 +1713,24 @@
+  */
+ css_error node_is_checked(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support checked nodes */
++	dom_node *n = node;
++	dom_string *s = NULL;
++	dom_exception exc;
+ 
+ 	*match = false;
+ 
++	exc = dom_node_get_node_name(n, &s);
++	if (exc != DOM_NO_ERR || s == NULL)
++		return CSS_OK;
++
++	if (dom_string_caseless_lwc_isequal(s, corestring_lwc_input)) {
++		dom_html_input_element_get_checked((dom_html_input_element *)n, match);
++	} else if (dom_string_caseless_lwc_isequal(s, corestring_lwc_option)) {
++		dom_html_option_element_get_selected((dom_html_option_element *)n, match);
++	}
++
++	dom_string_unref(s);
++
+ 	return CSS_OK;
+ }
+ 
