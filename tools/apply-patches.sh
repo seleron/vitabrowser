@@ -12,6 +12,22 @@ DRY=""
 [ "$1" = "--dry-run" ] && DRY="--dry-run"
 
 ok=0; bad=0
+# Apply one patch: prefer git apply (exact, reliable offset search), fall
+# back to GNU patch (needed for --forward "already applied" skip semantics).
+# GNU patch fails on some git-generated offsets (e.g. "succeeded at 1306
+# (offset 1 line)" that git apply finds fine) — observed 2026-09-21 on
+# netsurf/04 hunk #3 and libwapcaplet/02 hunk #3.
+apply_patch() {
+	# $1=tree  $2=strip  $3=patchfile
+	if git -C "$1" apply ${DRY:+--check} "$2" "$3" 2>/dev/null; then
+		return 0
+	fi
+	if patch $DRY "$2" -d "$1" --forward --no-backup-if-mismatch \
+	         -i "$3" 2>&1; then
+		return 0
+	fi
+	return 1
+}
 for lib in libwapcaplet libparserutils libhubbub libcss libdom netsurf; do
 	dir="$ROOT/patches/$lib"
 	[ -d "$dir" ] || continue
@@ -21,8 +37,7 @@ for lib in libwapcaplet libparserutils libhubbub libcss libdom netsurf; do
 		[ -f "$p" ] || continue
 		name="$lib/$(basename "$p")"
 		# -p2 strips the leading "upstream/<lib>/" that regen-patches.sh emits
-		if patch $DRY -p2 -d "$tree" --forward --no-backup-if-mismatch \
-		         -i "$p" > /tmp/patchlog.$$ 2>&1; then
+		if apply_patch "$tree" -p2 "$p" > /tmp/patchlog.$$ 2>&1; then
 			ok=$((ok + 1))
 		else
 			bad=$((bad + 1))
@@ -58,8 +73,7 @@ for p in "$ROOT"/patches/vitabrowser/*.patch; do
 	lib=$(echo "$base" | cut -d- -f2)
 	tree="$WORK/upstream/$lib"
 	[ -d "$tree" ] || { echo "SKIP $base (no $lib tree)"; continue; }
-	if patch $DRY -p1 -d "$tree" --forward --no-backup-if-mismatch \
-	         -i "$p" > /tmp/patchlog.$$ 2>&1; then
+	if apply_patch "$tree" -p1 "$p" > /tmp/patchlog.$$ 2>&1; then
 		ok=$((ok + 1))
 	else
 		bad=$((bad + 1))

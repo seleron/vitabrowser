@@ -1,0 +1,82 @@
+# vitabrowser: hand-port fixes to MacSurf's core (cache + build defects)
+#
+# Hand-maintained patch (like 15-netsurf-redraw-c.patch). These are NOT
+# generated: the files are part of the generated MacSurf stack, and the
+# fixes correct defects in that generated content. If a generated patch
+# ever rewrites a hunk's context, re-apply by hand.
+#
+# Defects, all found on first clean Linux build (2026-09-21):
+#
+# llcache.c: macsurf_debug_log_writef is called before any nested-extern
+#   declaration, so it needs a file-scope extern. (MacSurf's BAD_INPUT ->
+#   BAD_PARAMETER renames and the removal of its local nsu_base64 bodies --
+#   which would duplicate libnsutils's base64.c at link -- are already carried
+#   by the generated MacSurf-vs-upstream stack; adding them here would make
+#   this patch's hunks redundant on the clean path and fail it.)
+# hlcache.c: two entry_handle initializers predate the 4th struct field
+#   (bool dr_queued); C zero-fills it, -Werror does not.
+# utils/file.c: MAC_DIR is a CodeWarrior frontend-shim alias (shims/dirent.h)
+#   for DIR *; on Linux use the native DIR.
+# desktop/netsurf.c: MacSurf's memset call has no #include <string.h>
+#   (CodeWarrior's libc pulled it in implicitly).
+#
+# Generated: diff -u of the post-stack base files against these exact edits.
+# Applies to: netsurf (after the generated stack)
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -60,6 +60,11 @@
+ 
+ extern int macsurf_ptr_is_heap(const void *);
+ 
++/* MacSurf's llcache base64 helpers call the hardware-trace log writer
++ * before any nested-extern declaration; declared at file scope because
++ * -Werror=implicit-function-declaration rejects the implicit one. */
++extern void macsurf_debug_log_writef(const char *fmt, ...);
++
+ /* fixes518: an llcache_object pointer is "wild" if NULL or outside the
+  * malloc heap range used on this target (legitimate objects live in
+  * 0x01000000–0x20000000, same range hlcache validates its handles/entries
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -383,7 +383,7 @@
+ 
+ 	/* Search list of cached contents for a suitable one */
+ 	for (entry = hlcache->content_list; entry != NULL; entry = entry->next) {
+-		hlcache_handle entry_handle = { entry, NULL, NULL };
++		hlcache_handle entry_handle = { entry, NULL, NULL, false };
+ 		const llcache_handle *entry_llcache;
+ 
+ 		if (entry->content == NULL)
+@@ -847,7 +847,7 @@
+ 
+ 	nslog_log(__FILE__, "", __LINE__, "%"PRIu32" contents remaining:", num_contents);
+ 	for (entry = hlcache->content_list; entry != NULL; entry = entry->next) {
+-		hlcache_handle entry_handle = { entry, NULL, NULL };
++		hlcache_handle entry_handle = { entry, NULL, NULL, false };
+ 
+ 		if (entry->content != NULL) {
+ 			nslog_log(__FILE__, "", __LINE__,
+--- a/utils/file.c
++++ b/utils/file.c
+@@ -320,7 +320,10 @@
+ nserror
+ netsurf_recursive_rm(const char *path)
+ {
+-	MAC_DIR *parent;
++	/* MAC_DIR is a CodeWarrior frontend-shim alias for DIR * (shims/dirent.h,
++	 * frontends/macos9/), which we do not port; utils/dirent.h includes
++	 * <dirent.h>, so DIR is the native type here. */
++	DIR *parent;
+ 	struct dirent *entry;
+ 	nserror ret = NSERROR_OK;
+ 	struct stat ent_stat; /* stat result of leaf entry */
+--- a/desktop/netsurf.c
++++ b/desktop/netsurf.c
+@@ -23,6 +23,7 @@
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <libwapcaplet/libwapcaplet.h>
+ #include <dom/dom.h>
+ 

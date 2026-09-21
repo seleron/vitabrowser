@@ -77,9 +77,83 @@ def count_elements(body):
     return n + (1 if seen else 0)
 
 
+def top_level_pieces(body):
+    """Split an initializer body into top-level comma-separated pieces
+    (depth 0, ignoring string/char literals). Trailing empties dropped."""
+    pieces, cur = [], []
+    depth = 0
+    in_s = in_c = False
+    for ch in re.sub(r'/\*.*?\*/', '', body, flags=re.S):
+        if in_s:
+            cur.append(ch)
+            if ch == '"':
+                in_s = False
+            continue
+        if in_c:
+            cur.append(ch)
+            if ch == "'":
+                in_c = False
+            continue
+        if ch == '"':
+            in_s = True
+        elif ch == "'":
+            in_c = True
+        elif ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            pieces.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    pieces.append(''.join(cur))
+    while pieces and not pieces[-1].strip():
+        pieces.pop()
+    return pieces
+
+
+def pad_initializer_body(body, fields):
+    """Pad one initializer body (or an array of them) so every element has
+    len(fields) fields. A body made of braced elements is an ARRAY: pad each
+    element individually. Appending one pad after the whole array (the old
+    behaviour) produced a 16-field first element and 9-field overflows on the
+    rest -- page-info.c's info_styles hit exactly that.
+
+    Only the single-initializer case preserves the original line layout;
+    arrays are rebuilt (their layout was a one-per-line grid anyway)."""
+    pieces = top_level_pieces(body)
+    braced = [p for p in pieces if p.strip().startswith('{')
+              and p.strip().endswith('}')]
+    # Single initializer (multi-line bare values, or braced on one line):
+    # keep the original text, append the missing fields after the last line.
+    # An ARRAY is a body whose top-level pieces are braced elements.
+    if not braced:
+        return body, 'single'
+    out = []
+    for p in pieces:
+        s = p.strip()
+        if not s:
+            continue
+        if s.startswith('{') and s.endswith('}'):
+            inner = top_level_pieces(s[1:-1])
+            k = len(inner)
+            pad_n = len(fields) - k
+            if pad_n < 0:
+                return p, 'skip'  # already full/over: leave as-is
+            extra = ', '.join(f'0   /* {f} */' for f in fields[k:])
+            core = s[:-1].rstrip()
+            if not core.endswith(','):
+                core += ','
+            out.append(core + ' ' + extra + ' }')
+        else:
+            out.append(s)
+    return ', '.join(out) if out else body, 'array'
+
+
 def pad(text, fields_by_type):
     lines = text.splitlines(keepends=True)
-    decl = re.compile(r'\b(' + '|'.join(TYPES) + r')\b[^=;]*=\s*\{')
+    decl = re.compile(r'\b(' + '|'.join(TYPES) + r')\b[^=;]*(?:/\*[^*]*\*/\s*)*=\s*\{')
     out, i, n = [], 0, 0
     while i < len(lines):
         m = decl.search(lines[i])
@@ -96,8 +170,12 @@ def pad(text, fields_by_type):
             body.append(lines[j])
             j += 1
         joined = ''.join(body)
-        have = count_elements(joined)
-        if re.search(r'^\s*\.\w+\s*=', joined, re.M) or have >= len(fields):
+        if re.search(r'^\s*\.\w+\s*=', joined, re.M):
+            out.extend(body)
+            out.append(lines[j])
+            i = j + 1
+            continue
+        if all(count_elements(p) >= len(fields) for p in top_level_pieces(joined)):
             out.extend(body)
             out.append(lines[j])
             i = j + 1
@@ -106,12 +184,19 @@ def pad(text, fields_by_type):
         while k >= 0 and not body[k].strip():
             k -= 1
         indent = re.match(r'\s*', body[k]).group(0) or '\t'
-        body[k] = body[k].rstrip('\n').rstrip() + ',\n'
-        missing = fields[have:]
-        for idx, f in enumerate(missing):
-            sep = ',' if idx < len(missing) - 1 else ''
-            body.append(f'{indent}0{sep}   /* {f} */\n')
-        out.extend(body)
+        padded, kind = pad_initializer_body(joined, fields)
+        if kind == 'single':
+            body[k] = body[k].rstrip('\n').rstrip() + ',\n'
+            have = count_elements(joined)
+            missing = fields[have:]
+            for idx, f in enumerate(missing):
+                sep = ',' if idx < len(missing) - 1 else ''
+                body.append(f'{indent}0{sep}   /* {f} */\n')
+            out.extend(body)
+        else:
+            # Array: replace the whole body (all element lines) with the
+            # rebuilt one-line array; keeping the originals duplicates them.
+            out.extend([indent + padded + '\n'])
         out.append(lines[j])
         n += 1
         i = j + 1

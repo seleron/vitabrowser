@@ -93,6 +93,16 @@ void browser_window_set_status(struct browser_window *bw, const char *text);
 nserror macos9_schedule(int t, void (*callback)(void *p), void *p);
 extern struct gui_window *macos9_paint_gw;
 
+/* Frontend tracing hooks called from the core (browser_window.c) before the
+ * caller's nested extern comes into view, so they need a file-scope
+ * declaration here. Definitions: macsurf_debug_log_writef in
+ * macsurf_compat.c (weak, trace-gated); the two profile stubs there too.
+ * MacSurf's own no-op fallbacks for the profile functions are identical, so
+ * the stubs are a faithful stand-in. */
+void macsurf_debug_log_writef(const char *fmt, ...);
+void macsurf_profile_emit_phases(const char *url);
+void macsurf_profile_nav_begin(void);
+
 /* ---- prototypes MacSurf genuinely omitted -------------------------------
  *
  * Defined in the netsurf files we port, with no declaration anywhere. Note

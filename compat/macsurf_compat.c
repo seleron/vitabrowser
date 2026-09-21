@@ -227,3 +227,20 @@ void js_set_current_script(struct jsthread *thread, struct dom_node *node)
 {
 	(void) thread; (void) node;
 }
+
+/*
+ * Navigation phase profiler, defined in frontends/macos9/macsurf_debug_log.c
+ * (the frontend we do not port). MacSurf ships a no-op fallback for exactly
+ * the build without the real profiler, so these stubs are faithful. The Vita
+ * frontend will supply real ones if profiling the engine proves useful.
+ */
+__attribute__((weak))
+void macsurf_profile_emit_phases(const char *url)
+{
+	(void) url;
+}
+
+__attribute__((weak))
+void macsurf_profile_nav_begin(void)
+{
+}

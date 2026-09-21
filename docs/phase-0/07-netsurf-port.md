@@ -2,7 +2,9 @@
 
 **Date:** 2026-09-21
 **Covers:** `06-engine-comparison.md` §7 item 1 — the netsurf-side port
-**Status:** stack extended to `browser/netsurf`; **89 patches, all applying**.
+**Status:** stack extended to `browser/netsurf`; **104 patches applying**;
+engine **links and runs** — `nsmonkey` builds clean
+(see `08-patched-build.md`).
 Build status in §5.
 
 > **Why this task existed:** `06-engine-comparison.md` §3 found that patching

@@ -52,6 +52,10 @@ rm -rf "$WORK/applytest/upstream"
 mkdir -p "$WORK/applytest/upstream"
 for l in $LIBS netsurf; do
 	cp -r "$WORK/upstream/$l" "$WORK/applytest/upstream/$l"
+	# The work upstream trees carry local convenience edits (e.g. monkey window
+	# size in netsurf). git apply (used by apply-patches.sh) refuses to patch
+	# files that differ from HEAD, so reset each staged copy to pristine HEAD.
+	git -C "$WORK/applytest/upstream/$l" checkout -- .
 done
 ( cd "$WORK/applytest/upstream/netsurf" && rm -f nsmonkey && \
   make clean TARGET=monkey >/dev/null 2>&1 || true )
@@ -83,7 +87,7 @@ done
 echo "== building netsurf + nsmonkey =="
 export PREFIX="$P"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
--include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls"
+-include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
 ( cd "$WORK/applytest/upstream/netsurf" && \
   make TARGET=monkey -j4 > "$WORK/applytest/build-netsurf.log" 2>&1 ) \
   && echo "  netsurf ok" \

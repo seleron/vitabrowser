@@ -1,0 +1,291 @@
+# vitabrowser: Phase-0 link stubs for the discarded frontend + unported core files
+#
+# Hand-maintained patch (like 15-netsurf-redraw-c.patch).
+#
+# The MacSurf patch stack compiles engine code that calls into (a) the Mac OS 9
+# frontend we deliberately did not port, and (b) five core files MacSurf builds
+# via its CodeWarrior project but our Makefiles do not: layout_grid.c (CSS
+# grid), html_css.c (external <link> CSS), cssh_select.c (select reset),
+# html_font.c (font baseline), macsurf_dom_compat.c (DOM tag type).
+#
+# Phase-0 decision (2026-09-21): stub all 37 resulting link symbols rather
+# than port the five files -- each is entangled with the discarded atari/amiga/
+# macOS9 frontend (dead includes, frontend symbols, one real indentation bug)
+# and a full port is Phase-1 work. Known functional gaps until then: CSS grid
+# layout, external stylesheets, select reset, font baseline tuning, DOM tag
+# type query.
+#
+# Changes:
+#   content/handlers/html/Makefile
+#       + macsurf_frontend_stubs.c
+#   content/handlers/html/macsurf_frontend_stubs.c  (new)
+#       7 symbols implemented for real (libcss lexer hex/digit helpers,
+#       wapcaplet/libnsutils error mapping, lwc_string_caseless_hash_value --
+#       without the hash CSS selectors never match); the rest are weak no-ops
+#       (instrumentation, diagnostics, animation, gradients, JS profiling) so
+#       a future Vita frontend can override them.
+#
+# Applies to: netsurf (after the generated stack)
+--- a/content/handlers/html/Makefile	2026-09-20 23:29:00.054291976 +0100
++++ b/content/handlers/html/Makefile	2026-09-21 22:40:05.157265687 +0100
+@@ -22,4 +22,5 @@
+ 	redraw_border.c		\
+ 	script.c		\
+ 	table.c			\
+-	textselection.c
++	textselection.c		\
++	macsurf_frontend_stubs.c
+--- /dev/null	2026-09-19 12:51:45.348197100 +0100
++++ b/content/handlers/html/macsurf_frontend_stubs.c	2026-09-21 22:44:33.833822800 +0100
+@@ -0,0 +1,251 @@
++/*
++ * macsurf_frontend_stubs.c -- vitabrowser
++ *
++ * Weak stubs for MacSurf symbols defined in frontends/macos9/ (the Mac OS 9
++ * frontend this port does not compile). The generated MacSurf patch stack
++ * leaves their call sites in the netsurf core; CodeWarrior on Mac OS 9
++ * resolved them from the frontend, so they are simply absent here.
++ *
++ * Categories:
++ *   REAL (pure logic, no frontend dependency -- implemented faithfully):
++ *     isDigit / isHex / charToHex          libcss lexer helpers
++ *     css_error_from_lwc_error             libcss error mapping
++ *     css_error_from_parserutils_error
++ *     lwc_string_caseless_hash_value       CRITICAL: must equal the hash of
++ *                                          the caseless intern, or libcss's
++ *                                          selector hash returns nothing and
++ *                                          no author CSS ever matches
++ *   FUNCTIONAL-NOOP (safe: they only gate/measure, the page still renders):
++ *     layout_grid, html_css_discover_stylesheets, nscss_reset_node_data,
++ *     font_plot_style_baseline, macsurf_html_element_get_tag_type,
++ *     macos9_content_is_live, js_exec_module, macsurf_js_notify_content_freed,
++ *     macos9_hittest_scroll_x/y
++ *   INSTRUMENTATION-NOOP (Mac OS 9 diagnostics/tracing/animation/JS-profiling):
++ *     macsurf_profile_*, macsurf_diag_*, ms_diag_*, macsurf_gap_*,
++ *     macsurf_qjs_*, macos9_animation_*, macos9_grad_*_count,
++ *     macsurf_free_mem, macsurf_ptr_is_valid, macsurf_debug_log_reconv_flush,
++ *     macos9_deathrow_cur_ptr/fn
++ *
++ * Known functional gaps (documented in docs/phase-0/08): CSS grid, external
++ * <link> stylesheets, font-baseline tuning, inline ES modules.
++ *
++ * Compiled into content/handlers/html/ (has the libcss/libdom/libwapcaplet
++ * include paths). Weak, so a real implementation (the Vita frontend) can
++ * replace any of these without touching this file.
++ */
++#include <stddef.h>
++#include <string.h>
++#include <libcss/properties.h>
++#include <libwapcaplet/libwapcaplet.h>
++#include <dom/dom.h>
++#include <dom/html/html_element.h>
++
++/* Pointer-only parameters; full definitions live in layout.h / content.h
++ * which the stubs must not drag in (frontend-entangled includes). */
++struct box;
++struct content;
++
++/* ============================ REAL implementations ======================= */
++
++int isDigit(unsigned char c) { return c >= '0' && c <= '9'; }
++
++int isHex(unsigned char c)
++{
++	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
++	       (c >= 'A' && c <= 'F');
++}
++
++unsigned long charToHex(unsigned char c)
++{
++	if (c >= '0' && c <= '9') return c - '0';
++	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++	return 0;
++}
++
++/* css_error: 0=CSS_OK 1=CSS_NOMEM 2=CSS_BADPARM 3=CSS_INVALID
++ * lwc_error: 0=ok 1=oom 2=range ; parserutils_error: 0=ok 1=oom 2=invalid */
++int css_error_from_lwc_error(int err)
++{
++	switch (err) { case 0: return 0; case 1: return 1; default: return 2; }
++}
++
++int css_error_from_parserutils_error(int err)
++{
++	switch (err) { case 0: return 0; case 1: return 1; default: return 2; }
++}
++
++/* MUST return lwc_string_hash_value(str->insensitive): libcss inserts
++ * selector names keyed by the caseless intern's hash and looks them up with
++ * this function. Disagreeing buckets = every selector silently unmatched. */
++lwc_error lwc_string_caseless_hash_value(lwc_string *str, lwc_hash *hash)
++{
++	lwc_error err;
++	if (str == NULL || hash == NULL) return lwc_error_range;
++	if (str->insensitive == NULL) {
++		err = lwc__intern_caseless_string(str);
++		if (err != lwc_error_ok) return err;
++	}
++	*hash = lwc_string_hash_value(str->insensitive);
++	return lwc_error_ok;
++}
++
++/* ======================== FUNCTIONAL no-op stubs ========================= */
++
++__attribute__((weak)) bool layout_grid(struct box *box, int width,
++		struct content *content)
++{
++	(void) box; (void) width; (void) content;
++	return false;
++}
++
++__attribute__((weak)) void html_css_discover_stylesheets(void *htmlc)
++{
++	(void) htmlc;
++}
++
++__attribute__((weak)) int nscss_reset_node_data(void *node)
++{
++	(void) node;
++	return 0;
++}
++
++__attribute__((weak)) int font_plot_style_baseline(const void *fstyle,
++		int line_height)
++{
++	(void) fstyle;
++	return (line_height * 3 + 2) / 4;
++}
++
++__attribute__((weak)) int macsurf_html_element_get_tag_type(const void *node,
++		dom_html_element_type *type)
++{
++	*type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
++	return (node == NULL) ? 0 : 0;
++}
++
++__attribute__((weak)) int macos9_content_is_live(const void *c)
++{
++	/* html.c defines a macro that forces 1 when the symbol is unused;
++	 * when it is used, "treat everything as live" is the safe default
++	 * (the MacSurf registry exists to detect double-free, not to gate
++	 * rendering). */
++	(void) c;
++	return 1;
++}
++
++__attribute__((weak)) unsigned char js_exec_module(void *thread,
++		const unsigned char *txt, size_t txtlen, const char *name)
++{
++	/* No QJS module loader (it lives in the frontend). Inline ES modules
++	 * are dropped; classic <script> (js_exec) is unaffected. */
++	(void) thread; (void) txt; (void) txtlen; (void) name;
++	return 0;
++}
++
++__attribute__((weak)) void macsurf_js_notify_content_freed(void *c)
++{
++	(void) c;
++}
++
++/* Frontend scroll offset used by interaction.c's sticky-header math.
++ * The Vita frontend sets these around mouse events; 0 = no offset. */
++int macos9_hittest_scroll_x = 0;
++int macos9_hittest_scroll_y = 0;
++
++/* ========================== INSTRUMENTATION no-ops ======================= */
++
++long macos9_grad_set_count = 0;
++long macos9_grad_radial_unpack_count = 0;
++long macos9_grad_linear_unpack_count = 0;
++
++void *macos9_deathrow_cur_ptr = NULL;
++void *macos9_deathrow_cur_fn = NULL;
++
++__attribute__((weak)) void macsurf_profile_emit_phases(const char *url)
++{
++	(void) url;
++}
++
++__attribute__((weak)) void macsurf_profile_nav_begin(void)
++{
++}
++
++__attribute__((weak)) void macsurf_diag_nav_done(unsigned long nav_id)
++{
++	(void) nav_id;
++}
++
++__attribute__((weak)) unsigned long ms_diag_cur_nav(void)
++{
++	return 0;
++}
++
++__attribute__((weak)) void ms_diag_frame_open(void *bw)
++{
++	(void) bw;
++}
++
++__attribute__((weak)) void ms_diag_frame_close(void *bw)
++{
++	(void) bw;
++}
++
++__attribute__((weak)) void macsurf_gap_emit_summary(unsigned long nav_id)
++{
++	(void) nav_id;
++}
++
++__attribute__((weak)) void macsurf_qjs_emit_timer_profile(void)
++{
++}
++
++__attribute__((weak)) void macsurf_qjs_emit_js_profile(void)
++{
++}
++
++__attribute__((weak)) void macsurf_qjs_set_event_detail(int x, int y,
++		int button, int key, int mods)
++{
++	(void) x; (void) y; (void) button; (void) key; (void) mods;
++}
++
++__attribute__((weak)) void macsurf_qjs_clear_event_detail(void)
++{
++}
++
++__attribute__((weak)) void macos9_animation_register(void)
++{
++}
++
++__attribute__((weak)) void macos9_animation_register_rect(int x, int y,
++		int w, int h)
++{
++	(void) x; (void) y; (void) w; (void) h;
++}
++
++__attribute__((weak)) unsigned int macos9_animation_now_ticks(void)
++{
++	static unsigned int t = 0;
++	return t++;
++}
++
++__attribute__((weak)) long macsurf_free_mem(void)
++{
++	return -1;
++}
++
++__attribute__((weak)) int macsurf_ptr_is_valid(const void *p)
++{
++	(void) p;
++	return 1;
++}
++
++__attribute__((weak)) void macsurf_debug_log_reconv_flush(int on)
++{
++	(void) on;
++}
++
++/* Cascade probe flag: html.c sets it around the cascade call for the
++ * frontend's timing probe; nothing functional depends on its value. */
++int macsurf__cascade_probe_armed = 0;
