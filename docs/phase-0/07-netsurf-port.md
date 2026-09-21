@@ -414,3 +414,126 @@ The splitter strips `extern` declarations for whatever `compat/*.h` declares,
 so **editing a compat header invalidates the patch set**. Two failures this
 session were stale patches rather than bad code.
 `tools/build-patched.sh` now regenerates the stack before building.
+
+
+---
+
+## 10. Hand-porting the four files (2026-09-21, third session)
+
+### 10.1 The job was smaller than §9 assumed
+
+Surveying before editing changed the shape considerably.
+
+**Only `html.c` had instrumentation at all.** `layout.c`, `form.c` and
+`interaction.c` have *zero* references to the `macsurf__site_` /
+`macsurf_profile_` / `macos9_heap_` families — their failures were never about
+scaffolding.
+
+And of `html.c`'s 158 references, **49 are already inside `#ifdef __MACOS9__`**
+and compile out untouched. Only 109 needed removing, in 14 regions, most of
+them self-contained braced blocks.
+
+### 10.2 What was removed from `html.c`
+
+- The **SITE summary block** — 88 lines building one log line from ~23 frontend
+  counters.
+- Four pure-instrumentation blocks.
+- The QuickDraw font-measure and Mac heap probes bracketing `layout_document`.
+- The parse-chunk timing wrapper around `dom_hubbub_parser_parse_chunk`.
+- Three `macsurf_profile_stamp` calls and the `macsurf_debug_log_int` calls.
+- `html_post_render_queue` and `html_post_render_dispatch` — dead once their
+  only callers went.
+
+**Kept:** the real calls those wrapped (`layout_document`,
+`dom_hubbub_parser_parse_chunk`), and every `macos9_micros` use, since compat
+defines it.
+
+### 10.3 The two real bugs, fixed
+
+**`form.c`** — `form_atom_parse` set `out->literal` only on the two
+`FATOM_LITERAL` paths while the caller copies the struct by value, so every
+other kind left it indeterminate. All fields are initialised up front now;
+`.literal` is only read when `kind == FATOM_LITERAL`, so this is
+behaviour-neutral.
+
+**`layout.c`** — three comparisons of a `css_unit` variable against
+`CSS_INTRINSIC_MAX_CONTENT` / `_MIN_CONTENT`. libcss deliberately keeps
+`enum css_intrinsic_kind_e` out of `css_unit` (properties.h says why: `css_unit`
+has two free codes and three keywords are needed) and reuses the unit
+sub-field to carry it when `type == *_INTRINSIC`. The comparisons are
+semantically right and type-wrong; they now cast explicitly, and all three
+reads were already guarded by the matching `*_INTRINSIC` check.
+
+Also in `layout.c`: a signed/unsigned comparison (`int segment_index` against
+`unsigned int segment_count`) now casts, the index being initialised to 0 and
+only incremented.
+
+### 10.4 The oscillation is fixed, by giving up on it
+
+§9.3 recorded the build flipping between `redundant-decls` and
+`nested-externs`/undeclared failures depending on what compat declared. The fix
+was to stop fighting it: **the splitter no longer strips declarations** (only
+instrumentation ones), and `-Wnested-externs` and `-Wredundant-decls` are
+demoted for the netsurf build.
+
+MacSurf's inline declarations are valid C; upstream objects only on style.
+Two demoted style rules removed an entire failure class and the coupling that
+made editing a compat header invalidate the patch set.
+
+Demoted in total: `unused-variable`, `comment`, `nested-externs`,
+`redundant-decls`. **Everything that catches real defects stays at `-Werror`** —
+`implicit-function-declaration`, `missing-prototypes`, `sign-compare`,
+`enum-compare`, `uninitialized`, `switch`.
+
+### 10.5 Build status: 271 objects, two files
+
+Progress across the session: **264 → 265 → 267 → 271**. Two files remain,
+`redraw.c` and `script.c`, with a handful of missing declarations
+(`js_fire_script_load`, `js_set_current_script`, `macos9_heap_*`) of exactly
+the kind already solved several times.
+
+### 10.6 ⚠️ `include/netsurf/plot_style.h` is missing from the stack
+
+The most consequential finding of the session, and it is **not** a hand-port
+issue.
+
+`redraw.c` fails with `excess elements in struct initializer`: MacSurf
+initialises `plot_style_t` positionally with seven elements, and the tree's
+struct has five. Their `plot_style.h` is 359 lines against upstream's 288, and
+the extra members are exactly the capability task 5 is meant to measure:
+
+```
+box_shadow_y   box_shadow_color   opacity
+transform      transform_b        radial_set
+radial_sx      radial_sy          radial_px   radial_py
+```
+
+**That header is in the raw diff with 85 lines of churn, survives every rescue
+pass, is rejected by none of the exclusion rules — and still appears in no
+generated patch.** That is a classifier bug, not a design decision, and it
+means **the plotter extension carrying gradients, shadows, opacity and
+transform is currently not ported at all**.
+
+Which also means: had the build completed, `compare-engines.sh` would have
+shown far less movement than expected, and the cause would have looked like
+"MacSurf's CSS does not reach the plotters" rather than "one header went
+missing". Worth finding before drawing any conclusion from task 5.
+
+### 10.7 Task status
+
+| Task | Status |
+|---|---|
+| (1) hand-port the four files | **done** — §10.1–10.2 |
+| (2) fix the two real bugs | **done** — §10.3, plus the sign-compare |
+| (3) remove now-unused functions | **done** — `html_post_render_queue`, `_dispatch`, and `layout_safe.h`'s helpers made `static inline` |
+| (4) reach a clean build | **not reached** — 271 objects, two files left (§10.5) |
+| (5) re-run `compare-engines.sh` | **blocked on (4)**, and see §10.6 before trusting its result |
+
+Nothing needed sudo.
+
+### 10.8 Next
+
+1. **Find why `plot_style.h` is dropped** (§10.6). Highest value: it gates the
+   entire gradient/shadow/transform path.
+2. Finish `redraw.c` and `script.c` — the same declaration work as before.
+3. Then task 5, with §10.6 resolved so the comparison means something.
