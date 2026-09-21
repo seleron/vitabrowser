@@ -278,6 +278,12 @@ def de_inlined(upstream_text, macsurf_text):
 
 BOOL_SUB = re.compile(r'\bunsigned char\b')
 LONE_BOOL = re.compile(r'^\+(\s*)unsigned char (\w+) = ([01]);\s*$')
+# The corruption is an escaped quote where a string literal should BEGIN:
+# `SLEN(\"text\")`. An escaped quote INSIDE a literal is legitimate --
+# `fprintf(stream, "uri(\"%.*s\")", ...)` is correct C -- so require the
+# match to be preceded by an identifier's opening paren with no earlier
+# unescaped quote on the line.
+BAD_ESCAPE = re.compile(r'^[^"]*\w\(\\"')
 TRUE_SUB = re.compile(r'\btrue\b')
 FALSE_SUB = re.compile(r'\bfalse\b')
 
@@ -358,6 +364,18 @@ def keep_bool_decls(lines):
             out.append(' ' + cur[1:])
             i += 2
             continue
+        # Escaped-quote corruption. MacSurf's C89 declaration-splitting pass
+        # mangled three files, leaving `SLEN(\"If-None-Match:\")` -- an opening
+        # paren followed by an escaped quote, which is never valid C. They
+        # never noticed because their CodeWarrior project does not compile
+        # those files. Keep the upstream line instead.
+        if (cur.startswith('-') and nxt.startswith('+')
+                and not cur.startswith('---') and not nxt.startswith('+++')
+                and BAD_ESCAPE.search(nxt)):
+            out.append(' ' + cur[1:])
+            i += 2
+            continue
+
         # Unpaired case: MacSurf rewrote a whole function, so the C89
         # declaration arrives as a pure addition with no removal to pair with.
         # Only the exact scalar-initialised-to-0/1 idiom is rewritten; anything
