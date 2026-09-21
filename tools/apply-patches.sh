@@ -32,6 +32,26 @@ for lib in libwapcaplet libparserutils libhubbub libcss libdom; do
 		rm -f /tmp/patchlog.$$
 	done
 done
+# Our own port fixes, applied after the generated MacSurf stack. Named
+# NN-<lib>-<what>.patch and routed to <lib> by that middle field. These use
+# a/ b/ prefixes, so -p1.
+for p in "$ROOT"/patches/vitabrowser/*.patch; do
+	[ -f "$p" ] || continue
+	base=$(basename "$p" .patch)
+	lib=$(echo "$base" | cut -d- -f2)
+	tree="$WORK/upstream/$lib"
+	[ -d "$tree" ] || { echo "SKIP $base (no $lib tree)"; continue; }
+	if patch $DRY -p1 -d "$tree" --forward --no-backup-if-mismatch \
+	         -i "$p" > /tmp/patchlog.$$ 2>&1; then
+		ok=$((ok + 1))
+	else
+		bad=$((bad + 1))
+		echo "FAIL vitabrowser/$base"
+		sed 's/^/      /' /tmp/patchlog.$$ | head -6
+	fi
+	rm -f /tmp/patchlog.$$
+done
+
 echo
 echo "applied: $ok   failed: $bad"
 [ "$bad" -eq 0 ]

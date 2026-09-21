@@ -1,9 +1,415 @@
 # libcss: public-headers
-# 3 files, 520 changed lines
-# MacSurf fix ids: fixes1052 fixes113 fixes1309 fixes275 fixes353 fixes354 fixes356 fixes357 fixes77
+# 4 files, 951 changed lines
+# MacSurf fix ids: fixes1052 fixes113 fixes118 fixes1268c fixes1269 fixes1309 fixes150 fixes151 fixes152 fixes158 fixes191b fixes201 fixes267 fixes275 fixes344b fixes345 fixes353 fixes354 fixes355 fixes356 fixes357 fixes361b fixes362 fixes364 fixes365b fixes365c fixes73 fixes75 fixes76 fixes77
 #
 # Regenerate: tools/regen-patches.sh && tools/split-patches.py
 #
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/include/libcss/computed.h browser/libcss/include/libcss/computed.h
+--- upstream/libcss/include/libcss/computed.h	2026-09-20 23:27:15.830561676 +0100
++++ browser/libcss/include/libcss/computed.h	2026-09-20 23:19:17.173917034 +0100
+@@ -77,8 +77,86 @@
+ 	} data;
+ } css_computed_content_item;
+ 
++#define CSS_TRANSITION_MAX_LIST 8
++
++enum css_transition_prop_kind {
++	CSS_TRANS_PROP_ALL = 0,
++	CSS_TRANS_PROP_NONE,
++	CSS_TRANS_PROP_KNOWN,       /* Known CSS_PROP_* numeric opcode */
++	CSS_TRANS_PROP_CUSTOM_IDENT /* Preserved lwc_string* for custom/unsupported property */
++};
++
++typedef struct css_transition_prop_entry {
++	enum css_transition_prop_kind kind;
++	uint32_t prop_id;           /* CSS_PROP_* when kind == CSS_TRANS_PROP_KNOWN */
++	lwc_string *custom_name;    /* Refcounted when kind == CSS_TRANS_PROP_CUSTOM_IDENT */
++} css_transition_prop_entry;
++
++enum css_transition_timing_type {
++	CSS_TIMING_EASE = 0,
++	CSS_TIMING_LINEAR,
++	CSS_TIMING_EASE_IN,
++	CSS_TIMING_EASE_OUT,
++	CSS_TIMING_EASE_IN_OUT,
++	CSS_TIMING_CUBIC_BEZIER,
++	CSS_TIMING_STEPS
++};
++
++typedef struct css_transition_timing_entry {
++	enum css_transition_timing_type type;
++	int32_t x1, y1, x2, y2;     /* Q16.16 for cubic-bezier */
++	uint32_t step_count;        /* for steps(n, pos) */
++	uint8_t step_pos;           /* JUMP_START, JUMP_END, etc. */
++} css_transition_timing_entry;
++
++typedef struct css_computed_transition_data {
++	uint8_t inherit_flags;
++	uint8_t prop_count;
++	css_transition_prop_entry props[CSS_TRANSITION_MAX_LIST];
++
++	uint8_t duration_count;
++	css_fixed durations[CSS_TRANSITION_MAX_LIST]; /* css_fixed (seconds) */
++
++	uint8_t timing_count;
++	css_transition_timing_entry timings[CSS_TRANSITION_MAX_LIST];
++
++	uint8_t delay_count;
++	css_fixed delays[CSS_TRANSITION_MAX_LIST];    /* css_fixed (seconds), can be negative */
++} css_computed_transition_data;
++
++typedef struct css_effective_transition_descriptor {
++	css_transition_prop_entry prop;
++	css_fixed duration;
++	css_transition_timing_entry timing;
++	css_fixed delay;
++} css_effective_transition_descriptor;
++
+ css_error css_computed_style_destroy(css_computed_style *style);
+ 
++/* Semantic difference classification for conservative incremental styling. */
++enum css_computed_style_diff {
++	CSS_COMPUTED_STYLE_NO_DIFF = 0,
++	CSS_COMPUTED_STYLE_COLOR_DIFF,
++	CSS_COMPUTED_STYLE_OTHER_DIFF
++};
++
++enum css_computed_style_diff css_computed_style_diff(
++		const css_computed_style *a,
++		const css_computed_style *b);
++
++/* Diagnostic companion for the conservative colour classifier.
++ * Returns the first differing byte in the computed scalar payload after
++ * foreground colour is normalised, or -1 when the mismatch is in an
++ * out-of-line representation, or 1000 when the scalar payload matches. */
++int css_computed_style_color_diff_detail(const css_computed_style *a,
++		const css_computed_style *b);
++unsigned long css_computed_style_debug_bits0(const css_computed_style *style);
++
++/* Fast-path comparator for incremental styling */
++bool css_computed_style_is_paint_only_diff(
++		const css_computed_style *a,
++		const css_computed_style *b);
++
+ css_error css_computed_style_compose(
+ 		const css_computed_style *restrict parent,
+ 		const css_computed_style *restrict child,
+@@ -176,6 +254,214 @@
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+ 
++uint8_t css_computed_border_radius(
++		const css_computed_style *style,
++		css_fixed *length, css_unit *unit);
++
++uint8_t css_computed_box_shadow(
++		const css_computed_style *style,
++		int32_t *integer);
++
++/* fixes361b - second box-shadow packed value. Returns 0 if no second
++ * shadow set, otherwise the packed bsh int32 in the same format as
++ * css_computed_box_shadow's *integer (h<<24 | v<<16 | inset<<15 |
++ * rgb555). Used to paint a second inset bevel for Platinum 3D effect. */
++int32_t css_computed_box_shadow_2(
++		const css_computed_style *style);
++
++/* fixes362 - third box-shadow packed value. Same format as
++ * css_computed_box_shadow_2; the Platinum convention is two insets
++ * (light + dark bevels) followed by one outer drop shadow. */
++int32_t css_computed_box_shadow_3(
++		const css_computed_style *style);
++
++/* fixes364 - horizontal stripe background. Two RGB555 colors packed
++ * into one int32: bit 31 = set flag, bits 15..29 = c2 (high), bits
++ * 0..14 = c1 (low). Mapped from `repeating-linear-gradient(to bottom,
++ * ...)` by cssh_css.c so Platinum title bars get real alternating-row
++ * stripes. Returns 0 when unset. */
++int32_t css_computed_macsurf_hstripe_bg(
++		const css_computed_style *style);
++
++/* fixes365c - two-layer 2x2 dot-grid background pattern. Two RGB555
++ * colors packed into one int32: bit 31 = set flag, bits 15..29 = c2
++ * (horizontal stripe), bits 0..14 = c1 (vertical stripe). Mapped from
++ * the two-layer `linear-gradient(c1 1px, transparent 1px),
++ * linear-gradient(90deg, c2 1px, transparent 1px)` + `background-size:
++ * 2px 2px` pattern by cssh_css.c so mactrove's Platinum body texture
++ * paints as alternating 1px stripes on a 2x2 grid. Returns 0 unset. */
++int32_t css_computed_macsurf_dotgrid(
++		const css_computed_style *style);
++
++uint8_t css_computed_macsurf_gradient(
++		const css_computed_style *style,
++		int32_t *color);
++
++uint8_t css_computed_macsurf_text_shadow(
++		const css_computed_style *style,
++		int32_t *packed);
++
++uint8_t css_computed_macsurf_transform(
++		const css_computed_style *style,
++		int32_t *packed);
++
++/* fixes73: scale companion. Returns the raw scale packing
++ * (bits 31..16 scale_x Q8.8, bits 15..0 scale_y Q8.8).
++ * Identity = 0x01000100. */
++int32_t css_computed_macsurf_transform_b(
++		const css_computed_style *style);
++
++/* fixes75: -macsurf-grid: <cols> [<rows>]. packed = (cols << 16) | rows.
++ * cols = number of columns in the grid (1..255 reasonable).
++ * rows = 0 means auto-rows (size to content). */
++uint8_t css_computed_macsurf_grid(
++		const css_computed_style *style,
++		int32_t *packed);
++
++/* fixes118: pointer to 8-int track-width array, or NULL when no
++ * explicit grid-template-columns tracks are set. Each int32 packs
++ * (unit << 28) | value. Lifetime tied to the computed style. */
++const int32_t *css_computed_macsurf_grid_tracks(
++		const css_computed_style *style);
++
++/* fixes150: returns a pointer to an 8-int row-track descriptor array,
++ * or NULL when no explicit grid-template-rows tracks are set. Same
++ * encoding as macsurf_grid_tracks. Lifetime tied to the computed
++ * style. */
++const int32_t *css_computed_macsurf_grid_row_tracks(
++		const css_computed_style *style);
++
++/* fixes344b: returns a pointer to a 2-element css_color array carrying
++ * full ARGB for the gradient's two stops, or NULL when both stops are
++ * fully opaque (the painter falls back to the existing RGB565+R4G6B4
++ * unpack path in that case). When non-NULL, format is [c1, c2] with
++ * alpha in the high byte of each. Used by the gradient plotter to do
++ * per-pixel alpha blending against the underlying surface. */
++const css_color *css_computed_macsurf_gradient_full(
++		const css_computed_style *style);
++
++/* fixes345: returns a pointer to a 4-int radial-gradient size+position
++ * array, or NULL when the rule had no explicit size/position prefix.
++ * Format: [size_x_px, size_y_px, pos_x_percent_x100, pos_y_percent_x100]
++ * with -1 sentinels for any field that wasn't supplied. Painter uses
++ * these to place a small concentrated radial ellipse at the author's
++ * intended position instead of filling the bounding rect. */
++const int32_t *css_computed_macsurf_gradient_radial(
++		const css_computed_style *style);
++
++/* fixes365b: returns a pointer to a 7-int extended-linear-gradient
++ * descriptor, or NULL when the legacy 2-stop cardinal fast path suffices.
++ * Format:
++ *   [0] angle in degrees (0..359; full precision)
++ *   [1] position 0 as percent×100 (0..10000)
++ *   [2] position 1 as percent×100
++ *   [3] position 2 as percent×100 (0 when only 2 stops)
++ *   [4] colour 0 as css_color (ARGB)
++ *   [5] colour 1 as css_color
++ *   [6] colour 2 as css_color (0 when only 2 stops)
++ * Lifetime tied to the computed style. Painter uses this for diagonal
++ * angles (45/135/225/315) and any 3-stop gradient with positions. */
++const int32_t *css_computed_macsurf_gradient_stops(
++		const css_computed_style *style);
++
++/* fixes151: -macsurf-grid-col-span as a uint8_t. 0 = unset (caller
++ * treats as 1). 1..254 = literal span count. 255 = "fill the
++ * remainder of the row" sentinel (from `grid-column: 1 / -1`-style
++ * preprocessor rewrites). Returns only the low byte of the packed
++ * placement storage for backwards compatibility with fixes151 callers. */
++uint8_t css_computed_macsurf_grid_col_span(
++		const css_computed_style *style);
++
++/* fixes158: full packed grid placement int32. See
++ * autogenerated_computed.h for the bit layout:
++ *   bits  0..7  col_span    - 0=unset, 1..254 literal, 255 fill row
++ *   bits  8..15 col_start   - 0=auto, 1..254 explicit line
++ *   bits 16..23 row_start   - 0=auto, 1..254 explicit line
++ *   bits 24..31 row_span    - 0=unset, 1..254 literal, 255 fill
++ * 0 means "no placement set at all" (auto-flow, span 1, single row). */
++int32_t css_computed_macsurf_grid_placement(
++		const css_computed_style *style);
++
++/* fixes152: aspect-ratio packed as (num << 16) | denom.
++ * 0 = unset (no aspect-ratio constraint). Layout uses width = h * num
++ * / denom and height = w * denom / num to derive the missing
++ * dimension when one of width/height is set and the other is auto. */
++int32_t css_computed_aspect_ratio(
++		const css_computed_style *style);
++
++/* fixes191b: background-size packed int32.
++ *   bits 31..16: w_code (int16: 0=auto, +N=px, -1=cover, -2=contain)
++ *   bits 15..0:  h_code (int16: same encoding)
++ *   0 (whole word) = unset (treat as `auto auto`). */
++int32_t css_computed_background_size(
++		const css_computed_style *style);
++
++uint8_t css_computed_pointer_events(
++		const css_computed_style *style);
++
++/* fixes275 (#65): grid-auto-flow value. Returns one of
++ * CSS_MACSURF_GRID_FLOW_{ROW,COLUMN,ROW_DENSE,COLUMN_DENSE}.
++ * Defaults to ROW (sparse row-major) when unset. */
++uint8_t css_computed_macsurf_grid_flow(const css_computed_style *style);
++
++/* fixes353 (#73): accent-color. Returns CSS_ACCENT_COLOR_*; when the
++ * return is CSS_ACCENT_COLOR_COLOR, *color receives the css_color.
++ * For AUTO / CURRENTCOLOR / INHERIT, *color is 0. */
++uint8_t css_computed_accent_color(const css_computed_style *style,
++		css_color *color);
++
++/* fixes353 (#73): caret-color. Returns CSS_CARET_COLOR_*; when the
++ * return is CSS_CARET_COLOR_COLOR, *color receives the css_color. */
++uint8_t css_computed_caret_color(const css_computed_style *style,
++		css_color *color);
++
++/* fixes354 (#82): box-decoration-break. Returns
++ * CSS_BOX_DECORATION_BREAK_SLICE (default) or _CLONE. */
++uint8_t css_computed_box_decoration_break(
++		const css_computed_style *style);
++
++/* fixes355 (#58): tab-size. Returns the integer number of space
++ * widths; 0 stored = unset, returned as the CSS default of 8. */
++int32_t css_computed_tab_size(const css_computed_style *style);
++
++/* fixes356 (#78): image-rendering. Returns CSS_IMAGE_RENDERING_AUTO
++ * (default) / CRISP_EDGES / PIXELATED. The plotter consults this to
++ * decide whether to skip box-filter pre-downscale. */
++uint8_t css_computed_image_rendering(const css_computed_style *style);
++
++/* fixes1052 (#80): appearance. Returns CSS_APPEARANCE_AUTO when unset. */
++uint8_t css_computed_appearance(const css_computed_style *style);
++
++/* fixes357 (#44): text-decoration extended.
++ * text-decoration-color: returns CSS_TEXT_DECORATION_COLOR_* (default
++ * CURRENT_COLOR); *color receives css_color when return == COLOR. */
++uint8_t css_computed_text_decoration_color(
++		const css_computed_style *style, css_color *color);
++
++/* text-decoration-style: returns CSS_TEXT_DECORATION_STYLE_* (default
++ * SOLID). */
++uint8_t css_computed_text_decoration_style(
++		const css_computed_style *style);
++
++/* text-decoration-thickness: returns 0 = auto/from-font, N>0 = px. */
++int32_t css_computed_text_decoration_thickness(
++		const css_computed_style *style);
++
++/* fixes76: -macsurf-animation-opacity: <from> <to> <duration_ms>.
++ * from, to: opacity 0..255 (255 = opaque).
++ * duration_ms: full cycle in ms (1..65535). Cycle is from -> to -> from.
++ * packed: bits 0..7 from, bits 8..15 to, bits 16..31 duration_ms. */
++uint8_t css_computed_macsurf_animation_opacity(
++		const css_computed_style *style,
++		int32_t *packed);
++
++/* fixes77: -macsurf-animation-rotate: <from_deg> <to_deg> <duration_ms>.
++ * from, to: rotation in 0..255 (each step = ~1.4 deg). Ping-pong cycle.
++ * packed: bits 0..7 from_byte, bits 8..15 to_byte, bits 16..31 duration_ms. */
++uint8_t css_computed_macsurf_animation_rotate(
++		const css_computed_style *style,
++		int32_t *packed);
++
+ uint8_t css_computed_background_image(
+ 		const css_computed_style *style,
+ 		lwc_string **url);
+@@ -184,6 +470,10 @@
+ 		const css_computed_style *style,
+ 		css_color *color);
+ 
++/* SVG fill V1. Returns CSS_FILL_*; color is valid for CSS_FILL_COLOR. */
++uint8_t css_computed_fill(const css_computed_style *style,
++		css_color *color);
++
+ uint8_t css_computed_list_style_image(
+ 		const css_computed_style *style,
+ 		lwc_string **url);
+@@ -227,6 +517,55 @@
+ uint8_t css_computed_box_sizing(
+ 		const css_computed_style *style);
+ 
++uint8_t css_computed_object_fit(
++		const css_computed_style *style);
++
++uint8_t css_computed_macsurf_object_position(
++		const css_computed_style *style);
++
++/* fixes201: numeric (percent / px) object-position. Returns the
++ * packed int32 encoded in autogenerated_computed.h next to
++ * background_size. Bit 31 == 0 means "unset" - caller should fall
++ * back to the keyword accessor above. */
++int32_t css_computed_macsurf_object_position_xy(
++		const css_computed_style *style);
++
++uint8_t css_computed_text_overflow(
++		const css_computed_style *style);
++
++uint8_t css_computed_word_break(
++		const css_computed_style *style);
++
++uint8_t css_computed_text_align_last(
++		const css_computed_style *style);
++
++uint8_t css_computed_hyphens(
++		const css_computed_style *style);
++
++uint8_t css_computed_text_justify(
++		const css_computed_style *style);
++
++uint8_t css_computed_hanging_punctuation(
++		const css_computed_style *style);
++
++uint8_t css_computed_background_clip(
++		const css_computed_style *style);   /* #255 */
++
++uint8_t css_computed_background_origin(
++		const css_computed_style *style);
++
++uint8_t css_computed_background_blend_mode(
++		const css_computed_style *style);
++
++uint8_t css_computed_justify_items(
++		const css_computed_style *style);   /* #279 */
++
++uint8_t css_computed_justify_self(
++		const css_computed_style *style);   /* #279 follow-up */
++
++uint8_t css_computed_overflow_wrap(
++		const css_computed_style *style);
++
+ uint8_t css_computed_height(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+@@ -402,6 +741,10 @@
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+ 
++uint8_t css_computed_row_gap(
++		const css_computed_style *style,
++		css_fixed *length, css_unit *unit);
++
+ uint8_t css_computed_column_rule_color(
+ 		const css_computed_style *style,
+ 		css_color *color);
+@@ -524,6 +867,22 @@
+ 		const css_computed_style *style,
+ 		int32_t *order);
+ 
++/* CSS Transition Accessors */
++const css_computed_transition_data *css_computed_transition_data_get(
++		const css_computed_style *style);
++
++uint32_t css_computed_transition_descriptor_count(
++		const css_computed_style *style);
++
++bool css_computed_transition_descriptor(
++		const css_computed_style *style,
++		uint32_t index,
++		css_effective_transition_descriptor *out);
++
++bool css_computed_transition_data_equal(
++		const css_computed_style *a,
++		const css_computed_style *b);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/include/libcss/fpmath.h browser/libcss/include/libcss/fpmath.h
 --- upstream/libcss/include/libcss/fpmath.h	2026-09-20 23:27:15.830724404 +0100
 +++ browser/libcss/include/libcss/fpmath.h	2026-09-20 23:19:17.174407950 +0100
@@ -607,24 +1013,105 @@ diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upst
  #ifdef __cplusplus
  }
  #endif
-diff -urN upstream/libcss/include/libcss/types.h browser/libcss/include/libcss/types.h
---- upstream/libcss/include/libcss/types.h
-+++ browser/libcss/include/libcss/types.h
-@@ -111,7 +111,16 @@
- 	CSS_UNIT_HZ                 = 0x1b,
- 	CSS_UNIT_KHZ                = 0x1c,
+diff -urN -x .git -x 'build-*' -x test -x '*.o' -x '*.a' -x '*.d' -x '*.pc' upstream/libcss/include/libcss/select.h browser/libcss/include/libcss/select.h
+--- upstream/libcss/include/libcss/select.h	2026-09-20 23:27:15.830724404 +0100
++++ browser/libcss/include/libcss/select.h	2026-09-20 23:19:17.175577811 +0100
+@@ -44,6 +44,9 @@
+ 	css_computed_style *styles[CSS_PSEUDO_ELEMENT_COUNT];
+ } css_select_results;
  
--	CSS_UNIT_CALC               = 0x1d  /**< Un-resolved calc() */
-+	CSS_UNIT_CALC               = 0x1d, /**< Un-resolved calc() */
++/** Opaque standalone media-query list. */
++struct css_media_query;
 +
-+	CSS_UNIT_MIN                = 0x1e, /**< Un-resolved min() */
-+	CSS_UNIT_MAX                = 0x1f, /**< Un-resolved max() */
-+
-+	/* CSS_UNIT_CLAMP sits in the free middle slot (0x12): the computed
-+	 * style packs units into 5 bits (max value 31), and 0x1e/0x1f are
-+	 * the only free slots after CSS_UNIT_CALC.  0x12/0x13/0x14 are the
-+	 * free middle slots (0x15 is PCT). */
-+	CSS_UNIT_CLAMP              = 0x12  /**< Un-resolved clamp() */
- } css_unit;
+ typedef enum css_select_handler_version {
+ 	CSS_SELECT_HANDLER_VERSION_1 = 1
+ } css_select_handler_version;
+@@ -233,8 +236,88 @@
+ css_error css_select_font_faces_results_destroy(
+ 		css_select_font_faces_results *results);
  
- /**
++/**
++ * Create a standalone media-query list for non-stylesheet consumers.
++ * The query uses the same parser and matcher as @media rules.
++ */
++css_error css_media_query_create(const char *query,
++		struct css_media_query **result);
++
++/** Test a standalone media-query list against the supplied document media. */
++css_error css_media_query_matches(const struct css_media_query *query,
++		const css_unit_ctx *unit_ctx, const css_media *media,
++		bool *matches);
++
++/** Return the query's CSSOM-facing media text. */
++const char *css_media_query_text(const struct css_media_query *query);
++
++/** Destroy a standalone media-query list. */
++void css_media_query_destroy(struct css_media_query *query);
++
++/* fixes267 - register a stylesheet's custom_properties list into the
++ * doc-global inline-extras table. Used by NetSurf's
++ * nscss_create_inline_style so element-scoped --custom-props (parent
++ * defines, child uses) resolve correctly. Tokens are deep-cloned;
++ * caller retains ownership of `sheet`. */
++css_error css_inline_extras_register_sheet(const css_stylesheet *sheet);
++
++/* fixes267 - clear the doc-global inline-extras table. Call on
++ * new-document navigation to prevent cross-page bleed. */
++void css_inline_extras_clear(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+ 
++
++/* fixes1268c (#167) - custom-property inheritance.
++ *
++ * Custom properties inherit, so selecting an element needs the set in
++ * force on its PARENT. That cannot travel on css_computed_style: styles
++ * are interned by css__arena_intern_style, so two elements with
++ * identical computed properties share one struct, while their custom
++ * environments may differ entirely. Nor can it live on
++ * libcss_node_data, which is an opportunistic cache that
++ * css_libcss_node_data_handler destroys on any DOM change without
++ * rebuilding it.
++ *
++ * The client therefore threads it, alongside the parent style it already
++ * threads: set the parent's environment before selecting, take the
++ * element's afterwards, and hand that to the element's children.
++ *
++ * Passing NULL is always valid and means "root element".
++ */
++
++/**
++ * Set the parent element's custom-property environment for the NEXT
++ * css_select_style call on this context. The context takes a reference.
++ */
++css_error css_select_ctx_set_parent_custom_env(css_select_ctx *ctx,
++		css_custom_env *env);
++
++/**
++ * Take ownership of the environment produced by the most recent
++ * css_select_style call on this context. Returns NULL if that element
++ * had no custom properties in force. The caller must release it with
++ * css_custom_env_unref; calling this twice returns NULL the second time.
++ */
++css_custom_env *css_select_ctx_take_custom_env(css_select_ctx *ctx);
++
++/**
++ * Take an additional reference to an environment. Returns env.
++ */
++css_custom_env *css_custom_env_ref(css_custom_env *env);
++
++/**
++ * Release a reference to an environment.
++ */
++void css_custom_env_unref(css_custom_env *env);
++
++/**
++ * fixes1269 (#167) - number of times a node adopted another node's
++ * computed styles through the style-sharing path since process start.
++ * Diagnostic; lets a test prove it actually exercised sharing.
++ */
++uint32_t css_select_share_adoptions(void);
++
+ #endif
