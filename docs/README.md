@@ -15,7 +15,7 @@ and a findings document disagree, **the findings document is newer and wins**.
 | [`phase-0/05-capability-reaudit.md`](phase-0/05-capability-reaudit.md) | §6 re-audited against the stack: 44 added CSS properties, `min()`/`max()`/`clamp()`, and eight stale claims |
 | [`phase-0/06-engine-comparison.md`](phase-0/06-engine-comparison.md) | Both engines built and compared by plot stream: what the stack demonstrably changes, and what still waits on the netsurf-side port |
 | [`phase-0/07-netsurf-port.md`](phase-0/07-netsurf-port.md) | The netsurf-side port: extending the stack to `browser/netsurf`, the build-system quirks, and per-file port decisions |
-| [`phase-0/08-patched-build.md`](phase-0/08-patched-build.md) | The final link stage: a runnable patched `nsmonkey`, the stub-vs-port decision for the five frontend-entangled core files, and what the binary does and does not prove |
+| [`phase-0/08-patched-build.md`](phase-0/08-patched-build.md) | The final link stage: a runnable patched `nsmonkey`, the stub-vs-port decision for the five frontend-entangled core files, the grid + tag-type ports (patches 23+24), and what the binary does and does not prove |
 
 ## Conventions
 

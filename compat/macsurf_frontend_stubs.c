@@ -19,10 +19,13 @@
  *                                          registered via css.c's exported
  *                                          update_style/process_link helpers
  *   FUNCTIONAL-NOOP (safe: they only gate/measure, the page still renders):
- *     layout_grid, nscss_reset_node_data,
- *     font_plot_style_baseline, macsurf_html_element_get_tag_type,
+ *     nscss_reset_node_data,
+ *     font_plot_style_baseline,
  *     macos9_content_is_live, js_exec_module, macsurf_js_notify_content_freed,
  *     macos9_hittest_scroll_x/y
+ *   (layout_grid and macsurf_html_element_get_tag_type were promoted to real
+ *    ports in 2026-09-22: content/handlers/html/layout_grid.c and
+ *    macsurf_dom_compat.c, wired in by patch 23.)
  *   INSTRUMENTATION-NOOP (Mac OS 9 diagnostics/tracing/animation/JS-profiling):
  *     macsurf_profile_*, macsurf_diag_*, ms_diag_*, macsurf_gap_*,
  *     macsurf_qjs_*, macos9_animation_*, macos9_grad_*_count,
@@ -126,13 +129,6 @@ lwc_error lwc_string_caseless_hash_value(lwc_string *str, lwc_hash *hash)
 }
 
 /* ======================== FUNCTIONAL no-op stubs ========================= */
-
-__attribute__((weak)) bool layout_grid(struct box *box, int width,
-		struct content *content)
-{
-	(void) box; (void) width; (void) content;
-	return false;
-}
 
 /* ================= REAL: author-CSS stylesheet discovery ================
  *
@@ -281,13 +277,6 @@ __attribute__((weak)) int font_plot_style_baseline(const void *fstyle,
 {
 	(void) fstyle;
 	return (line_height * 3 + 2) / 4;
-}
-
-__attribute__((weak)) int macsurf_html_element_get_tag_type(const void *node,
-		dom_html_element_type *type)
-{
-	*type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
-	return (node == NULL) ? 0 : 0;
 }
 
 __attribute__((weak)) int macos9_content_is_live(const void *c)

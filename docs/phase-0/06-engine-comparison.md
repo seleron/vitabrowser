@@ -1,19 +1,22 @@
 # Phase 0 — measuring the patch stack with plot streams
 
-**Date:** 2026-09-21 (updated 2026-09-22, dom-walk discovery landed)
+**Date:** 2026-09-21 (updated 2026-09-22, twice: dom-walk discovery + grid/tag-type ports)
 **Covers:** `04-patch-stack.md` §8 item 2 — the first real use of the §14.3 harness
 **Status:** ✅ `nsmonkey` builds against the patched engine, author CSS now
-renders, and **L1 is byte-identical to the pristine golden.** L2/L3/L4 differ
-only where the patch stack adds behavior the pristine engine lacks.
+renders, **CSS grid + form-control tag-types are live** (patches 23+24), and
+**L1 is byte-identical to the pristine golden.** L2/L3/L4 differ only where the
+patch stack adds behavior the pristine engine lacks.
 
-> **Headline (2026-09-22, second pass):** After fixing the
-> `css_error_from_parserutils_error` stub (NEEDDATA→INVALID was fatal; must be
-> a 1:1 cast) *and* replacing the no-op `html_css_discover_stylesheets` stub
-> with a real DOM walk (§6), the patched engine renders **all author CSS**
-> (inline `<style>` and `<link>`). L1 now matches the pristine golden
-> byte-for-byte. The remaining L2/L3/L4 diffs are the value functions
-> (clamp/max/min) and layout reflows the stack is *meant* to add — not
-> regressions.
+> **Headline (2026-09-22, third pass):** After (1) fixing the
+> `css_error_from_parserutils_error` stub, (2) replacing the no-op
+> `html_css_discover_stylesheets` stub with a real DOM walk (§6), and (3)
+> promoting the `layout_grid` + `macsurf_html_element_get_tag_type` weak
+> no-op stubs to their real MacSurf implementations (§6b, patches 23+24),
+> the patched engine renders all author CSS (inline `<style>` and `<link>`),
+> lays out MacSurf's `-macsurf-grid`, and renders `<select>`/`<input>`
+> controls. L1 matches the pristine golden byte-for-byte. The remaining
+> L2/L3/L4 diffs are the value functions, MacSurf's proprietary grid dialect,
+> and layout reflows the stack is *meant* to add — not regressions.
 
 ---
 
@@ -30,12 +33,12 @@ overrides monkey's hardcoded 800x600; without it every comparison diff is
 dominated by window-size reflow (doc 03 §5).
 
 `tools/compare-engines.sh` renders every probe page with both and diffs the
-plot streams (2026-09-22, post-dom-walk run):
+plot streams (2026-09-22, post grid/tag-type ports, rebuild 12, 107 patches):
 
 ```
 SAME  L1-layout-basics
-DIFFER L2-macsurf-css  (plot ops 91 -> 89, 128 changed lines)
-DIFFER L3-grid  (plot ops 231 -> 154, 369 changed lines)
+DIFFER L2-macsurf-css  (plot ops 91 -> 93, 132 changed lines)
+DIFFER L3-grid  (plot ops 231 -> 224, 387 changed lines)
 DIFFER L4-flex  (plot ops 181 -> 188, 145 changed lines)
 
 same: 1   differ: 3
@@ -225,27 +228,73 @@ implementation). The binary's disassembly of the function is ~220 lines
 vs ~9.5 KB before). The Makefile hunk (adding `macsurf_frontend_stubs.c` to
 the html source list) is unchanged.
 
+## 6b. Grid + tag-type ports (2026-09-22, patches 23 + 24)
+
+Two more weak no-op stubs were promoted to real implementations:
+
+| symbol | was | now |
+|---|---|---|
+| `layout_grid` | weak stub returning `false` (every `display:grid` box silently fell back to block flow) | **real** `layout_grid.c` (1786 lines: MacSurf fixes75/115/148/150/158/161e/168a/168b) |
+| `macsurf_html_element_get_tag_type` | weak stub returning `DOM_HTML_ELEMENT_TYPE__UNKNOWN` (form controls degraded) | **real** `macsurf_dom_compat.c` (120 lines, proper tag→type table) |
+
+Both files were already shipped into `content/handlers/html/` by the
+generated stack (patches 4 + 11) but were **never listed in the Makefile**, so
+they never compiled. Patch 23 adds both to the source list (and the two weak
+stubs were removed from patch 20's embedded stub file, regenerated). Patch 24
+carries two `-Werror` fixes the MacSurf source needs under the monkey
+frontend's `-Werror` (missing `<string.h>` for `memset`; two brace-less ifs
+whose body is over-indented — a real source bug, the increment belongs in the
+second if).
+
+**Verification (new `PM-macsurf-grid.html` probe, `display:grid;
+-macsurf-grid:3; width:600px`, 6 children):**
+
+```
+C1(1,15)    C2(201,15)   C3(401,15)
+C4(1,47)    C5(201,47)   C6(401,47)
+```
+
+A real 3×2 grid — three equal columns of ~200px, two rows of 32px.
+`PM-tagtype.html` confirms the tag-type port: `<select>` now renders its
+`<option>` text (`optA`) and `<input value>` renders (`hello`), both of which
+were blank under the UNKNOWN stub. `nm`: both symbols now strong (`T`).
+
+**Scope note (why L3 still differs).** MacSurf's grid is its **proprietary
+`-macsurf-grid: N`** property (V1 grammar: N equal-width columns, auto-rows,
+optional `-macsurf-grid-rows`, `grid-column`/`grid-row` placement,
+row-gap/column-gap). Standard `grid-template-columns` — what L3-grid.html
+tests — is *not* what `layout_grid` implements, so L3's 231→224 op difference
+is two engines speaking different grid dialects, not a regression and not a
+fix. L1 staying byte-identical (SAME) confirms no incidental breakage.
+
 ## 7. Blocked / not done
 
-- **`<input>` form controls** — the `ui` label on L2 (from the page's
-  `<input>`) renders in pristine, not patched. Known Phase-1 gap (form
-  controls not yet in the layout port). Unrelated to CSS.
-- **`-Werror` still relaxed.** Libraries build with `-Wall`; netsurf core needs
-  `-Wno-error` for the new enum values. Both should be restored once the
-  netsurf-side port lands.
+- **Standard `grid-template-columns`** — not implemented (see §6b scope note).
+  MacSurf's own grid uses the `-macsurf-grid` property; L3 remains a
+  known-different page.
+- **`-Werror` for the two ported files** — fixed in patch 24; the broader
+  `-Werror` restore for the whole core is still open (see below).
+- **`-Werror` still relaxed core-wide.** Libraries build with `-Wall`;
+  netsurf core needs `-Wno-error` for the new enum values.
+- **Two MacSurf file-forks deferred** (not pure additions, would be
+  whole-file swaps of upstream code):
+  - `css/cssh_select.c` — a 1967-line fork of upstream `css/select.c`
+    (1859 lines) defining the *same* `nscss_*` symbols; only ~5% larger.
+    Upstream `select.c` already renders options (verified: `optA` in
+    §6b); the fork adds MacSurf styling the Vita port doesn't need yet.
+  - `html/html_font.c` — a fork of upstream `html/font.c` defining the same
+    `font_plot_style_*` symbols; the MacSurf baseline function is a no-op
+    identical to our existing stub, so the port buys nothing until the
+    MacSurf-side font rendering (text-shadow/transform) exists.
 - **No sudo** was used or needed.
 
 ## 8. Next actions
 
 1. **Port MacSurf's `browser/netsurf` changes** (plotters, box-model use of
    the 44 properties, animation timeline).
-2. **Grow `testpages/`** — add a probe page whose only styling is an
-   external `<link rel=\"stylesheet\">` (all current probe pages use inline
-   `<style>` only), so the `<link>` path in §6 is covered by the golden
-   harness.
-3. **Re-run `compare-engines.sh`** after each; expect L2/L3/L4 diffs to
-   shrink as the netsurf-side layout port lands (the value-function boxes
-   and grid/flex reflows are the remaining expected deltas).
-4. **Characterize the L3/L4 grid+flex reflows** — confirm they match
-   MacSurf's layout behavior (not regressions) by comparing against MacSurf's
-   own rendering of the same pages, if a MacSurf binary is available.
+2. **Grow `testpages/`** — `PM-macsurf-grid.html` and `PM-tagtype.html` are
+   in; add a probe page whose only styling is an external
+   `<link rel="stylesheet">` (all current probe pages use inline `<style>`
+   only), so the `<link>` path in §6 is covered by the golden harness.
+3. **Re-run `compare-engines.sh`** after each; L1 must stay SAME as the
+   canary.

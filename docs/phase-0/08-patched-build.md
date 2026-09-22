@@ -6,8 +6,9 @@
 scope decision it forced.
 **Status:** **achieved.** `tools/build-patched.sh` builds the full stack
 (5 libraries + 6 support libraries + netsurf) and links
-`nsmonkey` (13.6 MB, 2026-09-22 11:03 local, 105 patches applied).
-Author CSS (inline `<style>` and external `<link>`) now renders — see doc 06 §6.
+`nsmonkey` (13.68 MB, 2026-09-22 rebuild 12, 107 patches applied).
+Author CSS (inline `<style>` and external `<link>`), CSS grid
+(`-macsurf-grid`), and form-control tag types now render — see doc 06 §6/§6b.
 
 ---
 
@@ -18,12 +19,12 @@ $ WORK=<WORK>/vitabrowser-work tools/build-patched.sh
 == regenerating the patch stack ==
 excluded: 53380 rename, 34755 generated, 1095 include-rewrite, 117718 deletion, 243 shim
 == applying the stack ==
-applied: 103   failed: 2
+applied: 107   failed: 2
 == building libraries ==
   libwapcaplet ok  libparserutils ok  libhubbub ok  libcss ok  libdom ok
 == building netsurf + nsmonkey ==
   netsurf ok
--rwxrwxr-x 1 seleron seleron 13569880 Sep 21 22:57 .../netsurf/nsmonkey
+-rwxrwxr-x 1 seleron seleron 13684784 Sep 22 .../netsurf/nsmonkey
 ```
 
 The **2 failures are pre-existing, not new**: `libhubbub/04-treebuilder.patch`
@@ -67,7 +68,8 @@ end; the five capabilities ship in Phase 1 with the Vita frontend.
 ## 3. The stubs: `compat/macsurf_frontend_stubs.c`
 
 New file, shipped to `content/handlers/html/` by patch 20, listed in the
-html Makefile. ~38 symbols:
+html Makefile. ~36 symbols (2026-09-22: two more promoted to real
+implementations, patches 23+24):
 
 **Implemented for real (functional, not cosmetic):**
 
@@ -79,17 +81,27 @@ html Makefile. ~38 symbols:
 | `macsurf__cascade_probe_armed` | plain flag the engine sets around its cascade call |
 | `html_css_discover_stylesheets` | **real DOM walk** (2026-09-22) — walks `<style>`/`<link>` and calls the upstream `html_css_update_style` / `html_css_process_link` helpers in `css.c`; author CSS now renders (doc 06 §6) |
 
+**Promoted out of the stub file (2026-09-22, patches 23+24):** their real
+MacSurf sources (`content/handlers/html/layout_grid.c`,
+`content/handlers/html/macsurf_dom_compat.c`) were already staged by the
+stack but unlisted in the Makefile; patch 23 added them and patch 24 fixed
+the two `-Werror` violations they needed (missing `<string.h>`, two
+brace-less over-indented ifs). The weak no-op copies were removed from the
+stub file (patch 20 regenerated). Both symbols now strong in `nsmonkey`.
+
 **Weak no-ops (the rest):** every `macos9_*`/`macsurf_*` instrumentation,
 animation, gradient, memory-diagnostic and JS-profiling symbol. Declared
 `__attribute__((weak))` so a future Vita frontend can drop in real
 definitions without touching the stubs.
 
 Known functional gaps until Phase 1 (documented, expected, deliberate):
-CSS **grid layout** (no-op → block flow), **`<select>` reset**,
-**font baseline tuning** (default metrics), **DOM tag-type query** (returns
-`UNKNOWN`), **`<input>`/form-control rendering** (L2's `ui` label absent).
-Author CSS (inline `<style>` and external `<link>`) is **no longer a gap** —
-it was promoted from no-op to real DOM walk on 2026-09-22.
+**standard `grid-template-columns`** (MacSurf's grid is its proprietary
+`-macsurf-grid` property — that one now works, doc 06 §6b), **`<select>`
+reset / MacSurf select styling** (upstream `select.c` already renders
+options), **font baseline tuning** (MacSurf's `html_font.c` baseline is a
+no-op identical to ours; the real delta needs MacSurf-side text-shadow/
+transform rendering), and **`<input>`/form-control rendering polish**
+(tag types are now real — L2's `ui` label renders).
 
 ## 4. Durability: what survived re-staging
 
@@ -106,6 +118,8 @@ staged tree:
 | `NSUERROR_BAD_INPUT`→`BAD_PARAMETER`, `hlcache_handle` 4th-field init, `MAC_DIR`→`DIR`, missing `<string.h>` | patch 19 |
 | frontend/core link stubs + Makefile wiring | patch 20 + `compat/macsurf_frontend_stubs.c` |
 | `macsurf_profile_*` no-op stubs | `compat/macsurf_compat.c` / `macsurf_core_decls.h` |
+| grid + tag-type: Makefile wiring for `layout_grid.c` / `macsurf_dom_compat.c` | patch 23 |
+| `-Werror` fixes for `layout_grid.c` (`<string.h>`, two brace-less ifs) | patch 24 |
 | `-Wno-error=missing-prototypes / implicit-function-declaration / int-conversion` (MacSurf's new files ported from a CodeWarrior baseline) | `tools/build-patched.sh` CFLAGS |
 
 Two subtleties worth keeping:
@@ -126,10 +140,10 @@ Two subtleties worth keeping:
 
 - Rendering parity. Measured 2026-09-22 (doc 06): L1 byte-identical to the
   pristine golden; L2/L3/L4 differ where the stack adds behavior (value
-  functions, grid/flex reflow) plus the `<input>` gap.
-- The four remaining stubbed capabilities (grid, select reset, font
-  baseline, tag type) work — they don't; that is the Phase-1 work list.
-  (Author CSS, formerly fifth on this list, now works.)
+  functions, MacSurf's proprietary grid dialect, flex reflow).
+- The two deferred MacSurf file-forks (`cssh_select.c`, `html_font.c`)
+  work — they don't, because they were never ported (whole-file swaps of
+  upstream `select.c`/`font.c`, not pure additions — doc 06 §7).
 - Vita. The build is the Linux monkey frontend; `TARGET=macos9` is gone and
   the Vita frontend is not started.
 
