@@ -6,10 +6,10 @@
 scope decision it forced.
 **Status:** **achieved.** `tools/build-patched.sh` builds the full stack
 (5 libraries + 6 support libraries + netsurf) and links
-`nsmonkey` (13.69 MB, 2026-09-22 rebuild 13, 108 patches applied).
+`nsmonkey` (13.69 MB, 2026-09-22 rebuild 14, 109 patches applied).
 Author CSS (inline `<style>` and external `<link>`), CSS grid
-(`-macsurf-grid`), form-control tag types, and two-stop linear gradients
-now render — see doc 06 §6/§6b/§6c.
+(`-macsurf-grid`), form-control tag types, two-stop linear gradients,
+and box-shadows now render — see doc 06 §6/§6b/§6c/§6d.
 
 ---
 
@@ -20,12 +20,12 @@ $ WORK=<WORK>/vitabrowser-work tools/build-patched.sh
 == regenerating the patch stack ==
 excluded: 53380 rename, 34755 generated, 1095 include-rewrite, 117718 deletion, 243 shim
 == applying the stack ==
-applied: 108   failed: 2
+applied: 109   failed: 2
 == building libraries ==
   libwapcaplet ok  libparserutils ok  libhubbub ok  libcss ok  libdom ok
 == building netsurf + nsmonkey ==
   netsurf ok
--rwxrwxr-x 1 seleron seleron 13685768 Sep 22 .../netsurf/nsmonkey
+-rwxrwxr-x 1 seleron seleron 13689352 Sep 22 .../netsurf/nsmonkey
 ```
 
 The **2 failures are pre-existing, not new**: `libhubbub/04-treebuilder.patch`
@@ -125,6 +125,7 @@ staged tree:
 | grid + tag-type: Makefile wiring for `layout_grid.c` / `macsurf_dom_compat.c` | patch 23 |
 | `-Werror` fixes for `layout_grid.c` (`<string.h>`, two brace-less ifs) | patch 24 |
 | two-stop linear-gradient plotter: `monkey_plot_rectangle` bands `fill_colour`→`fill_colour2` into 32 solid strips (radial → single solid) | patch 25 (`frontends/monkey/plot.c`) |
+| box-shadow plotter: `monkey_plot_rectangle` paints the drop shadow (offset rect before fill) and inset edge bands (after fill) — MacSurf parity, no blur on either side | patch 26 (`frontends/monkey/plot.c`) |
 | `-Wno-error=missing-prototypes / implicit-function-declaration / int-conversion` (MacSurf's new files ported from a CodeWarrior baseline) | `tools/build-patched.sh` CFLAGS |
 
 Two subtleties worth keeping:

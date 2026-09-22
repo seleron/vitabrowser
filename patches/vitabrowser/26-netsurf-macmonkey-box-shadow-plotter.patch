@@ -1,0 +1,160 @@
+VitaBrowser patch 26: monkey plot.c — box-shadow rendering (MacSurf parity).
+
+MacSurf's plotters.c paints box-shadow with plain rect primitives (no blur):
+outer = solid offset rect BEFORE the fill, inset = two edge bands AFTER.
+monkey's plot.c ignored box_shadow_{,y,inset,color} entirely, so every
+box-shadow was invisible. This adds the identical geometry:
+- macmonk_paint_drop:  offsets clamped to +/-16px (MacSurf fixes48 clamp),
+  colour 0 = default grey documented (stream is geometry-only).
+- macmonk_paint_inset: horizontal + vertical edge bands, |offset| clamped
+  to the box, on the opposite side of the offset.
+One file, no core/Makefile/stub changes. See doc 06 sec 6d.
+diff --git a/frontends/monkey/plot.c b/frontends/monkey/plot.c
+--- a/frontends/monkey/plot.c
++++ b/frontends/monkey/plot.c
+@@ -140,6 +140,79 @@ monkey_plot_line(const struct redraw_context *ctx,
+  */
+ #define MACMONK_GRAD_BANDS 32
+ 
++/* MacSurf port: box-shadow (fixes48/49 parity, MacSurf plotters.c 1346/1972).
++
++ * The core (MacSurf redraw.c) sets box_shadow / box_shadow_y (Q0.10 fixed
++ * pixel offsets), box_shadow_inset and box_shadow_color (0 = default grey)
++ * on the fill style. MacSurf's own plotter has no blur primitive either:
++ * an OUTER shadow is a solid offset rectangle painted BEFORE the fill (the
++ * Mac OS 9 floating-window look), an INSET shadow is two edge bands clipped
++ * to the box painted AFTER the fill. We emit the identical geometry, so a
++ * colour-aware plotter (the Vita frontend) reproduces MacSurf's render.
++ */
++static void macmonk_shadow_rect(struct rect r)
++{
++	moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++			r.x0, r.y0, r.x1, r.y1);
++}
++
++/* MacSurf plotters.c 1346: outer (drop) shadow. Solid offset rect painted
++ * BEFORE the fill; offsets clamped to +/-16px; colour 0 = default grey. */
++static void macmonk_paint_drop(const plot_style_t *style,
++					   struct rect r)
++{
++	int hoff = (int)(style->box_shadow >> PLOT_STYLE_RADIX);
++	int voff = (int)(style->box_shadow_y >> PLOT_STYLE_RADIX);
++
++	if (hoff < -16) hoff = -16;
++	if (hoff >  16) hoff =  16;
++	if (voff < -16) voff = -16;
++	if (voff >  16) voff =  16;
++	if (hoff != 0 || voff != 0) {
++		r.x0 += hoff;
++		r.x1 += hoff;
++		r.y0 += voff;
++		r.y1 += voff;
++		macmonk_shadow_rect(r);
++	}
++}
++
++/* MacSurf plotters.c 1972: inset shadow. Two edge bands (width = |offset|,
++ * clamped to the box) painted AFTER the fill, on the opposite side. */
++static void macmonk_paint_inset(const plot_style_t *style,
++					    struct rect r)
++{
++	int hoff = (int)(style->box_shadow >> PLOT_STYLE_RADIX);
++	int voff = (int)(style->box_shadow_y >> PLOT_STYLE_RADIX);
++	int bw = r.x1 - r.x0;
++	int bh = r.y1 - r.y0;
++	struct rect edge;
++
++	if (hoff >  bw) hoff =  bw;
++	if (hoff < -bw) hoff = -bw;
++	if (voff >  bh) voff =  bh;
++	if (voff < -bh) voff = -bh;
++
++	if (hoff > 0) {
++		edge = r;
++		edge.x1 = r.x0 + hoff;
++		macmonk_shadow_rect(edge);
++	} else if (hoff < 0) {
++		edge = r;
++		edge.x0 = r.x1 + hoff;
++		macmonk_shadow_rect(edge);
++	}
++	if (voff > 0) {
++		edge = r;
++		edge.y1 = r.y0 + voff;
++		macmonk_shadow_rect(edge);
++	} else if (voff < 0) {
++		edge = r;
++		edge.y0 = r.y1 + voff;
++		macmonk_shadow_rect(edge);
++	}
++}
++
+ static nserror
+ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 		      const plot_style_t *style,
+@@ -148,18 +221,29 @@ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 	bool horizontal;
+ 	int n = MACMONK_GRAD_BANDS;
+ 	int span, i;
++	bool has_shadow = (style->box_shadow != 0 || style->box_shadow_y != 0)
++			&& style->fill_type != PLOT_OP_TYPE_NONE;
++	struct rect r = *rect;
++
++	if (has_shadow && style->box_shadow_inset == false) {
++		macmonk_paint_drop(style, r);
++	}
+ 
+ 	if (style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT &&
+ 			style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT_H) {
+ 		moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
+-			rect->x0, rect->y0, rect->x1, rect->y1);
++			r.x0, r.y0, r.x1, r.y1);
++		if (has_shadow && style->box_shadow_inset)
++			macmonk_paint_inset(style, r);
+ 		return NSERROR_OK;
+ 	}
+ 	horizontal = (style->fill_type == PLOT_OP_TYPE_LINEAR_GRADIENT_H);
+-	span = horizontal ? (rect->x1 - rect->x0) : (rect->y1 - rect->y0);
++	span = horizontal ? (r.x1 - r.x0) : (r.y1 - r.y0);
+ 	if (span <= 0) {
+ 		moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
+-			rect->x0, rect->y0, rect->x1, rect->y1);
++			r.x0, r.y0, r.x1, r.y1);
++		if (has_shadow && style->box_shadow_inset)
++			macmonk_paint_inset(style, r);
+ 		return NSERROR_OK;
+ 	}
+ 
+@@ -174,18 +258,18 @@ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 		int r2 = (int)(c2 & 0xFF), g2 = (int)((c2 >> 8) & 0xFF),
+ 		    b2 = (int)((c2 >> 16) & 0xFF);
+ 		for (i = 0; i < n; i++) {
+-			struct rect br = *rect;
++			struct rect br = r;
+ 			int t = (i * 255) / n;
+ 			int fr = r1 + ((r2 - r1) * t) / 255;
+ 			int fg = g1 + ((g2 - g1) * t) / 255;
+ 			int fb = b1 + ((b2 - b1) * t) / 255;
+ 			(void)fr; (void)fg; (void)fb;
+ 			if (horizontal) {
+-				br.x0 = rect->x0 + span * i / n;
+-				br.x1 = rect->x0 + span * (i + 1) / n;
++				br.x0 = r.x0 + span * i / n;
++				br.x1 = r.x0 + span * (i + 1) / n;
+ 			} else {
+-				br.y0 = rect->y0 + span * i / n;
+-				br.y1 = rect->y0 + span * (i + 1) / n;
++				br.y0 = r.y0 + span * i / n;
++				br.y1 = r.y0 + span * (i + 1) / n;
+ 			}
+ 			if (br.x1 <= br.x0 || br.y1 <= br.y0)
+ 				continue;
+@@ -193,6 +277,8 @@ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 				br.x0, br.y0, br.x1, br.y1);
+ 		}
+ 	}
++	if (has_shadow && style->box_shadow_inset)
++		macmonk_paint_inset(style, r);
+ 	return NSERROR_OK;
+ }
+ 

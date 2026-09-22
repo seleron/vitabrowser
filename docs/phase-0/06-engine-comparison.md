@@ -1,11 +1,12 @@
 # Phase 0 — measuring the patch stack with plot streams
 
-**Date:** 2026-09-21 (updated 2026-09-22, thrice: dom-walk discovery + grid/tag-type ports + gradient plotter)
+**Date:** 2026-09-21 (updated 2026-09-22, four times: dom-walk discovery + grid/tag-type ports + gradient plotter + box-shadow plotter)
 **Covers:** `04-patch-stack.md` §8 item 2 — the first real use of the §14.3 harness
 **Status:** ✅ `nsmonkey` builds against the patched engine, author CSS now
-renders, **CSS grid + form-control tag-types are live** (patches 23+24), and
-**L1 is byte-identical to the pristine golden.** L2/L3/L4 differ only where the
-patch stack adds behavior the pristine engine lacks.
+renders, **CSS grid + form-control tag-types are live** (patches 23+24),
+**linear gradients band** (patch 25), **box-shadows render** (patch 26),
+and **L1 is byte-identical to the pristine golden.** L2/L3/L4 differ only
+where the patch stack adds behavior the pristine engine lacks.
 
 > **Headline (2026-09-22, fourth pass):** After (1) fixing the
 > `css_error_from_parserutils_error` stub, (2) replacing the no-op
@@ -13,9 +14,12 @@ patch stack adds behavior the pristine engine lacks.
 > promoting the `layout_grid` + `macsurf_html_element_get_tag_type` weak
 > no-op stubs to their real MacSurf implementations (§6b, patches 23+24), and
 > (4) adding the two-stop linear-gradient plotter to monkey (§6c, patch 25),
+> and (5) adding box-shadow rendering to monkey (§6d, patch 26),
 > the patched engine renders all author CSS (inline `<style>` and `<link>`),
 > lays out MacSurf's `-macsurf-grid`, renders `<select>`/`<input>` controls,
-> and bands linear gradients. L1 matches the pristine golden byte-for-byte.
+> bands linear gradients, and paints box-shadows (drop = offset rect,
+> inset = edge bands — MacSurf's own plotters use the same primitives,
+> no blur on either side). L1 matches the pristine golden byte-for-byte.
 > The remaining L2/L3/L4 diffs are the value functions, MacSurf's proprietary
 > grid dialect, and layout reflows the stack is *meant* to add — not
 > regressions.
@@ -27,7 +31,7 @@ patch stack adds behavior the pristine engine lacks.
 | Binary | Built from | Size |
 |---|---|---|
 | upstream `nsmonkey` | pristine NetSurf | 12,784,000 B |
-| patched `nsmonkey` | + the 62-patch stack (+ 23 vitabrowser patches) | 13,685,768 B |
+| patched `nsmonkey` | + the 62-patch stack (+ 24 vitabrowser patches) | 13,689,352 B |
 
 Both render at **960x544** (Vita front screen). The patched binary's viewport
 is set by `patches/vitabrowser/22-netsurf-macmonkey-viewport.patch`, which
@@ -35,7 +39,7 @@ overrides monkey's hardcoded 800x600; without it every comparison diff is
 dominated by window-size reflow (doc 03 §5).
 
 `tools/compare-engines.sh` renders every probe page with both and diffs the
-plot streams (2026-09-22, post grid/tag-type/gradient ports, rebuild 13, 108 patches):
+plot streams (2026-09-22, post grid/tag-type/gradient/box-shadow ports, rebuild 14, 109 patches):
 
 ```
 SAME  L1-layout-basics
@@ -100,7 +104,7 @@ The property-level capabilities from doc 05 (grid, flex gap, word-break,
 value functions) show up as geometry deltas only where they are exercised.
 The honest statement remains: the 44 new properties parse and cascade; the
 ones that feed layout now change rendered geometry; the ones that need the
-plotters (box-shadow, gradients) wait on the netsurf-side port.
+plotters (box-shadow + gradients) are live on the stream frontend (§6c/§6d).
 
 ## 4. Getting `nsmonkey` to link against the patched engine
 
@@ -306,6 +310,40 @@ plotter itself bands `_H` correctly, so this is a libcss/cascade direction
 keyword issue, out of scope for the plotter port (diagonal/3-stop extended
 gradients, op `0x0180`, are a further separate layer).
 
+## 6d. Box-shadow port (patch 26, `frontends/monkey/plot.c` only)
+
+**The premise was wrong — there was no blur gap.** MacSurf's own
+`plotters.c` has no blur primitive either: an OUTER (drop) shadow is a
+solid offset rectangle painted *before* the box fill (the Mac OS 9
+floating-window look; offsets clamped to ±16px, colour 0 = default grey,
+`plotters.c` 1346), and an INSET shadow is two edge bands — width =
+|offset|, clamped to the box — painted *after* the fill, on the opposite
+side of the offset (`plotters.c` 1972). The core already ships everything:
+`redraw.c` 1709–1733 decodes `css_computed_box_shadow` (packed
+h/v/rgb555) into `plot_style_t`'s `box_shadow` / `box_shadow_y` (Q0.10
+fixed), `box_shadow_inset`, `box_shadow_color`. Monkey's `plot.c` simply
+ignored all four fields, so every box-shadow was invisible.
+
+Patch 26 adds `macmonk_paint_drop` + `macmonk_paint_inset` to
+`monkey_plot_rectangle`, emitting the identical geometry as `PLOT RECT`
+lines. One file, no core/Makefile/stub changes.
+
+**Verified (rebuild 14, 109 patches, `PM-shadow.html`):**
+- `box-shadow: 8px 8px` on a 200×80 box at (10,10): **drop rect at
+  (18,18)-(218,98)** = box + 8px both axes, painted before the fill ✓
+- `box-shadow: inset 6px 6px` on the box at (10,90)-(210,170): **left
+  band (10,90)-(16,170) + top band (10,90)-(210,96)**, painted after the
+  fill ✓ (MacSurf convention: positive inset offsets paint on the
+  opposite side)
+- **L1 SAME** (byte-identical to pristine golden), gradient probe
+  unchanged (32-strip vertical box) — patch 26 touches the same function
+  as 25, canary + regression both hold.
+
+Multi-shadow (`box_shadow_2`/`_3` one-shot statics) and real blur remain
+out of scope: the one-shots are `__MACOS9__`-gated and need macos9-side
+statics monkey has no business reading, and no stream-frontend plotter
+has a blur primitive.
+
 ## 7. Blocked / not done
 
 - **Standard `grid-template-columns`** — not implemented (see §6b scope note).
@@ -329,11 +367,14 @@ gradients, op `0x0180`, are a further separate layer).
 
 ## 8. Next actions
 
-1. **Port the remaining box-model consumers** — box-shadow (needs core
-   `plot_style_t` + monkey plumbing, and no blur primitive — a real gap, not
-   a plotter one-liner), then animation timeline.
+1. **Animation timeline** — the last of the four MacSurf plotters the
+   `redraw.c` fork emits (`-macsurf-animation-*`, fixes76/77 resolvers
+   already in the ported core).
 2. **Investigate the libcss `to right` direction gap** (§6c): the parser /
    cascade / redraw chain all look right, yet the `_H` op is lost in the
    bytecode `set_value` round-trip. Worth one focused session.
-3. **Re-run `compare-engines.sh`** after each; L1 must stay SAME as the
+3. **Multi-shadow / real blur** — out of scope on the stream frontend
+   (one-shot statics are `__MACOS9__`-gated; no blur primitive); revisit
+   if the Vita frontend gains a filter pass.
+4. **Re-run `compare-engines.sh`** after each; L1 must stay SAME as the
    canary.
