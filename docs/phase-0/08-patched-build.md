@@ -6,10 +6,10 @@
 scope decision it forced.
 **Status:** **achieved.** `tools/build-patched.sh` builds the full stack
 (5 libraries + 6 support libraries + netsurf) and links
-`nsmonkey` (13.69 MB, 2026-09-22 rebuild 14, 109 patches applied).
+`nsmonkey` (13.69 MB, 2026-09-22 rebuild 15, 110 patches applied).
 Author CSS (inline `<style>` and external `<link>`), CSS grid
 (`-macsurf-grid`), form-control tag types, two-stop linear gradients,
-and box-shadows now render — see doc 06 §6/§6b/§6c/§6d.
+and box-shadows and animation timelines now render — see doc 06 §6/§6b/§6c/§6d/§6e.
 
 ---
 
@@ -126,6 +126,7 @@ staged tree:
 | `-Werror` fixes for `layout_grid.c` (`<string.h>`, two brace-less ifs) | patch 24 |
 | two-stop linear-gradient plotter: `monkey_plot_rectangle` bands `fill_colour`→`fill_colour2` into 32 solid strips (radial → single solid) | patch 25 (`frontends/monkey/plot.c`) |
 | box-shadow plotter: `monkey_plot_rectangle` paints the drop shadow (offset rect before fill) and inset edge bands (after fill) — MacSurf parity, no blur on either side | patch 26 (`frontends/monkey/plot.c`) |
+| animation-timeline plotter: `monkey_plot_rectangle` paints a transformed box as a 4-corner `POLY` (MacSurf `transform_unpack` + Q15 sin/cos) and appends `OPAQUE <bucket>` for opacity <100% — both tokens conditional so L1 stays byte-identical; unit test `tools/test_anim_plotter.c` (24/24) | patch 27 (`frontends/monkey/plot.c`) |
 | `-Wno-error=missing-prototypes / implicit-function-declaration / int-conversion` (MacSurf's new files ported from a CodeWarrior baseline) | `tools/build-patched.sh` CFLAGS |
 
 Two subtleties worth keeping:

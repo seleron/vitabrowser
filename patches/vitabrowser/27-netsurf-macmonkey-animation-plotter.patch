@@ -1,0 +1,226 @@
+diff --git a/frontends/monkey/plot.c b/frontends/monkey/plot.c
+index 2ff5023..8690d57 100644
+--- a/frontends/monkey/plot.c
++++ b/frontends/monkey/plot.c
+@@ -213,6 +213,176 @@ static void macmonk_paint_inset(const plot_style_t *style,
+ 	}
+ }
+ 
++/* MacSurf port: animation timeline rendering (fixes71/72/76/77 parity).
++
++ * The core (MacSurf redraw.c, already ported) computes the CURRENT tick's
++ * values and puts them on the fill style before plot.rectangle runs:
++ *   - opacity   = current animated opacity (PLOT_STYLE_SCALE=1024), set by
++ *                 the -macsurf-animation-opacity resolver (fixes76)
++ *   - transform = packed rotate/scale/translate, rotation field overridden
++ *                 by the -macsurf-animation-rotate resolver (fixes77)
++ * Monkey previously ignored both fields, so animated boxes rendered static
++ * and full-opacity. We now honour them with the same primitives MacSurf's
++ * own plotter uses (plotters.c 994-1075, 1174-1260, 1799-1855):
++ *
++ *  OPACITY: MacSurf picks a stipple pattern bucket. A stream has no pattern
++ *  primitive, so the BUCKET is the observable contract (fixes49 thresholds):
++ *    0: <5% skip paint      1: 5-35%   2: 35-60%      3: 60-85%
++ *    4: >85% solid
++ *  Emitted as `OPAQUE <n>` on the PLOT RECT / POLY line. Unset opacity is
++ *  0 by convention (calloc'd plot_style_t) -> treated as opaque (fixes223).
++ *
++ *  TRANSFORM: a non-identity packed transform (rotation != 0, translate != 0,
++ *  scale != 1) turns the box into a 4-corner polygon, rotated/scaled around
++ *  its centre, emitted as a POLY line with the exact Q15 corners. Identity
++ *  transforms skip the branch so the 99% fast path is untouched (and L1 stays
++ *  byte-identical).
++ */
++static const int16_t macmonk_sin_q15_table[91] = {
++    0,   572,  1144,  1715,  2286,  2856,  3425,  3993,  4560,  5126,
++  5690,  6252,  6813,  7371,  7927,  8481,  9032,  9580, 10126, 10668,
++ 11207, 11743, 12275, 12803, 13328, 13848, 14365, 14876, 15384, 15886,
++ 16384, 16877, 17364, 17847, 18324, 18795, 19261, 19720, 20174, 20622,
++ 21063, 21498, 21926, 22348, 22763, 23170, 23571, 23965, 24351, 24730,
++ 25102, 25466, 25822, 26170, 26510, 26842, 27166, 27482, 27789, 28088,
++ 28378, 28660, 28932, 29197, 29452, 29698, 29935, 30163, 30382, 30592,
++ 30792, 30983, 31164, 31336, 31499, 31651, 31795, 31928, 32052, 32166,
++ 32270, 32365, 32449, 32524, 32588, 32643, 32688, 32723, 32748, 32763,
++ 32767
++};
++
++static int macmonk_sin_q15(int deg)
++{
++	while (deg < 0) deg += 360;
++	while (deg >= 360) deg -= 360;
++	if (deg <=  90) return  macmonk_sin_q15_table[deg];
++	if (deg <= 180) return  macmonk_sin_q15_table[180 - deg];
++	if (deg <= 270) return -macmonk_sin_q15_table[deg - 180];
++	return -macmonk_sin_q15_table[360 - deg];
++}
++
++static int macmonk_cos_q15(int deg)
++{
++	return macmonk_sin_q15(deg + 90);
++}
++
++/* MacSurf plotters.c 1043: unpack the -macsurf-transform packed value.
++ * bits 31=percent-translate, 30..16=rotation Q10.6 (15-bit signed),
++ * 15..8=tx int8, 7..0=ty int8. Returns 0..359 degrees. */
++static void macmonk_transform_unpack(int transform,
++							  int *rot_deg, int *tx, int *ty)
++{
++	int32_t rot_q106;
++	int deg;
++	int is_pct = (int)(((uint32_t)transform >> 31) & 1);
++	int8_t tx_px = (int8_t)((((uint32_t)transform) >> 8) & 0xff);
++	int8_t ty_px = (int8_t)( ((uint32_t)transform)       & 0xff);
++
++	rot_q106 = (int32_t)((((uint32_t)transform) >> 16) & 0x7fff);
++	if (rot_q106 & 0x4000) rot_q106 -= 0x8000;
++	deg = (int)(rot_q106 / 64);
++	while (deg < 0)   deg += 360;
++	while (deg >= 360) deg -= 360;
++
++	*rot_deg = deg;
++	if (is_pct) {
++		*tx = 0;
++		*ty = 0;
++	} else {
++		*tx = (int)tx_px;
++		*ty = (int)ty_px;
++	}
++}
++
++/* MacSurf plotters.c 1077: rotate a point around (cx,cy) by rot_deg then
++ * translate. Fast exact path for the four cardinals; Q15 affine otherwise. */
++static void macmonk_transform_point(int *px, int *py,
++						   int cx, int cy, int rot_deg,
++						   int tx, int ty)
++{
++	int dx = *px - cx;
++	int dy = *py - cy;
++	int s = macmonk_sin_q15(rot_deg);
++	int c = macmonk_cos_q15(rot_deg);
++	int nx, ny;
++
++	switch (rot_deg) {
++	case 0:    nx = dx;  ny = dy;  break;
++	case 90:   nx = -dy; ny = dx;  break;
++	case 180:  nx = -dx; ny = -dy; break;
++	case 270:  nx = dy;  ny = -dx; break;
++	default:
++		nx = (dx * c - dy * s + 16384) >> 15;
++		ny = (dx * s + dy * c + 16384) >> 15;
++		break;
++	}
++	*px = cx + nx + tx;
++	*py = cy + ny + ty;
++}
++
++/* MacSurf plotters.c 1799 (fixes49): map opacity to the stipple bucket.
++ * 0 (unset/calloc'd) -> opaque (fixes223). <5% -> skip (0). */
++static int macmonk_opacity_bucket(const plot_style_t *style)
++{
++	plot_style_fixed op = style->opacity;
++	if (op == 0) op = (plot_style_fixed)PLOT_STYLE_SCALE;
++	if (op < (plot_style_fixed)(PLOT_STYLE_SCALE / 20))
++		return 0;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 35) / 100))
++		return 1;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 60) / 100))
++		return 2;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 85) / 100))
++		return 3;
++	return 4;
++}
++
++/* Emit a 4-corner polygon (MacSurf plotters.c 1174-1260 geometry):
++ * pre-scale around centre, then rotate+translate each corner. The OPAQUE
++ * token is appended only for a non-solid bucket so the L1 canary stream is
++ * byte-identical. */
++static void macmonk_fill_transformed(const plot_style_t *style,
++						     struct rect r, int ob)
++{
++	int rot_deg, tx, ty;
++	int cx, cy;
++	int sx_q88, sy_q88;
++	int x[4], y[4];
++	int i;
++
++	macmonk_transform_unpack(style->transform, &rot_deg, &tx, &ty);
++	sx_q88 = (int)((((uint32_t)style->transform_b) >> 16) & 0xffff);
++	sy_q88 = (int)( ((uint32_t)style->transform_b)        & 0xffff);
++	if (sx_q88 == 0) sx_q88 = 256;
++	if (sy_q88 == 0) sy_q88 = 256;
++
++	cx = (r.x0 + r.x1) / 2;
++	cy = (r.y0 + r.y1) / 2;
++
++	x[0] = r.x0;  y[0] = r.y0;
++	x[1] = r.x1;  y[1] = r.y0;
++	x[2] = r.x1;  y[2] = r.y1;
++	x[3] = r.x0;  y[3] = r.y1;
++	if (sx_q88 != 256 || sy_q88 != 256) {
++		for (i = 0; i < 4; i++) {
++			int dx = x[i] - cx;
++			int dy = y[i] - cy;
++			x[i] = cx + (dx * sx_q88) / 256;
++			y[i] = cy + (dy * sy_q88) / 256;
++		}
++	}
++	for (i = 0; i < 4; i++) {
++		macmonk_transform_point(&x[i], &y[i], cx, cy, rot_deg, tx, ty);
++	}
++	if (ob == 4) {
++		moutf(MOUT_PLOT, "POLY X0 %d Y0 %d X1 %d Y1 %d X2 %d Y2 %d X3 %d Y3 %d",
++				x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
++	} else {
++		moutf(MOUT_PLOT, "POLY X0 %d Y0 %d X1 %d Y1 %d X2 %d Y2 %d X3 %d Y3 %d OPAQUE %d",
++				x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3], ob);
++	}
++}
++
+ static nserror
+ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 		      const plot_style_t *style,
+@@ -225,17 +395,39 @@ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 			&& style->fill_type != PLOT_OP_TYPE_NONE;
+ 	struct rect r = *rect;
+ 
++	/* patch 27: non-identity transform (rotation/scale/translate, possibly
++	 * animated via -macsurf-animation-rotate) -> fill as a rotated/scaled
++	 * 4-corner polygon with the current tick's opacity bucket. Identity
++	 * transforms and plain boxes skip this branch entirely (L1 byte-identical).
++	 */
++	if (style->fill_type != PLOT_OP_TYPE_NONE &&
++			(style->transform != 0 ||
++			 (style->transform_b != 0 &&
++			  style->transform_b != (int)0x01000100))) {
++		macmonk_fill_transformed(style, r,
++					 macmonk_opacity_bucket(style));
++		return NSERROR_OK;
++	}
++
+ 	if (has_shadow && style->box_shadow_inset == false) {
+ 		macmonk_paint_drop(style, r);
+ 	}
+ 
+ 	if (style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT &&
+ 			style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT_H) {
+-		moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
+-			r.x0, r.y0, r.x1, r.y1);
+-		if (has_shadow && style->box_shadow_inset)
+-			macmonk_paint_inset(style, r);
+-		return NSERROR_OK;
++		{
++			int ob = macmonk_opacity_bucket(style);
++			if (ob == 4) {
++				moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++					r.x0, r.y0, r.x1, r.y1);
++			} else {
++				moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d OPAQUE %d",
++					r.x0, r.y0, r.x1, r.y1, ob);
++			}
++			if (has_shadow && style->box_shadow_inset)
++				macmonk_paint_inset(style, r);
++			return NSERROR_OK;
++		}
+ 	}
+ 	horizontal = (style->fill_type == PLOT_OP_TYPE_LINEAR_GRADIENT_H);
+ 	span = horizontal ? (r.x1 - r.x0) : (r.y1 - r.y0);

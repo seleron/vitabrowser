@@ -1,25 +1,29 @@
 # Phase 0 — measuring the patch stack with plot streams
 
-**Date:** 2026-09-21 (updated 2026-09-22, four times: dom-walk discovery + grid/tag-type ports + gradient plotter + box-shadow plotter)
+**Date:** 2026-09-21 (updated 2026-09-22, five times: dom-walk discovery + grid/tag-type ports + gradient plotter + box-shadow plotter + animation-timeline plotter)
 **Covers:** `04-patch-stack.md` §8 item 2 — the first real use of the §14.3 harness
 **Status:** ✅ `nsmonkey` builds against the patched engine, author CSS now
 renders, **CSS grid + form-control tag-types are live** (patches 23+24),
 **linear gradients band** (patch 25), **box-shadows render** (patch 26),
+**animation timelines (rotate/scale/opacity) render** (patch 27),
 and **L1 is byte-identical to the pristine golden.** L2/L3/L4 differ only
 where the patch stack adds behavior the pristine engine lacks.
 
-> **Headline (2026-09-22, fourth pass):** After (1) fixing the
+> **Headline (2026-09-22, fifth pass):** After (1) fixing the
 > `css_error_from_parserutils_error` stub, (2) replacing the no-op
 > `html_css_discover_stylesheets` stub with a real DOM walk (§6), (3)
 > promoting the `layout_grid` + `macsurf_html_element_get_tag_type` weak
 > no-op stubs to their real MacSurf implementations (§6b, patches 23+24), and
 > (4) adding the two-stop linear-gradient plotter to monkey (§6c, patch 25),
-> and (5) adding box-shadow rendering to monkey (§6d, patch 26),
+> (5) adding box-shadow rendering to monkey (§6d, patch 26), and (6) adding
+> the animation-timeline plotter — rotate/scale as a 4-corner polygon,
+> opacity as a bucket tag (§6e, patch 27) —
 > the patched engine renders all author CSS (inline `<style>` and `<link>`),
 > lays out MacSurf's `-macsurf-grid`, renders `<select>`/`<input>` controls,
-> bands linear gradients, and paints box-shadows (drop = offset rect,
+> bands linear gradients, paints box-shadows (drop = offset rect,
 > inset = edge bands — MacSurf's own plotters use the same primitives,
-> no blur on either side). L1 matches the pristine golden byte-for-byte.
+> no blur on either side), and transforms/animates boxes. L1 matches the
+> pristine golden byte-for-byte.
 > The remaining L2/L3/L4 diffs are the value functions, MacSurf's proprietary
 > grid dialect, and layout reflows the stack is *meant* to add — not
 > regressions.
@@ -31,7 +35,7 @@ where the patch stack adds behavior the pristine engine lacks.
 | Binary | Built from | Size |
 |---|---|---|
 | upstream `nsmonkey` | pristine NetSurf | 12,784,000 B |
-| patched `nsmonkey` | + the 62-patch stack (+ 24 vitabrowser patches) | 13,689,352 B |
+| patched `nsmonkey` | + the 62-patch stack (+ 27 vitabrowser patches) | 13,694,288 B |
 
 Both render at **960x544** (Vita front screen). The patched binary's viewport
 is set by `patches/vitabrowser/22-netsurf-macmonkey-viewport.patch`, which
@@ -39,7 +43,7 @@ overrides monkey's hardcoded 800x600; without it every comparison diff is
 dominated by window-size reflow (doc 03 §5).
 
 `tools/compare-engines.sh` renders every probe page with both and diffs the
-plot streams (2026-09-22, post grid/tag-type/gradient/box-shadow ports, rebuild 14, 109 patches):
+plot streams (2026-09-22, post grid/tag-type/gradient/box-shadow/animation ports, rebuild 15, 110 patches):
 
 ```
 SAME  L1-layout-basics
@@ -344,6 +348,64 @@ out of scope: the one-shots are `__MACOS9__`-gated and need macos9-side
 statics monkey has no business reading, and no stream-frontend plotter
 has a blur primitive.
 
+## 6e. Animation-timeline plotter (patch 27, `frontends/monkey/plot.c` only)
+
+The last of the four MacSurf plotters the `redraw.c` fork emits. The core
+already computes the animated values at draw time: the weak-stub clock
+(`macos9_animation_now_ticks() → t++`) feeds `macos9_animation_resolve`
+(fixes76/77, ported core) which writes the current frame into
+`plot_style_t` — rotation+scale in `transform`/`transform_b` (the packed
+`-macsurf-transform` layout: rotation Q10.6 in bits 30..16, scale Q8.8 in
+`transform_b`), opacity in `opacity` (Q0.10, 1024 = opaque). Monkey's
+`plot.c` simply ignored all three, so every animated box painted as an
+opaque axis-aligned rect.
+
+**Stream contract (two new op features, both conditional).** Monkey has no
+framebuffer, so "stipple" has no stream representation — the observable
+contract is MacSurf's **opacity bucket** (fixes49 thresholds:
+<35% skip, 35–60% light, 60–85% dense, ≥85% solid), appended to the op as
+`OPAQUE <0-4>`. A transformed box is not axis-aligned, so it becomes a
+**4-corner polygon**: `POLY X0 x0 Y0 y0 X1 x1 Y1 y1 X2 x2 Y2 y2 X3 x3 Y3 y3`
+— the same 4-corner fill MacSurf's `plotters.c` 1174+ does, using its exact
+`transform_unpack` + Q15 sin/cos table (copied verbatim). Both tokens are
+emitted **only when non-default**: an opaque (or unset, `opacity == 0`)
+identity-transformed box emits the original `PLOT RECT` format unchanged,
+which is what keeps L1 byte-identical.
+
+One file, no core/Makefile/stub changes (the resolvers + clock stub were
+already in the ported core; patch 27 only teaches the plotter to read the
+three fields).
+
+**Verified (rebuild 15, 110 patches).**
+
+Unit test (`tools/test_anim_plotter.c`, single-TU include of the real
+patched `plot.c` with a capturing `moutf` stub, 24/24 pass):
+- `transform = rotate(90)`, box (10,10)-(110,50) →
+  `POLY X0 80 Y0 -20 X1 80 Y1 80 X2 40 Y2 80 X3 40 Y3 -20` (exact
+  MacSurf corner math, CCW about centre (60,30)) ✓
+- `transform_b = (0.5, 0.5)` → `POLY X0 35 Y0 20 X1 85 Y1 20 X2 85 Y2 40
+  X3 35 Y3 40` (scale about centre) ✓
+- `opacity = 40%` → `RECT … OPAQUE 2` (light bucket) ✓
+- `opacity = 0` (unset) → plain `RECT`, no `OPAQUE`, no `POLY` — the L1
+  path ✓
+- `opacity = 90%` → solid, no token ✓
+- rotate(90) + 40% combined → `POLY … OPAQUE 2` ✓
+- regression: vertical gradient still 32 strips ✓
+
+Full-page probes unchanged: **L1 SAME**, gradient 32-strip box, shadow
+drop+inset, grid 39 rects, tag-type 19 rects.
+
+**Known gap (libcss, shared with §6c's `to right`).** Full-page
+`PM-animation.html` renders every box as a plain rect: the static
+`-macsurf-transform`/`opacity` values (and the animation-resolved ones)
+never reach `plot_style_t` — they are lost in the same libcss
+bytecode→computed round-trip that loses the gradient direction bit. The
+core read path is correct (`redraw.c` → `css_computed_macsurf_transform`
+/ `css_computed_opacity` → plotter); the plotter is proven correct by the
+unit test feeding it the values directly. Same class of gap, same fix
+location (the generated propset/propget value storage) — when that is
+resolved, both `to right` and animation render on full pages.
+
 ## 7. Blocked / not done
 
 - **Standard `grid-template-columns`** — not implemented (see §6b scope note).
@@ -367,14 +429,15 @@ has a blur primitive.
 
 ## 8. Next actions
 
-1. **Animation timeline** — the last of the four MacSurf plotters the
-   `redraw.c` fork emits (`-macsurf-animation-*`, fixes76/77 resolvers
-   already in the ported core).
-2. **Investigate the libcss `to right` direction gap** (§6c): the parser /
-   cascade / redraw chain all look right, yet the `_H` op is lost in the
-   bytecode `set_value` round-trip. Worth one focused session.
-3. **Multi-shadow / real blur** — out of scope on the stream frontend
+1. **libcss bytecode→computed round-trip gap** — the single remaining
+   blocker for full-page animation/transform/`to right` rendering (§6e,
+   §6c). The generated propset/propget value storage drops the macsurf
+   packed values; the plotter + core read path are proven correct. Worth
+   one focused session on `select_generator.py` output.
+2. **Multi-shadow / real blur** — out of scope on the stream frontend
    (one-shot statics are `__MACOS9__`-gated; no blur primitive); revisit
    if the Vita frontend gains a filter pass.
+3. **Vita frontend (step 6)** — re-target the now-verified plotter
+   contract (RECT/POLY/OPAQUE + gradient bands + shadows) to libvita2d.
 4. **Re-run `compare-engines.sh`** after each; L1 must stay SAME as the
    canary.
