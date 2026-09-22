@@ -13,8 +13,8 @@ exactly which parts that covers.
 | Deliverable (task spec) | State | Evidence |
 |---|---|---|
 | (1) frontend skeleton + build hook | **done** | `make TARGET=vita` → `nsvita.elf` (ELF32 ARM); `tools/build-vita.sh` |
-| (2) libvita2d renderer for the contract | **done** | `tools/test-vita-renderer.sh`: 82/82, contract byte-identical to monkey over 200 000 fuzz cases |
-| (3) app entry point that fetches + renders a test page | **done, cross-built; run on host only** | `VitaBrowser.vpk` bundles `testpages/pages/`; `tools/run-vita-sim.sh` renders all 10 through the real frontend (§3.3) |
+| (2) libvita2d renderer for the contract | **done** | `tools/test-vita-renderer.sh`: 91/91, contract byte-identical to monkey over 200 000 fuzz cases |
+| (3) app entry point that fetches + renders a test page | **done, cross-built; run on host only** | `VitaBrowser.vpk` bundles `testpages/pages/`; `tools/run-vita-sim.sh` renders all 11 through the real frontend (§3.3) |
 | (4) docs | this file | |
 | fallback (renderer + host test + renderer cross-compile) | exceeded | the whole stack cross-compiles and links, not only the renderer |
 
@@ -22,9 +22,10 @@ Reproduce, from a clean checkout:
 
 ```
 WORK=<WORK>/vitabrowser-work tools/build-patched.sh     # stages + applies the stack (now incl. 29-31), host nsmonkey
-WORK=<WORK>/vitabrowser-work tools/test-vita-renderer.sh # 82/82
+tools/check-patched-streams.sh                      # probe fixtures match the live patched engine
+WORK=<WORK>/vitabrowser-work tools/test-vita-renderer.sh # 91/91
 WORK=<WORK>/vitabrowser-work tools/build-vita.sh         # nsvita.elf + VitaBrowser.vpk (2m41s)
-WORK=<WORK>/vitabrowser-work tools/run-vita-sim.sh       # 10 pages -> $WORK/vita-sim/shots/*.png
+WORK=<WORK>/vitabrowser-work tools/run-vita-sim.sh       # 11 pages -> $WORK/vita-sim/shots/*.png
 ```
 
 ## 1. What was built
@@ -39,6 +40,7 @@ Three patches in `patches/vitabrowser/`, applied after the generated stack
 | `29-netsurf-flex-use-after-free` | MacSurf `layout_flex.c` fixes167b logs `ctx->line.count` *after* `layout_flex_ctx__destroy(ctx)`; now logs first | A real bug on every platform (§4.1) |
 | `30-netsurf-vita-portability` | `fetch.c` curl include guard, `time.c` `<string.h>` + init, `config.h` `__vita__` entries | Core changes, no-ops on the host (L1 canary unchanged) |
 | `31-netsurf-vita-frontend` | `frontends/vita/**`, `vita` added to `VLDTARGET` in `frontends/Makefile.hts` | The frontend itself |
+| `32-netsurf-shadow-transform-ink-clip` | *(added later)* shadows and transform quads no longer clipped to their own box | The §5 finding's fix (§10); with it the stack applies 115 + the known 2 |
 
 `frontends/vita` (2 970 lines):
 
@@ -106,7 +108,7 @@ on.
 
 ## 3. Verification
 
-### 3.1 Host unit test — `tools/test-vita-renderer.sh` (82/82)
+### 3.1 Host unit test — `tools/test-vita-renderer.sh` (91/91)
 
 The test builds the frontend's `plot_geom.c`, `plot.c` and `replay.c` against a logging stub of
 `<vita2d.h>` (`tools/vita-stub/`: the real header's exact names, signatures
@@ -138,6 +140,9 @@ static `plotters` table.
   is counted, and the rect/fan call sequence equals a geometry sequence the
   test derives independently from the stream text, clip and bucket
   included.
+- **D. Ink clip** (added with patch 32, §10). On the patched-engine
+  fixtures, each drop shadow and the rotated quad lie inside the clip in
+  force when drawn, and a `clip: rect` still clips its shadow.
 
 **Mutation check.** A green suite is not evidence until it has failed on
 purpose. Three bugs were planted, one at a time:
@@ -180,13 +185,15 @@ The run directory holds a directory literally named `app0:`, so
 `file:///app0:/testpages/…` goes through the frontend's own `file.c` mapping
 to `app0:/testpages/…` and opens on Linux exactly as on the Vita.
 
-**Result: 10/10 pages fetched, laid out and drawn** (371 vita2d calls over 11
-frames). Screenshots, committed as evidence:
+**Result: 11/11 pages fetched, laid out and drawn** (388 vita2d calls over 12
+frames; 10/10 before `PM-shadow-clip` was added with patch 32). Screenshots,
+committed as evidence (regenerated after patch 32):
 
 | | |
 |---|---|
 | ![L1](img/09-vita-sim/L1-layout-basics.png) `L1-layout-basics`: heading, 200×60 block, wrapped paragraph, float, bordered table | ![gradient](img/09-vita-sim/PM-gradient.png) `PM-gradient`: 32-band vertical red→blue, horizontal black→white strips, radial = flat start colour |
-| ![shadow](img/09-vita-sim/PM-shadow.png) `PM-shadow`: see §5, the drop shadow is clipped away | ![animation](img/09-vita-sim/PM-animation.png) `PM-animation`: rotate(90) quad, `op40` at bucket 2 (50 %) |
+| ![shadow](img/09-vita-sim/PM-shadow.png) `PM-shadow`: the full 8 px drop shadow (was a 1 px sliver before patch 32, §5) | ![animation](img/09-vita-sim/PM-animation.png) `PM-animation`: rotate(90) quad to y = 80, seen through `op40` at bucket 2 (50 %) |
+| ![shadow clip](img/09-vita-sim/PM-shadow-clip.png) `PM-shadow-clip` (§10): last-child shadow, `overflow:hidden` card shadow, and the `clip: rect` control with its bottom clipped | |
 | ![L2](img/09-vita-sim/L2-macsurf-css.png) `L2-macsurf-css`, incl. a stroked form input | ![L4](img/09-vita-sim/L4-flex.png) `L4-flex`: justify-content variants |
 
 `L3-grid.png` shows standard `grid-template-columns` still unimplemented
@@ -254,7 +261,7 @@ rules. Every site they fire on in the libraries was checked:
 `__vita__` is predefined by the compiler (`arm-vita-eabi-gcc -dM -E`), so the
 frontend needs no `-Dvita` of its own.
 
-## 5. Finding: drop shadows and transformed boxes are clipped to their own box
+## 5. Finding: drop shadows and transformed boxes are clipped to their own box — fixed by patch 32 (§10)
 
 The simulator's `PM-shadow` frame shows the 8 px drop shadow as a **1 px
 sliver** at x = 210. The stream explains it:
@@ -275,8 +282,8 @@ is the engine's behaviour on MacSurf too, not a Vita artefact. The rotated
 Patch 26's verification (06 §6d) checked the shadow rect's geometry and not
 the clip in force, which only a rasteriser shows. This is a core
 (`redraw.c`) follow-up: widen the background clip by the shadow's offset (and
-a transformed box's rotated extent) before plotting. Recorded in 06 §8; not
-changed here, because it's an engine change with its own verification.
+a transformed box's rotated extent) before plotting. Recorded in 06 §8,
+and fixed by patch 32 (§10).
 
 ## 6. Decisions and hardware assumptions (unverified until a device run)
 
@@ -299,7 +306,10 @@ changed here, because it's an engine change with its own verification.
 - **No sudo** was used or needed: vdpm installs into `~/vitasdk`.
 - **Networking and JS are off** in this build. Brief Phase 1 steps 8/9 bring
   curl + TLS and QuickJS.
-- The drop-shadow / transform clip (§5) is a core follow-up.
+- `clip: rect(0px, 200px, 60px, 0px)` on an absolutely positioned box clips
+  its bottom edge but **not its right** (the clip stays at the parent's
+  x1 = 951). Seen on `PM-shadow-clip`; pre-existing (identical before and
+  after patch 32), not investigated.
 - The on-device plot-stream log that 03 anticipates ("the Vita frontend can
   emit the identical format over the UDP log") has its formatter
   (`vita_geom_format_rect/_quad`, tested in §3.1 A) but no transport yet.
@@ -309,8 +319,7 @@ changed here, because it's an engine change with its own verification.
 1. **First hardware run** of `VitaBrowser.vpk`. Calibrate `VITA_PGF_EM_PX`,
    check the PGF baseline and clip edges against the simulator screenshots,
    and measure the allocate-until-failure budget (pre-phase-0 §1).
-2. **Core clip fix for shadows/transforms** (§5), verified by the simulator's
-   `PM-shadow` frame showing the full 8 px strip.
+2. ~~**Core clip fix for shadows/transforms** (§5)~~ — done, patch 32 (§10).
 3. **Plot-stream log over UDP** from the frontend, diffed against the desktop
    goldens on-device.
 4. **curl + TLS** (vdpm `curl`, `openssl`) and **QuickJS**, the remaining
@@ -331,3 +340,75 @@ changed here, because it's an engine change with its own verification.
   is no rear screen (above). Corrected in place.
 - The task description named the cross toolchain `arm-none-eabi-gcc`. It is
   `arm-vita-eabi-gcc` 15.2.0, as 01 already records.
+
+## 10. The clip fix (patch 32)
+
+**What.** `32-netsurf-shadow-transform-ink-clip` makes the plotters' ink
+visible: drop shadows and transformed quads are no longer cut to their own
+box (§5). Three files, core only, no frontend changes:
+
+- `content/handlers/html/box_ink.h` (new, header-only): `box_ink_outset()`,
+  how far a box's background paint reaches past each border edge. For a drop
+  shadow (not inset), it's the offset, clamped ±16 px like every plotter.
+  For a non-identity `-macsurf-transform`, it's the quad's bounds, using the
+  plotters' own unpack (Q10.6 angle, Q8.8 scale, int8 translate, percent →
+  0). The bound is exact for a static angle, with +1 px for the plotters' integer
+  centre and Q15 rounding. An animated rotation (fixes77) replaces the angle at
+  draw time, so it uses the circumscribed circle, which bounds every angle. It is
+  conservative (it may be a pixel wide, never narrow) and capped at 4096 px per edge
+  against garbage scales (the fixes625 class).
+- **Part A, `layout.c` `layout_get_box_bbox`:** the box's own ink is added
+  to its bbox. That function is the one place a box's own extent enters the
+  descendant bboxes, including for an `overflow:hidden` child seen from its
+  parent. So every ancestor's redraw clip (a descendant bbox) contains it.
+  Text, line-break and inline-end boxes are skipped: they share a style but
+  paint no background.
+- **Part B, `redraw.c` `html_redraw_box`:** around the background paint
+  only, the clip is widened to border box + ink, bounded by the **parent's**
+  clip, then restored as before. A box's own `overflow:hidden` makes its own
+  clip its border box, which must not cut its own shadow. A CSS
+  `clip: rect` must still clip it, so that branch is left alone.
+
+**Both parts are needed, shown by building each alone** against the new
+probe `testpages/pages/PM-shadow-clip.html`:
+
+| Build | last child in a wrapper | `overflow:hidden` card | `clip: rect` control |
+|---|---|---|---|
+| before | cut to 1 px (wrapper clip `X1 211 Y1 71`) | cut away (own clip = border box) | clipped |
+| A only | visible | **cut away** | clipped |
+| B only | **cut by the wrapper** | visible | clipped |
+| A + B | visible | visible | clipped (bottom 10 px) |
+
+**What changed in the streams.** Pre- and post-fix builds were captured over
+all 10 earlier pages. **7 are byte-identical**, including the L1 canary. The 3
+with shadows or transforms (`L2-macsurf-css`, `PM-shadow`, `PM-animation`)
+changed **only in `CLIP` lines**: 0 `RECT`/`POLY`/`TEXT` lines differ, so no
+geometry moved. `PM-shadow` now draws its shadow under
+`CLIP X0 10 Y0 10 X1 218 Y1 98`, exactly the shadow's extent. In the
+simulator, the same seven screenshots are byte-identical and the three
+changed ones show the ink.
+
+**Guards.**
+- `tools/check-patched-streams.sh`, new: re-captures
+  `testpages/patched-streams/*.plot` with the live patched `nsmonkey` and
+  diffs them (`UPDATE=1` rewrites), the patched-engine counterpart of
+  `check-goldens.sh`. The fixtures were refreshed with patch 32 applied, and
+  `PM-shadow-clip.plot` was added.
+- Test layer **D** in `tools/test-vita-renderer.sh` (9 new checks, 91/91)
+  asserts on those fixtures that each shadow rect and the rotated quad lie
+  inside the clip in force when drawn, and that the `clip: rect` control's
+  shadow does not. Mutation check: run on the pre-fix fixtures, exactly the
+  4 positive assertions fail and the control passes. With A-only or B-only
+  engines, exactly the one assertion for the missing part fails.
+
+**Clean checkout:** applied 115, failed 2 (the known pair, 08 §1). L1 SAME,
+4/4 fixtures PASS, 91/91, `build-vita.sh` → `VitaBrowser.vpk` 4.0 MB with
+11 pages, simulator 11/11.
+
+**Known trade-off.** The descendant bbox also sizes the document (`html.c`
+`c->width/height`) and prunes hit-testing (`box_inspect.c`). So a shadow on
+the bottom-most or right-most box now extends the scrollable area by its
+offset (≤ 16 px). CSS counts box-shadow as ink overflow that does *not* extend
+scrolling (a transform does). The alternative is a separate ink bbox in
+`struct box`: 4 more fields computed alongside every descendant bbox, a
+larger change for ≤ 16 px. Recorded, not done.

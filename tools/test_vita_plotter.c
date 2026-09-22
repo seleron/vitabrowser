@@ -1,6 +1,6 @@
 /* Host-side test for the Vita frontend renderer (frontends/vita, patch 31).
  *
- * Three layers, each against something already verified:
+ * Four layers, each against something already verified:
  *
  *  A. CONTRACT. vita_geom_rectangle() must reproduce the monkey plot stream
  *     byte for byte. The reference is the REAL patched monkey plot.c
@@ -18,6 +18,10 @@
  *     pristine-engine goldens, and testpages/patched-streams/ *.plot, the
  *     patched engine's probe pages) is fed through vita/replay.c. Each op
  *     must reach vita2d as exactly one call with the stream's geometry.
+ *
+ *  D. INK CLIP. On the patched-engine captures, drop shadows and transform
+ *     quads lie inside the clip in force when drawn (patch 32), and a CSS
+ *     clip rect still clips them.
  *
  * Build and run: tools/test-vita-renderer.sh
  */
@@ -741,6 +745,87 @@ static void replay_dir(const char *dir, unsigned int *files)
 	vita_plot_fini();
 }
 
+/* --- D. ink clip (patch 32) --------------------------------------------- */
+
+/**
+ * Find the first op in a stream whose text starts with `op` and return the
+ * clip rectangle in force when it was plotted.
+ */
+static int clip_at_op(const char *stream, const char *op, struct rect *clip)
+{
+	const char *p = stream;
+	size_t ol = strlen(op);
+
+	clip->x0 = 0; clip->y0 = 0; clip->x1 = 960; clip->y1 = 544;
+	while (*p) {
+		struct rect c;
+		if (sscanf(p, "PLOT CLIP X0 %d Y0 %d X1 %d Y1 %d",
+			   &c.x0, &c.y0, &c.x1, &c.y1) == 4)
+			*clip = c;
+		else if (strncmp(p, op, ol) == 0)
+			return 1;
+		p = strchr(p, '\n');
+		if (p == NULL)
+			break;
+		p++;
+	}
+	return 0;
+}
+
+/** Is a shadow/quad bbox fully inside the clip in force when drawn? */
+static int ink_visible(const char *stream, const char *op, int x0, int y0,
+		       int x1, int y1)
+{
+	struct rect c;
+	if (!clip_at_op(stream, op, &c))
+		return -1;
+	return c.x0 <= x0 && c.y0 <= y0 && c.x1 >= x1 && c.y1 >= y1;
+}
+
+/*
+ * The core clipped a box's drop shadow and transformed quad to the box
+ * itself (09 §5). Patch 32 puts that ink in layout's descendant bbox and
+ * widens the background-paint clip. Checked on the patched-engine captures,
+ * which tools/check-patched-streams.sh keeps in step with the live engine.
+ */
+static void test_ink_clip(const char *root)
+{
+	char path[1024];
+	char *s;
+
+	snprintf(path, sizeof(path), "%s/testpages/patched-streams/PM-shadow.plot", root);
+	s = slurp(path);
+	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 18 Y0 18 X1 218 Y1 98",
+				       18, 18, 218, 98) == 1,
+	      "PM-shadow: 8px drop shadow fully inside its clip");
+	free(s);
+
+	snprintf(path, sizeof(path), "%s/testpages/patched-streams/PM-shadow-clip.plot", root);
+	s = slurp(path);
+	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 20 Y0 20 X1 220 Y1 80",
+				       20, 20, 220, 80) == 1,
+	      "PM-shadow-clip: last child's shadow survives the parent clip (part A)");
+	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 20 Y0 110 X1 220 Y1 170",
+				       20, 110, 220, 170) == 1,
+	      "PM-shadow-clip: overflow:hidden box keeps its own shadow (part B)");
+	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 310 Y0 20 X1 510 Y1 80",
+				       310, 20, 510, 80) == 0,
+	      "PM-shadow-clip: a CSS clip rect still clips the shadow (control)");
+	free(s);
+
+	snprintf(path, sizeof(path), "%s/testpages/patched-streams/PM-animation.plot", root);
+	s = slurp(path);
+	{
+		struct rect c;
+		/* rotate(90) quad spans y -20..80; the top is off-page, the
+		 * bottom must not be cut at the box's own edge (y 50). */
+		CHECK(s != NULL && clip_at_op(s, "PLOT POLY X0 80 Y0 -20", &c) &&
+		      c.y1 >= 80 && c.x0 <= 40 && c.x1 >= 80,
+		      "PM-animation: rotated quad's extent inside its clip");
+	}
+	free(s);
+}
+
 int main(int argc, char **argv)
 {
 	const char *root = argc > 1 ? argv[1] : ".";
@@ -753,7 +838,8 @@ int main(int argc, char **argv)
 	replay_dir(dir, &files);
 	snprintf(dir, sizeof(dir), "%s/testpages/patched-streams", root);
 	replay_dir(dir, &files);
-	CHECK(files >= 8, "expected >= 8 stream files, replayed %u", files);
+	CHECK(files >= 9, "expected >= 9 stream files, replayed %u", files);
+	test_ink_clip(root);
 
 	printf("\n%d/%d checks passed\n", run - failed, run);
 	return failed ? 1 : 0;

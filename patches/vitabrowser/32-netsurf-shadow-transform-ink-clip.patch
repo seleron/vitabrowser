@@ -1,0 +1,280 @@
+# netsurf: drop shadows and transformed boxes are no longer clipped to their own box
+# Generated 2026-09-22
+#
+# The core clipped a box's background paint to the box, so the drop-shadow
+# rect (patch 26) and the transformed quad (patch 27) that the plotters draw
+# outside the border box were cut off (PM-shadow showed 1px of an 8px shadow;
+# MacSurf's own renderer honours the same clip). Two parts, both needed:
+# - html/box_ink.h (new, header-only): the ink outset of a box's background
+#   paint -- shadow offset clamped +/-16 like the plotters; the transformed
+#   quad's bounds (exact for a static angle, circumscribed circle for an
+#   animated one).
+# - layout.c layout_get_box_bbox: include the box's own ink, so every
+#   ancestor's redraw clip (a descendant bbox) contains it.
+# - redraw.c html_redraw_box: widen the clip around the background paint to
+#   border box + ink, bounded by the parent's clip, so the box's own
+#   overflow:hidden does not cut its own shadow; a CSS clip: rect still does.
+# Only CLIP lines change in the plot stream; L1 canary SAME.
+# See docs/phase-0/09-vita-frontend.md §10.
+
+diff --git a/content/handlers/html/box_ink.h b/content/handlers/html/box_ink.h
+new file mode 100644
+index 000000000..aca4e196a
+--- /dev/null
++++ b/content/handlers/html/box_ink.h
+@@ -0,0 +1,156 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Ink overflow of a box's own background paint.
++ *
++ * The MacSurf plotters (frontends/monkey/plot.c, frontends/vita/plot_geom.c,
++ * MacSurf's macos9 plotters.c) paint two things outside the border box they
++ * are handed: the drop-shadow rect (offset clamped to +/-16px) and, for a
++ * non-identity -macsurf-transform, a rotated/scaled/translated quad in place
++ * of the fill. Layout's descendant bbox and redraw's clip rectangles only
++ * covered the border box, so both were cut to the box itself.
++ *
++ * box_ink_outset() gives how far that paint reaches past each border edge.
++ * Layout adds it to the box's own bbox (so ancestors' clips contain it) and
++ * redraw widens the clip around the background paint by it (so a box's own
++ * overflow:hidden does not cut its shadow). The bound is conservative: it
++ * may be a pixel wide, never narrow.
++ */
++
++#ifndef NETSURF_HTML_BOX_INK_H
++#define NETSURF_HTML_BOX_INK_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <libcss/libcss.h>
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++/** Largest outset reported per edge; a garbage scale must not blow up
++ * descendant extents (see fixes625 in layout.c). */
++#define BOX_INK_MAX 4096
++
++static inline int box_ink__clamp(float v)
++{
++	if (v <= 0.0f)
++		return 0;
++	if (v >= (float)BOX_INK_MAX)
++		return BOX_INK_MAX;
++	return (int)ceilf(v);
++}
++
++/**
++ * Ink outset of a box's background paint beyond its border box.
++ *
++ * \param style  the style the background is painted with (may be NULL)
++ * \param bw     border-box width, in the units of the result
++ * \param bh     border-box height, in the units of the result
++ * \param l, t, r, b  updated to the outset past each edge, >= 0
++ */
++static inline void box_ink_outset(const css_computed_style *style,
++		int bw, int bh, int *l, int *t, int *r, int *b)
++{
++	int32_t tfm = 0, tfm_b = 0x01000100, anim_rot = 0, bsh = 0;
++	bool animated;
++	float fl = 0, ft = 0, fr = 0, fb = 0;
++
++	*l = *t = *r = *b = 0;
++	if (style == NULL || bw < 0 || bh < 0)
++		return;
++
++	if (css_computed_macsurf_transform(style, &tfm) ==
++			CSS_MACSURF_TRANSFORM_SET)
++		tfm_b = css_computed_macsurf_transform_b(style);
++	else
++		tfm = 0;
++	/* fixes77: an animated rotation replaces the angle at draw time,
++	 * so no single angle bounds it. */
++	animated = css_computed_macsurf_animation_rotate(style, &anim_rot) ==
++			CSS_MACSURF_ANIMATION_ROTATE_SET;
++
++	if (tfm != 0 || animated ||
++			(tfm_b != 0 && tfm_b != (int32_t)0x01000100)) {
++		/* The plotter's quad: scale about the centre (Q8.8, 0 = 1),
++		 * rotate (Q10.6 degrees in bits 30..16), translate by the
++		 * int8 tx/ty in bits 15..0 unless bit 31 (percent) is set. */
++		int sx = (int)((((uint32_t)tfm_b) >> 16) & 0xffff);
++		int sy = (int)(((uint32_t)tfm_b) & 0xffff);
++		float hw, hh, ex, ey, tx = 0, ty = 0;
++
++		if (sx == 0) sx = 256;
++		if (sy == 0) sy = 256;
++		hw = (float)bw * (float)sx / 512.0f;
++		hh = (float)bh * (float)sy / 512.0f;
++		if (animated) {
++			/* Any angle: the circumscribed circle. */
++			ex = ey = sqrtf(hw * hw + hh * hh);
++		} else {
++			int32_t q = (int32_t)((((uint32_t)tfm) >> 16) & 0x7fff);
++			float rad, c, s;
++			if (q & 0x4000)
++				q -= 0x8000;
++			rad = (float)(q / 64) * (float)M_PI / 180.0f;
++			c = fabsf(cosf(rad));
++			s = fabsf(sinf(rad));
++			ex = hw * c + hh * s;
++			ey = hw * s + hh * c;
++		}
++		if (((((uint32_t)tfm) >> 31) & 1) == 0) {
++			tx = (float)(int8_t)((((uint32_t)tfm) >> 8) & 0xff);
++			ty = (float)(int8_t)(((uint32_t)tfm) & 0xff);
++		}
++		/* Quad bounds relative to the border box's top-left, less the
++		 * box itself; +1 covers the plotter's integer centre and Q15
++		 * rounding. */
++		fl = ex - (float)bw / 2.0f - tx + 1.0f;
++		fr = ex - (float)bw / 2.0f + tx + 1.0f;
++		ft = ey - (float)bh / 2.0f - ty + 1.0f;
++		fb = ey - (float)bh / 2.0f + ty + 1.0f;
++	}
++
++	if (css_computed_box_shadow(style, &bsh) == CSS_BOX_SHADOW_SET &&
++			(((uint32_t)bsh) & 0x8000) == 0) {
++		/* Drop shadow (inset paints inside the box). Packed v2:
++		 * int8 h in bits 31..24, int8 v in 23..16; the plotters clamp
++		 * the offset to +/-16px. An animated box can be drawn
++		 * untransformed (angle 0), so the shadow counts then too. */
++		int h = (int8_t)((((uint32_t)bsh) >> 24) & 0xff);
++		int v = (int8_t)((((uint32_t)bsh) >> 16) & 0xff);
++		if (h < -16) h = -16;
++		if (h > 16) h = 16;
++		if (v < -16) v = -16;
++		if (v > 16) v = 16;
++		if (-h > fl) fl = (float)-h;
++		if (h > fr) fr = (float)h;
++		if (-v > ft) ft = (float)-v;
++		if (v > fb) fb = (float)v;
++	}
++
++	*l = box_ink__clamp(fl);
++	*t = box_ink__clamp(ft);
++	*r = box_ink__clamp(fr);
++	*b = box_ink__clamp(fb);
++}
++
++#endif
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index aee527a50..ae87ade61 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -71,6 +71,7 @@
+ #include "html/font.h"
+ #include "html/form_internal.h"
+ #include "html/layout.h"
++#include "html/box_ink.h"
+ #include "html/layout_internal.h"
+ #include "html/layout_safe.h"
+ #include "html/macsurf_dom_compat.h"
+@@ -7110,6 +7111,23 @@ layout_get_box_bbox(
+ 		if (*desc_y1 <= *desc_y0) *desc_y1 = *desc_y0 + ((bh > 0) ? bh : 1);
+ 	}
+ 
++	/* The box's own drop shadow / transformed quad paints outside its
++	 * border edge (ink overflow, content/handlers/html/box_ink.h).
++	 * Include it, or every ancestor's redraw clip cuts it off. Text,
++	 * line breaks and inline ends share a style but paint no
++	 * background of their own. */
++	if (box->style != NULL && box->type != BOX_TEXT &&
++			box->type != BOX_BR && box->type != BOX_INLINE_END) {
++		int ink_l, ink_t, ink_r, ink_b;
++		box_ink_outset(box->style, *desc_x1 - *desc_x0,
++				*desc_y1 - *desc_y0,
++				&ink_l, &ink_t, &ink_r, &ink_b);
++		*desc_x0 -= ink_l;
++		*desc_y0 -= ink_t;
++		*desc_x1 += ink_r;
++		*desc_y1 += ink_b;
++	}
++
+ 	/* To stop the top of text getting clipped when css line-height is
+ 	 * reduced, we increase the top of the descendant bbox. */
+ 	if (box->type == BOX_BLOCK && box->style != NULL &&
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 9468f84eb..3b5d92ecd 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -86,6 +86,7 @@ extern void macsurf_recon_clamp(const char *field, long value);
+ #include "html/form_internal.h"
+ #include "html/private.h"
+ #include "html/layout.h"
++#include "html/box_ink.h"
+ #include "html/macsurf_dom_compat.h"
+ #include "html/layout_safe.h"
+ 
+@@ -4250,6 +4251,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	int x_scrolled, y_scrolled;
+ 	struct box *bg_box = NULL;
+ 	css_computed_clip_rect css_rect;
++	bool css_clip_rect = false;
+ 	enum css_overflow_e overflow_x = CSS_OVERFLOW_VISIBLE;
+ 	enum css_overflow_e overflow_y = CSS_OVERFLOW_VISIBLE;
+ 	dom_exception exc;
+@@ -4638,6 +4640,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			css_computed_clip(box->style, &css_rect) ==
+ 					CSS_CLIP_RECT) {
+ 		/* We have an absolutly positioned box with a clip rect */
++		css_clip_rect = true;
+ 		if (css_rect.left_auto == false)
+ 			r.x0 = x - border_left + FIXTOINT(css_unit_len2device_px(
+ 					box->style, &html->unit_len_ctx,
+@@ -4765,6 +4768,34 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		}
+ 		/* valid clipping rectangles only */
+ 		if ((p.x0 < p.x1) && (p.y0 < p.y1)) {
++			/* The background's drop shadow / transformed quad
++			 * paints past the border box (box_ink.h), but `r` is
++			 * this box's own extent -- its border box when its
++			 * overflow is not visible -- so widen the clip for
++			 * this paint only. Bounded by the parent's clip, which
++			 * layout sized to include the ink; a CSS clip: rect
++			 * clips the shadow too, so it is left alone. */
++			if (!css_clip_rect && bg_box->style != NULL) {
++				int bx0 = x - border_left;
++				int by0 = y - border_top;
++				int bx1 = x + padding_width + border_right;
++				int by1 = y + padding_height + border_bottom;
++				int ink_l, ink_t, ink_r, ink_b;
++				box_ink_outset(bg_box->style, bx1 - bx0,
++						by1 - by0, &ink_l, &ink_t,
++						&ink_r, &ink_b);
++				if (ink_l || ink_t || ink_r || ink_b) {
++					struct rect ink;
++					ink.x0 = max(bx0 - ink_l, clip->x0);
++					ink.y0 = max(by0 - ink_t, clip->y0);
++					ink.x1 = min(bx1 + ink_r, clip->x1);
++					ink.y1 = min(by1 + ink_b, clip->y1);
++					if (ink.x0 < ink.x1 && ink.y0 < ink.y1 &&
++					    ctx->plot->clip(ctx, &ink) !=
++							NSERROR_OK)
++						return false;
++				}
++			}
+ 			/* plot background */
+ 			if (!html_redraw_background(x, y, box, scale, &p,
+ 					&current_background_color, bg_box,

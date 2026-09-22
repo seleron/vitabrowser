@@ -22,7 +22,7 @@ WORK="${WORK:-$HOME/vitabrowser-work}"
 NS="$WORK/applytest/upstream/netsurf"
 P="$WORK/applytest/prefix"
 OUT="${OUT:-$WORK/vita-sim}"
-PAGES="${PAGES:-10}"
+PAGES="${PAGES:-11}"
 
 [ -f "$NS/frontends/vita/main.c" ] || { echo "no $NS/frontends/vita -- run tools/build-patched.sh"; exit 2; }
 [ -f "$P/lib/pkgconfig/libcss.pc" ] || { echo "no host engine at $P -- run tools/build-patched.sh"; exit 2; }

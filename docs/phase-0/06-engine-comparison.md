@@ -447,7 +447,10 @@ harness shows the packed transform/opacity values round-trip intact
    **Done 2026-09-22** (patches 29–31): contract proved byte-identical by
    fuzz, full stack cross-compiled to a VPK, all test pages rendered in a
    host simulator. See [09](09-vita-frontend.md).
-3b. **Drop shadows and transformed boxes are clipped to their own box**
+3b. ~~**Drop shadows and transformed boxes are clipped to their own box**~~
+   **Fixed 2026-09-22 by patch 32** (layout ink in the descendant bbox +
+   widened background clip; only CLIP lines change, L1 SAME): see
+   [09 §10](09-vita-frontend.md). The original finding:
    (found by the simulator, 09 §5): the core sets the box's border rect as
    the clip before the background `plot->rectangle`, so the patch 26 shadow
    rect and the patch 27 quad are cut to it (`PM-shadow`: 1 px of an 8 px
