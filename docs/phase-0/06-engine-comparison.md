@@ -304,15 +304,21 @@ vertical strips. Full page (`PM-gradient.html`, rebuild 13): vertical box =
 32 strips of 5px (Y 10→165); radial = single rect; **L1 SAME** (canary
 byte-identical).
 
-**Known gap (libcss, not the plotter).** `linear-gradient(to right, c1, c2)`
-renders as a vertical gradient end-to-end: the parser *does* set
-`horizontal=true` (verified `p_macsurf_gradient.c` 323), the cascade *does*
-pack bit 15, and `redraw.c` *does* pick `_H` — yet the `to right` box arrives
-at the plotter as `LINEAR_GRADIENT`, not `_H`. The loss is somewhere in the
-bytecode `set_value` (0x0080/0x00C0) round-trip; the unit test proves the
-plotter itself bands `_H` correctly, so this is a libcss/cascade direction
-keyword issue, out of scope for the plotter port (diagonal/3-stop extended
-gradients, op `0x0180`, are a further separate layer).
+**Fixed by patch 28 (2026-09-22).** `linear-gradient(to right, c1, c2)`
+now renders as a horizontal gradient end-to-end. The earlier note ("the
+parser *does* set `horizontal=true` … the loss is somewhere in the bytecode
+round-trip") was a **misdiagnosis**: the parser did *not* set
+`horizontal`. It compared the `to <side>` token against
+`c->strings[LIBCSS_RIGHT]`/`[LIBCSS_LEFT]`, which resolve to the *property
+keywords* `"-libcss-right"`/`"-libcss-left"`, never the bare `right`/`left`
+tokens — so the comparison always failed. Patch 28 compares against the
+plain `RIGHT`/`LEFT` propstring indices (2 tokens, one file). Verified:
+the standalone cascade harness shows `to right` → packed bit15(h)=1,
+`to bottom`/default → bit15(h)=0; the full page now emits 32 **vertical**
+strips for `to right` (was 32 horizontal bands). The plotter was correct all
+along; so was the bytecode→computed round-trip (it packs bit 15 faithfully
+once the parser sets it). (Angled gradients `to 45deg` remain deferred — no
+angle branch in the two-stop path.)
 
 ## 6d. Box-shadow port (patch 26, `frontends/monkey/plot.c` only)
 
@@ -392,19 +398,17 @@ patched `plot.c` with a capturing `moutf` stub, 24/24 pass):
 - rotate(90) + 40% combined → `POLY … OPAQUE 2` ✓
 - regression: vertical gradient still 32 strips ✓
 
-Full-page probes unchanged: **L1 SAME**, gradient 32-strip box, shadow
-drop+inset, grid 39 rects, tag-type 19 rects.
-
-**Known gap (libcss, shared with §6c's `to right`).** Full-page
-`PM-animation.html` renders every box as a plain rect: the static
-`-macsurf-transform`/`opacity` values (and the animation-resolved ones)
-never reach `plot_style_t` — they are lost in the same libcss
-bytecode→computed round-trip that loses the gradient direction bit. The
-core read path is correct (`redraw.c` → `css_computed_macsurf_transform`
-/ `css_computed_opacity` → plotter); the plotter is proven correct by the
-unit test feeding it the values directly. Same class of gap, same fix
-location (the generated propset/propget value storage) — when that is
-resolved, both `to right` and animation render on full pages.
+Full-page `PM-animation.html` renders correctly (verified 2026-09-22):
+the rotated box emits a `POLY` quad and the 40% box emits `OPAQUE 2`.
+The earlier "every box renders as a plain rect" note was a **probe bug**,
+not a libcss gap: the page used `rotate(90)` (no angle unit → the parser
+rejects it) and `opacity: 40%` (the parser accepts a number, not a
+percentage). Both declarations were silently dropped, so the boxes were
+identity-transformed and fully opaque. Corrected to `rotate(90deg)` /
+`opacity: 0.4` and the full page renders. The "lost in the libcss
+bytecode→computed round-trip" diagnosis was wrong — the standalone cascade
+harness shows the packed transform/opacity values round-trip intact
+(`rotate(90deg)` → `packed=0x16800000`, 90° in Q10.6, bit-exact).
 
 ## 7. Blocked / not done
 
@@ -429,11 +433,12 @@ resolved, both `to right` and animation render on full pages.
 
 ## 8. Next actions
 
-1. **libcss bytecode→computed round-trip gap** — the single remaining
-   blocker for full-page animation/transform/`to right` rendering (§6e,
-   §6c). The generated propset/propget value storage drops the macsurf
-   packed values; the plotter + core read path are proven correct. Worth
-   one focused session on `select_generator.py` output.
+1. **`to right` / angle gradient direction** — `to right`/`to left`/`to
+   top`/`to bottom` FIXED by patch 28 (2026-09-22, parser string-index bug,
+   NOT a storage gap — the old "bytecode→computed round-trip gap" diagnosis
+   was wrong, see §6c/§6e). Angled gradients (`to 45deg`) remain deferred:
+   the two-stop linear path has no angle branch; extend it via the
+   radial/diagonal side-channel (`fixes365b`, `__MACOS9__`-gated).
 2. **Multi-shadow / real blur** — out of scope on the stream frontend
    (one-shot statics are `__MACOS9__`-gated; no blur primitive); revisit
    if the Vita frontend gains a filter pass.
