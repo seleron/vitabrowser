@@ -1,0 +1,485 @@
+# netsurf: Vita hardware-test diagnostics, round 2 (frontends/vita)
+# Generated 2026-09-23
+#
+# Hardware run 1 (doc 10 §Results): every page stayed "load not finished"
+# with no document, while the same code loads in the host simulator. This
+# round makes the next run conclusive and carries the likely fix:
+# - engine log: NetSurf's NSLOG (all levels) and MacSurf's
+#   macsurf_debug_log_writef() traces to ux0:data/VitaBrowser/netsurf.log,
+#   buffered, flushed each second, capped at 16 MB;
+# - scheduler counters (added / fired / pending) and a once-a-second
+#   load-status line per page until its document arrives (NEW_CONTENT);
+# - window events, status text and URL changes logged;
+# - stall rescue: a page with no document 1.5 s after navigating switches
+#   on MacSurf's fetch_pump() (content/fetch.c fixes90) every loop
+#   iteration, and the log says so per page;
+# - the HUD / message overlay repaints on its own (it stayed stale on L/R
+#   while pages had no document).
+# See docs/phase-0/10-hardware-test-plan.md.
+
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index dba56cc5e..f74a7b102 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -44,6 +44,9 @@
+ #include <psp2/power.h>
+ #endif
+ 
++#include "utils/errors.h"
++#include "utils/log.h"
++
+ #include "vita/plot.h"
+ #include "vita/diag.h"
+ 
+@@ -54,6 +57,13 @@
+ 
+ FILE *vita_plot_trace;
+ 
++/** The engine log (NSLOG + MacSurf traces), NULL until initialised. */
++static FILE *engine_log;
++
++/** Stop engine logging past this size: the card and the frame rate both
++ * suffer, and the start of a failure is what matters. */
++#define ENGINE_LOG_CAP (16 * 1024 * 1024)
++
+ static struct timeval diag_t0;
+ static bool diag_ready;
+ 
+@@ -304,3 +314,63 @@ void vita_diag_marker(const char *name)
+ 	if (fp != NULL)
+ 		fclose(fp);
+ }
++
++/** nslog_init's hook: buffer the file, remember it for flushing. */
++static bool engine_log_ensure(FILE *fp)
++{
++	static char buf[64 * 1024];
++
++	setvbuf(fp, buf, _IOFBF, sizeof(buf));
++	engine_log = fp;
++	return true;
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_engine_log_init(void)
++{
++	/* nslog_init takes its target from the command line: -V <file>. */
++	static char a0[] = "nsvita", a1[] = "-V";
++	static char a2[] = VITA_DIAG_DIR "netsurf.log";
++	char *argv[] = { a0, a1, a2, NULL };
++	int argc = 3;
++	nserror ret = nslog_init(engine_log_ensure, &argc, argv);
++
++	vita_diag_log("engine log: %s -> %d", a2, ret);
++	if (engine_log != NULL)
++		fprintf(engine_log, "==== engine log, boot at diag %u ms ====\n",
++			vita_diag_ms());
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_engine_flush(void)
++{
++	if (engine_log == NULL)
++		return;
++	fflush(engine_log);
++	if (verbose_log && ftell(engine_log) > ENGINE_LOG_CAP) {
++		fprintf(engine_log, "==== engine log capped at %d bytes ====\n",
++			ENGINE_LOG_CAP);
++		fflush(engine_log);
++		verbose_log = false;
++		vita_diag_log("engine log: capped at %d bytes", ENGINE_LOG_CAP);
++	}
++}
++
++/**
++ * MacSurf's engine trace hook (VITABROWSER_ENGINE_TRACE). The compat
++ * layer's definition is weak and silent; this one writes to the engine
++ * log, so the navigation / fetch traces MacSurf left in the core are
++ * visible on the device.
++ */
++void macsurf_debug_log_writef(const char *fmt, ...)
++{
++	va_list ap;
++
++	if (engine_log == NULL || !verbose_log)
++		return;
++	fputs("MS ", engine_log);
++	va_start(ap, fmt);
++	vfprintf(engine_log, fmt, ap);
++	va_end(ap);
++	fputc('\n', engine_log);
++}
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+index c114c5878..c9b1f3885 100644
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -71,4 +71,14 @@ extern FILE *vita_plot_trace;
+ /** Create an empty marker file in VITA_DIAG_DIR (e.g. "autotest.done"). */
+ void vita_diag_marker(const char *name);
+ 
++/**
++ * Send the engine's own logging -- NetSurf's NSLOG at every level and
++ * MacSurf's macsurf_debug_log_writef() traces -- to VITA_DIAG_DIR
++ * "netsurf.log". Buffered; flush with vita_diag_engine_flush().
++ */
++void vita_diag_engine_log_init(void);
++
++/** Flush the engine log to the card; stops logging past its size cap. */
++void vita_diag_engine_flush(void);
++
+ #endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index e049569a2..e3a6f8e8f 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -53,6 +53,7 @@
+ #include "netsurf/browser_window.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/netsurf.h"
++#include "content/fetch.h"
+ 
+ #include "vita/bitmap.h"
+ #include "vita/diag.h"
+@@ -88,6 +89,15 @@ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ /** Frames per page whose timing is logged individually. */
+ #define VITA_LOGGED_FRAMES 3
+ 
++/**
++ * A page with no document this long after navigating counts as stalled:
++ * from then on the loop pumps the fetchers itself (see vita_run).
++ */
++#define VITA_STALL_MS 1500
++
++/** Per-second load-status lines are logged for this long per page. */
++#define VITA_STATUS_LOG_MS 30000
++
+ /** The test pages bundled under app0:/testpages/ (testpages/pages/). */
+ static const char *const vita_test_pages[] = {
+ 	"L1-layout-basics", "L2-macsurf-css", "L3-grid", "L4-flex",
+@@ -117,6 +127,10 @@ struct page_stats {
+ 	unsigned int cpu_ms_max, gpu_ms_max, cpu_ms_last, gpu_ms_last;
+ 	unsigned int calls_last;
+ 	bool was_loading;
++	bool pumping;			/**< stalled: fetch_pump() every loop */
++	unsigned int content_ms;	/**< 0 until the new document arrives */
++	unsigned int content_gen;	/**< window's document count at navigate */
++	unsigned int status_ms;		/**< last per-second status line */
+ };
+ 
+ static bool vita_quit;
+@@ -127,6 +141,7 @@ static bool vita_hud = true;
+ static bool vita_dump_next;		/**< SELECT: dump the next frame */
+ static char vita_message[128];		/**< overlay message, "" = none */
+ static unsigned int vita_message_until;	/**< ms; 0 = until replaced */
++static bool vita_overlay_dirty = true;	/**< HUD / message needs painting */
+ 
+ static void vita_gui_quit(void)
+ {
+@@ -155,7 +170,7 @@ static void set_message(unsigned int ms, const char *fmt, ...)
+ 	va_end(ap);
+ 	vita_message_until = ms ? vita_diag_ms() + ms : 0;
+ 	vita_diag_log("screen: %s", vita_message);
+-	vita_window_force_redraw(vita_window_current());
++	vita_overlay_dirty = true;
+ }
+ 
+ /** Navigate the window to bundled test page `idx`. */
+@@ -170,6 +185,9 @@ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ 		 vita_test_pages[vita_page]);
+ 	memset(&vita_stats, 0, sizeof(vita_stats));
+ 	vita_stats.nav_ms = vita_diag_ms();
++	vita_stats.content_gen =
++		vita_window_new_content(vita_window_current());
++	vita_overlay_dirty = true;
+ 	vita_diag_log("page %u/%u %s: navigate", vita_page + 1,
+ 		      (unsigned int)VITA_TEST_PAGE_COUNT,
+ 		      vita_test_pages[vita_page]);
+@@ -236,7 +254,7 @@ static int vita_input(struct gui_window *gw, struct browser_window *bw)
+ 		vita_quit = true;
+ 	if (pressed & SCE_CTRL_CIRCLE) {
+ 		vita_hud = !vita_hud;
+-		vita_window_force_redraw(gw);
++		vita_overlay_dirty = true;
+ 	}
+ 	if (vita_autotest != AT_OFF)
+ 		return 0;	/* the autotest drives navigation */
+@@ -401,6 +419,7 @@ static void draw_frame(struct gui_window *gw, bool dump)
+ 		vita_diag_trace_end();
+ 	vita_stats.calls_last = vita_plot_calls;
+ 	draw_overlay();
++	vita_overlay_dirty = false;
+ 	vita2d_end_drawing();
+ 	t1 = vita_diag_ms();
+ 	/* Wait for the GPU so the frame's cost is measurable; the test
+@@ -426,18 +445,79 @@ static void draw_frame(struct gui_window *gw, bool dump)
+ 			      dump ? " (dumped)" : "");
+ }
+ 
++/**
++ * Track whether the current page has a document yet, log its progress
++ * once a second until it does, and switch on the fetch pump if it stalls.
++ *
++ * Hardware test 1 (2026-09-22, doc 10): every page stayed "load not
++ * finished" with no document on the Vita, while the same code loads in the
++ * host simulator. MacSurf's core documents fetches getting stranded when
++ * the self-rescheduling fetcher poll goes dormant (content/fetch.c,
++ * fixes90), and its own event loop calls fetch_pump() every iteration.
++ * Upstream frontends get the same effect from fetch_fdset(). Here the pump
++ * starts only after a stall, and the log says so, so each page shows
++ * whether it needed it.
++ */
++static void watch_load(struct gui_window *gw)
++{
++	unsigned int now = vita_diag_ms();
++	unsigned int age = now - vita_stats.nav_ms;
++	int w, h;
++
++	/* The old page stays on screen until the new document replaces it,
++	 * so its arrival is the NEW_CONTENT event, not a non-zero extent. */
++	vita_window_extent(gw, &w, &h);
++	if (vita_stats.content_ms == 0 &&
++	    vita_window_new_content(gw) != vita_stats.content_gen) {
++		vita_stats.content_ms = now;
++		vita_diag_log("page %s: document after %u ms (extent %dx%d)%s",
++			      vita_test_pages[vita_page], age, w, h,
++			      vita_stats.pumping ? " -- with the fetch pump on" : "");
++	}
++	if (vita_stats.content_ms == 0 && !vita_stats.pumping &&
++	    age >= VITA_STALL_MS) {
++		vita_stats.pumping = true;
++		vita_diag_log("page %s: no document after %u ms -- fetch stalled? "
++			      "loading %d, sched pending %u (added %u, fired %u); "
++			      "pumping fetchers from now on",
++			      vita_test_pages[vita_page], age,
++			      vita_window_loading(gw), vita_schedule_pending(),
++			      vita_schedule_added, vita_schedule_fired);
++	}
++	if ((vita_stats.content_ms == 0 || vita_window_loading(gw)) &&
++	    age < VITA_STATUS_LOG_MS && now - vita_stats.status_ms >= 1000) {
++		vita_stats.status_ms = now;
++		vita_diag_log("load status %s +%u ms: loading %d, extent %dx%d, "
++			      "sched pending %u (added %u, fired %u), pump %s",
++			      vita_test_pages[vita_page], age,
++			      vita_window_loading(gw), w, h,
++			      vita_schedule_pending(), vita_schedule_added,
++			      vita_schedule_fired,
++			      vita_stats.pumping ? "on" : "off");
++	}
++}
++
+ static void vita_run(struct browser_window *bw)
+ {
++	unsigned int last_flush = 0;
++
+ 	while (!vita_quit) {
+ 		struct gui_window *gw = vita_window_current();
+ 		bool dump;
+ 		int step;
+ 
+ 		vita_schedule_run();
++		if (vita_diag_ms() - last_flush >= 1000) {
++			last_flush = vita_diag_ms();
++			vita_diag_engine_flush();
++		}
+ 		if (gw == NULL) {
+ 			sceKernelDelayThread(16 * 1000);
+ 			continue;
+ 		}
++		watch_load(gw);
++		if (vita_stats.pumping)
++			fetch_pump();
+ 
+ 		/* Load timing comes from the throbber events. */
+ 		if (vita_window_loading(gw)) {
+@@ -455,7 +535,8 @@ static void vita_run(struct browser_window *bw)
+ 		}
+ 		dump = autotest_pre(gw);
+ 
+-		if (vita_window_needs_redraw(gw) || dump) {
++		if (vita_window_needs_redraw(gw) || dump ||
++		    vita_overlay_dirty) {
+ 			draw_frame(gw, dump);
+ 			if (dump)
+ 				autotest_post(gw, bw);
+@@ -465,6 +546,7 @@ static void vita_run(struct browser_window *bw)
+ 		}
+ 	}
+ 	vita_diag_log("quit requested");
++	vita_diag_engine_flush();
+ }
+ 
+ /**
+@@ -512,6 +594,7 @@ int main(int argc, char **argv)
+ 	};
+ 
+ 	vita_diag_init();
++	vita_diag_engine_log_init();
+ 	vita_diag_memory("boot");
+ 
+ 	{
+@@ -576,6 +659,7 @@ int main(int argc, char **argv)
+ 	nsoption_finalise(nsoptions, nsoptions_default);
+ 	vita_diag_log("exit: clean");
+ fail:
++	vita_diag_engine_flush();
+ 	vita_plot_fini();
+ 	vita2d_fini();
+ 	sceKernelExitProcess(0);
+diff --git a/frontends/vita/schedule.c b/frontends/vita/schedule.c
+index 43182ce11..b54de171f 100644
+--- a/frontends/vita/schedule.c
++++ b/frontends/vita/schedule.c
+@@ -27,6 +27,10 @@
+ /* linked list of scheduled callbacks */
+ static struct nscallback *schedule_list = NULL;
+ 
++/* Hardware-test counters (vita/diag.h): callbacks added and run. */
++unsigned int vita_schedule_added;
++unsigned int vita_schedule_fired;
++
+ /**
+  * scheduled callback.
+  */
+@@ -121,6 +125,7 @@ nserror vita_schedule(int tival, void (*callback)(void *p), void *p)
+ 
+ 	nscb->callback = callback;
+ 	nscb->p = p;
++	vita_schedule_added++;
+ 
+ 	/* add to list front */
+ 	nscb->next = schedule_list;
+@@ -129,6 +134,17 @@ nserror vita_schedule(int tival, void (*callback)(void *p), void *p)
+ 	return NSERROR_OK;
+ }
+ 
++/* exported function documented in vita/schedule.h */
++unsigned int vita_schedule_pending(void)
++{
++	unsigned int n = 0;
++	struct nscallback *cur;
++
++	for (cur = schedule_list; cur != NULL; cur = cur->next)
++		n++;
++	return n;
++}
++
+ /* exported function documented in vita/schedule.h */
+ int vita_schedule_run(void)
+ {
+@@ -162,6 +178,7 @@ int vita_schedule_run(void)
+ 				prev_nscb->next = unlnk_nscb->next;
+ 			}
+ 
++			vita_schedule_fired++;
+ 			unlnk_nscb->callback(unlnk_nscb->p);
+ 
+ 			free(unlnk_nscb);
+diff --git a/frontends/vita/schedule.h b/frontends/vita/schedule.h
+index 21c30debf..56bf60dd3 100644
+--- a/frontends/vita/schedule.h
++++ b/frontends/vita/schedule.h
+@@ -40,6 +40,13 @@ nserror vita_schedule(int tival, void (*callback)(void *p), void *p);
+  */
+ int vita_schedule_run(void);
+ 
++/** Callbacks scheduled / run since start (hardware-test counters). */
++extern unsigned int vita_schedule_added;
++extern unsigned int vita_schedule_fired;
++
++/** Number of callbacks currently scheduled. */
++unsigned int vita_schedule_pending(void);
++
+ /**
+  * Log a list of all scheduled callbacks.
+  */
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index fc303aa75..f386dd25a 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -33,7 +33,9 @@
+ #include "netsurf/browser_window.h"
+ #include "netsurf/window.h"
+ #include "netsurf/plotters.h"
++#include "utils/nsurl.h"
+ 
++#include "vita/diag.h"
+ #include "vita/plot.h"
+ #include "vita/window.h"
+ 
+@@ -43,6 +45,7 @@ struct gui_window {
+ 	int scrolly;
+ 	bool dirty;
+ 	bool loading;	/**< between START_ and STOP_THROBBER */
++	unsigned int new_content;	/**< GW_EVENT_NEW_CONTENT count */
+ };
+ 
+ static struct gui_window *vita_current;
+@@ -104,8 +107,11 @@ static nserror vita_window_get_dimensions(struct gui_window *gw,
+ static nserror vita_window_event(struct gui_window *gw,
+ 				 enum gui_window_event event)
+ {
++	/* Hardware test: the page lifecycle, as the core reports it. */
++	vita_diag_log("gw event %d", (int)event);
+ 	switch (event) {
+ 	case GW_EVENT_NEW_CONTENT:
++		gw->new_content++;
+ 		gw->scrollx = 0;
+ 		gw->scrolly = 0;
+ 		gw->dirty = true;
+@@ -129,7 +135,19 @@ static nserror vita_window_event(struct gui_window *gw,
+ 
+ static void vita_window_set_title(struct gui_window *gw, const char *title)
+ {
+-	NSLOG(netsurf, INFO, "title: %s", title);
++	vita_diag_log("gw title: %s", title);
++}
++
++static nserror vita_window_set_url(struct gui_window *gw, struct nsurl *url)
++{
++	vita_diag_log("gw url: %s", nsurl_access(url));
++	return NSERROR_OK;
++}
++
++static void vita_window_set_status(struct gui_window *gw, const char *text)
++{
++	/* Loading progress and fetch errors arrive here. */
++	vita_diag_log("gw status: %s", text != NULL ? text : "(null)");
+ }
+ 
+ /* exported interface documented in vita/window.h */
+@@ -200,6 +218,12 @@ bool vita_window_loading(struct gui_window *gw)
+ 	return gw != NULL && gw->loading;
+ }
+ 
++/* exported interface documented in vita/window.h */
++unsigned int vita_window_new_content(struct gui_window *gw)
++{
++	return (gw != NULL) ? gw->new_content : 0;
++}
++
+ /* exported interface documented in vita/window.h */
+ void vita_window_force_redraw(struct gui_window *gw)
+ {
+@@ -231,6 +255,8 @@ static struct gui_window_table window_table = {
+ 	.get_dimensions = vita_window_get_dimensions,
+ 	.event = vita_window_event,
+ 	.set_title = vita_window_set_title,
++	.set_url = vita_window_set_url,
++	.set_status = vita_window_set_status,
+ };
+ 
+ struct gui_window_table *vita_window_table = &window_table;
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index 509e2e325..640cceabd 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -44,6 +44,9 @@ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy);
+ /** Is a fetch in progress (between the throbber events)? */
+ bool vita_window_loading(struct gui_window *gw);
+ 
++/** How many documents this window has been given (NEW_CONTENT events). */
++unsigned int vita_window_new_content(struct gui_window *gw);
++
+ /** Repaint on the next loop iteration even if nothing was invalidated. */
+ void vita_window_force_redraw(struct gui_window *gw);
+ 

@@ -51,9 +51,17 @@ Both halves of that concern soften:
 possible showstopper" to "a budget to be managed carefully." The §10 risk row
 should be downgraded accordingly, and §2's RAM row updated with real figures.
 
+> **Measured 2026-09-22** (PCH-2000, 3.65 HENkaku; [10](10-hardware-test-plan.md)
+> §Run 1): an allocate-until-failure probe on hardware gives **≈ 256 MiB**
+> of MAIN by default and **≈ 365 MiB with `ATTRIBUTE2=12`**, which works on
+> that setup (+109 MiB of USER_RW). CDRAM: 112 MiB free before
+> `vita2d_init`, 89 MiB after. PHYCONT: 26 MiB. The documented budgets are
+> confirmed on 3.65. 3.75 + enso itself remains untested.
+
 ### What is still open
 
-- `ATTRIBUTE2=12` must be confirmed to work on **3.75 + enso** specifically.
+- `ATTRIBUTE2=12` must be confirmed to work on **3.75 + enso** specifically
+  (confirmed on 3.65 HENkaku, see the note above).
 - The 365 MiB figure is a documented budget, not a measured allocation ceiling;
   real-world headroom after `sceKernelAllocMemBlock` fragmentation is unknown.
 - **Phase 0 step 0 still stands** — build the allocate-until-failure probe and

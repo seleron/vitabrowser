@@ -293,7 +293,7 @@ and fixed by patch 32 (§10).
 | PGF `y` | treated as the baseline (NetSurf's text `y`) | **assumption** |
 | DPI | core at 96 dpi (`browser_set_dpi`), plot converts pt → px at 96 | consistent by construction |
 | Clipping | `vita2d_enable_clipping` + `vita2d_set_clip_rectangle(x0,y0,x1,y1)`, max exclusive like NetSurf's rects | **assumption** about r188's exact edge semantics |
-| Memory | `_newlib_heap_size_user` 192 MiB (MacSurf's preferred partition), main-thread stack 4 MiB, vita2d vertex pool 4 MiB; `ATTRIBUTE2=12` **not** set (unconfirmed on 3.75 + enso, pre-phase-0 §1) | fits the default 256 MiB MAIN on paper |
+| Memory | `_newlib_heap_size_user` 192 MiB (MacSurf's preferred partition), main-thread stack 4 MiB, vita2d vertex pool 4 MiB; `ATTRIBUTE2=12` **not** set in the default VPK | **measured on hardware** (10 §Run 1): ≈ 256 MiB default, ≈ 365 MiB with `ATTRIBUTE2=12`, which works on 3.65 HENkaku |
 | Bitmaps | vita2d textures (default memblock type); `destroy` waits for the GPU first | correctness over speed; CPU writes to texture memory may be slow, so measure |
 | Glyph advances | `width("a"+c+"a") − width("aa")`, because PGF under-reports ink-less glyphs like space | **assumption** about PGF's measuring |
 | Title ID | `VBRW00001`, no LiveArea art | placeholder |

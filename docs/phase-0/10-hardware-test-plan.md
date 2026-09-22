@@ -252,3 +252,103 @@ OTHER   anything else you noticed:
 | memory probe (both VPKs) | the measured budget: closes pre-phase-0 §1's open item, and whether `ATTRIBUTE2=12` works here |
 | VT-text scripts | how much of the web the system font can show before freetype/harfbuzz |
 | step 7 | whether suspend/resume needs GXM handling before daily use |
+
+## Run 1 — results (2026-09-22, PCH-2000, firmware 3.65 HENkaku, no overclock)
+
+Files: `<WORK>/vitabrowser-work/hwtest-2026-09-22/device-results/` (log,
+17 plot dumps, 2 screenshots); the tester's filled-in template is quoted in
+the session.
+
+**What works on hardware.** Install (both VPKs), LiveArea, boot in about
+0.5 s to the first frame, every init stage (`vita2d_init_advanced -> 1`,
+PGF font, `netsurf_register`, `nsoption_init`, messages, `netsurf_init`
+all OK), GPU drawing (the HUD), input (L/R, ○, SELECT, △, START), the
+memory probe, clean exit, suspend/resume and PS-home/return. No crash, no
+crash dump.
+
+**The failure: no page ever loads.** Every page logs `load not finished`
+after the 20 s settle timeout, with `extent 0x0` and 1 draw call; every
+dump is `CLIP` + one full-screen `RECT`, the core's placeholder when it has
+no document. So the fetch never completes, and it does not fail either: a
+failure would have produced an error page. The same code loads every page
+in the host simulator (~165 ms each).
+
+What was ruled out:
+- **The file fetcher itself.** `stat` / `fopen` / `fread` would report an
+  error, not hang, and setup only converts the path.
+- **Miscompiled implicit calls.** A clean cross build has exactly one
+  implicit declaration, `strcasecmp` (returns `int`, ABI-safe).
+- **Init.** Every stage returned OK on the device.
+
+**Leading hypothesis: fetches stranded by the scheduler-only fetch poll.**
+Upstream frontends call `fetch_fdset()` every loop iteration (monkey, gtk),
+which also dispatches queued fetches and polls every fetcher. MacSurf's core
+documents fetches getting stranded when the self-rescheduling poll goes
+dormant, and its own event loop calls `fetch_pump()` every iteration
+(`content/fetch.c`, fixes90). The Vita loop did neither. It is not yet
+explained why the simulator escapes it, so run 2 is built to show the
+mechanism rather than assume it.
+
+**Measured memory (closes pre-phase-0 §1's open item):**
+
+| | default VPK (VBRW00001) | `ATTRIBUTE2=12` VPK (VBRW00002) |
+|---|---|---|
+| free USER at boot, after the 192 MiB heap + 4 MiB stack | 51 MiB | — |
+| newlib heap free to `malloc` | 190 MiB | 190 MiB |
+| USER_RW blocks beyond the heap | **40 MiB** | **149 MiB** |
+| app MAIN total, approx. | **≈ 256 MiB** | **≈ 365 MiB** |
+| CDRAM free (after vita2d's framebuffers) | 89 MiB (112 MiB before `vita2d_init`) | 89 MiB |
+| PHYCONT | 26 MiB | 26 MiB |
+
+The documented budgets hold on 3.65 HENkaku: 256 MiB default and
+**365 MiB with `ATTRIBUTE2=12`, which works here** (+109 MiB).
+`sceAppMgrGetBudgetInfo` is refused to a normal app (`0x8080201f`), as its
+header says. vita2d and the engine's init take about 13 MiB of USER and
+23 MiB of CDRAM.
+
+**Other readings.**
+- Clocks read ARM 333 MHz and GPU 41 MHz (as returned by
+  `scePowerGetGpuClockFrequency`; probably a power-managed idle reading).
+- The first blank frame took 52 ms of CPU and 4 ms of GPU.
+- The HUD did not update on L/R: the loop only repainted when the page
+  invalidated, and with no document it never did. Fixed in run 2.
+- VitaShell 2.02 showed "this package requests extended permissions" for
+  both VPKs. The eboot's authid is the safe `0x2F00000000000002` (file
+  offset 0x80), and none of the libraries VitaShell's current source flags
+  (`SceVshBridge`, `ScePromoterUtil`, `SceShellSvc`) are imported. The one
+  unusual import is `SceGxmInternalForVsh`, from libvita2d, which is the
+  likeliest trigger. Unverified and harmless; open.
+
+## Run 2 — the diagnostics-2 build (patch 34)
+
+The same VPK names in the hand-off folder, rebuilt (SHA256 first 12:
+`VitaBrowser.vpk` `0683dfb74f4d`, `VitaBrowser-ext.vpk` `7cbcc9129308`,
+`nsvita.elf` `60314993b2ca`; archive
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run2/`).
+
+What it adds:
+- `netsurf.log`: the engine's own log, with NetSurf's NSLOG at every level
+  plus MacSurf's engine traces. It is buffered, flushed each second, and
+  capped at 16 MB. A full simulator autotest writes about 0.5 MB.
+- Once a second until a page's document arrives: `load status … loading,
+  extent, sched pending (added, fired), pump on/off`. This shows directly
+  whether scheduled callbacks, including the fetch poll, run on the Vita.
+- Window events, status text and URL changes in `log.txt`.
+- **Stall rescue.** If a page has no document 1.5 s after navigating, the loop
+  logs `fetch stalled?` and calls `fetch_pump()` every iteration for that
+  page. The log then says whether the document arrived with the pump on.
+  Verified safe in the simulator by forcing the pump on for every page:
+  16/16 loads, dumps byte-identical, documents arrive sooner (117 ms vs
+  165 ms).
+- The HUD and messages repaint on their own.
+
+Run 2 is short:
+1. Install the new **VitaBrowser.vpk** over the old one (the ext-mem VPK
+   isn't needed this time).
+2. Delete `ux0:data/VitaBrowser/`.
+3. Launch VitaBrowser and wait 10 s on L1. **Does the page render now?**
+4. Press □ (autotest), wait for AUTOTEST DONE, then START.
+5. Copy `ux0:data/VitaBrowser/` (now including `netsurf.log`) into
+   `results\`.
+6. If pages render, also redo the checklist's steps 4, 4a, 4b, 5 and 7 with
+   screenshots.
