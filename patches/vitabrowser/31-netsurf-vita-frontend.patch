@@ -1,0 +1,3196 @@
+# netsurf: the Vita frontend (frontends/vita, TARGET=vita)
+# Generated 2026-09-22
+#
+# A NetSurf frontend for the PS Vita on libvita2d, and "vita" added to the
+# valid TARGETs. The rectangle plotter reproduces the verified monkey
+# plot-stream contract (patches 25-27: gradient bands, box-shadows, transform
+# quads, opacity buckets) through plot_geom.c, which is proved byte-identical
+# to monkey's plot.c by tools/test-vita-renderer.sh. VITA_HOST_SIM=YES builds
+# the same sources for the host against tools/vita-sim (run-vita-sim.sh).
+# Cross build: tools/build-vita.sh. See docs/phase-0/09-vita-frontend.md.
+
+diff --git a/frontends/Makefile.hts b/frontends/Makefile.hts
+index 83c1cfa3d..8ea0351fe 100644
+--- a/frontends/Makefile.hts
++++ b/frontends/Makefile.hts
+@@ -115,7 +115,7 @@ else
+ endif
+ 
+ # valid values for the TARGET
+-VLDTARGET := amiga atari beos framebuffer gtk monkey qt riscos windows
++VLDTARGET := amiga atari beos framebuffer gtk monkey qt riscos vita windows
+ 
+ # Check for valid TARGET
+ ifeq ($(filter $(VLDTARGET),$(TARGET)),)
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+new file mode 100644
+index 000000000..1e7be53f9
+--- /dev/null
++++ b/frontends/vita/Makefile
+@@ -0,0 +1,96 @@
++#
++# Makefile for NetSurf PS Vita target
++#
++# This file is part of NetSurf
++
++# ----------------------------------------------------------------------------
++# Vita flag setup
++# ----------------------------------------------------------------------------
++
++CWARNFLAGS += -Werror
++
++# compat/ shadows system headers the SDK declares but does not implement.
++CFLAGS += -std=c99 -g -Ifrontends/vita/compat \
++	  -D_POSIX_C_SOURCE=200809L \
++	  -D_XOPEN_SOURCE=700 \
++	  -D_DEFAULT_SOURCE \
++	  -DNETSURF_VITA_START_PAGE=\"$(NETSURF_VITA_START_PAGE)\"
++
++ifeq ($(VITA_HOST_SIM),YES)
++# Host simulator (see Makefile.tools): stand-in SDK headers and library.
++CFLAGS += -I$(VITA_SIM_INCLUDE)
++LDFLAGS += $(VITA_SIM_LIB) $(shell pkg-config --libs freetype2) \
++	-lpcre2-posix -lpcre2-8 -lz -lm
++else
++# vitaSDK libraries. vita2d draws through the GXM and needs PGF for the
++# system font; the SceXxx_stub archives resolve the firmware imports.
++LDFLAGS += -Wl,-q \
++	-lvita2d -lfreetype -lpng -ljpeg -lbz2 -lz \
++	-lpcre2-posix -lpcre2-8 \
++	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
++	-lScePgf_stub -lScePvf_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
++	-lSceAppMgr_stub \
++	-lm
++endif
++
++# ---------------------------------------------------------------------------
++# Target setup
++# ---------------------------------------------------------------------------
++
++VITA_RESOURCES_DIR := $(FRONTEND_RESOURCES_DIR)
++
++# The filter and target for split messages
++MESSAGES_FILTER=any
++MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
++
++# ----------------------------------------------------------------------------
++# Source file setup
++# ----------------------------------------------------------------------------
++
++# S_FRONTEND are sources purely for the Vita build
++S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
++	plot.c plot_geom.c replay.c
++
++# This is the final source build list
++# Note this is deliberately *not* expanded here as common and image
++#   are not yet available
++SOURCES = $(S_COMMON) $(S_IMAGE) $(S_BROWSER) $(S_FRONTEND)
++ifeq ($(VITA_HOST_SIM),YES)
++EXETARGET := nsvita-sim
++else
++EXETARGET := nsvita.elf
++endif
++
++# ----------------------------------------------------------------------------
++# Install target
++# ----------------------------------------------------------------------------
++
++install-vita:
++
++# ----------------------------------------------------------------------------
++# Package target: nsvita.elf -> eboot.bin -> VitaBrowser.vpk
++#
++# VITA_TITLE_ID is nine characters, four letters + five digits, and must be
++# unique on the device. VITA_EXTRA_FILES adds "src=dst" pairs to the VPK;
++# the VitaBrowser repo's tools/build-vita.sh passes the test pages that way.
++# ----------------------------------------------------------------------------
++
++VITA_TITLE_ID ?= VBRW00001
++VITA_APP_NAME ?= VitaBrowser
++VITA_PKGDIR := $(OBJROOT)/vpk
++VITA_RES_FILES := default.css quirks.css adblock.css internal.css \
++	Messages welcome.html credits.html licence.html
++
++package-vita: $(EXETARGET)
++	$(VQ)echo "     VPK: VitaBrowser.vpk"
++	$(Q)$(MKDIR) -p $(VITA_PKGDIR)
++	$(Q)$(VITA_ELF_CREATE) $(EXETARGET) $(VITA_PKGDIR)/nsvita.velf
++	$(Q)$(VITA_MAKE_FSELF) -s $(VITA_PKGDIR)/nsvita.velf \
++		$(VITA_PKGDIR)/eboot.bin
++	$(Q)$(VITA_MKSFOEX) -s TITLE_ID=$(VITA_TITLE_ID) "$(VITA_APP_NAME)" \
++		$(VITA_PKGDIR)/param.sfo
++	$(Q)$(VITA_PACK_VPK) -s $(VITA_PKGDIR)/param.sfo \
++		-b $(VITA_PKGDIR)/eboot.bin \
++		$(foreach f,$(VITA_RES_FILES),-a $(VITA_RESOURCES_DIR)/$(f)=res/$(f)) \
++		$(foreach p,$(VITA_EXTRA_FILES),-a $(p)) \
++		VitaBrowser.vpk
+diff --git a/frontends/vita/Makefile.defaults b/frontends/vita/Makefile.defaults
+new file mode 100644
+index 000000000..9c3a436a0
+--- /dev/null
++++ b/frontends/vita/Makefile.defaults
+@@ -0,0 +1,41 @@
++# ----------------------------------------------------------------------------
++# Vita-specific options
++# ----------------------------------------------------------------------------
++
++# The first milestone fetches bundled pages from app0: through the file
++# fetcher; networking (curl + TLS) and JavaScript (QuickJS, not Duktape)
++# are later Phase 1 items. See docs/phase-0/09-vita-frontend.md.
++NETSURF_USE_CURL := NO
++NETSURF_USE_OPENSSL := NO
++NETSURF_USE_DUKTAPE := NO
++
++# Image decoders that exist for the Vita: libnsgif / libnsbmp are built by
++# tools/build-vita.sh, libpng / libjpeg-turbo come from vdpm.
++NETSURF_USE_BMP := YES
++NETSURF_USE_GIF := YES
++NETSURF_USE_PNG := YES
++NETSURF_USE_JPEG := YES
++NETSURF_USE_JPEGXL := NO
++NETSURF_USE_WEBP := NO
++NETSURF_USE_NSSVG := NO
++NETSURF_USE_ROSPRITE := NO
++NETSURF_USE_RSVG := NO
++NETSURF_USE_VIDEO := NO
++NETSURF_USE_HARU_PDF := NO
++
++NETSURF_USE_NSPSL := YES
++NETSURF_USE_NSLOG := NO
++NETSURF_USE_UTF8PROC := YES
++# newlib carries iconv in libc.
++NETSURF_USE_LIBICONV_PLUG := YES
++
++# No disc cache yet: the memory card path and budget are undecided.
++NETSURF_FS_BACKING_STORE := NO
++
++# vita-elf-create needs the relocations; the ELF is never shipped as-is.
++NETSURF_STRIP_BINARY := NO
++
++# The page opened at start-up, relative to the app bundle.
++NETSURF_VITA_START_PAGE := file:///app0:/testpages/L1-layout-basics.html
++
++CFLAGS += -O2
+diff --git a/frontends/vita/Makefile.tools b/frontends/vita/Makefile.tools
+new file mode 100644
+index 000000000..7e8a243af
+--- /dev/null
++++ b/frontends/vita/Makefile.tools
+@@ -0,0 +1,46 @@
++# -*- mode: makefile-gmake -*-
++##
++## vita target tool setup
++##
++## Cross-compiles with vitaSDK's arm-vita-eabi toolchain. VITASDK must name
++## the SDK (the vitaSDK convention); VITA_PREFIX is where the NetSurf
++## libraries were installed for the Vita (tools/build-vita.sh in the
++## VitaBrowser repo builds them there).
++##
++## VITA_HOST_SIM=YES instead builds the same sources for the build machine
++## against a stand-in SDK (VITA_SIM_INCLUDE headers, VITA_SIM_LIB
++## implementation), so the frontend can run without Vita hardware. It gets
++## its own object directory, build/<host>-vita-sim.
++
++ifeq ($(VITA_HOST_SIM),YES)
++
++SUBTARGET := -sim
++# Host engine libraries: the caller points PKG_CONFIG_PATH at them.
++PKG_CONFIG := pkg-config
++
++else
++
++ifeq ($(VITASDK),)
++  $(error VITASDK is not set: point it at the vitaSDK install, e.g. ~/vitasdk)
++endif
++
++VITA_PREFIX ?= $(VITASDK)/arm-vita-eabi
++
++CC := $(VITASDK)/bin/arm-vita-eabi-gcc
++CXX := $(VITASDK)/bin/arm-vita-eabi-g++
++STRIP := $(VITASDK)/bin/arm-vita-eabi-strip
++
++# Only the Vita prefixes: never let a host .pc file leak host -I/-L paths
++# into the cross build. --static because everything links statically (so
++# libpng's .pc must pull in -lz); --define-prefix as vitaSDK's own
++# arm-vita-eabi-pkg-config does, since SDK packages carry build-time prefixes.
++PKG_CONFIG := PKG_CONFIG_PATH= \
++	PKG_CONFIG_LIBDIR="$(VITA_PREFIX)/lib/pkgconfig:$(VITASDK)/arm-vita-eabi/lib/pkgconfig" \
++	PKG_CONFIG_SYSROOT_DIR= pkg-config --define-prefix --static
++
++VITA_ELF_CREATE := $(VITASDK)/bin/vita-elf-create
++VITA_MAKE_FSELF := $(VITASDK)/bin/vita-make-fself
++VITA_MKSFOEX := $(VITASDK)/bin/vita-mksfoex
++VITA_PACK_VPK := $(VITASDK)/bin/vita-pack-vpk
++
++endif
+diff --git a/frontends/vita/bitmap.c b/frontends/vita/bitmap.c
+new file mode 100644
+index 000000000..19a31f212
+--- /dev/null
++++ b/frontends/vita/bitmap.c
+@@ -0,0 +1,150 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: bitmaps stored directly in vita2d textures.
++ *
++ * A vita2d RGBA8 texture (SCE_GXM_TEXTURE_FORMAT_A8B8G8R8) holds bytes
++ * R, G, B, A in memory: NetSurf's default BITMAP_LAYOUT_RGBA8888 on a
++ * little-endian CPU, straight alpha. So the image decoders write into the
++ * texture's memory and the plotter draws it with no conversion pass.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <vita2d.h>
++
++#include "utils/errors.h"
++#include "netsurf/bitmap.h"
++
++#include "vita/bitmap.h"
++
++struct bitmap {
++	vita2d_texture *tex;
++	int width;
++	int height;
++	bool opaque;
++};
++
++static void *bitmap_create(int width, int height, enum gui_bitmap_flags flags)
++{
++	struct bitmap *bm;
++
++	if (width <= 0 || height <= 0)
++		return NULL;
++	bm = calloc(1, sizeof(*bm));
++	if (bm == NULL)
++		return NULL;
++	bm->tex = vita2d_create_empty_texture((unsigned int)width,
++					      (unsigned int)height);
++	if (bm->tex == NULL) {
++		free(bm);
++		return NULL;
++	}
++	bm->width = width;
++	bm->height = height;
++	bm->opaque = (flags & BITMAP_OPAQUE) == BITMAP_OPAQUE;
++	/* vita2d zeroes new texture memory, which covers BITMAP_CLEAR. */
++	return bm;
++}
++
++static void bitmap_destroy(void *bitmap)
++{
++	struct bitmap *bm = bitmap;
++
++	if (bm == NULL)
++		return;
++	/* The GPU may still be sampling this texture from the frame in
++	 * flight; freeing it underneath the GPU corrupts that frame. */
++	vita2d_wait_rendering_done();
++	vita2d_free_texture(bm->tex);
++	free(bm);
++}
++
++static void bitmap_set_opaque(void *bitmap, bool opaque)
++{
++	struct bitmap *bm = bitmap;
++	bm->opaque = opaque;
++}
++
++static bool bitmap_get_opaque(void *bitmap)
++{
++	struct bitmap *bm = bitmap;
++	return bm->opaque;
++}
++
++static unsigned char *bitmap_get_buffer(void *bitmap)
++{
++	struct bitmap *bm = bitmap;
++	return vita2d_texture_get_datap(bm->tex);
++}
++
++static size_t bitmap_get_rowstride(void *bitmap)
++{
++	struct bitmap *bm = bitmap;
++	/* Texture rows are padded for the GPU; the stride is in bytes. */
++	return vita2d_texture_get_stride(bm->tex);
++}
++
++static int bitmap_get_width(void *bitmap)
++{
++	struct bitmap *bm = bitmap;
++	return bm->width;
++}
++
++static int bitmap_get_height(void *bitmap)
++{
++	struct bitmap *bm = bitmap;
++	return bm->height;
++}
++
++static void bitmap_modified(void *bitmap)
++{
++	/* The texture is the pixel store; nothing to upload. */
++}
++
++static nserror bitmap_render(struct bitmap *bitmap,
++			     struct hlcache_handle *content)
++{
++	/* Thumbnails are not needed until there is a history UI. */
++	return NSERROR_NOT_IMPLEMENTED;
++}
++
++/* exported interface documented in vita/bitmap.h */
++struct vita2d_texture *vita_bitmap_texture(struct bitmap *bitmap)
++{
++	return (bitmap != NULL) ? bitmap->tex : NULL;
++}
++
++static struct gui_bitmap_table bitmap_table = {
++	.create = bitmap_create,
++	.destroy = bitmap_destroy,
++	.set_opaque = bitmap_set_opaque,
++	.get_opaque = bitmap_get_opaque,
++	.get_buffer = bitmap_get_buffer,
++	.get_rowstride = bitmap_get_rowstride,
++	.get_width = bitmap_get_width,
++	.get_height = bitmap_get_height,
++	.modified = bitmap_modified,
++	.render = bitmap_render,
++};
++
++struct gui_bitmap_table *vita_bitmap_table = &bitmap_table;
+diff --git a/frontends/vita/bitmap.h b/frontends/vita/bitmap.h
+new file mode 100644
+index 000000000..161dbb814
+--- /dev/null
++++ b/frontends/vita/bitmap.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NETSURF_VITA_BITMAP_H
++#define NETSURF_VITA_BITMAP_H
++
++struct bitmap;
++struct vita2d_texture;
++
++/** The vita2d bitmap table. */
++extern struct gui_bitmap_table *vita_bitmap_table;
++
++/**
++ * The texture backing a bitmap, for the bitmap plotter.
++ *
++ * \return the texture, or NULL if the bitmap has none
++ */
++struct vita2d_texture *vita_bitmap_texture(struct bitmap *bitmap);
++
++#endif
+diff --git a/frontends/vita/compat/regex.h b/frontends/vita/compat/regex.h
+new file mode 100644
+index 000000000..0ab618a81
+--- /dev/null
++++ b/frontends/vita/compat/regex.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: POSIX regex from PCRE2.
++ *
++ * vitaSDK's newlib ships <regex.h> but no regcomp()/regexec() behind it.
++ * PCRE2's POSIX layer (vdpm libpcre2) implements the API, as macros onto
++ * pcre2_regcomp() and friends with its own regex_t. Shadowing <regex.h>
++ * (frontends/vita/compat is on the include path ahead of the SDK) puts every
++ * user in the core on that one set of types.
++ */
++
++#ifndef NETSURF_VITA_COMPAT_REGEX_H
++#define NETSURF_VITA_COMPAT_REGEX_H
++
++#include <pcre2posix.h>
++
++#endif
+diff --git a/frontends/vita/fetch.c b/frontends/vita/fetch.c
+new file mode 100644
+index 000000000..fdebd0adb
+--- /dev/null
++++ b/frontends/vita/fetch.c
+@@ -0,0 +1,95 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: file types and bundled resources.
++ *
++ * There is no /etc/mime.types on the Vita, so file types come from a
++ * built-in extension table covering what the file fetcher will meet in the
++ * app bundle. Resources (default.css and friends) live in app0:/res/.
++ */
++
++#include <stddef.h>
++#include <string.h>
++#include <strings.h>
++
++#include "utils/errors.h"
++#include "utils/file.h"
++#include "utils/nsurl.h"
++#include "netsurf/fetch.h"
++
++#include "vita/fetch.h"
++
++static const struct {
++	const char *ext;
++	const char *type;
++} vita_filetypes[] = {
++	{ "html", "text/html" },
++	{ "htm", "text/html" },
++	{ "css", "text/css" },
++	{ "txt", "text/plain" },
++	{ "png", "image/png" },
++	{ "gif", "image/gif" },
++	{ "jpg", "image/jpeg" },
++	{ "jpeg", "image/jpeg" },
++	{ "bmp", "image/bmp" },
++	{ "ico", "image/x-icon" },
++	{ "js", "application/javascript" },
++	{ "svg", "image/svg+xml" },
++};
++
++static const char *vita_fetch_filetype(const char *unix_path)
++{
++	const char *dot = strrchr(unix_path, '.');
++	const char *slash = strrchr(unix_path, '/');
++	size_t i;
++
++	if (dot == NULL || (slash != NULL && dot < slash))
++		return "text/plain";
++	dot++;
++	for (i = 0; i < sizeof(vita_filetypes) / sizeof(vita_filetypes[0]);
++	     i++) {
++		if (strcasecmp(dot, vita_filetypes[i].ext) == 0)
++			return vita_filetypes[i].type;
++	}
++	return "text/plain";
++}
++
++static nsurl *vita_get_resource_url(const char *path)
++{
++	char buf[256];
++	nsurl *url = NULL;
++
++	/* "Messages" and the like, but not "../escape": resources are flat. */
++	if (strchr(path, '/') != NULL)
++		return NULL;
++	strncpy(buf, VITA_RESOURCE_DIR, sizeof(buf) - 1);
++	buf[sizeof(buf) - 1] = '\0';
++	strncat(buf, path, sizeof(buf) - strlen(buf) - 1);
++	if (netsurf_path_to_nsurl(buf, &url) != NSERROR_OK)
++		return NULL;
++	return url;
++}
++
++static struct gui_fetch_table fetch_table = {
++	.filetype = vita_fetch_filetype,
++	.get_resource_url = vita_get_resource_url,
++};
++
++struct gui_fetch_table *vita_fetch_table = &fetch_table;
+diff --git a/frontends/vita/fetch.h b/frontends/vita/fetch.h
+new file mode 100644
+index 000000000..d4d721dd6
+--- /dev/null
++++ b/frontends/vita/fetch.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NETSURF_VITA_FETCH_H
++#define NETSURF_VITA_FETCH_H
++
++/** Directory of the bundled resources inside the app package. */
++#define VITA_RESOURCE_DIR "app0:/res/"
++
++/** The Vita fetch table. */
++extern struct gui_fetch_table *vita_fetch_table;
++
++#endif
+diff --git a/frontends/vita/file.c b/frontends/vita/file.c
+new file mode 100644
+index 000000000..9aecdd9e3
+--- /dev/null
++++ b/frontends/vita/file.c
+@@ -0,0 +1,107 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: file paths with device prefixes.
++ *
++ * Vita paths start with a device, "app0:/res/x" or "ux0:/data/x", with no
++ * leading slash. A file: URL needs an absolute path, so the device rides in
++ * the first path segment: file:///app0:/res/x. The POSIX table gets the
++ * rest right; these wrappers only move that one slash.
++ */
++
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "utils/errors.h"
++#include "utils/file.h"
++
++#include "vita/file.h"
++
++/** Does `path` start with a device ("app0:", "ux0:")? */
++static bool vita_is_device_path(const char *path)
++{
++	const char *colon = strchr(path, ':');
++	const char *slash = strchr(path, '/');
++
++	return colon != NULL && colon != path &&
++		(slash == NULL || colon < slash);
++}
++
++static nserror vita_mkpath(char **str, size_t *size, size_t nemb,
++			   va_list ap)
++{
++	return default_file_table->mkpath(str, size, nemb, ap);
++}
++
++static nserror vita_basename(const char *path, char **str, size_t *size)
++{
++	return default_file_table->basename(path, str, size);
++}
++
++static nserror vita_nsurl_to_path(struct nsurl *url, char **path_out)
++{
++	nserror res = default_file_table->nsurl_to_path(url, path_out);
++	char *path;
++
++	if (res != NSERROR_OK)
++		return res;
++	/* "/app0:/res/x" -> "app0:/res/x" */
++	path = *path_out;
++	if (path[0] == '/' && vita_is_device_path(path + 1))
++		memmove(path, path + 1, strlen(path));
++	return NSERROR_OK;
++}
++
++static nserror vita_path_to_nsurl(const char *path, struct nsurl **url_out)
++{
++	char *abs;
++	size_t len;
++	nserror res;
++
++	if (!vita_is_device_path(path))
++		return default_file_table->path_to_nsurl(path, url_out);
++	/* "app0:/res/x" -> "/app0:/res/x" -> file:///app0:/res/x */
++	len = strlen(path);
++	abs = malloc(len + 2);
++	if (abs == NULL)
++		return NSERROR_NOMEM;
++	abs[0] = '/';
++	memcpy(abs + 1, path, len + 1);
++	res = default_file_table->path_to_nsurl(abs, url_out);
++	free(abs);
++	return res;
++}
++
++static nserror vita_mkdir_all(const char *fname)
++{
++	return default_file_table->mkdir_all(fname);
++}
++
++static struct gui_file_table file_table = {
++	.mkpath = vita_mkpath,
++	.basename = vita_basename,
++	.nsurl_to_path = vita_nsurl_to_path,
++	.path_to_nsurl = vita_path_to_nsurl,
++	.mkdir_all = vita_mkdir_all,
++};
++
++struct gui_file_table *vita_file_table = &file_table;
+diff --git a/frontends/vita/file.h b/frontends/vita/file.h
+new file mode 100644
+index 000000000..c1ade231b
+--- /dev/null
++++ b/frontends/vita/file.h
+@@ -0,0 +1,25 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NETSURF_VITA_FILE_H
++#define NETSURF_VITA_FILE_H
++
++/** File table mapping Vita device paths to and from file: URLs. */
++extern struct gui_file_table *vita_file_table;
++
++#endif
+diff --git a/frontends/vita/layout.c b/frontends/vita/layout.c
+new file mode 100644
+index 000000000..50b43b838
+--- /dev/null
++++ b/frontends/vita/layout.c
+@@ -0,0 +1,181 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: text measurement with the system PGF font.
++ *
++ * The plotters draw text with vita2d's PGF renderer, so layout must measure
++ * with the same font or lines overflow. Per-glyph advances are measured
++ * once at scale 1.0 and scaled per font size: the core measures text far
++ * more often than it draws it, and PGF measurement walks glyph bitmaps.
++ * No kerning, which PGF text rendering does not apply either.
++ */
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <vita2d.h>
++
++#include "utils/errors.h"
++#include "utils/utf8.h"
++#include "netsurf/plot_style.h"
++#include "netsurf/layout.h"
++
++#include "vita/plot.h"
++#include "vita/layout.h"
++
++/** Advance widths at scale 1.0 for printable ASCII; < 0 = not measured. */
++static int ascii_advance[128];
++static bool ascii_ready;
++
++/**
++ * Advance of one UTF-8 character at scale 1.0.
++ *
++ * Measured as width("a" c "a") - width("aa"), because PGF reports a bare
++ * space, or any glyph with no ink at its edges, narrower than it advances.
++ */
++static int glyph_advance(vita2d_pgf *font, const char *utf8, size_t len)
++{
++	char buf[16];
++	int with, without;
++
++	if (len > sizeof(buf) - 3)
++		len = sizeof(buf) - 3;
++	buf[0] = 'a';
++	memcpy(buf + 1, utf8, len);
++	buf[len + 1] = 'a';
++	buf[len + 2] = '\0';
++	with = vita2d_pgf_text_width(font, 1.0f, buf);
++	without = vita2d_pgf_text_width(font, 1.0f, "aa");
++	return (with > without) ? with - without : 0;
++}
++
++static void ascii_init(vita2d_pgf *font)
++{
++	char c;
++
++	for (c = 0; c < 0x20; c++)
++		ascii_advance[(int)c] = 0;
++	for (c = 0x20; c < 0x7f; c++)
++		ascii_advance[(int)c] = glyph_advance(font, &c, 1);
++	ascii_advance[0x7f] = 0;
++	ascii_ready = true;
++}
++
++/** Advance at scale 1.0 of the character at string[idx]. */
++static int char_advance(const char *string, size_t length, size_t idx,
++			size_t next)
++{
++	vita2d_pgf *font = vita_plot_font();
++	unsigned char c = (unsigned char)string[idx];
++
++	if (font == NULL)
++		return 0;
++	if (!ascii_ready)
++		ascii_init(font);
++	if (c < 0x80)
++		return ascii_advance[c];
++	return glyph_advance(font, string + idx, next - idx);
++}
++
++/** Scale from advances at 1.0 to pixels for this font style. */
++static float style_scale(const plot_font_style_t *fstyle)
++{
++	return vita_plot_pgf_scale(vita_plot_font_px(fstyle->size));
++}
++
++static nserror vita_font_width(const plot_font_style_t *fstyle,
++			       const char *string, size_t length, int *width)
++{
++	float scale = style_scale(fstyle);
++	size_t idx = 0;
++	int units = 0;
++
++	while (idx < length) {
++		size_t next = utf8_next(string, length, idx);
++		units += char_advance(string, length, idx, next);
++		idx = next;
++	}
++	*width = (int)((float)units * scale + 0.5f);
++	return NSERROR_OK;
++}
++
++static nserror vita_font_position(const plot_font_style_t *fstyle,
++				  const char *string, size_t length,
++				  int x, size_t *char_offset, int *actual_x)
++{
++	float scale = style_scale(fstyle);
++	size_t idx = 0;
++	float pos = 0;
++
++	/* Stop at the character boundary nearest x. */
++	while (idx < length) {
++		size_t next = utf8_next(string, length, idx);
++		float adv = (float)char_advance(string, length, idx, next) *
++			scale;
++		if ((float)x < pos + adv / 2)
++			break;
++		pos += adv;
++		idx = next;
++	}
++	*char_offset = idx;
++	*actual_x = (int)(pos + 0.5f);
++	return NSERROR_OK;
++}
++
++static nserror vita_font_split(const plot_font_style_t *fstyle,
++			       const char *string, size_t length,
++			       int x, size_t *char_offset, int *actual_x)
++{
++	float scale = style_scale(fstyle);
++	size_t idx = 0;
++	float pos = 0;
++	float last_space_x = 0;
++	size_t last_space_idx = 0;
++
++	/* Same contract as the framebuffer frontend: break at the last space
++	 * before the width is exceeded; with no such space, don't break. */
++	while (idx < length) {
++		size_t next = utf8_next(string, length, idx);
++		if (string[idx] == ' ') {
++			last_space_x = pos;
++			last_space_idx = idx;
++		}
++		pos += (float)char_advance(string, length, idx, next) * scale;
++		if (pos > (float)x && last_space_idx != 0) {
++			*char_offset = last_space_idx;
++			*actual_x = (int)(last_space_x + 0.5f);
++			return NSERROR_OK;
++		}
++		idx = next;
++	}
++	*char_offset = idx;
++	*actual_x = (int)(pos + 0.5f);
++	return NSERROR_OK;
++}
++
++static struct gui_layout_table layout_table = {
++	.width = vita_font_width,
++	.position = vita_font_position,
++	.split = vita_font_split,
++};
++
++struct gui_layout_table *vita_layout_table = &layout_table;
+diff --git a/frontends/vita/layout.h b/frontends/vita/layout.h
+new file mode 100644
+index 000000000..11bb60019
+--- /dev/null
++++ b/frontends/vita/layout.h
+@@ -0,0 +1,25 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NETSURF_VITA_LAYOUT_H
++#define NETSURF_VITA_LAYOUT_H
++
++/** The PGF-metric layout table. */
++extern struct gui_layout_table *vita_layout_table;
++
++#endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+new file mode 100644
+index 000000000..59917b8c6
+--- /dev/null
++++ b/frontends/vita/main.c
+@@ -0,0 +1,239 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: application entry point and main loop.
++ *
++ * First milestone: open a bundled test page from app0: through the core's
++ * file fetcher, lay it out with PGF metrics and paint it with the vita2d
++ * plotters. Controls: D-pad / left stick scroll, L / R step through the
++ * bundled test pages, START quits.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <psp2/ctrl.h>
++#include <psp2/kernel/processmgr.h>
++#include <psp2/kernel/threadmgr.h>
++#include <vita2d.h>
++
++#include "utils/errors.h"
++#include "utils/messages.h"
++#include "utils/nsoption.h"
++#include "utils/nsurl.h"
++#include "netsurf/browser.h"
++#include "netsurf/browser_window.h"
++#include "netsurf/misc.h"
++#include "netsurf/netsurf.h"
++
++#include "vita/bitmap.h"
++#include "vita/fetch.h"
++#include "vita/file.h"
++#include "vita/layout.h"
++#include "vita/plot.h"
++#include "vita/schedule.h"
++#include "vita/window.h"
++
++/* Memory layout, read by the vitaSDK runtime at start-up. The heap matches
++ * MacSurf's preferred 192 MB partition and fits the default 256 MiB MAIN
++ * budget (docs/phase-0/pre-phase-0-findings.md §1); layout recursion on
++ * deep documents wants more than the default main-thread stack. */
++int _newlib_heap_size_user = 192 * 1024 * 1024;
++unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
++
++/** vita2d's per-frame vertex pool: every rect is a few vertices. */
++#define VITA_FRAME_POOL (4 * 1024 * 1024)
++
++/** Scroll speed in pixels per frame for the D-pad. */
++#define VITA_SCROLL_STEP 24
++
++/** Left stick dead zone around the 128 centre. */
++#define VITA_STICK_DEADZONE 24
++
++/** The test pages bundled under app0:/testpages/ (testpages/pages/). */
++static const char *const vita_test_pages[] = {
++	"L1-layout-basics", "L2-macsurf-css", "L3-grid", "L4-flex",
++	"PM-gradient", "PM-shadow", "PM-animation", "PM-macsurf-grid",
++	"PM-tagtype", "PM-link",
++};
++#define VITA_TEST_PAGE_COUNT \
++	(sizeof(vita_test_pages) / sizeof(vita_test_pages[0]))
++
++static bool vita_quit;
++
++static void vita_gui_quit(void)
++{
++	vita_quit = true;
++}
++
++static struct gui_misc_table vita_misc_table = {
++	.schedule = vita_schedule,
++	.quit = vita_gui_quit,
++};
++
++static nserror set_defaults(struct nsoption_s *defaults)
++{
++	/* Nothing to persist yet: no cookie jar or history on the card. */
++	return NSERROR_OK;
++}
++
++/** Navigate the window to bundled test page `idx`. */
++static nserror open_test_page(struct browser_window *bw, unsigned int idx)
++{
++	char url_s[128];
++	nsurl *url;
++	nserror err;
++
++	strcpy(url_s, "file:///app0:/testpages/");
++	strncat(url_s, vita_test_pages[idx % VITA_TEST_PAGE_COUNT],
++		sizeof(url_s) - strlen(url_s) - 6);
++	strcat(url_s, ".html");
++	err = nsurl_create(url_s, &url);
++	if (err != NSERROR_OK)
++		return err;
++	err = browser_window_navigate(bw, url, NULL, BW_NAVIGATE_HISTORY,
++				      NULL, NULL, NULL);
++	nsurl_unref(url);
++	return err;
++}
++
++/** Read the pad; returns true when the page should change (by *step). */
++static bool vita_input(struct gui_window *gw, int *step)
++{
++	static unsigned int prev_buttons;
++	SceCtrlData pad;
++	unsigned int pressed;
++	int dx = 0, dy = 0;
++
++	memset(&pad, 0, sizeof(pad));
++	sceCtrlPeekBufferPositive(0, &pad, 1);
++	pressed = pad.buttons & ~prev_buttons;
++	prev_buttons = pad.buttons;
++
++	if (pressed & SCE_CTRL_START)
++		vita_quit = true;
++	if (pad.buttons & SCE_CTRL_UP)
++		dy -= VITA_SCROLL_STEP;
++	if (pad.buttons & SCE_CTRL_DOWN)
++		dy += VITA_SCROLL_STEP;
++	if (pad.buttons & SCE_CTRL_LEFT)
++		dx -= VITA_SCROLL_STEP;
++	if (pad.buttons & SCE_CTRL_RIGHT)
++		dx += VITA_SCROLL_STEP;
++	if (abs((int)pad.lx - 128) > VITA_STICK_DEADZONE)
++		dx += ((int)pad.lx - 128) / 4;
++	if (abs((int)pad.ly - 128) > VITA_STICK_DEADZONE)
++		dy += ((int)pad.ly - 128) / 4;
++	if (dx != 0 || dy != 0)
++		vita_window_scroll_by(gw, dx, dy);
++
++	*step = 0;
++	if (pressed & SCE_CTRL_LTRIGGER)
++		*step = -1;
++	if (pressed & SCE_CTRL_RTRIGGER)
++		*step = 1;
++	return *step != 0;
++}
++
++static void vita_run(struct browser_window *bw)
++{
++	unsigned int page = 0;
++
++	while (!vita_quit) {
++		struct gui_window *gw = vita_window_current();
++		int step;
++
++		vita_schedule_run();
++
++		if (gw != NULL && vita_input(gw, &step)) {
++			page = (page + VITA_TEST_PAGE_COUNT + step) %
++				VITA_TEST_PAGE_COUNT;
++			open_test_page(bw, page);
++		}
++
++		if (vita_window_needs_redraw(gw)) {
++			vita2d_start_drawing();
++			vita2d_clear_screen();
++			vita_window_redraw(gw);
++			vita2d_end_drawing();
++			vita2d_swap_buffers();
++		} else {
++			/* Nothing to paint: yield for about a frame. */
++			sceKernelDelayThread(16 * 1000);
++		}
++	}
++}
++
++int main(int argc, char **argv)
++{
++	struct browser_window *bw = NULL;
++	nsurl *url;
++	nserror ret;
++	struct netsurf_table vita_table = {
++		.misc = &vita_misc_table,
++		.window = vita_window_table,
++		.fetch = vita_fetch_table,
++		.file = vita_file_table,
++		.bitmap = vita_bitmap_table,
++		.layout = vita_layout_table,
++	};
++
++	vita2d_init_advanced(VITA_FRAME_POOL);
++	vita2d_set_clear_color(RGBA8(0xff, 0xff, 0xff, 0xff));
++	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
++	if (vita_plot_init() != NSERROR_OK)
++		goto fail;
++
++	ret = netsurf_register(&vita_table);
++	if (ret != NSERROR_OK)
++		goto fail;
++	ret = nsoption_init(set_defaults, &nsoptions, &nsoptions_default);
++	if (ret != NSERROR_OK)
++		goto fail;
++	/* Missing messages only lose UI strings; not fatal. */
++	messages_add_from_file(VITA_RESOURCE_DIR "Messages");
++
++	ret = netsurf_init(NULL);
++	if (ret != NSERROR_OK)
++		goto fail;
++	/* plot.c converts font points back to pixels at the same dpi. */
++	browser_set_dpi(96);
++
++	ret = nsurl_create(NETSURF_VITA_START_PAGE, &url);
++	if (ret == NSERROR_OK) {
++		ret = browser_window_create(BW_CREATE_HISTORY, url, NULL,
++					    NULL, &bw);
++		nsurl_unref(url);
++	}
++	if (ret != NSERROR_OK)
++		goto fail;
++
++	vita_run(bw);
++
++	browser_window_destroy(bw);
++	netsurf_exit();
++	nsoption_finalise(nsoptions, nsoptions_default);
++fail:
++	vita_plot_fini();
++	vita2d_fini();
++	sceKernelExitProcess(0);
++	return 0;
++}
+diff --git a/frontends/vita/plot.c b/frontends/vita/plot.c
+new file mode 100644
+index 000000000..4aa503ea3
+--- /dev/null
++++ b/frontends/vita/plot.c
+@@ -0,0 +1,592 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: libvita2d plotters.
++ *
++ * Rectangles go through vita/plot_geom.c, which reproduces the monkey
++ * stream contract (gradient bands, drop/inset shadows, transform quads,
++ * opacity buckets) with colours. Everything is drawn inside a
++ * vita2d_start_drawing() / vita2d_end_drawing() pair owned by the caller.
++ *
++ * Opacity: MacSurf approximates the fixes49 buckets with QuickDraw stipple
++ * patterns (ltGray / gray / dkGray = 25 / 50 / 75% foreground). The GXM has
++ * real alpha blending, so each bucket is drawn as that coverage in alpha.
++ * The bucket, not the exact CSS opacity, is what reaches the screen: that
++ * keeps the Vita render a function of the verified stream.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++#include <vita2d.h>
++
++#include "utils/utils.h"
++#include "utils/errors.h"
++#include "netsurf/plotters.h"
++
++#include "vita/plot_geom.h"
++#include "vita/bitmap.h"
++#include "vita/plot.h"
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++/** Alpha for each opacity bucket: skip, 25%, 50%, 75%, opaque. */
++static const unsigned int vita_bucket_alpha[VITA_BUCKET_SOLID + 1] = {
++	0, 64, 128, 191, 255
++};
++
++/**
++ * Height in pixels of the system PGF font at scale 1.0.
++ * UNVERIFIED: calibrate on hardware; only the text scale depends on it.
++ */
++#define VITA_PGF_EM_PX 20.0f
++
++/** Segments used to approximate a full circle. */
++#define VITA_CIRCLE_SEGMENTS 32
++
++/** Segments used to flatten one cubic Bezier. */
++#define VITA_BEZIER_SEGMENTS 12
++
++static vita2d_pgf *vita_font;
++
++/** Current clip; drawing is suppressed while it is empty. */
++static struct rect vita_clip = { 0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT };
++static bool vita_clip_empty;
++
++/* exported interface documented in vita/plot.h */
++unsigned int vita_plot_rgba(colour c, int bucket)
++{
++	if (bucket < 0)
++		bucket = 0;
++	if (bucket > VITA_BUCKET_SOLID)
++		bucket = VITA_BUCKET_SOLID;
++	/* NetSurf's colour and vita2d's RGBA8 share a byte order:
++	 * R in the low byte, then G, then B. Only alpha needs adding. */
++	return (c & 0xffffff) | (vita_bucket_alpha[bucket] << 24);
++}
++
++/* exported interface documented in vita/plot.h */
++float vita_plot_font_px(int size)
++{
++	/* Plot font sizes are points in PLOT_STYLE_SCALE fixed point; the
++	 * frontend runs the core at 96 dpi (see vita/main.c). */
++	return ((float)size / PLOT_STYLE_SCALE) * 96.0f / 72.0f;
++}
++
++/* exported interface documented in vita/plot.h */
++float vita_plot_pgf_scale(float px)
++{
++	return px / VITA_PGF_EM_PX;
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_set_clip(int x0, int y0, int x1, int y1)
++{
++	if (x0 < 0) x0 = 0;
++	if (y0 < 0) y0 = 0;
++	if (x1 > VITA_SCREEN_WIDTH) x1 = VITA_SCREEN_WIDTH;
++	if (y1 > VITA_SCREEN_HEIGHT) y1 = VITA_SCREEN_HEIGHT;
++
++	vita_clip.x0 = x0;
++	vita_clip.y0 = y0;
++	vita_clip.x1 = x1;
++	vita_clip.y1 = y1;
++	vita_clip_empty = (x1 <= x0 || y1 <= y0);
++	if (vita_clip_empty)
++		return;
++	vita2d_enable_clipping();
++	vita2d_set_clip_rectangle(x0, y0, x1, y1);
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_fill_rect(int x0, int y0, int x1, int y1, colour c,
++			 int bucket)
++{
++	if (vita_clip_empty || bucket <= 0 || x1 <= x0 || y1 <= y0)
++		return;
++	vita2d_draw_rectangle((float)x0, (float)y0,
++			      (float)(x1 - x0), (float)(y1 - y0),
++			      vita_plot_rgba(c, bucket));
++}
++
++/**
++ * Draw a convex vertex list as a triangle fan.
++ *
++ * Vertices must live in GPU-visible memory until the frame is done, so
++ * they come from vita2d's per-frame pool rather than the stack.
++ */
++static void vita_plot_fan(const float *xy, unsigned int n, unsigned int rgba)
++{
++	vita2d_color_vertex *v;
++	unsigned int i;
++
++	if (vita_clip_empty || n < 3)
++		return;
++	v = vita2d_pool_memalign(n * sizeof(vita2d_color_vertex),
++				 sizeof(vita2d_color_vertex));
++	if (v == NULL)
++		return;
++	for (i = 0; i < n; i++) {
++		v[i].x = xy[i * 2];
++		v[i].y = xy[i * 2 + 1];
++		v[i].z = 0.5f;
++		v[i].color = rgba;
++	}
++	vita2d_draw_array(SCE_GXM_PRIMITIVE_TRIANGLE_FAN, v, n);
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_fill_quad(const int x[4], const int y[4], colour c,
++			 int bucket)
++{
++	float xy[8];
++	int i;
++
++	if (bucket <= 0)
++		return;
++	for (i = 0; i < 4; i++) {
++		xy[i * 2] = (float)x[i];
++		xy[i * 2 + 1] = (float)y[i];
++	}
++	vita_plot_fan(xy, 4, vita_plot_rgba(c, bucket));
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c)
++{
++	unsigned int rgba = vita_plot_rgba(c, VITA_BUCKET_SOLID);
++	int half;
++
++	if (vita_clip_empty)
++		return;
++	if (width <= 1) {
++		vita2d_draw_line((float)x0, (float)y0, (float)x1, (float)y1,
++				 rgba);
++		return;
++	}
++	/* Thick axis-aligned lines (the common case: borders) are exact
++	 * rectangles centred on the line, as the plotter API specifies. */
++	half = width / 2;
++	if (y0 == y1) {
++		vita_plot_fill_rect(min(x0, x1), y0 - half, max(x0, x1),
++				    y0 - half + width, c, VITA_BUCKET_SOLID);
++	} else if (x0 == x1) {
++		vita_plot_fill_rect(x0 - half, min(y0, y1),
++				    x0 - half + width, max(y0, y1),
++				    c, VITA_BUCKET_SOLID);
++	} else {
++		float dx = (float)(x1 - x0), dy = (float)(y1 - y0);
++		float len = sqrtf(dx * dx + dy * dy);
++		float nx = -dy / len * (float)width / 2.0f;
++		float ny = dx / len * (float)width / 2.0f;
++		float xy[8] = {
++			x0 + nx, y0 + ny,  x1 + nx, y1 + ny,
++			x1 - nx, y1 - ny,  x0 - nx, y0 - ny
++		};
++		vita_plot_fan(xy, 4, rgba);
++	}
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_text(int x, int y, const char *text, size_t length,
++		    colour c, float scale)
++{
++	char buf[512];
++
++	if (vita_clip_empty || vita_font == NULL || length == 0)
++		return;
++	/* The core hands us a counted, unterminated UTF-8 run. */
++	if (length >= sizeof(buf))
++		length = sizeof(buf) - 1;
++	memcpy(buf, text, length);
++	buf[length] = '\0';
++	vita2d_pgf_draw_text(vita_font, x, y,
++			     vita_plot_rgba(c, VITA_BUCKET_SOLID), scale, buf);
++}
++
++/* ---- the rectangle contract ---------------------------------------- */
++
++static void geom_rect(void *pw, enum vita_geom_kind kind,
++		      int x0, int y0, int x1, int y1,
++		      colour c, int bucket, bool paint)
++{
++	if (paint)
++		vita_plot_fill_rect(x0, y0, x1, y1, c, bucket);
++}
++
++static void geom_quad(void *pw, const int x[4], const int y[4],
++		      colour c, int bucket, bool paint)
++{
++	if (paint)
++		vita_plot_fill_quad(x, y, c, bucket);
++}
++
++static const struct vita_geom_sink vita_geom_sink = {
++	.rect = geom_rect,
++	.quad = geom_quad,
++	.pw = NULL,
++};
++
++/** Stroke width in whole pixels, at least one. */
++static int stroke_px(const plot_style_t *style)
++{
++	int w = plot_style_fixed_to_int(style->stroke_width);
++	return (w < 1) ? 1 : w;
++}
++
++/* ---- plotter table ------------------------------------------------- */
++
++static nserror
++vita_plot_clip(const struct redraw_context *ctx, const struct rect *clip)
++{
++	vita_plot_set_clip(clip->x0, clip->y0, clip->x1, clip->y1);
++	return NSERROR_OK;
++}
++
++/** Stroke a polyline given as float x,y pairs. */
++static void stroke_polyline(const float *xy, unsigned int n, bool closed,
++			    int width, colour c)
++{
++	unsigned int i;
++
++	for (i = 0; i + 1 < n; i++) {
++		vita_plot_line((int)xy[i * 2], (int)xy[i * 2 + 1],
++			       (int)xy[i * 2 + 2], (int)xy[i * 2 + 3],
++			       width, c);
++	}
++	if (closed && n > 2) {
++		vita_plot_line((int)xy[(n - 1) * 2], (int)xy[(n - 1) * 2 + 1],
++			       (int)xy[0], (int)xy[1], width, c);
++	}
++}
++
++static nserror
++vita_plot_arc(const struct redraw_context *ctx,
++	      const plot_style_t *style,
++	      int x, int y, int radius, int angle1, int angle2)
++{
++	float xy[(VITA_CIRCLE_SEGMENTS + 1) * 2];
++	int segs, i;
++	float a1, a2;
++
++	/* Anticlockwise from angle1 to angle2, degrees from horizontal. */
++	while (angle2 < angle1)
++		angle2 += 360;
++	segs = (VITA_CIRCLE_SEGMENTS * (angle2 - angle1)) / 360;
++	if (segs < 1)
++		segs = 1;
++	a1 = (float)angle1 * (float)M_PI / 180.0f;
++	a2 = (float)angle2 * (float)M_PI / 180.0f;
++	for (i = 0; i <= segs; i++) {
++		float a = a1 + (a2 - a1) * (float)i / (float)segs;
++		/* Screen y grows downwards, so anticlockwise is -sin. */
++		xy[i * 2] = (float)x + (float)radius * cosf(a);
++		xy[i * 2 + 1] = (float)y - (float)radius * sinf(a);
++	}
++	stroke_polyline(xy, (unsigned int)segs + 1, false, stroke_px(style),
++			style->stroke_colour);
++	return NSERROR_OK;
++}
++
++static nserror
++vita_plot_disc(const struct redraw_context *ctx,
++	       const plot_style_t *style,
++	       int x, int y, int radius)
++{
++	if (style->fill_type != PLOT_OP_TYPE_NONE && !vita_clip_empty) {
++		vita2d_draw_fill_circle((float)x, (float)y, (float)radius,
++				vita_plot_rgba(style->fill_colour,
++					       VITA_BUCKET_SOLID));
++	}
++	if (style->stroke_type != PLOT_OP_TYPE_NONE) {
++		float xy[VITA_CIRCLE_SEGMENTS * 2];
++		int i;
++		for (i = 0; i < VITA_CIRCLE_SEGMENTS; i++) {
++			float a = 2.0f * (float)M_PI * (float)i /
++				VITA_CIRCLE_SEGMENTS;
++			xy[i * 2] = (float)x + (float)radius * cosf(a);
++			xy[i * 2 + 1] = (float)y + (float)radius * sinf(a);
++		}
++		stroke_polyline(xy, VITA_CIRCLE_SEGMENTS, true,
++				stroke_px(style), style->stroke_colour);
++	}
++	return NSERROR_OK;
++}
++
++static nserror
++vita_plot_line_op(const struct redraw_context *ctx,
++		  const plot_style_t *style,
++		  const struct rect *line)
++{
++	if (style->stroke_type == PLOT_OP_TYPE_NONE)
++		return NSERROR_OK;
++	vita_plot_line(line->x0, line->y0, line->x1, line->y1,
++		       stroke_px(style), style->stroke_colour);
++	return NSERROR_OK;
++}
++
++static nserror
++vita_plot_rectangle(const struct redraw_context *ctx,
++		    const plot_style_t *style,
++		    const struct rect *rect)
++{
++	vita_geom_rectangle(style, rect, &vita_geom_sink);
++
++	/* The stream contract is fill-only (monkey never records strokes);
++	 * the outline is ours, drawn over the fill as the API specifies. */
++	if (style->stroke_type != PLOT_OP_TYPE_NONE) {
++		int w = stroke_px(style);
++		colour c = style->stroke_colour;
++		const struct rect *r = rect;
++		vita_plot_fill_rect(r->x0, r->y0, r->x1, r->y0 + w, c,
++				    VITA_BUCKET_SOLID);
++		vita_plot_fill_rect(r->x0, r->y1 - w, r->x1, r->y1, c,
++				    VITA_BUCKET_SOLID);
++		vita_plot_fill_rect(r->x0, r->y0 + w, r->x0 + w, r->y1 - w, c,
++				    VITA_BUCKET_SOLID);
++		vita_plot_fill_rect(r->x1 - w, r->y0 + w, r->x1, r->y1 - w, c,
++				    VITA_BUCKET_SOLID);
++	}
++	return NSERROR_OK;
++}
++
++static nserror
++vita_plot_polygon(const struct redraw_context *ctx,
++		  const plot_style_t *style,
++		  const int *p,
++		  unsigned int n)
++{
++	float xy[64 * 2];
++	unsigned int i;
++
++	/* A fan is exact for convex polygons, which is what the core sends
++	 * (list bullets, form widgets). Longer ones are truncated. */
++	if (n > 64)
++		n = 64;
++	for (i = 0; i < n * 2; i++)
++		xy[i] = (float)p[i];
++	if (style->fill_type != PLOT_OP_TYPE_NONE)
++		vita_plot_fan(xy, n, vita_plot_rgba(style->fill_colour,
++						    VITA_BUCKET_SOLID));
++	if (style->stroke_type != PLOT_OP_TYPE_NONE)
++		stroke_polyline(xy, n, true, stroke_px(style),
++				style->stroke_colour);
++	return NSERROR_OK;
++}
++
++/** Apply the path plotter's 2D affine transform to a point. */
++static void path_xform(const float t[6], float x, float y, float *ox,
++		       float *oy)
++{
++	*ox = t[0] * x + t[2] * y + t[4];
++	*oy = t[1] * x + t[3] * y + t[5];
++}
++
++/** Paint one flattened path segment list (fill then stroke). */
++static void path_flush(const plot_style_t *style, float *xy, unsigned int n,
++		       bool closed)
++{
++	if (n < 2)
++		return;
++	if (style->fill_type != PLOT_OP_TYPE_NONE && n >= 3)
++		vita_plot_fan(xy, n, vita_plot_rgba(style->fill_colour,
++						    VITA_BUCKET_SOLID));
++	if (style->stroke_type != PLOT_OP_TYPE_NONE)
++		stroke_polyline(xy, n, closed, stroke_px(style),
++				style->stroke_colour);
++}
++
++static nserror
++vita_plot_path(const struct redraw_context *ctx,
++	       const plot_style_t *pstyle,
++	       const float *p,
++	       unsigned int n,
++	       const float transform[6])
++{
++	/* SVG paths: flatten Beziers to polylines, one subpath at a time.
++	 * Fills are fans, exact only for convex subpaths. */
++	float xy[256 * 2];
++	unsigned int count = 0;
++	unsigned int i = 0;
++	float cx = 0, cy = 0;
++	bool closed = false;
++
++	while (i < n) {
++		int cmd = (int)p[i];
++		if (cmd == PLOTTER_PATH_MOVE && i + 2 < n) {
++			path_flush(pstyle, xy, count, closed);
++			count = 0;
++			closed = false;
++			path_xform(transform, p[i + 1], p[i + 2], &cx, &cy);
++			xy[0] = cx;
++			xy[1] = cy;
++			count = 1;
++			i += 3;
++		} else if (cmd == PLOTTER_PATH_LINE && i + 2 < n) {
++			path_xform(transform, p[i + 1], p[i + 2], &cx, &cy);
++			if (count < 256) {
++				xy[count * 2] = cx;
++				xy[count * 2 + 1] = cy;
++				count++;
++			}
++			i += 3;
++		} else if (cmd == PLOTTER_PATH_BEZIER && i + 6 < n) {
++			float x1, y1, x2, y2, x3, y3;
++			int s;
++			path_xform(transform, p[i + 1], p[i + 2], &x1, &y1);
++			path_xform(transform, p[i + 3], p[i + 4], &x2, &y2);
++			path_xform(transform, p[i + 5], p[i + 6], &x3, &y3);
++			for (s = 1; s <= VITA_BEZIER_SEGMENTS; s++) {
++				float t = (float)s / VITA_BEZIER_SEGMENTS;
++				float u = 1.0f - t;
++				float bx = u * u * u * cx + 3 * u * u * t * x1 +
++					3 * u * t * t * x2 + t * t * t * x3;
++				float by = u * u * u * cy + 3 * u * u * t * y1 +
++					3 * u * t * t * y2 + t * t * t * y3;
++				if (count < 256) {
++					xy[count * 2] = bx;
++					xy[count * 2 + 1] = by;
++					count++;
++				}
++			}
++			cx = x3;
++			cy = y3;
++			i += 7;
++		} else if (cmd == PLOTTER_PATH_CLOSE) {
++			closed = true;
++			i += 1;
++		} else {
++			/* Malformed or truncated path: stop, keep what we have. */
++			break;
++		}
++	}
++	path_flush(pstyle, xy, count, closed);
++	return NSERROR_OK;
++}
++
++static nserror
++vita_plot_bitmap(const struct redraw_context *ctx,
++		 struct bitmap *bitmap,
++		 int x, int y,
++		 int width,
++		 int height,
++		 colour bg,
++		 bitmap_flags_t flags)
++{
++	vita2d_texture *tex;
++	float sx, sy;
++	int tx, ty, x_end, y_end;
++
++	if (vita_clip_empty || width <= 0 || height <= 0)
++		return NSERROR_OK;
++	tex = vita_bitmap_texture(bitmap);
++	if (tex == NULL)
++		return NSERROR_OK;
++	sx = (float)width / (float)vita2d_texture_get_width(tex);
++	sy = (float)height / (float)vita2d_texture_get_height(tex);
++
++	/* Tile across the clip rectangle on repeating axes; the GPU clip
++	 * trims the partial tiles at the edges. */
++	if (flags & BITMAPF_REPEAT_X) {
++		while (x > vita_clip.x0)
++			x -= width;
++		while (x + width <= vita_clip.x0)
++			x += width;
++		x_end = vita_clip.x1;
++	} else {
++		x_end = x + 1;
++	}
++	if (flags & BITMAPF_REPEAT_Y) {
++		while (y > vita_clip.y0)
++			y -= height;
++		while (y + height <= vita_clip.y0)
++			y += height;
++		y_end = vita_clip.y1;
++	} else {
++		y_end = y + 1;
++	}
++	for (ty = y; ty < y_end; ty += height) {
++		for (tx = x; tx < x_end; tx += width) {
++			vita2d_draw_texture_scale(tex, (float)tx, (float)ty,
++						  sx, sy);
++		}
++	}
++	return NSERROR_OK;
++}
++
++static nserror
++vita_plot_text_op(const struct redraw_context *ctx,
++		  const struct plot_font_style *fstyle,
++		  int x,
++		  int y,
++		  const char *text,
++		  size_t length)
++{
++	vita_plot_text(x, y, text, length, fstyle->foreground,
++		       vita_plot_pgf_scale(vita_plot_font_px(fstyle->size)));
++	return NSERROR_OK;
++}
++
++/* exported interface documented in vita/plot.h */
++struct vita2d_pgf *vita_plot_font(void)
++{
++	return vita_font;
++}
++
++/* exported interface documented in vita/plot.h */
++nserror vita_plot_init(void)
++{
++	vita_font = vita2d_load_default_pgf();
++	if (vita_font == NULL)
++		return NSERROR_INIT_FAILED;
++	vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
++	return NSERROR_OK;
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_fini(void)
++{
++	if (vita_font != NULL) {
++		vita2d_free_pgf(vita_font);
++		vita_font = NULL;
++	}
++}
++
++/** vita2d plotter operations table */
++static const struct plotter_table plotters = {
++	.clip = vita_plot_clip,
++	.arc = vita_plot_arc,
++	.disc = vita_plot_disc,
++	.line = vita_plot_line_op,
++	.rectangle = vita_plot_rectangle,
++	.polygon = vita_plot_polygon,
++	.path = vita_plot_path,
++	.bitmap = vita_plot_bitmap,
++	.text = vita_plot_text_op,
++	/* Same as monkey: knockout reorders the core's plot calls, and the
++	 * verified stream was recorded with it on. */
++	.option_knockout = true,
++};
++
++const struct plotter_table *vita_plotters = &plotters;
+diff --git a/frontends/vita/plot.h b/frontends/vita/plot.h
+new file mode 100644
+index 000000000..d4461ec89
+--- /dev/null
++++ b/frontends/vita/plot.h
+@@ -0,0 +1,85 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: libvita2d plotters.
++ *
++ * The plotter table drives the rectangle contract through vita/plot_geom.c.
++ * The primitives below are what the table and the plot-stream replayer
++ * (vita/replay.c) both draw with, so a recorded monkey stream and a live
++ * engine render reach the GPU through the same calls.
++ */
++
++#ifndef NETSURF_VITA_PLOT_H
++#define NETSURF_VITA_PLOT_H
++
++#include <stddef.h>
++
++#include "utils/errors.h"
++#include "netsurf/types.h"
++
++struct plotter_table;
++
++/** Screen size of the Vita display. */
++#define VITA_SCREEN_WIDTH 960
++#define VITA_SCREEN_HEIGHT 544
++
++/** The vita2d plotter table. */
++extern const struct plotter_table *vita_plotters;
++
++/**
++ * Load the plotters' resources (the system PGF font).
++ * Call after vita2d_init().
++ */
++nserror vita_plot_init(void);
++
++/** Release the plotters' resources. */
++void vita_plot_fini(void);
++
++/** Convert a NetSurf colour and opacity bucket to a vita2d RGBA8 value. */
++unsigned int vita_plot_rgba(colour c, int bucket);
++
++/** Set the clip rectangle (x1/y1 exclusive), clamped to the screen. */
++void vita_plot_set_clip(int x0, int y0, int x1, int y1);
++
++/** Fill an axis-aligned rectangle (x1/y1 exclusive). Bucket 0 is a no-op. */
++void vita_plot_fill_rect(int x0, int y0, int x1, int y1, colour c,
++			 int bucket);
++
++/** Fill a 4-corner quad as a triangle fan. Bucket 0 is a no-op. */
++void vita_plot_fill_quad(const int x[4], const int y[4], colour c,
++			 int bucket);
++
++/** Draw a line of the given width in pixels. */
++void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c);
++
++/** Draw `length` bytes of UTF-8 text with its baseline at y. */
++void vita_plot_text(int x, int y, const char *text, size_t length,
++		    colour c, float scale);
++
++/** Font size in pixels for a plot font style size (pt, fixed point). */
++float vita_plot_font_px(int size);
++
++/** PGF scale factor that renders a font `px` pixels high. */
++float vita_plot_pgf_scale(float px);
++
++/** The system font the plotters draw with; NULL before vita_plot_init(). */
++struct vita2d_pgf *vita_plot_font(void);
++
++#endif
+diff --git a/frontends/vita/plot_geom.c b/frontends/vita/plot_geom.c
+new file mode 100644
+index 000000000..26c0fa778
+--- /dev/null
++++ b/frontends/vita/plot_geom.c
+@@ -0,0 +1,356 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the rectangle plot contract as coloured geometry.
++ *
++ * Every branch here mirrors monkey_plot_rectangle (frontends/monkey/plot.c,
++ * patches 25-27) statement for statement, in the same order, so the
++ * geometry cannot drift from the verified stream. Where monkey computes a
++ * value and drops it (the per-band gradient colour), we pass it on. Where
++ * MacSurf's own plotter paints differently from what the stream records,
++ * the difference is carried in the `paint` flag, never in the geometry.
++ */
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdio.h>
++
++#include "vita/plot_geom.h"
++
++/* exported interface documented in vita/plot_geom.h */
++int vita_geom_format_rect(char *buf, size_t len, int x0, int y0, int x1,
++			  int y1, int bucket)
++{
++	if (bucket == VITA_BUCKET_SOLID)
++		return snprintf(buf, len, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++				x0, y0, x1, y1);
++	return snprintf(buf, len, "RECT X0 %d Y0 %d X1 %d Y1 %d OPAQUE %d",
++			x0, y0, x1, y1, bucket);
++}
++
++/* exported interface documented in vita/plot_geom.h */
++int vita_geom_format_quad(char *buf, size_t len, const int x[4],
++			  const int y[4], int bucket)
++{
++	if (bucket == VITA_BUCKET_SOLID)
++		return snprintf(buf, len,
++			"POLY X0 %d Y0 %d X1 %d Y1 %d X2 %d Y2 %d X3 %d Y3 %d",
++			x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
++	return snprintf(buf, len,
++		"POLY X0 %d Y0 %d X1 %d Y1 %d X2 %d Y2 %d X3 %d Y3 %d OPAQUE %d",
++		x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3], bucket);
++}
++
++/* MacSurf plotters.c 994: Q15 sine table, 0..90 degrees (copied verbatim
++ * from the monkey plotter, which copied it from MacSurf). */
++static const int16_t vita_sin_q15_table[91] = {
++    0,   572,  1144,  1715,  2286,  2856,  3425,  3993,  4560,  5126,
++  5690,  6252,  6813,  7371,  7927,  8481,  9032,  9580, 10126, 10668,
++ 11207, 11743, 12275, 12803, 13328, 13848, 14365, 14876, 15384, 15886,
++ 16384, 16877, 17364, 17847, 18324, 18795, 19261, 19720, 20174, 20622,
++ 21063, 21498, 21926, 22348, 22763, 23170, 23571, 23965, 24351, 24730,
++ 25102, 25466, 25822, 26170, 26510, 26842, 27166, 27482, 27789, 28088,
++ 28378, 28660, 28932, 29197, 29452, 29698, 29935, 30163, 30382, 30592,
++ 30792, 30983, 31164, 31336, 31499, 31651, 31795, 31928, 32052, 32166,
++ 32270, 32365, 32449, 32524, 32588, 32643, 32688, 32723, 32748, 32763,
++ 32767
++};
++
++static int vita_sin_q15(int deg)
++{
++	while (deg < 0) deg += 360;
++	while (deg >= 360) deg -= 360;
++	if (deg <=  90) return  vita_sin_q15_table[deg];
++	if (deg <= 180) return  vita_sin_q15_table[180 - deg];
++	if (deg <= 270) return -vita_sin_q15_table[deg - 180];
++	return -vita_sin_q15_table[360 - deg];
++}
++
++static int vita_cos_q15(int deg)
++{
++	return vita_sin_q15(deg + 90);
++}
++
++/* MacSurf plotters.c 1043: unpack the -macsurf-transform packed value.
++ * bits 31=percent-translate, 30..16=rotation Q10.6 (15-bit signed),
++ * 15..8=tx int8, 7..0=ty int8. */
++static void vita_transform_unpack(int transform, int *rot_deg, int *tx,
++				  int *ty)
++{
++	int32_t rot_q106;
++	int deg;
++	int is_pct = (int)(((uint32_t)transform >> 31) & 1);
++	int8_t tx_px = (int8_t)((((uint32_t)transform) >> 8) & 0xff);
++	int8_t ty_px = (int8_t)( ((uint32_t)transform)       & 0xff);
++
++	rot_q106 = (int32_t)((((uint32_t)transform) >> 16) & 0x7fff);
++	if (rot_q106 & 0x4000) rot_q106 -= 0x8000;
++	deg = (int)(rot_q106 / 64);
++	while (deg < 0)   deg += 360;
++	while (deg >= 360) deg -= 360;
++
++	*rot_deg = deg;
++	if (is_pct) {
++		*tx = 0;
++		*ty = 0;
++	} else {
++		*tx = (int)tx_px;
++		*ty = (int)ty_px;
++	}
++}
++
++/* MacSurf plotters.c 1077: rotate a point around (cx,cy) then translate.
++ * Exact for the four cardinals, Q15 affine otherwise. */
++static void vita_transform_point(int *px, int *py, int cx, int cy,
++				 int rot_deg, int tx, int ty)
++{
++	int dx = *px - cx;
++	int dy = *py - cy;
++	int s = vita_sin_q15(rot_deg);
++	int c = vita_cos_q15(rot_deg);
++	int nx, ny;
++
++	switch (rot_deg) {
++	case 0:    nx = dx;  ny = dy;  break;
++	case 90:   nx = -dy; ny = dx;  break;
++	case 180:  nx = -dx; ny = -dy; break;
++	case 270:  nx = dy;  ny = -dx; break;
++	default:
++		nx = (dx * c - dy * s + 16384) >> 15;
++		ny = (dx * s + dy * c + 16384) >> 15;
++		break;
++	}
++	*px = cx + nx + tx;
++	*py = cy + ny + ty;
++}
++
++/* exported interface documented in vita/plot_geom.h */
++int vita_geom_opacity_bucket(const plot_style_t *style)
++{
++	plot_style_fixed op = style->opacity;
++	if (op == 0) op = (plot_style_fixed)PLOT_STYLE_SCALE;
++	if (op < (plot_style_fixed)(PLOT_STYLE_SCALE / 20))
++		return 0;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 35) / 100))
++		return 1;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 60) / 100))
++		return 2;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 85) / 100))
++		return 3;
++	return VITA_BUCKET_SOLID;
++}
++
++static void emit_rect(const struct vita_geom_sink *sink,
++		      enum vita_geom_kind kind, struct rect r,
++		      colour c, int bucket, bool paint)
++{
++	sink->rect(sink->pw, kind, r.x0, r.y0, r.x1, r.y1,
++		   c & 0xffffff, bucket, paint);
++}
++
++/* Drop shadow colour: the style's, or MacSurf's 50% grey when unset. */
++static colour drop_colour(const plot_style_t *style)
++{
++	if (style->box_shadow_color != 0)
++		return style->box_shadow_color;
++	return VITA_SHADOW_DEFAULT_COLOUR;
++}
++
++/* Monkey macmonk_paint_drop / MacSurf plotters.c 1346. */
++static void paint_drop(const plot_style_t *style, struct rect r,
++		       const struct vita_geom_sink *sink)
++{
++	int hoff = (int)(style->box_shadow >> PLOT_STYLE_RADIX);
++	int voff = (int)(style->box_shadow_y >> PLOT_STYLE_RADIX);
++
++	if (hoff < -16) hoff = -16;
++	if (hoff >  16) hoff =  16;
++	if (voff < -16) voff = -16;
++	if (voff >  16) voff =  16;
++	if (hoff != 0 || voff != 0) {
++		r.x0 += hoff;
++		r.x1 += hoff;
++		r.y0 += voff;
++		r.y1 += voff;
++		emit_rect(sink, VITA_GEOM_DROP_SHADOW, r, drop_colour(style),
++			  VITA_BUCKET_SOLID, true);
++	}
++}
++
++/* Monkey macmonk_paint_inset / MacSurf plotters.c 1972. MacSurf skips the
++ * paint when box_shadow_color is 0 (the fixes225 dark-wash regression); the
++ * stream still records the bands, so they are emitted with paint = false. */
++static void paint_inset(const plot_style_t *style, struct rect r,
++			const struct vita_geom_sink *sink)
++{
++	int hoff = (int)(style->box_shadow >> PLOT_STYLE_RADIX);
++	int voff = (int)(style->box_shadow_y >> PLOT_STYLE_RADIX);
++	int bw = r.x1 - r.x0;
++	int bh = r.y1 - r.y0;
++	colour c = style->box_shadow_color;
++	bool paint = (c != 0);
++	struct rect edge;
++
++	if (hoff >  bw) hoff =  bw;
++	if (hoff < -bw) hoff = -bw;
++	if (voff >  bh) voff =  bh;
++	if (voff < -bh) voff = -bh;
++
++	if (hoff > 0) {
++		edge = r;
++		edge.x1 = r.x0 + hoff;
++		emit_rect(sink, VITA_GEOM_INSET_SHADOW, edge, c,
++			  VITA_BUCKET_SOLID, paint);
++	} else if (hoff < 0) {
++		edge = r;
++		edge.x0 = r.x1 + hoff;
++		emit_rect(sink, VITA_GEOM_INSET_SHADOW, edge, c,
++			  VITA_BUCKET_SOLID, paint);
++	}
++	if (voff > 0) {
++		edge = r;
++		edge.y1 = r.y0 + voff;
++		emit_rect(sink, VITA_GEOM_INSET_SHADOW, edge, c,
++			  VITA_BUCKET_SOLID, paint);
++	} else if (voff < 0) {
++		edge = r;
++		edge.y0 = r.y1 + voff;
++		emit_rect(sink, VITA_GEOM_INSET_SHADOW, edge, c,
++			  VITA_BUCKET_SOLID, paint);
++	}
++}
++
++/* Monkey macmonk_fill_transformed / MacSurf plotters.c 1174-1260. */
++static void fill_transformed(const plot_style_t *style, struct rect r,
++			     int ob, const struct vita_geom_sink *sink)
++{
++	int rot_deg, tx, ty;
++	int cx, cy;
++	int sx_q88, sy_q88;
++	int x[4], y[4];
++	int i;
++
++	vita_transform_unpack(style->transform, &rot_deg, &tx, &ty);
++	sx_q88 = (int)((((uint32_t)style->transform_b) >> 16) & 0xffff);
++	sy_q88 = (int)( ((uint32_t)style->transform_b)        & 0xffff);
++	if (sx_q88 == 0) sx_q88 = 256;
++	if (sy_q88 == 0) sy_q88 = 256;
++
++	cx = (r.x0 + r.x1) / 2;
++	cy = (r.y0 + r.y1) / 2;
++
++	x[0] = r.x0;  y[0] = r.y0;
++	x[1] = r.x1;  y[1] = r.y0;
++	x[2] = r.x1;  y[2] = r.y1;
++	x[3] = r.x0;  y[3] = r.y1;
++	if (sx_q88 != 256 || sy_q88 != 256) {
++		for (i = 0; i < 4; i++) {
++			int dx = x[i] - cx;
++			int dy = y[i] - cy;
++			x[i] = cx + (dx * sx_q88) / 256;
++			y[i] = cy + (dy * sy_q88) / 256;
++		}
++	}
++	for (i = 0; i < 4; i++) {
++		vita_transform_point(&x[i], &y[i], cx, cy, rot_deg, tx, ty);
++	}
++	sink->quad(sink->pw, x, y, style->fill_colour & 0xffffff, ob,
++		   ob != 0);
++}
++
++/* exported interface documented in vita/plot_geom.h */
++void vita_geom_rectangle(const plot_style_t *style, const struct rect *rect,
++			 const struct vita_geom_sink *sink)
++{
++	bool horizontal;
++	int n = VITA_GRAD_BANDS;
++	int span, i;
++	bool has_shadow = (style->box_shadow != 0 || style->box_shadow_y != 0)
++			&& style->fill_type != PLOT_OP_TYPE_NONE;
++	bool filled = (style->fill_type != PLOT_OP_TYPE_NONE);
++	struct rect r = *rect;
++
++	/* patch 27: non-identity transform -> 4-corner quad. */
++	if (style->fill_type != PLOT_OP_TYPE_NONE &&
++			(style->transform != 0 ||
++			 (style->transform_b != 0 &&
++			  style->transform_b != (int)0x01000100))) {
++		fill_transformed(style, r, vita_geom_opacity_bucket(style),
++				 sink);
++		return;
++	}
++
++	if (has_shadow && style->box_shadow_inset == false) {
++		paint_drop(style, r, sink);
++	}
++
++	if (style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT &&
++			style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT_H) {
++		/* Solid, dot, dash and radial fills are one flat rect (the
++		 * radial gradient has no bandable axis: its start colour). */
++		int ob = vita_geom_opacity_bucket(style);
++		emit_rect(sink, VITA_GEOM_FILL, r, style->fill_colour, ob,
++			  filled && ob != 0);
++		if (has_shadow && style->box_shadow_inset)
++			paint_inset(style, r, sink);
++		return;
++	}
++	horizontal = (style->fill_type == PLOT_OP_TYPE_LINEAR_GRADIENT_H);
++	span = horizontal ? (r.x1 - r.x0) : (r.y1 - r.y0);
++	if (span <= 0) {
++		emit_rect(sink, VITA_GEOM_FILL, r, style->fill_colour,
++			  VITA_BUCKET_SOLID, true);
++		if (has_shadow && style->box_shadow_inset)
++			paint_inset(style, r, sink);
++		return;
++	}
++
++	/* NetSurf colour: R in the low byte, then G, then B. Same integer
++	 * interpolation monkey computes (and discards) per band. */
++	{
++		uint32_t c1 = (uint32_t)style->fill_colour & 0xFFFFFF;
++		uint32_t c2 = (uint32_t)style->fill_colour2 & 0xFFFFFF;
++		int r1 = (int)(c1 & 0xFF), g1 = (int)((c1 >> 8) & 0xFF),
++		    b1 = (int)((c1 >> 16) & 0xFF);
++		int r2 = (int)(c2 & 0xFF), g2 = (int)((c2 >> 8) & 0xFF),
++		    b2 = (int)((c2 >> 16) & 0xFF);
++		for (i = 0; i < n; i++) {
++			struct rect br = r;
++			int t = (i * 255) / n;
++			int fr = r1 + ((r2 - r1) * t) / 255;
++			int fg = g1 + ((g2 - g1) * t) / 255;
++			int fb = b1 + ((b2 - b1) * t) / 255;
++			if (horizontal) {
++				br.x0 = r.x0 + span * i / n;
++				br.x1 = r.x0 + span * (i + 1) / n;
++			} else {
++				br.y0 = r.y0 + span * i / n;
++				br.y1 = r.y0 + span * (i + 1) / n;
++			}
++			if (br.x1 <= br.x0 || br.y1 <= br.y0)
++				continue;
++			emit_rect(sink, VITA_GEOM_BAND, br,
++				  (colour)((fb << 16) | (fg << 8) | fr),
++				  VITA_BUCKET_SOLID, true);
++		}
++	}
++	if (has_shadow && style->box_shadow_inset)
++		paint_inset(style, r, sink);
++}
+diff --git a/frontends/vita/plot_geom.h b/frontends/vita/plot_geom.h
+new file mode 100644
+index 000000000..c9bcce2d4
+--- /dev/null
++++ b/frontends/vita/plot_geom.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the rectangle plot contract as coloured geometry.
++ *
++ * The monkey frontend (patches 25-27) turns one plot->rectangle call into a
++ * sequence of `PLOT RECT` / `PLOT POLY` lines: gradient bands, drop and
++ * inset shadow rects, transformed 4-corner quads and an OPAQUE bucket. That
++ * stream records geometry only. This module produces the SAME sequence with
++ * the colour and paint decision each piece needs, so a pixel backend
++ * (vita2d, or a test sink) can render it. It has no platform dependencies.
++ *
++ * Invariant (checked by tools/test_vita_plotter.c against the real monkey
++ * plot.c): formatting the pieces emitted here as monkey lines reproduces the
++ * monkey stream byte for byte.
++ */
++
++#ifndef NETSURF_VITA_PLOT_GEOM_H
++#define NETSURF_VITA_PLOT_GEOM_H
++
++#include <stdbool.h>
++#include <stddef.h>
++
++#include "netsurf/types.h"
++#include "netsurf/plot_style.h"
++
++/** Band count for two-stop linear gradients (monkey MACMONK_GRAD_BANDS). */
++#define VITA_GRAD_BANDS 32
++
++/** Opacity bucket that means "fully opaque" (no OPAQUE token). */
++#define VITA_BUCKET_SOLID 4
++
++/** MacSurf's default drop-shadow colour: 50% grey (plotters.c 1363). */
++#define VITA_SHADOW_DEFAULT_COLOUR 0x666666
++
++/** What a piece of geometry is, for backends that care. */
++enum vita_geom_kind {
++	VITA_GEOM_FILL,		/**< the box fill itself */
++	VITA_GEOM_BAND,		/**< one gradient band */
++	VITA_GEOM_DROP_SHADOW,	/**< outer shadow, painted before the fill */
++	VITA_GEOM_INSET_SHADOW	/**< inset edge band, painted after the fill */
++};
++
++/**
++ * Receiver for the geometry of one rectangle plot.
++ *
++ * Pieces arrive in paint order. `paint` is false for a piece the stream
++ * records but that must not reach the screen (a stroke-only rectangle's
++ * fill, or an inset shadow with no colour, which MacSurf skips).
++ */
++struct vita_geom_sink {
++	void (*rect)(void *pw, enum vita_geom_kind kind,
++		     int x0, int y0, int x1, int y1,
++		     colour c, int bucket, bool paint);
++	void (*quad)(void *pw, const int x[4], const int y[4],
++		     colour c, int bucket, bool paint);
++	void *pw;
++};
++
++/**
++ * Map a style's opacity to MacSurf's stipple bucket (fixes49):
++ * 0 skip, 1 = 5-35%, 2 = 35-60%, 3 = 60-85%, 4 = solid.
++ * An unset (zero) opacity counts as opaque.
++ */
++int vita_geom_opacity_bucket(const plot_style_t *style);
++
++/**
++ * Decompose one plot->rectangle call into coloured geometry.
++ *
++ * \param style the plot style passed to the rectangle plotter
++ * \param rect the rectangle passed to the rectangle plotter
++ * \param sink receiver for the pieces, in paint order
++ */
++void vita_geom_rectangle(const plot_style_t *style, const struct rect *rect,
++			 const struct vita_geom_sink *sink);
++
++/**
++ * Format a rect piece as its monkey stream line, without the "PLOT "
++ * prefix: `RECT X0 .. Y1 ..`, plus ` OPAQUE n` when not solid.
++ *
++ * Lets the frontend emit the same text stream as nsmonkey (for on-device
++ * diffing against the desktop goldens) and lets the host test compare it.
++ *
++ * \return the snprintf result
++ */
++int vita_geom_format_rect(char *buf, size_t len, int x0, int y0, int x1,
++			  int y1, int bucket);
++
++/** Format a quad piece as its monkey `POLY ...` stream line. */
++int vita_geom_format_quad(char *buf, size_t len, const int x[4],
++			  const int y[4], int bucket);
++
++#endif
+diff --git a/frontends/vita/replay.c b/frontends/vita/replay.c
+new file mode 100644
+index 000000000..4ff454227
+--- /dev/null
++++ b/frontends/vita/replay.c
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: replay a recorded monkey plot stream through vita2d.
++ */
++
++#include <stdio.h>
++#include <string.h>
++
++#include "netsurf/types.h"
++
++#include "vita/plot_geom.h"
++#include "vita/plot.h"
++#include "vita/replay.h"
++
++/** Fill palette (NetSurf 0xBBGGRR), cycled per filled op. */
++static const colour replay_palette[] = {
++	0xf0e0d0, 0xd0e8f0, 0xd8f0d0, 0xe8d8f0, 0xd0f0f0, 0xf0f0c8
++};
++#define REPLAY_PALETTE_SIZE \
++	(sizeof(replay_palette) / sizeof(replay_palette[0]))
++
++/** Default text size for replayed text; the stream records none. */
++#define REPLAY_TEXT_PX 16.0f
++
++static unsigned int replay_fill_index;
++
++static colour next_fill(void)
++{
++	colour c = replay_palette[replay_fill_index % REPLAY_PALETTE_SIZE];
++	replay_fill_index++;
++	return c;
++}
++
++/** Parse the optional " OPAQUE n" suffix; solid when absent. */
++static int parse_bucket(const char *line)
++{
++	const char *op = strstr(line, " OPAQUE ");
++	int b;
++
++	if (op == NULL || sscanf(op, " OPAQUE %d", &b) != 1)
++		return VITA_BUCKET_SOLID;
++	return b;
++}
++
++/* exported interface documented in vita/replay.h */
++void vita_replay_line(const char *line, struct vita_replay_stats *stats)
++{
++	struct vita_replay_stats dummy;
++	int x0, y0, x1, y1;
++
++	if (stats == NULL)
++		stats = &dummy;
++	if (strncmp(line, "PLOT ", 5) != 0)
++		return;
++	line += 5;
++
++	if (sscanf(line, "CLIP X0 %d Y0 %d X1 %d Y1 %d",
++		   &x0, &y0, &x1, &y1) == 4) {
++		vita_plot_set_clip(x0, y0, x1, y1);
++		stats->clip++;
++	} else if (sscanf(line, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++			  &x0, &y0, &x1, &y1) == 4) {
++		vita_plot_fill_rect(x0, y0, x1, y1, next_fill(),
++				    parse_bucket(line));
++		stats->rect++;
++	} else if (strncmp(line, "POLY X0", 7) == 0) {
++		int x[4], y[4];
++		if (sscanf(line, "POLY X0 %d Y0 %d X1 %d Y1 %d "
++			   "X2 %d Y2 %d X3 %d Y3 %d",
++			   &x[0], &y[0], &x[1], &y[1],
++			   &x[2], &y[2], &x[3], &y[3]) == 8) {
++			vita_plot_fill_quad(x, y, next_fill(),
++					    parse_bucket(line));
++			stats->poly++;
++		} else {
++			stats->skipped++;
++		}
++	} else if (sscanf(line, "LINE X0 %d Y0 %d X1 %d Y1 %d",
++			  &x0, &y0, &x1, &y1) == 4) {
++		vita_plot_line(x0, y0, x1, y1, 1, 0x404040);
++		stats->line++;
++	} else if (sscanf(line, "TEXT X %d Y %d STR ", &x0, &y0) == 2) {
++		const char *s = strstr(line, " STR ");
++		size_t len;
++		s = (s != NULL) ? s + 5 : "";
++		len = strcspn(s, "\r\n");
++		vita_plot_text(x0, y0, s, len, 0x000000,
++			       vita_plot_pgf_scale(REPLAY_TEXT_PX));
++		stats->text++;
++	} else if (sscanf(line, "DISC X %d Y %d RADIUS %d",
++			  &x0, &y0, &x1) == 3) {
++		/* Placeholder: the disc's bounding square at 50% coverage. */
++		vita_plot_fill_rect(x0 - x1, y0 - x1, x0 + x1, y0 + x1,
++				    next_fill(), 2);
++		stats->disc++;
++	} else if (sscanf(line, "BITMAP X %d Y %d WIDTH %d HEIGHT %d",
++			  &x0, &y0, &x1, &y1) == 4) {
++		/* Image placeholder: the stream has no pixels. */
++		vita_plot_fill_rect(x0, y0, x0 + x1, y0 + y1, 0xc0c0c0,
++				    VITA_BUCKET_SOLID);
++		stats->bitmap++;
++	} else {
++		/* ARC, POLYGON VERTICIES, PATH: counts only, no geometry. */
++		stats->skipped++;
++	}
++}
++
++/* exported interface documented in vita/replay.h */
++void vita_replay_stream(const char *stream, struct vita_replay_stats *stats)
++{
++	char line[1024];
++
++	replay_fill_index = 0;
++	while (*stream != '\0') {
++		size_t len = strcspn(stream, "\n");
++		size_t copy = (len < sizeof(line) - 1) ? len : sizeof(line) - 1;
++		memcpy(line, stream, copy);
++		line[copy] = '\0';
++		vita_replay_line(line, stats);
++		stream += len;
++		if (*stream == '\n')
++			stream++;
++	}
++}
+diff --git a/frontends/vita/replay.h b/frontends/vita/replay.h
+new file mode 100644
+index 000000000..6c03eb8a5
+--- /dev/null
++++ b/frontends/vita/replay.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: replay a recorded monkey plot stream through vita2d.
++ *
++ * A `.plot` file (tools/plotstream.py) records geometry but no colour, so
++ * fills use a fixed palette cycled per op and text is black. The point is
++ * that each stream op reaches vita2d through the same primitive the live
++ * plotter uses: RECT -> fill_rect, POLY -> fill_quad, CLIP -> set_clip,
++ * LINE -> line, TEXT -> text.
++ */
++
++#ifndef NETSURF_VITA_REPLAY_H
++#define NETSURF_VITA_REPLAY_H
++
++#include <stddef.h>
++
++/** Counts of stream ops replayed, by kind. */
++struct vita_replay_stats {
++	unsigned int clip;
++	unsigned int rect;
++	unsigned int poly;
++	unsigned int line;
++	unsigned int text;
++	unsigned int disc;
++	unsigned int bitmap;
++	unsigned int skipped;	/**< PLOT ops with no replayable geometry */
++};
++
++/**
++ * Replay one stream line. Non-PLOT lines are ignored.
++ *
++ * \param line one line, with or without its trailing newline
++ * \param stats counters to update, may be NULL
++ */
++void vita_replay_line(const char *line, struct vita_replay_stats *stats);
++
++/**
++ * Replay a whole stream held in memory (NUL-terminated).
++ *
++ * \param stream the stream text
++ * \param stats counters to update, may be NULL
++ */
++void vita_replay_stream(const char *stream, struct vita_replay_stats *stats);
++
++#endif
+diff --git a/frontends/vita/res/Messages b/frontends/vita/res/Messages
+new file mode 120000
+index 000000000..75bfdf53d
+--- /dev/null
++++ b/frontends/vita/res/Messages
+@@ -0,0 +1 @@
++en/Messages
+\ No newline at end of file
+diff --git a/frontends/vita/res/adblock.css b/frontends/vita/res/adblock.css
+new file mode 120000
+index 000000000..0d12aaa7c
+--- /dev/null
++++ b/frontends/vita/res/adblock.css
+@@ -0,0 +1 @@
++../../../resources/adblock.css
+\ No newline at end of file
+diff --git a/frontends/vita/res/credits.html b/frontends/vita/res/credits.html
+new file mode 120000
+index 000000000..b43a1a06c
+--- /dev/null
++++ b/frontends/vita/res/credits.html
+@@ -0,0 +1 @@
++../../../resources/en/credits.html
+\ No newline at end of file
+diff --git a/frontends/vita/res/default.css b/frontends/vita/res/default.css
+new file mode 120000
+index 000000000..fa3ae6c26
+--- /dev/null
++++ b/frontends/vita/res/default.css
+@@ -0,0 +1 @@
++../../../resources/default.css
+\ No newline at end of file
+diff --git a/frontends/vita/res/internal.css b/frontends/vita/res/internal.css
+new file mode 120000
+index 000000000..5583a9811
+--- /dev/null
++++ b/frontends/vita/res/internal.css
+@@ -0,0 +1 @@
++../../../resources/internal.css
+\ No newline at end of file
+diff --git a/frontends/vita/res/licence.html b/frontends/vita/res/licence.html
+new file mode 120000
+index 000000000..c0c1e6630
+--- /dev/null
++++ b/frontends/vita/res/licence.html
+@@ -0,0 +1 @@
++../../../resources/en/licence.html
+\ No newline at end of file
+diff --git a/frontends/vita/res/quirks.css b/frontends/vita/res/quirks.css
+new file mode 120000
+index 000000000..1e752cb9e
+--- /dev/null
++++ b/frontends/vita/res/quirks.css
+@@ -0,0 +1 @@
++../../../resources/quirks.css
+\ No newline at end of file
+diff --git a/frontends/vita/res/welcome.html b/frontends/vita/res/welcome.html
+new file mode 120000
+index 000000000..d5220f90a
+--- /dev/null
++++ b/frontends/vita/res/welcome.html
+@@ -0,0 +1 @@
++../../../resources/en/welcome.html
+\ No newline at end of file
+diff --git a/frontends/vita/schedule.c b/frontends/vita/schedule.c
+new file mode 100644
+index 000000000..43182ce11
+--- /dev/null
++++ b/frontends/vita/schedule.c
+@@ -0,0 +1,217 @@
++/*
++ * Copyright 2012 Vincent Sanders <vince@netsurf-browser.co.uk>
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <time.h>
++#include <stdlib.h>
++
++#include "utils/sys_time.h"
++#include "utils/log.h"
++
++#include "vita/schedule.h"
++
++/* linked list of scheduled callbacks */
++static struct nscallback *schedule_list = NULL;
++
++/**
++ * scheduled callback.
++ */
++struct nscallback
++{
++	struct nscallback *next;
++	struct timeval tv;
++	void (*callback)(void *p);
++	void *p;
++};
++
++/**
++ * Unschedule a callback.
++ *
++ * \param  callback  callback function
++ * \param  p         user parameter, passed to callback function
++ * \return NSERROR_OK if callback found and removed else NSERROR_NOT_FOUND
++ *
++ * All scheduled callbacks matching both callback and p are removed.
++ */
++static nserror schedule_remove(void (*callback)(void *p), void *p)
++{
++	struct nscallback *cur_nscb;
++	struct nscallback *prev_nscb;
++	struct nscallback *unlnk_nscb;
++	bool removed = false;
++
++	/* check there is something on the list to remove */
++	if (schedule_list == NULL) {
++		return NSERROR_NOT_FOUND;
++	}
++
++	NSLOG(schedule, DEBUG, "removing %p, %p", callback, p);
++
++	cur_nscb = schedule_list;
++	prev_nscb = NULL;
++
++	while (cur_nscb != NULL) {
++		if ((cur_nscb->callback ==  callback) &&
++		    (cur_nscb->p ==  p)) {
++			/* item to remove */
++
++			NSLOG(schedule, DEBUG, "callback entry %p removing  %p(%p)",
++			      cur_nscb, cur_nscb->callback, cur_nscb->p);
++
++			/* remove callback */
++			unlnk_nscb = cur_nscb;
++			cur_nscb = unlnk_nscb->next;
++
++			if (prev_nscb == NULL) {
++				schedule_list = cur_nscb;
++			} else {
++				prev_nscb->next = cur_nscb;
++			}
++			free (unlnk_nscb);
++			removed = true;
++		} else {
++			/* move to next element */
++			prev_nscb = cur_nscb;
++			cur_nscb = prev_nscb->next;
++		}
++	}
++
++	if (removed == false) {
++		return NSERROR_NOT_FOUND;
++	}
++	return NSERROR_OK;
++}
++
++/* exported function documented in vita/schedule.h */
++nserror vita_schedule(int tival, void (*callback)(void *p), void *p)
++{
++	struct nscallback *nscb;
++	struct timeval tv;
++	nserror ret;
++
++	/* ensure uniqueness of the callback and context */
++	ret = schedule_remove(callback, p);
++	if (tival < 0) {
++		return ret;
++	}
++
++	NSLOG(schedule, DEBUG, "Adding %p(%p) in %d", callback, p, tival);
++
++	tv.tv_sec = tival / 1000; /* miliseconds to seconds */
++	tv.tv_usec = (tival % 1000) * 1000; /* remainder to microseconds */
++
++	nscb = calloc(1, sizeof(struct nscallback));
++
++	gettimeofday(&nscb->tv, NULL);
++	timeradd(&nscb->tv, &tv, &nscb->tv);
++
++	nscb->callback = callback;
++	nscb->p = p;
++
++	/* add to list front */
++	nscb->next = schedule_list;
++	schedule_list = nscb;
++
++	return NSERROR_OK;
++}
++
++/* exported function documented in vita/schedule.h */
++int vita_schedule_run(void)
++{
++	struct timeval tv;
++	struct timeval nexttime;
++	struct timeval rettime;
++	struct nscallback *cur_nscb;
++	struct nscallback *prev_nscb;
++	struct nscallback *unlnk_nscb;
++
++	if (schedule_list == NULL)
++		return -1;
++
++	/* reset enumeration to the start of the list */
++	cur_nscb = schedule_list;
++	prev_nscb = NULL;
++	nexttime = cur_nscb->tv;
++
++	gettimeofday(&tv, NULL);
++
++	while (cur_nscb != NULL) {
++		if (timercmp(&tv, &cur_nscb->tv, >)) {
++			/* scheduled time */
++
++			/* remove callback */
++			unlnk_nscb = cur_nscb;
++
++			if (prev_nscb == NULL) {
++				schedule_list = unlnk_nscb->next;
++			} else {
++				prev_nscb->next = unlnk_nscb->next;
++			}
++
++			unlnk_nscb->callback(unlnk_nscb->p);
++
++			free(unlnk_nscb);
++
++			/* need to deal with callback modifying the list. */
++			if (schedule_list == NULL)
++				return -1; /* no more callbacks scheduled */
++
++			/* reset enumeration to the start of the list */
++			cur_nscb = schedule_list;
++			prev_nscb = NULL;
++			nexttime = cur_nscb->tv;
++		} else {
++			/* if the time to the event is sooner than the
++			 * currently recorded soonest event record it
++			 */
++			if (timercmp(&nexttime, &cur_nscb->tv, >)) {
++				nexttime = cur_nscb->tv;
++			}
++			/* move to next element */
++			prev_nscb = cur_nscb;
++			cur_nscb = prev_nscb->next;
++		}
++	}
++
++	/* make rettime relative to now */
++	timersub(&nexttime, &tv, &rettime);
++
++	NSLOG(schedule, DEBUG, "returning time to next event as %ldms",
++	      (long)((rettime.tv_sec * 1000) + (rettime.tv_usec / 1000)));
++
++	/* return next event time in milliseconds (24days max wait) */
++	return (rettime.tv_sec * 1000) + (rettime.tv_usec / 1000);
++}
++
++void vita_schedule_list(void)
++{
++	struct timeval tv;
++	struct nscallback *cur_nscb;
++
++	gettimeofday(&tv, NULL);
++
++	NSLOG(netsurf, INFO, "schedule list at %lld:%ld",
++	      (long long)tv.tv_sec, tv.tv_usec);
++
++	cur_nscb = schedule_list;
++
++	while (cur_nscb != NULL) {
++		NSLOG(netsurf, INFO, "Schedule %p at %lld:%ld", cur_nscb,
++		      (long long)cur_nscb->tv.tv_sec, cur_nscb->tv.tv_usec);
++		cur_nscb = cur_nscb->next;
++	}
++}
+diff --git a/frontends/vita/schedule.h b/frontends/vita/schedule.h
+new file mode 100644
+index 000000000..21c30debf
+--- /dev/null
++++ b/frontends/vita/schedule.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 2008 Vincent Sanders <vince@simtec.co.uk>
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NETSURF_VITA_SCHEDULE_H
++#define NETSURF_VITA_SCHEDULE_H
++
++/**
++ * Schedule a callback.
++ *
++ * \param  tival     interval before the callback should be made in ms
++ * \param  callback  callback function
++ * \param  p         user parameter, passed to callback function
++ *
++ * The callback function will be called as soon as possible after t ms have
++ * passed.
++ */
++
++nserror vita_schedule(int tival, void (*callback)(void *p), void *p);
++
++/**
++ * Process scheduled callbacks up to current time.
++ *
++ * @return The number of milliseconds untill the next scheduled event
++ * or -1 for no event.
++ */
++int vita_schedule_run(void);
++
++/**
++ * Log a list of all scheduled callbacks.
++ */
++void vita_schedule_list(void);
++
++#endif
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+new file mode 100644
+index 000000000..d9d63695a
+--- /dev/null
++++ b/frontends/vita/window.c
+@@ -0,0 +1,207 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the browser window.
++ *
++ * The Vita shows one page at a time, full screen, so there is one gui
++ * window and no chrome yet. Invalidation just marks the window dirty; the
++ * main loop repaints the whole screen, which vita2d does every frame anyway.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++
++#include "utils/errors.h"
++#include "utils/log.h"
++#include "netsurf/browser_window.h"
++#include "netsurf/window.h"
++#include "netsurf/plotters.h"
++
++#include "vita/plot.h"
++#include "vita/window.h"
++
++struct gui_window {
++	struct browser_window *bw;
++	int scrollx;
++	int scrolly;
++	bool dirty;
++};
++
++static struct gui_window *vita_current;
++
++static struct gui_window *
++vita_window_create(struct browser_window *bw,
++		   struct gui_window *existing,
++		   gui_window_create_flags flags)
++{
++	struct gui_window *gw = calloc(1, sizeof(*gw));
++
++	if (gw == NULL)
++		return NULL;
++	gw->bw = bw;
++	gw->dirty = true;
++	/* A new window (a link opened "in a new tab") replaces the view. */
++	vita_current = gw;
++	return gw;
++}
++
++static void vita_window_destroy(struct gui_window *gw)
++{
++	if (vita_current == gw)
++		vita_current = NULL;
++	free(gw);
++}
++
++static nserror vita_window_invalidate(struct gui_window *gw,
++				      const struct rect *rect)
++{
++	gw->dirty = true;
++	return NSERROR_OK;
++}
++
++static bool vita_window_get_scroll(struct gui_window *gw, int *sx, int *sy)
++{
++	*sx = gw->scrollx;
++	*sy = gw->scrolly;
++	return true;
++}
++
++static nserror vita_window_set_scroll(struct gui_window *gw,
++				      const struct rect *rect)
++{
++	gw->scrollx = rect->x0;
++	gw->scrolly = rect->y0;
++	gw->dirty = true;
++	return NSERROR_OK;
++}
++
++static nserror vita_window_get_dimensions(struct gui_window *gw,
++					  int *width, int *height)
++{
++	*width = VITA_SCREEN_WIDTH;
++	*height = VITA_SCREEN_HEIGHT;
++	return NSERROR_OK;
++}
++
++static nserror vita_window_event(struct gui_window *gw,
++				 enum gui_window_event event)
++{
++	switch (event) {
++	case GW_EVENT_NEW_CONTENT:
++		gw->scrollx = 0;
++		gw->scrolly = 0;
++		gw->dirty = true;
++		break;
++	case GW_EVENT_UPDATE_EXTENT:
++		/* Re-clamp the scroll offset to the new extent. */
++		vita_window_scroll_by(gw, 0, 0);
++		gw->dirty = true;
++		break;
++	default:
++		break;
++	}
++	return NSERROR_OK;
++}
++
++static void vita_window_set_title(struct gui_window *gw, const char *title)
++{
++	NSLOG(netsurf, INFO, "title: %s", title);
++}
++
++/* exported interface documented in vita/window.h */
++struct gui_window *vita_window_current(void)
++{
++	return vita_current;
++}
++
++/* exported interface documented in vita/window.h */
++bool vita_window_needs_redraw(struct gui_window *gw)
++{
++	return gw != NULL && gw->dirty && browser_window_redraw_ready(gw->bw);
++}
++
++/* exported interface documented in vita/window.h */
++void vita_window_redraw(struct gui_window *gw)
++{
++	struct rect clip = { 0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT };
++	struct redraw_context ctx = {
++		.interactive = true,
++		.background_images = true,
++		.plot = vita_plotters,
++	};
++
++	if (gw == NULL)
++		return;
++	vita_plot_set_clip(clip.x0, clip.y0, clip.x1, clip.y1);
++	/* The origin of the content on the canvas moves opposite to the
++	 * scroll offset. */
++	browser_window_redraw(gw->bw, -gw->scrollx, -gw->scrolly, &clip, &ctx);
++	gw->dirty = false;
++}
++
++/* exported interface documented in vita/window.h */
++void vita_window_scroll_by(struct gui_window *gw, int dx, int dy)
++{
++	int width = 0, height = 0;
++	int maxx, maxy;
++
++	if (gw == NULL)
++		return;
++	if (browser_window_get_extents(gw->bw, true, &width, &height) !=
++	    NSERROR_OK) {
++		width = VITA_SCREEN_WIDTH;
++		height = VITA_SCREEN_HEIGHT;
++	}
++	maxx = width - VITA_SCREEN_WIDTH;
++	maxy = height - VITA_SCREEN_HEIGHT;
++	if (maxx < 0) maxx = 0;
++	if (maxy < 0) maxy = 0;
++
++	dx += gw->scrollx;
++	dy += gw->scrolly;
++	if (dx < 0) dx = 0;
++	if (dy < 0) dy = 0;
++	if (dx > maxx) dx = maxx;
++	if (dy > maxy) dy = maxy;
++	if (dx != gw->scrollx || dy != gw->scrolly) {
++		gw->scrollx = dx;
++		gw->scrolly = dy;
++		gw->dirty = true;
++	}
++}
++
++/* exported interface documented in vita/window.h */
++struct browser_window *vita_window_browser(struct gui_window *gw)
++{
++	return (gw != NULL) ? gw->bw : NULL;
++}
++
++static struct gui_window_table window_table = {
++	.create = vita_window_create,
++	.destroy = vita_window_destroy,
++	.invalidate = vita_window_invalidate,
++	.get_scroll = vita_window_get_scroll,
++	.set_scroll = vita_window_set_scroll,
++	.get_dimensions = vita_window_get_dimensions,
++	.event = vita_window_event,
++	.set_title = vita_window_set_title,
++};
++
++struct gui_window_table *vita_window_table = &window_table;
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+new file mode 100644
+index 000000000..c4c1bcb88
+--- /dev/null
++++ b/frontends/vita/window.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NETSURF_VITA_WINDOW_H
++#define NETSURF_VITA_WINDOW_H
++
++#include <stdbool.h>
++
++struct gui_window;
++
++/** The Vita window table: one full-screen window. */
++extern struct gui_window_table *vita_window_table;
++
++/** The window on screen, or NULL before the first one is created. */
++struct gui_window *vita_window_current(void);
++
++/** Does the window need repainting? */
++bool vita_window_needs_redraw(struct gui_window *gw);
++
++/**
++ * Paint the window's content into the current vita2d frame.
++ * Call between vita2d_start_drawing() and vita2d_end_drawing().
++ */
++void vita_window_redraw(struct gui_window *gw);
++
++/** Scroll by a delta in pixels, clamped to the content extent. */
++void vita_window_scroll_by(struct gui_window *gw, int dx, int dy);
++
++/** The browser window shown in this gui window. */
++struct browser_window *vita_window_browser(struct gui_window *gw);
++
++#endif

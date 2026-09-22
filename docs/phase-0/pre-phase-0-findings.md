@@ -44,7 +44,7 @@ Both halves of that concern soften:
    preferred partition with ~170 MB of headroom and approaches its heavy-JS
    figure of 384 MB.
 2. **Framebuffers do not come out of MAIN.** CDRAM is a separate 112 MiB pool
-   and is the natural home for the 960×544 front and 480×272 rear surfaces plus
+   and is the natural home for the 960×544 display surfaces (*corrected 2026-09-22: there is no 480×272 rear screen, the rear panel is a touch pad — [09](09-vita-frontend.md) §9*) plus
    any scaled-image staging. The brief implicitly double-counted these.
 
 **Consequence:** memory drops from "the project's single biggest unknown and

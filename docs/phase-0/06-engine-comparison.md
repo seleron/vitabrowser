@@ -442,7 +442,17 @@ harness shows the packed transform/opacity values round-trip intact
 2. **Multi-shadow / real blur** — out of scope on the stream frontend
    (one-shot statics are `__MACOS9__`-gated; no blur primitive); revisit
    if the Vita frontend gains a filter pass.
-3. **Vita frontend (step 6)** — re-target the now-verified plotter
-   contract (RECT/POLY/OPAQUE + gradient bands + shadows) to libvita2d.
+3. ~~**Vita frontend (step 6)** — re-target the now-verified plotter
+   contract (RECT/POLY/OPAQUE + gradient bands + shadows) to libvita2d.~~
+   **Done 2026-09-22** (patches 29–31): contract proved byte-identical by
+   fuzz, full stack cross-compiled to a VPK, all test pages rendered in a
+   host simulator. See [09](09-vita-frontend.md).
+3b. **Drop shadows and transformed boxes are clipped to their own box**
+   (found by the simulator, 09 §5): the core sets the box's border rect as
+   the clip before the background `plot->rectangle`, so the patch 26 shadow
+   rect and the patch 27 quad are cut to it (`PM-shadow`: 1 px of an 8 px
+   shadow shows). MacSurf honours the same clip. §6d verified geometry, not
+   the clip in force. Fix in `redraw.c`: widen the background clip by the
+   shadow offset / transformed extent.
 4. **Re-run `compare-engines.sh`** after each; L1 must stay SAME as the
    canary.

@@ -315,7 +315,7 @@ crypto accelerator every extra origin costs a full software ECDHE handshake
 
 | Need | API |
 |---|---|
-| Framebuffer render | `libvita2d` (`v2d_*`, direct RGB565 960×544 front / 480×272 rear) |
+| Framebuffer render | `libvita2d` (`vita2d_*`, one 960×544 32-bit A8B8G8R8 display; *corrected 2026-09-22: not `v2d_*`, not RGB565, and there is no rear screen — the rear panel is the touch pad; see [`docs/phase-0/09-vita-frontend.md`](docs/phase-0/09-vita-frontend.md) §9*) |
 | Input | `sceCtrlReadPadStateExtended`, `sceTouchPeekState` (front + rear) |
 | System | `scePowerSetArmClockFrequency(533)` at startup (VitaClock does this) |
 | Filesystem | `sceIoOpen/sceIoWrite` — `ux0:/download/` for downloads |

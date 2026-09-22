@@ -1,0 +1,87 @@
+# netsurf: core portability for the Vita (newlib, no curl)
+# Generated 2026-09-22
+#
+# - content/fetch.c: include the curl fetcher header only WITH_CURL. Upstream
+#   registers the fetcher under the guard but includes its header (and so
+#   <curl/curl.h>) unconditionally; the Vita's first build has no curl.
+# - utils/time.c: <string.h> for memset (curl.h used to supply it); zero-init
+#   `value` in time__parse_number, the curl-less date parser, which GCC 11
+#   reports as maybe-uninitialized at -O2 (a false positive: a full-length
+#   parse always stores it).
+# - utils/config.h: __vita__ gets PATH_MAX from <sys/syslimits.h> (vitaSDK's
+#   <limits.h> resolves to GCC's, which lacks it) and joins the platforms
+#   without mmap and without dirfd/fstatat/unlinkat (newlib has neither).
+# All three are no-ops on the host monkey build (L1 canary unchanged).
+# See docs/phase-0/09-vita-frontend.md §3.
+
+diff --git a/content/fetch.c b/content/fetch.c
+index a8fa742a5..e56386baf 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -54,7 +54,9 @@
+ #include "content/fetchers.h"
+ #include "content/fetchers/resource.h"
+ #include "content/fetchers/about/about.h"
++#ifdef WITH_CURL
+ #include "content/fetchers/curl.h"
++#endif
+ #include "content/fetchers/data.h"
+ #include "content/fetchers/file/file.h"
+ #include "javascript/fetcher.h"
+diff --git a/utils/config.h b/utils/config.h
+index fd742f1aa..831d6a604 100644
+--- a/utils/config.h
++++ b/utils/config.h
+@@ -21,6 +21,10 @@
+ 
+ #include <stddef.h>
+ 
++#if defined(__vita__)
++#include <sys/syslimits.h>
++#endif
++
+ #if defined(__NetBSD__)
+ #include <sys/param.h>
+ #if (defined(__NetBSD_Version__) && __NetBSD_Prereq__(8,0,0))
+@@ -163,7 +167,7 @@ char *realpath(const char *path, char *resolved_path);
+ #endif
+ 
+ #define HAVE_MMAP
+-#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__) || defined(__MACOS9__))
++#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__) || defined(__MACOS9__) || defined(__vita__))
+ #undef HAVE_MMAP
+ #endif
+ 
+@@ -177,7 +181,7 @@ char *realpath(const char *path, char *resolved_path);
+ #define HAVE_DIRFD
+ #define HAVE_UNLINKAT
+ #define HAVE_FSTATAT
+-#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__) || defined(__MACOS9__))
++#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__) || defined(__MACOS9__) || defined(__vita__))
+ #undef HAVE_DIRFD
+ #undef HAVE_UNLINKAT
+ #undef HAVE_FSTATAT
+diff --git a/utils/time.c b/utils/time.c
+index d10a21547..8bf06c299 100644
+--- a/utils/time.c
++++ b/utils/time.c
+@@ -29,6 +29,7 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <stdbool.h>
++#include <string.h>
+ 
+ #ifdef WITH_CURL
+ #include <curl/curl.h>
+@@ -794,7 +795,10 @@ static inline bool time__parse_number(
+ 		enum nsc_date_component_flags *flags,
+ 		struct nsc_date_parse_ctx *ctx)
+ {
+-	int value;
++	/* Initialised for GCC 11's -Wmaybe-uninitialized, which cannot see
++	 * that a full-length parse always stores it. Only compiled without
++	 * curl, whose date parser is used otherwise. */
++	int value = 0;
+ 
+ 	if (len != ascii_string_to_int(str, &value)) {
+ 		return false;

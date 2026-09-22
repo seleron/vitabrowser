@@ -95,6 +95,11 @@ unblocks the build meanwhile.
 Both are worked around. Installing them properly is still preferable:
 `sudo apt-get install -y gperf pkg-config`.
 
+> **Update 2026-09-22:** `pkg-config` is now installed (`/usr/bin/pkg-config`)
+> and the `<WORK>/vitabrowser-work/bin/pkg-config` shim no longer exists; the Vita
+> cross build relies on the real one (`--static --define-prefix`, see
+> [09](09-vita-frontend.md) §4.3). gperf status unchanged.
+
 ### 3.3 Generated sources are vendored — gperf not actually required
 
 MacSurf builds with CodeWarrior on Mac OS 9, which has no gperf or perl, so the
