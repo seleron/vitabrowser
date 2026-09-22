@@ -11,7 +11,10 @@
 #
 # Each bundled test page is opened in turn (the frontend's R-trigger
 # handler) and its settled frame is written to $OUT/shots/page-NN.png, in
-# the order of vita_test_pages[] in frontends/vita/main.c.
+# the order of vita_test_pages[] in frontends/vita/main.c. A second run
+# drives the frontend's own autotest (SQUARE), which writes the same
+# ux0:data/VitaBrowser/ log and plot dumps as a Vita does; they are copied
+# to $OUT/reference/ for diffing against a device run.
 # See docs/phase-0/09-vita-frontend.md.
 #
 # Usage: WORK=<WORK>/vitabrowser-work tools/run-vita-sim.sh
@@ -22,7 +25,7 @@ WORK="${WORK:-$HOME/vitabrowser-work}"
 NS="$WORK/applytest/upstream/netsurf"
 P="$WORK/applytest/prefix"
 OUT="${OUT:-$WORK/vita-sim}"
-PAGES="${PAGES:-11}"
+PAGES="${PAGES:-15}"
 
 [ -f "$NS/frontends/vita/main.c" ] || { echo "no $NS/frontends/vita -- run tools/build-patched.sh"; exit 2; }
 [ -f "$P/lib/pkgconfig/libcss.pc" ] || { echo "no host engine at $P -- run tools/build-patched.sh"; exit 2; }
@@ -52,6 +55,8 @@ echo "== app0: bundle =="
 A="$OUT/run/app0:"
 rm -rf "$A"
 mkdir -p "$A/res" "$A/testpages"
+rm -rf "$OUT/run/ux0:data"
+mkdir -p "$OUT/run/ux0:data"
 for f in default.css quirks.css adblock.css internal.css Messages \
 	 welcome.html credits.html licence.html; do
 	cp -L "$NS/frontends/vita/res/$f" "$A/res/$f"
@@ -62,3 +67,9 @@ echo "== run: $PAGES pages =="
 ( cd "$OUT/run" && VITA_SIM_OUT="$OUT/shots" VITA_SIM_PAGES="$PAGES" \
 	timeout 300 "$NS/nsvita-sim" )
 ls "$OUT"/shots
+
+echo "== autotest run (reference dumps) =="
+rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
+( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 timeout 600 "$NS/nsvita-sim" )
+cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
+ls "$OUT/reference" | head -40

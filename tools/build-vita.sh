@@ -87,14 +87,21 @@ EXTRA=""
 for f in "$ROOT"/testpages/pages/*; do
 	EXTRA="$EXTRA $f=testpages/$(basename "$f")"
 done
-( cd "$UP/netsurf" && rm -f nsvita.elf VitaBrowser.vpk && \
+# Two VPKs from one ELF: the default memory budget, and the extended one
+# (param.sfo ATTRIBUTE2=12, pre-phase-0 §1) under its own title id so both
+# can be installed side by side for the memory probe.
+( cd "$UP/netsurf" && rm -f nsvita.elf VitaBrowser.vpk VitaBrowser-ext.vpk && \
   make TARGET=vita VITA_PREFIX="$VP" -j4 > "$WORK/applytest/vita-build-netsurf.log" 2>&1 && \
   make TARGET=vita VITA_PREFIX="$VP" package-vita VITA_EXTRA_FILES="$EXTRA" \
+    >> "$WORK/applytest/vita-build-netsurf.log" 2>&1 && \
+  make TARGET=vita VITA_PREFIX="$VP" package-vita VITA_EXTRA_FILES="$EXTRA" \
+    VITA_TITLE_ID=VBRW00002 VITA_APP_NAME="VitaBrowser ext-mem" \
+    VITA_SFO_FLAGS="-d ATTRIBUTE2=12" VITA_VPK=VitaBrowser-ext.vpk \
     >> "$WORK/applytest/vita-build-netsurf.log" 2>&1 ) \
-  && echo "  nsvita.elf + VitaBrowser.vpk ok" \
+  && echo "  nsvita.elf + VitaBrowser.vpk + VitaBrowser-ext.vpk ok" \
   || { echo "  netsurf FAILED"; \
        grep -oE '(error: |undefined reference to )[^[]*' \
          "$WORK/applytest/vita-build-netsurf.log" | sort -u | head -8; exit 1; }
 
 "$VITASDK/bin/arm-vita-eabi-readelf" -h "$UP/netsurf/nsvita.elf" | grep -E 'Class|Machine'
-ls -la "$UP/netsurf/nsvita.elf" "$UP/netsurf/VitaBrowser.vpk"
+ls -la "$UP/netsurf/nsvita.elf" "$UP/netsurf/VitaBrowser.vpk" "$UP/netsurf/VitaBrowser-ext.vpk"

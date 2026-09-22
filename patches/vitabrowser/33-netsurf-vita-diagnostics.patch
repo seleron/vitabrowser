@@ -1,0 +1,1388 @@
+# netsurf: Vita hardware-test diagnostics (frontends/vita)
+# Generated 2026-09-22
+#
+# Everything a first device run needs to report back, written to
+# ux0:data/VitaBrowser/ (vita/diag.c): a timestamped, crash-safe log of each
+# init stage, per-page load / first-frame / CPU+GPU frame times and draw-call
+# counts, free memory per pool, PGF font metrics, an allocate-until-failure
+# memory probe, and plot-stream dumps in the nsmonkey format (plot.c tees
+# every plotter call when a dump is open) so device renders diff against the
+# host simulator's. main.c: SQUARE runs an autotest over every bundled page
+# (settle, dump, dump the scrolled bottom of long pages, then font metrics
+# and the probe); SELECT dumps one page, TRIANGLE probes, CIRCLE toggles a
+# HUD; start-up failures are shown on screen instead of exiting silently.
+# Adds the VT-* hardware test pages to the page list, LiveArea assets
+# (8-bit paletted PNGs) and package-vita knobs for the ATTRIBUTE2=12
+# extended-memory variant. See docs/phase-0/10-hardware-test-plan.md.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 1e7be53f9..ad353af48 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -29,7 +29,7 @@ LDFLAGS += -Wl,-q \
+ 	-lpcre2-posix -lpcre2-8 \
+ 	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
+ 	-lScePgf_stub -lScePvf_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
+-	-lSceAppMgr_stub \
++	-lSceAppMgr_stub -lScePower_stub \
+ 	-lm
+ endif
+ 
+@@ -49,7 +49,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ 
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+-	plot.c plot_geom.c replay.c
++	plot.c plot_geom.c replay.c diag.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+@@ -68,29 +68,37 @@ endif
+ install-vita:
+ 
+ # ----------------------------------------------------------------------------
+-# Package target: nsvita.elf -> eboot.bin -> VitaBrowser.vpk
++# Package target: nsvita.elf -> eboot.bin -> $(VITA_VPK)
+ #
+ # VITA_TITLE_ID is nine characters, four letters + five digits, and must be
+-# unique on the device. VITA_EXTRA_FILES adds "src=dst" pairs to the VPK;
+-# the VitaBrowser repo's tools/build-vita.sh passes the test pages that way.
++# unique on the device. VITA_SFO_FLAGS adds param.sfo entries (e.g.
++# "-d ATTRIBUTE2=12" for the extended memory budget). VITA_EXTRA_FILES adds
++# "src=dst" pairs to the VPK; the VitaBrowser repo's tools/build-vita.sh
++# passes the test pages that way. LiveArea images must be 8-bit paletted.
+ # ----------------------------------------------------------------------------
+ 
+ VITA_TITLE_ID ?= VBRW00001
+ VITA_APP_NAME ?= VitaBrowser
++VITA_SFO_FLAGS ?=
++VITA_VPK ?= VitaBrowser.vpk
+ VITA_PKGDIR := $(OBJROOT)/vpk
++VITA_SCE_SYS := frontends/vita/sce_sys
+ VITA_RES_FILES := default.css quirks.css adblock.css internal.css \
+ 	Messages welcome.html credits.html licence.html
++VITA_SYS_FILES := icon0.png livearea/contents/bg.png \
++	livearea/contents/startup.png livearea/contents/template.xml
+ 
+ package-vita: $(EXETARGET)
+-	$(VQ)echo "     VPK: VitaBrowser.vpk"
++	$(VQ)echo "     VPK: $(VITA_VPK) ($(VITA_TITLE_ID))"
+ 	$(Q)$(MKDIR) -p $(VITA_PKGDIR)
+ 	$(Q)$(VITA_ELF_CREATE) $(EXETARGET) $(VITA_PKGDIR)/nsvita.velf
+ 	$(Q)$(VITA_MAKE_FSELF) -s $(VITA_PKGDIR)/nsvita.velf \
+ 		$(VITA_PKGDIR)/eboot.bin
+-	$(Q)$(VITA_MKSFOEX) -s TITLE_ID=$(VITA_TITLE_ID) "$(VITA_APP_NAME)" \
+-		$(VITA_PKGDIR)/param.sfo
++	$(Q)$(VITA_MKSFOEX) -s TITLE_ID=$(VITA_TITLE_ID) $(VITA_SFO_FLAGS) \
++		"$(VITA_APP_NAME)" $(VITA_PKGDIR)/param.sfo
+ 	$(Q)$(VITA_PACK_VPK) -s $(VITA_PKGDIR)/param.sfo \
+ 		-b $(VITA_PKGDIR)/eboot.bin \
++		$(foreach f,$(VITA_SYS_FILES),-a $(VITA_SCE_SYS)/$(f)=sce_sys/$(f)) \
+ 		$(foreach f,$(VITA_RES_FILES),-a $(VITA_RESOURCES_DIR)/$(f)=res/$(f)) \
+ 		$(foreach p,$(VITA_EXTRA_FILES),-a $(p)) \
+-		VitaBrowser.vpk
++		$(VITA_VPK)
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+new file mode 100644
+index 000000000..dba56cc5e
+--- /dev/null
++++ b/frontends/vita/diag.c
+@@ -0,0 +1,306 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: on-device diagnostics for hardware testing.
++ *
++ * The SDK-only queries (memory pools, budget, clocks) are under __vita__;
++ * the host simulator build logs "n/a" for them and runs the rest unchanged,
++ * which is what makes its dumps a reference for the device's.
++ */
++
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#ifdef __vita__
++#include <malloc.h>
++#endif
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <sys/types.h>
++
++#include <vita2d.h>
++#ifdef __vita__
++#include <psp2/appmgr.h>
++#include <psp2/kernel/sysmem.h>
++#include <psp2/power.h>
++#endif
++
++#include "vita/plot.h"
++#include "vita/diag.h"
++
++/** Chunk size for the allocate-until-failure probes. */
++#define PROBE_CHUNK (1024 * 1024)
++/** Probe cap: above the Vita's 365 MiB ceiling, and keeps a host sane. */
++#define PROBE_MAX 512
++
++FILE *vita_plot_trace;
++
++static struct timeval diag_t0;
++static bool diag_ready;
++
++/* exported interface documented in vita/diag.h */
++unsigned int vita_diag_ms(void)
++{
++	struct timeval tv;
++
++	gettimeofday(&tv, NULL);
++	return (unsigned int)((tv.tv_sec - diag_t0.tv_sec) * 1000 +
++			      (tv.tv_usec - diag_t0.tv_usec) / 1000);
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_log(const char *fmt, ...)
++{
++	FILE *fp;
++	va_list ap;
++	unsigned int ms;
++
++	if (!diag_ready)
++		return;
++	/* Open, write, close per line: slow, but a crash cannot lose what
++	 * was logged before it, and nothing here is on a hot path. */
++	fp = fopen(VITA_DIAG_DIR "log.txt", "a");
++	if (fp == NULL)
++		return;
++	ms = vita_diag_ms();
++	fprintf(fp, "[%6u.%03u] ", ms / 1000, ms % 1000);
++	va_start(ap, fmt);
++	vfprintf(fp, fmt, ap);
++	va_end(ap);
++	fputc('\n', fp);
++	fclose(fp);
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_init(void)
++{
++	gettimeofday(&diag_t0, NULL);
++	/* ux0:data exists on every Vita; our directory may not. */
++	mkdir("ux0:data", 0777);
++	mkdir(VITA_DIAG_DIR, 0777);
++	diag_ready = true;
++	vita_diag_log("==== VitaBrowser boot (build " __DATE__ " " __TIME__ ") ====");
++#ifdef __vita__
++	{
++		/* 12 = TITLE_ID: tells the default and extended-memory VPKs
++		 * apart, since they share this log. */
++		char tid[16] = "?";
++		sceAppMgrAppParamGetString(0, 12, tid, sizeof(tid));
++		vita_diag_log("title id %s", tid);
++	}
++	vita_diag_log("clocks: arm %d MHz, gpu %d MHz",
++		      scePowerGetArmClockFrequency(),
++		      scePowerGetGpuClockFrequency());
++#else
++	vita_diag_log("clocks: n/a (host simulator)");
++#endif
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_memory(const char *tag)
++{
++#ifdef __vita__
++	struct mallinfo mi = mallinfo();
++	SceKernelFreeMemorySizeInfo info;
++
++	memset(&info, 0, sizeof(info));
++	info.size = sizeof(info);
++	if (sceKernelGetFreeMemorySize(&info) == 0)
++		vita_diag_log("mem[%s]: free user %d KiB, cdram %d KiB, "
++			      "phycont %d KiB; heap in use %d KiB of %d KiB",
++			      tag, info.size_user / 1024,
++			      info.size_cdram / 1024, info.size_phycont / 1024,
++			      mi.uordblks / 1024, mi.arena / 1024);
++	else
++		vita_diag_log("mem[%s]: sceKernelGetFreeMemorySize failed; "
++			      "heap in use %d KiB", tag, mi.uordblks / 1024);
++#else
++	/* glibc deprecates mallinfo(); the host numbers mean nothing here. */
++	vita_diag_log("mem[%s]: n/a (host simulator)", tag);
++#endif
++}
++
++/** malloc 1 MiB chunks until failure; returns how many succeeded. */
++static int probe_heap(void)
++{
++	void *chunks[PROBE_MAX];
++	int n = 0, i;
++
++	while (n < PROBE_MAX) {
++		chunks[n] = malloc(PROBE_CHUNK);
++		if (chunks[n] == NULL)
++			break;
++		/* Write to it, so the allocation cannot stay notional. */
++		((char *)chunks[n])[0] = 1;
++		n++;
++	}
++	for (i = 0; i < n; i++)
++		free(chunks[i]);
++	return n;
++}
++
++#ifdef __vita__
++/** Allocate 1 MiB memory blocks of `type` until failure. */
++static int probe_blocks(SceKernelMemBlockType type, int *err)
++{
++	SceUID uids[PROBE_MAX];
++	int n = 0, i;
++
++	*err = 0;
++	while (n < PROBE_MAX) {
++		SceUID uid = sceKernelAllocMemBlock("vbprobe", type,
++						    PROBE_CHUNK, NULL);
++		if (uid < 0) {
++			*err = uid;
++			break;
++		}
++		uids[n++] = uid;
++	}
++	for (i = 0; i < n; i++)
++		sceKernelFreeMemBlock(uids[i]);
++	return n;
++}
++#endif
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_mem_probe(void)
++{
++	int heap;
++
++	vita_diag_memory("probe-before");
++	heap = probe_heap();
++	vita_diag_log("probe: newlib heap: %d MiB more malloc-able%s", heap,
++		      heap >= PROBE_MAX ? " (hit the probe cap)" : "");
++#ifdef __vita__
++	{
++		SceAppMgrBudgetInfo budget;
++		int n, err, ret;
++
++		n = probe_blocks(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, &err);
++		vita_diag_log("probe: USER_RW blocks: %d MiB beyond the heap "
++			      "(stopped with 0x%08x)", n, (unsigned int)err);
++		n = probe_blocks(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, &err);
++		vita_diag_log("probe: USER_CDRAM_RW blocks: %d MiB "
++			      "(stopped with 0x%08x)", n, (unsigned int)err);
++		n = probe_blocks(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW,
++				 &err);
++		vita_diag_log("probe: PHYCONT_NC blocks: %d MiB "
++			      "(stopped with 0x%08x)", n, (unsigned int)err);
++
++		memset(&budget, 0, sizeof(budget));
++		budget.size = sizeof(budget);
++		ret = sceAppMgrGetBudgetInfo(&budget);
++		if (ret == 0)
++			vita_diag_log("budget: mode %d, user_rw %u/%u KiB free, "
++				      "extra %s %u/%u KiB, phycont %u/%u KiB, "
++				      "cdram %u/%u KiB", budget.app_mode,
++				      budget.free_user_rw / 1024,
++				      budget.total_user_rw_mem / 1024,
++				      budget.extra_mem_allowed ? "on" : "off",
++				      budget.free_extra_mem / 1024,
++				      budget.total_extra_mem / 1024,
++				      budget.free_phycont_mem / 1024,
++				      budget.total_phycont_mem / 1024,
++				      budget.free_cdram_mem / 1024,
++				      budget.total_cdram_mem / 1024);
++		else
++			vita_diag_log("budget: sceAppMgrGetBudgetInfo -> 0x%08x "
++				      "(expected for a normal app)",
++				      (unsigned int)ret);
++	}
++#else
++	vita_diag_log("probe: memory blocks n/a (host simulator)");
++#endif
++	vita_diag_memory("probe-after");
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_font_metrics(void)
++{
++	struct vita2d_pgf *font = vita_plot_font();
++	char line[512];
++	size_t len = 0;
++	int c, aa;
++
++	if (font == NULL) {
++		vita_diag_log("font: no PGF font loaded");
++		return;
++	}
++	/* The numbers layout.c works from: text height at scale 1 and 2, and
++	 * each printable ASCII advance measured the way glyph_advance() does
++	 * (width of "a"c"a" minus "aa") next to the raw single-glyph width. */
++	vita_diag_log("font: height(\"Hg\") scale1 %d, scale2 %d; "
++		      "width(\"MMMMMMMMMM\") scale1 %d",
++		      vita2d_pgf_text_height(font, 1.0f, "Hg"),
++		      vita2d_pgf_text_height(font, 2.0f, "Hg"),
++		      vita2d_pgf_text_width(font, 1.0f, "MMMMMMMMMM"));
++	aa = vita2d_pgf_text_width(font, 1.0f, "aa");
++	for (c = 0x20; c < 0x7f; c++) {
++		char s1[2] = { (char)c, 0 };
++		char s3[4] = { 'a', (char)c, 'a', 0 };
++		len += (size_t)snprintf(line + len, sizeof(line) - len,
++				"%c=%d/%d ", c == ' ' ? '_' : c,
++				vita2d_pgf_text_width(font, 1.0f, s3) - aa,
++				vita2d_pgf_text_width(font, 1.0f, s1));
++		if (len > sizeof(line) - 16 || c == 0x7e) {
++			vita_diag_log("font advance/raw: %s", line);
++			len = 0;
++		}
++	}
++}
++
++/* exported interface documented in vita/diag.h */
++bool vita_diag_trace_begin(const char *name)
++{
++	char path[256];
++
++	vita_diag_trace_end();
++	snprintf(path, sizeof(path), VITA_DIAG_DIR "%s.plot", name);
++	vita_plot_trace = fopen(path, "w");
++	if (vita_plot_trace == NULL) {
++		vita_diag_log("dump: cannot open %s", path);
++		return false;
++	}
++	fprintf(vita_plot_trace, "# vitabrowser plot dump %s @ 960x544\n", name);
++	return true;
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_trace_end(void)
++{
++	if (vita_plot_trace != NULL) {
++		fclose(vita_plot_trace);
++		vita_plot_trace = NULL;
++	}
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_marker(const char *name)
++{
++	char path[256];
++	FILE *fp;
++
++	snprintf(path, sizeof(path), VITA_DIAG_DIR "%s", name);
++	fp = fopen(path, "w");
++	if (fp != NULL)
++		fclose(fp);
++}
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+new file mode 100644
+index 000000000..c114c5878
+--- /dev/null
++++ b/frontends/vita/diag.h
+@@ -0,0 +1,74 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: on-device diagnostics for hardware testing.
++ *
++ * Everything lands in VITA_DIAG_DIR on the memory card so a test run can be
++ * copied off and read on the desktop: a timestamped log (each line is
++ * flushed to the card, so a crash leaves everything up to it), plot-stream
++ * dumps in the nsmonkey format (diffable against the desktop goldens and
++ * the host simulator's dumps), PGF font metrics, and memory figures.
++ */
++
++#ifndef NETSURF_VITA_DIAG_H
++#define NETSURF_VITA_DIAG_H
++
++#include <stdbool.h>
++#include <stdio.h>
++
++/** Where diagnostics are written (created on start-up). */
++#define VITA_DIAG_DIR "ux0:data/VitaBrowser/"
++
++/** Open the log and write the boot banner. Safe to call before anything. */
++void vita_diag_init(void);
++
++/** Append one timestamped line to the log (printf format). */
++void vita_diag_log(const char *fmt, ...)
++	__attribute__((format(printf, 1, 2)));
++
++/** Milliseconds since vita_diag_init(), monotonic enough for timing. */
++unsigned int vita_diag_ms(void);
++
++/** Log free memory in every pool, tagged. */
++void vita_diag_memory(const char *tag);
++
++/** Allocate-until-failure in each pool, log the totals, free it all. */
++void vita_diag_mem_probe(void);
++
++/** Log the system font's metrics as the layout sees them. */
++void vita_diag_font_metrics(void);
++
++/**
++ * Start dumping plot calls to VITA_DIAG_DIR<name>.plot.
++ * Every plotter call until vita_diag_trace_end() is written in the
++ * nsmonkey plot-stream format.
++ */
++bool vita_diag_trace_begin(const char *name);
++
++/** Stop dumping; closes the file. */
++void vita_diag_trace_end(void);
++
++/** The open dump, or NULL: the plotters write to it when set. */
++extern FILE *vita_plot_trace;
++
++/** Create an empty marker file in VITA_DIAG_DIR (e.g. "autotest.done"). */
++void vita_diag_marker(const char *name);
++
++#endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 0416a5582..e049569a2 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -20,13 +20,23 @@
+  * \file
+  * Vita frontend: application entry point and main loop.
+  *
+- * First milestone: open a bundled test page from app0: through the core's
+- * file fetcher, lay it out with PGF metrics and paint it with the vita2d
+- * plotters. Controls: D-pad / left stick scroll, L / R step through the
+- * bundled test pages, START quits.
++ * Opens bundled test pages from app0: through the core's file fetcher, lays
++ * them out with PGF metrics and paints them with the vita2d plotters.
++ * Hardware-test build: everything is logged to ux0:data/VitaBrowser/
++ * (vita/diag.h).
++ *
++ * Controls:
++ *   D-pad / left stick  scroll          L / R     previous / next test page
++ *   SQUARE    autotest: every page settled and dumped, then font metrics
++ *             and the memory probe; "AUTOTEST DONE" when finished
++ *   SELECT    dump the current page's plot stream
++ *   TRIANGLE  memory probe            CIRCLE    toggle the HUD
++ *   START     quit
+  */
+ 
++#include <stdarg.h>
+ #include <stdbool.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -45,6 +55,7 @@
+ #include "netsurf/netsurf.h"
+ 
+ #include "vita/bitmap.h"
++#include "vita/diag.h"
+ #include "vita/fetch.h"
+ #include "vita/file.h"
+ #include "vita/layout.h"
+@@ -68,16 +79,54 @@ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ /** Left stick dead zone around the 128 centre. */
+ #define VITA_STICK_DEADZONE 24
+ 
++/** A page has settled when nothing has repainted for this long. */
++#define VITA_SETTLE_MS 700
++
++/** Give up waiting for a page to settle after this long (autotest). */
++#define VITA_SETTLE_TIMEOUT_MS 20000
++
++/** Frames per page whose timing is logged individually. */
++#define VITA_LOGGED_FRAMES 3
++
+ /** The test pages bundled under app0:/testpages/ (testpages/pages/). */
+ static const char *const vita_test_pages[] = {
+ 	"L1-layout-basics", "L2-macsurf-css", "L3-grid", "L4-flex",
+ 	"PM-gradient", "PM-shadow", "PM-animation", "PM-macsurf-grid",
+ 	"PM-tagtype", "PM-link", "PM-shadow-clip",
++	"VT-calibration", "VT-text", "VT-images", "VT-scroll",
+ };
+ #define VITA_TEST_PAGE_COUNT \
+ 	(sizeof(vita_test_pages) / sizeof(vita_test_pages[0]))
+ 
++/** Autotest progress. */
++enum autotest_state {
++	AT_OFF,
++	AT_SETTLE,		/**< waiting for the page to settle */
++	AT_DUMP,		/**< the next frame is dumped */
++	AT_BOTTOM_SETTLE,	/**< scrolled to the bottom, waiting */
++	AT_BOTTOM_DUMP		/**< the next frame is dumped as -bottom */
++};
++
++/** Per-page measurements, reset on every navigation. */
++struct page_stats {
++	unsigned int nav_ms;		/**< when navigation started */
++	unsigned int first_frame_ms;	/**< 0 until the first frame */
++	unsigned int load_done_ms;	/**< 0 until the throbber stopped */
++	unsigned int last_frame_ms;
++	unsigned int frames;
++	unsigned int cpu_ms_max, gpu_ms_max, cpu_ms_last, gpu_ms_last;
++	unsigned int calls_last;
++	bool was_loading;
++};
++
+ static bool vita_quit;
++static unsigned int vita_page;
++static struct page_stats vita_stats;
++static enum autotest_state vita_autotest = AT_OFF;
++static bool vita_hud = true;
++static bool vita_dump_next;		/**< SELECT: dump the next frame */
++static char vita_message[128];		/**< overlay message, "" = none */
++static unsigned int vita_message_until;	/**< ms; 0 = until replaced */
+ 
+ static void vita_gui_quit(void)
+ {
+@@ -95,6 +144,20 @@ static nserror set_defaults(struct nsoption_s *defaults)
+ 	return NSERROR_OK;
+ }
+ 
++static void set_message(unsigned int ms, const char *fmt, ...)
++	__attribute__((format(printf, 2, 3)));
++static void set_message(unsigned int ms, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(vita_message, sizeof(vita_message), fmt, ap);
++	va_end(ap);
++	vita_message_until = ms ? vita_diag_ms() + ms : 0;
++	vita_diag_log("screen: %s", vita_message);
++	vita_window_force_redraw(vita_window_current());
++}
++
+ /** Navigate the window to bundled test page `idx`. */
+ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ {
+@@ -102,26 +165,67 @@ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ 	nsurl *url;
+ 	nserror err;
+ 
+-	strcpy(url_s, "file:///app0:/testpages/");
+-	strncat(url_s, vita_test_pages[idx % VITA_TEST_PAGE_COUNT],
+-		sizeof(url_s) - strlen(url_s) - 6);
+-	strcat(url_s, ".html");
++	vita_page = idx % VITA_TEST_PAGE_COUNT;
++	snprintf(url_s, sizeof(url_s), "file:///app0:/testpages/%s.html",
++		 vita_test_pages[vita_page]);
++	memset(&vita_stats, 0, sizeof(vita_stats));
++	vita_stats.nav_ms = vita_diag_ms();
++	vita_diag_log("page %u/%u %s: navigate", vita_page + 1,
++		      (unsigned int)VITA_TEST_PAGE_COUNT,
++		      vita_test_pages[vita_page]);
+ 	err = nsurl_create(url_s, &url);
+ 	if (err != NSERROR_OK)
+ 		return err;
+ 	err = browser_window_navigate(bw, url, NULL, BW_NAVIGATE_HISTORY,
+ 				      NULL, NULL, NULL);
+ 	nsurl_unref(url);
++	if (err != NSERROR_OK)
++		vita_diag_log("page %s: navigate failed: %d",
++			      vita_test_pages[vita_page], err);
+ 	return err;
+ }
+ 
+-/** Read the pad; returns true when the page should change (by *step). */
+-static bool vita_input(struct gui_window *gw, int *step)
++/** Log the current page's load/paint summary. */
++static void log_page_summary(struct gui_window *gw, const char *why)
++{
++	const struct page_stats *s = &vita_stats;
++	int w, h;
++
++	vita_window_extent(gw, &w, &h);
++	vita_diag_log("page %s %s: first frame %u ms, load %s%u ms, "
++		      "%u frames, last frame cpu %u / gpu %u ms (max %u / %u), "
++		      "%u draw calls, extent %dx%d",
++		      vita_test_pages[vita_page], why,
++		      s->first_frame_ms ? s->first_frame_ms - s->nav_ms : 0,
++		      s->load_done_ms ? "" : "not finished, ",
++		      s->load_done_ms ? s->load_done_ms - s->nav_ms :
++				vita_diag_ms() - s->nav_ms,
++		      s->frames, s->cpu_ms_last, s->gpu_ms_last,
++		      s->cpu_ms_max, s->gpu_ms_max, s->calls_last, w, h);
++}
++
++/** Has the current page finished loading and stopped repainting? */
++static bool page_settled(struct gui_window *gw)
++{
++	unsigned int now = vita_diag_ms();
++
++	if (vita_stats.frames == 0 || vita_window_loading(gw))
++		return false;
++	return now - vita_stats.last_frame_ms >= VITA_SETTLE_MS;
++}
++
++static bool page_timed_out(void)
++{
++	return vita_diag_ms() - vita_stats.nav_ms > VITA_SETTLE_TIMEOUT_MS;
++}
++
++/** Read the pad; returns the page step requested by L / R (0 = none). */
++static int vita_input(struct gui_window *gw, struct browser_window *bw)
+ {
+ 	static unsigned int prev_buttons;
+ 	SceCtrlData pad;
+ 	unsigned int pressed;
+-	int dx = 0, dy = 0;
++	int dx = 0, dy = 0, step = 0;
+ 
+ 	memset(&pad, 0, sizeof(pad));
+ 	sceCtrlPeekBufferPositive(0, &pad, 1);
+@@ -130,6 +234,29 @@ static bool vita_input(struct gui_window *gw, int *step)
+ 
+ 	if (pressed & SCE_CTRL_START)
+ 		vita_quit = true;
++	if (pressed & SCE_CTRL_CIRCLE) {
++		vita_hud = !vita_hud;
++		vita_window_force_redraw(gw);
++	}
++	if (vita_autotest != AT_OFF)
++		return 0;	/* the autotest drives navigation */
++
++	if (pressed & SCE_CTRL_SQUARE) {
++		vita_diag_log("autotest: start");
++		vita_autotest = AT_SETTLE;
++		set_message(0, "AUTOTEST running - do not touch");
++		open_test_page(bw, 0);
++		return 0;
++	}
++	if (pressed & SCE_CTRL_SELECT) {
++		vita_dump_next = true;
++		vita_window_force_redraw(gw);
++	}
++	if (pressed & SCE_CTRL_TRIANGLE) {
++		set_message(0, "memory probe...");
++		vita_diag_mem_probe();
++		set_message(3000, "memory probe done (see log.txt)");
++	}
+ 	if (pad.buttons & SCE_CTRL_UP)
+ 		dy -= VITA_SCROLL_STEP;
+ 	if (pad.buttons & SCE_CTRL_DOWN)
+@@ -145,41 +272,229 @@ static bool vita_input(struct gui_window *gw, int *step)
+ 	if (dx != 0 || dy != 0)
+ 		vita_window_scroll_by(gw, dx, dy);
+ 
+-	*step = 0;
+ 	if (pressed & SCE_CTRL_LTRIGGER)
+-		*step = -1;
++		step = -1;
+ 	if (pressed & SCE_CTRL_RTRIGGER)
+-		*step = 1;
+-	return *step != 0;
++		step = 1;
++	return step;
+ }
+ 
+-static void vita_run(struct browser_window *bw)
++/** Autotest step before drawing: decide whether this frame is dumped. */
++static bool autotest_pre(struct gui_window *gw)
++{
++	char name[96];
++
++	switch (vita_autotest) {
++	case AT_SETTLE:
++	case AT_BOTTOM_SETTLE:
++		if (!page_settled(gw) && !page_timed_out())
++			return false;
++		if (!page_settled(gw))
++			vita_diag_log("autotest: %s did not settle in %u ms",
++				      vita_test_pages[vita_page],
++				      VITA_SETTLE_TIMEOUT_MS);
++		log_page_summary(gw, vita_autotest == AT_SETTLE ?
++				 "settled" : "settled at bottom");
++		vita_diag_memory(vita_test_pages[vita_page]);
++		snprintf(name, sizeof(name), "%02u-%s%s", vita_page + 1,
++			 vita_test_pages[vita_page],
++			 vita_autotest == AT_SETTLE ? "" : "-bottom");
++		vita_diag_trace_begin(name);
++		vita_autotest = (vita_autotest == AT_SETTLE) ?
++				AT_DUMP : AT_BOTTOM_DUMP;
++		vita_window_force_redraw(gw);
++		return true;
++	default:
++		return false;
++	}
++}
++
++/** Autotest step after a dumped frame: scroll, next page, or finish. */
++static void autotest_post(struct gui_window *gw, struct browser_window *bw)
++{
++	int w, h;
++
++	if (vita_autotest == AT_DUMP) {
++		vita_window_extent(gw, &w, &h);
++		if (h > VITA_SCREEN_HEIGHT) {
++			/* Long page: dump the bottom too, which exercises the
++			 * scrolled redraw offset. */
++			vita_window_scroll_by(gw, 0, h);
++			vita_stats.last_frame_ms = vita_diag_ms();
++			vita_stats.frames = 1;
++			vita_autotest = AT_BOTTOM_SETTLE;
++			return;
++		}
++	} else if (vita_autotest != AT_BOTTOM_DUMP) {
++		return;
++	}
++	if (vita_page + 1 < VITA_TEST_PAGE_COUNT) {
++		vita_autotest = AT_SETTLE;
++		set_message(0, "AUTOTEST page %u/%u - do not touch",
++			    vita_page + 2, (unsigned int)VITA_TEST_PAGE_COUNT);
++		open_test_page(bw, vita_page + 1);
++		return;
++	}
++	vita_autotest = AT_OFF;
++	vita_diag_font_metrics();
++	vita_diag_mem_probe();
++	vita_diag_log("autotest: done");
++	vita_diag_marker("autotest.done");
++	set_message(0, "AUTOTEST DONE - copy ux0:data/VitaBrowser/");
++}
++
++/** Draw a status line / message over the page (never dumped). */
++static void draw_overlay(void)
+ {
+-	unsigned int page = 0;
++	char hud[200];
++	float scale = vita_plot_pgf_scale(14.0f);
++
++	vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
++	if (vita_hud) {
++		snprintf(hud, sizeof(hud),
++			 "%u/%u %s | first %u ms | cpu %u gpu %u ms | %u calls"
++			 " | SQ autotest SEL dump TRI mem O hud",
++			 vita_page + 1, (unsigned int)VITA_TEST_PAGE_COUNT,
++			 vita_test_pages[vita_page],
++			 vita_stats.first_frame_ms ?
++				vita_stats.first_frame_ms - vita_stats.nav_ms : 0,
++			 vita_stats.cpu_ms_last, vita_stats.gpu_ms_last,
++			 vita_stats.calls_last);
++		vita_plot_fill_rect(0, VITA_SCREEN_HEIGHT - 22,
++				    VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
++				    0x000000, 3);
++		vita_plot_text(6, VITA_SCREEN_HEIGHT - 6, hud, strlen(hud),
++			       0xffffff, scale);
++	}
++	if (vita_message[0] != '\0') {
++		if (vita_message_until != 0 &&
++		    vita_diag_ms() > vita_message_until) {
++			vita_message[0] = '\0';
++			return;
++		}
++		vita_plot_fill_rect(180, 240, 780, 290, 0x202020, 4);
++		vita_plot_text(200, 272, vita_message, strlen(vita_message),
++			       0x00ffff, vita_plot_pgf_scale(20.0f));
++	}
++}
+ 
++/** Paint one frame, timing and optionally dumping it. */
++static void draw_frame(struct gui_window *gw, bool dump)
++{
++	unsigned int t0, t1, t2;
++	char name[96];
++
++	if (vita_dump_next && !dump) {
++		snprintf(name, sizeof(name), "manual-%s-%u",
++			 vita_test_pages[vita_page], vita_diag_ms());
++		dump = vita_diag_trace_begin(name);
++		if (dump)
++			set_message(2000, "dumped %s.plot", name);
++		vita_dump_next = false;
++	}
++	vita_plot_calls = 0;
++	t0 = vita_diag_ms();
++	vita2d_start_drawing();
++	vita2d_clear_screen();
++	vita_window_redraw(gw);
++	if (dump)
++		vita_diag_trace_end();
++	vita_stats.calls_last = vita_plot_calls;
++	draw_overlay();
++	vita2d_end_drawing();
++	t1 = vita_diag_ms();
++	/* Wait for the GPU so the frame's cost is measurable; the test
++	 * build trades a little overlap for the number. */
++	vita2d_wait_rendering_done();
++	t2 = vita_diag_ms();
++	vita2d_swap_buffers();
++
++	vita_stats.frames++;
++	vita_stats.last_frame_ms = t2;
++	if (vita_stats.first_frame_ms == 0)
++		vita_stats.first_frame_ms = t2;
++	vita_stats.cpu_ms_last = t1 - t0;
++	vita_stats.gpu_ms_last = t2 - t1;
++	if (t1 - t0 > vita_stats.cpu_ms_max)
++		vita_stats.cpu_ms_max = t1 - t0;
++	if (t2 - t1 > vita_stats.gpu_ms_max)
++		vita_stats.gpu_ms_max = t2 - t1;
++	if (vita_stats.frames <= VITA_LOGGED_FRAMES || dump)
++		vita_diag_log("frame %u of %s: cpu %u ms, gpu %u ms, %u calls%s",
++			      vita_stats.frames, vita_test_pages[vita_page],
++			      t1 - t0, t2 - t1, vita_stats.calls_last,
++			      dump ? " (dumped)" : "");
++}
++
++static void vita_run(struct browser_window *bw)
++{
+ 	while (!vita_quit) {
+ 		struct gui_window *gw = vita_window_current();
++		bool dump;
+ 		int step;
+ 
+ 		vita_schedule_run();
++		if (gw == NULL) {
++			sceKernelDelayThread(16 * 1000);
++			continue;
++		}
++
++		/* Load timing comes from the throbber events. */
++		if (vita_window_loading(gw)) {
++			vita_stats.was_loading = true;
++		} else if (vita_stats.was_loading &&
++			   vita_stats.load_done_ms == 0) {
++			vita_stats.load_done_ms = vita_diag_ms();
++		}
+ 
+-		if (gw != NULL && vita_input(gw, &step)) {
+-			page = (page + VITA_TEST_PAGE_COUNT + step) %
+-				VITA_TEST_PAGE_COUNT;
+-			open_test_page(bw, page);
++		step = vita_input(gw, bw);
++		if (step != 0) {
++			log_page_summary(gw, "left");
++			open_test_page(bw, (vita_page + VITA_TEST_PAGE_COUNT +
++					    step) % VITA_TEST_PAGE_COUNT);
+ 		}
++		dump = autotest_pre(gw);
+ 
+-		if (vita_window_needs_redraw(gw)) {
+-			vita2d_start_drawing();
+-			vita2d_clear_screen();
+-			vita_window_redraw(gw);
+-			vita2d_end_drawing();
+-			vita2d_swap_buffers();
++		if (vita_window_needs_redraw(gw) || dump) {
++			draw_frame(gw, dump);
++			if (dump)
++				autotest_post(gw, bw);
+ 		} else {
+ 			/* Nothing to paint: yield for about a frame. */
+ 			sceKernelDelayThread(16 * 1000);
+ 		}
+ 	}
++	vita_diag_log("quit requested");
++}
++
++/**
++ * Show a start-up failure on screen (when there is a font to show it
++ * with) and wait for START, instead of vanishing.
++ */
++static void fatal(const char *what, nserror err)
++{
++	char msg[160];
++
++	snprintf(msg, sizeof(msg), "VitaBrowser: %s failed (%d). "
++		 "See ux0:data/VitaBrowser/log.txt. START quits.", what, err);
++	vita_diag_log("FATAL: %s failed: %d", what, err);
++	if (vita_plot_font() == NULL)
++		return;
++	for (;;) {
++		SceCtrlData pad;
++		memset(&pad, 0, sizeof(pad));
++		sceCtrlPeekBufferPositive(0, &pad, 1);
++		if (pad.buttons & SCE_CTRL_START)
++			break;
++		vita2d_start_drawing();
++		vita2d_clear_screen();
++		vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
++		vita_plot_text(20, 270, msg, strlen(msg), 0x0000ff,
++			       vita_plot_pgf_scale(18.0f));
++		vita2d_end_drawing();
++		vita2d_swap_buffers();
++		sceKernelDelayThread(50 * 1000);
++	}
+ }
+ 
+ int main(int argc, char **argv)
+@@ -196,41 +511,70 @@ int main(int argc, char **argv)
+ 		.layout = vita_layout_table,
+ 	};
+ 
+-	vita2d_init_advanced(VITA_FRAME_POOL);
++	vita_diag_init();
++	vita_diag_memory("boot");
++
++	{
++		/* Logged raw: the header does not document the convention. */
++		int v2d = vita2d_init_advanced(VITA_FRAME_POOL);
++		vita_diag_log("init: vita2d_init_advanced -> %d", v2d);
++		if (v2d < 0)
++			goto fail;
++	}
+ 	vita2d_set_clear_color(RGBA8(0xff, 0xff, 0xff, 0xff));
+ 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+-	if (vita_plot_init() != NSERROR_OK)
++	ret = vita_plot_init();
++	vita_diag_log("init: PGF font -> %d", ret);
++	if (ret != NSERROR_OK)
+ 		goto fail;
+ 
+ 	ret = netsurf_register(&vita_table);
+-	if (ret != NSERROR_OK)
++	vita_diag_log("init: netsurf_register -> %d", ret);
++	if (ret != NSERROR_OK) {
++		fatal("netsurf_register", ret);
+ 		goto fail;
++	}
+ 	ret = nsoption_init(set_defaults, &nsoptions, &nsoptions_default);
+-	if (ret != NSERROR_OK)
++	vita_diag_log("init: nsoption_init -> %d", ret);
++	if (ret != NSERROR_OK) {
++		fatal("nsoption_init", ret);
+ 		goto fail;
++	}
+ 	/* Missing messages only lose UI strings; not fatal. */
+-	messages_add_from_file(VITA_RESOURCE_DIR "Messages");
++	ret = messages_add_from_file(VITA_RESOURCE_DIR "Messages");
++	vita_diag_log("init: messages -> %d", ret);
+ 
+ 	ret = netsurf_init(NULL);
+-	if (ret != NSERROR_OK)
++	vita_diag_log("init: netsurf_init -> %d", ret);
++	if (ret != NSERROR_OK) {
++		fatal("netsurf_init", ret);
+ 		goto fail;
++	}
+ 	/* plot.c converts font points back to pixels at the same dpi. */
+ 	browser_set_dpi(96);
++	vita_diag_memory("after init");
+ 
++	vita_page = 0;
++	memset(&vita_stats, 0, sizeof(vita_stats));
++	vita_stats.nav_ms = vita_diag_ms();
+ 	ret = nsurl_create(NETSURF_VITA_START_PAGE, &url);
+ 	if (ret == NSERROR_OK) {
+ 		ret = browser_window_create(BW_CREATE_HISTORY, url, NULL,
+ 					    NULL, &bw);
+ 		nsurl_unref(url);
+ 	}
+-	if (ret != NSERROR_OK)
++	vita_diag_log("init: open %s -> %d", NETSURF_VITA_START_PAGE, ret);
++	if (ret != NSERROR_OK) {
++		fatal("opening the start page", ret);
+ 		goto fail;
++	}
+ 
+ 	vita_run(bw);
+ 
+ 	browser_window_destroy(bw);
+ 	netsurf_exit();
+ 	nsoption_finalise(nsoptions, nsoptions_default);
++	vita_diag_log("exit: clean");
+ fail:
+ 	vita_plot_fini();
+ 	vita2d_fini();
+diff --git a/frontends/vita/plot.c b/frontends/vita/plot.c
+index 4aa503ea3..be8f82ea7 100644
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -32,8 +32,10 @@
+  * keeps the Vita render a function of the verified stream.
+  */
+ 
++#include <stdarg.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <math.h>
+ 
+@@ -46,6 +48,7 @@
+ #include "vita/plot_geom.h"
+ #include "vita/bitmap.h"
+ #include "vita/plot.h"
++#include "vita/diag.h"
+ 
+ #ifndef M_PI
+ #define M_PI 3.14159265358979323846
+@@ -70,6 +73,8 @@ static const unsigned int vita_bucket_alpha[VITA_BUCKET_SOLID + 1] = {
+ 
+ static vita2d_pgf *vita_font;
+ 
++unsigned int vita_plot_calls;
++
+ /** Current clip; drawing is suppressed while it is empty. */
+ static struct rect vita_clip = { 0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT };
+ static bool vita_clip_empty;
+@@ -125,6 +130,7 @@ void vita_plot_fill_rect(int x0, int y0, int x1, int y1, colour c,
+ {
+ 	if (vita_clip_empty || bucket <= 0 || x1 <= x0 || y1 <= y0)
+ 		return;
++	vita_plot_calls++;
+ 	vita2d_draw_rectangle((float)x0, (float)y0,
+ 			      (float)(x1 - x0), (float)(y1 - y0),
+ 			      vita_plot_rgba(c, bucket));
+@@ -153,6 +159,7 @@ static void vita_plot_fan(const float *xy, unsigned int n, unsigned int rgba)
+ 		v[i].z = 0.5f;
+ 		v[i].color = rgba;
+ 	}
++	vita_plot_calls++;
+ 	vita2d_draw_array(SCE_GXM_PRIMITIVE_TRIANGLE_FAN, v, n);
+ }
+ 
+@@ -181,6 +188,7 @@ void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c)
+ 	if (vita_clip_empty)
+ 		return;
+ 	if (width <= 1) {
++		vita_plot_calls++;
+ 		vita2d_draw_line((float)x0, (float)y0, (float)x1, (float)y1,
+ 				 rgba);
+ 		return;
+@@ -221,16 +229,40 @@ void vita_plot_text(int x, int y, const char *text, size_t length,
+ 		length = sizeof(buf) - 1;
+ 	memcpy(buf, text, length);
+ 	buf[length] = '\0';
++	vita_plot_calls++;
+ 	vita2d_pgf_draw_text(vita_font, x, y,
+ 			     vita_plot_rgba(c, VITA_BUCKET_SOLID), scale, buf);
+ }
+ 
++/* ---- plot-stream dump (vita/diag.h) --------------------------------- */
++
++/** Write one op to the open dump, in the nsmonkey `PLOT ...` format. */
++static void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++static void trace(const char *fmt, ...)
++{
++	va_list ap;
++
++	if (vita_plot_trace == NULL)
++		return;
++	fputs("PLOT ", vita_plot_trace);
++	va_start(ap, fmt);
++	vfprintf(vita_plot_trace, fmt, ap);
++	va_end(ap);
++	fputc('\n', vita_plot_trace);
++}
++
+ /* ---- the rectangle contract ---------------------------------------- */
+ 
+ static void geom_rect(void *pw, enum vita_geom_kind kind,
+ 		      int x0, int y0, int x1, int y1,
+ 		      colour c, int bucket, bool paint)
+ {
++	if (vita_plot_trace != NULL) {
++		char line[128];
++		vita_geom_format_rect(line, sizeof(line), x0, y0, x1, y1,
++				      bucket);
++		trace("%s", line);
++	}
+ 	if (paint)
+ 		vita_plot_fill_rect(x0, y0, x1, y1, c, bucket);
+ }
+@@ -238,6 +270,11 @@ static void geom_rect(void *pw, enum vita_geom_kind kind,
+ static void geom_quad(void *pw, const int x[4], const int y[4],
+ 		      colour c, int bucket, bool paint)
+ {
++	if (vita_plot_trace != NULL) {
++		char line[160];
++		vita_geom_format_quad(line, sizeof(line), x, y, bucket);
++		trace("%s", line);
++	}
+ 	if (paint)
+ 		vita_plot_fill_quad(x, y, c, bucket);
+ }
+@@ -260,6 +297,8 @@ static int stroke_px(const plot_style_t *style)
+ static nserror
+ vita_plot_clip(const struct redraw_context *ctx, const struct rect *clip)
+ {
++	trace("CLIP X0 %d Y0 %d X1 %d Y1 %d",
++	      clip->x0, clip->y0, clip->x1, clip->y1);
+ 	vita_plot_set_clip(clip->x0, clip->y0, clip->x1, clip->y1);
+ 	return NSERROR_OK;
+ }
+@@ -290,6 +329,8 @@ vita_plot_arc(const struct redraw_context *ctx,
+ 	int segs, i;
+ 	float a1, a2;
+ 
++	trace("ARC X %d Y %d RADIUS %d ANGLE1 %d ANGLE2 %d",
++	      x, y, radius, angle1, angle2);
+ 	/* Anticlockwise from angle1 to angle2, degrees from horizontal. */
+ 	while (angle2 < angle1)
+ 		angle2 += 360;
+@@ -314,7 +355,9 @@ vita_plot_disc(const struct redraw_context *ctx,
+ 	       const plot_style_t *style,
+ 	       int x, int y, int radius)
+ {
++	trace("DISC X %d Y %d RADIUS %d", x, y, radius);
+ 	if (style->fill_type != PLOT_OP_TYPE_NONE && !vita_clip_empty) {
++		vita_plot_calls++;
+ 		vita2d_draw_fill_circle((float)x, (float)y, (float)radius,
+ 				vita_plot_rgba(style->fill_colour,
+ 					       VITA_BUCKET_SOLID));
+@@ -339,6 +382,8 @@ vita_plot_line_op(const struct redraw_context *ctx,
+ 		  const plot_style_t *style,
+ 		  const struct rect *line)
+ {
++	trace("LINE X0 %d Y0 %d X1 %d Y1 %d",
++	      line->x0, line->y0, line->x1, line->y1);
+ 	if (style->stroke_type == PLOT_OP_TYPE_NONE)
+ 		return NSERROR_OK;
+ 	vita_plot_line(line->x0, line->y0, line->x1, line->y1,
+@@ -380,6 +425,7 @@ vita_plot_polygon(const struct redraw_context *ctx,
+ 	float xy[64 * 2];
+ 	unsigned int i;
+ 
++	trace("POLYGON VERTICIES %u", n);
+ 	/* A fan is exact for convex polygons, which is what the core sends
+ 	 * (list bullets, form widgets). Longer ones are truncated. */
+ 	if (n > 64)
+@@ -432,6 +478,8 @@ vita_plot_path(const struct redraw_context *ctx,
+ 	float cx = 0, cy = 0;
+ 	bool closed = false;
+ 
++	trace("PATH VERTICIES %u WIDTH %f", n,
++	      plot_style_fixed_to_float(pstyle->stroke_width));
+ 	while (i < n) {
+ 		int cmd = (int)p[i];
+ 		if (cmd == PLOTTER_PATH_MOVE && i + 2 < n) {
+@@ -498,6 +546,7 @@ vita_plot_bitmap(const struct redraw_context *ctx,
+ 	float sx, sy;
+ 	int tx, ty, x_end, y_end;
+ 
++	trace("BITMAP X %d Y %d WIDTH %d HEIGHT %d", x, y, width, height);
+ 	if (vita_clip_empty || width <= 0 || height <= 0)
+ 		return NSERROR_OK;
+ 	tex = vita_bitmap_texture(bitmap);
+@@ -528,6 +577,7 @@ vita_plot_bitmap(const struct redraw_context *ctx,
+ 	}
+ 	for (ty = y; ty < y_end; ty += height) {
+ 		for (tx = x; tx < x_end; tx += width) {
++			vita_plot_calls++;
+ 			vita2d_draw_texture_scale(tex, (float)tx, (float)ty,
+ 						  sx, sy);
+ 		}
+@@ -543,6 +593,7 @@ vita_plot_text_op(const struct redraw_context *ctx,
+ 		  const char *text,
+ 		  size_t length)
+ {
++	trace("TEXT X %d Y %d STR %.*s", x, y, (int)length, text);
+ 	vita_plot_text(x, y, text, length, fstyle->foreground,
+ 		       vita_plot_pgf_scale(vita_plot_font_px(fstyle->size)));
+ 	return NSERROR_OK;
+diff --git a/frontends/vita/plot.h b/frontends/vita/plot.h
+index d4461ec89..d920033dc 100644
+--- a/frontends/vita/plot.h
++++ b/frontends/vita/plot.h
+@@ -79,6 +79,9 @@ float vita_plot_font_px(int size);
+ /** PGF scale factor that renders a font `px` pixels high. */
+ float vita_plot_pgf_scale(float px);
+ 
++/** vita2d draw calls issued; the diagnostics reset and read it per frame. */
++extern unsigned int vita_plot_calls;
++
+ /** The system font the plotters draw with; NULL before vita_plot_init(). */
+ struct vita2d_pgf *vita_plot_font(void);
+ 
+diff --git a/frontends/vita/sce_sys/icon0.png b/frontends/vita/sce_sys/icon0.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..40d234b6807005cfed7c4d21755da56dd45459a0
+GIT binary patch
+literal 1204
+zcmbVLUuYL}5Wn#&tu-AzIScpFMN&f63~Deohof7F6Z0P2gXx3f;z*$w$*66<L?C%V
+zP(*~FWL(l8J$i@&r9dLZy;v9h(FY5}RU>s_JG*}SJ@(kceLs9Zci->la|ie8=1os7
+zYrm%*0G18YhAmB;T8ujy&GY)D*KaoA&V97)`6jltV&wj>z6EH&=8ap2ngjw6fB-0f
+z0|Y>}SVSNMK~Mxo2!w2vA^{Nyff6`D5M=8;3Xp&ZsDKNEK(;<b1yT?NRd9t+$d(d1
+zkb^j=gFA#nw&XE@0wh2KJRkzH<p~ogK@v2<6CxoOjWPlgumCHt0|#&d12Q5LvLGw6
+zBL{LK12Ga4u@Eb<69;h;gD?t{un4QL3x{wDgEA_UvM8&vD~EC_gEKmlvpB1>JBM>R
+zLofzYumo$c2S;!QLoy~)vLtJ=Cr5H70~mr4n1Csmg9TWE0UDwanxH9~qXk-`0U44J
+znUE=&lLc9lff$OBn24#Ei-lN<ff}ljny9IotA$#sfg8G!o4Bc)yM<f2K^TTnn1pGV
+zhecS1K^mq}nxtu(r$t((0Te<Jlt3wzLj_bq0TyBrmS8ECV+B@X0Togal~5^_Qw3F0
+zffP!Slt`(RONCTQffj0!mT0M#YlT*7ffss_mw2g{dxckeK@>(&ltgKiM@3XdK^A6F
+zmSky`XGK<KO>f-tdvh;Fhc~R>`r<pky}iEu%e5W1-5RRnz4MRlAAM@9^NX&d2fuFr
+z?7`D-uIU<IcX{TK`vz|wJoEIzz1JpITzI1U?vY=5&Q6`Eu_dEx56||W9k^@B8@EP!
+zW)8INs+}!v^3&ay9`8SSbxqH{=iWWBbo`mav(rDVSlu(XeAUId*G@j%_~6!$FHJ8d
+zPIZ60bhd2*CU)HDK6h;8`!8SJb#1Kk_|Hdfu4`P_+jsWV-pMn!FFCQlud%Ij>)#(;
+zUU+owhl~5Cr)B&3slI`~-um@MM>JkIH1@x*-}k-u!0xH#^RQ~Rtv4FiXTKR3KXheB
+z=gcRIzD{+o?%DU<ks7)3Z2up<3;!IuKH0T-zW-dS<yThjIsM-;oL}DYIcy)?x##Gz
+TKObtYDhv;8+VJ7vjsyP!h(S6U
+
+literal 0
+HcmV?d00001
+
+diff --git a/frontends/vita/sce_sys/livearea/contents/bg.png b/frontends/vita/sce_sys/livearea/contents/bg.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7e63cb2eb5931e4e7fccc08c56bdaf5176ca6ba
+GIT binary patch
+literal 2734
+zcmeH}y^Eez5XH}Cmwb^Gu}cCf?%1S?K`rwkn`BmEc3E}`I}1UHqY0!?(zuCL3UM~2
+zTBH!v0T+a^P!KI5M2tbu$hZ~;D;tdj3j?F$^FDut#amnk4)eQb819{WFRz?FIlp_~
+zZUFO3ytoR?GBESk&e=gZxcSe`A?!NG&z>LR%(#{xz4qgfg_Tol#|MFc0Z_nz01~KC
+zB?1$aV1ytfp~h5VFhd!}2u3n$<VnE_RhS|asi<*NGO$4nW(Y$XYILFi2Q*-T2xOo}
+zdrELZ6PAcXCTgsS3S7{F6{3)ZniMJoVTeKu5|D%x1SCYlBuZi=L6Rgz0v2Ln7G*J(
+zU`du@feNXximI4OsH94%z=TZLL`}>jOwy!G5JDjwq9GO%AsJF3NTC!?(G*LGluW4<
+zlu!wmXo;0XNtRRz-~?y5!VMnqgcls-M9$<&Zsb9p<V6m4VrO<`H}+sp_F{)Rsk6GO
+zn|i3Hda1*l%-LMc%{<K0yvz|!;T*2v79QalUg1cmbWYcFOONzSuXL1CIhSj>l}CA&
+zS2@sxX0)OW9q2?C8q`G1)JkpCL7mh^4Q}FQZsj)a;7;!1hBj%lwrZPpXs32*!<www
+zTCL4Gtkb%z5lzt?t<e@8(HULQ$fj)0)@;j;?98rgR8uuqYqeEJbyipP#Z#+)06W%}
+z7LTpH_U`XLeLR2d;GVBmKKkw3Ul0BK;C)}uJ@(CxOSk6^9De+zJI~y`@#!mg|Hg&0
+zPs<mtZhn6D$_qEoFVk{ttgqku<@*bF2Km;BM`mB9L*Jd)wyieS-q_;jufDmseT$E-
+zAGva7W&h<pv2p$A{#`r&Jh?i5W?|#vlMn2DabafWU-n}oHlZK>@}Z?CJ{Ylqo}2r7
+z;lu5pOt1;Pj@Rkd)e)P}_uqc&y?sASO{eXh9;E4&nGT2P?ET-oGDq&cbA9W;XLsKo
+QK51AwetL29spl^J2kF>L&Hw-a
+
+literal 0
+HcmV?d00001
+
+diff --git a/frontends/vita/sce_sys/livearea/contents/startup.png b/frontends/vita/sce_sys/livearea/contents/startup.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..69ec80d74605bcabccec53245ce7c5c47df6149c
+GIT binary patch
+literal 1433
+zcmc&!&x;mh5T13*Qr4h@@TJf~jY)^n&A@^r%@s#n)=hST4u!F$B9jG6q^*f{O4@Qd
+z2wG`gj2xr_CyX-OL#Tn4l*Jg-5*lXoLlifH(dqlXi~RvXhxeU%9^RSfVFuo<1N}><
+zO`S0n0H!UY-jx6yjb^_4#?I#b<Ci~w)eKXfrALRGv7>!f%=-L0fKC|b8(h*P5P$##
+zKmi;e0J6;@0wD;3A~-@IWcw)+5P=XVffEElw(C)V1VlguTp$Fp-4qo_K@?QM6+$7~
+zO6Wii;-C)h5DwXv#{deD01fbf2*|c4OrQiw&;(D2glrjQ1SVhsR$vDX-~<L_L?&cG
+zR%AyG<U|HyBqm}ZR$?a(;v@!P6eeL2R$&(o;S>gCR3>FnR%KTX<x~b|bS7tUR%dq(
+z=X8c(45nZS)?g2g;0%UjOr~T>)?`nP<V*%I1S2p3Q!ob$uml4%L?bjoQ#3~lv_u0k
+zBqK5*Q!*zDvLpjB6eBSaQ!y6{u@nO}R3kM}Q#Dr$wNwK)bR#!$Q#W@Dw{(Lr45Kg!
+z(=ZQ<undDVOrtbO(=<<uv`hmigd!+`QYeQCsDuJ6#3C%gQY^;`ti%E;q#`PzQYxnk
+zs-yxblp-mSQYn`TsgwdO)FLg>QZ3gCt<(Z9^dc|uQZM%kuk?Z_jG`!s(kPFLsEmRv
+z%%UvG(k#!4tjv0;Z{;5VlO9~wyJ&F3+rRHxv~F=vS8q)pKJdcMZ+?05%AM=4pSAay
+zHB+wpbNhz<yLP_v#3LuBf6#sE`OhA|IA=!Z+O7*v_nqBy)n+!+Jw0R7H$FW6?Q0$P
+zPCnTfyS4MzBhY%XYFo#1L(pPBJi6tRo-Hjlh8F(NSlD8J>)EruS=wYL8Uyp2g-v#(
+z>%Ezs-WcwF_sogAj%?b0`GLRBZx~*_ZR7rr`ZwG7r{_=aICuK+>+=sb4jewWbo2OZ
+zKXYPr*U7Jk`q%Vb9y$1C&%#%GW?y=0XU{}qWb~FxH;i=6y=Q3R=KBZtEtovF)xHUD
+zo3nl0wvOX1pQFcjyx4ma{|g>lzW4hfnAbE6x6fPM{l?<$*Weu&SMHl=jEy#(j~yF5
+zz4YwB-fM8{p+UQ*@jpvm*f{>z7b}jwb>*>11GVP9_K>gM-O-$FYgt<sOg{A=t!h)p
+aJ3p=6{qeEx_09hXmM!V;egC0VFaHDYl7C77
+
+literal 0
+HcmV?d00001
+
+diff --git a/frontends/vita/sce_sys/livearea/contents/template.xml b/frontends/vita/sce_sys/livearea/contents/template.xml
+new file mode 100644
+index 000000000..c6b763bc1
+--- /dev/null
++++ b/frontends/vita/sce_sys/livearea/contents/template.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<livearea style="a1" format-ver="01.00" content-rev="1">
++	<livearea-background>
++		<image>bg.png</image>
++	</livearea-background>
++	<gate>
++		<startup-image>startup.png</startup-image>
++	</gate>
++</livearea>
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index d9d63695a..fc303aa75 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -42,6 +42,7 @@ struct gui_window {
+ 	int scrollx;
+ 	int scrolly;
+ 	bool dirty;
++	bool loading;	/**< between START_ and STOP_THROBBER */
+ };
+ 
+ static struct gui_window *vita_current;
+@@ -109,6 +110,12 @@ static nserror vita_window_event(struct gui_window *gw,
+ 		gw->scrolly = 0;
+ 		gw->dirty = true;
+ 		break;
++	case GW_EVENT_START_THROBBER:
++		gw->loading = true;
++		break;
++	case GW_EVENT_STOP_THROBBER:
++		gw->loading = false;
++		break;
+ 	case GW_EVENT_UPDATE_EXTENT:
+ 		/* Re-clamp the scroll offset to the new extent. */
+ 		vita_window_scroll_by(gw, 0, 0);
+@@ -187,6 +194,28 @@ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy)
+ 	}
+ }
+ 
++/* exported interface documented in vita/window.h */
++bool vita_window_loading(struct gui_window *gw)
++{
++	return gw != NULL && gw->loading;
++}
++
++/* exported interface documented in vita/window.h */
++void vita_window_force_redraw(struct gui_window *gw)
++{
++	if (gw != NULL)
++		gw->dirty = true;
++}
++
++/* exported interface documented in vita/window.h */
++void vita_window_extent(struct gui_window *gw, int *width, int *height)
++{
++	*width = *height = 0;
++	if (gw == NULL || browser_window_get_extents(gw->bw, true,
++			width, height) != NSERROR_OK)
++		*width = *height = 0;
++}
++
+ /* exported interface documented in vita/window.h */
+ struct browser_window *vita_window_browser(struct gui_window *gw)
+ {
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index c4c1bcb88..509e2e325 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -41,6 +41,15 @@ void vita_window_redraw(struct gui_window *gw);
+ /** Scroll by a delta in pixels, clamped to the content extent. */
+ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy);
+ 
++/** Is a fetch in progress (between the throbber events)? */
++bool vita_window_loading(struct gui_window *gw);
++
++/** Repaint on the next loop iteration even if nothing was invalidated. */
++void vita_window_force_redraw(struct gui_window *gw);
++
++/** The content's extent in pixels (0 x 0 if none yet). */
++void vita_window_extent(struct gui_window *gw, int *width, int *height);
++
+ /** The browser window shown in this gui window. */
+ struct browser_window *vita_window_browser(struct gui_window *gw);
+ 

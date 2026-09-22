@@ -15,7 +15,10 @@
  *  - input is scripted: once the screen has been idle for a while (the page
  *    has settled) the last shown frame is written to VITA_SIM_OUT/page-N.png
  *    and R is pressed to open the next test page; after VITA_SIM_PAGES
- *    pages, START quits.
+ *    pages, START quits. With VITA_SIM_AUTOTEST=1 it instead presses SQUARE
+ *    once (the frontend's autotest, vita/main.c) and START when the
+ *    autotest's ux0:data/VitaBrowser/autotest.done marker appears -- so the
+ *    simulator writes the same log and plot dumps a Vita does.
  *
  * What this cannot tell you: anything about the GXM, PGF's real metrics,
  * memory, or speed. It proves the frontend's logic, not the hardware.
@@ -400,6 +403,27 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 	if (++polls > MAX_POLLS) {
 		fprintf(stderr, "vitasim: timed out on page %u\n", page);
 		exit(4);
+	}
+	if (getenv("VITA_SIM_AUTOTEST") != NULL) {
+		static int started;
+		if (started) {
+			if (access("ux0:data/VitaBrowser/autotest.done", F_OK) == 0) {
+				printf("vitasim: autotest done after %u frames\n",
+				       frames);
+				pad->buttons = SCE_CTRL_START;
+			}
+			return 1;
+		}
+		if (frames != last_frames) {
+			last_frames = frames;
+			idle = 0;
+			return 1;
+		}
+		if (++idle >= SETTLE_POLLS) {
+			started = 1;
+			pad->buttons = SCE_CTRL_SQUARE;
+		}
+		return 1;
 	}
 	if (frames != last_frames) {
 		last_frames = frames;

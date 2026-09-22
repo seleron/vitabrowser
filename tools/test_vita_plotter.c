@@ -38,6 +38,7 @@
 #include "vita/plot_geom.h"
 #include "vita/plot.h"
 #include "vita/replay.h"
+#include "vita/diag.h"
 
 void test_monkey_rectangle(const plot_style_t *style, const struct rect *r,
 			   char *out, size_t cap);
@@ -175,6 +176,9 @@ int vita2d_pgf_text_height(vita2d_pgf *f, float scale, const char *text)
  * which this test does not link (its table pulls in core headers only,
  * but it is exercised by the cross build). */
 struct bitmap { vita2d_texture *tex; };
+
+/* Owned by vita/diag.c, which this test does not link. */
+FILE *vita_plot_trace;
 struct vita2d_texture *vita_bitmap_texture(struct bitmap *b)
 {
 	return b ? b->tex : NULL;
@@ -588,6 +592,57 @@ static void test_backend(void)
 		CHECK(count_lines("tex ") == 6 && has_line("tex 10x20 -10 0 2 2"),
 		      "repeat-x tiles:\n%s", vlog);
 		vita2d_free_texture(bm.tex);
+	}
+
+	/* Plot-stream dump (the device-side diag format): every op written
+	 * exactly as nsmonkey would, so device dumps diff against the
+	 * desktop streams. The rectangle pieces must equal the real monkey
+	 * plotter's lines for the same style. */
+	{
+		static char mbuf[8192], dbuf[8192];
+		char expect[8192];
+		size_t got;
+		plot_font_style_t f;
+		int tri[6] = { 0, 0, 10, 0, 5, 8 };
+
+		vita_plot_trace = tmpfile();
+		CHECK(vita_plot_trace != NULL, "tmpfile");
+		r = (struct rect){ 1, 2, 300, 400 };
+		P->clip(&ctx, &r);
+		s = style0(); s.fill_type = PLOT_OP_TYPE_LINEAR_GRADIENT;
+		s.box_shadow = 8 << 10; s.box_shadow_y = 8 << 10;
+		s.opacity = (PLOT_STYLE_SCALE * 40) / 100;
+		r = (struct rect){ 10, 10, 210, 170 };
+		P->rectangle(&ctx, &s, &r);
+		memset(&f, 0, sizeof(f));
+		f.size = 12 * PLOT_STYLE_SCALE;
+		P->text(&ctx, &f, 5, 30, "Hello, world", 5);
+		P->polygon(&ctx, &s, tri, 3);
+		rewind(vita_plot_trace);
+		got = fread(dbuf, 1, sizeof(dbuf) - 1, vita_plot_trace);
+		dbuf[got] = '\0';
+		fclose(vita_plot_trace);
+		vita_plot_trace = NULL;
+
+		test_monkey_rectangle(&s, &r, mbuf, sizeof(mbuf));
+		{
+			/* monkey's lines come without the PLOT prefix */
+			size_t n = 0;
+			const char *m = mbuf;
+			n += (size_t)snprintf(expect + n, sizeof(expect) - n,
+				"PLOT CLIP X0 1 Y0 2 X1 300 Y1 400\n");
+			while (*m) {
+				size_t len = strcspn(m, "\n");
+				n += (size_t)snprintf(expect + n, sizeof(expect) - n,
+					"PLOT %.*s\n", (int)len, m);
+				m += len + (m[len] == '\n');
+			}
+			snprintf(expect + n, sizeof(expect) - n,
+				 "PLOT TEXT X 5 Y 30 STR Hello\n"
+				 "PLOT POLYGON VERTICIES 3\n");
+		}
+		CHECK(strcmp(dbuf, expect) == 0,
+		      "plot dump format:\n--- got\n%s--- expected\n%s", dbuf, expect);
 	}
 
 	vita_plot_fini();

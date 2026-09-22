@@ -131,6 +131,7 @@ staged tree:
 | core portability for newlib / no-curl builds: curl include guard, `<string.h>`, `PATH_MAX`, no mmap / `*at` for `__vita__` | patch 30, doc 09 §4.3 |
 | the Vita frontend (`frontends/vita`, `TARGET=vita`) | patch 31, doc 09 |
 | drop shadows / transform quads no longer clipped to their own box: ink outset (`html/box_ink.h`) in the layout bbox + widened background-paint clip | patch 32, doc 09 §10 |
+| Vita hardware-test diagnostics: crash-safe log, timings, memory probe, plot dumps, autotest, LiveArea assets, ext-memory VPK variant | patch 33, doc 10 |
 | `-Wno-error=missing-prototypes / implicit-function-declaration / int-conversion` (MacSurf's new files ported from a CodeWarrior baseline) | `tools/build-patched.sh` CFLAGS |
 
 Two subtleties worth keeping:

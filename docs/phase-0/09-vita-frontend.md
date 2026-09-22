@@ -316,7 +316,8 @@ and fixed by patch 32 (§10).
 
 ## 8. Next actions
 
-1. **First hardware run** of `VitaBrowser.vpk`. Calibrate `VITA_PGF_EM_PX`,
+1. **First hardware run**: plan and diagnostics build in
+   [10](10-hardware-test-plan.md) (patch 33). Calibrate `VITA_PGF_EM_PX`,
    check the PGF baseline and clip edges against the simulator screenshots,
    and measure the allocate-until-failure budget (pre-phase-0 §1).
 2. ~~**Core clip fix for shadows/transforms** (§5)~~ — done, patch 32 (§10).
