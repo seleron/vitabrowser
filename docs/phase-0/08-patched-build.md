@@ -6,9 +6,10 @@
 scope decision it forced.
 **Status:** **achieved.** `tools/build-patched.sh` builds the full stack
 (5 libraries + 6 support libraries + netsurf) and links
-`nsmonkey` (13.68 MB, 2026-09-22 rebuild 12, 107 patches applied).
+`nsmonkey` (13.69 MB, 2026-09-22 rebuild 13, 108 patches applied).
 Author CSS (inline `<style>` and external `<link>`), CSS grid
-(`-macsurf-grid`), and form-control tag types now render — see doc 06 §6/§6b.
+(`-macsurf-grid`), form-control tag types, and two-stop linear gradients
+now render — see doc 06 §6/§6b/§6c.
 
 ---
 
@@ -19,12 +20,12 @@ $ WORK=<WORK>/vitabrowser-work tools/build-patched.sh
 == regenerating the patch stack ==
 excluded: 53380 rename, 34755 generated, 1095 include-rewrite, 117718 deletion, 243 shim
 == applying the stack ==
-applied: 107   failed: 2
+applied: 108   failed: 2
 == building libraries ==
   libwapcaplet ok  libparserutils ok  libhubbub ok  libcss ok  libdom ok
 == building netsurf + nsmonkey ==
   netsurf ok
--rwxrwxr-x 1 seleron seleron 13684784 Sep 22 .../netsurf/nsmonkey
+-rwxrwxr-x 1 seleron seleron 13685768 Sep 22 .../netsurf/nsmonkey
 ```
 
 The **2 failures are pre-existing, not new**: `libhubbub/04-treebuilder.patch`
@@ -100,8 +101,11 @@ Known functional gaps until Phase 1 (documented, expected, deliberate):
 reset / MacSurf select styling** (upstream `select.c` already renders
 options), **font baseline tuning** (MacSurf's `html_font.c` baseline is a
 no-op identical to ours; the real delta needs MacSurf-side text-shadow/
-transform rendering), and **`<input>`/form-control rendering polish**
-(tag types are now real — L2's `ui` label renders).
+transform rendering), **`<input>`/form-control rendering polish**
+(tag types are now real — L2's `ui` label renders), **radial + multi-stop
+gradients** (the two-stop linear path is live, patch 25; radial has no
+bandable axis on the stream frontend, doc 06 §6c), and **the `to right`
+gradient direction** (libcss bytecode gap, doc 06 §6c).
 
 ## 4. Durability: what survived re-staging
 
@@ -120,6 +124,7 @@ staged tree:
 | `macsurf_profile_*` no-op stubs | `compat/macsurf_compat.c` / `macsurf_core_decls.h` |
 | grid + tag-type: Makefile wiring for `layout_grid.c` / `macsurf_dom_compat.c` | patch 23 |
 | `-Werror` fixes for `layout_grid.c` (`<string.h>`, two brace-less ifs) | patch 24 |
+| two-stop linear-gradient plotter: `monkey_plot_rectangle` bands `fill_colour`→`fill_colour2` into 32 solid strips (radial → single solid) | patch 25 (`frontends/monkey/plot.c`) |
 | `-Wno-error=missing-prototypes / implicit-function-declaration / int-conversion` (MacSurf's new files ported from a CodeWarrior baseline) | `tools/build-patched.sh` CFLAGS |
 
 Two subtleties worth keeping:

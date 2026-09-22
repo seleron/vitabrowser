@@ -1,0 +1,88 @@
+# netsurf monkey: two-stop linear-gradient plotter (fill_colour2 -> 32 banded PLOT RECT strips)
+# Generated 2026-09-22
+--- a/frontends/monkey/plot.c
++++ b/frontends/monkey/plot.c
+@@ -18,6 +18,7 @@
+ 
+ #include <stdio.h>
+ 
++#include <stdint.h>
+ #include "utils/utils.h"
+ #include "utils/errors.h"
+ #include "netsurf/plotters.h"
+@@ -125,13 +126,73 @@
+  * \param rect A rectangle defining the line to be drawn
+  * \return NSERROR_OK on success else error code.
+  */
++/* MacSurf port: two-stop linear gradients.
++ *
++ * The core (MacSurf redraw.c) sets fill_type to PLOT_OP_TYPE_LINEAR_GRADIENT
++ * (_H) with fill_colour as the start colour and fill_colour2 as the end
++ * colour. Monkey has no gradient fill primitive, so we band the fill into N
++ * thin solid rectangles. The plot stream records them as N `PLOT RECT`
++ * lines, so a gradient becomes a visible stack of strips (band *count* is
++ * the observable proof; a colour-aware plotter like the Vita frontend would
++ * consume the interpolated per-band colour, which we compute here). Radial
++ * gradients have no bandable axis on this frontend and fall back to a single
++ * solid fill.
++ */
++#define MACMONK_GRAD_BANDS 32
++
+ static nserror
+ monkey_plot_rectangle(const struct redraw_context *ctx,
+ 		      const plot_style_t *style,
+ 		      const struct rect *rect)
+ {
+-	moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
+-		rect->x0, rect->y0, rect->x1, rect->y1);
++	bool horizontal;
++	int n = MACMONK_GRAD_BANDS;
++	int span, i;
++
++	if (style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT &&
++			style->fill_type != PLOT_OP_TYPE_LINEAR_GRADIENT_H) {
++		moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++			rect->x0, rect->y0, rect->x1, rect->y1);
++		return NSERROR_OK;
++	}
++	horizontal = (style->fill_type == PLOT_OP_TYPE_LINEAR_GRADIENT_H);
++	span = horizontal ? (rect->x1 - rect->x0) : (rect->y1 - rect->y0);
++	if (span <= 0) {
++		moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++			rect->x0, rect->y0, rect->x1, rect->y1);
++		return NSERROR_OK;
++	}
++
++	/* NetSurf colour: R in the low byte, then G, then B. Interpolate
++	 * across the span; the per-band colour is a no-op here (geometry-only
++	 * stream) but documents the value a real plotter would fill with. */
++	{
++		uint32_t c1 = (uint32_t)style->fill_colour & 0xFFFFFF;
++		uint32_t c2 = (uint32_t)style->fill_colour2 & 0xFFFFFF;
++		int r1 = (int)(c1 & 0xFF), g1 = (int)((c1 >> 8) & 0xFF),
++		    b1 = (int)((c1 >> 16) & 0xFF);
++		int r2 = (int)(c2 & 0xFF), g2 = (int)((c2 >> 8) & 0xFF),
++		    b2 = (int)((c2 >> 16) & 0xFF);
++		for (i = 0; i < n; i++) {
++			struct rect br = *rect;
++			int t = (i * 255) / n;
++			int fr = r1 + ((r2 - r1) * t) / 255;
++			int fg = g1 + ((g2 - g1) * t) / 255;
++			int fb = b1 + ((b2 - b1) * t) / 255;
++			(void)fr; (void)fg; (void)fb;
++			if (horizontal) {
++				br.x0 = rect->x0 + span * i / n;
++				br.x1 = rect->x0 + span * (i + 1) / n;
++			} else {
++				br.y0 = rect->y0 + span * i / n;
++				br.y1 = rect->y0 + span * (i + 1) / n;
++			}
++			if (br.x1 <= br.x0 || br.y1 <= br.y0)
++				continue;
++			moutf(MOUT_PLOT, "RECT X0 %d Y0 %d X1 %d Y1 %d",
++				br.x0, br.y0, br.x1, br.y1);
++		}
++	}
+ 	return NSERROR_OK;
+ }
+ 

@@ -1,22 +1,24 @@
 # Phase 0 — measuring the patch stack with plot streams
 
-**Date:** 2026-09-21 (updated 2026-09-22, twice: dom-walk discovery + grid/tag-type ports)
+**Date:** 2026-09-21 (updated 2026-09-22, thrice: dom-walk discovery + grid/tag-type ports + gradient plotter)
 **Covers:** `04-patch-stack.md` §8 item 2 — the first real use of the §14.3 harness
 **Status:** ✅ `nsmonkey` builds against the patched engine, author CSS now
 renders, **CSS grid + form-control tag-types are live** (patches 23+24), and
 **L1 is byte-identical to the pristine golden.** L2/L3/L4 differ only where the
 patch stack adds behavior the pristine engine lacks.
 
-> **Headline (2026-09-22, third pass):** After (1) fixing the
+> **Headline (2026-09-22, fourth pass):** After (1) fixing the
 > `css_error_from_parserutils_error` stub, (2) replacing the no-op
-> `html_css_discover_stylesheets` stub with a real DOM walk (§6), and (3)
+> `html_css_discover_stylesheets` stub with a real DOM walk (§6), (3)
 > promoting the `layout_grid` + `macsurf_html_element_get_tag_type` weak
-> no-op stubs to their real MacSurf implementations (§6b, patches 23+24),
+> no-op stubs to their real MacSurf implementations (§6b, patches 23+24), and
+> (4) adding the two-stop linear-gradient plotter to monkey (§6c, patch 25),
 > the patched engine renders all author CSS (inline `<style>` and `<link>`),
-> lays out MacSurf's `-macsurf-grid`, and renders `<select>`/`<input>`
-> controls. L1 matches the pristine golden byte-for-byte. The remaining
-> L2/L3/L4 diffs are the value functions, MacSurf's proprietary grid dialect,
-> and layout reflows the stack is *meant* to add — not regressions.
+> lays out MacSurf's `-macsurf-grid`, renders `<select>`/`<input>` controls,
+> and bands linear gradients. L1 matches the pristine golden byte-for-byte.
+> The remaining L2/L3/L4 diffs are the value functions, MacSurf's proprietary
+> grid dialect, and layout reflows the stack is *meant* to add — not
+> regressions.
 
 ---
 
@@ -25,7 +27,7 @@ patch stack adds behavior the pristine engine lacks.
 | Binary | Built from | Size |
 |---|---|---|
 | upstream `nsmonkey` | pristine NetSurf | 12,784,000 B |
-| patched `nsmonkey` | + the 62-patch stack (+ 22 vitabrowser patches) | 13,590,640 B |
+| patched `nsmonkey` | + the 62-patch stack (+ 23 vitabrowser patches) | 13,685,768 B |
 
 Both render at **960x544** (Vita front screen). The patched binary's viewport
 is set by `patches/vitabrowser/22-netsurf-macmonkey-viewport.patch`, which
@@ -33,7 +35,7 @@ overrides monkey's hardcoded 800x600; without it every comparison diff is
 dominated by window-size reflow (doc 03 §5).
 
 `tools/compare-engines.sh` renders every probe page with both and diffs the
-plot streams (2026-09-22, post grid/tag-type ports, rebuild 12, 107 patches):
+plot streams (2026-09-22, post grid/tag-type/gradient ports, rebuild 13, 108 patches):
 
 ```
 SAME  L1-layout-basics
@@ -267,6 +269,43 @@ tests — is *not* what `layout_grid` implements, so L3's 231→224 op differenc
 is two engines speaking different grid dialects, not a regression and not a
 fix. L1 staying byte-identical (SAME) confirms no incidental breakage.
 
+## 6c. Two-stop linear-gradient plotter (2026-09-22, patch 25)
+
+The box-model consumer of `-macsurf-gradient`, the most-used of the 44 added
+properties on real MacSurf pages (body glow, pinstripes, section washes).
+
+**Gap.** The core (MacSurf `redraw.c`, staged verbatim) packs two endpoint
+colours + a direction bit (libcss `s_macsurf_gradient.c` → `fill_colour` /
+`fill_colour2`, op type `PLOT_OP_TYPE_LINEAR_GRADIENT` vertical /
+`..._GRADIENT_H` horizontal / `..._RADIAL_GRADIENT`) and emits it as a
+`plot->rectangle`. Monkey's `plot.c` only reads `fill_colour` — gradient ops
+fell through to a single solid `PLOT RECT`, so every gradient painted as its
+start colour.
+
+**Fix (one file).** `frontends/monkey/plot.c` `monkey_plot_rectangle` now
+bands the fill into 32 thin solid rectangles, interpolated per band
+(start→end, computed in-band even though the stream records geometry only).
+A colour-aware plotter (the Vita frontend) would fill each band with the
+interpolated colour; the plot stream proves the geometry. Radial gradients
+have no bandable axis on this frontend → single solid rect (documented gap).
+Self-contained 64-line patch; no core, Makefile, or stub changes.
+
+**Verification.** Unit test (`gradband/ut.c`, direct `monkey_plot_rectangle`
+calls): SOLID → 1 rect; VERTICAL → 32 horizontal strips; HORIZONTAL → 32
+vertical strips. Full page (`PM-gradient.html`, rebuild 13): vertical box =
+32 strips of 5px (Y 10→165); radial = single rect; **L1 SAME** (canary
+byte-identical).
+
+**Known gap (libcss, not the plotter).** `linear-gradient(to right, c1, c2)`
+renders as a vertical gradient end-to-end: the parser *does* set
+`horizontal=true` (verified `p_macsurf_gradient.c` 323), the cascade *does*
+pack bit 15, and `redraw.c` *does* pick `_H` — yet the `to right` box arrives
+at the plotter as `LINEAR_GRADIENT`, not `_H`. The loss is somewhere in the
+bytecode `set_value` (0x0080/0x00C0) round-trip; the unit test proves the
+plotter itself bands `_H` correctly, so this is a libcss/cascade direction
+keyword issue, out of scope for the plotter port (diagonal/3-stop extended
+gradients, op `0x0180`, are a further separate layer).
+
 ## 7. Blocked / not done
 
 - **Standard `grid-template-columns`** — not implemented (see §6b scope note).
@@ -290,11 +329,11 @@ fix. L1 staying byte-identical (SAME) confirms no incidental breakage.
 
 ## 8. Next actions
 
-1. **Port MacSurf's `browser/netsurf` changes** (plotters, box-model use of
-   the 44 properties, animation timeline).
-2. **Grow `testpages/`** — `PM-macsurf-grid.html` and `PM-tagtype.html` are
-   in; add a probe page whose only styling is an external
-   `<link rel="stylesheet">` (all current probe pages use inline `<style>`
-   only), so the `<link>` path in §6 is covered by the golden harness.
+1. **Port the remaining box-model consumers** — box-shadow (needs core
+   `plot_style_t` + monkey plumbing, and no blur primitive — a real gap, not
+   a plotter one-liner), then animation timeline.
+2. **Investigate the libcss `to right` direction gap** (§6c): the parser /
+   cascade / redraw chain all look right, yet the `_H` op is lost in the
+   bytecode `set_value` round-trip. Worth one focused session.
 3. **Re-run `compare-engines.sh`** after each; L1 must stay SAME as the
    canary.
