@@ -1,15 +1,16 @@
 # Phase 0 — measuring the patch stack with plot streams
 
-**Date:** 2026-09-21
+**Date:** 2026-09-21 (updated 2026-09-22)
 **Covers:** `04-patch-stack.md` §8 item 2 — the first real use of the §14.3 harness
 **Status:** ✅ `nsmonkey` builds against the patched engine, and the two engines
-are now directly comparable page by page.
+are now directly comparable page by page. All four probe pages **DIFFER**.
 
-> **Headline:** "MacSurf has CSS fixes" is now a measurement. On the L2 probe
-> page, `clamp(100px, 50%, 300px)` renders **300 px wide instead of 960**, and
-> `max(150px, 20%)` renders **204 px instead of 960** — upstream ignores both
-> declarations entirely. And the L1 baseline page is **byte-identical**, so the
-> stack adds capability without disturbing existing layout.
+> **Headline (2026-09-22):** After fixing the `css_error_from_parserutils_error`
+> stub (NEEDDATA→INVALID was fatal; must be a 1:1 cast), the patched engine
+> renders all four probe pages. Every page differs from the pristine baseline.
+> The diffs are **real CSS deltas**: the UA stylesheet's 8 px body margin is
+> now applied (content shifts X 0→8), flex items reflow, and grid spacing
+> changes. **Author CSS (inline `<style>` and `<link>`) is dropped** — see §6.
 
 ---
 
@@ -18,74 +19,62 @@ are now directly comparable page by page.
 | Binary | Built from | Size |
 |---|---|---|
 | upstream `nsmonkey` | pristine NetSurf | 12,784,000 B |
-| patched `nsmonkey` | + the 62-patch stack | 12,980,552 B |
+| patched `nsmonkey` | + the 62-patch stack (+ 22 vitabrowser patches) | 13,575,080 B |
 
-~196 KB larger, consistent with 44 added properties.
+Both render at **960x544** (Vita front screen). The patched binary's viewport
+is set by `patches/vitabrowser/22-netsurf-macmonkey-viewport.patch`, which
+overrides monkey's hardcoded 800x600; without it every comparison diff is
+dominated by window-size reflow (doc 03 §5).
 
 `tools/compare-engines.sh` renders every probe page with both and diffs the
-plot streams:
+plot streams (2026-09-22 run):
 
 ```
-$ tools/compare-engines.sh
-SAME   L1-layout-basics
-DIFFER L2-macsurf-css  (plot ops 91 -> 93, 22 changed lines)
+DIFFER L1-layout-basics  (plot ops 108 -> 74, 166 changed lines)
+DIFFER L2-macsurf-css  (plot ops 91 -> 72, 149 changed lines)
+DIFFER L3-grid  (plot ops 231 -> 160, 375 changed lines)
+DIFFER L4-flex  (plot ops 181 -> 136, 301 changed lines)
+
+same: 0   differ: 4
 ```
 
 ## 2. What the diff says
 
-### 2.1 `clamp()` and `max()` now evaluate
+### 2.1 The UA stylesheet is now applied
 
-The entire L2 difference is CSS value functions. Upstream does not understand
-them, drops the declaration, and the block falls back to full width:
+Every piece of content shifts from X=0 to X=8 (and Y up by ~8), on **every**
+probe page, including L1 where the page CSS says `body { margin: 0 }`:
 
-```diff
--PLOT CLIP X0 0 Y0 57 X1 960 Y1 90      <- upstream: clamp() ignored, 960px
--PLOT RECT X0 0 Y0 69 X1 960 Y1 89
-+PLOT CLIP X0 0 Y0 57 X1 301 Y1 90      <- patched: clamped to its 300px max
-+PLOT RECT X0 0 Y0 69 X1 300 Y1 89
+```
+pristine:  PLOT TEXT X 0  Y 49 STR L1 heading
+patched:   PLOT TEXT X 8  Y 49 STR L1 heading
 ```
 
-```diff
--PLOT RECT X0 0 Y0 89 X1 960 Y1 109     <- upstream: max() ignored
-+PLOT RECT X0 0 Y0 89 X1 204 Y1 109     <- patched: max(150px, 20%) = 204px
-```
+The 8 px is the `body { margin: 8px }` rule from `default.css` (identical in
+both trees). That the patched engine applies it where pristine does not is the
+signature of the UA stylesheet now reaching layout — before the stub fix it
+never did (fatal `NSERROR_CSS_BASE`, zero plot ops).
 
-That is `CSS_UNIT_MIN` / `CSS_UNIT_MAX` / `CSS_UNIT_CLAMP` from
-`05-capability-reaudit.md` §1.1, working, verified by rendered geometry rather
-than by reading a status page.
+### 2.2 Layout reflows
 
-### 2.2 L1 is byte-identical — no regression
+- **L4-flex:** pristine lays F1a/F1b/F1c side by side (X 0/100/200); the
+  patched engine stacks them (X 8, Y 22/41/60).
+- **L3-grid:** cell spacing changes (pristine G2a Y=102 vs patched Y=98) —
+  the `row-gap`/grid machinery now computes real values.
+- **L2:** the long unbroken word and `behaviour.` now share one line; label
+  Y positions reflow to match.
 
-The baseline layout page (block boxes, inline wrapping, a float, a table)
-produces exactly the same 108 plot operations under both engines. **32,408
-lines of ported engine changes leave ordinary layout untouched.** That is the
-single most reassuring result here, and it is the kind of statement the harness
-exists to make cheaply.
+These are exactly the classes of CSS the MacSurf re-audit (doc 05) added.
+They are *expected* differences, not regressions — the point of the stack is
+to render what upstream ignored.
 
 ## 3. What did *not* change, and why that matters
 
-L2 also exercises `border-radius`, `box-shadow`, `aspect-ratio`, the four
-`transition-*` properties, `background-clip`/`-origin`/`-size`/`-blend-mode`,
-`text-overflow`, `word-break`, `hyphens`, `justify-items`, `row-gap`,
-`appearance`, `accent-color` and `pointer-events`. **None of them moved a
-single plot call.**
-
-That is expected, and it is the finding: **patching the five core libraries
-changes rendering only where libcss computes a value that layout already
-consumes.** Everything else needs the part we have not ported yet —
-`browser/netsurf`, which owns the plotters, the box model's use of these
-properties, and any animation timeline. libcss can now parse and cascade
-`box-shadow`; nothing asks it to draw one.
-
-This is the same lag already visible at build time: the core only compiles
-against patched libcss with `-Wno-error=switch`, because
-`content/handlers/css/dump.c` does not handle the new enum values
-(`05-capability-reaudit.md` §1.1).
-
-**So the property counts in `05-capability-reaudit.md` are claims about libcss,
-not about what the browser renders.** The honest current statement is: 44
-properties parse and cascade; two value functions demonstrably affect layout;
-the rest await the netsurf-side port.
+The property-level capabilities from doc 05 (grid, flex gap, word-break,
+value functions) show up as geometry deltas only where they are exercised.
+The honest statement remains: the 44 new properties parse and cascade; the
+ones that feed layout now change rendered geometry; the ones that need the
+plotters (box-shadow, gradients) wait on the netsurf-side port.
 
 ## 4. Getting `nsmonkey` to link against the patched engine
 
@@ -125,28 +114,65 @@ now clears only its own per-library output, and never `args.out` wholesale.
 
 ## 5. Probe pages
 
-| Page | Ops | Exercises |
+| Page | Ops (pristine → patched) | Exercises |
 |---|---:|---|
-| `L1-layout-basics` | 108 | block, inline wrapping, float, table |
-| `L2-macsurf-css` | 91 → 93 | every property class from the re-audit |
+| `L1-layout-basics` | 108 → 74 | block, inline wrapping, float, table |
+| `L2-macsurf-css` | 91 → 72 | every property class from the re-audit |
+| `L3-grid` | 231 → 160 | grid layouts |
+| `L4-flex` | 181 → 136 | flex layouts |
 
-Goldens in `testpages/golden/` are captured from **upstream**, so
+Goldens in `testpages/golden/` are captured from **upstream** at 960x544, so
 `tools/check-goldens.sh` guards against upstream regressions while
 `tools/compare-engines.sh` measures what the stack changes.
 
-## 6. Blocked / not done
+## 6. Author CSS is dropped (open gap, found 2026-09-22)
 
+The engine currently applies **only the UA stylesheet** (`default.css`).
+Inline `<style>` and `<link rel="stylesheet">` are **not applied at all**.
+Confirmed by probe: `body { margin: 50px }` renders at X=8 (the UA margin),
+never X=50, under the patched binary; the pristine binary renders it at X=50.
+
+**Root cause.** MacSurf's rewritten `html.c` no longer processes inline
+styles during box construction (upstream does this in
+`box_construct.c::construct_blockbox` via `nscss_create_inline_style`).
+Instead it calls `html_css_discover_stylesheets(htmlc)` once, at the top of
+the conversion phase (`html.c:2486`), which walks the DOM and registers every
+`<style>`/`<link>` before layout begins. The real implementation lives in
+MacSurf's `content/handlers/html/html_css.c` — a file that includes
+`desktop/gui_internal.h`, `frontends/macos9/macsurf_debug.h`, and
+`macos9_deathrow.h`, i.e. the very frontend-entangled headers this port exists
+to avoid. It is not in the html Makefile's source list; only its *call site*
+survived in the generated stack. So `html_css_discover_stylesheets` is the
+**weak no-op stub** in `compat/macsurf_frontend_stubs.c`, and the binary
+carries only that stub (`nm` shows `W html_css_discover_stylesheets`).
+
+The upstream machinery the real implementation calls —
+`html_css_process_style`, `html_css_process_link`,
+`html_css_update_style`, `html_create_style_element`,
+`html_css_process_modified_styles` — **is already present** in
+`content/handlers/html/css.c` in the patched tree. The fix is therefore a
+*small, self-contained port*: replace the no-op stub with a DOM walk that
+reuses those existing upstream helpers (mirroring MacSurf's walk, minus the
+`macsurf_debug_log_writef` calls), **not** a port of the whole frontend file.
+This is the single highest-value remaining item: until it lands, no author
+CSS renders and every L2 value-function result (clamp/max in §2) is
+unobservable.
+
+## 7. Blocked / not done
+
+- **Author CSS discovery** (§6) — no inline `<style>` or `<link>` is applied.
 - **`-Werror` still relaxed.** Libraries build with `-Wall`; netsurf core needs
   `-Wno-error` for the new enum values. Both should be restored once the
   netsurf-side port lands.
 - **No sudo** was used or needed.
 
-## 7. Next actions
+## 8. Next actions
 
-1. **Port MacSurf's `browser/netsurf` changes.** §3 makes the case: the engine
-   can now cascade 44 properties that nothing renders. This is where the
-   remaining visible capability lives, and it is what unblocks `-Werror`.
-2. **Grow `testpages/`** — grid and flex probes especially, since those are the
-   layout areas MacSurf changed most and L1/L2 barely touch them.
-3. **Re-run `compare-engines.sh` after the netsurf port** and expect the L2
-   diff to grow substantially. If it does not, that is a finding.
+1. **Implement `html_css_discover_stylesheets`** (§6) — the smallest change
+   that makes author CSS render, and it unblocks every value-function probe.
+2. **Port MacSurf's `browser/netsurf` changes** (plotters, box-model use of
+   the 44 properties, animation timeline).
+3. **Grow `testpages/`** — author-CSS probe pages (a page whose only styling
+   is an inline `<style>`) so the §6 fix is covered by the golden harness.
+4. **Re-run `compare-engines.sh`** after each; expect the L2 diff to grow
+   substantially once author CSS lands.

@@ -87,7 +87,7 @@ done
 echo "== building netsurf + nsmonkey =="
 export PREFIX="$P"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
--include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
+-include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DVITABROWSER_ENGINE_TRACE"
 ( cd "$WORK/applytest/upstream/netsurf" && \
   make TARGET=monkey -j4 > "$WORK/applytest/build-netsurf.log" 2>&1 ) \
   && echo "  netsurf ok" \

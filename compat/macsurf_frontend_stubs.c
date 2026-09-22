@@ -35,6 +35,7 @@
  */
 #include <stddef.h>
 #include <string.h>
+#include <libcss/errors.h>
 #include <libcss/properties.h>
 #include <libwapcaplet/libwapcaplet.h>
 #include <dom/dom.h>
@@ -63,16 +64,31 @@ unsigned long charToHex(unsigned char c)
 	return 0;
 }
 
-/* css_error: 0=CSS_OK 1=CSS_NOMEM 2=CSS_BADPARM 3=CSS_INVALID
- * lwc_error: 0=ok 1=oom 2=range ; parserutils_error: 0=ok 1=oom 2=invalid */
+/* css_error:  0=OK 1=NOMEM 2=BADPARM 3=INVALID 4=FILENOTFOUND 5=NEEDDATA
+ *              6=BADCHARSET 7=EOF
+ * lwc_error:  0=ok 1=oom 2=range
+ *
+ * css_error_from_parserutils_error MUST be a 1:1 cast. The css_error and
+ * parserutils_error enums are value-aligned (both 0..7 in the same order),
+ * and upstream libcss/src/utils/parserutilserror.h defines it exactly as
+ * `(css_error) error`. A default-to-CSS_INVALID switch was fatal: it turned
+ * PARSERUTILS_NEEDDATA (5) -- a *recoverable* "feed me more data" signal the
+ * streaming parser emits on every chunked append -- into CSS_INVALID (3),
+ * which invalidated the base sheet (default.css) and raised NSERROR_CSS_BASE
+ * on every page. Keep it a plain cast.
+ *
+ * css_error_from_lwc_error: lwc is {ok,oom,range}; oom is the only one worth
+ * propagating, everything else maps to INVALID (matches upstream lwcerr.h).
+ */
 int css_error_from_lwc_error(int err)
 {
-	switch (err) { case 0: return 0; case 1: return 1; default: return 2; }
+	switch (err) { case 0: return CSS_OK; case 1: return CSS_NOMEM;
+	                default: return CSS_INVALID; }
 }
 
 int css_error_from_parserutils_error(int err)
 {
-	switch (err) { case 0: return 0; case 1: return 1; default: return 2; }
+	return (css_error) err;
 }
 
 /* MUST return lwc_string_hash_value(str->insensitive): libcss inserts

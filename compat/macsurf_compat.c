@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 
 struct content;
@@ -31,15 +32,15 @@ void ns_color_hex_alpha(char *buf, unsigned long col);
 __attribute__((weak))
 void macsurf_debug_log_writef(const char *fmt, ...)
 {
-#ifdef VITABROWSER_ENGINE_TRACE
+	if (getenv("MS_TRACE") == NULL) {
+		(void) fmt;
+		return;
+	}
 	va_list ap;
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
-#else
-	(void) fmt;
-#endif
 }
 
 /*
