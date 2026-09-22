@@ -15,8 +15,11 @@
  *                                          the caseless intern, or libcss's
  *                                          selector hash returns nothing and
  *                                          no author CSS ever matches
+ *     html_css_discover_stylesheets        DOM walk finding <style>/<link>,
+ *                                          registered via css.c's exported
+ *                                          update_style/process_link helpers
  *   FUNCTIONAL-NOOP (safe: they only gate/measure, the page still renders):
- *     layout_grid, html_css_discover_stylesheets, nscss_reset_node_data,
+ *     layout_grid, nscss_reset_node_data,
  *     font_plot_style_baseline, macsurf_html_element_get_tag_type,
  *     macos9_content_is_live, js_exec_module, macsurf_js_notify_content_freed,
  *     macos9_hittest_scroll_x/y
@@ -26,8 +29,8 @@
  *     macsurf_free_mem, macsurf_ptr_is_valid, macsurf_debug_log_reconv_flush,
  *     macos9_deathrow_cur_ptr/fn
  *
- * Known functional gaps (documented in docs/phase-0/08): CSS grid, external
- * <link> stylesheets, font-baseline tuning, inline ES modules.
+ * Known functional gaps (documented in docs/phase-0/08): CSS grid,
+ * font-baseline tuning, inline ES modules.
  *
  * Compiled into content/handlers/html/ (has the libcss/libdom/libwapcaplet
  * include paths). Weak, so a real implementation (the Vita frontend) can
@@ -40,6 +43,22 @@
 #include <libwapcaplet/libwapcaplet.h>
 #include <dom/dom.h>
 #include <dom/html/html_element.h>
+
+/* html_css_discover_stylesheets (REAL below) walks the DOM and needs the
+ * full html_content definition (->document, ->stylesheets_discovered) plus
+ * the two exported stylesheet-registration helpers that css.c already
+ * provides. private.h is core-only (css.c includes it in the same build);
+ * it is the only heavy include this file drags in. */
+#include "utils/errors.h"
+#include "utils/log.h"
+#include "html/private.h"
+#include "utils/corestrings.h"
+#include "utils/nsoption.h"
+
+/* css.c exports (css.h:87, css.h:105). Declared here so we don't pull in
+ * the rest of css.h; the linker resolves them to the real definitions. */
+extern bool html_css_update_style(struct html_content *c, dom_node *style);
+extern bool html_css_process_link(struct html_content *c, dom_node *node);
 
 /* Pointer-only parameters; full definitions live in layout.h / content.h
  * which the stubs must not drag in (frontend-entangled includes). */
@@ -115,9 +134,140 @@ __attribute__((weak)) bool layout_grid(struct box *box, int width,
 	return false;
 }
 
-__attribute__((weak)) void html_css_discover_stylesheets(void *htmlc)
+/* ================= REAL: author-CSS stylesheet discovery ================
+ *
+ * html.c:2486 walks the parsed DOM before conversion and calls this once
+ * (guarded by c->stylesheets_discovered) to find every <style> and
+ * <link rel="stylesheet"> and start their CSS fetch. Upstream NetSurf
+ * discovered these via the libdom DOMSubtreeModified/DOMNodeInserted event
+ * chain; MacSurf (which we port from) replaced that with an explicit
+ * pre-conversion walk because the event chain is unreliable in its build.
+ *
+ * The old stub here was a no-op, so NO author stylesheet was ever
+ * registered/parsed/applied -- only the UA stylesheet (default.css). Every
+ * page rendered at the UA 8px body margin and author <style>/<link> was
+ * silently dropped (see docs/phase-0/06 §7: margin:50px -> X=8, not X=50).
+ *
+ * We implement the walk with the two stylesheet-registration helpers that
+ * css.c ALREADY exports (html_css_update_style / html_css_process_link) and
+ * that are compiled into this same target. The walk is the frontend-agnostic
+ * part; the fetch/parse/convert machinery (the modified flag that gates
+ * html_can_begin_conversion, the x-ns-css fetcher, html_convert_css_callback)
+ * is all upstream and already present. This is what MacSurf's
+ * html_css_register_inline_style_sync / html_css_process_link do, minus the
+ * frontends/macos9/ includes that cannot build here.
+ *
+ * Signature matches the declaration in html/css.h:119 and the call site in
+ * html.c:2486. */
+__attribute__((weak)) nserror html_css_discover_stylesheets(struct html_content *c)
 {
-	(void) htmlc;
+	dom_node *root = NULL;
+	dom_node *node = NULL;
+	dom_node *next = NULL;
+	dom_node *child = NULL;
+	dom_node *parent = NULL;
+	dom_exception exc;
+	dom_node_type ntype;
+	dom_string *tagname = NULL;
+	long style_found = 0;
+	long link_found = 0;
+
+	if (c == NULL) {
+		return NSERROR_BAD_PARAMETER;
+	}
+	if (c->stylesheets_discovered) {
+		return NSERROR_OK;
+	}
+	if (c->document == NULL) {
+		return NSERROR_OK;
+	}
+
+	exc = dom_document_get_document_element(c->document, &root);
+	if ((exc != DOM_NO_ERR) || (root == NULL)) {
+		return NSERROR_OK;
+	}
+
+	/* Iterative depth-first walk: child -> sibling -> parent.sibling.
+	 * We ref the node we descend into and unref the one we leave, keeping
+	 * exactly one ref outstanding besides the current node. */
+	node = root;
+	while (node != NULL) {
+		exc = dom_node_get_node_type(node, &ntype);
+		if ((exc == DOM_NO_ERR) && (ntype == DOM_ELEMENT_NODE)) {
+			exc = dom_node_get_node_name(node, &tagname);
+			if ((exc == DOM_NO_ERR) && (tagname != NULL)) {
+				if (dom_string_caseless_lwc_isequal(
+						tagname,
+						corestring_lwc_style)) {
+					/* Inline <style>. update_style
+					 * creates the slot, marks it
+					 * modified, and schedules the
+					 * fetch; the modified flag then
+					 * holds conversion until the
+					 * sheet is loaded. */
+					if (nsoption_bool(author_level_css)) {
+						(void)html_css_update_style(c, node);
+						style_found++;
+					}
+				} else if (dom_string_caseless_lwc_isequal(
+						tagname,
+						corestring_lwc_link)) {
+					/* process_link self-gates on
+					 * author_level_css, rel, type and
+					 * media; only starts a fetch for a
+					 * real rel=stylesheet link. */
+					(void)html_css_process_link(c, node);
+					link_found++;
+				}
+				dom_string_unref(tagname);
+				tagname = NULL;
+			}
+		}
+
+		/* Descend to first child if present. */
+		child = NULL;
+		exc = dom_node_get_first_child(node, &child);
+		if ((exc == DOM_NO_ERR) && (child != NULL)) {
+			dom_node_unref(node);
+			node = child;
+			continue;
+		}
+
+		/* Else move to next sibling if present. */
+		next = NULL;
+		exc = dom_node_get_next_sibling(node, &next);
+		if ((exc == DOM_NO_ERR) && (next != NULL)) {
+			dom_node_unref(node);
+			node = next;
+			continue;
+		}
+
+		/* Leaf with no sibling: climb until we find a parent that has a
+		 * next sibling, or run out of tree. */
+		for (;;) {
+			parent = NULL;
+			exc = dom_node_get_parent_node(node, &parent);
+			dom_node_unref(node);
+			node = NULL;
+			if ((exc != DOM_NO_ERR) || (parent == NULL)) {
+				break;
+			}
+			next = NULL;
+			exc = dom_node_get_next_sibling(parent, &next);
+			if ((exc == DOM_NO_ERR) && (next != NULL)) {
+				dom_node_unref(parent);
+				node = next;
+				break;
+			}
+			node = parent;
+		}
+	}
+
+	c->stylesheets_discovered = true;
+	NSLOG(netsurf, INFO,
+	      "discover: %ld <style> + %ld <link> elements found",
+	      style_found, link_found);
+	return NSERROR_OK;
 }
 
 __attribute__((weak)) int nscss_reset_node_data(void *node)

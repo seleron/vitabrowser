@@ -6,7 +6,8 @@
 scope decision it forced.
 **Status:** **achieved.** `tools/build-patched.sh` builds the full stack
 (5 libraries + 6 support libraries + netsurf) and links
-`nsmonkey` (13.5 MB, 2026-09-21 22:57 local).
+`nsmonkey` (13.6 MB, 2026-09-22 11:03 local, 105 patches applied).
+Author CSS (inline `<style>` and external `<link>`) now renders — see doc 06 §6.
 
 ---
 
@@ -66,16 +67,17 @@ end; the five capabilities ship in Phase 1 with the Vita frontend.
 ## 3. The stubs: `compat/macsurf_frontend_stubs.c`
 
 New file, shipped to `content/handlers/html/` by patch 20, listed in the
-html Makefile. 37 symbols:
+html Makefile. ~38 symbols:
 
 **Implemented for real (functional, not cosmetic):**
 
 | Symbol | Why real |
 |---|---|
 | `isDigit`, `isHex`, `charToHex` | libcss's lexer calls these; no-op versions silently break CSS tokenizing |
-| `css_error_from_lwc_error`, `css_error_from_parserutils_error` | error-path mapping; cheap to get right |
+| `css_error_from_lwc_error`, `css_error_from_parserutils_error` | error-path mapping; cheap to get right (the parserutils one is a 1:1 cast — see doc 06 §1) |
 | `lwc_string_caseless_hash_value` | **load-bearing** — per libdom's own comment, CSS selectors never match without it |
 | `macsurf__cascade_probe_armed` | plain flag the engine sets around its cascade call |
+| `html_css_discover_stylesheets` | **real DOM walk** (2026-09-22) — walks `<style>`/`<link>` and calls the upstream `html_css_update_style` / `html_css_process_link` helpers in `css.c`; author CSS now renders (doc 06 §6) |
 
 **Weak no-ops (the rest):** every `macos9_*`/`macsurf_*` instrumentation,
 animation, gradient, memory-diagnostic and JS-profiling symbol. Declared
@@ -83,9 +85,11 @@ animation, gradient, memory-diagnostic and JS-profiling symbol. Declared
 definitions without touching the stubs.
 
 Known functional gaps until Phase 1 (documented, expected, deliberate):
-CSS **grid layout** (no-op → block flow), **external stylesheets** (none
-discovered), **`<select>` reset**, **font baseline tuning** (default
-metrics), **DOM tag-type query** (returns `UNKNOWN`).
+CSS **grid layout** (no-op → block flow), **`<select>` reset**,
+**font baseline tuning** (default metrics), **DOM tag-type query** (returns
+`UNKNOWN`), **`<input>`/form-control rendering** (L2's `ui` label absent).
+Author CSS (inline `<style>` and external `<link>`) is **no longer a gap** —
+it was promoted from no-op to real DOM walk on 2026-09-22.
 
 ## 4. Durability: what survived re-staging
 
@@ -120,9 +124,12 @@ Two subtleties worth keeping:
 
 ## 5. What this does *not* prove
 
-- Rendering parity. No probes have run against this binary yet.
-- The five stubbed capabilities (grid, external CSS, select reset, font
+- Rendering parity. Measured 2026-09-22 (doc 06): L1 byte-identical to the
+  pristine golden; L2/L3/L4 differ where the stack adds behavior (value
+  functions, grid/flex reflow) plus the `<input>` gap.
+- The four remaining stubbed capabilities (grid, select reset, font
   baseline, tag type) work — they don't; that is the Phase-1 work list.
+  (Author CSS, formerly fifth on this list, now works.)
 - Vita. The build is the Linux monkey frontend; `TARGET=macos9` is gone and
   the Vita frontend is not started.
 
