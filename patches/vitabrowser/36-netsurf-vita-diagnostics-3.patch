@@ -1,0 +1,244 @@
+# netsurf: Vita hardware-test diagnostics, round 3 (frontends/vita)
+# Generated 2026-09-23
+#
+# After hardware run 2 (doc 10): the fetch-stall hypothesis behind round 2's
+# automatic fetch_pump() was wrong -- run 2's engine log shows the fetch
+# finishing and HTML creation failing (vitaSDK's newlib has an empty iconv;
+# fixed by building libparserutils WITHOUT_ICONV_FILTER). So:
+# - the automatic fetch pump is removed; the per-page "no document yet" and
+#   load-status lines stay;
+# - log.txt: run 2 left it untouched while netsurf.log was written. It is
+#   now one handle opened at boot, line-buffered, every write checked, a
+#   failure reported with its errno in netsurf.log, and every line mirrored
+#   there as "DIAG ...". The autotest marker reports fopen/fclose errors.
+
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index f74a7b102..56f705d17 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -25,6 +25,7 @@
+  * which is what makes its dumps a reference for the device's.
+  */
+ 
++#include <errno.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+@@ -67,6 +68,11 @@ static FILE *engine_log;
+ static struct timeval diag_t0;
+ static bool diag_ready;
+ 
++/** log.txt, open for the whole run; NULL if it could not be opened. */
++static FILE *diag_fp;
++/** errno of the failed log.txt open / first failed write, 0 if none. */
++static int diag_open_errno, diag_write_errno;
++
+ /* exported interface documented in vita/diag.h */
+ unsigned int vita_diag_ms(void)
+ {
+@@ -80,24 +86,37 @@ unsigned int vita_diag_ms(void)
+ /* exported interface documented in vita/diag.h */
+ void vita_diag_log(const char *fmt, ...)
+ {
+-	FILE *fp;
++	char line[512];
+ 	va_list ap;
+ 	unsigned int ms;
++	int n;
+ 
+ 	if (!diag_ready)
+ 		return;
+-	/* Open, write, close per line: slow, but a crash cannot lose what
+-	 * was logged before it, and nothing here is on a hot path. */
+-	fp = fopen(VITA_DIAG_DIR "log.txt", "a");
+-	if (fp == NULL)
+-		return;
+ 	ms = vita_diag_ms();
+-	fprintf(fp, "[%6u.%03u] ", ms / 1000, ms % 1000);
++	n = snprintf(line, sizeof(line), "[%6u.%03u] ", ms / 1000, ms % 1000);
+ 	va_start(ap, fmt);
+-	vfprintf(fp, fmt, ap);
++	vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
+ 	va_end(ap);
+-	fputc('\n', fp);
+-	fclose(fp);
++
++	/* Hardware run 2 left log.txt untouched while netsurf.log was
++	 * written fine (doc 10). One handle, line-buffered, every write
++	 * checked, and each line mirrored into the engine log -- so a failing
++	 * log.txt shows up with its errno instead of silently. */
++	if (diag_fp != NULL) {
++		if (fprintf(diag_fp, "%s\n", line) < 0 || fflush(diag_fp) != 0) {
++			if (diag_write_errno == 0) {
++				diag_write_errno = errno ? errno : -1;
++				if (engine_log != NULL)
++					fprintf(engine_log, "DIAG log.txt write "
++						"failed: errno %d\n",
++						diag_write_errno);
++			}
++			clearerr(diag_fp);
++		}
++	}
++	if (engine_log != NULL)
++		fprintf(engine_log, "DIAG %s\n", line);
+ }
+ 
+ /* exported interface documented in vita/diag.h */
+@@ -107,6 +126,11 @@ void vita_diag_init(void)
+ 	/* ux0:data exists on every Vita; our directory may not. */
+ 	mkdir("ux0:data", 0777);
+ 	mkdir(VITA_DIAG_DIR, 0777);
++	diag_fp = fopen(VITA_DIAG_DIR "log.txt", "a");
++	if (diag_fp == NULL)
++		diag_open_errno = errno ? errno : -1;
++	else
++		setvbuf(diag_fp, NULL, _IOLBF, 1024);
+ 	diag_ready = true;
+ 	vita_diag_log("==== VitaBrowser boot (build " __DATE__ " " __TIME__ ") ====");
+ #ifdef __vita__
+@@ -311,8 +335,12 @@ void vita_diag_marker(const char *name)
+ 
+ 	snprintf(path, sizeof(path), VITA_DIAG_DIR "%s", name);
+ 	fp = fopen(path, "w");
+-	if (fp != NULL)
+-		fclose(fp);
++	if (fp == NULL) {
++		vita_diag_log("marker %s: fopen failed, errno %d", name, errno);
++		return;
++	}
++	if (fclose(fp) != 0)
++		vita_diag_log("marker %s: fclose failed, errno %d", name, errno);
+ }
+ 
+ /** nslog_init's hook: buffer the file, remember it for flushing. */
+@@ -336,9 +364,12 @@ void vita_diag_engine_log_init(void)
+ 	nserror ret = nslog_init(engine_log_ensure, &argc, argv);
+ 
+ 	vita_diag_log("engine log: %s -> %d", a2, ret);
+-	if (engine_log != NULL)
++	if (engine_log != NULL) {
+ 		fprintf(engine_log, "==== engine log, boot at diag %u ms ====\n",
+ 			vita_diag_ms());
++		fprintf(engine_log, "DIAG log.txt: %s (open errno %d)\n",
++			diag_fp != NULL ? "open" : "NOT OPEN", diag_open_errno);
++	}
+ }
+ 
+ /* exported interface documented in vita/diag.h */
+@@ -347,6 +378,8 @@ void vita_diag_engine_flush(void)
+ 	if (engine_log == NULL)
+ 		return;
+ 	fflush(engine_log);
++	if (diag_fp != NULL)
++		fflush(diag_fp);
+ 	if (verbose_log && ftell(engine_log) > ENGINE_LOG_CAP) {
+ 		fprintf(engine_log, "==== engine log capped at %d bytes ====\n",
+ 			ENGINE_LOG_CAP);
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index e3a6f8e8f..a600027d2 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -53,7 +53,6 @@
+ #include "netsurf/browser_window.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/netsurf.h"
+-#include "content/fetch.h"
+ 
+ #include "vita/bitmap.h"
+ #include "vita/diag.h"
+@@ -89,10 +88,7 @@ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ /** Frames per page whose timing is logged individually. */
+ #define VITA_LOGGED_FRAMES 3
+ 
+-/**
+- * A page with no document this long after navigating counts as stalled:
+- * from then on the loop pumps the fetchers itself (see vita_run).
+- */
++/** A page with no document this long after navigating is logged as stuck. */
+ #define VITA_STALL_MS 1500
+ 
+ /** Per-second load-status lines are logged for this long per page. */
+@@ -127,7 +123,7 @@ struct page_stats {
+ 	unsigned int cpu_ms_max, gpu_ms_max, cpu_ms_last, gpu_ms_last;
+ 	unsigned int calls_last;
+ 	bool was_loading;
+-	bool pumping;			/**< stalled: fetch_pump() every loop */
++	bool stall_logged;		/**< "no document yet" was logged */
+ 	unsigned int content_ms;	/**< 0 until the new document arrives */
+ 	unsigned int content_gen;	/**< window's document count at navigate */
+ 	unsigned int status_ms;		/**< last per-second status line */
+@@ -446,17 +442,15 @@ static void draw_frame(struct gui_window *gw, bool dump)
+ }
+ 
+ /**
+- * Track whether the current page has a document yet, log its progress
+- * once a second until it does, and switch on the fetch pump if it stalls.
++ * Track whether the current page has a document yet, and log its progress
++ * once a second until it does.
+  *
+- * Hardware test 1 (2026-09-22, doc 10): every page stayed "load not
+- * finished" with no document on the Vita, while the same code loads in the
+- * host simulator. MacSurf's core documents fetches getting stranded when
+- * the self-rescheduling fetcher poll goes dormant (content/fetch.c,
+- * fixes90), and its own event loop calls fetch_pump() every iteration.
+- * Upstream frontends get the same effect from fetch_fdset(). Here the pump
+- * starts only after a stall, and the log says so, so each page shows
+- * whether it needed it.
++ * Hardware runs 1-2 (doc 10): no page ever got a document on the Vita. Run
++ * 2's engine log showed why -- the fetch finished, but HTML could not be
++ * created, because vitaSDK's newlib iconv has no converters and
++ * libparserutils' input filter needs iconv_open() even for UTF-8. Fixed by
++ * building libparserutils with WITHOUT_ICONV_FILTER (tools/build-vita.sh).
++ * These lines stay so a page that stops arriving says so in the log.
+  */
+ static void watch_load(struct gui_window *gw)
+ {
+@@ -470,30 +464,25 @@ static void watch_load(struct gui_window *gw)
+ 	if (vita_stats.content_ms == 0 &&
+ 	    vita_window_new_content(gw) != vita_stats.content_gen) {
+ 		vita_stats.content_ms = now;
+-		vita_diag_log("page %s: document after %u ms (extent %dx%d)%s",
+-			      vita_test_pages[vita_page], age, w, h,
+-			      vita_stats.pumping ? " -- with the fetch pump on" : "");
++		vita_diag_log("page %s: document after %u ms (extent %dx%d)",
++			      vita_test_pages[vita_page], age, w, h);
+ 	}
+-	if (vita_stats.content_ms == 0 && !vita_stats.pumping &&
++	if (vita_stats.content_ms == 0 && !vita_stats.stall_logged &&
+ 	    age >= VITA_STALL_MS) {
+-		vita_stats.pumping = true;
+-		vita_diag_log("page %s: no document after %u ms -- fetch stalled? "
+-			      "loading %d, sched pending %u (added %u, fired %u); "
+-			      "pumping fetchers from now on",
+-			      vita_test_pages[vita_page], age,
+-			      vita_window_loading(gw), vita_schedule_pending(),
+-			      vita_schedule_added, vita_schedule_fired);
++		vita_stats.stall_logged = true;
++		vita_diag_log("page %s: no document after %u ms "
++			      "(see netsurf.log for the engine's side)",
++			      vita_test_pages[vita_page], age);
+ 	}
+ 	if ((vita_stats.content_ms == 0 || vita_window_loading(gw)) &&
+ 	    age < VITA_STATUS_LOG_MS && now - vita_stats.status_ms >= 1000) {
+ 		vita_stats.status_ms = now;
+ 		vita_diag_log("load status %s +%u ms: loading %d, extent %dx%d, "
+-			      "sched pending %u (added %u, fired %u), pump %s",
++			      "sched pending %u (added %u, fired %u)",
+ 			      vita_test_pages[vita_page], age,
+ 			      vita_window_loading(gw), w, h,
+ 			      vita_schedule_pending(), vita_schedule_added,
+-			      vita_schedule_fired,
+-			      vita_stats.pumping ? "on" : "off");
++			      vita_schedule_fired);
+ 	}
+ }
+ 
+@@ -516,8 +505,6 @@ static void vita_run(struct browser_window *bw)
+ 			continue;
+ 		}
+ 		watch_load(gw);
+-		if (vita_stats.pumping)
+-			fetch_pump();
+ 
+ 		/* Load timing comes from the throbber events. */
+ 		if (vita_window_loading(gw)) {

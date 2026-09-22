@@ -20,6 +20,10 @@
  *    autotest's ux0:data/VitaBrowser/autotest.done marker appears -- so the
  *    simulator writes the same log and plot dumps a Vita does.
  *
+ *  - the C library's gaps are modelled where they have bitten: vitaSDK's
+ *    newlib iconv has no converters at all, so iconv_open() fails here too
+ *    (hardware run 2, doc 10). Every engine library must work without it.
+ *
  * What this cannot tell you: anything about the GXM, PGF's real metrics,
  * memory, or speed. It proves the frontend's logic, not the hardware.
  */
@@ -30,6 +34,8 @@
 #include <math.h>
 #include <unistd.h>
 
+#include <errno.h>
+#include <iconv.h>
 #include <zlib.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -467,4 +473,18 @@ int sceKernelDelayThread(SceUInt delay)
 int sceKernelExitProcess(int res)
 {
 	exit(sim_failures ? 6 : res);
+}
+
+/* ---- newlib gaps ------------------------------------------------------- */
+
+/* vitaSDK's newlib is built without iconv converters: its alias table is
+ * empty, so every iconv_open() fails with EINVAL (checked with nm/objdump
+ * on arm-vita-eabi/lib/libc.a). Defined in the executable, this wins over
+ * glibc's for every caller, including the static engine libraries. */
+iconv_t iconv_open(const char *tocode, const char *fromcode)
+{
+	(void)tocode;
+	(void)fromcode;
+	errno = EINVAL;
+	return (iconv_t)-1;
 }

@@ -257,6 +257,7 @@ rules. Every site they fire on in the libraries was checked:
 | libdom's expat binding | `WITH_EXPAT_BINDING=no` (XML/SVG only; SVG off) |
 | static linking | `pkg-config --static --define-prefix`, as vitaSDK's own `arm-vita-eabi-pkg-config` does |
 | upstream `test/Makefile` calls bare `pkg-config` at parse time (prints "No package … found") | harmless noise on any cross target, only used by `make test`; left alone |
+| **newlib's `iconv` has no converters** (every `iconv_open` fails); libparserutils' input filter needs it even for UTF-8, so no HTML/CSS parser could be created. *Found on hardware, run 2; the host simulator missed it because it linked glibc.* | libparserutils built `-DWITHOUT_ICONV_FILTER` (its own codecs); the simulator now models the empty `iconv` ([10](10-hardware-test-plan.md) §Run 2) |
 
 `__vita__` is predefined by the compiler (`arm-vita-eabi-gcc -dM -E`), so the
 frontend needs no `-Dvita` of its own.

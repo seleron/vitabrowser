@@ -132,6 +132,9 @@ staged tree:
 | the Vita frontend (`frontends/vita`, `TARGET=vita`) | patch 31, doc 09 |
 | drop shadows / transform quads no longer clipped to their own box: ink outset (`html/box_ink.h`) in the layout bbox + widened background-paint clip | patch 32, doc 09 §10 |
 | Vita hardware-test diagnostics: crash-safe log, timings, memory probe, plot dumps, autotest, LiveArea assets, ext-memory VPK variant | patch 33, doc 10 |
+| diagnostics round 2: engine log to `netsurf.log`, scheduler counters, load status (its auto-pump was removed again in 36) | patch 34, doc 10 |
+| the error page failing forever when it cannot be built itself (upstream behaviour): stop instead of retrying | patch 35, doc 10 §Run 2 |
+| diagnostics round 3: auto-pump removed, `log.txt` written through one checked handle and mirrored into `netsurf.log` | patch 36, doc 10 §Run 2 |
 | `-Wno-error=missing-prototypes / implicit-function-declaration / int-conversion` (MacSurf's new files ported from a CodeWarrior baseline) | `tools/build-patched.sh` CFLAGS |
 
 Two subtleties worth keeping:

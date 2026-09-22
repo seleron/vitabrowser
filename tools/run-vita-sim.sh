@@ -40,11 +40,35 @@ gcc -std=c99 -D_DEFAULT_SOURCE -O2 -g -Wall -Wextra -Wno-unused-parameter -Werro
 rm -f "$OUT/libvitasim.a"
 ar rcs "$OUT/libvitasim.a" "$OUT/vitasim.o"
 
+# libparserutils as the Vita builds it (tools/build-vita.sh): without the
+# iconv input filter, since the stand-in libc has no iconv either. Kept in
+# its own prefix, searched first, so the host nsmonkey build is untouched.
+# If this overlay ever stops being linked, no page can load in the
+# simulator -- the run below fails loudly rather than passing by accident.
+echo "== libparserutils overlay (WITHOUT_ICONV_FILTER) =="
+OV="$OUT/overlay"
+rm -rf "$OV"
+# Built from a private copy: the staged tree's object directory belongs to
+# the host nsmonkey build, and make would happily reinstall its iconv objects.
+rm -rf "$OUT/src-parserutils"
+cp -r "$WORK/applytest/upstream/libparserutils" "$OUT/src-parserutils"
+rm -rf "$OUT"/src-parserutils/build-*
+( cd "$OUT/src-parserutils" && \
+  CFLAGS="-I$ROOT/compat -include macsurf_lib_decls.h -DWITHOUT_ICONV_FILTER" \
+  PKG_CONFIG_PATH="$P/lib/pkgconfig" \
+  make install PREFIX="$OV" NSSHARED="$P/share/netsurf-buildsystem" \
+    WARNFLAGS=-Wall > "$OUT/overlay.log" 2>&1 ) \
+  || { echo "  overlay FAILED"; grep -m3 error "$OUT/overlay.log"; exit 1; }
+if nm "$OV/lib/libparserutils.a" | grep -q " U iconv_open"; then
+	echo "  overlay still uses iconv"; exit 1
+fi
+
 echo "== frontends/vita, host simulator build =="
 # Same core flags as tools/build-patched.sh's nsmonkey build.
-export PKG_CONFIG_PATH="$P/lib/pkgconfig"
+export PKG_CONFIG_PATH="$OV/lib/pkgconfig:$P/lib/pkgconfig"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
 -include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DVITABROWSER_ENGINE_TRACE"
+rm -f "$NS/nsvita-sim"	# the overlay changed under it; force the relink
 ( cd "$NS" && make TARGET=vita VITA_HOST_SIM=YES \
 	VITA_SIM_INCLUDE="$ROOT/tools/vita-stub" VITA_SIM_LIB="$OUT/libvitasim.a" \
 	-j4 > "$OUT/build.log" 2>&1 ) \

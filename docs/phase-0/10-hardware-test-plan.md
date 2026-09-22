@@ -280,7 +280,12 @@ What was ruled out:
   implicit declaration, `strcasecmp` (returns `int`, ABI-safe).
 - **Init.** Every stage returned OK on the device.
 
-**Leading hypothesis: fetches stranded by the scheduler-only fetch poll.**
+> **Corrected after run 2: this hypothesis was wrong.** The fetch
+> completes in about 100 ms; HTML creation fails because vitaSDK's newlib
+> has an empty `iconv`. See §Run 2 — results.
+
+**Leading hypothesis (wrong, see above): fetches stranded by the
+scheduler-only fetch poll.**
 Upstream frontends call `fetch_fdset()` every loop iteration (monkey, gtk),
 which also dispatches queued fetches and polls every fetcher. MacSurf's core
 documents fetches getting stranded when the self-rescheduling poll goes
@@ -352,3 +357,83 @@ Run 2 is short:
    `results\`.
 6. If pages render, also redo the checklist's steps 4, 4a, 4b, 5 and 7 with
    screenshots.
+
+## Run 2 — results (2026-09-23)
+
+Files: `<WORK>/vitabrowser-work/hwtest-2026-09-23-run2/device-results/`.
+Pages still did not render. `netsurf.log` (13.5 MB, the engine's own log)
+settled the cause.
+
+**The fetch was never the problem.** For every page the engine log reads:
+
+```
+llcache: Starting fetch ... Fetch event 2/3/4    (headers, data, done)
+MS fetch FINISHED                                (~100 ms after navigating)
+MS html create
+MS hlcache content create FAILED
+MS NAV: ERROR ... -> error page                  (about:query/fetcherror)
+MS html create
+MS hlcache content create FAILED                 (the error page is HTML too)
+... repeated: 6111 times in 5 minutes
+```
+
+**Root cause: vitaSDK's newlib ships `iconv` with no converters.** Its alias
+table is a single empty string, its CCS table is empty, and its encoding
+handler tables are two empty NULL-terminated lists (`arm-vita-eabi-nm`/
+`objdump` on `libc.a`). So every `iconv_open()` fails, even UTF-8 → UTF-8.
+libparserutils' input filter calls `iconv_open()` for every input stream,
+UTF-8 included (`src/input/filter.c` `filter_set_encoding`). No HTML or CSS
+parser can be created. The host simulator linked glibc, whose `iconv` works,
+which is why only the device failed.
+
+**Reproduced on the host, and the fix proven there:**
+- With `iconv_open()` forced to fail (an `LD_PRELOAD` shim), the simulator
+  produces the device's exact trace (`html create` → `content create
+  FAILED` → error page, looping).
+- With libparserutils built `-DWITHOUT_ICONV_FILTER`, an upstream option
+  that uses its own codecs (UTF-8/16, ISO-8859-x, Windows-125x), and
+  `iconv_open()` still failing: **0 failures, 16/16 documents, every dump
+  byte-identical** to the reference made with a working `iconv`.
+
+**What changed for run 3:**
+- `tools/build-vita.sh` builds libparserutils `-DWITHOUT_ICONV_FILTER` and
+  fails the build if the archive still references `iconv_open`.
+- **The simulator now models the gap.** `vitasim.c` defines an
+  `iconv_open()` that always fails, like newlib, and `run-vita-sim.sh`
+  links a libparserutils built exactly as the Vita's. If that overlay ever
+  stops being linked, no page loads and the run fails. (Its own check
+  caught a stale-object mistake while it was being written.) Lesson: the
+  simulator stands in for the SDK's *libc* as well as its GPU.
+- **Patch 35: the error-page loop is guarded.** When the page that failed
+  is `about:query/fetcherror` itself, the core stops the load instead of
+  retrying forever. This is upstream behaviour, not MacSurf's. Verified in
+  the broken configuration: two failures per page (the page, then its
+  error page), then `STOP_THROBBER`.
+- **Patch 36:** the automatic fetch pump from run 2 is removed (its
+  hypothesis was wrong); the load-status lines stay.
+- **`log.txt` stayed untouched in run 2** (its timestamp moved; its bytes did
+  not), while `netsurf.log` and the dumps were written, and the
+  `autotest.done` marker was not refreshed. Not explained yet, so patch 36
+  instruments it: one line-buffered handle, every write checked, failures
+  reported with their errno in `netsurf.log`, and every line mirrored there
+  as `DIAG …`.
+- **Still using `iconv`:** NetSurf's form-submission encoding
+  (`utils/utf8.c`, from `html/form.c`) for non-UTF-8 charsets. Irrelevant
+  until forms and networking exist, then it needs a converter (libiconv,
+  or libparserutils' codecs).
+
+## Run 3 — the iconv fix (patches 35–36)
+
+Hand-off VPKs rebuilt (SHA256 first 12: `VitaBrowser.vpk`
+`fbf54ea178b3`, `VitaBrowser-ext.vpk` `2f03b5c184ee`, `nsvita.elf`
+`0bd94a0eaee2`; archive `<WORK>/vitabrowser-work/hwtest-2026-09-23-run3/`).
+Clean checkout: applied 119 + the known 2; L1 SAME; fixtures 4/4; 93/93;
+simulator 15/15 pages with newlib's `iconv` modelled.
+
+This time the full checklist applies:
+1. Install the new **VitaBrowser.vpk** over the old one, and delete
+   `ux0:data/VitaBrowser/`.
+2. Launch it. L1 should render within about a second.
+3. Work through the checklist from step 3 (autotest) to step 8, clearing its
+   old answers first.
+4. Copy `ux0:data/VitaBrowser/` and the screenshots into `results\`.

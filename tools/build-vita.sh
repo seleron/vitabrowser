@@ -25,6 +25,14 @@
 #                               it is ABI-safe.
 #   WITH_EXPAT_BINDING=no       libdom's XML binding is only for SVG / XML
 #                               documents, which the Vita build leaves off.
+#   -DWITHOUT_ICONV_FILTER      (libparserutils only) vitaSDK's newlib ships
+#                               iconv with NO converters, so iconv_open()
+#                               always fails -- and libparserutils' input
+#                               filter calls it even for UTF-8, so no HTML
+#                               or CSS parser could be created (hardware
+#                               run 2, doc 10). This upstream build option
+#                               uses libparserutils' own codecs instead
+#                               (UTF-8/16, ISO-8859-x, Windows-125x).
 #   -I compat ... decls.h       the same shim headers as the host build.
 #
 # Needs vdpm packages: libvita2d (pulls freetype, libpng, libjpeg-turbo,
@@ -59,14 +67,22 @@ rm -rf "$VP"
 ( cd "$WORK/buildsystem" && make install PREFIX="$VP" >/dev/null 2>&1 )
 
 echo "== engine libraries (arm-vita-eabi) =="
-export CFLAGS="-I$ROOT/compat -include macsurf_lib_decls.h $GCC14"
+LIBCFLAGS="-I$ROOT/compat -include macsurf_lib_decls.h $GCC14"
 for l in $LIBS; do
+	CFLAGS="$LIBCFLAGS"
+	[ "$l" = libparserutils ] && CFLAGS="$CFLAGS -DWITHOUT_ICONV_FILTER"
+	export CFLAGS
 	( cd "$UP/$l" && make install HOST=arm-vita-eabi PREFIX="$VP" \
 	    PKG_CONFIG_PATH="$VP/lib/pkgconfig" WARNFLAGS="-Wall" \
 	    WITH_EXPAT_BINDING=no > "$WORK/applytest/vita-build-$l.log" 2>&1 ) \
 	  && echo "  $l ok" || { echo "  $l FAILED"; \
 	     grep -m3 'error' "$WORK/applytest/vita-build-$l.log"; exit 1; }
 done
+
+if "$VITASDK/bin/arm-vita-eabi-nm" "$VP/lib/libparserutils.a" | grep -q " U iconv_open"; then
+	echo "  libparserutils still calls iconv_open: no page could load on the Vita"
+	exit 1
+fi
 
 echo "== support libraries (arm-vita-eabi) =="
 export CFLAGS="$GCC14"
