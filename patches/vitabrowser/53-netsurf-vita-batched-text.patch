@@ -1,0 +1,200 @@
+# netsurf: Vita text drawn a run at a time
+# Generated 2026-09-24
+#
+# Hardware run 10: text-heavy pages cost 120-240 ms of CPU per frame, and
+# every glyph was its own vita2d_draw_texture_tint_part() -- a vertex
+# allocation and a GXM draw each. vita/text.c now collects a run's glyphs
+# and draws them with one vita2d_draw_array_textured() per atlas page:
+# triangle pairs with the same corners and texture coordinates as
+# libvita2d's tint_part strip, so the pixels are the same. A run shares one
+# colour, and blending two layers of one colour gives the same result in
+# either order, so grouping by page cannot change overlaps. The glyphs'
+# atlas rectangles are copied, not referenced: a later glyph of the run can
+# take over a glyph_cache slot (the first cut drew a "9" as an "A").
+# Simulator: ~15 glyphs per draw over the autotest; 68/68 frames pixel-
+# identical to one draw per glyph (VITA_SIM_TEXT_UNBATCHED, the reference
+# path the simulator keeps). font: log line with glyphs and draws.
+# See docs/phase-0/10-hardware-test-plan.md §Run 14.
+
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index 954a579..c57f577 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -403,6 +403,11 @@ void vita_diag_font_metrics(void)
+ 		      vita_text_stats.rasterised, vita_text_stats.atlas_hits,
+ 		      vita_text_stats.flushes, vita_text_stats.dropped,
+ 		      vita_text_stats.missing, vita_text_stats.face_failures);
++	vita_diag_log("font: %u glyphs drawn in %u batched draws (%.1f per "
++		      "draw)", vita_text_stats.glyphs_drawn,
++		      vita_text_stats.batches, vita_text_stats.batches ?
++		      (double)vita_text_stats.glyphs_drawn /
++		      vita_text_stats.batches : 0.0);
+ }
+ 
+ /** Note a finished dump or marker, for catch_up(). */
+diff --git a/frontends/vita/text.c b/frontends/vita/text.c
+index dc8edf4..1349e2a 100644
+--- a/frontends/vita/text.c
++++ b/frontends/vita/text.c
+@@ -29,7 +29,8 @@
+  * Glyphs are rendered at the exact pixel size into 512x512 8-bit alpha
+  * atlas pages (SCE_GXM_TEXTURE_FORMAT_U8_R111: white, alpha = coverage),
+  * shelf-packed with a 1-pixel gap, sampled with point filtering, and drawn
+- * unscaled at whole-pixel positions with vita2d_draw_texture_tint_part().
++ * unscaled at whole-pixel positions, a run at a time: one textured draw
++ * per atlas page instead of one per glyph (draw_placed()).
+  * When every page is full the atlas is reset between frames, never during
+  * one, since the GPU may still be reading glyphs already drawn.
+  */
+@@ -355,12 +356,100 @@ static const struct glyph_entry *glyph_get(int face, uint32_t gi, int px)
+ 	return g;
+ }
+ 
++/** Glyphs drawn per batch (6 vertices each; vita2d's linear index
++ * buffer covers 65535). */
++#define TEXT_BATCH 256
++
++/** One glyph placed in a run, waiting for its batch: a copy of its atlas
++ * rectangle, not a pointer into glyph_cache -- a later glyph of the same
++ * run can take over the cache slot (the first cut of this drew a "9" as
++ * an "A" in the simulator). */
++struct placed {
++	int page, gx, gy, gw, gh;	/**< the atlas rectangle */
++	int x, y;			/**< where it goes on screen */
++};
++
++/**
++ * Draw placed glyphs: one vita2d_draw_array_textured() per atlas page, as
++ * triangle pairs with the same corners and texture coordinates as
++ * vita2d_draw_texture_tint_part()'s strip (libvita2d draw_texture_part_
++ * generic), so the pixels are the same. A run's glyphs share one colour,
++ * and alpha blending two layers of one colour gives the same result in
++ * either order, so grouping by page cannot change overlaps.
++ */
++static void draw_placed(const struct placed *pl, int n, unsigned int rgba)
++{
++	int page, i;
++
++	for (page = 0; page < page_count; page++) {
++		vita2d_texture_vertex *v;
++		float tw, th;
++		int count = 0, k = 0;
++
++		for (i = 0; i < n; i++)
++			if (pl[i].page == page)
++				count++;
++		if (count == 0)
++			continue;
++		v = vita2d_pool_memalign(6 * (unsigned int)count *
++					 sizeof(vita2d_texture_vertex),
++					 sizeof(vita2d_texture_vertex));
++		if (v == NULL) {
++			vita_text_stats.dropped += (unsigned int)count;
++			continue;
++		}
++		tw = (float)vita2d_texture_get_width(pages[page].tex);
++		th = (float)vita2d_texture_get_height(pages[page].tex);
++		for (i = 0; i < n; i++) {
++			const struct placed *g = &pl[i];
++			float x0, y0, x1, y1, u0, v0, u1, v1;
++			if (g->page != page)
++				continue;
++			x0 = (float)g->x;
++			y0 = (float)g->y;
++			x1 = x0 + (float)g->gw;
++			y1 = y0 + (float)g->gh;
++			u0 = (float)g->gx / tw;
++			v0 = (float)g->gy / th;
++			u1 = (float)(g->gx + g->gw) / tw;
++			v1 = (float)(g->gy + g->gh) / th;
++			/* The strip's two triangles: 0 1 2, then 2 1 3. */
++			v[k++] = (vita2d_texture_vertex){ x0, y0, 0.5f, u0, v0 };
++			v[k++] = (vita2d_texture_vertex){ x1, y0, 0.5f, u1, v0 };
++			v[k++] = (vita2d_texture_vertex){ x0, y1, 0.5f, u0, v1 };
++			v[k++] = (vita2d_texture_vertex){ x0, y1, 0.5f, u0, v1 };
++			v[k++] = (vita2d_texture_vertex){ x1, y0, 0.5f, u1, v0 };
++			v[k++] = (vita2d_texture_vertex){ x1, y1, 0.5f, u1, v1 };
++		}
++		vita2d_draw_array_textured(pages[page].tex,
++					   SCE_GXM_PRIMITIVE_TRIANGLES, v,
++					   (size_t)k, rgba);
++		vita_text_stats.batches++;
++	}
++}
++
++/** The simulator's reference path: VITA_SIM_TEXT_UNBATCHED=1 draws each
++ * glyph on its own, as before batching, so tools/run-vita-sim.sh can
++ * compare the two pixel for pixel. Always batched on the Vita. */
++static bool unbatched(void)
++{
++#ifdef VITA_HOST_SIM
++	static int on = -1;
++	if (on < 0)
++		on = getenv("VITA_SIM_TEXT_UNBATCHED") != NULL;
++	return on != 0;
++#else
++	return false;
++#endif
++}
++
+ /* exported interface documented in vita/text.h */
+ int vita_text_draw(const struct vita_text_style *style, int x, int y,
+ 		   const char *utf8, size_t len, unsigned int rgba)
+ {
++	struct placed pl[TEXT_BATCH];
+ 	size_t i = 0;
+-	int pen = x;
++	int pen = x, n = 0;
+ 
+ 	while (i < len) {
+ 		const struct adv_entry *e =
+@@ -370,18 +459,34 @@ int vita_text_draw(const struct vita_text_style *style, int x, int y,
+ 		i = utf8_next(utf8, len, i);
+ 		if (e->cp >= 0x20 && e->cp != 0x20 && e->cp != 0xa0) {
+ 			g = glyph_get(e->face, e->gi, e->px);
+-			if (g == NULL)
++			if (g == NULL) {
+ 				vita_text_stats.dropped++;
+-			else if (g->w > 0 && g->h > 0)
++			} else if (g->w > 0 && g->h > 0 && unbatched()) {
+ 				vita2d_draw_texture_tint_part(
+ 					pages[g->page].tex,
+ 					(float)(pen + g->left),
+ 					(float)(y - g->top),
+ 					(float)g->x, (float)g->y,
+ 					(float)g->w, (float)g->h, rgba);
++			} else if (g->w > 0 && g->h > 0) {
++				pl[n].page = g->page;
++				pl[n].gx = g->x;
++				pl[n].gy = g->y;
++				pl[n].gw = g->w;
++				pl[n].gh = g->h;
++				pl[n].x = pen + g->left;
++				pl[n].y = y - g->top;
++				vita_text_stats.glyphs_drawn++;
++				if (++n == TEXT_BATCH) {
++					draw_placed(pl, n, rgba);
++					n = 0;
++				}
++			}
+ 		}
+ 		pen += e->adv;
+ 	}
++	if (n > 0)
++		draw_placed(pl, n, rgba);
+ 	return pen - x;
+ }
+ 
+diff --git a/frontends/vita/text.h b/frontends/vita/text.h
+index 16271f5..7bf748a 100644
+--- a/frontends/vita/text.h
++++ b/frontends/vita/text.h
+@@ -65,6 +65,8 @@ struct vita_text_stats {
+ 	unsigned int atlas_pages;	/**< atlas textures allocated */
+ 	unsigned int flushes;		/**< atlas reset because it was full */
+ 	unsigned int dropped;		/**< glyphs not drawn: atlas full */
++	unsigned int glyphs_drawn;	/**< glyph quads drawn */
++	unsigned int batches;		/**< draws they took (per run and page) */
+ 	unsigned int missing;		/**< code points no face has */
+ 	unsigned int face_failures;	/**< font files that would not open */
+ };

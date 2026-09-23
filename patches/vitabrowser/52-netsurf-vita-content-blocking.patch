@@ -1,0 +1,296 @@
+# netsurf: content blocking in the Vita's resolver
+# Generated 2026-09-24
+#
+# README §14.5: on the Vita every extra origin costs a software TLS
+# handshake (~1 s each, hardware run 11), so ad and tracker hosts are
+# refused before any lookup or connection. vita/resolve.c checks each host,
+# and every domain it is under, against the bundled list
+# (app0:/res/blocklist.txt, 71 ad-serving and tracking hosts, narrowed so
+# no company's own site is blocked) and the user's
+# ux0:data/VitaBrowser/blocklist.txt ("host" blocks, "@@host" allows; the
+# user's entries win). A blocked fetch fails at once as
+# CURLE_COULDNT_RESOLVE_HOST (patch 49's failed-lookup path). Counted in
+# vita_resolve_blocked (the HUD shows it).
+# See docs/phase-0/10-hardware-test-plan.md §Run 14.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 4e237e8..16c2aea 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -114,7 +114,7 @@ VITA_VPK ?= VitaBrowser.vpk
+ VITA_PKGDIR := $(OBJROOT)/vpk
+ VITA_SCE_SYS := frontends/vita/sce_sys
+ VITA_RES_FILES := default.css quirks.css adblock.css internal.css \
+-	Messages welcome.html credits.html licence.html
++	Messages welcome.html credits.html licence.html blocklist.txt
+ VITA_SYS_FILES := icon0.png livearea/contents/bg.png \
+ 	livearea/contents/startup.png livearea/contents/template.xml
+ 
+diff --git a/frontends/vita/res/blocklist.txt b/frontends/vita/res/blocklist.txt
+new file mode 100644
+index 0000000..c68a483
+--- /dev/null
++++ b/frontends/vita/res/blocklist.txt
+@@ -0,0 +1,77 @@
++# VitaBrowser: hosts refused before any lookup or connection (README
++# §14.5: every origin costs a software TLS handshake on the Vita). A host
++# is blocked if it, or a domain it is under, is listed. Add your own in
++# ux0:data/VitaBrowser/blocklist.txt: "host" blocks, "@@host" allows.
++# Ad serving
++doubleclick.net
++googlesyndication.com
++googleadservices.com
++adservice.google.com
++pagead2.googlesyndication.com
++amazon-adsystem.com
++adnxs.com
++adsrvr.org
++advertising.com
++criteo.net
++pubmatic.com
++rubiconproject.com
++openx.net
++casalemedia.com
++contextweb.com
++indexww.com
++smartadserver.com
++teads.tv
++taboola.com
++outbrain.com
++revcontent.com
++mgid.com
++media.net
++adform.net
++yieldmo.com
++sharethrough.com
++3lift.com
++bidswitch.net
++moatads.com
++serving-sys.com
++zedo.com
++d.adroll.com
++# Analytics and tracking
++google-analytics.com
++googletagmanager.com
++googletagservices.com
++analytics.google.com
++scorecardresearch.com
++quantserve.com
++static.chartbeat.com
++chartbeat.net
++static.hotjar.com
++script.hotjar.com
++api-js.mixpanel.com
++cdn.mxpnl.com
++segment.io
++cdn.segment.com
++js-agent.newrelic.com
++nr-data.net
++cdn.optimizely.com
++script.crazyegg.com
++cdn.mouseflow.com
++edge.fullstory.com
++bat.bing.com
++clarity.ms
++connect.facebook.net
++pixel.facebook.com
++analytics.twitter.com
++ads-twitter.com
++static.ads-twitter.com
++px.ads.linkedin.com
++snap.licdn.com
++app-measurement.com
++krxd.net
++bluekai.com
++exelator.com
++demdex.net
++omtrdc.net
++everesttech.net
++agkn.com
++tapad.com
++rlcdn.com
+diff --git a/frontends/vita/resolve.c b/frontends/vita/resolve.c
+index f4d473a..6c86a1a 100644
+--- a/frontends/vita/resolve.c
++++ b/frontends/vita/resolve.c
+@@ -48,6 +48,7 @@
+ #endif
+ 
+ #include "content/fetchers/curl_resolve.h"
++#include "utils/log.h"
+ 
+ #include "vita/diag.h"
+ #include "vita/resolve.h"
+@@ -82,6 +83,136 @@ static bool worker_failed;
+ /** Counters for the log. */
+ static unsigned int n_lookups, n_failed, n_hits;
+ 
++/*
++ * Content blocking (README §14.5): on this CPU every extra origin costs a
++ * software TLS handshake, so ad and tracker hosts are refused here, before
++ * any lookup or connection. A host is blocked if it, or any domain it is
++ * under, is listed. The lists: VITA_BLOCKLIST_BUNDLED, then the user's
++ * VITA_BLOCKLIST_USER, where "host" adds and "@@host" allows.
++ */
++struct block_entry {
++	char *host;
++	bool allow;
++	unsigned int order;	/**< position in the files: later wins */
++};
++static struct block_entry *blocklist;
++static size_t block_count;
++static bool block_loaded;
++unsigned int vita_resolve_blocked;
++
++static int block_cmp(const void *a, const void *b)
++{
++	return strcmp(((const struct block_entry *)a)->host,
++		      ((const struct block_entry *)b)->host);
++}
++
++static int block_cmp_order(const void *a, const void *b)
++{
++	const struct block_entry *x = a, *y = b;
++	int c = strcmp(x->host, y->host);
++
++	if (c != 0)
++		return c;
++	return (x->order > y->order) - (x->order < y->order);
++}
++
++static void block_add_file(const char *path)
++{
++	static size_t cap;
++	char line[300];
++	FILE *fp = fopen(path, "r");
++	size_t n0 = block_count;
++
++	if (fp == NULL)
++		return;
++	while (fgets(line, sizeof(line), fp) != NULL) {
++		char *h = line, *e;
++		bool allow = false;
++
++		while (*h == ' ' || *h == '\t')
++			h++;
++		if (strncmp(h, "@@", 2) == 0) {
++			allow = true;
++			h += 2;
++		}
++		for (e = h; *e != '\0' && *e != ' ' && *e != '\t' &&
++			     *e != '\r' && *e != '\n' && *e != '#'; e++)
++			if (*e >= 'A' && *e <= 'Z')
++				*e = (char)(*e - 'A' + 'a');
++		*e = '\0';
++		if (*h == '\0')
++			continue;	/* blank or a # comment */
++		if (block_count == cap) {
++			size_t c = cap ? cap * 2 : 256;
++			struct block_entry *nb =
++				realloc(blocklist, c * sizeof(*blocklist));
++			if (nb == NULL)
++				break;
++			blocklist = nb;
++			cap = c;
++		}
++		blocklist[block_count].host = strdup(h);
++		blocklist[block_count].allow = allow;
++		blocklist[block_count].order = (unsigned int)block_count;
++		if (blocklist[block_count].host != NULL)
++			block_count++;
++	}
++	fclose(fp);
++	vita_diag_log("dns: blocklist %s: %u entries", path,
++		      (unsigned int)(block_count - n0));
++}
++
++/** Load the lists once: sorted by host, one entry per host, the last one
++ * in file order (so the user's list overrides the bundled one). */
++static void block_load(void)
++{
++	size_t i, o = 0;
++
++	block_loaded = true;
++	block_add_file(VITA_BLOCKLIST_BUNDLED);
++	block_add_file(VITA_BLOCKLIST_USER);
++	if (block_count == 0)
++		return;
++	qsort(blocklist, block_count, sizeof(*blocklist), block_cmp_order);
++	for (i = 0; i < block_count; i++) {
++		if (i + 1 < block_count &&
++		    strcmp(blocklist[i].host, blocklist[i + 1].host) == 0) {
++			free(blocklist[i].host);
++			continue;
++		}
++		blocklist[o++] = blocklist[i];
++	}
++	block_count = o;
++}
++
++/* exported interface documented in vita/resolve.h */
++bool vita_resolve_is_blocked(const char *host)
++{
++	char h[RESOLVE_HOST_MAX];
++	const char *p;
++	size_t i;
++
++	if (!block_loaded)
++		block_load();
++	if (block_count == 0 || strlen(host) >= sizeof(h))
++		return false;
++	for (i = 0; host[i] != '\0'; i++)
++		h[i] = (host[i] >= 'A' && host[i] <= 'Z') ?
++			(char)(host[i] - 'A' + 'a') : host[i];
++	h[i] = '\0';
++	/* The host, then each domain it is under; the most specific
++	 * listed one decides (so @@sub.example.com beats example.com). */
++	for (p = h; p != NULL; p = strchr(p, '.') ? strchr(p, '.') + 1 :
++		     NULL) {
++		struct block_entry key = { .host = (char *)p }, *e;
++		e = bsearch(&key, blocklist, block_count, sizeof(key),
++			    block_cmp);
++		if (e != NULL)
++			return !e->allow;
++	}
++	return false;
++}
++
+ /** Finished lookups for the log, which is main-thread code
+  * (vita_resolve_poll() writes them). */
+ #define RESOLVE_LOG_LINES 8
+@@ -225,6 +356,11 @@ fetch_curl_resolve(const char *host, char *addr, size_t size)
+ 	int i;
+ 
+ 	addr[0] = '\0';
++	if (vita_resolve_is_blocked(host)) {
++		vita_resolve_blocked++;
++		NSLOG(netsurf, INFO, "blocked: %s", host);
++		return FETCH_CURL_RESOLVE_FAILED;
++	}
+ 	if (is_address(host) || strlen(host) >= RESOLVE_HOST_MAX)
+ 		return FETCH_CURL_RESOLVE_READY;
+ 
+diff --git a/frontends/vita/resolve.h b/frontends/vita/resolve.h
+index fffb09e..c0ff488 100644
+--- a/frontends/vita/resolve.h
++++ b/frontends/vita/resolve.h
+@@ -25,6 +25,19 @@
+ #ifndef NETSURF_VITA_RESOLVE_H
+ #define NETSURF_VITA_RESOLVE_H
+ 
++#include <stdbool.h>
++
++/** Content blocking: the bundled list, and the user's additions ("host")
++ * and exceptions ("@@host"), one per line. */
++#define VITA_BLOCKLIST_BUNDLED "app0:/res/blocklist.txt"
++#define VITA_BLOCKLIST_USER "ux0:data/VitaBrowser/blocklist.txt"
++
++/** Is host, or a domain it is under, blocked? */
++bool vita_resolve_is_blocked(const char *host);
++
++/** Fetches refused because their host is blocked. */
++extern unsigned int vita_resolve_blocked;
++
+ /** Log the lookups finished since the last call. Main loop, every pass. */
+ void vita_resolve_poll(void);
+ 

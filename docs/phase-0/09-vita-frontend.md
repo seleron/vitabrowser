@@ -352,6 +352,15 @@ and fixed by patch 32 (§10).
    example.com, byte-identical to the simulator). DNS off the main thread:
    patch 49. Next costs: CPU per frame on text pages (~100 ms) and the
    mbedTLS handshake (~1 s).
+6. **A browser to hold** (patches 51–54, 10 §Run 14):
+   - touch, pointer, back/forward, zoom;
+   - URL and text entry (the system keyboard, or a URL sent from a phone
+     to the Vita's LAN listener on :8080);
+   - a home page built from `bookmarks.txt`;
+   - a persistent cookie jar;
+   - ad and tracker blocking;
+   - text drawn in batches;
+   - an autotest interaction pass that drives all of it on the device.
 
 ## 9. Corrections to earlier documents
 

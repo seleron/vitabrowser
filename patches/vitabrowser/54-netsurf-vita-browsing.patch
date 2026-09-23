@@ -1,0 +1,2378 @@
+# netsurf: Vita browsing -- controls, home page, URL entry, cookies
+# Generated 2026-09-24
+#
+# README §14.8's v0 chrome: a URL, a page, back/forward on the buttons,
+# bookmarks in a text file on ux0:; §14.6's URL entry without the OSK.
+# - vita/input.c/.h (new): touch (tap = click, drag = scroll; the front
+#   panel's 1920x1088 halved), a left-stick pointer with CROSS to click
+#   (press down, click up, hover tracked), right stick and D-pad scroll,
+#   L/R back/forward, SQUARE zoom 100/125/150/200 %, TRIANGLE text entry,
+#   START home. Input is a per-pass record, from the pad or from a script.
+# - vita/chrome.c/.h (new): home page generated at start-up from
+#   ux0:data/VitaBrowser/bookmarks.txt ("Title | URL", written with
+#   defaults if missing) plus the test pages; typed text -> URL (a URL as
+#   is, a host gets https:// (an IPv4 address or localhost http://), words
+#   search lite.duckduckgo.com); text goes
+#   into the focused field when there is one (key presses), else opens as
+#   a URL; the system keyboard (sceImeDialog, URL mode) on the Vita,
+#   VITA_SIM_TYPE in the simulator.
+# - vita/remote.c/.h (new): a LAN listener on :8080 served from the main
+#   loop, never blocking it: GET / is a form, /open?url= opens the URL on
+#   the Vita, /cookie sets and shows a cookie (the jar's persistence test).
+#   The simulator moves the port (VITA_SIM_REMOTE_PORT).
+# - vita/interact.c/.h (new): the autotest's interaction pass, after pass
+#   N: 22 scripted steps through vita_input_browse() on the IN-* test pages
+#   (taps, pointer, back/forward, drag, zoom, blocked hosts, a form filled
+#   in and sent, typed URL, a URL pushed to the listener over loopback, the
+#   cookie jar saved, home), each checked and logged; dumps IN-zoom125,
+#   IN-block, IN-form-sent.
+# - main.c: the test functions move behind SELECT (SELECT + SQUARE
+#   autotest, + CIRCLE dump, + TRIANGLE memory probe, + L/R test pages,
+#   + START quit); the cookie jar loaded at start-up and saved after page
+#   loads (at most every 10 s) and on quit, since the PS button runs no
+#   exit code; start page = the home page (argv[1] overrides: the
+#   simulator); the HUD shows title/URL/loading on top and zoom, blocked
+#   count and the listener's address below; the pointer is drawn.
+# - window.c/.h: the title kept for the HUD; the throbber and title
+#   repaint it. Makefile: the new sources, -lSceTouch_stub.
+#   Makefile.defaults: NETSURF_VITA_START_PAGE = the home page.
+# See docs/phase-0/10-hardware-test-plan.md §Run 14.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 16c2aea..9db8a40 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -59,6 +59,7 @@ LDFLAGS += -Wl,-q -L$(VITA_QUICKJS)/lib -lquickjs \
+ 	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
+ 	-lScePgf_stub -lScePvf_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
+ 	-lSceAppMgr_stub -lScePower_stub -lSceNet_stub -lSceNetCtl_stub \
++	-lSceTouch_stub \
+ 	-lpthread -lm
+ endif
+ 
+@@ -79,7 +80,8 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+ 	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
+-	qjs_hooks.c js_platform.c netprobe.c resolve.c
++	qjs_hooks.c js_platform.c netprobe.c resolve.c input.c chrome.c \
++	remote.c interact.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/Makefile.defaults b/frontends/vita/Makefile.defaults
+index f00d5c7..dd1dd8b 100644
+--- a/frontends/vita/Makefile.defaults
++++ b/frontends/vita/Makefile.defaults
+@@ -42,6 +42,6 @@ NETSURF_FS_BACKING_STORE := NO
+ NETSURF_STRIP_BINARY := NO
+ 
+ # The page opened at start-up, relative to the app bundle.
+-NETSURF_VITA_START_PAGE := file:///app0:/testpages/L1-layout-basics.html
++NETSURF_VITA_START_PAGE := file:///ux0:data/VitaBrowser/home.html
+ 
+ CFLAGS += -O2
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+new file mode 100644
+index 0000000..3550442
+--- /dev/null
++++ b/frontends/vita/chrome.c
+@@ -0,0 +1,405 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the home page, bookmarks, and entering URLs and text
++ * (see vita/chrome.h).
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef __vita__
++#include <psp2/common_dialog.h>
++#include <psp2/ime_dialog.h>
++#include <psp2/libime.h>
++#include <psp2/kernel/threadmgr.h>
++#include <vita2d.h>
++#endif
++
++#include "utils/errors.h"
++#include "utils/nsurl.h"
++#include "utils/utf8.h"
++#include "netsurf/browser_window.h"
++#include "netsurf/keypress.h"
++
++#include "vita/diag.h"
++#include "vita/remote.h"
++#include "vita/window.h"
++#include "vita/chrome.h"
++
++/** Room for the keyboard's longest text in UTF-8. */
++#define TEXT_MAX (2048 * 3 + 1)
++
++/** Where typed words go (a page that works without JavaScript). */
++#define SEARCH_URL "https://lite.duckduckgo.com/lite/?q="
++
++static const char default_bookmarks[] =
++	"# VitaBrowser bookmarks: one \"Title | URL\" per line; lines\n"
++	"# starting with # are ignored. Edit this file freely (VitaShell,\n"
++	"# FTP); the home page is rebuilt from it at every start.\n"
++	"Claude Code | https://claude.ai/code\n"
++	"Wikipedia (mobile) | https://en.m.wikipedia.org/\n"
++	"Hacker News | https://news.ycombinator.com/\n"
++	"CNN Lite | https://lite.cnn.com/\n"
++	"example.com | https://example.com/\n";
++
++/** Write s to fp with HTML's special characters escaped. */
++static void put_escaped(FILE *fp, const char *s, size_t n)
++{
++	size_t i;
++
++	for (i = 0; i < n && s[i] != '\0'; i++) {
++		switch (s[i]) {
++		case '&': fputs("&amp;", fp); break;
++		case '<': fputs("&lt;", fp); break;
++		case '>': fputs("&gt;", fp); break;
++		case '"': fputs("&quot;", fp); break;
++		default: fputc(s[i], fp); break;
++		}
++	}
++}
++
++/** Trim spaces from both ends of [*s, *s + *n). */
++static void trim(const char **s, size_t *n)
++{
++	while (*n > 0 && (**s == ' ' || **s == '\t')) {
++		(*s)++;
++		(*n)--;
++	}
++	while (*n > 0 && ((*s)[*n - 1] == ' ' || (*s)[*n - 1] == '\t' ||
++			  (*s)[*n - 1] == '\r' || (*s)[*n - 1] == '\n'))
++		(*n)--;
++}
++
++/* exported interface documented in vita/chrome.h */
++nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
++{
++	char line[1024];
++	FILE *bm, *fp;
++	unsigned int i, count = 0;
++
++	bm = fopen(VITA_BOOKMARKS_FILE, "r");
++	if (bm == NULL) {
++		fp = fopen(VITA_BOOKMARKS_FILE, "w");
++		if (fp != NULL) {
++			fputs(default_bookmarks, fp);
++			fclose(fp);
++			vita_diag_log("chrome: wrote default %s",
++				      VITA_BOOKMARKS_FILE);
++		}
++		bm = fopen(VITA_BOOKMARKS_FILE, "r");
++	}
++	fp = fopen(VITA_HOME_FILE, "w");
++	if (fp == NULL) {
++		if (bm != NULL)
++			fclose(bm);
++		return NSERROR_SAVE_FAILED;
++	}
++	fputs("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
++	      "<title>VitaBrowser</title><style>\n"
++	      "body { font-family: sans-serif; font-size: 18px;"
++	      " margin: 28px 12px 30px 12px; }\n"
++	      "h1 { font-size: 26px; margin: 0 0 6px 0; }\n"
++	      "h2 { font-size: 20px; margin: 14px 0 4px 0; }\n"
++	      ".bm a { display: block; padding: 9px 12px; margin: 4px 0;"
++	      " background: #e8eef8; border-radius: 6px; color: #103070;"
++	      " text-decoration: none; font-size: 22px; }\n"
++	      ".hint { color: #444; font-size: 15px; }\n"
++	      ".tests a { display: inline-block; margin: 2px 8px 2px 0;"
++	      " font-size: 15px; }\n"
++	      "</style></head><body>\n<h1>VitaBrowser</h1>\n"
++	      "<p class=\"hint\">Tap a link, or move the pointer (left stick)"
++	      " and press &#x2715;. &#x25b3; types a URL. L / R: back /"
++	      " forward. &#x25a1;: zoom. START: this page.", fp);
++	if (vita_remote_address() != NULL) {
++		fputs(" From a phone or PC on the same Wi-Fi: <b>http://", fp);
++		put_escaped(fp, vita_remote_address(), 64);
++		fputs("/</b>", fp);
++	}
++	fputs("</p>\n<h2>Bookmarks</h2>\n<div class=\"bm\">\n", fp);
++	while (bm != NULL && fgets(line, sizeof(line), bm) != NULL) {
++		const char *bar = strchr(line, '|');
++		const char *t = line, *u;
++		size_t tn, un;
++
++		if (line[0] == '#' || bar == NULL)
++			continue;
++		tn = (size_t)(bar - line);
++		u = bar + 1;
++		un = strlen(u);
++		trim(&t, &tn);
++		trim(&u, &un);
++		if (un == 0)
++			continue;
++		fputs("<a href=\"", fp);
++		put_escaped(fp, u, un);
++		fputs("\">", fp);
++		put_escaped(fp, tn > 0 ? t : u, tn > 0 ? tn : un);
++		fputs("</a>\n", fp);
++		count++;
++	}
++	if (bm != NULL)
++		fclose(bm);
++	fputs("</div>\n<p class=\"hint\">Bookmarks: "
++	      VITA_BOOKMARKS_FILE "</p>\n<h2>Test pages</h2>\n"
++	      "<div class=\"tests\">\n", fp);
++	for (i = 0; i < n; i++) {
++		fprintf(fp, "<a href=\"file:///app0:/testpages/%s.html\">",
++			test_pages[i]);
++		put_escaped(fp, test_pages[i], 64);
++		fputs("</a>\n", fp);
++	}
++	/* The cookie jar's persistence test (vita/remote.c /cookie). */
++	fprintf(fp, "<a href=\"http://127.0.0.1:%d/cookie\">cookie test</a>\n",
++		vita_remote_port());
++	fputs("</div>\n</body></html>\n", fp);
++	fclose(fp);
++	vita_diag_log("chrome: home page with %u bookmarks", count);
++	return NSERROR_OK;
++}
++
++/* exported interface documented in vita/chrome.h */
++char *vita_chrome_typed_url(const char *typed)
++{
++	const char *s = typed;
++	size_t n = strlen(typed), i;
++	char *out, *o;
++	nsurl *url;
++
++	trim(&s, &n);
++	if (n == 0)
++		return NULL;
++	/* A URL with a scheme, as it is. */
++	for (i = 0; i < n && s[i] != ':' && s[i] != '/' && s[i] != ' '; i++)
++		;
++	if (i > 0 && i < n && s[i] == ':' && nsurl_create(s, &url) ==
++	    NSERROR_OK) {
++		out = strndup(s, n);
++		nsurl_unref(url);
++		return out;
++	}
++	/* A host or host/path: no spaces, and a dot (or localhost). An
++	 * IPv4 address or localhost gets http:// -- a LAN device, like the
++	 * Vita's own listener, rarely speaks TLS -- anything else https://. */
++	if (memchr(s, ' ', n) == NULL && (memchr(s, '.', n) != NULL ||
++					   strncmp(s, "localhost", 9) == 0)) {
++		size_t h = strcspn(s, ":/?#");
++		bool ip = h > 0 && h <= n && strspn(s, "0123456789.") == h;
++		bool plain = ip || (h == 9 && strncmp(s, "localhost", 9) == 0);
++		out = malloc(n + 9);
++		if (out != NULL)
++			snprintf(out, n + 9, "%s%.*s",
++				 plain ? "http://" : "https://", (int)n, s);
++		return out;
++	}
++	/* Words: a search. */
++	out = malloc(sizeof(SEARCH_URL) + n * 3);
++	if (out == NULL)
++		return NULL;
++	o = out + sprintf(out, "%s", SEARCH_URL);
++	for (i = 0; i < n; i++) {
++		unsigned char c = (unsigned char)s[i];
++		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++		    (c >= '0' && c <= '9') || c == '-' || c == '_' ||
++		    c == '.' || c == '~')
++			*o++ = (char)c;
++		else if (c == ' ')
++			*o++ = '+';
++		else
++			o += sprintf(o, "%%%02X", c);
++	}
++	*o = '\0';
++	return out;
++}
++
++/* exported interface documented in vita/chrome.h */
++nserror vita_chrome_open(struct gui_window *gw, const char *typed,
++			 const char *why)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	char *s = vita_chrome_typed_url(typed);
++	nsurl *url;
++	nserror err;
++
++	if (bw == NULL || s == NULL) {
++		free(s);
++		return NSERROR_BAD_PARAMETER;
++	}
++	err = nsurl_create(s, &url);
++	vita_diag_log("chrome: open %s (%s) -> %d", s, why, err);
++	free(s);
++	if (err != NSERROR_OK)
++		return err;
++	err = browser_window_navigate(bw, url, NULL, BW_NAVIGATE_HISTORY,
++				      NULL, NULL, NULL);
++	nsurl_unref(url);
++	return err;
++}
++
++/* exported interface documented in vita/chrome.h */
++bool vita_chrome_editing(struct gui_window *gw)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++
++	return bw != NULL &&
++		(browser_window_get_editor_flags(bw) & BW_EDITOR_CAN_PASTE);
++}
++
++/* exported interface documented in vita/chrome.h */
++void vita_chrome_enter_text(struct gui_window *gw, const char *utf8)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	size_t i = 0, n = strlen(utf8);
++	unsigned int chars = 0;
++
++	if (bw == NULL)
++		return;
++	if (!vita_chrome_editing(gw)) {
++		vita_chrome_open(gw, utf8, "typed");
++		return;
++	}
++	while (i < n) {
++		uint32_t cp = utf8_to_ucs4(utf8 + i, n - i);
++		i = utf8_next(utf8, n, i);
++		/* The keyboard's line breaks become the page's. */
++		browser_window_key_press(bw, cp == '\n' ? NS_KEY_NL : cp);
++		chars++;
++	}
++	vita_diag_log("chrome: typed %u characters into the page", chars);
++	vita_window_force_redraw(gw);
++}
++
++#ifdef __vita__
++/** UTF-8 -> UTF-16 (no surrogates past the BMP: the dialog's limit). */
++static void to_utf16(const char *s, SceWChar16 *out, size_t max)
++{
++	size_t i = 0, n = strlen(s), o = 0;
++
++	while (i < n && o + 1 < max) {
++		uint32_t cp = utf8_to_ucs4(s + i, n - i);
++		i = utf8_next(s, n, i);
++		out[o++] = (SceWChar16)(cp > 0xffff ? '?' : cp);
++	}
++	out[o] = 0;
++}
++
++/** UTF-16 -> UTF-8. */
++static void from_utf16(const SceWChar16 *s, char *out, size_t max)
++{
++	size_t o = 0;
++	char buf[6];
++
++	for (; *s != 0; s++) {
++		size_t k = utf8_from_ucs4(*s, buf);
++		if (o + k + 1 > max)
++			break;
++		memcpy(out + o, buf, k);
++		o += k;
++	}
++	out[o] = '\0';
++}
++
++/** The system keyboard; false if cancelled or not shown. */
++static bool ime_dialog(bool url_mode, const char *initial, char *out,
++		       size_t max)
++{
++	static SceWChar16 title[64], init[SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1],
++		buf[SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1];
++	SceImeDialogParam param;
++	SceImeDialogResult result;
++	int r;
++
++	to_utf16(url_mode ? "Open URL or search" : "Text", title, 64);
++	to_utf16(initial, init, SCE_IME_DIALOG_MAX_TEXT_LENGTH);
++	memset(buf, 0, sizeof(buf));
++	sceImeDialogParamInit(&param);
++	param.supportedLanguages = 0x0001FFFF;
++	param.languagesForced = SCE_TRUE;
++	param.type = url_mode ? SCE_IME_TYPE_URL : SCE_IME_TYPE_DEFAULT;
++	param.option = url_mode ? SCE_IME_OPTION_NO_AUTO_CAPITALIZATION : 0;
++	param.dialogMode = SCE_IME_DIALOG_DIALOG_MODE_WITH_CANCEL;
++	param.textBoxMode = SCE_IME_DIALOG_TEXTBOX_MODE_WITH_CLEAR;
++	param.title = title;
++	param.maxTextLength = SCE_IME_DIALOG_MAX_TEXT_LENGTH;
++	param.initialText = init;
++	param.inputTextBuffer = buf;
++	r = sceImeDialogInit(&param);
++	if (r < 0) {
++		vita_diag_log("chrome: sceImeDialogInit -> 0x%08x",
++			      (unsigned int)r);
++		return false;
++	}
++	while (sceImeDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING) {
++		vita2d_start_drawing();
++		vita2d_clear_screen();
++		vita2d_end_drawing();
++		vita2d_common_dialog_update();
++		vita2d_swap_buffers();
++		sceKernelDelayThread(16 * 1000);
++	}
++	memset(&result, 0, sizeof(result));
++	r = sceImeDialogGetResult(&result);
++	sceImeDialogTerm();
++	if (r < 0 || result.button != SCE_IME_DIALOG_BUTTON_ENTER)
++		return false;
++	from_utf16(buf, out, max);
++	return true;
++}
++#endif
++
++/* exported interface documented in vita/chrome.h */
++void vita_chrome_text_entry(struct gui_window *gw)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	bool editing = vita_chrome_editing(gw);
++	const char *initial = "";
++	char text[TEXT_MAX];
++
++	if (bw == NULL)
++		return;
++	if (!editing) {
++		nsurl *u = browser_window_access_url(bw);
++		initial = u != NULL ? nsurl_access(u) : "";
++		/* The generated home page is no URL to edit. */
++		if (strcmp(initial, VITA_HOME_URL) == 0)
++			initial = "";
++	}
++#ifdef __vita__
++	if (!ime_dialog(!editing, initial, text, sizeof(text))) {
++		vita_diag_log("chrome: text entry cancelled");
++		vita_window_force_redraw(gw);
++		return;
++	}
++#else
++	/* The simulator has no keyboard: VITA_SIM_TYPE stands in for it. */
++	{
++		const char *t = getenv("VITA_SIM_TYPE");
++		(void)initial;
++		if (t == NULL)
++			return;
++		snprintf(text, sizeof(text), "%s", t);
++	}
++#endif
++	vita_chrome_enter_text(gw, text);
++	vita_window_force_redraw(gw);
++}
+diff --git a/frontends/vita/chrome.h b/frontends/vita/chrome.h
+new file mode 100644
+index 0000000..35d2ab4
+--- /dev/null
++++ b/frontends/vita/chrome.h
+@@ -0,0 +1,80 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the home page, bookmarks, and entering URLs and text
++ * (vita/chrome.c). The README's v0 chrome (§14.8): a URL, a page,
++ * back/forward on the buttons, bookmarks in a text file on ux0:.
++ */
++
++#ifndef NETSURF_VITA_CHROME_H
++#define NETSURF_VITA_CHROME_H
++
++#include <stdbool.h>
++#include <stddef.h>
++
++#include "utils/errors.h"
++
++struct gui_window;
++
++/** The bookmarks: one "Title | URL" per line, '#' comments. Created with
++ * defaults if missing; the user edits it (VitaShell, FTP). */
++#define VITA_BOOKMARKS_FILE "ux0:data/VitaBrowser/bookmarks.txt"
++
++/** The home page, generated from the bookmarks at start-up. */
++#define VITA_HOME_FILE "ux0:data/VitaBrowser/home.html"
++#define VITA_HOME_URL "file:///ux0:data/VitaBrowser/home.html"
++
++/**
++ * Write the home page from the bookmarks and the bundled test pages.
++ *
++ * \param test_pages  names of the bundled test pages (app0:/testpages/)
++ * \param n           how many
++ */
++nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n);
++
++/**
++ * Turn what the user typed into a URL: a URL as it is, a bare host or
++ * path gets https://, anything else (spaces, no dot) becomes a search.
++ *
++ * \return the URL (malloc()ed) or NULL
++ */
++char *vita_chrome_typed_url(const char *typed);
++
++/** Open url (as typed or pushed) in the window. */
++nserror vita_chrome_open(struct gui_window *gw, const char *url,
++			 const char *why);
++
++/** Is the caret in a text field (typed text goes into the page)? */
++bool vita_chrome_editing(struct gui_window *gw);
++
++/**
++ * Deliver entered text: into the focused field when editing, else as a
++ * URL to open. Separate from the keyboard, so the autotest can drive it.
++ */
++void vita_chrome_enter_text(struct gui_window *gw, const char *utf8);
++
++/**
++ * TRIANGLE: show the system keyboard (on the Vita), prefilled with the
++ * current URL unless a text field has the caret, and deliver the result.
++ * The page is not repainted meanwhile (as for alert(), vita/js_platform.c).
++ */
++void vita_chrome_text_entry(struct gui_window *gw);
++
++#endif
+diff --git a/frontends/vita/input.c b/frontends/vita/input.c
+new file mode 100644
+index 0000000..89582b8
+--- /dev/null
++++ b/frontends/vita/input.c
+@@ -0,0 +1,306 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: browsing controls (see vita/input.h for the mapping).
++ *
++ * Clicks go to the core in window coordinates -- screen position plus the
++ * scroll offset; the core divides by the zoom itself -- as a press on the
++ * way down and a click on the way up, like the framebuffer frontend's
++ * mouse. The front panel reports 1920 x 1088 for the 960 x 544 screen.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <psp2/ctrl.h>
++#include <psp2/touch.h>
++
++#include "utils/errors.h"
++#include "netsurf/browser_window.h"
++#include "netsurf/mouse.h"
++#include "desktop/browser_history.h"
++
++#include "vita/diag.h"
++#include "vita/plot.h"
++#include "vita/window.h"
++#include "vita/input.h"
++
++/** Stick dead zone around the 128 centre. */
++#define STICK_DEADZONE 24
++/** D-pad scroll, pixels per pass. */
++#define DPAD_STEP 24
++/** Pointer speed at full stick deflection, pixels per pass. */
++#define POINTER_MAX_SPEED 14.0f
++/** A touch that moves further than this is a drag, not a tap. */
++#define TAP_SLOP 12
++/** ...and one held longer than this, ms, is not a tap either. */
++#define TAP_MAX_MS 700
++/** The pointer is drawn for this long after it last moved, ms. */
++#define POINTER_SHOW_MS 4000
++
++const float vita_zoom_steps[VITA_ZOOM_STEPS] = { 1.0f, 1.25f, 1.5f, 2.0f };
++
++struct vita_input_stats vita_input_stats;
++
++static struct {
++	float x, y;			/**< the pointer */
++	unsigned int moved_ms;		/**< when it last moved */
++	bool cross_down;		/**< CROSS pressed on the page */
++	int cross_x, cross_y;		/**< ...here (window coordinates) */
++	bool touching;			/**< a finger is down */
++	bool dragging;			/**< ...and has moved past TAP_SLOP */
++	int touch_x0, touch_y0;		/**< where it went down */
++	int touch_x, touch_y;		/**< where it was last pass */
++	unsigned int touch_ms;		/**< when it went down */
++	unsigned int zoom;		/**< index into vita_zoom_steps */
++} st = { .x = VITA_SCREEN_WIDTH / 2.0f, .y = VITA_SCREEN_HEIGHT / 2.0f };
++
++/* exported interface documented in vita/input.h */
++void vita_input_idle(struct vita_input *in)
++{
++	memset(in, 0, sizeof(*in));
++	in->lx = in->ly = in->rx = in->ry = 128;
++}
++
++/* exported interface documented in vita/input.h */
++void vita_input_read(struct vita_input *in)
++{
++	static bool touch_on;
++	SceCtrlData pad;
++	SceTouchData touch;
++
++	vita_input_idle(in);
++	memset(&pad, 0, sizeof(pad));
++	sceCtrlPeekBufferPositive(0, &pad, 1);
++	in->buttons = pad.buttons;
++	in->lx = pad.lx;
++	in->ly = pad.ly;
++	in->rx = pad.rx;
++	in->ry = pad.ry;
++	if (!touch_on) {
++		sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
++					 SCE_TOUCH_SAMPLING_STATE_START);
++		touch_on = true;
++	}
++	memset(&touch, 0, sizeof(touch));
++	if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) >= 0 &&
++	    touch.reportNum > 0) {
++		in->touch = true;
++		in->tx = touch.report[0].x / 2;
++		in->ty = touch.report[0].y / 2;
++	}
++}
++
++/** Stick deflection beyond the dead zone, -1 .. 1. */
++static float stick(unsigned char v)
++{
++	int d = (int)v - 128;
++
++	if (abs(d) <= STICK_DEADZONE)
++		return 0.0f;
++	d += (d > 0) ? -STICK_DEADZONE : STICK_DEADZONE;
++	return (float)d / (float)(128 - STICK_DEADZONE);
++}
++
++static void window_xy(struct gui_window *gw, int sx, int sy, int *x, int *y)
++{
++	int scx, scy;
++
++	vita_window_scroll_pos(gw, &scx, &scy);
++	*x = sx + scx;
++	*y = sy + scy;
++}
++
++/** A click at a screen position: press and release in one go. */
++static void click_at(struct gui_window *gw, int sx, int sy)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	int x, y;
++
++	window_xy(gw, sx, sy, &x, &y);
++	vita_diag_log("input: click at %d,%d (page %d,%d)", sx, sy, x, y);
++	browser_window_mouse_click(bw, BROWSER_MOUSE_PRESS_1, x, y);
++	browser_window_mouse_click(bw, BROWSER_MOUSE_CLICK_1, x, y);
++	browser_window_mouse_track(bw, 0, x, y);
++	vita_input_stats.clicks++;
++}
++
++/** The front panel: tap = click, drag = scroll with the finger. */
++static void touch_step(struct gui_window *gw, const struct vita_input *in)
++{
++	unsigned int now = vita_diag_ms();
++
++	if (in->touch && !st.touching) {
++		st.touching = true;
++		st.dragging = false;
++		st.touch_x0 = st.touch_x = in->tx;
++		st.touch_y0 = st.touch_y = in->ty;
++		st.touch_ms = now;
++		return;
++	}
++	if (in->touch) {
++		if (!st.dragging &&
++		    (abs(in->tx - st.touch_x0) > TAP_SLOP ||
++		     abs(in->ty - st.touch_y0) > TAP_SLOP)) {
++			st.dragging = true;
++			vita_input_stats.drags++;
++		}
++		if (st.dragging)
++			vita_window_scroll_by(gw, st.touch_x - in->tx,
++					      st.touch_y - in->ty);
++		st.touch_x = in->tx;
++		st.touch_y = in->ty;
++		return;
++	}
++	if (st.touching) {
++		st.touching = false;
++		if (!st.dragging && now - st.touch_ms <= TAP_MAX_MS) {
++			vita_input_stats.taps++;
++			click_at(gw, st.touch_x0, st.touch_y0);
++		}
++	}
++}
++
++/** The pointer: the left stick moves it, CROSS clicks under it. */
++static void pointer_step(struct gui_window *gw, const struct vita_input *in,
++			 const struct vita_input *prev)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	float dx = stick(in->lx), dy = stick(in->ly);
++	int x, y;
++
++	if (dx != 0.0f || dy != 0.0f) {
++		/* Quadratic: fine control near the centre. */
++		st.x += dx * (dx < 0 ? -dx : dx) * POINTER_MAX_SPEED;
++		st.y += dy * (dy < 0 ? -dy : dy) * POINTER_MAX_SPEED;
++		if (st.x < 0) st.x = 0;
++		if (st.y < 0) st.y = 0;
++		if (st.x > VITA_SCREEN_WIDTH - 1) st.x = VITA_SCREEN_WIDTH - 1;
++		if (st.y > VITA_SCREEN_HEIGHT - 1) st.y = VITA_SCREEN_HEIGHT - 1;
++		st.moved_ms = vita_diag_ms();
++		window_xy(gw, (int)st.x, (int)st.y, &x, &y);
++		/* Hover: link highlighting and the status text. */
++		browser_window_mouse_track(bw, st.cross_down ?
++					   BROWSER_MOUSE_HOLDING_1 : 0, x, y);
++		vita_window_force_redraw(gw);
++	}
++	if ((in->buttons & SCE_CTRL_CROSS) &&
++	    !(prev->buttons & SCE_CTRL_CROSS)) {
++		st.moved_ms = vita_diag_ms();
++		window_xy(gw, (int)st.x, (int)st.y, &st.cross_x, &st.cross_y);
++		browser_window_mouse_click(bw, BROWSER_MOUSE_PRESS_1,
++					   st.cross_x, st.cross_y);
++		st.cross_down = true;
++	} else if (!(in->buttons & SCE_CTRL_CROSS) && st.cross_down) {
++		window_xy(gw, (int)st.x, (int)st.y, &x, &y);
++		vita_diag_log("input: pointer click at %d,%d (page %d,%d)",
++			      (int)st.x, (int)st.y, x, y);
++		browser_window_mouse_click(bw, BROWSER_MOUSE_CLICK_1, x, y);
++		browser_window_mouse_track(bw, 0, x, y);
++		st.cross_down = false;
++		vita_input_stats.clicks++;
++	}
++}
++
++/* exported interface documented in vita/input.h */
++void vita_input_set_zoom(struct gui_window *gw, unsigned int step)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++
++	st.zoom = step % VITA_ZOOM_STEPS;
++	if (bw != NULL) {
++		vita_diag_log("input: zoom %d%%",
++			      (int)(vita_zoom_steps[st.zoom] * 100.0f + 0.5f));
++		browser_window_set_scale(bw, vita_zoom_steps[st.zoom], true);
++		vita_window_force_redraw(gw);
++	}
++}
++
++/* exported interface documented in vita/input.h */
++unsigned int vita_input_zoom_step(void)
++{
++	return st.zoom;
++}
++
++/* exported interface documented in vita/input.h */
++enum vita_browse_action vita_input_browse(struct gui_window *gw,
++					  const struct vita_input *in,
++					  const struct vita_input *prev)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	unsigned int pressed = in->buttons & ~prev->buttons;
++	int dx = 0, dy = 0;
++
++	if (gw == NULL || bw == NULL)
++		return VITA_BROWSE_NONE;
++
++	touch_step(gw, in);
++	pointer_step(gw, in, prev);
++
++	if (in->buttons & SCE_CTRL_UP)
++		dy -= DPAD_STEP;
++	if (in->buttons & SCE_CTRL_DOWN)
++		dy += DPAD_STEP;
++	if (in->buttons & SCE_CTRL_LEFT)
++		dx -= DPAD_STEP;
++	if (in->buttons & SCE_CTRL_RIGHT)
++		dx += DPAD_STEP;
++	dx += (int)(stick(in->rx) * 32.0f);
++	dy += (int)(stick(in->ry) * 32.0f);
++	if (dx != 0 || dy != 0)
++		vita_window_scroll_by(gw, dx, dy);
++
++	if ((pressed & SCE_CTRL_LTRIGGER) &&
++	    browser_window_history_back_available(bw)) {
++		vita_diag_log("input: back");
++		vita_input_stats.backs++;
++		browser_window_history_back(bw, false);
++	}
++	if ((pressed & SCE_CTRL_RTRIGGER) &&
++	    browser_window_history_forward_available(bw)) {
++		vita_diag_log("input: forward");
++		vita_input_stats.forwards++;
++		browser_window_history_forward(bw, false);
++	}
++	if (pressed & SCE_CTRL_SQUARE)
++		vita_input_set_zoom(gw, st.zoom + 1);
++	if (pressed & SCE_CTRL_TRIANGLE)
++		return VITA_BROWSE_ENTER_TEXT;
++	if (pressed & SCE_CTRL_START)
++		return VITA_BROWSE_HOME;
++	return VITA_BROWSE_NONE;
++}
++
++/* exported interface documented in vita/input.h */
++void vita_input_pointer_home(void)
++{
++	st.x = VITA_SCREEN_WIDTH / 2.0f;
++	st.y = VITA_SCREEN_HEIGHT / 2.0f;
++}
++
++/* exported interface documented in vita/input.h */
++bool vita_input_pointer(int *x, int *y)
++{
++	*x = (int)st.x;
++	*y = (int)st.y;
++	return st.moved_ms != 0 &&
++		vita_diag_ms() - st.moved_ms < POINTER_SHOW_MS;
++}
+diff --git a/frontends/vita/input.h b/frontends/vita/input.h
+new file mode 100644
+index 0000000..4895b59
+--- /dev/null
++++ b/frontends/vita/input.h
+@@ -0,0 +1,97 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: browsing controls (vita/input.c).
++ *
++ * Input arrives as one record per main-loop pass -- the buttons held, the
++ * sticks, and a finger on the front touch panel -- read from the hardware
++ * or, in the autotest's interaction pass, scripted (vita/interact.c). Both
++ * go through vita_input_browse(), so the pass tests the real controls.
++ */
++
++#ifndef NETSURF_VITA_INPUT_H
++#define NETSURF_VITA_INPUT_H
++
++#include <stdbool.h>
++
++struct gui_window;
++
++/** One pass's input. */
++struct vita_input {
++	unsigned int buttons;		/**< SCE_CTRL_* held */
++	unsigned char lx, ly, rx, ry;	/**< sticks, 128 = centre */
++	bool touch;			/**< a finger on the front panel */
++	int tx, ty;			/**< where, in screen pixels */
++};
++
++/** What the main loop has to do after vita_input_browse(). */
++enum vita_browse_action {
++	VITA_BROWSE_NONE,
++	VITA_BROWSE_ENTER_TEXT,		/**< TRIANGLE: URL or text entry */
++	VITA_BROWSE_HOME,		/**< START: the home page */
++};
++
++/** Zoom steps SQUARE cycles through. */
++#define VITA_ZOOM_STEPS 4
++extern const float vita_zoom_steps[VITA_ZOOM_STEPS];
++
++/** Read the pad and the front touch panel. */
++void vita_input_read(struct vita_input *in);
++
++/** Neutral input: nothing held, sticks centred, no touch. */
++void vita_input_idle(struct vita_input *in);
++
++/**
++ * Apply the browsing controls for one pass.
++ *
++ *   touch: tap = click, drag = scroll    left stick: pointer, CROSS clicks
++ *   right stick, D-pad: scroll           L / R: back / forward
++ *   SQUARE: zoom 100/125/150/200 %       TRIANGLE: enter a URL or text
++ *   START: home                          (SELECT combinations are the test
++ *                                         functions, handled by main.c)
++ *
++ * \param in    this pass's input
++ * \param prev  the previous pass's, for button presses (edges)
++ */
++enum vita_browse_action vita_input_browse(struct gui_window *gw,
++					  const struct vita_input *in,
++					  const struct vita_input *prev);
++
++/** The pointer: position and whether to draw it (moved recently). */
++bool vita_input_pointer(int *x, int *y);
++
++/** Put the pointer back in the middle of the screen. */
++void vita_input_pointer_home(void);
++
++/** The current zoom step's index into vita_zoom_steps. */
++unsigned int vita_input_zoom_step(void);
++
++/** Set the zoom step (and the window's scale). */
++void vita_input_set_zoom(struct gui_window *gw, unsigned int step);
++
++/** Counters, for the log and the interaction pass. */
++struct vita_input_stats {
++	unsigned int clicks;		/**< clicks sent to the page */
++	unsigned int taps, drags;	/**< touch gestures recognised */
++	unsigned int backs, forwards;	/**< history steps taken */
++};
++extern struct vita_input_stats vita_input_stats;
++
++#endif
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+new file mode 100644
+index 0000000..4660d03
+--- /dev/null
++++ b/frontends/vita/interact.c
+@@ -0,0 +1,408 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the autotest's interaction pass (see vita/interact.h).
++ *
++ * The script works on the IN-* test pages (testpages/pages/IN-*.html),
++ * whose links and fields sit at fixed positions. Each step acts, waits for
++ * the page to settle (at least SETTLE_MIN_MS after acting), then checks.
++ */
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <psp2/ctrl.h>
++
++#include "utils/nsurl.h"
++#include "netsurf/browser_window.h"
++
++#include "vita/chrome.h"
++#include "vita/diag.h"
++#include "vita/input.h"
++#include "vita/remote.h"
++#include "vita/resolve.h"
++#include "vita/window.h"
++#include "vita/interact.h"
++
++/** After acting, wait at least this long before a page can count as
++ * settled, ms: a navigation's fetch may not have started yet. */
++#define SETTLE_MIN_MS 400
++/** Give up on a step after this long, ms. */
++#define STEP_TIMEOUT_MS 20000
++
++#define T "file:///app0:/testpages/"
++
++enum act {
++	A_NONE,		/**< nothing: a check only */
++	A_OPEN,		/**< navigate to arg */
++	A_TAP,		/**< touch at x,y and let go */
++	A_BUTTON,	/**< press and release button */
++	A_POINT,	/**< move the pointer to x,y with the stick, CROSS */
++	A_DRAG,		/**< touch at x,y, move to x2,y2, let go */
++	A_TYPE,		/**< deliver arg as entered text */
++	A_REMOTE,	/**< navigate to the LAN listener's path arg */
++};
++
++enum check {
++	C_URL,		/**< the URL ends with expect */
++	C_SCROLL,	/**< the vertical scroll offset is value */
++	C_ZOOM,		/**< the zoom step is value */
++	C_BLOCKED,	/**< at least value fetches were blocked by this step */
++	C_EDITING,	/**< a text field has the caret */
++	C_REMOTE,	/**< a pushed URL was opened, and the URL ends expect */
++	C_COOKIE,	/**< the saved jar holds the listener's cookie */
++	C_TYPED,	/**< vita_chrome_typed_url() turns text into URLs */
++	C_NONE,		/**< nothing to check */
++};
++
++static const struct step {
++	const char *name;
++	enum act act;
++	const char *arg;
++	int x, y, x2, y2;
++	unsigned int button;
++	enum check check;
++	const char *expect;
++	int value;
++	const char *dump;
++} steps[] = {
++	{ "typed text becomes a URL", A_NONE, NULL, 0, 0, 0, 0, 0,
++	  C_TYPED, NULL, 0, NULL },
++	{ "open IN-links", A_OPEN, T "IN-links.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-links.html", 0, NULL },
++	{ "tap a link", A_TAP, NULL, 250, 140, 0, 0, 0,
++	  C_URL, "IN-target.html?via=tap", 0, NULL },
++	{ "L goes back", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_LTRIGGER,
++	  C_URL, "IN-links.html", 0, NULL },
++	{ "R goes forward", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_RTRIGGER,
++	  C_URL, "IN-target.html?via=tap", 0, NULL },
++	{ "L back again", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_LTRIGGER,
++	  C_URL, "IN-links.html", 0, NULL },
++	{ "pointer + CROSS clicks", A_POINT, NULL, 620, 272, 0, 0, 0,
++	  C_URL, "IN-target.html?via=pointer", 0, NULL },
++	{ "L back", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_LTRIGGER,
++	  C_URL, "IN-links.html", 0, NULL },
++	{ "drag scrolls", A_DRAG, NULL, 480, 450, 480, 150, 0,
++	  C_SCROLL, NULL, 300, NULL },
++	{ "SQUARE zooms to 125%", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_SQUARE,
++	  C_ZOOM, NULL, 1, "IN-zoom125" },
++	{ "SQUARE: 150%", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_SQUARE,
++	  C_ZOOM, NULL, 2, NULL },
++	{ "SQUARE: 200%", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_SQUARE,
++	  C_ZOOM, NULL, 3, NULL },
++	{ "SQUARE: back to 100%", A_BUTTON, NULL, 0, 0, 0, 0,
++	  SCE_CTRL_SQUARE, C_ZOOM, NULL, 0, NULL },
++	{ "ad and tracker hosts are blocked", A_OPEN, T "IN-block.html",
++	  0, 0, 0, 0, 0, C_BLOCKED, NULL, 3, "IN-block" },
++	{ "open IN-form", A_OPEN, T "IN-form.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-form.html", 0, NULL },
++	{ "tap puts the caret in a field", A_TAP, NULL, 300, 120, 0, 0, 0,
++	  C_EDITING, NULL, 0, NULL },
++	{ "text goes into the field", A_TYPE, "hello vita", 0, 0, 0, 0, 0,
++	  C_EDITING, NULL, 0, NULL },
++	{ "tap the submit button", A_TAP, NULL, 200, 225, 0, 0, 0,
++	  C_URL, "IN-target.html?via=form&q=hello+vita", 0, "IN-form-sent" },
++	{ "a typed URL opens", A_TYPE, T "IN-target.html?via=typed",
++	  0, 0, 0, 0, 0, C_URL, "IN-target.html?via=typed", 0, NULL },
++	{ "a URL pushed to the LAN listener opens", A_REMOTE,
++	  "/open?url=file%3A%2F%2F%2Fapp0%3A%2F"
++	  "testpages%2FIN-target.html%3Fvia%3Dremote", 0, 0, 0, 0, 0,
++	  C_REMOTE, "IN-target.html?via=remote", 0, NULL },
++	{ "cookies are saved to the card", A_REMOTE,
++	  "/cookie", 0, 0, 0, 0, 0,
++	  C_COOKIE, NULL, 0, NULL },
++	{ "START goes home", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_START,
++	  C_URL, "VitaBrowser/home.html", 0, NULL },
++};
++#define STEP_COUNT (sizeof(steps) / sizeof(steps[0]))
++
++unsigned int vita_interact_passed, vita_interact_total;
++
++static const struct vita_interact_host *host;
++static struct {
++	unsigned int step;
++	enum { PH_ACT, PH_WAIT, PH_DUMP } phase;
++	unsigned int pass;		/**< passes into the current act */
++	unsigned int acted_ms;		/**< when the act finished */
++	unsigned int started_ms;	/**< when the step started */
++	unsigned int blocked0;		/**< vita_resolve_blocked before */
++	unsigned int opened0;		/**< vita_remote_opened before */
++	bool cross;			/**< A_POINT: CROSS is down */
++} run;
++
++/* exported interface documented in vita/interact.h */
++void vita_interact_start(const struct vita_interact_host *h)
++{
++	host = h;
++	memset(&run, 0, sizeof(run));
++	vita_interact_passed = vita_interact_total = 0;
++	run.started_ms = vita_diag_ms();
++	vita_input_pointer_home();
++	vita_diag_log("interact: start, %u steps", (unsigned int)STEP_COUNT);
++}
++
++static bool url_ends(struct gui_window *gw, const char *suffix, char *got,
++		     size_t max)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	nsurl *u = bw ? browser_window_access_url(bw) : NULL;
++	const char *s = u ? nsurl_access(u) : "";
++	size_t n = strlen(s), k = strlen(suffix);
++
++	snprintf(got, max, "%s", s);
++	return n >= k && strcmp(s + n - k, suffix) == 0;
++}
++
++static bool typed_ok(char *detail, size_t max)
++{
++	static const struct { const char *in, *out; } t[] = {
++		{ "example.com", "https://example.com" },
++		{ "  en.m.wikipedia.org/wiki/PS_Vita ",
++		  "https://en.m.wikipedia.org/wiki/PS_Vita" },
++		{ "http://x.test/a?b=1", "http://x.test/a?b=1" },
++		{ "vita browser",
++		  "https://lite.duckduckgo.com/lite/?q=vita+browser" },
++		{ "127.0.0.1:8080/cookie", "http://127.0.0.1:8080/cookie" },
++		{ "localhost/x", "http://localhost/x" },
++		{ "1.example.com", "https://1.example.com" },
++	};
++	unsigned int i;
++
++	for (i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
++		char *u = vita_chrome_typed_url(t[i].in);
++		bool ok = u != NULL && strcmp(u, t[i].out) == 0;
++		if (!ok) {
++			snprintf(detail, max, "\"%s\" -> \"%s\"", t[i].in,
++				 u ? u : "(null)");
++			free(u);
++			return false;
++		}
++		free(u);
++	}
++	snprintf(detail, max, "%u cases", i);
++	return true;
++}
++
++static bool cookie_ok(char *detail, size_t max)
++{
++	const char *path = host->save_cookies();
++	char buf[4096];
++	size_t n = 0;
++	FILE *fp = path ? fopen(path, "rb") : NULL;
++
++	if (fp != NULL) {
++		n = fread(buf, 1, sizeof(buf) - 1, fp);
++		fclose(fp);
++	}
++	buf[n] = '\0';
++	snprintf(detail, max, "%s: %u bytes%s", path ? path : "(no jar)",
++		 (unsigned int)n, strstr(buf, "vbtest") ? ", has vbtest" : "");
++	return strstr(buf, "vbtest") != NULL;
++}
++
++/** Check the step just settled; log it. */
++static void check(struct gui_window *gw, const struct step *s)
++{
++	char detail[300] = "";
++	bool ok = false;
++	int x, y;
++
++	switch (s->check) {
++	case C_URL:
++		ok = url_ends(gw, s->expect, detail, sizeof(detail));
++		break;
++	case C_REMOTE:
++		ok = url_ends(gw, s->expect, detail, sizeof(detail)) &&
++			vita_remote_opened == run.opened0 + 1;
++		break;
++	case C_SCROLL:
++		vita_window_scroll_pos(gw, &x, &y);
++		ok = y == s->value;
++		snprintf(detail, sizeof(detail), "scroll %d,%d", x, y);
++		break;
++	case C_ZOOM:
++		ok = (int)vita_input_zoom_step() == s->value;
++		snprintf(detail, sizeof(detail), "zoom %d%%",
++			 (int)(vita_zoom_steps[vita_input_zoom_step()] *
++			       100.0f + 0.5f));
++		break;
++	case C_BLOCKED:
++		ok = vita_resolve_blocked - run.blocked0 >=
++			(unsigned int)s->value;
++		snprintf(detail, sizeof(detail), "%u blocked",
++			 vita_resolve_blocked - run.blocked0);
++		break;
++	case C_EDITING:
++		ok = vita_chrome_editing(gw);
++		snprintf(detail, sizeof(detail), "caret %s",
++			 ok ? "in a field" : "not in a field");
++		break;
++	case C_COOKIE:
++		ok = cookie_ok(detail, sizeof(detail));
++		break;
++	case C_TYPED:
++		ok = typed_ok(detail, sizeof(detail));
++		break;
++	case C_NONE:
++		ok = true;
++		break;
++	}
++	vita_interact_total++;
++	if (ok)
++		vita_interact_passed++;
++	vita_diag_log("interact: %u %s: %s (%s)", run.step + 1, s->name,
++		      ok ? "PASS" : "FAIL", detail);
++}
++
++/** This pass's input for the current act; true when the act is done. */
++static bool act(struct gui_window *gw, const struct step *s,
++		struct vita_input *in)
++{
++	unsigned int p = run.pass++;
++	int px, py;
++
++	switch (s->act) {
++	case A_NONE:
++		return true;
++	case A_OPEN:
++		host->open(gw, s->arg);
++		return true;
++	case A_REMOTE: {
++		/* Through curl and the listener, over loopback. */
++		char url[512];
++		snprintf(url, sizeof(url), "http://127.0.0.1:%d%s",
++			 vita_remote_port(), s->arg);
++		host->open(gw, url);
++		return true;
++	}
++	case A_TYPE:
++		vita_chrome_enter_text(gw, s->arg);
++		return true;
++	case A_BUTTON:
++		if (p == 0) {
++			in->buttons = s->button;
++			return false;
++		}
++		return true;	/* released */
++	case A_TAP:
++		if (p == 0) {
++			in->touch = true;
++			in->tx = s->x;
++			in->ty = s->y;
++			return false;
++		}
++		return true;
++	case A_DRAG: {
++		/* Ten passes from (x, y) to (x2, y2), then let go. */
++		if (p <= 10) {
++			in->touch = true;
++			in->tx = s->x + (s->x2 - s->x) * (int)p / 10;
++			in->ty = s->y + (s->y2 - s->y) * (int)p / 10;
++			return false;
++		}
++		return true;
++	}
++	case A_POINT:
++		/* The real stick path: push toward the target until the
++		 * pointer is within a few pixels, then press and release
++		 * CROSS. */
++		vita_input_pointer(&px, &py);
++		if (p < 400 && (abs(px - s->x) > 6 || abs(py - s->y) > 6)) {
++			int dx = s->x - px, dy = s->y - py;
++			/* Slow down near the target (the curve is
++			 * quadratic). */
++			int mag = (abs(dx) > 40 || abs(dy) > 40) ? 127 : 70;
++			if (dx != 0)
++				in->lx = (unsigned char)(128 + (dx > 0 ? mag :
++								-mag));
++			if (dy != 0)
++				in->ly = (unsigned char)(128 + (dy > 0 ? mag :
++								-mag));
++			if (abs(dx) <= 6)
++				in->lx = 128;
++			if (abs(dy) <= 6)
++				in->ly = 128;
++			return false;
++		}
++		if (!run.cross) {
++			/* Reached: CROSS down this pass, up the next. */
++			run.cross = true;
++			in->buttons = SCE_CTRL_CROSS;
++			return false;
++		}
++		return true;
++	}
++	return true;
++}
++
++/* exported interface documented in vita/interact.h */
++bool vita_interact_step(struct gui_window *gw, struct vita_input *in)
++{
++	const struct step *s;
++	unsigned int now = vita_diag_ms();
++
++	vita_input_idle(in);
++	if (run.step >= STEP_COUNT) {
++		vita_diag_log("interact: %u/%u passed", vita_interact_passed,
++			      vita_interact_total);
++		return false;
++	}
++	s = &steps[run.step];
++	switch (run.phase) {
++	case PH_ACT:
++		if (run.pass == 0) {
++			run.started_ms = now;
++			run.blocked0 = vita_resolve_blocked;
++			run.opened0 = vita_remote_opened;
++			vita_diag_log("interact: %u %s", run.step + 1, s->name);
++		}
++		if (act(gw, s, in)) {
++			run.phase = PH_WAIT;
++			run.acted_ms = now;
++		}
++		return true;
++	case PH_WAIT:
++		if (now - run.acted_ms < SETTLE_MIN_MS ||
++		    (!host->settled(gw) &&
++		     now - run.started_ms < STEP_TIMEOUT_MS))
++			return true;
++		if (!host->settled(gw))
++			vita_diag_log("interact: %u did not settle in %u ms",
++				      run.step + 1, STEP_TIMEOUT_MS);
++		check(gw, s);
++		if (s->dump != NULL) {
++			host->dump(s->dump);
++			run.phase = PH_DUMP;
++			return true;
++		}
++		break;
++	case PH_DUMP:
++		if (!host->dump_done())
++			return true;
++		break;
++	}
++	run.step++;
++	run.phase = PH_ACT;
++	run.pass = 0;
++	run.cross = false;
++	return true;
++}
+diff --git a/frontends/vita/interact.h b/frontends/vita/interact.h
+new file mode 100644
+index 0000000..ee41991
+--- /dev/null
++++ b/frontends/vita/interact.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the autotest's interaction pass (vita/interact.c).
++ *
++ * Drives the browsing controls with scripted input -- taps, drags, the
++ * pointer, buttons, typed text, a URL pushed to the LAN listener -- through
++ * the same vita_input_browse() the pad uses, and checks what each step did
++ * (the URL, the scroll offset, the zoom, blocked fetches, the cookie jar).
++ * Runs on the device with nobody touching it, so one hardware run covers
++ * the controls too.
++ */
++
++#ifndef NETSURF_VITA_INTERACT_H
++#define NETSURF_VITA_INTERACT_H
++
++#include <stdbool.h>
++
++struct gui_window;
++struct vita_input;
++
++/** What the pass needs from the main loop. */
++struct vita_interact_host {
++	/** Has the page finished loading and repainting? */
++	bool (*settled)(struct gui_window *gw);
++	/** Navigate to url (the main loop's page bookkeeping included). */
++	void (*open)(struct gui_window *gw, const char *url);
++	/** Dump the next frame's plot calls as name. */
++	void (*dump)(const char *name);
++	/** Has the dump asked for been taken? */
++	bool (*dump_done)(void);
++	/** Save the cookie jar now; its file name. */
++	const char *(*save_cookies)(void);
++};
++
++/** Start the pass. */
++void vita_interact_start(const struct vita_interact_host *host);
++
++/**
++ * One main-loop pass: the scripted input for this pass in *in.
++ *
++ * \return false once the pass has finished (its summary is logged)
++ */
++bool vita_interact_step(struct gui_window *gw, struct vita_input *in);
++
++/** Steps passed and run, for the summary. */
++extern unsigned int vita_interact_passed, vita_interact_total;
++
++#endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 901a58e..30e7b01 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -26,13 +26,17 @@
+  * Hardware-test build: everything is logged to ux0:data/VitaBrowser/
+  * (vita/diag.h).
+  *
+- * Controls:
+- *   D-pad / left stick  scroll          L / R     previous / next test page
++ * Controls (browsing: vita/input.h):
++ *   touch: tap = click, drag = scroll   left stick: pointer, CROSS clicks
++ *   right stick / D-pad: scroll         L / R: back / forward
++ *   SQUARE: zoom    TRIANGLE: URL or text    START: home    CIRCLE: HUD
++ * Test functions, SELECT held with:
+  *   SQUARE    autotest: every page settled, timed and dumped, once per
+- *             pass (clip mode x clock profile, vita_passes[]), then font
++ *             pass (clip mode x clock profile, vita_passes[]), the network
++ *             pages, the interaction pass (vita/interact.c), then font
+  *             metrics and the memory probe; "AUTOTEST DONE" when finished
+- *   SELECT    dump the current page's plot stream
+- *   TRIANGLE  memory probe            CIRCLE    toggle the HUD
++ *   CIRCLE    dump the current page's plot stream
++ *   TRIANGLE  memory probe          L / R   previous / next test page
+  *   START     quit
+  */
+ 
+@@ -63,6 +67,11 @@
+ #include "vita/netlog.h"
+ #include "vita/js_platform.h"
+ #include "vita/resolve.h"
++#include "vita/input.h"
++#include "vita/chrome.h"
++#include "vita/remote.h"
++#include "vita/interact.h"
++#include "content/urldb.h"
+ #include "vita/netprobe.h"
+ /* The QuickJS bridge's event-loop pump (quickjs/macsurf_qjs.c) and its
+  * relayout driver's per-content query (quickjs/macos9_reconvert.c). */
+@@ -86,11 +95,11 @@ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ /** vita2d's per-frame vertex pool: every rect is a few vertices. */
+ #define VITA_FRAME_POOL (4 * 1024 * 1024)
+ 
+-/** Scroll speed in pixels per frame for the D-pad. */
+-#define VITA_SCROLL_STEP 24
++/** The cookie jar (NetSurf's own format). */
++#define VITA_COOKIE_FILE "ux0:data/VitaBrowser/cookies"
+ 
+-/** Left stick dead zone around the 128 centre. */
+-#define VITA_STICK_DEADZONE 24
++/** Save the jar at most this often after page loads, ms. */
++#define VITA_COOKIE_SAVE_MS 10000
+ 
+ /** A page has settled when nothing has repainted for this long. */
+ #define VITA_SETTLE_MS 700
+@@ -224,7 +233,8 @@ enum autotest_state {
+ 	AT_MEASURE,		/**< rendering the timed frames */
+ 	AT_DUMP,		/**< the next frame is dumped */
+ 	AT_BOTTOM_SETTLE,	/**< scrolled to the bottom, waiting */
+-	AT_BOTTOM_DUMP		/**< the next frame is dumped as -bottom */
++	AT_BOTTOM_DUMP,		/**< the next frame is dumped as -bottom */
++	AT_INTERACT		/**< the interaction pass (vita/interact.c) */
+ };
+ 
+ /** What the autotest wants from the next frame. */
+@@ -253,6 +263,7 @@ struct page_stats {
+ 
+ static bool vita_quit;
+ static unsigned int vita_page;
++static bool vita_test_pages;	/**< a test page has been opened */
+ static struct page_stats vita_stats;
+ static enum autotest_state vita_autotest = AT_OFF;
+ static unsigned int vita_pass;		/**< index into vita_passes */
+@@ -293,6 +304,12 @@ static nserror set_defaults(struct nsoption_s *defaults)
+ 	/* HTTPS is verified against Mozilla's roots, bundled by the
+ 	 * VitaBrowser repo's tools/fetch-certs.sh: vitaSDK's libcurl would
+ 	 * otherwise use the firmware's CA list, which on 3.65 is from 2017. */
++	/* Logins survive a restart: the cookie jar lives on the card. It is
++	 * saved after page loads (vita_run), since the PS button ends the
++	 * app without running any exit code. */
++	nsoption_setnull_charp(cookie_file, strdup(VITA_COOKIE_FILE));
++	nsoption_setnull_charp(cookie_jar, strdup(VITA_COOKIE_FILE));
++
+ 	nsoption_setnull_charp(ca_bundle, strdup(VITA_RESOURCE_DIR
+ 						 "ca-bundle.pem"));
+ 	return NSERROR_OK;
+@@ -320,6 +337,7 @@ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ 	nserror err;
+ 
+ 	vita_page = idx % VITA_PAGE_COUNT;
++	vita_test_pages = true;
+ 	if (vita_page < VITA_LOCAL_PAGES)
+ 		snprintf(url_s, sizeof(url_s), "file:///app0:/testpages/%s.html",
+ 			 vita_local_pages[vita_page]);
+@@ -414,61 +432,61 @@ static bool page_timed_out(void)
+ 	return vita_diag_ms() - vita_stats.nav_ms > VITA_SETTLE_TIMEOUT_MS;
+ }
+ 
+-/** Read the pad; returns the page step requested by L / R (0 = none). */
+-static int vita_input(struct gui_window *gw, struct browser_window *bw)
++/**
++ * The controls for one pass: SELECT combinations are the test functions,
++ * everything else browses (vita/input.c).
++ *
++ * \return the test-page step asked for with SELECT + L / R (0 = none)
++ */
++static int vita_controls(struct gui_window *gw, struct browser_window *bw,
++			 const struct vita_input *in,
++			 const struct vita_input *prev)
+ {
+-	static unsigned int prev_buttons;
+-	SceCtrlData pad;
+-	unsigned int pressed;
+-	int dx = 0, dy = 0, step = 0;
+-
+-	memset(&pad, 0, sizeof(pad));
+-	sceCtrlPeekBufferPositive(0, &pad, 1);
+-	pressed = pad.buttons & ~prev_buttons;
+-	prev_buttons = pad.buttons;
+-
+-	if (pressed & SCE_CTRL_START)
+-		vita_quit = true;
++	unsigned int pressed = in->buttons & ~prev->buttons;
++	int step = 0;
++
++	if (in->buttons & SCE_CTRL_SELECT) {
++		if (pressed & SCE_CTRL_START)
++			vita_quit = true;
++		if (vita_autotest != AT_OFF)
++			return 0;	/* the autotest drives navigation */
++		if (pressed & SCE_CTRL_SQUARE) {
++			autotest_start(bw);
++			return 0;
++		}
++		if (pressed & SCE_CTRL_CIRCLE) {
++			vita_dump_next = true;
++			vita_window_force_redraw(gw);
++		}
++		if (pressed & SCE_CTRL_TRIANGLE) {
++			set_message(0, "memory probe...");
++			vita_diag_mem_probe();
++			set_message(3000, "memory probe done (see log.txt)");
++		}
++		if (pressed & SCE_CTRL_LTRIGGER)
++			step = -1;
++		if (pressed & SCE_CTRL_RTRIGGER)
++			step = 1;
++		return step;
++	}
+ 	if (pressed & SCE_CTRL_CIRCLE) {
+ 		vita_hud = !vita_hud;
+ 		vita_overlay_dirty = true;
+ 	}
+-	if (vita_autotest != AT_OFF)
+-		return 0;	/* the autotest drives navigation */
+-
+-	if (pressed & SCE_CTRL_SQUARE) {
+-		autotest_start(bw);
++	/* During the autotest only its interaction pass browses. */
++	if (vita_autotest != AT_OFF && vita_autotest != AT_INTERACT)
+ 		return 0;
++	switch (vita_input_browse(gw, in, prev)) {
++	case VITA_BROWSE_ENTER_TEXT:
++		vita_chrome_text_entry(gw);
++		break;
++	case VITA_BROWSE_HOME:
++		vita_chrome_open(gw, VITA_HOME_URL, "home");
++		break;
++	default:
++		break;
+ 	}
+-	if (pressed & SCE_CTRL_SELECT) {
+-		vita_dump_next = true;
+-		vita_window_force_redraw(gw);
+-	}
+-	if (pressed & SCE_CTRL_TRIANGLE) {
+-		set_message(0, "memory probe...");
+-		vita_diag_mem_probe();
+-		set_message(3000, "memory probe done (see log.txt)");
+-	}
+-	if (pad.buttons & SCE_CTRL_UP)
+-		dy -= VITA_SCROLL_STEP;
+-	if (pad.buttons & SCE_CTRL_DOWN)
+-		dy += VITA_SCROLL_STEP;
+-	if (pad.buttons & SCE_CTRL_LEFT)
+-		dx -= VITA_SCROLL_STEP;
+-	if (pad.buttons & SCE_CTRL_RIGHT)
+-		dx += VITA_SCROLL_STEP;
+-	if (abs((int)pad.lx - 128) > VITA_STICK_DEADZONE)
+-		dx += ((int)pad.lx - 128) / 4;
+-	if (abs((int)pad.ly - 128) > VITA_STICK_DEADZONE)
+-		dy += ((int)pad.ly - 128) / 4;
+-	if (dx != 0 || dy != 0)
+-		vita_window_scroll_by(gw, dx, dy);
+-
+-	if (pressed & SCE_CTRL_LTRIGGER)
+-		step = -1;
+-	if (pressed & SCE_CTRL_RTRIGGER)
+-		step = 1;
+-	return step;
++	return 0;
+ }
+ 
+ /** Switch clip mode and clocks to autotest pass `i`. */
+@@ -575,6 +593,58 @@ static bool autotest_begin_pass(struct browser_window *bw, unsigned int i)
+ 	return true;
+ }
+ 
++/* The interaction pass's hooks into the main loop (vita/interact.h). */
++static char interact_dump[96];		/**< dump the next frame as this */
++static bool interact_dumped;
++
++static bool ih_settled(struct gui_window *gw)
++{
++	return page_settled(gw);
++}
++
++static void ih_open(struct gui_window *gw, const char *url)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	nsurl *u;
++
++	vita_stats.nav_ms = vita_diag_ms();
++	vita_stats.content_gen = vita_window_new_content(gw);
++	vita_stats.content_ms = 0;
++	vita_stats.load_done_ms = 0;
++	vita_stats.was_loading = false;
++	if (bw != NULL && nsurl_create(url, &u) == NSERROR_OK) {
++		browser_window_navigate(bw, u, NULL, BW_NAVIGATE_HISTORY,
++					NULL, NULL, NULL);
++		nsurl_unref(u);
++	}
++}
++
++static void ih_dump(const char *name)
++{
++	snprintf(interact_dump, sizeof(interact_dump), "%s", name);
++	interact_dumped = false;
++	vita_window_force_redraw(vita_window_current());
++}
++
++static bool ih_dump_done(void)
++{
++	return interact_dumped;
++}
++
++static const char *ih_save_cookies(void)
++{
++	urldb_save_cookies(VITA_COOKIE_FILE);
++	return VITA_COOKIE_FILE;
++}
++
++static const struct vita_interact_host interact_host = {
++	.settled = ih_settled,
++	.open = ih_open,
++	.dump = ih_dump,
++	.dump_done = ih_dump_done,
++	.save_cookies = ih_save_cookies,
++};
++
+ /** Start the autotest: passes A-D over the bundled pages, N over the
+  * network pages. */
+ static void autotest_start(struct browser_window *bw)
+@@ -602,6 +672,17 @@ static void autotest_next(struct browser_window *bw)
+ 	log_pass_summary();
+ 	if (autotest_begin_pass(bw, vita_pass + 1))
+ 		return;
++	/* The controls, scripted (vita/interact.c), in the browsing
++	 * profile; autotest_finish() once the script is done. */
++	apply_run_profile();
++	vita_autotest = AT_INTERACT;
++	set_message(0, "AUTOTEST interaction - do not touch");
++	vita_interact_start(&interact_host);
++}
++
++/** The end of the autotest, after the interaction pass. */
++static void autotest_finish(void)
++{
+ 	vita_autotest = AT_OFF;
+ 	vita_js_dialog_auto = false;
+ 	apply_run_profile();
+@@ -711,24 +792,49 @@ static void draw_overlay(void)
+ 	char hud[240];
+ 
+ 	vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
++	if (vita_hud && vita_autotest == AT_OFF) {
++		/* Where am I: the title and the URL, and whether it loads. */
++		struct gui_window *gw = vita_window_current();
++		struct browser_window *bw = vita_window_browser(gw);
++		nsurl *u = bw ? browser_window_access_url(bw) : NULL;
++		char top[240];
++		snprintf(top, sizeof(top), "%s%s  %s",
++			 vita_window_loading(gw) ? "[loading] " : "",
++			 vita_window_title(gw), u ? nsurl_access(u) : "");
++		vita_plot_fill_rect(0, 0, VITA_SCREEN_WIDTH, 20, 0x000000, 3);
++		vita_plot_text(6, 15, top, strlen(top), 0xffffff, 13);
++	}
+ 	if (vita_hud) {
++		const char *remote = vita_remote_address();
+ 		snprintf(hud, sizeof(hud),
+-			 "%u/%u %s | first %u ms | cpu %u gpu %u ms | %u calls"
+-			 " %u st | net %s | SQ test SEL dump TRI mem O hud",
+-			 vita_page + 1, VITA_PAGE_COUNT,
+-			 page_name(vita_page),
+-			 vita_stats.first_frame_ms ?
+-				vita_stats.first_frame_ms - vita_stats.nav_ms : 0,
++			 "cpu %u gpu %u ms | %u calls | zoom %d%% | blocked %u"
++			 " | log %s | send URLs: %s | O hud",
+ 			 vita_stats.cpu_ms_last, vita_stats.gpu_ms_last,
+ 			 vita_stats.calls_last,
+-			 vita_stats.clip_last.stencil_writes,
+-			 vita_netlog_hud());
++			 (int)(vita_zoom_steps[vita_input_zoom_step()] * 100.0f
++			       + 0.5f), vita_resolve_blocked,
++			 vita_netlog_hud(), remote ? remote : "off");
+ 		vita_plot_fill_rect(0, VITA_SCREEN_HEIGHT - 22,
+ 				    VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
+ 				    0x000000, 3);
+ 		vita_plot_text(6, VITA_SCREEN_HEIGHT - 6, hud, strlen(hud),
+ 			       0xffffff, 13);
+ 	}
++	{
++		/* The pointer, while it is being used: a dark ring round a
++		 * light centre, visible on any page. */
++		int px, py;
++		if (vita_input_pointer(&px, &py)) {
++			vita_plot_fill_rect(px - 6, py - 1, px + 7, py + 2,
++					    0x000000, 3);
++			vita_plot_fill_rect(px - 1, py - 6, px + 2, py + 7,
++					    0x000000, 3);
++			vita_plot_fill_rect(px - 4, py, px + 5, py + 1,
++					    0xffffff, 3);
++			vita_plot_fill_rect(px, py - 4, px + 1, py + 5,
++					    0xffffff, 3);
++		}
++	}
+ 	if (vita_message[0] != '\0') {
+ 		if (vita_message_until != 0 &&
+ 		    vita_diag_ms() > vita_message_until) {
+@@ -861,11 +967,15 @@ static void watch_load(struct gui_window *gw)
+ 
+ static void vita_run(struct browser_window *bw)
+ {
+-	unsigned int last_flush = 0;
++	unsigned int last_flush = 0, cookies_saved = 0;
++	bool cookies_due = false;
++	struct vita_input in, prev;
+ 
++	vita_input_idle(&prev);
+ 	while (!vita_quit) {
+ 		struct gui_window *gw = vita_window_current();
+ 		enum frame_kind kind;
++		bool dump_now = false;
+ 		int step;
+ 
+ 		vita_schedule_run();
+@@ -892,18 +1002,48 @@ static void vita_run(struct browser_window *bw)
+ 		} else if (vita_stats.was_loading &&
+ 			   vita_stats.load_done_ms == 0) {
+ 			vita_stats.load_done_ms = vita_diag_ms();
++			cookies_due = true;
+ 		}
+-
+-		step = vita_input(gw, bw);
++		/* A page may have set cookies: save the jar, at most every
++		 * VITA_COOKIE_SAVE_MS (the PS button skips any exit code). */
++		if (cookies_due &&
++		    vita_diag_ms() - cookies_saved >= VITA_COOKIE_SAVE_MS) {
++			urldb_save_cookies(VITA_COOKIE_FILE);
++			cookies_saved = vita_diag_ms();
++			cookies_due = false;
++		}
++		/* A URL sent from a phone or PC (vita/remote.c). */
++		vita_remote_poll(gw);
++
++		/* The pad, or the interaction pass's script in its place. */
++		if (vita_autotest == AT_INTERACT) {
++			if (!vita_interact_step(gw, &in)) {
++				vita_input_idle(&in);
++				autotest_finish();
++			}
++		} else {
++			vita_input_read(&in);
++		}
++		step = vita_controls(gw, bw, &in, &prev);
++		prev = in;
+ 		if (step != 0) {
+ 			log_page_summary(gw, "left");
+-			open_test_page(bw, (vita_page + VITA_PAGE_COUNT +
+-					    step) % VITA_PAGE_COUNT);
++			/* The first step from elsewhere (the home page) goes
++			 * to the first or the last test page. */
++			open_test_page(bw, !vita_test_pages ?
++				       (step > 0 ? 0 : VITA_PAGE_COUNT - 1) :
++				       (vita_page + VITA_PAGE_COUNT + step) %
++				       VITA_PAGE_COUNT);
+ 		}
+ 		kind = autotest_pre(gw);
++		if (interact_dump[0] != '\0' && kind == FRAME_NONE) {
++			dump_now = vita_diag_trace_begin(interact_dump);
++			interact_dump[0] = '\0';
++			interact_dumped = true;
++		}
+ 
+ 		if (vita_window_needs_redraw(gw) || kind != FRAME_NONE ||
+-		    vita_overlay_dirty) {
++		    vita_overlay_dirty || dump_now) {
+ 			char snap[96];
+ 			const char *snap_name = NULL;
+ 
+@@ -918,7 +1058,8 @@ static void vita_run(struct browser_window *bw)
+ 					 page_name(vita_page));
+ 				snap_name = snap;
+ 			}
+-			draw_frame(gw, kind == FRAME_DUMP, snap_name);
++			draw_frame(gw, kind == FRAME_DUMP || dump_now,
++				   snap_name);
+ 			if (kind != FRAME_NONE)
+ 				autotest_post(gw, bw, kind);
+ 		} else {
+@@ -927,6 +1068,7 @@ static void vita_run(struct browser_window *bw)
+ 		}
+ 	}
+ 	vita_diag_log("quit requested");
++	urldb_save_cookies(VITA_COOKIE_FILE);
+ 	vita_diag_engine_flush();
+ }
+ 
+@@ -962,6 +1104,7 @@ static void fatal(const char *what, nserror err)
+ int main(int argc, char **argv)
+ {
+ 	struct browser_window *bw = NULL;
++	const char *start;
+ 	nsurl *url;
+ 	nserror ret;
+ 	struct netsurf_table vita_table = {
+@@ -1026,16 +1169,26 @@ int main(int argc, char **argv)
+ 	vita_diag_memory("after init");
+ 	apply_run_profile();
+ 
++	/* The cookie jar from the last run (the core leaves loading and
++	 * saving it to the frontend). */
++	urldb_load_cookies(VITA_COOKIE_FILE);
++	/* URLs from a phone or PC (vita/remote.c), then the home page,
++	 * which shows the address to send them to. */
++	vita_remote_start();
++	vita_chrome_write_home(vita_local_pages, VITA_LOCAL_PAGES);
++
+ 	vita_page = 0;
+ 	memset(&vita_stats, 0, sizeof(vita_stats));
+ 	vita_stats.nav_ms = vita_diag_ms();
+-	ret = nsurl_create(NETSURF_VITA_START_PAGE, &url);
++	/* The home page; the simulator passes a start page instead. */
++	start = argc > 1 ? argv[1] : NETSURF_VITA_START_PAGE;
++	ret = nsurl_create(start, &url);
+ 	if (ret == NSERROR_OK) {
+ 		ret = browser_window_create(BW_CREATE_HISTORY, url, NULL,
+ 					    NULL, &bw);
+ 		nsurl_unref(url);
+ 	}
+-	vita_diag_log("init: open %s -> %d", NETSURF_VITA_START_PAGE, ret);
++	vita_diag_log("init: open %s -> %d", start, ret);
+ 	if (ret != NSERROR_OK) {
+ 		fatal("opening the start page", ret);
+ 		goto fail;
+diff --git a/frontends/vita/remote.c b/frontends/vita/remote.c
+new file mode 100644
+index 0000000..c0c2333
+--- /dev/null
++++ b/frontends/vita/remote.c
+@@ -0,0 +1,311 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: send a URL from a phone or PC (see vita/remote.h).
++ *
++ * Routes:
++ *   GET /             a form: one URL field and a button
++ *   GET /open?url=U   opens U on the Vita
++ *   GET /cookie       sets a cookie and shows the one the browser sent:
++ *                     loaded from the Vita (http://127.0.0.1:8080/cookie)
++ *                     it shows whether the cookie jar survived a restart
++ *
++ * Anyone on the LAN can open a page on the Vita this way; nothing else.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <time.h>
++#include <unistd.h>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++#include "utils/errors.h"
++
++#include "vita/chrome.h"
++#include "vita/diag.h"
++#include "vita/net.h"
++#include "vita/remote.h"
++
++/** A client gets this long to send its request, ms. */
++#define REQUEST_MS 3000
++
++unsigned int vita_remote_requests, vita_remote_opened;
++
++static int listen_fd = -1;
++static int client_fd = -1;
++static unsigned int client_ms;
++static char req[4096];
++static size_t req_len;
++static char address[64];
++static int port = VITA_REMOTE_PORT;
++
++/* exported interface documented in vita/remote.h */
++int vita_remote_port(void)
++{
++	return port;
++}
++
++static int set_nonblocking(int fd)
++{
++#ifdef __vita__
++	int on = 1;
++	return setsockopt(fd, SOL_SOCKET, SO_NONBLOCK, &on, sizeof(on));
++#else
++	return fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
++#endif
++}
++
++/* exported interface documented in vita/remote.h */
++nserror vita_remote_start(void)
++{
++	struct sockaddr_in sa;
++	int on = 1;
++
++#ifdef VITA_HOST_SIM
++	if (getenv("VITA_SIM_REMOTE_PORT") != NULL)
++		port = atoi(getenv("VITA_SIM_REMOTE_PORT"));
++#endif
++	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
++	if (listen_fd < 0) {
++		vita_diag_log("remote: socket -> errno %d", errno);
++		return NSERROR_INIT_FAILED;
++	}
++	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++	memset(&sa, 0, sizeof(sa));
++	sa.sin_family = AF_INET;
++	sa.sin_port = htons((unsigned short)port);
++	sa.sin_addr.s_addr = htonl(INADDR_ANY);
++	if (bind(listen_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
++	    listen(listen_fd, 4) != 0 || set_nonblocking(listen_fd) != 0) {
++		vita_diag_log("remote: cannot listen on :%d, errno %d",
++			      port, errno);
++		close(listen_fd);
++		listen_fd = -1;
++		return NSERROR_INIT_FAILED;
++	}
++	vita_diag_log("remote: listening on :%d", port);
++	return NSERROR_OK;
++}
++
++/* exported interface documented in vita/remote.h */
++const char *vita_remote_address(void)
++{
++	struct in_addr a;
++	const char *ip;
++
++	if (listen_fd < 0)
++		return NULL;
++	ip = vita_net_ip();
++	if (ip == NULL || inet_pton(AF_INET, ip, &a) != 1)
++		return NULL;
++	snprintf(address, sizeof(address), "%s:%d", ip, port);
++	return address;
++}
++
++static void send_all(const char *s, size_t n)
++{
++	unsigned int t0 = vita_diag_ms();
++
++	/* Small responses; a full socket buffer only waits briefly. */
++	while (n > 0 && vita_diag_ms() - t0 < 1000) {
++		ssize_t w = send(client_fd, s, n, 0);
++		if (w > 0) {
++			s += w;
++			n -= (size_t)w;
++		} else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++			break;
++		}
++	}
++}
++
++static void respond(const char *status, const char *extra_headers,
++		    const char *body)
++{
++	char head[512];
++	int n = snprintf(head, sizeof(head),
++			 "HTTP/1.0 %s\r\nContent-Type: text/html; "
++			 "charset=utf-8\r\nContent-Length: %u\r\n"
++			 "Cache-Control: no-store\r\n%sConnection: close\r\n\r\n",
++			 status, (unsigned int)strlen(body),
++			 extra_headers ? extra_headers : "");
++	send_all(head, (size_t)n);
++	send_all(body, strlen(body));
++}
++
++/** Decode %XX and '+' in place. */
++static void url_decode(char *s)
++{
++	char *o = s;
++
++	for (; *s != '\0'; s++) {
++		if (*s == '+') {
++			*o++ = ' ';
++		} else if (*s == '%' && s[1] != '\0' && s[2] != '\0') {
++			char hex[3] = { s[1], s[2], 0 };
++			*o++ = (char)strtol(hex, NULL, 16);
++			s += 2;
++		} else {
++			*o++ = *s;
++		}
++	}
++	*o = '\0';
++}
++
++/** HTML-escape into out. */
++static void escape(const char *s, char *out, size_t max)
++{
++	size_t o = 0;
++
++	for (; *s != '\0' && o + 7 < max; s++) {
++		switch (*s) {
++		case '&': o += (size_t)sprintf(out + o, "&amp;"); break;
++		case '<': o += (size_t)sprintf(out + o, "&lt;"); break;
++		case '>': o += (size_t)sprintf(out + o, "&gt;"); break;
++		case '"': o += (size_t)sprintf(out + o, "&quot;"); break;
++		default: out[o++] = *s; break;
++		}
++	}
++	out[o] = '\0';
++}
++
++static const char form_page[] =
++	"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
++	"<meta name=\"viewport\" content=\"width=device-width\">"
++	"<title>VitaBrowser</title></head><body style=\"font-family:"
++	"sans-serif;margin:24px\"><h1>Open on the Vita</h1>"
++	"<form action=\"/open\" method=\"get\"><input name=\"url\" "
++	"style=\"width:90%;font-size:20px\" autofocus placeholder="
++	"\"https://...\"> <button style=\"font-size:20px\">Open</button>"
++	"</form></body></html>";
++
++/** The value of header name in the request, or "". */
++static void header(const char *name, char *out, size_t max)
++{
++	const char *p = req;
++	size_t nl = strlen(name);
++
++	out[0] = '\0';
++	while ((p = strstr(p, "\r\n")) != NULL) {
++		p += 2;
++		if (strncasecmp(p, name, nl) == 0 && p[nl] == ':') {
++			const char *v = p + nl + 1, *e;
++			while (*v == ' ')
++				v++;
++			e = strstr(v, "\r\n");
++			if (e == NULL)
++				e = v + strlen(v);
++			snprintf(out, max, "%.*s", (int)(e - v), v);
++			return;
++		}
++	}
++}
++
++static void handle(struct gui_window *gw)
++{
++	char path[2048], body[4096], esc[2200], cookie[512];
++	char *q;
++
++	vita_remote_requests++;
++	if (sscanf(req, "GET %2047s", path) != 1) {
++		respond("405 Method Not Allowed", NULL, "GET only");
++		return;
++	}
++	vita_diag_log("remote: GET %.200s", path);
++	if (strcmp(path, "/") == 0) {
++		respond("200 OK", NULL, form_page);
++	} else if (strncmp(path, "/open?", 6) == 0 &&
++		   (q = strstr(path, "url=")) != NULL) {
++		char *amp = strchr(q, '&');
++		if (amp != NULL)
++			*amp = '\0';
++		url_decode(q + 4);
++		escape(q + 4, esc, sizeof(esc));
++		snprintf(body, sizeof(body), "<!DOCTYPE html><html><head>"
++			 "<meta charset=\"utf-8\"><title>Sent</title></head>"
++			 "<body style=\"font-family:sans-serif;margin:24px\">"
++			 "<p>Opening on the Vita: <b>%s</b></p>"
++			 "<p><a href=\"/\">Send another</a></p></body></html>",
++			 esc);
++		respond("200 OK", NULL, body);
++		if (vita_chrome_open(gw, q + 4, "remote") == NSERROR_OK)
++			vita_remote_opened++;
++	} else if (strcmp(path, "/cookie") == 0) {
++		char set[128];
++		header("Cookie", cookie, sizeof(cookie));
++		vita_diag_log("remote: /cookie request carried \"%s\"",
++			      cookie);
++		escape(cookie, esc, sizeof(esc));
++		snprintf(set, sizeof(set), "Set-Cookie: vbtest=%ld; "
++			 "Max-Age=31536000; Path=/\r\n", (long)time(NULL));
++		snprintf(body, sizeof(body), "<!DOCTYPE html><html><head>"
++			 "<meta charset=\"utf-8\"><title>Cookie test</title>"
++			 "</head><body style=\"font-family:sans-serif\">"
++			 "<p id=\"got\">Cookie sent: [%s]</p></body></html>",
++			 esc);
++		respond("200 OK", set, body);
++	} else {
++		respond("404 Not Found", NULL, "not found");
++	}
++}
++
++/* exported interface documented in vita/remote.h */
++void vita_remote_poll(struct gui_window *gw)
++{
++	if (listen_fd < 0)
++		return;
++	if (client_fd < 0) {
++		client_fd = accept(listen_fd, NULL, NULL);
++		if (client_fd < 0)
++			return;
++		set_nonblocking(client_fd);
++		client_ms = vita_diag_ms();
++		req_len = 0;
++	}
++	for (;;) {
++		ssize_t r = recv(client_fd, req + req_len,
++				 sizeof(req) - 1 - req_len, 0);
++		if (r > 0) {
++			req_len += (size_t)r;
++			req[req_len] = '\0';
++			if (strstr(req, "\r\n\r\n") != NULL ||
++			    req_len >= sizeof(req) - 1)
++				break;
++			continue;
++		}
++		if (r == 0 ||
++		    (errno != EAGAIN && errno != EWOULDBLOCK) ||
++		    vita_diag_ms() - client_ms > REQUEST_MS) {
++			/* Closed, failed or too slow: drop it. */
++			close(client_fd);
++			client_fd = -1;
++		}
++		return;	/* the rest next pass */
++	}
++	handle(gw);
++	close(client_fd);
++	client_fd = -1;
++}
+diff --git a/frontends/vita/remote.h b/frontends/vita/remote.h
+new file mode 100644
+index 0000000..5a465ce
+--- /dev/null
++++ b/frontends/vita/remote.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: send a URL from a phone or PC (vita/remote.c).
++ *
++ * README §14.6: typing a URL on the Vita is the worst interaction in the
++ * product, so a tiny HTTP listener on the LAN takes one instead. Opening
++ * http://<vita>:8080/ on any device on the same Wi-Fi shows a form; what it
++ * sends opens on the Vita. Served from the main loop, one request at a
++ * time, never blocking it.
++ */
++
++#ifndef NETSURF_VITA_REMOTE_H
++#define NETSURF_VITA_REMOTE_H
++
++#include "utils/errors.h"
++
++struct gui_window;
++
++/** The listener's port. */
++#define VITA_REMOTE_PORT 8080
++
++/** The port listened on: VITA_REMOTE_PORT (in the simulator,
++ * VITA_SIM_REMOTE_PORT may move it: the build machine's 8080 can be
++ * taken). */
++int vita_remote_port(void);
++
++/** Start listening on every interface. */
++nserror vita_remote_start(void);
++
++/** "ip:port" to show the user, or NULL when not listening / no address. */
++const char *vita_remote_address(void);
++
++/** Serve what has arrived; open pushed URLs in gw. Main loop, every pass. */
++void vita_remote_poll(struct gui_window *gw);
++
++/** Requests served so far, and URLs opened from them. */
++extern unsigned int vita_remote_requests, vita_remote_opened;
++
++#endif
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index 5a345aa..5b0c1ee 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <stdbool.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ 
+ #include "utils/errors.h"
+@@ -46,6 +47,7 @@ struct gui_window {
+ 	bool dirty;
+ 	bool loading;	/**< between START_ and STOP_THROBBER */
+ 	unsigned int new_content;	/**< GW_EVENT_NEW_CONTENT count */
++	char title[160];		/**< the page's title, for the HUD */
+ };
+ 
+ static struct gui_window *vita_current;
+@@ -118,9 +120,11 @@ static nserror vita_window_event(struct gui_window *gw,
+ 		break;
+ 	case GW_EVENT_START_THROBBER:
+ 		gw->loading = true;
++		gw->dirty = true;	/* the HUD's loading mark */
+ 		break;
+ 	case GW_EVENT_STOP_THROBBER:
+ 		gw->loading = false;
++		gw->dirty = true;
+ 		break;
+ 	case GW_EVENT_UPDATE_EXTENT:
+ 		/* Re-clamp the scroll offset to the new extent. */
+@@ -136,6 +140,14 @@ static nserror vita_window_event(struct gui_window *gw,
+ static void vita_window_set_title(struct gui_window *gw, const char *title)
+ {
+ 	vita_diag_log("gw title: %s", title);
++	snprintf(gw->title, sizeof(gw->title), "%s", title ? title : "");
++	gw->dirty = true;	/* the HUD shows it */
++}
++
++/* exported interface documented in vita/window.h */
++const char *vita_window_title(struct gui_window *gw)
++{
++	return gw != NULL ? gw->title : "";
+ }
+ 
+ static nserror vita_window_set_url(struct gui_window *gw, struct nsurl *url)
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index ea7dfff..53c0b44 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -59,6 +59,9 @@ void vita_window_force_redraw(struct gui_window *gw);
+ /** The content's extent in pixels (0 x 0 if none yet). */
+ void vita_window_extent(struct gui_window *gw, int *width, int *height);
+ 
++/** The page's title as the core last set it ("" before any). */
++const char *vita_window_title(struct gui_window *gw);
++
+ /** The browser window shown in this gui window. */
+ struct browser_window *vita_window_browser(struct gui_window *gw);
+ 

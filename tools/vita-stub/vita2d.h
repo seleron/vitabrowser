@@ -84,4 +84,14 @@ void *vita2d_texture_get_datap(const vita2d_texture *texture);
 void vita2d_draw_texture_scale(const vita2d_texture *texture, float x, float y, float x_scale, float y_scale);
 void vita2d_draw_texture_tint_part(const vita2d_texture *texture, float x, float y, float tex_x, float tex_y, float tex_w, float tex_h, unsigned int color);
 
+typedef struct vita2d_texture_vertex {
+	float x;
+	float y;
+	float z;
+	float u;
+	float v;
+} vita2d_texture_vertex;
+
+void vita2d_draw_array_textured(const vita2d_texture *texture, SceGxmPrimitiveType mode, const vita2d_texture_vertex *vertices, size_t count, unsigned int color);
+
 #endif

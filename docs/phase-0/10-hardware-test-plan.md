@@ -1775,3 +1775,153 @@ Automatic:**
 **Run 13 on the device:** the autotest once, DNS Automatic. The one thing
 to see: **`receiver.txt` shows 18-JS-window SAME** (11/11), and every
 other dump SAME apart from the time-varying PM-animation.
+
+## Run 14 — a browser to hold: controls, home page, URL entry, cookies, blocking, faster text (patches 51–54)
+
+**Why one big run.** Device runs are costly, so this batch builds and
+simulator-tests everything first. One run then covers it: the autotest
+now also drives the new controls by itself (the interaction pass), and
+the manual part is a short checklist. Run 13's build (patch 50) is folded
+in; its VPK is replaced.
+
+### What is new
+
+| | what | where |
+|---|---|---|
+| **Touch** | tap = click, drag = scroll | patch 54, `vita/input.c` |
+| **Pointer** | left stick moves it, ✕ clicks, links highlight under it | 54 |
+| **Scrolling** | right stick, D-pad, touch drag | 54 |
+| **Back / forward** | L / R | 54 |
+| **Zoom** | □: 100 → 125 → 150 → 200 %; the page reflows | 54 |
+| **Typing** | △: the system keyboard. On a page it asks for a URL (prefilled with the current one); a bare host gets `https://` (`http://` for an IP address or localhost), words become a DuckDuckGo Lite search. With the caret in a text field, the text goes into the field | 54, `vita/chrome.c` |
+| **Send a URL from a phone or PC** | open `http://<vita-ip>:8080/` (the HUD shows the address) on the same Wi-Fi: a form; what it sends opens on the Vita | 54, `vita/remote.c` |
+| **Home page and bookmarks** | START; generated at start-up from `ux0:data/VitaBrowser/bookmarks.txt` ("Title \| URL" per line; written with Claude Code, Wikipedia, Hacker News, CNN Lite, example.com if missing) plus the test pages | 54 |
+| **Logins survive a restart** | the cookie jar at `ux0:data/VitaBrowser/cookies`, loaded at start-up, saved after page loads and on quit (the PS button runs no exit code) | 54 |
+| **Ad and tracker blocking** | 71 hosts (and everything under them) refused before any lookup: no handshake, no download. Your additions / exceptions in `ux0:data/VitaBrowser/blocklist.txt` (`host` / `@@host`). The HUD counts them | 52, `vita/resolve.c` |
+| **Faster text** | a run of text is one GPU draw per atlas page instead of one per glyph: ~15 glyphs per draw | 53, `vita/text.c` |
+| **Where am I** | HUD top bar: title, URL, "[loading]"; bottom: zoom, blocked count, the send-URL address. ○ hides both | 54 |
+| **Fix (core)** | any page that reflowed claimed a caret in a text field; typed URLs went into the page as keystrokes | 51, `desktop/textinput.c` |
+
+**The test functions moved behind SELECT:** SELECT + □ autotest,
+SELECT + ○ plot dump, SELECT + △ memory probe, SELECT + L / R the test
+pages, SELECT + START quit.
+
+### The interaction pass (the autotest's last pass)
+
+After pass N, 22 scripted steps drive the real controls
+(`vita_input_browse()`, the same code the pad feeds) on the IN-* test
+pages, whose links and fields sit at fixed positions. Nobody touches the
+Vita. Each step is checked and logged (`interact: N name: PASS (…)`), and
+the pass ends `interact: 22/22 passed`:
+
+| # | step | checked |
+|---|---|---|
+| 1 | typed text → URL (7 cases: URL, host, host/path, IP:port, localhost, words) | the URLs |
+| 2–8 | open IN-links; **tap** a link; **L** back; **R** forward; L; **pointer** to a link with the stick, **✕**; L | the URL after each |
+| 9 | **drag** 300 px up | scroll offset 300 |
+| 10–13 | **□** ×4: 125, 150, 200, 100 % | the zoom (dump IN-zoom125) |
+| 14 | IN-block: a fetch, an XHR and an image to blocked hosts | ≥ 3 blocked, the page's rows (dump IN-block) |
+| 15–18 | IN-form: **tap** the field (caret), **type** "hello vita", **tap** Send | caret, then `…?via=form&q=hello+vita` (dump IN-form-sent) |
+| 19 | a typed URL with no field focused | the URL |
+| 20 | a URL pushed to the listener (`/open?url=…` over loopback) | the URL, and the listener's count |
+| 21 | the listener's `/cookie` page | the jar on the card holds its cookie |
+| 22 | **START** | the home page |
+
+### Verified on the host (simulator)
+
+- **Interaction pass 22/22**, at full speed and at the Vita's pace.
+- **Batched text:** ~15 glyphs per draw (194 392 glyphs in 12 923 draws
+  over the autotest). **68 of 68 frames pixel-identical** to one draw per
+  glyph: the device-pace run draws text the old way
+  (`VITA_SIM_TEXT_UNBATCHED`), and `run-vita-sim.sh` compares the two
+  runs' frames.
+  - That comparison caught a real bug in the first cut: the batch kept
+    pointers into the glyph cache, so a later glyph of the same run
+    taking over a cache slot redrew an earlier one ("9" came out as
+    "A").
+  - The text unit test now decodes each batched quad back into its
+    screen and atlas rectangles: 30/30.
+- **The core caret bug (patch 51)** was found by step 19. After a
+  form's result page reflowed, the core still reported a caret in a text
+  field, so the typed URL went into the page as keystrokes.
+- Everything from runs 11–13: JS-dom 13/13, JS-fetch 5/5 × 3, JS-window
+  11/11, the DNS hang handled, the rogue certificate refused, the mirror
+  40/40. Bundled pages at the Vita's pace are identical to full speed.
+- The home page, rendered: five bookmarks as large tap targets, the test
+  pages, a cookie-test link (screenshot below).
+- **In the simulator only:** the listener runs on port 45180, because the
+  build PC's 8080 is taken (signal-cli). The Vita uses 8080.
+
+![The home page](img/10-run14/home.png)
+
+**Clean checkout:**
+- Applied 137 + the known 2; L1 PASS; 101/101 + 30/30.
+- The simulator passes every check, at full speed and at the Vita's pace.
+- The Vita build is packaged. The ELF has `sceImeDialogInit`,
+  `sceTouchPeek`, `vita2d_draw_array_textured`, the interaction pass,
+  the listener and the blocklist.
+- The internet-connected reference run gives interaction 22/22,
+  `dns: example.com` on the worker, and 15.2 glyphs per draw.
+
+**Hand-off.**
+- SHA256, first 12: `VitaBrowser.vpk` `02982d1ce67b`,
+  `VitaBrowser-ext.vpk` `117a2e0d8e3f`, `nsvita.elf` `1b4f2a3046c7`. They
+  replace run 13's.
+- `reference-dumps\` is regenerated: 29 dumps, the three IN-* ones new.
+- `results\` is empty (run 13 was never run).
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-24-run14/`.
+
+### Not tested by the simulator
+
+These need the Vita:
+- **The system keyboard (`sceImeDialog`).** The simulator stands in with
+  `VITA_SIM_TYPE`, and step 19 covers what happens to the text.
+- **Real touch coordinates:** the panel's 1920 × 1088 halved.
+- **Loopback on the Vita**, for steps 20 and 21.
+- **Whether batching actually saves CPU time**, and how scrolling feels.
+
+### Run 14 on the device: one sitting, about 15 minutes
+
+**A. The autotest (automatic, about 7 minutes; hands off).**
+1. On the PC, start `receive-results.bat`.
+2. On the Vita, keep DNS on Automatic and install the new
+   `VitaBrowser.vpk`. You don't need to delete `ux0:data/VitaBrowser/`
+   (the home page and bookmarks are created on first launch).
+3. Launch. It now opens on **the home page**, not L1.
+4. Hold **SELECT** and press **□**.
+   - The passes run as before (A–D, then the network probe and pages).
+   - Then "AUTOTEST interaction": the pointer moves by itself, pages
+     change, the zoom cycles.
+   - Wait for AUTOTEST DONE.
+
+Expected in `receiver.txt`:
+- every dump SAME, including 18-JS-window and the new IN-zoom125,
+  IN-block and IN-form-sent. PM-animation may differ (it's
+  time-varying).
+
+Expected in log.txt:
+- `interact: 22/22 passed`;
+- `dns: blocklist app0:/res/blocklist.txt: 71 entries`;
+- the `font: … batched draws` line;
+- `remote: listening on :8080`.
+
+**B. By hand (about 5 minutes).** The results mirror is still on, so
+everything below lands in log.txt too.
+
+| # | do | expect |
+|---|---|---|
+| 1 | Look at the bottom HUD line | `send URLs: 192.168.x.x:8080` (your Vita's address) |
+| 2 | **Tap** "example.com" | it loads; the top bar shows the title and URL, with [loading] while loading |
+| 3 | Push the **left stick** | a small cross-hair pointer moves; over a link, press **✕** |
+| 4 | **L**, then **R** | back, forward |
+| 5 | **□** a few times | 125 → 150 → 200 → 100 %; the text gets bigger and re-wraps |
+| 6 | **△**, type `en.m.wikipedia.org`, OK | the system keyboard, prefilled with the current URL; Wikipedia loads |
+| 7 | **Tap** Wikipedia's search box, **△**, type `PlayStation Vita`, OK, then **tap** the search button | the text appears in the box; search results load |
+| 8 | **Drag** the page with a finger; also try the right stick and the D-pad | it scrolls. Is it smooth? Watch `cpu … ms` on the HUD |
+| 9 | On your **phone or PC**: open `http://<address from step 1>/`, enter `news.ycombinator.com`, Open | Hacker News opens on the Vita |
+| 10 | Open a news site with ads (e.g. `cnn.com`) | it loads; the HUD's `blocked` count goes up |
+| 11 | **START** | the home page. Tap **cookie test** (at the end of the test pages): the page reads `Cookie sent: [vbtest=…]` |
+| 12 | Wait about 10 s (the jar is saved at most every 10 s), **close the app** (PS button, close), relaunch, tap **cookie test** | `Cookie sent: [vbtest=…]`, **not empty**, means cookies (and so logins) survive a restart. Each visit sets a new value, so the number changes |
+
+Tell me anything that felt wrong: the pointer speed, the drag direction,
+tap accuracy, the zoom steps, the keyboard.

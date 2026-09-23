@@ -38,6 +38,7 @@
 #include <zlib.h>
 
 #include <vita2d.h>
+#include <psp2/touch.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
@@ -136,6 +137,88 @@ void vita2d_draw_rectangle(float x, float y, float w, float h, unsigned int c)
 static float edge(float ax, float ay, float bx, float by, float px, float py)
 {
 	return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+
+/* The GPU's top-left fill rule: a pixel centre exactly on an edge belongs
+ * to the triangle only if that edge is a top or a left one, so two
+ * triangles sharing an edge never both draw a pixel (tested for every
+ * glyph-quad size: each pixel exactly once). Orientation: positive area. */
+static int top_left(float ax, float ay, float bx, float by)
+{
+	float dx = bx - ax, dy = by - ay;
+	return dy < 0 || (dy == 0 && dx > 0);
+}
+
+/* vita2d_draw_array_textured (frontends/vita/text.c batches glyphs with
+ * it): triangles, texture coordinates interpolated at pixel centres,
+ * point sampled, alpha = coverage, tinted with one colour -- the same
+ * pixels vita2d_draw_texture_tint_part gives the same quad. */
+static void textured_triangle(const vita2d_texture *t,
+			      const vita2d_texture_vertex *a,
+			      const vita2d_texture_vertex *b,
+			      const vita2d_texture_vertex *c,
+			      unsigned int color)
+{
+	float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
+	int minx, maxx, miny, maxy, i, j, bc, ca, ab;
+
+	if (area == 0)
+		return;
+	if (area < 0) {
+		const vita2d_texture_vertex *tmp = b;
+		b = c;
+		c = tmp;
+		area = -area;
+	}
+	minx = first_px(fminf(a->x, fminf(b->x, c->x)));
+	maxx = first_px(fmaxf(a->x, fmaxf(b->x, c->x)));
+	miny = first_px(fminf(a->y, fminf(b->y, c->y)));
+	maxy = first_px(fmaxf(a->y, fmaxf(b->y, c->y)));
+	bc = top_left(b->x, b->y, c->x, c->y);
+	ca = top_left(c->x, c->y, a->x, a->y);
+	ab = top_left(a->x, a->y, b->x, b->y);
+	for (j = miny; j < maxy; j++) {
+		for (i = minx; i < maxx; i++) {
+			float px = i + 0.5f, py = j + 0.5f;
+			float w0 = edge(b->x, b->y, c->x, c->y, px, py);
+			float w1 = edge(c->x, c->y, a->x, a->y, px, py);
+			float w2 = edge(a->x, a->y, b->x, b->y, px, py);
+			float u, v;
+			unsigned int tu, tv, cover;
+			if (!((w0 > 0 || (w0 == 0 && bc)) &&
+			      (w1 > 0 || (w1 == 0 && ca)) &&
+			      (w2 > 0 || (w2 == 0 && ab))))
+				continue;
+			u = (w0 * a->u + w1 * b->u + w2 * c->u) / area;
+			v = (w0 * a->v + w1 * b->v + w2 * c->v) / area;
+			tu = (unsigned int)floorf(u * (float)t->w);
+			tv = (unsigned int)floorf(v * (float)t->h);
+			if (tu >= t->w || tv >= t->h)
+				continue;
+			if (t->alpha8)
+				cover = t->data[tv * t->stride + tu];
+			else
+				cover = t->data[tv * t->stride + tu * 4 + 3];
+			blend(i, j, color, cover);
+		}
+	}
+}
+
+void vita2d_draw_array_textured(const vita2d_texture *t,
+				SceGxmPrimitiveType mode,
+				const vita2d_texture_vertex *v, size_t count,
+				unsigned int color)
+{
+	size_t k;
+
+	calls++;
+	if (mode != SCE_GXM_PRIMITIVE_TRIANGLES) {
+		fprintf(stderr, "vitasim: draw_array_textured: only "
+			"SCE_GXM_PRIMITIVE_TRIANGLES is modelled\n");
+		exit(6);
+	}
+	for (k = 0; k + 2 < count; k += 3)
+		textured_triangle(t, &v[k], &v[k + 1], &v[k + 2], color);
 }
 
 static void fill_triangle(const vita2d_color_vertex *a,
@@ -398,7 +481,8 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 			if (access("ux0:data/VitaBrowser/autotest.done", F_OK) == 0) {
 				printf("vitasim: autotest done after %u frames\n",
 				       frames);
-				pad->buttons = SCE_CTRL_START;
+				pad->buttons = SCE_CTRL_SELECT |
+					       SCE_CTRL_START;
 			}
 			return 1;
 		}
@@ -409,7 +493,7 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 		}
 		if (++idle >= SETTLE_POLLS) {
 			started = 1;
-			pad->buttons = SCE_CTRL_SQUARE;
+			pad->buttons = SCE_CTRL_SELECT | SCE_CTRL_SQUARE;
 		}
 		return 1;
 	}
@@ -440,7 +524,28 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 	idle = 0;
 	page++;
 	frames_at_press = frames;
-	pad->buttons = (page >= pages) ? SCE_CTRL_START : SCE_CTRL_RTRIGGER;
+	/* The test functions are SELECT combinations (frontends/vita/main.c):
+	 * SELECT + R the next test page, SELECT + START quit. */
+	pad->buttons = SCE_CTRL_SELECT |
+		((page >= pages) ? SCE_CTRL_START : SCE_CTRL_RTRIGGER);
+	return 1;
+}
+
+/* ---- touch: no finger on the panel (the interaction pass scripts its
+ * own touches, above the SDK) ------------------------------------------ */
+
+int sceTouchSetSamplingState(uint32_t port, SceTouchSamplingState state)
+{
+	(void)port;
+	(void)state;
+	return 0;
+}
+
+int sceTouchPeek(uint32_t port, SceTouchData *pData, uint32_t nBufs)
+{
+	(void)port;
+	(void)nBufs;
+	memset(pData, 0, sizeof(*pData));
 	return 1;
 }
 

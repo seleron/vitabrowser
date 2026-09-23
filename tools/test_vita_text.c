@@ -116,6 +116,55 @@ void vita2d_draw_texture_tint_part(const vita2d_texture *t, float x, float y,
 						 (int)ty, (int)tw, (int)th };
 }
 
+unsigned int vita2d_texture_get_width(const vita2d_texture *t) { return t->w; }
+unsigned int vita2d_texture_get_height(const vita2d_texture *t) { return t->h; }
+
+/* The per-frame vertex pool: never reset here, only ever a few runs. */
+void *vita2d_pool_memalign(unsigned int size, unsigned int alignment)
+{
+	static unsigned char pool[4 << 20];
+	static size_t used;
+	void *p;
+
+	used = (used + alignment - 1) / alignment * alignment;
+	if (used + size > sizeof(pool))
+		used = 0;
+	p = pool + used;
+	used += size;
+	return p;
+}
+
+/* Batched glyphs (text.c draw_placed): each quad is 6 vertices, two
+ * triangles 0 1 2 / 2 1 3 of a tint_part strip. Decoded back into the same
+ * records tint_part makes, so every check below also checks the vertex
+ * math -- and the two triangles must really make that rectangle. */
+void vita2d_draw_array_textured(const vita2d_texture *t,
+				SceGxmPrimitiveType mode,
+				const vita2d_texture_vertex *v, size_t count,
+				unsigned int color)
+{
+	size_t k;
+
+	(void)color;
+	if (mode != SCE_GXM_PRIMITIVE_TRIANGLES || count % 6 != 0)
+		printf("FAIL: batched glyphs not whole triangle pairs\n");
+	for (k = 0; k + 5 < count; k += 6) {
+		const vita2d_texture_vertex *q = &v[k];
+		float w = (float)t->w, h = (float)t->h;
+		if (q[1].x != q[4].x || q[1].y != q[4].y ||
+		    q[2].x != q[3].x || q[2].y != q[3].y ||
+		    q[0].x != q[2].x || q[0].y != q[1].y ||
+		    q[5].x != q[1].x || q[5].y != q[2].y)
+			printf("FAIL: batched glyph is not a rectangle\n");
+		if (ndraws < MAX_DRAWS)
+			draws[ndraws++] = (struct draw){ t, (int)q[0].x,
+				(int)q[0].y, (int)(q[0].u * w + 0.5f),
+				(int)(q[0].v * h + 0.5f),
+				(int)((q[5].u - q[0].u) * w + 0.5f),
+				(int)((q[5].v - q[0].v) * h + 0.5f) };
+	}
+}
+
 /* ---- harness ----------------------------------------------------------- */
 
 static int run, failed;

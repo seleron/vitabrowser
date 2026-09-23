@@ -30,6 +30,9 @@ fail() { echo "  FAILED: $*"; exit 1; }
 # to it instead.
 HTTPD=; RX=
 trap 'kill $HTTPD $RX 2>/dev/null || true' EXIT
+# The Vita's LAN listener (vita/remote.c) takes 8080 on the device; here
+# that port may be taken, so the simulator's listener moves.
+export VITA_SIM_REMOTE_PORT="${REMOTE_PORT:-45180}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK="${WORK:-$HOME/vitabrowser-work}"
 NS="$WORK/applytest/upstream/netsurf"
@@ -104,7 +107,7 @@ mkdir -p "$OUT/run/ux0:data/VitaBrowser"
 # No network mirror for the screenshot run (and it tests netlog.cfg "off").
 echo off > "$OUT/run/ux0:data/VitaBrowser/netlog.cfg"
 for f in default.css quirks.css adblock.css internal.css Messages \
-	 welcome.html credits.html licence.html; do
+	 welcome.html credits.html licence.html blocklist.txt; do
 	cp -L "$NS/frontends/vita/res/$f" "$A/res/$f"
 done
 cp "$ROOT"/testpages/pages/* "$A/testpages/"
@@ -132,8 +135,10 @@ mkdir -p "$A/res/fonts"
 cp "$WORK"/fonts/*.ttf "$WORK"/fonts/LICENSE-*.txt "$A/res/fonts/"
 
 echo "== run: $PAGES pages =="
+# Started on the first test page (the Vita starts on its home page), so
+# page-00.png is L1 as before.
 ( cd "$OUT/run" && VITA_SIM_OUT="$OUT/shots" VITA_SIM_PAGES="$PAGES" \
-	timeout 300 "$NS/nsvita-sim" )
+	timeout 300 "$NS/nsvita-sim" file:///app0:/testpages/L1-layout-basics.html )
 ls "$OUT"/shots
 
 echo "== autotest run (reference dumps) =="
@@ -205,8 +210,10 @@ NET=$(ls -d "$OUT"/net/net-* 2>/dev/null | tail -1)
 [ -n "$NET" ] || { echo "  no boot reached the receiver"; cat "$OUT/netlog-receiver.log"; exit 1; }
 same=0; bad=0
 for f in "$OUT"/reference/*; do
-	[ -f "$f" ] || continue	# LocalStorage/: the mirror sends files only
 	n=${f##*/}
+	# What the mirror carries: dumps, logs, markers (not LocalStorage/,
+	# the home page, bookmarks or the cookie jar).
+	case "$n" in *.plot|log.txt|netsurf.log|autotest.done) ;; *) continue ;; esac
 	if cmp -s "$f" "$NET/$n"; then same=$((same + 1))
 	else bad=$((bad + 1)); echo "  DIFFERS or missing: $n"; fi
 done
@@ -308,6 +315,23 @@ grep -q 'dns: dead\.sim-hang -> FAILED' "$R/log.txt" || dbad=$((dbad + 1))
 grep -q 'page NET-dns-hang settled' "$R/log.txt" || dbad=$((dbad + 1))
 [ "$dbad" -eq 0 ] || fail "name lookup"
 
+# The controls, scripted (vita/interact.c, after pass N): taps, the
+# pointer, back / forward, drag scrolling, zoom, blocked hosts, a form
+# filled in, a typed URL, a URL pushed to the LAN listener, the cookie jar,
+# home. Every step is checked by the frontend itself.
+echo "== interaction pass (browsing controls) =="
+grep -E 'interact: [0-9]+ .*: (PASS|FAIL)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /' | cut -c1-140
+isum=$(sed -n 's/.*interact: \([0-9]*\/[0-9]*\) passed.*/\1/p' "$R/log.txt" | tail -1)
+echo "  interaction: ${isum:-no summary} passed"
+iblk=$(sed -n 's/.*STR \(IN block: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/IN-block.plot" 2>/dev/null | head -1)
+echo "  IN-block dump: ${iblk:-missing}"
+grep -h 'font: .* batched draws' "$R/log.txt" | tail -1 | sed 's/^\[[^]]*\] /  /'
+grep -c '<a href="https://' "$R/home.html" | sed 's/^/  home page bookmarks: /'
+[ -n "$isum" ] && [ "${isum%/*}" = "${isum#*/}" ] && \
+	[ "$iblk" = "IN block: 2/2 passed" ] && [ -f "$R/IN-zoom125.plot" ] && \
+	[ -f "$R/IN-form-sent.plot" ] && \
+	[ "$(grep -c '<a href="https://' "$R/home.html")" -ge 5 ] || fail "interaction pass"
+
 # The network probe (frontends/vita/netprobe.c) before pass N: against the
 # local servers every step must succeed, with curl's own verdict logged.
 echo "== network probe =="
@@ -329,7 +353,10 @@ grep -q 'js: probe took .*: \([0-9]*\)/\1 checks' "$R/log.txt" && \
 # settled the moment its frameless load ended, before its own timers ran.
 # Every bundled page must dump exactly as it did at full speed (bar the
 # time-varying animation), and JS-window must finish in every pass.
-echo "== at the Vita's pace (VITA_SIM_SLOW_MS=40) =="
+# This run also draws text the old way, one quad per glyph
+# (VITA_SIM_TEXT_UNBATCHED), so its frames must match the batched run's
+# pixel for pixel: the check that caught batching drawing a "9" as an "A".
+echo "== at the Vita's pace (VITA_SIM_SLOW_MS=40), text unbatched =="
 S2="$OUT/slow"
 rm -rf "$S2"; mkdir -p "$S2/ux0:data/VitaBrowser"
 cp -r "$OUT/run/app0:" "$S2/"
@@ -339,7 +366,9 @@ python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 HTTPD=$!
 echo "NET-http-local http://127.0.0.1:$HP/L1-layout-basics.html" \
 	> "$S2/ux0:data/VitaBrowser/nettest.txt"
-( cd "$S2" && VITA_SIM_SLOW_MS=40 VITA_SIM_AUTOTEST=1 timeout 1200 "$NS/nsvita-sim" \
+mkdir -p "$S2/snaps"
+( cd "$S2" && VITA_SIM_SLOW_MS=40 VITA_SIM_TEXT_UNBATCHED=1 VITA_SIM_AUTOTEST=1 \
+	VITA_SIM_SNAP="$S2/snaps" timeout 1200 "$NS/nsvita-sim" \
 	> "$S2/stdout.log" 2>&1 ) || fail "slow autotest run"
 kill $HTTPD 2>/dev/null || true
 same=0; bad=0
@@ -352,4 +381,16 @@ done
 echo "  bundled pages at the Vita's pace vs full speed: $same identical, $bad differ"
 jsw_slow=$(grep -c 'JS-window row 7 passed' "$S2/ux0:data/VitaBrowser/netsurf.log")
 echo "  JS-window finished in $jsw_slow of 4 passes"
-[ "$bad" -eq 0 ] && [ "$same" -gt 0 ] && [ "$jsw_slow" -ge 4 ] || fail "at the Vita's pace"
+psame=0; pbad=0
+for f in "$OUT"/snaps/[ABCD]-*.png; do
+	n=${f##*/}
+	case "$n" in *PM-animation*) continue ;; esac
+	if cmp -s "$f" "$S2/snaps/$n"; then psame=$((psame + 1))
+	else pbad=$((pbad + 1)); echo "  PIXELS DIFFER, batched vs per glyph: $n"; fi
+done
+echo "  text batched vs one draw per glyph: $psame frames identical, $pbad differ"
+[ "$pbad" -eq 0 ] && [ "$psame" -gt 0 ] || fail "text batching pixels"
+isum_slow=$(sed -n 's/.*interact: \([0-9]*\/[0-9]*\) passed.*/\1/p' "$S2/ux0:data/VitaBrowser/log.txt" | tail -1)
+echo "  interaction pass at the Vita's pace: ${isum_slow:-no summary} passed"
+[ "$bad" -eq 0 ] && [ "$same" -gt 0 ] && [ "$jsw_slow" -ge 4 ] && \
+	[ -n "$isum_slow" ] && [ "${isum_slow%/*}" = "${isum_slow#*/}" ] || fail "at the Vita's pace"
