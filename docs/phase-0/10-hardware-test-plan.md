@@ -417,6 +417,9 @@ which is why only the device failed.
   instruments it: one line-buffered handle, every write checked, failures
   reported with their errno in `netsurf.log`, and every line mirrored there
   as `DIAG …`.
+  > **Corrected after run 3: not a Vita bug.** The copy to the PC served
+  > cached old versions of every filename it had seen before (see §Run 3).
+  > Patch 36's instrumentation is harmless and stays.
 - **Still using `iconv`:** NetSurf's form-submission encoding
   (`utils/utf8.c`, from `html/form.c`) for non-UTF-8 charsets. Irrelevant
   until forms and networking exist, then it needs a converter (libiconv,
@@ -437,3 +440,57 @@ This time the full checklist applies:
 3. Work through the checklist from step 3 (autotest) to step 8, clearing its
    old answers first.
 4. Copy `ux0:data/VitaBrowser/` and the screenshots into `results\`.
+
+## Run 3 — results (2026-09-23): pages render on hardware
+
+**Every page renders.** The tester's checklist:
+- Autotest completed in about a minute, with no stalls.
+- Pages 1–11 pass against the references.
+- **All seven VT-calibration checks pass** (ticks, shared edge, hairlines,
+  clip, text size and baseline, width agreement, wrapping).
+- Latin-1, Greek, Cyrillic, Japanese and Chinese render; PNG, JPEG, GIF, BMP,
+  ×2 scaling, tiling and alpha are correct.
+- D-pad scrolling rated 5/5 with no artefacts; the stick works and reaches
+  the far right.
+- HUD, dumps, memory probe, clean exit, the ext-mem VPK, a 1-minute scroll,
+  suspend/resume and PS-home all pass.
+
+Files: `<WORK>/vitabrowser-work/hwtest-2026-09-23-run3/device-results-partial/`.
+
+**Issues seen:**
+- **Korean** renders as blanks. The default PGF set that
+  `vita2d_load_default_pgf()` loads evidently lacks Hangul; the system has
+  a separate Korean font to try.
+- **Emoji** render as blanks (expected: no colour-glyph font).
+- **Bold** is not distinguishable (known: weight is not implemented).
+- The **strike-through** line sits a little high, towards the top of the
+  lower-case letters.
+- **Performance while scrolling** (HUD): CPU 2–3 ms, but **GPU 31–37 ms**
+  per frame. The "GPU" figure is `vita2d_end_drawing()` →
+  `vita2d_wait_rendering_done()`. A blank frame measured 4 ms in run 1, so
+  the cost grows with content: either display-queue / vblank waiting is
+  counted in it, or `vita2d_set_clip_rectangle` is expensive (a page issues
+  about 100 clips per frame). Needs its own look before real pages.
+
+**The file-copy problem, and the run-2 "log.txt bug" explained.** In the
+copied `results\`, every file whose name already existed on the card from
+an earlier run came back **byte-identical to that earlier run's copy**.
+That covers `log.txt` (= run 1), `netsurf.log` (= run 2), the top-of-page
+dumps (= run 2's placeholders) and `autotest.done`, even though the listing
+showed this run's times. Every *new* filename has new content: the
+`-bottom` dumps and the two new manual dumps. The screenshots from this run
+were not visible either. The Vita writes correctly; the PC-side copy served
+cached files and listings for known names, which is typical of Windows
+Explorer's FTP view. That is also what run 2's untouched `log.txt` was.
+
+**What the fresh files show.** The device's `-bottom` dumps match the host
+simulator's reference structurally (same op and rect counts). The only
+differences are text widths: PGF's glyphs are about a pixel wider than
+DejaVu's in places, so shrink-to-fit boxes (flex items, table cells) come
+out a pixel wider and everything around them shifts consistently. Pages
+without shrink-to-fit text (L3-grid, PM-gradient) are **byte-identical to
+the simulator** at the scrolled bottom, so scrolled redraw is correct on
+hardware.
+
+**Still to collect**, re-copied past the cache: this run's `log.txt`
+(timings, font metrics, memory), `netsurf.log`, and the screenshots.
