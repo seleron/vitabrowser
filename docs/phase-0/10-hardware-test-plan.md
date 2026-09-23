@@ -888,3 +888,43 @@ the simulator's reference files, shots and received mirror). New in
   investigate.
 - **`receiver.txt`'s loss count on real Wi-Fi.** If it isn't 0, add
   retransmission.
+
+### Run 6 — results: none arrived; the receiver was not running (checked 2026-09-23 04:56)
+
+What is on the PC, checked directly rather than inferred:
+- `VitaBrowser-hwtest\results\` is **empty** (mtime 03:06). Nothing in
+  `VitaBrowser-hwtest\` is newer than the run-6 hand-off (04:06).
+- **No receiver ever ran.** Nothing is listening on UDP 45100. The only
+  `python.exe` processes on Windows are the Hermes voice bridges
+  (`desktop_bridge.py`, `audio_bridge.py`, started 2026-09-22 21:42).
+  `receive-results.bat` was not started.
+- **The firewall is not the cause.** Windows has `python.exe` (Python312)
+  rules that **allow inbound on Private** and block on Public. The PC's
+  only LAN interface is wired `Ethernet` at 192.168.x.x/24, category
+  **Private**. So a running receiver would have been reachable, provided
+  the router passes broadcast from Wi-Fi to the wired LAN (untested).
+- **There is no evidence that a device run happened.** The supervising
+  watchdog records that the "run 6 results are in" message it relayed was
+  never actually submitted. Only the Vita's own
+  `ux0:data/VitaBrowser/log.txt` could show whether the app ran and what
+  its `netlog:` lines said.
+
+**Finding: the network mirror fails silently when no receiver listens.**
+- UDP needs no connection, so the Vita's sends succeed and Windows drops
+  the datagrams unseen.
+- A receiver started later gets only what is sent after it starts: the
+  earlier log lines and dumps are never re-sent.
+- On the PC nothing shows that anything was missed.
+- The Vita does show it: AUTOTEST DONE says "copy ux0:data/VitaBrowser/"
+  instead of "results sent to …". But that message appears only at the end
+  of the run, and nothing on screen says so earlier.
+
+Fix, next (§Run 7):
+1. When a receiver answers, the Vita re-sends everything this launch has
+   written so far, so a receiver started late still gets the whole run.
+2. The HUD shows the mirror's state from the first frame ("net: waiting
+   for PC", "net → 192.168.x.x"), so a receiver that is not running is
+   obvious at launch, not at the end.
+
+Runs 4, 5 and 6 remain **unmeasured**. The run-6 VPKs in
+`VitaBrowser-hwtest\` stay valid until run 7's replace them.
