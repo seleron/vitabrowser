@@ -107,11 +107,14 @@ mkdir -p "$OUT/snaps" "$OUT/run/ux0:data/VitaBrowser"
 # machine: the same code path as on the Vita after a receiver answers.
 NETLOG_PORT="${NETLOG_PORT:-45199}"
 echo "127.0.0.1:$NETLOG_PORT" > "$OUT/run/ux0:data/VitaBrowser/netlog.cfg"
-python3 "$ROOT/tools/vita-netlog.py" --port "$NETLOG_PORT" --bind 127.0.0.1 \
-	--out "$OUT/net" --quiet --exit-when-done --timeout 1000 \
-	> "$OUT/netlog-receiver.log" 2>&1 &
+# The receiver starts LATE, as it did not start at all in hardware run 6:
+# 15 s into the autotest, with log lines and dumps already sent to nobody.
+# When it answers the next hello, the frontend re-sends this launch's files
+# (vita/diag.c catch_up), so the mirror must still come out complete.
+( sleep "${NETLOG_LATE:-15}"; exec python3 "$ROOT/tools/vita-netlog.py" \
+	--port "$NETLOG_PORT" --bind 127.0.0.1 --out "$OUT/net" --quiet \
+	--exit-when-done --timeout 1000 ) > "$OUT/netlog-receiver.log" 2>&1 &
 RX=$!
-sleep 1
 ( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
 	timeout 900 "$NS/nsvita-sim" )
 wait $RX || true

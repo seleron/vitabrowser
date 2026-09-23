@@ -1,0 +1,232 @@
+# netsurf: Vita network mirror -- a late receiver gets the whole run; HUD state
+# Generated 2026-09-23
+#
+# Hardware run 6: no results arrived, and no receiver had been running on
+# the PC. Datagrams sent before a receiver listens are gone, and nothing
+# said so until AUTOTEST DONE.
+# - diag.c: when a receiver first answers, re-send this launch's files from
+#   the start -- log.txt (read back from the card, or the early buffer),
+#   every finished plot dump and marker, and netsurf.log re-tailed from its
+#   start. Same bytes at the same offsets, so a receiver that heard the
+#   broadcasts is unaffected.
+# - netlog.c/.h: vita_netlog_hud(): off / no network / waiting for PC / the
+#   receiver's address.
+# - main.c: the HUD shows it from the first frame ("net waiting for PC").
+# See docs/phase-0/10-hardware-test-plan.md §Run 7.
+
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index 4946bb0f6..bfcbb0dff 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -88,6 +88,15 @@ static uint32_t log_off, log_crc;
+ static long engine_start;
+ static uint32_t engine_sent, engine_crc;
+ static char trace_name[128];
++/** Where this boot's part of log.txt starts in the file (appended to
++ * across boots), and whether a receiver has answered yet. */
++static long log_file_start;
++static bool had_receiver;
++/** The dumps and markers written so far this boot, to re-send when a
++ * receiver answers late. */
++#define SENT_FILES_MAX 96
++static char sent_files[SENT_FILES_MAX][64];
++static unsigned int sent_count;
+ 
+ /** netsurf.log sent per tail (about once a second), and in all: the
+  * engine log can reach 16 MiB with tracing on, too much for a mirror. */
+@@ -169,6 +178,11 @@ void vita_diag_init(void)
+ 	/* ux0:data exists on every Vita; our directory may not. */
+ 	mkdir("ux0:data", 0777);
+ 	mkdir(VITA_DIAG_DIR, 0777);
++	{
++		struct stat st;
++		if (stat(VITA_DIAG_DIR "log.txt", &st) == 0)
++			log_file_start = (long)st.st_size;
++	}
+ 	diag_fp = fopen(VITA_DIAG_DIR "log.txt", "a");
+ 	if (diag_fp == NULL)
+ 		diag_open_errno = errno ? errno : -1;
+@@ -390,6 +404,69 @@ void vita_diag_font_metrics(void)
+ 		      vita_text_stats.missing, vita_text_stats.face_failures);
+ }
+ 
++/** Note a finished dump or marker, for catch_up(). */
++static void remember_sent(const char *name)
++{
++	unsigned int i;
++
++	for (i = 0; i < sent_count; i++)
++		if (strcmp(sent_files[i], name) == 0)
++			return;
++	if (sent_count < SENT_FILES_MAX)
++		snprintf(sent_files[sent_count++], sizeof(sent_files[0]), "%s",
++			 name);
++}
++
++/**
++ * A receiver has just answered. Until now everything went out as
++ * broadcast, which only a receiver already listening could get (hardware
++ * run 6: none was, and nothing showed it). Send this boot's files again
++ * from the start: log.txt up to now, the finished dumps and markers, and
++ * netsurf.log from its start (re-tailed at the usual pace). A receiver
++ * that did hear the broadcasts gets the same bytes at the same offsets
++ * again, which changes nothing.
++ * eturn the number of files re-sent
++ */
++static unsigned int catch_up(void)
++{
++	char buf[VITA_NETLOG_CHUNK], path[256];
++	uint32_t off = 0;
++	unsigned int i, n_files = 0;
++	size_t n;
++	FILE *fp = NULL;
++
++	/* log.txt: from the file when there is one (the early buffer holds
++	 * only the first 16 KiB), else what the buffer has. */
++	if (diag_fp != NULL) {
++		fflush(diag_fp);
++		fp = fopen(VITA_DIAG_DIR "log.txt", "rb");
++	}
++	if (fp != NULL && fseek(fp, log_file_start, SEEK_SET) == 0) {
++		while (off < log_off &&
++		       (n = fread(buf, 1, sizeof(buf), fp)) > 0) {
++			if (n > log_off - off)
++				n = log_off - off;
++			vita_netlog_data("log.txt", off, buf, n);
++			off += (uint32_t)n;
++		}
++	} else {
++		vita_netlog_data("log.txt", 0, early_log, early_len);
++	}
++	if (fp != NULL)
++		fclose(fp);
++
++	for (i = 0; i < sent_count; i++) {
++		/* %.63s: one row of sent_files (GCC 15 sizes it as the whole array). */
++		snprintf(path, sizeof(path), VITA_DIAG_DIR "%.63s", sent_files[i]);
++		if (vita_netlog_file(sent_files[i], path))
++			n_files++;
++	}
++
++	engine_sent = 0;
++	engine_crc = (uint32_t)crc32(0L, Z_NULL, 0);
++	return n_files;
++}
++
+ /* exported interface documented in vita/diag.h */
+ bool vita_diag_trace_begin(const char *name)
+ {
+@@ -416,6 +493,7 @@ void vita_diag_trace_end(void)
+ 		fclose(vita_plot_trace);
+ 		vita_plot_trace = NULL;
+ 		snprintf(path, sizeof(path), VITA_DIAG_DIR "%s", trace_name);
++		remember_sent(trace_name);
+ 		if (net_started && !vita_netlog_file(trace_name, path))
+ 			vita_diag_log("netlog: cannot read back %s", path);
+ 	}
+@@ -435,6 +513,7 @@ void vita_diag_marker(const char *name)
+ 	}
+ 	if (fclose(fp) != 0)
+ 		vita_diag_log("marker %s: fclose failed, errno %d", name, errno);
++	remember_sent(name);
+ 	if (net_started) {
+ 		vita_netlog_file(name, path);
+ 		/* A checkpoint: log.txt is complete up to here. */
+@@ -568,6 +647,13 @@ void vita_diag_engine_flush(void)
+ 		const char *st = vita_netlog_poll();
+ 		if (st != NULL)
+ 			vita_diag_log("%s", st);
++		if (!had_receiver && vita_netlog_receiver() != NULL) {
++			had_receiver = true;
++			vita_diag_log("netlog: re-sent log.txt (%u bytes) and %u "
++				      "files to the receiver; netsurf.log "
++				      "follows from its start", (unsigned int)log_off,
++				      catch_up());
++		}
+ 	}
+ 	if (engine_log == NULL)
+ 		return;
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 9ca1eb757..56057ffa7 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -551,20 +551,21 @@ static void autotest_post(struct gui_window *gw, struct browser_window *bw,
+ /** Draw a status line / message over the page (never dumped). */
+ static void draw_overlay(void)
+ {
+-	char hud[200];
++	char hud[240];
+ 
+ 	vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
+ 	if (vita_hud) {
+ 		snprintf(hud, sizeof(hud),
+ 			 "%u/%u %s | first %u ms | cpu %u gpu %u ms | %u calls"
+-			 " %u st | SQ test SEL dump TRI mem O hud",
++			 " %u st | net %s | SQ test SEL dump TRI mem O hud",
+ 			 vita_page + 1, (unsigned int)VITA_TEST_PAGE_COUNT,
+ 			 vita_test_pages[vita_page],
+ 			 vita_stats.first_frame_ms ?
+ 				vita_stats.first_frame_ms - vita_stats.nav_ms : 0,
+ 			 vita_stats.cpu_ms_last, vita_stats.gpu_ms_last,
+ 			 vita_stats.calls_last,
+-			 vita_stats.clip_last.stencil_writes);
++			 vita_stats.clip_last.stencil_writes,
++			 vita_netlog_hud());
+ 		vita_plot_fill_rect(0, VITA_SCREEN_HEIGHT - 22,
+ 				    VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
+ 				    0x000000, 3);
+diff --git a/frontends/vita/netlog.c b/frontends/vita/netlog.c
+index 83cf354ed..8084d3ce4 100644
+--- a/frontends/vita/netlog.c
++++ b/frontends/vita/netlog.c
+@@ -309,6 +309,21 @@ const char *vita_netlog_receiver(void)
+ 	return acked ? receiver : NULL;
+ }
+ 
++/* exported interface documented in vita/netlog.h */
++const char *vita_netlog_hud(void)
++{
++	static char hud[24];
++
++	if (sock < 0)
++		return "off";
++	if (paused)
++		return "no network";
++	if (!acked)
++		return "waiting for PC";
++	snprintf(hud, sizeof(hud), "%s", inet_ntoa(dest.sin_addr));
++	return hud;
++}
++
+ /* exported interface documented in vita/netlog.h */
+ void vita_netlog_data(const char *name, uint32_t offset, const void *data,
+ 		      size_t len)
+diff --git a/frontends/vita/netlog.h b/frontends/vita/netlog.h
+index 607144190..cc66773ab 100644
+--- a/frontends/vita/netlog.h
++++ b/frontends/vita/netlog.h
+@@ -42,7 +42,9 @@
+  * everything is broadcast, so no address needs configuring; after the
+  * answer it is sent to the receiver alone (unicast Wi-Fi frames are
+  * retried by the radio; broadcast ones are not). The hello is repeated
+- * every few seconds until then, so the receiver may start late.
++ * every few seconds until then, so the receiver may start late; when it
++ * answers, the frontend re-sends what this launch has written so far
++ * (vita/diag.c), so starting it late loses nothing.
+  *
+  * ux0:data/VitaBrowser/netlog.cfg, if present, overrides the target:
+  * "off", or "a.b.c.d" / "a.b.c.d:port" to send there from the start.
+@@ -97,6 +99,13 @@ bool vita_netlog_active(void);
+ /** The receiver's address once one has answered, else NULL. */
+ const char *vita_netlog_receiver(void);
+ 
++/**
++ * The mirror's state in a few words, for the HUD: "off", "no network",
++ * "waiting for PC" (no receiver has answered: whatever is sent now reaches
++ * only a receiver already listening), or the receiver's address.
++ */
++const char *vita_netlog_hud(void);
++
+ /** Send `len` bytes of file `name` found at `offset`, in chunks. */
+ void vita_netlog_data(const char *name, uint32_t offset, const void *data,
+ 		      size_t len);

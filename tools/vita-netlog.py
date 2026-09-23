@@ -75,6 +75,7 @@ class Boot:
         self.reference = reference
         self.quiet = quiet
         self.seqs = set()
+        self.min_seq = None
         self.max_seq = -1
         self.ranges = {}    # file -> [(start, end)]
         self.ends = {}      # file -> (total, crc, verdict)
@@ -162,18 +163,24 @@ class Boot:
         return v
 
     def lost(self):
-        if self.max_seq < 0:
+        # Counted from the first datagram heard: what was sent before the
+        # receiver started is not lost -- the Vita re-sends its files when
+        # the receiver answers (vita/diag.c catch_up).
+        if self.min_seq is None:
             return 0
-        return self.max_seq + 1 - len(self.seqs)
+        return self.max_seq - self.min_seq + 1 - len(self.seqs)
 
     def summary(self):
         lines = [
             "VitaBrowser netlog receiver",
             "boot      %s from %s:%d" % (self.boot, self.addr[0], self.addr[1]),
             "hello     %s" % self.hello,
-            "datagrams %d received, %d lost (by sequence number)%s" % (
+            "datagrams %d received, %d lost (by sequence number)%s%s" % (
                 len(self.seqs), self.lost(),
-                ", clean exit (bye)" if self.bye else ""),
+                ", clean exit (bye)" if self.bye else "",
+                "; started listening at datagram #%d (earlier ones count "
+                "only if re-sent; see the files below)" % self.min_seq
+                if self.min_seq else ""),
             "",
             "files:",
         ]
@@ -277,6 +284,8 @@ def main():
             b.last = now
             b.seqs.add(seq)
             b.max_seq = max(b.max_seq, seq)
+            if b.min_seq is None or seq < b.min_seq:
+                b.min_seq = seq
             try:
                 if typ == "H":
                     b.hello = payload.decode("utf-8", "replace")

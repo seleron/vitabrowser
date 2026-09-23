@@ -928,3 +928,58 @@ Fix, next (§Run 7):
 
 Runs 4, 5 and 6 remain **unmeasured**. The run-6 VPKs in
 `VitaBrowser-hwtest\` stay valid until run 7's replace them.
+
+## Run 7 — a late receiver still gets everything (patch 40)
+
+This fixes run 6's silent failure (above).
+
+**Patch 40:**
+- **Catch-up:** when a receiver first answers, the Vita re-sends this
+  launch's files from the start: `log.txt` (read back from the card), every
+  finished plot dump and marker, and `netsurf.log`, re-tailed from its
+  start at the usual pace. The hello repeats every 3 s, so a receiver
+  started at any point before the app exits gets the whole run.
+  A receiver that was already listening gets the same bytes at the same
+  offsets again, which changes nothing.
+- **HUD:** the bottom line shows `net waiting for PC`, `net <PC address>`,
+  `net no network` or `net off` from the first frame. A receiver that isn't
+  running is visible at launch.
+- **Receiver:** losses are counted from the first datagram it heard;
+  anything earlier matters only if the re-sent files come out incomplete,
+  and `receiver.txt` checks each file.
+
+**Verified on the host:**
+- `run-vita-sim.sh` now starts the receiver **15 s late**, as a stand-in
+  for run 6's receiver that never started. By then about 800 datagrams had
+  gone to nobody. The receiver's first answer got 26 KB of `log.txt` and 17
+  finished files re-sent. Result: **23/23 files byte-identical, 0 lost
+  after joining**.
+- **Mutation:** with the catch-up disabled, the same test fails with
+  **18 of 23 files missing or incomplete**.
+- Clean checkout: applied 123 + the known 2; L1 PASS; fixtures 4/4;
+  101/101 + 30/30; simulator 15/15, clip modes 14/14. The dumps are
+  identical to run 6's.
+- The cross build needed one fix: GCC 15's `-Wformat-truncation` counts a
+  row of a 2-D array as the whole array, so the path now uses `%.63s`.
+  The host compiler did not warn.
+
+**Hand-off.** SHA256, first 12: `VitaBrowser.vpk` `963b53636073`,
+`VitaBrowser-ext.vpk` `e7d0d958613e`, `nsvita.elf` `7c808fb35289`. In
+`VitaBrowser-hwtest\` with the updated `vita-netlog.py`. Archive:
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run7/`.
+
+**Run 7 on the device** is run 6's procedure, with a check at launch:
+1. Double-click `receive-results.bat`. The window must say
+   `listening on UDP 0.0.0.0:45100`.
+2. Install the new VPK, delete `ux0:data/VitaBrowser/`, and launch.
+3. **Look at the HUD.**
+   - `net 192.168.x.x` (this PC's wired address) means it works.
+   - `net waiting for PC` for more than a few seconds means the broadcast
+     is not reaching the PC. Either the router does not pass broadcast
+     from Wi-Fi to the wired LAN, or the Vita is on another network.
+     Write the PC's address into `ux0:data/VitaBrowser/netlog.cfg`
+     (`192.168.x.x`, set once via VitaShell) and relaunch.
+   - `net no network` means the Vita's Wi-Fi is off.
+4. Then as in run 6: □, AUTOTEST DONE, START; a VT-text screenshot.
+
+Everything is still on the memory card whatever happens to the network.
