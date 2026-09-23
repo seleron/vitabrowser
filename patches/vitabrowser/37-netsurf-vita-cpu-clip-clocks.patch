@@ -1,0 +1,835 @@
+# netsurf: Vita clipping on the CPU, clock control, run-4 autotest (frontends/vita)
+# Generated 2026-09-23
+#
+# Hardware run 3 (doc 10): 12-69 ms of GPU per frame, growing with the draw.
+# vita2d clips with the stencil, and every vita2d_set_clip_rectangle() --
+# vita2d_enable_clipping() calls it too -- rewrites it: a full 960x544 fill
+# plus the clip rect. The plotter called both per core clip (30-160 a frame).
+# - plot.c: clipping moves to the CPU. Axis-aligned fills are intersected
+#   with the clip exactly, primitives wholly outside are skipped, wholly
+#   inside need nothing, and only a primitive crossing the clip edge uses the
+#   stencil, rewritten only when the clip changed. The old behaviour stays
+#   selectable (VITA_CLIP_STENCIL) for measuring. Per-frame counters.
+# - diag.c: logs ARM/bus/GPU/crossbar clocks at boot; vita_diag_set_clocks().
+# - main.c: the browsing profile is CPU clipping + GPU 222 MHz; the autotest
+#   runs 4 passes (A boot clocks + stencil clip, B GPU 222 + stencil,
+#   C boot clocks + CPU clip, D ARM 444/bus 222/GPU 222 + CPU clip), each
+#   page timed over 5 frames, with per-pass summaries in log.txt.
+# - Makefile: -DVITA_HOST_SIM for the simulator build (snapshot hook, so the
+#   simulator can compare the clip modes pixel for pixel).
+# See docs/phase-0/10-hardware-test-plan.md §Run 4.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index ad353af48..71dcbd779 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -18,7 +18,7 @@ CFLAGS += -std=c99 -g -Ifrontends/vita/compat \
+ 
+ ifeq ($(VITA_HOST_SIM),YES)
+ # Host simulator (see Makefile.tools): stand-in SDK headers and library.
+-CFLAGS += -I$(VITA_SIM_INCLUDE)
++CFLAGS += -I$(VITA_SIM_INCLUDE) -DVITA_HOST_SIM
+ LDFLAGS += $(VITA_SIM_LIB) $(shell pkg-config --libs freetype2) \
+ 	-lpcre2-posix -lpcre2-8 -lz -lm
+ else
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index 56f705d17..247504ea4 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -68,6 +68,9 @@ static FILE *engine_log;
+ static struct timeval diag_t0;
+ static bool diag_ready;
+ 
++/** Clocks as found at boot, restored by a 0 in vita_diag_set_clocks(). */
++static int boot_arm, boot_bus, boot_gpu, boot_xbar;
++
+ /** log.txt, open for the whole run; NULL if it could not be opened. */
+ static FILE *diag_fp;
+ /** errno of the failed log.txt open / first failed write, 0 if none. */
+@@ -141,14 +144,47 @@ void vita_diag_init(void)
+ 		sceAppMgrAppParamGetString(0, 12, tid, sizeof(tid));
+ 		vita_diag_log("title id %s", tid);
+ 	}
+-	vita_diag_log("clocks: arm %d MHz, gpu %d MHz",
+-		      scePowerGetArmClockFrequency(),
+-		      scePowerGetGpuClockFrequency());
++	boot_arm = scePowerGetArmClockFrequency();
++	boot_bus = scePowerGetBusClockFrequency();
++	boot_gpu = scePowerGetGpuClockFrequency();
++	boot_xbar = scePowerGetGpuXbarClockFrequency();
++	vita_diag_log("clocks at boot: arm %d, bus %d, gpu %d, gpu xbar %d MHz",
++		      boot_arm, boot_bus, boot_gpu, boot_xbar);
+ #else
+ 	vita_diag_log("clocks: n/a (host simulator)");
+ #endif
+ }
+ 
++/* exported interface documented in vita/diag.h */
++void vita_diag_set_clocks(const char *tag, int arm, int bus, int gpu,
++			  int xbar)
++{
++#ifdef __vita__
++	int ra, rb, rg, rx;
++
++	if (arm == 0) arm = boot_arm;
++	if (bus == 0) bus = boot_bus;
++	if (gpu == 0) gpu = boot_gpu;
++	if (xbar == 0) xbar = boot_xbar;
++	ra = scePowerSetArmClockFrequency(arm);
++	rb = scePowerSetBusClockFrequency(bus);
++	rg = scePowerSetGpuClockFrequency(gpu);
++	rx = scePowerSetGpuXbarClockFrequency(xbar);
++	vita_diag_log("clocks[%s]: set arm %d (0x%x), bus %d (0x%x), gpu %d "
++		      "(0x%x), xbar %d (0x%x); now arm %d, bus %d, gpu %d, "
++		      "xbar %d MHz", tag, arm, (unsigned int)ra, bus,
++		      (unsigned int)rb, gpu, (unsigned int)rg, xbar,
++		      (unsigned int)rx, scePowerGetArmClockFrequency(),
++		      scePowerGetBusClockFrequency(),
++		      scePowerGetGpuClockFrequency(),
++		      scePowerGetGpuXbarClockFrequency());
++#else
++	(void)boot_arm; (void)boot_bus; (void)boot_gpu; (void)boot_xbar;
++	vita_diag_log("clocks[%s]: arm %d, bus %d, gpu %d, xbar %d requested "
++		      "(host simulator: no effect)", tag, arm, bus, gpu, xbar);
++#endif
++}
++
+ /* exported interface documented in vita/diag.h */
+ void vita_diag_memory(const char *tag)
+ {
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+index c9b1f3885..f38fdbbf3 100644
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -46,6 +46,14 @@ void vita_diag_log(const char *fmt, ...)
+ /** Milliseconds since vita_diag_init(), monotonic enough for timing. */
+ unsigned int vita_diag_ms(void);
+ 
++/**
++ * Set the ARM / bus / GPU / GPU-crossbar clocks in MHz; 0 means "as at
++ * boot". Logs each call's result and the clocks read back afterwards.
++ * No-op (logged) in the host simulator.
++ */
++void vita_diag_set_clocks(const char *tag, int arm, int bus, int gpu,
++			  int xbar);
++
+ /** Log free memory in every pool, tagged. */
+ void vita_diag_memory(const char *tag);
+ 
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index a600027d2..b7bf3df0b 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -27,8 +27,9 @@
+  *
+  * Controls:
+  *   D-pad / left stick  scroll          L / R     previous / next test page
+- *   SQUARE    autotest: every page settled and dumped, then font metrics
+- *             and the memory probe; "AUTOTEST DONE" when finished
++ *   SQUARE    autotest: every page settled, timed and dumped, once per
++ *             pass (clip mode x clock profile, vita_passes[]), then font
++ *             metrics and the memory probe; "AUTOTEST DONE" when finished
+  *   SELECT    dump the current page's plot stream
+  *   TRIANGLE  memory probe            CIRCLE    toggle the HUD
+  *   START     quit
+@@ -104,15 +105,55 @@ static const char *const vita_test_pages[] = {
+ #define VITA_TEST_PAGE_COUNT \
+ 	(sizeof(vita_test_pages) / sizeof(vita_test_pages[0]))
+ 
++/** Frames rendered per page per autotest pass, for min/avg/max timing. */
++#define VITA_MEASURE_FRAMES 5
++
++/** One autotest pass: a clip mode and a clock profile (MHz; 0 = boot). */
++struct autotest_pass {
++	char tag;
++	const char *name;
++	enum vita_clip_mode clip;
++	int arm, bus, gpu, xbar;
++	bool dumps;	/**< dump plot streams (clip-independent: once is enough) */
++};
++
++/*
++ * Hardware run 4 (doc 10): the GPU time per frame (12-69 ms in run 3), taken
++ * apart. B against A is the GPU clock alone, C against A is CPU clipping
++ * alone, and D is both, with the ARM raised too for page-load time.
++ */
++static const struct autotest_pass vita_passes[] = {
++	{ 'A', "boot clocks, stencil clip", VITA_CLIP_STENCIL, 0, 0, 0, 0, true },
++	{ 'B', "GPU 222, stencil clip", VITA_CLIP_STENCIL, 0, 0, 222, 166, false },
++	{ 'C', "boot clocks, CPU clip", VITA_CLIP_CPU, 0, 0, 0, 0, false },
++	{ 'D', "ARM 444 bus 222 GPU 222, CPU clip", VITA_CLIP_CPU,
++	  444, 222, 222, 166, false },
++};
++#define VITA_PASS_COUNT (sizeof(vita_passes) / sizeof(vita_passes[0]))
++
++/** The browsing profile, applied at start-up and after the autotest:
++ * CPU clipping and the GPU at 222 MHz; the ARM stays as booted. */
++#define VITA_RUN_CLIP VITA_CLIP_CPU
++#define VITA_RUN_GPU 222
++#define VITA_RUN_XBAR 166
++
+ /** Autotest progress. */
+ enum autotest_state {
+ 	AT_OFF,
+ 	AT_SETTLE,		/**< waiting for the page to settle */
++	AT_MEASURE,		/**< rendering the timed frames */
+ 	AT_DUMP,		/**< the next frame is dumped */
+ 	AT_BOTTOM_SETTLE,	/**< scrolled to the bottom, waiting */
+ 	AT_BOTTOM_DUMP		/**< the next frame is dumped as -bottom */
+ };
+ 
++/** What the autotest wants from the next frame. */
++enum frame_kind {
++	FRAME_NONE,		/**< nothing: draw only if something changed */
++	FRAME_MEASURE,		/**< a timed frame */
++	FRAME_DUMP		/**< a frame whose plot calls are dumped */
++};
++
+ /** Per-page measurements, reset on every navigation. */
+ struct page_stats {
+ 	unsigned int nav_ms;		/**< when navigation started */
+@@ -122,6 +163,7 @@ struct page_stats {
+ 	unsigned int frames;
+ 	unsigned int cpu_ms_max, gpu_ms_max, cpu_ms_last, gpu_ms_last;
+ 	unsigned int calls_last;
++	struct vita_plot_clip_stats clip_last;	/**< the page's part only */
+ 	bool was_loading;
+ 	bool stall_logged;		/**< "no document yet" was logged */
+ 	unsigned int content_ms;	/**< 0 until the new document arrives */
+@@ -133,12 +175,27 @@ static bool vita_quit;
+ static unsigned int vita_page;
+ static struct page_stats vita_stats;
+ static enum autotest_state vita_autotest = AT_OFF;
++static unsigned int vita_pass;		/**< index into vita_passes */
++
++/** Timed frames of the current page in the current pass. */
++static struct {
++	unsigned int n;
++	unsigned int gpu_min, gpu_sum, gpu_max, cpu_min, cpu_sum, cpu_max;
++} vita_measure;
++
++/** Running totals of the current pass, over its pages. */
++static struct {
++	unsigned int pages;
++	unsigned int gpu_avg_sum, cpu_avg_sum, load_sum, stencil_sum, clips_sum;
++} vita_pass_total;
+ static bool vita_hud = true;
+ static bool vita_dump_next;		/**< SELECT: dump the next frame */
+ static char vita_message[128];		/**< overlay message, "" = none */
+ static unsigned int vita_message_until;	/**< ms; 0 = until replaced */
+ static bool vita_overlay_dirty = true;	/**< HUD / message needs painting */
+ 
++static void autotest_start(struct browser_window *bw);
++
+ static void vita_gui_quit(void)
+ {
+ 	vita_quit = true;
+@@ -256,10 +313,7 @@ static int vita_input(struct gui_window *gw, struct browser_window *bw)
+ 		return 0;	/* the autotest drives navigation */
+ 
+ 	if (pressed & SCE_CTRL_SQUARE) {
+-		vita_diag_log("autotest: start");
+-		vita_autotest = AT_SETTLE;
+-		set_message(0, "AUTOTEST running - do not touch");
+-		open_test_page(bw, 0);
++		autotest_start(bw);
+ 		return 0;
+ 	}
+ 	if (pressed & SCE_CTRL_SELECT) {
+@@ -293,8 +347,114 @@ static int vita_input(struct gui_window *gw, struct browser_window *bw)
+ 	return step;
+ }
+ 
+-/** Autotest step before drawing: decide whether this frame is dumped. */
+-static bool autotest_pre(struct gui_window *gw)
++/** Switch clip mode and clocks to autotest pass `i`. */
++static void apply_pass(unsigned int i)
++{
++	const struct autotest_pass *p = &vita_passes[i];
++	char tag[2] = { p->tag, 0 };
++
++	vita_pass = i;
++	memset(&vita_pass_total, 0, sizeof(vita_pass_total));
++	vita_plot_clip_mode = p->clip;
++	vita_diag_log("autotest pass %c: %s", p->tag, p->name);
++	vita_diag_set_clocks(tag, p->arm, p->bus, p->gpu, p->xbar);
++}
++
++/** The browsing profile (VITA_RUN_*). */
++static void apply_run_profile(void)
++{
++	vita_plot_clip_mode = VITA_RUN_CLIP;
++	vita_diag_set_clocks("run", 0, 0, VITA_RUN_GPU, VITA_RUN_XBAR);
++}
++
++/** Log one page's timed frames and add them to the pass totals. */
++static void log_measure(void)
++{
++	const struct autotest_pass *p = &vita_passes[vita_pass];
++	const struct vita_plot_clip_stats *c = &vita_stats.clip_last;
++	unsigned int n = vita_measure.n ? vita_measure.n : 1;
++	unsigned int load = vita_stats.content_ms ?
++		vita_stats.content_ms - vita_stats.nav_ms : 0;
++
++	vita_diag_log("measure %c %02u-%s: gpu %u/%u/%u ms, cpu %u/%u/%u ms "
++		      "(min/avg/max of %u), %u calls, clips %u, stencil writes "
++		      "%u, culled %u, cut %u, gpu-clipped %u, load %u ms",
++		      p->tag, vita_page + 1, vita_test_pages[vita_page],
++		      vita_measure.gpu_min, vita_measure.gpu_sum / n,
++		      vita_measure.gpu_max, vita_measure.cpu_min,
++		      vita_measure.cpu_sum / n, vita_measure.cpu_max,
++		      vita_measure.n, vita_stats.calls_last, c->clips,
++		      c->stencil_writes, c->culled, c->cut, c->gpu_clipped,
++		      load);
++	vita_pass_total.pages++;
++	vita_pass_total.gpu_avg_sum += vita_measure.gpu_sum / n;
++	vita_pass_total.cpu_avg_sum += vita_measure.cpu_sum / n;
++	vita_pass_total.load_sum += load;
++	vita_pass_total.stencil_sum += c->stencil_writes;
++	vita_pass_total.clips_sum += c->clips;
++}
++
++/** Log the finished pass's averages over its pages. */
++static void log_pass_summary(void)
++{
++	const struct autotest_pass *p = &vita_passes[vita_pass];
++	unsigned int n = vita_pass_total.pages ? vita_pass_total.pages : 1;
++
++	vita_diag_log("pass %c summary (%s): %u pages, per frame avg gpu %u ms, "
++		      "cpu %u ms, clips %u, stencil writes %u; page load avg "
++		      "%u ms", p->tag, p->name, vita_pass_total.pages,
++		      vita_pass_total.gpu_avg_sum / n,
++		      vita_pass_total.cpu_avg_sum / n,
++		      vita_pass_total.clips_sum / n,
++		      vita_pass_total.stencil_sum / n,
++		      vita_pass_total.load_sum / n);
++}
++
++/** Start the autotest: every pass over every page. */
++static void autotest_start(struct browser_window *bw)
++{
++	vita_diag_log("autotest: start, %u passes x %u pages",
++		      (unsigned int)VITA_PASS_COUNT,
++		      (unsigned int)VITA_TEST_PAGE_COUNT);
++	apply_pass(0);
++	vita_autotest = AT_SETTLE;
++	set_message(0, "AUTOTEST pass %c page 1/%u - do not touch",
++		    vita_passes[0].tag, (unsigned int)VITA_TEST_PAGE_COUNT);
++	open_test_page(bw, 0);
++}
++
++/** Next page, next pass, or the end of the autotest. */
++static void autotest_next(struct browser_window *bw)
++{
++	if (vita_page + 1 < VITA_TEST_PAGE_COUNT) {
++		vita_autotest = AT_SETTLE;
++		set_message(0, "AUTOTEST pass %c page %u/%u - do not touch",
++			    vita_passes[vita_pass].tag, vita_page + 2,
++			    (unsigned int)VITA_TEST_PAGE_COUNT);
++		open_test_page(bw, vita_page + 1);
++		return;
++	}
++	log_pass_summary();
++	if (vita_pass + 1 < VITA_PASS_COUNT) {
++		apply_pass(vita_pass + 1);
++		vita_autotest = AT_SETTLE;
++		set_message(0, "AUTOTEST pass %c page 1/%u - do not touch",
++			    vita_passes[vita_pass].tag,
++			    (unsigned int)VITA_TEST_PAGE_COUNT);
++		open_test_page(bw, 0);
++		return;
++	}
++	vita_autotest = AT_OFF;
++	apply_run_profile();
++	vita_diag_font_metrics();
++	vita_diag_mem_probe();
++	vita_diag_log("autotest: done");
++	vita_diag_marker("autotest.done");
++	set_message(0, "AUTOTEST DONE - copy ux0:data/VitaBrowser/");
++}
++
++/** Autotest step before drawing: what the next frame is for. */
++static enum frame_kind autotest_pre(struct gui_window *gw)
+ {
+ 	char name[96];
+ 
+@@ -302,32 +462,67 @@ static bool autotest_pre(struct gui_window *gw)
+ 	case AT_SETTLE:
+ 	case AT_BOTTOM_SETTLE:
+ 		if (!page_settled(gw) && !page_timed_out())
+-			return false;
++			return FRAME_NONE;
+ 		if (!page_settled(gw))
+ 			vita_diag_log("autotest: %s did not settle in %u ms",
+ 				      vita_test_pages[vita_page],
+ 				      VITA_SETTLE_TIMEOUT_MS);
+ 		log_page_summary(gw, vita_autotest == AT_SETTLE ?
+ 				 "settled" : "settled at bottom");
++		if (vita_autotest == AT_BOTTOM_SETTLE) {
++			snprintf(name, sizeof(name), "%02u-%s-bottom",
++				 vita_page + 1, vita_test_pages[vita_page]);
++			vita_diag_trace_begin(name);
++			vita_autotest = AT_BOTTOM_DUMP;
++			return FRAME_DUMP;
++		}
+ 		vita_diag_memory(vita_test_pages[vita_page]);
+-		snprintf(name, sizeof(name), "%02u-%s%s", vita_page + 1,
+-			 vita_test_pages[vita_page],
+-			 vita_autotest == AT_SETTLE ? "" : "-bottom");
++		memset(&vita_measure, 0, sizeof(vita_measure));
++		vita_autotest = AT_MEASURE;
++		return FRAME_MEASURE;
++	case AT_MEASURE:
++		return FRAME_MEASURE;
++	case AT_DUMP:
++		snprintf(name, sizeof(name), "%02u-%s", vita_page + 1,
++			 vita_test_pages[vita_page]);
+ 		vita_diag_trace_begin(name);
+-		vita_autotest = (vita_autotest == AT_SETTLE) ?
+-				AT_DUMP : AT_BOTTOM_DUMP;
+-		vita_window_force_redraw(gw);
+-		return true;
++		return FRAME_DUMP;
+ 	default:
+-		return false;
++		return FRAME_NONE;
+ 	}
+ }
+ 
+-/** Autotest step after a dumped frame: scroll, next page, or finish. */
+-static void autotest_post(struct gui_window *gw, struct browser_window *bw)
++/** Autotest step after a frame it asked for. */
++static void autotest_post(struct gui_window *gw, struct browser_window *bw,
++			  enum frame_kind kind)
+ {
+ 	int w, h;
+ 
++	if (kind == FRAME_MEASURE && vita_autotest == AT_MEASURE) {
++		unsigned int g = vita_stats.gpu_ms_last;
++		unsigned int c = vita_stats.cpu_ms_last;
++
++		if (vita_measure.n == 0 || g < vita_measure.gpu_min)
++			vita_measure.gpu_min = g;
++		if (vita_measure.n == 0 || c < vita_measure.cpu_min)
++			vita_measure.cpu_min = c;
++		if (g > vita_measure.gpu_max)
++			vita_measure.gpu_max = g;
++		if (c > vita_measure.cpu_max)
++			vita_measure.cpu_max = c;
++		vita_measure.gpu_sum += g;
++		vita_measure.cpu_sum += c;
++		if (++vita_measure.n < VITA_MEASURE_FRAMES)
++			return;
++		log_measure();
++		if (vita_passes[vita_pass].dumps)
++			vita_autotest = AT_DUMP;
++		else
++			autotest_next(bw);
++		return;
++	}
++	if (kind != FRAME_DUMP)
++		return;
+ 	if (vita_autotest == AT_DUMP) {
+ 		vita_window_extent(gw, &w, &h);
+ 		if (h > VITA_SCREEN_HEIGHT) {
+@@ -342,19 +537,7 @@ static void autotest_post(struct gui_window *gw, struct browser_window *bw)
+ 	} else if (vita_autotest != AT_BOTTOM_DUMP) {
+ 		return;
+ 	}
+-	if (vita_page + 1 < VITA_TEST_PAGE_COUNT) {
+-		vita_autotest = AT_SETTLE;
+-		set_message(0, "AUTOTEST page %u/%u - do not touch",
+-			    vita_page + 2, (unsigned int)VITA_TEST_PAGE_COUNT);
+-		open_test_page(bw, vita_page + 1);
+-		return;
+-	}
+-	vita_autotest = AT_OFF;
+-	vita_diag_font_metrics();
+-	vita_diag_mem_probe();
+-	vita_diag_log("autotest: done");
+-	vita_diag_marker("autotest.done");
+-	set_message(0, "AUTOTEST DONE - copy ux0:data/VitaBrowser/");
++	autotest_next(bw);
+ }
+ 
+ /** Draw a status line / message over the page (never dumped). */
+@@ -367,13 +550,14 @@ static void draw_overlay(void)
+ 	if (vita_hud) {
+ 		snprintf(hud, sizeof(hud),
+ 			 "%u/%u %s | first %u ms | cpu %u gpu %u ms | %u calls"
+-			 " | SQ autotest SEL dump TRI mem O hud",
++			 " %u st | SQ test SEL dump TRI mem O hud",
+ 			 vita_page + 1, (unsigned int)VITA_TEST_PAGE_COUNT,
+ 			 vita_test_pages[vita_page],
+ 			 vita_stats.first_frame_ms ?
+ 				vita_stats.first_frame_ms - vita_stats.nav_ms : 0,
+ 			 vita_stats.cpu_ms_last, vita_stats.gpu_ms_last,
+-			 vita_stats.calls_last);
++			 vita_stats.calls_last,
++			 vita_stats.clip_last.stencil_writes);
+ 		vita_plot_fill_rect(0, VITA_SCREEN_HEIGHT - 22,
+ 				    VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
+ 				    0x000000, 3);
+@@ -392,8 +576,17 @@ static void draw_overlay(void)
+ 	}
+ }
+ 
+-/** Paint one frame, timing and optionally dumping it. */
+-static void draw_frame(struct gui_window *gw, bool dump)
++#ifdef VITA_HOST_SIM
++/* tools/vita-sim: write the page as drawn so far to a PNG. */
++void vitasim_snapshot(const char *name);
++#endif
++
++/**
++ * Paint one frame, timing it and optionally dumping it.
++ *
++ * \param snap  in the host simulator, snapshot the page under this name
++ */
++static void draw_frame(struct gui_window *gw, bool dump, const char *snap)
+ {
+ 	unsigned int t0, t1, t2;
+ 	char name[96];
+@@ -410,12 +603,21 @@ static void draw_frame(struct gui_window *gw, bool dump)
+ 	t0 = vita_diag_ms();
+ 	vita2d_start_drawing();
+ 	vita2d_clear_screen();
++	vita_plot_frame_begin();
+ 	vita_window_redraw(gw);
+ 	if (dump)
+ 		vita_diag_trace_end();
+ 	vita_stats.calls_last = vita_plot_calls;
++	vita_stats.clip_last = vita_plot_clip_stats;
++#ifdef VITA_HOST_SIM
++	if (snap != NULL)
++		vitasim_snapshot(snap);
++#else
++	(void)snap;
++#endif
+ 	draw_overlay();
+ 	vita_overlay_dirty = false;
++	vita_plot_frame_end();
+ 	vita2d_end_drawing();
+ 	t1 = vita_diag_ms();
+ 	/* Wait for the GPU so the frame's cost is measurable; the test
+@@ -435,9 +637,12 @@ static void draw_frame(struct gui_window *gw, bool dump)
+ 	if (t2 - t1 > vita_stats.gpu_ms_max)
+ 		vita_stats.gpu_ms_max = t2 - t1;
+ 	if (vita_stats.frames <= VITA_LOGGED_FRAMES || dump)
+-		vita_diag_log("frame %u of %s: cpu %u ms, gpu %u ms, %u calls%s",
++		vita_diag_log("frame %u of %s: cpu %u ms, gpu %u ms, %u calls, "
++			      "%u clips, %u stencil writes%s",
+ 			      vita_stats.frames, vita_test_pages[vita_page],
+ 			      t1 - t0, t2 - t1, vita_stats.calls_last,
++			      vita_stats.clip_last.clips,
++			      vita_stats.clip_last.stencil_writes,
+ 			      dump ? " (dumped)" : "");
+ }
+ 
+@@ -492,7 +697,7 @@ static void vita_run(struct browser_window *bw)
+ 
+ 	while (!vita_quit) {
+ 		struct gui_window *gw = vita_window_current();
+-		bool dump;
++		enum frame_kind kind;
+ 		int step;
+ 
+ 		vita_schedule_run();
+@@ -520,13 +725,27 @@ static void vita_run(struct browser_window *bw)
+ 			open_test_page(bw, (vita_page + VITA_TEST_PAGE_COUNT +
+ 					    step) % VITA_TEST_PAGE_COUNT);
+ 		}
+-		dump = autotest_pre(gw);
++		kind = autotest_pre(gw);
+ 
+-		if (vita_window_needs_redraw(gw) || dump ||
++		if (vita_window_needs_redraw(gw) || kind != FRAME_NONE ||
+ 		    vita_overlay_dirty) {
+-			draw_frame(gw, dump);
+-			if (dump)
+-				autotest_post(gw, bw);
++			char snap[96];
++			const char *snap_name = NULL;
++
++			/* The last timed frame of each page is the one the
++			 * simulator keeps, to compare clip modes pixel for
++			 * pixel. */
++			if (kind == FRAME_MEASURE &&
++			    vita_measure.n + 1 == VITA_MEASURE_FRAMES) {
++				snprintf(snap, sizeof(snap), "%c-%02u-%s",
++					 vita_passes[vita_pass].tag,
++					 vita_page + 1,
++					 vita_test_pages[vita_page]);
++				snap_name = snap;
++			}
++			draw_frame(gw, kind == FRAME_DUMP, snap_name);
++			if (kind != FRAME_NONE)
++				autotest_post(gw, bw, kind);
+ 		} else {
+ 			/* Nothing to paint: yield for about a frame. */
+ 			sceKernelDelayThread(16 * 1000);
+@@ -623,6 +842,7 @@ int main(int argc, char **argv)
+ 	/* plot.c converts font points back to pixels at the same dpi. */
+ 	browser_set_dpi(96);
+ 	vita_diag_memory("after init");
++	apply_run_profile();
+ 
+ 	vita_page = 0;
+ 	memset(&vita_stats, 0, sizeof(vita_stats));
+diff --git a/frontends/vita/plot.c b/frontends/vita/plot.c
+index be8f82ea7..78bec0aa0 100644
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -105,6 +105,105 @@ float vita_plot_pgf_scale(float px)
+ 	return px / VITA_PGF_EM_PX;
+ }
+ 
++/* ---- clipping --------------------------------------------------------
++ *
++ * vita2d clips with the stencil buffer, and every
++ * vita2d_set_clip_rectangle() -- vita2d_enable_clipping() calls it too --
++ * rewrites that stencil: a full 960x544 rectangle to clear it, then the
++ * clip rectangle (libvita2d vita2d.c). The first version called both per
++ * core clip, four stencil fills each, and hardware run 3 measured 12-69 ms
++ * of GPU per frame at 30-160 core clips a frame (doc 10).
++ *
++ * So clipping happens on the CPU wherever it can: an axis-aligned fill is
++ * intersected with the clip exactly, a primitive wholly inside the clip
++ * needs no clipping, one wholly outside is skipped, and only a primitive
++ * that really crosses the clip edge gets the stencil -- rewritten only if
++ * the clip changed since it was last written. VITA_CLIP_STENCIL keeps the
++ * old behaviour, for measuring against.
++ */
++enum vita_clip_mode vita_plot_clip_mode = VITA_CLIP_CPU;
++struct vita_plot_clip_stats vita_plot_clip_stats;
++
++static bool gpu_clip_on;	/**< stencil test enabled in vita2d */
++static bool stencil_valid;	/**< the stencil holds stencil_rect */
++static struct rect stencil_rect;
++
++static bool rect_inside(int x0, int y0, int x1, int y1, const struct rect *r)
++{
++	return x0 >= r->x0 && y0 >= r->y0 && x1 <= r->x1 && y1 <= r->y1;
++}
++
++/**
++ * Get the GPU clip state right for a primitive covering [x0,x1) x [y0,y1).
++ *
++ * \return false if nothing of it can be visible (skip drawing it)
++ */
++static bool clip_prepare(int x0, int y0, int x1, int y1)
++{
++	const struct rect *c = &vita_clip;
++
++	if (vita_clip_empty)
++		return false;
++	if (vita_plot_clip_mode == VITA_CLIP_STENCIL)
++		return true;	/* the stencil was set by vita_plot_set_clip */
++	if (x1 <= c->x0 || y1 <= c->y0 || x0 >= c->x1 || y0 >= c->y1) {
++		vita_plot_clip_stats.culled++;
++		return false;
++	}
++	if (rect_inside(x0, y0, x1, y1, c)) {
++		/* Needs no clip -- but a live stencil test for some other
++		 * rectangle must not cut it. Disabling is a state change only. */
++		if (gpu_clip_on &&
++		    !rect_inside(x0, y0, x1, y1, &stencil_rect)) {
++			vita2d_disable_clipping();
++			gpu_clip_on = false;
++		}
++		return true;
++	}
++	/* Crosses the clip edge: only the stencil can cut it exactly. */
++	if (!stencil_valid || stencil_rect.x0 != c->x0 ||
++	    stencil_rect.y0 != c->y0 || stencil_rect.x1 != c->x1 ||
++	    stencil_rect.y1 != c->y1) {
++		vita2d_set_clip_rectangle(c->x0, c->y0, c->x1, c->y1);
++		stencil_rect = *c;
++		stencil_valid = true;
++		vita_plot_clip_stats.stencil_writes++;
++	}
++	if (!gpu_clip_on) {
++		/* Rewrites the stencil once more: vita2d has no cheaper way
++		 * to switch the test on. */
++		vita2d_enable_clipping();
++		gpu_clip_on = true;
++		vita_plot_clip_stats.stencil_writes++;
++	}
++	vita_plot_clip_stats.gpu_clipped++;
++	return true;
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_frame_begin(void)
++{
++	memset(&vita_plot_clip_stats, 0, sizeof(vita_plot_clip_stats));
++	stencil_valid = false;
++	if (vita_plot_clip_mode == VITA_CLIP_CPU) {
++		/* A stencil mode frame before this one may have left the
++		 * test on; switching it off is a state change, no fill. */
++		vita2d_disable_clipping();
++		gpu_clip_on = false;
++	}
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_frame_end(void)
++{
++	/* With clipping left on, vita2d_start_drawing() rewrites the stencil
++	 * before the next frame draws anything. */
++	if (vita_plot_clip_mode == VITA_CLIP_CPU && gpu_clip_on) {
++		vita2d_disable_clipping();
++		gpu_clip_on = false;
++	}
++}
++
+ /* exported interface documented in vita/plot.h */
+ void vita_plot_set_clip(int x0, int y0, int x1, int y1)
+ {
+@@ -118,10 +217,14 @@ void vita_plot_set_clip(int x0, int y0, int x1, int y1)
+ 	vita_clip.x1 = x1;
+ 	vita_clip.y1 = y1;
+ 	vita_clip_empty = (x1 <= x0 || y1 <= y0);
+-	if (vita_clip_empty)
++	vita_plot_clip_stats.clips++;
++	if (vita_clip_empty || vita_plot_clip_mode != VITA_CLIP_STENCIL)
+ 		return;
++	/* The first version's behaviour, kept for comparison: the stencil
++	 * is rewritten twice per clip (see above). */
+ 	vita2d_enable_clipping();
+ 	vita2d_set_clip_rectangle(x0, y0, x1, y1);
++	vita_plot_clip_stats.stencil_writes += 2;
+ }
+ 
+ /* exported interface documented in vita/plot.h */
+@@ -130,6 +233,21 @@ void vita_plot_fill_rect(int x0, int y0, int x1, int y1, colour c,
+ {
+ 	if (vita_clip_empty || bucket <= 0 || x1 <= x0 || y1 <= y0)
+ 		return;
++	if (vita_plot_clip_mode == VITA_CLIP_CPU) {
++		/* An axis-aligned fill clips exactly on the CPU. */
++		const struct rect *cl = &vita_clip;
++		int cx0 = max(x0, cl->x0), cy0 = max(y0, cl->y0);
++		int cx1 = min(x1, cl->x1), cy1 = min(y1, cl->y1);
++
++		if (cx1 <= cx0 || cy1 <= cy0) {
++			vita_plot_clip_stats.culled++;
++			return;
++		}
++		if (cx0 != x0 || cy0 != y0 || cx1 != x1 || cy1 != y1)
++			vita_plot_clip_stats.cut++;
++		x0 = cx0; y0 = cy0; x1 = cx1; y1 = cy1;
++		clip_prepare(x0, y0, x1, y1);	/* inside now: no stencil */
++	}
+ 	vita_plot_calls++;
+ 	vita2d_draw_rectangle((float)x0, (float)y0,
+ 			      (float)(x1 - x0), (float)(y1 - y0),
+@@ -146,9 +264,21 @@ static void vita_plot_fan(const float *xy, unsigned int n, unsigned int rgba)
+ {
+ 	vita2d_color_vertex *v;
+ 	unsigned int i;
++	float bx0, by0, bx1, by1;
+ 
+ 	if (vita_clip_empty || n < 3)
+ 		return;
++	bx0 = bx1 = xy[0];
++	by0 = by1 = xy[1];
++	for (i = 1; i < n; i++) {
++		if (xy[i * 2] < bx0) bx0 = xy[i * 2];
++		if (xy[i * 2] > bx1) bx1 = xy[i * 2];
++		if (xy[i * 2 + 1] < by0) by0 = xy[i * 2 + 1];
++		if (xy[i * 2 + 1] > by1) by1 = xy[i * 2 + 1];
++	}
++	if (!clip_prepare((int)floorf(bx0), (int)floorf(by0),
++			  (int)ceilf(bx1), (int)ceilf(by1)))
++		return;
+ 	v = vita2d_pool_memalign(n * sizeof(vita2d_color_vertex),
+ 				 sizeof(vita2d_color_vertex));
+ 	if (v == NULL)
+@@ -188,6 +318,9 @@ void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c)
+ 	if (vita_clip_empty)
+ 		return;
+ 	if (width <= 1) {
++		if (!clip_prepare(min(x0, x1), min(y0, y1),
++				  max(x0, x1) + 1, max(y0, y1) + 1))
++			return;
+ 		vita_plot_calls++;
+ 		vita2d_draw_line((float)x0, (float)y0, (float)x1, (float)y1,
+ 				 rgba);
+@@ -221,6 +354,8 @@ void vita_plot_text(int x, int y, const char *text, size_t length,
+ 		    colour c, float scale)
+ {
+ 	char buf[512];
++	int w;
++	float h;
+ 
+ 	if (vita_clip_empty || vita_font == NULL || length == 0)
+ 		return;
+@@ -229,6 +364,13 @@ void vita_plot_text(int x, int y, const char *text, size_t length,
+ 		length = sizeof(buf) - 1;
+ 	memcpy(buf, text, length);
+ 	buf[length] = '\0';
++	/* A generous box around the run: ascenders well above the baseline,
++	 * descenders below, so "inside" is never wrongly claimed. */
++	w = vita2d_pgf_text_width(vita_font, scale, buf);
++	h = VITA_PGF_EM_PX * scale;
++	if (!clip_prepare(x - 1, y - (int)(h * 1.3f) - 1, x + w + 2,
++			  y + (int)(h * 0.6f) + 1))
++		return;
+ 	vita_plot_calls++;
+ 	vita2d_pgf_draw_text(vita_font, x, y,
+ 			     vita_plot_rgba(c, VITA_BUCKET_SOLID), scale, buf);
+@@ -356,7 +498,9 @@ vita_plot_disc(const struct redraw_context *ctx,
+ 	       int x, int y, int radius)
+ {
+ 	trace("DISC X %d Y %d RADIUS %d", x, y, radius);
+-	if (style->fill_type != PLOT_OP_TYPE_NONE && !vita_clip_empty) {
++	if (style->fill_type != PLOT_OP_TYPE_NONE &&
++	    clip_prepare(x - radius, y - radius, x + radius + 1,
++			 y + radius + 1)) {
+ 		vita_plot_calls++;
+ 		vita2d_draw_fill_circle((float)x, (float)y, (float)radius,
+ 				vita_plot_rgba(style->fill_colour,
+@@ -577,6 +721,8 @@ vita_plot_bitmap(const struct redraw_context *ctx,
+ 	}
+ 	for (ty = y; ty < y_end; ty += height) {
+ 		for (tx = x; tx < x_end; tx += width) {
++			if (!clip_prepare(tx, ty, tx + width, ty + height))
++				continue;
+ 			vita_plot_calls++;
+ 			vita2d_draw_texture_scale(tex, (float)tx, (float)ty,
+ 						  sx, sy);
+diff --git a/frontends/vita/plot.h b/frontends/vita/plot.h
+index d920033dc..f1de4b33a 100644
+--- a/frontends/vita/plot.h
++++ b/frontends/vita/plot.h
+@@ -79,6 +79,29 @@ float vita_plot_font_px(int size);
+ /** PGF scale factor that renders a font `px` pixels high. */
+ float vita_plot_pgf_scale(float px);
+ 
++/** How clipping reaches the GPU (see plot.c "clipping"). */
++enum vita_clip_mode {
++	VITA_CLIP_CPU,		/**< CPU-clip; stencil only for edge-crossers */
++	VITA_CLIP_STENCIL	/**< the first version: stencil per clip */
++};
++extern enum vita_clip_mode vita_plot_clip_mode;
++
++/** Per-frame clipping counters, reset by vita_plot_frame_begin(). */
++struct vita_plot_clip_stats {
++	unsigned int clips;		/**< clip rectangles set */
++	unsigned int stencil_writes;	/**< vita2d stencil rewrites */
++	unsigned int culled;		/**< primitives skipped, all outside */
++	unsigned int cut;		/**< fills intersected on the CPU */
++	unsigned int gpu_clipped;	/**< primitives the stencil clipped */
++};
++extern struct vita_plot_clip_stats vita_plot_clip_stats;
++
++/** Call after vita2d_start_drawing(): resets clip state and counters. */
++void vita_plot_frame_begin(void);
++
++/** Call before vita2d_end_drawing(): leaves vita2d's clipping off. */
++void vita_plot_frame_end(void);
++
+ /** vita2d draw calls issued; the diagnostics reset and read it per frame. */
+ extern unsigned int vita_plot_calls;
+ 

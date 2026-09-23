@@ -488,3 +488,20 @@ iconv_t iconv_open(const char *tocode, const char *fromcode)
 	errno = EINVAL;
 	return (iconv_t)-1;
 }
+
+/* ---- test hook --------------------------------------------------------- */
+
+/* Called by frontends/vita (VITA_HOST_SIM) with the page drawn but before
+ * the HUD: writes that frame to $VITA_SIM_SNAP/<name>.png, so the autotest's
+ * clip-mode passes can be compared pixel for pixel. */
+void vitasim_snapshot(const char *name);
+void vitasim_snapshot(const char *name)
+{
+	const char *dir = getenv("VITA_SIM_SNAP");
+	char path[1024];
+
+	if (dir == NULL)
+		return;
+	snprintf(path, sizeof(path), "%s/%s.png", dir, name);
+	write_png(path, back);
+}

@@ -484,8 +484,12 @@ static void test_backend(void)
 	s.transform = (90 << 6) << 16; s.transform_b = (int)0x01000100;
 	r = (struct rect){ 10, 10, 110, 50 };
 	P->rectangle(&ctx, &s, &r);
-	CHECK(vcalls == 1 && has_line("fan 4 80,-20 80,80 40,80 40,-20 #ff0000ff"),
-	      "rotate90 fan:\n%s", vlog);
+	/* Its corners reach y = -20, across the screen-sized clip's top edge,
+	 * so the stencil clips it: set once, then switched on. */
+	CHECK(has_line("fan 4 80,-20 80,80 40,80 40,-20 #ff0000ff") &&
+	      line_index("clip 0 0 960 544") >= 0 &&
+	      line_index("clip-on") < line_index("fan 4 80,-20 80,80 40,80 40,-20 #ff0000ff"),
+	      "rotate90 fan (crosses the clip: stencil first):\n%s", vlog);
 	/* ...and with 40% opacity the fan carries alpha 128. */
 	full_clip();
 	s.opacity = (PLOT_STYLE_SCALE * 40) / 100;
@@ -532,11 +536,57 @@ static void test_backend(void)
 	CHECK(vcalls == 4 && has_line("rect 10 10 100 2 #ff000000") &&
 	      has_line("rect 108 12 2 36 #ff000000"), "stroke rect:\n%s", vlog);
 
-	/* Clip: forwarded exclusive; clamped to the screen; empty suppresses. */
+	/* Clipping, CPU mode (the default since hardware run 4). A clip only
+	 * records the rectangle, clamped to the screen; it costs the GPU
+	 * nothing until a primitive crosses it. Each frame starts clean. */
+	vita_plot_frame_begin();
 	vlog_reset();
 	r = (struct rect){ -5, 20, 2000, 300 };
 	P->clip(&ctx, &r);
-	CHECK(has_line("clip-on") && has_line("clip 0 20 960 300"), "clip clamp:\n%s", vlog);
+	CHECK(vcalls == 0, "cpu clip: setting a clip draws nothing:\n%s", vlog);
+	s = style0(); s.fill_colour = 0x0000ff;
+	r = (struct rect){ 0, 0, 100, 100 };
+	P->rectangle(&ctx, &s, &r);
+	CHECK(vcalls == 1 && has_line("rect 0 20 100 80 #ff0000ff"),
+	      "cpu clip: a fill crossing the clip is cut on the CPU:\n%s", vlog);
+	vlog_reset();
+	r = (struct rect){ 0, 400, 100, 500 };
+	P->rectangle(&ctx, &s, &r);
+	CHECK(vcalls == 0, "cpu clip: a fill wholly outside is skipped:\n%s", vlog);
+	vlog_reset();
+	{
+		int in[6] = { 10, 30, 50, 30, 30, 60 };		/* inside */
+		int across[6] = { 10, 10, 50, 30, 30, 60 };	/* crosses y=20 */
+		P->polygon(&ctx, &s, in, 3);
+		CHECK(vcalls == 1 && line_index("fan 3") == 0,
+		      "cpu clip: a fan inside the clip needs no stencil:\n%s", vlog);
+		vlog_reset();
+		P->polygon(&ctx, &s, across, 3);
+		P->polygon(&ctx, &s, across, 3);
+		CHECK(count_lines("clip 0 20 960 300") == 1 &&
+		      count_lines("clip-on") == 1 && count_lines("fan 3") == 2,
+		      "cpu clip: crossing fans set the stencil once, not per "
+		      "primitive:\n%s", vlog);
+		vlog_reset();
+		P->polygon(&ctx, &s, in, 3);
+		CHECK(vcalls == 1, "cpu clip: an inside fan leaves a stencil that "
+		      "contains it alone:\n%s", vlog);
+	}
+	vita_plot_frame_end();
+	CHECK(has_line("clip-off"), "cpu clip: the frame ends with clipping "
+	      "off, so vita2d_start_drawing() rewrites nothing:\n%s", vlog);
+
+	/* Stencil mode: the first version's behaviour, kept for measuring
+	 * against -- every clip rewrites the stencil. */
+	vita_plot_clip_mode = VITA_CLIP_STENCIL;
+	vlog_reset();
+	r = (struct rect){ -5, 20, 2000, 300 };
+	P->clip(&ctx, &r);
+	CHECK(has_line("clip-on") && has_line("clip 0 20 960 300") &&
+	      vita_plot_clip_stats.stencil_writes >= 2,
+	      "stencil clip: clamped, and written per clip:\n%s", vlog);
+	vita_plot_clip_mode = VITA_CLIP_CPU;
+	vita_plot_frame_begin();
 	vlog_reset();
 	r = (struct rect){ 50, 50, 50, 80 };
 	P->clip(&ctx, &r);
@@ -702,15 +752,31 @@ static int replay_matches(const char *stream, const char *name)
 			cx0 = a < 0 ? 0 : a; cy0 = b < 0 ? 0 : b;
 			cx1 = c > 960 ? 960 : c; cy1 = d > 544 ? 544 : d;
 		} else if (sscanf(line, "PLOT RECT X0 %d Y0 %d X1 %d Y1 %d", &a, &b, &c, &d) == 4) {
-			if (cx1 > cx0 && cy1 > cy0 && bucket > 0 && c > a && d > b)
+			/* CPU clipping: a fill arrives cut to the clip, or not at
+			 * all if nothing of it is inside. */
+			int ia = a > cx0 ? a : cx0, ib = b > cy0 ? b : cy0;
+			int ic = c < cx1 ? c : cx1, id = d < cy1 ? d : cy1;
+			if (cx1 > cx0 && cy1 > cy0 && bucket > 0 && ic > ia && id > ib)
 				elen += (size_t)snprintf(expect + elen, sizeof(expect) - elen,
-					"rect %d %d %d %d a%u\n", a, b, c - a, d - b,
+					"rect %d %d %d %d a%u\n", ia, ib, ic - ia, id - ib,
 					(vita_plot_rgba(0, bucket) >> 24));
 		} else if (strncmp(line, "PLOT POLY ", 10) == 0) {
 			int x[4], y[4];
+			int k, bx0, by0, bx1, by1;
 			if (sscanf(line, "PLOT POLY X0 %d Y0 %d X1 %d Y1 %d X2 %d Y2 %d X3 %d Y3 %d",
-				   &x[0], &y[0], &x[1], &y[1], &x[2], &y[2], &x[3], &y[3]) == 8 &&
-			    cx1 > cx0 && cy1 > cy0 && bucket > 0)
+				   &x[0], &y[0], &x[1], &y[1], &x[2], &y[2], &x[3], &y[3]) != 8)
+				continue;
+			bx0 = bx1 = x[0]; by0 = by1 = y[0];
+			for (k = 1; k < 4; k++) {
+				if (x[k] < bx0) bx0 = x[k];
+				if (x[k] > bx1) bx1 = x[k];
+				if (y[k] < by0) by0 = y[k];
+				if (y[k] > by1) by1 = y[k];
+			}
+			/* A quad wholly outside the clip is skipped; one that
+			 * reaches in is drawn whole and the stencil cuts it. */
+			if (cx1 > cx0 && cy1 > cy0 && bucket > 0 &&
+			    bx1 > cx0 && by1 > cy0 && bx0 < cx1 && by0 < cy1)
 				elen += (size_t)snprintf(expect + elen, sizeof(expect) - elen,
 					"fan 4 %d,%d %d,%d %d,%d %d,%d a%u\n",
 					x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3],

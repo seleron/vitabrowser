@@ -93,7 +93,28 @@ echo "== run: $PAGES pages =="
 ls "$OUT"/shots
 
 echo "== autotest run (reference dumps) =="
-rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
-( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 timeout 600 "$NS/nsvita-sim" )
+rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps"
+mkdir -p "$OUT/snaps"
+( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
+	timeout 900 "$NS/nsvita-sim" )
 cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
 ls "$OUT/reference" | head -40
+
+# The autotest renders every page once per pass (frontends/vita/main.c
+# vita_passes[]). Clocks do nothing here, but the clip modes must not change
+# a pixel: pass C (CPU clipping) against pass A (the stencil per clip).
+# A page whose frames differ even between A and B -- the same clip mode;
+# clocks do nothing here -- changes over time by itself (PM-animation's
+# rotation is driven by the animation clock), so it cannot be compared and
+# is reported as such.
+echo "== clip modes, pixel for pixel =="
+same=0; diff=0; timed=0
+for a in "$OUT"/snaps/A-*.png; do
+	page=${a##*/A-}
+	if ! cmp -s "$a" "$OUT/snaps/B-$page"; then
+		timed=$((timed + 1)); echo "  time-varying, skipped: $page"
+	elif cmp -s "$a" "$OUT/snaps/C-$page"; then same=$((same + 1))
+	else diff=$((diff + 1)); echo "  DIFFERS: $page"; fi
+done
+echo "  CPU clip vs stencil clip: $same identical, $diff differ, $timed time-varying"
+[ "$diff" -eq 0 ] && [ "$same" -gt 0 ]

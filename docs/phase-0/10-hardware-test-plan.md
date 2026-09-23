@@ -559,3 +559,85 @@ system PGF, and for measuring with the same face.
    simulator) and fix in the engine.
 4. **Transfers:** copy results over USB or with a client that doesn't cache
    (FileZilla, WinSCP), or rename the folder on the Vita first.
+
+## Run 4 — GPU time: clipping on the CPU, and the GPU clock (patch 37)
+
+**Why run 3's GPU time was so high.** libvita2d clips with the stencil
+buffer, and `vita2d_set_clip_rectangle()` rewrites the whole stencil every
+time: a full 960×544 rectangle to clear it, then the clip rectangle
+(libvita2d `vita2d.c`, read upstream). `vita2d_enable_clipping()` calls it
+too. The plotter called **both for every core clip**: four stencil fills,
+two of them full-screen, per clip, at 30–160 clips a frame. That fits both
+the 12–69 ms and its growth with page complexity. `vita2d_wait_rendering_done()`
+is `sceGxmFinish()`, so the number is real GPU work, not a vblank wait.
+
+**The fix (patch 37, `frontends/vita/plot.c`): clip on the CPU.**
+- Axis-aligned fills (backgrounds, gradient bands, shadows, borders, most
+  calls) are intersected with the clip exactly on the CPU.
+- A primitive wholly outside the clip is skipped; one wholly inside needs
+  nothing.
+- Only a primitive that crosses the clip edge (a quad, text, a texture or
+  a line) uses the stencil, and the stencil is rewritten only when the clip
+  changed since it was last written.
+- Clipping is left off at the end of each frame, so
+  `vita2d_start_drawing()` doesn't rewrite it before the next.
+- The old behaviour stays selectable (`VITA_CLIP_STENCIL`) for measuring
+  against.
+
+**The GPU clock.** The run-1 and run-3 boot logs read "gpu 41 MHz". The build
+now logs ARM, bus, GPU and GPU-crossbar clocks at boot, and the **browsing
+profile sets the GPU to 222 MHz (crossbar 166)**, leaving the ARM as booted.
+Every change is logged with its return code and the clocks read back.
+
+**Verified on the host:**
+- Unit test 100/100: new checks for each clipping path (cut, skipped,
+  inside, crossing → stencil set once for many primitives, clipping off at
+  frame end, stencil mode unchanged). Two planted mutations (no stencil
+  cache, no CPU cut) are caught.
+- Simulator: CPU clipping is **pixel-identical to the stencil clip on all
+  14 comparable pages**. PM-animation changes by itself over time (its
+  rotation is clock-driven: it differs even between two stencil-mode
+  passes), so the harness reports it as time-varying and skips it. The
+  harness now fails if any other page differs.
+- Stencil writes per frame, same pages (simulator):
+
+| page | clips | stencil writes, run-3 behaviour | CPU clip |
+|---|---|---|---|
+| VT-calibration | 169 | 338 | **25** (18 crossing primitives) |
+| VT-scroll | 90 | 180 | **2** (1 crossing) |
+| average over 15 pages | 77 | 154 | **13** |
+
+- Plot dumps are byte-identical to run 3's reference, except
+  PM-animation's animated box (time).
+- Clean checkout: applied 120 + the known 2; L1 SAME; fixtures 4/4.
+
+**The run-4 autotest measures both changes on the device.** It runs **four
+passes** over all 15 pages, each page timed over 5 redraws (min/avg/max),
+with a `pass X summary` line per pass in `log.txt`:
+
+| pass | clipping | clocks | isolates |
+|---|---|---|---|
+| A | stencil per clip (run 3) | as booted | the baseline (≈ run 3) |
+| B | stencil per clip | GPU 222 / crossbar 166 | the GPU clock alone |
+| C | CPU | as booted | CPU clipping alone |
+| D | CPU | ARM 444, bus 222, GPU 222, crossbar 166 | both, plus the ARM for load time |
+
+Hand-off VPKs rebuilt (SHA256 first 12: `VitaBrowser.vpk` `83290de32e4f`,
+`VitaBrowser-ext.vpk` `4233dac74fe0`, `nsvita.elf` `bdb66bef8a3a`; archive
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run4/`, with the simulator's
+reference log, dumps and per-pass snapshots).
+
+Run 4 on the device (about 5 minutes):
+1. Install the new **VitaBrowser.vpk**, and **delete
+   `ux0:data/VitaBrowser/`** first.
+2. Launch, press □, wait for AUTOTEST DONE (four passes, a few minutes),
+   then START.
+3. Scroll VT-scroll for a few seconds and note the HUD's `cpu … gpu … ms`
+   and `… st` (stencil writes).
+4. Copy `ux0:data/VitaBrowser/` into `results\` over USB mode or a
+   non-caching FTP client (FileZilla / WinSCP), not Explorer's FTP view
+   (§Run 3).
+
+What decides the next step: pass B vs A (the clock), C vs A (the clipping),
+and D (both). Whether GPU 222 needs anything beyond a safe homebrew
+(`scePowerSetGpuClockFrequency` return codes in the log).
