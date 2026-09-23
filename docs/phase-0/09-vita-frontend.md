@@ -48,6 +48,7 @@ Three patches in `patches/vitabrowser/`, applied after the generated stack
 |---|---|
 | `plot_geom.c/.h` | **The contract as coloured geometry.** One `plot->rectangle` → the pieces monkey records (bands, drop/inset shadow rects, transform quad, bucket), each with its colour and a `paint` flag. No platform dependencies. Also formats pieces as monkey stream lines. |
 | `plot.c/.h` | The vita2d `plotter_table`, plus primitives shared with the replayer: `fill_rect`, `fill_quad` (triangle fan), `line`, `text` (FreeType, §11; system PGF before patch 38), `set_clip` |
+| `net.c/.h` | Brings sceNet up once, for curl and the mirror (patch 42) |
 | `netlog.c/.h` | Mirrors `ux0:data/VitaBrowser/` (logs, plot dumps, markers) to a PC receiver over UDP (patch 39; 10 §Run 6) |
 | `text.c/.h` | The FreeType text engine (patch 38, §11): bundled fonts, fallback chain, glyph atlas; measures and draws |
 | `replay.c/.h` | Replays a recorded `.plot` stream through the same primitives (a debug viewer, and test layer C) |
@@ -309,8 +310,9 @@ and fixed by patch 32 (§10).
 - **No on-device run.** No Vita hardware in this session (out of scope by
   the task). Everything in §6 marked *assumption* waits for one.
 - **No sudo** was used or needed: vdpm installs into `~/vitasdk`.
-- **Networking and JS are off** in this build. Brief Phase 1 steps 8/9 bring
-  curl + TLS and QuickJS.
+- ~~**Networking and JS are off** in this build.~~ Networking is on since
+  patches 41–42: libcurl 8.22 on mbedTLS 3.6.5, with Mozilla's roots
+  bundled (10 §Run 8). JavaScript (QuickJS) is still off.
 - `clip: rect(0px, 200px, 60px, 0px)` on an absolutely positioned box clips
   its bottom edge but **not its right** (the clip stays at the parent's
   x1 = 951). Seen on `PM-shadow-clip`; pre-existing (identical before and
@@ -334,8 +336,9 @@ and fixed by patch 32 (§10).
    the simulator's dumps (same frontend, fonts and FreeType), not the
    nsmonkey goldens: monkey measures text differently, so any wrapped line
    would differ for no reason.
-4. **curl + TLS** (vdpm `curl`, `openssl`) and **QuickJS**, the remaining
-   Phase 1 engine items.
+4. ~~**curl + TLS**~~ (done: patches 41–42, `curl-mbedtls` rather than
+   `curl` + OpenSSL 1.0.2; 10 §Run 8) and **QuickJS**, the remaining
+   Phase 1 engine item.
 
 ## 9. Corrections to earlier documents
 

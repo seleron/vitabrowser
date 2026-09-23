@@ -33,8 +33,11 @@ PAGES="${PAGES:-15}"
 mkdir -p "$OUT/shots" "$OUT/run"
 # The frontend draws text with FreeType from app0:/res/fonts (vita/text.c).
 [ -f "$WORK/fonts/DejaVuSans.ttf" ] || WORK="$WORK" "$ROOT/tools/fetch-fonts.sh"
-# ...with the Vita's FreeType release, so text measures as on the device.
+# ...with the Vita's FreeType release, so text measures as on the device,
+# and its curl + mbedTLS and CA bundle, so HTTPS verifies as on the device.
 WORK="$WORK" "$ROOT/tools/build-host-freetype.sh"
+WORK="$WORK" "$ROOT/tools/build-host-curl.sh"
+WORK="$WORK" "$ROOT/tools/fetch-certs.sh"
 rm -f "$OUT"/shots/*.png
 
 echo "== stand-in SDK =="
@@ -69,7 +72,7 @@ fi
 
 echo "== frontends/vita, host simulator build =="
 # Same core flags as tools/build-patched.sh's nsmonkey build.
-export PKG_CONFIG_PATH="$WORK/host-freetype/lib/pkgconfig:$OV/lib/pkgconfig:$P/lib/pkgconfig"
+export PKG_CONFIG_PATH="$WORK/host-curl/lib/pkgconfig:$WORK/host-freetype/lib/pkgconfig:$OV/lib/pkgconfig:$P/lib/pkgconfig"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
 -include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DVITABROWSER_ENGINE_TRACE"
 rm -f "$NS/nsvita-sim"	# the overlay changed under it; force the relink
@@ -92,6 +95,26 @@ for f in default.css quirks.css adblock.css internal.css Messages \
 	cp -L "$NS/frontends/vita/res/$f" "$A/res/$f"
 done
 cp "$ROOT"/testpages/pages/* "$A/testpages/"
+
+# The network pages' servers (tools/vita-sim/httpd.py): a throwaway test CA,
+# a certificate for 127.0.0.1 signed by it, and a rogue self-signed one.
+# The simulator's ca-bundle.pem is Mozilla's plus the test CA.
+T="$OUT/tls"
+rm -rf "$T"; mkdir -p "$T"
+( cd "$T" && \
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem \
+    -days 30 -subj "/CN=VitaBrowser simulator test CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" && \
+  openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr \
+    -subj "/CN=127.0.0.1" && \
+  printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > leaf.ext && \
+  openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+    -out leaf.pem -days 30 -extfile leaf.ext && \
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout rogue.key -out rogue.pem \
+    -days 30 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" \
+  ) > "$OUT/tls.log" 2>&1 || { echo "  test certificates FAILED"; cat "$OUT/tls.log"; exit 1; }
+cat "$WORK/certs/ca-bundle.pem" "$T/ca.pem" > "$A/res/ca-bundle.pem"
 mkdir -p "$A/res/fonts"
 cp "$WORK"/fonts/*.ttf "$WORK"/fonts/LICENSE-*.txt "$A/res/fonts/"
 
@@ -107,6 +130,19 @@ mkdir -p "$OUT/snaps" "$OUT/run/ux0:data/VitaBrowser"
 # machine: the same code path as on the Vita after a receiver answers.
 NETLOG_PORT="${NETLOG_PORT:-45199}"
 echo "127.0.0.1:$NETLOG_PORT" > "$OUT/run/ux0:data/VitaBrowser/netlog.cfg"
+# Pass N's network pages: the same page as 01 over http, over https with a
+# trusted certificate, and over https with a rogue one.
+HP="${HTTPD_PORT:-45280}"
+cat > "$OUT/run/ux0:data/VitaBrowser/nettest.txt" <<NET
+NET-http-local http://127.0.0.1:$HP/L1-layout-basics.html
+NET-https-local https://127.0.0.1:$((HP + 1))/L1-layout-basics.html
+NET-https-rogue https://127.0.0.1:$((HP + 2))/L1-layout-basics.html
+NET
+python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
+	--https-bad $((HP + 2)) "$T/rogue.pem" "$T/rogue.key" \
+	> "$OUT/httpd.log" 2>&1 &
+HTTPD=$!
 # The receiver starts LATE, as it did not start at all in hardware run 6:
 # 15 s into the autotest, with log lines and dumps already sent to nobody.
 # When it answers the next hello, the frontend re-sends this launch's files
@@ -118,8 +154,9 @@ RX=$!
 ( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
 	timeout 900 "$NS/nsvita-sim" )
 wait $RX || true
+kill $HTTPD 2>/dev/null || true
 cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
-rm -f "$OUT/reference/netlog.cfg"
+rm -f "$OUT/reference/netlog.cfg" "$OUT/reference/nettest.txt"
 ls "$OUT/reference" | head -40
 
 # The autotest renders every page once per pass (frontends/vita/main.c
@@ -156,4 +193,32 @@ grep -E '^datagrams' "$NET/receiver.txt" | sed 's/^/  /'
 echo "  mirror vs memory card: $same identical, $bad differ"
 [ "$bad" -eq 0 ] && grep -q 'received, 0 lost' "$NET/receiver.txt" && \
 	! grep -qE 'INCOMPLETE|MISMATCH' "$NET/receiver.txt"
+
+# curl + mbedTLS: the page fetched over http and over https (trusted
+# certificate) must plot exactly as the bundled file does; the rogue
+# certificate must be refused.
+echo "== network pages (curl + mbedTLS) =="
+R="$OUT/reference"
+body() { tail -n +2 "$1"; }	# line 1 names the dump
+body "$R/01-L1-layout-basics.plot" > "$OUT/l1.body"
+nbad=0
+for n in 16-NET-http-local 17-NET-https-local; do
+	if [ -f "$R/$n.plot" ] && body "$R/$n.plot" | cmp -s - "$OUT/l1.body"; then
+		echo "  $n: plots as 01-L1-layout-basics"
+	else
+		echo "  $n: DIFFERS from 01-L1-layout-basics (or missing)"; nbad=$((nbad + 1))
+	fi
+done
+# NetSurf's refusal is its certificate query page, titled "Privacy error".
+rogue_title=$(sed -n '/page 18\/18 NET-https-rogue: navigate/,/NET-https-rogue settled/p' \
+	"$R/log.txt" | sed -n 's/.*gw title: //p' | tail -1)
+if [ -f "$R/18-NET-https-rogue.plot" ] && [ "$rogue_title" = "Privacy error" ] && \
+   ! body "$R/18-NET-https-rogue.plot" | cmp -s - "$OUT/l1.body"; then
+	echo "  18-NET-https-rogue: refused (\"$rogue_title\" page)"
+else
+	echo "  18-NET-https-rogue: LOADED OR MISSING"; nbad=$((nbad + 1))
+fi
+grep -E 'pass N summary' "$R/log.txt" | sed 's/^/  /'
+grep -m1 'curl_version' "$R/netsurf.log" | sed 's/.*curl_version /  libcurl: /'
+[ "$nbad" -eq 0 ]
 

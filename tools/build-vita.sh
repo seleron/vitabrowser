@@ -38,8 +38,9 @@
 #   -I compat ... decls.h       the same shim headers as the host build.
 #
 # Needs vdpm packages: libvita2d (pulls freetype, libpng, libjpeg-turbo,
-# zlib, bzip2) and libpcre2. Install without sudo:
-#   VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2
+# zlib, bzip2), libpcre2 and curl-mbedtls (pulls mbedtls, zstd). Install
+# without sudo:
+#   VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2 curl-mbedtls
 #
 # Usage: WORK=<WORK>/vitabrowser-work VITASDK=~/vitasdk tools/build-vita.sh
 set -e
@@ -61,6 +62,8 @@ GCC14="-Wno-error=implicit-function-declaration \
 	{ echo "no libvita2d: VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2"; exit 2; }
 [ -f "$VITASDK/arm-vita-eabi/include/pcre2posix.h" ] || \
 	{ echo "no libpcre2: VDPM_NONINTERACTIVE=1 vdpm install libpcre2"; exit 2; }
+grep -q 'mbedTLS\|mbedtls' "$VITASDK/arm-vita-eabi/lib/pkgconfig/libcurl.pc" 2>/dev/null || \
+	{ echo "no curl-mbedtls: VDPM_NONINTERACTIVE=1 vdpm install curl-mbedtls"; exit 2; }
 [ -f "$UP/netsurf/frontends/vita/main.c" ] || \
 	{ echo "no patched tree at $UP -- run tools/build-patched.sh"; exit 2; }
 
@@ -110,6 +113,9 @@ done
 for f in "$WORK"/fonts/*.ttf "$WORK"/fonts/LICENSE-*.txt; do
 	EXTRA="$EXTRA $f=res/fonts/$(basename "$f")"
 done
+# HTTPS is verified against Mozilla's roots (tools/fetch-certs.sh).
+WORK="$WORK" "$ROOT/tools/fetch-certs.sh" >/dev/null
+EXTRA="$EXTRA $WORK/certs/ca-bundle.pem=res/ca-bundle.pem"
 # Two VPKs from one ELF: the default memory budget, and the extended one
 # (param.sfo ATTRIBUTE2=12, pre-phase-0 §1) under its own title id so both
 # can be installed side by side for the memory probe.

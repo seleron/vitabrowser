@@ -983,3 +983,106 @@ This fixes run 6's silent failure (above).
 4. Then as in run 6: □, AUTOTEST DONE, START; a VT-text screenshot.
 
 Everything is still on the memory card whatever happens to the network.
+
+## Run 8 — http and https: libcurl on mbedTLS (patches 41–42)
+
+Phase 1's networking item: pages from the web, not only from `app0:`.
+
+**The TLS stack.** vdpm offers two builds of curl:
+- `curl`: 8.17 on **OpenSSL 1.0.2**, end-of-life and without TLS 1.3;
+- `curl-mbedtls`: **8.22.0 on mbedTLS 3.6.5**, the current LTS, with
+  TLS 1.3.
+
+The build uses `curl-mbedtls`, installed with vdpm (userspace, no sudo).
+NetSurf's curl fetcher already works without OpenSSL: it detects the
+backend at start-up, and its OpenSSL hooks only add certificate-chain
+display. So `NETSURF_USE_OPENSSL` stays off.
+- **Entropy:** the Vita has no `/dev/urandom`. vitaSDK's mbedTLS patch
+  reads entropy through newlib's `getentropy()`, which calls
+  `sceKernelGetRandomNumber`, checked in the library objects.
+- **Certificates:** vitaSDK's libcurl defaults to the firmware's CA list,
+  `vs0:data/external/cert/CA_LIST.cer`, which on 3.65 dates from 2017.
+  The frontend points NetSurf's `ca_bundle` at `app0:/res/ca-bundle.pem`
+  instead: Mozilla's roots as extracted by curl, **2026-08-13, 121 roots**,
+  pinned by date and SHA256 (`tools/fetch-certs.sh`; MPL 2.0 data,
+  bundled unmodified). The VPK grows to 11.6 MB.
+- **Network start-up** moved to its own module, `vita/net.c`, called once at
+  boot for curl and the diagnostics mirror alike. Before, it lived in
+  netlog.c, so `netlog.cfg` `off` would have left curl without a network.
+  The sceNet pool is now 1 MiB.
+
+**Patch 41 (core, upstreamable).** `fetch_curl_register()` passed
+`CURLOPT_VERBOSE` an `int`. libcurl 8.x's GCC type checks reject that
+under `-Werror`. It is now `0L` / `1L`, like every other option in the
+file.
+
+**Patch 42 (frontend).**
+- curl is on, and `ca_bundle` defaults to the bundled file.
+- **Network pages** follow the 15 bundled ones. The defaults are
+  `http://example.com/` and `https://example.com/`;
+  `ux0:data/VitaBrowser/nettest.txt` (`name url` per line) overrides them.
+- L/R reach them, and a new **autotest pass N** times and dumps them.
+- The timing passes A–D stay on bundled pages, so network time never
+  mixes into the clip and clock comparison.
+
+**The host now runs the Vita's TLS stack too.**
+`tools/build-host-curl.sh` builds mbedTLS 3.6.5 and curl 8.22.0 from the
+tarballs pinned in vitaSDK's own VITABUILDs. It uses the same `config.py`
+settings and the same cmake options, minus the Vita-only ones. vitaSDK's
+mbedTLS patch only adds `__vita__` branches, so nothing else differs. The
+simulator's netsurf.log confirms the stack in use:
+`libcurl/8.22.0 mbedTLS/3.6.5`, `ca_bundle: 'app0:/res/ca-bundle.pem'`,
+`cURL not linked against openssl`.
+
+**Verified on the host.** `run-vita-sim.sh` starts a local server
+(`tools/vita-sim/httpd.py`) and a throwaway test CA. The simulator's
+bundle is Mozilla's roots plus that CA.
+
+| page | served as | result |
+|---|---|---|
+| 16 `NET-http-local` | L1 over plain http | **plots byte-identical to the bundled `01-L1-layout-basics`** |
+| 17 `NET-https-local` | L1 over https, certificate signed by the test CA | **byte-identical**: mbedTLS verified the chain against the bundle |
+| 18 `NET-https-rogue` | L1 over https, a self-signed certificate | **refused**: NetSurf's "Privacy error" page (asserted by title) |
+
+- A separate simulator autotest with the **default** pages fetched the real
+  `http://example.com/` (189 ms) and `https://example.com/` (263 ms) over
+  the internet. The https fetch verified a public chain against the
+  bundled Mozilla roots with mbedTLS, and both pages rendered ("Example
+  Domain").
+- Clean checkout: applied 125 + the known 2; L1 PASS; fixtures 4/4;
+  101/101 + 30/30; simulator 15/15, clip modes 14/14; network mirror 28/28
+  with a late receiver; the network pages as above. The cross build has
+  `fetch_curl_register`, `mbedtls_ssl_handshake` and `getentropy` in the
+  ELF, and `res/ca-bundle.pem` in the VPK.
+- Found on the way: switching `NETSURF_USE_CURL` does not rebuild
+  `content/fetch.c`, so an incremental build had no http fetcher
+  (`navigate failed: 3`, `NSERROR_NO_FETCH_HANDLER`) until its object
+  directory was cleared. The clean chain always builds from scratch.
+
+**Known limits:**
+- curl resolves names on the main thread (no threaded resolver in the
+  Vita build), so a slow DNS lookup stalls the UI for its duration.
+- There is no cookie jar and no disc cache (as before).
+- A certificate error shows NetSurf's query page, but there is no way yet
+  to accept an exception on the Vita.
+- mbedTLS parses the 121-root bundle when curl sets up TLS. Its cost on the
+  Vita's ARM shows in pass N's https load time.
+
+**Hand-off.** SHA256, first 12: `VitaBrowser.vpk` `b5cfb75eb90f`,
+`VitaBrowser-ext.vpk` `2ecbb7ec1e5b`, `nsvita.elf` `06517505e099`. They
+replace run 7's in `VitaBrowser-hwtest\`. `reference-dumps\` now holds the
+22 dumps of the internet-connected simulator run, including
+`16-NET-http-example` and `17-NET-https-example`. Archive:
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run8/`.
+
+**Run 8 on the device** is run 7's procedure. The autotest now ends with
+pass N, which needs the Vita on Wi-Fi with internet access. Then:
+- **`log.txt`**: `init: net: up, ip …`, pass N's
+  `NET-http-example` / `NET-https-example` lines, and `gw title: Example
+  Domain` for both. "Privacy error" for https means certificate
+  verification failed on the device.
+- **`pass N summary`**: the load times, where https minus http is the TLS
+  cost.
+- **`receiver.txt`**: SAME for `16-`/`17-NET-…` against `reference-dumps\`.
+
+This run still also measures runs 4–7, which remain pending.

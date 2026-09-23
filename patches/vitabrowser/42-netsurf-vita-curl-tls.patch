@@ -1,0 +1,739 @@
+# netsurf: Vita http and https through libcurl on mbedTLS (frontends/vita)
+# Generated 2026-09-23
+#
+# Phase 1's networking item: pages from the web, not only app0:.
+# - Makefile.defaults: NETSURF_USE_CURL=YES with vdpm's curl-mbedtls
+#   (libcurl 8.22, mbedTLS 3.6.5 LTS: TLS 1.3); OpenSSL stays off (NetSurf's
+#   OpenSSL hooks are optional; the Vita's OpenSSL package is 1.0.2).
+# - Makefile: net.c; -lpthread (mbedTLS is built with pthread threading).
+# - net.c/.h (new): sceNet start-up, once, for curl and the diagnostics
+#   mirror alike (it was inside netlog.c, so netlog.cfg "off" would have
+#   left curl without a network); 1 MiB sceNet pool.
+# - netlog.c: uses net.c.
+# - main.c: ca_bundle defaults to app0:/res/ca-bundle.pem (Mozilla's roots,
+#   bundled by the VitaBrowser repo) instead of the firmware's 2017 list;
+#   network pages after the bundled ones (defaults: example.com over http
+#   and https; ux0:data/VitaBrowser/nettest.txt overrides), reached by L/R
+#   and by a new autotest pass N that times and dumps them, kept apart
+#   from the timing passes A-D. mbedTLS's entropy is newlib's getentropy()
+#   -> sceKernelGetRandomNumber (vitaSDK's mbedtls.patch).
+# See docs/phase-0/10-hardware-test-plan.md §Run 8.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 450eaed99..fcd2c38d5 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -35,7 +35,7 @@ LDFLAGS += -Wl,-q \
+ 	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
+ 	-lScePgf_stub -lScePvf_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
+ 	-lSceAppMgr_stub -lScePower_stub -lSceNet_stub -lSceNetCtl_stub \
+-	-lm
++	-lpthread -lm
+ endif
+ 
+ # ---------------------------------------------------------------------------
+@@ -54,7 +54,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ 
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+-	plot.c plot_geom.c replay.c diag.c text.c netlog.c
++	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/Makefile.defaults b/frontends/vita/Makefile.defaults
+index 9c3a436a0..abcd1231e 100644
+--- a/frontends/vita/Makefile.defaults
++++ b/frontends/vita/Makefile.defaults
+@@ -2,10 +2,13 @@
+ # Vita-specific options
+ # ----------------------------------------------------------------------------
+ 
+-# The first milestone fetches bundled pages from app0: through the file
+-# fetcher; networking (curl + TLS) and JavaScript (QuickJS, not Duktape)
+-# are later Phase 1 items. See docs/phase-0/09-vita-frontend.md.
+-NETSURF_USE_CURL := NO
++# Bundled pages come from app0: through the file fetcher; http and https
++# through libcurl (vdpm curl-mbedtls: curl 8.22 on mbedTLS 3.6, TLS 1.3).
++# OpenSSL stays off: NetSurf's OpenSSL hooks (certificate chain display)
++# are optional, and the Vita's OpenSSL package is 1.0.2 (no TLS 1.3).
++# JavaScript (QuickJS, not Duktape) is a later Phase 1 item. See
++# docs/phase-0/10-hardware-test-plan.md §Run 8.
++NETSURF_USE_CURL := YES
+ NETSURF_USE_OPENSSL := NO
+ NETSURF_USE_DUKTAPE := NO
+ 
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 56057ffa7..3c0df3eed 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -58,6 +58,7 @@
+ 
+ #include "vita/bitmap.h"
+ #include "vita/diag.h"
++#include "vita/net.h"
+ #include "vita/netlog.h"
+ #include "vita/fetch.h"
+ #include "vita/file.h"
+@@ -99,14 +100,72 @@ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ #define VITA_STATUS_LOG_MS 30000
+ 
+ /** The test pages bundled under app0:/testpages/ (testpages/pages/). */
+-static const char *const vita_test_pages[] = {
++static const char *const vita_local_pages[] = {
+ 	"L1-layout-basics", "L2-macsurf-css", "L3-grid", "L4-flex",
+ 	"PM-gradient", "PM-shadow", "PM-animation", "PM-macsurf-grid",
+ 	"PM-tagtype", "PM-link", "PM-shadow-clip",
+ 	"VT-calibration", "VT-text", "VT-images", "VT-scroll",
+ };
+-#define VITA_TEST_PAGE_COUNT \
+-	(sizeof(vita_test_pages) / sizeof(vita_test_pages[0]))
++#define VITA_LOCAL_PAGES \
++	((unsigned int)(sizeof(vita_local_pages) / sizeof(vita_local_pages[0])))
++
++/*
++ * Network pages, after the bundled ones: the autotest's pass N, and L / R
++ * reach them too. The defaults, or ux0:data/VitaBrowser/nettest.txt with
++ * one "name url" per line (the simulator points them at a local server).
++ */
++#define VITA_NET_PAGES_MAX 8
++static const char *const vita_net_defaults[][2] = {
++	{ "NET-http-example", "http://example.com/" },
++	{ "NET-https-example", "https://example.com/" },
++};
++static char vita_net_names[VITA_NET_PAGES_MAX][48];
++static char vita_net_urls[VITA_NET_PAGES_MAX][256];
++static unsigned int vita_net_count;
++#define VITA_PAGE_COUNT (VITA_LOCAL_PAGES + vita_net_count)
++
++static const char *page_name(unsigned int i)
++{
++	return i < VITA_LOCAL_PAGES ? vita_local_pages[i] :
++		vita_net_names[i - VITA_LOCAL_PAGES];
++}
++
++/** The network pages: nettest.txt if there is one, else the defaults. */
++static void load_net_pages(void)
++{
++	char line[320], name[48], url[256];
++	FILE *fp = fopen(VITA_DIAG_DIR "nettest.txt", "r");
++	unsigned int i;
++
++	vita_net_count = 0;
++	if (fp != NULL) {
++		while (vita_net_count < VITA_NET_PAGES_MAX &&
++		       fgets(line, sizeof(line), fp) != NULL) {
++			if (line[0] == '#' ||
++			    sscanf(line, "%47s %255s", name, url) != 2)
++				continue;
++			snprintf(vita_net_names[vita_net_count], sizeof(name),
++				 "%s", name);
++			snprintf(vita_net_urls[vita_net_count], sizeof(url),
++				 "%s", url);
++			vita_net_count++;
++		}
++		fclose(fp);
++	} else {
++		for (i = 0; i < sizeof(vita_net_defaults) /
++			     sizeof(vita_net_defaults[0]); i++) {
++			snprintf(vita_net_names[i], sizeof(name), "%s",
++				 vita_net_defaults[i][0]);
++			snprintf(vita_net_urls[i], sizeof(url), "%s",
++				 vita_net_defaults[i][1]);
++		}
++		vita_net_count = i;
++	}
++	for (i = 0; i < vita_net_count; i++)
++		vita_diag_log("net page %u: %s %s (%s)", VITA_LOCAL_PAGES + i + 1,
++			      vita_net_names[i], vita_net_urls[i],
++			      fp != NULL ? "nettest.txt" : "default");
++}
+ 
+ /** Frames rendered per page per autotest pass, for min/avg/max timing. */
+ #define VITA_MEASURE_FRAMES 5
+@@ -118,6 +177,7 @@ struct autotest_pass {
+ 	enum vita_clip_mode clip;
+ 	int arm, bus, gpu, xbar;
+ 	bool dumps;	/**< dump plot streams (clip-independent: once is enough) */
++	bool net;	/**< the network pages instead of the bundled ones */
+ };
+ 
+ /*
+@@ -126,11 +186,19 @@ struct autotest_pass {
+  * alone, and D is both, with the ARM raised too for page-load time.
+  */
+ static const struct autotest_pass vita_passes[] = {
+-	{ 'A', "boot clocks, stencil clip", VITA_CLIP_STENCIL, 0, 0, 0, 0, true },
+-	{ 'B', "GPU 222, stencil clip", VITA_CLIP_STENCIL, 0, 0, 222, 166, false },
+-	{ 'C', "boot clocks, CPU clip", VITA_CLIP_CPU, 0, 0, 0, 0, false },
++	{ 'A', "boot clocks, stencil clip", VITA_CLIP_STENCIL,
++	  0, 0, 0, 0, true, false },
++	{ 'B', "GPU 222, stencil clip", VITA_CLIP_STENCIL,
++	  0, 0, 222, 166, false, false },
++	{ 'C', "boot clocks, CPU clip", VITA_CLIP_CPU,
++	  0, 0, 0, 0, false, false },
+ 	{ 'D', "ARM 444 bus 222 GPU 222, CPU clip", VITA_CLIP_CPU,
+-	  444, 222, 222, 166, false },
++	  444, 222, 222, 166, false, false },
++	/* curl + TLS (doc 10 §Run 8): the network pages once, browsing
++	 * profile. Load times here are network time, so they are kept out
++	 * of passes A-D. */
++	{ 'N', "network pages, GPU 222, CPU clip", VITA_CLIP_CPU,
++	  0, 0, 222, 166, true, true },
+ };
+ #define VITA_PASS_COUNT (sizeof(vita_passes) / sizeof(vita_passes[0]))
+ 
+@@ -212,6 +280,12 @@ static struct gui_misc_table vita_misc_table = {
+ static nserror set_defaults(struct nsoption_s *defaults)
+ {
+ 	/* Nothing to persist yet: no cookie jar or history on the card. */
++
++	/* HTTPS is verified against Mozilla's roots, bundled by the
++	 * VitaBrowser repo's tools/fetch-certs.sh: vitaSDK's libcurl would
++	 * otherwise use the firmware's CA list, which on 3.65 is from 2017. */
++	nsoption_setnull_charp(ca_bundle, strdup(VITA_RESOURCE_DIR
++						 "ca-bundle.pem"));
+ 	return NSERROR_OK;
+ }
+ 
+@@ -232,21 +306,26 @@ static void set_message(unsigned int ms, const char *fmt, ...)
+ /** Navigate the window to bundled test page `idx`. */
+ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ {
+-	char url_s[128];
++	char url_s[300];
+ 	nsurl *url;
+ 	nserror err;
+ 
+-	vita_page = idx % VITA_TEST_PAGE_COUNT;
+-	snprintf(url_s, sizeof(url_s), "file:///app0:/testpages/%s.html",
+-		 vita_test_pages[vita_page]);
++	vita_page = idx % VITA_PAGE_COUNT;
++	if (vita_page < VITA_LOCAL_PAGES)
++		snprintf(url_s, sizeof(url_s), "file:///app0:/testpages/%s.html",
++			 vita_local_pages[vita_page]);
++	else
++		snprintf(url_s, sizeof(url_s), "%s",
++			 vita_net_urls[vita_page - VITA_LOCAL_PAGES]);
+ 	memset(&vita_stats, 0, sizeof(vita_stats));
+ 	vita_stats.nav_ms = vita_diag_ms();
+ 	vita_stats.content_gen =
+ 		vita_window_new_content(vita_window_current());
+ 	vita_overlay_dirty = true;
+-	vita_diag_log("page %u/%u %s: navigate", vita_page + 1,
+-		      (unsigned int)VITA_TEST_PAGE_COUNT,
+-		      vita_test_pages[vita_page]);
++	vita_diag_log("page %u/%u %s: navigate%s%s", vita_page + 1,
++		      VITA_PAGE_COUNT, page_name(vita_page),
++		      vita_page < VITA_LOCAL_PAGES ? "" : " to ",
++		      vita_page < VITA_LOCAL_PAGES ? "" : url_s);
+ 	err = nsurl_create(url_s, &url);
+ 	if (err != NSERROR_OK)
+ 		return err;
+@@ -255,7 +334,7 @@ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ 	nsurl_unref(url);
+ 	if (err != NSERROR_OK)
+ 		vita_diag_log("page %s: navigate failed: %d",
+-			      vita_test_pages[vita_page], err);
++			      page_name(vita_page), err);
+ 	return err;
+ }
+ 
+@@ -269,7 +348,7 @@ static void log_page_summary(struct gui_window *gw, const char *why)
+ 	vita_diag_log("page %s %s: first frame %u ms, load %s%u ms, "
+ 		      "%u frames, last frame cpu %u / gpu %u ms (max %u / %u), "
+ 		      "%u draw calls, extent %dx%d",
+-		      vita_test_pages[vita_page], why,
++		      page_name(vita_page), why,
+ 		      s->first_frame_ms ? s->first_frame_ms - s->nav_ms : 0,
+ 		      s->load_done_ms ? "" : "not finished, ",
+ 		      s->load_done_ms ? s->load_done_ms - s->nav_ms :
+@@ -382,7 +461,7 @@ static void log_measure(void)
+ 	vita_diag_log("measure %c %02u-%s: gpu %u/%u/%u ms, cpu %u/%u/%u ms "
+ 		      "(min/avg/max of %u), %u calls, clips %u, stencil writes "
+ 		      "%u, culled %u, cut %u, gpu-clipped %u, load %u ms",
+-		      p->tag, vita_page + 1, vita_test_pages[vita_page],
++		      p->tag, vita_page + 1, page_name(vita_page),
+ 		      vita_measure.gpu_min, vita_measure.gpu_sum / n,
+ 		      vita_measure.gpu_max, vita_measure.cpu_min,
+ 		      vita_measure.cpu_sum / n, vita_measure.cpu_max,
+@@ -413,40 +492,56 @@ static void log_pass_summary(void)
+ 		      vita_pass_total.load_sum / n);
+ }
+ 
+-/** Start the autotest: every pass over every page. */
+-static void autotest_start(struct browser_window *bw)
++/** The pages a pass covers: [first, end). */
++static unsigned int pass_first(unsigned int i)
++{
++	return vita_passes[i].net ? VITA_LOCAL_PAGES : 0;
++}
++static unsigned int pass_end(unsigned int i)
++{
++	return vita_passes[i].net ? VITA_PAGE_COUNT : VITA_LOCAL_PAGES;
++}
++
++/** Begin pass `i` (skipping passes with no pages); false if none left. */
++static bool autotest_begin_pass(struct browser_window *bw, unsigned int i)
+ {
+-	vita_diag_log("autotest: start, %u passes x %u pages",
+-		      (unsigned int)VITA_PASS_COUNT,
+-		      (unsigned int)VITA_TEST_PAGE_COUNT);
+-	apply_pass(0);
++	while (i < VITA_PASS_COUNT && pass_first(i) >= pass_end(i))
++		i++;
++	if (i >= VITA_PASS_COUNT)
++		return false;
++	apply_pass(i);
+ 	vita_autotest = AT_SETTLE;
+ 	set_message(0, "AUTOTEST pass %c page 1/%u - do not touch",
+-		    vita_passes[0].tag, (unsigned int)VITA_TEST_PAGE_COUNT);
+-	open_test_page(bw, 0);
++		    vita_passes[i].tag, pass_end(i) - pass_first(i));
++	open_test_page(bw, pass_first(i));
++	return true;
++}
++
++/** Start the autotest: passes A-D over the bundled pages, N over the
++ * network pages. */
++static void autotest_start(struct browser_window *bw)
++{
++	vita_diag_log("autotest: start, %u passes x %u pages, then %u network "
++		      "pages", (unsigned int)VITA_PASS_COUNT - 1,
++		      VITA_LOCAL_PAGES, vita_net_count);
++	autotest_begin_pass(bw, 0);
+ }
+ 
+ /** Next page, next pass, or the end of the autotest. */
+ static void autotest_next(struct browser_window *bw)
+ {
+-	if (vita_page + 1 < VITA_TEST_PAGE_COUNT) {
++	if (vita_page + 1 < pass_end(vita_pass)) {
+ 		vita_autotest = AT_SETTLE;
+ 		set_message(0, "AUTOTEST pass %c page %u/%u - do not touch",
+-			    vita_passes[vita_pass].tag, vita_page + 2,
+-			    (unsigned int)VITA_TEST_PAGE_COUNT);
++			    vita_passes[vita_pass].tag,
++			    vita_page + 2 - pass_first(vita_pass),
++			    pass_end(vita_pass) - pass_first(vita_pass));
+ 		open_test_page(bw, vita_page + 1);
+ 		return;
+ 	}
+ 	log_pass_summary();
+-	if (vita_pass + 1 < VITA_PASS_COUNT) {
+-		apply_pass(vita_pass + 1);
+-		vita_autotest = AT_SETTLE;
+-		set_message(0, "AUTOTEST pass %c page 1/%u - do not touch",
+-			    vita_passes[vita_pass].tag,
+-			    (unsigned int)VITA_TEST_PAGE_COUNT);
+-		open_test_page(bw, 0);
++	if (autotest_begin_pass(bw, vita_pass + 1))
+ 		return;
+-	}
+ 	vita_autotest = AT_OFF;
+ 	apply_run_profile();
+ 	vita_diag_font_metrics();
+@@ -473,18 +568,18 @@ static enum frame_kind autotest_pre(struct gui_window *gw)
+ 			return FRAME_NONE;
+ 		if (!page_settled(gw))
+ 			vita_diag_log("autotest: %s did not settle in %u ms",
+-				      vita_test_pages[vita_page],
++				      page_name(vita_page),
+ 				      VITA_SETTLE_TIMEOUT_MS);
+ 		log_page_summary(gw, vita_autotest == AT_SETTLE ?
+ 				 "settled" : "settled at bottom");
+ 		if (vita_autotest == AT_BOTTOM_SETTLE) {
+ 			snprintf(name, sizeof(name), "%02u-%s-bottom",
+-				 vita_page + 1, vita_test_pages[vita_page]);
++				 vita_page + 1, page_name(vita_page));
+ 			vita_diag_trace_begin(name);
+ 			vita_autotest = AT_BOTTOM_DUMP;
+ 			return FRAME_DUMP;
+ 		}
+-		vita_diag_memory(vita_test_pages[vita_page]);
++		vita_diag_memory(page_name(vita_page));
+ 		memset(&vita_measure, 0, sizeof(vita_measure));
+ 		vita_autotest = AT_MEASURE;
+ 		return FRAME_MEASURE;
+@@ -492,7 +587,7 @@ static enum frame_kind autotest_pre(struct gui_window *gw)
+ 		return FRAME_MEASURE;
+ 	case AT_DUMP:
+ 		snprintf(name, sizeof(name), "%02u-%s", vita_page + 1,
+-			 vita_test_pages[vita_page]);
++			 page_name(vita_page));
+ 		vita_diag_trace_begin(name);
+ 		return FRAME_DUMP;
+ 	default:
+@@ -558,8 +653,8 @@ static void draw_overlay(void)
+ 		snprintf(hud, sizeof(hud),
+ 			 "%u/%u %s | first %u ms | cpu %u gpu %u ms | %u calls"
+ 			 " %u st | net %s | SQ test SEL dump TRI mem O hud",
+-			 vita_page + 1, (unsigned int)VITA_TEST_PAGE_COUNT,
+-			 vita_test_pages[vita_page],
++			 vita_page + 1, VITA_PAGE_COUNT,
++			 page_name(vita_page),
+ 			 vita_stats.first_frame_ms ?
+ 				vita_stats.first_frame_ms - vita_stats.nav_ms : 0,
+ 			 vita_stats.cpu_ms_last, vita_stats.gpu_ms_last,
+@@ -601,7 +696,7 @@ static void draw_frame(struct gui_window *gw, bool dump, const char *snap)
+ 
+ 	if (vita_dump_next && !dump) {
+ 		snprintf(name, sizeof(name), "manual-%s-%u",
+-			 vita_test_pages[vita_page], vita_diag_ms());
++			 page_name(vita_page), vita_diag_ms());
+ 		dump = vita_diag_trace_begin(name);
+ 		if (dump)
+ 			set_message(2000, "dumped %s.plot", name);
+@@ -650,7 +745,7 @@ static void draw_frame(struct gui_window *gw, bool dump, const char *snap)
+ 	if (vita_stats.frames <= VITA_LOGGED_FRAMES || dump)
+ 		vita_diag_log("frame %u of %s: cpu %u ms, gpu %u ms, %u calls, "
+ 			      "%u clips, %u stencil writes%s",
+-			      vita_stats.frames, vita_test_pages[vita_page],
++			      vita_stats.frames, page_name(vita_page),
+ 			      t1 - t0, t2 - t1, vita_stats.calls_last,
+ 			      vita_stats.clip_last.clips,
+ 			      vita_stats.clip_last.stencil_writes,
+@@ -681,21 +776,21 @@ static void watch_load(struct gui_window *gw)
+ 	    vita_window_new_content(gw) != vita_stats.content_gen) {
+ 		vita_stats.content_ms = now;
+ 		vita_diag_log("page %s: document after %u ms (extent %dx%d)",
+-			      vita_test_pages[vita_page], age, w, h);
++			      page_name(vita_page), age, w, h);
+ 	}
+ 	if (vita_stats.content_ms == 0 && !vita_stats.stall_logged &&
+ 	    age >= VITA_STALL_MS) {
+ 		vita_stats.stall_logged = true;
+ 		vita_diag_log("page %s: no document after %u ms "
+ 			      "(see netsurf.log for the engine's side)",
+-			      vita_test_pages[vita_page], age);
++			      page_name(vita_page), age);
+ 	}
+ 	if ((vita_stats.content_ms == 0 || vita_window_loading(gw)) &&
+ 	    age < VITA_STATUS_LOG_MS && now - vita_stats.status_ms >= 1000) {
+ 		vita_stats.status_ms = now;
+ 		vita_diag_log("load status %s +%u ms: loading %d, extent %dx%d, "
+ 			      "sched pending %u (added %u, fired %u)",
+-			      vita_test_pages[vita_page], age,
++			      page_name(vita_page), age,
+ 			      vita_window_loading(gw), w, h,
+ 			      vita_schedule_pending(), vita_schedule_added,
+ 			      vita_schedule_fired);
+@@ -733,8 +828,8 @@ static void vita_run(struct browser_window *bw)
+ 		step = vita_input(gw, bw);
+ 		if (step != 0) {
+ 			log_page_summary(gw, "left");
+-			open_test_page(bw, (vita_page + VITA_TEST_PAGE_COUNT +
+-					    step) % VITA_TEST_PAGE_COUNT);
++			open_test_page(bw, (vita_page + VITA_PAGE_COUNT +
++					    step) % VITA_PAGE_COUNT);
+ 		}
+ 		kind = autotest_pre(gw);
+ 
+@@ -751,7 +846,7 @@ static void vita_run(struct browser_window *bw)
+ 				snprintf(snap, sizeof(snap), "%c-%02u-%s",
+ 					 vita_passes[vita_pass].tag,
+ 					 vita_page + 1,
+-					 vita_test_pages[vita_page]);
++					 page_name(vita_page));
+ 				snap_name = snap;
+ 			}
+ 			draw_frame(gw, kind == FRAME_DUMP, snap_name);
+@@ -811,7 +906,10 @@ int main(int argc, char **argv)
+ 
+ 	vita_diag_init();
+ 	vita_diag_engine_log_init();
++	/* The network first: curl needs it, and so does the mirror. */
++	vita_diag_log("init: %s", vita_net_start());
+ 	vita_diag_net_start();
++	load_net_pages();
+ 	vita_diag_memory("boot");
+ 
+ 	{
+diff --git a/frontends/vita/net.c b/frontends/vita/net.c
+new file mode 100644
+index 000000000..7a19573d8
+--- /dev/null
++++ b/frontends/vita/net.c
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: bringing the network up (see vita/net.h).
++ */
++
++#include <stdio.h>
++
++#ifdef __vita__
++#include <psp2/sysmodule.h>
++#include <psp2/net/net.h>
++#include <psp2/net/netctl.h>
++#endif
++
++#include "vita/net.h"
++
++static bool started, up;
++static char status[160];
++
++#ifdef __vita__
++/** sceNet's working memory: socket buffers for every connection curl
++ * keeps open, plus the diagnostics mirror. 1 MiB, as VitaShell uses. */
++static char net_pool[1024 * 1024] __attribute__((aligned(64)));
++
++/** \return 0, or the failing call's result with *what naming it */
++static int net_init(const char **what)
++{
++	SceNetInitParam p;
++	int r;
++
++	*what = "sceSysmoduleLoadModule(NET)";
++	if (sceSysmoduleIsLoaded(SCE_SYSMODULE_NET) != 0) {
++		r = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
++		if (r < 0)
++			return r;
++	}
++	*what = "sceNetInit";
++	p.memory = net_pool;
++	p.size = sizeof(net_pool);
++	p.flags = 0;
++	r = sceNetInit(&p);
++	/* Already initialised (by a plugin) is fine. */
++	if (r < 0 && r != (int)SCE_NET_ERROR_EBUSY)
++		return r;
++	*what = "sceNetCtlInit";
++	r = sceNetCtlInit();
++	/* 0x80412102: already initialised (VitaShell's
++	 * NET_CTL_ERROR_NOT_TERMINATED; vitaSDK has no name for it). */
++	if (r < 0 && (unsigned int)r != 0x80412102u)
++		return r;
++	return 0;
++}
++#endif
++
++/* exported interface documented in vita/net.h */
++const char *vita_net_start(void)
++{
++	if (started)
++		return status;
++	started = true;
++#ifdef __vita__
++	{
++		const char *what;
++		int r = net_init(&what);
++		if (r != 0) {
++			snprintf(status, sizeof(status), "net: %s -> 0x%08x; no "
++				 "network this run", what, (unsigned int)r);
++			return status;
++		}
++	}
++#endif
++	up = true;
++	snprintf(status, sizeof(status), "net: up, ip %s", vita_net_ip());
++	return status;
++}
++
++/* exported interface documented in vita/net.h */
++bool vita_net_up(void)
++{
++	return up;
++}
++
++/* exported interface documented in vita/net.h */
++const char *vita_net_ip(void)
++{
++#ifdef __vita__
++	static char ip[24];
++	SceNetCtlInfo info;
++
++	if (!up)
++		return "none (sceNet down)";
++	if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info) < 0)
++		return "none (Wi-Fi off or not connected)";
++	snprintf(ip, sizeof(ip), "%s", info.ip_address);
++	return ip;
++#else
++	return "host";
++#endif
++}
+diff --git a/frontends/vita/net.h b/frontends/vita/net.h
+new file mode 100644
+index 000000000..40921aece
+--- /dev/null
++++ b/frontends/vita/net.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: bringing the network up.
++ *
++ * vitaSDK's newlib provides BSD sockets (and so libcurl's) on top of
++ * sceNet, but only after the application has loaded the NET module and
++ * run sceNetInit() and sceNetCtlInit(). Both the fetcher (curl) and the
++ * diagnostics mirror (vita/netlog.c) need that, whichever comes first.
++ * On the host simulator there is nothing to do.
++ */
++
++#ifndef NETSURF_VITA_NET_H
++#define NETSURF_VITA_NET_H
++
++#include <stdbool.h>
++
++/**
++ * Start sceNet once; later calls return the first result.
++ * \return a line for the log saying what happened; static storage
++ */
++const char *vita_net_start(void);
++
++/** Whether sceNet is up (always true on the host). */
++bool vita_net_up(void);
++
++/** The Vita's IP address now, or a reason there is none; static. */
++const char *vita_net_ip(void);
++
++#endif
+diff --git a/frontends/vita/netlog.c b/frontends/vita/netlog.c
+index 8084d3ce4..12dce7d2c 100644
+--- a/frontends/vita/netlog.c
++++ b/frontends/vita/netlog.c
+@@ -23,8 +23,7 @@
+  *
+  * The sending side is plain BSD sockets, which vitaSDK's newlib provides
+  * on top of sceNet once sceNetInit() has run, so the host simulator runs
+- * this same code on Linux sockets. Only bringing the network up is
+- * Vita-specific.
++ * this same code on Linux sockets. Bringing the network up is vita/net.c.
+  */
+ 
+ #include <errno.h>
+@@ -40,11 +39,9 @@
+ 
+ #ifdef __vita__
+ #include <psp2/kernel/threadmgr.h>
+-#include <psp2/sysmodule.h>
+-#include <psp2/net/net.h>
+-#include <psp2/net/netctl.h>
+ #endif
+ 
++#include "vita/net.h"
+ #include "vita/netlog.h"
+ 
+ struct vita_netlog_stats vita_netlog_stats;
+@@ -78,10 +75,6 @@ static char receiver[32];
+ static char status[160];
+ static struct timeval t0;
+ 
+-#ifdef __vita__
+-/** sceNet's working memory: it keeps socket buffers here. */
+-static char net_pool[256 * 1024] __attribute__((aligned(64)));
+-#endif
+ 
+ static unsigned int now_ms(void)
+ {
+@@ -204,41 +197,11 @@ static bool read_config(const char *path, bool *off)
+ 	return ok;
+ }
+ 
+-#ifdef __vita__
+-/** sceNet up, once. \return 0 or the failing call's result */
+-static int net_start(const char **what)
+-{
+-	SceNetInitParam p;
+-	int r;
+-
+-	*what = "sceSysmoduleLoadModule(NET)";
+-	if (sceSysmoduleIsLoaded(SCE_SYSMODULE_NET) != 0) {
+-		r = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+-		if (r < 0)
+-			return r;
+-	}
+-	*what = "sceNetInit";
+-	p.memory = net_pool;
+-	p.size = sizeof(net_pool);
+-	p.flags = 0;
+-	r = sceNetInit(&p);
+-	/* Already initialised (by a plugin) is fine. */
+-	if (r < 0 && r != (int)SCE_NET_ERROR_EBUSY)
+-		return r;
+-	*what = "sceNetCtlInit";
+-	r = sceNetCtlInit();
+-	/* 0x80412102: already initialised (VitaShell's
+-	 * NET_CTL_ERROR_NOT_TERMINATED; vitaSDK has no name for it). */
+-	if (r < 0 && (unsigned int)r != 0x80412102u)
+-		return r;
+-	return 0;
+-}
+-#endif
+ 
+ /* exported interface documented in vita/netlog.h */
+ const char *vita_netlog_init(const char *config, const char *hello)
+ {
+-	char ip[20] = "?";
++	char ip[40];
+ 	bool off;
+ 	int on = 1;
+ 
+@@ -261,25 +224,13 @@ const char *vita_netlog_init(const char *config, const char *hello)
+ 		snprintf(status, sizeof(status), "netlog: off (%s)", config);
+ 		return status;
+ 	}
+-#ifdef __vita__
+-	{
+-		const char *what;
+-		SceNetCtlInfo info;
+-		int r = net_start(&what);
+-		if (r != 0) {
+-			snprintf(status, sizeof(status), "netlog: %s -> 0x%08x;"
+-				 " not sending", what, (unsigned int)r);
+-			return status;
+-		}
+-		if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS,
+-					 &info) >= 0)
+-			snprintf(ip, sizeof(ip), "%s", info.ip_address);
+-		else
+-			snprintf(ip, sizeof(ip), "none (Wi-Fi off?)");
++	vita_net_start();
++	if (!vita_net_up()) {
++		snprintf(status, sizeof(status), "netlog: no network (%s); "
++			 "not sending", vita_net_start());
++		return status;
+ 	}
+-#else
+-	snprintf(ip, sizeof(ip), "host");
+-#endif
++	snprintf(ip, sizeof(ip), "%s", vita_net_ip());
+ 	sock = socket(AF_INET, SOCK_DGRAM, 0);
+ 	if (sock < 0) {
+ 		snprintf(status, sizeof(status), "netlog: socket -> errno %d;"
