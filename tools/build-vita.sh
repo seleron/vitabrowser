@@ -99,6 +99,9 @@ for l in $SUPPORT; do
 	     grep -m3 'error' "$WORK/applytest/vita-build-$l.log"; exit 1; }
 done
 
+echo "== QuickJS-ng (arm-vita-eabi) =="
+WORK="$WORK" VITA_PREFIX="$VP" VITASDK="$VITASDK" "$ROOT/tools/build-quickjs.sh" vita
+
 echo "== netsurf TARGET=vita =="
 export CFLAGS="-I$VP/include/libutf8proc -I$ROOT/compat \
 -include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment \

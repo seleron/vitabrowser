@@ -38,6 +38,8 @@ mkdir -p "$OUT/shots" "$OUT/run"
 WORK="$WORK" "$ROOT/tools/build-host-freetype.sh"
 WORK="$WORK" "$ROOT/tools/build-host-curl.sh"
 WORK="$WORK" "$ROOT/tools/fetch-certs.sh"
+# ...and QuickJS-ng (tools/build-quickjs.sh), whose probe the autotest runs.
+WORK="$WORK" "$ROOT/tools/build-quickjs.sh" host
 rm -f "$OUT"/shots/*.png
 
 echo "== stand-in SDK =="
@@ -78,6 +80,7 @@ export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
 rm -f "$NS/nsvita-sim"	# the overlay changed under it; force the relink
 ( cd "$NS" && make TARGET=vita VITA_HOST_SIM=YES \
 	VITA_SIM_INCLUDE="$ROOT/tools/vita-stub" VITA_SIM_LIB="$OUT/libvitasim.a" \
+	VITA_SIM_QUICKJS="$WORK/host-quickjs" \
 	-j4 > "$OUT/build.log" 2>&1 ) \
   || { echo "  build FAILED"; grep -m8 -E 'error|undefined' "$OUT/build.log"; exit 1; }
 echo "  nsvita-sim ok"
@@ -221,4 +224,10 @@ fi
 grep -E 'pass N summary' "$R/log.txt" | sed 's/^/  /'
 grep -m1 'curl_version' "$R/netsurf.log" | sed 's/.*curl_version /  libcurl: /'
 [ "$nbad" -eq 0 ]
+
+# The QuickJS engine probe (frontends/vita/jsprobe.c) at the autotest's end.
+echo "== QuickJS engine probe =="
+grep -E 'js: (QuickJS|FAIL|engine|probe took)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /'
+grep -q 'js: probe took .*: \([0-9]*\)/\1 checks' "$R/log.txt" && \
+	! grep -q 'js: FAIL' "$R/log.txt"
 

@@ -1086,3 +1086,118 @@ pass N, which needs the Vita on Wi-Fi with internet access. Then:
 - **`receiver.txt`**: SAME for `16-`/`17-NET-…` against `reference-dumps\`.
 
 This run still also measures runs 4–7, which remain pending.
+
+## Run 9 — QuickJS, step 1: the engine on the Vita (patch 43)
+
+This is Phase 1's JavaScript item. NetSurf itself has only Duktape (ES5.1)
+and a "none" backend. The project's plan (README §5, §13.2) is MacSurf's
+QuickJS: **QuickJS-ng 0.15.1, ES2023**, with MacSurf's hand-written DOM
+bridge (`macsurf_qjs.c`). Step 1 puts the engine on the Vita and proves
+it there, with the runaway-script and memory limits in from the first
+hour (README §14.7). The bridge is step 2 (below).
+
+**The engine source:**
+- **Where from:** `tools/fetch-quickjs.sh` sparse-clones
+  `mplsllc/macsurf` at the pinned revision **`55e64fa`** (the one every
+  other MacSurf finding uses) and takes `quickjs-macos9/`, not
+  `browser/libquickjs/`, which lacks the generated headers (doc 01 §5.3).
+  The two `quickjs.c` differ in one Mac OS 9-only line.
+- **Line endings:** MacSurf's classic-Mac CR endings are converted to LF.
+- **`patches/quickjs/01-quickjs-cutils-posix.patch`** undoes two Mac OS 9
+  edits that break non-glibc POSIX targets like vitaSDK's newlib:
+  - `#include <sys/time.h>` had been commented out for every compiler;
+  - `JS_ONCE_INIT` was `0` instead of `PTHREAD_ONCE_INIT`. vitaSDK's
+    `pthread_once_t` is a struct, so `0` fails with "invalid initializer".
+- **`tools/build-quickjs.sh`** builds `libquickjs.a` for the host
+  (`$WORK/host-quickjs`) and the Vita (`vita-prefix`, 6.5 MiB with debug
+  info), with MacSurf's Linux flags.
+- **The MacSurf hooks inside the engine.** MacSurf instrumented
+  `quickjs.c` itself:
+  - every native call is counted, and 1 in 64 is timed;
+  - every garbage collection is timed.
+
+  Its Mac OS 9 frontend defines those hooks; `macos9_micros()` returns
+  0 off the Mac. `vita/qjs_hooks.c` defines them here with a real
+  microsecond clock (`sceKernelGetProcessTimeWide`), so the counters mean
+  something.
+
+**The probe (`vita/jsprobe.c`), shared by the host test and the Vita
+autotest.** It runs 18 checks in a fresh runtime:
+- **12 language checks:** private class fields; template, arrow and
+  spread; destructuring with rest; `?.` and `??`; `at`, `hasOwn`,
+  `findLast` and `toSorted`; BigInt; Map, Set and WeakMap; `\p{Script}`
+  and case mapping; named groups and lookbehind; JSON; `Date` in UTC;
+  `Error.cause`.
+- **async/await:** drained through the job queue, as the browser's event
+  loop will.
+- **`fib(25)`:** a CPU benchmark.
+- **The two limits from README §14.7**, each followed by a check that
+  the runtime is still usable:
+  - `for(;;){}` must be stopped by `JS_SetInterruptHandler` at the
+    **250 ms** budget;
+  - an allocate-forever loop must hit `JS_SetMemoryLimit`'s **32 MiB**
+    cap as an `out of memory` exception inside the script.
+
+**Verified on the host:**
+- `tools/test-quickjs.sh`, under **AddressSanitizer + UBSan with leak
+  detection** (MacSurf's own Layer-1 harness setup): **18/18**, no leaks,
+  no UB reports.
+  - The first run failed 3 checks, all mistakes in the probe: top-level
+    `let` bindings leaking between evals, and a mis-escaped expectation.
+    They are fixed; each check now evaluates in its own block.
+- The simulator's autotest runs the probe at its end: 18/18. `fib(25)`
+  takes 9 ms, the interrupt fires at 250 ms, and the 32 MiB cap is hit
+  after 25 ms.
+- Clean checkout: applied 126 + the known 2; L1 PASS; fixtures 4/4;
+  101/101 + 30/30 + QuickJS 18/18; simulator 15/15, clip modes 14/14,
+  mirror 28/28, network pages as run 8. Cross build clean: the ELF has
+  `JS_NewRuntime`, `JS_SetInterruptHandler`, `vita_jsprobe_run`. The VPK
+  is 14.4 MB.
+- The plot dumps are unchanged, since the probe draws nothing. Run 8's
+  `reference-dumps\` still apply.
+
+**What the Vita run must show** (log.txt, at the end of the autotest):
+- the `js:` lines, ending in `js: probe took … ms: 18/18 checks`;
+- **`fib(25)`'s time on the Vita's ARM**, the first number for how fast
+  page scripts will run there (9 ms on this PC);
+- that the interrupt fires near 250 ms and the memory cap as an
+  exception, on newlib and pthread-embedded rather than glibc.
+
+A crash inside the probe would stop the run before `autotest.done`. The
+log's last `js:` line then says where.
+
+**Step 2, the DOM bridge.** It is sized by compiling MacSurf's bridge
+against our patched tree:
+- **Size:** `macsurf_qjs.c` is **16 803 lines**, plus
+  `macsurf_qjs_audit.c` (1 071) and `macos9_js_fetch.c` (852). It
+  implements NetSurf's `js_*` interface plus MacSurf's extensions
+  (`js_exec_module`, `js_fire_dom_ready`/`window_load`/`script_load`,
+  mutation batches, realm generations).
+- **The core side is already in our stack:** `script.c` calls
+  `js_set_current_script`, `js_fire_script_load` and `js_exec_module`,
+  with weak stubs in `macsurf_frontend_stubs.c`.
+- **It does not compile as-is:** it includes `macos9.h`, whose
+  `gui_window` holds Mac Toolbox types (`WindowRef`, `ControlRef`,
+  `Rect`). It reaches into `gui_window` in only 4 places.
+- **It calls 41 external functions**, in five groups:
+  - **Fetch:** `macos9_js_fetch_install` / `_flush`, the `fetch()` / XHR
+    seam that README §13.2 calls original engineering. It is to be
+    re-hosted on NetSurf's llcache or on curl.
+  - **Reconvert:** relayout after DOM mutation
+    (`macos9_reconvert_*`, `macos9_js_mark_dom_dirty_node`).
+  - **Frontend services:** schedule, scroll-to, URL display, cache
+    lookup, storage file names, the data directory.
+  - **MacSurf's audit and diagnostics:** the `ms_diag_*` and
+    `macsurf_qjs_emit_*` functions. They can start as log lines.
+  - **Two allocation wrappers:** `macsurf_try_alloc` and
+    `macsurf_try_realloc`.
+
+So step 2 is:
+1. a `vita/js/` shim layer for the 41 functions;
+2. `macsurf_qjs.c` with its Toolbox header swapped for it;
+3. `NETSURF_USE_QUICKJS` wiring in NetSurf's javascript Makefile, in
+   place of Duktape / none;
+4. fetch/XHR last.
+
+Every piece is testable in the simulator first, against pages with
+scripts.

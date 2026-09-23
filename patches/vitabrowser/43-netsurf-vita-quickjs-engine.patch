@@ -1,0 +1,619 @@
+# netsurf: Vita QuickJS engine, step 1 -- the engine and its probe (frontends/vita)
+# Generated 2026-09-23
+#
+# Phase 1's JavaScript item, first step: the engine the project chose
+# (QuickJS-ng 0.15.1 as MacSurf ships it, ES2023; README §5) linked into
+# the Vita build and exercised on its own, before any DOM binding.
+# - jsprobe.c/.h (new): ES2023 language checks, promise jobs, Unicode
+#   regexps, and the two limits README §14.7 requires from the first hour
+#   -- JS_SetMemoryLimit (32 MiB) and JS_SetInterruptHandler (250 ms
+#   budget): a runaway `for(;;){}` and an allocate-forever loop are both
+#   stopped inside the script, and the runtime is checked usable after
+#   each. Plus fib(25) as a CPU benchmark. Shared with the host test.
+# - qjs_hooks.c/.h (new): MacSurf instrumented quickjs.c with native-call
+#   and GC timing hooks that its Mac OS 9 frontend defines; defined here
+#   with a real microsecond clock (sceKernelGetProcessTimeWide) until the
+#   bridge is ported.
+# - diag.c: vita_diag_js_probe(); main.c runs it at the end of the autotest.
+# - Makefile: jsprobe.c, qjs_hooks.c; -lquickjs from VITA_QUICKJS (the
+#   VitaBrowser repo's tools/build-quickjs.sh).
+# The DOM bridge (MacSurf's macsurf_qjs.c) is step 2.
+# See docs/phase-0/10-hardware-test-plan.md §Run 9.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index fcd2c38d5..701a278bf 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -19,17 +19,29 @@ CFLAGS += -std=c99 -g -Ifrontends/vita/compat \
+ # Text is drawn and measured with FreeType (vita/text.c).
+ CFLAGS += $(shell $(PKG_CONFIG) --cflags freetype2)
+ 
++# JavaScript engine: QuickJS-ng as MacSurf ships it, built by the VitaBrowser
++# repo's tools/build-quickjs.sh into VITA_QUICKJS (include/quickjs,
++# lib/libquickjs.a). So far the engine only runs its probe (vita/jsprobe.c);
++# the DOM bridge is the next step (doc 10 §Run 9).
++ifeq ($(VITA_HOST_SIM),YES)
++VITA_QUICKJS ?= $(VITA_SIM_QUICKJS)
++else
++VITA_QUICKJS ?= $(VITA_PREFIX)
++endif
++CFLAGS += -I$(VITA_QUICKJS)/include/quickjs
++
+ ifeq ($(VITA_HOST_SIM),YES)
+ # Host simulator (see Makefile.tools): stand-in SDK headers and library.
+ CFLAGS += -I$(VITA_SIM_INCLUDE) -DVITA_HOST_SIM
+ LDFLAGS += $(VITA_SIM_LIB) $(shell pkg-config --libs freetype2) \
++	-L$(VITA_QUICKJS)/lib -lquickjs \
+ 	-lpcre2-posix -lpcre2-8 -lz -lm
+ else
+ # vitaSDK libraries. vita2d draws through the GXM; text is FreeType
+ # (vita/text.c), from the fonts bundled under res/fonts. The PGF/PVF stubs
+ # stay only for libvita2d's own font objects, which are not linked unless
+ # something calls them. The SceXxx_stub archives resolve firmware imports.
+-LDFLAGS += -Wl,-q \
++LDFLAGS += -Wl,-q -L$(VITA_QUICKJS)/lib -lquickjs \
+ 	-lvita2d -lfreetype -lpng -ljpeg -lbz2 -lz \
+ 	-lpcre2-posix -lpcre2-8 \
+ 	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
+@@ -54,7 +66,8 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ 
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+-	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c
++	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
++	qjs_hooks.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index bfcbb0dff..838594a99 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -53,6 +53,7 @@
+ #include "vita/text.h"
+ #include "vita/diag.h"
+ #include "vita/netlog.h"
++#include "vita/jsprobe.h"
+ 
+ /** Chunk size for the allocate-until-failure probes. */
+ #define PROBE_CHUNK (1024 * 1024)
+@@ -425,7 +426,8 @@ static void remember_sent(const char *name)
+  * netsurf.log from its start (re-tailed at the usual pace). A receiver
+  * that did hear the broadcasts gets the same bytes at the same offsets
+  * again, which changes nothing.
+- * eturn the number of files re-sent
++ * 
++eturn the number of files re-sent
+  */
+ static unsigned int catch_up(void)
+ {
+@@ -467,6 +469,19 @@ static unsigned int catch_up(void)
+ 	return n_files;
+ }
+ 
++/* exported interface documented in vita/diag.h */
++void vita_diag_js_probe(void)
++{
++	struct vita_jsprobe_result r;
++	unsigned int t0 = vita_diag_ms();
++
++	vita_jsprobe_run(vita_diag_log, &r);
++	vita_diag_log("js: probe took %u ms: %u/%u checks, fib(25) %u ms, "
++		      "interrupt after %u ms, out of memory after %u ms",
++		      vita_diag_ms() - t0, r.checks - r.failed, r.checks,
++		      r.fib_ms, r.interrupt_ms, r.oom_ms);
++}
++
+ /* exported interface documented in vita/diag.h */
+ bool vita_diag_trace_begin(const char *name)
+ {
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+index c610f9c7a..305c37ce0 100644
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -63,6 +63,9 @@ void vita_diag_mem_probe(void);
+ /** Log the system font's metrics as the layout sees them. */
+ void vita_diag_font_metrics(void);
+ 
++/** Run the QuickJS engine probe (vita/jsprobe.h) and log its results. */
++void vita_diag_js_probe(void);
++
+ /**
+  * Start dumping plot calls to VITA_DIAG_DIR<name>.plot.
+  * Every plotter call until vita_diag_trace_end() is written in the
+diff --git a/frontends/vita/jsprobe.c b/frontends/vita/jsprobe.c
+new file mode 100644
+index 000000000..eeada5bb4
+--- /dev/null
++++ b/frontends/vita/jsprobe.c
+@@ -0,0 +1,277 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: QuickJS engine probe (see vita/jsprobe.h).
++ */
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/time.h>
++
++#include "quickjs.h"
++
++#include "vita/jsprobe.h"
++#include "vita/qjs_hooks.h"
++
++static unsigned int now_ms(void)
++{
++	struct timeval tv;
++
++	gettimeofday(&tv, NULL);
++	return (unsigned int)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
++}
++
++/** The interrupt handler's deadline; 0 = no deadline. */
++static unsigned int deadline_ms;
++static unsigned int interrupts;
++
++/* QuickJS polls this every few thousand instructions; non-zero stops the
++ * script with an uncatchable InternalError ("interrupted"). */
++static int interrupt_handler(JSRuntime *rt, void *opaque)
++{
++	(void)rt;
++	(void)opaque;
++	if (deadline_ms != 0 && now_ms() >= deadline_ms) {
++		interrupts++;
++		return 1;
++	}
++	return 0;
++}
++
++/** Evaluate `src`; the result, or the exception, as a string in `out`.
++ * \return true if it completed without an exception */
++static bool eval_str(JSContext *ctx, const char *src, char *out, size_t len)
++{
++	JSValue v = JS_Eval(ctx, src, strlen(src), "<probe>",
++			    JS_EVAL_TYPE_GLOBAL);
++	bool ok = !JS_IsException(v);
++	const char *s;
++
++	if (!ok) {
++		JS_FreeValue(ctx, v);
++		v = JS_GetException(ctx);
++	}
++	s = JS_ToCString(ctx, v);
++	snprintf(out, len, "%s", s != NULL ? s : "(unprintable)");
++	if (s != NULL)
++		JS_FreeCString(ctx, s);
++	JS_FreeValue(ctx, v);
++	return ok;
++}
++
++/** Run the promise job queue dry. \return jobs run, or -1 on an error */
++static int run_jobs(JSRuntime *rt)
++{
++	JSContext *jctx;
++	int n = 0, r;
++
++	while ((r = JS_ExecutePendingJob(rt, &jctx)) > 0)
++		n++;
++	return r < 0 ? -1 : n;
++}
++
++/** A check: evaluate, compare with the expected string. */
++struct check {
++	const char *what;
++	const char *src;
++	const char *expect;
++};
++
++static const struct check language_checks[] = {
++	{ "class with private field and getter",
++	  "class A { #x = 41; get x() { return this.#x + 1; } }; new A().x",
++	  "42" },
++	{ "template literal, arrow, spread",
++	  "const f = (...a) => `${a.length}:${a.join('-')}`; f(...[1, 2, 3])",
++	  "3:1-2-3" },
++	{ "destructuring, default, rest",
++	  "const { a = 1, ...r } = { b: 2, c: 3 }; a + Object.keys(r).join('')",
++	  "1bc" },
++	{ "optional chaining, nullish coalescing",
++	  "const o = { p: null }; String(o.p?.q ?? 'dflt')",
++	  "dflt" },
++	{ "ES2022 at(), Object.hasOwn, ES2023 findLast, toSorted",
++	  "[[1,2,3].at(-1), Object.hasOwn({k:1}, 'k'),"
++	  " [1,2,3,4].findLast(x => x % 2), [3,1,2].toSorted().join('')].join()",
++	  "3,true,3,123" },
++	{ "BigInt",
++	  "(2n ** 64n).toString()",
++	  "18446744073709551616" },
++	{ "Map, Set, WeakMap, Symbol.iterator",
++	  "const m = new Map([[1,'a']]); const s = new Set([1,1,2]);"
++	  " new WeakMap(); [...m.values(), s.size].join()",
++	  "a,2" },
++	{ "Unicode property escape, case mapping (libregexp, libunicode)",
++	  "/\\p{Script=Greek}+/u.exec('abc \\u03b1\\u03b2\\u03b3')[0].length"
++	  " + ':' + '\\u00df'.toUpperCase()",
++	  "3:SS" },
++	{ "named groups, lookbehind",
++	  "'2026-09-23'.match(/(?<y>\\d{4})-(?<m>\\d\\d)/).groups.m"
++	  " + /(?<=\\$)\\d+/.exec('cost $42')[0]",
++	  "0942" },
++	{ "JSON round trip",
++	  "JSON.stringify(JSON.parse('{\"a\":[1,{\"b\":2}],\"c\":\"\\u00e9\"}'))",
++	  "{\"a\":[1,{\"b\":2}],\"c\":\"\xc3\xa9\"}" },
++	{ "Date arithmetic (UTC)",
++	  "new Date(Date.UTC(2026, 8, 23, 12)).toISOString()",
++	  "2026-09-23T12:00:00.000Z" },
++	{ "try/catch/finally, Error.cause",
++	  "let r = ''; try { throw new Error('x', { cause: 7 }); }"
++	  " catch (e) { r = e.cause; } finally { r += '!'; } r",
++	  "7!" },
++};
++
++void vita_jsprobe_run(vita_jsprobe_log_fn log,
++		      struct vita_jsprobe_result *res)
++{
++	JSRuntime *rt;
++	JSContext *ctx;
++	char out[256];
++	unsigned int i, t0;
++	bool ok;
++
++	memset(res, 0, sizeof(*res));
++	rt = JS_NewRuntime();
++	if (rt == NULL) {
++		log("js: JS_NewRuntime failed");
++		res->checks = res->failed = 1;
++		return;
++	}
++	/* The limits the browser will run pages under (README §14.7). */
++	JS_SetMemoryLimit(rt, VITA_JSPROBE_MEMORY_LIMIT);
++	JS_SetMaxStackSize(rt, 512 * 1024);
++	JS_SetInterruptHandler(rt, interrupt_handler, NULL);
++	ctx = JS_NewContext(rt);
++	if (ctx == NULL) {
++		log("js: JS_NewContext failed");
++		JS_FreeRuntime(rt);
++		res->checks = res->failed = 1;
++		return;
++	}
++	log("js: QuickJS-ng %s, memory cap %u MiB, script budget %u ms",
++	    JS_GetVersion(), VITA_JSPROBE_MEMORY_LIMIT >> 20,
++	    VITA_JSPROBE_BUDGET_MS);
++
++	for (i = 0; i < sizeof(language_checks) / sizeof(language_checks[0]);
++	     i++) {
++		const struct check *c = &language_checks[i];
++		char src[512];
++		/* A block of its own: top-level let / const would otherwise
++		 * persist into the next check. Its completion value is the
++		 * last expression's. */
++		snprintf(src, sizeof(src), "{ %s }", c->src);
++		ok = eval_str(ctx, src, out, sizeof(out)) &&
++		     strcmp(out, c->expect) == 0;
++		res->checks++;
++		if (!ok)
++			res->failed++;
++		log("js: %s %s%s%s", ok ? "ok  " : "FAIL", c->what,
++		    ok ? "" : " -> ", ok ? "" : out);
++	}
++
++	/* async / await: the job queue has to be run, as the browser's event
++	 * loop will. */
++	{
++		int jobs;
++		eval_str(ctx, "globalThis.r = 'pending';"
++			 " (async () => { await null; const v = await"
++			 " Promise.all([1, Promise.resolve(2)]);"
++			 " r = 'done ' + v.join('+'); })();", out, sizeof(out));
++		jobs = run_jobs(rt);
++		eval_str(ctx, "r", out, sizeof(out));
++		ok = jobs > 0 && strcmp(out, "done 1+2") == 0;
++		res->checks++;
++		if (!ok)
++			res->failed++;
++		log("js: %s async/await via the job queue (%d jobs) -> %s",
++		    ok ? "ok  " : "FAIL", jobs, out);
++	}
++
++	/* CPU: fib(25), 242785 calls. */
++	t0 = now_ms();
++	ok = eval_str(ctx, "function fib(n) { return n < 2 ? n :"
++		      " fib(n - 1) + fib(n - 2); } fib(25)", out, sizeof(out)) &&
++	     strcmp(out, "75025") == 0;
++	res->fib_ms = now_ms() - t0;
++	res->checks++;
++	if (!ok)
++		res->failed++;
++	log("js: %s fib(25) = %s in %u ms", ok ? "ok  " : "FAIL", out,
++	    res->fib_ms);
++
++	/* A runaway script is stopped by the interrupt handler, and the
++	 * runtime carries on. */
++	interrupts = 0;
++	t0 = now_ms();
++	deadline_ms = t0 + VITA_JSPROBE_BUDGET_MS;
++	ok = !eval_str(ctx, "for (;;) {}", out, sizeof(out));
++	res->interrupt_ms = now_ms() - t0;
++	deadline_ms = 0;
++	ok = ok && interrupts > 0 && strstr(out, "interrupted") != NULL &&
++	     res->interrupt_ms >= VITA_JSPROBE_BUDGET_MS &&
++	     res->interrupt_ms < VITA_JSPROBE_BUDGET_MS + 1000;
++	res->checks++;
++	if (!ok)
++		res->failed++;
++	log("js: %s while(true){} stopped after %u ms: %s",
++	    ok ? "ok  " : "FAIL", res->interrupt_ms, out);
++	ok = eval_str(ctx, "6 * 7", out, sizeof(out)) &&
++	     strcmp(out, "42") == 0;
++	res->checks++;
++	if (!ok)
++		res->failed++;
++	log("js: %s runtime usable after the interrupt", ok ? "ok  " : "FAIL");
++
++	/* Allocation past the cap fails inside the script, not in the
++	 * browser; the runtime survives and frees it all. */
++	t0 = now_ms();
++	ok = !eval_str(ctx, "let hog = []; for (;;) hog.push(new Array(65536)"
++		       ".fill(1.5));", out, sizeof(out));
++	res->oom_ms = now_ms() - t0;
++	ok = ok && strstr(out, "out of memory") != NULL;
++	res->checks++;
++	if (!ok)
++		res->failed++;
++	log("js: %s allocation stopped at the %u MiB cap after %u ms: %s",
++	    ok ? "ok  " : "FAIL", VITA_JSPROBE_MEMORY_LIMIT >> 20,
++	    res->oom_ms, out);
++	eval_str(ctx, "hog = null", out, sizeof(out));
++	JS_RunGC(rt);
++	ok = eval_str(ctx, "[...'abc'].reverse().join('')", out, sizeof(out)) &&
++	     strcmp(out, "cba") == 0;
++	res->checks++;
++	if (!ok)
++		res->failed++;
++	log("js: %s runtime usable after running out of memory",
++	    ok ? "ok  " : "FAIL");
++
++	JS_FreeContext(ctx);
++	JS_FreeRuntime(rt);
++	{
++		struct vita_qjs_stats st;
++		vita_qjs_stats_get(&st);
++		log("js: engine counters: %ld native calls (%ld sampled, %ld us"
++		    " in the samples), %ld collections in %ld us",
++		    st.ncalls, st.native_samples, st.native_us, st.gc_runs,
++		    st.gc_us);
++	}
++	log("js: %u/%u checks passed", res->checks - res->failed, res->checks);
++}
+diff --git a/frontends/vita/jsprobe.h b/frontends/vita/jsprobe.h
+new file mode 100644
+index 000000000..8297398bc
+--- /dev/null
++++ b/frontends/vita/jsprobe.h
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: QuickJS engine probe.
++ *
++ * The JavaScript engine the Vita build is to use (QuickJS-ng, as MacSurf
++ * ships it), exercised on its own, before any DOM binding exists: ES2023
++ * language features, promise jobs, Unicode regular expressions, and the
++ * two limits the design requires from the first hour (README §14.7) -- a
++ * hard memory cap and an interrupt handler that stops a runaway script
++ * without taking the runtime down. Plus a CPU benchmark.
++ *
++ * The same checks run in the host test (tools/test-quickjs.sh) and in the
++ * Vita autotest, so a device log says exactly which of them held there.
++ */
++
++#ifndef NETSURF_VITA_JSPROBE_H
++#define NETSURF_VITA_JSPROBE_H
++
++/** Where the probe reports: printf-like, one line per call, no newline. */
++typedef void (*vita_jsprobe_log_fn)(const char *fmt, ...)
++	__attribute__((format(printf, 1, 2)));
++
++/** Results of one probe run. */
++struct vita_jsprobe_result {
++	unsigned int checks;		/**< checks run */
++	unsigned int failed;		/**< checks that failed */
++	unsigned int fib_ms;		/**< fib(25) wall time */
++	unsigned int interrupt_ms;	/**< while(true){} until interrupted */
++	unsigned int oom_ms;		/**< allocating until the cap stopped it */
++};
++
++/**
++ * Run every check in a fresh runtime, logging each.
++ * \param log  where lines go
++ * \param res  filled in
++ */
++void vita_jsprobe_run(vita_jsprobe_log_fn log,
++		      struct vita_jsprobe_result *res);
++
++/** The memory cap the probe runs under, bytes. */
++#define VITA_JSPROBE_MEMORY_LIMIT (32 * 1024 * 1024)
++
++/** The runaway-script budget the probe's interrupt handler enforces, ms. */
++#define VITA_JSPROBE_BUDGET_MS 250
++
++#endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 3c0df3eed..be4c6d9e3 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -545,6 +545,7 @@ static void autotest_next(struct browser_window *bw)
+ 	vita_autotest = AT_OFF;
+ 	apply_run_profile();
+ 	vita_diag_font_metrics();
++	vita_diag_js_probe();
+ 	vita_diag_mem_probe();
+ 	vita_diag_log("autotest: done");
+ 	vita_diag_net_report();
+diff --git a/frontends/vita/qjs_hooks.c b/frontends/vita/qjs_hooks.c
+new file mode 100644
+index 000000000..9fc3f1e0a
+--- /dev/null
++++ b/frontends/vita/qjs_hooks.c
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the instrumentation hooks MacSurf's QuickJS expects (see
++ * vita/qjs_hooks.h).
++ */
++
++#include <stddef.h>
++#include <sys/time.h>
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++#endif
++
++#include "vita/qjs_hooks.h"
++
++long macsurf_qjs_ncalls;
++long macsurf_qjs_native_us;
++long macsurf_qjs_native_samp;
++static long gc_runs, gc_us;
++
++/* A monotonic microsecond clock. The name is MacSurf's: quickjs.c calls it
++ * around every 64th native call and around every collection. */
++double macos9_micros(void)
++{
++#ifdef __vita__
++	return (double)sceKernelGetProcessTimeWide();
++#else
++	struct timeval tv;
++
++	gettimeofday(&tv, NULL);
++	return (double)tv.tv_sec * 1e6 + (double)tv.tv_usec;
++#endif
++}
++
++void macsurf_qjs_gc_note(long us)
++{
++	gc_runs++;
++	if (us > 0)
++		gc_us += us;
++}
++
++void vita_qjs_stats_get(struct vita_qjs_stats *s)
++{
++	s->ncalls = macsurf_qjs_ncalls;
++	s->native_us = macsurf_qjs_native_us;
++	s->native_samples = macsurf_qjs_native_samp;
++	s->gc_runs = gc_runs;
++	s->gc_us = gc_us;
++}
+diff --git a/frontends/vita/qjs_hooks.h b/frontends/vita/qjs_hooks.h
+new file mode 100644
+index 000000000..be4448efa
+--- /dev/null
++++ b/frontends/vita/qjs_hooks.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the instrumentation hooks MacSurf's QuickJS expects.
++ *
++ * MacSurf instrumented quickjs.c itself (fixes1071a/1078 and the GC note):
++ * every native call is counted, 1 in 64 is timed, and every collection is
++ * timed. The engine declares the counters and a microsecond clock extern;
++ * MacSurf defines them in its Mac OS 9 frontend (main.c's macos9_micros(),
++ * which returns 0 off the Mac, and the JS bridge). Until the bridge is
++ * ported, the Vita frontend defines them here, with a real clock, so the
++ * numbers mean something on the Vita and in the host test.
++ */
++
++#ifndef NETSURF_VITA_QJS_HOOKS_H
++#define NETSURF_VITA_QJS_HOOKS_H
++
++/** What the engine's instrumentation has counted since start-up. */
++struct vita_qjs_stats {
++	long ncalls;		/**< native (C) function calls */
++	long native_us;		/**< time in sampled native calls, us */
++	long native_samples;	/**< native calls sampled (1 in 64) */
++	long gc_runs;		/**< garbage collections */
++	long gc_us;		/**< time in them, us */
++};
++
++void vita_qjs_stats_get(struct vita_qjs_stats *s);
++
++/* The engine's side of the contract (quickjs.c declares these extern). */
++extern long macsurf_qjs_ncalls;
++extern long macsurf_qjs_native_us;
++extern long macsurf_qjs_native_samp;
++double macos9_micros(void);
++void macsurf_qjs_gc_note(long us);
++
++#endif
