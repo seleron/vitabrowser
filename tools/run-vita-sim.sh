@@ -33,6 +33,8 @@ PAGES="${PAGES:-15}"
 mkdir -p "$OUT/shots" "$OUT/run"
 # The frontend draws text with FreeType from app0:/res/fonts (vita/text.c).
 [ -f "$WORK/fonts/DejaVuSans.ttf" ] || WORK="$WORK" "$ROOT/tools/fetch-fonts.sh"
+# ...with the Vita's FreeType release, so text measures as on the device.
+WORK="$WORK" "$ROOT/tools/build-host-freetype.sh"
 rm -f "$OUT"/shots/*.png
 
 echo "== stand-in SDK =="
@@ -67,7 +69,7 @@ fi
 
 echo "== frontends/vita, host simulator build =="
 # Same core flags as tools/build-patched.sh's nsmonkey build.
-export PKG_CONFIG_PATH="$OV/lib/pkgconfig:$P/lib/pkgconfig"
+export PKG_CONFIG_PATH="$WORK/host-freetype/lib/pkgconfig:$OV/lib/pkgconfig:$P/lib/pkgconfig"
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
 -include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DVITABROWSER_ENGINE_TRACE"
 rm -f "$NS/nsvita-sim"	# the overlay changed under it; force the relink
@@ -82,7 +84,9 @@ A="$OUT/run/app0:"
 rm -rf "$A"
 mkdir -p "$A/res" "$A/testpages"
 rm -rf "$OUT/run/ux0:data"
-mkdir -p "$OUT/run/ux0:data"
+mkdir -p "$OUT/run/ux0:data/VitaBrowser"
+# No network mirror for the screenshot run (and it tests netlog.cfg "off").
+echo off > "$OUT/run/ux0:data/VitaBrowser/netlog.cfg"
 for f in default.css quirks.css adblock.css internal.css Messages \
 	 welcome.html credits.html licence.html; do
 	cp -L "$NS/frontends/vita/res/$f" "$A/res/$f"
@@ -97,11 +101,22 @@ echo "== run: $PAGES pages =="
 ls "$OUT"/shots
 
 echo "== autotest run (reference dumps) =="
-rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps"
-mkdir -p "$OUT/snaps"
+rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
+mkdir -p "$OUT/snaps" "$OUT/run/ux0:data/VitaBrowser"
+# The network mirror (frontends/vita/netlog.c) goes to a receiver on this
+# machine: the same code path as on the Vita after a receiver answers.
+NETLOG_PORT="${NETLOG_PORT:-45199}"
+echo "127.0.0.1:$NETLOG_PORT" > "$OUT/run/ux0:data/VitaBrowser/netlog.cfg"
+python3 "$ROOT/tools/vita-netlog.py" --port "$NETLOG_PORT" --bind 127.0.0.1 \
+	--out "$OUT/net" --quiet --exit-when-done --timeout 1000 \
+	> "$OUT/netlog-receiver.log" 2>&1 &
+RX=$!
+sleep 1
 ( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
 	timeout 900 "$NS/nsvita-sim" )
+wait $RX || true
 cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
+rm -f "$OUT/reference/netlog.cfg"
 ls "$OUT/reference" | head -40
 
 # The autotest renders every page once per pass (frontends/vita/main.c
@@ -122,3 +137,20 @@ for a in "$OUT"/snaps/A-*.png; do
 done
 echo "  CPU clip vs stencil clip: $same identical, $diff differ, $timed time-varying"
 [ "$diff" -eq 0 ] && [ "$same" -gt 0 ]
+
+# Every file the frontend wrote must have arrived over the network,
+# byte for byte, with no datagram lost.
+echo "== network mirror (netlog) =="
+NET=$(ls -d "$OUT"/net/net-* 2>/dev/null | tail -1)
+[ -n "$NET" ] || { echo "  no boot reached the receiver"; cat "$OUT/netlog-receiver.log"; exit 1; }
+same=0; bad=0
+for f in "$OUT"/reference/*; do
+	n=${f##*/}
+	if cmp -s "$f" "$NET/$n"; then same=$((same + 1))
+	else bad=$((bad + 1)); echo "  DIFFERS or missing: $n"; fi
+done
+grep -E '^datagrams' "$NET/receiver.txt" | sed 's/^/  /'
+echo "  mirror vs memory card: $same identical, $bad differ"
+[ "$bad" -eq 0 ] && grep -q 'received, 0 lost' "$NET/receiver.txt" && \
+	! grep -qE 'INCOMPLETE|MISMATCH' "$NET/receiver.txt"
+

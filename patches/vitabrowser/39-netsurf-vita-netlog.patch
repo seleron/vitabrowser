@@ -1,0 +1,902 @@
+# netsurf: Vita diagnostics mirrored to the PC over UDP (frontends/vita)
+# Generated 2026-09-23
+#
+# The on-device plot-stream log that doc 03 anticipated, and a fix for the
+# results transfer: hardware run 2's copies were stale (Explorer's FTP
+# cache) and runs 4 and 5 never reached the results folder.
+# - netlog.c/.h (new): everything written under ux0:data/VitaBrowser/ --
+#   log.txt, netsurf.log, the plot dumps, autotest.done -- is also sent over
+#   UDP as it is written, to a receiver on the LAN (VitaBrowser repo:
+#   tools/vita-netlog.py) that rebuilds the same files per launch. Broadcast
+#   until the receiver answers, then unicast; sequence numbers for losses;
+#   each finished file carries its length and CRC-32. Non-blocking, paced
+#   (2 ms per ~10 KB), pauses itself when the network is gone; never fatal.
+#   Plain BSD sockets (vitaSDK newlib on sceNet), so the simulator runs the
+#   same code. netlog.cfg: "off" or "a.b.c.d[:port]".
+# - diag.c: log.txt lines mirrored live (held until the network is up),
+#   netsurf.log tailed about once a second, dumps and markers sent when
+#   closed, end marks at autotest.done and exit, counters in the log.
+# - main.c: start after the engine log, report at autotest end, stop at
+#   exit; AUTOTEST DONE names the receiver the results went to.
+# - Makefile: netlog.c; SceNet / SceNetCtl stubs.
+# See docs/phase-0/10-hardware-test-plan.md §Run 6.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 271730fca..450eaed99 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -34,7 +34,7 @@ LDFLAGS += -Wl,-q \
+ 	-lpcre2-posix -lpcre2-8 \
+ 	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
+ 	-lScePgf_stub -lScePvf_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
+-	-lSceAppMgr_stub -lScePower_stub \
++	-lSceAppMgr_stub -lScePower_stub -lSceNet_stub -lSceNetCtl_stub \
+ 	-lm
+ endif
+ 
+@@ -54,7 +54,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ 
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+-	plot.c plot_geom.c replay.c diag.c text.c
++	plot.c plot_geom.c replay.c diag.c text.c netlog.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index 6c171259f..4946bb0f6 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -39,6 +39,7 @@
+ #include <sys/types.h>
+ 
+ #include <vita2d.h>
++#include <zlib.h>
+ #ifdef __vita__
+ #include <psp2/appmgr.h>
+ #include <psp2/kernel/sysmem.h>
+@@ -51,6 +52,7 @@
+ #include "vita/plot.h"
+ #include "vita/text.h"
+ #include "vita/diag.h"
++#include "vita/netlog.h"
+ 
+ /** Chunk size for the allocate-until-failure probes. */
+ #define PROBE_CHUNK (1024 * 1024)
+@@ -72,6 +74,26 @@ static bool diag_ready;
+ /** Clocks as found at boot, restored by a 0 in vita_diag_set_clocks(). */
+ static int boot_arm, boot_bus, boot_gpu, boot_xbar;
+ 
++/*
++ * The network mirror (vita/netlog.c). log.txt lines are sent as they are
++ * logged, at their offset within this boot's part of the file; lines
++ * logged before the network is up wait in early_log. netsurf.log is
++ * tailed from where this boot started it, about once a second.
++ */
++static bool net_started;
++static char early_log[16 * 1024];
++static size_t early_len;
++static bool early_overflow;
++static uint32_t log_off, log_crc;
++static long engine_start;
++static uint32_t engine_sent, engine_crc;
++static char trace_name[128];
++
++/** netsurf.log sent per tail (about once a second), and in all: the
++ * engine log can reach 16 MiB with tracing on, too much for a mirror. */
++#define ENGINE_TAIL_STEP (64 * 1024)
++#define ENGINE_NET_CAP (4 * 1024 * 1024)
++
+ /** log.txt, open for the whole run; NULL if it could not be opened. */
+ static FILE *diag_fp;
+ /** errno of the failed log.txt open / first failed write, 0 if none. */
+@@ -121,6 +143,23 @@ void vita_diag_log(const char *fmt, ...)
+ 	}
+ 	if (engine_log != NULL)
+ 		fprintf(engine_log, "DIAG %s\n", line);
++
++	/* The same bytes to the network mirror, or held until it is up. */
++	{
++		size_t len = strlen(line);
++		line[len++] = '\n';	/* vsnprintf left room: len < 512 */
++		log_crc = (uint32_t)crc32(log_crc, (const Bytef *)line,
++					  (uInt)len);
++		if (net_started) {
++			vita_netlog_data("log.txt", log_off, line, len);
++		} else if (early_len + len <= sizeof(early_log)) {
++			memcpy(early_log + early_len, line, len);
++			early_len += len;
++		} else {
++			early_overflow = true;
++		}
++		log_off += (uint32_t)len;
++	}
+ }
+ 
+ /* exported interface documented in vita/diag.h */
+@@ -135,6 +174,8 @@ void vita_diag_init(void)
+ 		diag_open_errno = errno ? errno : -1;
+ 	else
+ 		setvbuf(diag_fp, NULL, _IOLBF, 1024);
++	log_crc = (uint32_t)crc32(0L, Z_NULL, 0);
++	engine_crc = log_crc;
+ 	diag_ready = true;
+ 	vita_diag_log("==== VitaBrowser boot (build " __DATE__ " " __TIME__ ") ====");
+ #ifdef __vita__
+@@ -356,6 +397,7 @@ bool vita_diag_trace_begin(const char *name)
+ 
+ 	vita_diag_trace_end();
+ 	snprintf(path, sizeof(path), VITA_DIAG_DIR "%s.plot", name);
++	snprintf(trace_name, sizeof(trace_name), "%s.plot", name);
+ 	vita_plot_trace = fopen(path, "w");
+ 	if (vita_plot_trace == NULL) {
+ 		vita_diag_log("dump: cannot open %s", path);
+@@ -368,9 +410,14 @@ bool vita_diag_trace_begin(const char *name)
+ /* exported interface documented in vita/diag.h */
+ void vita_diag_trace_end(void)
+ {
++	char path[256];
++
+ 	if (vita_plot_trace != NULL) {
+ 		fclose(vita_plot_trace);
+ 		vita_plot_trace = NULL;
++		snprintf(path, sizeof(path), VITA_DIAG_DIR "%s", trace_name);
++		if (net_started && !vita_netlog_file(trace_name, path))
++			vita_diag_log("netlog: cannot read back %s", path);
+ 	}
+ }
+ 
+@@ -388,6 +435,11 @@ void vita_diag_marker(const char *name)
+ 	}
+ 	if (fclose(fp) != 0)
+ 		vita_diag_log("marker %s: fclose failed, errno %d", name, errno);
++	if (net_started) {
++		vita_netlog_file(name, path);
++		/* A checkpoint: log.txt is complete up to here. */
++		vita_netlog_end("log.txt", log_off, log_crc);
++	}
+ }
+ 
+ /** nslog_init's hook: buffer the file, remember it for flushing. */
+@@ -410,6 +462,12 @@ void vita_diag_engine_log_init(void)
+ 	int argc = 3;
+ 	nserror ret = nslog_init(engine_log_ensure, &argc, argv);
+ 
++	{
++		/* The file is appended to across boots; mirror only ours. */
++		struct stat st;
++		if (stat(a2, &st) == 0)
++			engine_start = (long)st.st_size;
++	}
+ 	vita_diag_log("engine log: %s -> %d", a2, ret);
+ 	if (engine_log != NULL) {
+ 		fprintf(engine_log, "==== engine log, boot at diag %u ms ====\n",
+@@ -419,12 +477,102 @@ void vita_diag_engine_log_init(void)
+ 	}
+ }
+ 
++/** Send what netsurf.log gained since the last call, up to `max` bytes. */
++static void engine_tail(size_t max)
++{
++	char buf[VITA_NETLOG_CHUNK];
++	size_t n, sent = 0;
++	FILE *fp;
++
++	if (!net_started || !vita_netlog_active() ||
++	    engine_sent >= ENGINE_NET_CAP)
++		return;
++	fp = fopen(VITA_DIAG_DIR "netsurf.log", "rb");
++	if (fp == NULL)
++		return;
++	if (fseek(fp, engine_start + (long)engine_sent, SEEK_SET) == 0) {
++		while (sent < max && engine_sent < ENGINE_NET_CAP &&
++		       (n = fread(buf, 1, sizeof(buf), fp)) > 0) {
++			vita_netlog_data("netsurf.log", engine_sent, buf, n);
++			engine_crc = (uint32_t)crc32(engine_crc,
++						     (const Bytef *)buf, (uInt)n);
++			engine_sent += (uint32_t)n;
++			sent += n;
++		}
++	}
++	fclose(fp);
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_net_start(void)
++{
++	char hello[160];
++	const char *st;
++
++	snprintf(hello, sizeof(hello), "VitaBrowser build " __DATE__ " "
++		 __TIME__);
++#ifdef __vita__
++	{
++		char tid[16] = "?";
++		size_t n = strlen(hello);
++		sceAppMgrAppParamGetString(0, 12, tid, sizeof(tid));
++		snprintf(hello + n, sizeof(hello) - n, ", title id %s", tid);
++	}
++#endif
++	st = vita_netlog_init(VITA_DIAG_DIR "netlog.cfg", hello);
++	if (vita_netlog_active()) {
++		/* This boot's log so far, then live from here on. */
++		net_started = true;
++		vita_netlog_data("log.txt", 0, early_log, early_len);
++	}
++	vita_diag_log("%s", st);
++	if (early_overflow)
++		vita_diag_log("netlog: the first %u bytes of log.txt were "
++			      "held, the rest before this line is missing "
++			      "from the mirror", (unsigned int)sizeof(early_log));
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_net_report(void)
++{
++	const char *rx = vita_netlog_receiver();
++
++	vita_diag_log("netlog: %u packets, %lu bytes, %u retried, %u dropped "
++		      "(last errno %d), %u pacing pauses, %u hellos, receiver %s",
++		      vita_netlog_stats.packets, vita_netlog_stats.bytes,
++		      vita_netlog_stats.retries, vita_netlog_stats.dropped,
++		      vita_netlog_stats.last_errno, vita_netlog_stats.pauses,
++		      vita_netlog_stats.hellos,
++		      rx != NULL ? rx : "none answered");
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_net_stop(void)
++{
++	if (!net_started)
++		return;
++	vita_diag_net_report();
++	vita_netlog_end("log.txt", log_off, log_crc);
++	if (engine_log != NULL)
++		fflush(engine_log);
++	engine_tail(ENGINE_NET_CAP);
++	vita_netlog_end("netsurf.log", engine_sent, engine_crc);
++	vita_netlog_fini();
++	net_started = false;
++}
++
+ /* exported interface documented in vita/diag.h */
+ void vita_diag_engine_flush(void)
+ {
++	if (net_started) {
++		const char *st = vita_netlog_poll();
++		if (st != NULL)
++			vita_diag_log("%s", st);
++	}
+ 	if (engine_log == NULL)
+ 		return;
+ 	fflush(engine_log);
++	engine_tail(ENGINE_TAIL_STEP);
+ 	if (diag_fp != NULL)
+ 		fflush(diag_fp);
+ 	if (verbose_log && ftell(engine_log) > ENGINE_LOG_CAP) {
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+index f38fdbbf3..c610f9c7a 100644
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -83,10 +83,25 @@ void vita_diag_marker(const char *name);
+  * Send the engine's own logging -- NetSurf's NSLOG at every level and
+  * MacSurf's macsurf_debug_log_writef() traces -- to VITA_DIAG_DIR
+  * "netsurf.log". Buffered; flush with vita_diag_engine_flush().
++ * vita_diag_engine_flush() also feeds the network mirror (about once a
++ * second): the new part of netsurf.log, and the receiver's answer.
+  */
+ void vita_diag_engine_log_init(void);
+ 
+ /** Flush the engine log to the card; stops logging past its size cap. */
+ void vita_diag_engine_flush(void);
+ 
++/**
++ * Start the network mirror of the diagnostics files (vita/netlog.h):
++ * this boot's log.txt so far, then everything as it is written. Call
++ * after vita_diag_engine_log_init(). Never fatal.
++ */
++void vita_diag_net_start(void);
++
++/** Log the network mirror's counters. */
++void vita_diag_net_report(void);
++
++/** Final counters, the end marks for log.txt and netsurf.log, goodbye. */
++void vita_diag_net_stop(void);
++
+ #endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index b39a20465..9ca1eb757 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -58,6 +58,7 @@
+ 
+ #include "vita/bitmap.h"
+ #include "vita/diag.h"
++#include "vita/netlog.h"
+ #include "vita/fetch.h"
+ #include "vita/file.h"
+ #include "vita/layout.h"
+@@ -451,8 +452,13 @@ static void autotest_next(struct browser_window *bw)
+ 	vita_diag_font_metrics();
+ 	vita_diag_mem_probe();
+ 	vita_diag_log("autotest: done");
++	vita_diag_net_report();
+ 	vita_diag_marker("autotest.done");
+-	set_message(0, "AUTOTEST DONE - copy ux0:data/VitaBrowser/");
++	if (vita_netlog_receiver() != NULL)
++		set_message(0, "AUTOTEST DONE - results sent to %s",
++			    vita_netlog_receiver());
++	else
++		set_message(0, "AUTOTEST DONE - copy ux0:data/VitaBrowser/");
+ }
+ 
+ /** Autotest step before drawing: what the next frame is for. */
+@@ -804,6 +810,7 @@ int main(int argc, char **argv)
+ 
+ 	vita_diag_init();
+ 	vita_diag_engine_log_init();
++	vita_diag_net_start();
+ 	vita_diag_memory("boot");
+ 
+ 	{
+@@ -870,6 +877,7 @@ int main(int argc, char **argv)
+ 	vita_diag_log("exit: clean");
+ fail:
+ 	vita_diag_engine_flush();
++	vita_diag_net_stop();
+ 	vita_plot_fini();
+ 	vita2d_fini();
+ 	sceKernelExitProcess(0);
+diff --git a/frontends/vita/netlog.c b/frontends/vita/netlog.c
+new file mode 100644
+index 000000000..83cf354ed
+--- /dev/null
++++ b/frontends/vita/netlog.c
+@@ -0,0 +1,420 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the diagnostics files, mirrored to a PC over UDP
++ * (protocol in vita/netlog.h).
++ *
++ * The sending side is plain BSD sockets, which vitaSDK's newlib provides
++ * on top of sceNet once sceNetInit() has run, so the host simulator runs
++ * this same code on Linux sockets. Only bringing the network up is
++ * Vita-specific.
++ */
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/time.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <zlib.h>
++
++#ifdef __vita__
++#include <psp2/kernel/threadmgr.h>
++#include <psp2/sysmodule.h>
++#include <psp2/net/net.h>
++#include <psp2/net/netctl.h>
++#endif
++
++#include "vita/netlog.h"
++
++struct vita_netlog_stats vita_netlog_stats;
++
++/** Sends retried per datagram (1 ms apart), when the send buffer is
++ * full, before it is dropped. Other errors are not retried. */
++#define SEND_RETRIES 8
++/** Datagrams dropped in a row before sending pauses (network gone). */
++#define PAUSE_AFTER_DROPS 16
++/** Pacing: a pause of PACE_MS after every PACE_BURST datagrams (about
++ * 10 KB), so a burst -- netsurf.log's tail, a plot dump -- cannot overrun
++ * the receiver's socket buffer or the access point's queue. Sending 2 MB
++ * costs about 0.4 s of pauses in all. */
++#define PACE_BURST 8
++#define PACE_MS 2
++/** How often the hello is repeated until a receiver answers, and how
++ * often a paused mirror tries again. */
++#define HELLO_EVERY_MS 3000
++
++static int sock = -1;
++static struct sockaddr_in dest;
++static uint32_t boot_id;
++static uint32_t seq;
++static bool acked;
++static bool paused;
++static unsigned int drops_in_row;
++static unsigned int burst;
++static unsigned int last_hello_ms;
++static char hello_text[256];
++static char receiver[32];
++static char status[160];
++static struct timeval t0;
++
++#ifdef __vita__
++/** sceNet's working memory: it keeps socket buffers here. */
++static char net_pool[256 * 1024] __attribute__((aligned(64)));
++#endif
++
++static unsigned int now_ms(void)
++{
++	struct timeval t;
++
++	gettimeofday(&t, NULL);
++	return (unsigned int)((t.tv_sec - t0.tv_sec) * 1000 +
++			      (t.tv_usec - t0.tv_usec) / 1000);
++}
++
++static void sleep_ms(unsigned int ms)
++{
++#ifdef __vita__
++	sceKernelDelayThread(ms * 1000);
++#else
++	usleep(ms * 1000);
++#endif
++}
++
++/** A send that may succeed if retried: the socket buffer is full. The
++ * raw numbers are the BSD values sceNet uses (SCE_NET_EAGAIN 35,
++ * SCE_NET_ENOBUFS 55), in case newlib passes them through untranslated. */
++static bool transient(int e)
++{
++	return e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS ||
++	       e == 35 || e == 55;
++}
++
++/** One datagram. Never blocks for more than SEND_RETRIES ms. */
++static bool send_packet(char type, const char *name, uint32_t off,
++			const void *data, size_t len)
++{
++	char buf[VITA_NETLOG_CHUNK + 160];
++	int n, tries;
++
++	if (sock < 0 || paused)
++		return false;
++	n = snprintf(buf, sizeof(buf) - VITA_NETLOG_CHUNK,
++		     "VBL1 %08x %u %c %s %u %u\n", (unsigned int)boot_id,
++		     (unsigned int)seq, type, name, (unsigned int)off,
++		     (unsigned int)len);
++	if (n < 0 || (size_t)n >= sizeof(buf) - VITA_NETLOG_CHUNK ||
++	    len > VITA_NETLOG_CHUNK)
++		return false;
++	memcpy(buf + n, data, len);
++	/* The sequence number counts attempts, so a dropped datagram shows
++	 * up at the receiver as a gap. */
++	seq++;
++	for (tries = 0; tries <= SEND_RETRIES; tries++) {
++		ssize_t r = sendto(sock, buf, (size_t)n + len, MSG_DONTWAIT,
++				   (struct sockaddr *)&dest, sizeof(dest));
++		if (r == (ssize_t)((size_t)n + len)) {
++			vita_netlog_stats.packets++;
++			vita_netlog_stats.bytes += len;
++			drops_in_row = 0;
++			if (++burst >= PACE_BURST) {
++				burst = 0;
++				vita_netlog_stats.pauses++;
++				sleep_ms(PACE_MS);
++			}
++			return true;
++		}
++		vita_netlog_stats.last_errno = errno;
++		if (!transient(errno))
++			break;
++		if (tries < SEND_RETRIES) {
++			vita_netlog_stats.retries++;
++			sleep_ms(1);
++		}
++	}
++	vita_netlog_stats.dropped++;
++	if (++drops_in_row >= PAUSE_AFTER_DROPS) {
++		/* No network (or no route): stop trying per log line. poll()
++		 * tries a hello again every few seconds. */
++		paused = true;
++		snprintf(status, sizeof(status), "netlog: paused after %u "
++			 "failed sends in a row (errno %d)", drops_in_row,
++			 vita_netlog_stats.last_errno);
++	}
++	return false;
++}
++
++static void send_hello(void)
++{
++	last_hello_ms = now_ms();
++	if (send_packet('H', "hello", 0, hello_text, strlen(hello_text)))
++		vita_netlog_stats.hellos++;
++}
++
++/** netlog.cfg: "off", "a.b.c.d" or "a.b.c.d:port"; absent = broadcast. */
++static bool read_config(const char *path, bool *off)
++{
++	char line[64], *colon, *end;
++	FILE *fp = fopen(path, "r");
++	bool ok = true;
++
++	*off = false;
++	if (fp == NULL)
++		return true;
++	if (fgets(line, sizeof(line), fp) != NULL) {
++		line[strcspn(line, " \t\r\n")] = '\0';
++		if (strcmp(line, "off") == 0) {
++			*off = true;
++		} else if (line[0] != '\0') {
++			colon = strchr(line, ':');
++			if (colon != NULL) {
++				long port;
++				*colon = '\0';
++				port = strtol(colon + 1, &end, 10);
++				if (*end != '\0' || port <= 0 || port > 65535)
++					ok = false;
++				else
++					dest.sin_port = htons((uint16_t)port);
++			}
++			if (inet_pton(AF_INET, line, &dest.sin_addr) != 1)
++				ok = false;
++		}
++	}
++	fclose(fp);
++	return ok;
++}
++
++#ifdef __vita__
++/** sceNet up, once. \return 0 or the failing call's result */
++static int net_start(const char **what)
++{
++	SceNetInitParam p;
++	int r;
++
++	*what = "sceSysmoduleLoadModule(NET)";
++	if (sceSysmoduleIsLoaded(SCE_SYSMODULE_NET) != 0) {
++		r = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
++		if (r < 0)
++			return r;
++	}
++	*what = "sceNetInit";
++	p.memory = net_pool;
++	p.size = sizeof(net_pool);
++	p.flags = 0;
++	r = sceNetInit(&p);
++	/* Already initialised (by a plugin) is fine. */
++	if (r < 0 && r != (int)SCE_NET_ERROR_EBUSY)
++		return r;
++	*what = "sceNetCtlInit";
++	r = sceNetCtlInit();
++	/* 0x80412102: already initialised (VitaShell's
++	 * NET_CTL_ERROR_NOT_TERMINATED; vitaSDK has no name for it). */
++	if (r < 0 && (unsigned int)r != 0x80412102u)
++		return r;
++	return 0;
++}
++#endif
++
++/* exported interface documented in vita/netlog.h */
++const char *vita_netlog_init(const char *config, const char *hello)
++{
++	char ip[20] = "?";
++	bool off;
++	int on = 1;
++
++	gettimeofday(&t0, NULL);
++	memset(&vita_netlog_stats, 0, sizeof(vita_netlog_stats));
++	memset(&dest, 0, sizeof(dest));
++	dest.sin_family = AF_INET;
++	dest.sin_port = htons(VITA_NETLOG_PORT);
++	dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
++	/* Distinct per launch (the Vita's clock is set; so is the host's). */
++	boot_id = (uint32_t)t0.tv_sec * 2654435761u ^ (uint32_t)t0.tv_usec;
++	snprintf(hello_text, sizeof(hello_text), "%s", hello);
++
++	if (!read_config(config, &off)) {
++		snprintf(status, sizeof(status), "netlog: %s unreadable; "
++			 "expected off, a.b.c.d or a.b.c.d:port", config);
++		return status;
++	}
++	if (off) {
++		snprintf(status, sizeof(status), "netlog: off (%s)", config);
++		return status;
++	}
++#ifdef __vita__
++	{
++		const char *what;
++		SceNetCtlInfo info;
++		int r = net_start(&what);
++		if (r != 0) {
++			snprintf(status, sizeof(status), "netlog: %s -> 0x%08x;"
++				 " not sending", what, (unsigned int)r);
++			return status;
++		}
++		if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS,
++					 &info) >= 0)
++			snprintf(ip, sizeof(ip), "%s", info.ip_address);
++		else
++			snprintf(ip, sizeof(ip), "none (Wi-Fi off?)");
++	}
++#else
++	snprintf(ip, sizeof(ip), "host");
++#endif
++	sock = socket(AF_INET, SOCK_DGRAM, 0);
++	if (sock < 0) {
++		snprintf(status, sizeof(status), "netlog: socket -> errno %d;"
++			 " not sending", errno);
++		return status;
++	}
++	setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
++	send_hello();
++	snprintf(status, sizeof(status), "netlog: boot %08x, our ip %s, "
++		 "sending to %s:%u (%s), hello %s", (unsigned int)boot_id, ip,
++		 inet_ntoa(dest.sin_addr), (unsigned int)ntohs(dest.sin_port),
++		 dest.sin_addr.s_addr == htonl(INADDR_BROADCAST) ?
++		 "broadcast until a receiver answers" : "netlog.cfg",
++		 vita_netlog_stats.hellos ? "sent" : "NOT sent");
++	return status;
++}
++
++/* exported interface documented in vita/netlog.h */
++bool vita_netlog_active(void)
++{
++	return sock >= 0 && !paused;
++}
++
++/* exported interface documented in vita/netlog.h */
++const char *vita_netlog_receiver(void)
++{
++	return acked ? receiver : NULL;
++}
++
++/* exported interface documented in vita/netlog.h */
++void vita_netlog_data(const char *name, uint32_t offset, const void *data,
++		      size_t len)
++{
++	const char *p = data;
++
++	while (len > 0 && vita_netlog_active()) {
++		size_t n = len < VITA_NETLOG_CHUNK ? len : VITA_NETLOG_CHUNK;
++		send_packet('D', name, offset, p, n);
++		p += n;
++		offset += (uint32_t)n;
++		len -= n;
++	}
++}
++
++/* exported interface documented in vita/netlog.h */
++void vita_netlog_end(const char *name, uint32_t total, uint32_t crc)
++{
++	char hex[12];
++
++	snprintf(hex, sizeof(hex), "%08x", (unsigned int)crc);
++	send_packet('E', name, total, hex, 8);
++}
++
++/* exported interface documented in vita/netlog.h */
++bool vita_netlog_file(const char *name, const char *path)
++{
++	char buf[VITA_NETLOG_CHUNK];
++	uint32_t off = 0;
++	uLong crc = crc32(0L, Z_NULL, 0);
++	size_t n;
++	FILE *fp;
++
++	if (!vita_netlog_active())
++		return true;
++	fp = fopen(path, "rb");
++	if (fp == NULL)
++		return false;
++	while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
++		vita_netlog_data(name, off, buf, n);
++		crc = crc32(crc, (const Bytef *)buf, (uInt)n);
++		off += (uint32_t)n;
++	}
++	fclose(fp);
++	vita_netlog_end(name, off, (uint32_t)crc);
++	return true;
++}
++
++/* exported interface documented in vita/netlog.h */
++const char *vita_netlog_poll(void)
++{
++	char buf[64];
++	struct sockaddr_in from;
++	socklen_t fromlen;
++	ssize_t r;
++	unsigned int ack_boot;
++
++	if (sock < 0)
++		return NULL;
++	if (paused) {
++		if (now_ms() - last_hello_ms < HELLO_EVERY_MS)
++			return NULL;
++		paused = false;
++		last_hello_ms = now_ms();
++		if (!send_packet('H', "hello", 0, hello_text,
++				 strlen(hello_text))) {
++			paused = true;
++			return NULL;
++		}
++		vita_netlog_stats.hellos++;
++		drops_in_row = 0;
++		snprintf(status, sizeof(status), "netlog: sending again");
++		return status;
++	}
++	for (;;) {
++		fromlen = sizeof(from);
++		r = recvfrom(sock, buf, sizeof(buf) - 1, MSG_DONTWAIT,
++			     (struct sockaddr *)&from, &fromlen);
++		if (r <= 0)
++			break;
++		buf[r] = '\0';
++		if (acked || sscanf(buf, "VBL1 ACK %x", &ack_boot) != 1 ||
++		    ack_boot != boot_id)
++			continue;
++		/* From now on, to the receiver alone. */
++		dest = from;
++		acked = true;
++		snprintf(receiver, sizeof(receiver), "%s:%u",
++			 inet_ntoa(from.sin_addr),
++			 (unsigned int)ntohs(from.sin_port));
++		snprintf(status, sizeof(status), "netlog: receiver %s answered;"
++			 " unicast from now on", receiver);
++		return status;
++	}
++	if (!acked && now_ms() - last_hello_ms >= HELLO_EVERY_MS)
++		send_hello();
++	return paused ? status : NULL;
++}
++
++/* exported interface documented in vita/netlog.h */
++void vita_netlog_fini(void)
++{
++	if (sock < 0)
++		return;
++	paused = false;
++	send_packet('B', "bye", 0, "", 0);
++	close(sock);
++	sock = -1;
++}
+diff --git a/frontends/vita/netlog.h b/frontends/vita/netlog.h
+new file mode 100644
+index 000000000..607144190
+--- /dev/null
++++ b/frontends/vita/netlog.h
+@@ -0,0 +1,121 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the diagnostics files, mirrored to a PC over UDP.
++ *
++ * Everything the frontend writes under ux0:data/VitaBrowser/ (log.txt,
++ * netsurf.log, the plot dumps, autotest.done) is also sent, as it is
++ * written, to a receiver on the LAN (tools/vita-netlog.py in the
++ * VitaBrowser repo), which rebuilds the same files on the PC. The manual
++ * copy from the Vita to the PC has cost results before (run 2's stale FTP
++ * copies; runs 4 and 5 never reached the results folder); this removes
++ * the copy.
++ *
++ * Datagrams are one text header line, then payload bytes:
++ *
++ *   VBL1 <boot> <seq> <type> <name> <offset> <length>\n<payload>
++ *
++ *   boot    8 hex digits, new each launch: one receiver folder per boot
++ *   seq     packet number from 0, so the receiver can count losses
++ *   type    H hello (payload: who we are), D data at <offset> of <name>,
++ *           E end of <name>: <offset> is its total length and the payload
++ *           its CRC-32 in 8 hex digits, B bye (clean exit)
++ *
++ * Until a receiver answers ("VBL1 ACK <boot>\n" to the sender's port)
++ * everything is broadcast, so no address needs configuring; after the
++ * answer it is sent to the receiver alone (unicast Wi-Fi frames are
++ * retried by the radio; broadcast ones are not). The hello is repeated
++ * every few seconds until then, so the receiver may start late.
++ *
++ * ux0:data/VitaBrowser/netlog.cfg, if present, overrides the target:
++ * "off", or "a.b.c.d" / "a.b.c.d:port" to send there from the start.
++ *
++ * Sending never blocks the frontend for long: sockets are non-blocking, a
++ * full send buffer is retried for a few milliseconds and then the packet
++ * is dropped (and counted); other send errors are not retried, and after
++ * a run of failures sending pauses until a hello gets through again.
++ * Bursts are paced (a 2 ms pause per ~10 KB) so a receiver or an access
++ * point is not overrun. Losing the network loses only the mirror;
++ * the files on the memory card are written as before.
++ */
++
++#ifndef NETSURF_VITA_NETLOG_H
++#define NETSURF_VITA_NETLOG_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/** The receiver's UDP port (tools/vita-netlog.py --port). */
++#define VITA_NETLOG_PORT 45100
++
++/** Largest payload per datagram: header + payload stay under one
++ * Ethernet/Wi-Fi MTU, so nothing is fragmented. */
++#define VITA_NETLOG_CHUNK 1200
++
++/** Counters for the log and the tests. */
++struct vita_netlog_stats {
++	unsigned int packets;		/**< datagrams sent */
++	unsigned long bytes;		/**< payload bytes sent */
++	unsigned int retries;		/**< sends retried: buffer full */
++	unsigned int dropped;		/**< datagrams given up on */
++	unsigned int hellos;		/**< hello datagrams sent */
++	unsigned int pauses;		/**< pacing pauses taken */
++	int last_errno;			/**< errno of the last failed send */
++};
++extern struct vita_netlog_stats vita_netlog_stats;
++
++/**
++ * Bring up the network (sceNet on the Vita) and the socket, read
++ * netlog.cfg, send the first hello. Never fatal.
++ * \param config  path of netlog.cfg
++ * \param hello   text for the hello payload (title id, build)
++ * \return a line for the log saying what happened; static storage
++ */
++const char *vita_netlog_init(const char *config, const char *hello);
++
++/** Whether packets are being sent at all (not off, socket open). */
++bool vita_netlog_active(void);
++
++/** The receiver's address once one has answered, else NULL. */
++const char *vita_netlog_receiver(void);
++
++/** Send `len` bytes of file `name` found at `offset`, in chunks. */
++void vita_netlog_data(const char *name, uint32_t offset, const void *data,
++		      size_t len);
++
++/** Mark file `name` complete at `total` bytes with CRC-32 `crc`. */
++void vita_netlog_end(const char *name, uint32_t total, uint32_t crc);
++
++/** Send a whole file from the card as `name`, then its end mark.
++ * \return false if it could not be read */
++bool vita_netlog_file(const char *name, const char *path);
++
++/**
++ * Check for the receiver's answer and repeat the hello if none yet.
++ * Call about once a second.
++ * \return a line for the log if the state changed, else NULL
++ */
++const char *vita_netlog_poll(void);
++
++/** Say goodbye and close. */
++void vita_netlog_fini(void);
++
++#endif

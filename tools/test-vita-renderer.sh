@@ -43,8 +43,11 @@ gcc -std=c99 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter \
 # The text engine (frontends/vita/text.c): real FreeType, real fonts.
 FONTS="$WORK/fonts"
 [ -f "$FONTS/DejaVuSans.ttf" ] || WORK="$WORK" "$ROOT/tools/fetch-fonts.sh"
+# The Vita's FreeType release, not the host's (tools/build-host-freetype.sh).
+WORK="$WORK" "$ROOT/tools/build-host-freetype.sh" >/dev/null
+FT_PC="$WORK/host-freetype/lib/pkgconfig"
 gcc -std=c99 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter \
-	-Werror $INC $(pkg-config --cflags freetype2) -o "$OUT-text" \
+	-Werror $INC $(PKG_CONFIG_PATH="$FT_PC" pkg-config --cflags freetype2) -o "$OUT-text" \
 	"$ROOT/tools/test_vita_text.c" \
-	"$NS/frontends/vita/text.c" $(pkg-config --libs freetype2)
+	"$NS/frontends/vita/text.c" $(PKG_CONFIG_PATH="$FT_PC" pkg-config --libs freetype2) -lz
 "$OUT-text" "$FONTS"

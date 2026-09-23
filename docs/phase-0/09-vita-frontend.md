@@ -48,6 +48,7 @@ Three patches in `patches/vitabrowser/`, applied after the generated stack
 |---|---|
 | `plot_geom.c/.h` | **The contract as coloured geometry.** One `plot->rectangle` → the pieces monkey records (bands, drop/inset shadow rects, transform quad, bucket), each with its colour and a `paint` flag. No platform dependencies. Also formats pieces as monkey stream lines. |
 | `plot.c/.h` | The vita2d `plotter_table`, plus primitives shared with the replayer: `fill_rect`, `fill_quad` (triangle fan), `line`, `text` (FreeType, §11; system PGF before patch 38), `set_clip` |
+| `netlog.c/.h` | Mirrors `ux0:data/VitaBrowser/` (logs, plot dumps, markers) to a PC receiver over UDP (patch 39; 10 §Run 6) |
 | `text.c/.h` | The FreeType text engine (patch 38, §11): bundled fonts, fallback chain, glyph atlas; measures and draws |
 | `replay.c/.h` | Replays a recorded `.plot` stream through the same primitives (a debug viewer, and test layer C) |
 | `bitmap.c/.h` | Bitmaps *are* vita2d textures: RGBA8 texture memory = NetSurf's default `BITMAP_LAYOUT_RGBA8888`, so decoders write straight into GPU-visible memory |
@@ -314,9 +315,12 @@ and fixed by patch 32 (§10).
   its bottom edge but **not its right** (the clip stays at the parent's
   x1 = 951). Seen on `PM-shadow-clip`; pre-existing (identical before and
   after patch 32), not investigated.
-- The on-device plot-stream log that 03 anticipates ("the Vita frontend can
+- ~~The on-device plot-stream log that 03 anticipates ("the Vita frontend can
   emit the identical format over the UDP log") has its formatter
-  (`vita_geom_format_rect/_quad`, tested in §3.1 A) but no transport yet.
+  (`vita_geom_format_rect/_quad`, tested in §3.1 A) but no transport yet.~~
+  Done in patch 39: the plot dumps, both logs and the markers go to a
+  receiver on the PC over UDP, which compares each dump with the
+  simulator's (10 §Run 6).
 
 ## 8. Next actions
 
@@ -325,8 +329,11 @@ and fixed by patch 32 (§10).
    (PGF replaced, §11), check the baseline and clip edges against the simulator screenshots,
    and measure the allocate-until-failure budget (pre-phase-0 §1).
 2. ~~**Core clip fix for shadows/transforms** (§5)~~ — done, patch 32 (§10).
-3. **Plot-stream log over UDP** from the frontend, diffed against the desktop
-   goldens on-device.
+3. ~~**Plot-stream log over UDP** from the frontend, diffed against the desktop
+   goldens on-device.~~ Done, patch 39 (10 §Run 6). The comparison is against
+   the simulator's dumps (same frontend, fonts and FreeType), not the
+   nsmonkey goldens: monkey measures text differently, so any wrapped line
+   would differ for no reason.
 4. **curl + TLS** (vdpm `curl`, `openssl`) and **QuickJS**, the remaining
    Phase 1 engine items.
 
@@ -483,6 +490,9 @@ The VPK grows from 4.1 MB to 10.3 MB (the fonts compress).
   pixel-identical on 14/14 comparable pages. `VT-text` shows every script,
   and the gap before punctuation is gone (10 §Run 5).
 - Cross build: `-Werror` clean; the ELF has no PGF symbols.
+- Since patch 39 the simulator and this test link FreeType 2.14.3, the
+  Vita's release (`tools/build-host-freetype.sh`). Every dump and page is
+  identical to the 2.11.1 results (10 §Run 6).
 
 **Not proven without hardware:** FreeType's speed on the Vita's ARM (the
 first page rasterises a few hundred glyphs), how long a cold open of the

@@ -760,3 +760,131 @@ Twice now the results did not arrive through the manual copy step (plus
 run 2's stale Explorer-FTP copies). That is one more reason for the next
 task: the Vita sends its log and plot dumps over the network itself
 (§Run 6).
+
+## Run 6 — results over the network (patch 39), plus runs 4 and 5
+
+**Why.** Three runs have now lost results between the Vita and the PC:
+- run 2's copies were stale, served from Explorer's FTP cache;
+- runs 4 and 5 never reached `results\`.
+
+Doc 03 also anticipated an on-device plot-stream log "over the UDP log"
+([09 §7](09-vita-frontend.md)), and until now the formatter had no
+transport.
+
+**Patch 39 (`frontends/vita/netlog.c`)** sends everything the frontend
+writes under `ux0:data/VitaBrowser/` to a receiver on the PC as it is
+written: `log.txt` lines live, `netsurf.log` about once a second, and each
+plot dump and `autotest.done` as it closes. The files on the memory card
+are written exactly as before, so the network copy is an addition, not a
+replacement.
+- **Finding the PC:** the Vita broadcasts on UDP port 45100 until a
+  receiver answers, then sends to the receiver alone. Nothing needs
+  configuring. `ux0:data/VitaBrowser/netlog.cfg` can hold `off` or an
+  address.
+- **Checking:**
+  - Every datagram carries a sequence number, so losses are counted.
+  - Every finished file carries its length and CRC-32, and the receiver
+    checks both.
+  - Each launch gets its own folder (`results\net-<date>-<time>-<boot>\`),
+    so a result can never be an old copy.
+- **Safety:**
+  - Sockets are non-blocking; only a full send buffer is retried (up to
+    8 ms).
+  - Bursts are paced at 2 ms per ~10 KB.
+  - Sending pauses after 16 failures in a row and retries every 3 s.
+  - A network failure is never fatal.
+- **The receiver (`tools/vita-netlog.py`):**
+  - Python stdlib only, for the PC's Python 3.12.10 (`py -3`).
+  - It prints `log.txt` as it arrives.
+  - With `--reference`, it compares each plot dump with the simulator's
+    (SAME / DIFF + first differing line). That is the on-device diff the
+    plot-stream item asked for.
+
+**Host FreeType now matches the Vita's.** The simulator and the text test
+used the host's FreeType 2.11.1, but the Vita has 2.14.3.
+`tools/build-host-freetype.sh` builds 2.14.3 into `$WORK/host-freetype`
+(userspace, no sudo). The SHA256 matched from both official mirrors, and
+the simulator and the text test link it. Result: all 23 plot dumps are
+byte-identical under both releases, and so are all 15 page screenshots
+(only the HUD's timing numbers differ). So the fonts and sizes used today
+hint the same in both. The pin stays as a guard, so a device-vs-simulator
+DIFF means a real difference.
+
+**Verified on the host:**
+- The simulator's autotest sends to a local receiver, the same code path as
+  after a receiver answers on the Vita. Result: **23/23 files byte-identical
+  to the simulator's memory card** (log.txt, netsurf.log 2.0 MB, 20 dumps,
+  autotest.done), **3 613 datagrams, 0 lost**, and a clean goodbye.
+  `run-vita-sim.sh` now fails if any file differs or any datagram is lost.
+- **The first attempt lost 5 datagrams, and the test caught it.** netsurf.log
+  grows at ~32 KB/s, the old tail step, so a backlog went out at exit as
+  one unpaced burst and overflowed the receiver's socket buffer. Pacing and
+  a 64 KB/s tail fixed it. The cost is 450 pacing pauses (≈0.9 s) over a
+  64 s autotest.
+- **What the mirror costs the measurements (simulator):**
+  - Frame times are unchanged: the mirror sends between frames.
+  - Page-load averages rise by **≈7 ms** (160 → 167 ms in every pass), from
+    the log lines and netsurf.log tails that land during loading.
+  - All four passes pay it alike, so pass-vs-pass comparisons still hold.
+  - For absolute load times on the device, put `off` in `netlog.cfg`.
+- **Windows side:** the receiver ran under the PC's own Python 3.12.10
+  (bound to 127.0.0.1, so no firewall prompt). It answered the hello, and
+  all 22 files replayed to it arrived byte-identical, with matching CRCs.
+- The `netlog.cfg` `off` path runs in the screenshot pass.
+- Clean checkout: applied 122 + the known 2; L1 PASS; fixtures 4/4;
+  101/101 + 30/30; simulator 15/15 with clip modes 14/14 identical; cross
+  build `-Werror` clean; the ELF imports `sceNetInit`, `sceNetCtlInit` and
+  `sceNetSendto`.
+
+**Not verifiable without the device:**
+- broadcast on real Wi-Fi, and whether the router passes it;
+- Windows Firewall on the user's network profile;
+- whether newlib translates sceNet's errno values (both forms are
+  handled);
+- sceNet start-up on 3.65 HENkaku (the result code is logged).
+
+If nothing arrives, the memory-card copy is unaffected, and `log.txt` says
+why: its `netlog:` lines.
+
+**Hand-off.** SHA256, first 12: `VitaBrowser.vpk` `890c37c6d7bf`,
+`VitaBrowser-ext.vpk` `b8b4a7746f01`, `nsvita.elf` `efac32b43687`. They
+replace run 5's in `VitaBrowser-hwtest\`; run 5's stay in
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run5/`. Archive:
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run6/` (VPKs, ELF, SHA256SUMS,
+the simulator's reference files, shots and received mirror). New in
+`VitaBrowser-hwtest\`:
+- `receive-results.bat`
+- `vita-netlog.py`
+- `reference-dumps\`: the simulator's 20 plot dumps for this build.
+
+**Run 6 on the device** covers runs 4, 5 and 6 in one go (about 6 min):
+1. On the PC, double-click **`receive-results.bat`** in
+   `VitaBrowser-hwtest\`. If Windows asks whether Python may use the
+   network, allow **private** networks. Leave the window open.
+2. The Vita must be on the same Wi-Fi as the PC. Install the new
+   **VitaBrowser.vpk** and **delete `ux0:data/VitaBrowser/`** first.
+3. Launch. Within a few seconds the window should print
+   `== boot … from 192.168.…` and the Vita's log lines.
+4. Press □ and wait for AUTOTEST DONE. The Vita's message should say
+   `results sent to <PC address>`. Then START (a clean exit sends the rest
+   of netsurf.log and a goodbye).
+5. As in run 5: open VT-text, compare it with
+   `reference-screenshots\13-VT-text.png`, and take a screenshot. Also
+   scroll VT-scroll and note the HUD numbers.
+6. **Results:**
+   - The receiver's folder `results\net-…\` is the run. Its
+     `receiver.txt` lists every file with OK/INCOMPLETE and each dump's
+     SAME/DIFF.
+   - Screenshots still need copying: USB, or FileZilla/WinSCP.
+   - If nothing arrived over the network, copy `ux0:data/VitaBrowser/`
+     as before.
+
+**What decides the next step:**
+- **The four passes:** B vs A is the GPU clock, C vs A is CPU clipping,
+  D is both.
+- **Text:** VT-text on the device (run 5's checks).
+- **The dump comparison.** SAME on all 20 means the device lays out and
+  plots exactly like the simulator. Each DIFF points at a line to
+  investigate.
+- **`receiver.txt`'s loss count on real Wi-Fi.** If it isn't 0, add
+  retransmission.
