@@ -1,0 +1,728 @@
+# netsurf: name lookup off the main thread for the curl fetcher
+# Generated 2026-09-23
+#
+# Hardware run 11: vitaSDK's libcurl has no asynchronous resolver (its
+# asyn-thrdd object is empty), so curl looked names up with a blocking
+# getaddrinfo() inside curl_multi_perform(), on the browser's only thread.
+# A DNS server that did not answer froze everything for curl's 30 s
+# connect timeout, per page.
+# - content/fetchers/curl_resolve.h (new): fetch_curl_resolve(), a lookup
+#   that never blocks, implemented by the frontend (WITH_CURL_ASYNC_RESOLVE).
+# - curl.c: start() asks it first. PENDING: the job stays queued (start()
+#   returns false, as it already does "inside cURL") and fetch_kick is
+#   scheduled to retry in 50 ms. READY: the address goes to curl with
+#   CURLOPT_RESOLVE, so curl never resolves by itself. FAILED: the fetch
+#   never reaches curl and ends on the next poll through fetch_curl_done()
+#   with CURLE_COULDNT_RESOLVE_HOST -- the error curl itself would give.
+# - content/fetch.c/.h: fetch_kick(), fetch_start()'s dispatch-and-poll
+#   step as a schedule callback (fetch_pump() dispatches but does not
+#   restart the poll chain, so a deferred job could be stranded).
+# - vita/resolve.c/.h (new): one worker thread, lookups one at a time,
+#   each bounded (sceNetResolverStartNtoa, 2 s x 2 tries); a 32-entry
+#   cache (answers 5 min, failures 15 s); lines for the log handed to the
+#   main loop (vita_resolve_poll). In the simulator, getaddrinfo(); names
+#   ending .sim-hang take the Vita's worst case and fail, standing in for
+#   a DNS server that never answers.
+# - vita/Makefile: resolve.c, -DWITH_CURL_ASYNC_RESOLVE.
+# See docs/phase-0/10-hardware-test-plan.md §Run 12.
+
+diff --git a/content/fetch.c b/content/fetch.c
+index e56386b..76c9480 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -301,6 +301,16 @@ void fetch_pump(void)
+ 	}
+ }
+ 
++/* exported interface documented in content/fetch.h */
++void fetch_kick(void *unused)
++{
++	/* As fetch_start() does after queueing: dispatch, and poll the
++	 * fetchers again if anything is now active. */
++	if (fetch_dispatch_jobs()) {
++		guit->misc->schedule(SCHEDULE_TIME, fetcher_poll, NULL);
++	}
++}
++
+ /* exported interface documented in content/fetch.h */
+ #ifndef __MACOS9__
+ nserror fetcher_init(void)
+diff --git a/content/fetch.h b/content/fetch.h
+index 979fe96..a43382b 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -184,6 +184,15 @@ void fetch_abort(struct fetch *f);
+  */
+ void fetch_pump(void);
+ 
++/**
++ * Try to dispatch queued fetches again, and poll if any is active.
++ *
++ * For a fetcher whose start() deferred a job (it waits in the queue) to
++ * schedule once its reason to wait is gone; unlike fetch_pump(), it keeps
++ * the poll chain going. The argument is unused (a schedule callback).
++ */
++void fetch_kick(void *unused);
++
+ 
+ /**
+  * Check if a URL's scheme can be fetched.
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index af71944..5a4f5e5 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -60,6 +60,9 @@
+ #include "content/fetchers.h"
+ #include "content/fetchers/curl.h"
+ #include "content/urldb.h"
++#ifdef WITH_CURL_ASYNC_RESOLVE
++#include "content/fetchers/curl_resolve.h"
++#endif
+ 
+ /**
+  * maximum number of progress notifications per second
+@@ -256,6 +259,11 @@ struct curl_fetch_info {
+ 	uint64_t last_progress_update;	/**< Time of last progress update */
+ 	int cert_depth; /**< deepest certificate in use */
+ 	struct cert_info cert_data[MAX_CERT_DEPTH]; /**< HTTPS certificate data */
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	struct curl_slist *resolve; /**< CURLOPT_RESOLVE: host:port:address */
++	bool dns_failed; /**< the lookup failed: end without curl */
++	struct curl_fetch_info *dns_next; /**< fetch_curl_dns_failed list */
++#endif
+ };
+ 
+ /** curl handle cache entry */
+@@ -291,6 +299,14 @@ static char fetch_proxy_userpwd[100];
+ /** Interlock to prevent initiation during callbacks */
+ static bool inside_curl = false;
+ 
++#ifdef WITH_CURL_ASYNC_RESOLVE
++/** Fetches whose name lookup failed, to end on the next poll. */
++static struct curl_fetch_info *fetch_curl_dns_failed;
++
++/** Ask the fetch queue again while a lookup is pending. */
++#define FETCH_CURL_RESOLVE_RETRY_MS 50
++#endif
++
+ 
+ /**
+  * Initialise a cURL fetcher.
+@@ -445,6 +461,11 @@ static struct curl_fetch_info *fetch_alloc(void)
+ 	/* Clear certificate chain data */
+ 	memset(fetch->cert_data, 0, sizeof(fetch->cert_data));
+ 	fetch->cert_depth = -1;
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	fetch->resolve = NULL;
++	fetch->dns_failed = false;
++	fetch->dns_next = NULL;
++#endif
+ 
+ 	return fetch;
+ }
+@@ -1176,6 +1197,11 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 
+ 	SETOPT(CURLOPT_URL, nsurl_access(f->url));
+ 	SETOPT(CURLOPT_PRIVATE, f);
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	/* The address the frontend looked up (curl_resolve.h); a duplicated
++	 * blank handle carries no list, so NULL clears any old one. */
++	SETOPT(CURLOPT_RESOLVE, f->resolve);
++#endif
+ 	SETOPT(CURLOPT_WRITEDATA, f);
+ 	SETOPT(CURLOPT_WRITEHEADER, f);
+ 	SETOPT(NSCURLOPT_PROGRESS_DATA, f);
+@@ -1286,6 +1312,16 @@ fetch_curl_initiate_fetch(struct curl_fetch_info *fetch, CURL *handle)
+ 		return false;
+ 	}
+ 
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	if (fetch->dns_failed) {
++		/* Never given to curl, which would only look the name up
++		 * again, blocking. fetch_curl_poll() ends it. */
++		fetch->dns_next = fetch_curl_dns_failed;
++		fetch_curl_dns_failed = fetch;
++		return true;
++	}
++#endif
++
+ 	/* add to the global curl multi handle */
+ 	codem = curl_multi_add_handle(fetch_curl_multi, fetch->curl_handle);
+ 	assert(codem == CURLM_OK || codem == CURLM_CALL_MULTI_PERFORM);
+@@ -1293,6 +1329,56 @@ fetch_curl_initiate_fetch(struct curl_fetch_info *fetch, CURL *handle)
+ 	return true;
+ }
+ 
++#ifdef WITH_CURL_ASYNC_RESOLVE
++/**
++ * Look the fetch's host up through the frontend (curl_resolve.h).
++ *
++ * 
++eturn false while the lookup is pending: the fetch stays queued, and
++ *	   the queue is asked again shortly.
++ */
++static bool fetch_curl_resolve_host(struct curl_fetch_info *fetch)
++{
++	char addr[64], entry[400];
++	const char *host = lwc_string_data(fetch->host);
++	lwc_string *port_s;
++	long port;
++
++	if (fetch->resolve != NULL || fetch->dns_failed)
++		return true;	/* decided on an earlier attempt */
++	switch (fetch_curl_resolve(host, addr, sizeof(addr))) {
++	case FETCH_CURL_RESOLVE_PENDING:
++		NSLOG(netsurf, DEBUG, "Deferring fetch: looking up %s", host);
++		guit->misc->schedule(FETCH_CURL_RESOLVE_RETRY_MS,
++				fetch_kick, NULL);
++		return false;
++	case FETCH_CURL_RESOLVE_FAILED:
++		NSLOG(netsurf, INFO, "No address for %s", host);
++		fetch->dns_failed = true;
++		return true;
++	case FETCH_CURL_RESOLVE_READY:
++		break;
++	}
++	if (addr[0] == '\0')
++		return true;	/* an address already: curl needs no help */
++
++	port_s = nsurl_get_component(fetch->url, NSURL_PORT);
++	if (port_s != NULL) {
++		port = strtol(lwc_string_data(port_s), NULL, 10);
++		lwc_string_unref(port_s);
++	} else {
++		port = (nsurl_get_scheme_type(fetch->url) ==
++				NSURL_SCHEME_HTTPS) ? 443 : 80;
++	}
++	snprintf(entry, sizeof(entry), "%s:%ld:%s", host, port, addr);
++	fetch->resolve = curl_slist_append(NULL, entry);
++	/* Without the list curl would resolve by itself: fail instead. */
++	if (fetch->resolve == NULL)
++		fetch->dns_failed = true;
++	return true;
++}
++#endif
++
+ 
+ /**
+  * Find a CURL handle to use to dispatch a job
+@@ -1324,6 +1410,10 @@ static bool fetch_curl_start(void *vfetch)
+ 		NSLOG(netsurf, DEBUG, "Deferring fetch because we're inside cURL");
+ 		return false;
+ 	}
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	if (!fetch_curl_resolve_host(fetch))
++		return false;
++#endif
+ 	return fetch_curl_initiate_fetch(fetch,
+ 			fetch_curl_get_handle(fetch->host));
+ }
+@@ -1448,6 +1538,19 @@ static void fetch_curl_free(void *vf)
+ 	if (f->headers) {
+ 		curl_slist_free_all(f->headers);
+ 	}
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	{
++		/* An aborted fetch may still be waiting to be ended. */
++		struct curl_fetch_info **pp = &fetch_curl_dns_failed;
++		while (*pp != NULL && *pp != f)
++			pp = &(*pp)->dns_next;
++		if (*pp == f)
++			*pp = f->dns_next;
++	}
++	if (f->resolve) {
++		curl_slist_free_all(f->resolve);
++	}
++#endif
+ 	fetch_curl_free_postdata(f->postdata);
+ 	NSCURL_POSTDATA_FREE(f->curl_postdata);
+ 
+@@ -1686,6 +1789,19 @@ static void fetch_curl_poll(lwc_string *scheme_ignored)
+ 		}
+ 	}
+ 
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	/* Fetches whose lookup failed end as curl would have ended them,
++	 * without the wait. Unlinked first: ending one can free others. */
++	inside_curl = true;
++	while (fetch_curl_dns_failed != NULL) {
++		struct curl_fetch_info *f = fetch_curl_dns_failed;
++		fetch_curl_dns_failed = f->dns_next;
++		f->dns_next = NULL;
++		fetch_curl_done(f->curl_handle, CURLE_COULDNT_RESOLVE_HOST);
++	}
++	inside_curl = false;
++#endif
++
+ 	/* do any possible work on the current fetches */
+ 	inside_curl = true;
+ 	do {
+diff --git a/content/fetchers/curl_resolve.h b/content/fetchers/curl_resolve.h
+new file mode 100644
+index 0000000..6a75b11
+--- /dev/null
++++ b/content/fetchers/curl_resolve.h
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Name lookup for the curl fetcher, done by the frontend without blocking
++ * (WITH_CURL_ASYNC_RESOLVE).
++ *
++ * A libcurl built without its threaded or c-ares resolver -- vitaSDK's is
++ * one -- looks names up with a blocking getaddrinfo() inside
++ * curl_multi_perform(), on the only thread the browser has. A DNS server
++ * that does not answer then freezes everything for curl's whole connect
++ * timeout (hardware run 11: 30 s per page). With this switch the fetcher
++ * asks the frontend first and hands curl the answer with CURLOPT_RESOLVE,
++ * so curl never resolves by itself; a fetch whose name is still being
++ * looked up waits in the fetch queue, and one whose lookup failed ends
++ * with CURLE_COULDNT_RESOLVE_HOST at once.
++ */
++
++#ifndef NETSURF_CONTENT_FETCHERS_CURL_RESOLVE_H
++#define NETSURF_CONTENT_FETCHERS_CURL_RESOLVE_H
++
++#include <stddef.h>
++
++enum fetch_curl_resolve_result {
++	FETCH_CURL_RESOLVE_READY,	/**< addr holds the address, or ""
++					 * when curl needs no help (the
++					 * host is an address itself) */
++	FETCH_CURL_RESOLVE_PENDING,	/**< being looked up; ask again */
++	FETCH_CURL_RESOLVE_FAILED	/**< no such name, or no answer */
++};
++
++/**
++ * Look a host name up without blocking. Implemented by the frontend.
++ *
++ * \param host  the host name, as in the URL
++ * \param addr  receives the numeric address on READY
++ * \param size  size of addr (46 bytes holds any address)
++ */
++enum fetch_curl_resolve_result
++fetch_curl_resolve(const char *host, char *addr, size_t size);
++
++#endif
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 792974f..4e237e8 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -16,6 +16,11 @@ CFLAGS += -std=c99 -g -Ifrontends/vita/compat \
+ 	  -D_DEFAULT_SOURCE \
+ 	  -DNETSURF_VITA_START_PAGE=\"$(NETSURF_VITA_START_PAGE)\"
+ 
++# The curl fetcher asks vita/resolve.c for addresses instead of letting
++# vitaSDK's libcurl (no asynchronous resolver) block in getaddrinfo()
++# (content/fetchers/curl_resolve.h).
++CFLAGS += -DWITH_CURL_ASYNC_RESOLVE
++
+ # Text is drawn and measured with FreeType (vita/text.c).
+ CFLAGS += $(shell $(PKG_CONFIG) --cflags freetype2)
+ 
+@@ -74,7 +79,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+ 	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
+-	qjs_hooks.c js_platform.c netprobe.c
++	qjs_hooks.c js_platform.c netprobe.c resolve.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index c897965..3fc9e17 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -62,6 +62,7 @@
+ #include "vita/net.h"
+ #include "vita/netlog.h"
+ #include "vita/js_platform.h"
++#include "vita/resolve.h"
+ #include "vita/netprobe.h"
+ /* The QuickJS bridge's event-loop pump (quickjs/macsurf_qjs.c) and its
+  * relayout driver's per-content query (quickjs/macos9_reconvert.c). */
+@@ -864,6 +865,9 @@ static void vita_run(struct browser_window *bw)
+ 		 * pass (fixes321): due setTimeout / setInterval callbacks, the
+ 		 * promise job queue, queued events. Cheap when nothing is due. */
+ 		macsurf_qjs_pump_all();
++		/* Name lookups finished off the main thread (vita/resolve.c):
++		 * log them here, where logging is safe. */
++		vita_resolve_poll();
+ 		if (vita_diag_ms() - last_flush >= 1000) {
+ 			last_flush = vita_diag_ms();
+ 			vita_diag_engine_flush();
+diff --git a/frontends/vita/resolve.c b/frontends/vita/resolve.c
+new file mode 100644
+index 0000000..f4d473a
+--- /dev/null
++++ b/frontends/vita/resolve.c
+@@ -0,0 +1,315 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: name lookup for the curl fetcher, off the main thread
++ * (content/fetchers/curl_resolve.h).
++ *
++ * Hardware run 11: vitaSDK's libcurl has no asynchronous resolver, so curl
++ * looked names up with newlib's getaddrinfo() -> gethostbyname() ->
++ * sceNetResolverStartNtoa() with the system's default bound, inside
++ * curl_multi_perform(). With a DNS server that did not answer, the whole
++ * browser froze for curl's 30 s connect timeout per page.
++ *
++ * Here one worker thread does the lookups, one at a time, each bounded
++ * (on the Vita: sceNetResolverStartNtoa, 2 s x 2 tries); the main thread
++ * only reads a small cache. IPv4 only: the Vita has no IPv6.
++ */
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <pthread.h>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <netdb.h>
++
++#ifdef __vita__
++#include <psp2/net/net.h>
++#endif
++
++#include "content/fetchers/curl_resolve.h"
++
++#include "vita/diag.h"
++#include "vita/resolve.h"
++
++/** Remember answers this long, ms. */
++#define RESOLVE_OK_TTL_MS (5 * 60 * 1000)
++/** ...and failures this long, so a page's many requests to a dead name
++ * fail together instead of one lookup each. */
++#define RESOLVE_FAIL_TTL_MS (15 * 1000)
++/** On the Vita: per try, us, and tries. */
++#define RESOLVE_TIMEOUT_US (2 * 1000 * 1000)
++#define RESOLVE_TRIES 2
++
++#define RESOLVE_SLOTS 32
++#define RESOLVE_HOST_MAX 256
++
++enum slot_state { SLOT_FREE, SLOT_QUEUED, SLOT_BUSY, SLOT_OK, SLOT_FAILED };
++
++static struct resolve_slot {
++	enum slot_state state;
++	char host[RESOLVE_HOST_MAX];
++	char addr[INET_ADDRSTRLEN];
++	unsigned int done_ms;	/**< when the answer arrived */
++	unsigned int asked_ms;	/**< when the fetcher first asked */
++} slots[RESOLVE_SLOTS];
++
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;
++static bool worker_started;
++static bool worker_failed;
++
++/** Counters for the log. */
++static unsigned int n_lookups, n_failed, n_hits;
++
++/** Finished lookups for the log, which is main-thread code
++ * (vita_resolve_poll() writes them). */
++#define RESOLVE_LOG_LINES 8
++static char log_lines[RESOLVE_LOG_LINES][320];
++static unsigned int log_head, log_tail;
++
++/**
++ * One bounded lookup; on success addr holds a dotted quad.
++ *
++ * \return 0 or an error code for the log
++ */
++static int lookup(const char *host, char *addr, size_t size)
++{
++#ifdef __vita__
++	SceNetInAddr sa;
++	struct in_addr in;
++	int rid, r;
++
++	rid = sceNetResolverCreate("vbdns", NULL, 0);
++	if (rid < 0)
++		return rid;
++	r = sceNetResolverStartNtoa(rid, host, &sa, RESOLVE_TIMEOUT_US,
++				    RESOLVE_TRIES, 0);
++	sceNetResolverDestroy(rid);
++	if (r < 0)
++		return r;
++	memcpy(&in, &sa, sizeof(in));
++	inet_ntop(AF_INET, &in, addr, size);
++	return 0;
++#else
++	struct addrinfo hints, *res = NULL;
++	int r;
++
++#ifdef VITA_HOST_SIM
++	/* The simulator's stand-in for a DNS server that never answers:
++	 * any *.sim-hang name takes the Vita's worst case, then fails. */
++	size_t n = strlen(host);
++	if (n > 9 && strcmp(host + n - 9, ".sim-hang") == 0) {
++		struct timespec ts = { RESOLVE_TRIES * RESOLVE_TIMEOUT_US /
++				       1000000, 0 };
++		nanosleep(&ts, NULL);
++		return -1;
++	}
++#endif
++	memset(&hints, 0, sizeof(hints));
++	hints.ai_family = AF_INET;
++	hints.ai_socktype = SOCK_STREAM;
++	r = getaddrinfo(host, NULL, &hints, &res);
++	if (r != 0 || res == NULL)
++		return r != 0 ? r : -1;
++	inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr,
++		  addr, size);
++	freeaddrinfo(res);
++	return 0;
++#endif
++}
++
++static void *worker(void *unused)
++{
++	(void)unused;
++	pthread_mutex_lock(&lock);
++	for (;;) {
++		struct resolve_slot *s = NULL;
++		char host[RESOLVE_HOST_MAX], addr[INET_ADDRSTRLEN];
++		unsigned int t0;
++		int i, r;
++
++		for (i = 0; i < RESOLVE_SLOTS && s == NULL; i++)
++			if (slots[i].state == SLOT_QUEUED)
++				s = &slots[i];
++		if (s == NULL) {
++			pthread_cond_wait(&wake, &lock);
++			continue;
++		}
++		s->state = SLOT_BUSY;
++		memcpy(host, s->host, sizeof(host));
++		pthread_mutex_unlock(&lock);
++
++		t0 = vita_diag_ms();
++		addr[0] = '\0';
++		r = lookup(host, addr, sizeof(addr));
++
++		pthread_mutex_lock(&lock);
++		/* The slot is ours while BUSY: nothing else reuses it. */
++		s->state = (r == 0) ? SLOT_OK : SLOT_FAILED;
++		memcpy(s->addr, addr, sizeof(s->addr));
++		s->done_ms = vita_diag_ms();
++		n_lookups++;
++		if (r != 0)
++			n_failed++;
++		if (log_head - log_tail < RESOLVE_LOG_LINES) {
++			char *l = log_lines[log_head++ % RESOLVE_LOG_LINES];
++			if (r == 0)
++				snprintf(l, sizeof(log_lines[0]),
++					 "dns: %.200s -> %s in %u ms", host,
++					 addr, s->done_ms - t0);
++			else
++				snprintf(l, sizeof(log_lines[0]),
++					 "dns: %.200s -> FAILED (%d / 0x%08x) "
++					 "in %u ms", host, r, (unsigned int)r,
++					 s->done_ms - t0);
++		}
++	}
++	return NULL;
++}
++
++/** Start the worker on first use. Called with the lock held. */
++static bool start_worker(void)
++{
++	pthread_attr_t attr;
++	pthread_t t;
++
++	if (worker_started || worker_failed)
++		return worker_started;
++	pthread_attr_init(&attr);
++	pthread_attr_setstacksize(&attr, 64 * 1024);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	if (pthread_create(&t, &attr, worker, NULL) == 0)
++		worker_started = true;
++	else
++		worker_failed = true;
++	pthread_attr_destroy(&attr);
++	return worker_started;
++}
++
++/** Is host an IPv4 or IPv6 address (curl needs no lookup)? */
++static bool is_address(const char *host)
++{
++	struct in_addr a;
++
++	return inet_pton(AF_INET, host, &a) == 1 || strchr(host, ':') != NULL;
++}
++
++/* exported interface documented in content/fetchers/curl_resolve.h */
++enum fetch_curl_resolve_result
++fetch_curl_resolve(const char *host, char *addr, size_t size)
++{
++	enum fetch_curl_resolve_result result;
++	struct resolve_slot *s = NULL, *oldest = NULL;
++	unsigned int now = vita_diag_ms();
++	int i;
++
++	addr[0] = '\0';
++	if (is_address(host) || strlen(host) >= RESOLVE_HOST_MAX)
++		return FETCH_CURL_RESOLVE_READY;
++
++	pthread_mutex_lock(&lock);
++	for (i = 0; i < RESOLVE_SLOTS; i++) {
++		struct resolve_slot *c = &slots[i];
++		if (c->state == SLOT_FREE)
++			continue;
++		/* Expire finished answers. */
++		if ((c->state == SLOT_OK &&
++		     now - c->done_ms > RESOLVE_OK_TTL_MS) ||
++		    (c->state == SLOT_FAILED &&
++		     now - c->done_ms > RESOLVE_FAIL_TTL_MS)) {
++			c->state = SLOT_FREE;
++			continue;
++		}
++		if (strcmp(c->host, host) == 0)
++			s = c;
++	}
++	if (s == NULL) {
++		if (!start_worker()) {
++			/* No thread: let curl look it up, blocking, as it
++			 * did before. */
++			pthread_mutex_unlock(&lock);
++			return FETCH_CURL_RESOLVE_READY;
++		}
++		for (i = 0; i < RESOLVE_SLOTS && s == NULL; i++)
++			if (slots[i].state == SLOT_FREE)
++				s = &slots[i];
++		for (i = 0; i < RESOLVE_SLOTS && s == NULL; i++) {
++			/* Full: reuse the oldest finished answer. */
++			struct resolve_slot *c = &slots[i];
++			if ((c->state == SLOT_OK || c->state == SLOT_FAILED) &&
++			    (oldest == NULL || c->done_ms < oldest->done_ms))
++				oldest = c;
++		}
++		if (s == NULL)
++			s = oldest;
++		if (s == NULL) {
++			/* 32 lookups in flight: wait for one to finish. */
++			pthread_mutex_unlock(&lock);
++			return FETCH_CURL_RESOLVE_PENDING;
++		}
++		memset(s, 0, sizeof(*s));
++		snprintf(s->host, sizeof(s->host), "%s", host);
++		s->state = SLOT_QUEUED;
++		s->asked_ms = now;
++		pthread_cond_signal(&wake);
++	}
++	switch (s->state) {
++	case SLOT_OK:
++		snprintf(addr, size, "%s", s->addr);
++		n_hits++;
++		result = FETCH_CURL_RESOLVE_READY;
++		break;
++	case SLOT_FAILED:
++		result = FETCH_CURL_RESOLVE_FAILED;
++		break;
++	default:
++		result = FETCH_CURL_RESOLVE_PENDING;
++		break;
++	}
++	pthread_mutex_unlock(&lock);
++	return result;
++}
++
++/* exported interface documented in vita/resolve.h */
++void vita_resolve_poll(void)
++{
++	char line[sizeof(log_lines[0])];
++	unsigned int lookups, failed, hits;
++
++	for (;;) {
++		pthread_mutex_lock(&lock);
++		if (log_tail == log_head) {
++			pthread_mutex_unlock(&lock);
++			return;
++		}
++		memcpy(line, log_lines[log_tail++ % RESOLVE_LOG_LINES],
++		       sizeof(line));
++		lookups = n_lookups;
++		failed = n_failed;
++		hits = n_hits;
++		pthread_mutex_unlock(&lock);
++		vita_diag_log("%s (%u lookups, %u failed, %u cache hits)",
++			      line, lookups, failed, hits);
++	}
++}
+diff --git a/frontends/vita/resolve.h b/frontends/vita/resolve.h
+new file mode 100644
+index 0000000..fffb09e
+--- /dev/null
++++ b/frontends/vita/resolve.h
+@@ -0,0 +1,31 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: name lookup off the main thread for the curl fetcher
++ * (vita/resolve.c; the fetcher's side is content/fetchers/curl_resolve.h).
++ */
++
++#ifndef NETSURF_VITA_RESOLVE_H
++#define NETSURF_VITA_RESOLVE_H
++
++/** Log the lookups finished since the last call. Main loop, every pass. */
++void vita_resolve_poll(void);
++
++#endif

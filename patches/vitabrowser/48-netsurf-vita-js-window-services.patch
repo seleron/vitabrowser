@@ -1,0 +1,931 @@
+# netsurf: the QuickJS bridge's window services on the Vita
+# Generated 2026-09-23
+#
+# MacSurf's bridge implements location, history, scrolling, the viewport,
+# document.title, alert/confirm and localStorage persistence only under
+# __MACOS9__ (Carbon window list, StandardAlert, FSSpec files); elsewhere
+# they were inert: location.href read "about:blank", nothing navigated.
+# - quickjs/macos9.h: the services as a frontend API, switched on by
+#   MACSURF_WINDOW_SERVICES; c = the script's own document.
+# - macsurf_qjs.c: a MACSURF_WINDOW_SERVICES branch beside each __MACOS9__
+#   one (the Mac code is untouched), and three deliberate differences:
+#   * location reads THIS realm's document (with its #fragment, which
+#     NetSurf keeps on the window), as document.cookie does (fixes879) --
+#     not the front window, which during a load is still the old page;
+#   * localStorage is keyed by ORIGIN: the Mac path hashes the whole page
+#     URL into the filename, so no two pages of a site shared a store;
+#     plain stdio, written to a temporary file and then renamed;
+#   * location.replace() is native (no history entry) and
+#     `window.location = url` navigates (PutForwards=href, as
+#     document.location already did); both were missing on every platform.
+#   Time the user spends reading an alert() is not charged to the script's
+#   runaway deadline.
+# - vita/js_platform.c: the Vita's services. Navigation and history steps
+#   are queued on the scheduler, never run inside the script (MacSurf
+#   navigated synchronously, under the running document); relative URLs
+#   are joined to the document's (MacSurf passed them to nsurl_create,
+#   which fails); a stale realm's request is dropped. history.go(n) walks
+#   the top-level window's history, out of range does nothing.
+#   alert/confirm: the system message dialog (sceMsgDialog); answered OK
+#   at once during the autotest and in the simulator. localStorage lives
+#   in ux0:data/VitaBrowser/LocalStorage/.
+# - vita/window.c: scroll_to / scroll_pos. vita/main.c: page 18 JS-window
+#   (testpages/pages/JS-window.html); a queued script navigation keeps a
+#   page from counting as settled; dialogs auto-answer in the autotest.
+# See docs/phase-0/10-hardware-test-plan.md §Run 12.
+
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+index 31816da..b096901 100644
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -77,4 +77,51 @@ extern struct gui_layout_table *macos9_layout_table;
+ /** Add us to the time spent in JavaScript. */
+ void macsurf_profile_accum_js(long us);
+ 
++/*
++ * Window services. MacSurf's bridge implements location, history,
++ * scrolling, the viewport, document.title, alert/confirm and localStorage
++ * persistence only under __MACOS9__, against its Carbon window list and
++ * FSSpec files; elsewhere they are inert. A frontend that provides the
++ * services below defines MACSURF_WINDOW_SERVICES, and the bridge's
++ * MACSURF_WINDOW_SERVICES branches call them instead.
++ *
++ * c is the content of the script's realm (the document whose script is
++ * running), or NULL where the bridge has no realm to hand (then the front
++ * window is meant). Navigation and history requests are queued, never run
++ * inside the script: the running document may be the one they replace.
++ */
++#define MACSURF_WINDOW_SERVICES 1
++
++/** c's URL as location.href shows it: with the fragment, which NetSurf
++ * keeps on the window, not the document. malloc()ed; NULL: none. */
++char *macsurf_window_location(struct content *c);
++
++/** Load url (absolute, or relative to c's URL) in c's window; replace:
++ * without a new session-history entry (location.replace). */
++void macsurf_window_navigate(struct content *c, const char *url, int replace);
++
++/** Session history: delta < 0 back, > 0 forward, 0 reload. */
++void macsurf_window_history(struct content *c, int delta);
++
++/** document.title was set. */
++void macsurf_window_set_title(struct content *c, const char *title);
++
++/** The window's scroll offset, in CSS pixels. */
++void macsurf_window_get_scroll(struct content *c, int *x, int *y);
++
++/** Scroll the window (clamped to the page's extent). */
++void macsurf_window_scroll_to(struct content *c, int x, int y);
++
++/** The viewport's size, in CSS pixels. */
++void macsurf_window_get_viewport(struct content *c, int *w, int *h);
++
++/** A modal message (alert, confirm when ask). Returns 1 for OK / yes.
++ * *blocked_ms is set to how long the script waited on the user. */
++int macsurf_window_dialog(struct content *c, const char *msg, int ask,
++		double *blocked_ms);
++
++/** The directory localStorage files live in, ending in '/', or NULL when
++ * there is none. */
++const char *macsurf_storage_dir(void);
++
+ #endif
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 009e24b..99d54c8 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -860,6 +860,22 @@ static JSValue qjs_alert(JSContext *ctx, JSValueConst this_val,
+ 			JS_FreeCString(ctx, msg);
+ 		}
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	/* VitaBrowser: the frontend's modal dialog (macos9.h). The script is
++	 * stopped while the user reads it, as on the Mac; that wait must not
++	 * count against the runaway-script deadline. */
++	if (argc > 0) {
++		const char *msg = JS_ToCString(ctx, argv[0]);
++		if (msg) {
++			double blocked = 0.0;
++			MS_LOG(msg);
++			(void)macsurf_window_dialog(qjs_get_content_for_ctx(ctx),
++					msg, 0, &blocked);
++			if (g_qjs_script_deadline != 0.0)
++				g_qjs_script_deadline += blocked;
++			JS_FreeCString(ctx, msg);
++		}
++	}
+ #else
+ 	if (argc > 0) {
+ 		const char *msg = JS_ToCString(ctx, argv[0]);
+@@ -910,6 +926,22 @@ static JSValue qjs_confirm(JSContext *ctx, JSValueConst this_val,
+ 		}
+ 	}
+ 	return JS_FALSE;
++#elif defined(MACSURF_WINDOW_SERVICES)
++	if (argc > 0) {
++		const char *msg = JS_ToCString(ctx, argv[0]);
++		if (msg) {
++			double blocked = 0.0;
++			int ok;
++			MS_LOG(msg);
++			ok = macsurf_window_dialog(qjs_get_content_for_ctx(ctx),
++					msg, 1, &blocked);
++			if (g_qjs_script_deadline != 0.0)
++				g_qjs_script_deadline += blocked;
++			JS_FreeCString(ctx, msg);
++			return JS_NewBool(ctx, ok ? 1 : 0);
++		}
++	}
++	return JS_FALSE;
+ #else
+ 	(void)argc; (void)argv;
+ 	return JS_FALSE;
+@@ -1120,6 +1152,8 @@ static JSValue qjs_js_scroll_to(JSContext *ctx, JSValueConst this_val,
+ 		struct gui_window *gw = macos9_window_list_head();
+ 		if (gw != NULL) macos9_window_scroll_to(gw, (int)x, (int)y);
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	macsurf_window_scroll_to(qjs_get_content_for_ctx(ctx), (int)x, (int)y);
+ #endif
+ 	return JS_UNDEFINED;
+ }
+@@ -1145,6 +1179,17 @@ static JSValue qjs_location_get(JSContext *ctx, JSValueConst this_val,
+ 		}
+ 		return JS_NewString(ctx, href);
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	{
++		/* VitaBrowser: the URL of THIS realm's document, as
++		 * document.cookie reads it (fixes879), not the front window's.
++		 * While a page loads, the window still shows the previous page,
++		 * so a script in <head> would read the page it replaces. */
++		char *href = macsurf_window_location(qjs_get_content_for_ctx(ctx));
++		JSValue v = JS_NewString(ctx, href != NULL ? href : "about:blank");
++		free(href);
++		return v;
++	}
+ #else
+ 	return JS_NewString(ctx, "about:blank");
+ #endif
+@@ -1163,12 +1208,41 @@ static JSValue qjs_location_set(JSContext *ctx, JSValueConst this_val,
+ 			JS_FreeCString(ctx, url);
+ 		}
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	if (argc > 0) {
++		const char *url = JS_ToCString(ctx, argv[0]);
++		if (url) {
++			macsurf_window_navigate(qjs_get_content_for_ctx(ctx),
++					url, 0);
++			JS_FreeCString(ctx, url);
++		}
++	}
+ #else
+ 	(void)argc; (void)argv;
+ #endif
+ 	return JS_UNDEFINED;
+ }
+ 
++#ifdef MACSURF_WINDOW_SERVICES
++/* VitaBrowser: location.replace() loads without a session-history entry.
++ * The JS fallback (location.href = u) only installs itself when this is
++ * missing. */
++static JSValue qjs_location_replace(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)this_val;
++	if (argc > 0) {
++		const char *url = JS_ToCString(ctx, argv[0]);
++		if (url) {
++			macsurf_window_navigate(qjs_get_content_for_ctx(ctx),
++					url, 1);
++			JS_FreeCString(ctx, url);
++		}
++	}
++	return JS_UNDEFINED;
++}
++#endif
++
+ static JSValue qjs_location_reload(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+@@ -1178,6 +1252,8 @@ static JSValue qjs_location_reload(JSContext *ctx, JSValueConst this_val,
+ 		struct gui_window *win = macos9_window_list_head();
+ 		if (win != NULL) macos9_window_reload(win);
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	macsurf_window_history(qjs_get_content_for_ctx(ctx), 0);
+ #endif
+ 	return JS_UNDEFINED;
+ }
+@@ -1191,6 +1267,8 @@ static JSValue qjs_history_back(JSContext *ctx, JSValueConst this_val,
+ 		struct gui_window *win = macos9_window_list_head();
+ 		if (win != NULL) macos9_window_back(win);
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	macsurf_window_history(qjs_get_content_for_ctx(ctx), -1);
+ #endif
+ 	return JS_UNDEFINED;
+ }
+@@ -1204,6 +1282,8 @@ static JSValue qjs_history_forward(JSContext *ctx, JSValueConst this_val,
+ 		struct gui_window *win = macos9_window_list_head();
+ 		if (win != NULL) macos9_window_forward(win);
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	macsurf_window_history(qjs_get_content_for_ctx(ctx), 1);
+ #endif
+ 	return JS_UNDEFINED;
+ }
+@@ -1227,6 +1307,13 @@ static JSValue qjs_history_go(JSContext *ctx, JSValueConst this_val,
+ 			while (delta > 0) { macos9_window_forward(win); delta--; }
+ 		}
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	{
++		/* go(), go(0): reload, per the HTML standard. */
++		double d = 0.0;
++		if (argc > 0) JS_ToFloat64(ctx, &d, argv[0]);
++		macsurf_window_history(qjs_get_content_for_ctx(ctx), (int)d);
++	}
+ #else
+ 	(void)argc; (void)argv;
+ #endif
+@@ -1941,6 +2028,19 @@ static JSValue qjs_document_title_set(JSContext *ctx, JSValueConst this_val,
+ 			JS_FreeCString(ctx, title);
+ 		}
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	if (argc > 0) {
++		const char *title = JS_ToCString(ctx, argv[0]);
++		if (title != NULL) {
++			size_t n = strlen(title);
++			if (n >= sizeof(g_last_title)) n = sizeof(g_last_title) - 1;
++			memcpy(g_last_title, title, n);
++			g_last_title[n] = '\0';
++			macsurf_window_set_title(qjs_get_content_for_ctx(ctx),
++					g_last_title);
++			JS_FreeCString(ctx, title);
++		}
++	}
+ #else
+ 	(void)argc; (void)argv;
+ #endif
+@@ -6141,6 +6241,10 @@ static int macsurf_qjs_scroll_x(void)
+ #ifdef __MACOS9__
+ 	struct gui_window *gw = macos9_window_list_head();
+ 	if (gw != NULL) return gw->scroll_x;
++#elif defined(MACSURF_WINDOW_SERVICES)
++	int x, y;
++	macsurf_window_get_scroll(NULL, &x, &y);
++	return x;
+ #endif
+ 	return 0;
+ }
+@@ -6150,6 +6254,10 @@ static int macsurf_qjs_scroll_y(void)
+ #ifdef __MACOS9__
+ 	struct gui_window *gw = macos9_window_list_head();
+ 	if (gw != NULL) return gw->scroll_y;
++#elif defined(MACSURF_WINDOW_SERVICES)
++	int x, y;
++	macsurf_window_get_scroll(NULL, &x, &y);
++	return y;
+ #endif
+ 	return 0;
+ }
+@@ -6162,6 +6270,12 @@ static int macsurf_qjs_viewport_w(void)
+ 		int w = gw->content_rect.right - gw->content_rect.left;
+ 		if (w > 0) return w;
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	{
++		int w = 0, h = 0;
++		macsurf_window_get_viewport(NULL, &w, &h);
++		if (w > 0) return w;
++	}
+ #endif
+ 	return 949;   /* matches the innerWidth the shim has always reported */
+ }
+@@ -6174,6 +6288,12 @@ static int macsurf_qjs_viewport_h(void)
+ 		int h = gw->content_rect.bottom - gw->content_rect.top;
+ 		if (h > 0) return h;
+ 	}
++#elif defined(MACSURF_WINDOW_SERVICES)
++	{
++		int w = 0, h = 0;
++		macsurf_window_get_viewport(NULL, &w, &h);
++		if (h > 0) return h;
++	}
+ #endif
+ 	return 613;
+ }
+@@ -10654,6 +10774,45 @@ macsurf_storage_spec(const char *url, FSSpec *out)
+ 
+ #endif /* __MACOS9__ */
+ 
++#if defined(MACSURF_WINDOW_SERVICES) && !defined(__MACOS9__)
++/* VitaBrowser: localStorage as plain files in macsurf_storage_dir(), one
++ * per ORIGIN (scheme://host[:port]). The Mac path above hashes the whole
++ * page URL into the filename, so page.html?a and page.html?b -- or any two
++ * pages of one site -- got separate stores; the name part and the hash here
++ * are both of the origin, so a site's pages share one map, as the spec
++ * says. Only http, https and file documents persist (about:, data: and
++ * the like have no origin worth a file). Writes go to a temporary file
++ * that then replaces the old one, so a crash mid-write cannot leave a
++ * truncated map that JSON.parse would reject. */
++static int
++macsurf_storage_path(JSContext *ctx, char *path, size_t size)
++{
++	struct content *c = qjs_get_content_for_ctx(ctx);
++	const char *dir = macsurf_storage_dir();
++	unsigned char fname[32];
++	char *origin = NULL;
++	size_t olen = 0;
++	int ok;
++
++	if (dir == NULL || c == NULL || !macos9_content_is_live(c) ||
++	    c->llcache == NULL)
++		return 0;
++	if (nsurl_get(content_get_url(c), NSURL_SCHEME | NSURL_HOST |
++			NSURL_PORT, &origin, &olen) != NSERROR_OK)
++		return 0;
++	ok = strncmp(origin, "http://", 7) == 0 ||
++	     strncmp(origin, "https://", 8) == 0 ||
++	     strncmp(origin, "file://", 7) == 0;
++	if (ok) {
++		macsurf_storage_fname(origin, fname);
++		snprintf(path, size, "%s%.*s", dir, (int)fname[0],
++				(const char *)fname + 1);
++	}
++	free(origin);
++	return ok;
++}
++#endif
++
+ /* __storageLoad() -> JSON string of the current origin's saved map, or
+  * null when there is nothing persisted (or anything failed). Called by
+  * the _Storage shim at realm build; returning null is the no-data case,
+@@ -10712,6 +10871,33 @@ qjs_storage_load(JSContext *ctx, JSValueConst this_val,
+ 	out = JS_NewStringLen(ctx, buf, (size_t) count);
+ 	free(buf);
+ 	return out;
++#elif defined(MACSURF_WINDOW_SERVICES)
++	char path[512];
++	FILE *fp;
++	long len;
++	char *buf;
++	JSValue out;
++
++	(void) this_val; (void) argc; (void) argv;
++	if (!macsurf_storage_path(ctx, path, sizeof path)) return JS_NULL;
++	fp = fopen(path, "rb");
++	if (fp == NULL) return JS_NULL;
++	if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) <= 0 ||
++	    len > MACSURF_STORAGE_MAX_BYTES || fseek(fp, 0, SEEK_SET) != 0) {
++		fclose(fp);
++		return JS_NULL;
++	}
++	buf = (char *) malloc((size_t) len + 1);
++	if (buf == NULL || fread(buf, 1, (size_t) len, fp) != (size_t) len) {
++		free(buf);
++		fclose(fp);
++		return JS_NULL;
++	}
++	fclose(fp);
++	buf[len] = '\0';
++	out = JS_NewStringLen(ctx, buf, (size_t) len);
++	free(buf);
++	return out;
+ #else
+ 	(void) ctx; (void) this_val; (void) argc; (void) argv;
+ 	return JS_NULL;
+@@ -10780,6 +10966,39 @@ qjs_storage_save(JSContext *ctx, JSValueConst this_val,
+ 	FSClose(ref);
+ 	JS_FreeCString(ctx, s);
+ 	return JS_UNDEFINED;
++#elif defined(MACSURF_WINDOW_SERVICES)
++	char path[512], tmp[520];
++	const char *s;
++	size_t count;
++	FILE *fp;
++	int ok;
++
++	(void) this_val;
++	if (argc < 1 || !JS_IsString(argv[0])) return JS_UNDEFINED;
++	if (!macsurf_storage_path(ctx, path, sizeof path)) return JS_UNDEFINED;
++	s = JS_ToCString(ctx, argv[0]);
++	if (s == NULL) return JS_UNDEFINED;
++	count = strlen(s);
++	if (count > (size_t) MACSURF_STORAGE_MAX_BYTES) {
++		/* over the per-file cap: drop the write, like the Mac path. */
++		JS_FreeCString(ctx, s);
++		return JS_UNDEFINED;
++	}
++	snprintf(tmp, sizeof tmp, "%s.tmp", path);
++	fp = fopen(tmp, "wb");
++	ok = fp != NULL && fwrite(s, 1, count, fp) == count;
++	if (fp != NULL && fclose(fp) != 0) ok = 0;
++	JS_FreeCString(ctx, s);
++	/* The Vita's rename() will not replace an existing file. */
++	if (ok) {
++		(void) remove(path);
++		ok = rename(tmp, path) == 0;
++	}
++	if (!ok) {
++		MS_LOG("storage save failed");
++		(void) remove(tmp);
++	}
++	return JS_UNDEFINED;
+ #else
+ 	(void) ctx; (void) this_val; (void) argc; (void) argv;
+ 	return JS_UNDEFINED;
+@@ -10913,7 +11132,21 @@ static void register_browser_globals(JSContext *ctx)
+ 		JS_FreeAtom(ctx, href_atom);
+ 	}
+ 	qjs_set_func(ctx, location_obj, "reload", qjs_location_reload, 0);
++#ifdef MACSURF_WINDOW_SERVICES
++	qjs_set_func(ctx, location_obj, "replace", qjs_location_replace, 1);
++#endif
+ 	JS_SetPropertyStr(ctx, global, "location", location_obj);
++#ifdef MACSURF_WINDOW_SERVICES
++	/* VitaBrowser: `window.location = url` navigates (the Location
++	 * interface's PutForwards=href, as document.location already has, see
++	 * fixes1279). As a data property the assignment replaced the Location
++	 * object with a string and loaded nothing. */
++	macsurf_qjs__safe_eval(ctx,
++		"(function(){var L=globalThis.location;"
++		"Object.defineProperty(globalThis,'location',{configurable:true,"
++		"get:function(){return L;},"
++		"set:function(v){L.href=String(v);}});})();");
++#endif
+ 
+ 	/* Extended location properties in JS */
+ 	macsurf_qjs__safe_eval(ctx,
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+index b738ad7..9bcddb5 100644
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -27,15 +27,35 @@
+  * shared with the engine's own instrumentation.
+  */
+ 
++#include <stdbool.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
++#include <sys/stat.h>
+ #include <sys/time.h>
+ 
++#ifdef __vita__
++#include <psp2/common_dialog.h>
++#include <psp2/message_dialog.h>
++#include <psp2/kernel/threadmgr.h>
++#include <vita2d.h>
++#endif
++
+ #include "utils/errors.h"
++#include "utils/nsurl.h"
++#include "content/content_protected.h"
++#include "content/hlcache.h"
++#include "content/handlers/html/private.h"
++#include "netsurf/browser_window.h"
++#include "desktop/browser_private.h"
++#include "desktop/browser_history.h"
+ #include "content/handlers/javascript/quickjs/macos9.h"
+ 
++#include "vita/diag.h"
++#include "vita/plot.h"
+ #include "vita/schedule.h"
+ #include "vita/layout.h"
++#include "vita/window.h"
+ #include "vita/js_platform.h"
+ 
+ /* Time spent in JavaScript, us, as the bridge reports it. */
+@@ -126,6 +146,318 @@ void macsurf_profile_accum_js(long us)
+ 		vita_js_time_us += us;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Window services (quickjs/macos9.h, MACSURF_WINDOW_SERVICES)          */
++/* ------------------------------------------------------------------ */
++
++bool vita_js_dialog_auto;
++
++/**
++ * The browser window a script's document is shown in, or NULL.
++ *
++ * An HTML content knows its window once it is opened (html->bw, which is
++ * also how an iframe's document finds its own child window). A document
++ * still being parsed -- where a script in <head> runs -- has no window
++ * yet; it can only be the front window's loading page. Anything else (a
++ * document already replaced, an iframe still loading) gets no window, so a
++ * stale realm can never steer the page that replaced it.
++ */
++static struct browser_window *window_for(struct content *c)
++{
++	struct browser_window *bw =
++		vita_window_browser(vita_window_current());
++	html_content *htmlc = (html_content *)c;
++
++	if (c == NULL)
++		return bw;
++	if (!macos9_content_is_live(c))
++		return NULL;
++	if (htmlc->bw != NULL)
++		return htmlc->bw;
++	if (bw != NULL && bw->loading_content != NULL &&
++	    hlcache_handle_get_content(bw->loading_content) == c)
++		return bw;
++	if (bw != NULL && bw->current_content != NULL &&
++	    hlcache_handle_get_content(bw->current_content) == c)
++		return bw;
++	return NULL;
++}
++
++/*
++ * One queued navigation or history step. Never run inside the script that
++ * asked for it: that script's document may be the one being replaced, and
++ * MacSurf navigated synchronously from inside JS. The last request of a
++ * script wins, as in browsers (location.href = a; location.href = b loads
++ * b).
++ */
++static struct {
++	bool queued;
++	struct content *c;	/**< the requesting document */
++	nsurl *url;		/**< navigate here; NULL: history step */
++	nsurl *referer;
++	bool replace;		/**< no new session-history entry */
++	int delta;		/**< history: <0 back, >0 forward, 0 reload */
++} vita_js_nav;
++
++static void js_nav_clear(void)
++{
++	if (vita_js_nav.url != NULL)
++		nsurl_unref(vita_js_nav.url);
++	if (vita_js_nav.referer != NULL)
++		nsurl_unref(vita_js_nav.referer);
++	memset(&vita_js_nav, 0, sizeof(vita_js_nav));
++}
++
++static void js_nav_run(void *p)
++{
++	struct browser_window *bw;
++	nserror err = NSERROR_OK;
++
++	(void)p;
++	if (!vita_js_nav.queued)
++		return;
++	bw = window_for(vita_js_nav.c);
++	if (bw == NULL) {
++		vita_diag_log("js nav: dropped, its document is gone");
++	} else if (vita_js_nav.url != NULL) {
++		vita_diag_log("js nav: %s%s", nsurl_access(vita_js_nav.url),
++			      vita_js_nav.replace ? " (replace)" : "");
++		err = browser_window_navigate(bw, vita_js_nav.url,
++				vita_js_nav.referer,
++				vita_js_nav.replace ? 0 : BW_NAVIGATE_HISTORY,
++				NULL, NULL, NULL);
++	} else if (vita_js_nav.delta == 0) {
++		vita_diag_log("js nav: reload");
++		err = browser_window_reload(bw, false);
++	} else {
++		/* Session history is the top-level window's. Walk to the
++		 * entry; out of range does nothing (the HTML standard). */
++		struct browser_window *root = browser_window_get_root(bw);
++		struct history_entry *e = (root->history != NULL) ?
++			root->history->current : NULL;
++		int d = vita_js_nav.delta;
++
++		while (e != NULL && d < 0) {
++			e = e->back;
++			d++;
++		}
++		while (e != NULL && d > 0) {
++			e = e->forward_pref;
++			d--;
++		}
++		vita_diag_log("js nav: history %+d%s", vita_js_nav.delta,
++			      e != NULL ? "" : " (out of range)");
++		if (e != NULL)
++			err = browser_window_history_go(root, e, false);
++	}
++	if (err != NSERROR_OK)
++		vita_diag_log("js nav: failed: %d", err);
++	js_nav_clear();
++}
++
++static void js_nav_queue(struct content *c)
++{
++	vita_js_nav.queued = true;
++	vita_js_nav.c = c;
++	vita_schedule(0, js_nav_run, NULL);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++char *macsurf_window_location(struct content *c)
++{
++	struct browser_window *bw;
++	lwc_string *frag = NULL;
++	nsurl *url, *full;
++	char *s;
++
++	if (c == NULL || c->llcache == NULL)
++		return NULL;
++	url = content_get_url(c);
++	/* The window's fragment is the one of the page it is loading, or
++	 * of the page it shows when it is loading nothing. */
++	bw = window_for(c);
++	if (bw != NULL && bw->frag_id != NULL) {
++		if (bw->loading_content != NULL ?
++		    hlcache_handle_get_content(bw->loading_content) == c :
++		    (bw->current_content != NULL &&
++		     hlcache_handle_get_content(bw->current_content) == c))
++			frag = bw->frag_id;
++	}
++	if (frag != NULL && nsurl_refragment(url, frag, &full) == NSERROR_OK) {
++		s = strdup(nsurl_access(full));
++		nsurl_unref(full);
++		return s;
++	}
++	return strdup(nsurl_access(url));
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_window_navigate(struct content *c, const char *url, int replace)
++{
++	nsurl *base = (c != NULL && c->llcache != NULL) ?
++		content_get_url(c) : NULL;
++	nsurl *joined = NULL;
++	nserror err;
++
++	/* location.href = "page2.html" is relative to the document. */
++	if (base != NULL)
++		err = nsurl_join(base, url, &joined);
++	else
++		err = nsurl_create(url, &joined);
++	if (err != NSERROR_OK) {
++		vita_diag_log("js nav: bad URL '%s' (%d)", url, err);
++		return;
++	}
++	js_nav_clear();
++	vita_js_nav.url = joined;
++	vita_js_nav.referer = (base != NULL) ? nsurl_ref(base) : NULL;
++	vita_js_nav.replace = replace != 0;
++	js_nav_queue(c);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_window_history(struct content *c, int delta)
++{
++	js_nav_clear();
++	vita_js_nav.delta = delta;
++	js_nav_queue(c);
++}
++
++/* exported interface documented in vita/js_platform.h */
++bool vita_js_nav_pending(void)
++{
++	return vita_js_nav.queued;
++}
++
++/* exported interface documented in quickjs/macos9.h: the Vita has no
++ * title bar yet; the log keeps it. */
++void macsurf_window_set_title(struct content *c, const char *title)
++{
++	(void)c;
++	vita_diag_log("js title: %s", title);
++}
++
++/* exported interface documented in quickjs/macos9.h: one full-screen
++ * window, so c always means the front window. */
++void macsurf_window_get_scroll(struct content *c, int *x, int *y)
++{
++	(void)c;
++	vita_window_scroll_pos(vita_window_current(), x, y);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_window_scroll_to(struct content *c, int x, int y)
++{
++	(void)c;
++	vita_window_scroll_to(vita_window_current(), x, y);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_window_get_viewport(struct content *c, int *w, int *h)
++{
++	(void)c;
++	*w = VITA_SCREEN_WIDTH;
++	*h = VITA_SCREEN_HEIGHT;
++}
++
++#ifdef __vita__
++/**
++ * The system message dialog, run to completion. The page is not repainted
++ * underneath: this runs inside a script, possibly in the middle of
++ * building the page's boxes, where drawing it is not safe.
++ *
++ * 
++eturn 1 for OK / Yes, 0 for No / cancel, -1 if it could not be shown
++ */
++static int msg_dialog(const char *msg, int ask)
++{
++	SceMsgDialogUserMessageParam user;
++	SceMsgDialogParam param;
++	SceMsgDialogResult result;
++	char text[500];
++	size_t n = strlen(msg);
++	int r;
++
++	/* The dialog takes at most 512 bytes; cut on a UTF-8 boundary. */
++	if (n >= sizeof(text)) {
++		n = sizeof(text) - 1;
++		while (n > 0 && ((unsigned char)msg[n] & 0xc0) == 0x80)
++			n--;
++	}
++	memcpy(text, msg, n);
++	text[n] = '\0';
++
++	memset(&user, 0, sizeof(user));
++	user.buttonType = ask ? SCE_MSG_DIALOG_BUTTON_TYPE_YESNO :
++		SCE_MSG_DIALOG_BUTTON_TYPE_OK;
++	user.msg = (const SceChar8 *)text;
++	sceMsgDialogParamInit(&param);
++	param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
++	param.userMsgParam = &user;
++	r = sceMsgDialogInit(&param);
++	if (r < 0) {
++		vita_diag_log("js dialog: sceMsgDialogInit -> 0x%08x", r);
++		return -1;
++	}
++	while (sceMsgDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING) {
++		vita2d_start_drawing();
++		vita2d_clear_screen();
++		vita2d_end_drawing();
++		vita2d_common_dialog_update();
++		vita2d_swap_buffers();
++		sceKernelDelayThread(16 * 1000);
++	}
++	memset(&result, 0, sizeof(result));
++	r = sceMsgDialogGetResult(&result);
++	sceMsgDialogTerm();
++	if (r < 0)
++		return -1;
++	return (result.buttonId == SCE_MSG_DIALOG_BUTTON_ID_YES) ? 1 : 0;
++}
++#endif
++
++/* exported interface documented in quickjs/macos9.h */
++int macsurf_window_dialog(struct content *c, const char *msg, int ask,
++		double *blocked_ms)
++{
++	unsigned int t0 = vita_diag_ms();
++	int r = 1;
++
++	(void)c;
++	*blocked_ms = 0.0;
++#ifdef __vita__
++	if (!vita_js_dialog_auto) {
++		r = msg_dialog(msg, ask);
++		*blocked_ms = (double)(vita_diag_ms() - t0);
++		vita_diag_log("js %s: \"%.200s\" -> %s after %u ms",
++			      ask ? "confirm" : "alert", msg,
++			      r < 0 ? "not shown" : r ? "OK" : "cancel",
++			      vita_diag_ms() - t0);
++		/* Could not ask: an alert is as good as read, a confirm is
++		 * a no. */
++		return r < 0 ? !ask : r;
++	}
++#endif
++	/* The autotest (and the simulator) cannot press buttons: answer
++	 * OK at once, and say so. */
++	vita_diag_log("js %s (auto OK): \"%.200s\"", ask ? "confirm" : "alert",
++		      msg);
++	(void)t0;
++	return r;
++}
++
++/* exported interface documented in quickjs/macos9.h */
++const char *macsurf_storage_dir(void)
++{
++	static bool made;
++
++	if (!made) {
++		mkdir(VITA_DIAG_DIR "LocalStorage", 0777);
++		made = true;
++	}
++	return VITA_DIAG_DIR "LocalStorage/";
++}
++
+ /* exported interface documented in vita/js_platform.h */
+ void vita_js_platform_init(void)
+ {
+diff --git a/frontends/vita/js_platform.h b/frontends/vita/js_platform.h
+index 8bcd91f..29c8f4e 100644
+--- a/frontends/vita/js_platform.h
++++ b/frontends/vita/js_platform.h
+@@ -25,6 +25,8 @@
+ #ifndef NETSURF_VITA_JS_PLATFORM_H
+ #define NETSURF_VITA_JS_PLATFORM_H
+ 
++#include <stdbool.h>
++
+ /** Set the bridge's services up; call before netsurf_init(). */
+ void vita_js_platform_init(void);
+ 
+@@ -34,4 +36,11 @@ extern long vita_js_time_us;
+ /** crypto.getRandomValues() requests the kernel could not fill. */
+ extern unsigned long vita_js_random_failures;
+ 
++/** Is a script's navigation or history step queued and not yet run? */
++bool vita_js_nav_pending(void);
++
++/** Answer alert() / confirm() at once with OK instead of asking (the
++ * autotest, which cannot press buttons). */
++extern bool vita_js_dialog_auto;
++
+ #endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 26dc204..c897965 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -112,7 +112,7 @@ static const char *const vita_local_pages[] = {
+ 	"PM-gradient", "PM-shadow", "PM-animation", "PM-macsurf-grid",
+ 	"PM-tagtype", "PM-link", "PM-shadow-clip",
+ 	"VT-calibration", "VT-text", "VT-images", "VT-scroll",
+-	"JS-dom", "JS-fetch",
++	"JS-dom", "JS-fetch", "JS-window",
+ };
+ #define VITA_LOCAL_PAGES \
+ 	((unsigned int)(sizeof(vita_local_pages) / sizeof(vita_local_pages[0])))
+@@ -391,6 +391,12 @@ static bool page_settled(struct gui_window *gw)
+ 		vita_stats.last_frame_ms = now;
+ 		return false;
+ 	}
++	/* Nor while a script's navigation is queued (location.href = ...,
++	 * history.back()): the page is about to be replaced. */
++	if (vita_js_nav_pending()) {
++		vita_stats.last_frame_ms = now;
++		return false;
++	}
+ 	return now - vita_stats.last_frame_ms >= VITA_SETTLE_MS;
+ }
+ 
+@@ -567,6 +573,8 @@ static void autotest_start(struct browser_window *bw)
+ 	vita_diag_log("autotest: start, %u passes x %u pages, then %u network "
+ 		      "pages", (unsigned int)VITA_PASS_COUNT - 1,
+ 		      VITA_LOCAL_PAGES, vita_net_count);
++	/* Nobody is there to press OK on a page's alert(). */
++	vita_js_dialog_auto = true;
+ 	autotest_begin_pass(bw, 0);
+ }
+ 
+@@ -586,6 +594,7 @@ static void autotest_next(struct browser_window *bw)
+ 	if (autotest_begin_pass(bw, vita_pass + 1))
+ 		return;
+ 	vita_autotest = AT_OFF;
++	vita_js_dialog_auto = false;
+ 	apply_run_profile();
+ 	vita_diag_font_metrics();
+ 	vita_diag_js_probe();
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index f386dd2..5a345aa 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -212,6 +212,20 @@ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy)
+ 	}
+ }
+ 
++/* exported interface documented in vita/window.h */
++void vita_window_scroll_to(struct gui_window *gw, int x, int y)
++{
++	if (gw != NULL)
++		vita_window_scroll_by(gw, x - gw->scrollx, y - gw->scrolly);
++}
++
++/* exported interface documented in vita/window.h */
++void vita_window_scroll_pos(struct gui_window *gw, int *x, int *y)
++{
++	*x = (gw != NULL) ? gw->scrollx : 0;
++	*y = (gw != NULL) ? gw->scrolly : 0;
++}
++
+ /* exported interface documented in vita/window.h */
+ bool vita_window_loading(struct gui_window *gw)
+ {
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index 640ccea..ea7dfff 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -41,6 +41,12 @@ void vita_window_redraw(struct gui_window *gw);
+ /** Scroll by a delta in pixels, clamped to the content extent. */
+ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy);
+ 
++/** Scroll to an offset in pixels, clamped to the content extent. */
++void vita_window_scroll_to(struct gui_window *gw, int x, int y);
++
++/** The scroll offset in pixels (0, 0 without a window). */
++void vita_window_scroll_pos(struct gui_window *gw, int *x, int *y);
++
+ /** Is a fetch in progress (between the throbber events)? */
+ bool vita_window_loading(struct gui_window *gw);
+ 

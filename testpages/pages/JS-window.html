@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS window</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+#tall { height: 1200px; }
+</style>
+</head>
+<body>
+<p id="sum" class="wait">JS window: script did not run</p>
+<p id="r1" class="wait">1 location.href is this document: waiting</p>
+<p id="r2" class="wait">2 location parts (protocol, pathname): waiting</p>
+<p id="r3" class="wait">3 relative location.href navigates: waiting</p>
+<p id="r4" class="wait">4 localStorage survives navigation: waiting</p>
+<p id="r5" class="wait">5 location.replace navigates: waiting</p>
+<p id="r6" class="wait">6 history.back, replace left no entry: waiting</p>
+<p id="r7" class="wait">7 scrollTo / scrollY: waiting</p>
+<p id="r8" class="wait">8 viewport 960x544: waiting</p>
+<p id="r9" class="wait">9 document.title: waiting</p>
+<p id="r10" class="wait">10 alert / confirm return: waiting</p>
+<p id="r11" class="wait">11 window.location = url is an accessor: waiting</p>
+<div id="tall"></div>
+<script>
+/* The bridge's window services (MACSURF_WINDOW_SERVICES, frontends/vita/
+ * js_platform.c). The page navigates itself and keeps its progress in
+ * localStorage, so it only finishes if navigation, persistence and history
+ * all work. Each step navigates 300 ms after its page was parsed: a page
+ * that navigates while still loading never gets a history entry of its own
+ * (NetSurf adds it when the page is ready; the HTML standard likewise
+ * replaces it), and back() would then skip past it.
+ *   JS-window.html          step 1: checks location, then
+ *                           location.href = 'JS-window.html?step=2#frag'
+ *   ?step=2#frag            step 2: location.replace('JS-window.html?step=3')
+ *   ?step=3                 step 3: history.back()
+ *   JS-window.html (again)  replace() left no entry for ?step=2, so back
+ *                           lands here: the results, then the rest.
+ * Every row starts as "waiting"; only a working service turns it PASS. */
+var KEY = 'jsw';
+var passed = 0, total = 11;
+var st = null;
+try { st = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) {}
+var search = location.search, hash = location.hash;
+
+function save() { localStorage.setItem(KEY, JSON.stringify(st)); }
+
+if (search === '?step=2') {
+  if (st && st.step === 1) {
+    st.step = 2;
+    st.r3 = (hash === '#frag') ? 'search ' + search + ', hash ' + hash : 'FAIL hash ' + hash;
+    st.r4 = 'step 1 state read back';
+    save();
+    later(function () { location.replace('JS-window.html?step=3'); });
+  } else if (st && st.step === 3) {
+    /* back() came here: replace() kept this entry instead of its own. */
+    st.r6 = 'FAIL back went to ?step=2: replace() left it in history';
+    st.step = 4;
+    save();
+    report();
+  }
+} else if (search === '?step=3') {
+  if (st && st.step === 2) {
+    st.step = 3;
+    st.t = Date.now();
+    st.r5 = 'reached ' + search;
+    save();
+    later(function () { history.back(); });
+  }
+} else if (search === '' && st && st.step === 3 && Date.now() - st.t < 20000) {
+  st.r6 = 'back to the first page';
+  report();
+} else if (search === '') {
+  /* Step 1 (or a sequence left unfinished: start again). */
+  var href = location.href;
+  st = { step: 1 };
+  st.r1 = /^[a-z]+:.*\/JS-window\.html$/.test(href) ? href.replace(/^.*\//, '.../') : 'FAIL ' + href;
+  st.r2 = (location.protocol === 'file:' || location.protocol === 'http:' || location.protocol === 'https:') &&
+          /\/JS-window\.html$/.test(location.pathname) ?
+          location.protocol + ' ' + location.pathname.replace(/^.*\//, '.../') : 'FAIL ' + location.protocol + ' ' + location.pathname;
+  save();
+  later(function () { location.href = 'JS-window.html?step=2#frag'; });
+}
+
+function later(fn) { setTimeout(fn, 300); }
+
+function row(n, what, detail) {
+  var p = document.getElementById('r' + n);
+  var ok = detail !== undefined && String(detail).indexOf('FAIL') !== 0;
+  if (!p) return;
+  p.textContent = n + ' ' + what + ': ' + (ok ? 'PASS' : 'FAIL') + (detail ? ' (' + detail + ')' : '');
+  p.className = ok ? 'pass' : 'wait';
+  if (ok) passed++;
+  var s = document.getElementById('sum');
+  s.textContent = 'JS window: ' + passed + '/' + total + ' passed';
+  s.className = passed === total ? 'pass' : 'wait';
+  console.log('JS-window row ' + n + (ok ? ' passed ' : ' failed ') + (detail || ''));
+}
+
+function report() {
+  row(1, 'location.href is this document', st.r1);
+  row(2, 'location parts (protocol, pathname)', st.r2);
+  row(3, 'relative location.href navigates', st.r3);
+  row(4, 'localStorage survives navigation', st.r4);
+  row(5, 'location.replace navigates', st.r5);
+  row(6, 'history.back, replace left no entry', st.r6);
+  localStorage.removeItem(KEY);
+
+  document.title = 'JS window done';
+  row(9, 'document.title', document.title === 'JS window done' ? 'reads back' : 'FAIL ' + document.title);
+  var a = alert('JS-window alert'), c = confirm('JS-window confirm');
+  row(10, 'alert / confirm return', a === undefined && typeof c === 'boolean' ? 'confirm ' + c : 'FAIL ' + a + ' ' + c);
+  var d = Object.getOwnPropertyDescriptor(window, 'location');
+  row(11, 'window.location = url is an accessor',
+      d && typeof d.set === 'function' && typeof location === 'object' ? 'setter' : 'FAIL');
+  row(8, 'viewport 960x544', innerWidth === 960 && innerHeight === 544 ?
+      innerWidth + 'x' + innerHeight : 'FAIL ' + innerWidth + 'x' + innerHeight);
+
+  /* After layout, so the page has its full height to scroll in. */
+  setTimeout(function () {
+    window.scrollTo(0, 300);
+    var y1 = window.scrollY;
+    window.scrollTo(0, 0);
+    var y0 = window.scrollY;
+    row(7, 'scrollTo / scrollY', y1 === 300 && y0 === 0 ? '300 then 0' : 'FAIL ' + y1 + ' then ' + y0);
+  }, 600);
+}
+</script>
+</body>
+</html>

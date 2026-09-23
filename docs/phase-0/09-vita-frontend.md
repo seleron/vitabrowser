@@ -316,8 +316,10 @@ and fixed by patch 32 (§10).
   patches 41–42: libcurl 8.22 on mbedTLS 3.6.5, with Mozilla's roots
   bundled (10 §Run 8). JavaScript: pages run scripts through QuickJS-ng
   and MacSurf's DOM bridge since patches 44–46 (10 §Run 10), fetch()/XHR
-  included; the bridge's window services (location, history, scroll) are
-  the remaining gap.
+  included; its window services (location, history, scrolling, title,
+  alert/confirm, localStorage) since patch 48 (10 §Run 12). Name lookup
+  runs off the main thread since patch 49: vitaSDK's libcurl resolves
+  blocking, and a dead DNS server froze the browser (10 §Run 11).
 - `clip: rect(0px, 200px, 60px, 0px)` on an absolutely positioned box clips
   its bottom edge but **not its right** (the clip stays at the parent's
   x1 = 951). Seen on `PM-shadow-clip`; pre-existing (identical before and
@@ -345,7 +347,11 @@ and fixed by patch 32 (§10).
    `curl` + OpenSSL 1.0.2; 10 §Run 8) and **QuickJS**, the remaining
    Phase 1 engine item: step 1 (the engine, its limits and probe) done in
    patch 43 (10 §Run 9); step 2, MacSurf's DOM bridge, done in patches
-   44–46 (10 §Run 10). Next: its window services.
+   44–46 (10 §Run 10); its window services in patch 48 (10 §Run 12).
+5. **Real internet pages work on the device** (10 §Run 11: http and https
+   example.com, byte-identical to the simulator). DNS off the main thread:
+   patch 49. Next costs: CPU per frame on text pages (~100 ms) and the
+   mbedTLS handshake (~1 s).
 
 ## 9. Corrections to earlier documents
 

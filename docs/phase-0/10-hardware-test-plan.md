@@ -1517,3 +1517,190 @@ answer in its `netprobe:` lines:
 | resolver and `getaddrinfo` take ~30 s or fail; connect and curl lookups with an address are fast | DNS | resolve names on a worker thread, bounded; give curl the address (`CURLOPT_RESOLVE`) |
 | `select`/`poll(timeout 0)` take seconds | a blocking poll on the Vita | run curl's transfers off the main thread, or patch its wait |
 | DNS and connect fine, curl fails with an error text | curl or TLS | whatever the text says |
+
+## Run 11 — results (2026-09-23 22:21 and 22:27, PCH-2000, 3.65 HENkaku): DNS
+
+Two launches, both delivered over the network with 0 datagrams lost.
+
+**Launch 1 (boot `4a468ef5`): the Vita's DNS server does not answer.**
+- Its Wi-Fi profile had a manual DNS server, **212.47.229.76, with no
+  secondary** (the probe's "DHCP" label is wrong: it prints whatever
+  `sceNetCtl` reports, manual settings included). HENkaku-era guides
+  handed that address out to block firmware updates. **From the PC on the
+  same LAN it times out too** (`nslookup example.com 212.47.229.76`),
+  while the router's DNS (the ISP's, 89.101.160.4) answers at once.
+- The probe:
+
+  | step | result |
+  |---|---|
+  | resolver, bounded 3 s × 2 | **timed out**, `0x804101e2`, in 9 001 ms |
+  | `getaddrinfo` (curl's path) | **failed** (-5, "No address associated with hostname"), in **38 584 ms** |
+  | curl http / https | "Could not resolve: example.com", **30 001 ms** each |
+
+- **The run 10 freeze, reproduced exactly:** each network page froze the
+  main loop for **30.0 s**, with no frames and no log lines, then showed
+  the error page. The connect/poll suspect is ruled out; the lookup is on
+  the browser's only thread, and nothing bounds it but curl's connect
+  timeout.
+- 21 of 24 dumps SAME: the two network pages (error page) and
+  PM-animation (time-varying: the simulator already classes it so).
+
+**Launch 2 (boot `9d8c6030`), DNS set to Automatic: everything works.**
+- **24 of 24 dumps SAME as the simulator, including http and https
+  example.com**, fetched from the real internet on the Vita for the first
+  time.
+- DNS 89.101.160.4 + .5 (DHCP). The probe:
+
+  | step | result |
+  |---|---|
+  | resolver | example.com → 104.20.23.154 in **16 ms** |
+  | `getaddrinfo` | 1 ms (cached) |
+  | `select` / `poll` at timeout 0 | 0 ms, as they should |
+  | TCP connect | 140 ms |
+  | curl http | HTTP 200 in **74 ms** |
+  | curl https (mbedTLS) | HTTP 200 in **1 085 ms, of which TLS 1 060 ms** |
+
+- The pages: http example.com loaded in **891 ms**, https in
+  **1 355 ms**, title "Example Domain". The mbedTLS handshake is ~1 s of
+  ARM time (the PC: 57 ms), the next network cost to look at.
+- Engine probe 18/18, fib(25) 374 ms (as run 10).
+
+**Conclusion.** The browser itself was right; the network profile was
+broken. But a DNS server that does not answer must cost one failed page,
+not a frozen console: vitaSDK's libcurl has no asynchronous resolver (its
+`asyn-thrdd.o` is empty), so every lookup blocks the main loop. Fixed in
+run 12 (patch 49): lookups on a worker thread, bounded, handed to curl
+with `CURLOPT_RESOLVE`.
+
+## Run 12 — window services for scripts (patch 48) and DNS off the main thread (patch 49)
+
+### Patch 48: location, history, scrolling, title, dialogs, localStorage
+
+MacSurf's bridge has these only under `__MACOS9__` (Carbon window list,
+`StandardAlert`, `FSSpec` files); elsewhere they were inert (10 §Run 10,
+"Known gaps"). Now `quickjs/macos9.h` declares them as a frontend API
+behind `MACSURF_WINDOW_SERVICES`. The bridge has a branch for it beside
+each Mac one, leaving the Mac code untouched, and the Vita implements the
+API in `vita/js_platform.c`.
+
+| service | on the Vita |
+|---|---|
+| `location.href` (read) | **the script's own document**, with its `#fragment` (NetSurf keeps that on the window), like MacSurf's `document.cookie` (fixes879). MacSurf reads the front window, which during a load still shows the previous page. |
+| `location.href =`, `assign`, `window.location =`, `document.location =` | joined to the document's URL (MacSurf passed relative URLs to `nsurl_create`, which fails), then **queued**: run on the next scheduler pass, never inside the script (MacSurf navigated synchronously, under the running document). The last request wins. A request from a document that has since been replaced is dropped. |
+| `location.replace` | native, **no history entry** (the JS fallback added one) |
+| `location.reload`, `history.back/forward/go` | queued the same way; `go(n)` walks the top-level window's history, out of range does nothing, `go(0)` reloads |
+| `scrollTo`, `scrollX/Y`, `innerWidth/Height` | the Vita window: 960 × 544, scroll clamped to the page |
+| `document.title =` | reads back; logged (`js title:`), since the Vita has no title bar yet |
+| `alert`, `confirm` | the **system message dialog** (`sceMsgDialog`, OK / Yes-No). The page is not repainted under it: the script may be mid-layout. The wait is not charged to the script's runaway deadline. **The autotest (and the simulator) answer OK at once**, and log it. |
+| `localStorage` | files in `ux0:data/VitaBrowser/LocalStorage/`, **one per origin**. MacSurf's comment says per origin, but its code hashes the whole page URL, so no two pages of a site shared a store. Written to a temporary file, then renamed. |
+
+Not done: `history.pushState` still only changes the displayed URL (no
+entry, no `popstate`), as in MacSurf; the ES module loader's disk-cache
+step stays Mac-only; `prompt()` returns its default.
+
+**New bundled page 18, `JS-window`.** It navigates itself three times
+(relative `location.href` with a fragment, `location.replace`,
+`history.back`), carrying its state in `localStorage`. Only then can it
+report, and it also checks scrolling, the viewport, the title and the
+dialogs: **11 rows**. Each step waits 300 ms: a page that navigates while
+still loading gets no history entry of its own (NetSurf adds it at "ready";
+the HTML standard likewise replaces it), so `back()` would skip it. That
+cost one design round. The network pages are now 19–20 on the device and
+19–25 in the simulator.
+
+### Patch 49: name lookup off the main thread
+
+Run 11 showed that vitaSDK's libcurl looks names up blocking, on the only
+thread (its threaded resolver is compiled out). Now:
+- **curl's `start()` asks the frontend first**
+  (`content/fetchers/curl_resolve.h`, `WITH_CURL_ASYNC_RESOLVE`):
+  - *pending*: the fetch stays queued, retried every 50 ms (`fetch_kick`,
+    new in `fetch.c`, which also restarts the poll chain);
+  - *ready*: curl gets the address with `CURLOPT_RESOLVE` and never
+    resolves by itself;
+  - *failed*: the fetch never reaches curl and ends on the next poll as
+    `CURLE_COULDNT_RESOLVE_HOST`, curl's own error, through
+    `fetch_curl_done`.
+- **`vita/resolve.c`:** one worker thread, one lookup at a time, each
+  bounded (`sceNetResolverStartNtoa`, 2 s × 2 tries); a 32-entry cache
+  (answers 5 min, failures 15 s, so a page's many requests to a dead
+  name fail together). Lookups are logged from the main loop
+  (`dns: host -> addr in N ms`).
+- **The simulator models a dead DNS server:** names ending in
+  `.sim-hang` take the Vita's worst case (4 s) and fail.
+
+### Verified on the host (simulator)
+
+| check | result |
+|---|---|
+| 18 `JS-window` | **11/11 in all four passes**; the log shows `js nav: …?step=2#frag`, `…?step=3 (replace)`, `history -1`; one storage file |
+| 24 `NET-dns-name` (`http://localhost:…`) | resolved on the worker, then `CURLOPT_RESOLVE`; **plots exactly as the bundled file** |
+| 25 `NET-dns-hang` (`dead.sim-hang`) | lookup FAILED after 4 000 ms; **the main loop kept running** (5 load-status lines during the wait); the error page at 4.2 s (before: frozen 30 s) |
+| everything else | clip modes 17/17 (+1 time-varying), mirror 37/37 files and 0 lost, http/https as the file, rogue certificate refused, JS-dom 13/13, JS-fetch 5/5 × 3, probes OK |
+
+**The simulator's checks were partly hollow.** `run-vita-sim.sh` runs
+under `set -e`, but a failing `a && b` list only stops a script when its
+*last* command fails. So the clip-mode, network-mirror, network-probe and
+QuickJS-probe checks could fail without failing the run. The first run of
+this round exited 0 with JS-window failing and a mirror file missing.
+Every multi-part check now ends in `|| fail`. Its first catch was real:
+a crashed run had left its netlog receiver listening, and the next run
+mirrored to that stale receiver. The script now kills its background
+servers on any exit, and refuses to start while the port is taken.
+
+Also found by the simulator on the way: patch 49's first cut left the
+three new `curl_fetch_info` fields uninitialised (the struct is
+`malloc`ed and set field by field), and the first network fetch crashed.
+
+![JS-window](img/10-run12/JS-window.png)
+
+**Clean checkout:**
+- Applied 132 + the known 2; L1 PASS; renderer tests 101/101 + 30/30;
+  QuickJS probe 18/18.
+- Simulator: every check above passes.
+- The Vita cross build is `-Werror` clean and packaged. The ELF has
+  `fetch_curl_resolve`, `fetch_kick`, `macsurf_window_location` and
+  `macsurf_window_dialog`, and imports `sceMsgDialogInit` and
+  `sceNetResolverStartNtoa`.
+- **Internet-connected simulator run** (the device's default pages):
+  - `dns: example.com -> 104.20.23.154 in 1 ms` on the worker;
+  - its http and https example.com dumps are **identical to the ones
+    the Vita drew in run 11** (launch 2);
+  - JS-window 11/11.
+  - One bundled dump differs from run 11's, as intended: JS-fetch's
+    `origin:` row now reads `file:` (it read nothing, since `location`
+    was `about:blank`).
+
+**Hand-off.**
+- SHA256, first 12: `VitaBrowser.vpk` `517b89ef1057`,
+  `VitaBrowser-ext.vpk` `0312ce54a69e`, `nsvita.elf` `2835a55806b7`.
+- `reference-dumps\`: the internet-connected simulator run's 26 dumps.
+  JS-window is 18 (it has a `-bottom` dump), example.com is 19–20.
+- `reference-screenshots\18-JS-window.png`.
+- Run 11's results are moved to `results-run11\`.
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-23-run12/`.
+
+**Run 12 on the device** is run 11's procedure (`receive-results.bat`
+first, then the autotest with □). DNS stays on Automatic. Then:
+- **JS-window (page 18) reads 11/11.** The autotest answers its
+  alert/confirm itself. log.txt shows `js nav:` lines, and
+  `js alert (auto OK)`.
+- **`receiver.txt`: all 26 SAME.** The example.com pages are now 19–20.
+- log.txt: `dns: example.com -> … in N ms` from the worker, before the
+  network pages.
+- **By hand, after the autotest (optional):** press R to reach page 18,
+  JS-window. It runs again, and this time the system dialog should show
+  "JS-window alert" (OK), then "JS-window confirm" (Yes/No). The row
+  reads `confirm true` or `confirm false` to match your answer.
+
+**The proof of patch 49 (optional, one extra launch):** set the Wi-Fi
+DNS back to Manual, 212.47.229.76, run the autotest again, then set it
+back to Automatic. The expected result:
+- the network pages fail with an error page after at most ~4–9 s each,
+  not 30 s;
+- **the HUD, the log and the netlog keep going during the wait:** no
+  gap of several seconds in log.txt;
+- `dns: example.com -> FAILED` in log.txt.
+
+The probe at the start of pass N still calls `getaddrinfo` and curl
+directly, on purpose, so it will still take its ~1.5 minutes then.

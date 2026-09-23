@@ -20,12 +20,22 @@
 # Usage: WORK=<WORK>/vitabrowser-work tools/run-vita-sim.sh
 #        (after tools/build-patched.sh: needs its host engine prefix)
 set -e
+# Under set -e a failing `a && b` list only stops the script when its LAST
+# command fails, so a multi-part check that fails early would pass silently:
+# every such check ends in `|| fail`.
+fail() { echo "  FAILED: $*"; exit 1; }
+# The local servers and the netlog receiver run in the background; a run
+# that stops early (a crash, a failed check) must not leave them behind, or
+# the next run's frontend finds a stale receiver on its port and mirrors
+# to it instead.
+HTTPD=; RX=
+trap 'kill $HTTPD $RX 2>/dev/null || true' EXIT
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK="${WORK:-$HOME/vitabrowser-work}"
 NS="$WORK/applytest/upstream/netsurf"
 P="$WORK/applytest/prefix"
 OUT="${OUT:-$WORK/vita-sim}"
-PAGES="${PAGES:-17}"
+PAGES="${PAGES:-18}"
 
 [ -f "$NS/frontends/vita/main.c" ] || { echo "no $NS/frontends/vita -- run tools/build-patched.sh"; exit 2; }
 [ -f "$P/lib/pkgconfig/libcss.pc" ] || { echo "no host engine at $P -- run tools/build-patched.sh"; exit 2; }
@@ -128,6 +138,9 @@ ls "$OUT"/shots
 
 echo "== autotest run (reference dumps) =="
 rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
+if ss -Hlun 2>/dev/null | grep -q ":${NETLOG_PORT:-45199} "; then
+	fail "something already listens on UDP ${NETLOG_PORT:-45199} (a stale receiver?)"
+fi
 mkdir -p "$OUT/snaps" "$OUT/run/ux0:data/VitaBrowser"
 # The network mirror (frontends/vita/netlog.c) goes to a receiver on this
 # machine: the same code path as on the Vita after a receiver answers.
@@ -142,6 +155,8 @@ NET-https-local https://127.0.0.1:$((HP + 1))/L1-layout-basics.html
 NET-https-rogue https://127.0.0.1:$((HP + 2))/L1-layout-basics.html
 NET-js-fetch-http http://127.0.0.1:$HP/JS-fetch.html
 NET-js-fetch-https https://127.0.0.1:$((HP + 1))/JS-fetch.html
+NET-dns-name http://localhost:$HP/L1-layout-basics.html
+NET-dns-hang http://dead.sim-hang:$HP/L1-layout-basics.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -181,7 +196,7 @@ for a in "$OUT"/snaps/A-*.png; do
 	else diff=$((diff + 1)); echo "  DIFFERS: $page"; fi
 done
 echo "  CPU clip vs stencil clip: $same identical, $diff differ, $timed time-varying"
-[ "$diff" -eq 0 ] && [ "$same" -gt 0 ]
+[ "$diff" -eq 0 ] && [ "$same" -gt 0 ] || fail "clip modes"
 
 # Every file the frontend wrote must have arrived over the network,
 # byte for byte, with no datagram lost.
@@ -190,6 +205,7 @@ NET=$(ls -d "$OUT"/net/net-* 2>/dev/null | tail -1)
 [ -n "$NET" ] || { echo "  no boot reached the receiver"; cat "$OUT/netlog-receiver.log"; exit 1; }
 same=0; bad=0
 for f in "$OUT"/reference/*; do
+	[ -f "$f" ] || continue	# LocalStorage/: the mirror sends files only
 	n=${f##*/}
 	if cmp -s "$f" "$NET/$n"; then same=$((same + 1))
 	else bad=$((bad + 1)); echo "  DIFFERS or missing: $n"; fi
@@ -197,7 +213,7 @@ done
 grep -E '^datagrams' "$NET/receiver.txt" | sed 's/^/  /'
 echo "  mirror vs memory card: $same identical, $bad differ"
 [ "$bad" -eq 0 ] && grep -q 'received, 0 lost' "$NET/receiver.txt" && \
-	! grep -qE 'INCOMPLETE|MISMATCH' "$NET/receiver.txt"
+	! grep -qE 'INCOMPLETE|MISMATCH' "$NET/receiver.txt" || fail "network mirror"
 
 # curl + mbedTLS: the page fetched over http and over https (trusted
 # certificate) must plot exactly as the bundled file does; the rogue
@@ -207,7 +223,7 @@ R="$OUT/reference"
 body() { tail -n +2 "$1"; }	# line 1 names the dump
 body "$R/01-L1-layout-basics.plot" > "$OUT/l1.body"
 nbad=0
-for n in 18-NET-http-local 19-NET-https-local; do
+for n in 19-NET-http-local 20-NET-https-local; do
 	if [ -f "$R/$n.plot" ] && body "$R/$n.plot" | cmp -s - "$OUT/l1.body"; then
 		echo "  $n: plots as 01-L1-layout-basics"
 	else
@@ -215,13 +231,13 @@ for n in 18-NET-http-local 19-NET-https-local; do
 	fi
 done
 # NetSurf's refusal is its certificate query page, titled "Privacy error".
-rogue_title=$(sed -n '/page 20\/22 NET-https-rogue: navigate/,/NET-https-rogue settled/p' \
+rogue_title=$(sed -n '/page 21\/[0-9]* NET-https-rogue: navigate/,/NET-https-rogue settled/p' \
 	"$R/log.txt" | sed -n 's/.*gw title: //p' | tail -1)
-if [ -f "$R/20-NET-https-rogue.plot" ] && [ "$rogue_title" = "Privacy error" ] && \
-   ! body "$R/20-NET-https-rogue.plot" | cmp -s - "$OUT/l1.body"; then
-	echo "  20-NET-https-rogue: refused (\"$rogue_title\" page)"
+if [ -f "$R/21-NET-https-rogue.plot" ] && [ "$rogue_title" = "Privacy error" ] && \
+   ! body "$R/21-NET-https-rogue.plot" | cmp -s - "$OUT/l1.body"; then
+	echo "  21-NET-https-rogue: refused (\"$rogue_title\" page)"
 else
-	echo "  20-NET-https-rogue: LOADED OR MISSING"; nbad=$((nbad + 1))
+	echo "  21-NET-https-rogue: LOADED OR MISSING"; nbad=$((nbad + 1))
 fi
 grep -E 'pass N summary' "$R/log.txt" | sed 's/^/  /'
 grep -m1 'curl_version' "$R/netsurf.log" | sed 's/.*curl_version /  libcurl: /'
@@ -242,7 +258,7 @@ grep -o 'STR [0-9]* [^:]*: waiting' "$R/16-JS-dom.plot" | sed 's/^STR /  still w
 # must have seen the requests.
 echo "== fetch() / XMLHttpRequest (JS-fetch) =="
 jsf_bad=0
-for n in 17-JS-fetch 21-NET-js-fetch-http 22-NET-js-fetch-https; do
+for n in 17-JS-fetch 22-NET-js-fetch-http 23-NET-js-fetch-https; do
 	r=$(sed -n 's/.*STR \(JS fetch: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/$n.plot" 2>/dev/null | head -1)
 	echo "  $n: ${r:-no summary line}"
 	[ "$r" = "JS fetch: 5/5 passed" ] || jsf_bad=$((jsf_bad + 1))
@@ -254,16 +270,54 @@ for port in "$HP" $((HP + 1)); do
 done
 [ "$jsf_bad" -eq 0 ]
 
+# The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
+# JS-window navigates itself three times (relative location.href,
+# location.replace, history.back) carrying its state in localStorage, then
+# checks scrolling, the viewport, title and dialogs. It only reaches its
+# summary if all of that works, in every one of the autotest's passes.
+echo "== window services (JS-window) =="
+jsw=$(sed -n 's/.*STR \(JS window: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/18-JS-window.plot" | head -1)
+echo "  18-JS-window: ${jsw:-no summary line}"
+grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$R/18-JS-window.plot" | sed 's/^STR /  /'
+grep -E 'js nav: ' "$R/log.txt" | head -4 | sed 's/^\[[^]]*\] /  /'
+ls "$R/LocalStorage/" 2>/dev/null | sed 's/^/  storage file: /'
+[ "$jsw" = "JS window: 11/11 passed" ] && \
+	[ "$(grep -c 'JS-window row 7 passed' "$R/netsurf.log")" -ge 4 ] && \
+	ls "$R"/LocalStorage/l_*.json > /dev/null || fail "JS-window"
+
+# Name lookup off the main thread (vita/resolve.c, curl_resolve.h). Hardware
+# run 11: with a DNS server that never answered, curl's blocking lookup froze
+# the whole browser for 30 s per page. localhost goes through the worker and
+# CURLOPT_RESOLVE and must plot as the file does; a *.sim-hang name takes the
+# Vita's worst case (2 s x 2) and fails -- meanwhile the main loop must keep
+# running (its once-a-second load status lines), and the page must end.
+echo "== name lookup off the main thread =="
+dbad=0
+if [ -f "$R/24-NET-dns-name.plot" ] && body "$R/24-NET-dns-name.plot" | cmp -s - "$OUT/l1.body"; then
+	echo "  24-NET-dns-name: plots as 01-L1-layout-basics"
+else
+	echo "  24-NET-dns-name: DIFFERS (or missing)"; dbad=$((dbad + 1))
+fi
+grep -E 'dns: (localhost|dead\.sim-hang)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /'
+nstat=$(grep -c 'load status NET-dns-hang' "$R/log.txt")
+echo "  main loop ran through the hanging lookup: $nstat status lines"
+grep -E 'page NET-dns-hang (settled|did not settle)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /' | cut -c1-120
+grep -q 'dns: localhost -> 127.0.0.1' "$R/log.txt" || dbad=$((dbad + 1))
+grep -q 'dns: dead\.sim-hang -> FAILED' "$R/log.txt" || dbad=$((dbad + 1))
+[ "$nstat" -ge 3 ] || dbad=$((dbad + 1))
+grep -q 'page NET-dns-hang settled' "$R/log.txt" || dbad=$((dbad + 1))
+[ "$dbad" -eq 0 ] || fail "name lookup"
+
 # The network probe (frontends/vita/netprobe.c) before pass N: against the
 # local servers every step must succeed, with curl's own verdict logged.
 echo "== network probe =="
 grep -E 'netprobe: (getaddrinfo .* ->|connect|curl)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /' | cut -c1-150
 grep -q 'netprobe: connect .*: connected' "$R/log.txt" && \
-	[ "$(grep -c 'netprobe: curl .*: OK (0)' "$R/log.txt")" -eq 2 ]
+	[ "$(grep -c 'netprobe: curl .*: OK (0)' "$R/log.txt")" -eq 2 ] || fail "network probe"
 
 # The QuickJS engine probe (frontends/vita/jsprobe.c) at the autotest's end.
 echo "== QuickJS engine probe =="
 grep -E 'js: (QuickJS|FAIL|engine|probe took)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /'
 grep -q 'js: probe took .*: \([0-9]*\)/\1 checks' "$R/log.txt" && \
-	! grep -q 'js: FAIL' "$R/log.txt"
+	! grep -q 'js: FAIL' "$R/log.txt" || fail "QuickJS probe"
 
