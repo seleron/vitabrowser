@@ -641,3 +641,12 @@ Run 4 on the device (about 5 minutes):
 What decides the next step: pass B vs A (the clock), C vs A (the clipping),
 and D (both). Whether GPU 222 needs anything beyond a safe homebrew
 (`scePowerSetGpuClockFrequency` return codes in the log).
+
+### Run 4 — results: not received (checked 2026-09-23)
+
+`VitaBrowser-hwtest\results\` was **empty** when checked for the run-4
+data: no `log.txt`, no `autotest.done`, nothing newer than the hand-off
+(03:06), and no stray copy elsewhere under `VitaBrowser-hwtest\`. The
+four-pass timings (clock vs clipping) are therefore **still unmeasured**.
+Nothing was waited for. The next build (text, below) keeps the same
+four-pass autotest, so one device run can measure both.
