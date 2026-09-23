@@ -745,3 +745,18 @@ autotest, so one run measures both:
 - **The atlas line** in `log.txt` (`font: atlas … pages, … flushes, …
   dropped`). Any flushes or drops on the device mean the atlas needs more
   pages or an LRU.
+
+### Run 5 — results: not received (checked 2026-09-23 03:48–03:52)
+
+`VitaBrowser-hwtest\results\` was **empty** again: no `VitaBrowser\`
+folder, no `log.txt`, no `autotest.done`, no screenshots. A search of the
+whole user profile and drives D:–F: found nothing newer than the run-5
+hand-off (03:31) apart from files this project wrote. The hand-off was 17
+minutes old at the check, so the device run may simply not have happened
+yet. Run 5 (text) and run 4 (timings) are both **still unmeasured**; the
+VPKs in `VitaBrowser-hwtest\` stay valid.
+
+Twice now the results did not arrive through the manual copy step (plus
+run 2's stale Explorer-FTP copies). That is one more reason for the next
+task: the Vita sends its log and plot dumps over the network itself
+(§Run 6).
