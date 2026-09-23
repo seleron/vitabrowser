@@ -492,5 +492,70 @@ without shrink-to-fit text (L3-grid, PM-gradient) are **byte-identical to
 the simulator** at the scrolled bottom, so scrolled redraw is correct on
 hardware.
 
-**Still to collect**, re-copied past the cache: this run's `log.txt`
-(timings, font metrics, memory), `netsurf.log`, and the screenshots.
+### Run 3 — the full data (re-copied past the cache)
+
+Files: `<WORK>/vitabrowser-work/hwtest-2026-09-23-run3/device-results/` (log,
+engine log, 22 dumps, 7 screenshots). All 9 boots of the run-3 build report
+`log.txt: open (errno 0)` with no write failures, and the engine log has no
+HTML failures from run 3 (its 6111 are all run 2's, appended to), which
+confirms the copy-cache explanation above.
+
+**Timings on hardware (333 MHz ARM, no overclock):**
+
+| | measured |
+|---|---|
+| boot to first frame | ~0.5 s |
+| navigate → document (bundled pages) | **344–1403 ms**, most 400–700 ms (simulator: ~165 ms) |
+| CPU per frame (layout walk + plot submit) | **1–7 ms** |
+| GPU per frame (`end_drawing` → `wait_rendering_done`) | **12–69 ms**, growing with draw calls: 7-call PM-link 12 ms, 123-call VT-calibration 69 ms |
+
+**The GPU figure is the performance problem.** About 0.5 ms per draw call is
+far slower than the GXM should be. Two suspects, both cheap to test:
+- the boot log reads **GPU clock 41 MHz** (`scePowerGetGpuClockFrequency`);
+  homebrew ports commonly raise it with `scePowerSetGpuClockFrequency`;
+- the per-call cost of `vita2d_set_clip_rectangle` (a page issues 30–160
+  clips a frame).
+
+CPU is not the constraint.
+
+**PGF font metrics:** `text_height("Hg")` at scale 1 is 17 px (34 at scale
+2), and "M" advances 17 px. Advances measured `"a"c"a" − "aa"` equal the
+raw single-glyph widths for every printable ASCII character, space
+included (6 px). The workaround in `layout.c` for PGF under-reporting
+ink-less glyphs is therefore unnecessary on hardware, though harmless.
+Calibration E and F passed visually with `VITA_PGF_EM_PX = 20`.
+
+**Memory:** as in runs 1–2 (≈ 40 MiB USER_RW beyond the heap, 84–89 MiB
+CDRAM, 26 MiB PHYCONT).
+
+**Screenshots** (pixel-exact, from the Vita) show five rendering issues,
+none of which the checklist asked about:
+1. **Stray marks above some glyphs** (`Caf̄é`, `f̄açade`, `d̄ash`,
+   `J̄apanese`, `C̄hinese`): pieces of neighbouring glyphs from vita2d's PGF
+   atlas, sampled with linear filtering at a non-integer scale. Large
+   headings are also soft (bitmap glyphs scaled up).
+2. **Greek and Cyrillic are spaced out** (`Ε λ λ η ν ι κ _`), and accented
+   `ά` is missing: the Latin system font lacks them, so they come from the
+   Japanese font as full-width glyphs. Simplified Chinese is partial
+   (`_体中文`: `简` missing). Korean and emoji are blank.
+3. **A gap before punctuation after inline elements** (`Bold text ,
+   italic text ,`). The host simulator shows it too, so it is a layout bug
+   in the engine, not a device issue.
+4. The strike-through sits a little high (tester).
+5. One screenshot is completely black (probably taken mid-transition; not
+   reproducible from the log).
+
+Issues 1 and 2 argue for drawing text with FreeType from a TTF with
+broad coverage (vita2d's `vita2d_font`, already linked) instead of the
+system PGF, and for measuring with the same face.
+
+## Next actions after run 3
+
+1. **GPU time:** raise the GPU clock and measure; then measure clip cost,
+   and batch or avoid clips.
+2. **Text:** FreeType + a broad-coverage TTF for drawing and layout (fixes
+   the atlas marks, Greek/Cyrillic/CJK coverage, and the soft headings).
+3. **Inline punctuation gap:** reproduce on the desktop (it shows in the
+   simulator) and fix in the engine.
+4. **Transfers:** copy results over USB or with a client that doesn't cache
+   (FileZilla, WinSCP), or rename the folder on the Vita first.
