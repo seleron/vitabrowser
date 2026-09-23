@@ -1344,3 +1344,95 @@ procedure, with `receive-results.bat` running. Then:
   recursion ended in a RangeError, not a crash.
 - A crash, or no `autotest.done`, on page 16 or 17 points at the bridge
   on real hardware; the last `MS` lines in netsurf.log say where.
+
+## Run 10 — results (2026-09-23 10:14, PCH-2000, 3.65 HENkaku): the first run delivered over the network
+
+This one device run answers runs 4–10. **Its results reached the PC by
+themselves**: `receive-results.bat` got four launches in
+`results\net-…\`. The full autotest is boot `fcb3cd6c`:
+- **2 945 datagrams, 0 lost, over real Wi-Fi.**
+- Every file's length and CRC-32 checked out: log.txt 129 545 bytes,
+  netsurf.log 717 994 bytes, 24 plot dumps.
+- The Vita (192.168.x.x) found the PC (192.168.x.x) by broadcast with no
+  configuration. The HUD read `net 192.168.x.x`, and AUTOTEST DONE
+  said "results sent to 192.168.x.x:45100".
+
+**Rendering is identical to the simulator.** The receiver compared each
+dump with `reference-dumps\`: **22 of 24 SAME**, byte for byte. That
+covers every bundled page, both scroll positions, VT-text with FreeType,
+**JS-dom and JS-fetch**. The two exceptions are the network pages
+(below). The user's screenshot of JS-fetch matches the simulator's.
+
+**JavaScript works on the Vita:**
+- **JS-dom 13/13**: DOM, events, promises, `setTimeout`, DOMContentLoaded,
+  and **deep recursion ending in a RangeError, not a crash**. The stack
+  guard logged `qjs: stack guard=3668967 (stack room=4193255 of
+  4194304)`, sized as designed (room − 512 KiB).
+- **JS-fetch 5/5** over `file:`.
+- **Engine probe 18/18.**
+  - `fib(25)` **374 ms**, about 40× the PC (9 ms): the Vita's JS speed.
+  - The 250 ms interrupt fired on time; the 32 MiB cap was hit after
+    5.2 s.
+- `console.log` lines arrived in netsurf.log (`MS [js] …`).
+
+**Run 4's question, answered: GPU time.** Averages over 17 pages:
+
+| pass | GPU / frame | CPU / frame | page load |
+|---|---|---|---|
+| A: GPU 41 MHz (as booted), stencil clip — run 3's setup | 86 ms | 73 ms | 1 302 ms |
+| B: GPU 222 MHz, stencil clip | 16 ms (5.4×) | 38 ms | 944 ms |
+| C: GPU 41 MHz, CPU clip | 12 ms (7×) | 40 ms | 731 ms |
+| D: ARM 444, GPU 222, CPU clip | **3 ms (29×)** | 30 ms | 682 ms |
+
+- **Both fixes are real and independent.** The GPU clock and CPU clipping
+  each cut GPU time about 5–7×, and together about 29×.
+- **Stencil writes** fell from 157 to 12 per frame, as in the simulator.
+- **All `scePowerSet*` calls returned 0**, so GPU 222 MHz needs nothing
+  beyond a normal homebrew.
+- **The browsing profile** (GPU 222, CPU clip, ARM as booted) sits
+  between C and D.
+- **The bottleneck is now CPU time per frame** on text-heavy pages. In
+  pass C, VT-text takes 121–237 ms and VT-calibration 128–190 ms of CPU.
+  Plain pages take 11–50 ms. That is the next performance target: text
+  drawing costs one textured-quad draw per glyph.
+
+**Run 5's question, answered: text.**
+- VT-text's dump is SAME as the simulator's, so the FreeType engine lays
+  out and draws identically on the device.
+- The atlas used 3 pages for 2 437 glyphs, with 0 flushes and 0 drops.
+- Every probe code point resolved to its intended face: Greek and Cyrillic
+  from DejaVu, kana and CJK from Droid, Hangul from Nanum.
+
+**Memory:**
+- 188 MiB of the newlib heap still allocatable;
+- 36 MiB of user blocks beyond it;
+- CDRAM 71 MiB;
+- phycont 26 MiB.
+
+**Failed: the network pages (http and https example.com).**
+- Each navigation **froze the whole app for 30 s**. The log shows no
+  frames and no log lines from 172.075 to 202.085, and again for https.
+  The autotest's 20 s settle timeout then gave up. That is why both
+  dumps show the previous page (JS-fetch) and compare as DIFF.
+- About 40 s after the https navigation, the page arrived as NetSurf's
+  **"Error occurred fetching page"**.
+- A second launch that went straight to the https page froze the same way
+  and was ended by hand.
+- The Wi-Fi was up throughout: UDP to the PC never stopped, and `net: up,
+  ip 192.168.x.x`.
+- curl's own error text is not in the results. netsurf.log reached its
+  16 MB cap at 72 s (MacSurf's traces are verbose on the device), and the
+  hand-ended launch never flushed its tail.
+- A main-loop freeze at the start of a fetch fits **curl's blocking name
+  resolution**. The Vita's curl is built without the threaded resolver
+  (run 8's "known limit"), so `getaddrinfo` runs on the main thread. Here
+  it apparently ran to a 30 s timeout without an answer. **Not confirmed**:
+  the next task makes the network path log each step to log.txt (name
+  lookup, TCP connect, the curl result and error text) and removes the
+  freeze.
+
+**Other observations:**
+- `location.protocol` is empty on the device as in the simulator
+  (the window-services gap, §Run 10).
+- The first frame of the first page takes 546 ms: fonts open lazily and
+  glyphs rasterise.
