@@ -1,0 +1,457 @@
+# netsurf: Vita network path probe (frontends/vita)
+# Generated 2026-09-23
+#
+# Hardware run 10: http:// and https://example.com froze the whole app for
+# 30.010 s each (exactly curl_fetch_timeout) and then failed, while UDP to
+# the PC kept working; curl's error text was lost to the capped engine log.
+# - netprobe.c/.h (new): at the start of the autotest's network pass, walk
+#   the path one bounded step at a time and log each to log.txt: the DHCP
+#   DNS servers; the system resolver with an explicit 3 s x 2 bound;
+#   getaddrinfo() (on the Vita newlib's gethostbyname ->
+#   sceNetResolverStartNtoa with timeout 0, the system default); a
+#   non-blocking TCP connect, timing select() and poll() at timeout 0 on
+#   the way (curl checks a connect in progress that way, so a blocking
+#   zero-timeout poll would freeze curl_multi_perform); curl over http and
+#   https with its error buffer and lookup / connect / TLS / total times.
+# - main.c: run it before pass N's pages. Makefile: netprobe.c, and
+#   -Wl,--defsym=__sce_headroom=0x4000: the SDK linker script's reserve
+#   after the code segment for vita-elf-create's SCE data. Without it, this
+#   build's code ended 1 008 bytes short of the 64 KiB-aligned data segment
+#   and packaging failed ("Cannot allocate 3036 bytes for SCE data at end of
+#   segment 0; segment 1 overlaps") -- a latent hazard of every build.
+# See docs/phase-0/10-hardware-test-plan.md §Run 11.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index e9c18aa79..792974f11 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -41,6 +41,13 @@ else
+ # (vita/text.c), from the fonts bundled under res/fonts. The PGF/PVF stubs
+ # stay only for libvita2d's own font objects, which are not linked unless
+ # something calls them. The SceXxx_stub archives resolve firmware imports.
++# vita-elf-create appends the module's SCE data (import stubs, module info;
++# ~3 KB and growing with the import count) after the code segment. The SDK
++# linker script aligns the data segment straight after the code unless
++# __sce_headroom reserves room, so a build whose code happens to end within
++# ~3 KB of the alignment boundary fails to package ("Cannot allocate N bytes
++# for SCE data at end of segment 0; segment 1 overlaps"). Reserve 16 KiB.
++LDFLAGS += -Wl,--defsym=__sce_headroom=0x4000
+ LDFLAGS += -Wl,-q -L$(VITA_QUICKJS)/lib -lquickjs \
+ 	-lvita2d -lfreetype -lpng -ljpeg -lbz2 -lz \
+ 	-lpcre2-posix -lpcre2-8 \
+@@ -67,7 +74,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+ 	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
+-	qjs_hooks.c js_platform.c
++	qjs_hooks.c js_platform.c netprobe.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 6934d57cf..26dc20473 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -62,6 +62,7 @@
+ #include "vita/net.h"
+ #include "vita/netlog.h"
+ #include "vita/js_platform.h"
++#include "vita/netprobe.h"
+ /* The QuickJS bridge's event-loop pump (quickjs/macsurf_qjs.c) and its
+  * relayout driver's per-content query (quickjs/macos9_reconvert.c). */
+ void macsurf_qjs_pump_all(void);
+@@ -536,6 +537,22 @@ static bool autotest_begin_pass(struct browser_window *bw, unsigned int i)
+ 	if (i >= VITA_PASS_COUNT)
+ 		return false;
+ 	apply_pass(i);
++	if (vita_passes[i].net) {
++		/* The network path, step by step, before the network pages
++		 * (hardware run 10: they froze the app 30 s each). */
++		const char *http = NULL, *https = NULL;
++		unsigned int k;
++		for (k = 0; k < vita_net_count; k++) {
++			if (http == NULL &&
++			    strncmp(vita_net_urls[k], "http:", 5) == 0)
++				http = vita_net_urls[k];
++			if (https == NULL &&
++			    strncmp(vita_net_urls[k], "https:", 6) == 0)
++				https = vita_net_urls[k];
++		}
++		set_message(0, "AUTOTEST network probe - do not touch");
++		vita_netprobe_run(http, https, vita_diag_log);
++	}
+ 	vita_autotest = AT_SETTLE;
+ 	set_message(0, "AUTOTEST pass %c page 1/%u - do not touch",
+ 		    vita_passes[i].tag, pass_end(i) - pass_first(i));
+diff --git a/frontends/vita/netprobe.c b/frontends/vita/netprobe.c
+new file mode 100644
+index 000000000..2d97e65b1
+--- /dev/null
++++ b/frontends/vita/netprobe.c
+@@ -0,0 +1,305 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: network path probe (see vita/netprobe.h).
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <poll.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <curl/curl.h>
++
++#ifdef __vita__
++#include <psp2/net/net.h>
++#include <psp2/net/netctl.h>
++#endif
++
++#include "utils/nsoption.h"
++
++#include "vita/diag.h"
++#include "vita/netprobe.h"
++
++/** Bounds, ms / s. */
++#define CONNECT_MS 10000
++#define CURL_CONNECT_S 10L
++#define CURL_TOTAL_S 20L
++
++/** scheme://host[:port]/... -> host, port (default by scheme). */
++static int parse_url(const char *url, char *host, size_t hl, int *port)
++{
++	const char *p = strstr(url, "://"), *h, *e, *c;
++	size_t n;
++
++	if (p == NULL)
++		return -1;
++	*port = (strncmp(url, "https", 5) == 0) ? 443 : 80;
++	h = p + 3;
++	e = h + strcspn(h, "/?#");
++	c = memchr(h, ':', (size_t)(e - h));
++	n = (size_t)((c != NULL ? c : e) - h);
++	if (n == 0 || n >= hl)
++		return -1;
++	memcpy(host, h, n);
++	host[n] = '\0';
++	if (c != NULL)
++		*port = atoi(c + 1);
++	return 0;
++}
++
++/** Non-blocking connect to addr:port, bounded by select(). */
++static void probe_connect(struct in_addr addr, int port,
++			  void (*log)(const char *fmt, ...))
++{
++	struct sockaddr_in sa;
++	char ip[INET_ADDRSTRLEN];
++	unsigned int t0 = vita_diag_ms();
++	int fd, r, err = 0, on = 1;
++	socklen_t el = sizeof(err);
++	fd_set wf;
++	struct timeval tv;
++
++	inet_ntop(AF_INET, &addr, ip, sizeof(ip));
++	fd = socket(AF_INET, SOCK_STREAM, 0);
++	if (fd < 0) {
++		log("netprobe: connect %s:%d: socket -> errno %d", ip, port,
++		    errno);
++		return;
++	}
++#ifdef __vita__
++	r = setsockopt(fd, SOL_SOCKET, SO_NONBLOCK, &on, sizeof(on));
++#else
++	(void)on;
++	r = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
++#endif
++	if (r != 0)
++		log("netprobe: connect: could not make the socket non-blocking "
++		    "(errno %d); the connect below may block", errno);
++	memset(&sa, 0, sizeof(sa));
++	sa.sin_family = AF_INET;
++	sa.sin_port = htons((unsigned short)port);
++	sa.sin_addr = addr;
++	r = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
++	if (r != 0 && errno != EINPROGRESS && errno != EWOULDBLOCK &&
++	    errno != EAGAIN) {
++		log("netprobe: connect %s:%d: failed at once, errno %d, %u ms",
++		    ip, port, errno, vita_diag_ms() - t0);
++		close(fd);
++		return;
++	}
++	if (r != 0) {
++		/* How curl checks a connect in progress: select() / poll()
++		 * with a zero timeout must return at once. If either blocks
++		 * here, it blocks inside curl_multi_perform() too -- the main
++		 * loop freeze of hardware run 10, whatever the network does. */
++		struct pollfd pf;
++		unsigned int tz = vita_diag_ms();
++		int z;
++		FD_ZERO(&wf);
++		FD_SET(fd, &wf);
++		tv.tv_sec = 0;
++		tv.tv_usec = 0;
++		z = select(fd + 1, NULL, &wf, NULL, &tv);
++		log("netprobe: select(timeout 0) on the connecting socket -> %d "
++		    "in %u ms", z, vita_diag_ms() - tz);
++		pf.fd = fd;
++		pf.events = POLLOUT;
++		pf.revents = 0;
++		tz = vita_diag_ms();
++		z = poll(&pf, 1, 0);
++		log("netprobe: poll(timeout 0) on the connecting socket -> %d "
++		    "(revents 0x%x) in %u ms", z, (unsigned int)pf.revents,
++		    vita_diag_ms() - tz);
++		FD_ZERO(&wf);
++		FD_SET(fd, &wf);
++		tv.tv_sec = CONNECT_MS / 1000;
++		tv.tv_usec = 0;
++		r = select(fd + 1, NULL, &wf, NULL, &tv);
++		if (r <= 0) {
++			log("netprobe: connect %s:%d: %s after %u ms", ip, port,
++			    r == 0 ? "NO ANSWER (select timed out)" :
++			    "select failed", vita_diag_ms() - t0);
++			close(fd);
++			return;
++		}
++		getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
++	}
++	log("netprobe: connect %s:%d: %s (so_error %d) in %u ms", ip, port,
++	    err == 0 ? "connected" : "FAILED", err, vita_diag_ms() - t0);
++	close(fd);
++}
++
++static size_t discard(char *d, size_t s, size_t n, void *u)
++{
++	(void)d;
++	*(size_t *)u += s * n;
++	return s * n;
++}
++
++/** One curl easy fetch with its error text and phase times. */
++static void probe_curl(const char *url, void (*log)(const char *fmt, ...))
++{
++	char errbuf[CURL_ERROR_SIZE] = "";
++	CURL *h = curl_easy_init();
++	curl_off_t tdns = 0, tcon = 0, ttls = 0, ttot = 0;
++	long code = 0;
++	char *pip = NULL;
++	size_t bytes = 0;
++	unsigned int t0 = vita_diag_ms();
++	CURLcode rc;
++
++	if (h == NULL) {
++		log("netprobe: curl %s: curl_easy_init failed", url);
++		return;
++	}
++	curl_easy_setopt(h, CURLOPT_URL, url);
++	curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
++	curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
++	curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, CURL_CONNECT_S);
++	curl_easy_setopt(h, CURLOPT_TIMEOUT, CURL_TOTAL_S);
++	curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, discard);
++	curl_easy_setopt(h, CURLOPT_WRITEDATA, &bytes);
++	if (nsoption_charp(ca_bundle) != NULL)
++		curl_easy_setopt(h, CURLOPT_CAINFO, nsoption_charp(ca_bundle));
++	rc = curl_easy_perform(h);
++	curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
++	curl_easy_getinfo(h, CURLINFO_NAMELOOKUP_TIME_T, &tdns);
++	curl_easy_getinfo(h, CURLINFO_CONNECT_TIME_T, &tcon);
++	curl_easy_getinfo(h, CURLINFO_APPCONNECT_TIME_T, &ttls);
++	curl_easy_getinfo(h, CURLINFO_TOTAL_TIME_T, &ttot);
++	curl_easy_getinfo(h, CURLINFO_PRIMARY_IP, &pip);
++	log("netprobe: curl %s: %s (%d) \"%s\", HTTP %ld, %lu bytes from %s; "
++	    "lookup %ld ms, connect %ld ms, tls %ld ms, total %ld ms "
++	    "(wall %u ms)", url, rc == CURLE_OK ? "OK" : "FAILED", (int)rc,
++	    errbuf[0] ? errbuf : curl_easy_strerror(rc), code,
++	    (unsigned long)bytes, (pip && *pip) ? pip : "-",
++	    (long)(tdns / 1000), (long)(tcon / 1000), (long)(ttls / 1000),
++	    (long)(ttot / 1000), vita_diag_ms() - t0);
++	curl_easy_cleanup(h);
++}
++
++/* exported interface documented in vita/netprobe.h */
++void vita_netprobe_run(const char *http_url, const char *https_url,
++		       void (*log)(const char *fmt, ...))
++{
++	char host[256];
++	int port;
++	struct in_addr addr;
++	int have_addr = 0;
++	unsigned int t0;
++
++	if (http_url == NULL && https_url == NULL)
++		return;
++	if (parse_url(http_url ? http_url : https_url, host, sizeof(host),
++		      &port) != 0) {
++		log("netprobe: cannot parse %s", http_url ? http_url : https_url);
++		return;
++	}
++	log("netprobe: start: host %s, port %d", host, port);
++
++#ifdef __vita__
++	{
++		SceNetCtlInfo info;
++		char dns1[20] = "?", dns2[20] = "?";
++		if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_PRIMARY_DNS,
++					 &info) >= 0)
++			snprintf(dns1, sizeof(dns1), "%s", info.primary_dns);
++		if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_SECONDARY_DNS,
++					 &info) >= 0)
++			snprintf(dns2, sizeof(dns2), "%s", info.secondary_dns);
++		log("netprobe: DNS servers (DHCP): primary %s, secondary %s",
++		    dns1, dns2);
++	}
++	{
++		/* The system resolver, bounded: 3 s, 2 retries. */
++		SceNetInAddr sa;
++		int rid, r;
++		t0 = vita_diag_ms();
++		rid = sceNetResolverCreate("vbprobe", NULL, 0);
++		if (rid < 0) {
++			log("netprobe: sceNetResolverCreate -> 0x%08x",
++			    (unsigned int)rid);
++		} else {
++			r = sceNetResolverStartNtoa(rid, host, &sa,
++						    3 * 1000 * 1000, 2, 0);
++			sceNetResolverDestroy(rid);
++			if (r < 0) {
++				log("netprobe: resolver (3 s x 2) %s: FAILED "
++				    "0x%08x in %u ms", host, (unsigned int)r,
++				    vita_diag_ms() - t0);
++			} else {
++				memcpy(&addr, &sa, sizeof(addr));
++				have_addr = 1;
++				log("netprobe: resolver (3 s x 2) %s -> %s in %u ms",
++				    host, inet_ntoa(addr), vita_diag_ms() - t0);
++			}
++		}
++	}
++#endif
++	{
++		/* What curl calls. On the Vita: gethostbyname ->
++		 * sceNetResolverStartNtoa with the system's default bound. */
++		struct addrinfo hints, *res = NULL;
++		char portstr[8];
++		int r;
++		memset(&hints, 0, sizeof(hints));
++		hints.ai_family = AF_INET;
++		hints.ai_socktype = SOCK_STREAM;
++		snprintf(portstr, sizeof(portstr), "%d", port);
++		log("netprobe: getaddrinfo %s ... (unbounded on the Vita)", host);
++		t0 = vita_diag_ms();
++		r = getaddrinfo(host, portstr, &hints, &res);
++		if (r != 0 || res == NULL) {
++			log("netprobe: getaddrinfo %s: FAILED %d (%s), errno %d, "
++			    "in %u ms", host, r, gai_strerror(r), errno,
++			    vita_diag_ms() - t0);
++		} else {
++			struct sockaddr_in sin;
++			struct in_addr a;
++			/* Copied out: a cast would raise ai_addr's alignment
++			 * (-Wcast-align on ARM). */
++			memcpy(&sin, res->ai_addr, sizeof(sin));
++			a = sin.sin_addr;
++			log("netprobe: getaddrinfo %s -> %s in %u ms", host,
++			    inet_ntoa(a), vita_diag_ms() - t0);
++			if (!have_addr) {
++				addr = a;
++				have_addr = 1;
++			}
++			freeaddrinfo(res);
++		}
++	}
++	if (have_addr)
++		probe_connect(addr, port, log);
++	if (http_url != NULL)
++		probe_curl(http_url, log);
++	if (https_url != NULL)
++		probe_curl(https_url, log);
++	log("netprobe: done");
++}
+diff --git a/frontends/vita/netprobe.h b/frontends/vita/netprobe.h
+new file mode 100644
+index 000000000..193d60fd6
+--- /dev/null
++++ b/frontends/vita/netprobe.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: network path probe.
++ *
++ * Hardware run 10: fetching http:// and https://example.com froze the whole
++ * app for 30 s (curl_fetch_timeout) each, then failed, while UDP to the PC
++ * worked. curl's own error text was lost (netsurf.log was capped). This
++ * probe walks the path one step at a time, bounds each step, and logs the
++ * result and its time to log.txt:
++ *
++ *   1. the DNS servers the Vita was given (sceNetCtl);
++ *   2. the system resolver with an explicit bound (sceNetResolverStartNtoa);
++ *   3. getaddrinfo(), the call curl makes -- on the Vita it is newlib's
++ *      gethostbyname() -> sceNetResolverStartNtoa(timeout 0 = default);
++ *   4. a non-blocking TCP connect bounded by select(), with select() and
++ *      poll() at timeout 0 timed on the way: curl checks a connect in
++ *      progress that way, so if they block, so does curl_multi_perform().
++ *      A freeze of exactly curl's connect timeout (30.010 s in run 10)
++ *      points there rather than at DNS;
++ *   5. curl itself, over http and https, with its error buffer and its
++ *      name-lookup / connect / TLS / total times.
++ *
++ * Run once at the start of the autotest's network pass. It blocks while
++ * it runs; each step is bounded, except (3), whose bound is the system's.
++ */
++
++#ifndef NETSURF_VITA_NETPROBE_H
++#define NETSURF_VITA_NETPROBE_H
++
++/**
++ * Probe the path to the hosts of these URLs (either may be NULL).
++ * \param log  where lines go (printf-like)
++ */
++void vita_netprobe_run(const char *http_url, const char *https_url,
++		       void (*log)(const char *fmt, ...));
++
++#endif

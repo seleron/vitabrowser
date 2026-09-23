@@ -1436,3 +1436,84 @@ covers every bundled page, both scroll positions, VT-text with FreeType,
   (the window-services gap, §Run 10).
 - The first frame of the first page takes 546 ms: fonts open lazily and
   glyphs rasterise.
+
+## Run 11 — where the network path stops (patch 47)
+
+**Purpose:** find out why run 10's network pages froze the app for 30 s,
+and remove the freeze.
+
+**What is known:**
+- Each http or https navigation froze the main loop for **30.010 s:
+  exactly `curl_fetch_timeout`**, NetSurf's `CURLOPT_CONNECTTIMEOUT`.
+- The Wi-Fi worked throughout.
+- curl's error text is lost.
+
+**What the build shows** (read from the libraries, not guessed):
+- **Name lookup is synchronous and unbounded.** The Vita's curl is built
+  without the threaded resolver and without socketpair, so it resolves on
+  the calling thread with `getaddrinfo`. On the Vita, `getaddrinfo` is
+  newlib's wrapper around `gethostbyname`. That calls
+  `sceNetResolverStartNtoa(rid, host, &addr, timeout 0, retry 0, 0)`
+  (disassembled), so every lookup waits the system's *default* resolver
+  time.
+- **But the freeze equals curl's own timeout**, which curl can enforce only
+  while its loop runs. A blocking lookup would last the resolver's
+  timeout, not curl's.
+- That makes a second suspect as likely: curl checks a connect in progress
+  with `poll`/`select` at timeout 0, and on the Vita that check may block
+  until curl's deadline.
+
+**The probe (`frontends/vita/netprobe.c`)** decides between them before
+anything is "fixed". It runs at the start of the autotest's network pass,
+logs to log.txt (uncapped, mirrored live), and bounds each step:
+1. the DHCP DNS servers (`sceNetCtl`);
+2. the system resolver with an explicit 3 s × 2 bound;
+3. `getaddrinfo`, curl's path, which is unbounded on the Vita;
+4. a non-blocking TCP connect, timing `select()` and `poll()` at timeout 0
+   along the way, then bounded to 10 s;
+5. curl over http and https, with its error buffer and the lookup,
+   connect, TLS and total times.
+
+**Host baselines:**
+- **Real internet** (simulator run with the default pages):
+  - lookup of example.com: 11 ms;
+  - connect: 13 ms;
+  - curl http: 41 ms; curl https: 80 ms, of which TLS 57 ms;
+  - zero-timeout `select`/`poll`: 0 ms.
+- **Local servers:** every step succeeds, and `run-vita-sim.sh` now
+  asserts that.
+
+**Also fixed: a latent packaging hazard.**
+- vita-elf-create appends about 3 KB of SCE data after the code segment.
+  The SDK linker script leaves room only if `__sce_headroom` is defined.
+- This build's code ended 1 008 bytes before the 64 KiB-aligned data
+  segment, so packaging failed ("Cannot allocate 3036 bytes for SCE data
+  at end of segment 0; segment 1 overlaps") and vita-elf-create crashed.
+- Any build could hit this by the luck of its code size. The Vita link now
+  reserves 16 KiB (`-Wl,--defsym=__sce_headroom=0x4000`).
+- Also: the probe's `getaddrinfo` address copy is written with `memcpy`,
+  because GCC 15 on ARM rejects the cast (`-Wcast-align`).
+
+**Verification:**
+- Clean checkout: applied 130 + the known 2; L1 PASS; fixtures 4/4.
+- Tests: 101/101 + 30/30 + QuickJS 18/18.
+- Simulator: JS-dom 13/13, JS-fetch 5/5 ×3, probe OK.
+- Vita build packaged.
+
+**Hand-off.** SHA256, first 12: `VitaBrowser.vpk` `6ae362a73101`,
+`VitaBrowser-ext.vpk` `e8c9e45861d8`, `nsvita.elf` `909843020efa`. Run
+10's results are moved to `VitaBrowser-hwtest\results-run10\`, so
+`results\` is empty. The reference dumps are unchanged. Archive:
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run11/`.
+
+**Run 11 on the device** is run 10's procedure (`receive-results.bat`
+first; □; the Vita on Wi-Fi with internet access). Just before the
+network pages, the screen says "AUTOTEST network probe", and it may sit
+there for up to about a minute if a step blocks. log.txt then holds the
+answer in its `netprobe:` lines:
+
+| if the log shows | the cause is | the fix (next task) |
+|---|---|---|
+| resolver and `getaddrinfo` take ~30 s or fail; connect and curl lookups with an address are fast | DNS | resolve names on a worker thread, bounded; give curl the address (`CURLOPT_RESOLVE`) |
+| `select`/`poll(timeout 0)` take seconds | a blocking poll on the Vita | run curl's transfers off the main thread, or patch its wait |
+| DNS and connect fine, curl fails with an error text | curl or TLS | whatever the text says |

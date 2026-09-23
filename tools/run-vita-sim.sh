@@ -254,6 +254,13 @@ for port in "$HP" $((HP + 1)); do
 done
 [ "$jsf_bad" -eq 0 ]
 
+# The network probe (frontends/vita/netprobe.c) before pass N: against the
+# local servers every step must succeed, with curl's own verdict logged.
+echo "== network probe =="
+grep -E 'netprobe: (getaddrinfo .* ->|connect|curl)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /' | cut -c1-150
+grep -q 'netprobe: connect .*: connected' "$R/log.txt" && \
+	[ "$(grep -c 'netprobe: curl .*: OK (0)' "$R/log.txt")" -eq 2 ]
+
 # The QuickJS engine probe (frontends/vita/jsprobe.c) at the autotest's end.
 echo "== QuickJS engine probe =="
 grep -E 'js: (QuickJS|FAIL|engine|probe took)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /'
