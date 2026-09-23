@@ -1704,3 +1704,74 @@ back to Automatic. The expected result:
 
 The probe at the start of pass N still calls `getaddrinfo` and curl
 directly, on purpose, so it will still take its ~1.5 minutes then.
+
+## Run 12 — results (2026-09-23 23:03 and 23:12, PCH-2000, 3.65 HENkaku)
+
+Two launches, both over the network with 0 datagrams lost.
+
+**Launch 1 (boot `1340947e`), the autotest (□ pressed twice), DNS
+Automatic:**
+- **23 of 26 dumps SAME.** The others:
+  - PM-animation, which is time-varying;
+  - **JS-window and its bottom dump**, which show the page reading "script
+    did not run".
+- **The scripts worked:** the log has the whole sequence in every pass
+  (`js nav: …?step=2#frag`, `…?step=3 (replace)`, `history -1`, then
+  `js alert (auto OK)`, `js confirm (auto OK)`).
+- **The autotest took its dump mid-sequence.** The Vita drew no frame
+  during a step page's 1.4 s load, so with 700 ms since the last frame,
+  the page counted as settled the moment its load ended (66.656). That
+  came before the page's own 300 ms timer navigated on (66.905). The
+  simulator loads the same page in 0.17 s and never showed it.
+- example.com: `dns: example.com -> 104.20.23.154` **on the worker**,
+  http 967 ms, https 1 335 ms, both SAME.
+- Pass timings as run 10: GPU per frame 87 / 16 / 12 / 2 ms for passes
+  A–D.
+
+**Launch 2 (boot `e402b15c`), by hand, with the DNS set back to the dead
+212.47.229.76 (the optional proof of patch 49):**
+- **JS-window with the real dialogs:** `js alert: "JS-window alert" ->
+  OK after 2138 ms`, then `js confirm … -> OK after 2120 ms` (Yes). You
+  saw both system dialogs.
+- **http example.com: `dns: example.com -> FAILED (0x804101e2) in
+  6001 ms`, on the worker.** Meanwhile the main loop kept running: its
+  load-status line came every second (+1.2 s … +5.2 s), with no gap.
+  Then "Error occurred fetching page" at 7.2 s. **Before patch 49: frozen
+  30 s.**
+- **https example.com: failed in 0.7 s,** straight from the cached
+  failure (15 s).
+- The resolver bound is 2 s × 2 tries. The Vita spent 6.0 s: evidently
+  one attempt more than the tries count.
+
+**Fixed for run 13 (patch 50 and the test page):**
+1. **The autotest's settle rule** (`main.c`): loading counts as activity,
+   so a page gets 700 ms of quiet after its load as well as after its
+   last frame.
+2. **JS-window's steps wait for DOMContentLoaded** instead of 300 ms after
+   parsing. DOMContentLoaded fires just before NetSurf marks the page
+   ready and adds its history entry (`html.c`), so a timer set there
+   always runs after it. At the Vita's pace, the fixed delay also failed:
+   step 1 navigated before its page was ready, got no history entry, and
+   `back()` skipped two pages.
+3. **The simulator runs the autotest a second time at the Vita's pace:**
+   `VITA_SIM_SLOW_MS=40`, a 40 ms delay per main-loop pass. Loads take
+   1–2 s as on the device, while page timers stay wall-clock. Before
+   the fixes it failed JS-window (fix 2's failure; fix 1's alone was not
+   isolated there, since the device showed it directly). After them,
+   **25 of 25
+   bundled dumps are identical to full speed, and JS-window finishes in
+   4 of 4 passes.**
+
+**Run 13 hand-off (patch 50).**
+- Clean checkout: applied 133 + the known 2; L1 PASS; 101/101 + 30/30;
+  the simulator passes every check, including the run at the Vita's pace;
+  the Vita build is packaged.
+- SHA256, first 12: `VitaBrowser.vpk` `0611f80fed70`,
+  `VitaBrowser-ext.vpk` `659ccbdf5284`, `nsvita.elf` `bc7957cd2c72`.
+- `reference-dumps\` is regenerated (26 dumps, internet-connected run).
+- Run 12's results are moved to `results-run12\`.
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-23-run13/`.
+
+**Run 13 on the device:** the autotest once, DNS Automatic. The one thing
+to see: **`receiver.txt` shows 18-JS-window SAME** (11/11), and every
+other dump SAME apart from the time-varying PM-animation.

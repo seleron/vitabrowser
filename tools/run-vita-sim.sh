@@ -321,3 +321,35 @@ grep -E 'js: (QuickJS|FAIL|engine|probe took)' "$R/log.txt" | sed 's/^\[[^]]*\] 
 grep -q 'js: probe took .*: \([0-9]*\)/\1 checks' "$R/log.txt" && \
 	! grep -q 'js: FAIL' "$R/log.txt" || fail "QuickJS probe"
 
+
+# The autotest again at the Vita's pace (tools/vita-sim VITA_SIM_SLOW_MS: every
+# main-loop pass takes 40 ms longer, so loads take the device's 1-2 s while
+# page timers stay wall-clock). Hardware run 12: JS-window passed here at
+# full speed and failed on the Vita, because the autotest judged a page
+# settled the moment its frameless load ended, before its own timers ran.
+# Every bundled page must dump exactly as it did at full speed (bar the
+# time-varying animation), and JS-window must finish in every pass.
+echo "== at the Vita's pace (VITA_SIM_SLOW_MS=40) =="
+S2="$OUT/slow"
+rm -rf "$S2"; mkdir -p "$S2/ux0:data/VitaBrowser"
+cp -r "$OUT/run/app0:" "$S2/"
+echo off > "$S2/ux0:data/VitaBrowser/netlog.cfg"
+python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+	--http "$HP" > "$OUT/httpd-slow.log" 2>&1 &
+HTTPD=$!
+echo "NET-http-local http://127.0.0.1:$HP/L1-layout-basics.html" \
+	> "$S2/ux0:data/VitaBrowser/nettest.txt"
+( cd "$S2" && VITA_SIM_SLOW_MS=40 VITA_SIM_AUTOTEST=1 timeout 1200 "$NS/nsvita-sim" \
+	> "$S2/stdout.log" 2>&1 ) || fail "slow autotest run"
+kill $HTTPD 2>/dev/null || true
+same=0; bad=0
+for f in "$R"/[01]*.plot; do
+	n=${f##*/}
+	case "$n" in 07-PM-animation*) continue ;; esac
+	if cmp -s "$f" "$S2/ux0:data/VitaBrowser/$n"; then same=$((same + 1))
+	else bad=$((bad + 1)); echo "  DIFFERS at the Vita's pace: $n"; fi
+done
+echo "  bundled pages at the Vita's pace vs full speed: $same identical, $bad differ"
+jsw_slow=$(grep -c 'JS-window row 7 passed' "$S2/ux0:data/VitaBrowser/netsurf.log")
+echo "  JS-window finished in $jsw_slow of 4 passes"
+[ "$bad" -eq 0 ] && [ "$same" -gt 0 ] && [ "$jsw_slow" -ge 4 ] || fail "at the Vita's pace"

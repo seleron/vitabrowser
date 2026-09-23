@@ -373,6 +373,21 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 
 	memset(pad, 0, sizeof(*pad));
 	pad->lx = pad->ly = pad->rx = pad->ry = 128;
+	/* VITA_SIM_SLOW_MS: the Vita's pace. Every main-loop pass reads the
+	 * pad once, so a delay here stretches everything the loop drives --
+	 * fetches, parsing, layout -- while page timers stay wall-clock. Run
+	 * 12 on the device: a page loaded in 1.4 s, drawing nothing, then its
+	 * own 300 ms timer navigated; the simulator loaded it in 0.17 s and
+	 * never showed the autotest settling in between. */
+	{
+		static int slow = -1;
+		if (slow < 0) {
+			const char *s = getenv("VITA_SIM_SLOW_MS");
+			slow = s ? atoi(s) : 0;
+		}
+		if (slow > 0)
+			usleep((useconds_t)slow * 1000);
+	}
 	if (++polls > MAX_POLLS) {
 		fprintf(stderr, "vitasim: timed out on page %u\n", page);
 		exit(4);
