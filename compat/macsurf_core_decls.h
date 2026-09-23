@@ -77,7 +77,7 @@ unsigned long js_realm_generation(struct jsthread *thread);
 unsigned long js_thread_generation(struct jsthread *thread);
 /* Fired when a <script> element finishes loading, and the setter for
  * document.currentScript. Both are bridge behaviour, not diagnostics. */
-void js_fire_script_load(struct jsthread *thread, struct dom_node *node,
+unsigned char js_fire_script_load(struct jsthread *thread, struct dom_node *node,
 		int success);
 void js_set_current_script(struct jsthread *thread, struct dom_node *node);
 

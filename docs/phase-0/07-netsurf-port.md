@@ -450,6 +450,16 @@ them self-contained braced blocks.
 `dom_hubbub_parser_parse_chunk`), and every `macos9_micros` use, since compat
 defines it.
 
+> **Correction (2026-09-23, 10 §Run 10).** Removing the `SITE` summary
+> block also removed the three statements that followed it in MacSurf's
+> `html_reformat`: `selection_reinit(htmlc->sel)`,
+> `htmlc->reflowing = false` and `htmlc->had_initial_layout = true`.
+> `reflowing` therefore stayed true after the first layout. Every later
+> relayout was refused, and the mouse path treated every page as
+> mid-reformat. This went unseen until scripts first asked for a relayout.
+> The three lines are restored in `$WORK/handport/html.c`, and patch 13
+> has been regenerated.
+
 ### 10.3 The two real bugs, fixed
 
 **`form.c`** — `form_atom_parse` set `out->literal` only on the two

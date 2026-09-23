@@ -1201,3 +1201,146 @@ So step 2 is:
 
 Every piece is testable in the simulator first, against pages with
 scripts.
+
+## Run 10 — QuickJS, step 2: pages run JavaScript through MacSurf's DOM bridge (patches 44–46)
+
+**What changed:** the Vita build now runs page scripts: QuickJS-ng
+(ES2023) behind MacSurf's hand-written DOM bridge. Duktape and the "none"
+backend are both out. The bridge became a NetSurf JS backend beside
+`duktape/` and `none/`, selected by a new `NETSURF_USE_QUICKJS` feature
+switch.
+
+**Patch 45 — the backend, `content/handlers/javascript/quickjs/`:**
+- **MacSurf's files, byte-for-byte** except CR → LF (verified file by
+  file): the bridge (`macsurf_qjs.c`, 16 803 lines), its audit module,
+  the fetch/XHR backend (`macos9_js_fetch.c`), the relayout driver's header,
+  the live-content registry, `macsurf_dom_dispatch.c` (libdom calls as
+  functions), and its portable debug/diag/timebase headers.
+- **Two deliberate edits:**
+  - `macos9_reconvert.c`: its registry declarations are enabled under
+    `WITH_QUICKJS`.
+  - `macsurf_qjs.c`: a `__vita__` stack guard (below).
+- **Ours:**
+  - `macos9.h` replaces MacSurf's Toolbox-laden frontend header under the
+    same name. It declares only the services the bridge uses off the Mac,
+    with MacSurf's own prototypes.
+  - `macsurf_diag_none.c` switches off MacSurf's 2 573-line diagnostics
+    store. Its ids only gate further diagnostics; checked in the relayout
+    driver.
+  - Three `-Wno-error` flags, for `macsurf_qjs.o` only.
+
+**Patch 44 — core:**
+- The `QUICKJS` feature switch.
+- **MacSurf's live-content registry and owner-cancel, made real:** they
+  were `__MACOS9__`-only, the rest getting "always live" macros. They are
+  now real under `WITH_QUICKJS`, because callbacks outlive contents once
+  scripts run. Death row stays Mac-only.
+- **`select.c`:** the two pieces of MacSurf's deferred `cssh_select.c` the
+  relayout needs (fixes899 `nscss_reset_node_data`, fixes130e).
+
+**Patch 46 — the Vita frontend:**
+- **`js_platform.c`:** the services, on the Vita's scheduler, clocks, text
+  measurement, and randomness from `getentropy()` →
+  `sceKernelGetRandomNumber`.
+- **Main loop:** the bridge's event loop (`macsurf_qjs_pump_all`: timers,
+  promise jobs, events) runs every pass, as in MacSurf.
+- **`console.log`** goes to netsurf.log (`MS [js] …`).
+- **Settling:** a page counts as settled only once no script-driven
+  relayout is pending.
+
+**Found and fixed on the way (all verified by the tests below):**
+1. **Our patch 13 had broken every relayout after the first**, scripts or
+   not. Removing MacSurf's `SITE` diagnostic block from the hand-ported
+   `html.c` also removed the three lines after it:
+   - `selection_reinit`;
+   - **`htmlc->reflowing = false`**;
+   - `had_initial_layout = true`.
+
+   So `reflowing` stayed true forever. Every script-driven relayout was
+   refused (`html_reconvert_content rc=16`, shown by temporary guard
+   logging, since removed). **The mouse path also treated every page as
+   mid-reformat**, so clicks would have done nothing on the device. Fixed
+   in the hand-port source; patch 13 regenerated (the only patch that
+   changed).
+2. **With relayout finally running, the first one aborted in
+   `set_libcss_node_data`**, a second cascade over nodes that still had
+   node data. The fix is MacSurf's own (the `select.c` port above).
+3. **`js_fire_script_load` was declared `void` in our compat shim**
+   (`compat/macsurf_core_decls.h`); the real type is `unsigned char`.
+4. **The compat shim's weak `macos9_schedule` was a no-op**, so MacSurf's
+   deferred core callbacks never ran on the Vita. They run now.
+5. **The bridge's `console.log` went to stderr**, which the Vita discards.
+6. **The autotest could judge a page settled while its scripts' relayout
+   was still due (400 ms debounce)**, so dumps and screenshots showed the
+   page before the scripts' changes.
+7. **Stack guard (safety):** off the Mac, the bridge sets QuickJS's native
+   stack guard to 4 MB, "well under the 8 MB Linux main-thread stack". The
+   Vita's main thread has 4 MiB *in total*, and `js_newheap` runs deep
+   inside NetSurf. So deep recursion would overrun the real stack before
+   QuickJS threw: MacSurf's fixes590 freeze. The `__vita__` branch sizes
+   the guard like the Mac branch does, to the real headroom
+   (`sceKernelGetThreadInfo`: current SP minus the stack base) less a
+   512 KiB margin for the C frames beneath JS, capped at 4 MB. Logged as
+   `qjs: stack guard=…`.
+
+**fetch() and XMLHttpRequest needed no rewrite.** README §13.2 expected
+MacSurf's async fetch/XHR to be bound to its discarded networking layer.
+`macos9_js_fetch.c` is built on NetSurf's own `fetch_start()`, the layer
+above the transport. In our build that means NetSurf's file fetcher for
+`file:` and curl (patches 41–42) for http and https. It works unchanged,
+proven below. "Move fetch()/XHR onto curl" was a verification, not a
+port.
+
+**Verified on the host** (simulator; clean checkout: applied 129 + the
+known 2, L1 PASS, fixtures 4/4, 101/101 + 30/30 + QuickJS probe 18/18):
+
+| page | what | result |
+|---|---|---|
+| 16 `JS-dom` (bundled) | inline script, createElement/appendChild, style, classList, selectors, ES2023 syntax, innerHTML, title, events, promise microtask, DOMContentLoaded, setTimeout, deep recursion → RangeError | **13/13**, laid out: the dump carries "JS: 13/13 passed" |
+| 17 `JS-fetch` (bundled, `file:`) | fetch + json, XHR, async/await fetch, status/header, 404 | **5/5** |
+| 21 / 22 `JS-fetch` over http / https | the same page, served locally; https via curl + mbedTLS | **5/5 each**; the server logged 4 data requests + the 404 on each port |
+
+- Every row starts as "waiting" in the HTML, and only a working script
+  turns it PASS. The simulator asserts the summaries; a run at 11/12 failed
+  it.
+- All 20 bundled-page dumps are byte-identical to the run-8/9 reference,
+  so the scripting stack and the fixes above did not move any script-free
+  page. Clip modes 16/16, mirror 32/32, network pages as run 8.
+- The Vita cross build is `-Werror` clean. The ELF has the bridge
+  (`macsurf_qjs_pump_all`, `js_newheap`), the registry,
+  `nscss_reset_node_data` and the stack guard.
+
+![JS-dom](img/10-run10/JS-dom.png) ![JS-fetch](img/10-run10/JS-fetch.png)
+
+**Known gaps (the next task, "window services"):** the bridge's window
+services are `__MACOS9__`-only with inert fallbacks:
+- `location.href` reads `about:blank`, so `location.protocol` is empty (it
+  shows on the JS-fetch page), and assigning to it does not navigate;
+- `history.back/forward/go`, `scrollTo`, `scrollX/Y` and the viewport size;
+- `document.title` does not reach the window (the JS side reads back fine);
+- `alert`/`confirm`;
+- `localStorage` persistence (Mac `FSSpec` files);
+- the ES module loader.
+
+Also by MacSurf's choice: `window` `load` is compiled out
+(`MACSURF_JS_FIRE_LOAD`, fixes1022), and QuickJS's automatic GC is off
+below the 96 MiB per-page heap cap (fixes593). The page's runtime is torn
+down on navigation.
+
+**Hand-off.** SHA256, first 12: `VitaBrowser.vpk` `d5ba4f62ac07`,
+`VitaBrowser-ext.vpk` `e1b6e47f4ebe`, `nsvita.elf` `082c3a3eb8d4`, in
+`VitaBrowser-hwtest\`. `reference-dumps\` is regenerated (24 dumps from an
+internet-connected simulator run: pages 16–17 are the JS pages, 18–19
+example.com), and `reference-screenshots\` has `16-JS-dom.png` and
+`17-JS-fetch.png`. Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-23-run10/`.
+
+**Run 10 on the device** (it still covers runs 4–9) follows run 7's
+procedure, with `receive-results.bat` running. Then:
+- **JS-dom** (page 16) must read **13/13**, and **JS-fetch** (page 17)
+  **5/5**. `receiver.txt` compares their dumps with `reference-dumps\`
+  (SAME/DIFF).
+- **netsurf.log** should have `qjs: stack guard=…` with the Vita's real
+  stack room, and `MS [js] JS-dom row 13 passed`. That means deep
+  recursion ended in a RangeError, not a crash.
+- A crash, or no `autotest.done`, on page 16 or 17 points at the bridge
+  on real hardware; the last `MS` lines in netsurf.log say where.

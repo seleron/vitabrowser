@@ -25,7 +25,7 @@ WORK="${WORK:-$HOME/vitabrowser-work}"
 NS="$WORK/applytest/upstream/netsurf"
 P="$WORK/applytest/prefix"
 OUT="${OUT:-$WORK/vita-sim}"
-PAGES="${PAGES:-15}"
+PAGES="${PAGES:-17}"
 
 [ -f "$NS/frontends/vita/main.c" ] || { echo "no $NS/frontends/vita -- run tools/build-patched.sh"; exit 2; }
 [ -f "$P/lib/pkgconfig/libcss.pc" ] || { echo "no host engine at $P -- run tools/build-patched.sh"; exit 2; }
@@ -140,6 +140,8 @@ cat > "$OUT/run/ux0:data/VitaBrowser/nettest.txt" <<NET
 NET-http-local http://127.0.0.1:$HP/L1-layout-basics.html
 NET-https-local https://127.0.0.1:$((HP + 1))/L1-layout-basics.html
 NET-https-rogue https://127.0.0.1:$((HP + 2))/L1-layout-basics.html
+NET-js-fetch-http http://127.0.0.1:$HP/JS-fetch.html
+NET-js-fetch-https https://127.0.0.1:$((HP + 1))/JS-fetch.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -205,7 +207,7 @@ R="$OUT/reference"
 body() { tail -n +2 "$1"; }	# line 1 names the dump
 body "$R/01-L1-layout-basics.plot" > "$OUT/l1.body"
 nbad=0
-for n in 16-NET-http-local 17-NET-https-local; do
+for n in 18-NET-http-local 19-NET-https-local; do
 	if [ -f "$R/$n.plot" ] && body "$R/$n.plot" | cmp -s - "$OUT/l1.body"; then
 		echo "  $n: plots as 01-L1-layout-basics"
 	else
@@ -213,17 +215,44 @@ for n in 16-NET-http-local 17-NET-https-local; do
 	fi
 done
 # NetSurf's refusal is its certificate query page, titled "Privacy error".
-rogue_title=$(sed -n '/page 18\/18 NET-https-rogue: navigate/,/NET-https-rogue settled/p' \
+rogue_title=$(sed -n '/page 20\/22 NET-https-rogue: navigate/,/NET-https-rogue settled/p' \
 	"$R/log.txt" | sed -n 's/.*gw title: //p' | tail -1)
-if [ -f "$R/18-NET-https-rogue.plot" ] && [ "$rogue_title" = "Privacy error" ] && \
-   ! body "$R/18-NET-https-rogue.plot" | cmp -s - "$OUT/l1.body"; then
-	echo "  18-NET-https-rogue: refused (\"$rogue_title\" page)"
+if [ -f "$R/20-NET-https-rogue.plot" ] && [ "$rogue_title" = "Privacy error" ] && \
+   ! body "$R/20-NET-https-rogue.plot" | cmp -s - "$OUT/l1.body"; then
+	echo "  20-NET-https-rogue: refused (\"$rogue_title\" page)"
 else
-	echo "  18-NET-https-rogue: LOADED OR MISSING"; nbad=$((nbad + 1))
+	echo "  20-NET-https-rogue: LOADED OR MISSING"; nbad=$((nbad + 1))
 fi
 grep -E 'pass N summary' "$R/log.txt" | sed 's/^/  /'
 grep -m1 'curl_version' "$R/netsurf.log" | sed 's/.*curl_version /  libcurl: /'
 [ "$nbad" -eq 0 ]
+
+# Scripts on a page (testpages/pages/JS-dom.html, through MacSurf's DOM
+# bridge): every row turns PASS only if its script ran and the result was
+# laid out, so the dump must carry the full count.
+echo "== JavaScript on a page (JS-dom) =="
+js_sum=$(sed -n 's/.*STR \(JS: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/16-JS-dom.plot" | head -1)
+echo "  16-JS-dom: ${js_sum:-no summary line (script did not run?)}"
+grep -o 'STR [0-9]* [^:]*: waiting' "$R/16-JS-dom.plot" | sed 's/^STR /  still waiting: /'
+[ "$js_sum" = "JS: 13/13 passed" ]
+
+# fetch() and XMLHttpRequest (MacSurf's macos9_js_fetch.c on NetSurf's fetch
+# layer): the same page over file: (bundled), http and https (curl +
+# mbedTLS), each 5/5 only with real response bodies, and the local server
+# must have seen the requests.
+echo "== fetch() / XMLHttpRequest (JS-fetch) =="
+jsf_bad=0
+for n in 17-JS-fetch 21-NET-js-fetch-http 22-NET-js-fetch-https; do
+	r=$(sed -n 's/.*STR \(JS fetch: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/$n.plot" 2>/dev/null | head -1)
+	echo "  $n: ${r:-no summary line}"
+	[ "$r" = "JS fetch: 5/5 passed" ] || jsf_bad=$((jsf_bad + 1))
+done
+for port in "$HP" $((HP + 1)); do
+	c=$(grep -c "httpd $port \"GET /fetch-data.json" "$OUT/httpd.log")
+	echo "  server :$port saw $c fetch-data.json requests"
+	[ "$c" -ge 4 ] || jsf_bad=$((jsf_bad + 1))
+done
+[ "$jsf_bad" -eq 0 ]
 
 # The QuickJS engine probe (frontends/vita/jsprobe.c) at the autotest's end.
 echo "== QuickJS engine probe =="

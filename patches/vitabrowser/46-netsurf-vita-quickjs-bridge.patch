@@ -1,0 +1,440 @@
+# netsurf: Vita frontend runs pages' JavaScript through the QuickJS bridge (frontends/vita)
+# Generated 2026-09-23
+#
+# QuickJS step 2, the frontend half (core: patch 44; backend: patch 45).
+# - Makefile.defaults: NETSURF_USE_QUICKJS=YES (Duktape stays off).
+# - js_platform.c/.h (new): the services quickjs/macos9.h declares --
+#   macos9_schedule / _cancel_owner / sched_is_queued on the Vita scheduler,
+#   allocation, TickCount, performance.now()'s clock, crypto random bytes
+#   from getentropy() (sceKernelGetRandomNumber on the Vita), the text
+#   measurement table, the JS-time profile counter.
+# - schedule.c/.h: remove every callback of an owner (a destroyed content
+#   takes its pending callbacks with it) and an is-queued query.
+# - main.c: enable_javascript on; the bridge's event loop
+#   (macsurf_qjs_pump_all: timers, promise jobs, queued events) every pass
+#   of the main loop, as MacSurf's main loop runs it; a page is not
+#   "settled" while a script-driven relayout is pending for it; the
+#   JS-dom and JS-fetch test pages.
+# - diag.c: macsurf_debug_log_write (MS_LOG, so also the page's
+#   console.log) into netsurf.log; the compat fallback wrote to stderr.
+# - qjs_hooks.c: the engine counters are the bridge's when it is linked.
+# See docs/phase-0/10-hardware-test-plan.md §Run 10.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 701a278bf..e9c18aa79 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -67,7 +67,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+ 	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
+-	qjs_hooks.c
++	qjs_hooks.c js_platform.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/Makefile.defaults b/frontends/vita/Makefile.defaults
+index abcd1231e..f00d5c7c9 100644
+--- a/frontends/vita/Makefile.defaults
++++ b/frontends/vita/Makefile.defaults
+@@ -11,6 +11,9 @@
+ NETSURF_USE_CURL := YES
+ NETSURF_USE_OPENSSL := NO
+ NETSURF_USE_DUKTAPE := NO
++# JavaScript: QuickJS-ng (ES2023) with MacSurf's DOM bridge, not Duktape
++# (ES5.1). See docs/phase-0/10-hardware-test-plan.md §Run 10.
++NETSURF_USE_QUICKJS := YES
+ 
+ # Image decoders that exist for the Vita: libnsgif / libnsbmp are built by
+ # tools/build-vita.sh, libpng / libjpeg-turbo come from vdpm.
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index 838594a99..954a5796c 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -691,6 +691,15 @@ void vita_diag_engine_flush(void)
+  * log, so the navigation / fetch traces MacSurf left in the core are
+  * visible on the device.
+  */
++void macsurf_debug_log_write(const char *msg)
++{
++	/* MacSurf's MS_LOG: bridge traces and the page's console.log. The
++	 * compat fallback wrote to stderr, which the Vita discards. */
++	if (engine_log == NULL || !verbose_log || msg == NULL)
++		return;
++	fprintf(engine_log, "MS %s\n", msg);
++}
++
+ void macsurf_debug_log_writef(const char *fmt, ...)
+ {
+ 	va_list ap;
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+new file mode 100644
+index 000000000..b738ad760
+--- /dev/null
++++ b/frontends/vita/js_platform.c
+@@ -0,0 +1,133 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the services MacSurf's QuickJS bridge calls
++ * (content/handlers/javascript/quickjs/macos9.h).
++ *
++ * The bridge was written against MacSurf's Mac OS 9 frontend. These are
++ * the Vita's versions: the frontend scheduler, plain allocation, and
++ * clocks. The microsecond clock macos9_micros() is in vita/qjs_hooks.c,
++ * shared with the engine's own instrumentation.
++ */
++
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/time.h>
++
++#include "utils/errors.h"
++#include "content/handlers/javascript/quickjs/macos9.h"
++
++#include "vita/schedule.h"
++#include "vita/layout.h"
++#include "vita/js_platform.h"
++
++/* Time spent in JavaScript, us, as the bridge reports it. */
++long vita_js_time_us;
++unsigned long vita_js_random_failures;
++
++/* exported interface documented in quickjs/macos9.h */
++nserror macos9_schedule(int t, void (*callback)(void *p), void *p)
++{
++	return vita_schedule(t, callback, p);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macos9_schedule_cancel_owner(void *p)
++{
++	vita_schedule_remove_owner(p);
++}
++
++/* exported interface documented in quickjs/macos9.h: may fail, and the
++ * bridge handles NULL (the QuickJS heap itself is capped separately). */
++void *macsurf_try_alloc(size_t size)
++{
++	return malloc(size);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void *macsurf_try_realloc(void *ptr, size_t size)
++{
++	return realloc(ptr, size);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++unsigned long TickCount(void)
++{
++	return (unsigned long)(macos9_micros() * 60.0 / 1e6);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++int macos9_sched_is_queued(void (*callback)(void *p), void *p)
++{
++	return vita_schedule_is_queued(callback, p) ? 1 : 0;
++}
++
++/* exported interface documented in quickjs/macos9.h: performance.now()'s
++ * clock, ms since start-up with sub-millisecond resolution. */
++double macsurf_monotonic_ms(void)
++{
++	static double t0 = -1.0;
++	double now = macos9_micros();
++
++	if (t0 < 0.0)
++		t0 = now;
++	return (now - t0) / 1000.0;
++}
++
++/* exported interface documented in quickjs/macos9.h: crypto.getRandomValues
++ * and crypto.randomUUID. getentropy() is the kernel's generator (on the
++ * Vita, newlib's getentropy() calls sceKernelGetRandomNumber); it takes at
++ * most 256 bytes a call. Never falls back to a weak source: on failure the
++ * buffer is left zeroed and the failure logged by the caller's counters. */
++void OSTLS_RandomBytes(void *out, unsigned long len)
++{
++	unsigned char *p = out;
++
++	while (len > 0) {
++		size_t n = len > 256 ? 256 : (size_t)len;
++		if (getentropy(p, n) != 0) {
++			while (len-- > 0)
++				*p++ = 0;
++			vita_js_random_failures++;
++			return;
++		}
++		p += n;
++		len -= n;
++	}
++}
++
++/* The frontend's text measurement, for canvas measureText() and the
++ * bridge's geometry (MacSurf's macos9_layout_table). Set by
++ * vita_js_platform_init(). */
++struct gui_layout_table *macos9_layout_table;
++
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_profile_accum_js(long us)
++{
++	if (us > 0)
++		vita_js_time_us += us;
++}
++
++/* exported interface documented in vita/js_platform.h */
++void vita_js_platform_init(void)
++{
++	macos9_layout_table = vita_layout_table;
++}
+diff --git a/frontends/vita/js_platform.h b/frontends/vita/js_platform.h
+new file mode 100644
+index 000000000..8bcd91ffc
+--- /dev/null
++++ b/frontends/vita/js_platform.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: the services MacSurf's QuickJS bridge calls (see
++ * vita/js_platform.c and content/handlers/javascript/quickjs/macos9.h).
++ */
++
++#ifndef NETSURF_VITA_JS_PLATFORM_H
++#define NETSURF_VITA_JS_PLATFORM_H
++
++/** Set the bridge's services up; call before netsurf_init(). */
++void vita_js_platform_init(void);
++
++/** Time spent in JavaScript so far, us, as the bridge reports it. */
++extern long vita_js_time_us;
++
++/** crypto.getRandomValues() requests the kernel could not fill. */
++extern unsigned long vita_js_random_failures;
++
++#endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index be4c6d9e3..6934d57cf 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -53,6 +53,7 @@
+ #include "utils/nsurl.h"
+ #include "netsurf/browser.h"
+ #include "netsurf/browser_window.h"
++#include "content/hlcache.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/netsurf.h"
+ 
+@@ -60,6 +61,11 @@
+ #include "vita/diag.h"
+ #include "vita/net.h"
+ #include "vita/netlog.h"
++#include "vita/js_platform.h"
++/* The QuickJS bridge's event-loop pump (quickjs/macsurf_qjs.c) and its
++ * relayout driver's per-content query (quickjs/macos9_reconvert.c). */
++void macsurf_qjs_pump_all(void);
++int macos9_reconvert_pending_for(void *cv);
+ #include "vita/fetch.h"
+ #include "vita/file.h"
+ #include "vita/layout.h"
+@@ -105,6 +111,7 @@ static const char *const vita_local_pages[] = {
+ 	"PM-gradient", "PM-shadow", "PM-animation", "PM-macsurf-grid",
+ 	"PM-tagtype", "PM-link", "PM-shadow-clip",
+ 	"VT-calibration", "VT-text", "VT-images", "VT-scroll",
++	"JS-dom", "JS-fetch",
+ };
+ #define VITA_LOCAL_PAGES \
+ 	((unsigned int)(sizeof(vita_local_pages) / sizeof(vita_local_pages[0])))
+@@ -357,6 +364,19 @@ static void log_page_summary(struct gui_window *gw, const char *why)
+ 		      s->cpu_ms_max, s->gpu_ms_max, s->calls_last, w, h);
+ }
+ 
++/** Is the page's DOM waiting for a relayout the scripts asked for?
++ * (MacSurf's reconvert driver, quickjs/macos9_reconvert.c: a mutation
++ * that lands while the box tree is being built is retried 400 ms later,
++ * after the page can look idle.) */
++static bool page_reconvert_pending(struct gui_window *gw)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++	struct hlcache_handle *h = bw ? browser_window_get_content(bw) : NULL;
++	struct content *c = h ? hlcache_handle_get_content(h) : NULL;
++
++	return c != NULL && macos9_reconvert_pending_for(c);
++}
++
+ /** Has the current page finished loading and stopped repainting? */
+ static bool page_settled(struct gui_window *gw)
+ {
+@@ -364,6 +384,12 @@ static bool page_settled(struct gui_window *gw)
+ 
+ 	if (vita_stats.frames == 0 || vita_window_loading(gw))
+ 		return false;
++	/* Not while script-driven relayout is still due: its frame is the
++	 * page as the scripts left it. */
++	if (page_reconvert_pending(gw)) {
++		vita_stats.last_frame_ms = now;
++		return false;
++	}
+ 	return now - vita_stats.last_frame_ms >= VITA_SETTLE_MS;
+ }
+ 
+@@ -808,6 +834,10 @@ static void vita_run(struct browser_window *bw)
+ 		int step;
+ 
+ 		vita_schedule_run();
++		/* JavaScript's event loop, as MacSurf's main loop runs it once a
++		 * pass (fixes321): due setTimeout / setInterval callbacks, the
++		 * promise job queue, queued events. Cheap when nothing is due. */
++		macsurf_qjs_pump_all();
+ 		if (vita_diag_ms() - last_flush >= 1000) {
+ 			last_flush = vita_diag_ms();
+ 			vita_diag_engine_flush();
+@@ -939,6 +969,10 @@ int main(int argc, char **argv)
+ 		fatal("nsoption_init", ret);
+ 		goto fail;
+ 	}
++	/* JavaScript: QuickJS-ng with MacSurf's DOM bridge (NetSurf's default
++	 * is off). */
++	nsoption_set_bool(enable_javascript, true);
++	vita_js_platform_init();
+ 	/* Missing messages only lose UI strings; not fatal. */
+ 	ret = messages_add_from_file(VITA_RESOURCE_DIR "Messages");
+ 	vita_diag_log("init: messages -> %d", ret);
+diff --git a/frontends/vita/qjs_hooks.c b/frontends/vita/qjs_hooks.c
+index 9fc3f1e0a..476fa3aa3 100644
+--- a/frontends/vita/qjs_hooks.c
++++ b/frontends/vita/qjs_hooks.c
+@@ -30,10 +30,17 @@
+ 
+ #include "vita/qjs_hooks.h"
+ 
++#ifndef WITH_QUICKJS
++/* Without MacSurf's bridge (the engine probe's host test) the counters are
++ * defined here; with it, the bridge defines them and its audit module keeps
++ * the GC totals (reported as -1, unknown, below). */
+ long macsurf_qjs_ncalls;
+ long macsurf_qjs_native_us;
+ long macsurf_qjs_native_samp;
+ static long gc_runs, gc_us;
++#else
++static const long gc_runs = -1, gc_us = -1;
++#endif
+ 
+ /* A monotonic microsecond clock. The name is MacSurf's: quickjs.c calls it
+  * around every 64th native call and around every collection. */
+@@ -49,12 +56,14 @@ double macos9_micros(void)
+ #endif
+ }
+ 
++#ifndef WITH_QUICKJS
+ void macsurf_qjs_gc_note(long us)
+ {
+ 	gc_runs++;
+ 	if (us > 0)
+ 		gc_us += us;
+ }
++#endif
+ 
+ void vita_qjs_stats_get(struct vita_qjs_stats *s)
+ {
+diff --git a/frontends/vita/schedule.c b/frontends/vita/schedule.c
+index b54de171f..3d6436dd6 100644
+--- a/frontends/vita/schedule.c
++++ b/frontends/vita/schedule.c
+@@ -69,7 +69,8 @@ static nserror schedule_remove(void (*callback)(void *p), void *p)
+ 	prev_nscb = NULL;
+ 
+ 	while (cur_nscb != NULL) {
+-		if ((cur_nscb->callback ==  callback) &&
++		/* A NULL callback matches any: every entry owned by p. */
++		if ((callback == NULL || cur_nscb->callback == callback) &&
+ 		    (cur_nscb->p ==  p)) {
+ 			/* item to remove */
+ 
+@@ -232,3 +233,20 @@ void vita_schedule_list(void)
+ 		cur_nscb = cur_nscb->next;
+ 	}
+ }
++
++/* exported interface documented in vita/schedule.h */
++void vita_schedule_remove_owner(void *p)
++{
++	schedule_remove(NULL, p);
++}
++
++/* exported interface documented in vita/schedule.h */
++bool vita_schedule_is_queued(void (*callback)(void *p), void *p)
++{
++	struct nscallback *cur;
++
++	for (cur = schedule_list; cur != NULL; cur = cur->next)
++		if (cur->callback == callback && cur->p == p)
++			return true;
++	return false;
++}
+diff --git a/frontends/vita/schedule.h b/frontends/vita/schedule.h
+index 56bf60dd3..3e5184898 100644
+--- a/frontends/vita/schedule.h
++++ b/frontends/vita/schedule.h
+@@ -19,6 +19,8 @@
+ #ifndef NETSURF_VITA_SCHEDULE_H
+ #define NETSURF_VITA_SCHEDULE_H
+ 
++#include <stdbool.h>
++
+ /**
+  * Schedule a callback.
+  *
+@@ -47,6 +49,16 @@ extern unsigned int vita_schedule_fired;
+ /** Number of callbacks currently scheduled. */
+ unsigned int vita_schedule_pending(void);
+ 
++/**
++ * Remove every scheduled callback whose argument is p, whatever the
++ * function (MacSurf's macos9_schedule_cancel_owner: a content being
++ * destroyed takes its pending callbacks with it).
++ */
++void vita_schedule_remove_owner(void *p);
++
++/** Is callback(p) scheduled and not yet run? */
++bool vita_schedule_is_queued(void (*callback)(void *p), void *p);
++
+ /**
+  * Log a list of all scheduled callbacks.
+  */

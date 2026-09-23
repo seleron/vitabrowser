@@ -1,0 +1,222 @@
+# netsurf: QuickJS backend switch, live-content registry, reconvert CSS reset (core)
+# Generated 2026-09-23
+#
+# The core half of running MacSurf's QuickJS DOM bridge (QuickJS step 2).
+# - Makefile, Makefile.defaults: NETSURF_USE_QUICKJS (default NO), a
+#   feature switch that defines WITH_QUICKJS.
+# - javascript/Makefile: QuickJS selects content/handlers/javascript/quickjs
+#   (patch 45) ahead of Duktape / none.
+# - content.c, hlcache.c, html.c, script.c, object.c, box_construct.c:
+#   MacSurf's live-content registry (register at creation, unregister at
+#   destroy; is_live / generation tokens for callbacks that outlive a
+#   content) and macos9_schedule_cancel_owner were compiled for __MACOS9__
+#   only, the rest getting "always live" macros. With scripts, callbacks
+#   do outlive contents, so they are now real under WITH_QUICKJS too.
+#   Death row (deferred destruction) stays Mac-only.
+# - css/select.c: the two pieces of MacSurf's css/cssh_select.c the
+#   reconvert needs (fixes899 nscss_reset_node_data; fixes130e freeing
+#   first-cascade node data instead of asserting). Without them the first
+#   script-driven relayout aborted in set_libcss_node_data. The rest of
+#   that file-fork stays deferred (doc 06 §7).
+# See docs/phase-0/10-hardware-test-plan.md §Run 10.
+
+diff --git a/Makefile b/Makefile
+index d6ba68388..97f1a6bfa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -124,6 +124,7 @@ $(eval $(call feature_switch,JPEG,JPEG (libjpeg),-DWITH_JPEG,-ljpeg,-UWITH_JPEG,
+ $(eval $(call feature_switch,HARU_PDF,PDF export (haru),-DWITH_PDF_EXPORT,-lhpdf -lpng,-UWITH_PDF_EXPORT,))
+ $(eval $(call feature_switch,LIBICONV_PLUG,glibc internal iconv,-DLIBICONV_PLUG,,-ULIBICONV_PLUG,-liconv))
+ $(eval $(call feature_switch,DUKTAPE,Javascript (Duktape),,,,,))
++$(eval $(call feature_switch,QUICKJS,Javascript (QuickJS-ng + MacSurf bridge),-DWITH_QUICKJS,,-UWITH_QUICKJS,))
+ 
+ # Common libraries with pkgconfig
+ $(eval $(call pkg_config_find_and_add,libcss,CSS))
+diff --git a/Makefile.defaults b/Makefile.defaults
+index 76bc2e7d7..ef32fe78f 100644
+--- a/Makefile.defaults
++++ b/Makefile.defaults
+@@ -71,6 +71,12 @@ NETSURF_USE_WEBP := AUTO
+ # Valid options: YES, NO
+ NETSURF_USE_DUKTAPE := YES
+ 
++# Enable NetSurf's use of QuickJS-ng with MacSurf's DOM bridge
++# (content/handlers/javascript/quickjs) instead of Duktape. The frontend
++# links libquickjs and implements the services in quickjs/macos9.h.
++# Valid options: YES, NO
++NETSURF_USE_QUICKJS := NO
++
+ # Enable NetSurf's use of libharu for PDF export and GTK printing support.
+ # There is no auto-detection available for this, as it does not have a
+ # pkg-config file.
+diff --git a/content/content.c b/content/content.c
+index 3fe593a86..097548c77 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -48,7 +48,7 @@
+  * file, Mac-only fork) rather than pulling the macos9 frontend header into
+  * content core - same approach as the macsurf_debug_log_writef forward decl
+  * in content_protected.h.  No-op on non-Mac syntax-check builds. */
+-#ifdef __MACOS9__
++#if defined(__MACOS9__) || defined(WITH_QUICKJS)
+ extern void macos9_schedule_cancel_owner(void *p);
+ /* fixes533: out-of-band live-content registry (anti-UAF).  A content
+  * registers at content__init and deregisters as the first action of
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index bf1f0f545..d144adb21 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -1837,7 +1837,15 @@ css_error set_libcss_node_data(void *pw, void *node, void *libcss_node_data)
+ 		return CSS_NOMEM;
+ 	}
+ 
+-	assert(old_node_data == NULL);
++	/* MacSurf fixes130e (VitaBrowser: ported with the reconvert,
++	 * docs/phase-0/10 §Run 10): when a script's DOM change is laid out
++	 * the node is cascaded a second time, and old_node_data is the libcss
++	 * node data from the first cascade. Free it rather than asserting it
++	 * away. */
++	if (old_node_data != NULL) {
++		css_libcss_node_data_handler(&selection_handler,
++				CSS_NODE_DELETED, NULL, n, NULL, old_node_data);
++	}
+ 
+ 	return CSS_OK;
+ }
+@@ -1857,3 +1865,42 @@ css_error get_libcss_node_data(void *pw, void *node, void **libcss_node_data)
+ 
+ 	return CSS_OK;
+ }
++
++/* MacSurf fixes899 (VitaBrowser: ported from MacSurf's css/cssh_select.c
++ * with the reconvert, docs/phase-0/10 §Run 10; the rest of that file-fork
++ * stays deferred, doc 06 §7) - release a node's cached libcss node data
++ * (the pass-1 partial computed styles + bloom) and clear the user-data slot.
++ *
++ * The reconvert re-cascade UAF: on the SECOND cascade every element still
++ * carries its pass-1 node data, and libcss's cross-node style-sharing
++ * optimization pulls those stale pass-1 partial styles -- owned by the OLD box
++ * tree that html_reconvert_free_old is about to talloc_free -- into pass-2
++ * results, then the value-matching arena remove (see css__arena_remove_style)
++ * unlinks the wrong entry and leaves a freed style linked -> PC=0x2710.
++ *
++ * html_reconvert walks the DOM and calls this on every element BEFORE
++ * re-cascading, so pass 2 starts from empty node data exactly like the initial
++ * build. set_libcss_node_data(NULL) NULLs the slot AND, because the old data is
++ * non-NULL, routes it through css_libcss_node_data_handler(CSS_NODE_DELETED) --
++ * the proper unref, so this releases refs rather than leaking them. Returns
++ * non-zero if a node actually had node data (so the caller can count how many
++ * stale caches it cleared). */
++int nscss_reset_node_data(dom_node *node);
++int nscss_reset_node_data(dom_node *node)
++{
++	void *existing = NULL;
++
++	if (node == NULL)
++		return 0;
++
++	/* peek so we can report whether there was anything to clear */
++	if (dom_node_get_user_data(node,
++			corestring_dom___ns_key_libcss_node_data,
++			&existing) != DOM_NO_ERR)
++		return 0;
++	if (existing == NULL)
++		return 0;
++
++	(void) set_libcss_node_data(NULL, node, NULL);
++	return 1;
++}
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index b6fe4a0ce..0eec16a60 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -46,15 +46,19 @@
+  * content_destroy, so unlike hlcache_content_is_live (removed from the entry
+  * gate at fixes521 for false-negatives) this never false-bails a live
+  * conversion.  No-op (always live) on non-Mac syntax-check builds. */
+-#ifdef __MACOS9__
++#if defined(__MACOS9__) || defined(WITH_QUICKJS)
+ extern int macos9_content_is_live(struct content *c);
+ extern unsigned long macos9_content_token(struct content *c);
+ extern int macos9_content_token_valid(struct content *c, unsigned long token);
+-extern void macos9_content_drain_deferred(void);
+ #else
+ #define macos9_content_is_live(c) (1)
+ #define macos9_content_token(c) (1UL)
+ #define macos9_content_token_valid(c, t) (1)
++#endif
++/* Death row (deferred content destruction) is Mac OS 9 only. */
++#ifdef __MACOS9__
++extern void macos9_content_drain_deferred(void);
++#else
+ #define macos9_content_drain_deferred() ((void)0)
+ #endif
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 73b7c8ba1..ca690b890 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -100,7 +100,7 @@ extern const char *macsurf_talloc_free_ctx;
+  * Used in html_close/html_destroy to cancel every scheduled callback keyed
+  * on this html_content (deferred_parser_unpause, html_css_process_modified_
+  * styles, ...) before any parser/content state is torn down. */
+-#ifdef __MACOS9__
++#if defined(__MACOS9__) || defined(WITH_QUICKJS)
+ extern void macos9_schedule_cancel_owner(void *p);
+ extern int macos9_content_is_live(struct content *c);
+ extern unsigned long macos9_content_token(struct content *c);
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 6dd32cc45..665a2422f 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -105,7 +105,7 @@ static nserror html_object_callback(hlcache_handle *object,
+  * cancel in content_destroy/html_destroy cannot match it.  Validate the
+  * owning content by registry membership (never dereferences it) before
+  * acting.  No-op (always live) on non-Mac syntax-check builds. */
+-#ifdef __MACOS9__
++#if defined(__MACOS9__) || defined(WITH_QUICKJS)
+ extern int macos9_content_is_live(struct content *c);
+ #else
+ #define macos9_content_is_live(c) (1)
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 6341d7e60..c908eb9d6 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -66,7 +66,7 @@ typedef bool (script_handler_t)(struct jsthread *jsthread, const uint8_t *data,
+  * the find-script loop and assert below walk freed memory.  Validate the parent
+  * by registry membership (never dereferences it) before touching parent->scripts.
+  * No-op (always live) on non-Mac syntax-check builds. */
+-#ifdef __MACOS9__
++#if defined(__MACOS9__) || defined(WITH_QUICKJS)
+ extern int macos9_content_is_live(struct content *c);
+ extern unsigned long macos9_content_token(struct content *c);
+ extern int macos9_content_token_valid(struct content *c, unsigned long token);
+diff --git a/content/handlers/javascript/Makefile b/content/handlers/javascript/Makefile
+index 5cd0fc36b..a486e053e 100644
+--- a/content/handlers/javascript/Makefile
++++ b/content/handlers/javascript/Makefile
+@@ -6,7 +6,10 @@
+ 
+ S_JAVASCRIPT_BINDING:=
+ 
+-ifeq ($(NETSURF_USE_DUKTAPE),YES)
++ifeq ($(NETSURF_USE_QUICKJS),YES)
++# QuickJS-ng with MacSurf's DOM bridge
++include content/handlers/javascript/quickjs/Makefile
++else ifeq ($(NETSURF_USE_DUKTAPE),YES)
+ # Duktape
+ include content/handlers/javascript/duktape/Makefile
+ else
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 9601b23bc..4ff8922ed 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -44,7 +44,7 @@
+ #include "macsurf_debug.h"
+ #include "macos9_deathrow.h"
+ 
+-#ifdef __MACOS9__
++#if defined(__MACOS9__) || defined(WITH_QUICKJS)
+ /* fixes553 - defined in content/handlers/html/box_construct.c.  Returns non-zero
+  * when the content is pinned by the box walk currently on the stack (the walked
+  * html_content or any sub-resource content in its object_list).  hlcache_clean
