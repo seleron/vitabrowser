@@ -39,3 +39,12 @@ gcc -std=c99 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter \
 	"$NS/frontends/vita/replay.c" \
 	"$OUT-monkey.o" -lm
 "$OUT" "$ROOT"
+
+# The text engine (frontends/vita/text.c): real FreeType, real fonts.
+FONTS="$WORK/fonts"
+[ -f "$FONTS/DejaVuSans.ttf" ] || WORK="$WORK" "$ROOT/tools/fetch-fonts.sh"
+gcc -std=c99 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter \
+	-Werror $INC $(pkg-config --cflags freetype2) -o "$OUT-text" \
+	"$ROOT/tools/test_vita_text.c" \
+	"$NS/frontends/vita/text.c" $(pkg-config --libs freetype2)
+"$OUT-text" "$FONTS"

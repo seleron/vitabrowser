@@ -31,11 +31,13 @@ PAGES="${PAGES:-15}"
 [ -f "$P/lib/pkgconfig/libcss.pc" ] || { echo "no host engine at $P -- run tools/build-patched.sh"; exit 2; }
 
 mkdir -p "$OUT/shots" "$OUT/run"
+# The frontend draws text with FreeType from app0:/res/fonts (vita/text.c).
+[ -f "$WORK/fonts/DejaVuSans.ttf" ] || WORK="$WORK" "$ROOT/tools/fetch-fonts.sh"
 rm -f "$OUT"/shots/*.png
 
 echo "== stand-in SDK =="
 gcc -std=c99 -D_DEFAULT_SOURCE -O2 -g -Wall -Wextra -Wno-unused-parameter -Werror \
-	-I"$ROOT/tools/vita-stub" $(pkg-config --cflags freetype2) \
+	-I"$ROOT/tools/vita-stub" \
 	-c "$ROOT/tools/vita-sim/vitasim.c" -o "$OUT/vitasim.o"
 rm -f "$OUT/libvitasim.a"
 ar rcs "$OUT/libvitasim.a" "$OUT/vitasim.o"
@@ -86,6 +88,8 @@ for f in default.css quirks.css adblock.css internal.css Messages \
 	cp -L "$NS/frontends/vita/res/$f" "$A/res/$f"
 done
 cp "$ROOT"/testpages/pages/* "$A/testpages/"
+mkdir -p "$A/res/fonts"
+cp "$WORK"/fonts/*.ttf "$WORK"/fonts/LICENSE-*.txt "$A/res/fonts/"
 
 echo "== run: $PAGES pages =="
 ( cd "$OUT/run" && VITA_SIM_OUT="$OUT/shots" VITA_SIM_PAGES="$PAGES" \

@@ -9,6 +9,8 @@
 #   2. NetSurf's support libraries (nsutils, utf8proc, nspsl, nsgif, nsbmp)
 #   3. make TARGET=vita          -> nsvita.elf
 #   4. make package-vita         -> VitaBrowser.vpk, with testpages/pages/
+#                                   and the fonts (tools/fetch-fonts.sh) in
+#                                   res/fonts/, licence texts beside them
 #
 # Each flag is load-bearing:
 #
@@ -102,6 +104,11 @@ export CFLAGS="-I$VP/include/libutf8proc -I$ROOT/compat \
 EXTRA=""
 for f in "$ROOT"/testpages/pages/*; do
 	EXTRA="$EXTRA $f=testpages/$(basename "$f")"
+done
+# Text is FreeType from app0:/res/fonts (frontends/vita/text.c).
+[ -f "$WORK/fonts/DejaVuSans.ttf" ] || WORK="$WORK" "$ROOT/tools/fetch-fonts.sh"
+for f in "$WORK"/fonts/*.ttf "$WORK"/fonts/LICENSE-*.txt; do
+	EXTRA="$EXTRA $f=res/fonts/$(basename "$f")"
 done
 # Two VPKs from one ELF: the default memory budget, and the extended one
 # (param.sfo ATTRIBUTE2=12, pre-phase-0 §1) under its own title id so both

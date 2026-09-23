@@ -3,15 +3,14 @@
  * Links under the real Vita frontend (built with VITA_HOST_SIM=YES, see
  * tools/run-vita-sim.sh) in place of libvita2d and the SceCtrl / kernel
  * stubs, so the unmodified frontend -- main loop, window, file-path table,
- * PGF layout, bitmaps, plotters -- runs the real patched engine on the
+ * text layout, bitmaps, plotters -- runs the real patched engine on the
  * build machine:
  *
  *  - vita2d draw calls are rasterised into a 960x544 RGBA frame with the
  *    GPU's pixel-centre coverage rule and straight-alpha blending, honouring
  *    the clip rectangle;
- *  - "PGF" text is FreeType (VITA_SIM_FONT, default DejaVu Sans) at
- *    scale x VITA_PGF_EM_PX pixels, drawn with its baseline at y. Layout
- *    measures with the same face, so line breaks are real;
+ *  - text is the frontend's own (vita/text.c: FreeType into an alpha
+ *    atlas, the same fonts as on the Vita); only the atlas draw is here;
  *  - input is scripted: once the screen has been idle for a while (the page
  *    has settled) the last shown frame is written to VITA_SIM_OUT/page-N.png
  *    and R is pressed to open the next test page; after VITA_SIM_PAGES
@@ -24,7 +23,7 @@
  *    newlib iconv has no converters at all, so iconv_open() fails here too
  *    (hardware run 2, doc 10). Every engine library must work without it.
  *
- * What this cannot tell you: anything about the GXM, PGF's real metrics,
+ * What this cannot tell you: anything about the GXM, the Vita's real
  * memory, or speed. It proves the frontend's logic, not the hardware.
  */
 #include <stdint.h>
@@ -37,8 +36,6 @@
 #include <errno.h>
 #include <iconv.h>
 #include <zlib.h>
-#include <ft2build.h>
-#include FT_FREETYPE_H
 
 #include <vita2d.h>
 #include <psp2/ctrl.h>
@@ -47,8 +44,6 @@
 
 #define W 960
 #define H 544
-/* Must match VITA_PGF_EM_PX in frontends/vita/plot.c. */
-#define PGF_EM_PX 20.0f
 
 static uint32_t back[W * H];	/* frame being drawn, RGBA8 as vita2d packs */
 static uint32_t shown[W * H];	/* last swapped frame */
@@ -250,91 +245,63 @@ void vita2d_draw_texture_scale(const vita2d_texture *t, float x, float y,
 		}
 }
 
-/* ---- "PGF": FreeType ------------------------------------------------- */
+/* ---- textures: the text atlas -----------------------------------------
+ *
+ * frontends/vita/text.c renders glyphs with FreeType into 8-bit alpha
+ * textures (SCE_GXM_TEXTURE_FORMAT_U8_R111: white, alpha = the texel) and
+ * draws them with vita2d_draw_texture_tint_part(). On the GPU the tint
+ * multiplies the texel; here likewise.
+ */
 
-static FT_Library ft;
-static FT_Face face;
-static int face_px;
-
-static int set_px(float scale)
+vita2d_texture *vita2d_create_empty_texture_format(unsigned int w,
+		unsigned int h, SceGxmTextureFormat format)
 {
-	int px = (int)(scale * PGF_EM_PX + 0.5f);
-	if (px < 1)
-		px = 1;
-	if (px != face_px) {
-		FT_Set_Pixel_Sizes(face, 0, (FT_UInt)px);
-		face_px = px;
-	}
-	return px;
-}
+	vita2d_texture *t;
 
-/* Minimal UTF-8 decode; invalid bytes decode as themselves. */
-static uint32_t next_cp(const char **s)
-{
-	const unsigned char *p = (const unsigned char *)*s;
-	uint32_t c = p[0];
-	int n = 0, k;
-
-	if (c >= 0xf0) { c &= 0x07; n = 3; }
-	else if (c >= 0xe0) { c &= 0x0f; n = 2; }
-	else if (c >= 0xc0) { c &= 0x1f; n = 1; }
-	for (k = 1; k <= n && (p[k] & 0xc0) == 0x80; k++)
-		c = (c << 6) | (p[k] & 0x3f);
-	*s += k;
-	return c;
-}
-
-vita2d_pgf *vita2d_load_default_pgf(void)
-{
-	const char *path = getenv("VITA_SIM_FONT");
-	if (path == NULL)
-		path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-	if (FT_Init_FreeType(&ft) != 0 || FT_New_Face(ft, path, 0, &face) != 0) {
-		fprintf(stderr, "vitasim: cannot load font %s\n", path);
+	if (format != SCE_GXM_TEXTURE_FORMAT_U8_R111)
+		return vita2d_create_empty_texture(w, h);
+	t = calloc(1, sizeof(*t));
+	if (t == NULL)
+		return NULL;
+	t->w = w;
+	t->h = h;
+	t->stride = (w + 7) & ~7u;	/* vita2d pads rows to 8 texels */
+	t->alpha8 = 1;
+	t->data = calloc(t->stride, h);
+	if (t->data == NULL) {
+		free(t);
 		return NULL;
 	}
-	return (vita2d_pgf *)face;
+	return t;
 }
-void vita2d_free_pgf(vita2d_pgf *f) { (void)f; }
 
-int vita2d_pgf_draw_text(vita2d_pgf *f, int x, int y, unsigned int color,
-			 float scale, const char *text)
+void vita2d_texture_set_filters(vita2d_texture *t, SceGxmTextureFilter min,
+				SceGxmTextureFilter mag)
 {
-	int pen = x;
+	(void)t; (void)min; (void)mag;	/* sampling here is always exact */
+}
+
+void vita2d_draw_texture_tint_part(const vita2d_texture *t, float x, float y,
+				   float tx, float ty, float tw, float th,
+				   unsigned int color)
+{
+	int i, j;
+
 	calls++;
-	set_px(scale);
-	while (*text) {
-		uint32_t cp = next_cp(&text);
-		FT_Bitmap *bm;
-		unsigned int r, c;
-		if (FT_Load_Char(face, cp, FT_LOAD_RENDER) != 0)
-			continue;
-		bm = &face->glyph->bitmap;
-		for (r = 0; r < bm->rows; r++)
-			for (c = 0; c < bm->width; c++)
-				blend(pen + face->glyph->bitmap_left + (int)c,
-				      y - face->glyph->bitmap_top + (int)r, color,
-				      bm->buffer[r * bm->pitch + c]);
-		pen += (int)(face->glyph->advance.x >> 6);
-	}
-	return pen - x;
-}
-
-int vita2d_pgf_text_width(vita2d_pgf *f, float scale, const char *text)
-{
-	int w = 0;
-	set_px(scale);
-	while (*text) {
-		uint32_t cp = next_cp(&text);
-		if (FT_Load_Char(face, cp, FT_LOAD_DEFAULT) == 0)
-			w += (int)(face->glyph->advance.x >> 6);
-	}
-	return w;
-}
-
-int vita2d_pgf_text_height(vita2d_pgf *f, float scale, const char *text)
-{
-	return set_px(scale);
+	for (j = 0; j < (int)th; j++)
+		for (i = 0; i < (int)tw; i++) {
+			unsigned int u = (unsigned int)tx + (unsigned int)i;
+			unsigned int v = (unsigned int)ty + (unsigned int)j;
+			unsigned int cover;
+			if (u >= t->w || v >= t->h)
+				continue;
+			if (t->alpha8) {
+				cover = t->data[v * t->stride + u];
+			} else {
+				cover = t->data[v * t->stride + u * 4 + 3];
+			}
+			blend(first_px(x) + i, first_px(y) + j, color, cover);
+		}
 }
 
 /* ---- PNG out --------------------------------------------------------- */

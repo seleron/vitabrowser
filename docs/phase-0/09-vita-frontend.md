@@ -47,10 +47,11 @@ Three patches in `patches/vitabrowser/`, applied after the generated stack
 | File | Role |
 |---|---|
 | `plot_geom.c/.h` | **The contract as coloured geometry.** One `plot->rectangle` → the pieces monkey records (bands, drop/inset shadow rects, transform quad, bucket), each with its colour and a `paint` flag. No platform dependencies. Also formats pieces as monkey stream lines. |
-| `plot.c/.h` | The vita2d `plotter_table`, plus primitives shared with the replayer: `fill_rect`, `fill_quad` (triangle fan), `line`, `text` (system PGF), `set_clip` |
+| `plot.c/.h` | The vita2d `plotter_table`, plus primitives shared with the replayer: `fill_rect`, `fill_quad` (triangle fan), `line`, `text` (FreeType, §11; system PGF before patch 38), `set_clip` |
+| `text.c/.h` | The FreeType text engine (patch 38, §11): bundled fonts, fallback chain, glyph atlas; measures and draws |
 | `replay.c/.h` | Replays a recorded `.plot` stream through the same primitives (a debug viewer, and test layer C) |
 | `bitmap.c/.h` | Bitmaps *are* vita2d textures: RGBA8 texture memory = NetSurf's default `BITMAP_LAYOUT_RGBA8888`, so decoders write straight into GPU-visible memory |
-| `layout.c/.h` | Text measurement with the same PGF font the plotter draws with; per-glyph advances cached at scale 1.0 |
+| `layout.c/.h` | Text measurement with the advances the plotter draws with (`text.c`; PGF before patch 38) |
 | `window.c/.h` | One full-screen window; invalidate marks dirty; redraw at `(-scrollx, -scrolly)` |
 | `file.c/.h` | `file:///app0:/x` ↔ `app0:/x`: Vita paths have a device prefix and no leading slash |
 | `fetch.c/.h` | MIME type from a built-in extension table (no `/etc/mime.types`); resources from `app0:/res/` |
@@ -175,8 +176,10 @@ place of the SDK. The stand-in:
 
 - rasterises vita2d calls into a 960×544 frame with the pixel-centre
   coverage rule, straight alpha and the clip rectangle;
-- renders "PGF" text with FreeType (DejaVu Sans) at `scale × 20` px, baseline
-  at y. Layout measures with the same face, so line breaks are real;
+- provides 8-bit alpha textures and `vita2d_draw_texture_tint_part`, which
+  the frontend's own FreeType engine (§11) draws glyphs with, so text in the
+  simulator is the device's text path, fonts included (before patch 38 the
+  stand-in drew "PGF" text itself, with DejaVu Sans at `scale × 20` px);
 - scripts the pad: once no frame has been drawn for ~1 s it writes the last
   shown frame to PNG and presses R (the frontend's next-page handler), then
   START after the last page. A page that draws no new frame fails the run.
@@ -290,13 +293,13 @@ and fixed by patch 32 (§10).
 
 | Item | Choice | Status |
 |---|---|---|
-| PGF size | `VITA_PGF_EM_PX 20`: scale = px / 20 | **assumption**: calibrate on hardware; only text size depends on it |
-| PGF `y` | treated as the baseline (NetSurf's text `y`) | **assumption** |
+| ~~PGF size~~ | ~~`VITA_PGF_EM_PX 20`~~ | superseded by patch 38: FreeType renders at the exact pixel size (§11) |
+| Text `y` | the baseline (NetSurf's text `y`); FreeType's `bitmap_top` places each glyph | by construction since patch 38 |
 | DPI | core at 96 dpi (`browser_set_dpi`), plot converts pt → px at 96 | consistent by construction |
 | Clipping | `vita2d_enable_clipping` + `vita2d_set_clip_rectangle(x0,y0,x1,y1)`, max exclusive like NetSurf's rects | **assumption** about r188's exact edge semantics |
 | Memory | `_newlib_heap_size_user` 192 MiB (MacSurf's preferred partition), main-thread stack 4 MiB, vita2d vertex pool 4 MiB; `ATTRIBUTE2=12` **not** set in the default VPK | **measured on hardware** (10 §Run 1): ≈ 256 MiB default, ≈ 365 MiB with `ATTRIBUTE2=12`, which works on 3.65 HENkaku |
 | Bitmaps | vita2d textures (default memblock type); `destroy` waits for the GPU first | correctness over speed; CPU writes to texture memory may be slow, so measure |
-| Glyph advances | `width("a"+c+"a") − width("aa")`, because PGF under-reports ink-less glyphs like space | **assumption** about PGF's measuring |
+| Glyph advances | FreeType's hinted advance, rounded to whole pixels, used by layout and drawing alike | by construction since patch 38 (was `width("a"+c+"a") − width("aa")` for PGF) |
 | Title ID | `VBRW00001`, no LiveArea art | placeholder |
 | Redraw | whole screen on any invalidate, only when dirty; idle loop sleeps 16 ms | simple first |
 
@@ -318,8 +321,8 @@ and fixed by patch 32 (§10).
 ## 8. Next actions
 
 1. **First hardware run**: plan and diagnostics build in
-   [10](10-hardware-test-plan.md) (patch 33). Calibrate `VITA_PGF_EM_PX`,
-   check the PGF baseline and clip edges against the simulator screenshots,
+   [10](10-hardware-test-plan.md) (patch 33). ~~Calibrate `VITA_PGF_EM_PX`~~
+   (PGF replaced, §11), check the baseline and clip edges against the simulator screenshots,
    and measure the allocate-until-failure budget (pre-phase-0 §1).
 2. ~~**Core clip fix for shadows/transforms** (§5)~~ — done, patch 32 (§10).
 3. **Plot-stream log over UDP** from the frontend, diffed against the desktop
@@ -414,3 +417,77 @@ offset (≤ 16 px). CSS counts box-shadow as ink overflow that does *not* extend
 scrolling (a transform does). The alternative is a separate ink bbox in
 `struct box`: 4 more fields computed alongside every descendant bbox, a
 larger change for ≤ 16 px. Recorded, not done.
+
+## 11. Text: FreeType and bundled fonts (patch 38)
+
+Hardware run 3 (10 §Run 3) showed the limits of the system PGF font, which
+vita2d rasterises once and scales. The atlas bled marks next to glyphs.
+Greek and Cyrillic came from the Japanese font at full width. Hangul, emoji
+and `简` were missing. The simulator's gap before punctuation after an
+inline element (`text ,`) came from layout measuring PGF advances
+indirectly (`width("a"+c+"a") − width("aa")`) while drawing used other
+metrics.
+
+**`frontends/vita/text.c`** is one engine for measuring and drawing:
+
+- **Faces** open lazily from `app0:/res/fonts/`. There are twelve DejaVu 2.37
+  faces: Sans, Serif and Mono, each with real bold, italic and bold-italic.
+  CSS `serif` and `monospace` map to their family and everything else to
+  Sans. `font-weight ≥ 600` is bold; italic and oblique are italic.
+- **Fallback, per code point:** the style's face, then DejaVuSans, then
+  DroidSansFallbackFull (kana, kanji, simplified and traditional Hanzi),
+  then NanumGothic (Hangul). A code point no face has draws DejaVu's
+  `.notdef` box and is counted.
+- **Advances** are FreeType's hinted advances in whole pixels. They come
+  from one cache that layout and drawing share, so a line is drawn exactly
+  as wide as it was measured.
+- **Glyphs** are rasterised at the exact pixel size and drawn unscaled with
+  point sampling. They sit in 512×512 8-bit alpha atlas pages (U8 → R111,
+  so the tint's RGB passes through), shelf-packed with a 1-pixel empty gap.
+  At most 16 pages (4 MiB). Nothing is ever sampled across a glyph's edge.
+- **Full atlas:** later glyphs in that frame are dropped and counted. The
+  atlas is reset at the next frame start, after `vita2d_wait_rendering_done()`,
+  so a texel the GPU may still read is never overwritten.
+
+**Fonts** are third-party binaries, so `tools/fetch-fonts.sh` fetches them
+into `$WORK/fonts`. Every source is pinned (a release or a commit) and
+checked by SHA256. `build-vita.sh` and `run-vita-sim.sh` bundle them into
+`res/fonts/`, with each licence beside its fonts:
+
+| Font | Covers | Size | Licence |
+|---|---|---|---|
+| DejaVu 2.37 (12 faces) | Latin, Greek incl. tonos, Cyrillic, symbols, some emoji | 5.3 MB | Bitstream Vera / Arev (free, redistributable) |
+| DroidSansFallbackFull (AOSP, pinned commit) | kana, CJK ideographs | 4.0 MB | Apache 2.0 |
+| NanumGothic Regular (google/fonts, pinned commit) | Hangul | 2.1 MB | SIL OFL 1.1 |
+
+The VPK grows from 4.1 MB to 10.3 MB (the fonts compress).
+
+**Verification (host):**
+- `tools/test_vita_text.c`, run by `test-vita-renderer.sh`: **30/30**.
+  It uses the real engine, real FreeType and the real fonts, with a vita2d
+  stand-in whose atlas textures are real memory, pre-filled with garbage.
+  - Coverage: each run-3 failure resolves to a face that has it.
+  - Styles pick the real faces; bold is wider; Mono advances are all equal.
+  - Width equals the sum of advances, and every glyph of `iiii`, `WWWW`,
+    kanji and Hangul is drawn exactly one advance after the previous one.
+  - 17 px is rasterised afresh, not scaled; a repeat is an atlas hit.
+  - No two atlas rects overlap, and each glyph's 1-pixel border is empty
+    in the texture itself.
+  - Overfilling drops glyphs and does not overwrite; the next frame resets
+    the atlas exactly once, after one GPU wait.
+  - Mutations, each caught: gap 0 (2 checks fail), pages not cleared (1),
+    a double flush (1).
+- `test_vita_plotter.c`: **101/101** (+1: a weight-700 run is drawn bold).
+- Simulator: all 15 pages render. The whole 4-pass autotest used **3 atlas
+  pages, 0 flushes, 0 drops**. CPU clip vs stencil clip is still
+  pixel-identical on 14/14 comparable pages. `VT-text` shows every script,
+  and the gap before punctuation is gone (10 §Run 5).
+- Cross build: `-Werror` clean; the ELF has no PGF symbols.
+
+**Not proven without hardware:** FreeType's speed on the Vita's ARM (the
+first page rasterises a few hundred glyphs), how long a cold open of the
+4 MB Droid face takes from `app0:`, and whether CPU writes into the atlas
+are seen by the GPU without artefacts. Run 5 shows them indirectly: every
+page's first-frame time, `VT-text`'s first frame (the Droid and Nanum faces
+open there), the atlas counters in `log.txt`, and the screenshots (10 §Run 5).
+

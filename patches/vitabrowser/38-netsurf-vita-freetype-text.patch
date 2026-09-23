@@ -1,0 +1,1272 @@
+# netsurf: Vita text with FreeType and bundled fonts (frontends/vita)
+# Generated 2026-09-23
+#
+# Hardware run 3 (doc 10): the system PGF font, rasterised once and scaled
+# by vita2d, left atlas-bleed marks; Greek and Cyrillic came from the
+# Japanese font at full width; Hangul, emoji and simplified Chinese were
+# missing; and layout measured with other metrics than drawing used.
+# - text.c/text.h (new): one FreeType engine measures and draws. Faces open
+#   lazily from app0:/res/fonts/: DejaVu Sans/Serif/Mono with real bold and
+#   italic faces, falling back per code point to DroidSansFallbackFull
+#   (kana, CJK) and NanumGothic (Hangul). Glyphs are rasterised at the exact
+#   pixel size and drawn unscaled, point-sampled, from 512x512 8-bit alpha
+#   atlas pages with a 1-pixel empty gap. A full atlas drops glyphs for the
+#   rest of the frame and is reset at the next frame start, after
+#   sceGxmFinish, never overwritten while the GPU may read it.
+# - layout.c: widths, splits and positions from the same advances as drawn.
+# - plot.c: text through the engine (weight >= 600 bold, italic/oblique,
+#   serif/monospace families); PGF removed. CPU clipping unchanged.
+# - main.c: vita_text_frame_begin() before each frame; HUD/overlay text.
+# - diag.c: face resolution for probe code points, metrics, atlas counters.
+# - Makefile: text.c; freetype2 cflags. The fonts are fetched and bundled by
+#   the VitaBrowser repo (tools/fetch-fonts.sh, tools/build-vita.sh).
+# See docs/phase-0/10-hardware-test-plan.md §Run 5.
+
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 71dcbd779..271730fca 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -16,14 +16,19 @@ CFLAGS += -std=c99 -g -Ifrontends/vita/compat \
+ 	  -D_DEFAULT_SOURCE \
+ 	  -DNETSURF_VITA_START_PAGE=\"$(NETSURF_VITA_START_PAGE)\"
+ 
++# Text is drawn and measured with FreeType (vita/text.c).
++CFLAGS += $(shell $(PKG_CONFIG) --cflags freetype2)
++
+ ifeq ($(VITA_HOST_SIM),YES)
+ # Host simulator (see Makefile.tools): stand-in SDK headers and library.
+ CFLAGS += -I$(VITA_SIM_INCLUDE) -DVITA_HOST_SIM
+ LDFLAGS += $(VITA_SIM_LIB) $(shell pkg-config --libs freetype2) \
+ 	-lpcre2-posix -lpcre2-8 -lz -lm
+ else
+-# vitaSDK libraries. vita2d draws through the GXM and needs PGF for the
+-# system font; the SceXxx_stub archives resolve the firmware imports.
++# vitaSDK libraries. vita2d draws through the GXM; text is FreeType
++# (vita/text.c), from the fonts bundled under res/fonts. The PGF/PVF stubs
++# stay only for libvita2d's own font objects, which are not linked unless
++# something calls them. The SceXxx_stub archives resolve firmware imports.
+ LDFLAGS += -Wl,-q \
+ 	-lvita2d -lfreetype -lpng -ljpeg -lbz2 -lz \
+ 	-lpcre2-posix -lpcre2-8 \
+@@ -49,7 +54,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ 
+ # S_FRONTEND are sources purely for the Vita build
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+-	plot.c plot_geom.c replay.c diag.c
++	plot.c plot_geom.c replay.c diag.c text.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index 247504ea4..6c171259f 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -49,6 +49,7 @@
+ #include "utils/log.h"
+ 
+ #include "vita/plot.h"
++#include "vita/text.h"
+ #include "vita/diag.h"
+ 
+ /** Chunk size for the allocate-until-failure probes. */
+@@ -306,36 +307,46 @@ void vita_diag_mem_probe(void)
+ /* exported interface documented in vita/diag.h */
+ void vita_diag_font_metrics(void)
+ {
+-	struct vita2d_pgf *font = vita_plot_font();
+-	char line[512];
+-	size_t len = 0;
+-	int c, aa;
+-
+-	if (font == NULL) {
+-		vita_diag_log("font: no PGF font loaded");
++	/* The characters hardware run 3 showed failing with the system PGF
++	 * font, and which font file each now resolves to. */
++	static const struct { const char *what; uint32_t cp; } probe[] = {
++		{ "A", 0x41 }, { "e-acute", 0xe9 }, { "Greek alpha-tonos", 0x3ac },
++		{ "Cyrillic K", 0x41a }, { "hiragana hi", 0x3072 },
++		{ "kanji nichi", 0x65e5 }, { "simplified jian", 0x7b80 },
++		{ "Hangul han", 0xd55c }, { "emoji grin", 0x1f600 },
++		{ "private use", 0xe000 },
++	};
++	static const int sizes[] = { 12, 16, 32 };
++	struct vita_text_style st;
++	unsigned int i;
++
++	if (!vita_plot_text_ready()) {
++		vita_diag_log("font: text engine not ready (fonts missing?)");
+ 		return;
+ 	}
+-	/* The numbers layout.c works from: text height at scale 1 and 2, and
+-	 * each printable ASCII advance measured the way glyph_advance() does
+-	 * (width of "a"c"a" minus "aa") next to the raw single-glyph width. */
+-	vita_diag_log("font: height(\"Hg\") scale1 %d, scale2 %d; "
+-		      "width(\"MMMMMMMMMM\") scale1 %d",
+-		      vita2d_pgf_text_height(font, 1.0f, "Hg"),
+-		      vita2d_pgf_text_height(font, 2.0f, "Hg"),
+-		      vita2d_pgf_text_width(font, 1.0f, "MMMMMMMMMM"));
+-	aa = vita2d_pgf_text_width(font, 1.0f, "aa");
+-	for (c = 0x20; c < 0x7f; c++) {
+-		char s1[2] = { (char)c, 0 };
+-		char s3[4] = { 'a', (char)c, 'a', 0 };
+-		len += (size_t)snprintf(line + len, sizeof(line) - len,
+-				"%c=%d/%d ", c == ' ' ? '_' : c,
+-				vita2d_pgf_text_width(font, 1.0f, s3) - aa,
+-				vita2d_pgf_text_width(font, 1.0f, s1));
+-		if (len > sizeof(line) - 16 || c == 0x7e) {
+-			vita_diag_log("font advance/raw: %s", line);
+-			len = 0;
+-		}
++	vita_text_style_default(&st, 16);
++	for (i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
++		const char *face = vita_text_face_name(&st, probe[i].cp);
++		vita_diag_log("font: U+%04X %s -> %s, advance %d px at 16",
++			      (unsigned int)probe[i].cp, probe[i].what,
++			      face != NULL ? face : "(missing: tofu)",
++			      vita_text_advance(&st, probe[i].cp));
++	}
++	for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++		int asc, desc;
++		vita_text_style_default(&st, sizes[i]);
++		vita_text_extents(&st, &asc, &desc);
++		vita_diag_log("font: sans %d px: ascent %d, descent %d, "
++			      "width(\"The quick brown fox\") %d", sizes[i],
++			      asc, desc, vita_text_width(&st,
++						"The quick brown fox", 19));
+ 	}
++	vita_diag_log("font: atlas %u pages, %u glyphs rasterised, %u hits, "
++		      "%u flushes, %u dropped, %u missing code points, %u font "
++		      "files failed", vita_text_stats.atlas_pages,
++		      vita_text_stats.rasterised, vita_text_stats.atlas_hits,
++		      vita_text_stats.flushes, vita_text_stats.dropped,
++		      vita_text_stats.missing, vita_text_stats.face_failures);
+ }
+ 
+ /* exported interface documented in vita/diag.h */
+diff --git a/frontends/vita/layout.c b/frontends/vita/layout.c
+index 50b43b838..2c94e9400 100644
+--- a/frontends/vita/layout.c
++++ b/frontends/vita/layout.c
+@@ -18,103 +18,42 @@
+ 
+ /**
+  * \file
+- * Vita frontend: text measurement with the system PGF font.
++ * Vita frontend: text measurement.
+  *
+- * The plotters draw text with vita2d's PGF renderer, so layout must measure
+- * with the same font or lines overflow. Per-glyph advances are measured
+- * once at scale 1.0 and scaled per font size: the core measures text far
+- * more often than it draws it, and PGF measurement walks glyph bitmaps.
+- * No kerning, which PGF text rendering does not apply either.
++ * Measures with vita/text.c -- the same FreeType faces, at the same pixel
++ * size, with the same per-code-point advances the plotters draw with -- so a
++ * line layout computes is exactly the line that is drawn. (The first
++ * version measured the system PGF font; hardware run 3 showed PGF's own
++ * shortcomings, doc 10.)
+  */
+ 
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
+-#include <string.h>
+-
+-#include <vita2d.h>
+ 
+ #include "utils/errors.h"
+ #include "utils/utf8.h"
+ #include "netsurf/plot_style.h"
+ #include "netsurf/layout.h"
+ 
+-#include "vita/plot.h"
++#include "vita/text.h"
+ #include "vita/layout.h"
+ 
+-/** Advance widths at scale 1.0 for printable ASCII; < 0 = not measured. */
+-static int ascii_advance[128];
+-static bool ascii_ready;
+-
+-/**
+- * Advance of one UTF-8 character at scale 1.0.
+- *
+- * Measured as width("a" c "a") - width("aa"), because PGF reports a bare
+- * space, or any glyph with no ink at its edges, narrower than it advances.
+- */
+-static int glyph_advance(vita2d_pgf *font, const char *utf8, size_t len)
+-{
+-	char buf[16];
+-	int with, without;
+-
+-	if (len > sizeof(buf) - 3)
+-		len = sizeof(buf) - 3;
+-	buf[0] = 'a';
+-	memcpy(buf + 1, utf8, len);
+-	buf[len + 1] = 'a';
+-	buf[len + 2] = '\0';
+-	with = vita2d_pgf_text_width(font, 1.0f, buf);
+-	without = vita2d_pgf_text_width(font, 1.0f, "aa");
+-	return (with > without) ? with - without : 0;
+-}
+-
+-static void ascii_init(vita2d_pgf *font)
+-{
+-	char c;
+-
+-	for (c = 0; c < 0x20; c++)
+-		ascii_advance[(int)c] = 0;
+-	for (c = 0x20; c < 0x7f; c++)
+-		ascii_advance[(int)c] = glyph_advance(font, &c, 1);
+-	ascii_advance[0x7f] = 0;
+-	ascii_ready = true;
+-}
+-
+-/** Advance at scale 1.0 of the character at string[idx]. */
+-static int char_advance(const char *string, size_t length, size_t idx,
+-			size_t next)
+-{
+-	vita2d_pgf *font = vita_plot_font();
+-	unsigned char c = (unsigned char)string[idx];
+-
+-	if (font == NULL)
+-		return 0;
+-	if (!ascii_ready)
+-		ascii_init(font);
+-	if (c < 0x80)
+-		return ascii_advance[c];
+-	return glyph_advance(font, string + idx, next - idx);
+-}
+-
+-/** Scale from advances at 1.0 to pixels for this font style. */
+-static float style_scale(const plot_font_style_t *fstyle)
++/** Advance of the character at string[idx] in `style`. */
++static int char_advance(const struct vita_text_style *style,
++			const char *string, size_t length, size_t idx)
+ {
+-	return vita_plot_pgf_scale(vita_plot_font_px(fstyle->size));
++	return vita_text_advance(style,
++				 utf8_to_ucs4(string + idx, length - idx));
+ }
+ 
+ static nserror vita_font_width(const plot_font_style_t *fstyle,
+ 			       const char *string, size_t length, int *width)
+ {
+-	float scale = style_scale(fstyle);
+-	size_t idx = 0;
+-	int units = 0;
++	struct vita_text_style style;
+ 
+-	while (idx < length) {
+-		size_t next = utf8_next(string, length, idx);
+-		units += char_advance(string, length, idx, next);
+-		idx = next;
+-	}
+-	*width = (int)((float)units * scale + 0.5f);
++	vita_text_style_from_plot(fstyle, &style);
++	*width = vita_text_width(&style, string, length);
+ 	return NSERROR_OK;
+ }
+ 
+@@ -122,22 +61,21 @@ static nserror vita_font_position(const plot_font_style_t *fstyle,
+ 				  const char *string, size_t length,
+ 				  int x, size_t *char_offset, int *actual_x)
+ {
+-	float scale = style_scale(fstyle);
++	struct vita_text_style style;
+ 	size_t idx = 0;
+-	float pos = 0;
++	int pos = 0;
+ 
++	vita_text_style_from_plot(fstyle, &style);
+ 	/* Stop at the character boundary nearest x. */
+ 	while (idx < length) {
+-		size_t next = utf8_next(string, length, idx);
+-		float adv = (float)char_advance(string, length, idx, next) *
+-			scale;
+-		if ((float)x < pos + adv / 2)
++		int adv = char_advance(&style, string, length, idx);
++		if (2 * x < 2 * pos + adv)
+ 			break;
+ 		pos += adv;
+-		idx = next;
++		idx = utf8_next(string, length, idx);
+ 	}
+ 	*char_offset = idx;
+-	*actual_x = (int)(pos + 0.5f);
++	*actual_x = pos;
+ 	return NSERROR_OK;
+ }
+ 
+@@ -145,30 +83,30 @@ static nserror vita_font_split(const plot_font_style_t *fstyle,
+ 			       const char *string, size_t length,
+ 			       int x, size_t *char_offset, int *actual_x)
+ {
+-	float scale = style_scale(fstyle);
++	struct vita_text_style style;
+ 	size_t idx = 0;
+-	float pos = 0;
+-	float last_space_x = 0;
++	int pos = 0;
++	int last_space_x = 0;
+ 	size_t last_space_idx = 0;
+ 
++	vita_text_style_from_plot(fstyle, &style);
+ 	/* Same contract as the framebuffer frontend: break at the last space
+ 	 * before the width is exceeded; with no such space, don't break. */
+ 	while (idx < length) {
+-		size_t next = utf8_next(string, length, idx);
+ 		if (string[idx] == ' ') {
+ 			last_space_x = pos;
+ 			last_space_idx = idx;
+ 		}
+-		pos += (float)char_advance(string, length, idx, next) * scale;
+-		if (pos > (float)x && last_space_idx != 0) {
++		pos += char_advance(&style, string, length, idx);
++		if (pos > x && last_space_idx != 0) {
+ 			*char_offset = last_space_idx;
+-			*actual_x = (int)(last_space_x + 0.5f);
++			*actual_x = last_space_x;
+ 			return NSERROR_OK;
+ 		}
+-		idx = next;
++		idx = utf8_next(string, length, idx);
+ 	}
+ 	*char_offset = idx;
+-	*actual_x = (int)(pos + 0.5f);
++	*actual_x = pos;
+ 	return NSERROR_OK;
+ }
+ 
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index b7bf3df0b..b39a20465 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -21,7 +21,8 @@
+  * Vita frontend: application entry point and main loop.
+  *
+  * Opens bundled test pages from app0: through the core's file fetcher, lays
+- * them out with PGF metrics and paints them with the vita2d plotters.
++ * them out and paints them with the vita2d plotters, text in FreeType
++ * (vita/text.c).
+  * Hardware-test build: everything is logged to ux0:data/VitaBrowser/
+  * (vita/diag.h).
+  *
+@@ -62,6 +63,7 @@
+ #include "vita/layout.h"
+ #include "vita/plot.h"
+ #include "vita/schedule.h"
++#include "vita/text.h"
+ #include "vita/window.h"
+ 
+ /* Memory layout, read by the vitaSDK runtime at start-up. The heap matches
+@@ -544,7 +546,6 @@ static void autotest_post(struct gui_window *gw, struct browser_window *bw,
+ static void draw_overlay(void)
+ {
+ 	char hud[200];
+-	float scale = vita_plot_pgf_scale(14.0f);
+ 
+ 	vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
+ 	if (vita_hud) {
+@@ -562,7 +563,7 @@ static void draw_overlay(void)
+ 				    VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
+ 				    0x000000, 3);
+ 		vita_plot_text(6, VITA_SCREEN_HEIGHT - 6, hud, strlen(hud),
+-			       0xffffff, scale);
++			       0xffffff, 13);
+ 	}
+ 	if (vita_message[0] != '\0') {
+ 		if (vita_message_until != 0 &&
+@@ -572,7 +573,7 @@ static void draw_overlay(void)
+ 		}
+ 		vita_plot_fill_rect(180, 240, 780, 290, 0x202020, 4);
+ 		vita_plot_text(200, 272, vita_message, strlen(vita_message),
+-			       0x00ffff, vita_plot_pgf_scale(20.0f));
++			       0x00ffff, 20);
+ 	}
+ }
+ 
+@@ -601,6 +602,9 @@ static void draw_frame(struct gui_window *gw, bool dump, const char *snap)
+ 	}
+ 	vita_plot_calls = 0;
+ 	t0 = vita_diag_ms();
++	/* Before the scene opens: a full atlas is reset here, which waits for
++	 * the GPU (vita/text.c). */
++	vita_text_frame_begin();
+ 	vita2d_start_drawing();
+ 	vita2d_clear_screen();
+ 	vita_plot_frame_begin();
+@@ -766,7 +770,7 @@ static void fatal(const char *what, nserror err)
+ 	snprintf(msg, sizeof(msg), "VitaBrowser: %s failed (%d). "
+ 		 "See ux0:data/VitaBrowser/log.txt. START quits.", what, err);
+ 	vita_diag_log("FATAL: %s failed: %d", what, err);
+-	if (vita_plot_font() == NULL)
++	if (!vita_plot_text_ready())
+ 		return;
+ 	for (;;) {
+ 		SceCtrlData pad;
+@@ -777,8 +781,7 @@ static void fatal(const char *what, nserror err)
+ 		vita2d_start_drawing();
+ 		vita2d_clear_screen();
+ 		vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
+-		vita_plot_text(20, 270, msg, strlen(msg), 0x0000ff,
+-			       vita_plot_pgf_scale(18.0f));
++		vita_plot_text(20, 270, msg, strlen(msg), 0x0000ff, 18);
+ 		vita2d_end_drawing();
+ 		vita2d_swap_buffers();
+ 		sceKernelDelayThread(50 * 1000);
+@@ -813,7 +816,7 @@ int main(int argc, char **argv)
+ 	vita2d_set_clear_color(RGBA8(0xff, 0xff, 0xff, 0xff));
+ 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+ 	ret = vita_plot_init();
+-	vita_diag_log("init: PGF font -> %d", ret);
++	vita_diag_log("init: fonts (%s) -> %d", VITA_FONT_DIR, ret);
+ 	if (ret != NSERROR_OK)
+ 		goto fail;
+ 
+diff --git a/frontends/vita/plot.c b/frontends/vita/plot.c
+index 78bec0aa0..f3213e663 100644
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -49,6 +49,7 @@
+ #include "vita/bitmap.h"
+ #include "vita/plot.h"
+ #include "vita/diag.h"
++#include "vita/text.h"
+ 
+ #ifndef M_PI
+ #define M_PI 3.14159265358979323846
+@@ -59,19 +60,13 @@ static const unsigned int vita_bucket_alpha[VITA_BUCKET_SOLID + 1] = {
+ 	0, 64, 128, 191, 255
+ };
+ 
+-/**
+- * Height in pixels of the system PGF font at scale 1.0.
+- * UNVERIFIED: calibrate on hardware; only the text scale depends on it.
+- */
+-#define VITA_PGF_EM_PX 20.0f
+-
+ /** Segments used to approximate a full circle. */
+ #define VITA_CIRCLE_SEGMENTS 32
+ 
+ /** Segments used to flatten one cubic Bezier. */
+ #define VITA_BEZIER_SEGMENTS 12
+ 
+-static vita2d_pgf *vita_font;
++static bool vita_text_ready;
+ 
+ unsigned int vita_plot_calls;
+ 
+@@ -91,20 +86,6 @@ unsigned int vita_plot_rgba(colour c, int bucket)
+ 	return (c & 0xffffff) | (vita_bucket_alpha[bucket] << 24);
+ }
+ 
+-/* exported interface documented in vita/plot.h */
+-float vita_plot_font_px(int size)
+-{
+-	/* Plot font sizes are points in PLOT_STYLE_SCALE fixed point; the
+-	 * frontend runs the core at 96 dpi (see vita/main.c). */
+-	return ((float)size / PLOT_STYLE_SCALE) * 96.0f / 72.0f;
+-}
+-
+-/* exported interface documented in vita/plot.h */
+-float vita_plot_pgf_scale(float px)
+-{
+-	return px / VITA_PGF_EM_PX;
+-}
+-
+ /* ---- clipping --------------------------------------------------------
+  *
+  * vita2d clips with the stencil buffer, and every
+@@ -349,31 +330,35 @@ void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c)
+ 	}
+ }
+ 
+-/* exported interface documented in vita/plot.h */
+-void vita_plot_text(int x, int y, const char *text, size_t length,
+-		    colour c, float scale)
++/** Draw a counted UTF-8 run in `style`, baseline at y. */
++static void plot_text_styled(const struct vita_text_style *style, int x,
++			     int y, const char *text, size_t length, colour c)
+ {
+-	char buf[512];
+-	int w;
+-	float h;
++	int w, ascent, descent;
+ 
+-	if (vita_clip_empty || vita_font == NULL || length == 0)
++	if (vita_clip_empty || !vita_text_ready || length == 0)
+ 		return;
+-	/* The core hands us a counted, unterminated UTF-8 run. */
+-	if (length >= sizeof(buf))
+-		length = sizeof(buf) - 1;
+-	memcpy(buf, text, length);
+-	buf[length] = '\0';
+-	/* A generous box around the run: ascenders well above the baseline,
+-	 * descenders below, so "inside" is never wrongly claimed. */
+-	w = vita2d_pgf_text_width(vita_font, scale, buf);
+-	h = VITA_PGF_EM_PX * scale;
+-	if (!clip_prepare(x - 1, y - (int)(h * 1.3f) - 1, x + w + 2,
+-			  y + (int)(h * 0.6f) + 1))
++	/* The run's box: measured width, and the face's ascent and descent
++	 * with a pixel to spare (glyphs may overhang the advance a little),
++	 * so "inside the clip" is never wrongly claimed. */
++	w = vita_text_width(style, text, length);
++	vita_text_extents(style, &ascent, &descent);
++	if (!clip_prepare(x - style->px / 4 - 1, y - ascent - 1,
++			  x + w + style->px / 4 + 1, y + descent + 1))
+ 		return;
+ 	vita_plot_calls++;
+-	vita2d_pgf_draw_text(vita_font, x, y,
+-			     vita_plot_rgba(c, VITA_BUCKET_SOLID), scale, buf);
++	vita_text_draw(style, x, y, text, length,
++		       vita_plot_rgba(c, VITA_BUCKET_SOLID));
++}
++
++/* exported interface documented in vita/plot.h */
++void vita_plot_text(int x, int y, const char *text, size_t length,
++		    colour c, int px)
++{
++	struct vita_text_style style;
++
++	vita_text_style_default(&style, px);
++	plot_text_styled(&style, x, y, text, length, c);
+ }
+ 
+ /* ---- plot-stream dump (vita/diag.h) --------------------------------- */
+@@ -739,35 +724,36 @@ vita_plot_text_op(const struct redraw_context *ctx,
+ 		  const char *text,
+ 		  size_t length)
+ {
++	struct vita_text_style style;
++
+ 	trace("TEXT X %d Y %d STR %.*s", x, y, (int)length, text);
+-	vita_plot_text(x, y, text, length, fstyle->foreground,
+-		       vita_plot_pgf_scale(vita_plot_font_px(fstyle->size)));
++	vita_text_style_from_plot(fstyle, &style);
++	plot_text_styled(&style, x, y, text, length, fstyle->foreground);
+ 	return NSERROR_OK;
+ }
+ 
+ /* exported interface documented in vita/plot.h */
+-struct vita2d_pgf *vita_plot_font(void)
++bool vita_plot_text_ready(void)
+ {
+-	return vita_font;
++	return vita_text_ready;
+ }
+ 
+ /* exported interface documented in vita/plot.h */
+ nserror vita_plot_init(void)
+ {
+-	vita_font = vita2d_load_default_pgf();
+-	if (vita_font == NULL)
+-		return NSERROR_INIT_FAILED;
++	nserror err = vita_text_init(VITA_FONT_DIR);
++
++	vita_text_ready = (err == NSERROR_OK);
+ 	vita_plot_set_clip(0, 0, VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
+-	return NSERROR_OK;
++	return err;
+ }
+ 
+ /* exported interface documented in vita/plot.h */
+ void vita_plot_fini(void)
+ {
+-	if (vita_font != NULL) {
+-		vita2d_free_pgf(vita_font);
+-		vita_font = NULL;
+-	}
++	if (vita_text_ready)
++		vita_text_fini();
++	vita_text_ready = false;
+ }
+ 
+ /** vita2d plotter operations table */
+diff --git a/frontends/vita/plot.h b/frontends/vita/plot.h
+index f1de4b33a..c920104da 100644
+--- a/frontends/vita/plot.h
++++ b/frontends/vita/plot.h
+@@ -29,6 +29,7 @@
+ #ifndef NETSURF_VITA_PLOT_H
+ #define NETSURF_VITA_PLOT_H
+ 
++#include <stdbool.h>
+ #include <stddef.h>
+ 
+ #include "utils/errors.h"
+@@ -44,7 +45,8 @@ struct plotter_table;
+ extern const struct plotter_table *vita_plotters;
+ 
+ /**
+- * Load the plotters' resources (the system PGF font).
++ * Load the plotters' resources (the text engine and its fonts, from
++ * VITA_FONT_DIR; see vita/text.h).
+  * Call after vita2d_init().
+  */
+ nserror vita_plot_init(void);
+@@ -69,15 +71,10 @@ void vita_plot_fill_quad(const int x[4], const int y[4], colour c,
+ /** Draw a line of the given width in pixels. */
+ void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c);
+ 
+-/** Draw `length` bytes of UTF-8 text with its baseline at y. */
++/** Draw `length` bytes of UTF-8 in regular sans at `px` pixels, baseline
++ * at y (the HUD, messages, stream replay). */
+ void vita_plot_text(int x, int y, const char *text, size_t length,
+-		    colour c, float scale);
+-
+-/** Font size in pixels for a plot font style size (pt, fixed point). */
+-float vita_plot_font_px(int size);
+-
+-/** PGF scale factor that renders a font `px` pixels high. */
+-float vita_plot_pgf_scale(float px);
++		    colour c, int px);
+ 
+ /** How clipping reaches the GPU (see plot.c "clipping"). */
+ enum vita_clip_mode {
+@@ -105,7 +102,7 @@ void vita_plot_frame_end(void);
+ /** vita2d draw calls issued; the diagnostics reset and read it per frame. */
+ extern unsigned int vita_plot_calls;
+ 
+-/** The system font the plotters draw with; NULL before vita_plot_init(). */
+-struct vita2d_pgf *vita_plot_font(void);
++/** Whether text can be drawn (the fonts loaded). */
++bool vita_plot_text_ready(void);
+ 
+ #endif
+diff --git a/frontends/vita/replay.c b/frontends/vita/replay.c
+index 4ff454227..ab9efc2c4 100644
+--- a/frontends/vita/replay.c
++++ b/frontends/vita/replay.c
+@@ -38,7 +38,7 @@ static const colour replay_palette[] = {
+ 	(sizeof(replay_palette) / sizeof(replay_palette[0]))
+ 
+ /** Default text size for replayed text; the stream records none. */
+-#define REPLAY_TEXT_PX 16.0f
++#define REPLAY_TEXT_PX 16
+ 
+ static unsigned int replay_fill_index;
+ 
+@@ -102,8 +102,7 @@ void vita_replay_line(const char *line, struct vita_replay_stats *stats)
+ 		size_t len;
+ 		s = (s != NULL) ? s + 5 : "";
+ 		len = strcspn(s, "\r\n");
+-		vita_plot_text(x0, y0, s, len, 0x000000,
+-			       vita_plot_pgf_scale(REPLAY_TEXT_PX));
++		vita_plot_text(x0, y0, s, len, 0x000000, REPLAY_TEXT_PX);
+ 		stats->text++;
+ 	} else if (sscanf(line, "DISC X %d Y %d RADIUS %d",
+ 			  &x0, &y0, &x1) == 3) {
+diff --git a/frontends/vita/text.c b/frontends/vita/text.c
+new file mode 100644
+index 000000000..dc8edf435
+--- /dev/null
++++ b/frontends/vita/text.c
+@@ -0,0 +1,484 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: text, rendered with FreeType.
++ *
++ * Faces open lazily. A code point resolves to the style's DejaVu face if it
++ * has the glyph, else to the regular sans (coverage), else through the
++ * fallbacks; the result and its advance are cached per (code point, size,
++ * style), and layout and drawing both read that cache, so measured and
++ * drawn widths cannot disagree.
++ *
++ * Glyphs are rendered at the exact pixel size into 512x512 8-bit alpha
++ * atlas pages (SCE_GXM_TEXTURE_FORMAT_U8_R111: white, alpha = coverage),
++ * shelf-packed with a 1-pixel gap, sampled with point filtering, and drawn
++ * unscaled at whole-pixel positions with vita2d_draw_texture_tint_part().
++ * When every page is full the atlas is reset between frames, never during
++ * one, since the GPU may still be reading glyphs already drawn.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <ft2build.h>
++#include FT_FREETYPE_H
++#include <vita2d.h>
++
++#include "utils/errors.h"
++#include "utils/log.h"
++#include "utils/utf8.h"
++#include "netsurf/plot_style.h"
++
++#include "vita/text.h"
++
++/* The twelve DejaVu faces, indexed family * 4 + bold * 2 + italic, then the
++ * fallbacks, in the order they are tried. */
++static const char *const face_files[] = {
++	"DejaVuSans.ttf", "DejaVuSans-Oblique.ttf",
++	"DejaVuSans-Bold.ttf", "DejaVuSans-BoldOblique.ttf",
++	"DejaVuSerif.ttf", "DejaVuSerif-Italic.ttf",
++	"DejaVuSerif-Bold.ttf", "DejaVuSerif-BoldItalic.ttf",
++	"DejaVuSansMono.ttf", "DejaVuSansMono-Oblique.ttf",
++	"DejaVuSansMono-Bold.ttf", "DejaVuSansMono-BoldOblique.ttf",
++	"DroidSansFallbackFull.ttf",	/* kana, CJK */
++	"NanumGothic-Regular.ttf",	/* Hangul */
++};
++#define FACE_COUNT ((int)(sizeof(face_files) / sizeof(face_files[0])))
++#define FACE_SANS 0
++#define FACE_FIRST_FALLBACK 12
++
++/** Advance / resolution cache entries (direct-mapped). */
++#define ADV_CACHE 8192
++/** Atlas glyph entries (direct-mapped). */
++#define GLYPH_CACHE 4096
++/** Atlas page size and count: 16 x 256 KiB. */
++#define ATLAS_W 512
++#define ATLAS_H 512
++#define ATLAS_PAGES 16
++/** Gap left around every glyph in the atlas. */
++#define ATLAS_GAP 1
++
++struct face {
++	FT_Face ft;
++	int px;		/**< size currently set on ft, 0 = none */
++	bool tried;	/**< an open was attempted */
++};
++
++struct adv_entry {
++	uint32_t cp;
++	uint16_t px;
++	uint8_t slot;	/**< style slot the entry is for */
++	uint8_t face;	/**< face the code point resolved to */
++	uint32_t gi;	/**< glyph index in that face (0 = missing) */
++	int16_t adv;
++	bool valid;
++};
++
++struct glyph_entry {
++	uint32_t gi;
++	uint16_t px;
++	uint8_t face;
++	uint8_t page;
++	uint16_t x, y, w, h;
++	int16_t left, top;
++	bool valid;
++};
++
++struct atlas_page {
++	vita2d_texture *tex;
++	int x, y, row_h;	/**< shelf packing cursor */
++};
++
++struct vita_text_stats vita_text_stats;
++
++static FT_Library ft_lib;
++static struct face faces[FACE_COUNT];
++static char font_dir[256];
++static struct adv_entry adv_cache[ADV_CACHE];
++static struct glyph_entry glyph_cache[GLYPH_CACHE];
++static struct atlas_page pages[ATLAS_PAGES];
++static int page_count, page_cur;
++static bool flush_pending;
++
++static int style_slot(const struct vita_text_style *s)
++{
++	return (int)s->family * 4 + (s->bold ? 2 : 0) + (s->italic ? 1 : 0);
++}
++
++/** The face at index i, opened on first use; NULL if it cannot be. */
++static FT_Face face_get(int i)
++{
++	char path[512];
++
++	if (faces[i].tried)
++		return faces[i].ft;
++	faces[i].tried = true;
++	snprintf(path, sizeof(path), "%s%s", font_dir, face_files[i]);
++	if (FT_New_Face(ft_lib, path, 0, &faces[i].ft) != 0) {
++		faces[i].ft = NULL;
++		vita_text_stats.face_failures++;
++		NSLOG(netsurf, ERROR, "font %s: cannot open", path);
++	}
++	return faces[i].ft;
++}
++
++/** Face i at `px` pixels; NULL if the face is unavailable. */
++static FT_Face face_at(int i, int px)
++{
++	FT_Face f = face_get(i);
++
++	if (f != NULL && faces[i].px != px) {
++		FT_Set_Pixel_Sizes(f, 0, (FT_UInt)px);
++		faces[i].px = px;
++	}
++	return f;
++}
++
++static unsigned int hash3(uint32_t a, uint32_t b, uint32_t c)
++{
++	uint32_t h = a * 2654435761u ^ (b * 40503u) ^ (c * 2246822519u);
++	return h ^ (h >> 15);
++}
++
++/**
++ * Resolve a code point: the style's face, the regular sans, then the
++ * fallbacks. A code point nobody has resolves to the style's face with
++ * glyph 0, which draws its "missing glyph" box.
++ */
++static const struct adv_entry *resolve(const struct vita_text_style *s,
++				       uint32_t cp)
++{
++	int slot = style_slot(s);
++	int px = s->px < 1 ? 1 : (s->px > 1000 ? 1000 : s->px);
++	struct adv_entry *e = &adv_cache[hash3(cp, (uint32_t)px,
++					       (uint32_t)slot) % ADV_CACHE];
++	int order[FACE_COUNT - FACE_FIRST_FALLBACK + 2];
++	int n = 0, i, face = -1;
++	FT_UInt gi = 0;
++	FT_Face f;
++
++	if (e->valid && e->cp == cp && e->px == px && e->slot == slot)
++		return e;
++
++	order[n++] = slot;
++	if (slot != FACE_SANS)
++		order[n++] = FACE_SANS;
++	for (i = FACE_FIRST_FALLBACK; i < FACE_COUNT; i++)
++		order[n++] = i;
++	for (i = 0; i < n; i++) {
++		f = face_get(order[i]);
++		if (f != NULL && (gi = FT_Get_Char_Index(f, cp)) != 0) {
++			face = order[i];
++			break;
++		}
++	}
++	if (face < 0) {
++		face = face_get(slot) != NULL ? slot : FACE_SANS;
++		gi = 0;
++		if (cp >= 0x20)
++			vita_text_stats.missing++;
++	}
++
++	e->cp = cp;
++	e->px = (uint16_t)px;
++	e->slot = (uint8_t)slot;
++	e->face = (uint8_t)face;
++	e->gi = gi;
++	e->adv = 0;
++	f = face_at(face, px);
++	if (f != NULL && FT_Load_Glyph(f, gi, FT_LOAD_DEFAULT) == 0)
++		e->adv = (int16_t)((f->glyph->advance.x + 32) >> 6);
++	/* Control characters take no room, whatever the font says. */
++	if (cp < 0x20)
++		e->adv = 0;
++	e->valid = true;
++	return e;
++}
++
++/* exported interface documented in vita/text.h */
++int vita_text_advance(const struct vita_text_style *style, uint32_t cp)
++{
++	return resolve(style, cp)->adv;
++}
++
++/* exported interface documented in vita/text.h */
++int vita_text_width(const struct vita_text_style *style, const char *utf8,
++		    size_t len)
++{
++	size_t i = 0;
++	int w = 0;
++
++	while (i < len) {
++		w += resolve(style, utf8_to_ucs4(utf8 + i, len - i))->adv;
++		i = utf8_next(utf8, len, i);
++	}
++	return w;
++}
++
++/* exported interface documented in vita/text.h */
++void vita_text_extents(const struct vita_text_style *style, int *ascent,
++		       int *descent)
++{
++	FT_Face f = face_at(style_slot(style), style->px < 1 ? 1 : style->px);
++
++	if (f == NULL)
++		f = face_at(FACE_SANS, style->px < 1 ? 1 : style->px);
++	if (f == NULL) {
++		*ascent = style->px;
++		*descent = style->px / 4;
++		return;
++	}
++	*ascent = (int)((f->size->metrics.ascender + 63) >> 6);
++	*descent = (int)((-f->size->metrics.descender + 63) >> 6);
++}
++
++/** Make room for a w x h glyph; false (and a pending reset) if full. */
++static bool atlas_place(int w, int h, int *page, int *x, int *y)
++{
++	struct atlas_page *p;
++
++	if (w + 2 * ATLAS_GAP > ATLAS_W || h + 2 * ATLAS_GAP > ATLAS_H)
++		return false;	/* bigger than a page: never cached */
++	while (page_cur < ATLAS_PAGES) {
++		if (page_cur == page_count) {
++			vita2d_texture *t = vita2d_create_empty_texture_format(
++				ATLAS_W, ATLAS_H, SCE_GXM_TEXTURE_FORMAT_U8_R111);
++			if (t == NULL)
++				break;
++			/* Zeroed so every gap reads as empty coverage. */
++			memset(vita2d_texture_get_datap(t), 0,
++			       vita2d_texture_get_stride(t) * ATLAS_H);
++			vita2d_texture_set_filters(t, SCE_GXM_TEXTURE_FILTER_POINT,
++						   SCE_GXM_TEXTURE_FILTER_POINT);
++			pages[page_count].tex = t;
++			pages[page_count].x = ATLAS_GAP;
++			pages[page_count].y = ATLAS_GAP;
++			pages[page_count].row_h = 0;
++			page_count++;
++			vita_text_stats.atlas_pages++;
++		}
++		p = &pages[page_cur];
++		if (p->x + w + ATLAS_GAP > ATLAS_W) {
++			/* Next shelf. */
++			p->x = ATLAS_GAP;
++			p->y += p->row_h + ATLAS_GAP;
++			p->row_h = 0;
++		}
++		if (p->y + h + ATLAS_GAP <= ATLAS_H) {
++			*page = page_cur;
++			*x = p->x;
++			*y = p->y;
++			p->x += w + ATLAS_GAP;
++			if (h > p->row_h)
++				p->row_h = h;
++			return true;
++		}
++		page_cur++;
++	}
++	flush_pending = true;
++	return false;
++}
++
++/** The atlas entry for a resolved glyph, rendering it on first use. */
++static const struct glyph_entry *glyph_get(int face, uint32_t gi, int px)
++{
++	struct glyph_entry *g = &glyph_cache[hash3(gi, (uint32_t)px,
++						   (uint32_t)face) % GLYPH_CACHE];
++	FT_Bitmap *bm;
++	FT_Face f;
++	int page, x, y, r, c;
++	unsigned char *dst;
++	unsigned int stride;
++
++	if (g->valid && g->gi == gi && g->px == px && g->face == face) {
++		vita_text_stats.atlas_hits++;
++		return g;
++	}
++	f = face_at(face, px);
++	if (f == NULL || FT_Load_Glyph(f, gi, FT_LOAD_RENDER) != 0)
++		return NULL;
++	bm = &f->glyph->bitmap;
++	g->valid = false;
++	g->gi = gi;
++	g->px = (uint16_t)px;
++	g->face = (uint8_t)face;
++	g->w = (uint16_t)bm->width;
++	g->h = (uint16_t)bm->rows;
++	g->left = (int16_t)f->glyph->bitmap_left;
++	g->top = (int16_t)f->glyph->bitmap_top;
++	g->page = 0;
++	g->x = g->y = 0;
++	if (bm->width > 0 && bm->rows > 0) {
++		if (!atlas_place((int)bm->width, (int)bm->rows, &page, &x, &y))
++			return NULL;
++		g->page = (uint8_t)page;
++		g->x = (uint16_t)x;
++		g->y = (uint16_t)y;
++		dst = vita2d_texture_get_datap(pages[page].tex);
++		stride = vita2d_texture_get_stride(pages[page].tex);
++		for (r = 0; r < (int)bm->rows; r++) {
++			const unsigned char *src = bm->buffer +
++				(bm->pitch >= 0 ? r * bm->pitch :
++				 ((int)bm->rows - 1 - r) * -bm->pitch);
++			unsigned char *row = dst + (y + r) * stride + x;
++			if (bm->pixel_mode == FT_PIXEL_MODE_MONO) {
++				for (c = 0; c < (int)bm->width; c++)
++					row[c] = (src[c >> 3] & (0x80 >> (c & 7))) ?
++						0xff : 0;
++			} else {
++				memcpy(row, src, bm->width);
++			}
++		}
++	}
++	vita_text_stats.rasterised++;
++	g->valid = true;
++	return g;
++}
++
++/* exported interface documented in vita/text.h */
++int vita_text_draw(const struct vita_text_style *style, int x, int y,
++		   const char *utf8, size_t len, unsigned int rgba)
++{
++	size_t i = 0;
++	int pen = x;
++
++	while (i < len) {
++		const struct adv_entry *e =
++			resolve(style, utf8_to_ucs4(utf8 + i, len - i));
++		const struct glyph_entry *g;
++
++		i = utf8_next(utf8, len, i);
++		if (e->cp >= 0x20 && e->cp != 0x20 && e->cp != 0xa0) {
++			g = glyph_get(e->face, e->gi, e->px);
++			if (g == NULL)
++				vita_text_stats.dropped++;
++			else if (g->w > 0 && g->h > 0)
++				vita2d_draw_texture_tint_part(
++					pages[g->page].tex,
++					(float)(pen + g->left),
++					(float)(y - g->top),
++					(float)g->x, (float)g->y,
++					(float)g->w, (float)g->h, rgba);
++		}
++		pen += e->adv;
++	}
++	return pen - x;
++}
++
++/* exported interface documented in vita/text.h */
++void vita_text_frame_begin(void)
++{
++	int i;
++
++	if (!flush_pending)
++		return;
++	/* The previous frame may still be reading the atlas. */
++	vita2d_wait_rendering_done();
++	for (i = 0; i < page_count; i++) {
++		memset(vita2d_texture_get_datap(pages[i].tex), 0,
++		       vita2d_texture_get_stride(pages[i].tex) * ATLAS_H);
++		pages[i].x = ATLAS_GAP;
++		pages[i].y = ATLAS_GAP;
++		pages[i].row_h = 0;
++	}
++	page_cur = 0;
++	memset(glyph_cache, 0, sizeof(glyph_cache));
++	flush_pending = false;
++	vita_text_stats.flushes++;
++}
++
++/* exported interface documented in vita/text.h */
++void vita_text_style_default(struct vita_text_style *style, int px)
++{
++	style->px = px;
++	style->family = VITA_FAMILY_SANS;
++	style->bold = false;
++	style->italic = false;
++}
++
++/* exported interface documented in vita/text.h */
++void vita_text_style_from_plot(const plot_font_style_t *fstyle,
++			       struct vita_text_style *style)
++{
++	/* Plot font sizes are points in PLOT_STYLE_SCALE fixed point; the
++	 * core runs at 96 dpi (vita/main.c), so px = pt * 96 / 72. */
++	int px = (int)((fstyle->size * 96 / 72 + PLOT_STYLE_SCALE / 2) /
++		       PLOT_STYLE_SCALE);
++
++	style->px = px < 1 ? 1 : px;
++	switch (fstyle->family) {
++	case PLOT_FONT_FAMILY_SERIF:
++		style->family = VITA_FAMILY_SERIF;
++		break;
++	case PLOT_FONT_FAMILY_MONOSPACE:
++		style->family = VITA_FAMILY_MONO;
++		break;
++	default:	/* sans-serif, cursive, fantasy */
++		style->family = VITA_FAMILY_SANS;
++		break;
++	}
++	style->bold = fstyle->weight >= 600;
++	style->italic = (fstyle->flags & (FONTF_ITALIC | FONTF_OBLIQUE)) != 0;
++}
++
++/* exported interface documented in vita/text.h */
++const char *vita_text_face_name(const struct vita_text_style *style,
++				uint32_t cp)
++{
++	const struct adv_entry *e = resolve(style, cp);
++
++	return e->gi != 0 ? face_files[e->face] : NULL;
++}
++
++/* exported interface documented in vita/text.h */
++nserror vita_text_init(const char *dir)
++{
++	memset(&vita_text_stats, 0, sizeof(vita_text_stats));
++	snprintf(font_dir, sizeof(font_dir), "%s", dir);
++	if (FT_Init_FreeType(&ft_lib) != 0)
++		return NSERROR_INIT_FAILED;
++	/* The primary face is required; the rest open when first needed. */
++	if (face_get(FACE_SANS) == NULL)
++		return NSERROR_INIT_FAILED;
++	return NSERROR_OK;
++}
++
++/* exported interface documented in vita/text.h */
++void vita_text_fini(void)
++{
++	int i;
++
++	for (i = 0; i < page_count; i++)
++		vita2d_free_texture(pages[i].tex);
++	page_count = page_cur = 0;
++	for (i = 0; i < FACE_COUNT; i++) {
++		if (faces[i].ft != NULL)
++			FT_Done_Face(faces[i].ft);
++		faces[i].ft = NULL;
++		faces[i].tried = false;
++		faces[i].px = 0;
++	}
++	memset(adv_cache, 0, sizeof(adv_cache));
++	memset(glyph_cache, 0, sizeof(glyph_cache));
++	FT_Done_FreeType(ft_lib);
++}
+diff --git a/frontends/vita/text.h b/frontends/vita/text.h
+new file mode 100644
+index 000000000..16271f54e
+--- /dev/null
++++ b/frontends/vita/text.h
+@@ -0,0 +1,119 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: text, rendered with FreeType.
++ *
++ * One engine measures (vita/layout.c) and draws (vita/plot.c), with the
++ * same faces at the same pixel size, so what layout measures is what is
++ * drawn. Glyphs are rasterised at the exact size they are drawn at and
++ * drawn unscaled from an 8-bit alpha atlas with a 1-pixel gap, so no
++ * neighbouring glyph can bleed in (the system PGF font's marks, hardware
++ * run 3). Code points the style's face lacks fall back through a chain:
++ * DejaVu (Latin, Greek, Cyrillic) -> DroidSansFallback (kana, CJK) ->
++ * NanumGothic (Hangul); see tools/fetch-fonts.sh in the VitaBrowser repo.
++ */
++
++#ifndef NETSURF_VITA_TEXT_H
++#define NETSURF_VITA_TEXT_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "utils/errors.h"
++#include "netsurf/plot_style.h"
++
++/** Where the fonts are, inside the app bundle. */
++#define VITA_FONT_DIR "app0:/res/fonts/"
++
++/** Generic families, each with bold / italic faces. */
++enum vita_text_family {
++	VITA_FAMILY_SANS,
++	VITA_FAMILY_SERIF,
++	VITA_FAMILY_MONO
++};
++
++/** What text is set in. */
++struct vita_text_style {
++	int px;				/**< em size in pixels */
++	enum vita_text_family family;
++	bool bold;
++	bool italic;
++};
++
++/** Counters since start-up, for the diagnostics. */
++struct vita_text_stats {
++	unsigned int rasterised;	/**< glyphs rendered into the atlas */
++	unsigned int atlas_hits;	/**< glyph draws served from the atlas */
++	unsigned int atlas_pages;	/**< atlas textures allocated */
++	unsigned int flushes;		/**< atlas reset because it was full */
++	unsigned int dropped;		/**< glyphs not drawn: atlas full */
++	unsigned int missing;		/**< code points no face has */
++	unsigned int face_failures;	/**< font files that would not open */
++};
++extern struct vita_text_stats vita_text_stats;
++
++/**
++ * Start FreeType; faces open lazily from `dir` on first use.
++ * \return NSERROR_OK, or NSERROR_INIT_FAILED if FreeType or the primary
++ *         face (DejaVuSans) cannot be used
++ */
++nserror vita_text_init(const char *dir);
++
++/** Release faces, the atlas and FreeType. */
++void vita_text_fini(void);
++
++/** A text style from the core's plot font style (size in pt at 96 dpi). */
++void vita_text_style_from_plot(const plot_font_style_t *fstyle,
++			       struct vita_text_style *style);
++
++/** Regular sans-serif at `px` pixels (HUD, messages, replay). */
++void vita_text_style_default(struct vita_text_style *style, int px);
++
++/** Advance of one code point, in whole pixels, as drawn. */
++int vita_text_advance(const struct vita_text_style *style, uint32_t cp);
++
++/** Width of `len` bytes of UTF-8, as drawn: the sum of the advances. */
++int vita_text_width(const struct vita_text_style *style, const char *utf8,
++		    size_t len);
++
++/** The primary face's ascent and descent (both >= 0) at this size. */
++void vita_text_extents(const struct vita_text_style *style, int *ascent,
++		       int *descent);
++
++/**
++ * Draw `len` bytes of UTF-8 with the baseline at y, in vita2d RGBA8.
++ * Call between vita2d_start_drawing() and vita2d_end_drawing().
++ * \return the advance, as vita_text_width() would give it
++ */
++int vita_text_draw(const struct vita_text_style *style, int x, int y,
++		   const char *utf8, size_t len, unsigned int rgba);
++
++/** Call at the start of a frame: resets the atlas if it filled up. */
++void vita_text_frame_begin(void);
++
++/**
++ * Which font a code point is drawn with (diagnostics and tests).
++ * \return the font file name, or NULL if no face has it
++ */
++const char *vita_text_face_name(const struct vita_text_style *style,
++				uint32_t cp);
++
++#endif

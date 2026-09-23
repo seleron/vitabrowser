@@ -555,8 +555,11 @@ system PGF, and for measuring with the same face.
    and batch or avoid clips.
 2. **Text:** FreeType + a broad-coverage TTF for drawing and layout (fixes
    the atlas marks, Greek/Cyrillic/CJK coverage, and the soft headings).
+   **Done in patch 38 (§Run 5).**
 3. **Inline punctuation gap:** reproduce on the desktop (it shows in the
    simulator) and fix in the engine.
+   **Gone in the simulator with patch 38** (a PGF measuring artefact, §Run 5);
+   confirm on the device.
 4. **Transfers:** copy results over USB or with a client that doesn't cache
    (FileZilla, WinSCP), or rename the folder on the Vita first.
 
@@ -650,3 +653,95 @@ data: no `log.txt`, no `autotest.done`, nothing newer than the hand-off
 four-pass timings (clock vs clipping) are therefore **still unmeasured**.
 Nothing was waited for. The next build (text, below) keeps the same
 four-pass autotest, so one device run can measure both.
+
+## Run 5 — text with FreeType and bundled fonts (patch 38), plus run 4's timings
+
+**Why.** Run 3's text problems all came from the system PGF font. vita2d
+rasterises it once and scales it: the scaled atlas bled marks next to
+glyphs. Its fallback put Greek and Cyrillic in the Japanese font at full
+width, and it has no Hangul, no emoji and no `简`. Patch 38 replaces it with
+one FreeType engine, `frontends/vita/text.c` ([09 §11](09-vita-frontend.md)):
+- **Fonts:** DejaVu Sans/Serif/Mono with real bold and italic faces; per
+  code point, fallback to DroidSansFallbackFull (kana, CJK) and NanumGothic
+  (Hangul).
+- **Glyphs:** rasterised at the exact size and drawn unscaled from an alpha
+  atlas with a 1-pixel empty gap.
+- **Advances:** one set, used by layout and drawing alike.
+
+The fonts (11 MB, three licences) are fetched by `tools/fetch-fonts.sh`,
+pinned and SHA256-checked, and bundled in `res/fonts/`. The VPK is now
+10.3 MB.
+
+**Host results** (sim screenshots: `img/10-run5/`):
+
+| run-3 problem | cause | now (simulator) |
+|---|---|---|
+| marks beside glyphs | scaled glyphs sampled past their atlas cell | exact-size glyphs with an empty border, point-sampled; the test checks every border texel |
+| Greek/Cyrillic full-width | PGF fallback to the Japanese font | DejaVu Sans: `Ελληνικά`, `Кириллица` at proportional width |
+| Korean, emoji, `简` blank | not in the PGF fonts | NanumGothic, DejaVu (😀 as an outline), Droid |
+| gap before punctuation after inline elements | layout's PGF advances (`width("a"+c+"a") − width("aa")`) ≠ what was drawn | **gone**: measured = drawn (below) |
+| strike-through too high | PGF ascent vs the engine's baseline guess | through the x-height (below); confirm on device |
+| soft headings | no bold face (PGF regular only) | real DejaVu Bold (≥ 600) and Oblique |
+
+![VT-text in the simulator](img/10-run5/VT-text.png)
+
+Before (run-3 simulator reference) and after, the same line at 2×:
+
+![before](img/10-run5/punct-before.png)
+![after](img/10-run5/punct-after.png)
+
+- `tools/test_vita_text.c` **30/30**. It uses the real engine, FreeType and
+  fonts. Three mutations were planted and each is caught.
+- `test_vita_plotter.c` **101/101**.
+- Clip modes: still pixel-identical, 14/14 comparable pages.
+- Atlas over the whole 4-pass autotest: **3 pages, 0 flushes, 0 drops, 1
+  missing** (the U+E000 probe).
+- `VT-calibration`: every grey width box ends with its text, and every
+  yellow row holds its descenders.
+- Clean checkout: applied 121 + the known 2; L1 PASS; fixtures 4/4;
+  101/101 + 30/30; simulator 15/15; cross build `-Werror` clean, no PGF
+  symbols in the ELF.
+- Seen, not changed: on `VT-calibration` the in-flow paragraph paints over
+  the absolutely positioned 200 px box. The pixels are identical before
+  patch 38, so this is a paint-order issue, not a text one.
+
+**Hand-off.** Built from the clean chain: `VitaBrowser.vpk` `bba81d5cdce7`,
+`VitaBrowser-ext.vpk` `353b963ade0b`, `nsvita.elf` `59e5942ccdd7` (SHA256,
+first 12). They are copied to `VitaBrowser-hwtest\`, replacing run 4's,
+which stay in `<WORK>/vitabrowser-work/hwtest-2026-09-23-run4/`. Archive:
+`<WORK>/vitabrowser-work/hwtest-2026-09-23-run5/` (VPKs, ELF, SHA256SUMS, the
+simulator's reference log, dumps, shots and per-pass snapshots).
+`VitaBrowser-hwtest\reference-screenshots\` is refreshed with the new
+simulator shots.
+
+**Run 5 on the device** (about 6 minutes). It keeps run 4's four-pass
+autotest, so one run measures both:
+1. Install the new **VitaBrowser.vpk** over the old one, and **delete
+   `ux0:data/VitaBrowser/`** first.
+2. Launch. The boot log should read `init: fonts (app0:/res/fonts/) -> 0`.
+   If the fonts cannot be opened there is nothing to draw an error with, so
+   the app returns straight to LiveArea; `log.txt` then ends at
+   `init: fonts … -> <non-zero>`.
+3. Press □ and wait for AUTOTEST DONE (four passes), then START.
+4. Open **VT-text** (R to cycle) and compare it with
+   `reference-screenshots\13-VT-text.png`:
+   - Greek, Cyrillic, Japanese, Korean, Chinese and the emoji outline are
+     all present;
+   - no marks beside glyphs;
+   - no gap before commas;
+   - the strike-through crosses the middle of the lowercase letters;
+   - bold and italic are distinct.
+   Take a screenshot (PS + START).
+5. Scroll VT-scroll and note the HUD's `cpu … gpu … ms` and `… st`.
+6. Copy `ux0:data/VitaBrowser/` and the screenshots into `results\` over USB
+   or with FileZilla/WinSCP.
+
+**What decides the next step:**
+- **The four passes (run 4's question):** pass B vs A is the GPU clock, C
+  vs A is CPU clipping, and D is both.
+- **Text cost:** each page's `first frame` ms against run 3. The first
+  frame now rasterises glyphs, and VT-text's first frame also opens the
+  Droid and Nanum faces.
+- **The atlas line** in `log.txt` (`font: atlas … pages, … flushes, …
+  dropped`). Any flushes or drops on the device mean the atlas needs more
+  pages or an LRU.

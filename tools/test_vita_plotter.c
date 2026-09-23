@@ -39,6 +39,7 @@
 #include "vita/plot.h"
 #include "vita/replay.h"
 #include "vita/diag.h"
+#include "vita/text.h"
 
 void test_monkey_rectangle(const plot_style_t *style, const struct rect *r,
 			   char *out, size_t cap);
@@ -154,22 +155,58 @@ void vita2d_draw_texture_scale(const vita2d_texture *t, float x, float y,
 {
 	vlogf("tex %ux%u %g %g %g %g", t->w, t->h, x, y, sx, sy);
 }
-static int fake_font;
-vita2d_pgf *vita2d_load_default_pgf(void) { return (vita2d_pgf *)&fake_font; }
-void vita2d_free_pgf(vita2d_pgf *f) { (void)f; }
-int vita2d_pgf_draw_text(vita2d_pgf *f, int x, int y, unsigned int c,
-			 float scale, const char *text)
+/* The text engine (vita/text.c) is FreeType and fonts, and has its own
+ * test (tools/test_vita_text.c); here it logs what plot.c asks of it. A
+ * glyph is 10 px wide, ascent 0.8 em, descent 0.2 em. */
+nserror vita_text_init(const char *dir) { (void)dir; return NSERROR_OK; }
+void vita_text_fini(void) { }
+void vita_text_style_default(struct vita_text_style *s, int px)
 {
-	vlogf("text %d %d #%08x %.3f '%s'", x, y, c, scale, text);
-	return 0;
+	s->px = px; s->family = VITA_FAMILY_SANS; s->bold = s->italic = false;
 }
-int vita2d_pgf_text_width(vita2d_pgf *f, float scale, const char *text)
+void vita_text_style_from_plot(const plot_font_style_t *f,
+			       struct vita_text_style *s)
 {
-	return (int)(strlen(text) * 10 * scale);
+	vita_text_style_default(s, (int)((f->size * 96 / 72 +
+					  PLOT_STYLE_SCALE / 2) /
+					 PLOT_STYLE_SCALE));
+	s->bold = f->weight >= 600;
 }
-int vita2d_pgf_text_height(vita2d_pgf *f, float scale, const char *text)
+int vita_text_width(const struct vita_text_style *s, const char *t,
+		    size_t len)
 {
-	return (int)(20 * scale);
+	(void)s; (void)t;
+	return (int)len * 10;
+}
+void vita_text_extents(const struct vita_text_style *s, int *a, int *d)
+{
+	*a = s->px * 8 / 10;
+	*d = s->px * 2 / 10;
+}
+int vita_text_draw(const struct vita_text_style *s, int x, int y,
+		   const char *t, size_t len, unsigned int rgba)
+{
+	vlogf("text %d %d #%08x %dpx%s '%.*s'", x, y, rgba, s->px,
+	      s->bold ? " bold" : "", (int)len, t);
+	return (int)len * 10;
+}
+vita2d_texture *vita2d_create_empty_texture_format(unsigned int w,
+		unsigned int h, SceGxmTextureFormat f)
+{
+	(void)f;
+	return vita2d_create_empty_texture(w, h);
+}
+void vita2d_texture_set_filters(vita2d_texture *t, SceGxmTextureFilter a,
+				SceGxmTextureFilter b)
+{
+	(void)t; (void)a; (void)b;
+}
+void vita2d_draw_texture_tint_part(const vita2d_texture *t, float x, float y,
+				   float tx, float ty, float tw, float th,
+				   unsigned int c)
+{
+	vlogf("glyph %g %g", x, y);
+	(void)t; (void)tx; (void)ty; (void)tw; (void)th; (void)c;
 }
 
 /* The bitmap plotter needs a texture; the real one is in vita/bitmap.c,
@@ -603,7 +640,13 @@ static void test_backend(void)
 		f.size = 12 * PLOT_STYLE_SCALE;	/* 12pt = 16px at 96 dpi */
 		f.foreground = 0x0000ff;
 		P->text(&ctx, &f, 5, 30, "Hello, world", 5);
-		CHECK(has_line("text 5 30 #ff0000ff 0.800 'Hello'"), "text:\n%s", vlog);
+		CHECK(has_line("text 5 30 #ff0000ff 16px 'Hello'"), "text:\n%s", vlog);
+		/* The core's weight reaches the engine: 700 is bold. */
+		vlog_reset();
+		f.weight = 700;
+		P->text(&ctx, &f, 5, 30, "Bold", 4);
+		CHECK(has_line("text 5 30 #ff0000ff 16px bold 'Bold'"),
+		      "text: weight 700 is bold:\n%s", vlog);
 	}
 
 	/* Lines: 1px -> draw_line; thick horizontal -> exact rect. */
