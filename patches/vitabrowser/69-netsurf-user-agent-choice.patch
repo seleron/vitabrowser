@@ -1,0 +1,225 @@
+# netsurf: choose the user agent (Chrome on Android by default)
+# Generated 2026-09-24
+#
+# Hardware run 15: claude.ai's Cloudflare check turned the browser away as
+# "too old" -- the PlayStation Vita / NetSurf user agent (patch 55) names no
+# browser it supports. ux0:data/VitaBrowser/useragent.txt (created on first
+# start) names a preset -- chrome (default), safari, firefox, vita -- or holds
+# a whole string; vita_chrome_load_useragent() applies it before netsurf_init
+# through the new user_agent_override() (utils/useragent.c). Scripts see the
+# same browser: navigator.platform follows the user agent ("Linux armv8l" for
+# Android) and navigator.vendor is Chrome's or Safari's.
+
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index c7eb221..e729cd8 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -12755,8 +12755,24 @@ static void register_browser_globals(JSContext *ctx)
+ 			JS_NewString(ctx, ua));
+ 		JS_SetPropertyStr(ctx, nav_obj, "appVersion",
+ 			JS_NewString(ctx, av));
++		/* navigator.platform matches whichever browser the user
++		 * agent names (the user may choose one, vita/chrome.c):
++		 * scripts that cross-check the two see one device. */
++		const char *pf = MACSURF_JS_PLATFORM;
++		if (strstr(ua, "Android") != NULL)
++			pf = "Linux armv8l";
++		else if (strstr(ua, "iPhone") != NULL)
++			pf = "iPhone";
++		else if (strstr(ua, "Windows") != NULL)
++			pf = "Win32";
+ 		JS_SetPropertyStr(ctx, nav_obj, "platform",
+-			JS_NewString(ctx, MACSURF_JS_PLATFORM));
++			JS_NewString(ctx, pf));
++		/* Chrome's and Safari's vendor strings (Firefox's is ""). */
++		JS_SetPropertyStr(ctx, nav_obj, "vendor", JS_NewString(ctx,
++			strstr(ua, "Chrome/") != NULL ? "Google Inc." :
++			strstr(ua, "Safari/") != NULL &&
++			strstr(ua, "Version/") != NULL ? "Apple Computer, Inc." :
++			""));
+ 	}
+ #else
+ 	JS_SetPropertyStr(ctx, nav_obj, "userAgent",
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+index 3550442..90c3f73 100644
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -27,6 +27,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #ifdef __vita__
+ #include <psp2/common_dialog.h>
+@@ -39,6 +40,7 @@
+ #include "utils/errors.h"
+ #include "utils/nsurl.h"
+ #include "utils/utf8.h"
++#include "utils/useragent.h"
+ #include "netsurf/browser_window.h"
+ #include "netsurf/keypress.h"
+ 
+@@ -63,6 +65,32 @@ static const char default_bookmarks[] =
+ 	"CNN Lite | https://lite.cnn.com/\n"
+ 	"example.com | https://example.com/\n";
+ 
++static const char default_useragent[] =
++	"# VitaBrowser user agent: the browser every site is told this is.\n"
++	"# The first line that is not a comment is used; takes effect at the\n"
++	"# next start. One of:\n"
++	"#   chrome   Chrome on Android (the default: sites that turn old\n"
++	"#            browsers away, e.g. Cloudflare's checks, accept it)\n"
++	"#   safari   Safari on an iPhone\n"
++	"#   firefox  Firefox on Android\n"
++	"#   vita     VitaBrowser's own (PlayStation Vita, NetSurf)\n"
++	"# or a whole user agent string of your own.\n"
++	"chrome\n";
++
++/** The presets useragent.txt may name. */
++static const struct {
++	const char *name, *ua;
++} ua_presets[] = {
++	{ "chrome", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"
++		" (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36" },
++	{ "safari", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X)"
++		" AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6"
++		" Mobile/15E148 Safari/604.1" },
++	{ "firefox", "Mozilla/5.0 (Android 14; Mobile; rv:143.0)"
++		" Gecko/143.0 Firefox/143.0" },
++	{ "vita", NULL },
++};
++
+ /** Write s to fp with HTML's special characters escaped. */
+ static void put_escaped(FILE *fp, const char *s, size_t n)
+ {
+@@ -91,6 +119,49 @@ static void trim(const char **s, size_t *n)
+ 		(*n)--;
+ }
+ 
++/* exported interface documented in vita/chrome.h */
++void vita_chrome_load_useragent(void)
++{
++	char line[1024];
++	const char *ua = NULL, *l;
++	size_t n, i;
++	bool found = false;
++	FILE *fp;
++
++	fp = fopen(VITA_USERAGENT_FILE, "r");
++	if (fp == NULL) {
++		fp = fopen(VITA_USERAGENT_FILE, "w");
++		if (fp != NULL) {
++			fputs(default_useragent, fp);
++			fclose(fp);
++			vita_diag_log("chrome: wrote default %s",
++				      VITA_USERAGENT_FILE);
++		}
++		fp = fopen(VITA_USERAGENT_FILE, "r");
++	}
++	while (fp != NULL && !found && fgets(line, sizeof(line), fp) != NULL) {
++		l = line;
++		n = strlen(line);
++		trim(&l, &n);
++		if (n == 0 || l[0] == '#')
++			continue;
++		((char *)l)[n] = '\0';
++		found = true;
++		ua = l;
++		for (i = 0; i < sizeof(ua_presets) / sizeof(ua_presets[0]); i++)
++			if (strcasecmp(l, ua_presets[i].name) == 0) {
++				ua = ua_presets[i].ua;
++				break;
++			}
++	}
++	if (fp != NULL)
++		fclose(fp);
++	if (!found)	/* no file (ux0: unwritable) or only comments */
++		ua = ua_presets[0].ua;
++	user_agent_override(ua);
++	vita_diag_log("chrome: user agent: %s", user_agent_string());
++}
++
+ /* exported interface documented in vita/chrome.h */
+ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ {
+diff --git a/frontends/vita/chrome.h b/frontends/vita/chrome.h
+index 35d2ab4..7da3659 100644
+--- a/frontends/vita/chrome.h
++++ b/frontends/vita/chrome.h
+@@ -37,6 +37,10 @@ struct gui_window;
+  * defaults if missing; the user edits it (VitaShell, FTP). */
+ #define VITA_BOOKMARKS_FILE "ux0:data/VitaBrowser/bookmarks.txt"
+ 
++/** The user agent: a preset name or a whole string (vita/chrome.c).
++ * Created with the default (Chrome on Android) if missing. */
++#define VITA_USERAGENT_FILE "ux0:data/VitaBrowser/useragent.txt"
++
+ /** The home page, generated from the bookmarks at start-up. */
+ #define VITA_HOME_FILE "ux0:data/VitaBrowser/home.html"
+ #define VITA_HOME_URL "file:///ux0:data/VitaBrowser/home.html"
+@@ -49,6 +53,10 @@ struct gui_window;
+  */
+ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n);
+ 
++/** Read VITA_USERAGENT_FILE and set the user agent sites and scripts
++ * see; before netsurf_init(). */
++void vita_chrome_load_useragent(void);
++
+ /**
+  * Turn what the user typed into a URL: a URL as it is, a bare host or
+  * path gets https://, anything else (spaces, no dot) becomes a search.
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index ec15a1e..b33ede3 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -1165,6 +1165,7 @@ int main(int argc, char **argv)
+ 	ret = messages_add_from_file(VITA_RESOURCE_DIR "Messages");
+ 	vita_diag_log("init: messages -> %d", ret);
+ 
++	vita_chrome_load_useragent();
+ 	ret = netsurf_init(NULL);
+ 	vita_diag_log("init: netsurf_init -> %d", ret);
+ 	if (ret != NSERROR_OK) {
+diff --git a/utils/useragent.c b/utils/useragent.c
+index 547999c..fde3c2f 100644
+--- a/utils/useragent.c
++++ b/utils/useragent.c
+@@ -74,6 +74,20 @@ user_agent_build_string(void)
+               core_user_agent_string);
+ }
+ 
++/* Public API documented in useragent.h */
++void
++user_agent_override(const char *ua)
++{
++	char *copy = NULL;
++
++	if (ua != NULL && ua[0] != '\0' && (copy = strdup(ua)) == NULL)
++		return;
++	free_user_agent_string();
++	core_user_agent_string = copy;
++	if (copy != NULL)
++		NSLOG(netsurf, INFO, "User agent overridden: \"%s\"", copy);
++}
++
+ /* This is a function so that later we can override it trivially */
+ const char *
+ user_agent_string(void)
+diff --git a/utils/useragent.h b/utils/useragent.h
+index 6eb309a..168c113 100644
+--- a/utils/useragent.h
++++ b/utils/useragent.h
+@@ -27,6 +27,12 @@
+  */
+ const char * user_agent_string(void);
+ 
++/**
++ * Replace the user agent with ua (copied), for frontends that let the user
++ * choose one; NULL or "" restores the built-in string.
++ */
++void user_agent_override(const char *ua);
++
+ /** Free any memory allocated for the user_agent_string
+  *
+  * After calling this, the value returned by \ref user_agent_string()
