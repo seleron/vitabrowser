@@ -164,6 +164,8 @@ NET-dns-name http://localhost:$HP/L1-layout-basics.html
 NET-dns-hang http://dead.sim-hang:$HP/L1-layout-basics.html
 CSS-ovf file:///app0:/testpages/CSS-overflow-viewport.html
 CSS-space file:///app0:/testpages/CSS-inline-space.html
+IMG-svg file:///app0:/testpages/IMG-svg.html
+CSS-mask file:///app0:/testpages/CSS-mask-icon.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -345,8 +347,23 @@ sp=$(ls "$R"/*-CSS-space.plot 2>/dev/null | head -1)
 xpos() { sed -n "s/^PLOT TEXT X \([0-9]*\) Y [0-9]* STR $1\$/\1/p" "$sp" | head -1; }
 b1=$(xpos BRAVO1); b2=$(xpos BRAVO2); c1=$(xpos CHARLIE1); c2=$(xpos CHARLIE2)
 echo "  CSS-space: BRAVO at x $b1 / $b2, CHARLIE at x $c1 / $c2"
+# SVG (libsvgtiny + libdom's expat binding): the logo and the CSS icon draw
+# as paths, and the logo's alt text -- drawn only if the image is refused --
+# never appears.
+sv=$(ls "$R"/*-IMG-svg.plot 2>/dev/null | head -1)
+npath=$(grep -c '^PLOT PATH' "$sv" 2>/dev/null || true)
+echo "  IMG-svg: ${npath:-0} paths drawn$(grep -q LOGO-NOT-DRAWN "$sv" 2>/dev/null && echo ', ALT TEXT SHOWN')"
+# mask-image icons (patch 60): the two masked spans draw their SVG icon,
+# not a 24x24 block; only the two unmasked ones (-webkit-mask with a size,
+# which the background shorthand cannot take, and mask-image: none) do.
+mk=$(ls "$R"/*-CSS-mask.plot 2>/dev/null | head -1)
+# PLOT RECT X0 x0 Y0 y0 X1 x1 Y1 y1
+nblk=$(awk '/^PLOT RECT/ { if ($8 - $4 == 24 && $10 - $6 == 24) n++ } END { print n + 0 }' "$mk" 2>/dev/null)
+echo "  CSS-mask: $nblk solid 24x24 blocks (2 expected: the unmasked spans)"
+[ "$nblk" = 2 ] || fail "mask-image icons"
 [ -n "$ext" ] && [ "$ext" -gt 1500 ] && [ -n "$b1" ] && [ "$b1" = "$b2" ] && \
-	[ -n "$c1" ] && [ "$c1" = "$c2" ] || fail "real-site layout regressions"
+	[ -n "$c1" ] && [ "$c1" = "$c2" ] && [ "${npath:-0}" -ge 5 ] && \
+	! grep -q LOGO-NOT-DRAWN "$sv" || fail "real-site layout regressions"
 
 # The network probe (frontends/vita/netprobe.c) before pass N: against the
 # local servers every step must succeed, with curl's own verdict logged.

@@ -25,8 +25,9 @@
 #                               site they fire on is recorded in
 #                               docs/phase-0/09-vita-frontend.md §3 with why
 #                               it is ABI-safe.
-#   WITH_EXPAT_BINDING=no       libdom's XML binding is only for SVG / XML
-#                               documents, which the Vita build leaves off.
+#   WITH_EXPAT_BINDING=yes      libdom's XML binding, which libsvgtiny parses
+#                               SVG with (docs/phase-0/11: SVG logos and
+#                               icons on real sites). Needs vdpm's expat.
 #   -DWITHOUT_ICONV_FILTER      (libparserutils only) vitaSDK's newlib ships
 #                               iconv with NO converters, so iconv_open()
 #                               always fails -- and libparserutils' input
@@ -37,10 +38,10 @@
 #                               (UTF-8/16, ISO-8859-x, Windows-125x).
 #   -I compat ... decls.h       the same shim headers as the host build.
 #
-# Needs vdpm packages: libvita2d (pulls freetype, libpng, libjpeg-turbo,
+# Needs vdpm packages: expat (SVG), libvita2d (pulls freetype, libpng, libjpeg-turbo,
 # zlib, bzip2), libpcre2 and curl-mbedtls (pulls mbedtls, zstd). Install
 # without sudo:
-#   VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2 curl-mbedtls
+#   VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2 curl-mbedtls expat
 #
 # Usage: WORK=<WORK>/vitabrowser-work VITASDK=~/vitasdk tools/build-vita.sh
 set -e
@@ -51,7 +52,7 @@ export PATH="$VITASDK/bin:$PATH"
 UP="$WORK/applytest/upstream"
 VP="${VITA_PREFIX:-$WORK/vita-prefix}"
 LIBS="libwapcaplet libparserutils libhubbub libcss libdom"
-SUPPORT="libnsutils libutf8proc libnspsl libnsgif libnsbmp"
+SUPPORT="libnsutils libutf8proc libnspsl libnsgif libnsbmp libsvgtiny"
 GCC14="-Wno-error=implicit-function-declaration \
 -Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
 -Wno-error=implicit-int -Wno-error=return-mismatch \
@@ -64,6 +65,8 @@ GCC14="-Wno-error=implicit-function-declaration \
 	{ echo "no libpcre2: VDPM_NONINTERACTIVE=1 vdpm install libpcre2"; exit 2; }
 grep -q 'mbedTLS\|mbedtls' "$VITASDK/arm-vita-eabi/lib/pkgconfig/libcurl.pc" 2>/dev/null || \
 	{ echo "no curl-mbedtls: VDPM_NONINTERACTIVE=1 vdpm install curl-mbedtls"; exit 2; }
+[ -f "$VITASDK/arm-vita-eabi/lib/libexpat.a" ] || \
+	{ echo "no expat: VDPM_NONINTERACTIVE=1 vdpm install expat"; exit 2; }
 [ -f "$UP/netsurf/frontends/vita/main.c" ] || \
 	{ echo "no patched tree at $UP -- run tools/build-patched.sh"; exit 2; }
 
@@ -79,7 +82,7 @@ for l in $LIBS; do
 	export CFLAGS
 	( cd "$UP/$l" && make install HOST=arm-vita-eabi PREFIX="$VP" \
 	    PKG_CONFIG_PATH="$VP/lib/pkgconfig" WARNFLAGS="-Wall" \
-	    WITH_EXPAT_BINDING=no > "$WORK/applytest/vita-build-$l.log" 2>&1 ) \
+	    WITH_EXPAT_BINDING=yes > "$WORK/applytest/vita-build-$l.log" 2>&1 ) \
 	  && echo "  $l ok" || { echo "  $l FAILED"; \
 	     grep -m3 'error' "$WORK/applytest/vita-build-$l.log"; exit 1; }
 done

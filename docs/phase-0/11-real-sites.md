@@ -10,7 +10,10 @@ mbedTLS, DNS on the resolver's worker thread (patch 49), QuickJS and
 MacSurf's bridge, against the live internet. Stage a device hand-off only
 for something device-specific.
 
-**Status (2026-09-24):**
+**Status (2026-09-24, round 2 added):** SVG, mask-image icons and
+`background-size` fixed (patches 59–61, "Round 2" below).
+
+**Round 1 status:**
 - example.com (http), English Wikipedia (https, article and main page),
   Hacker News, CNN Lite and a DuckDuckGo Lite search all load and lay
   out.
@@ -138,30 +141,133 @@ What each layer did on the Wikipedia article:
 ![Wikipedia on the simulator, patches 1–58](img/11-real-sites/wikipedia-article.png)
 ![Hacker News](img/11-real-sites/hacker-news.png)
 
+## Round 2: SVG, masks, background-size (patches 59–61)
+
+### 4. SVG images (patch 61, tools/build-vita.sh)
+
+- **The Vita prefix:** expat 2.8.4 from vdpm
+  (`~/vitasdk/bin/vdpm install expat`: vitaSDK's own vdpm, no sudo).
+  The checkout under `<WORK>/vitabrowser-work/vdpm` wants a pacman it doesn't
+  have.
+- **libdom** is built `WITH_EXPAT_BINDING=yes`, its XML parser, which
+  libsvgtiny uses.
+- **libsvgtiny** is cross-built with the other support libraries.
+- `NETSURF_USE_NSSVG := YES`.
+- **The simulator** links the host prefix's libsvgtiny, which the host
+  build already had.
+- **Verified** with `IMG-svg.html`: an `<img>` logo (a rect, a stroked
+  path, a circle, a polygon, scaled 120×40 → 240×80), a CSS background
+  icon, and a `background-size`d one. The first two are in the screenshot
+  below. `run-vita-sim.sh` asserts ≥ 5 paths drawn and no alt text.
+- **Live:** Hacker News's "Y" logo draws, with 0 SVGs refused (there were
+  658 refusals on Wikipedia before).
+- **The Vita build** links libsvgtiny and expat (`svgtiny_*`,
+  `XML_Parse*` in the ELF).
+
+![SVG](img/11-real-sites/svg.png)
+
+### 5. background-size never applied (patch 59, libcss)
+
+**Found through the mask icons**, whose size is a `background-size`:
+- a 12 px SVG icon given `background-size: 48px` drew at 12 px;
+- then a PNG given the same didn't scale either (it was only clipped to
+  its box);
+- `nsmonkey` agreed. So the bug was in the engine, not the Vita
+  plotter.
+
+**Traced stage by stage:** the tile-size code received 0 ("unset") for
+every element. The cascade received a SET opcode with a packed value of
+0. **The parser already emitted 0 for `48px`.**
+
+**Root cause:**
+- MacSurf's `background-size` parser (fixes191b) compared the unit from
+  `css__parse_unit_keyword()` with the public `CSS_UNIT_PX` (0). That
+  function returns the *bytecode* unit, `UNIT_PX = 0x100` in this libcss.
+- MacSurf wrote it against an older libcss where the two coincided, so
+  in our build every length read as `auto`.
+- It's the only parser comparing public units this way (checked every
+  file that parses units).
+
+**Verified** (`X-bg`): SVG icon 12 → 48 px and centred, SVG logo
+48 × 16, PNG 120 → 48 px wide.
+
+### 6. mask-image icons drew as solid blocks (patch 60, libcss)
+
+**The problem:**
+- Icons like Minerva's and Vector's are a span with a
+  `background-color`, shaped by `mask-image: url(icon.svg)`.
+- libcss has no masking, so each drew as a solid block of its colour.
+- A real mask property would need new computed-style fields, in files
+  MacSurf hand-edited after generation (its `row_gap` is not in
+  `select_config.py`, so regenerating would drop it).
+
+**Instead, the parser maps the mask properties to the background ones:**
+- `mask-image` and `-webkit-mask-image` → `background-image`, plus
+  `background-color: transparent` (unless the value is `none`);
+- `mask-size`, `mask-position` and `mask-repeat` (and their `-webkit-`
+  forms) → their `background-*` counterparts;
+- `mask` and `-webkit-mask` → the `background` shorthand.
+
+The icon then shows its own shape, in the SVG's own colour rather than
+the element's.
+
+One lookup, `css__property_id()`, serves both the parser and the
+deferred `var()` path, which re-parses by name at cascade time. That
+matters because Minerva's `mask-size` is `calc(var(...) + 4px)`.
+
+**Verified** (`CSS-mask-icon.html`, below):
+- plain and `var()`-sized masked spans draw the icon at 24 px;
+- `mask-image: none` keeps its block;
+- `run-vita-sim.sh` counts exactly the two expected solid 24 × 24
+  blocks.
+
+**Limits:**
+- `-webkit-mask` with `/ size` is dropped: libcss's background shorthand
+  doesn't take a size.
+- An element with both a background image and a mask shows only the
+  mask image.
+
+![mask icons](img/11-real-sites/mask-icons.png)
+
+### Clean checkout, round 2
+
+- Applied 144 + the known 2; L1 PASS; recorded plot streams unchanged.
+- Renderer tests 101/101 + 30/30.
+- **Simulator:** every check passes, including the new ones: `IMG-svg`
+  6 paths drawn, `CSS-mask` exactly 2 blocks, interaction 22/22 at both
+  paces, 68 of 68 frames identical batched vs per glyph.
+- **Live, Wikipedia excluded (see below):**
+
+  | site | document | extent | RSS |
+  |---|---|---|---|
+  | example.com | 279 ms | 960 × 544 | 17 MB |
+  | Hacker News | 1 580 ms | 960 × 1 303 | 25 MB |
+  | CNN Lite | 614 ms | 960 × 3 620 | 25 MB |
+  | DDG search | 1 174 ms | 960 × 1 754 | 24 MB |
+
+- **The Vita build** is packaged with libsvgtiny, expat and
+  `css__property_id` in the ELF.
+
+### Wikipedia rate-limits repeated test loads
+
+After about 15 loads of the Wikipedia article in an hour (about 50
+requests each), Wikimedia answered "Too many requests. Please respect our
+robot policy".
+- Run `run-live-sites.sh`'s Wikipedia pages sparingly.
+- The round-2 chain ran it without them.
+- A person browsing is far below that rate.
+
 ## Not done: the gaps left
 
-- **SVG images are refused** (`NETSURF_USE_NSSVG=NO`). Examples:
-  - Wikipedia's wordmark and the footer logos;
-  - Hacker News's "Y" logo;
-  - the "external link" icon CSS puts on each of Wikipedia's 656
-    external links. That's one fetch, then 656 refused content objects
-    from the cache; no network cost.
-
-  libsvgtiny builds for the host already. The Vita needs it
-  cross-built, plus an XML parser: libdom's XML binding is built with
-  `WITH_EXPAT_BINDING=no`, and expat is not yet in the Vita prefix.
-  **The next item.**
-- **`mask-image` is not parsed** (libcss). Icon spans painted by
-  `background-color` through a mask draw as solid bars: Minerva's
-  Language / Watch / Edit icons, and Vector's. They are cosmetic.
-- **Minerva's page-action labels** ("Language", "Watch", "Edit") show
-  clipped, where they should be visually hidden. The same "visually
-  hidden" rules on minimal pages (inline, inline-flex, nested flex) hide
-  the label correctly, so something specific to Minerva's markup or the
-  scripts' changes remains to be found.
+- **Minerva's page-action labels** ("Language", "Watch", "Edit") still
+  show clipped, where they should be visually hidden. Minimal pages with
+  the same rules (inline, inline-flex, nested flex) hide them, so
+  something specific to Minerva's markup or its scripts' changes remains.
+  Re-check live now that the icons draw.
 - **Wikipedia's article is 1011 px wide:** the page-actions row overflows
   the 960-px screen by 51 px.
-- **Memory:** host RSS peaks at about 78 MB for the Wikipedia article (a
-  64-bit process: pointers and allocator overhead double some of it).
-  The Vita's budget is 192 MB of heap. A device run would give the real
-  figure, and the autotest already logs `mem[...]` per page.
+- **Memory:** host RSS peaks at about 76 MB for the Wikipedia article (a
+  64-bit process). The Vita's heap budget is 192 MB. A device run gives
+  the real figure: the autotest logs `mem[...]` per page.
+- **Percentage and em/rem `background-size` values** still read as auto
+  (MacSurf's parser takes px only).

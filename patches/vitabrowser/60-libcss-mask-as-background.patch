@@ -1,0 +1,230 @@
+# libcss: the CSS mask properties, read as background ones
+# Generated 2026-09-24
+#
+# libcss has no masking. Sites use mask-image for monochrome icons -- a span
+# with a background-color, shaped by an SVG mask -- so each such icon drew
+# as a solid block of its colour (Wikipedia's Minerva and Vector skins: the
+# Language / Watch / Edit bars). A real mask property would mean new
+# computed-style fields in files MacSurf hand-edited after generation; this
+# maps the mask properties onto the background ones at parse time instead:
+#   mask-image, -webkit-mask-image         -> background-image, and
+#                                             background-color: transparent
+#                                             (unless the value is none)
+#   mask-size / -position / -repeat (+ -webkit-) -> background-*
+#   mask, -webkit-mask                     -> the background shorthand
+# so the icon shows its own shape, in the SVG's own colour rather than the
+# element's. One lookup, css__property_id(), serves both the parser and the
+# deferred var() path (custom_properties.c), which re-parses by name at
+# cascade time (Minerva's mask-size is calc(var(...) + 4px)).
+# Limits: an element with both a background image and a mask shows only
+# the mask image; libcss's background shorthand does not take "/ size", so
+# -webkit-mask with a size is dropped.
+# See docs/phase-0/11-real-sites.md.
+
+diff --git a/src/parse/custom_properties.c b/src/parse/custom_properties.c
+index be89d8b..8e7ee77 100644
+--- a/src/parse/custom_properties.c
++++ b/src/parse/custom_properties.c
+@@ -1372,21 +1372,6 @@ static void cp__tokens_to_text(const css_cp_token *const *items, uint32_t n,
+ 	buf[out] = '\0';
+ }
+ 
+-/* Linear-search for property ID matching the ident's idata. */
+-static int find_property_id(css_language *c, lwc_string *name)
+-{
+-	int i;
+-	bool match;
+-
+-	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
+-		match = false;
+-		if (lwc_string_caseless_isequal(name, c->strings[i],
+-					&match) == lwc_error_ok && match)
+-			return i;
+-	}
+-	return -1;
+-}
+-
+ css_error css__deferred_decl_resolve(const css_deferred_decl *dd,
+ 		const css_stylesheet *origin_sheet,
+ 		css_select_ctx *ctx,
+@@ -1400,6 +1385,7 @@ css_error css__deferred_decl_resolve(const css_deferred_decl *dd,
+ 	css_style *scratch_style;
+ 	css_language stub_lang;
+ 	int prop_id;
++	bool mask_image = false;
+ 	css_prop_handler handler;
+ 	uint8_t important_flag;
+ 	css_style cascade_walker;
+@@ -1481,7 +1467,7 @@ css_error css__deferred_decl_resolve(const css_deferred_decl *dd,
+ 	stub_lang.sheet = (css_stylesheet *)origin_sheet;
+ 	stub_lang.strings = origin_sheet->propstrings;
+ 
+-	prop_id = find_property_id(&stub_lang, dd->property);
++	prop_id = css__property_id(&stub_lang, dd->property, &mask_image);
+ 	if (prop_id < 0) {
+ 		parserutils_vector_destroy(replay);
+ 		return CSS_OK;
+@@ -1501,6 +1487,8 @@ css_error css__deferred_decl_resolve(const css_deferred_decl *dd,
+ 
+ 	ctx_idx = 0;
+ 	error = handler(&stub_lang, replay, &ctx_idx, scratch_style);
++	if (error == CSS_OK && mask_image)
++		error = css__mask_image_hides_colour(replay, 0, scratch_style);
+ #ifdef MACSURF_DEBUG
+ 	{
+ 		extern void macsurf_debug_log_tracef(
+diff --git a/src/parse/language.c b/src/parse/language.c
+index e20a5d7..7c3775c 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -2038,6 +2038,8 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 	css_prop_handler handler = NULL;
+ 	int i = 0;
+ 	uint8_t flags = 0;
++	bool mask_image = false;
++	int32_t value_ctx;
+ 	css_style *style = NULL;
+ 	const css_token *token;
+ 
+@@ -2097,16 +2099,9 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 				cp_tokens, cp_n);
+ 	}
+ 
+-	/* Find property index */
+-	/** \todo improve on this linear search */
+-	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
+-		bool match = false;
+-
+-		if (lwc_string_caseless_isequal(property->idata, c->strings[i],
+-				&match) == lwc_error_ok && match)
+-			break;
+-	}
+-	if (i == LAST_PROP + 1)
++	/* Find property index (the mask properties map to background ones) */
++	i = css__property_id(c, property->idata, &mask_image);
++	if (i < 0)
+ 		return CSS_INVALID;
+ 
+ 	/* If the value references var(), we cannot compile to bytecode now
+@@ -2165,7 +2160,10 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 	assert (style != NULL);
+ 
+ 	/* Call the handler */
++	value_ctx = *ctx;
+ 	error = handler(c, vector, ctx, style);
++	if (error == CSS_OK && mask_image)
++		error = css__mask_image_hides_colour(vector, value_ctx, style);
+ 	if (error != CSS_OK) {
+ 		css__stylesheet_style_destroy(style);
+ 		return error;
+diff --git a/src/parse/properties/properties.c b/src/parse/properties/properties.c
+index 21c9ab3..658e795 100644
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -5,6 +5,10 @@
+  * Copyright 2008 John-Mark Bell <jmb@netsurf-browser.org>
+  */
+ 
++#include <string.h>
++#include <strings.h>
++
++#include "bytecode/opcodes.h"
+ #include "parse/properties/properties.h"
+ 
+ /**
+@@ -374,3 +378,73 @@ const uint32_t property_unit_mask[CSS_N_PROPERTIES] = {
+ 	[CSS_PROP_TRANSITION_TIMING_FUNCTION] = 0,
+ 	[CSS_PROP_TRANSITION_DELAY]      = 0,
+ };
++
++/*
++ * VitaBrowser: the CSS mask properties, read as their background
++ * counterparts (docs/phase-0/11). libcss has no masking; sites use
++ * mask-image for monochrome icons -- a span with a background-color, shaped
++ * by an SVG mask -- so without it every such icon drew as a solid block of
++ * its background colour (Wikipedia's Minerva and Vector skins). Drawn as a
++ * background image instead, the icon shows its own shape, in the SVG's own
++ * colour rather than the element's. mask-image also makes the background
++ * colour transparent (css__mask_image_hides_colour), and the mask shorthand
++ * resets it through the background one.
++ */
++static const struct {
++	const char *name;
++	int prop;
++	bool image;
++} mask_aliases[] = {
++	{ "mask-image", BACKGROUND_IMAGE, true },
++	{ "-webkit-mask-image", BACKGROUND_IMAGE, true },
++	{ "mask-size", BACKGROUND_SIZE, false },
++	{ "-webkit-mask-size", BACKGROUND_SIZE, false },
++	{ "mask-position", BACKGROUND_POSITION, false },
++	{ "-webkit-mask-position", BACKGROUND_POSITION, false },
++	{ "mask-repeat", BACKGROUND_REPEAT, false },
++	{ "-webkit-mask-repeat", BACKGROUND_REPEAT, false },
++	{ "mask", BACKGROUND, false },
++	{ "-webkit-mask", BACKGROUND, false },
++};
++
++int css__property_id(css_language *c, lwc_string *name, bool *mask_image)
++{
++	const char *d = lwc_string_data(name);
++	size_t n = lwc_string_length(name), k;
++	bool match;
++	int i;
++
++	*mask_image = false;
++	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
++		match = false;
++		if (lwc_string_caseless_isequal(name, c->strings[i],
++				&match) == lwc_error_ok && match)
++			return i;
++	}
++	for (k = 0; k < sizeof(mask_aliases) / sizeof(mask_aliases[0]); k++) {
++		const char *a = mask_aliases[k].name;
++		if (strlen(a) == n && strncasecmp(d, a, n) == 0) {
++			*mask_image = mask_aliases[k].image;
++			return mask_aliases[k].prop;
++		}
++	}
++	return -1;
++}
++
++css_error css__mask_image_hides_colour(const parserutils_vector *vector,
++		int32_t ctx, css_style *style)
++{
++	const css_token *t;
++
++	do {
++		t = parserutils_vector_iterate(vector, &ctx);
++	} while (t != NULL && t->type == CSS_TOKEN_S);
++	/* mask-image: none is no mask: the colour stays. */
++	if (t != NULL && t->type == CSS_TOKEN_IDENT && t->idata != NULL &&
++			lwc_string_length(t->idata) == 4 &&
++			strncasecmp(lwc_string_data(t->idata), "none", 4) == 0)
++		return CSS_OK;
++	return css__stylesheet_style_appendOPV(style,
++			CSS_PROP_BACKGROUND_COLOR, 0,
++			BACKGROUND_COLOR_TRANSPARENT);
++}
+diff --git a/src/parse/properties/properties.h b/src/parse/properties/properties.h
+index 7a9fcdc..1d62529 100644
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -31,6 +31,17 @@ typedef css_error (*css_prop_handler)(css_language *c,
+ 
+ extern const css_prop_handler property_handlers[LAST_PROP + 1 - FIRST_PROP];
+ 
++/** The property a declaration's name selects (FIRST_PROP..LAST_PROP), or
++ * -1. The CSS mask properties map to their background counterparts
++ * (VitaBrowser); *mask_image is set for mask-image, whose declaration also
++ * needs css__mask_image_hides_colour(). */
++int css__property_id(css_language *c, lwc_string *name, bool *mask_image);
++
++/** Append background-color: transparent to style, unless the value at ctx
++ * is "none". */
++css_error css__mask_image_hides_colour(const parserutils_vector *vector,
++		int32_t ctx, css_style *style);
++
+ css_error css__parse_align_content(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
