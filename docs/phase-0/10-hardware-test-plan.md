@@ -1925,3 +1925,112 @@ everything below lands in log.txt too.
 
 Tell me anything that felt wrong: the pointer speed, the drag direction,
 tap accuracy, the zoom steps, the keyboard.
+
+## Run 14 — results (2026-09-24 08:53–08:57, PCH-2000, 3.65 HENkaku): browsing by hand
+
+The build was run 14's (VPK `02982d1ce67b`). This session was manual
+browsing; the autotest was not run. Three launches reached
+`receive-results.bat`. Two crash dumps (`psp2core-*.psp2dmp`) were
+copied off the card.
+
+**What worked:**
+- **The home page** with its 5 bookmarks, written on first launch
+  (`chrome: wrote default …bookmarks.txt`).
+- **The LAN listener** (`remote: listening on :8080`).
+- **Zoom** 125/150 %.
+- **The pointer:** hover status lines, and a pointer click opening a
+  bookmark.
+- **DNS on the worker thread:** `claude.ai -> 160.79.104.10 in 14 ms`.
+- **Wikipedia loaded** (your report).
+
+**What failed:**
+1. **claude.ai/code served Cloudflare's "Just a moment..." challenge**, not
+   the app. From this PC, curl with the same user agent gets the same 403
+   challenge. The simulator got the real page, so Cloudflare's decision
+   varies.
+   - Passing it means running Cloudflare's challenge script: 238 KB of
+     obfuscated JavaScript that talks to `challenges.cloudflare.com`. It
+     ran in the simulator without effect, because it only works when
+     served from `claude.ai`.
+   - That is the next big item on the way to the north star
+     (`docs/north-star.md`).
+2. **The browser crashed twice on that page, about 2 s after it arrived.**
+   - The dumps' timestamps (08:54:56, 08:57:05) fall exactly after the
+     last log lines of launches 1 and 3, and the second dump's memory
+     holds `claude.ai/code`.
+   - Read with `vita-parse-core`, against the archived ELF:
+
+     > SIGABRT: `__assert_func` ← `layout_minmax_line`, layout.c:1121,
+     > `assert(0 <= *line_min)`
+
+   - `vita-parse-core` is Python 2; ported to Python 3 in the session's
+     scratchpad (utils only).
+   - **Fixed in patch 62:** clamp to the invariant, and log it.
+3. **"The receiver had problems":** the receiver was fine; **the app had
+   crashed.**
+   - Launch 3's folder is empty because it crashed 36 s in.
+   - There's no `receiver.txt` because it was written only at a file-end
+     marker or a clean exit, and a manual session ends with the PS
+     button. The receiver now rewrites it every 5 s
+     (`tools/vita-netlog.py`).
+4. **The engine log was useless:** `engine log: capped at 16777216 bytes`
+   1.2 s after boot, every launch. The cap measured the whole file, which
+   is appended to across launches, so earlier sessions had filled it.
+   **Fixed in patch 63:** a per-boot cap, and rotation to
+   `netsurf.old.log`.
+
+**Noticed, not yet explained:** the home page's first frames took 762 and
+1 053 ms of CPU. The earlier test pages' first frames took 70–200 ms. The
+likely cost is FreeType rasterising the home page's new text sizes on
+first use (26/22/20/18/15 px); later frames are served from the atlas.
+Only the autotest's timed frames can tell, and it wasn't run this time.
+
+## Run 15 — hand-off: the crash fix and the web-compat fixes (patches 55–66)
+
+**What changed since run 14:**
+- **Crash fix (patch 62):** a layout assertion can no longer abort the
+  browser.
+- **Engine log (patch 63):** capped per boot, so it records again.
+- **Web compatibility** (doc 11):
+  - a mobile user agent, so Wikipedia serves its mobile skin;
+  - body `overflow` goes to the viewport;
+  - the leading space in inline elements is kept;
+  - SVG images;
+  - `background-size` works;
+  - mask-image icons draw;
+  - no horizontal overflow on Wikipedia.
+- **The receiver** rewrites `receiver.txt` every 5 s.
+
+**Clean checkout:**
+- Applied 149 + the known 2; L1 PASS; 101/101 + 30/30.
+- The simulator suite passes, including the new regression pages
+  (`CSS-overflow-viewport`, `CSS-inline-space`, `IMG-svg`,
+  `CSS-mask-icon`, `CSS-overflow-x`).
+- Live sites 4/4, Wikipedia skipped: Wikimedia rate-limits repeated test
+  loads.
+- The internet-connected reference run gives interaction 22/22.
+
+**Hand-off.**
+- SHA256, first 12: `VitaBrowser.vpk` `4c7f7d2ae1e8`,
+  `VitaBrowser-ext.vpk` `444122000880`, `nsvita.elf` `729c1a38fd29`.
+- `reference-dumps\` is regenerated (29 dumps).
+- `vita-netlog.py` is updated in `VitaBrowser-hwtest\`.
+- Run 14's results, with the crash dumps, are in `results-run14\`.
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-24-run15/`.
+
+**Run 15 on the device:**
+1. **The autotest first** (`receive-results.bat`, then SELECT+□):
+   - `interact: 22/22 passed`;
+   - all dumps SAME except PM-animation;
+   - the timed frames tell whether the home page's slow first frames
+     (run 14) were glyph rasterisation.
+2. **By hand:**
+   - Open **Wikipedia**: the mobile skin, icons instead of dark bars,
+     the logo drawn, no sideways scrolling.
+   - Open **claude.ai/code**: expect the Cloudflare page again, but **no
+     crash**. If `minmax line clamped` appears in netsurf.log, it was
+     that path.
+   - Open **Hacker News**: its logo draws, and the rows read
+     "Title (site.com)" with a space.
+3. **If it crashes anyway:** copy the `psp2core-*.psp2dmp` from
+   `ux0:data/` as you did; the ELF is archived.

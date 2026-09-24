@@ -524,6 +524,19 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 			return 1;
 	}
 
+	/* VITA_SIM_DUMP: before moving on, have the frontend dump this page's
+	 * plot stream (SELECT + CIRCLE, ux0:data/VitaBrowser/manual-*.plot)
+	 * and settle again -- a text-level record of what a live page drew. */
+	{
+		static unsigned int dumped_page = ~0u;
+		if (getenv("VITA_SIM_DUMP") != NULL && dumped_page != page) {
+			dumped_page = page;
+			idle = 0;
+			pad->buttons = SCE_CTRL_SELECT | SCE_CTRL_CIRCLE;
+			return 1;
+		}
+	}
+
 	/* Settled: record this page, then move on. */
 	if (frames == 0) {
 		fprintf(stderr, "vitasim: page %u never drew a frame\n", page);

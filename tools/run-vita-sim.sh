@@ -166,6 +166,7 @@ CSS-ovf file:///app0:/testpages/CSS-overflow-viewport.html
 CSS-space file:///app0:/testpages/CSS-inline-space.html
 IMG-svg file:///app0:/testpages/IMG-svg.html
 CSS-mask file:///app0:/testpages/CSS-mask-icon.html
+CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -361,6 +362,11 @@ mk=$(ls "$R"/*-CSS-mask.plot 2>/dev/null | head -1)
 nblk=$(awk '/^PLOT RECT/ { if ($8 - $4 == 24 && $10 - $6 == 24) n++ } END { print n + 0 }' "$mk" 2>/dev/null)
 echo "  CSS-mask: $nblk solid 24x24 blocks (2 expected: the unmasked spans)"
 [ "$nblk" = 2 ] || fail "mask-image icons"
+# No horizontal overflow (patches 64, 65): an unbreakable URL in break-word
+# text, and a min-width button in Minerva's header arrangement.
+xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)
+echo "  CSS-overflow-x: page width ${xw:-?} (the screen is 960)"
+[ "$xw" = 960 ] || fail "horizontal overflow"
 [ -n "$ext" ] && [ "$ext" -gt 1500 ] && [ -n "$b1" ] && [ "$b1" = "$b2" ] && \
 	[ -n "$c1" ] && [ "$c1" = "$c2" ] && [ "${npath:-0}" -ge 5 ] && \
 	! grep -q LOGO-NOT-DRAWN "$sv" || fail "real-site layout regressions"

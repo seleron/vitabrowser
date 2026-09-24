@@ -1,0 +1,75 @@
+# netsurf: intrinsic widths are clamped, not asserted (device crash)
+# Generated 2026-09-24
+#
+# Hardware run 14 (claude.ai): the browser aborted twice, both times on
+# claude.ai's Cloudflare "Just a moment..." challenge page, about 2 s after it
+# arrived (its script rebuilding the page). The psp2core dumps, read with
+# vita-parse-core against the archived ELF: SIGABRT from __assert_func,
+# called from layout_minmax_line, layout.c:1121 -- assert(0 <= *line_min).
+# Under white-space: nowrap a line's min is its max, and max sums inline
+# boxes' max_width; UNKNOWN_MAX_WIDTH / UNKNOWN_WIDTH are INT_MAX sentinels,
+# so one left in a sum wraps it negative (the likely path; the exact page
+# state could not be replayed offline -- Cloudflare's script bails when not
+# served from claude.ai).
+# layout_minmax_line, layout_minmax_block and layout_minmax_table now clamp
+# to the invariant their asserts state (0 <= min <= max) before asserting;
+# the line clamp logs "minmax line clamped: min .. max .." to the engine log
+# so a device run shows how often it fires. A wrong width is survivable; an
+# abort takes the whole browser down.
+# See docs/phase-0/11-real-sites.md.
+
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index d1d1806..c951cdf 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -662,6 +662,11 @@ static void layout_minmax_table(struct box *table,
+ 	table->min_width += (table->columns + 1) * border_spacing_h;
+ 	table->max_width += (table->columns + 1) * border_spacing_h;
+ 
++	/* VitaBrowser: clamp, don't abort (see layout_minmax_line). */
++	if (table->min_width < 0)
++		table->min_width = 0;
++	if (table->max_width < table->min_width)
++		table->max_width = table->min_width;
+ 	assert(0 <= table->min_width && table->min_width <= table->max_width);
+ }
+ 
+@@ -1121,6 +1126,24 @@ layout_minmax_line(struct box *first,
+ 		max = (max + text_indent < 0) ? 0 : max + text_indent;
+ 	}
+ 
++	/* VitaBrowser: page CSS must never abort the browser. Under
++	 * white-space: nowrap, min = max, and max sums inline-blocks'
++	 * max_width, margins included -- a large negative margin (the
++	 * off-screen hiding idiom) makes it negative, and the asserts below
++	 * killed the app: hardware run 14, twice, on claude.ai's Cloudflare
++	 * challenge page (psp2core: __assert_func from here). Clamp to the
++	 * invariant the asserts state. */
++	if (min < 0 || max < min) {
++		/* Most likely an INT_MAX sentinel (UNKNOWN_MAX_WIDTH) summed
++		 * into max and wrapped; logged so a device run says how often
++		 * pages hit it. */
++		NSLOG(layout, INFO, "minmax line clamped: min %i max %i", min,
++		      max);
++		if (min < 0)
++			min = 0;
++		if (max < min)
++			max = min;
++	}
+ 	*line_min = min;
+ 	*line_max = max;
+ 
+@@ -1722,6 +1745,13 @@ static void layout_minmax_block_inner(
+ 		block->max_width = (max + extra_fixed) / (1.0 - extra_frac);
+ 	}
+ 
++	/* VitaBrowser: as in layout_minmax_line -- max-width can pull max
++	 * below a min-width min (CSS: min-width wins), and negative content
++	 * widths reach here; clamp to the invariant, don't abort. */
++	if (block->min_width < 0)
++		block->min_width = 0;
++	if (block->max_width < block->min_width)
++		block->max_width = block->min_width;
+ 	assert(0 <= block->min_width);
+ 	assert(block->min_width <= block->max_width);
+ }

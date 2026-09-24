@@ -282,6 +282,16 @@ def main():
                 print("== boot %s from %s: %s -> %s" % (
                     boot, addr[0], hello, b.dir), flush=True)
             b.last = now
+            # A launch closed with the PS button sends no end markers, and
+            # a receiver window closed with X never reaches its summary:
+            # keep receiver.txt current every few seconds instead
+            # (hardware run 14 left none).
+            if now - getattr(b, "reported", 0) > 5:
+                b.reported = now
+                try:
+                    b.summary()
+                except OSError:
+                    pass
             b.seqs.add(seq)
             b.max_seq = max(b.max_seq, seq)
             if b.min_seq is None or seq < b.min_seq:

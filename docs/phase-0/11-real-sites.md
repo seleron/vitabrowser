@@ -257,17 +257,87 @@ robot policy".
 - The round-2 chain ran it without them.
 - A person browsing is far below that rate.
 
+## Round 3: widths, the mask colour, a device crash (patches 62–66)
+
+### 7. Wikipedia's 1011-px width had two causes (patches 64, 65)
+
+**The finder:** a local snapshot of the article (HTML and its two
+stylesheets, served from the scratchpad) plus a temporary box-tree walk,
+since removed. It printed every box whose right edge passed 962.
+
+**JavaScript geometry can't help here:**
+- `getBoundingClientRect` returns 0s, and `offsetWidth` is undefined.
+- That's by MacSurf's design: `MACSURF_JS_GEOMETRY` is 0, because real
+  geometry costs about 1.6 s of synchronous layout per measurement
+  burst. It's allowed only inside user-event handlers.
+
+**The causes:**
+1. **An unbreakable citation URL** (964 px, in an 897-px column).
+   - `.content { word-wrap: break-word }` should break it, and MacSurf's
+     fixes202 implements the character break. But it fires only when the
+     font split returns 0.
+   - The Vita's split follows the framebuffer contract and returns the
+     whole length when there is no break opportunity.
+   - The fallback now fires in both cases.
+2. **Minerva's icon-only header button:**
+   - `min-width: 44px`, in a flex nav whose last child has
+     `margin-right: -12px`.
+   - `layout_minmax_block` raised a box's min width to its `min-width`
+     but left the preferred (max) width below it. Only the
+     intrinsic-keyword branch fixed that up.
+   - So the button reported 16 px, the nav got 4 px, and the button sat
+     25 px past the screen.
+
+**Checked:** in the final layout pass, no box passes 960. The regression
+page `CSS-overflow-x.html` holds both cases, and the simulator asserts
+the page is exactly 960 wide.
+
+### 8. The mask's transparent colour must win (patch 66)
+
+- Live, the page-action icons were still solid bars after patch 60.
+- Minerva's `.minerva-icon { background-color }` comes **after** its
+  `.minerva-icon--* { mask-image }` rules, at the same specificity, so it
+  beat the injected `transparent`.
+- A masked element's colour only shows through the mask, which isn't
+  drawn, so the `transparent` is now important, on that opcode alone.
+- **Verified:**
+  - `CSS-mask-icon.html` gained the Minerva-order case (MASKED-LATE),
+    and it draws the icon;
+  - live Wikipedia shows the language, star and pencil icons.
+
+### 9. A layout assertion aborted the browser on the device (patch 62)
+
+Hardware run 14 (doc 10): on claude.ai's Cloudflare challenge page, the
+line min-width assert fired: `assert(0 <= *line_min)`, layout.c:1121,
+from the crash dumps. The likely path:
+- under `white-space: nowrap`, a line's min is its max;
+- max sums inline boxes' `max_width`;
+- NetSurf's `UNKNOWN_MAX_WIDTH` / `UNKNOWN_WIDTH` sentinels are
+  `INT_MAX`, so one left in the sum wraps negative.
+
+The line, block and table min/max functions now clamp to `0 ≤ min ≤ max`
+before their asserts. The line clamp logs `minmax line clamped`, so a
+device run shows whether and where it fires.
+
 ## Not done: the gaps left
 
+- **claude.ai/code:** Cloudflare's "Just a moment..." challenge, on the
+  device and for curl. It needs Cloudflare's challenge script to succeed
+  in QuickJS + MacSurf's DOM bridge (doc 10, run 14 results). It is the
+  next big item on the way to the north star.
 - **Minerva's page-action labels** ("Language", "Watch", "Edit") still
-  show clipped, where they should be visually hidden. Minimal pages with
-  the same rules (inline, inline-flex, nested flex) hide them, so
-  something specific to Minerva's markup or its scripts' changes remains.
-  Re-check live now that the icons draw.
-- **Wikipedia's article is 1011 px wide:** the page-actions row overflows
-  the 960-px screen by 51 px.
-- **Memory:** host RSS peaks at about 76 MB for the Wikipedia article (a
-  64-bit process). The Vita's heap budget is 192 MB. A device run gives
-  the real figure: the autotest logs `mem[...]` per page.
-- **Percentage and em/rem `background-size` values** still read as auto
+  draw, clipped.
+  - They reproduce statically: the page-actions markup plus Minerva's
+    stylesheet, no scripts.
+  - Yet a minimal page with the same hiding rule, flex nesting and
+    buttons hides them.
+  - A bisection over Minerva's stylesheet is the next step:
+    `VITA_SIM_DUMP=1` makes the simulator record the plot dump, where
+    the labels show as `PLOT TEXT … STR Watch`.
+- **Memory:** host RSS peaks at about 78 MB for the Wikipedia article (a
+  64-bit process). The Vita's heap budget is 192 MB. The autotest logs
+  `mem[...]` per page on the device.
+- **Percentage and em/rem `background-size`** still read as `auto`
   (MacSurf's parser takes px only).
+- **`-webkit-mask` with `/ size`** is dropped (libcss's background
+  shorthand has no size).
