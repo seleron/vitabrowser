@@ -1,0 +1,169 @@
+# netsurf: log formats the Vita's newlib can print
+# Generated 2026-09-24
+#
+# Hardware run 16 crashed on boot, in strlen under vfprintf: patch 76's
+# "css rewrite: %zu -> %zu ... (%s)" line. The Vita's newlib is built
+# without C99 formats (_WANT_IO_C99_FORMATS unset), so %zu is not a
+# conversion there: the arguments shift and the %s read a size (5202,
+# default.css) as a pointer. glibc prints it, so the simulator never saw it.
+# Patch 76 now uses %lu; and since NetSurf and MacSurf log %zu in dozens of
+# places (some before a %s, e.g. the llcache cleaner), every log sink --
+# nslog_log, vita_diag_log, macsurf_debug_log_writef -- now passes its
+# format through nslog_portable_format(), which rewrites z/t to l, j to ll
+# and drops hh where the C library lacks them (tested with
+# NSLOG_FORCE_PORTABLE_FORMAT). tools/build-vita.sh refuses a patch that
+# adds a C99 length modifier.
+
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index e0a252a..e767be8 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -132,7 +132,11 @@ void vita_diag_log(const char *fmt, ...)
+ 	ms = vita_diag_ms();
+ 	n = snprintf(line, sizeof(line), "[%6u.%03u] ", ms / 1000, ms % 1000);
+ 	va_start(ap, fmt);
+-	vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
++	{
++		char pf[512];	/* no C99 length modifiers in newlib */
++		vsnprintf(line + n, sizeof(line) - (size_t)n,
++			  nslog_portable_format(fmt, pf, sizeof(pf)), ap);
++	}
+ 	va_end(ap);
+ 
+ 	/* Hardware run 2 left log.txt untouched while netsurf.log was
+@@ -805,7 +809,11 @@ void macsurf_debug_log_writef(const char *fmt, ...)
+ 		return;
+ 	fputs("MS ", engine_log);
+ 	va_start(ap, fmt);
+-	vfprintf(engine_log, fmt, ap);
++	{
++		char pf[512];	/* no C99 length modifiers in newlib */
++		vfprintf(engine_log, nslog_portable_format(fmt, pf, sizeof(pf)),
++			 ap);
++	}
+ 	va_end(ap);
+ 	fputc('\n', engine_log);
+ }
+diff --git a/utils/log.c b/utils/log.c
+index c2c5037..eb8e73d 100644
+--- a/utils/log.c
++++ b/utils/log.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include <stdarg.h>
++#include <string.h>
+ #include <stdio.h>
+ 
+ #include "utils/config.h"
+@@ -90,6 +91,56 @@ static const char *nslog_gettime(void)
+ 	return buff;
+ }
+ 
++/* exported interface documented in utils/log.h */
++const char *nslog_portable_format(const char *fmt, char *buf, size_t size)
++{
++#if (defined(__NEWLIB__) && !defined(_WANT_IO_C99_FORMATS)) || \
++	defined(NSLOG_FORCE_PORTABLE_FORMAT)
++	size_t o = 0;
++	const char *p;
++	bool changed = false;
++
++	if (fmt == NULL || buf == NULL || size < 2)
++		return fmt;
++	for (p = fmt; *p != '\0'; p++) {
++		if (o + 3 >= size)
++			return fmt;	/* too long: leave it */
++		buf[o++] = *p;
++		if (*p != '%')
++			continue;
++		if (p[1] == '%') {
++			buf[o++] = *++p;
++			continue;
++		}
++		/* flags, width, precision */
++		while (p[1] != '\0' && strchr("-+ #0123456789.*'", p[1]) != NULL) {
++			if (o + 3 >= size)
++				return fmt;
++			buf[o++] = *++p;
++		}
++		if (p[1] == 'z' || p[1] == 't') {	/* size_t, ptrdiff_t: 32-bit */
++			buf[o++] = 'l';
++			p++;
++			changed = true;
++		} else if (p[1] == 'j') {		/* intmax_t: 64-bit */
++			buf[o++] = 'l';
++			buf[o++] = 'l';
++			p++;
++			changed = true;
++		} else if (p[1] == 'h' && p[2] == 'h') {	/* char: promoted */
++			p += 2;
++			changed = true;
++		}
++	}
++	buf[o] = '\0';
++	return changed ? buf : fmt;
++#else
++	(void)buf;
++	(void)size;
++	return fmt;
++#endif
++}
++
+ #ifdef WITH_NSLOG
+ 
+ NSLOG_DEFINE_CATEGORY(netsurf, "NetSurf default logging");
+@@ -121,7 +172,11 @@ netsurf_render_log(void *_ctx,
+ 		ctx->funcnamelen,
+ 		ctx->funcname);
+ 
+-	vfprintf(logfile, fmt, args);
++	{
++		char pf[512];
++		vfprintf(logfile, nslog_portable_format(fmt, pf, sizeof(pf)),
++			 args);
++	}
+ 
+ 	/* Log entries aren't newline terminated add one for clarity */
+ 	fputc('\n', logfile);
+@@ -168,7 +223,11 @@ nslog_log(const char *file, const char *func, int ln, const char *format, ...)
+ 
+ 		va_start(ap, format);
+ 
+-		vfprintf(logfile, format, ap);
++		{
++			char pf[512];
++			vfprintf(logfile, nslog_portable_format(format, pf,
++					sizeof(pf)), ap);
++		}
+ 
+ 		va_end(ap);
+ 
+diff --git a/utils/log.h b/utils/log.h
+index b7aa833..5812196 100644
+--- a/utils/log.h
++++ b/utils/log.h
+@@ -22,6 +22,7 @@
+ 
+ #include <stdio.h>
+ #include <stdbool.h>
++#include <stddef.h>
+ 
+ #include "utils/errors.h"
+ 
+@@ -122,4 +123,15 @@ extern void nslog_log(const char *file, const char *func, int ln, const char *fo
+ 
+ #endif  /* WITH_NSLOG */
+ 
++/**
++ * A printf format the C library can print. The Vita's newlib has no C99
++ * length modifiers (z, t, j, hh): a size_t conversion there shifts every later argument,
++ * so a following %s reads a size as a pointer (hardware run 16 crashed in
++ * strlen). Where they are missing, they are rewritten into buf (size_t and
++ * ptrdiff_t are long-sized there); elsewhere fmt comes back unchanged.
++ *
++ * \return fmt, or buf holding the rewritten format
++ */
++const char *nslog_portable_format(const char *fmt, char *buf, size_t size);
++
+ #endif

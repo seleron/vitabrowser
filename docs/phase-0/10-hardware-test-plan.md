@@ -2173,3 +2173,41 @@ results are in `results-run15\`.
 6. **If something looks wrong** with the new user agent, put `vita` in
    `ux0:data/VitaBrowser/useragent.txt` (VitaShell) and restart to
    compare.
+
+## Run 16 — first attempt (2026-09-24 ~21:00): crashed at boot; fixed (patch 83)
+
+- **What happened:** both launches of the 18:54 build
+  (`76c1859669d3`) died while the home page was being processed. The
+  logs are in `results-run16-crash\`.
+- **The core dump** (`vita-parse-core`, the archived ELF): a data abort
+  in newlib's `strlen`, under `_vfprintf_r`, reading address `0x1450`.
+  R0 was `0x1452`, which is 5202, the length of `default.css`.
+- **The cause:** patch 76's new log line `css rewrite: %zu -> %zu bytes
+  in %u ms (%s)`. The Vita's newlib is built without C99 formats
+  (`_WANT_IO_C99_FORMATS` is unset in its `newlib.h`), so `%zu` is not a
+  conversion there. The arguments shift, and the `%s` took the sheet's
+  size as a pointer.
+  - glibc prints `%zu`, so **the simulator cannot see this class of bug**.
+  - The line runs for the first style sheet of every page, so the
+    browser could not open its home page.
+- **The fix (patch 83):**
+  - that line uses `%lu` with casts;
+  - every log sink (`nslog_log`, `vita_diag_log`,
+    `macsurf_debug_log_writef`) passes its format through
+    `nslog_portable_format()`. It rewrites `z`/`t` to `l`, `j` to `ll`
+    and drops `hh` where the C library lacks them. NetSurf and MacSurf
+    log `%zu` in dozens of places, some before a `%s`.
+  - The rewriter was unit-tested on the host with
+    `NSLOG_FORCE_PORTABLE_FORMAT`.
+  - `tools/build-vita.sh` now refuses any patch that adds a C99 length
+    modifier.
+- **Clean checkout:**
+  - applied 166 + the known 2; L1–L4 PASS; 101/101 + 30/30;
+  - the simulator suite passes;
+  - the reference dumps are unchanged (log format only).
+- **Hand-off:**
+  - SHA256, first 12: `VitaBrowser.vpk` `cdde43287eb8`,
+    `VitaBrowser-ext.vpk` `202b542faebe`, `nsvita.elf` `16816782def3`
+    (build `Sep 24 2026 21:17:42`).
+  - Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-24-run16b/`.
+  - The run 16 checklist above is unchanged.

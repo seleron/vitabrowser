@@ -51,6 +51,15 @@ export VITASDK="${VITASDK:-$HOME/vitasdk}"
 export PATH="$VITASDK/bin:$PATH"
 UP="$WORK/applytest/upstream"
 VP="${VITA_PREFIX:-$WORK/vita-prefix}"
+
+# The Vita's newlib printf has no C99 length modifiers (z, j, t, hh:
+# _WANT_IO_C99_FORMATS is off in its newlib.h): a %zu shifts every
+# later argument, so a following %s reads a size as a pointer (hardware run
+# 16 crashed in strlen on boot). glibc prints it, so the simulator cannot
+# catch this; refuse it in anything our patches add.
+if grep -nE '^\+.*%(z|j|t|hh)[udxX]' "$ROOT"/patches/vitabrowser/*.patch; then
+	echo "build-vita: %z format above: use %lu/%lx with casts (newlib)"; exit 1
+fi
 LIBS="libwapcaplet libparserutils libhubbub libcss libdom"
 SUPPORT="libnsutils libutf8proc libnspsl libnsgif libnsbmp libsvgtiny"
 GCC14="-Wno-error=implicit-function-declaration \
