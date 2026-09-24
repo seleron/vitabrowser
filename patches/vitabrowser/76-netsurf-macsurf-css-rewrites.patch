@@ -1,0 +1,6095 @@
+# netsurf: MacSurf's CSS source rewrites, run on whole sheets
+# Generated 2026-09-24
+#
+# MacSurf rewrites style sheet text before libcss parses it -- @supports and
+# @layer blocks unwrapped or dropped, grid templates/placement/areas to its
+# -macsurf-grid dialect, logical properties, inset, transform, text-shadow,
+# gradients, calc() folding, word-break aliases, ... -- in its fork of
+# css.c (cssh_css.c), which the Vita build never compiled (it forks an older
+# css.c). So claude.ai's Tailwind sheet, all inside @layer, reached libcss
+# as one unparseable block, and standard CSS grid did not work at all.
+# - css_rewrite.c: MacSurf's rewrite functions verbatim from cssh_css.c,
+#   and its pass chain as macsurf_css_rewrite().
+# - css.c gathers a sheet's data and rewrites it whole in nscss_convert
+#   (MacSurf rewrote each network chunk on its own: a rule split between
+#   two reads was mangled). Each sheet's rewrite time is logged (claude.ai:
+#   1.4 MB in 373 ms on a desktop).
+# - select.c: style="" attributes get MacSurf's inline rewrite, and their
+#   --custom-properties register for descendants (cssh_select.c).
+# - VitaBrowser pass: calc() in @media preludes is folded to px. libcss's
+#   media queries take plain lengths, so Minerva's
+#   (max-width: calc(1120px - 1px)) dropped the block that hides
+#   Wikipedia's page-action labels ("Language", "Watch", "Edit").
+# testpages L3-grid now lays out as a browser does (explicit placement,
+# spans, fr, gaps); L2's justify-self:end on a plain block becomes
+# text-align:right (a MacSurf heuristic).
+
+diff --git a/content/handlers/css/Makefile b/content/handlers/css/Makefile
+index d5cf166..d95e321 100644
+--- a/content/handlers/css/Makefile
++++ b/content/handlers/css/Makefile
+@@ -1,4 +1,4 @@
+ # CSS sources
+ 
+-S_CSS := css.c dump.c internal.c hints.c select.c
++S_CSS := css.c css_rewrite.c dump.c internal.c hints.c select.c
+ 
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index e5ae238..90571f0 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -16,10 +16,12 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
+ #include <libwapcaplet/libwapcaplet.h>
+ #include <dom/dom.h>
++#include <nsutils/time.h>
+ 
+ #include "utils/errors.h"
+ #include "utils/corestrings.h"
+@@ -36,6 +38,7 @@
+ #include "css/css.h"
+ #include "css/hints.h"
+ #include "css/internal.h"
++#include "css/css_rewrite.h"
+ 
+ /* Define to trace import fetches */
+ #undef NSCSS_IMPORT_TRACE
+@@ -75,6 +78,11 @@ typedef struct nscss_content
+ 	struct content base;		/**< Underlying content object */
+ 
+ 	struct content_css_data data;	/**< CSS data */
++
++	/** VitaBrowser: the sheet's text, gathered until nscss_convert
++	 * rewrites it whole (css_rewrite.c) and hands it to libcss. */
++	char *pending;
++	size_t pending_len, pending_cap;
+ } nscss_content;
+ 
+ /**
+@@ -251,14 +259,27 @@ static bool
+ nscss_process_data(struct content *c, const char *data, unsigned int size)
+ {
+ 	nscss_content *css = (nscss_content *) c;
+-	css_error error;
+ 
+-	error = nscss_process_css_data(&css->data, data, size);
+-	if (error != CSS_OK && error != CSS_NEEDDATA) {
+-		content_broadcast_error(c, NSERROR_CSS, NULL);
++	/* Gathered, not parsed: MacSurf's source rewrites (css_rewrite.c)
++	 * must see the sheet whole -- an @layer block or a rule split
++	 * between two network reads would be mangled. */
++	if (css->pending_len + size + 1 > css->pending_cap) {
++		size_t cap = css->pending_cap ? css->pending_cap : 16384;
++		char *p;
++		while (cap < css->pending_len + size + 1)
++			cap *= 2;
++		p = realloc(css->pending, cap);
++		if (p == NULL) {
++			content_broadcast_error(c, NSERROR_NOMEM, NULL);
++			return false;
++		}
++		css->pending = p;
++		css->pending_cap = cap;
+ 	}
+-
+-	return (error == CSS_OK || error == CSS_NEEDDATA);
++	memcpy(css->pending + css->pending_len, data, size);
++	css->pending_len += size;
++	css->pending[css->pending_len] = '\0';
++	return true;
+ }
+ 
+ /**
+@@ -287,6 +308,35 @@ bool nscss_convert(struct content *c)
+ 	nscss_content *css = (nscss_content *) c;
+ 	css_error error;
+ 
++	if (css->pending != NULL) {
++		size_t len = 0;
++		uint64_t t0, t1;
++		char *rw;
++		nsu_getmonotonic_ms(&t0);
++		rw = macsurf_css_rewrite(css->pending, css->pending_len, &len);
++		nsu_getmonotonic_ms(&t1);
++		NSLOG(netsurf, INFO, "css rewrite: %zu -> %zu bytes in %u ms (%s)",
++		      css->pending_len, rw != NULL ? len : css->pending_len,
++		      (unsigned int)(t1 - t0),
++		      nsurl_access(content_get_url(c)));
++		if (rw != NULL) {
++			error = nscss_process_css_data(&css->data, rw,
++					(unsigned int)len);
++			free(rw);
++		} else {
++			error = nscss_process_css_data(&css->data,
++					css->pending,
++					(unsigned int)css->pending_len);
++		}
++		free(css->pending);
++		css->pending = NULL;
++		css->pending_len = css->pending_cap = 0;
++		if (error != CSS_OK && error != CSS_NEEDDATA) {
++			content_broadcast_error(c, NSERROR_CSS, NULL);
++			return false;
++		}
++	}
++
+ 	error = nscss_convert_css_data(&css->data);
+ 	if (error != CSS_OK) {
+ 		content_broadcast_error(c, NSERROR_CSS, NULL);
+@@ -344,6 +394,9 @@ void nscss_destroy(struct content *c)
+ {
+ 	nscss_content *css = (nscss_content *) c;
+ 
++	free(css->pending);
++	css->pending = NULL;
++
+ 	nscss_destroy_css_data(&css->data);
+ }
+ 
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+new file mode 100644
+index 0000000..9028af8
+--- /dev/null
++++ b/content/handlers/css/css_rewrite.c
+@@ -0,0 +1,5844 @@
++/*
++ * Copyright 2009 John-Mark Bell <jmb@netsurf-browser.org>
++ * Copyright 2026 MacSurf and VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * MacSurf's CSS source rewrites, run before libcss parses a sheet
++ * (content/handlers/css/css_rewrite.h).
++ *
++ * The passes and their order are MacSurf's, from its fork of css.c
++ * (cssh_css.c, which the Vita build does not compile: it forks an older
++ * css.c). They turn what this libcss cannot parse -- @supports and
++ * @layer blocks, grid templates, logical properties, inset, transform,
++ * text-shadow, gradients, ... -- into what it can, including MacSurf's
++ * -macsurf-* properties. MacSurf ran them per data chunk; VitaBrowser runs
++ * them once over the whole sheet (css.c gathers it), so a rule split
++ * between two network reads is seen whole.
++ */
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <ctype.h>
++
++#include <libcss/libcss.h>
++
++#include "css/internal.h"
++#include "css/css_rewrite.h"
++#include "macsurf_debug.h"
++
++/* fixes115 - count column tracks in a grid-template-columns value
++ * (the substring between `:` and `;`/`}` of the declaration).
++ *
++ * Handles the dominant patterns mactrove and similar Drupal/CMS themes
++ * use without trying to be a full CSS Grid grammar parser:
++ *   none / auto                                -> 1
++ *   <track> <track> <track> ...                -> count of tokens
++ *   repeat(<int>, <inner-tracks>)              -> int * count(inner)
++ *   repeat(auto-fill|auto-fit, ...)            -> 3 * count(inner) (heuristic)
++ *   minmax(...) / fit-content(...) / calc(...) -> counts as 1 track
++ *
++ * Pure text-level parser - does NOT depend on libcss. We rewrite the
++ * declaration to `-macsurf-grid: N` before libcss parses the sheet,
++ * so the existing -macsurf-grid select/layout path handles it. */
++static int
++macsurf__count_grid_columns_text(const char *p, const char *end)
++{
++	int tracks = 0;
++	int depth = 0;
++	int in_repeat = 0;
++	int repeat_mult = 1;
++	int repeat_inner = 0;
++	int repeat_depth = 0;
++
++	while (p < end) {
++		char ch = *p;
++
++		if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
++				ch == ',') {
++			p++;
++			continue;
++		}
++
++		if (ch == '(') {
++			depth++;
++			p++;
++			continue;
++		}
++
++		if (ch == ')') {
++			if (depth > 0) depth--;
++			p++;
++			if (in_repeat && depth < repeat_depth) {
++				if (repeat_inner < 1) repeat_inner = 1;
++				tracks += repeat_mult * repeat_inner;
++				in_repeat = 0;
++				repeat_inner = 0;
++				repeat_mult = 1;
++			}
++			continue;
++		}
++
++		if (depth == 0 && (end - p) >= 7 &&
++				(p[0] == 'r' || p[0] == 'R') &&
++				(p[1] == 'e' || p[1] == 'E') &&
++				(p[2] == 'p' || p[2] == 'P') &&
++				(p[3] == 'e' || p[3] == 'E') &&
++				(p[4] == 'a' || p[4] == 'A') &&
++				(p[5] == 't' || p[5] == 'T') &&
++				p[6] == '(') {
++			p += 7;
++			depth++;
++			in_repeat = 1;
++			repeat_depth = depth;
++			repeat_mult = 1;
++			repeat_inner = 0;
++			while (p < end && (*p == ' ' || *p == '\t')) p++;
++			if (p < end && *p >= '0' && *p <= '9') {
++				int n = 0;
++				while (p < end && *p >= '0' && *p <= '9') {
++					n = n * 10 + (*p - '0');
++					p++;
++				}
++				if (n > 0 && n < 1000) repeat_mult = n;
++			} else {
++				/* auto-fill / auto-fit / unknown - heuristic. */
++				repeat_mult = 3;
++				while (p < end && *p != ',' && *p != ')') p++;
++			}
++			while (p < end && (*p == ' ' || *p == '\t')) p++;
++			if (p < end && *p == ',') p++;
++			continue;
++		}
++
++		/* Any other non-whitespace token at the current depth counts
++		 * as one track at its level. Skip the rest of the token until
++		 * a separator. Nested-function bodies (minmax, fit-content,
++		 * calc) are skipped via the depth tracking above. */
++		if (depth == 0) {
++			tracks++;
++		} else if (in_repeat && depth == repeat_depth) {
++			repeat_inner++;
++		}
++		while (p < end) {
++			char c2 = *p;
++			if (c2 == ' ' || c2 == '\t' || c2 == '\n' ||
++					c2 == '\r' || c2 == ',' ||
++					c2 == '(' || c2 == ')') break;
++			p++;
++		}
++	}
++
++	if (tracks < 1) tracks = 1;
++	if (tracks > 255) tracks = 255;
++	return tracks;
++}
++
++
++/* fixes115 - case-insensitive 1-byte compare; checks word boundary so
++ * "grid-template-columns" doesn't match `xgrid-template-columns`. */
++static int
++macsurf__match_prop_name(const char *buf, size_t len, size_t pos,
++		const char *name, size_t name_len)
++{
++	size_t i;
++	if (pos + name_len > len) return 0;
++	if (pos > 0) {
++		char prev = buf[pos - 1];
++		if ((prev >= 'a' && prev <= 'z') ||
++				(prev >= 'A' && prev <= 'Z') ||
++				(prev >= '0' && prev <= '9') ||
++				prev == '-' || prev == '_') {
++			return 0;
++		}
++	}
++	for (i = 0; i < name_len; i++) {
++		char b = buf[pos + i];
++		char n = name[i];
++		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++		if (n >= 'A' && n <= 'Z') n = (char)(n - 'A' + 'a');
++		if (b != n) return 0;
++	}
++	return 1;
++}
++
++
++/* fixes117 - extract up to MAX_TRACKS track-width tokens from a
++ * grid-template-columns value, expanding repeat(N, ...) and collapsing
++ * minmax()/fit-content()/calc() to a single token. Each emitted token
++ * is appended to `out` followed by a single space; the total bytes
++ * written is returned. Tracks beyond MAX_TRACKS are silently dropped.
++ *
++ * Token normalisation: each token is emitted verbatim from its source
++ * substring (e.g. "210px", "1fr", "50%", "auto"). The libcss parser
++ * (p_macsurf_grid.c V2 grammar) only recognises <length> / <flex> /
++ * <percentage>; idents and minmax-results fall back to "1fr" so the
++ * grid still has equal cells in those positions. */
++#define MACSURF_GRID_TRACK_MAX 8
++
++static int
++macsurf__emit_one_track(char *out, size_t cap,
++		const char *tok, size_t tok_len)
++{
++	const char *fr_fallback = "1fr";
++	const char *tok_to_emit = tok;
++	size_t emit_len = tok_len;
++	size_t i;
++	bool is_value = false;
++	bool is_auto = false;
++	bool is_minmax_marker = false;
++
++	/* Detect if the token looks like a value (starts with digit, '.',
++	 * '+' or '-'). Anything else (auto, min-content, max-content,
++	 * leftover minmax/calc) becomes "1fr" -- EXCEPT `auto` (below). */
++	if (tok_len > 0) {
++		char c = tok[0];
++		if ((c >= '0' && c <= '9') || c == '.' || c == '+' ||
++				c == '-') {
++			is_value = true;
++		}
++	}
++	/* fixes817 (#62): emit the `auto` track keyword VERBATIM so the libcss
++	 * columns parser can pack a distinct UNIT_AUTO and layout can
++	 * content-size it. min-content/max-content/minmax/calc still fold to
++	 * 1fr (deferred). */
++	if (tok_len == 4 && tok[0] == 'a' && tok[1] == 'u' &&
++			tok[2] == 't' && tok[3] == 'o') {
++		is_auto = true;
++	}
++	if (tok_len > 2 && (tok[0] == 'm' || tok[0] == 'M') &&
++			(tok[1] == 'm' || tok[1] == 'M')) {
++		is_minmax_marker = true;
++	}
++	if (!is_value && !is_auto && !is_minmax_marker) {
++		tok_to_emit = fr_fallback;
++		emit_len = 3;
++	}
++
++	/* fixes275g: write value first; trailing space is optional. The
++	 * caller (emit_grid_tracks) trims any trailing space after the
++	 * last track anyway, so when we're short by exactly 1 byte we
++	 * can still emit the value and let the next caller's check decide.
++	 * This recovers the 3rd track in the in-place rewrite case where
++	 * `30px 30px 30px` (14 chars) needs to fit `30px 30px 30px ` (15
++	 * chars with naive trailing spaces). */
++	if (emit_len > cap) return -1;
++	for (i = 0; i < emit_len; i++) {
++		out[i] = tok_to_emit[i];
++	}
++	if (emit_len + 1 <= cap) {
++		out[emit_len] = ' ';
++		return (int)(emit_len + 1);
++	}
++	return (int)emit_len;
++}
++
++/* Walk a flat (paren-free, repeat-free) chunk of track tokens, emitting
++ * one normalised token per track up to `room` remaining slots. Returns
++ * the number of tracks emitted; *out_pos advanced; *room decremented. */
++static void
++macsurf__emit_flat_tracks(const char *p, const char *end,
++		char *out, size_t cap, size_t *out_pos,
++		int *room, int *emitted)
++{
++	while (p < end && *room > 0) {
++		const char *tok_start;
++		size_t tok_len;
++		int n;
++
++		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' ||
++				*p == '\r' || *p == ',')) p++;
++		if (p >= end) break;
++
++		tok_start = p;
++		while (p < end && *p != ' ' && *p != '\t' && *p != '\n' &&
++				*p != '\r' && *p != ',' && *p != '(' &&
++				*p != ')') {
++			p++;
++		}
++		tok_len = (size_t)(p - tok_start);
++		if (tok_len == 0) {
++			/* fixes118a: p is sitting on '(' or ')' which the
++			 * whitespace skip above doesn't consume and the
++			 * tokeniser above stops at -- advance past it or
++			 * we loop forever. Triggered by repeat() inner
++			 * content with nested parens like
++			 * `repeat(auto-fill, minmax(150px, 1fr))`. */
++			if (p < end) p++;
++			continue;
++		}
++
++		/* fixes148b3: if this token is immediately followed by '(',
++		 * it's a function name (minmax / fit-content / calc / ...).
++		 * Skip the balanced parenthesised body so its inner tokens
++		 * don't get flat-tokenised into extra tracks, and emit ONE
++		 * "1fr" for the function as a whole -- matching the top-
++		 * level emit_grid_tracks handling.  Without this branch,
++		 * repeat(3, minmax(100px, 1fr)) flat-tokenises each
++		 * minmax(...) inside the repeat into three tokens
++		 * (minmax-name -> "1fr", 100px, 1fr) and emits 3 * 3 = 9
++		 * tokens (capped to MAX 8). */
++		if (p < end && *p == '(') {
++			int depth = 1;
++			int nfr;
++			p++;
++			while (p < end && depth > 0) {
++				if (*p == '(') depth++;
++				else if (*p == ')') {
++					depth--;
++					if (depth == 0) { p++; break; }
++				}
++				p++;
++			}
++			nfr = macsurf__emit_one_track(out + *out_pos,
++					cap - *out_pos, "1fr", 3);
++			if (nfr < 0) return;
++			*out_pos += (size_t)nfr;
++			(*room)--;
++			(*emitted)++;
++			continue;
++		}
++
++		n = macsurf__emit_one_track(out + *out_pos,
++				cap - *out_pos, tok_start, tok_len);
++		if (n < 0) return;
++		*out_pos += (size_t)n;
++		(*room)--;
++		(*emitted)++;
++	}
++}
++
++/* fixes117 - emit a track-list rewrite for one grid-template-columns
++ * declaration. Returns bytes written to `out` (excluding trailing NUL),
++ * or 0 if the value couldn't be coerced into a usable track-list (in
++ * which case the caller should fall back to the count-only rewrite). */
++static size_t
++macsurf__emit_grid_tracks(const char *p, const char *end,
++		char *out, size_t cap)
++{
++	size_t pos = 0;
++	int emitted = 0;
++	int room = MACSURF_GRID_TRACK_MAX;
++
++	while (p < end && room > 0) {
++		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' ||
++				*p == '\r' || *p == ',')) p++;
++		if (p >= end) break;
++
++		/* repeat(N, T1 T2 ...) -> emit T1 T2 ... N times. */
++		if ((end - p) >= 7 &&
++				(p[0] == 'r' || p[0] == 'R') &&
++				(p[1] == 'e' || p[1] == 'E') &&
++				(p[2] == 'p' || p[2] == 'P') &&
++				(p[3] == 'e' || p[3] == 'E') &&
++				(p[4] == 'a' || p[4] == 'A') &&
++				(p[5] == 't' || p[5] == 'T') &&
++				p[6] == '(') {
++			int mult = 1;
++			const char *inner_start;
++			const char *inner_end;
++			int depth = 1;
++			int r;
++
++			p += 7;
++			while (p < end && (*p == ' ' || *p == '\t')) p++;
++			if (p < end && *p >= '0' && *p <= '9') {
++				int n = 0;
++				while (p < end && *p >= '0' && *p <= '9') {
++					n = n * 10 + (*p - '0');
++					p++;
++				}
++				if (n > 0 && n < 1000) mult = n;
++			} else {
++				/* fixes362 - auto-fill / auto-fit: compute the
++				 * column count by reading the minmax(N<unit>, ...)
++				 * min-track-width and dividing a viewport-estimate
++				 * by it. mactrove's /hardware page uses
++				 *   grid-template-columns:
++				 *     repeat(auto-fill, minmax(200px, 1fr));
++				 * on a 949px viewport - that should resolve to 4
++				 * columns, not the legacy mult=3 fallback. */
++				mult = 3;
++				while (p < end && *p != ',' && *p != ')') p++;
++				/* p is now at ',' (or end/')' if malformed).
++				 * Look for "minmax(<digits>" in the inner half. */
++				if (p < end && *p == ',') {
++					const char *scan = p + 1;
++					const char *scan_end = end;
++					while (scan < scan_end &&
++							(*scan == ' ' || *scan == '\t')) scan++;
++					/* Match "minmax(" case-insensitive. */
++					if ((scan_end - scan) >= 7 &&
++							(scan[0] == 'm' || scan[0] == 'M') &&
++							(scan[1] == 'i' || scan[1] == 'I') &&
++							(scan[2] == 'n' || scan[2] == 'N') &&
++							(scan[3] == 'm' || scan[3] == 'M') &&
++							(scan[4] == 'a' || scan[4] == 'A') &&
++							(scan[5] == 'x' || scan[5] == 'X') &&
++							scan[6] == '(') {
++						const char *mm = scan + 7;
++						int min_n = 0;
++						while (mm < scan_end && (*mm == ' ' ||
++								*mm == '\t')) mm++;
++						while (mm < scan_end && *mm >= '0' &&
++								*mm <= '9') {
++							min_n = min_n * 10 + (*mm - '0');
++							mm++;
++						}
++						/* mm should point at unit ("px", "em", ...)
++						 * or comma. Treat any non-zero N as a px
++						 * estimate - fine for the common
++						 * minmax(NNNpx, 1fr) idiom. */
++						if (min_n > 16 && min_n < 1000) {
++							/* Viewport estimate ~900px. */
++							int cols = 900 / min_n;
++							if (cols < 1) cols = 1;
++							if (cols > 8) cols = 8;
++							mult = cols;
++						}
++					}
++				}
++			}
++			while (p < end && (*p == ' ' || *p == '\t')) p++;
++			if (p < end && *p == ',') p++;
++
++			inner_start = p;
++			while (p < end && depth > 0) {
++				if (*p == '(') depth++;
++				else if (*p == ')') {
++					depth--;
++					if (depth == 0) break;
++				}
++				p++;
++			}
++			inner_end = p;
++			if (p < end && *p == ')') p++;
++
++			for (r = 0; r < mult && room > 0; r++) {
++				macsurf__emit_flat_tracks(inner_start,
++						inner_end, out, cap, &pos,
++						&room, &emitted);
++			}
++			continue;
++		}
++
++		/* minmax(A, B) / fit-content(N) / calc(...) -> single
++		 * "1fr"-equivalent token. */
++		if (p < end &&
++				(((end - p) >= 7 &&
++				  (p[0] == 'm' || p[0] == 'M') &&
++				  (p[1] == 'i' || p[1] == 'I') &&
++				  (p[2] == 'n' || p[2] == 'N') &&
++				  (p[3] == 'm' || p[3] == 'M') &&
++				  (p[4] == 'a' || p[4] == 'A') &&
++				  (p[5] == 'x' || p[5] == 'X') &&
++				  p[6] == '(') ||
++				 ((end - p) >= 12 &&
++				  (p[0] == 'f' || p[0] == 'F') &&
++				  (p[1] == 'i' || p[1] == 'I') &&
++				  (p[2] == 't' || p[2] == 'T') &&
++				  p[3] == '-' &&
++				  (p[4] == 'c' || p[4] == 'C') &&
++				  p[11] == '(') ||
++				 ((end - p) >= 5 &&
++				  (p[0] == 'c' || p[0] == 'C') &&
++				  (p[1] == 'a' || p[1] == 'A') &&
++				  (p[2] == 'l' || p[2] == 'L') &&
++				  (p[3] == 'c' || p[3] == 'C') &&
++				  p[4] == '('))) {
++			int depth = 0;
++			int n;
++			const char *fn_start = p;
++			bool is_minmax = (end - p) >= 7 &&
++				((p[0] == 'm' || p[0] == 'M') &&
++				 (p[1] == 'i' || p[1] == 'I') &&
++				 (p[2] == 'n' || p[2] == 'N') &&
++				 (p[3] == 'm' || p[3] == 'M') &&
++				 (p[4] == 'a' || p[4] == 'A') &&
++				 (p[5] == 'x' || p[5] == 'X') && p[6] == '(');
++			while (p < end) {
++				if (*p == '(') depth++;
++				else if (*p == ')') {
++					depth--;
++					if (depth == 0) { p++; break; }
++				}
++				p++;
++			}
++			if (is_minmax) {
++				const char *q = fn_start + 7;
++				int floor_px = 0;
++				char marker[32];
++				while (q < p && (*q == ' ' || *q == '\t')) q++;
++				while (q < p && *q >= '0' && *q <= '9') {
++					floor_px = floor_px * 10 + (*q - '0');
++					q++;
++				}
++				if (floor_px > 0 && q + 1 < p &&
++						(q[0] == 'p' || q[0] == 'P') &&
++						(q[1] == 'x' || q[1] == 'X')) {
++					n = snprintf(marker, sizeof(marker), "mm%d", floor_px);
++					if (n > 0)
++						n = macsurf__emit_one_track(out + pos,
++							cap - pos, marker, (size_t)n);
++					else n = -1;
++				} else n = -1;
++			} else n = -1;
++			if (n < 0)
++				n = macsurf__emit_one_track(out + pos, cap - pos,
++						"1fr", 3);
++			if (n < 0) break;
++			pos += (size_t)n;
++			room--;
++			emitted++;
++			continue;
++		}
++
++		/* Plain track token. */
++		{
++			const char *tok_start = p;
++			size_t tok_len;
++			int n;
++			while (p < end && *p != ' ' && *p != '\t' &&
++					*p != '\n' && *p != '\r' &&
++					*p != ',' && *p != '(' && *p != ')') {
++				p++;
++			}
++			tok_len = (size_t)(p - tok_start);
++			if (tok_len == 0) {
++				if (p < end) p++;
++				continue;
++			}
++			n = macsurf__emit_one_track(out + pos, cap - pos,
++					tok_start, tok_len);
++			if (n < 0) break;
++			pos += (size_t)n;
++			room--;
++			emitted++;
++		}
++	}
++
++	if (emitted == 0) return 0;
++	/* Trim the trailing space we appended after the last token. */
++	if (pos > 0 && out[pos - 1] == ' ') pos--;
++	return pos;
++}
++
++
++/* fixes115/117 - rewrite every `grid-template-columns: VALUE` declaration
++ * inside the buffer to `-macsurf-grid: <tracks>` followed by enough
++ * spaces to preserve the original byte count. The replacement is shorter
++ * because the property name shrinks 22->14 chars; if track-list emission
++ * fits we use it (fixes117), else fall back to the legacy column-count
++ * rewrite (fixes115). The caller owns the returned malloc'd buffer and
++ * must free it. Returns NULL on OOM.
++ *
++ * fixes1161c: non-static (was static) so the Linux harness can run the
++ * real grid-template rewrite in --layout mode instead of skipping it --
++ * matches the existing macsurf__rewrite_inline_style precedent. No
++ * behavior change; this only affects symbol linkage. */
++char *
++macsurf__rewrite_grid_template_columns(const char *data, size_t size)
++{
++	static const char NEEDLE[] = "grid-template-columns";
++	static const size_t NEEDLE_LEN = 21;
++	char *out;
++	size_t i;
++
++	out = (char *)malloc(size);
++	if (out == NULL) return NULL;
++	memcpy(out, data, size);
++
++	i = 0;
++	while (i + NEEDLE_LEN < size) {
++		size_t j;
++		size_t val_start;
++		size_t val_end;
++		size_t total_replace;
++		size_t prefix_len;
++		size_t tracks_room;
++		size_t tracks_written;
++		char buf[256];
++		int paren_depth = 0;
++
++		if (!macsurf__match_prop_name(out, size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			i++;
++			continue;
++		}
++
++		j = i + NEEDLE_LEN;
++		while (j < size && (out[j] == ' ' || out[j] == '\t' ||
++				out[j] == '\n' || out[j] == '\r')) j++;
++		if (j >= size || out[j] != ':') {
++			i++;
++			continue;
++		}
++
++		val_start = j + 1;
++		while (val_start < size && (out[val_start] == ' ' ||
++				out[val_start] == '\t')) val_start++;
++
++		val_end = val_start;
++		while (val_end < size) {
++			char c = out[val_end];
++			if (c == '(') paren_depth++;
++			else if (c == ')') {
++				if (paren_depth > 0) paren_depth--;
++			} else if (paren_depth == 0 &&
++					(c == ';' || c == '}' || c == '!')) {
++				break;
++			}
++			val_end++;
++		}
++
++		total_replace = val_end - i;
++		prefix_len = (size_t)sprintf(buf, "-macsurf-grid: ");
++		if (prefix_len >= total_replace) {
++			/* Can't even fit the prefix -- leave the source
++			 * declaration untouched. libcss will error on the
++			 * unknown property and skip it gracefully. */
++			i = val_end;
++			continue;
++		}
++
++		tracks_room = total_replace - prefix_len;
++		if (tracks_room > sizeof(buf) - prefix_len - 1) {
++			tracks_room = sizeof(buf) - prefix_len - 1;
++		}
++
++		tracks_written = macsurf__emit_grid_tracks(
++				out + val_start, out + val_end,
++				buf + prefix_len, tracks_room);
++
++		if (tracks_written == 0 ||
++				prefix_len + tracks_written > total_replace) {
++			/* Fall back to legacy count-only rewrite. */
++			int columns = macsurf__count_grid_columns_text(
++					out + val_start, out + val_end);
++			int n = sprintf(buf, "-macsurf-grid: %d", columns);
++			if (n > 0 && (size_t)n <= total_replace) {
++				memcpy(out + i, buf, (size_t)n);
++				memset(out + i + n, ' ',
++						total_replace - (size_t)n);
++			}
++		} else {
++			size_t total = prefix_len + tracks_written;
++			memcpy(out + i, buf, total);
++			memset(out + i + total, ' ', total_replace - total);
++		}
++		i = val_end;
++	}
++
++	return out;
++}
++
++
++/* fixes150 - rewrite every `grid-template-rows: VALUE` declaration to
++ * `-macsurf-grid-rows: <tracks>` in place. Both names are 18 chars so
++ * the prefix substitution is byte-for-byte; only the value is reformed
++ * via macsurf__emit_grid_tracks (same flat-tokeniser as columns, with
++ * the fixes148b3 minmax/fit-content/calc collapse). The caller owns the
++ * returned malloc'd buffer and must free it. Returns NULL on OOM.
++ *
++ * fixes1161c: non-static, same reasoning as
++ * macsurf__rewrite_grid_template_columns above. */
++char *
++macsurf__rewrite_grid_template_rows(const char *data, size_t size)
++{
++	static const char NEEDLE[] = "grid-template-rows";
++	static const size_t NEEDLE_LEN = 18;
++	char *out;
++	size_t i;
++
++	out = (char *)malloc(size);
++	if (out == NULL) return NULL;
++	memcpy(out, data, size);
++
++	i = 0;
++	while (i + NEEDLE_LEN < size) {
++		size_t j;
++		size_t val_start;
++		size_t val_end;
++		size_t total_replace;
++		size_t prefix_len;
++		size_t tracks_room;
++		size_t tracks_written;
++		char buf[256];
++		int paren_depth = 0;
++
++		if (!macsurf__match_prop_name(out, size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			i++;
++			continue;
++		}
++
++		j = i + NEEDLE_LEN;
++		while (j < size && (out[j] == ' ' || out[j] == '\t' ||
++				out[j] == '\n' || out[j] == '\r')) j++;
++		if (j >= size || out[j] != ':') {
++			i++;
++			continue;
++		}
++
++		val_start = j + 1;
++		while (val_start < size && (out[val_start] == ' ' ||
++				out[val_start] == '\t')) val_start++;
++
++		val_end = val_start;
++		while (val_end < size) {
++			char c = out[val_end];
++			if (c == '(') paren_depth++;
++			else if (c == ')') {
++				if (paren_depth > 0) paren_depth--;
++			} else if (paren_depth == 0 &&
++					(c == ';' || c == '}' || c == '!')) {
++				break;
++			}
++			val_end++;
++		}
++
++		total_replace = val_end - i;
++		prefix_len = (size_t)sprintf(buf, "-macsurf-grid-rows: ");
++		if (prefix_len >= total_replace) {
++			i = val_end;
++			continue;
++		}
++
++		tracks_room = total_replace - prefix_len;
++		if (tracks_room > sizeof(buf) - prefix_len - 1) {
++			tracks_room = sizeof(buf) - prefix_len - 1;
++		}
++
++		tracks_written = macsurf__emit_grid_tracks(
++				out + val_start, out + val_end,
++				buf + prefix_len, tracks_room);
++
++		if (tracks_written == 0 ||
++				prefix_len + tracks_written > total_replace) {
++			/* No usable tracks -- leave the original declaration
++			 * in place. libcss will reject the unknown
++			 * grid-template-rows property and skip it. */
++			i = val_end;
++			continue;
++		}
++
++		{
++			size_t total = prefix_len + tracks_written;
++			memcpy(out + i, buf, total);
++			memset(out + i + total, ' ', total_replace - total);
++		}
++		i = val_end;
++	}
++
++	return out;
++}
++
++
++/* fixes158 - grid placement rewriter.
++ *
++ * Replaces the fixes151 column-only rewriter. Walks `{ ... }` blocks
++ * looking for any of:
++ *   grid-column        : A | A/B | A/-1 | span N | A/span N
++ *   grid-row           : same forms
++ *   grid-column-start  : positive integer
++ *   grid-column-end    : positive integer (or -1)
++ *   grid-row-start     : positive integer
++ *   grid-row-end       : positive integer (or -1)
++ *
++ * All recognised declarations within a single brace-depth-1 block are
++ * combined into one packed `-macsurf-grid-col-span: <int32>` emitted at
++ * the closing `}`. The int packs four 8-bit fields:
++ *   bits  0..7  col_span    1..254 / 255 = fill
++ *   bits  8..15 col_start   1..254 = explicit line, 0 = auto
++ *   bits 16..23 row_start   same
++ *   bits 24..31 row_span    same as col_span
++ *
++ * Original declarations are stripped from the output. Unrecognised
++ * value forms (named lines, negative starts, calc(), keywords) leave
++ * that specific declaration in the output untouched and don't update
++ * the accumulator - libcss will then drop them as unknown properties.
++ *
++ * V1 limitations (documented, not bugs):
++ *   - only positive integer line numbers are recognised in the
++ *     longhand `-end` declarations; we don't carry around the matching
++ *     `-start` to do A/B math across non-contiguous declarations
++ *   - `grid-column-end: -1` is honoured as the "fill" sentinel only
++ *     if `grid-column-start` has been seen earlier in the same block
++ *   - `grid-area` is NOT parsed
++ *   - named grid lines, calc(), and `auto` are deferred to V2
++ *
++ * Brace tracking uses a small stack so nested rules (e.g. inside
++ * @media) accumulate per-innermost-block. Max nesting depth 8 is
++ * enough for any real-world CSS.
++ */
++
++#define MACSURF_GRID_PLACEMENT_MAX_DEPTH 8
++
++struct macsurf_grid_placement {
++	bool any;
++	uint8_t col_start;
++	uint8_t col_span;
++	uint8_t row_start;
++	uint8_t row_span;
++};
++
++/* Parse a positive integer at *p, return value (1..254 clamped) or
++ * 0 if no digits. Advance *p past the digits. Returns 255 if the
++ * value is -1 (the "fill" sentinel). */
++static int
++macsurf__grid_parse_int_or_minus1(const char **p, const char *end)
++{
++	const char *q = *p;
++	int n = 0;
++
++	while (q < end && (*q == ' ' || *q == '\t')) q++;
++	if (q < end && *q == '-') {
++		q++;
++		if (q < end && *q == '1') {
++			q++;
++			*p = q;
++			return 255; /* `-1` sentinel = fill */
++		}
++		return 0; /* anything else negative is unsupported */
++	}
++	while (q < end && *q >= '0' && *q <= '9') {
++		n = n * 10 + (*q - '0');
++		q++;
++	}
++	*p = q;
++	if (n < 1) return 0;
++	if (n > 254) n = 254;
++	return n;
++}
++
++/* Try to parse "span N" at *p. Returns N (1..254) on success and
++ * advances *p; returns 0 on failure leaving *p unchanged. */
++static int
++macsurf__grid_parse_span(const char **p, const char *end)
++{
++	const char *q = *p;
++
++	while (q < end && (*q == ' ' || *q == '\t')) q++;
++	if ((end - q) < 4) return 0;
++	if (!((q[0] == 's' || q[0] == 'S') &&
++			(q[1] == 'p' || q[1] == 'P') &&
++			(q[2] == 'a' || q[2] == 'A') &&
++			(q[3] == 'n' || q[3] == 'N'))) {
++		return 0;
++	}
++	if ((end - q) > 4) {
++		char c = q[4];
++		if (c != ' ' && c != '\t') return 0;
++	} else {
++		return 0;
++	}
++	q += 4;
++	while (q < end && (*q == ' ' || *q == '\t')) q++;
++	{
++		int n = 0;
++		while (q < end && *q >= '0' && *q <= '9') {
++			n = n * 10 + (*q - '0');
++			q++;
++		}
++		if (n < 1) return 0;
++		if (n > 254) n = 254;
++		*p = q;
++		return n;
++	}
++}
++
++/* Parse a `grid-column` / `grid-row` value. Writes into *start_out
++ * and *span_out (0 = leave alone). Returns true if anything was
++ * parsed. */
++static bool
++macsurf__grid_parse_axis_value(const char *p, const char *end,
++		uint8_t *start_out, uint8_t *span_out)
++{
++	int span;
++	int a;
++	const char *cursor = p;
++
++	*start_out = 0;
++	*span_out = 0;
++
++	while (cursor < end && (*cursor == ' ' || *cursor == '\t'))
++		cursor++;
++	if (cursor >= end) return false;
++
++	/* span N (alone) */
++	span = macsurf__grid_parse_span(&cursor, end);
++	if (span > 0) {
++		*span_out = (uint8_t)span;
++		return true;
++	}
++
++	/* leading positive integer */
++	if (*cursor >= '0' && *cursor <= '9') {
++		a = macsurf__grid_parse_int_or_minus1(&cursor, end);
++		if (a < 1 || a == 255) return false; /* lone -1 unsupported */
++		*start_out = (uint8_t)a;
++		while (cursor < end && (*cursor == ' ' || *cursor == '\t'))
++			cursor++;
++		if (cursor >= end || *cursor != '/') {
++			/* Just "A" - start only, span 1 implicit. */
++			*span_out = 1;
++			return true;
++		}
++		cursor++;
++		while (cursor < end && (*cursor == ' ' || *cursor == '\t'))
++			cursor++;
++		/* `A / span N` */
++		span = macsurf__grid_parse_span(&cursor, end);
++		if (span > 0) {
++			*span_out = (uint8_t)span;
++			return true;
++		}
++		/* `A / B` or `A / -1` */
++		{
++			int b = macsurf__grid_parse_int_or_minus1(&cursor,
++					end);
++			if (b == 255) {
++				*span_out = 255; /* fill row */
++				return true;
++			}
++			if (b > a) {
++				int s = b - a;
++				if (s > 254) s = 254;
++				*span_out = (uint8_t)s;
++				return true;
++			}
++			/* B <= A or 0 - unsupported, drop */
++			*start_out = 0;
++			return false;
++		}
++	}
++
++	return false;
++}
++
++/* Match a property name at buf[pos..] case-insensitively, with a
++ * boundary check after (must be followed by `:` or whitespace). */
++static bool
++macsurf__grid_match_name(const char *buf, size_t len, size_t pos,
++		const char *name, size_t name_len)
++{
++	size_t i;
++	char next;
++	if (!macsurf__match_prop_name(buf, len, pos, name, name_len))
++		return false;
++	i = pos + name_len;
++	if (i >= len) return false;
++	next = buf[i];
++	if (next == ':' || next == ' ' || next == '\t' || next == '\n' ||
++			next == '\r')
++		return true;
++	return false;
++}
++
++/* Emit a packed `-macsurf-grid-col-span: <col_span> <col_start>
++ * <row_start> <row_span>;` declaration into out at pos. Grows the
++ * buffer as needed.
++ *
++ * Four space-separated unsigned integers (each 0..255) - avoids the
++ * css_fixed Q22.10 range limit a single packed int32 would hit.
++ * Leading `;` guards against the previous declaration lacking its
++ * own terminator (legal in CSS for the last decl before `}`). */
++static bool
++macsurf__grid_emit_packed(char **out_p, size_t *cap_p, size_t *pos_p,
++		const struct macsurf_grid_placement *acc)
++{
++	char tmp[64];
++	int n;
++	size_t need;
++
++	n = sprintf(tmp, "; -macsurf-grid-col-span: %u %u %u %u;",
++			(unsigned)acc->col_span,
++			(unsigned)acc->col_start,
++			(unsigned)acc->row_start,
++			(unsigned)acc->row_span);
++	if (n <= 0) return false;
++
++	need = *pos_p + (size_t)n + 1;
++	while (need >= *cap_p) {
++		size_t newcap = *cap_p * 2;
++		char *neu = (char *)realloc(*out_p, newcap);
++		if (neu == NULL) return false;
++		*out_p = neu;
++		*cap_p = newcap;
++	}
++	memcpy(*out_p + *pos_p, tmp, (size_t)n);
++	*pos_p += (size_t)n;
++	return true;
++}
++
++
++/* Stub of the legacy fixes151 entry point - preserved so any direct
++ * callers in older code paths still compile, but it now just calls
++ * the unified placement rewriter below. */
++static char *
++macsurf__rewrite_grid_placement(const char *data, size_t in_size,
++		size_t *out_size_p);
++
++static char *
++macsurf__rewrite_grid_column(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	return macsurf__rewrite_grid_placement(data, in_size, out_size_p);
++}
++
++
++/* fixes158 unified grid-placement rewriter. Walks brace-tracked
++ * declarations and rolls all six grid placement properties into a
++ * single packed `-macsurf-grid-col-span: <int32>` declaration at the
++ * close of each innermost block. */
++static char *
++macsurf__rewrite_grid_placement(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	struct macsurf_grid_placement stack[MACSURF_GRID_PLACEMENT_MAX_DEPTH];
++	int depth = 0;
++	size_t cap;
++	size_t pos = 0;
++	char *out;
++	size_t i = 0;
++	int k;
++
++	for (k = 0; k < MACSURF_GRID_PLACEMENT_MAX_DEPTH; k++) {
++		stack[k].any = false;
++		stack[k].col_start = 0;
++		stack[k].col_span = 0;
++		stack[k].row_start = 0;
++		stack[k].row_span = 0;
++	}
++
++	cap = in_size + 256;
++	if (cap < in_size * 2) cap = in_size * 2;
++	if (cap < 1024) cap = 1024;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		char c = data[i];
++
++		/* Attempt to match a placement declaration if we're inside
++		 * a block and the byte could start one. */
++		if (depth >= 1 && depth <= MACSURF_GRID_PLACEMENT_MAX_DEPTH &&
++				(c == 'g' || c == 'G')) {
++			static const char N_GC[]   = "grid-column";
++			static const char N_GR[]   = "grid-row";
++			static const char N_GCS[]  = "grid-column-start";
++			static const char N_GCE[]  = "grid-column-end";
++			static const char N_GRS[]  = "grid-row-start";
++			static const char N_GRE[]  = "grid-row-end";
++			static const char N_GA[]   = "grid-area";
++			size_t name_len = 0;
++			int prop = 0; /* 1=GC 2=GR 3=GCS 4=GCE 5=GRS 6=GRE 7=GA */
++
++			/* Check longer names first to avoid GC matching
++			 * the prefix of GCS/GCE. */
++			if (macsurf__grid_match_name(data, in_size, i,
++					N_GCS, sizeof(N_GCS) - 1)) {
++				prop = 3; name_len = sizeof(N_GCS) - 1;
++			} else if (macsurf__grid_match_name(data, in_size, i,
++					N_GCE, sizeof(N_GCE) - 1)) {
++				prop = 4; name_len = sizeof(N_GCE) - 1;
++			} else if (macsurf__grid_match_name(data, in_size, i,
++					N_GRS, sizeof(N_GRS) - 1)) {
++				prop = 5; name_len = sizeof(N_GRS) - 1;
++			} else if (macsurf__grid_match_name(data, in_size, i,
++					N_GRE, sizeof(N_GRE) - 1)) {
++				prop = 6; name_len = sizeof(N_GRE) - 1;
++			} else if (macsurf__grid_match_name(data, in_size, i,
++					N_GC, sizeof(N_GC) - 1)) {
++				prop = 1; name_len = sizeof(N_GC) - 1;
++			} else if (macsurf__grid_match_name(data, in_size, i,
++					N_GA, sizeof(N_GA) - 1)) {
++				prop = 7; name_len = sizeof(N_GA) - 1;
++			} else if (macsurf__grid_match_name(data, in_size, i,
++					N_GR, sizeof(N_GR) - 1)) {
++				prop = 2; name_len = sizeof(N_GR) - 1;
++			}
++
++			if (prop != 0) {
++				size_t j = i + name_len;
++				size_t val_start;
++				size_t val_end;
++				const char *p;
++				const char *end;
++				struct macsurf_grid_placement *acc =
++						&stack[depth - 1];
++				uint8_t s = 0;
++				uint8_t sp = 0;
++				int v;
++
++				while (j < in_size && (data[j] == ' ' ||
++						data[j] == '\t' ||
++						data[j] == '\n' ||
++						data[j] == '\r')) j++;
++				if (j >= in_size || data[j] != ':') {
++					/* Not actually a declaration. */
++					goto not_grid;
++				}
++				val_start = j + 1;
++				while (val_start < in_size &&
++						(data[val_start] == ' ' ||
++						data[val_start] == '\t'))
++					val_start++;
++				val_end = val_start;
++				while (val_end < in_size) {
++					char vc = data[val_end];
++					if (vc == ';' || vc == '}' ||
++							vc == '!') break;
++					val_end++;
++				}
++
++				p = data + val_start;
++				end = data + val_end;
++
++				if (prop == 1) {
++					/* grid-column */
++					if (macsurf__grid_parse_axis_value(
++							p, end, &s, &sp)) {
++						if (s != 0) acc->col_start = s;
++						if (sp != 0) acc->col_span = sp;
++						acc->any = true;
++					}
++				} else if (prop == 2) {
++					/* grid-row */
++					if (macsurf__grid_parse_axis_value(
++							p, end, &s, &sp)) {
++						if (s != 0) acc->row_start = s;
++						if (sp != 0) acc->row_span = sp;
++						acc->any = true;
++					}
++				} else if (prop == 3) {
++					/* grid-column-start */
++					v = macsurf__grid_parse_int_or_minus1(
++							&p, end);
++					if (v >= 1 && v <= 254) {
++						acc->col_start = (uint8_t)v;
++						acc->any = true;
++					}
++				} else if (prop == 4) {
++					/* grid-column-end */
++					v = macsurf__grid_parse_int_or_minus1(
++							&p, end);
++					if (v == 255 && acc->col_start > 0) {
++						acc->col_span = 255;
++						acc->any = true;
++					} else if (v >= 1 && v <= 254 &&
++							acc->col_start > 0 &&
++							v > acc->col_start) {
++						int sp2 = v - acc->col_start;
++						if (sp2 > 254) sp2 = 254;
++						acc->col_span = (uint8_t)sp2;
++						acc->any = true;
++					}
++				} else if (prop == 5) {
++					/* grid-row-start */
++					v = macsurf__grid_parse_int_or_minus1(
++							&p, end);
++					if (v >= 1 && v <= 254) {
++						acc->row_start = (uint8_t)v;
++						acc->any = true;
++					}
++				} else if (prop == 6) {
++					/* grid-row-end */
++					v = macsurf__grid_parse_int_or_minus1(
++							&p, end);
++					if (v == 255 && acc->row_start > 0) {
++						acc->row_span = 255;
++						acc->any = true;
++					} else if (v >= 1 && v <= 254 &&
++							acc->row_start > 0 &&
++							v > acc->row_start) {
++						int sp2 = v - acc->row_start;
++						if (sp2 > 254) sp2 = 254;
++						acc->row_span = (uint8_t)sp2;
++						acc->any = true;
++					}
++				} else if (prop == 7) {
++					/* fixes178c: grid-area shorthand.
++					 *
++					 * 4-value form:  rs / cs / re / ce
++					 * 2-value form:  rs / cs   (span 1)
++					 *
++					 * Named-area form (single ident) is
++					 * NOT supported in V1 - that needs
++					 * grid-template-areas resolution
++					 * which is deferred. A single-token
++					 * ident value falls through with no
++					 * placement emitted.
++					 *
++					 * Tokens are positive ints 1..254 or
++					 * -1 (the "fill row" sentinel encoded
++					 * as 255). */
++					int rs2 = 0, cs2 = 0, re2 = 0, ce2 = 0;
++					int slashes = 0;
++					const char *q = p;
++					/* Count `/` separators (excluding any
++					 * outside whitespace) so we can pick
++					 * which form to expect. */
++					{
++						const char *qq = p;
++						while (qq < end) {
++							if (*qq == '/') slashes++;
++							qq++;
++						}
++					}
++					rs2 = macsurf__grid_parse_int_or_minus1(
++							&q, end);
++					if (rs2 >= 1 && rs2 <= 254 && q < end &&
++							*q == '/') {
++						q++;
++						cs2 = macsurf__grid_parse_int_or_minus1(
++								&q, end);
++						if (slashes >= 3) {
++							if (q < end && *q == '/') q++;
++							re2 = macsurf__grid_parse_int_or_minus1(
++									&q, end);
++							if (q < end && *q == '/') q++;
++							ce2 = macsurf__grid_parse_int_or_minus1(
++									&q, end);
++						}
++					}
++					if (rs2 >= 1 && rs2 <= 254 &&
++							cs2 >= 1 && cs2 <= 254) {
++						acc->row_start = (uint8_t)rs2;
++						acc->col_start = (uint8_t)cs2;
++						if (slashes >= 3) {
++							/* row_end */
++							if (re2 == 255) {
++								acc->row_span = 255;
++							} else if (re2 > rs2 &&
++									re2 <= 254) {
++								int sp2 = re2 - rs2;
++								if (sp2 > 254) sp2 = 254;
++								acc->row_span = (uint8_t)sp2;
++							} else {
++								acc->row_span = 1;
++							}
++							/* col_end */
++							if (ce2 == 255) {
++								acc->col_span = 255;
++							} else if (ce2 > cs2 &&
++									ce2 <= 254) {
++								int sp2 = ce2 - cs2;
++								if (sp2 > 254) sp2 = 254;
++								acc->col_span = (uint8_t)sp2;
++							} else {
++								acc->col_span = 1;
++							}
++						} else {
++							acc->row_span = 1;
++							acc->col_span = 1;
++						}
++						acc->any = true;
++					}
++				}
++
++				/* Skip the declaration in the input (including
++				 * the trailing `;` if present). The closing `}`
++				 * stays in the input - we don't eat it. */
++				i = val_end;
++				if (i < in_size && data[i] == ';') i++;
++				goto next_iter;
++			}
++not_grid:
++			;
++		}
++
++		if (c == '{') {
++			if (depth < MACSURF_GRID_PLACEMENT_MAX_DEPTH) {
++				stack[depth].any = false;
++				stack[depth].col_start = 0;
++				stack[depth].col_span = 0;
++				stack[depth].row_start = 0;
++				stack[depth].row_span = 0;
++			}
++			depth++;
++		} else if (c == '}') {
++			/* Before emitting `}`, emit any accumulated
++			 * placement for the innermost block. */
++			if (depth >= 1 && depth <=
++					MACSURF_GRID_PLACEMENT_MAX_DEPTH &&
++					stack[depth - 1].any) {
++				if (!macsurf__grid_emit_packed(&out, &cap, &pos,
++						&stack[depth - 1])) {
++					free(out);
++					return NULL;
++				}
++				stack[depth - 1].any = false;
++			}
++			if (depth > 0) depth--;
++		}
++
++		/* Emit the current byte. */
++		{
++			size_t need = pos + 2;
++			while (need >= cap) {
++				size_t newcap = cap * 2;
++				char *neu = (char *)realloc(out, newcap);
++				if (neu == NULL) { free(out); return NULL; }
++				out = neu;
++				cap = newcap;
++			}
++		}
++		out[pos++] = c;
++		i++;
++
++next_iter:
++		;
++	}
++
++	*out_size_p = pos;
++	return out;
++}
++
++
++/* fixes175 - rewrite every author `text-shadow: VALUE` declaration to
++ * `-macsurf-text-shadow: VALUE` so the existing vendor parser
++ * (p_macsurf_text_shadow.c from fixes50) picks up standard CSS3
++ * text-shadow without touching libcss internals.
++ *
++ * Standard CSS3 text-shadow accepts an optional blur radius and lets the
++ * color appear first or last. The vendor parser is stricter and accepts
++ * only `<hoff> <voff> <color>`. This pass renames the declaration but
++ * does NOT normalise the value, so authors using a blur radius or
++ * color-first form will still see the declaration parse-fail at libcss.
++ * Closing that gap is a separate, narrower fix on the vendor parser.
++ *
++ * The grow-buffer scheme is the same one fixes151 uses for grid-column:
++ * malloc with worst-case headroom, copy bytes through, substitute
++ * property name on match.
++ *
++ * Property-level aliasing inside libcss (the fixes141 approach) hung the
++ * browser pre-reformat on real hardware; the preprocessor route is the
++ * safe pattern for vendor->standard bridges. */
++
++
++/* fixes178b: grid-template-areas + named grid-area resolution.
++ *
++ * Document-scope V1: scans the input for any
++ *   grid-template-areas: "a b c" "d d e" ...
++ * declarations and builds a flat name->bbox table. Then scans for any
++ *   grid-area: <ident>
++ * single-token declarations and rewrites them to numeric 4-value form
++ *   grid-area: rs / cs / re / ce
++ * which the existing prop==7 handler in the placement pass turns into a
++ * packed `-macsurf-grid-col-span` declaration.
++ *
++ * Limitations:
++ *  - 32 areas max, 32 char per name max, 8x8 grid max
++ *  - last-write-wins on name conflicts across multiple
++ *    grid-template-areas declarations
++ *  - cells named `.` are treated as empty / skipped
++ *  - the original grid-template-areas declaration stays in the output;
++ *    libcss does not have a parser for it, so it parse-fails silently.
++ *  - if the area parse hits any error, the pass returns NULL and the
++ *    caller falls back to the unmodified input.
++ */
++
++#define MACSURF_GTA_NAMES_MAX 32
++#define MACSURF_GTA_NAME_MAX  32
++
++struct macsurf_gta_area {
++	char  name[MACSURF_GTA_NAME_MAX];
++	uint8_t col_start; /* 1-indexed */
++	uint8_t row_start;
++	uint8_t col_end;   /* 1-indexed, inclusive */
++	uint8_t row_end;
++};
++
++struct macsurf_gta_table {
++	struct macsurf_gta_area entries[MACSURF_GTA_NAMES_MAX];
++	int n;
++};
++
++static int macsurf_gta__is_ident_char(char c)
++{
++	return (c >= 'a' && c <= 'z') ||
++	       (c >= 'A' && c <= 'Z') ||
++	       (c >= '0' && c <= '9') ||
++	       c == '-' || c == '_';
++}
++
++static int macsurf_gta__find(struct macsurf_gta_table *tbl,
++		const char *name, size_t name_len)
++{
++	int k;
++	for (k = 0; k < tbl->n; k++) {
++		size_t L = strlen(tbl->entries[k].name);
++		if (L == name_len &&
++		    memcmp(tbl->entries[k].name, name, L) == 0)
++			return k;
++	}
++	return -1;
++}
++
++/* Parse one `grid-template-areas: "..." "..." ...` declaration value
++ * starting at `p` (just past the `:`) and ending at `end`. Updates the
++ * shared table.
++ *
++ * Per CSS Grid spec each `"..."` is a row of whitespace-separated cell
++ * tokens. Each cell is either a single `.` (null cell) or an
++ * identifier. All cells in a contiguous rectangular bbox sharing the
++ * same name belong to the same area. We compute a bbox per unique
++ * name. Non-rectangular groupings (illegal per spec) end up with the
++ * minimum bbox containing all instances. */
++static void macsurf_gta__parse_decl(const char *p, const char *end,
++		struct macsurf_gta_table *tbl)
++{
++	int row = 0;
++	while (p < end) {
++		const char *str_start;
++		const char *str_end;
++		int col = 0;
++		/* Find next `"..."`. */
++		while (p < end && *p != '"') p++;
++		if (p >= end) return;
++		p++;
++		str_start = p;
++		while (p < end && *p != '"') p++;
++		if (p >= end) return;
++		str_end = p;
++		p++;
++		/* Walk cells inside the string. */
++		{
++			const char *q = str_start;
++			while (q < str_end) {
++				const char *cell_s;
++				const char *cell_e;
++				size_t L;
++				while (q < str_end &&
++				       (*q == ' ' || *q == '\t'))
++					q++;
++				if (q >= str_end) break;
++				cell_s = q;
++				while (q < str_end &&
++				       *q != ' ' && *q != '\t')
++					q++;
++				cell_e = q;
++				L = (size_t)(cell_e - cell_s);
++				if (L == 0) { col++; continue; }
++				if (L == 1 && cell_s[0] == '.') {
++					col++;
++					continue;
++				}
++				if (L < MACSURF_GTA_NAME_MAX) {
++					int idx = macsurf_gta__find(tbl,
++						cell_s, L);
++					if (idx < 0 &&
++					    tbl->n < MACSURF_GTA_NAMES_MAX) {
++						idx = tbl->n++;
++						memcpy(tbl->entries[idx].name,
++						       cell_s, L);
++						tbl->entries[idx].name[L] = 0;
++						tbl->entries[idx].col_start =
++							(uint8_t)(col + 1);
++						tbl->entries[idx].col_end =
++							(uint8_t)(col + 1);
++						tbl->entries[idx].row_start =
++							(uint8_t)(row + 1);
++						tbl->entries[idx].row_end =
++							(uint8_t)(row + 1);
++					} else if (idx >= 0) {
++						uint8_t cs1 = (uint8_t)(col + 1);
++						uint8_t rs1 = (uint8_t)(row + 1);
++						if (cs1 < tbl->entries[idx].col_start)
++							tbl->entries[idx].col_start = cs1;
++						if (cs1 > tbl->entries[idx].col_end)
++							tbl->entries[idx].col_end = cs1;
++						if (rs1 < tbl->entries[idx].row_start)
++							tbl->entries[idx].row_start = rs1;
++						if (rs1 > tbl->entries[idx].row_end)
++							tbl->entries[idx].row_end = rs1;
++					}
++				}
++				col++;
++			}
++		}
++		row++;
++		if (row > 254) return;
++	}
++}
++
++static char *
++macsurf__rewrite_grid_template_areas(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char N_GTA[] = "grid-template-areas";
++	static const size_t N_GTA_LEN = 19;
++	static const char N_GA[]  = "grid-area";
++	static const size_t N_GA_LEN  = 9;
++	struct macsurf_gta_table tbl;
++	size_t cap;
++	size_t pos = 0;
++	char *out;
++	size_t i = 0;
++
++	tbl.n = 0;
++	memset(&tbl.entries, 0, sizeof(tbl.entries));
++
++	/* --- Pass 1: collect area definitions. */
++	while (i + N_GTA_LEN <= in_size) {
++		if (data[i] == 'g' &&
++		    macsurf__match_prop_name(data, in_size, i,
++				N_GTA, N_GTA_LEN)) {
++			size_t j = i + N_GTA_LEN;
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' ||
++					data[j] == '\n' ||
++					data[j] == '\r')) j++;
++			if (j < in_size && data[j] == ':') {
++				size_t val_start = j + 1;
++				size_t val_end = val_start;
++				while (val_end < in_size) {
++					char vc = data[val_end];
++					if (vc == ';' || vc == '}') break;
++					val_end++;
++				}
++				macsurf_gta__parse_decl(data + val_start,
++						data + val_end, &tbl);
++				i = val_end;
++				continue;
++			}
++		}
++		i++;
++	}
++
++	if (tbl.n == 0) {
++		*out_size_p = in_size;
++		out = (char *)malloc(in_size + 1);
++		if (out == NULL) return NULL;
++		memcpy(out, data, in_size);
++		out[in_size] = 0;
++		return out;
++	}
++
++	/* --- Pass 2: rewrite `grid-area: <ident>` to numeric form. */
++	cap = in_size + 256;
++	if (cap < 1024) cap = 1024;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++	i = 0;
++	while (i < in_size) {
++		if (data[i] == 'g' && i + N_GA_LEN <= in_size &&
++		    macsurf__match_prop_name(data, in_size, i,
++				N_GA, N_GA_LEN)) {
++			size_t j = i + N_GA_LEN;
++			size_t val_start;
++			size_t val_end;
++			size_t name_s, name_e;
++			int idx;
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' ||
++					data[j] == '\n' ||
++					data[j] == '\r')) j++;
++			if (j >= in_size || data[j] != ':') goto emit_byte;
++			val_start = j + 1;
++			while (val_start < in_size &&
++				(data[val_start] == ' ' ||
++				 data[val_start] == '\t')) val_start++;
++			val_end = val_start;
++			while (val_end < in_size) {
++				char vc = data[val_end];
++				if (vc == ';' || vc == '}' ||
++						vc == '!') break;
++				val_end++;
++			}
++			/* Look at the value: only single-IDENT form is
++			 * the named-area shorthand. If it contains `/`
++			 * or a digit anywhere, leave it for the numeric
++			 * handler. */
++			{
++				const char *q;
++				int has_slash = 0;
++				for (q = data + val_start;
++						q < data + val_end; q++) {
++					if (*q == '/') { has_slash = 1; break; }
++				}
++				if (has_slash) goto emit_byte;
++			}
++			name_s = val_start;
++			while (name_s < val_end &&
++				(data[name_s] == ' ' ||
++				 data[name_s] == '\t')) name_s++;
++			name_e = name_s;
++			while (name_e < val_end &&
++				macsurf_gta__is_ident_char(data[name_e]))
++				name_e++;
++			if (name_e == name_s ||
++				(name_e - name_s) >= MACSURF_GTA_NAME_MAX)
++				goto emit_byte;
++			idx = macsurf_gta__find(&tbl, data + name_s,
++					(size_t)(name_e - name_s));
++			if (idx < 0) goto emit_byte;
++			{
++				/* Emit `grid-area: rs / cs / re / ce`. */
++				char tmp[80];
++				int n;
++				size_t need;
++				n = sprintf(tmp,
++					"grid-area: %u / %u / %u / %u",
++					(unsigned)tbl.entries[idx].row_start,
++					(unsigned)tbl.entries[idx].col_start,
++					(unsigned)(tbl.entries[idx].row_end + 1),
++					(unsigned)(tbl.entries[idx].col_end + 1));
++				if (n <= 0) goto emit_byte;
++				need = pos + (size_t)n + 1;
++				while (need >= cap) {
++					size_t newcap = cap * 2;
++					char *neu = (char *)realloc(out,
++							newcap);
++					if (neu == NULL) {
++						free(out);
++						return NULL;
++					}
++					out = neu;
++					cap = newcap;
++				}
++				memcpy(out + pos, tmp, (size_t)n);
++				pos += (size_t)n;
++				i = val_end;
++				continue;
++			}
++		}
++emit_byte:
++		{
++			size_t need = pos + 2;
++			while (need >= cap) {
++				size_t newcap = cap * 2;
++				char *neu = (char *)realloc(out, newcap);
++				if (neu == NULL) {
++					free(out);
++					return NULL;
++				}
++				out = neu;
++				cap = newcap;
++			}
++		}
++		out[pos++] = data[i++];
++	}
++	*out_size_p = pos;
++	return out;
++}
++
++
++static char *
++macsurf__rewrite_text_shadow(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char NEEDLE[] = "text-shadow";
++	static const size_t NEEDLE_LEN = 11;
++	static const char REPLACE[] = "-macsurf-text-shadow";
++	static const size_t REPLACE_LEN = 20;
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++
++	/* Worst case: every NEEDLE_LEN-byte window is a match. Each match
++	 * grows by REPLACE_LEN - NEEDLE_LEN = 9 bytes. Plus 256 padding so
++	 * single-byte appends near the tail never reallocate. */
++	cap = in_size +
++		(in_size / NEEDLE_LEN + 1) * (REPLACE_LEN - NEEDLE_LEN) + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		if (macsurf__match_prop_name(data, in_size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			/* Boundary check passed; confirm this is a real
++			 * declaration by looking for optional whitespace
++			 * then ':'. The boundary check already rejects
++			 * `-macsurf-text-shadow` (prev byte is '-'). */
++			size_t j = i + NEEDLE_LEN;
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' ||
++					data[j] == '\n' ||
++					data[j] == '\r')) j++;
++			if (j < in_size && data[j] == ':') {
++				if (pos + REPLACE_LEN >= cap) {
++					free(out);
++					return NULL;
++				}
++				memcpy(out + pos, REPLACE, REPLACE_LEN);
++				pos += REPLACE_LEN;
++				i += NEEDLE_LEN;
++				continue;
++			}
++		}
++		if (pos + 1 >= cap) {
++			free(out);
++			return NULL;
++		}
++		out[pos++] = data[i++];
++	}
++
++	*out_size_p = pos;
++	return out;
++}
++
++
++/* fixes183 - rewrite standard `transform:` → `-macsurf-transform:` so
++ * author CSS reaches the existing vendor transform paint path (sin/cos
++ * LUT rotation, translate, scale composition). Mirrors fixes175 text-shadow
++ * pattern. `transform-origin`, `transform-style`, `transform-box` are NOT
++ * matched because the post-NEEDLE scan requires `:` next (those longhands
++ * have `-` next so they fall through unchanged). fixes141 attempted this
++ * via property_handlers[] aliasing and hung pre-reformat; this preprocessor
++ * route bypasses libcss internals entirely. */
++static char *
++macsurf__rewrite_transform(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char NEEDLE[] = "transform";
++	static const size_t NEEDLE_LEN = 9;
++	static const char REPLACE[] = "-macsurf-transform";
++	static const size_t REPLACE_LEN = 18;
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++
++	cap = in_size +
++		(in_size / NEEDLE_LEN + 1) * (REPLACE_LEN - NEEDLE_LEN) + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		if (macsurf__match_prop_name(data, in_size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			size_t j = i + NEEDLE_LEN;
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' ||
++					data[j] == '\n' ||
++					data[j] == '\r')) j++;
++			if (j < in_size && data[j] == ':') {
++				if (pos + REPLACE_LEN >= cap) {
++					free(out);
++					return NULL;
++				}
++				memcpy(out + pos, REPLACE, REPLACE_LEN);
++				pos += REPLACE_LEN;
++				i += NEEDLE_LEN;
++				continue;
++			}
++		}
++		if (pos + 1 >= cap) {
++			free(out);
++			return NULL;
++		}
++		out[pos++] = data[i++];
++	}
++
++	*out_size_p = pos;
++	return out;
++}
++
++/* fixes191g -- rewrite standard `object-position:` to
++ * `-macsurf-object-position:` so author CSS reaches the compact
++ * keyword-only V1 parser. Like transform/text-shadow, this only matches
++ * the exact property name followed by optional whitespace and `:`, so
++ * unrelated longhands are left alone. */
++static char *
++macsurf__rewrite_object_position(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char NEEDLE[] = "object-position";
++	static const size_t NEEDLE_LEN = 15;
++	static const char REPLACE[] = "-macsurf-object-position";
++	static const size_t REPLACE_LEN = 24;
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++
++	cap = in_size +
++		(in_size / NEEDLE_LEN + 1) * (REPLACE_LEN - NEEDLE_LEN) + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		if (macsurf__match_prop_name(data, in_size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			size_t j = i + NEEDLE_LEN;
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' ||
++					data[j] == '\n' ||
++					data[j] == '\r')) j++;
++			if (j < in_size && data[j] == ':') {
++				if (pos + REPLACE_LEN >= cap) {
++					free(out);
++					return NULL;
++				}
++				memcpy(out + pos, REPLACE, REPLACE_LEN);
++				pos += REPLACE_LEN;
++				i += NEEDLE_LEN;
++				continue;
++			}
++		}
++		if (pos + 1 >= cap) {
++			free(out);
++			return NULL;
++		}
++		out[pos++] = data[i++];
++	}
++
++	out[pos] = '\0';
++	if (out_size_p != NULL) *out_size_p = pos;
++	return out;
++}
++
++
++/* fixes266 - rewrite `background-image: linear-gradient(...)` to
++ * `-macsurf-gradient: linear-gradient(...)` so author CSS that uses the
++ * standard CSS3 syntax reaches the existing -macsurf-gradient paint path
++ * (fixes47/49 linear-gradient, fixes74 radial-gradient).
++ *
++ * Scope and limits:
++ *   - Matches only when the value (after optional whitespace) STARTS with
++ *     `linear-gradient(` or `radial-gradient(`. URLs and other functions
++ *     fall through untouched (libcss continues to drop them).
++ *   - Stacked layered backgrounds like `background-image: linear-gradient(a),
++ *     linear-gradient(b)` rename to `-macsurf-gradient: ...` but the parser
++ *     fails on the trailing `, linear-gradient(...)` - net result: stacked
++ *     gradients drop, same as pre-fix behaviour. Single-layer gradients
++ *     paint, which is the strict improvement.
++ *   - Does NOT touch `background:` shorthand. Authors who use shorthand for
++ *     gradients (rare) need to opt in with `background-image:`.
++ *   - REPLACE is one byte longer than NEEDLE (17 vs 16), so each match
++ *     grows the output by 1; pre-allocate accordingly. */
++static char *
++macsurf__rewrite_background_image_gradient(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char NEEDLE[] = "background-image";
++	static const size_t NEEDLE_LEN = 16;
++	static const char REPLACE[] = "-macsurf-gradient";
++	static const size_t REPLACE_LEN = 17;
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++
++	cap = in_size +
++		(in_size / NEEDLE_LEN + 1) * (REPLACE_LEN - NEEDLE_LEN) + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		if (macsurf__match_prop_name(data, in_size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			size_t j = i + NEEDLE_LEN;
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' ||
++					data[j] == '\n' ||
++					data[j] == '\r')) j++;
++			if (j < in_size && data[j] == ':') {
++				size_t k = j + 1;
++				bool is_gradient = false;
++				while (k < in_size && (data[k] == ' ' ||
++						data[k] == '\t' ||
++						data[k] == '\n' ||
++						data[k] == '\r')) k++;
++				/* Test for `linear-gradient(` or `radial-gradient(`
++				 * (case-insensitive) at value start. */
++				if (k + 16 <= in_size) {
++					const char *p = data + k;
++					if ((p[0] == 'l' || p[0] == 'L') &&
++					    (p[1] == 'i' || p[1] == 'I') &&
++					    (p[2] == 'n' || p[2] == 'N') &&
++					    (p[3] == 'e' || p[3] == 'E') &&
++					    (p[4] == 'a' || p[4] == 'A') &&
++					    (p[5] == 'r' || p[5] == 'R') &&
++					     p[6] == '-' &&
++					    (p[7] == 'g' || p[7] == 'G') &&
++					    (p[8] == 'r' || p[8] == 'R') &&
++					    (p[9] == 'a' || p[9] == 'A') &&
++					    (p[10] == 'd' || p[10] == 'D') &&
++					    (p[11] == 'i' || p[11] == 'I') &&
++					    (p[12] == 'e' || p[12] == 'E') &&
++					    (p[13] == 'n' || p[13] == 'N') &&
++					    (p[14] == 't' || p[14] == 'T') &&
++					     p[15] == '(')
++						is_gradient = true;
++				}
++				if (k + 16 <= in_size && !is_gradient) {
++					const char *p = data + k;
++					if ((p[0] == 'r' || p[0] == 'R') &&
++					    (p[1] == 'a' || p[1] == 'A') &&
++					    (p[2] == 'd' || p[2] == 'D') &&
++					    (p[3] == 'i' || p[3] == 'I') &&
++					    (p[4] == 'a' || p[4] == 'A') &&
++					    (p[5] == 'l' || p[5] == 'L') &&
++					     p[6] == '-' &&
++					    (p[7] == 'g' || p[7] == 'G') &&
++					    (p[8] == 'r' || p[8] == 'R') &&
++					    (p[9] == 'a' || p[9] == 'A') &&
++					    (p[10] == 'd' || p[10] == 'D') &&
++					    (p[11] == 'i' || p[11] == 'I') &&
++					    (p[12] == 'e' || p[12] == 'E') &&
++					    (p[13] == 'n' || p[13] == 'N') &&
++					    (p[14] == 't' || p[14] == 'T') &&
++					     p[15] == '(')
++						is_gradient = true;
++				}
++				if (is_gradient) {
++					if (pos + REPLACE_LEN >= cap) {
++						free(out);
++						return NULL;
++					}
++					memcpy(out + pos, REPLACE, REPLACE_LEN);
++					pos += REPLACE_LEN;
++					i += NEEDLE_LEN;
++					continue;
++				}
++			}
++		}
++		if (pos + 1 >= cap) {
++			free(out);
++			return NULL;
++		}
++		out[pos++] = data[i++];
++	}
++
++	out[pos] = '\0';
++	if (out_size_p != NULL) *out_size_p = pos;
++	return out;
++}
++
++
++/* fixes318 (#145) - extract gradient from `background:` shorthand.
++ *
++ * Authors commonly write `background: <colour> linear-gradient(...)` or
++ * just `background: linear-gradient(...)` instead of the longhand
++ * `background-image: linear-gradient(...)`. fixes266 only handles the
++ * longhand, so shorthand-form gradients silently drop.
++ *
++ * This pass walks `background:` declarations (NOT `background-image`,
++ * `background-color`, etc.) and looks for `linear-gradient(` /
++ * `radial-gradient(` somewhere in the value. When found:
++ *   1. Records the gradient's bounds (function-call open through balanced
++ *      close-paren).
++ *   2. Replaces the entire `background:` declaration's name with
++ *      `-macsurf-gradient` and the value with just the extracted gradient
++ *      call. Tokens before and after the gradient (colour, position,
++ *      repeat, etc.) are wiped to spaces.
++ *
++ * Loss: any solid colour or other shorthand parts are dropped. Same
++ * loss-budget as fixes266 - single-gradient cases paint correctly,
++ * stacked or complex shorthand drop. Authors who need the colour can
++ * add a separate `background-color:` declaration.
++ *
++ * In-place same-size rewrite using a fresh output buffer (capacity is
++ * input + per-match REPLACE_LEN delta, same shape as fixes266).
++ *
++ * REPLACE is 17 bytes (-macsurf-gradient), NEEDLE is 10 bytes
++ * (background), so each match grows the output by 7 bytes plus the
++ * surrounding-whitespace fill.
++ */
++static char *
++macsurf__rewrite_background_shorthand_gradient(const char *data,
++		size_t in_size, size_t *out_size_p)
++{
++	static const char NEEDLE[]  = "background";
++	static const size_t NEEDLE_LEN  = 10;
++	static const char REPLACE[] = "-macsurf-gradient";
++	static const size_t REPLACE_LEN = 17;
++	static const size_t DELTA = REPLACE_LEN - NEEDLE_LEN; /* 7 */
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	/* fixes343 - also reserve room for the per-match
++	 * `; background-repeat: no-repeat` (~32 bytes) we now emit. */
++	cap = in_size +
++		(in_size / NEEDLE_LEN + 1) * (DELTA + 32) + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		size_t j, k, value_start, val_end;
++		bool gradient_at;
++		size_t grad_start = 0;
++		size_t grad_end = 0;
++		int paren;
++
++		if (!macsurf__match_prop_name(data, in_size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			if (pos + 1 >= cap) { free(out); return NULL; }
++			out[pos++] = data[i++];
++			continue;
++		}
++		/* Reject `background-image`, `background-color`, etc.
++		 * Only match BARE `background` followed by ':' (after
++		 * optional whitespace). */
++		j = i + NEEDLE_LEN;
++		if (j < in_size && data[j] == '-') {
++			/* It's a longhand like background-image; pass through. */
++			if (pos + 1 >= cap) { free(out); return NULL; }
++			out[pos++] = data[i++];
++			continue;
++		}
++		while (j < in_size && (data[j] == ' ' || data[j] == '\t' ||
++				data[j] == '\n' || data[j] == '\r')) j++;
++		if (j >= in_size || data[j] != ':') {
++			if (pos + 1 >= cap) { free(out); return NULL; }
++			out[pos++] = data[i++];
++			continue;
++		}
++		value_start = j + 1;
++
++		/* Find end of value (the next depth-0 `;`, `}`, or `!`). */
++		k = value_start;
++		paren = 0;
++		while (k < in_size) {
++			char c = data[k];
++			if (c == '(') paren++;
++			else if (c == ')') { if (paren > 0) paren--; }
++			else if (paren == 0 &&
++					(c == ';' || c == '}' || c == '!')) break;
++			k++;
++		}
++		val_end = k;
++
++		/* Scan value for `linear-gradient(` or `radial-gradient(`. */
++		gradient_at = false;
++		{
++			size_t s;
++			for (s = value_start; s < val_end; s++) {
++				if (s + 16 > val_end) break;
++				if ((data[s] == 'l' || data[s] == 'L') &&
++				    (data[s+1] == 'i' || data[s+1] == 'I') &&
++				    (data[s+2] == 'n' || data[s+2] == 'N') &&
++				    (data[s+3] == 'e' || data[s+3] == 'E') &&
++				    (data[s+4] == 'a' || data[s+4] == 'A') &&
++				    (data[s+5] == 'r' || data[s+5] == 'R') &&
++				     data[s+6] == '-' &&
++				    (data[s+7] == 'g' || data[s+7] == 'G') &&
++				    (data[s+8] == 'r' || data[s+8] == 'R') &&
++				    (data[s+9] == 'a' || data[s+9] == 'A') &&
++				    (data[s+10] == 'd' || data[s+10] == 'D') &&
++				    (data[s+11] == 'i' || data[s+11] == 'I') &&
++				    (data[s+12] == 'e' || data[s+12] == 'E') &&
++				    (data[s+13] == 'n' || data[s+13] == 'N') &&
++				    (data[s+14] == 't' || data[s+14] == 'T') &&
++				     data[s+15] == '(') {
++					/* fixes346 - skip if this match is
++					 * actually the `linear-gradient(` tail
++					 * of `repeating-linear-gradient(`. Without
++					 * this guard the preprocessor strips the
++					 * `repeating-` prefix and the parser
++					 * sees a non-repeating gradient, losing
++					 * the pinstripe pattern entirely. */
++					if (s >= 10 &&
++					    (data[s-10]=='r'||data[s-10]=='R') &&
++					    (data[s-9]=='e'||data[s-9]=='E') &&
++					    (data[s-8]=='p'||data[s-8]=='P') &&
++					    (data[s-7]=='e'||data[s-7]=='E') &&
++					    (data[s-6]=='a'||data[s-6]=='A') &&
++					    (data[s-5]=='t'||data[s-5]=='T') &&
++					    (data[s-4]=='i'||data[s-4]=='I') &&
++					    (data[s-3]=='n'||data[s-3]=='N') &&
++					    (data[s-2]=='g'||data[s-2]=='G') &&
++					     data[s-1]=='-') {
++						/* Skip 10 chars back and let
++						 * the loop continue past the
++						 * full token. */
++						continue;
++					}
++					grad_start = s;
++					gradient_at = true;
++					break;
++				}
++				if ((data[s] == 'r' || data[s] == 'R') &&
++				    (data[s+1] == 'a' || data[s+1] == 'A') &&
++				    (data[s+2] == 'd' || data[s+2] == 'D') &&
++				    (data[s+3] == 'i' || data[s+3] == 'I') &&
++				    (data[s+4] == 'a' || data[s+4] == 'A') &&
++				    (data[s+5] == 'l' || data[s+5] == 'L') &&
++				     data[s+6] == '-' &&
++				    (data[s+7] == 'g' || data[s+7] == 'G') &&
++				    (data[s+8] == 'r' || data[s+8] == 'R') &&
++				    (data[s+9] == 'a' || data[s+9] == 'A') &&
++				    (data[s+10] == 'd' || data[s+10] == 'D') &&
++				    (data[s+11] == 'i' || data[s+11] == 'I') &&
++				    (data[s+12] == 'e' || data[s+12] == 'E') &&
++				    (data[s+13] == 'n' || data[s+13] == 'N') &&
++				    (data[s+14] == 't' || data[s+14] == 'T') &&
++				     data[s+15] == '(') {
++					grad_start = s;
++					gradient_at = true;
++					break;
++				}
++			}
++		}
++		if (!gradient_at) {
++			if (pos + 1 >= cap) { free(out); return NULL; }
++			out[pos++] = data[i++];
++			continue;
++		}
++
++		/* Find matching close paren for the gradient call. */
++		{
++			size_t s = grad_start + 16; /* past `(` */
++			int p = 1;
++			while (s < val_end && p > 0) {
++				if (data[s] == '(') p++;
++				else if (data[s] == ')') p--;
++				if (p == 0) { grad_end = s; break; }
++				s++;
++			}
++			if (p != 0) {
++				/* Unbalanced; bail. */
++				if (pos + 1 >= cap) { free(out); return NULL; }
++				out[pos++] = data[i++];
++				continue;
++			}
++		}
++
++		/* Emit `-macsurf-gradient` in place of `background`. */
++		if (pos + REPLACE_LEN >= cap) { free(out); return NULL; }
++		memcpy(out + pos, REPLACE, REPLACE_LEN);
++		pos += REPLACE_LEN;
++
++		/* Emit whitespace/colon up to value_start unchanged. */
++		{
++			size_t span = value_start - (i + NEEDLE_LEN);
++			if (pos + span >= cap) { free(out); return NULL; }
++			memcpy(out + pos, data + i + NEEDLE_LEN, span);
++			pos += span;
++		}
++
++		/* Emit spaces for any tokens between value_start and grad_start. */
++		{
++			size_t span = grad_start - value_start;
++			size_t s2;
++			if (pos + span >= cap) { free(out); return NULL; }
++			for (s2 = 0; s2 < span; s2++) out[pos + s2] = ' ';
++			pos += span;
++		}
++
++		/* Emit the gradient call itself, unchanged. */
++		{
++			size_t span = (grad_end + 1) - grad_start;
++			if (pos + span >= cap) { free(out); return NULL; }
++			memcpy(out + pos, data + grad_start, span);
++			pos += span;
++		}
++
++		/* Emit spaces for anything between grad_end+1 and val_end. */
++		{
++			size_t span = val_end - (grad_end + 1);
++			size_t s2;
++			if (pos + span >= cap) { free(out); return NULL; }
++			for (s2 = 0; s2 < span; s2++) out[pos + s2] = ' ';
++			pos += span;
++		}
++
++		/* fixes343 - scan the original shorthand for repeat-x /
++		 * repeat-y / no-repeat / repeat keywords and emit a
++		 * `; background-repeat: X` declaration after the gradient.
++		 * Without this, every shorthand-with-gradient lost its
++		 * repeat info; libcss defaulted to `repeat` and gradients
++		 * tiled across elements like mactrove's metallic chrome.
++		 *
++		 * Scan order matters: check `no-repeat` first (longest),
++		 * then `repeat-x`, `repeat-y`, then bare `repeat`. Default
++		 * to `no-repeat` for gradients (overwhelming author intent
++		 * when using shorthand). */
++		{
++			const char *rep_keyword = "no-repeat";
++			size_t scan;
++			for (scan = value_start; scan < val_end; scan++) {
++				if (scan + 9 <= val_end &&
++				    (data[scan]=='n'||data[scan]=='N') &&
++				    (data[scan+1]=='o'||data[scan+1]=='O') &&
++				     data[scan+2]=='-' &&
++				    (data[scan+3]=='r'||data[scan+3]=='R') &&
++				    (data[scan+4]=='e'||data[scan+4]=='E') &&
++				    (data[scan+5]=='p'||data[scan+5]=='P') &&
++				    (data[scan+6]=='e'||data[scan+6]=='E') &&
++				    (data[scan+7]=='a'||data[scan+7]=='A') &&
++				    (data[scan+8]=='t'||data[scan+8]=='T')) {
++					rep_keyword = "no-repeat";
++					break;
++				}
++				if (scan + 8 <= val_end &&
++				    (data[scan]=='r'||data[scan]=='R') &&
++				    (data[scan+1]=='e'||data[scan+1]=='E') &&
++				    (data[scan+2]=='p'||data[scan+2]=='P') &&
++				    (data[scan+3]=='e'||data[scan+3]=='E') &&
++				    (data[scan+4]=='a'||data[scan+4]=='A') &&
++				    (data[scan+5]=='t'||data[scan+5]=='T') &&
++				     data[scan+6]=='-' &&
++				    (data[scan+7]=='x'||data[scan+7]=='X')) {
++					rep_keyword = "repeat-x";
++					break;
++				}
++				if (scan + 8 <= val_end &&
++				    (data[scan]=='r'||data[scan]=='R') &&
++				    (data[scan+1]=='e'||data[scan+1]=='E') &&
++				    (data[scan+2]=='p'||data[scan+2]=='P') &&
++				    (data[scan+3]=='e'||data[scan+3]=='E') &&
++				    (data[scan+4]=='a'||data[scan+4]=='A') &&
++				    (data[scan+5]=='t'||data[scan+5]=='T') &&
++				     data[scan+6]=='-' &&
++				    (data[scan+7]=='y'||data[scan+7]=='Y')) {
++					rep_keyword = "repeat-y";
++					break;
++				}
++				if (scan + 6 <= val_end &&
++				    (data[scan]=='r'||data[scan]=='R') &&
++				    (data[scan+1]=='e'||data[scan+1]=='E') &&
++				    (data[scan+2]=='p'||data[scan+2]=='P') &&
++				    (data[scan+3]=='e'||data[scan+3]=='E') &&
++				    (data[scan+4]=='a'||data[scan+4]=='A') &&
++				    (data[scan+5]=='t'||data[scan+5]=='T')) {
++					/* Avoid matching the trailing -x/-y form
++					 * here; those branches above came first.
++					 * Plain `repeat` is the libcss default
++					 * anyway, but emit it explicitly so
++					 * later author CSS overrides cleanly. */
++					rep_keyword = "repeat";
++					break;
++				}
++			}
++			{
++				static const char SEP[] = "; background-repeat: ";
++				size_t sep_len = sizeof SEP - 1;
++				size_t k_len = strlen(rep_keyword);
++				if (pos + sep_len + k_len >= cap) {
++					free(out);
++					return NULL;
++				}
++				memcpy(out + pos, SEP, sep_len);
++				pos += sep_len;
++				memcpy(out + pos, rep_keyword, k_len);
++				pos += k_len;
++			}
++		}
++
++		i = val_end;
++		changed++;
++	}
++
++	out[pos] = '\0';
++	if (out_size_p != NULL) *out_size_p = pos;
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
++
++/* fixes279 (#27) - strip trailing stacked gradients from
++ * `-macsurf-gradient:` declarations. Author CSS commonly stacks layered
++ * backgrounds like `background-image: linear-gradient(a), linear-gradient(b)`.
++ * After fixes266's rename pass we have `-macsurf-gradient: linear-gradient(a),
++ * linear-gradient(b)` which libcss's vendor-gradient parser rejects on the
++ * trailing `, linear-gradient(b)`. This pass walks each `-macsurf-gradient:`
++ * declaration, finds the first depth-0 comma in the value, and replaces it
++ * plus everything up to `;` / `}` / `!` with spaces. The first gradient
++ * survives intact.
++ *
++ * In-place same-size rewrite (only spaces are introduced). */
++static char *
++macsurf__strip_stacked_gradients(const char *data, size_t in_size)
++{
++	static const char NEEDLE[] = "-macsurf-gradient";
++	static const size_t NEEDLE_LEN = 17;
++	char *out;
++	size_t i;
++	int changed = 0;
++
++	out = (char *)malloc(in_size);
++	if (out == NULL) return NULL;
++	memcpy(out, data, in_size);
++
++	i = 0;
++	while (i + NEEDLE_LEN < in_size) {
++		size_t j;
++		size_t k;
++		int paren = 0;
++		bool found_comma = false;
++		size_t comma_pos = 0;
++
++		if (!macsurf__match_prop_name(out, in_size, i,
++				NEEDLE, NEEDLE_LEN)) {
++			i++;
++			continue;
++		}
++		j = i + NEEDLE_LEN;
++		while (j < in_size && (out[j] == ' ' || out[j] == '\t' ||
++				out[j] == '\n' || out[j] == '\r')) j++;
++		if (j >= in_size || out[j] != ':') {
++			i = j;
++			continue;
++		}
++		k = j + 1;
++		/* Scan value, tracking paren depth. */
++		while (k < in_size) {
++			char c = out[k];
++			if (c == '(') paren++;
++			else if (c == ')') {
++				if (paren > 0) paren--;
++			} else if (paren == 0 && c == ',') {
++				found_comma = true;
++				comma_pos = k;
++				break;
++			} else if (paren == 0 &&
++					(c == ';' || c == '}' || c == '!')) {
++				break;
++			}
++			k++;
++		}
++		if (found_comma) {
++			/* Wipe from the comma to the value terminator. */
++			size_t w = comma_pos;
++			int p2 = 0;
++			while (w < in_size) {
++				char c = out[w];
++				if (c == '(') p2++;
++				else if (c == ')') {
++					if (p2 > 0) p2--;
++				} else if (p2 == 0 && (c == ';' ||
++						c == '}' || c == '!')) {
++					break;
++				}
++				out[w] = ' ';
++				w++;
++			}
++			changed = 1;
++		}
++		i = k;
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
++
++/* fixes280 - narrow calc() evaluator for the aspect-ratio padding hack.
++ *
++ * Real-world pattern: `padding-top: calc(105 / 478 * 100%)`. mactrove's
++ * Platinum theme uses this to maintain a fixed aspect ratio on absolutely-
++ * positioned banner images. If libcss can't fold the expression, padding-
++ * top stays 0, the container collapses, and the positioned images render
++ * at 0×0.
++ *
++ * Scope: recognise EXACTLY the patterns
++ *   calc( <num> / <num> * <num>% )
++ *   calc( <num> * <num>% )
++ *   calc( <num>% * <num> )
++ *   calc( <num> / <num> )       -> emit unitless number scaled to 4 decimals
++ * Numbers are integer or decimal; whitespace flexible. Anything more
++ * complex falls through unchanged for libcss's existing calc parser.
++ *
++ * In-place same-size rewrite: output is padded with trailing spaces so
++ * the declaration's length stays put.
++ *
++ * Why a preprocessor instead of fixing libcss's calc: libcss's calc
++ * resolution happens at bytecode-eval time and supports lengths better
++ * than percentages-with-arithmetic. This pattern is constant-folded at
++ * source-rewrite time so libcss sees a plain percentage. */
++static int
++macsurf__cc_skip_ws(const char *s, int len, int p)
++{
++	while (p < len && (s[p] == ' ' || s[p] == '\t' ||
++			s[p] == '\n' || s[p] == '\r'))
++		p++;
++	return p;
++}
++
++static bool
++macsurf__cc_read_number(const char *s, int len, int *p,
++		double *out)
++{
++	int start = *p;
++	bool seen_digit = false;
++	double sign = 1.0;
++	double value = 0.0;
++	double frac = 0.0;
++	double div = 10.0;
++
++	if (*p < len && s[*p] == '-') { sign = -1.0; (*p)++; }
++	else if (*p < len && s[*p] == '+') { (*p)++; }
++	while (*p < len && s[*p] >= '0' && s[*p] <= '9') {
++		value = value * 10.0 + (s[*p] - '0');
++		seen_digit = true;
++		(*p)++;
++	}
++	if (*p < len && s[*p] == '.') {
++		(*p)++;
++		while (*p < len && s[*p] >= '0' && s[*p] <= '9') {
++			frac += (s[*p] - '0') / div;
++			div *= 10.0;
++			seen_digit = true;
++			(*p)++;
++		}
++	}
++	if (!seen_digit) {
++		*p = start;
++		return false;
++	}
++	*out = sign * (value + frac);
++	return true;
++}
++
++static char *
++macsurf__rewrite_calc_aspect(const char *data, size_t in_size)
++{
++	static const char NEEDLE[] = "calc(";
++	static const size_t NEEDLE_LEN = 5;
++	char *out;
++	size_t i;
++	int changed = 0;
++
++	out = (char *)malloc(in_size);
++	if (out == NULL) return NULL;
++	memcpy(out, data, in_size);
++
++	i = 0;
++	while (i + NEEDLE_LEN < in_size) {
++		int p, q;
++		double a, b, c;
++		bool ok;
++		char rep[40];
++		size_t rlen;
++		size_t close_pos;
++		int paren;
++		bool has_pct = false;
++		double result = 0.0;
++		bool result_is_pct = false;
++		int op1 = 0;
++		int op2 = 0;
++
++		if (memcmp(out + i, NEEDLE, NEEDLE_LEN) != 0) {
++			i++;
++			continue;
++		}
++
++		p = (int)(i + NEEDLE_LEN);
++		paren = 1;
++		q = p;
++		while (q < (int)in_size && paren > 0) {
++			if (out[q] == '(') paren++;
++			else if (out[q] == ')') {
++				paren--;
++				if (paren == 0) break;
++			}
++			q++;
++		}
++		if (q >= (int)in_size) { i++; continue; }
++		close_pos = (size_t)q;
++
++		/* Try to read: <num>[%] [op <num>[%] [op <num>[%]]] */
++		p = macsurf__cc_skip_ws(out, q, p);
++		ok = macsurf__cc_read_number(out, q, &p, &a);
++		if (!ok) { i = close_pos + 1; continue; }
++		p = macsurf__cc_skip_ws(out, q, p);
++		if (p < q && out[p] == '%') { has_pct = true; result_is_pct = true; p++; }
++		p = macsurf__cc_skip_ws(out, q, p);
++
++		if (p >= q) {
++			/* calc(num) or calc(num%) - already simple, skip. */
++			i = close_pos + 1;
++			continue;
++		}
++
++		if (out[p] == '*' || out[p] == '/') {
++			op1 = out[p];
++			p++;
++			p = macsurf__cc_skip_ws(out, q, p);
++			ok = macsurf__cc_read_number(out, q, &p, &b);
++			if (!ok) { i = close_pos + 1; continue; }
++			p = macsurf__cc_skip_ws(out, q, p);
++			if (p < q && out[p] == '%') {
++				has_pct = true;
++				result_is_pct = true;
++				p++;
++			}
++			p = macsurf__cc_skip_ws(out, q, p);
++		} else {
++			i = close_pos + 1;
++			continue;
++		}
++
++		if (p < q && (out[p] == '*' || out[p] == '/')) {
++			op2 = out[p];
++			p++;
++			p = macsurf__cc_skip_ws(out, q, p);
++			ok = macsurf__cc_read_number(out, q, &p, &c);
++			if (!ok) { i = close_pos + 1; continue; }
++			p = macsurf__cc_skip_ws(out, q, p);
++			if (p < q && out[p] == '%') {
++				has_pct = true;
++				result_is_pct = true;
++				p++;
++			}
++			p = macsurf__cc_skip_ws(out, q, p);
++		}
++
++		if (p != q) { i = close_pos + 1; continue; }
++		(void)has_pct;
++
++		/* Compute. */
++		result = a;
++		if (op1 == '*') result = result * b;
++		else if (op1 == '/') {
++			if (b == 0.0) { i = close_pos + 1; continue; }
++			result = result / b;
++		}
++		if (op2 == '*') result = result * c;
++		else if (op2 == '/') {
++			if (c == 0.0) { i = close_pos + 1; continue; }
++			result = result / c;
++		}
++
++		rlen = (size_t)sprintf(rep, result_is_pct ? "%.4f%%" : "%.4f",
++				result);
++		/* Replace calc(...) [length = close_pos - i + 1] with rep,
++		 * pad remainder with spaces. */
++		{
++			size_t span = close_pos - i + 1;
++			if (rlen > span) {
++				/* Won't fit - leave alone. */
++				i = close_pos + 1;
++				continue;
++			}
++			memcpy(out + i, rep, rlen);
++			memset(out + i + rlen, ' ', span - rlen);
++		}
++		i = close_pos + 1;
++		changed = 1;
++	}
++
++	if (!changed) { free(out); return NULL; }
++	return out;
++}
++
++
++/* fixes364 - emit `-macsurf-hstripe-bg: c1 c2;` for each
++ * `repeating-linear-gradient(to bottom, ...)` encountered.
++ *
++ * Parses the first two distinct hex colors from inside the gradient
++ * call and inserts a new declaration immediately after the source
++ * declaration's terminating semicolon, keeping the property inside the
++ * same rule block. The fixes281 rewriter still runs afterwards and
++ * collapses the original gradient call to `#cccccc`, so the cascade
++ * sees both `background-color: #cccccc` (fallback) and
++ * `-macsurf-hstripe-bg: c1 c2;` (real stripes). The plotter checks the
++ * stripe slot first and paints alternating-row stripes when set.
++ *
++ * Output is to a new buffer because each insert grows the source by
++ * up to ~50 bytes. Worst-case: every 26-byte window holds one match,
++ * so grow budget is (in_size / 26 + 1) × 50 + 256 padding.
++ *
++ * Only matches `repeating-linear-gradient(` with `to bottom` (the
++ * Platinum pattern). Other directions (to right, diagonal) fall
++ * through to the fixes281 solid-colour collapse. */
++static char *
++macsurf__rewrite_repeating_gradient_hstripe(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char NEEDLE[] = "repeating-linear-gradient(";
++	static const size_t NEEDLE_LEN = 26;
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	cap = in_size + (in_size / NEEDLE_LEN + 1) * 64 + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		bool match;
++		size_t j;
++		int paren;
++		char c1[8];
++		char c2[8];
++		int got_c1 = 0;
++		int got_c2 = 0;
++		bool has_to_bottom = false;
++		size_t scan;
++		size_t decl_end;
++
++		/* Case-insensitive prefix match. */
++		match = false;
++		if (i + NEEDLE_LEN <= in_size) {
++			size_t k;
++			match = true;
++			for (k = 0; k < NEEDLE_LEN; k++) {
++				char a = data[i + k];
++				char b = NEEDLE[k];
++				if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++				if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++				if (a != b) { match = false; break; }
++			}
++		}
++		if (!match) {
++			out[pos++] = data[i++];
++			continue;
++		}
++
++		/* Find balanced close paren. */
++		j = i + NEEDLE_LEN;
++		paren = 1;
++		while (j < in_size && paren > 0) {
++			if (data[j] == '(') paren++;
++			else if (data[j] == ')') {
++				paren--;
++				if (paren == 0) break;
++			}
++			j++;
++		}
++		if (j >= in_size) {
++			out[pos++] = data[i++];
++			continue;
++		}
++
++		/* Scan inside for `to bottom` and first 2 distinct hex colors. */
++		for (scan = i + NEEDLE_LEN; scan < j; scan++) {
++			if (!has_to_bottom && scan + 9 <= j) {
++				if ((data[scan] == 't' || data[scan] == 'T') &&
++				    (data[scan + 1] == 'o' || data[scan + 1] == 'O') &&
++				    data[scan + 2] == ' ' &&
++				    (data[scan + 3] == 'b' || data[scan + 3] == 'B')) {
++					has_to_bottom = true;
++				}
++			}
++			if (data[scan] == '#' && got_c2 == 0) {
++				size_t hex_len = 0;
++				size_t m;
++				for (m = scan + 1;
++				     m < j && hex_len < 6 &&
++				     ((data[m] >= '0' && data[m] <= '9') ||
++				      (data[m] >= 'a' && data[m] <= 'f') ||
++				      (data[m] >= 'A' && data[m] <= 'F'));
++				     m++) {
++					hex_len++;
++				}
++				if (hex_len == 3 || hex_len == 6) {
++					char buf[8];
++					int b;
++					if (hex_len == 6) {
++						for (b = 0; b < 7; b++) {
++							buf[b] = data[scan + b];
++						}
++						buf[7] = 0;
++					} else {
++						/* Expand #abc -> #aabbcc. */
++						buf[0] = '#';
++						buf[1] = data[scan + 1];
++						buf[2] = data[scan + 1];
++						buf[3] = data[scan + 2];
++						buf[4] = data[scan + 2];
++						buf[5] = data[scan + 3];
++						buf[6] = data[scan + 3];
++						buf[7] = 0;
++					}
++					if (!got_c1) {
++						memcpy(c1, buf, 8);
++						got_c1 = 1;
++					} else {
++						/* Compare case-insensitively. */
++						int diff = 0;
++						int k;
++						for (k = 1; k < 7; k++) {
++							char a = buf[k];
++							char b = c1[k];
++							if (a >= 'A' && a <= 'Z')
++								a = (char)(a - 'A' + 'a');
++							if (b >= 'A' && b <= 'Z')
++								b = (char)(b - 'A' + 'a');
++							if (a != b) { diff = 1; break; }
++						}
++						if (diff) {
++							memcpy(c2, buf, 8);
++							got_c2 = 1;
++						}
++					}
++					scan += hex_len; /* skip past hex digits */
++				}
++			}
++		}
++
++		/* Copy through close paren. */
++		if (pos + (j - i + 1) >= cap) {
++			free(out);
++			return NULL;
++		}
++		memcpy(out + pos, data + i, j - i + 1);
++		pos += j - i + 1;
++		i = j + 1;
++
++		/* Walk to declaration terminator (`;` or `}`). */
++		decl_end = i;
++		while (decl_end < in_size && data[decl_end] != ';' &&
++				data[decl_end] != '}') {
++			decl_end++;
++		}
++
++		/* Copy up to and INCLUDING the terminator. */
++		if (decl_end < in_size) {
++			if (pos + (decl_end - i + 1) >= cap) {
++				free(out);
++				return NULL;
++			}
++			memcpy(out + pos, data + i, decl_end - i + 1);
++			pos += decl_end - i + 1;
++			i = decl_end + 1;
++		}
++
++		/* Insert hstripe declaration only when we have a `to bottom`
++		 * direction AND two distinct colors. */
++		if (has_to_bottom && got_c1 && got_c2) {
++			static const char PFX[] = " -macsurf-hstripe-bg:";
++			static const size_t PFX_LEN = 21;
++			if (pos + PFX_LEN + 8 + 1 + 7 + 1 >= cap) {
++				free(out);
++				return NULL;
++			}
++			memcpy(out + pos, PFX, PFX_LEN);
++			pos += PFX_LEN;
++			memcpy(out + pos, c1, 7);
++			pos += 7;
++			out[pos++] = ' ';
++			memcpy(out + pos, c2, 7);
++			pos += 7;
++			out[pos++] = ';';
++			changed = 1;
++			macsurf_debug_log_writef("cssh: hstripe matched c1=%s c2=%s",
++				c1, c2);
++		}
++	}
++
++	*out_size_p = pos;
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
++
++/* fixes365c - emit `-macsurf-dotgrid: c1 c2;` for mactrove's two-layer
++ * 1px-stripe + 2x2 background-size pattern.
++ *
++ * mactrove's body texture is built from two crossed 1px linear
++ * gradients tiled on a 2px grid:
++ *   background-image:
++ *     linear-gradient(rgba(255,255,255,.5) 1px, transparent 1px),
++ *     linear-gradient(90deg, rgba(0,0,0,.03) 1px, transparent 1px);
++ *   background-size: 2px 2px;
++ *
++ * The single-layer fixes266 rewriter drops the second layer and the
++ * vendor parser can't see the matched-pair shape. This pass walks one
++ * `{ ... }` block at a time, looks for a `background-image:` with two
++ * `linear-gradient(...)` calls AND a `background-size:` whose width
++ * and height tokens both round to 2 (px), pulls one colour from each
++ * gradient, and inserts `-macsurf-dotgrid: c1 c2;` right after the
++ * source declaration's terminating `;`. The plotter then paints
++ * alternating 1px vertical (c1) + horizontal (c2) stripes on a 2x2
++ * grid, reproducing the dot-grid texture.
++ *
++ * Colour extraction handles `rgba(R,G,B,A)`, `rgb(R,G,B)`, and `#hex`
++ * (3 or 6 digits). The alpha channel is ignored - the Mac plotter is
++ * 1-bit transparent, so RGB alone is the visual signal. Out-of-range
++ * sizes (4px tiles, 1px tiles, mismatched W/H) skip the insert.
++ *
++ * Output buffer is fresh (each insert grows the rule). Worst-case
++ * grow: one match per { ... } block, ~80 bytes per insert. */
++static char *
++macsurf__rewrite_dotgrid_pattern(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	char *out;
++	size_t cap;
++	size_t pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	cap = in_size + (in_size / 256 + 1) * 96 + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		size_t brace_open;
++		size_t brace_close;
++		size_t bi_start;
++		size_t bi_end;
++		size_t bi_paren_close;
++		size_t bs_start;
++		size_t bs_end;
++		size_t scan;
++		size_t k;
++		int paren;
++		int gradient_count;
++		bool size_match;
++		bool bi_found;
++		bool bs_found;
++		char c1[8];
++		char c2[8];
++		int got_c1;
++		int got_c2;
++		size_t insert_at;
++		size_t insert_len;
++
++		/* Find next `{`. Copy through it. */
++		brace_open = i;
++		while (brace_open < in_size && data[brace_open] != '{') {
++			brace_open++;
++		}
++		if (brace_open >= in_size) {
++			/* No more rules; copy remainder. */
++			if (pos + (in_size - i) >= cap) {
++				free(out);
++				return NULL;
++			}
++			memcpy(out + pos, data + i, in_size - i);
++			pos += in_size - i;
++			i = in_size;
++			break;
++		}
++		/* Find matching `}`. */
++		brace_close = brace_open + 1;
++		paren = 1;
++		while (brace_close < in_size && paren > 0) {
++			if (data[brace_close] == '{') paren++;
++			else if (data[brace_close] == '}') {
++				paren--;
++				if (paren == 0) break;
++			}
++			brace_close++;
++		}
++		if (brace_close >= in_size) {
++			/* Unbalanced; copy remainder. */
++			if (pos + (in_size - i) >= cap) {
++				free(out);
++				return NULL;
++			}
++			memcpy(out + pos, data + i, in_size - i);
++			pos += in_size - i;
++			i = in_size;
++			break;
++		}
++
++		/* Scan inside [brace_open+1 .. brace_close) for the pattern. */
++		bi_found = false;
++		bs_found = false;
++		size_match = false;
++		gradient_count = 0;
++		got_c1 = 0;
++		got_c2 = 0;
++		bi_start = 0;
++		bi_end = 0;
++		bi_paren_close = 0;
++		bs_start = 0;
++		bs_end = 0;
++
++		/* Pass 1: find `background-image:` value start/end. */
++		{
++			static const char BI[] = "background-image:";
++			static const size_t BI_LEN = 17;
++			scan = brace_open + 1;
++			while (scan + BI_LEN <= brace_close) {
++				bool m = true;
++				for (k = 0; k < BI_LEN; k++) {
++					char a = data[scan + k];
++					char b = BI[k];
++					if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++					if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++					if (a != b) { m = false; break; }
++				}
++				if (m) {
++					/* Confirm preceding char is `;`, `{`, or
++					 * whitespace so we don't match inside a
++					 * longhand like `-foo-background-image:`. */
++					if (scan == brace_open + 1) {
++						bi_found = true;
++					} else {
++						char p = data[scan - 1];
++						if (p == ';' || p == '{' || p == ' ' ||
++								p == '\t' || p == '\n' ||
++								p == '\r') {
++							bi_found = true;
++						}
++					}
++					if (bi_found) {
++						bi_start = scan;
++						bi_end = scan + BI_LEN;
++						while (bi_end < brace_close &&
++								data[bi_end] != ';' &&
++								data[bi_end] != '}') {
++							bi_end++;
++						}
++						break;
++					}
++				}
++				scan++;
++			}
++		}
++
++		/* Pass 2: find `background-size:` and check 2x2. */
++		if (bi_found) {
++			static const char BS[] = "background-size:";
++			static const size_t BS_LEN = 16;
++			scan = brace_open + 1;
++			while (scan + BS_LEN <= brace_close) {
++				bool m = true;
++				for (k = 0; k < BS_LEN; k++) {
++					char a = data[scan + k];
++					char b = BS[k];
++					if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++					if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++					if (a != b) { m = false; break; }
++				}
++				if (m) {
++					bool ok_pref = false;
++					if (scan == brace_open + 1) {
++						ok_pref = true;
++					} else {
++						char p = data[scan - 1];
++						if (p == ';' || p == '{' || p == ' ' ||
++								p == '\t' || p == '\n' ||
++								p == '\r') {
++							ok_pref = true;
++						}
++					}
++					if (ok_pref) {
++						bs_found = true;
++						bs_start = scan + BS_LEN;
++						bs_end = bs_start;
++						while (bs_end < brace_close &&
++								data[bs_end] != ';' &&
++								data[bs_end] != '}') {
++							bs_end++;
++						}
++						break;
++					}
++				}
++				scan++;
++			}
++		}
++
++		/* Confirm size is 2x2 (or matched 2-px). */
++		if (bs_found) {
++			int v_w = -1;
++			int v_h = -1;
++			int *cur = &v_w;
++			int accum = -1;
++			bool in_num = false;
++			size_t s;
++			for (s = bs_start; s <= bs_end; s++) {
++				char ch = (s < bs_end) ? data[s] : ' ';
++				if (ch >= '0' && ch <= '9') {
++					if (!in_num) { accum = 0; in_num = true; }
++					accum = accum * 10 + (ch - '0');
++				} else {
++					if (in_num) {
++						if (cur == &v_w && v_w == -1) {
++							v_w = accum;
++						} else if (cur == &v_h && v_h == -1) {
++							v_h = accum;
++						}
++						in_num = false;
++						accum = -1;
++						if (v_w != -1 && v_h == -1) {
++							cur = &v_h;
++						}
++					}
++				}
++			}
++			if (v_w == 2 && v_h == 2) {
++				size_match = true;
++			} else if (v_w == 2 && v_h == -1) {
++				/* Single-value form: applies to both axes. */
++				size_match = true;
++			}
++		}
++
++		/* Pass 3: count `linear-gradient(` in the bg-image value and
++		 * extract the first colour from each of the first two layers. */
++		if (bi_found && size_match) {
++			static const char LG[] = "linear-gradient(";
++			static const size_t LG_LEN = 16;
++			size_t layer_close;
++			scan = bi_end;
++			(void)scan; /* keep scope */
++			bi_paren_close = bi_end;
++			scan = bi_start;
++			while (scan + LG_LEN <= bi_end) {
++				bool m = true;
++				for (k = 0; k < LG_LEN; k++) {
++					char a = data[scan + k];
++					char b = LG[k];
++					if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++					if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++					if (a != b) { m = false; break; }
++				}
++				if (!m) {
++					scan++;
++					continue;
++				}
++				/* Balanced paren walk. */
++				layer_close = scan + LG_LEN;
++				paren = 1;
++				while (layer_close < bi_end && paren > 0) {
++					if (data[layer_close] == '(') paren++;
++					else if (data[layer_close] == ')') {
++						paren--;
++						if (paren == 0) break;
++					}
++					layer_close++;
++				}
++				if (layer_close >= bi_end) break;
++				gradient_count++;
++
++				/* Extract first colour token inside this layer. */
++				if (gradient_count <= 2) {
++					size_t cs;
++					char buf[8];
++					bool got = false;
++					for (cs = scan + LG_LEN;
++							cs < layer_close && !got; cs++) {
++						/* `#hex` */
++						if (data[cs] == '#') {
++							size_t hex_len = 0;
++							size_t m2;
++							for (m2 = cs + 1;
++									m2 < layer_close &&
++									hex_len < 6 &&
++									((data[m2] >= '0' && data[m2] <= '9') ||
++									 (data[m2] >= 'a' && data[m2] <= 'f') ||
++									 (data[m2] >= 'A' && data[m2] <= 'F'));
++									m2++) {
++								hex_len++;
++							}
++							if (hex_len == 3) {
++								buf[0] = '#';
++								buf[1] = data[cs + 1];
++								buf[2] = data[cs + 1];
++								buf[3] = data[cs + 2];
++								buf[4] = data[cs + 2];
++								buf[5] = data[cs + 3];
++								buf[6] = data[cs + 3];
++								buf[7] = 0;
++								got = true;
++							} else if (hex_len == 6) {
++								int b2;
++								for (b2 = 0; b2 < 7; b2++) {
++									buf[b2] = data[cs + b2];
++								}
++								buf[7] = 0;
++								got = true;
++							}
++						}
++						/* `rgb(R,G,B)` / `rgba(R,G,B,A)` */
++						else if ((data[cs] == 'r' || data[cs] == 'R') &&
++								cs + 4 <= layer_close &&
++								(data[cs + 1] == 'g' || data[cs + 1] == 'G') &&
++								(data[cs + 2] == 'b' || data[cs + 2] == 'B')) {
++							size_t op;
++							int rgb[3];
++							int idx = 0;
++							int val = -1;
++							bool in_n = false;
++							/* Find `(` then parse up to 3 ints. */
++							op = cs + 3;
++							if (data[op] == 'a' || data[op] == 'A') op++;
++							if (op < layer_close && data[op] == '(') {
++								size_t cp = op + 1;
++								rgb[0] = 0; rgb[1] = 0; rgb[2] = 0;
++								while (cp < layer_close && idx < 3) {
++									char ch2 = data[cp];
++									if (ch2 >= '0' && ch2 <= '9') {
++										if (!in_n) { val = 0; in_n = true; }
++										val = val * 10 + (ch2 - '0');
++									} else {
++										if (in_n) {
++											if (val > 255) val = 255;
++											rgb[idx++] = val;
++											in_n = false;
++											val = -1;
++										}
++										if (ch2 == ')') break;
++									}
++									cp++;
++								}
++								if (idx >= 3) {
++									static const char H[] = "0123456789abcdef";
++									buf[0] = '#';
++									buf[1] = H[(rgb[0] >> 4) & 0xf];
++									buf[2] = H[rgb[0] & 0xf];
++									buf[3] = H[(rgb[1] >> 4) & 0xf];
++									buf[4] = H[rgb[1] & 0xf];
++									buf[5] = H[(rgb[2] >> 4) & 0xf];
++									buf[6] = H[rgb[2] & 0xf];
++									buf[7] = 0;
++									got = true;
++								}
++							}
++						}
++					}
++					if (got) {
++						if (gradient_count == 1) {
++							memcpy(c1, buf, 8);
++							got_c1 = 1;
++						} else {
++							memcpy(c2, buf, 8);
++							got_c2 = 1;
++						}
++					}
++				}
++				scan = layer_close + 1;
++			}
++			bi_paren_close = bi_end;
++		}
++
++		/* Copy through the brace block, inserting the dotgrid decl
++		 * right after `bi_end` (the `;` terminator) if the pattern
++		 * matched. */
++		if (bi_found && size_match && gradient_count == 2 &&
++				got_c1 && got_c2) {
++			/* Insert just after bi_end's terminator. If bi_end is at
++			 * a `;`, insert after it; if it stopped at `}`, insert
++			 * before the `}` with a leading `;`. */
++			insert_at = bi_end;
++			if (insert_at < brace_close && data[insert_at] == ';') {
++				insert_at++;
++			}
++			insert_len = (brace_close + 1) - i;
++			if (pos + insert_len + 96 >= cap) {
++				free(out);
++				return NULL;
++			}
++			/* Copy from i .. insert_at. */
++			memcpy(out + pos, data + i, insert_at - i);
++			pos += insert_at - i;
++			/* Insert the new declaration. */
++			{
++				static const char PFX[] = " -macsurf-dotgrid:";
++				static const size_t PFX_LEN = 18;
++				memcpy(out + pos, PFX, PFX_LEN);
++				pos += PFX_LEN;
++				out[pos++] = ' ';
++				memcpy(out + pos, c1, 7);
++				pos += 7;
++				out[pos++] = ' ';
++				memcpy(out + pos, c2, 7);
++				pos += 7;
++				out[pos++] = ';';
++			}
++			/* Copy remainder of the rule (insert_at .. brace_close]. */
++			memcpy(out + pos, data + insert_at,
++					(brace_close + 1) - insert_at);
++			pos += (brace_close + 1) - insert_at;
++			i = brace_close + 1;
++			changed = 1;
++			macsurf_debug_log_writef("cssh: dotgrid matched c1=%s c2=%s",
++				c1, c2);
++		} else {
++			/* No match - copy block verbatim. */
++			insert_len = (brace_close + 1) - i;
++			if (pos + insert_len >= cap) {
++				free(out);
++				return NULL;
++			}
++			memcpy(out + pos, data + i, insert_len);
++			pos += insert_len;
++			i = brace_close + 1;
++		}
++	}
++
++	*out_size_p = pos;
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
++
++/* fixes281 - fallback solid color for repeating-linear-gradient.
++ *
++ * mactrove's Platinum theme paints window title bars with
++ *   background: repeating-linear-gradient(to bottom,
++ *                 #ffffff 0, #ffffff 1px,
++ *                 #cccccc 1px, #cccccc 2px, ...);
++ * to get a horizontal 1-px-stripe pattern. fixes185's current handling
++ * is to strip the "repeating-" prefix, leaving a plain linear-gradient
++ * whose first two color stops are barely 1px apart - libcss collapses
++ * that to nearly solid white, and title bars appear empty.
++ *
++ * V1 fix: detect `repeating-linear-gradient(...)` / `repeating-radial-
++ * gradient(...)` (case-insensitive) and replace the entire call with the
++ * platinum window-chrome hex `#cccccc`. fixes363 - was `#dddddd` but
++ * that exactly matches `--platinum-bg`, making striped title bars
++ * disappear into the page background. `#cccccc` (the platinum chrome
++ * variable) gives visible contrast against both page bg (#dddddd) and
++ * window body (#eeeeee). In the `background:` shorthand context this
++ * sets background-color, giving title bars a visible solid backdrop.
++ *
++ * Trade-off: loses the striped texture but matches platinum vocabulary
++ * and is far better than vanishing. A real repeating-gradient plotter
++ * (QuickDraw pattern fill) is a separate round.
++ *
++ * In-place same-size rewrite (pads with trailing spaces). */
++static char *
++macsurf__rewrite_repeating_gradient_solid(const char *data, size_t in_size)
++{
++	char *out;
++	size_t i;
++	int changed = 0;
++
++	out = (char *)malloc(in_size);
++	if (out == NULL) return NULL;
++	memcpy(out, data, in_size);
++
++	i = 0;
++	while (i + 26 < in_size) {
++		const char *p = out + i;
++		bool match_lin = false;
++		bool match_rad = false;
++		size_t j;
++		size_t span;
++		int paren;
++		static const char LIN[] = "repeating-linear-gradient(";
++		static const char RAD[] = "repeating-radial-gradient(";
++		static const size_t REPL_LEN = 7; /* "#cccccc" */
++
++		/* Case-insensitive match for both. */
++		{
++			size_t m;
++			match_lin = true;
++			for (m = 0; m < 26; m++) {
++				char a = p[m];
++				char b = LIN[m];
++				if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++				if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++				if (a != b) { match_lin = false; break; }
++			}
++			if (!match_lin) {
++				match_rad = true;
++				for (m = 0; m < 26; m++) {
++					char a = p[m];
++					char b = RAD[m];
++					if (a >= 'A' && a <= 'Z')
++						a = (char)(a - 'A' + 'a');
++					if (b >= 'A' && b <= 'Z')
++						b = (char)(b - 'A' + 'a');
++					if (a != b) {
++						match_rad = false;
++						break;
++					}
++				}
++			}
++		}
++		if (!match_lin && !match_rad) {
++			i++;
++			continue;
++		}
++
++		/* Find matching close paren. */
++		j = i + 26;
++		paren = 1;
++		while (j < in_size && paren > 0) {
++			if (out[j] == '(') paren++;
++			else if (out[j] == ')') {
++				paren--;
++				if (paren == 0) break;
++			}
++			j++;
++		}
++		if (j >= in_size) { i++; continue; }
++
++		span = j - i + 1;
++		if (span < REPL_LEN) { i = j + 1; continue; }
++
++		/* Replace with #cccccc + spaces. (fixes363) */
++		memcpy(out + i, "#cccccc", REPL_LEN);
++		memset(out + i + REPL_LEN, ' ', span - REPL_LEN);
++		i = j + 1;
++		changed = 1;
++	}
++
++	if (!changed) { free(out); return NULL; }
++	return out;
++}
++
++
++/* fixes185 - modern-CSS compatibility preprocessor. Rewrites unsupported
++ * modern syntax into supported equivalents (or drops it) so author CSS
++ * keeps cascading instead of having rules silently dropped by libcss.
++ * In-place rewrites only (length-preserving): no new property names,
++ * no libcss internal changes. Mirrors the fixes175 text-shadow / fixes183
++ * transform preprocessor pattern.
++ *
++ * Rewrites:
++ *  - `:focus-visible` -> `:focus        ` (8 trailing spaces; same length)
++ *  - `:focus-within`  -> `:focus       ` (7 trailing spaces; same length)
++ *  - declarations dropped (name+value replaced with spaces, terminator kept):
++ *    -webkit-line-clamp, line-clamp,
++ *    font-variant-numeric, break-inside, outline-offset
++ *    (#256: image-rendering un-dropped -- it now parses/stores in libcss;
++ *     no consumer reads css_computed_image_rendering so behaviour is
++ *     unchanged, the plotter stays nearest-neighbor/box-filter.)
++ *  - `repeating-linear-gradient(` -> `          linear-gradient(`
++ *    (10 leading spaces; first cycle still renders via fixes49)
++ *  - `repeating-radial-gradient(` -> `          radial-gradient(`
++ */
++static char *
++macsurf__rewrite_modern_compat(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const DROP_PROPS[] = {
++		"-webkit-line-clamp",
++		"line-clamp",
++		"font-variant-numeric",
++		"break-inside",
++		"outline-offset",
++		/* fixes191f -- transition/animation/keyframes-triggered props
++		 * silently dropped. MacSurf has no animation timer playback in
++		 * this round; the final static computed value still applies via
++		 * the regular cascade. The shorthand and all longhands need to
++		 * drop together so the value isn't a stray ident the parser
++		 * trips on. */
++		"transition",
++		"transition-property",
++		"transition-duration",
++		"transition-timing-function",
++		"transition-delay",
++		"animation",
++		"animation-name",
++		"animation-duration",
++		"animation-timing-function",
++		"animation-delay",
++		"animation-iteration-count",
++		"animation-direction",
++		"animation-fill-mode",
++		"animation-play-state",
++		/* fixes201 -- pointer-events PROMOTED out of the drop list.
++		 * libcss now has a real CSS_PROP_POINTER_EVENTS with parser
++		 * + selector + accessor wiring; the cascade respects the
++		 * declaration and the hit-test path in box_at_point honours
++		 * `pointer-events: none`. fixes191e's "drop" entry is gone. */
++		/* fixes191f -- user-select / overscroll-behavior etc. are
++		 * silently dropped. MacSurf has no native equivalent for
++		 * these; pages render fine without them. */
++		"user-select",
++		"-webkit-user-select",
++		"-moz-user-select",
++		"overscroll-behavior",
++		"overscroll-behavior-x",
++		"overscroll-behavior-y",
++		"-webkit-overflow-scrolling",
++		"-webkit-font-smoothing",
++		"-moz-osx-font-smoothing",
++		"-webkit-tap-highlight-color",
++		"-webkit-box-orient",
++		"will-change",
++		"contain",
++		"content-visibility",
++		"scroll-margin-top",
++		"scroll-margin-bottom",
++		"scroll-margin-left",
++		"scroll-margin-right",
++		"scroll-margin",
++		"scroll-padding",
++		"scroll-snap-type",
++		"scroll-snap-align",
++		"font-display"
++	};
++	static const size_t N_DROP_PROPS =
++			sizeof(DROP_PROPS) / sizeof(DROP_PROPS[0]);
++	static const char REPEAT_LIN_FROM[] = "repeating-linear-gradient(";
++	static const char REPEAT_LIN_TO[]   = "          linear-gradient(";
++	static const char REPEAT_RAD_FROM[] = "repeating-radial-gradient(";
++	static const char REPEAT_RAD_TO[]   = "          radial-gradient(";
++	static const size_t REPEAT_LEN = 26;
++	static const char FV[] = ":focus-visible";
++	static const char FV_REP[] = ":focus        ";
++	static const size_t FV_LEN = 14;
++	static const char FW[] = ":focus-within";
++	static const char FW_REP[] = ":focus       ";
++	static const size_t FW_LEN = 13;
++	char *out;
++	size_t i, k;
++	int changed = 0;
++
++	out = (char *)malloc(in_size + 1);
++	if (out == NULL) return NULL;
++	memcpy(out, data, in_size);
++	out[in_size] = '\0';
++
++	/* Pass A - :focus-visible -> :focus + spaces */
++	i = 0;
++	while (i + FV_LEN <= in_size) {
++		size_t m;
++		int match = 1;
++		char next;
++		if (out[i] != ':') { i++; continue; }
++		for (m = 0; m < FV_LEN; m++) {
++			char a = out[i + m];
++			char b = FV[m];
++			if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++			if (a != b) { match = 0; break; }
++		}
++		if (!match) { i++; continue; }
++		next = (i + FV_LEN < in_size) ? out[i + FV_LEN] : '\0';
++		if ((next >= 'a' && next <= 'z') ||
++				(next >= 'A' && next <= 'Z') ||
++				(next >= '0' && next <= '9') ||
++				next == '-' || next == '_') {
++			i++;
++			continue;
++		}
++		memcpy(out + i, FV_REP, FV_LEN);
++		changed = 1;
++		i += FV_LEN;
++	}
++
++	/* Pass B - :focus-within -> :focus + spaces */
++	i = 0;
++	while (i + FW_LEN <= in_size) {
++		size_t m;
++		int match = 1;
++		char next;
++		if (out[i] != ':') { i++; continue; }
++		for (m = 0; m < FW_LEN; m++) {
++			char a = out[i + m];
++			char b = FW[m];
++			if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++			if (a != b) { match = 0; break; }
++		}
++		if (!match) { i++; continue; }
++		next = (i + FW_LEN < in_size) ? out[i + FW_LEN] : '\0';
++		if ((next >= 'a' && next <= 'z') ||
++				(next >= 'A' && next <= 'Z') ||
++				(next >= '0' && next <= '9') ||
++				next == '-' || next == '_') {
++			i++;
++			continue;
++		}
++		memcpy(out + i, FW_REP, FW_LEN);
++		changed = 1;
++		i += FW_LEN;
++	}
++
++	/* Pass C - declaration drops: replace `name<ws>:<value>` with spaces,
++	 * keeping the terminator (`;` or `}`) intact. */
++	for (k = 0; k < N_DROP_PROPS; k++) {
++		const char *name = DROP_PROPS[k];
++		size_t nlen = strlen(name);
++		i = 0;
++		while (i < in_size) {
++			size_t j;
++			size_t end;
++			size_t p;
++			if (!macsurf__match_prop_name(out, in_size, i,
++					name, nlen)) {
++				i++;
++				continue;
++			}
++			j = i + nlen;
++			while (j < in_size && (out[j] == ' ' ||
++					out[j] == '\t' ||
++					out[j] == '\n' ||
++					out[j] == '\r')) j++;
++			if (j >= in_size || out[j] != ':') {
++				i++;
++				continue;
++			}
++			end = j + 1;
++			while (end < in_size && out[end] != ';' &&
++					out[end] != '}') end++;
++			for (p = i; p < end; p++) {
++				if (out[p] != '\n' && out[p] != '\r') {
++					out[p] = ' ';
++				}
++			}
++			changed = 1;
++			i = end;
++		}
++	}
++
++	/* Pass D - repeating-*-gradient( -> linear-/radial-gradient( with
++	 * leading whitespace pad. Left word-boundary check identical to
++	 * macsurf__match_prop_name. */
++	i = 0;
++	while (i + REPEAT_LEN <= in_size) {
++		int hit_lin;
++		int hit_rad;
++		size_t m;
++		char prev;
++		hit_lin = 1;
++		hit_rad = 1;
++		for (m = 0; m < REPEAT_LEN; m++) {
++			char a = out[i + m];
++			char bl = REPEAT_LIN_FROM[m];
++			char br = REPEAT_RAD_FROM[m];
++			if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
++			if (a != bl) hit_lin = 0;
++			if (a != br) hit_rad = 0;
++			if (!hit_lin && !hit_rad) break;
++		}
++		if (!hit_lin && !hit_rad) { i++; continue; }
++		if (i > 0) {
++			prev = out[i - 1];
++			if ((prev >= 'a' && prev <= 'z') ||
++					(prev >= 'A' && prev <= 'Z') ||
++					(prev >= '0' && prev <= '9') ||
++					prev == '-' || prev == '_') {
++				i++;
++				continue;
++			}
++		}
++		if (hit_lin) {
++			memcpy(out + i, REPEAT_LIN_TO, REPEAT_LEN);
++		} else {
++			memcpy(out + i, REPEAT_RAD_TO, REPEAT_LEN);
++		}
++		changed = 1;
++		i += REPEAT_LEN;
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	*out_size_p = in_size;
++	return out;
++}
++
++
++/* fixes191a - inset shorthand expander.
++ *
++ * Rewrite `inset: A [B [C [D]]]` declarations to the four longhands
++ * `top:A; right:B; bottom:C; left:D` per CSS Logical Properties.
++ * Expansion table:
++ *   inset: A;         -> top:A; right:A; bottom:A; left:A;
++ *   inset: A B;       -> top:A; right:B; bottom:A; left:B;
++ *   inset: A B C;     -> top:A; right:B; bottom:C; left:B;
++ *   inset: A B C D;   -> top:A; right:B; bottom:C; left:D;
++ * Values: length, percentage, auto, calc(), var() (tokens kept verbatim).
++ * `!important` on the shorthand is propagated to all four longhands.
++ *
++ * Output grows (longest case ~5x: "inset:0" -> 36 chars). Allocates a
++ * fresh buffer; returns NULL on no-op.
++ *
++ * Word-boundary safe via macsurf__match_prop_name: only triggers on
++ * property-position "inset", never on `border-style: inset` or
++ * `box-shadow: inset ...`. */
++static char *
++macsurf__rewrite_inset(const char *data, size_t in_size, size_t *out_size_p)
++{
++	static const char NAME[] = "inset";
++	static const size_t NAME_LEN = 5;
++	char *out;
++	size_t cap;
++	size_t out_pos;
++	size_t i;
++	int changed = 0;
++
++	cap = in_size + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++	out_pos = 0;
++	i = 0;
++
++	while (i < in_size) {
++		size_t name_end;
++		size_t val_start;
++		size_t val_end;
++		const char *toks[4];
++		size_t tlens[4];
++		int ntok;
++		int important;
++		size_t scan;
++		size_t expanded_max;
++		const char *part_v[4];
++		size_t part_l[4];
++		static const char *const FIELDS[4] = {
++			"top:", "right:", "bottom:", "left:"
++		};
++		static const size_t FIELD_LENS[4] = {4, 6, 7, 5};
++		int k;
++
++		/* Copy CSS comments verbatim -- an "inset" written inside a
++		 * comment must not be treated as a property; otherwise the
++		 * value scan runs past the comment close and eats the following
++		 * rule (fixes801g, same class as the shorthand expander fix). */
++		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
++			if (out_pos + 2 >= cap) goto grow_fail;
++			out[out_pos++] = data[i++];
++			out[out_pos++] = data[i++];
++			while (i < in_size) {
++				if (out_pos + 1 >= cap) goto grow_fail;
++				out[out_pos++] = data[i];
++				if (data[i] == '*' && i + 1 < in_size &&
++						data[i + 1] == '/') {
++					i++;
++					if (out_pos + 1 >= cap) goto grow_fail;
++					out[out_pos++] = data[i++];
++					break;
++				}
++				i++;
++			}
++			continue;
++		}
++
++		if (!macsurf__match_prop_name(data, in_size, i,
++				NAME, NAME_LEN)) {
++			if (out_pos + 1 >= cap) goto grow_fail;
++			out[out_pos++] = data[i++];
++			continue;
++		}
++		name_end = i + NAME_LEN;
++		while (name_end < in_size && (data[name_end] == ' ' ||
++				data[name_end] == '\t' ||
++				data[name_end] == '\n' ||
++				data[name_end] == '\r')) name_end++;
++		if (name_end >= in_size || data[name_end] != ':') {
++			if (out_pos + 1 >= cap) goto grow_fail;
++			out[out_pos++] = data[i++];
++			continue;
++		}
++		val_start = name_end + 1;
++		val_end = val_start;
++		while (val_end < in_size && data[val_end] != ';' &&
++				data[val_end] != '}') val_end++;
++
++		/* Tokenise value into up to 4 components.
++		 * Whitespace splits; balanced () groups are one token. */
++		ntok = 0;
++		important = 0;
++		scan = val_start;
++		while (scan < val_end && ntok < 4) {
++			size_t tok_start;
++			while (scan < val_end && (data[scan] == ' ' ||
++					data[scan] == '\t' ||
++					data[scan] == '\n' ||
++					data[scan] == '\r')) scan++;
++			if (scan >= val_end) break;
++			tok_start = scan;
++			if (data[scan] == '!') {
++				/* !important suffix -- stop tokenising. */
++				important = 1;
++				scan = val_end;
++				break;
++			}
++			while (scan < val_end && data[scan] != ' ' &&
++					data[scan] != '\t' &&
++					data[scan] != '\n' &&
++					data[scan] != '\r') {
++				if (data[scan] == '(') {
++					int depth = 1;
++					scan++;
++					while (scan < val_end && depth > 0) {
++						if (data[scan] == '(') depth++;
++						else if (data[scan] == ')') depth--;
++						scan++;
++					}
++				} else {
++					scan++;
++				}
++			}
++			toks[ntok] = data + tok_start;
++			tlens[ntok] = scan - tok_start;
++			ntok++;
++		}
++
++		if (ntok < 1 || ntok > 4) {
++			/* Malformed value -- pass through unchanged. */
++			while (i < val_end) {
++				if (out_pos + 1 >= cap) goto grow_fail;
++				out[out_pos++] = data[i++];
++			}
++			continue;
++		}
++
++		/* Expand to TRBL per CSS shorthand rules. */
++		switch (ntok) {
++		case 1:
++			part_v[0] = part_v[1] = part_v[2] = part_v[3] = toks[0];
++			part_l[0] = part_l[1] = part_l[2] = part_l[3] = tlens[0];
++			break;
++		case 2:
++			part_v[0] = toks[0]; part_l[0] = tlens[0];
++			part_v[1] = toks[1]; part_l[1] = tlens[1];
++			part_v[2] = toks[0]; part_l[2] = tlens[0];
++			part_v[3] = toks[1]; part_l[3] = tlens[1];
++			break;
++		case 3:
++			part_v[0] = toks[0]; part_l[0] = tlens[0];
++			part_v[1] = toks[1]; part_l[1] = tlens[1];
++			part_v[2] = toks[2]; part_l[2] = tlens[2];
++			part_v[3] = toks[1]; part_l[3] = tlens[1];
++			break;
++		default:
++			part_v[0] = toks[0]; part_l[0] = tlens[0];
++			part_v[1] = toks[1]; part_l[1] = tlens[1];
++			part_v[2] = toks[2]; part_l[2] = tlens[2];
++			part_v[3] = toks[3]; part_l[3] = tlens[3];
++			break;
++		}
++
++		/* Grow if needed: 4 fields, each "name:value [!important];" */
++		expanded_max = 0;
++		for (k = 0; k < 4; k++) {
++			expanded_max += FIELD_LENS[k] + part_l[k] +
++				(important ? 11 : 0) + 2;
++		}
++		while (out_pos + expanded_max + 8 >= cap) {
++			char *grown;
++			size_t newcap = cap * 2 + 256;
++			grown = (char *)realloc(out, newcap);
++			if (grown == NULL) goto grow_fail;
++			out = grown;
++			cap = newcap;
++		}
++
++		for (k = 0; k < 4; k++) {
++			memcpy(out + out_pos, FIELDS[k], FIELD_LENS[k]);
++			out_pos += FIELD_LENS[k];
++			memcpy(out + out_pos, part_v[k], part_l[k]);
++			out_pos += part_l[k];
++			if (important) {
++				memcpy(out + out_pos, " !important", 11);
++				out_pos += 11;
++			}
++			if (k < 3) {
++				out[out_pos++] = ';';
++			}
++		}
++		changed = 1;
++		i = val_end;  /* keep terminator (; or }) for caller. */
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	*out_size_p = out_pos;
++	return out;
++
++grow_fail:
++	free(out);
++	return NULL;
++}
++
++
++/* #247 phase 2 - 2-value logical shorthand expander.
++ *
++ * Expands the inline/block-axis 2-value logical shorthands to their
++ * physical longhands (horizontal-tb / LTR):
++ *   margin-inline:  A [B]  -> margin-left:A;  margin-right:B;
++ *   margin-block:   A [B]  -> margin-top:A;   margin-bottom:B;
++ *   padding-inline: A [B]  -> padding-left:A; padding-right:B;
++ *   padding-block:  A [B]  -> padding-top:A;  padding-bottom:B;
++ *   inset-inline:   A [B]  -> left:A;         right:B;
++ *   inset-block:    A [B]  -> top:A;          bottom:B;
++ * A single value fills both sides -- `margin-inline: auto` -> both auto,
++ * the common horizontal-centering idiom. !important is propagated.
++ *
++ * A ':' is required immediately after the name (modulo whitespace), so it
++ * never fires on the -start/-end longhands (margin-inline-start, ...),
++ * which the alias table handles separately. Values (length / % / auto /
++ * calc() / var()) are copied verbatim; a balanced () group is one token.
++ * Models macsurf__rewrite_inset; pass-through (NULL) on no-op. */
++static char *
++macsurf__rewrite_logical_shorthands(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const struct {
++		const char *name; size_t nlen;
++		const char *fs;   size_t fslen;   /* start-side field, e.g. "margin-left:" */
++		const char *fe;   size_t felen;   /* end-side field,   e.g. "margin-right:" */
++	} PAIRS[] = {
++		{ "margin-inline",  13, "margin-left:",  12, "margin-right:",  13 },
++		{ "margin-block",   12, "margin-top:",   11, "margin-bottom:", 14 },
++		{ "padding-inline", 14, "padding-left:", 13, "padding-right:", 14 },
++		{ "padding-block",  13, "padding-top:",  12, "padding-bottom:",15 },
++		{ "inset-inline",   12, "left:",          5, "right:",          6 },
++		{ "inset-block",    11, "top:",           4, "bottom:",         7 }
++	};
++	char *out;
++	size_t cap;
++	size_t out_pos;
++	size_t i;
++	int changed = 0;
++	int np = (int)(sizeof(PAIRS) / sizeof(PAIRS[0]));
++
++	cap = in_size * 2 + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++	out_pos = 0;
++	i = 0;
++
++	while (i < in_size) {
++		int p;
++		int matched = -1;
++		size_t name_end;
++		size_t val_start;
++		size_t val_end;
++		const char *toks[2];
++		size_t tlens[2];
++		int ntok;
++		int important;
++		size_t scan;
++		const char *va; size_t la;
++		const char *vb; size_t lb;
++		size_t need;
++
++		/* Copy CSS comments verbatim -- a property name inside a
++		 * comment (e.g. a note like "margin-inline: auto centers")
++		 * must NOT be rewritten; doing so would also consume the
++		 * comment's close and the following rule while scanning for a
++		 * value terminator, dropping the whole rule. */
++		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
++			if (out_pos + 2 >= cap) goto grow_fail;
++			out[out_pos++] = data[i++];
++			out[out_pos++] = data[i++];
++			while (i < in_size) {
++				if (out_pos + 1 >= cap) goto grow_fail;
++				out[out_pos++] = data[i];
++				if (data[i] == '*' && i + 1 < in_size &&
++						data[i + 1] == '/') {
++					i++;
++					if (out_pos + 1 >= cap) goto grow_fail;
++					out[out_pos++] = data[i++];
++					break;
++				}
++				i++;
++			}
++			continue;
++		}
++
++		for (p = 0; p < np; p++) {
++			if (macsurf__match_prop_name(data, in_size, i,
++					PAIRS[p].name, PAIRS[p].nlen)) {
++				matched = p;
++				break;
++			}
++		}
++		if (matched < 0) {
++			if (out_pos + 1 >= cap) goto grow_fail;
++			out[out_pos++] = data[i++];
++			continue;
++		}
++
++		name_end = i + PAIRS[matched].nlen;
++		while (name_end < in_size && (data[name_end] == ' ' ||
++				data[name_end] == '\t' || data[name_end] == '\n' ||
++				data[name_end] == '\r')) name_end++;
++		if (name_end >= in_size || data[name_end] != ':') {
++			/* not a shorthand here (e.g. margin-inline-start) */
++			if (out_pos + 1 >= cap) goto grow_fail;
++			out[out_pos++] = data[i++];
++			continue;
++		}
++		val_start = name_end + 1;
++		val_end = val_start;
++		while (val_end < in_size && data[val_end] != ';' &&
++				data[val_end] != '}') val_end++;
++
++		/* tokenise up to 2 values; balanced () is one token */
++		ntok = 0;
++		important = 0;
++		scan = val_start;
++		while (scan < val_end && ntok < 2) {
++			size_t tok_start;
++			while (scan < val_end && (data[scan] == ' ' ||
++					data[scan] == '\t' || data[scan] == '\n' ||
++					data[scan] == '\r')) scan++;
++			if (scan >= val_end) break;
++			if (data[scan] == '!') {
++				important = 1;
++				scan = val_end;
++				break;
++			}
++			tok_start = scan;
++			while (scan < val_end && data[scan] != ' ' &&
++					data[scan] != '\t' && data[scan] != '\n' &&
++					data[scan] != '\r') {
++				if (data[scan] == '(') {
++					int depth = 1;
++					scan++;
++					while (scan < val_end && depth > 0) {
++						if (data[scan] == '(') depth++;
++						else if (data[scan] == ')') depth--;
++						scan++;
++					}
++				} else {
++					scan++;
++				}
++			}
++			toks[ntok] = data + tok_start;
++			tlens[ntok] = scan - tok_start;
++			ntok++;
++		}
++
++		if (ntok < 1) {
++			/* malformed -- pass through unchanged */
++			while (i < val_end) {
++				if (out_pos + 1 >= cap) goto grow_fail;
++				out[out_pos++] = data[i++];
++			}
++			continue;
++		}
++
++		va = toks[0]; la = tlens[0];
++		if (ntok >= 2) { vb = toks[1]; lb = tlens[1]; }
++		else { vb = toks[0]; lb = tlens[0]; }
++
++		need = PAIRS[matched].fslen + la + PAIRS[matched].felen + lb +
++			(important ? 22 : 0) + 8;
++		while (out_pos + need >= cap) {
++			char *grown;
++			size_t newcap = cap * 2 + 256;
++			grown = (char *)realloc(out, newcap);
++			if (grown == NULL) goto grow_fail;
++			out = grown;
++			cap = newcap;
++		}
++
++		/* start side */
++		memcpy(out + out_pos, PAIRS[matched].fs, PAIRS[matched].fslen);
++		out_pos += PAIRS[matched].fslen;
++		memcpy(out + out_pos, va, la);
++		out_pos += la;
++		if (important) {
++			memcpy(out + out_pos, " !important", 11);
++			out_pos += 11;
++		}
++		out[out_pos++] = ';';
++		/* end side */
++		memcpy(out + out_pos, PAIRS[matched].fe, PAIRS[matched].felen);
++		out_pos += PAIRS[matched].felen;
++		memcpy(out + out_pos, vb, lb);
++		out_pos += lb;
++		if (important) {
++			memcpy(out + out_pos, " !important", 11);
++			out_pos += 11;
++		}
++
++		changed = 1;
++		i = val_end;  /* keep terminator (; or }) for caller */
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	*out_size_p = out_pos;
++	return out;
++
++grow_fail:
++	free(out);
++	return NULL;
++}
++
++
++/* fixes273 (Bundle I) - at-rule preprocessor for @supports and @layer.
++ *
++ * libcss in this vintage doesn't parse @supports or @layer rules
++ * natively. Without preprocessing, author CSS that wraps modern
++ * feature-detection or cascade-layer organisation around their rules
++ * loses everything inside the wrapper.
++ *
++ * V1 strategy (zero libcss surgery):
++ *
++ *   @supports ( PROP : VAL ) { INNER }
++ *     -> INNER (assume support, let cascade handle the inner rules;
++ *        any libcss-unsupported declarations drop naturally)
++ *
++ *   @supports not ( PROP : VAL ) { INNER }
++ *     -> (drop entirely; the block was intended for browsers WITHOUT
++ *        the feature, but we DO support most modern properties)
++ *
++ *   @supports ( A ) and ( B ) { INNER } / @supports ( A ) or ( B ) { ... }
++ *     -> INNER (conservative include for complex queries)
++ *
++ *   @layer NAME { INNER }     -> INNER (flatten cascade priority)
++ *   @layer NAME, NAME, ... ;  -> (strip declaration-only form)
++ *
++ * Brace-counting scan to find matching '}'. String / comment / paren
++ * contents are tracked to avoid counting braces inside them. Output
++ * grows when blocks are kept, shrinks when blocks are dropped. */
++static char *
++macsurf__rewrite_at_rules(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	char *out;
++	size_t cap;
++	size_t out_pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	cap = in_size + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		bool is_supports = false;
++		bool is_layer = false;
++		size_t name_len = 0;
++
++		/* Skip CSS comments - without this, `/ * @supports ... * /`
++		 * comment text falsely triggers the preprocessor and orphans
++		 * the comment opening, which libcss then treats as eating the
++		 * rest of the stylesheet. */
++		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
++			size_t k = i + 2;
++			while (k + 1 < in_size) {
++				if (data[k] == '*' && data[k + 1] == '/') {
++					k += 2;
++					break;
++				}
++				k++;
++			}
++			if (k + 1 >= in_size) k = in_size;
++			while (out_pos + (k - i) + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + (k - i) + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, data + i, k - i);
++			out_pos += (k - i);
++			i = k;
++			continue;
++		}
++
++		/* Skip CSS string literals - same reason as comments. */
++		if (data[i] == '"' || data[i] == '\'') {
++			char quote = data[i];
++			size_t k = i + 1;
++			while (k < in_size && data[k] != quote) {
++				if (data[k] == '\\' && k + 1 < in_size) k += 2;
++				else k++;
++			}
++			if (k < in_size) k++;   /* include closing quote */
++			while (out_pos + (k - i) + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + (k - i) + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, data + i, k - i);
++			out_pos += (k - i);
++			i = k;
++			continue;
++		}
++
++		/* Detect @supports / @layer at this position. Must be at
++		 * statement start (preceded by whitespace, ';', '{', '}',
++		 * or start-of-input). */
++		if (data[i] == '@' && i + 8 < in_size) {
++			char prev = (i > 0) ? data[i - 1] : ' ';
++			if (prev == ' ' || prev == '\t' || prev == '\n' ||
++			    prev == '\r' || prev == ';' || prev == '{' ||
++			    prev == '}' || i == 0) {
++				if (i + 9 <= in_size &&
++				    memcmp(data + i, "@supports", 9) == 0 &&
++				    (data[i + 9] == ' ' || data[i + 9] == '\t' ||
++				     data[i + 9] == '(' || data[i + 9] == '\n')) {
++					is_supports = true;
++					name_len = 9;
++				} else if (i + 6 <= in_size &&
++					   memcmp(data + i, "@layer", 6) == 0 &&
++					   (data[i + 6] == ' ' || data[i + 6] == '\t' ||
++					    data[i + 6] == ';' || data[i + 6] == '\n')) {
++					is_layer = true;
++					name_len = 6;
++				}
++			}
++		}
++
++		if (!is_supports && !is_layer) {
++			if (out_pos + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			out[out_pos++] = data[i++];
++			continue;
++		}
++
++		changed = 1;
++
++		{
++			size_t j = i + name_len;
++			bool has_not = false;
++			size_t brace_open;
++			size_t brace_close;
++			int depth;
++			size_t inner_start;
++			size_t inner_end;
++			bool keep_inner;
++
++			/* Skip whitespace after the at-rule name. */
++			while (j < in_size && (data[j] == ' ' ||
++					data[j] == '\t' || data[j] == '\n' ||
++					data[j] == '\r')) j++;
++
++			/* For @supports, check for leading 'not' keyword. */
++			if (is_supports && j + 3 < in_size &&
++			    memcmp(data + j, "not", 3) == 0 &&
++			    (data[j + 3] == ' ' || data[j + 3] == '\t' ||
++			     data[j + 3] == '(')) {
++				has_not = true;
++				j += 3;
++				while (j < in_size && (data[j] == ' ' ||
++						data[j] == '\t')) j++;
++			}
++
++			/* For @layer in declaration form (ends at ';' before
++			 * any '{') - strip the whole statement. */
++			if (is_layer) {
++				size_t scan = j;
++				size_t semi = (size_t)-1;
++				while (scan < in_size && data[scan] != '{' &&
++						data[scan] != ';') scan++;
++				if (scan < in_size && data[scan] == ';') {
++					semi = scan;
++					i = semi + 1;
++					continue;
++				}
++				/* otherwise falls through to block form below */
++			}
++
++			/* Find the opening '{' that begins the inner block.
++			 * Tracking parens so '(' / ')' inside the condition
++			 * aren't confused. */
++			brace_open = (size_t)-1;
++			{
++				int paren = 0;
++				size_t k = j;
++				while (k < in_size) {
++					char c = data[k];
++					if (c == '(') paren++;
++					else if (c == ')') paren--;
++					else if (c == '{' && paren == 0) {
++						brace_open = k;
++						break;
++					} else if (c == ';' && paren == 0) {
++						break;   /* shouldn't happen here */
++					}
++					k++;
++				}
++			}
++			if (brace_open == (size_t)-1) {
++				/* Malformed; skip the '@' and continue. */
++				out[out_pos++] = data[i++];
++				continue;
++			}
++
++			/* Find the matching close brace. */
++			depth = 1;
++			brace_close = (size_t)-1;
++			{
++				size_t k = brace_open + 1;
++				while (k < in_size) {
++					char c = data[k];
++					if (c == '{') depth++;
++					else if (c == '}') {
++						depth--;
++						if (depth == 0) {
++							brace_close = k;
++							break;
++						}
++					}
++					k++;
++				}
++			}
++			if (brace_close == (size_t)-1) {
++				/* Unterminated; emit rest as-is. */
++				while (i < in_size) {
++					if (out_pos + 1 >= cap) {
++						char *bigger;
++						cap = cap * 2 + 64;
++						bigger = (char *)realloc(out, cap);
++						if (bigger == NULL) { free(out); return NULL; }
++						out = bigger;
++					}
++					out[out_pos++] = data[i++];
++				}
++				break;
++			}
++
++			inner_start = brace_open + 1;
++			inner_end = brace_close;
++
++			/* Decide whether to keep the inner block. */
++			if (is_supports) {
++				keep_inner = !has_not;
++			} else {
++				keep_inner = true;   /* @layer always flattens */
++			}
++
++			if (keep_inner) {
++				size_t copy_len = inner_end - inner_start;
++				while (out_pos + copy_len + 1 >= cap) {
++					char *bigger;
++					cap = cap * 2 + copy_len + 64;
++					bigger = (char *)realloc(out, cap);
++					if (bigger == NULL) { free(out); return NULL; }
++					out = bigger;
++				}
++				memcpy(out + out_pos, data + inner_start,
++						copy_len);
++				out_pos += copy_len;
++			}
++
++			i = brace_close + 1;
++		}
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++
++	*out_size_p = out_pos;
++	return out;
++}
++
++
++/* fixes274 (Bundle C, #25 + #64) - grid alignment shorthand expansion +
++ * justify-items / justify-self bridge.
++ *
++ * There is no `place-items` / `place-content` shorthand support. fixes270
++ * wired the four properties libcss DOES expose
++ * (justify-content, align-content, align-items, align-self). This pass
++ * extends authoring-side support by:
++ *
++ *   1. Splitting `place-items: A B` into `align-items: A; justify-items: B`
++ *      (or both = A when only one value).
++ *   2. Splitting `place-content: A B` into `align-content: A;
++ *      justify-content: B`.
++ *   3. Shadowing `justify-items: VAL` declarations with an additional
++ *      `text-align: VAL` declaration. text-align inherits to grid cells'
++ *      inline content, producing visually-correct cell horizontal
++ *      alignment for the typical-case (cell content is text or inline
++ *      content that text-align governs).
++ *   4. Shadowing `justify-self: VAL` similarly with `text-align: VAL`.
++ *
++ * Spec-loose: real justify-items affects ONLY cell positioning within the
++ * track, not inline content alignment. For pure-text cells they look the
++ * same; for cells with mixed content (image + text) the visual may differ.
++ * Acceptable V1 - the alternative is libcss surgery, which is the trap
++ * zone documented in project memory.
++ *
++ * Each pass-through can grow the output. We malloc a working buffer and
++ * append. */
++
++/* CSS-keyword-safe match: confirm the position contains exactly the given
++ * property name, not as a substring of a longer identifier. */
++static bool
++macsurf__cc_prop_at(const char *buf, size_t len, size_t pos,
++		const char *name, size_t name_len)
++{
++	size_t i;
++	if (pos + name_len > len) return false;
++	if (pos > 0) {
++		char prev = buf[pos - 1];
++		if ((prev >= 'a' && prev <= 'z') ||
++				(prev >= 'A' && prev <= 'Z') ||
++				(prev >= '0' && prev <= '9') ||
++				prev == '-' || prev == '_') {
++			return false;
++		}
++	}
++	for (i = 0; i < name_len; i++) {
++		char b = buf[pos + i];
++		char n = name[i];
++		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++		if (n >= 'A' && n <= 'Z') n = (char)(n - 'A' + 'a');
++		if (b != n) return false;
++	}
++	return true;
++}
++
++/* Find the byte index of the next ';' or '}' at brace-depth zero from
++ * position `start`. Skips chars inside parens / strings / comments to
++ * avoid confusing those with declaration boundaries. */
++static size_t
++macsurf__cc_find_decl_end(const char *buf, size_t len, size_t start)
++{
++	size_t k = start;
++	int paren = 0;
++	while (k < len) {
++		char c = buf[k];
++		if (c == '/' && k + 1 < len && buf[k + 1] == '*') {
++			k += 2;
++			while (k + 1 < len &&
++					!(buf[k] == '*' && buf[k + 1] == '/'))
++				k++;
++			if (k + 1 < len) k += 2;
++			continue;
++		}
++		if (c == '"' || c == '\'') {
++			char q = c;
++			k++;
++			while (k < len && buf[k] != q) {
++				if (buf[k] == '\\' && k + 1 < len) k += 2;
++				else k++;
++			}
++			if (k < len) k++;
++			continue;
++		}
++		if (c == '(') paren++;
++		else if (c == ')') paren--;
++		else if (paren == 0 && (c == ';' || c == '}'))
++			return k;
++		k++;
++	}
++	return len;
++}
++
++/* Trim whitespace inside [from, to). Returns the new bounds via outs. */
++static void
++macsurf__cc_trim(const char *buf, size_t from, size_t to,
++		size_t *out_from, size_t *out_to)
++{
++	while (from < to && (buf[from] == ' ' || buf[from] == '\t' ||
++			buf[from] == '\n' || buf[from] == '\r')) from++;
++	while (to > from && (buf[to - 1] == ' ' || buf[to - 1] == '\t' ||
++			buf[to - 1] == '\n' || buf[to - 1] == '\r')) to--;
++	*out_from = from;
++	*out_to = to;
++}
++
++
++/* fixes1055 - ASCII case-insensitive compare, n bytes.
++ *
++ * CSS property names and keywords are case-INSENSITIVE per spec, but this
++ * file has only ever used case-sensitive strncmp, and strncasecmp is POSIX
++ * rather than C89 so it is not guaranteed under CW8. Hand-rolled to stay
++ * portable and to avoid depending on locale (tolower() is locale-sensitive;
++ * CSS is defined on ASCII).
++ */
++static int macsurf__ci_eq(const char *a, const char *b, size_t n)
++{
++	size_t k;
++	for (k = 0; k < n; k++) {
++		char ca = a[k];
++		char cb = b[k];
++		if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
++		if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
++		if (ca != cb) return 0;
++	}
++	return 1;
++}
++
++/**
++ * fixes1055 (#274) - expand `word-break: break-word` to its SPEC definition.
++ *
++ * CSS Text 3 defines the legacy keyword exactly:
++ *
++ *   "word-break: break-word  has the same effect as word-break: normal and
++ *    overflow-wrap: anywhere, REGARDLESS of the actual value of the
++ *    overflow-wrap property."
++ *
++ * so emitting that pair is the definition, not an approximation.
++ *
++ * Doing it here rather than in libcss is also the cheaper AND safer route:
++ * css_word_break_e is bit-packed with 2 bits (MASK 0x180) and a fifth value
++ * would need a third bit, but bits[16] is completely full (0 free bits across
++ * all 16 words). overflow-wrap:anywhere is already parsed and already consumed
++ * by the line breaker (layout.c:4536 treats it as break-word), so the pair
++ * lands on machinery that works today.
++ *
++ * Before this the declaration was simply INVALID and dropped, so an
++ * overflowing word never broke at all.
++ */
++static char *
++macsurf__rewrite_word_break_alias(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char PROP[] = "word-break";
++	static const char VAL[] = "break-word";
++	static const char REPL[] = "word-break:normal;overflow-wrap:anywhere";
++	char *out;
++	size_t cap;
++	size_t out_pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	if (data == NULL || in_size == 0) return NULL;
++
++	cap = in_size * 2 + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		size_t j;
++		size_t colon;
++		size_t vstart;
++		size_t vend;
++
++		/* only look at a property name sitting at a declaration
++		 * boundary, so `-ms-word-break` and the like are left alone */
++		if ((i == 0 || data[i - 1] == ';' || data[i - 1] == '{' ||
++				data[i - 1] == ' ' || data[i - 1] == '\t' ||
++				data[i - 1] == '\n' || data[i - 1] == '\r') &&
++				i + sizeof(PROP) - 1 < in_size &&
++				macsurf__ci_eq(data + i, PROP, sizeof(PROP) - 1)) {
++
++			j = i + sizeof(PROP) - 1;
++			while (j < in_size && (data[j] == ' ' || data[j] == '\t'))
++				j++;
++			if (j < in_size && data[j] == ':') {
++				colon = j;
++				vstart = colon + 1;
++				while (vstart < in_size && (data[vstart] == ' ' ||
++						data[vstart] == '\t' ||
++						data[vstart] == '\n' ||
++						data[vstart] == '\r'))
++					vstart++;
++				vend = vstart;
++				while (vend < in_size && data[vend] != ';' &&
++						data[vend] != '}')
++					vend++;
++				/* trim trailing space off the value */
++				while (vend > vstart && (data[vend - 1] == ' ' ||
++						data[vend - 1] == '\t' ||
++						data[vend - 1] == '\n' ||
++						data[vend - 1] == '\r'))
++					vend--;
++
++				if (vend - vstart == sizeof(VAL) - 1 &&
++						macsurf__ci_eq(data + vstart, VAL,
++							sizeof(VAL) - 1)) {
++					while (out_pos + sizeof(REPL) >= cap) {
++						char *bigger;
++						cap *= 2;
++						bigger = (char *)realloc(out, cap);
++						if (bigger == NULL) {
++							free(out);
++							return NULL;
++						}
++						out = bigger;
++					}
++					memcpy(out + out_pos, REPL,
++							sizeof(REPL) - 1);
++					out_pos += sizeof(REPL) - 1;
++					i = vend;   /* ';' / '}' copied next pass */
++					changed = 1;
++					continue;
++				}
++			}
++		}
++
++		if (out_pos + 1 >= cap) {
++			char *bigger;
++			cap *= 2;
++			bigger = (char *)realloc(out, cap);
++			if (bigger == NULL) { free(out); return NULL; }
++			out = bigger;
++		}
++		out[out_pos++] = data[i++];
++	}
++
++	if (changed == 0) {
++		free(out);
++		return NULL;
++	}
++
++	*out_size_p = out_pos;
++	return out;
++}
++
++static char *
++macsurf__rewrite_grid_alignment(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	char *out;
++	size_t cap;
++	size_t out_pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	cap = in_size * 2 + 256;   /* shadowed declarations can ~double size */
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		size_t colon;
++		size_t value_start;
++		size_t value_end;
++		size_t end;
++		size_t v1_start;
++		size_t v1_end;
++		size_t v2_start;
++		size_t v2_end;
++		size_t k;
++		const char *match_prop = NULL;
++		const char *align_axis = NULL;
++		const char *justify_axis = NULL;
++
++		/* Comment + string pass-through (same pattern as
++		 * macsurf__rewrite_at_rules). */
++		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
++			size_t kk = i + 2;
++			while (kk + 1 < in_size) {
++				if (data[kk] == '*' && data[kk + 1] == '/') {
++					kk += 2;
++					break;
++				}
++				kk++;
++			}
++			if (kk + 1 >= in_size) kk = in_size;
++			while (out_pos + (kk - i) + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + (kk - i) + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, data + i, kk - i);
++			out_pos += (kk - i);
++			i = kk;
++			continue;
++		}
++		if (data[i] == '"' || data[i] == '\'') {
++			char quote = data[i];
++			size_t kk = i + 1;
++			while (kk < in_size && data[kk] != quote) {
++				if (data[kk] == '\\' && kk + 1 < in_size) kk += 2;
++				else kk++;
++			}
++			if (kk < in_size) kk++;
++			while (out_pos + (kk - i) + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + (kk - i) + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, data + i, kk - i);
++			out_pos += (kk - i);
++			i = kk;
++			continue;
++		}
++
++		/* Detect one of the four shorthand / longhand patterns. */
++		if (macsurf__cc_prop_at(data, in_size, i, "place-items", 11)) {
++			match_prop = "place-items";
++			align_axis = "align-items";
++			justify_axis = "justify-items";
++			k = i + 11;
++		} else if (macsurf__cc_prop_at(data, in_size, i,
++				"place-content", 13)) {
++			match_prop = "place-content";
++			align_axis = "align-content";
++			justify_axis = "justify-content";
++			k = i + 13;
++		} else if (macsurf__cc_prop_at(data, in_size, i,
++				"place-self", 10)) {
++			/* #253: place-self: A [B] -> align-self: A; justify-self: B
++			 * (single value fills both). justify-self picks up the
++			 * text-align shadow below, same as the standalone longhand. */
++			match_prop = "place-self";
++			align_axis = "align-self";
++			justify_axis = "justify-self";
++			k = i + 10;
++		} else if (macsurf__cc_prop_at(data, in_size, i,
++				"justify-items", 13)) {
++			match_prop = "justify-items";
++			align_axis = NULL;
++			justify_axis = "justify-items";
++			k = i + 13;
++		} else if (macsurf__cc_prop_at(data, in_size, i,
++				"justify-self", 12)) {
++			match_prop = "justify-self";
++			align_axis = NULL;
++			justify_axis = "justify-self";
++			k = i + 12;
++		} else {
++			match_prop = NULL;
++		}
++
++		if (match_prop == NULL) {
++			if (out_pos + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			out[out_pos++] = data[i++];
++			continue;
++		}
++
++		/* Walk past whitespace, expect ':'. */
++		while (k < in_size && (data[k] == ' ' || data[k] == '\t' ||
++				data[k] == '\n' || data[k] == '\r')) k++;
++		if (k >= in_size || data[k] != ':') {
++			/* Not a real property declaration; emit char and skip. */
++			out[out_pos++] = data[i++];
++			continue;
++		}
++		colon = k;
++		value_start = k + 1;
++		end = macsurf__cc_find_decl_end(data, in_size, value_start);
++		value_end = end;
++
++		/* For place-* shorthand, split values; for justify-* longhand,
++		 * use the whole value verbatim. */
++		macsurf__cc_trim(data, value_start, value_end,
++				&value_start, &value_end);
++		if (align_axis != NULL) {
++			/* place-items or place-content. */
++			size_t split = value_start;
++			while (split < value_end && data[split] != ' ' &&
++					data[split] != '\t') split++;
++			if (split < value_end) {
++				v1_start = value_start;
++				v1_end = split;
++				v2_start = split;
++				while (v2_start < value_end &&
++						(data[v2_start] == ' ' ||
++						 data[v2_start] == '\t'))
++					v2_start++;
++				v2_end = value_end;
++			} else {
++				v1_start = value_start;
++				v1_end = value_end;
++				v2_start = value_start;
++				v2_end = value_end;
++			}
++		} else {
++			v1_start = v2_start = value_start;
++			v1_end = v2_end = value_end;
++		}
++
++		changed = 1;
++
++		/* Emit replacement. For shorthand: align-axis: V1; justify-axis: V2;
++		 * with text-align: V2 shadow when justify_axis is justify-items.
++		 * For longhand: keep original + text-align: V shadow. */
++		{
++			char tmp[256];
++			size_t tlen;
++			size_t need;
++
++			tlen = 0;
++			if (align_axis != NULL) {
++				/* place-* shorthand */
++				/* emit align-axis declaration */
++				memcpy(tmp + tlen, align_axis, strlen(align_axis));
++				tlen += strlen(align_axis);
++				tmp[tlen++] = ':';
++				tmp[tlen++] = ' ';
++				need = v1_end - v1_start;
++				if (tlen + need + 2 >= sizeof tmp) need = sizeof tmp - tlen - 2;
++				memcpy(tmp + tlen, data + v1_start, need);
++				tlen += need;
++				tmp[tlen++] = ';';
++				tmp[tlen++] = ' ';
++			}
++			/* These are now real libcss properties. Preserve every
++			 * justify-axis declaration for native grid layout, while keeping
++			 * the text-align shadow below for existing inline-content cases. */
++			if (justify_axis != NULL &&
++					(strcmp(justify_axis, "justify-content") == 0 ||
++					 strcmp(justify_axis, "justify-items") == 0 ||
++					 strcmp(justify_axis, "justify-self") == 0)) {
++				memcpy(tmp + tlen, justify_axis,
++						strlen(justify_axis));
++				tlen += strlen(justify_axis);
++				tmp[tlen++] = ':';
++				tmp[tlen++] = ' ';
++				need = v2_end - v2_start;
++				if (tlen + need + 2 >= sizeof tmp)
++					need = sizeof tmp - tlen - 2;
++				memcpy(tmp + tlen, data + v2_start, need);
++				tlen += need;
++				/* fixes833c (#279): terminate the justify-* decl so
++				 * the text-align shadow that may follow is a SEPARATE
++				 * declaration. Without this the emit ran together as
++				 * "justify-items: centertext-align: center", which
++				 * libcss rejected -> justify-items never cascaded
++				 * (probe showed ji=1/STRETCH). Harmless trailing
++				 * "; " for justify-content (no shadow follows). */
++				if (tlen + 2 < sizeof tmp) {
++					tmp[tlen++] = ';';
++					tmp[tlen++] = ' ';
++				}
++			}
++
++			/* Shadow with text-align for justify-items / justify-self
++			 * paths only (so visual cell-content alignment works).
++			 * fixes274e: libcss's text-align parser does not accept
++			 * CSS3 logical values (start / end). Map them to physical
++			 * keywords here (start/flex-start/self-start -> left,
++			 * end/flex-end/self-end -> right). Skip the shadow for
++			 * stretch / baseline / normal / auto where there's no
++			 * sensible text-align equivalent. */
++			if (justify_axis != NULL && (
++					strcmp(justify_axis, "justify-items") == 0 ||
++					strcmp(justify_axis, "justify-self") == 0)) {
++				size_t vlen = v2_end - v2_start;
++				const char *src = data + v2_start;
++				const char *out_kw = NULL;
++				size_t out_kw_len = 0;
++				if ((vlen == 6 && memcmp(src, "center", 6) == 0) ||
++						(vlen == 4 && memcmp(src, "left", 4) == 0) ||
++						(vlen == 5 && memcmp(src, "right", 5) == 0) ||
++						(vlen == 7 && memcmp(src, "justify", 7) == 0)) {
++					out_kw = src;
++					out_kw_len = vlen;
++				} else if ((vlen == 5 && memcmp(src, "start", 5) == 0) ||
++						(vlen == 10 && memcmp(src, "flex-start", 10) == 0) ||
++						(vlen == 10 && memcmp(src, "self-start", 10) == 0)) {
++					out_kw = "left";
++					out_kw_len = 4;
++				} else if ((vlen == 3 && memcmp(src, "end", 3) == 0) ||
++						(vlen == 8 && memcmp(src, "flex-end", 8) == 0) ||
++						(vlen == 8 && memcmp(src, "self-end", 8) == 0)) {
++					out_kw = "right";
++					out_kw_len = 5;
++				}
++				if (out_kw != NULL) {
++					/* align_axis (if present) already emitted its
++					 * trailing "; "; standalone justify-* starts
++					 * fresh -- so no leading separator here. */
++					memcpy(tmp + tlen, "text-align: ", 12);
++					tlen += 12;
++					if (tlen + out_kw_len + 2 >= sizeof tmp)
++						out_kw_len = sizeof tmp - tlen - 2;
++					memcpy(tmp + tlen, out_kw, out_kw_len);
++					tlen += out_kw_len;
++				}
++			}
++
++			while (out_pos + tlen + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + tlen + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, tmp, tlen);
++			out_pos += tlen;
++		}
++
++		/* Skip past the original declaration up to the terminator. */
++		i = end;
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	*out_size_p = out_pos;
++	return out;
++}
++
++
++/* fixes275 (#65) - grid-auto-flow preprocessor.
++ *
++ * Rewrites standard CSS `grid-auto-flow: VALUE` declarations to
++ * `-macsurf-grid-flow: N` integer values for the vendor property:
++ *
++ *   row              → 1
++ *   column           → 2
++ *   row dense        → 3  (also bare `dense` per CSS spec default-axis = row)
++ *   dense row        → 3
++ *   column dense     → 4
++ *   dense column     → 4
++ *
++ * Standard CSS lets the two-keyword form appear in either order. We
++ * tokenize and dispatch on the keyword set.
++ *
++ * Output grows: source ~14 bytes ("grid-auto-flow"), output ~22 bytes
++ * ("-macsurf-grid-flow: N"). Allocates fresh buffer. */
++static char *
++macsurf__rewrite_grid_auto_flow(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	char *out;
++	size_t cap;
++	size_t out_pos = 0;
++	size_t i = 0;
++	int changed = 0;
++
++	cap = in_size + 256;
++	out = (char *)malloc(cap);
++	if (out == NULL) return NULL;
++
++	while (i < in_size) {
++		size_t k;
++		size_t end;
++		size_t v_start;
++		size_t v_end;
++		bool has_row;
++		bool has_column;
++		bool has_dense;
++		int flow_val;
++		char emit[40];
++		size_t emit_len;
++
++		/* Comment pass-through. */
++		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
++			size_t kk = i + 2;
++			while (kk + 1 < in_size) {
++				if (data[kk] == '*' && data[kk + 1] == '/') {
++					kk += 2;
++					break;
++				}
++				kk++;
++			}
++			if (kk + 1 >= in_size) kk = in_size;
++			while (out_pos + (kk - i) + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + (kk - i) + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, data + i, kk - i);
++			out_pos += (kk - i);
++			i = kk;
++			continue;
++		}
++		/* String pass-through. */
++		if (data[i] == '"' || data[i] == '\'') {
++			char quote = data[i];
++			size_t kk = i + 1;
++			while (kk < in_size && data[kk] != quote) {
++				if (data[kk] == '\\' && kk + 1 < in_size) kk += 2;
++				else kk++;
++			}
++			if (kk < in_size) kk++;
++			while (out_pos + (kk - i) + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + (kk - i) + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			memcpy(out + out_pos, data + i, kk - i);
++			out_pos += (kk - i);
++			i = kk;
++			continue;
++		}
++
++		if (!macsurf__cc_prop_at(data, in_size, i,
++				"grid-auto-flow", 14)) {
++			if (out_pos + 1 >= cap) {
++				char *bigger;
++				cap = cap * 2 + 64;
++				bigger = (char *)realloc(out, cap);
++				if (bigger == NULL) { free(out); return NULL; }
++				out = bigger;
++			}
++			out[out_pos++] = data[i++];
++			continue;
++		}
++
++		k = i + 14;
++		while (k < in_size && (data[k] == ' ' || data[k] == '\t' ||
++				data[k] == '\n' || data[k] == '\r')) k++;
++		if (k >= in_size || data[k] != ':') {
++			out[out_pos++] = data[i++];
++			continue;
++		}
++		v_start = k + 1;
++		end = macsurf__cc_find_decl_end(data, in_size, v_start);
++		v_end = end;
++		macsurf__cc_trim(data, v_start, v_end, &v_start, &v_end);
++
++		/* Tokenise the value into row / column / dense detection. */
++		has_row = false;
++		has_column = false;
++		has_dense = false;
++		{
++			size_t p = v_start;
++			while (p < v_end) {
++				size_t tok_start;
++				size_t tok_end;
++				size_t tlen;
++				while (p < v_end && (data[p] == ' ' ||
++						data[p] == '\t')) p++;
++				tok_start = p;
++				while (p < v_end && data[p] != ' ' &&
++						data[p] != '\t') p++;
++				tok_end = p;
++				tlen = tok_end - tok_start;
++				if (tlen == 3 && memcmp(data + tok_start,
++						"row", 3) == 0) {
++					has_row = true;
++				} else if (tlen == 6 && memcmp(data + tok_start,
++						"column", 6) == 0) {
++					has_column = true;
++				} else if (tlen == 5 && memcmp(data + tok_start,
++						"dense", 5) == 0) {
++					has_dense = true;
++				}
++			}
++		}
++
++		if (has_column && has_dense) {
++			flow_val = 4;
++		} else if (has_column) {
++			flow_val = 2;
++		} else if (has_dense) {
++			flow_val = 3;
++		} else if (has_row) {
++			flow_val = 1;
++		} else {
++			/* No recognised keyword - drop and emit nothing. */
++			i = end;
++			changed = 1;
++			continue;
++		}
++
++		emit_len = (size_t)sprintf(emit,
++				"-macsurf-grid-flow: %d", flow_val);
++		while (out_pos + emit_len + 1 >= cap) {
++			char *bigger;
++			cap = cap * 2 + emit_len + 64;
++			bigger = (char *)realloc(out, cap);
++			if (bigger == NULL) { free(out); return NULL; }
++			out = bigger;
++		}
++		memcpy(out + out_pos, emit, emit_len);
++		out_pos += emit_len;
++
++		changed = 1;
++		i = end;
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	*out_size_p = out_pos;
++	return out;
++}
++
++
++/* fixes277 (#61) - logical properties → physical aliases (LTR-only V1).
++ *
++ * CSS Logical Properties Level 1 lets authors write direction-agnostic
++ * declarations:
++ *   inline-size, block-size
++ *   padding-inline-{start,end}, padding-block-{start,end}
++ *   margin-inline-{start,end},  margin-block-{start,end}
++ *   inset-inline-{start,end},   inset-block-{start,end}
++ *   border-inline-{start,end},  border-block-{start,end}
++ *
++ * In LTR mode (the only writing mode MacSurf supports), these map 1:1 to
++ * the physical properties below. We rewrite the property name in the
++ * source before libcss sees it.
++ *
++ * All physical names are SHORTER than their logical equivalents, so this
++ * is an in-place rewrite (replace name + pad with trailing spaces inside
++ * the original declaration footprint).
++ *
++ * Limitations: this is LTR-only. When MacSurf gains RTL support, swap
++ * start/end for inline-axis writes. block-axis aliases are direction-
++ * agnostic and stay the same in RTL. */
++static const struct {
++	const char *logical;
++	size_t llen;
++	const char *physical;
++	size_t plen;
++} macsurf__logical_aliases[] = {
++	/* Order: longest first so substring matches don't fire (e.g.
++	 * "padding-inline-start" before "padding-inline"). */
++	{ "padding-inline-start", 20, "padding-left",     12 },
++	{ "padding-inline-end",   18, "padding-right",    13 },
++	{ "padding-block-start",  19, "padding-top",      11 },
++	{ "padding-block-end",    17, "padding-bottom",   14 },
++	{ "margin-inline-start",  19, "margin-left",      11 },
++	{ "margin-inline-end",    17, "margin-right",     12 },
++	{ "margin-block-start",   18, "margin-top",       10 },
++	{ "margin-block-end",     16, "margin-bottom",    13 },
++	/* #247 phase 2: logical border longhands. MUST precede the
++	 * border-inline-start/... shorthand entries below -- the matcher has
++	 * no trailing-boundary check, so the shorter name would otherwise win
++	 * the prefix match inside "border-inline-start-width". */
++	{ "border-inline-start-width", 25, "border-left-width",   17 },
++	{ "border-inline-start-style", 25, "border-left-style",   17 },
++	{ "border-inline-start-color", 25, "border-left-color",   17 },
++	{ "border-inline-end-width",   23, "border-right-width",  18 },
++	{ "border-inline-end-style",   23, "border-right-style",  18 },
++	{ "border-inline-end-color",   23, "border-right-color",  18 },
++	{ "border-block-start-width",  24, "border-top-width",    16 },
++	{ "border-block-start-style",  24, "border-top-style",    16 },
++	{ "border-block-start-color",  24, "border-top-color",    16 },
++	{ "border-block-end-width",    22, "border-bottom-width", 19 },
++	{ "border-block-end-style",    22, "border-bottom-style", 19 },
++	{ "border-block-end-color",    22, "border-bottom-color", 19 },
++	{ "border-inline-start",  19, "border-left",      11 },
++	{ "border-inline-end",    17, "border-right",     12 },
++	{ "border-block-start",   18, "border-top",       10 },
++	{ "border-block-end",     16, "border-bottom",    13 },
++	{ "inset-inline-start",   18, "left",              4 },
++	{ "inset-inline-end",     16, "right",             5 },
++	{ "inset-block-start",    17, "top",               3 },
++	{ "inset-block-end",      15, "bottom",            6 },
++	{ "inline-size",          11, "width",             5 },
++	{ "block-size",           10, "height",            6 },
++	/* #247: min/max logical sizing - the one gap in the fixes277 table.
++	 * All physical names are shorter, so the in-place space-pad holds. */
++	{ "min-inline-size",      15, "min-width",         9 },
++	{ "max-inline-size",      15, "max-width",         9 },
++	{ "min-block-size",       14, "min-height",       10 },
++	{ "max-block-size",       14, "max-height",       10 },
++	{ NULL, 0, NULL, 0 }
++};
++
++static char *
++macsurf__rewrite_logical_properties(const char *data, size_t size)
++{
++	char *out;
++	size_t i;
++	int changed = 0;
++
++	out = (char *)malloc(size);
++	if (out == NULL) return NULL;
++	memcpy(out, data, size);
++
++	i = 0;
++	while (i < size) {
++		size_t a;
++		bool matched = false;
++
++		for (a = 0; macsurf__logical_aliases[a].logical != NULL; a++) {
++			const char *lname =
++				macsurf__logical_aliases[a].logical;
++			size_t llen = macsurf__logical_aliases[a].llen;
++			const char *pname =
++				macsurf__logical_aliases[a].physical;
++			size_t plen = macsurf__logical_aliases[a].plen;
++
++			if (!macsurf__match_prop_name(out, size, i,
++					lname, llen)) {
++				continue;
++			}
++			/* Replace name in place, pad with spaces. */
++			memcpy(out + i, pname, plen);
++			memset(out + i + plen, ' ', llen - plen);
++			i += llen;
++			matched = true;
++			changed = 1;
++			break;
++		}
++		if (!matched) i++;
++	}
++
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
++
++/* fixes202 - inline-style preprocessor.
++ *
++ * External stylesheets and <style> blocks run through nscss_process_data
++ * below, which threads the source bytes through a chain of name-rewriting
++ * passes (fixes175 text-shadow, fixes183 transform, fixes191g
++ * object-position, etc). Inline `style="..."` attributes take a different
++ * path: box_construct calls nscss_create_inline_style which hands the
++ * bytes straight to libcss with no preprocessing. Result: inline
++ * declarations like `transform: rotate(30deg)` or `text-shadow: 2px 2px`
++ * are unknown to libcss and silently dropped - TS1/TC1-3 on advanced.html
++ * shipped at fixes201b rendered as plain boxes with no shadow / no
++ * rotation / no translation / no scale.
++ *
++ * This helper runs the inline-style-relevant rewrite passes against a
++ * buffer and returns a freshly-allocated, length-prefixed result. The
++ * caller frees the result with free(). When no rewrites apply, the
++ * helper returns NULL and *out_size_p is unchanged; the caller should
++ * use the original buffer in that case.
++ *
++ * Grid template / inset / modern-compat passes are deliberately
++ * omitted - they target stylesheet patterns (selectors, multi-line
++ * declarations) that don't appear in inline-style attributes. Adding
++ * them is cheap if a future inline declaration needs them. */
++char *macsurf__rewrite_inline_style(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	char *cur = NULL;
++	size_t cur_size = in_size;
++	const char *src = data;
++	size_t src_size = in_size;
++	char *next;
++	size_t next_size = 0;
++
++	if (data == NULL || in_size == 0 || out_size_p == NULL) {
++		return NULL;
++	}
++
++	next = macsurf__rewrite_text_shadow(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = next_size;
++		src = (const char *)cur;
++		src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_transform(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = next_size;
++		src = (const char *)cur;
++		src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_object_position(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = next_size;
++		src = (const char *)cur;
++		src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_background_image_gradient(src, src_size,
++			&next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = next_size;
++		src = (const char *)cur;
++		src_size = cur_size;
++	}
++
++	/* fixes817e (#62): inline style attributes NEVER ran the grid
++	 * template rewrites -- a grid declared via style="display:grid;
++	 * grid-template-columns:..." kept the raw property, which has no
++	 * macsurf parser, so -macsurf-grid was never set and the grid
++	 * collapsed to one column (t.html 4b/4c/4d stacked; PRE-EXISTING,
++	 * predates fixes817 -- only <style>/external sheets got the
++	 * rewrite via nscss_process_data). Run the same in-place same-size
++	 * rewrites here. NOTE contract differs from the rewriters above:
++	 * these return a malloc'd SAME-SIZE buffer (NULL = OOM), so the
++	 * size does not change. The broader gap (logical props, place-*,
++	 * grid placement etc. also skipped inline) is tracked separately. */
++	next = macsurf__rewrite_grid_template_columns(src, src_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = src_size;
++		src = (const char *)cur;
++		src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_grid_template_rows(src, src_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = src_size;
++		src = (const char *)cur;
++		src_size = cur_size;
++	}
++
++	/* fixes831 (#277): the inline path historically ran only a handful of
++	 * rewriters, so CSS written in a style="" attribute silently dropped
++	 * every feature the stylesheet path (nscss_process_data) rewrites but
++	 * the raw libcss parser doesn't understand -- logical properties/
++	 * shorthands, inset, grid alignment/flow, modern-compat, calc(),
++	 * background: shorthand gradients. Real pages set these inline all the
++	 * time (React/Tailwind-style `style={{...}}`, framework inline styles),
++	 * so shipped features (#247 logical props, #253 place-*, grid) no-op'd
++	 * exactly where many pages use them. Run the same rewriters here.
++	 * Two contracts, matching nscss_process_data:
++	 *   - size-changing (out_size_p): swap + take next_size.
++	 *   - same-size in-place (no out_size_p, NULL=OOM): swap + keep size. */
++	next = macsurf__rewrite_modern_compat(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_inset(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_logical_shorthands(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_logical_properties(src, src_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = src_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_word_break_alias(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_grid_alignment(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_grid_auto_flow(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_calc_aspect(src, src_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = src_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	next = macsurf__rewrite_background_shorthand_gradient(src, src_size,
++			&next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	if (cur == NULL) {
++		return NULL;
++	}
++	*out_size_p = cur_size;
++	return cur;
++}
++
++/* ---- VitaBrowser: calc() in @media preludes ---------------------------
++ * libcss's media-query parser takes plain lengths only, so a query like
++ * Wikipedia Minerva's `(max-width: calc(1120px - 1px))` made the whole
++ * @media block invalid -- and with it the rule that visually hides the
++ * page-action labels ("Language", "Watch", "Edit"). Media-query calc()
++ * can only mix absolute lengths and em/rem (the initial font size, 16px),
++ * so each one is folded to a px value here. */
++
++/* Evaluate the calc() body [p, end): numbers with px/em/rem or none,
++ * + - * / and parentheses. Returns false if it holds anything else. */
++static bool vita_mq_expr(const char **pp, const char *end, double *out);
++
++static void vita_mq_ws(const char **pp, const char *end)
++{
++	while (*pp < end && (**pp == ' ' || **pp == '\t' || **pp == '\n' ||
++			**pp == '\r'))
++		(*pp)++;
++}
++
++static bool vita_mq_term(const char **pp, const char *end, double *out)
++{
++	const char *p;
++	char *q;
++	double v;
++
++	vita_mq_ws(pp, end);
++	p = *pp;
++	if (p < end && *p == '(') {
++		*pp = p + 1;
++		if (!vita_mq_expr(pp, end, out))
++			return false;
++		vita_mq_ws(pp, end);
++		if (*pp >= end || **pp != ')')
++			return false;
++		(*pp)++;
++		return true;
++	}
++	if (p + 5 <= end && strncasecmp(p, "calc(", 5) == 0) {
++		*pp = p + 4;
++		return vita_mq_term(pp, end, out);
++	}
++	v = strtod(p, &q);
++	if (q == p || q > end)
++		return false;
++	p = q;
++	if (p + 2 <= end && strncasecmp(p, "px", 2) == 0) {
++		p += 2;
++	} else if (p + 3 <= end && strncasecmp(p, "rem", 3) == 0) {
++		v *= 16;
++		p += 3;
++	} else if (p + 2 <= end && strncasecmp(p, "em", 2) == 0) {
++		v *= 16;
++		p += 2;
++	}
++	*pp = p;
++	*out = v;
++	return true;
++}
++
++static bool vita_mq_prod(const char **pp, const char *end, double *out)
++{
++	double a, b;
++	char op;
++
++	if (!vita_mq_term(pp, end, &a))
++		return false;
++	for (;;) {
++		vita_mq_ws(pp, end);
++		if (*pp >= end || (**pp != '*' && **pp != '/'))
++			break;
++		op = *(*pp)++;
++		if (!vita_mq_term(pp, end, &b))
++			return false;
++		if (op == '*')
++			a *= b;
++		else if (b != 0)
++			a /= b;
++		else
++			return false;
++	}
++	*out = a;
++	return true;
++}
++
++static bool vita_mq_expr(const char **pp, const char *end, double *out)
++{
++	double a, b;
++	char op;
++
++	if (!vita_mq_prod(pp, end, &a))
++		return false;
++	for (;;) {
++		vita_mq_ws(pp, end);
++		/* calc() wants spaces around + and -, so a sign glued to a
++		 * number belongs to it (handled by strtod) */
++		if (*pp >= end || (**pp != '+' && **pp != '-'))
++			break;
++		op = *(*pp)++;
++		if (!vita_mq_prod(pp, end, &b))
++			return false;
++		a = op == '+' ? a + b : a - b;
++	}
++	*out = a;
++	return true;
++}
++
++/** Fold calc() in every @media prelude; NULL if there is none. */
++static char *vita_rewrite_media_calc(const char *data, size_t len,
++		size_t *out_len)
++{
++	char *out = NULL;
++	size_t o = 0, cap = 0, i = 0, copied = 0;
++
++	while (i + 6 < len) {
++		const char *m = memchr(data + i, '@', len - i);
++		size_t pre_end, j;
++
++		if (m == NULL)
++			break;
++		i = (size_t)(m - data);
++		if (i + 6 > len || strncasecmp(data + i, "@media", 6) != 0) {
++			i++;
++			continue;
++		}
++		for (pre_end = i + 6; pre_end < len && data[pre_end] != '{' &&
++				data[pre_end] != ';'; pre_end++)
++			;
++		for (j = i + 6; j + 5 <= pre_end; j++) {
++			const char *p, *close;
++			int depth = 0;
++			double v;
++			char num[48];
++			size_t k, n;
++
++			if (strncasecmp(data + j, "calc(", 5) != 0)
++				continue;
++			for (k = j + 4; k < pre_end; k++) {
++				if (data[k] == '(')
++					depth++;
++				else if (data[k] == ')' && --depth == 0)
++					break;
++			}
++			if (k >= pre_end)
++				break;
++			close = data + k;
++			p = data + j + 5;
++			if (!vita_mq_expr(&p, close, &v) || p != close) {
++				vita_mq_ws(&p, close);
++				if (p != close)
++					continue;
++			}
++			n = (size_t)snprintf(num, sizeof(num), "%.3fpx", v);
++			/* grow and copy what precedes the calc() */
++			if (out == NULL || o + (j - copied) + n + 1 > cap) {
++				size_t need = o + (j - copied) + n + (len - k) + 64;
++				char *q = realloc(out, need);
++				if (q == NULL) {
++					free(out);
++					return NULL;
++				}
++				out = q;
++				cap = need;
++			}
++			memcpy(out + o, data + copied, j - copied);
++			o += j - copied;
++			memcpy(out + o, num, n);
++			o += n;
++			copied = k + 1;
++			j = k;
++		}
++		i = pre_end;
++	}
++	if (out == NULL)
++		return NULL;
++	if (o + (len - copied) + 1 > cap) {
++		char *q = realloc(out, o + (len - copied) + 1);
++		if (q == NULL) {
++			free(out);
++			return NULL;
++		}
++		out = q;
++	}
++	memcpy(out + o, data + copied, len - copied);
++	o += len - copied;
++	out[o] = '\0';
++	*out_len = o;
++	return out;
++}
++
++/* exported interface documented in content/handlers/css/css_rewrite.h */
++char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size)
++{
++	char *result = NULL;
++	unsigned int size = (unsigned int)in_size;
++	char *rewritten;
++	char *rewritten_rows;
++	char *rewritten_col_span = NULL;
++	char *rewritten_text_shadow = NULL;
++	char *rewritten_transform = NULL;
++	char *rewritten_object_position = NULL;
++	char *rewritten_modern_compat = NULL;
++	char *rewritten_inset = NULL;
++	char *rewritten_lshort = NULL;   /* #247 phase 2 */
++	char *rewritten_at_rules = NULL;   /* fixes273 - @supports/@layer */
++	char *rewritten_grid_align = NULL; /* fixes274 grid alignment */
++	char *rewritten_word_break = NULL; /* fixes1055 (#274) */
++	char *rewritten_grid_flow = NULL;  /* fixes275 grid-auto-flow */
++	char *rewritten_logical = NULL;    /* fixes277 logical properties */
++	char *rewritten_calc = NULL;       /* fixes280 calc() arithmetic */
++	char *rewritten_rep_grad = NULL;   /* fixes281 repeating-gradient -> solid */
++	char *rewritten_hstripe = NULL;    /* fixes364 -macsurf-hstripe-bg emission */
++	char *rewritten_dotgrid = NULL;    /* fixes365c -macsurf-dotgrid emission */
++	char *rewritten_bg_short = NULL;   /* fixes318 background: shorthand gradient */
++	size_t col_span_size = 0;
++	size_t text_shadow_size = 0;
++	size_t transform_size = 0;
++	size_t object_position_size = 0;
++	size_t modern_compat_size = 0;
++	size_t inset_size = 0;
++	size_t lshort_size = 0;   /* #247 phase 2 */
++	const char *final_data;
++	unsigned int final_size;
++
++
++	if (in_size > (size_t)0x7fffffff)
++		return NULL;
++
++	/* VitaBrowser: calc() in @media preludes, before anything else. */
++	{
++		size_t mq_len = 0;
++		char *mq = vita_rewrite_media_calc(data, in_size, &mq_len);
++		if (mq != NULL) {
++			char *r = macsurf_css_rewrite(mq, mq_len, out_size);
++			if (r == NULL) {
++				*out_size = mq_len;
++				return mq;
++			}
++			free(mq);
++			return r;
++		}
++	}
++
++	/* fixes273 (Bundle I) - earliest pass: unwrap / drop @supports
++	 * and @layer wrappers since libcss in this vintage doesn't parse
++	 * them natively. Inner rules then flow through the rest of the
++	 * preprocessing chain normally. */
++	{
++		size_t at_size = 0;
++		rewritten_at_rules = macsurf__rewrite_at_rules(data,
++				(size_t)size, &at_size);
++		if (rewritten_at_rules != NULL &&
++				at_size <= (size_t)0x7fffffff) {
++			data = (const char *)rewritten_at_rules;
++			size = (unsigned int)at_size;
++		}
++	}
++
++	/* fixes274 (Bundle C) - grid alignment shorthand expansion +
++	 * justify-items / justify-self → text-align bridge. Splits
++	 * place-items / place-content shorthands and shadows the
++	 * justify-* longhands with text-align so cell content aligns
++	 * visually. Runs early so subsequent property-rewrite passes
++	 * see the expanded declarations. */
++	/* fixes1055 (#274) - word-break:break-word is a legacy alias for
++	 * word-break:normal + overflow-wrap:anywhere (CSS Text 3). Expand it
++	 * here as well as in the inline-style chain: THIS is the path external
++	 * and <style> sheets take, and the inline one only ever sees style=""
++	 * attributes. Runs first so later passes see the expanded pair. */
++	{
++		size_t wb_size = 0;
++		rewritten_word_break = macsurf__rewrite_word_break_alias(data,
++				(size_t)size, &wb_size);
++		if (rewritten_word_break != NULL &&
++				wb_size <= (size_t)0x7fffffff) {
++			data = (const char *)rewritten_word_break;
++			size = (unsigned int)wb_size;
++		}
++	}
++
++	{
++		size_t ga_size = 0;
++		rewritten_grid_align = macsurf__rewrite_grid_alignment(data,
++				(size_t)size, &ga_size);
++		if (rewritten_grid_align != NULL &&
++				ga_size <= (size_t)0x7fffffff) {
++			data = (const char *)rewritten_grid_align;
++			size = (unsigned int)ga_size;
++		}
++	}
++
++	/* fixes275 (#65) - grid-auto-flow → -macsurf-grid-flow rewrite. */
++	{
++		size_t gf_size = 0;
++		rewritten_grid_flow = macsurf__rewrite_grid_auto_flow(data,
++				(size_t)size, &gf_size);
++		if (rewritten_grid_flow != NULL &&
++				gf_size <= (size_t)0x7fffffff) {
++			data = (const char *)rewritten_grid_flow;
++			size = (unsigned int)gf_size;
++		}
++	}
++
++	/* fixes277 (#61) - logical → physical property aliases (LTR). */
++	rewritten_logical = macsurf__rewrite_logical_properties(data,
++			(size_t)size);
++	if (rewritten_logical != NULL) {
++		data = (const char *)rewritten_logical;
++		/* In-place rewrite: size unchanged. */
++	}
++
++	/* fixes280 - fold calc() arithmetic for simple aspect-ratio
++	 * padding-hack patterns: calc(N / M * 100%) -> N*100/M %. */
++	rewritten_calc = macsurf__rewrite_calc_aspect(data, (size_t)size);
++	if (rewritten_calc != NULL) {
++		data = (const char *)rewritten_calc;
++		/* In-place same-size rewrite. */
++	}
++
++	/* fixes364 - emit `-macsurf-hstripe-bg: c1 c2;` for each
++	 * `repeating-linear-gradient(to bottom, ...)` so the plotter can
++	 * paint real alternating-row stripes for Platinum title bars.
++	 * Runs BEFORE the fixes281+363 solid collapse so it can read the
++	 * original gradient text. Output is a new buffer (may grow). */
++	{
++		size_t hstripe_size = 0;
++		rewritten_hstripe = macsurf__rewrite_repeating_gradient_hstripe(
++				data, (size_t)size, &hstripe_size);
++		if (rewritten_hstripe != NULL &&
++				hstripe_size <= (size_t)0x7fffffff) {
++			data = (const char *)rewritten_hstripe;
++			size = (unsigned int)hstripe_size;
++		}
++	}
++
++	/* fixes365c - emit `-macsurf-dotgrid: c1 c2;` for mactrove's
++	 * two-layer 1px-gradient + 2x2 background-size dot-grid texture.
++	 * Runs alongside the hstripe rewriter; the patterns are disjoint
++	 * (hstripe is `repeating-linear-gradient`, dotgrid is two plain
++	 * `linear-gradient` calls). Output is a new buffer (may grow). */
++	{
++		size_t dotgrid_size = 0;
++		rewritten_dotgrid = macsurf__rewrite_dotgrid_pattern(
++				data, (size_t)size, &dotgrid_size);
++		if (rewritten_dotgrid != NULL &&
++				dotgrid_size <= (size_t)0x7fffffff) {
++			/* fixes365 review fix - release the upstream hstripe
++			 * buffer as soon as dotgrid succeeds, matching the
++			 * free-as-you-go pattern used by the grid rewrites
++			 * below. Both buffers were already freed at function
++			 * end, so this is defensive housekeeping rather than
++			 * a hard leak. */
++			if (rewritten_hstripe != NULL) {
++				free(rewritten_hstripe);
++				rewritten_hstripe = NULL;
++			}
++			data = (const char *)rewritten_dotgrid;
++			size = (unsigned int)dotgrid_size;
++		}
++	}
++
++	/* fixes281+363 - collapse repeating-{linear,radial}-gradient(...) to
++	 * the platinum chrome #cccccc (was #dddddd; that matched the page bg
++	 * and the title bars disappeared). Visible fallback for striped
++	 * title-bar backgrounds. */
++	rewritten_rep_grad = macsurf__rewrite_repeating_gradient_solid(
++			data, (size_t)size);
++	if (rewritten_rep_grad != NULL) {
++		data = (const char *)rewritten_rep_grad;
++		/* In-place same-size rewrite. */
++	}
++
++	/* fixes115 - pre-process the CSS bytes to convert
++	 * `grid-template-columns: ...` declarations to `-macsurf-grid: N`
++	 * so the existing -macsurf-grid select/layout path picks up
++	 * standard CSS Grid track lists from real-world stylesheets.
++	 * Mactrove and most modern Drupal themes lean on
++	 * grid-template-columns for their main 2-column sidebar layout;
++	 * without this they collapse to a single column. fixes112 tried
++	 * to do this via a new libcss property entry and destabilised
++	 * the cascade on CW8; rewriting the source text before libcss
++	 * sees it avoids touching libcss internals entirely. */
++	rewritten = macsurf__rewrite_grid_template_columns(data, (size_t)size);
++	rewritten_rows = NULL;
++	if (rewritten != NULL) {
++		/* fixes150 - second pass for grid-template-rows. Same
++		 * in-place rewrite scheme; runs against the columns-rewritten
++		 * buffer so both passes see the same source layout. */
++		rewritten_rows = macsurf__rewrite_grid_template_rows(
++				rewritten, (size_t)size);
++	}
++
++	/* Pick the buffer for the final pass: rows-rewritten if available,
++	 * else columns-rewritten, else original. All previous passes are
++	 * in-place rewrites of the same size, so size stays the same here. */
++	final_data = rewritten_rows ? (const char *)rewritten_rows :
++			rewritten ? (const char *)rewritten : data;
++	final_size = size;
++
++	/* fixes178b - between rows and placement: resolve
++	 * grid-template-areas + named grid-area shorthand into the
++	 * numeric 4-value grid-area form that the placement pass below
++	 * already handles. Pass-through on no-op (no template-areas
++	 * declarations in the input). */
++	{
++		size_t gta_size = 0;
++		char *rewritten_gta = macsurf__rewrite_grid_template_areas(
++				final_data, (size_t)final_size, &gta_size);
++		if (rewritten_gta != NULL && gta_size <= (size_t)0x7fffffff) {
++			if (rewritten_rows != NULL) {
++				free(rewritten_rows);
++				rewritten_rows = NULL;
++			}
++			if (rewritten != NULL) {
++				free(rewritten);
++				rewritten = NULL;
++			}
++			rewritten_rows = rewritten_gta;
++			final_data = (const char *)rewritten_gta;
++			final_size = (unsigned int)gta_size;
++		} else if (rewritten_gta != NULL) {
++			free(rewritten_gta);
++		}
++	}
++
++	/* fixes151 - third pass for `grid-column: VALUE`. This pass needs
++	 * a growable output buffer (new property name is longer than the
++	 * source), so it allocates fresh and returns the new size. */
++	rewritten_col_span = macsurf__rewrite_grid_column(final_data,
++			(size_t)final_size, &col_span_size);
++	if (rewritten_col_span != NULL && col_span_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_col_span;
++		final_size = (unsigned int)col_span_size;
++	}
++
++	/* fixes175 - fourth pass: rewrite standard `text-shadow:` to the
++	 * vendor `-macsurf-text-shadow:` so author CSS uses the bound
++	 * paint path. Allocates a new growable buffer. */
++	rewritten_text_shadow = macsurf__rewrite_text_shadow(final_data,
++			(size_t)final_size, &text_shadow_size);
++	if (rewritten_text_shadow != NULL &&
++			text_shadow_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_text_shadow;
++		final_size = (unsigned int)text_shadow_size;
++	}
++
++	/* fixes183 - fifth pass: rewrite standard `transform:` to the
++	 * vendor `-macsurf-transform:` so author CSS reaches the existing
++	 * paint path. */
++	rewritten_transform = macsurf__rewrite_transform(final_data,
++			(size_t)final_size, &transform_size);
++	if (rewritten_transform != NULL &&
++			transform_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_transform;
++		final_size = (unsigned int)transform_size;
++	}
++
++	/* fixes191g - sixth pass: rewrite standard `object-position:` to
++	 * `-macsurf-object-position:` so the keyword-only V1 parser can
++	 * steer replaced-element alignment without touching libcss struct
++	 * layout. */
++	rewritten_object_position = macsurf__rewrite_object_position(final_data,
++			(size_t)final_size, &object_position_size);
++	if (rewritten_object_position != NULL &&
++			object_position_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_object_position;
++		final_size = (unsigned int)object_position_size;
++	}
++
++	/* fixes185 - seventh pass: modern-CSS compatibility. Rewrites
++	 * `:focus-visible` / `:focus-within` to `:focus`, drops unsupported
++	 * declarations (line-clamp, image-rendering, font-variant-numeric,
++	 * break-inside, outline-offset), and strips the `repeating-` prefix
++	 * from `repeating-linear/radial-gradient(` so the first cycle still
++	 * renders through the existing gradient handler. In-place,
++	 * length-preserving; returns NULL when no rewrites apply. */
++	rewritten_modern_compat = macsurf__rewrite_modern_compat(final_data,
++			(size_t)final_size, &modern_compat_size);
++	if (rewritten_modern_compat != NULL &&
++			modern_compat_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_modern_compat;
++		final_size = (unsigned int)modern_compat_size;
++	}
++
++	/* fixes191a - inset shorthand expansion to top/right/bottom/left.
++	 * Allocates a growable buffer (output is up to ~5x input for the
++	 * matched declarations). Pass-through on no-op. */
++	rewritten_inset = macsurf__rewrite_inset(final_data,
++			(size_t)final_size, &inset_size);
++	if (rewritten_inset != NULL &&
++			inset_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_inset;
++		final_size = (unsigned int)inset_size;
++	}
++
++	/* #247 phase 2 - 2-value logical shorthands (margin-inline: A B, etc.)
++	 * to physical longhand pairs. Runs after the inset expander; requires
++	 * ':' after the name so it never touches the -start/-end longhands. */
++	rewritten_lshort = macsurf__rewrite_logical_shorthands(final_data,
++			(size_t)final_size, &lshort_size);
++	if (rewritten_lshort != NULL &&
++			lshort_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_lshort;
++		final_size = (unsigned int)lshort_size;
++	}
++
++	/* fixes318 (#145) - background: shorthand → -macsurf-gradient:.
++	 * Runs BEFORE fixes266 so by the time fixes266's matcher inspects
++	 * the data, any shorthand-form gradient has already been extracted
++	 * into a longhand `-macsurf-gradient:` declaration. */
++	{
++		size_t bg_short_size = 0;
++		rewritten_bg_short =
++			macsurf__rewrite_background_shorthand_gradient(
++				final_data, (size_t)final_size, &bg_short_size);
++		if (rewritten_bg_short != NULL &&
++				bg_short_size <= (size_t)0x7fffffff) {
++			final_data = (const char *)rewritten_bg_short;
++			final_size = (unsigned int)bg_short_size;
++		}
++	}
++
++	/* fixes266 - background-image: linear-gradient(...) → -macsurf-gradient:
++	 * linear-gradient(...) so author CSS reaches the existing gradient
++	 * paint path. Net +1 byte per match. */
++	{
++		size_t bg_grad_size = 0;
++		char *rewritten_bg_grad = macsurf__rewrite_background_image_gradient(
++				final_data, (size_t)final_size, &bg_grad_size);
++		char *rewritten_strip = NULL;
++		if (rewritten_bg_grad != NULL &&
++				bg_grad_size <= (size_t)0x7fffffff) {
++			final_data = (const char *)rewritten_bg_grad;
++			final_size = (unsigned int)bg_grad_size;
++		}
++
++		/* fixes279 (#27) - strip stacked gradients (everything past
++		 * the first depth-0 comma in any -macsurf-gradient value).
++		 * Same-size in-place rewrite; only spaces introduced. */
++		rewritten_strip = macsurf__strip_stacked_gradients(
++				final_data, (size_t)final_size);
++		if (rewritten_strip != NULL) {
++			final_data = (const char *)rewritten_strip;
++			/* size unchanged */
++		}
++
++
++		/* The rewritten text, in a buffer of its own. */
++		result = malloc((size_t)final_size + 1);
++		if (result != NULL) {
++			memcpy(result, final_data, final_size);
++			result[final_size] = '\0';
++			*out_size = final_size;
++		}
++
++		if (rewritten_strip != NULL) free(rewritten_strip);
++		if (rewritten_bg_grad != NULL) free(rewritten_bg_grad);
++	}
++
++	if (rewritten_inset != NULL) free(rewritten_inset);
++	if (rewritten_lshort != NULL) free(rewritten_lshort); /* #247 phase 2 */
++	if (rewritten_modern_compat != NULL) free(rewritten_modern_compat);
++	if (rewritten_object_position != NULL) free(rewritten_object_position);
++	if (rewritten_transform != NULL) free(rewritten_transform);
++	if (rewritten_text_shadow != NULL) free(rewritten_text_shadow);
++	if (rewritten_col_span != NULL) free(rewritten_col_span);
++	if (rewritten_rows != NULL) free(rewritten_rows);
++	if (rewritten != NULL) free(rewritten);
++	if (rewritten_at_rules != NULL) free(rewritten_at_rules);   /* fixes273 */
++	if (rewritten_word_break != NULL) free(rewritten_word_break); /* fixes1055 */
++	if (rewritten_grid_align != NULL) free(rewritten_grid_align); /* fixes274 */
++	if (rewritten_grid_flow != NULL) free(rewritten_grid_flow); /* fixes275 */
++	if (rewritten_logical != NULL) free(rewritten_logical); /* fixes277 */
++	if (rewritten_calc != NULL) free(rewritten_calc); /* fixes280 */
++	if (rewritten_rep_grad != NULL) free(rewritten_rep_grad); /* fixes281 */
++	if (rewritten_hstripe != NULL) free(rewritten_hstripe); /* fixes364 */
++	if (rewritten_dotgrid != NULL) free(rewritten_dotgrid); /* fixes365c */
++	if (rewritten_bg_short != NULL) free(rewritten_bg_short); /* fixes318 */
++
++	return result;
++}
+diff --git a/content/handlers/css/css_rewrite.h b/content/handlers/css/css_rewrite.h
+new file mode 100644
+index 0000000..20d2147
+--- /dev/null
++++ b/content/handlers/css/css_rewrite.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * MacSurf's CSS source rewrites (css_rewrite.c).
++ */
++
++#ifndef NETSURF_CSS_CSS_REWRITE_H_
++#define NETSURF_CSS_CSS_REWRITE_H_
++
++#include <stddef.h>
++
++/**
++ * Rewrite a whole style sheet's text for libcss.
++ *
++ * \param data      the sheet
++ * \param in_size   its length
++ * \param out_size  receives the result's length
++ * \return the rewritten sheet (malloc()ed, NUL-terminated), or NULL when
++ *         out of memory (then parse the original)
++ */
++char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size);
++
++#endif
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index d144adb..a5a6baf 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
+ 
+@@ -180,7 +181,21 @@ css_stylesheet *nscss_create_inline_style(const uint8_t *data, size_t len,
+ 		return NULL;
+ 	}
+ 
+-	error = css_stylesheet_append_data(sheet, data, len);
++	/* MacSurf (cssh_select.c fixes202): style="" gets the same property
++	 * rewrites as style sheets (css_rewrite.c), so transform, inset,
++	 * text-shadow, grid placement ... in an attribute are not dropped. */
++	{
++		size_t rw_len = 0;
++		char *rw = macsurf__rewrite_inline_style((const char *)data,
++				len, &rw_len);
++		if (rw != NULL) {
++			error = css_stylesheet_append_data(sheet,
++					(const uint8_t *)rw, rw_len);
++			free(rw);
++		} else {
++			error = css_stylesheet_append_data(sheet, data, len);
++		}
++	}
+ 	if (error != CSS_OK && error != CSS_NEEDDATA) {
+ 		NSLOG(netsurf, INFO, "failed appending data: %d", error);
+ 		css_stylesheet_destroy(sheet);
+@@ -194,6 +209,10 @@ css_stylesheet *nscss_create_inline_style(const uint8_t *data, size_t len,
+ 		return NULL;
+ 	}
+ 
++	/* MacSurf (fixes267): the attribute's --custom-properties are seen
++	 * by descendants' var() too (React sets them as style props). */
++	(void)css_inline_extras_register_sheet(sheet);
++
+ 	return sheet;
+ }
+ 
