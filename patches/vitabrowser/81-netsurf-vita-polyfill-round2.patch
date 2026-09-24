@@ -1,0 +1,556 @@
+# netsurf (MacSurf bridge): polyfill round 2 -- anchors, interfaces, ChildNode
+# Generated 2026-09-24
+#
+# - <a>/<area> URL parts (protocol, host, pathname, search, hash, origin,
+#   ...) and a resolved href: YouTube resolves URLs through an anchor
+#   ("cannot read property 'startsWith' of undefined").
+# - The HTML*Element / SVG*Element interfaces the bridge has no
+#   constructor for, instanceof answered by tag (YouTube:
+#   "invalid 'instanceof' right operand" on HTMLObjectElement).
+# - remove/before/after/replaceWith/append/prepend/replaceChildren/
+#   toggleAttribute/closest on every tag's prototype: the bridge puts some
+#   tags on prototypes without them (claude.ai: <title>.remove() "not a
+#   function" brought its app down).
+# - Every section is idempotent, since patch 80 evaluates the polyfill
+#   twice per page.
+
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index f3f41fb..d043170 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1174,6 +1174,217 @@
+ "\t}\n"
+ "})();\n"
+ "\n"
++"/* ---- the element interfaces the bridge has no constructor for ----------\n"
++" * `x instanceof HTMLObjectElement` throws when the name is undefined\n"
++" * (YouTube's app shell). Each missing one becomes a constructor whose\n"
++" * instanceof is answered by the element's tag. */\n"
++"\n"
++"(function () {\n"
++"\tvar HE = g.HTMLElement;\n"
++"\tif (typeof HE !== 'function') return;\n"
++"\tvar map = {\n"
++"\t\tHTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLAudioElement: 'audio',\n"
++"\t\tHTMLBRElement: 'br', HTMLBaseElement: 'base', HTMLBodyElement: 'body',\n"
++"\t\tHTMLButtonElement: 'button', HTMLCanvasElement: 'canvas', HTMLDListElement: 'dl',\n"
++"\t\tHTMLDataElement: 'data', HTMLDataListElement: 'datalist', HTMLDetailsElement: 'details',\n"
++"\t\tHTMLDialogElement: 'dialog', HTMLDivElement: 'div', HTMLEmbedElement: 'embed',\n"
++"\t\tHTMLFieldSetElement: 'fieldset', HTMLFormElement: 'form', HTMLHRElement: 'hr',\n"
++"\t\tHTMLHeadElement: 'head', HTMLHeadingElement: 'h1 h2 h3 h4 h5 h6', HTMLHtmlElement: 'html',\n"
++"\t\tHTMLIFrameElement: 'iframe', HTMLImageElement: 'img', HTMLInputElement: 'input',\n"
++"\t\tHTMLLIElement: 'li', HTMLLabelElement: 'label', HTMLLegendElement: 'legend',\n"
++"\t\tHTMLLinkElement: 'link', HTMLMapElement: 'map', HTMLMediaElement: 'audio video',\n"
++"\t\tHTMLMenuElement: 'menu', HTMLMetaElement: 'meta', HTMLMeterElement: 'meter',\n"
++"\t\tHTMLModElement: 'ins del', HTMLOListElement: 'ol', HTMLObjectElement: 'object',\n"
++"\t\tHTMLOptGroupElement: 'optgroup', HTMLOptionElement: 'option', HTMLOutputElement: 'output',\n"
++"\t\tHTMLParagraphElement: 'p', HTMLPictureElement: 'picture', HTMLPreElement: 'pre',\n"
++"\t\tHTMLProgressElement: 'progress', HTMLQuoteElement: 'q blockquote', HTMLScriptElement: 'script',\n"
++"\t\tHTMLSelectElement: 'select', HTMLSlotElement: 'slot', HTMLSourceElement: 'source',\n"
++"\t\tHTMLSpanElement: 'span', HTMLStyleElement: 'style', HTMLTableCaptionElement: 'caption',\n"
++"\t\tHTMLTableCellElement: 'td th', HTMLTableColElement: 'col colgroup', HTMLTableElement: 'table',\n"
++"\t\tHTMLTableRowElement: 'tr', HTMLTableSectionElement: 'thead tbody tfoot',\n"
++"\t\tHTMLTemplateElement: 'template', HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time',\n"
++"\t\tHTMLTitleElement: 'title', HTMLTrackElement: 'track', HTMLUListElement: 'ul',\n"
++"\t\tHTMLVideoElement: 'video', HTMLUnknownElement: '',\n"
++"\t\tSVGSVGElement: 'svg', SVGPathElement: 'path', SVGGElement: 'g', SVGUseElement: 'use',\n"
++"\t\tSVGCircleElement: 'circle', SVGRectElement: 'rect', SVGTextElement: 'text',\n"
++"\t\tSVGGraphicsElement: 'svg path g use circle rect text line polygon polyline ellipse image'\n"
++"\t};\n"
++"\tObject.keys(map).forEach(function (name) {\n"
++"\t\tif (typeof g[name] === 'function') return;\n"
++"\t\tvar tags = map[name] ? map[name].split(' ') : [];\n"
++"\t\tvar C = function () { throw new TypeError('Illegal constructor'); };\n"
++"\t\ttry { Object.defineProperty(C, 'name', { value: name }); } catch (e) { /* */ }\n"
++"\t\tC.prototype = Object.create(HE.prototype);\n"
++"\t\tC.prototype.constructor = C;\n"
++"\t\tObject.defineProperty(C, Symbol.hasInstance, { value: function (x) {\n"
++"\t\t\tif (!x || typeof x !== 'object' || x.nodeType !== 1) return false;\n"
++"\t\t\treturn tags.indexOf(String(x.localName || x.tagName || '').toLowerCase()) >= 0;\n"
++"\t\t} });\n"
++"\t\tdefine(g, name, C);\n"
++"\t});\n"
++"\tif (typeof g.SVGElement !== 'function') {\n"
++"\t\tvar S = function () { throw new TypeError('Illegal constructor'); };\n"
++"\t\tObject.defineProperty(S, Symbol.hasInstance, { value: function (x) {\n"
++"\t\t\treturn !!(x && x.namespaceURI === 'http://www.w3.org/2000/svg');\n"
++"\t\t} });\n"
++"\t\tdefine(g, 'SVGElement', S);\n"
++"\t}\n"
++"})();\n"
++"\n"
++"/* ---- ChildNode / ParentNode methods on every element ------------------\n"
++" * The bridge builds some tags' wrappers on other prototypes, and those\n"
++" * lack remove() and friends (claude.ai: <title>.remove() \"not a\n"
++" * function\", which took its whole app down). One element of each tag is\n"
++" * made and its prototype given whatever is missing. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tfunction nodes(args) {\n"
++"\t\tvar out = [];\n"
++"\t\tfor (var i = 0; i < args.length; i++)\n"
++"\t\t\tout.push(typeof args[i] === 'string' ? d.createTextNode(args[i]) : args[i]);\n"
++"\t\treturn out;\n"
++"\t}\n"
++"\tvar M = {\n"
++"\t\tremove: function () { if (this.parentNode) this.parentNode.removeChild(this); },\n"
++"\t\tbefore: function () {\n"
++"\t\t\tvar p = this.parentNode, n = nodes(arguments);\n"
++"\t\t\tif (p) for (var i = 0; i < n.length; i++) p.insertBefore(n[i], this);\n"
++"\t\t},\n"
++"\t\tafter: function () {\n"
++"\t\t\tvar p = this.parentNode, n = nodes(arguments), ref = this.nextSibling;\n"
++"\t\t\tif (p) for (var i = 0; i < n.length; i++) p.insertBefore(n[i], ref);\n"
++"\t\t},\n"
++"\t\treplaceWith: function () {\n"
++"\t\t\tvar p = this.parentNode, n = nodes(arguments), ref = this.nextSibling;\n"
++"\t\t\tif (!p) return;\n"
++"\t\t\tp.removeChild(this);\n"
++"\t\t\tfor (var i = 0; i < n.length; i++) p.insertBefore(n[i], ref);\n"
++"\t\t},\n"
++"\t\tappend: function () {\n"
++"\t\t\tvar n = nodes(arguments);\n"
++"\t\t\tfor (var i = 0; i < n.length; i++) this.appendChild(n[i]);\n"
++"\t\t},\n"
++"\t\tprepend: function () {\n"
++"\t\t\tvar n = nodes(arguments), first = this.firstChild;\n"
++"\t\t\tfor (var i = 0; i < n.length; i++) this.insertBefore(n[i], first);\n"
++"\t\t},\n"
++"\t\treplaceChildren: function () {\n"
++"\t\t\twhile (this.firstChild) this.removeChild(this.firstChild);\n"
++"\t\t\tM.append.apply(this, arguments);\n"
++"\t\t},\n"
++"\t\ttoggleAttribute: function (name, force) {\n"
++"\t\t\tvar has = this.hasAttribute(name);\n"
++"\t\t\tif (force === undefined) force = !has;\n"
++"\t\t\tif (force && !has) this.setAttribute(name, '');\n"
++"\t\t\tif (!force && has) this.removeAttribute(name);\n"
++"\t\t\treturn !!force;\n"
++"\t\t},\n"
++"\t\tclosest: function (sel) {\n"
++"\t\t\tfor (var e = this; e && e.nodeType === 1; e = e.parentNode)\n"
++"\t\t\t\tif (e.matches && e.matches(sel)) return e;\n"
++"\t\t\treturn null;\n"
++"\t\t}\n"
++"\t};\n"
++"\tvar tags = ('a abbr address area article aside audio b base bdi bdo blockquote body br ' +\n"
++"\t\t'button canvas caption cite code col colgroup data datalist dd del details dfn dialog ' +\n"
++"\t\t'div dl dt em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 head ' +\n"
++"\t\t'header hr html i iframe img input ins kbd label legend li link main map mark menu ' +\n"
++"\t\t'meta meter nav noscript object ol optgroup option output p picture pre progress q ' +\n"
++"\t\t'rp rt ruby s samp script section select slot small source span strong style sub ' +\n"
++"\t\t'summary sup table tbody td template textarea tfoot th thead time title tr track u ' +\n"
++"\t\t'ul var video wbr svg path').split(' ');\n"
++"\tvar seen = [];\n"
++"\ttags.forEach(function (t) {\n"
++"\t\tvar el;\n"
++"\t\ttry { el = d.createElement(t); } catch (e) { return; }\n"
++"\t\tvar P = el && Object.getPrototypeOf(el);\n"
++"\t\tif (!P || seen.indexOf(P) >= 0) return;\n"
++"\t\tseen.push(P);\n"
++"\t\tObject.keys(M).forEach(function (k) {\n"
++"\t\t\tif (typeof el[k] !== 'function') {\n"
++"\t\t\t\ttry { define(P, k, M[k]); } catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t});\n"
++"\t/* text nodes: remove / before / after / replaceWith */\n"
++"\ttry {\n"
++"\t\tvar tn = d.createTextNode(''), TP = Object.getPrototypeOf(tn);\n"
++"\t\t['remove', 'before', 'after', 'replaceWith'].forEach(function (k) {\n"
++"\t\t\tif (TP && typeof tn[k] !== 'function') define(TP, k, M[k]);\n"
++"\t\t});\n"
++"\t} catch (e) { /* */ }\n"
++"})();\n"
++"\n"
++"/* ---- <a> and <area>: the URL parts (HTMLHyperlinkElementUtils) ---------\n"
++" * Scripts resolve URLs with an anchor: a.href = url; a.pathname. The\n"
++" * bridge's elements had no such properties (YouTube: \"cannot read\n"
++" * property 'startsWith' of undefined\"). Elements share one prototype in\n"
++" * the bridge, so the accessors check the tag. */\n"
++"\n"
++"(function () {\n"
++"\t/* The object in an anchor's prototype chain that carries the bridge's\n"
++"\t * href (not HTMLElement.prototype: the bridge's elements have their\n"
++"\t * own chain), else HTMLElement.prototype. */\n"
++"\tvar P = null, probe = null;\n"
++"\ttry { probe = g.document && g.document.createElement('a'); } catch (e) { /* */ }\n"
++"\tfor (var o = probe; o && !P; o = Object.getPrototypeOf(o))\n"
++"\t\tif (o !== probe && Object.getOwnPropertyDescriptor(o, 'href')) P = o;\n"
++"\tif (!P) P = g.HTMLElement && g.HTMLElement.prototype;\n"
++"\tvar had = P && Object.getOwnPropertyDescriptor(P, 'href');\n"
++"\tif (!P || (had && had.get && had.get.__vita)) return;\n"
++"\tfunction isLink(el) {\n"
++"\t\tvar t = el && el.tagName ? String(el.tagName).toUpperCase() : '';\n"
++"\t\treturn t === 'A' || t === 'AREA';\n"
++"\t}\n"
++"\tfunction urlOf(el) {\n"
++"\t\tvar h = el.getAttribute('href');\n"
++"\t\tif (h === null) return null;\n"
++"\t\tvar base = (g.document && g.document.baseURI) || (g.location && g.location.href) || undefined;\n"
++"\t\ttry { return new URL(h, base); } catch (e) { return null; }\n"
++"\t}\n"
++"\t/* href reads back resolved, as in a browser; other elements keep\n"
++"\t * whatever the bridge gives them (e.g. <link href>). */\n"
++"\tvar hrefDesc = Object.getOwnPropertyDescriptor(P, 'href');\n"
++"\tfunction hrefGet() {\n"
++"\t\t\tif (isLink(this)) {\n"
++"\t\t\t\tvar u = urlOf(this);\n"
++"\t\t\t\treturn u ? u.href : '';\n"
++"\t\t\t}\n"
++"\t\t\tif (hrefDesc && hrefDesc.get) return hrefDesc.get.call(this);\n"
++"\t\t\tvar a = this.getAttribute ? this.getAttribute('href') : null;\n"
++"\t\t\treturn a === null ? undefined : a;\n"
++"\t}\n"
++"\threfGet.__vita = true;\n"
++"\tObject.defineProperty(P, 'href', {\n"
++"\t\tconfigurable: true,\n"
++"\t\tget: hrefGet,\n"
++"\t\tset: function (v) {\n"
++"\t\t\tif (hrefDesc && hrefDesc.set && !isLink(this)) hrefDesc.set.call(this, v);\n"
++"\t\t\telse this.setAttribute('href', String(v));\n"
++"\t\t}\n"
++"\t});\n"
++"\t['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash',\n"
++"\t 'username', 'password', 'origin'].forEach(function (k) {\n"
++"\t\tObject.defineProperty(P, k, {\n"
++"\t\t\tconfigurable: true,\n"
++"\t\t\tget: function () {\n"
++"\t\t\t\tif (!isLink(this)) return undefined;\n"
++"\t\t\t\tvar u = urlOf(this);\n"
++"\t\t\t\treturn u ? u[k] : (k === 'origin' ? 'null' : '');\n"
++"\t\t\t},\n"
++"\t\t\tset: function (v) {\n"
++"\t\t\t\tif (!isLink(this) || k === 'origin') return;\n"
++"\t\t\t\tvar u = urlOf(this);\n"
++"\t\t\t\tif (!u) return;\n"
++"\t\t\t\tu[k] = v;\n"
++"\t\t\t\tthis.setAttribute('href', u.href);\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t});\n"
++"})();\n"
++"\n"
+ "/* ---- CSS.supports: what NetSurf's CSS engine understands --------------- */\n"
+ "\n"
+ "(function () {\n"
+@@ -1234,7 +1445,7 @@
+ "\n"
+ "(function () {\n"
+ "\tvar gcs = g.getComputedStyle;\n"
+-"\tif (typeof gcs !== 'function' || typeof Proxy !== 'function') return;\n"
++"\tif (typeof gcs !== 'function' || typeof Proxy !== 'function' || gcs.__vita) return;\n"
+ "\tvar INITIAL = {\n"
+ "\t\tanimationName: 'none', animationDuration: '0s', animationDelay: '0s',\n"
+ "\t\tanimationIterationCount: '1', animationDirection: 'normal', animationFillMode: 'none',\n"
+@@ -1269,7 +1480,7 @@
+ "\t\tif (p.slice(0, 2) === '--') return p;\n"
+ "\t\treturn p.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, function (m, x) { return x.toUpperCase(); });\n"
+ "\t}\n"
+-"\tdefine(g, 'getComputedStyle', function (el, pseudo) {\n"
++"\tvar vgcs = function (el, pseudo) {\n"
+ "\t\tif (!el || typeof el !== 'object')\n"
+ "\t\t\tthrow new TypeError(\"Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.\");\n"
+ "\t\tvar base = gcs.call(g, el, pseudo) || {}, inl = el.style || null;\n"
+@@ -1290,7 +1501,9 @@
+ "\t\t\t\treturn t[k];\n"
+ "\t\t\t}\n"
+ "\t\t});\n"
+-"\t});\n"
++"\t};\n"
++"\tvgcs.__vita = true;\n"
++"\tdefine(g, 'getComputedStyle', vgcs);\n"
+ "})();\n"
+ "\n"
+ "/* ---- window: a top-level browsing context ------------------------------ */\n"
+@@ -1323,8 +1536,8 @@
+ "\tvoid ric;\n"
+ "\t/* console.error(err): the log gets where it was thrown, too. */\n"
+ "\tvar c = g.console, ce = c && c.error;\n"
+-"\tif (typeof ce === 'function') {\n"
+-"\t\tc.error = function () {\n"
++"\tif (typeof ce === 'function' && !ce.__vita) {\n"
++"\t\tc.error = function vitaError() {\n"
+ "\t\t\tce.apply(c, arguments);\n"
+ "\t\t\tfor (var i = 0; i < arguments.length; i++) {\n"
+ "\t\t\t\tvar a = arguments[i];\n"
+@@ -1332,6 +1545,7 @@
+ "\t\t\t\t\tce.call(c, '  at: ' + a.stack.split('\\n').slice(0, 4).join(' | '));\n"
+ "\t\t\t}\n"
+ "\t\t};\n"
++"\t\tc.error.__vita = true;\n"
+ "\t}\n"
+ "})();\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 4f0408d..18f6cc4 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1173,6 +1173,217 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ })();
+ 
++/* ---- the element interfaces the bridge has no constructor for ----------
++ * `x instanceof HTMLObjectElement` throws when the name is undefined
++ * (YouTube's app shell). Each missing one becomes a constructor whose
++ * instanceof is answered by the element's tag. */
++
++(function () {
++	var HE = g.HTMLElement;
++	if (typeof HE !== 'function') return;
++	var map = {
++		HTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLAudioElement: 'audio',
++		HTMLBRElement: 'br', HTMLBaseElement: 'base', HTMLBodyElement: 'body',
++		HTMLButtonElement: 'button', HTMLCanvasElement: 'canvas', HTMLDListElement: 'dl',
++		HTMLDataElement: 'data', HTMLDataListElement: 'datalist', HTMLDetailsElement: 'details',
++		HTMLDialogElement: 'dialog', HTMLDivElement: 'div', HTMLEmbedElement: 'embed',
++		HTMLFieldSetElement: 'fieldset', HTMLFormElement: 'form', HTMLHRElement: 'hr',
++		HTMLHeadElement: 'head', HTMLHeadingElement: 'h1 h2 h3 h4 h5 h6', HTMLHtmlElement: 'html',
++		HTMLIFrameElement: 'iframe', HTMLImageElement: 'img', HTMLInputElement: 'input',
++		HTMLLIElement: 'li', HTMLLabelElement: 'label', HTMLLegendElement: 'legend',
++		HTMLLinkElement: 'link', HTMLMapElement: 'map', HTMLMediaElement: 'audio video',
++		HTMLMenuElement: 'menu', HTMLMetaElement: 'meta', HTMLMeterElement: 'meter',
++		HTMLModElement: 'ins del', HTMLOListElement: 'ol', HTMLObjectElement: 'object',
++		HTMLOptGroupElement: 'optgroup', HTMLOptionElement: 'option', HTMLOutputElement: 'output',
++		HTMLParagraphElement: 'p', HTMLPictureElement: 'picture', HTMLPreElement: 'pre',
++		HTMLProgressElement: 'progress', HTMLQuoteElement: 'q blockquote', HTMLScriptElement: 'script',
++		HTMLSelectElement: 'select', HTMLSlotElement: 'slot', HTMLSourceElement: 'source',
++		HTMLSpanElement: 'span', HTMLStyleElement: 'style', HTMLTableCaptionElement: 'caption',
++		HTMLTableCellElement: 'td th', HTMLTableColElement: 'col colgroup', HTMLTableElement: 'table',
++		HTMLTableRowElement: 'tr', HTMLTableSectionElement: 'thead tbody tfoot',
++		HTMLTemplateElement: 'template', HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time',
++		HTMLTitleElement: 'title', HTMLTrackElement: 'track', HTMLUListElement: 'ul',
++		HTMLVideoElement: 'video', HTMLUnknownElement: '',
++		SVGSVGElement: 'svg', SVGPathElement: 'path', SVGGElement: 'g', SVGUseElement: 'use',
++		SVGCircleElement: 'circle', SVGRectElement: 'rect', SVGTextElement: 'text',
++		SVGGraphicsElement: 'svg path g use circle rect text line polygon polyline ellipse image'
++	};
++	Object.keys(map).forEach(function (name) {
++		if (typeof g[name] === 'function') return;
++		var tags = map[name] ? map[name].split(' ') : [];
++		var C = function () { throw new TypeError('Illegal constructor'); };
++		try { Object.defineProperty(C, 'name', { value: name }); } catch (e) { /* */ }
++		C.prototype = Object.create(HE.prototype);
++		C.prototype.constructor = C;
++		Object.defineProperty(C, Symbol.hasInstance, { value: function (x) {
++			if (!x || typeof x !== 'object' || x.nodeType !== 1) return false;
++			return tags.indexOf(String(x.localName || x.tagName || '').toLowerCase()) >= 0;
++		} });
++		define(g, name, C);
++	});
++	if (typeof g.SVGElement !== 'function') {
++		var S = function () { throw new TypeError('Illegal constructor'); };
++		Object.defineProperty(S, Symbol.hasInstance, { value: function (x) {
++			return !!(x && x.namespaceURI === 'http://www.w3.org/2000/svg');
++		} });
++		define(g, 'SVGElement', S);
++	}
++})();
++
++/* ---- ChildNode / ParentNode methods on every element ------------------
++ * The bridge builds some tags' wrappers on other prototypes, and those
++ * lack remove() and friends (claude.ai: <title>.remove() "not a
++ * function", which took its whole app down). One element of each tag is
++ * made and its prototype given whatever is missing. */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	function nodes(args) {
++		var out = [];
++		for (var i = 0; i < args.length; i++)
++			out.push(typeof args[i] === 'string' ? d.createTextNode(args[i]) : args[i]);
++		return out;
++	}
++	var M = {
++		remove: function () { if (this.parentNode) this.parentNode.removeChild(this); },
++		before: function () {
++			var p = this.parentNode, n = nodes(arguments);
++			if (p) for (var i = 0; i < n.length; i++) p.insertBefore(n[i], this);
++		},
++		after: function () {
++			var p = this.parentNode, n = nodes(arguments), ref = this.nextSibling;
++			if (p) for (var i = 0; i < n.length; i++) p.insertBefore(n[i], ref);
++		},
++		replaceWith: function () {
++			var p = this.parentNode, n = nodes(arguments), ref = this.nextSibling;
++			if (!p) return;
++			p.removeChild(this);
++			for (var i = 0; i < n.length; i++) p.insertBefore(n[i], ref);
++		},
++		append: function () {
++			var n = nodes(arguments);
++			for (var i = 0; i < n.length; i++) this.appendChild(n[i]);
++		},
++		prepend: function () {
++			var n = nodes(arguments), first = this.firstChild;
++			for (var i = 0; i < n.length; i++) this.insertBefore(n[i], first);
++		},
++		replaceChildren: function () {
++			while (this.firstChild) this.removeChild(this.firstChild);
++			M.append.apply(this, arguments);
++		},
++		toggleAttribute: function (name, force) {
++			var has = this.hasAttribute(name);
++			if (force === undefined) force = !has;
++			if (force && !has) this.setAttribute(name, '');
++			if (!force && has) this.removeAttribute(name);
++			return !!force;
++		},
++		closest: function (sel) {
++			for (var e = this; e && e.nodeType === 1; e = e.parentNode)
++				if (e.matches && e.matches(sel)) return e;
++			return null;
++		}
++	};
++	var tags = ('a abbr address area article aside audio b base bdi bdo blockquote body br ' +
++		'button canvas caption cite code col colgroup data datalist dd del details dfn dialog ' +
++		'div dl dt em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 head ' +
++		'header hr html i iframe img input ins kbd label legend li link main map mark menu ' +
++		'meta meter nav noscript object ol optgroup option output p picture pre progress q ' +
++		'rp rt ruby s samp script section select slot small source span strong style sub ' +
++		'summary sup table tbody td template textarea tfoot th thead time title tr track u ' +
++		'ul var video wbr svg path').split(' ');
++	var seen = [];
++	tags.forEach(function (t) {
++		var el;
++		try { el = d.createElement(t); } catch (e) { return; }
++		var P = el && Object.getPrototypeOf(el);
++		if (!P || seen.indexOf(P) >= 0) return;
++		seen.push(P);
++		Object.keys(M).forEach(function (k) {
++			if (typeof el[k] !== 'function') {
++				try { define(P, k, M[k]); } catch (e) { /* */ }
++			}
++		});
++	});
++	/* text nodes: remove / before / after / replaceWith */
++	try {
++		var tn = d.createTextNode(''), TP = Object.getPrototypeOf(tn);
++		['remove', 'before', 'after', 'replaceWith'].forEach(function (k) {
++			if (TP && typeof tn[k] !== 'function') define(TP, k, M[k]);
++		});
++	} catch (e) { /* */ }
++})();
++
++/* ---- <a> and <area>: the URL parts (HTMLHyperlinkElementUtils) ---------
++ * Scripts resolve URLs with an anchor: a.href = url; a.pathname. The
++ * bridge's elements had no such properties (YouTube: "cannot read
++ * property 'startsWith' of undefined"). Elements share one prototype in
++ * the bridge, so the accessors check the tag. */
++
++(function () {
++	/* The object in an anchor's prototype chain that carries the bridge's
++	 * href (not HTMLElement.prototype: the bridge's elements have their
++	 * own chain), else HTMLElement.prototype. */
++	var P = null, probe = null;
++	try { probe = g.document && g.document.createElement('a'); } catch (e) { /* */ }
++	for (var o = probe; o && !P; o = Object.getPrototypeOf(o))
++		if (o !== probe && Object.getOwnPropertyDescriptor(o, 'href')) P = o;
++	if (!P) P = g.HTMLElement && g.HTMLElement.prototype;
++	var had = P && Object.getOwnPropertyDescriptor(P, 'href');
++	if (!P || (had && had.get && had.get.__vita)) return;
++	function isLink(el) {
++		var t = el && el.tagName ? String(el.tagName).toUpperCase() : '';
++		return t === 'A' || t === 'AREA';
++	}
++	function urlOf(el) {
++		var h = el.getAttribute('href');
++		if (h === null) return null;
++		var base = (g.document && g.document.baseURI) || (g.location && g.location.href) || undefined;
++		try { return new URL(h, base); } catch (e) { return null; }
++	}
++	/* href reads back resolved, as in a browser; other elements keep
++	 * whatever the bridge gives them (e.g. <link href>). */
++	var hrefDesc = Object.getOwnPropertyDescriptor(P, 'href');
++	function hrefGet() {
++			if (isLink(this)) {
++				var u = urlOf(this);
++				return u ? u.href : '';
++			}
++			if (hrefDesc && hrefDesc.get) return hrefDesc.get.call(this);
++			var a = this.getAttribute ? this.getAttribute('href') : null;
++			return a === null ? undefined : a;
++	}
++	hrefGet.__vita = true;
++	Object.defineProperty(P, 'href', {
++		configurable: true,
++		get: hrefGet,
++		set: function (v) {
++			if (hrefDesc && hrefDesc.set && !isLink(this)) hrefDesc.set.call(this, v);
++			else this.setAttribute('href', String(v));
++		}
++	});
++	['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash',
++	 'username', 'password', 'origin'].forEach(function (k) {
++		Object.defineProperty(P, k, {
++			configurable: true,
++			get: function () {
++				if (!isLink(this)) return undefined;
++				var u = urlOf(this);
++				return u ? u[k] : (k === 'origin' ? 'null' : '');
++			},
++			set: function (v) {
++				if (!isLink(this) || k === 'origin') return;
++				var u = urlOf(this);
++				if (!u) return;
++				u[k] = v;
++				this.setAttribute('href', u.href);
++			}
++		});
++	});
++})();
++
+ /* ---- CSS.supports: what NetSurf's CSS engine understands --------------- */
+ 
+ (function () {
+@@ -1233,7 +1444,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 
+ (function () {
+ 	var gcs = g.getComputedStyle;
+-	if (typeof gcs !== 'function' || typeof Proxy !== 'function') return;
++	if (typeof gcs !== 'function' || typeof Proxy !== 'function' || gcs.__vita) return;
+ 	var INITIAL = {
+ 		animationName: 'none', animationDuration: '0s', animationDelay: '0s',
+ 		animationIterationCount: '1', animationDirection: 'normal', animationFillMode: 'none',
+@@ -1268,7 +1479,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		if (p.slice(0, 2) === '--') return p;
+ 		return p.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, function (m, x) { return x.toUpperCase(); });
+ 	}
+-	define(g, 'getComputedStyle', function (el, pseudo) {
++	var vgcs = function (el, pseudo) {
+ 		if (!el || typeof el !== 'object')
+ 			throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
+ 		var base = gcs.call(g, el, pseudo) || {}, inl = el.style || null;
+@@ -1289,7 +1500,9 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				return t[k];
+ 			}
+ 		});
+-	});
++	};
++	vgcs.__vita = true;
++	define(g, 'getComputedStyle', vgcs);
+ })();
+ 
+ /* ---- window: a top-level browsing context ------------------------------ */
+@@ -1322,8 +1535,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	void ric;
+ 	/* console.error(err): the log gets where it was thrown, too. */
+ 	var c = g.console, ce = c && c.error;
+-	if (typeof ce === 'function') {
+-		c.error = function () {
++	if (typeof ce === 'function' && !ce.__vita) {
++		c.error = function vitaError() {
+ 			ce.apply(c, arguments);
+ 			for (var i = 0; i < arguments.length; i++) {
+ 				var a = arguments[i];
+@@ -1331,6 +1544,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 					ce.call(c, '  at: ' + a.stack.split('\n').slice(0, 4).join(' | '));
+ 			}
+ 		};
++		c.error.__vita = true;
+ 	}
+ })();
+ 

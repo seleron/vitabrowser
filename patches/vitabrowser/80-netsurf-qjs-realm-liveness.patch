@@ -1,0 +1,103 @@
+# netsurf (MacSurf bridge): stale realms, the polyfill after DOM installs
+# Generated 2026-09-24
+#
+# - js_exec, js_exec_module and js_set_current_script check that the
+#   thread's context is still its heap's live one. A navigation frees the
+#   old page's context while its content (and thread) lingers; an async
+#   script of the old page finishing afterwards read document from the
+#   freed context (claude.ai's redirect to /login: SIGSEGV in
+#   find_own_property).
+# - js_newthread and js_thread_rebind_document call qjs_dom_install, which
+#   re-installs the bridge's DOM properties over the polyfill's (anchor
+#   href, ...): the polyfill is evaluated again after it.
+# - Unhandled-rejection stacks are logged up to 2000 characters (bundle
+#   URLs run past 600).
+
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index a0d6c59..d6699c4 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -319,6 +319,24 @@ static int qjs_thread_is_live_for_dispatch(struct jsthread *thread,
+ 	return 1;
+ }
+ 
++/* VitaBrowser: is thread's realm still the one its heap runs? A thread
++ * outlives its realm when the window navigates: js_newthread frees the
++ * old context and builds a new one on the same heap, while the old page's
++ * content -- and its thread -- lingers until destroyed. An async script
++ * of the old page finishing then ran js_set_current_script against the
++ * freed context (claude.ai's redirect to /login, SIGSEGV in
++ * find_own_property). Safe on a freed thread: the registry is checked
++ * before any dereference. */
++static int qjs_thread_ctx_live(struct jsthread *thread)
++{
++	if (thread == NULL || qjs_thread_owner(thread) == NULL)
++		return 0;
++	if (thread->ctx == NULL || thread->heap == NULL ||
++			thread->ctx != thread->heap->ctx)
++		return 0;
++	return qjs_ctx_gen(thread->ctx) != 0;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Interrupt handler - Cmd-. on OS 9                                   */
+ /* ------------------------------------------------------------------ */
+@@ -14851,7 +14869,7 @@ static void qjs_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
+ 		JSValue st = JS_GetPropertyStr(ctx, reason, "stack");
+ 		const char *sts = JS_IsString(st) ? JS_ToCString(ctx, st) : NULL;
+ 		if (sts != NULL) {
+-			macsurf_debug_log_writef("LIFE js rejection stack: %.600s",
++			macsurf_debug_log_writef("LIFE js rejection stack: %.2000s",
+ 					sts);
+ 			JS_FreeCString(ctx, sts);
+ 		}
+@@ -15854,6 +15872,9 @@ nserror js_newthread(struct jsheap *heap, void *win_priv, void *doc_priv,
+ 		qjs_set_content(heap, (struct content *)htmlc);
+ 		/* Re-wire getElementById/querySelectorAll with real document now */
+ 		qjs_dom_install(heap->ctx);
++		/* VitaBrowser: which re-installed the bridge's DOM properties
++		 * over the polyfill's (anchor href, ...): apply it again. */
++		qjs_vita_polyfill(heap->ctx);
+ 		MS_LOG("qjs: thread document wired");
+ 	}
+ 	MS_LOG("qjs: thread created");
+@@ -15876,6 +15897,7 @@ nserror js_thread_rebind_document(struct jsthread *thread)
+ 	htmlc = (html_content *)thread->doc_priv;
+ 	qjs_set_document(thread->heap, htmlc->document);
+ 	qjs_dom_install(thread->heap->ctx);
++	qjs_vita_polyfill(thread->heap->ctx);
+ 	MS_LOG("qjs: thread document re-wired (encoding change)");
+ 	return NSERROR_OK;
+ }
+@@ -16293,8 +16315,8 @@ unsigned char js_exec(struct jsthread *thread,
+ 	 * even reaching the entry breadcrumb, and NOTHING about this script
+ 	 * is ever logged. Make that visible too, so "zero js activity" in a
+ 	 * hardware log can be told apart from "no thread was ever wired". */
+-	if (thread == NULL || thread->ctx == NULL) {
+-		macsurf_debug_log_writef("LIFE js exec: NO THREAD/CTX [%s]",
++	if (!qjs_thread_ctx_live(thread)) {
++		macsurf_debug_log_writef("LIFE js exec: NO LIVE THREAD/CTX [%s]",
+ 				name ? name : "(anon)");
+ 		return 0;
+ 	}
+@@ -16702,9 +16724,9 @@ unsigned char js_exec_module(struct jsthread *thread,
+ 	struct ms_diag_scope diag_script_scope;
+ 	int diag_script_state = MS_SCR_DONE;
+ 
+-	if (thread == NULL || thread->ctx == NULL) {
++	if (!qjs_thread_ctx_live(thread)) {
+ 		macsurf_debug_log_writef(
+-			"LIFE js exec module: NO THREAD/CTX [%s]",
++			"LIFE js exec module: NO LIVE THREAD/CTX [%s]",
+ 			name ? name : "(anon)");
+ 		return 0;
+ 	}
+@@ -17084,7 +17106,7 @@ void js_set_current_script(struct jsthread *thread, struct dom_node *node)
+ 	JSValue doc;
+ 	JSValue el;
+ 
+-	if (thread == NULL || thread->ctx == NULL) return;
++	if (!qjs_thread_ctx_live(thread)) return;
+ 	ctx = thread->ctx;
+ 
+ 	global = JS_GetGlobalObject(ctx);
