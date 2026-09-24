@@ -539,6 +539,73 @@ for `:root`, `html`, `body`, a parent, and fallbacks.
   skeleton. It is cut off below, so its buttons are not visible yet.
 - **Wikipedia:** icons-only page actions, 960 px wide.
 
+## Round 6: speed (patches 84–88, quickjs/02)
+
+Hardware run 16 put numbers on it (doc 10): 15–25 s per real site, and
+claude.ai spending 12.6 s on CSS, 13 s downloading, and 82 s compiling
+before it ran out of memory.
+
+### 18. The CSS rewrite chain was 25 full scans (patch 84)
+
+Timed per pass on the desktop (claude.ai's sheet, 382 ms):
+- `modern_compat` took 154 ms: it scanned the whole sheet once per
+  dropped property name, 43 times.
+- `logical_properties` took 120 ms: it tried 30 aliases at every byte.
+
+The fixes:
+- Both now scan once, trying names only at word starts whose first letter
+  can begin a name.
+- Every other pass runs only when one of its trigger names occurs in the
+  sheet (found with memchr).
+
+The output is byte-identical on claude.ai's, YouTube's and Wikipedia's
+sheets, and 2.7–4.9× faster. `css.c` also caches the last 16 rewrites by
+content, because `<style>` blocks are re-parsed on every reformat.
+
+### 19. Every connection was a new TLS handshake (patch 85)
+
+- `curl_easy_duphandle` copies no session cache, so each handle's first
+  connection to a host did a full handshake: 543 ms of CPU on the Vita.
+- The module loader's own curl multi had separate connections too.
+- One `CURLSH` now shares SSL sessions, DNS and connections. claude.ai's
+  65-module fetch dropped from 1.0 to 0.64 s here; the Vita gains far
+  more per avoided handshake.
+
+### 20. JavaScript: parse once, keep less (patch 87, quickjs/02)
+
+- **Setup scripts.** Each page's realm parsed the same setup scripts: the
+  bridge's ~40 and the polyfill. They are now compiled once and read back
+  as bytecode, so a realm takes 4.5 ms instead of 16 here.
+- **Source text.** QuickJS keeps every function's source for `toString`,
+  one copy per function, nested ones included. A new QuickJS option
+  (`JS_SetStripFunctionSource`) skips that for scripts of 128 KB or more.
+  claude.ai's heap goes from 99 to 76 MB.
+- **A card cache for modules.** Compiled modules go to
+  `ux0:data/VitaBrowser/jscache/` with their static imports.
+  - Hash-named modules (Vite's) are neither fetched nor parsed on a later
+    visit.
+  - Other modules are fetched, and their bytecode is reused when the
+    source text is unchanged.
+  - A second claude.ai visit: module run 2.19 → 0.31 s, title at 4.9 s
+    instead of 11.8 s (simulator).
+- **A dead end, for the record.** I first compiled modules in a scratch
+  context and moved them over as stripped bytecode. That needed a full GC
+  per batch, since MacSurf keeps automatic GC off, and those collections
+  were a third of all CPU time (gprof). Stripping at parse time replaced
+  it.
+
+### 21. Forms did not submit on the Vita (patch 88)
+
+Form fields are converted to the form's charset through iconv, and the
+Vita's newlib iconv has no converters (the engine log said `Could not
+encode name for fetch data`). UTF-8, Latin-1 / Windows-1252 and ASCII are
+now converted directly.
+
+### 22. The ARM clock (patch 86)
+
+Browsing now runs at 444 MHz / bus 222, pass D's clocks; the ARM used to
+stay at its boot 333 MHz.
+
 ## Not done: the gaps left
 
 - **claude.ai/code:**
@@ -547,6 +614,11 @@ for `:root`, `html`, `body`, a parent, and fallbacks.
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.
 - **YouTube:** the consent dialog's cut-off buttons (it needs to scroll), then the feed.
+- **Wikipedia article: 1045 px wide.** The new `wide box` log lines point
+  at a header `SPAN` (x 936–1034) and a reference-list `LI`, probably a
+  long unbreakable citation URL.
+- **claude.ai's first visit on the Vita** still has to parse 19 MB. Only
+  run 17 can say whether it now fits in time and memory.
 - **Memory:** host RSS peaks at about 78 MB for the Wikipedia article (a
   64-bit process). The Vita's heap budget is 192 MB. The autotest logs
   `mem[...]` per page on the device.

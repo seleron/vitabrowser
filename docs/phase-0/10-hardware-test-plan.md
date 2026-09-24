@@ -2211,3 +2211,98 @@ results are in `results-run15\`.
     (build `Sep 24 2026 21:17:42`).
   - Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-24-run16b/`.
   - The run 16 checklist above is unchanged.
+
+## Run 16 — results (2026-09-24 21:22–21:47, PCH-2000, 3.65 HENkaku)
+
+The results are in `results-run16\`. Five boots arrived, 0 datagrams lost.
+
+**The autotest:**
+- **28 of 29 dumps SAME.** That includes L2 and L3 (the CSS-rewrite
+  changes) and VT-text: the font fix (patch 67) holds, with `0 font files
+  failed`.
+- Interaction **20/22**. Steps 18–19 failed again; the engine log now
+  says why (patch 88 below).
+- **Bundled pages got slower:** pass D averages 1314 ms per page, against
+  926 ms in run 15. Each page's realm built by parsing the bridge's setup
+  scripts and the new 80 KB polyfill (twice).
+
+**By hand:**
+- **SELECT + ✕ screenshots work** (7 arrived).
+- Hacker News, Wikipedia and YouTube load, and YouTube's consent dialog
+  draws. But real sites took **15–25 s**; the Wikipedia Main Page took
+  22.3 s.
+- **claude.ai/code never loaded.** From the log:
+
+| step | on the Vita (ARM 333) |
+|---|---|
+| CSS rewrite of the 1.4 MB sheet | 12.6 s |
+| 65 modules, 19 MB | 13.3 s |
+| compile + run | **82.5 s** |
+| JS heap afterwards | 84 MB |
+| then | `InternalError: out of memory` on dynamic imports (the 128 MB cap) |
+
+**Where the time went:**
+- **CSS rewrites** (patch 76), everywhere:
+  - 1.3 s for Wikipedia's 169 KB sheet;
+  - 3.7 s for YouTube's 437 KB;
+  - 362 ms for the same 42 KB inline sheet on every reformat.
+- **TLS handshakes:** the probe measured 543 ms of CPU each. Every curl
+  handle started without a session cache, so each new connection paid
+  it again.
+- **Parsing JavaScript:** per-page setup scripts, and claude.ai's
+  bundles.
+- **The ARM ran at 333 MHz while browsing.**
+- **Form submission** (steps 18–19): `Could not encode name for fetch
+  data`. Form fields go through iconv, which has no converters in the
+  Vita's newlib.
+
+## Run 17 — hand-off: speed (patches 84–88, quickjs/02)
+
+**What changed since run 16** (doc 11, round 6):
+- **84:** the CSS rewrite passes are 3–5× faster with byte-identical
+  output, and rewrites are cached by content.
+- **85:** one curl share: TLS sessions resume and connections are reused,
+  module fetches included.
+- **86:** browsing runs at **ARM 444 MHz** / bus 222 (was 333);
+  `enginelog.cfg` "off" disables the engine log.
+- **87 + quickjs/02:**
+  - setup scripts are cached as bytecode (a realm builds 3.5× faster);
+  - big scripts keep no per-function source text: claude.ai's heap goes
+    from 99 to 76 MB in the simulator, about 25% less;
+  - **compiled modules are kept on the card** in
+    `ux0:data/VitaBrowser/jscache/`: a second claude.ai visit skips the
+    download and the compile. The cache is capped at 96 MB.
+- **88:** UTF-8, Latin-1 and ASCII conversions no longer use iconv, so
+  forms submit.
+
+**Clean checkout:**
+- Applied 171 + the known 2; L1–L4 PASS; 101/101 + 30/30.
+- The simulator suite passes, interaction 22/22.
+- Reference dumps unchanged.
+
+**Simulator timings** (desktop, for the ratios):
+- claude.ai's first visit: title at 11.8 s.
+- Its **second visit: 4.9 s**, with the module run at 0.31 s instead of
+  2.19 s.
+
+**Hand-off.**
+- SHA256, first 12: `VitaBrowser.vpk` `ee87b22d2337`,
+  `VitaBrowser-ext.vpk` `1b6316794bcb`, `nsvita.elf` `1a03d5a15fd0`
+  (build `Sep 24 2026 23:57:52`).
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-25-run17/`.
+- Run 16's results are copied to `results-run16\`. Moving the folder was
+  refused: Windows had it open.
+
+**Run 17 on the device:**
+1. **The autotest** (`receive-results.bat`, then SELECT + □):
+   - expect **interact: 22/22**: the form now submits;
+   - pass D's page load average should drop well below run 16's 1314 ms;
+   - `clocks[run]` should say arm 444.
+2. **claude.ai/code, twice.** Open it, wait for the login page (or up to
+   5 minutes), and take a screenshot (SELECT + ✕). Then press START (home)
+   and open it again. The second visit should be much faster: its
+   `module graph:` line should say "65 from the card". `netsurf.log`'s
+   `module compile` and `css rewrite` lines give the times.
+3. **Wikipedia, YouTube, Hacker News:** note roughly how long each takes
+   compared with run 16 (15–25 s).
+
