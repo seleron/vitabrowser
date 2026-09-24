@@ -108,6 +108,8 @@ void vita2d_swap_buffers(void)
 	memcpy(shown, back, sizeof(shown));
 	frames++;
 }
+/* The front buffer: what vita_diag_screenshot() reads. */
+void *vita2d_get_current_fb(void) { return shown; }
 void vita2d_enable_clipping(void) { clip_on = 1; }
 void vita2d_disable_clipping(void) { clip_on = 0; }
 void vita2d_set_clip_rectangle(int x0, int y0, int x1, int y1)
@@ -533,6 +535,18 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 			dumped_page = page;
 			idle = 0;
 			pad->buttons = SCE_CTRL_SELECT | SCE_CTRL_CIRCLE;
+			return 1;
+		}
+	}
+
+	/* VITA_SIM_SHOT: likewise take the frontend's own screenshot
+	 * (SELECT + CROSS, ux0:data/VitaBrowser/shot-*.png). */
+	{
+		static unsigned int shot_page = ~0u;
+		if (getenv("VITA_SIM_SHOT") != NULL && shot_page != page) {
+			shot_page = page;
+			idle = 0;
+			pad->buttons = SCE_CTRL_SELECT | SCE_CTRL_CROSS;
 			return 1;
 		}
 	}

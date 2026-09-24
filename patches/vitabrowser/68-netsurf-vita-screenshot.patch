@@ -1,0 +1,139 @@
+# netsurf (Vita frontend): SELECT + CROSS saves a screenshot
+# Generated 2026-09-24
+#
+# Hardware run 15: the system screenshot (PS + START) saved nothing while the
+# browser ran. vita_diag_screenshot() reads the frame on screen -- vita2d's
+# front buffer, 960 x 544 A8B8G8R8 -- and writes it as an RGB PNG (zlib level
+# 1) to ux0:data/VitaBrowser/shot-<ms>.png, and sends it to the results
+# receiver like the other diagnostics when the network log is on.
+
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index df88e08..e0a252a 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -541,6 +541,84 @@ void vita_diag_marker(const char *name)
+ 	}
+ }
+ 
++static void png_chunk(FILE *fp, const char *type, const unsigned char *d,
++		      uint32_t n)
++{
++	unsigned char b[4];
++	uint32_t crc;
++
++	b[0] = n >> 24; b[1] = n >> 16; b[2] = n >> 8; b[3] = n;
++	fwrite(b, 1, 4, fp);
++	fwrite(type, 1, 4, fp);
++	if (n > 0)
++		fwrite(d, 1, n, fp);
++	crc = (uint32_t)crc32(0L, (const Bytef *)type, 4);
++	if (n > 0)
++		crc = (uint32_t)crc32(crc, d, n);
++	b[0] = crc >> 24; b[1] = crc >> 16; b[2] = crc >> 8; b[3] = crc;
++	fwrite(b, 1, 4, fp);
++}
++
++/* exported interface documented in vita/diag.h */
++void vita_diag_screenshot(void)
++{
++	/* The frame on screen: vita2d's front buffer, 960 x 544, 32-bit
++	 * A8B8G8R8 (red in the low byte), rows 960 pixels apart. */
++	const uint32_t *px = vita2d_get_current_fb();
++	const size_t w = VITA_SCREEN_WIDTH, h = VITA_SCREEN_HEIGHT;
++	size_t rawlen = h * (1 + w * 3), x, y;
++	unsigned char *raw = malloc(rawlen), *z = NULL;
++	uLongf zlen = compressBound(rawlen);
++	unsigned char ihdr[13] = { 0, 0, w >> 8, w & 0xff, 0, 0, h >> 8,
++				   h & 0xff, 8, 2, 0, 0, 0 };
++	char name[64], path[256];
++	FILE *fp;
++
++	if (px == NULL || raw == NULL || (z = malloc(zlen)) == NULL) {
++		vita_diag_log("screenshot: out of memory");
++		free(raw);
++		return;
++	}
++	for (y = 0; y < h; y++) {
++		unsigned char *row = raw + y * (1 + w * 3);
++		row[0] = 0;
++		for (x = 0; x < w; x++) {
++			uint32_t c = px[y * w + x];
++			row[1 + x * 3] = c & 0xff;
++			row[2 + x * 3] = (c >> 8) & 0xff;
++			row[3 + x * 3] = (c >> 16) & 0xff;
++		}
++	}
++	/* Level 1: the Vita's CPU is slow and the frame is mostly flat. */
++	if (compress2(z, &zlen, raw, rawlen, 1) != Z_OK) {
++		vita_diag_log("screenshot: compress failed");
++		free(raw);
++		free(z);
++		return;
++	}
++	free(raw);
++	snprintf(name, sizeof(name), "shot-%06u.png", vita_diag_ms());
++	snprintf(path, sizeof(path), VITA_DIAG_DIR "%s", name);
++	fp = fopen(path, "wb");
++	if (fp == NULL) {
++		vita_diag_log("screenshot %s: fopen failed, errno %d", name,
++			      errno);
++		free(z);
++		return;
++	}
++	fwrite("\x89PNG\r\n\x1a\n", 1, 8, fp);
++	png_chunk(fp, "IHDR", ihdr, 13);
++	png_chunk(fp, "IDAT", z, (uint32_t)zlen);
++	png_chunk(fp, "IEND", NULL, 0);
++	fclose(fp);
++	free(z);
++	vita_diag_log("screenshot: %s, %lu bytes", name,
++		      (unsigned long)zlen + 57);
++	remember_sent(name);
++	if (net_started)
++		vita_netlog_file(name, path);
++}
++
+ /** nslog_init's hook: buffer the file, remember it for flushing. */
+ static bool engine_log_ensure(FILE *fp)
+ {
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+index 305c37c..b6e7f9c 100644
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -79,6 +79,11 @@ void vita_diag_trace_end(void);
+ /** The open dump, or NULL: the plotters write to it when set. */
+ extern FILE *vita_plot_trace;
+ 
++/** Save the frame on screen as VITA_DIAG_DIR shot-<ms>.png and send it
++ * to the results receiver (SELECT + CROSS; the system's PS + START
++ * screenshot did not save in hardware run 15). */
++void vita_diag_screenshot(void);
++
+ /** Create an empty marker file in VITA_DIAG_DIR (e.g. "autotest.done"). */
+ void vita_diag_marker(const char *name);
+ 
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 35df143..ec15a1e 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -36,6 +36,8 @@
+  *             pages, the interaction pass (vita/interact.c), then font
+  *             metrics and the memory probe; "AUTOTEST DONE" when finished
+  *   CIRCLE    dump the current page's plot stream
++ *   CROSS     screenshot (ux0:data/VitaBrowser/shot-*.png, also sent to
++ *             the results receiver)
+  *   TRIANGLE  memory probe          L / R   previous / next test page
+  *   START     quit
+  */
+@@ -458,6 +460,11 @@ static int vita_controls(struct gui_window *gw, struct browser_window *bw,
+ 			vita_dump_next = true;
+ 			vita_window_force_redraw(gw);
+ 		}
++		if (pressed & SCE_CTRL_CROSS) {
++			/* The frame now on screen, HUD included. */
++			vita_diag_screenshot();
++			set_message(1500, "screenshot saved");
++		}
+ 		if (pressed & SCE_CTRL_TRIANGLE) {
+ 			set_message(0, "memory probe...");
+ 			vita_diag_mem_probe();
