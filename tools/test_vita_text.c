@@ -62,6 +62,16 @@ void nslog_log(const char *file, const char *func, int ln,
 	fputc('\n', stdout);
 }
 
+/* vita/diag.c stand-in: text.c logs face failures there. */
+void vita_diag_log(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stdout, fmt, ap);
+	va_end(ap);
+	fputc('\n', stdout);
+}
+
 /* ---- vita2d stand-in --------------------------------------------------- */
 
 #define MAX_DRAWS 4096

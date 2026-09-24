@@ -1,0 +1,94 @@
+# netsurf (Vita frontend): load font faces into memory
+# Generated 2026-09-24
+#
+# Hardware run 15: one of the bundled faces failed to open ("font: ...:
+# cannot open") while the others worked, so bold text was measured and drawn
+# with the regular face and the VT-text dump differed from the simulator's.
+# FT_New_Face keeps the file open and reads it lazily through newlib's stdio
+# on app0:, where every glyph load is a seek + read. Each face is now read
+# whole with fopen/fread and opened with FT_New_Memory_Face (the buffer lives
+# until vita_text_fini), and a failure logs the FreeType error and errno.
+
+diff --git a/frontends/vita/text.c b/frontends/vita/text.c
+index 1349e2a..219f182 100644
+--- a/frontends/vita/text.c
++++ b/frontends/vita/text.c
+@@ -35,6 +35,7 @@
+  * one, since the GPU may still be reading glyphs already drawn.
+  */
+ 
++#include <errno.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -50,6 +51,7 @@
+ #include "utils/utf8.h"
+ #include "netsurf/plot_style.h"
+ 
++#include "vita/diag.h"
+ #include "vita/text.h"
+ 
+ /* The twelve DejaVu faces, indexed family * 4 + bold * 2 + italic, then the
+@@ -83,6 +85,7 @@ struct face {
+ 	FT_Face ft;
+ 	int px;		/**< size currently set on ft, 0 = none */
+ 	bool tried;	/**< an open was attempted */
++	unsigned char *data;	/**< the font file, in memory */
+ };
+ 
+ struct adv_entry {
+@@ -130,15 +133,43 @@ static int style_slot(const struct vita_text_style *s)
+ static FT_Face face_get(int i)
+ {
+ 	char path[512];
++	FT_Error err;
++	FILE *fp;
++	long len = 0;
+ 
+ 	if (faces[i].tried)
+ 		return faces[i].ft;
+ 	faces[i].tried = true;
+ 	snprintf(path, sizeof(path), "%s%s", font_dir, face_files[i]);
+-	if (FT_New_Face(ft_lib, path, 0, &faces[i].ft) != 0) {
++	/* Read into memory rather than FT_New_Face(path): that keeps a
++	 * file handle open for as long as the face lives, one per face,
++	 * and hardware run 15 had one face fail to open ("1 font files
++	 * failed"; bold text measured as regular) once the browsing
++	 * features held more handles of their own. */
++	fp = fopen(path, "rb");
++	if (fp != NULL && fseek(fp, 0, SEEK_END) == 0 &&
++	    (len = ftell(fp)) > 0 && fseek(fp, 0, SEEK_SET) == 0) {
++		faces[i].data = malloc((size_t)len);
++		if (faces[i].data != NULL &&
++		    fread(faces[i].data, 1, (size_t)len, fp) != (size_t)len) {
++			free(faces[i].data);
++			faces[i].data = NULL;
++		}
++	}
++	if (fp != NULL)
++		fclose(fp);
++	err = faces[i].data == NULL ? -1 :
++		FT_New_Memory_Face(ft_lib, faces[i].data, (FT_Long)len, 0,
++				   &faces[i].ft);
++	if (err != 0) {
++		vita_diag_log("font: %s: cannot open (%s, FreeType %d, errno "
++			      "%d)", path, fp == NULL ? "fopen failed" :
++			      faces[i].data == NULL ? "read failed" : "parse",
++			      (int)err, errno);
++		free(faces[i].data);
++		faces[i].data = NULL;
+ 		faces[i].ft = NULL;
+ 		vita_text_stats.face_failures++;
+-		NSLOG(netsurf, ERROR, "font %s: cannot open", path);
+ 	}
+ 	return faces[i].ft;
+ }
+@@ -579,6 +610,8 @@ void vita_text_fini(void)
+ 	for (i = 0; i < FACE_COUNT; i++) {
+ 		if (faces[i].ft != NULL)
+ 			FT_Done_Face(faces[i].ft);
++		free(faces[i].data);
++		faces[i].data = NULL;
+ 		faces[i].ft = NULL;
+ 		faces[i].tried = false;
+ 		faces[i].px = 0;
