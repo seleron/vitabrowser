@@ -2074,7 +2074,7 @@ results are in `results-run15\`.
 - **Screenshots:** PS + START saved nothing to the Vita's screenshots
   folder.
 
-## Run 16 — hand-off: claude.ai past Cloudflare, ES modules, web APIs (patches 67–75)
+## Run 16 — hand-off: claude.ai past Cloudflare, ES modules, web APIs, modern CSS (patches 67–82)
 
 **What changed since run 15** (doc 11, round 4):
 - **Patch 67:** fonts are read into memory, so a face that failed to
@@ -2094,9 +2094,25 @@ results are in `results-run15\`.
   getComputedStyle, ...
 - **Patch 75:** scripts up to 8 MB run (YouTube's bundle is 1.6 MB).
 - **Patch 74:** the interaction pass waits for a slow navigation.
+- **Patches 76–82, added the same afternoon (doc 11, round 5):**
+  - **Modern CSS.** MacSurf's own CSS rewrites now run (76): `@layer`,
+    `@supports`, standard grid, logical properties, `calc()` in media
+    queries. Before, claude.ai's stylesheet reached the parser as one
+    unreadable block.
+  - **Custom properties inherit** (77): `:root { --x }` variables
+    reached no element before.
+  - **Flex `gap`** stays inside its container (78).
+  - **Transparent backgrounds:** `rgba()` backgrounds are
+    see-through (79).
+  - **Fixes for scripts** (80–81):
+    - no crash when an old page's script finishes after a redirect;
+    - links (`<a>`) give their URL parts to scripts;
+    - more element types and element methods.
+  - **Page width in the log** (82): each page logs its size once loaded,
+    and any box sticking out past the screen.
 
 **Clean checkout:**
-- Applied 158 + the known 2; L1–L4 PASS; 101/101 + 30/30.
+- Applied 165 + the known 2; L1–L4 PASS; 101/101 + 30/30.
 - The simulator suite passes. New:
   - `JS-apis`: **151/176** present, 10/10 behaviours;
   - `JS-module`: **6/6** from `app0:` and over http;
@@ -2106,9 +2122,13 @@ results are in `results-run15\`.
 - The internet-connected reference run gives interaction **22/22**.
 
 **Hand-off.**
-- SHA256, first 12: `VitaBrowser.vpk` `330f44f92418`,
-  `VitaBrowser-ext.vpk` `14423d09c344`, `nsvita.elf` `8d2bf778e52b`.
+- SHA256, first 12: `VitaBrowser.vpk` `76c1859669d3`,
+  `VitaBrowser-ext.vpk` `ca3bbdb9c1fe`, `nsvita.elf` `0d5b2275ae38`
+  (replacing the 14:32 build's `330f44f92418`).
 - `reference-dumps\` is regenerated (29 dumps, the same pages as run 15).
+  L2 and L3 changed on purpose: L3 is now a real CSS grid, and L2
+  right-aligns a `justify-self: end` block. Expect **SAME** for them
+  too.
 - Run 15's results are in `results-run15\`.
 - Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-24-run16/`.
 
@@ -2129,16 +2149,27 @@ results are in `results-run15\`.
    - The screen stays on the old page while about 19 MB of modules
      download and compile; the browser is frozen meanwhile.
    - Give it **up to 3 minutes**.
-   - Expected: claude.ai's login page, **unstyled** (plain text and grey
-     buttons), as in the simulator.
+   - Expected: claude.ai's login page, **partly styled**, as in the
+     simulator:
+     - centred, with a serif "The AI for problem solvers" heading;
+     - the logo and an email field;
+     - the Google / Apple / email buttons without their fills.
    - Then SELECT + ✕.
    - The log's `module graph:` and `module memory:` lines give the
      download time and the Vita's JS heap (expected ~60 MB, cap 128 MB).
+   - `netsurf.log`'s `css rewrite:` lines give the CSS cost. The 1.4 MB
+     sheet took 373 ms on a desktop; expect several seconds on the
+     Vita.
    - If it runs out of memory, try again with `VitaBrowser-ext.vpk`.
-4. **YouTube** (`m.youtube.com`): expect grey-and-black loading blocks in
-   a grid, not an empty page. The feed itself is not expected yet.
-5. **Wikipedia:** still the mobile skin. Note any sideways scrolling: the
-   simulator shows 1011 px under the new user agent.
+4. **YouTube** (`m.youtube.com`): expect the **"Before you continue to
+   YouTube"** consent dialog, white over a dimmed page. Its buttons are
+   cut off below; the feed itself is not expected yet.
+5. **Wikipedia:**
+   - The Language / Watch / Edit row should be **icons only**, with no
+     clipped words.
+   - There should be no sideways scrolling. The 1011 px measured before
+     was a mid-layout reading; `log.txt`'s `loaded, extent` line gives
+     the final size.
 6. **If something looks wrong** with the new user agent, put `vita` in
    `ux0:data/VitaBrowser/useragent.txt` (VitaShell) and restart to
    compare.

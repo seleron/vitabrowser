@@ -1,0 +1,150 @@
+# netsurf (Vita frontend): the loaded page's size, and what sticks out
+# Generated 2026-09-24
+#
+# The "document after" extent is mid-layout: Wikipedia logged 1011 px there
+# and settles at 960. Once a page stops loading, log.txt now records
+# "page X: loaded, extent WxH", and when that is wider than the screen, the
+# innermost boxes past its edge ("wide box: tag#id.class x a..b") -- the
+# device's own answer to a sideways-scrolling page. tools/run-live-sites.sh
+# reports the loaded extent.
+
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index b33ede3..b3072e9 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -960,6 +960,22 @@ static void watch_load(struct gui_window *gw)
+ 			      "(see netsurf.log for the engine's side)",
+ 			      page_name(vita_page), age);
+ 	}
++	/* Once loaded: its final size (the size at "document after" is
++	 * mid-layout), and when wider than the screen, what sticks out. */
++	{
++		static unsigned int loaded_nav = ~0u;
++		if (vita_stats.content_ms != 0 && !vita_window_loading(gw) &&
++		    loaded_nav != vita_stats.nav_ms) {
++			loaded_nav = vita_stats.nav_ms;
++			vita_diag_log("page %s: loaded, extent %dx%d%s",
++				      page_name(vita_page), w, h,
++				      w > VITA_SCREEN_WIDTH ?
++				      ", wider than the screen" : "");
++			if (w > VITA_SCREEN_WIDTH)
++				vita_window_log_wide_boxes(gw,
++						VITA_SCREEN_WIDTH);
++		}
++	}
+ 	if ((vita_stats.content_ms == 0 || vita_window_loading(gw)) &&
+ 	    age < VITA_STATUS_LOG_MS && now - vita_stats.status_ms >= 1000) {
+ 		vita_stats.status_ms = now;
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index 5b0c1ee..95548e1 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -35,6 +35,15 @@
+ #include "netsurf/window.h"
+ #include "netsurf/plotters.h"
+ #include "utils/nsurl.h"
++#include <string.h>
++#include <dom/dom.h>
++#include "netsurf/content.h"
++#include "content/content.h"
++#include "content/hlcache.h"
++#include "utils/corestrings.h"
++#include "content/handlers/html/box.h"
++#include "content/handlers/html/box_inspect.h"
++#include "content/handlers/html/html_save.h"
+ 
+ #include "vita/diag.h"
+ #include "vita/plot.h"
+@@ -266,6 +275,77 @@ void vita_window_extent(struct gui_window *gw, int *width, int *height)
+ 		*width = *height = 0;
+ }
+ 
++/** A box's element as "tag#id.class" (for the log). */
++static void wide_box_name(struct box *b, char *out, size_t max)
++{
++	dom_string *s = NULL;
++	size_t n = 0;
++
++	out[0] = '\0';
++	while (b != NULL && b->node == NULL)
++		b = b->parent;
++	if (b == NULL)
++		return;
++	if (dom_node_get_node_name(b->node, &s) == DOM_NO_ERR && s != NULL) {
++		n = (size_t)snprintf(out, max, "%s", dom_string_data(s));
++		dom_string_unref(s);
++	}
++	s = NULL;
++	if (n < max && dom_element_get_attribute(b->node, corestring_dom_id,
++			&s) == DOM_NO_ERR && s != NULL) {
++		n += (size_t)snprintf(out + n, max - n, "#%s",
++				dom_string_data(s));
++		dom_string_unref(s);
++	}
++	s = NULL;
++	if (n < max && dom_element_get_attribute(b->node,
++			corestring_dom_class, &s) == DOM_NO_ERR && s != NULL) {
++		snprintf(out + n, max - n, ".%.60s", dom_string_data(s));
++		dom_string_unref(s);
++	}
++}
++
++/** Log the innermost boxes whose border edge passes limit; how many. */
++static unsigned int wide_boxes(struct box *b, int limit, unsigned int left)
++{
++	unsigned int logged = 0;
++	struct box *c;
++	int x, y, right;
++
++	for (c = b->children; c != NULL && logged < left; c = c->next)
++		logged += wide_boxes(c, limit, left - logged);
++	if (logged > 0 || b->type == BOX_INLINE_END)
++		return logged;
++	box_coords(b, &x, &y);
++	right = x + b->padding[LEFT] + b->width + b->padding[RIGHT] +
++		b->border[LEFT].width + b->border[RIGHT].width;
++	if (right > limit && b->width != UNKNOWN_WIDTH && b->width >= 0) {
++		char name[128];
++		wide_box_name(b, name, sizeof(name));
++		vita_diag_log("wide box: %s x %d..%d, y %d (type %d)",
++			      name[0] ? name : "(anonymous)", x, right, y,
++			      (int)b->type);
++		return 1;
++	}
++	return 0;
++}
++
++/* exported interface documented in vita/window.h */
++void vita_window_log_wide_boxes(struct gui_window *gw, int limit)
++{
++	struct hlcache_handle *h;
++	struct box *root;
++
++	if (gw == NULL || gw->bw == NULL)
++		return;
++	h = browser_window_get_content(gw->bw);
++	if (h == NULL || content_get_type(h) != CONTENT_HTML)
++		return;
++	root = html_get_box_tree(h);
++	if (root != NULL)
++		wide_boxes(root, limit, 5);
++}
++
+ /* exported interface documented in vita/window.h */
+ struct browser_window *vita_window_browser(struct gui_window *gw)
+ {
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index 53c0b44..08f18e6 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -65,4 +65,10 @@ const char *vita_window_title(struct gui_window *gw);
+ /** The browser window shown in this gui window. */
+ struct browser_window *vita_window_browser(struct gui_window *gw);
+ 
++/**
++ * Log (up to 5 of) the innermost boxes whose right edge passes limit: what
++ * makes a page wider than the screen.
++ */
++void vita_window_log_wide_boxes(struct gui_window *gw, int limit);
++
+ #endif

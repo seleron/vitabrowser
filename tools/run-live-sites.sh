@@ -4,7 +4,7 @@
 # Opens each site below in nsvita-sim -- the Vita frontend and engine, the
 # Vita's curl + mbedTLS, DNS on the resolver's worker thread, QuickJS and
 # MacSurf's bridge -- over the live network, and reports for each: when the
-# document arrived, its extent, its title, blocked hosts, peak memory (host
+# document arrived, its extent once loaded, its title, blocked hosts, peak memory (host
 # RSS: a 64-bit process, so an upper bound for the Vita's 32-bit one), and a
 # screenshot in $OUT/live/<name>/shots/page-00.png once it settled.
 #
@@ -50,6 +50,9 @@ while [ $# -ge 2 ]; do
 		> "$D/out.log" 2>&1 ) || true
 	L="$D/ux0:data/VitaBrowser/log.txt"
 	doc=$(sed -n 's/.*: document after \([0-9]*\) ms (extent \([0-9x]*\)).*/\1 \2/p' "$L" | tail -1)
+	# The extent once loaded (at "document after" it is mid-layout).
+	fin=$(sed -n 's/.*: loaded, extent \([0-9x]*\).*/\1/p' "$L" | tail -1)
+	[ -n "$fin" ] && [ -n "$doc" ] && doc="${doc%% *} $fin"
 	title=$(sed -n 's/.*gw title: //p' "$L" | tail -1)
 	blocked=$(grep -c 'blocked: ' "$D/ux0:data/VitaBrowser/netsurf.log" || true)
 	rss=$(sed -n 's/.*Maximum resident set size (kbytes): \([0-9]*\)/\1/p' "$D/out.log")

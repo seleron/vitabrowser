@@ -449,27 +449,104 @@ after**, 10/10 behaviour checks.
 - The feed then stops on a `startsWith` of undefined in the bundle. The
   stack is truncated in the log: the bundle's URL is 600+ characters.
 
+## Round 5: modern CSS reaches the page (patches 76–82)
+
+### 14. MacSurf's CSS rewrites never ran (patch 76)
+
+MacSurf does most of its modern-CSS support before libcss sees a sheet,
+in a fork of `css.c` (`cssh_css.c`). About 25 text passes cover:
+- `@supports` and `@layer` (unwrapped or dropped);
+- grid templates, placement and areas, rewritten to its `-macsurf-grid`
+  dialect;
+- logical properties, `inset`, `transform`, `text-shadow`, gradients,
+  `calc()` folding.
+
+The Vita build compiled plain `css.c`. The fork is of an older `css.c`, so
+it cannot simply be swapped in.
+
+- `css_rewrite.c` now holds MacSurf's functions verbatim, plus its pass
+  chain as `macsurf_css_rewrite()`.
+- `css.c` gathers each sheet and rewrites it whole at convert time.
+  MacSurf rewrote each network chunk, which breaks a rule split between
+  two reads.
+- `style=""` attributes get the inline rewrite, and their
+  `--properties` are seen by descendants.
+- A new pass folds `calc()` in `@media` preludes to px. Minerva's
+  `(max-width: calc(1120px - 1px))` was invalid to libcss, and it dropped
+  the block that hides the page-action labels. **Wikipedia's "Language /
+  Watch / Edit" labels are now hidden.**
+
+Results:
+- claude.ai's 1.4 MB Tailwind sheet, all inside `@layer`, now applies.
+  The rewrite costs 373 ms on a desktop.
+- **Standard CSS grid works**. testpages L3 now has explicit
+  placement, spans, `fr` and gaps right; `grid-auto-flow: column` still
+  loses two items. This covers the "standard grid-template-columns"
+  stretch item.
+- One deviation: L2's `justify-self: end` on a plain block becomes
+  `text-align: right`. That is MacSurf's heuristic; browsers ignore it.
+
+### 15. Custom properties did not inherit (patch 77)
+
+MacSurf's libcss keeps each element's custom properties in an
+environment seeded from the parent's. The caller must hand those
+environments in and out around `css_select_style`. `cssh_select.c` does
+that; our `select.c` did not.
+
+So a variable reached only the element declaring it. Every `:root` theme
+variable resolved to nothing: claude.ai's fonts and spacing, YouTube's
+dialog background, most of Minerva's colours. Probe pages now pass
+for `:root`, `html`, `body`, a parent, and fallbacks.
+
+### 16. Flex gap, rgba, and the true page width (patches 78, 79, 82)
+
+- **Flex gap (78):** the gaps were added on top of the flexed items, so
+  a row overflowed by its gaps. Wikipedia's page-action row ran 40 px
+  past its column.
+- **rgba (79):** NetSurf's colour type has no alpha, so
+  `rgba(0,0,0,.6)` painted solid black. YouTube's consent scrim was a
+  black page. The background alpha now goes into the plot opacity.
+- **Page width (82):**
+  - Wikipedia's "1011 px" was the extent at "document after", which is
+    mid-layout. Once loaded it is **960**.
+  - `log.txt` now records `page X: loaded, extent WxH`. When a page is
+    wider than the screen, it also lists the innermost boxes sticking
+    out.
+  - `run-live-sites.sh` reports the loaded extent.
+
+### 17. Scripts: stale realms, anchors, interfaces (patches 80, 81)
+
+- **A freed context (80).** After claude.ai redirected to `/login`, an
+  old page's async script ran `js_set_current_script` against a freed
+  context (SIGSEGV). JS entry points now check that their realm is live.
+- **The polyfill was overwritten (80).** The bridge re-installs its DOM
+  after the realm is built (`js_newthread`, encoding restarts), which
+  overwrote polyfill properties. The polyfill runs again after each
+  install, and every section is idempotent.
+- **Anchor URL parts (81).** YouTube reads `a.pathname`; these were
+  undefined before.
+- **Missing interfaces (81).** `HTMLObjectElement` and 60-odd others are
+  now defined, with `instanceof` answered by tag.
+- **ChildNode methods on every tag's prototype (81).** `<title>` had no
+  `remove()`, which took claude.ai's app down.
+
+### State (simulator)
+
+- **claude.ai/code:** the login page, centred, with its serif heading,
+  logo and email field. The buttons have no fills yet; likely
+  `color-mix()` / `oklab` colours, which libcss cannot parse.
+- **YouTube:** the EU consent dialog draws correctly over a dimmed
+  skeleton. It is cut off below, so its buttons are not visible yet.
+- **Wikipedia:** icons-only page actions, 960 px wide.
+
 ## Not done: the gaps left
 
 - **claude.ai/code:**
-  - Its CSS: the login page draws unstyled. It is the next item on the
-    way to the north star.
+  - Button fills: probably `color-mix()`, `oklab()` and friends.
   - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.
-- **YouTube:** the `startsWith` failure, and CSS custom properties for
-  its colours.
-- **Wikipedia is 1011 px wide again** under the Chrome UA. The mobile
-  skin now comes from `en.wikipedia.org`, with a different header.
-- **Minerva's page-action labels** ("Language", "Watch", "Edit") still
-  draw, clipped.
-  - They reproduce statically: the page-actions markup plus Minerva's
-    stylesheet, no scripts.
-  - Yet a minimal page with the same hiding rule, flex nesting and
-    buttons hides them.
-  - A bisection over Minerva's stylesheet is the next step:
-    `VITA_SIM_DUMP=1` makes the simulator record the plot dump, where
-    the labels show as `PLOT TEXT … STR Watch`.
+- **YouTube:** the consent dialog's cut-off buttons (it needs to scroll), then the feed.
 - **Memory:** host RSS peaks at about 78 MB for the Wikipedia article (a
   64-bit process). The Vita's heap budget is 192 MB. The autotest logs
   `mem[...]` per page on the device.
