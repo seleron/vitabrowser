@@ -1,0 +1,130 @@
+# netsurf: UTF-8/Latin-1/ASCII conversions without iconv (forms submit)
+# Generated 2026-09-24
+#
+# Hardware runs 15 and 16: interaction step 18 (submit IN-form) failed on
+# the device only. The engine log says why: "fetch_data_list_add: Could not
+# encode name for fetch data" -- form names and values are converted to
+# the form's charset ("UTF-8//TRANSLIT") by utf8_to_enc, i.e. iconv, and
+# the Vita's newlib iconv has no converters at all (hardware run 2 found
+# the same for the parser). The simulator uses glibc's iconv, so it
+# passed there. utf8_convert now does UTF-8 <-> UTF-8, Latin-1 /
+# Windows-1252 and ASCII itself (unmappable characters become '?') and
+# leaves only other charsets to iconv. Step 19 failed as a consequence
+# (the caret stayed in the field).
+
+diff --git a/utils/utf8.c b/utils/utf8.c
+index cf842dc..5227033 100644
+--- a/utils/utf8.c
++++ b/utils/utf8.c
+@@ -24,6 +24,7 @@
+ #include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <ctype.h>
+ #include <strings.h>
+ #include <iconv.h>
+ #include <parserutils/charset/utf8.h>
+@@ -218,6 +219,89 @@ nserror utf8_finalise(void)
+  * \return NSERROR_OK for no error, NSERROR_NOMEM on allocation error,
+  *         NSERROR_BAD_ENCODING for a bad character encoding
+  */
++/* VitaBrowser: the common conversions without iconv. The Vita's newlib
++ * iconv has no converters at all (hardware run 2's root cause, for the
++ * parser), so a form submission -- names and values go to the form's
++ * charset through here, as "UTF-8//TRANSLIT" -- failed with "Could not
++ * encode name for fetch data" and never navigated (hardware runs 15-16,
++ * interaction steps 18-19). UTF-8 <-> UTF-8, Latin-1, Windows-1252 and
++ * ASCII are done directly; anything else still goes to iconv. */
++enum utf8_builtin_cs { CS_OTHER, CS_UTF8, CS_LATIN1, CS_ASCII };
++
++static enum utf8_builtin_cs utf8_builtin_charset(const char *name)
++{
++	char n[32];
++	size_t i;
++
++	for (i = 0; name[i] != '\0' && name[i] != '/' && i + 1 < sizeof(n); i++)
++		n[i] = (char)tolower((unsigned char)name[i]);
++	n[i] = '\0';
++	if (strcmp(n, "utf-8") == 0 || strcmp(n, "utf8") == 0)
++		return CS_UTF8;
++	if (strcmp(n, "iso-8859-1") == 0 || strcmp(n, "iso8859-1") == 0 ||
++	    strcmp(n, "latin1") == 0 || strcmp(n, "windows-1252") == 0 ||
++	    strcmp(n, "cp1252") == 0 || strcmp(n, "l1") == 0)
++		return CS_LATIN1;
++	if (strcmp(n, "us-ascii") == 0 || strcmp(n, "ascii") == 0)
++		return CS_ASCII;
++	return CS_OTHER;
++}
++
++static nserror
++utf8_convert_builtin(const char *string, size_t slen, const char *from,
++		     const char *to, char **result_out, size_t *result_len_out)
++{
++	enum utf8_builtin_cs f = utf8_builtin_charset(from);
++	enum utf8_builtin_cs t = utf8_builtin_charset(to);
++	char *out;
++	size_t o = 0, i = 0;
++
++	if (f == CS_OTHER || t == CS_OTHER)
++		return NSERROR_NOT_IMPLEMENTED;
++	/* UTF-8 -> Latin-1 shrinks, the other way at most doubles */
++	out = malloc(slen * 2 + 4);
++	if (out == NULL)
++		return NSERROR_NOMEM;
++	if (f == CS_UTF8 && t == CS_UTF8) {
++		memcpy(out, string, slen);
++		o = slen;
++	} else if (f == CS_UTF8) {
++		while (i < slen) {
++			uint32_t c = utf8_to_ucs4(string + i, slen - i);
++			size_t n = utf8_next(string, slen, i) - i;
++			if (n == 0)
++				n = 1;
++			i += n;
++			out[o++] = (c < (t == CS_ASCII ? 0x80u : 0x100u)) ?
++					(char)c : '?';
++		}
++	} else if (t == CS_UTF8) {
++		for (i = 0; i < slen; i++) {
++			unsigned char c = (unsigned char)string[i];
++			if (c < 0x80 || f == CS_ASCII) {
++				out[o++] = (char)(c & 0x7f);
++			} else {
++				out[o++] = (char)(0xc0 | (c >> 6));
++				out[o++] = (char)(0x80 | (c & 0x3f));
++			}
++		}
++	} else {
++		for (i = 0; i < slen; i++)
++			out[o++] = (t == CS_ASCII &&
++				    (unsigned char)string[i] >= 0x80) ?
++					'?' : string[i];
++	}
++	/* NUL-terminated with room to spare, as the iconv path leaves it */
++	out[o] = '\0';
++	out[o + 1] = '\0';
++	out[o + 2] = '\0';
++	out[o + 3] = '\0';
++	*result_out = out;
++	if (result_len_out != NULL)
++		*result_len_out = o;
++	return NSERROR_OK;
++}
++
+ static nserror
+ utf8_convert(const char *string,
+ 	     size_t slen,
+@@ -244,6 +328,13 @@ utf8_convert(const char *string,
+ 	 * This optimisation is necessary on AmigaOS as iconv()
+ 	 * returns an error if an empty string is passed.
+ 	 */
++	{
++		nserror bres = utf8_convert_builtin(string, slen, from, to,
++				result_out, result_len_out);
++		if (bres != NSERROR_NOT_IMPLEMENTED)
++			return bres;
++	}
++
+ 	if ((slen == 0) || (strcasecmp(from, to) == 0)) {
+ 		*result_out = strndup(string, slen);
+ 		if (*result_out == NULL) {
