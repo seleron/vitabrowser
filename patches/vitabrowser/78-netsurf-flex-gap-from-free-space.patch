@@ -1,0 +1,81 @@
+# netsurf: flex gaps come out of the free space
+# Generated 2026-09-24
+#
+# MacSurf's flex (fixes148) placed column-gap between items but did not
+# take it from the space the items share, so growing items plus gaps
+# overflowed the container by the gaps: Wikipedia's page-action row (gap:
+# 20px, a growing first item) ran 40 px past its column. Each line now
+# records its gaps (gap_total); flexing resolves against the space without
+# them and justify-content distributes what remains after them.
+
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index bb6e351..820bac6 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -197,6 +197,9 @@ struct flex_line_data {
+ 
+ 	int used_main_size;
+ 	int main_auto_margin_count;
++	/** The main-axis gaps between this line's items, px: space the
++	 * items do not get (VitaBrowser; see layout_flex__resolve_line). */
++	int gap_total;
+ 
+ 	int pos;
+ 
+@@ -976,6 +979,7 @@ static struct flex_line_data *layout_flex__build_line(struct flex_ctx *ctx,
+ 		if (lh__box_is_flex_out_of_flow(item->box) == false) {
+ 			if (line->count > 0) {
+ 				line->main_size += ctx->main_gap;
++				line->gap_total += ctx->main_gap;
+ 				used_main += ctx->main_gap;
+ 			}
+ 			line->main_size += item->main_size;
+@@ -1286,6 +1290,17 @@ static bool layout_flex__resolve_line(
+ 	bool grow;
+ 	size_t i;
+ 
++	/* VitaBrowser: the gaps come out of the space the items share, so
++	 * grown items plus gaps fill the container -- the gaps were added
++	 * on top, and Wikipedia's page-action row (gap: 20px, a growing
++	 * first item) ran 40 px past its column. */
++	if (available_main != AUTO && available_main != UNKNOWN_WIDTH &&
++	    line->gap_total > 0) {
++		available_main -= line->gap_total;
++		if (available_main < 0)
++			available_main = 0;
++	}
++
+ 	/* fixes1313 (#167, 68kmla regression) - CSS Flexbox SS9.7: flexible
+ 	 * lengths only ever resolve against a DEFINITE main size. An
+ 	 * indefinite container (most commonly an auto-height column flex --
+@@ -1320,7 +1335,7 @@ static bool layout_flex__resolve_line(
+ 		return true;
+ 	}
+ 
+-	grow = (line->main_size < available_main);
++	grow = (line->main_size - line->gap_total < available_main);
+ 	initial_free_main = available_main;
+ 
+ 	NSLOG(flex, DEEPDEBUG, "box %p: line %zu: first: %zu, count: %zu",
+@@ -1429,16 +1444,18 @@ static bool layout_flex__place_line_items_main(
+ 
+ 	if (ctx->available_main != AUTO &&
+ 	    ctx->available_main != UNKNOWN_WIDTH &&
+-	    ctx->available_main > line->used_main_size) {
++	    ctx->available_main > line->used_main_size + line->gap_total) {
+ 		if (line->main_auto_margin_count > 0) {
+-			extra = ctx->available_main - line->used_main_size;
++			extra = ctx->available_main - line->used_main_size -
++					line->gap_total;
+ 
+ 			extra_remainder = extra % line->main_auto_margin_count;
+ 			extra /= line->main_auto_margin_count;
+ 		} else {
+ 			/* fixes41 -- no auto-margin consumers, free main
+ 			 * space goes to justify-content. */
+-			jc_free = ctx->available_main - line->used_main_size;
++			jc_free = ctx->available_main - line->used_main_size -
++					line->gap_total;
+ 		}
+ 	}
+ 
