@@ -1,0 +1,84 @@
+# netsurf: all transfers share TLS sessions, DNS and connections
+# Generated 2026-09-24
+#
+# NetSurf makes each curl handle with curl_easy_duphandle, which copies no
+# TLS session cache, and fetch_get_blocking (patch 71) ran on its own multi
+# handle too: every new connection was a full TLS handshake, 543 ms of the
+# Vita's CPU in hardware run 16's probe, several per page. One CURLSH now
+# shares SSL sessions, DNS and the connection cache between every handle
+# (duphandle does not copy CURLOPT_SHARE, so each is attached): later
+# connections to a host resume their session and idle ones are reused,
+# module fetches included (claude.ai's 65 modules: 1.0 -> 0.64 s here).
+
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index e83b4dc..7c1715d 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -280,6 +280,22 @@ CURLM *fetch_curl_multi;
+ 
+ /** Curl handle with default options set; not used for transfers. */
+ static CURL *fetch_blank_curl;
++/** VitaBrowser: what every transfer shares -- TLS sessions, name lookups
++ * and open connections. A curl handle made by curl_easy_duphandle starts
++ * with none of them, so each new connection paid a full TLS handshake:
++ * 543 ms of the Vita's CPU (hardware run 16's probe), several per page.
++ * With the share, a second connection to a host resumes the session and
++ * an idle connection is reused, whichever handle or multi asks
++ * (fetch_get_blocking's module fetches included). Single-threaded, so no
++ * lock callbacks. */
++static CURLSH *fetch_curl_share;
++
++/** Attach e to fetch_curl_share (duphandle does not copy CURLOPT_SHARE). */
++static void fetch_curl_use_share(CURL *e)
++{
++	if (e != NULL && fetch_curl_share != NULL)
++		curl_easy_setopt(e, CURLOPT_SHARE, fetch_curl_share);
++}
+ 
+ /** Ring of cached handles */
+ static struct cache_handle *curl_handle_ring = 0;
+@@ -345,6 +361,12 @@ static void fetch_curl_finalise(lwc_string *scheme)
+ 			NSLOG(netsurf, INFO,
+ 			      "curl_multi_cleanup failed: ignoring");
+ 
++		/* Refused (CURLSHE_IN_USE) while a cached handle still holds
++		 * it; this is exit, so that is harmless. */
++		if (fetch_curl_share != NULL &&
++		    curl_share_cleanup(fetch_curl_share) == CURLSHE_OK)
++			fetch_curl_share = NULL;
++
+ 		curl_global_cleanup();
+ 
+ 		NSLOG(netsurf, DEBUG, "Cleaning up SSL cert chain hashmap");
+@@ -1416,6 +1438,7 @@ static CURL *fetch_curl_get_handle(lwc_string *host)
+ 		free(h);
+ 	} else {
+ 		ret = curl_easy_duphandle(fetch_blank_curl);
++		fetch_curl_use_share(ret);
+ 	}
+ 	return ret;
+ }
+@@ -2167,6 +2190,15 @@ nserror fetch_curl_register(void)
+ 	/* Create a curl easy handle with the options that are common to all
+ 	 *  fetches.
+ 	 */
++	fetch_curl_share = curl_share_init();
++	if (fetch_curl_share != NULL) {
++		curl_share_setopt(fetch_curl_share, CURLSHOPT_SHARE,
++				  CURL_LOCK_DATA_SSL_SESSION);
++		curl_share_setopt(fetch_curl_share, CURLSHOPT_SHARE,
++				  CURL_LOCK_DATA_DNS);
++		curl_share_setopt(fetch_curl_share, CURLSHOPT_SHARE,
++				  CURL_LOCK_DATA_CONNECT);
++	}
+ 	fetch_blank_curl = curl_easy_init();
+ 	if (!fetch_blank_curl) {
+ 		NSLOG(netsurf, INFO, "curl_easy_init failed");
+@@ -2367,6 +2399,7 @@ fetch_blocking_start(CURLM *multi, const char *url, const char *referer,
+ 	e = curl_easy_duphandle(fetch_blank_curl);
+ 	if (e == NULL)
+ 		return -1;
++	fetch_curl_use_share(e);
+ 	curl_easy_setopt(e, CURLOPT_URL, url);
+ 	curl_easy_setopt(e, CURLOPT_PRIVATE, (void *)(uintptr_t)i);
+ 	curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, fetch_blocking_write);

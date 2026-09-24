@@ -1,0 +1,648 @@
+# netsurf (MacSurf bridge): bytecode caches; big scripts keep no source
+# Generated 2026-09-24
+#
+# Hardware run 16: every page built a realm parsing the same setup scripts
+# (bundled test pages 1.3 s each), and claude.ai took 13 s to download its
+# 19 MB of modules and 82 s to compile and run them, then ran out of
+# memory (84 MB) on its dynamic imports.
+# - Setup scripts (the bridge's and vita_polyfill.js) are compiled once and
+#   read back as bytecode after (qjs_eval_cached): a realm takes 4.5 ms
+#   instead of 16 on the desktop. "realm built" and "vita_polyfill" times
+#   are logged.
+# - Scripts and modules of 128 KB or more are compiled without keeping
+#   each function's source text (patches/quickjs/02): claude.ai's heap
+#   goes from ~99 to 76 MB (desktop).
+# - Modules are kept compiled in ux0:data/VitaBrowser/jscache/
+#   (MACSURF_JSCACHE_DIR) with their static imports. On a later visit a
+#   module whose name carries a content hash ("index-DKU2AWSS.js") is
+#   neither fetched nor parsed; others are fetched and their bytecode reused
+#   when the text matches. Files carry the build stamp. "module compile"
+#   logs how many came from the card. Past 96 MB the cache is cleared at
+#   the session's first save (one claude.ai visit leaves ~40 MB).
+
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+index 898359a..b1640f7 100644
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -99,6 +99,12 @@ void macsurf_profile_accum_js(long us);
+ #define MACSURF_JS_MAX_BYTES (8UL * 1024UL * 1024UL)
+ #endif
+ 
++/** Where compiled ES modules are kept between visits (macsurf_qjs.c
++ * module cache); unset, nothing is kept. */
++#ifndef MACSURF_JSCACHE_DIR
++#define MACSURF_JSCACHE_DIR "ux0:data/VitaBrowser/jscache/"
++#endif
++
+ /** navigator.platform. */
+ #ifndef MACSURF_JS_PLATFORM
+ #define MACSURF_JS_PLATFORM "PlayStation Vita"
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index d6699c4..7986535 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -20,6 +20,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <ctype.h>
++#include <sys/stat.h>
++#include <dirent.h>
+ 
+ #include "utils/ns_errors.h"
+ #include "macos9.h"
+@@ -713,6 +715,82 @@ static void qjs_log_exc(JSContext *ctx, JSValueConst exc,
+  * both precede it. See the definition for the full rationale. */
+ static void qjs_geom_settle_begin(void);
+ 
++/* VitaBrowser: bytecode for the scripts every realm evaluates. A realm
++ * is built for each page (fixes532), and building one parses the same
++ * setup scripts -- the bridge's ~40 and vita_polyfill.js -- every time:
++ * 14 ms on a desktop, most of a second on the Vita (hardware run 16:
++ * bundled test pages took 1.3 s each). The first evaluation of a text
++ * compiles it and keeps the bytecode (JS_WriteObject, runtime-independent),
++ * later ones read that back, which skips the parser. Short texts -- event
++ * dispatch snippets built per call -- are evaluated as before. */
++#define QJS_BC_CACHE_SLOTS 96
++#define QJS_BC_CACHE_MIN 256
++static struct {
++	uint32_t hash;
++	size_t len;
++	uint8_t *bc;
++	size_t bc_len;
++} qjs_bc_cache[QJS_BC_CACHE_SLOTS];
++static unsigned int qjs_bc_cache_n;
++
++static uint32_t qjs_bc_hash(const char *s, size_t n)
++{
++	uint32_t h = 2166136261u;	/* FNV-1a */
++	size_t i;
++	for (i = 0; i < n; i++) {
++		h ^= (unsigned char)s[i];
++		h *= 16777619u;
++	}
++	return h;
++}
++
++static JSValue qjs_eval_cached(JSContext *ctx, const char *src, size_t len,
++		const char *name)
++{
++	uint32_t h;
++	unsigned int i;
++	JSValue fn;
++	uint8_t *bc;
++	size_t bc_len = 0;
++
++	if (len < QJS_BC_CACHE_MIN)
++		return JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_GLOBAL);
++	h = qjs_bc_hash(src, len);
++	for (i = 0; i < qjs_bc_cache_n; i++) {
++		if (qjs_bc_cache[i].hash == h && qjs_bc_cache[i].len == len) {
++			fn = JS_ReadObject(ctx, qjs_bc_cache[i].bc,
++					qjs_bc_cache[i].bc_len,
++					JS_READ_OBJ_BYTECODE);
++			if (JS_IsException(fn)) {
++				JS_FreeValue(ctx, JS_GetException(ctx));
++				return JS_Eval(ctx, src, len, name,
++						JS_EVAL_TYPE_GLOBAL);
++			}
++			return JS_EvalFunction(ctx, fn);
++		}
++	}
++	fn = JS_Eval(ctx, src, len, name,
++			JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
++	if (JS_IsException(fn))
++		return fn;
++	if (qjs_bc_cache_n < QJS_BC_CACHE_SLOTS) {
++		bc = JS_WriteObject(ctx, &bc_len, fn, JS_WRITE_OBJ_BYTECODE);
++		if (bc != NULL) {
++			uint8_t *keep = (uint8_t *)malloc(bc_len);
++			if (keep != NULL) {
++				memcpy(keep, bc, bc_len);
++				qjs_bc_cache[qjs_bc_cache_n].hash = h;
++				qjs_bc_cache[qjs_bc_cache_n].len = len;
++				qjs_bc_cache[qjs_bc_cache_n].bc = keep;
++				qjs_bc_cache[qjs_bc_cache_n].bc_len = bc_len;
++				qjs_bc_cache_n++;
++			}
++			js_free(ctx, bc);
++		}
++	}
++	return JS_EvalFunction(ctx, fn);
++}
++
+ void macsurf_qjs__safe_eval(JSContext *qctx, const char *src)
+ {
+ 	/* fixes586 - safe_eval runs PAGE event listeners (js_fire_event /
+@@ -730,8 +808,7 @@ void macsurf_qjs__safe_eval(JSContext *qctx, const char *src)
+ 	 * declarations above, so this call sits after them but before the
+ 	 * JS_Eval below.) */
+ 	qjs_geom_settle_begin();
+-	val = JS_Eval(qctx, src, strlen(src),
+-			"<init>", JS_EVAL_TYPE_GLOBAL);
++	val = qjs_eval_cached(qctx, src, strlen(src), "<init>");
+ 	qjs_deadline_pop(prevdl);
+ 	if (JS_IsException(val)) {
+ 		JSValue exc = JS_GetException(qctx);
+@@ -14882,6 +14959,8 @@ static void qjs_vita_polyfill(JSContext *ctx);
+ static JSContext *qjs_build_context(struct jsheap *heap,
+ 		dom_document *document, struct content *content)
+ {
++	extern double macos9_micros(void);
++	double t_build = macos9_micros();
+ 	JSContext *ctx;
+ 	ctx = JS_NewContextRaw(heap->rt);
+ 	if (ctx == NULL) return NULL;
+@@ -14927,6 +15006,8 @@ static JSContext *qjs_build_context(struct jsheap *heap,
+ 	MS_LOG("qjs: browser_globals"); register_browser_globals(ctx);
+ 	MS_LOG("qjs: dom_install");     qjs_dom_install(ctx);
+ 	MS_LOG("qjs: vita_polyfill");   qjs_vita_polyfill(ctx);
++	macsurf_debug_log_writef("LIFE realm built: %ld us",
++			(long)(macos9_micros() - t_build));
+ 	return ctx;
+ }
+ 
+@@ -14939,15 +15020,18 @@ static const char qjs_vita_polyfill_src[] =
+ 
+ static void qjs_vita_polyfill(JSContext *ctx)
+ {
+-	JSValue v = JS_Eval(ctx, qjs_vita_polyfill_src,
+-		sizeof(qjs_vita_polyfill_src) - 1, "<vita_polyfill>",
+-		JS_EVAL_TYPE_GLOBAL);
++	extern double macos9_micros(void);
++	double t0 = macos9_micros();
++	JSValue v = qjs_eval_cached(ctx, qjs_vita_polyfill_src,
++		sizeof(qjs_vita_polyfill_src) - 1, "<vita_polyfill>");
+ 	if (JS_IsException(v)) {
+ 		JSValue exc = JS_GetException(ctx);
+ 		qjs_log_exc(ctx, exc, "vita_polyfill", "<vita_polyfill>");
+ 		JS_FreeValue(ctx, exc);
+ 	}
+ 	JS_FreeValue(ctx, v);
++	macsurf_debug_log_writef("LIFE vita_polyfill: %ld us",
++			(long)(macos9_micros() - t0));
+ }
+ 
+ /* fixes593 - QuickJS capability self-test. Runs a battery of JS through the
+@@ -15165,6 +15249,13 @@ struct module_entry {
+ 	char   *source;  /* source text (malloc'd, NUL-terminated), or NULL */
+ 	size_t  srclen;
+ 	int     compiled; /* handed to QuickJS (source freed) */
++	/* VitaBrowser module cache: bytecode read from MACSURF_JSCACHE_DIR
++	 * (source may then be NULL: not fetched at all) and the static
++	 * import URLs it was saved with (NUL-separated). */
++	uint8_t *bc;
++	size_t   bc_len;
++	char    *imports;
++	size_t   imports_len;
+ };
+ 
+ /* Module registry lives per heap; opaque pointer in the loader. */
+@@ -15329,6 +15420,198 @@ static unsigned int qjs_module_scan(struct module_registry *reg,
+ 	return n;
+ }
+ 
++/* ---- VitaBrowser: compiled modules kept on the memory card -----------
++ * claude.ai's app is 66 modules, 19 MB: on the Vita (hardware run 16)
++ * 13 s to download and 82 s to compile and run. Each module's bytecode
++ * goes to MACSURF_JSCACHE_DIR with its static imports; on a later visit a
++ * module whose file name carries a content hash (Vite's
++ * "index-DKU2AWSS.js": the text cannot change under that name) is neither
++ * fetched nor parsed, and any other is fetched and its bytecode reused if
++ * the text is the same. Files carry the build's stamp: another build's
++ * bytecode is ignored. */
++static uint32_t g_mod_compiled, g_mod_from_cache;
++static double g_mod_compile_us, g_mod_read_us;
++
++/* Scripts this large are compiled without keeping their functions'
++ * source text (patches/quickjs/02): QuickJS keeps one copy per function,
++ * nested ones included, so a big bundle's text sits in the heap several
++ * times over. toString of those functions gives "[native code]". */
++#define QJS_STRIP_SOURCE_MIN (128u * 1024u)
++
++#ifdef MACSURF_JSCACHE_DIR
++#define QJS_JSCACHE_MAX (96ul * 1024ul * 1024ul)
++static const char qjs_jscache_stamp[32] = "VBQ2 " __DATE__ " " __TIME__;
++
++static uint32_t qjs_fnv32(const char *s, size_t n)
++{
++	uint32_t h = 2166136261u;
++	size_t i;
++	for (i = 0; i < n; i++) {
++		h ^= (unsigned char)s[i];
++		h *= 16777619u;
++	}
++	return h;
++}
++
++static void qjs_jscache_path(const char *url, char *out, size_t max)
++{
++	size_t n = strlen(url);
++	snprintf(out, max, "%s%08lx%08lx.qbc", MACSURF_JSCACHE_DIR,
++		 (unsigned long)qjs_fnv32(url, n),
++		 (unsigned long)qjs_fnv32(url, n / 2 + 1));
++}
++
++/* A file name with a content hash before .js/.mjs: "name-AbC12xYz.js". */
++static bool qjs_url_immutable(const char *url)
++{
++	const char *q = strchr(url, '?'), *end, *p;
++	size_t run = 0;
++	bool upper_or_digit = false;
++	end = q != NULL ? q : url + strlen(url);
++	if (end - url > 3 && strncmp(end - 3, ".js", 3) == 0)
++		end -= 3;
++	else if (end - url > 4 && strncmp(end - 4, ".mjs", 4) == 0)
++		end -= 4;
++	else
++		return false;
++	for (p = end; p > url && (isalnum((unsigned char)p[-1]) ||
++			p[-1] == '_' || p[-1] == '-'); p--) {
++		if (p[-1] == '-' && run >= 8)
++			break;
++		run++;
++		if (isupper((unsigned char)p[-1]) ||
++				isdigit((unsigned char)p[-1]))
++			upper_or_digit = true;
++	}
++	return run >= 8 && upper_or_digit && p > url && p[-1] == '-';
++}
++
++/* Read url's cache file into e (bytecode and imports); its source's
++ * length and hash come back for comparison. */
++static bool qjs_jscache_load(const char *url, struct module_entry *e,
++		uint32_t *srclen, uint32_t *srchash)
++{
++	char path[256], stamp[32];
++	uint32_t hdr[3];
++	FILE *fp;
++	long size;
++	char *imports = NULL;
++	uint8_t *bc = NULL;
++	size_t bclen;
++
++	qjs_jscache_path(url, path, sizeof(path));
++	fp = fopen(path, "rb");
++	if (fp == NULL)
++		return false;
++	if (fread(stamp, 1, 32, fp) != 32 ||
++			memcmp(stamp, qjs_jscache_stamp, 32) != 0 ||
++			fread(hdr, sizeof(uint32_t), 3, fp) != 3 ||
++			fseek(fp, 0, SEEK_END) != 0 || (size = ftell(fp)) < 0 ||
++			(size_t)size < 32 + 12 + hdr[2]) {
++		fclose(fp);
++		return false;
++	}
++	bclen = (size_t)size - 32 - 12 - hdr[2];
++	imports = (char *)malloc(hdr[2] + 1);
++	bc = (uint8_t *)malloc(bclen ? bclen : 1);
++	if (imports == NULL || bc == NULL || fseek(fp, 32 + 12, SEEK_SET) != 0 ||
++			fread(imports, 1, hdr[2], fp) != hdr[2] ||
++			fread(bc, 1, bclen, fp) != bclen) {
++		free(imports);
++		free(bc);
++		fclose(fp);
++		return false;
++	}
++	fclose(fp);
++	imports[hdr[2]] = '\0';
++	free(e->bc);
++	free(e->imports);
++	e->bc = bc;
++	e->bc_len = bclen;
++	e->imports = imports;
++	e->imports_len = hdr[2];
++	*srclen = hdr[0];
++	*srchash = hdr[1];
++	return true;
++}
++
++static void qjs_jscache_store(const char *url, const char *src,
++		size_t srclen, const char *imports, size_t imports_len,
++		const uint8_t *bc, size_t bclen)
++{
++	static bool made;
++	char path[256];
++	uint32_t hdr[3];
++	FILE *fp;
++
++	if (!made) {
++		/* Once a session: past QJS_JSCACHE_MAX on the card, start the
++		 * cache afresh (one claude.ai visit leaves ~40 MB). */
++		DIR *d;
++		struct dirent *de;
++		struct stat st;
++		unsigned long total = 0;
++		char f[sizeof(MACSURF_JSCACHE_DIR) + 260];
++		mkdir(MACSURF_JSCACHE_DIR, 0777);
++		made = true;
++		d = opendir(MACSURF_JSCACHE_DIR);
++		while (d != NULL && (de = readdir(d)) != NULL) {
++			snprintf(f, sizeof(f), "%s%s", MACSURF_JSCACHE_DIR,
++				 de->d_name);
++			if (strstr(de->d_name, ".qbc") != NULL &&
++			    stat(f, &st) == 0)
++				total += (unsigned long)st.st_size;
++		}
++		if (d != NULL)
++			closedir(d);
++		if (total > QJS_JSCACHE_MAX) {
++			d = opendir(MACSURF_JSCACHE_DIR);
++			while (d != NULL && (de = readdir(d)) != NULL) {
++				if (strstr(de->d_name, ".qbc") == NULL)
++					continue;
++				snprintf(f, sizeof(f), "%s%s",
++					 MACSURF_JSCACHE_DIR, de->d_name);
++				remove(f);
++			}
++			if (d != NULL)
++				closedir(d);
++			macsurf_debug_log_writef("LIFE module cache: %lu KiB, "
++				"cleared", total / 1024);
++		}
++	}
++	qjs_jscache_path(url, path, sizeof(path));
++	fp = fopen(path, "wb");
++	if (fp == NULL)
++		return;
++	hdr[0] = (uint32_t)srclen;
++	hdr[1] = qjs_fnv32(src, srclen);
++	hdr[2] = (uint32_t)imports_len;
++	if (fwrite(qjs_jscache_stamp, 1, 32, fp) != 32 ||
++			fwrite(hdr, sizeof(uint32_t), 3, fp) != 3 ||
++			fwrite(imports, 1, imports_len, fp) != imports_len ||
++			fwrite(bc, 1, bclen, fp) != bclen) {
++		fclose(fp);
++		remove(path);
++		return;
++	}
++	fclose(fp);
++}
++#endif
++
++/* Add url (copied) to next[] unless the registry or next has it. */
++static unsigned int qjs_module_add_next(struct module_registry *reg,
++	const char *url, char **next, unsigned int n, unsigned int max)
++{
++	unsigned int m;
++	if (n >= max || qjs_module_find(reg, url) != NULL)
++		return n;
++	for (m = 0; m < n; m++)
++		if (strcmp(next[m], url) == 0)
++			return n;
++	next[n] = strdup(url);
++	return next[n] != NULL ? n + 1 : n;
++}
++
+ /* Fetch the static import graph below the modules named in urls[0..n)
+  * (sources already registered are scanned, the rest fetched), level by
+  * level, each level's fetches in parallel (fetch_get_blocking). Frees
+@@ -15337,7 +15620,7 @@ static void qjs_module_crawl(struct module_registry *reg, char **urls,
+ 	unsigned int n)
+ {
+ 	char **next;
+-	unsigned int level = 0, fetched = 0, failed = 0, i, nn;
++	unsigned int level = 0, fetched = 0, failed = 0, cached = 0, i, nn;
+ 	size_t bytes = 0;
+ 	extern double macos9_micros(void);
+ 	double t0 = macos9_micros();
+@@ -15361,19 +15644,68 @@ static void qjs_module_crawl(struct module_registry *reg, char **urls,
+ 			break;
+ 		}
+ 		for (i = 0; i < n; i++) {
+-			if (qjs_module_find(reg, urls[i]) == NULL)
+-				want[nw++] = urls[i];
++			if (qjs_module_find(reg, urls[i]) != NULL)
++				continue;
++#ifdef MACSURF_JSCACHE_DIR
++			/* Hash-named and cached: neither fetched nor parsed. */
++			if (qjs_url_immutable(urls[i])) {
++				struct module_entry tmp;
++				uint32_t sl, sh;
++				memset(&tmp, 0, sizeof(tmp));
++				if (qjs_jscache_load(urls[i], &tmp, &sl, &sh)) {
++					struct module_entry *ce =
++						qjs_module_register(reg,
++							urls[i], NULL, 0);
++					if (ce != NULL) {
++						ce->bc = tmp.bc;
++						ce->bc_len = tmp.bc_len;
++						ce->imports = tmp.imports;
++						ce->imports_len =
++							tmp.imports_len;
++						cached++;
++						continue;
++					}
++					free(tmp.bc);
++					free(tmp.imports);
++				}
++			}
++#endif
++			want[nw++] = urls[i];
+ 		}
+ 		if (nw > 0)
+ 			fetch_get_blocking(want, nw, NULL, res);
+ 		for (i = 0; i < nw; i++) {
+ 			int good = res[i].data != NULL &&
+ 				res[i].status >= 200 && res[i].status < 300;
+-			qjs_module_register(reg, want[i],
+-				good ? res[i].data : NULL, res[i].len);
++			struct module_entry *fe = qjs_module_register(reg,
++				want[i], good ? res[i].data : NULL, res[i].len);
+ 			if (good) {
+ 				fetched++;
+ 				bytes += res[i].len;
++#ifdef MACSURF_JSCACHE_DIR
++				/* The same text compiled before: reuse it. */
++				if (fe != NULL && fe->source != NULL) {
++					uint32_t sl, sh;
++					struct module_entry tmp;
++					memset(&tmp, 0, sizeof(tmp));
++					if (qjs_jscache_load(want[i], &tmp, &sl,
++							&sh) &&
++					    sl == fe->srclen &&
++					    sh == qjs_fnv32(fe->source,
++							fe->srclen)) {
++						fe->bc = tmp.bc;
++						fe->bc_len = tmp.bc_len;
++						fe->imports = tmp.imports;
++						fe->imports_len =
++							tmp.imports_len;
++					} else {
++						free(tmp.bc);
++						free(tmp.imports);
++					}
++				}
++#else
++				(void)fe;
++#endif
+ 			} else {
+ 				failed++;
+ 				macsurf_debug_log_writef(
+@@ -15388,7 +15720,15 @@ static void qjs_module_crawl(struct module_registry *reg, char **urls,
+ 		nn = 0;
+ 		for (i = 0; i < n; i++) {
+ 			struct module_entry *e = qjs_module_find(reg, urls[i]);
+-			if (e != NULL && e->source != NULL &&
++			if (e != NULL && e->imports != NULL) {
++				/* from the cache: its saved imports */
++				const char *u = e->imports;
++				while (u < e->imports + e->imports_len) {
++					nn = qjs_module_add_next(reg, u, next,
++						nn, QJS_MODULE_MAX_COUNT);
++					u += strlen(u) + 1;
++				}
++			} else if (e != NULL && e->source != NULL &&
+ 					reg->count < QJS_MODULE_MAX_COUNT &&
+ 					reg->bytes < QJS_MODULE_MAX_BYTES)
+ 				nn = qjs_module_scan(reg, e->name, e->source,
+@@ -15402,9 +15742,9 @@ static void qjs_module_crawl(struct module_registry *reg, char **urls,
+ 	}
+ 	free(next);
+ 	macsurf_debug_log_writef(
+-		"LIFE module graph: %u fetched (%lu KiB), %u failed, %u levels,"
+-		" %ld ms; registry %u modules",
+-		fetched, (unsigned long)(bytes / 1024), failed, level,
++		"LIFE module graph: %u fetched (%lu KiB), %u from the card, "
++		"%u failed, %u levels, %ld ms; registry %u modules",
++		fetched, (unsigned long)(bytes / 1024), cached, failed, level,
+ 		(long)((macos9_micros() - t0) / 1000), reg->count);
+ }
+ 
+@@ -15458,13 +15798,97 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx,
+ 		qjs_module_crawl_from(reg, module_name);
+ 		e = qjs_module_find(reg, module_name);
+ 	}
++	if (e != NULL && e->bc != NULL) {
++		/* From the card (or compiled on an earlier visit). */
++		extern double macos9_micros(void);
++		double t0 = macos9_micros();
++		val = JS_ReadObject(ctx, e->bc, e->bc_len,
++			JS_READ_OBJ_BYTECODE);
++		free(e->bc);
++		e->bc = NULL;
++		if (!JS_IsException(val)) {
++			g_mod_read_us += macos9_micros() - t0;
++			g_mod_from_cache++;
++			reg->bytes -= e->srclen;
++			free(e->source);
++			e->source = NULL;
++			e->srclen = 0;
++			e->compiled = 1;
++			return (JSModuleDef *)JS_VALUE_GET_PTR(val);
++		}
++		/* Unreadable: fall back to the text, fetched if need be. */
++		JS_FreeValue(ctx, JS_GetException(ctx));
++		macsurf_debug_log_writef("LIFE module cache unreadable: %s",
++			module_name);
++		if (e->source == NULL) {
++			struct fetch_blocking_body r;
++			const char *u = e->name;
++			if (fetch_get_blocking(&u, 1, NULL, &r) == 1) {
++				e->source = r.data;
++				e->srclen = r.len;
++			} else {
++				free(r.data);
++			}
++		}
++	}
+ 	if (e == NULL || e->source == NULL) {
+ 		JS_ThrowReferenceError(ctx, "could not load module '%s'",
+ 			module_name);
+ 		return NULL;
+ 	}
+-	val = JS_Eval(ctx, e->source, e->srclen, module_name,
+-		JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
++	{
++		extern double macos9_micros(void);
++		double t0 = macos9_micros();
++
++		/* Compiling resolves the module's imports: this loader runs
++		 * again, nested, for each; the switch is per compile. */
++		JS_SetStripFunctionSource(e->srclen >= QJS_STRIP_SOURCE_MIN);
++		val = JS_Eval(ctx, e->source, e->srclen, module_name,
++			JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
++		JS_SetStripFunctionSource(false);
++		g_mod_compile_us += macos9_micros() - t0;
++		g_mod_compiled++;
++#ifdef MACSURF_JSCACHE_DIR
++		if (!JS_IsException(val)) {
++			/* Save it, with its imports for the next crawl. */
++			size_t bclen = 0;
++			uint8_t *bc = JS_WriteObject(ctx, &bclen, val,
++				JS_WRITE_OBJ_BYTECODE |
++				JS_WRITE_OBJ_STRIP_SOURCE);
++			char **imp = (char **)calloc(QJS_MODULE_MAX_COUNT,
++				sizeof(*imp));
++			if (bc != NULL && imp != NULL) {
++				unsigned int ni, k;
++				size_t il = 0;
++				char *list;
++				struct module_registry empty;
++				memset(&empty, 0, sizeof(empty));
++				ni = qjs_module_scan(&empty, e->name,
++					e->source, e->srclen, imp, 0,
++					QJS_MODULE_MAX_COUNT);
++				for (k = 0; k < ni; k++)
++					il += strlen(imp[k]) + 1;
++				list = (char *)malloc(il + 1);
++				if (list != NULL) {
++					il = 0;
++					for (k = 0; k < ni; k++) {
++						size_t l = strlen(imp[k]) + 1;
++						memcpy(list + il, imp[k], l);
++						il += l;
++					}
++					qjs_jscache_store(e->name, e->source,
++						e->srclen, list, il, bc, bclen);
++					free(list);
++				}
++				for (k = 0; k < ni; k++)
++					free(imp[k]);
++			}
++			free(imp);
++			if (bc != NULL)
++				js_free(ctx, bc);
++		}
++#endif
++	}
+ 	reg->bytes -= e->srclen;
+ 	free(e->source);
+ 	e->source = NULL;
+@@ -15483,6 +15907,8 @@ static void qjs_module_registry_free(struct module_registry *reg)
+ 		next = e->next;
+ 		free(e->name);
+ 		free(e->source);
++		free(e->bc);
++		free(e->imports);
+ 		free(e);
+ 	}
+ 	reg->head = NULL;
+@@ -16586,10 +17012,14 @@ unsigned char js_exec(struct jsthread *thread,
+ 		ms_diag_script_enter(&diag_script_scope,
+ 			(unsigned long)g_qjs_nav_seq, MS_SCRIPT_CLASSIC, name);
+ 		ms_diag_task_set_script(g_qjs_task_id, diag_script_scope.my_id);
++		/* VitaBrowser: big bundles keep no function source text
++		 * (QJS_STRIP_SOURCE_MIN, patches/quickjs/02). */
++		JS_SetStripFunctionSource(txtlen >= QJS_STRIP_SOURCE_MIN);
+ 		fn = JS_Eval(thread->ctx, src, txtlen,
+ 				name ? name : "<script>",
+ 				JS_EVAL_TYPE_GLOBAL |
+ 				JS_EVAL_FLAG_COMPILE_ONLY);
++		JS_SetStripFunctionSource(false);
+ 		t_mid = macos9_micros();
+ 		c_us = (long)(t_mid - t_js);
+ 		if (JS_IsException(fn)) {
+@@ -16820,6 +17250,13 @@ unsigned char js_exec_module(struct jsthread *thread,
+ 		{
+ 			JSMemoryUsage mu;
+ 			JS_ComputeMemoryUsage(JS_GetRuntime(ctx), &mu);
++			macsurf_debug_log_writef(
++				"LIFE module compile: %lu compiled in %ld ms, "
++				"%lu from the card in %ld ms",
++				(unsigned long)g_mod_compiled,
++				(long)(g_mod_compile_us / 1000),
++				(unsigned long)g_mod_from_cache,
++				(long)(g_mod_read_us / 1000));
+ 			macsurf_debug_log_writef(
+ 				"LIFE module memory: %lld KiB used, %lld objects,"
+ 				" %lld functions (%lld KiB bytecode), %lld atoms",

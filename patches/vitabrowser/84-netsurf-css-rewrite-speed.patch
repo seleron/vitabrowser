@@ -1,0 +1,784 @@
+# netsurf: MacSurf's CSS rewrites, 3-5x faster, and cached
+# Generated 2026-09-24
+#
+# Hardware run 16 measured the rewrite chain (patch 76) at 12.6 s for
+# claude.ai's 1.4 MB sheet, 3.7 s for YouTube's 437 KB, 1.3 s for
+# Wikipedia's 169 KB -- and 362 ms for the same 42 KB of inline CSS on
+# every reformat. Timed per pass on a desktop, two passes were 76%:
+# - modern_compat's declaration drops made one full scan per property name
+#   (43); now one scan tries every name, and only at word starts whose
+#   letter begins some name. A blanked declaration holds no name, so the
+#   result is the same.
+# - logical_properties tried all 30 aliases at every byte; now only at
+#   word starts beginning b, i, m or p.
+# - Every pass now runs only if one of its trigger names occurs in the text
+#   (found with memchr), via a same-signature wrapper round each pass.
+# Output is byte-identical on claude.ai's, YouTube's and Wikipedia's
+# sheets; claude.ai's goes 382 -> 143 ms on the desktop.
+# css.c keeps the last 16 rewrites by content hash, so re-parsed <style>
+# blocks cost nothing.
+
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 55de5f9..2ab3a93 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -17,6 +17,8 @@
+  */
+ 
+ #include <stdlib.h>
++#include <stdint.h>
++#include <stdbool.h>
+ #include <string.h>
+ #include <assert.h>
+ #include <libwapcaplet/libwapcaplet.h>
+@@ -247,6 +249,86 @@ static nserror nscss_create_css_data(struct content_css_data *c,
+ 	return NSERROR_OK;
+ }
+ 
++/* VitaBrowser: the last few rewrites, by content. A page's <style>
++ * blocks are made into fresh sheets on every reformat (hardware run 16:
++ * the same 42 KB of claude.ai's inline CSS rewritten again and again, 362
++ * ms each time on the Vita); the same text gets the same rewrite. */
++#define REWRITE_CACHE_SLOTS 16
++#define REWRITE_CACHE_MAX (512 * 1024)
++static struct {
++	uint64_t hash;
++	size_t in_len, out_len;
++	char *out;	/* NULL: the rewrite changed nothing */
++	bool used;
++	unsigned int age;
++} rewrite_cache[REWRITE_CACHE_SLOTS];
++static unsigned int rewrite_clock;
++
++static uint64_t rewrite_hash(const char *d, size_t n)
++{
++	uint64_t h = 1469598103934665603ULL;	/* FNV-1a */
++	size_t i;
++	for (i = 0; i < n; i++) {
++		h ^= (unsigned char)d[i];
++		h *= 1099511628211ULL;
++	}
++	return h;
++}
++
++/**
++ * Rewrite a sheet (css_rewrite.c), from the cache when the same text was
++ * rewritten lately.
++ *
++ * \return the rewritten text (malloc()ed) or NULL for "use the original"
++ */
++static char *nscss_rewrite_cached(const char *d, size_t n, size_t *out_len)
++{
++	uint64_t h;
++	unsigned int i, victim = 0;
++	char *rw;
++
++	if (n > REWRITE_CACHE_MAX)
++		return macsurf_css_rewrite(d, n, out_len);
++	h = rewrite_hash(d, n);
++	for (i = 0; i < REWRITE_CACHE_SLOTS; i++) {
++		if (rewrite_cache[i].used && rewrite_cache[i].hash == h &&
++		    rewrite_cache[i].in_len == n) {
++			rewrite_cache[i].age = ++rewrite_clock;
++			if (rewrite_cache[i].out == NULL)
++				return NULL;
++			rw = malloc(rewrite_cache[i].out_len + 1);
++			if (rw == NULL)
++				return NULL;
++			memcpy(rw, rewrite_cache[i].out,
++			       rewrite_cache[i].out_len + 1);
++			*out_len = rewrite_cache[i].out_len;
++			return rw;
++		}
++		if (!rewrite_cache[i].used ||
++		    rewrite_cache[i].age < rewrite_cache[victim].age)
++			victim = i;
++		if (!rewrite_cache[i].used)
++			break;
++	}
++	rw = macsurf_css_rewrite(d, n, out_len);
++	free(rewrite_cache[victim].out);
++	rewrite_cache[victim].out = NULL;
++	rewrite_cache[victim].used = true;
++	rewrite_cache[victim].hash = h;
++	rewrite_cache[victim].in_len = n;
++	rewrite_cache[victim].age = ++rewrite_clock;
++	if (rw != NULL) {
++		rewrite_cache[victim].out = malloc(*out_len + 1);
++		if (rewrite_cache[victim].out != NULL) {
++			memcpy(rewrite_cache[victim].out, rw, *out_len + 1);
++			rewrite_cache[victim].out_len = *out_len;
++		} else {
++			rewrite_cache[victim].used = false;
++		}
++	}
++	return rw;
++}
++
+ /**
+  * Process CSS source data
+  *
+@@ -313,7 +395,7 @@ bool nscss_convert(struct content *c)
+ 		uint64_t t0, t1;
+ 		char *rw;
+ 		nsu_getmonotonic_ms(&t0);
+-		rw = macsurf_css_rewrite(css->pending, css->pending_len, &len);
++		rw = nscss_rewrite_cached(css->pending, css->pending_len, &len);
+ 		nsu_getmonotonic_ms(&t1);
+ 		/* %lu with casts: the Vita's newlib printf has no z length
+ 		 * modifier, and one here made the next %s read a size as a
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+index 9028af8..8ac580a 100644
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -47,6 +47,40 @@
+ #include "css/css_rewrite.h"
+ #include "macsurf_debug.h"
+ 
++
++/* ---- VitaBrowser: skip a pass whose trigger text is absent ------------
++ * Each pass scans the whole sheet (claude.ai's is 1.4 MB) whether or not
++ * it has anything to do; on the Vita the chain took 12.6 s for that sheet
++ * (hardware run 16). A pass now runs only when one of its property or
++ * function names occurs in the text (case-insensitively), found with
++ * memchr; the pass itself decides the rest, exactly as before. */
++static bool macsurf__has_ci(const char *d, size_t n, const char *key)
++{
++	size_t k = strlen(key), pass;
++	for (pass = 0; pass < 2; pass++) {
++		char c0 = pass == 0 ? (char)tolower((unsigned char)key[0]) :
++				(char)toupper((unsigned char)key[0]);
++		const char *p = d, *end = d + n;
++		if (pass == 1 && c0 == (char)tolower((unsigned char)key[0]))
++			break;	/* no case for this character */
++		while (p + k <= end &&
++		       (p = memchr(p, c0, (size_t)(end - p) - k + 1)) != NULL) {
++			if (strncasecmp(p + 1, key + 1, k - 1) == 0)
++				return true;
++			p++;
++		}
++	}
++	return false;
++}
++
++static bool macsurf__has_any_ci(const char *d, size_t n, const char *const *keys)
++{
++	for (; *keys != NULL; keys++)
++		if (macsurf__has_ci(d, n, *keys))
++			return true;
++	return false;
++}
++
+ /* fixes115 - count column tracks in a grid-template-columns value
+  * (the substring between `:` and `;`/`}` of the declaration).
+  *
+@@ -557,7 +591,7 @@ macsurf__emit_grid_tracks(const char *p, const char *end,
+  * matches the existing macsurf__rewrite_inline_style precedent. No
+  * behavior change; this only affects symbol linkage. */
+ char *
+-macsurf__rewrite_grid_template_columns(const char *data, size_t size)
++macsurf__rewrite_grid_template_columns_impl(const char *data, size_t size)
+ {
+ 	static const char NEEDLE[] = "grid-template-columns";
+ 	static const size_t NEEDLE_LEN = 21;
+@@ -652,6 +686,15 @@ macsurf__rewrite_grid_template_columns(const char *data, size_t size)
+ 	return out;
+ }
+ 
++char *
++macsurf__rewrite_grid_template_columns(const char *data, size_t size)
++{
++	static const char *const keys[] = { "grid-template-columns", NULL };
++	if (!macsurf__has_any_ci(data, size, keys))
++		return NULL;
++	return macsurf__rewrite_grid_template_columns_impl(data, size);
++}
++
+ 
+ /* fixes150 - rewrite every `grid-template-rows: VALUE` declaration to
+  * `-macsurf-grid-rows: <tracks>` in place. Both names are 18 chars so
+@@ -663,7 +706,7 @@ macsurf__rewrite_grid_template_columns(const char *data, size_t size)
+  * fixes1161c: non-static, same reasoning as
+  * macsurf__rewrite_grid_template_columns above. */
+ char *
+-macsurf__rewrite_grid_template_rows(const char *data, size_t size)
++macsurf__rewrite_grid_template_rows_impl(const char *data, size_t size)
+ {
+ 	static const char NEEDLE[] = "grid-template-rows";
+ 	static const size_t NEEDLE_LEN = 18;
+@@ -753,6 +796,15 @@ macsurf__rewrite_grid_template_rows(const char *data, size_t size)
+ 	return out;
+ }
+ 
++char *
++macsurf__rewrite_grid_template_rows(const char *data, size_t size)
++{
++	static const char *const keys[] = { "grid-template-rows", NULL };
++	if (!macsurf__has_any_ci(data, size, keys))
++		return NULL;
++	return macsurf__rewrite_grid_template_rows_impl(data, size);
++}
++
+ 
+ /* fixes158 - grid placement rewriter.
+  *
+@@ -1484,7 +1536,7 @@ static void macsurf_gta__parse_decl(const char *p, const char *end,
+ }
+ 
+ static char *
+-macsurf__rewrite_grid_template_areas(const char *data, size_t in_size,
++macsurf__rewrite_grid_template_areas_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char N_GTA[] = "grid-template-areas";
+@@ -1644,9 +1696,19 @@ emit_byte:
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_grid_template_areas(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "grid-template-areas", "grid-area", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_grid_template_areas_impl(data, in_size, out_size_p);
++}
++
+ 
+ static char *
+-macsurf__rewrite_text_shadow(const char *data, size_t in_size,
++macsurf__rewrite_text_shadow_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char NEEDLE[] = "text-shadow";
+@@ -1700,6 +1762,16 @@ macsurf__rewrite_text_shadow(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_text_shadow(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "text-shadow", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_text_shadow_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes183 - rewrite standard `transform:` → `-macsurf-transform:` so
+  * author CSS reaches the existing vendor transform paint path (sin/cos
+@@ -1710,7 +1782,7 @@ macsurf__rewrite_text_shadow(const char *data, size_t in_size,
+  * via property_handlers[] aliasing and hung pre-reformat; this preprocessor
+  * route bypasses libcss internals entirely. */
+ static char *
+-macsurf__rewrite_transform(const char *data, size_t in_size,
++macsurf__rewrite_transform_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char NEEDLE[] = "transform";
+@@ -1757,13 +1829,23 @@ macsurf__rewrite_transform(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_transform(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "transform", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_transform_impl(data, in_size, out_size_p);
++}
++
+ /* fixes191g -- rewrite standard `object-position:` to
+  * `-macsurf-object-position:` so author CSS reaches the compact
+  * keyword-only V1 parser. Like transform/text-shadow, this only matches
+  * the exact property name followed by optional whitespace and `:`, so
+  * unrelated longhands are left alone. */
+ static char *
+-macsurf__rewrite_object_position(const char *data, size_t in_size,
++macsurf__rewrite_object_position_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char NEEDLE[] = "object-position";
+@@ -1811,6 +1893,16 @@ macsurf__rewrite_object_position(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_object_position(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "object-position", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_object_position_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes266 - rewrite `background-image: linear-gradient(...)` to
+  * `-macsurf-gradient: linear-gradient(...)` so author CSS that uses the
+@@ -1831,7 +1923,7 @@ macsurf__rewrite_object_position(const char *data, size_t in_size,
+  *   - REPLACE is one byte longer than NEEDLE (17 vs 16), so each match
+  *     grows the output by 1; pre-allocate accordingly. */
+ static char *
+-macsurf__rewrite_background_image_gradient(const char *data, size_t in_size,
++macsurf__rewrite_background_image_gradient_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char NEEDLE[] = "background-image";
+@@ -1929,6 +2021,16 @@ macsurf__rewrite_background_image_gradient(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_background_image_gradient(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "gradient", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_background_image_gradient_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes318 (#145) - extract gradient from `background:` shorthand.
+  *
+@@ -1960,7 +2062,7 @@ macsurf__rewrite_background_image_gradient(const char *data, size_t in_size,
+  * surrounding-whitespace fill.
+  */
+ static char *
+-macsurf__rewrite_background_shorthand_gradient(const char *data,
++macsurf__rewrite_background_shorthand_gradient_impl(const char *data,
+ 		size_t in_size, size_t *out_size_p)
+ {
+ 	static const char NEEDLE[]  = "background";
+@@ -2256,6 +2358,16 @@ macsurf__rewrite_background_shorthand_gradient(const char *data,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_background_shorthand_gradient(const char *data,
++		size_t in_size, size_t *out_size_p)
++{
++	static const char *const keys[] = { "gradient", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_background_shorthand_gradient_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes279 (#27) - strip trailing stacked gradients from
+  * `-macsurf-gradient:` declarations. Author CSS commonly stacks layered
+@@ -2269,7 +2381,7 @@ macsurf__rewrite_background_shorthand_gradient(const char *data,
+  *
+  * In-place same-size rewrite (only spaces are introduced). */
+ static char *
+-macsurf__strip_stacked_gradients(const char *data, size_t in_size)
++macsurf__strip_stacked_gradients_impl(const char *data, size_t in_size)
+ {
+ 	static const char NEEDLE[] = "-macsurf-gradient";
+ 	static const size_t NEEDLE_LEN = 17;
+@@ -2346,6 +2458,15 @@ macsurf__strip_stacked_gradients(const char *data, size_t in_size)
+ 	return out;
+ }
+ 
++static char *
++macsurf__strip_stacked_gradients(const char *data, size_t in_size)
++{
++	static const char *const keys[] = { "-macsurf-gradient", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__strip_stacked_gradients_impl(data, in_size);
++}
++
+ 
+ /* fixes280 - narrow calc() evaluator for the aspect-ratio padding hack.
+  *
+@@ -2415,7 +2536,7 @@ macsurf__cc_read_number(const char *s, int len, int *p,
+ }
+ 
+ static char *
+-macsurf__rewrite_calc_aspect(const char *data, size_t in_size)
++macsurf__rewrite_calc_aspect_impl(const char *data, size_t in_size)
+ {
+ 	static const char NEEDLE[] = "calc(";
+ 	static const size_t NEEDLE_LEN = 5;
+@@ -2546,6 +2667,15 @@ macsurf__rewrite_calc_aspect(const char *data, size_t in_size)
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_calc_aspect(const char *data, size_t in_size)
++{
++	static const char *const keys[] = { "calc(", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_calc_aspect_impl(data, in_size);
++}
++
+ 
+ /* fixes364 - emit `-macsurf-hstripe-bg: c1 c2;` for each
+  * `repeating-linear-gradient(to bottom, ...)` encountered.
+@@ -2567,7 +2697,7 @@ macsurf__rewrite_calc_aspect(const char *data, size_t in_size)
+  * Platinum pattern). Other directions (to right, diagonal) fall
+  * through to the fixes281 solid-colour collapse. */
+ static char *
+-macsurf__rewrite_repeating_gradient_hstripe(const char *data, size_t in_size,
++macsurf__rewrite_repeating_gradient_hstripe_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char NEEDLE[] = "repeating-linear-gradient(";
+@@ -2752,6 +2882,16 @@ macsurf__rewrite_repeating_gradient_hstripe(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_repeating_gradient_hstripe(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "repeating-linear-gradient", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_repeating_gradient_hstripe_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes365c - emit `-macsurf-dotgrid: c1 c2;` for mactrove's two-layer
+  * 1px-stripe + 2x2 background-size pattern.
+@@ -2781,7 +2921,7 @@ macsurf__rewrite_repeating_gradient_hstripe(const char *data, size_t in_size,
+  * Output buffer is fresh (each insert grows the rule). Worst-case
+  * grow: one match per { ... } block, ~80 bytes per insert. */
+ static char *
+-macsurf__rewrite_dotgrid_pattern(const char *data, size_t in_size,
++macsurf__rewrite_dotgrid_pattern_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	char *out;
+@@ -3190,6 +3330,16 @@ macsurf__rewrite_dotgrid_pattern(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_dotgrid_pattern(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "linear-gradient", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_dotgrid_pattern_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes281 - fallback solid color for repeating-linear-gradient.
+  *
+@@ -3217,7 +3367,7 @@ macsurf__rewrite_dotgrid_pattern(const char *data, size_t in_size,
+  *
+  * In-place same-size rewrite (pads with trailing spaces). */
+ static char *
+-macsurf__rewrite_repeating_gradient_solid(const char *data, size_t in_size)
++macsurf__rewrite_repeating_gradient_solid_impl(const char *data, size_t in_size)
+ {
+ 	char *out;
+ 	size_t i;
+@@ -3298,6 +3448,15 @@ macsurf__rewrite_repeating_gradient_solid(const char *data, size_t in_size)
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_repeating_gradient_solid(const char *data, size_t in_size)
++{
++	static const char *const keys[] = { "repeating-", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_repeating_gradient_solid_impl(data, in_size);
++}
++
+ 
+ /* fixes185 - modern-CSS compatibility preprocessor. Rewrites unsupported
+  * modern syntax into supported equivalents (or drops it) so author CSS
+@@ -3459,38 +3618,61 @@ macsurf__rewrite_modern_compat(const char *data, size_t in_size,
+ 
+ 	/* Pass C - declaration drops: replace `name<ws>:<value>` with spaces,
+ 	 * keeping the terminator (`;` or `}`) intact. */
+-	for (k = 0; k < N_DROP_PROPS; k++) {
+-		const char *name = DROP_PROPS[k];
+-		size_t nlen = strlen(name);
++	/* VitaBrowser: one scan trying every name, only where a name can
++	 * start (a word start whose letter begins some name) -- MacSurf made
++	 * one full scan per name, 43 of them (6 s of the Vita's 12.6 s on
++	 * claude.ai's sheet). A blanked declaration holds no name, so the
++	 * result is the same. */
++	{
++		unsigned char first[256];
++		memset(first, 0, sizeof(first));
++		for (k = 0; k < N_DROP_PROPS; k++) {
++			unsigned char c = (unsigned char)DROP_PROPS[k][0];
++			first[c] = 1;
++			first[(unsigned char)toupper(c)] = 1;
++		}
+ 		i = 0;
+ 		while (i < in_size) {
+-			size_t j;
+-			size_t end;
+-			size_t p;
+-			if (!macsurf__match_prop_name(out, in_size, i,
+-					name, nlen)) {
+-				i++;
+-				continue;
+-			}
+-			j = i + nlen;
+-			while (j < in_size && (out[j] == ' ' ||
+-					out[j] == '\t' ||
+-					out[j] == '\n' ||
+-					out[j] == '\r')) j++;
+-			if (j >= in_size || out[j] != ':') {
+-				i++;
+-				continue;
++			char prev;
++			bool hit = false;
++			if (!first[(unsigned char)out[i]]) { i++; continue; }
++			if (i > 0) {
++				prev = out[i - 1];
++				if ((prev >= 'a' && prev <= 'z') ||
++						(prev >= 'A' && prev <= 'Z') ||
++						(prev >= '0' && prev <= '9') ||
++						prev == '-' || prev == '_') {
++					i++;
++					continue;
++				}
+ 			}
+-			end = j + 1;
+-			while (end < in_size && out[end] != ';' &&
+-					out[end] != '}') end++;
+-			for (p = i; p < end; p++) {
+-				if (out[p] != '\n' && out[p] != '\r') {
+-					out[p] = ' ';
++			for (k = 0; k < N_DROP_PROPS && !hit; k++) {
++				const char *name = DROP_PROPS[k];
++				size_t nlen = strlen(name);
++				size_t j, end, p;
++				if (!macsurf__match_prop_name(out, in_size, i,
++						name, nlen))
++					continue;
++				j = i + nlen;
++				while (j < in_size && (out[j] == ' ' ||
++						out[j] == '\t' ||
++						out[j] == '\n' ||
++						out[j] == '\r')) j++;
++				if (j >= in_size || out[j] != ':')
++					continue;
++				end = j + 1;
++				while (end < in_size && out[end] != ';' &&
++						out[end] != '}') end++;
++				for (p = i; p < end; p++) {
++					if (out[p] != '\n' && out[p] != '\r') {
++						out[p] = ' ';
++					}
+ 				}
++				changed = 1;
++				i = end;
++				hit = true;
+ 			}
+-			changed = 1;
+-			i = end;
++			if (!hit) i++;
+ 		}
+ 	}
+ 
+@@ -3562,7 +3744,7 @@ macsurf__rewrite_modern_compat(const char *data, size_t in_size,
+  * property-position "inset", never on `border-style: inset` or
+  * `box-shadow: inset ...`. */
+ static char *
+-macsurf__rewrite_inset(const char *data, size_t in_size, size_t *out_size_p)
++macsurf__rewrite_inset_impl(const char *data, size_t in_size, size_t *out_size_p)
+ {
+ 	static const char NAME[] = "inset";
+ 	static const size_t NAME_LEN = 5;
+@@ -3759,6 +3941,15 @@ grow_fail:
+ 	return NULL;
+ }
+ 
++static char *
++macsurf__rewrite_inset(const char *data, size_t in_size, size_t *out_size_p)
++{
++	static const char *const keys[] = { "inset", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_inset_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* #247 phase 2 - 2-value logical shorthand expander.
+  *
+@@ -3779,7 +3970,7 @@ grow_fail:
+  * calc() / var()) are copied verbatim; a balanced () group is one token.
+  * Models macsurf__rewrite_inset; pass-through (NULL) on no-op. */
+ static char *
+-macsurf__rewrite_logical_shorthands(const char *data, size_t in_size,
++macsurf__rewrite_logical_shorthands_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const struct {
+@@ -3970,6 +4161,16 @@ grow_fail:
+ 	return NULL;
+ }
+ 
++static char *
++macsurf__rewrite_logical_shorthands(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "inline", "block", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_logical_shorthands_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes273 (Bundle I) - at-rule preprocessor for @supports and @layer.
+  *
+@@ -3998,7 +4199,7 @@ grow_fail:
+  * contents are tracked to avoid counting braces inside them. Output
+  * grows when blocks are kept, shrinks when blocks are dropped. */
+ static char *
+-macsurf__rewrite_at_rules(const char *data, size_t in_size,
++macsurf__rewrite_at_rules_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	char *out;
+@@ -4240,6 +4441,16 @@ macsurf__rewrite_at_rules(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_at_rules(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "@layer", "@supports", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_at_rules_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes274 (Bundle C, #25 + #64) - grid alignment shorthand expansion +
+  * justify-items / justify-self bridge.
+@@ -4390,7 +4601,7 @@ static int macsurf__ci_eq(const char *a, const char *b, size_t n)
+  * overflowing word never broke at all.
+  */
+ static char *
+-macsurf__rewrite_word_break_alias(const char *data, size_t in_size,
++macsurf__rewrite_word_break_alias_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char PROP[] = "word-break";
+@@ -4487,7 +4698,17 @@ macsurf__rewrite_word_break_alias(const char *data, size_t in_size,
+ }
+ 
+ static char *
+-macsurf__rewrite_grid_alignment(const char *data, size_t in_size,
++macsurf__rewrite_word_break_alias(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "break-word", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_word_break_alias_impl(data, in_size, out_size_p);
++}
++
++static char *
++macsurf__rewrite_grid_alignment_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	char *out;
+@@ -4773,6 +4994,16 @@ macsurf__rewrite_grid_alignment(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_grid_alignment(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "justify", "place-", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_grid_alignment_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes275 (#65) - grid-auto-flow preprocessor.
+  *
+@@ -4792,7 +5023,7 @@ macsurf__rewrite_grid_alignment(const char *data, size_t in_size,
+  * Output grows: source ~14 bytes ("grid-auto-flow"), output ~22 bytes
+  * ("-macsurf-grid-flow: N"). Allocates fresh buffer. */
+ static char *
+-macsurf__rewrite_grid_auto_flow(const char *data, size_t in_size,
++macsurf__rewrite_grid_auto_flow_impl(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	char *out;
+@@ -4956,6 +5187,16 @@ macsurf__rewrite_grid_auto_flow(const char *data, size_t in_size,
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_grid_auto_flow(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "grid-auto-flow", NULL };
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	return macsurf__rewrite_grid_auto_flow_impl(data, in_size, out_size_p);
++}
++
+ 
+ /* fixes277 (#61) - logical properties → physical aliases (LTR-only V1).
+  *
+@@ -5030,7 +5271,7 @@ static const struct {
+ };
+ 
+ static char *
+-macsurf__rewrite_logical_properties(const char *data, size_t size)
++macsurf__rewrite_logical_properties_impl(const char *data, size_t size)
+ {
+ 	char *out;
+ 	size_t i;
+@@ -5044,6 +5285,20 @@ macsurf__rewrite_logical_properties(const char *data, size_t size)
+ 	while (i < size) {
+ 		size_t a;
+ 		bool matched = false;
++		char c = out[i];
++
++		/* VitaBrowser: every logical name starts with b, i, m or p, at
++		 * a word start (as match_prop_name requires): skip the rest of
++		 * the positions without trying all 30 names at each. */
++		if (!(c == 'b' || c == 'i' || c == 'm' || c == 'p' ||
++				c == 'B' || c == 'I' || c == 'M' || c == 'P') ||
++				(i > 0 && ((out[i - 1] >= 'a' && out[i - 1] <= 'z') ||
++				(out[i - 1] >= 'A' && out[i - 1] <= 'Z') ||
++				(out[i - 1] >= '0' && out[i - 1] <= '9') ||
++				out[i - 1] == '-' || out[i - 1] == '_'))) {
++			i++;
++			continue;
++		}
+ 
+ 		for (a = 0; macsurf__logical_aliases[a].logical != NULL; a++) {
+ 			const char *lname =
+@@ -5075,6 +5330,15 @@ macsurf__rewrite_logical_properties(const char *data, size_t size)
+ 	return out;
+ }
+ 
++static char *
++macsurf__rewrite_logical_properties(const char *data, size_t size)
++{
++	static const char *const keys[] = { "inline", "block", NULL };
++	if (!macsurf__has_any_ci(data, size, keys))
++		return NULL;
++	return macsurf__rewrite_logical_properties_impl(data, size);
++}
++
+ 
+ /* fixes202 - inline-style preprocessor.
+  *
