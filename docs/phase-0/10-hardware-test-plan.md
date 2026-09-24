@@ -2034,3 +2034,111 @@ Only the autotest's timed frames can tell, and it wasn't run this time.
      "Title (site.com)" with a space.
 3. **If it crashes anyway:** copy the `psp2core-*.psp2dmp` from
    `ux0:data/` as you did; the ELF is archived.
+
+## Run 15 — results (2026-09-24 10:27, PCH-2000, 3.65 HENkaku)
+
+Everything arrived over the network: **6,913 datagrams, 0 lost**. The
+results are in `results-run15\`.
+
+**The autotest:**
+
+| pass | GPU / frame | CPU / frame |
+|---|---|---|
+| A (boot clocks, stencil clip) | 85 ms | 59 ms |
+| B (GPU 222, stencil clip) | 16 ms | 27 ms |
+| C (boot clocks, CPU clip) | 10 ms | 27 ms |
+| D (ARM 444, bus 222, GPU 222, CPU clip) | 3 ms | **23 ms** |
+
+- Batched text (patch 54) paid off: CPU per frame in pass D fell from
+  **36–38 ms** (run 12) to **23 ms**, at **16.6 glyphs per draw**. Page
+  loads got slower, though: 926 ms against 628–663 ms. The pages carry
+  more CSS since, and fonts were read from the card.
+- **27 of 29 dumps SAME** as the simulator. The two that differ:
+  - **VT-text:** one bundled font file failed to open, so bold text was
+    measured with the regular face. The log says `1 font files failed`;
+    it did not say which. Patch 67 fixes that (below).
+  - **IN-form-sent:** the interaction pass got **20/22**. Step 18 (tap
+    the submit button) did not navigate. Step 19 (a typed URL) then
+    failed as a consequence: the caret was still in the field, so the
+    "URL" was typed into the form. The likely cause is the font failure,
+    which moves the button under the scripted tap. The typed text itself
+    arrived.
+- `minmax line clamped` appears once in `netsurf.log`: the run-14 crash
+  path fired, and patch 62 held. **No crash all run.**
+
+**By hand:**
+- **Wikipedia:** fine. `en.m.wikipedia.org` now redirects to
+  `en.wikipedia.org`, which still serves the mobile skin.
+- **claude.ai/code:** Cloudflare's page said the browser is "too old".
+- **YouTube:** black and white.
+- **Screenshots:** PS + START saved nothing to the Vita's screenshots
+  folder.
+
+## Run 16 — hand-off: claude.ai past Cloudflare, ES modules, web APIs (patches 67–75)
+
+**What changed since run 15** (doc 11, round 4):
+- **Patch 67:** fonts are read into memory, so a face that failed to
+  open (run 15's VT-text) opens. A failure now logs the file, FreeType's
+  error and errno.
+- **Patch 68:** **SELECT + ✕ saves a screenshot** of the screen. It goes
+  to `ux0:data/VitaBrowser/shot-<ms>.png` and, while the receiver runs,
+  to the results folder.
+- **Patches 69–70:** the browser presents itself as **Chrome on
+  Android**, and page loads send a browser's `Accept`. In the simulator,
+  claude.ai then serves its app instead of the Cloudflare challenge.
+  `ux0:data/VitaBrowser/useragent.txt` switches this: `chrome`, `safari`,
+  `firefox`, `vita`, or any string.
+- **Patches 71–72:** ES modules load, and scripts see the right document
+  after a late `<meta charset>`.
+- **Patch 73:** web APIs: URL, UTF-8 TextEncoder, Intl, IndexedDB,
+  getComputedStyle, ...
+- **Patch 75:** scripts up to 8 MB run (YouTube's bundle is 1.6 MB).
+- **Patch 74:** the interaction pass waits for a slow navigation.
+
+**Clean checkout:**
+- Applied 158 + the known 2; L1–L4 PASS; 101/101 + 30/30.
+- The simulator suite passes. New:
+  - `JS-apis`: **151/176** present, 10/10 behaviours;
+  - `JS-module`: **6/6** from `app0:` and over http;
+  - `netsurf.log`'s mirror is checked up to its 4 MiB cap.
+- Live sites 6/6, including claude.ai/code (title "Claude") and
+  Wikipedia.
+- The internet-connected reference run gives interaction **22/22**.
+
+**Hand-off.**
+- SHA256, first 12: `VitaBrowser.vpk` `330f44f92418`,
+  `VitaBrowser-ext.vpk` `14423d09c344`, `nsvita.elf` `8d2bf778e52b`.
+- `reference-dumps\` is regenerated (29 dumps, the same pages as run 15).
+- Run 15's results are in `results-run15\`.
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-24-run16/`.
+
+**Run 16 on the device.** Everything new is tested in one sitting.
+1. **The autotest** (`receive-results.bat`, then SELECT + □):
+   - expect `interact: 22/22 passed`;
+   - expect all dumps SAME except PM-animation (VT-text and
+     IN-form-sent should now match);
+   - `log.txt` should say `chrome: user agent: Mozilla/5.0 (Linux;
+     Android 10; K) ... Chrome/140...`.
+2. **A screenshot:** on any page, **SELECT + ✕**.
+   - The HUD says "screenshot saved".
+   - `shot-*.png` appears in `ux0:data/VitaBrowser/` and in the results
+     folder.
+   - Take one on each site below; they are the results.
+3. **claude.ai/code** (the Claude Code bookmark), the main test:
+   - Cloudflare's page should **not** appear.
+   - The screen stays on the old page while about 19 MB of modules
+     download and compile; the browser is frozen meanwhile.
+   - Give it **up to 3 minutes**.
+   - Expected: claude.ai's login page, **unstyled** (plain text and grey
+     buttons), as in the simulator.
+   - Then SELECT + ✕.
+   - The log's `module graph:` and `module memory:` lines give the
+     download time and the Vita's JS heap (expected ~60 MB, cap 128 MB).
+   - If it runs out of memory, try again with `VitaBrowser-ext.vpk`.
+4. **YouTube** (`m.youtube.com`): expect grey-and-black loading blocks in
+   a grid, not an empty page. The feed itself is not expected yet.
+5. **Wikipedia:** still the mobile skin. Note any sideways scrolling: the
+   simulator shows 1011 px under the new user agent.
+6. **If something looks wrong** with the new user agent, put `vita` in
+   `ux0:data/VitaBrowser/useragent.txt` (VitaShell) and restart to
+   compare.

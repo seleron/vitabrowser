@@ -319,12 +319,148 @@ The line, block and table min/max functions now clamp to `0 ≤ min ≤ max`
 before their asserts. The line clamp logs `minmax line clamped`, so a
 device run shows whether and where it fires.
 
+## Round 4: claude.ai — past Cloudflare, into the React app (patches 69–75)
+
+Hardware run 15 (doc 10): Cloudflare turned claude.ai/code away as "too
+old", YouTube drew black and white, and the system screenshot saved
+nothing (fixed on the device side by patch 68, SELECT + ✕). This round
+takes claude.ai from the challenge page to its own React app.
+
+### 10. Cloudflare scored the request, not the browser (patches 69, 70)
+
+The challenge page ran and then showed "Browser not supported". But real
+Chromium (Playwright) is not challenged at all. It gets the sign-in page
+directly, so the decision is made on the request. Measured with curl
+over HTTP/1.1 (the Vita's libcurl has no HTTP/2):
+
+| request | answer |
+|---|---|
+| Chrome Android UA | 403, "Just a moment..." |
+| Chrome UA + `Accept: text/html,...` | **200, the app** |
+| Chrome UA + that Accept, over HTTP/2 (curl's) | 403 |
+| the Vita UA (patch 55) + that Accept | 403 |
+
+- **Patch 69:** `ux0:data/VitaBrowser/useragent.txt` picks the user
+  agent. It is created on first start with `chrome` (Chrome 140 on
+  Android); `safari`, `firefox`, `vita` or a whole string also work.
+  `navigator.platform` and `navigator.vendor` follow the choice.
+- **Patch 70:** page loads (verifiable fetches) send Chrome's navigation
+  `Accept` and `Upgrade-Insecure-Requests`. Before, it was curl's `*/*`.
+  Scripts' fetch()/XHR and sub-resources are unchanged.
+
+The simulator uses the Vita's own curl + mbedTLS, so its TLS fingerprint
+is the device's. It now gets the app page, not the challenge.
+
+### 11. The app is ES modules: 66 of them, 19 MB (patch 71)
+
+claude.ai's page has one `<script type="module">`:
+- its static imports reach **66 modules, 19 MB** (three levels);
+- dynamic `import()` reaches **2,645 modules, 167 MB**.
+
+MacSurf ran external modules as classic scripts, which is a SyntaxError
+at the first `import`. Its loader could only find inline modules and the
+Mac's disk cache.
+
+QuickJS links a module graph synchronously, so the sources must be in
+hand before linking starts. The loader now works like this:
+- `js_exec_module` scans the module's static imports (`from "x"`,
+  `import "x"`, resolved with `nsurl_join`).
+- It fetches each level in parallel through `fetch_get_blocking()`: a
+  private curl multi with 6 transfers, the same UA, CA bundle, name
+  lookups and timeouts. `file:` URLs are read directly.
+- Level by level, that is **65 modules in ~1 s** on a desktop link.
+- The loader compiles each module from that registry and frees its
+  source.
+- A dynamic `import()` fetches its module, and that module's static
+  graph, when it runs. It blocks, as a module link must.
+- Module scripts are deferred, and inline ones are too (queued, then run
+  after the deferred scripts).
+
+Two more fixes came out of it:
+- **The JS heap cap.** At MacSurf's 96 MB every allocation failed, and
+  QuickJS reported it as a bare `null` rejection. The compiled app is
+  **~99 MB on the 64-bit host**; about 60 MB is expected on the Vita. The
+  cap now scales with the pointer size: **128 MB of the Vita's 192 MB
+  heap**, and 256 MB in the simulator.
+- **Rejections are visible.** A module's evaluation promise is checked,
+  so a throw is logged with its stack instead of passing as success.
+
+### 12. The page's scripts saw an abandoned document (patch 72)
+
+The app threw "Root element #root not found". Its DOM ended at the
+`<meta charset="UTF-8">`, **byte 1185**, which is past hubbub's
+1024-byte prescan. When the parser meets that meta, it restarts the parse
+into a *new* document (`html_process_encoding_change`). The JS realm,
+wired to the first document when the thread was made, kept answering
+from the abandoned one.
+
+The new `js_thread_rebind_document()` re-wires the realm after the
+switch. testpages `JS-module` puts its charset past byte 1024 on purpose.
+
+### 13. Web APIs the app needs (patches 73, 75)
+
+`vita_polyfill.js` is compiled in and evaluated in every realm after the
+bridge. Each item below was found as the app's next failure, or by
+testpages `JS-apis`, a census of 176 APIs: 121 present before, **151
+after**, 10/10 behaviour checks.
+
+- **URL / URLSearchParams:** MacSurf's were stubs. `.entries()` was
+  missing, and the app's first failure was spreading it. Checked against
+  Node on 20 URLs.
+- **TextEncoder:** encoded Latin-1 bytes, not UTF-8.
+- **Intl:** QuickJS-ng has none. Added an en-US one, matched against
+  Node's ICU on about 200 cases. (Chrome's time format uses a plain space
+  before AM/PM, not ICU's U+202F.)
+- **IndexedDB:** the app's idb-keyval opens one at boot. It is in memory
+  now, and not kept between restarts.
+- **getComputedStyle** returned `undefined` for anything the cascade did
+  not answer. The UI kit calls `animationName.split` and
+  `backgroundColor.trim()` on it.
+- **Smaller gaps:**
+  - `window.parent` and `window.top` were undefined, so
+    `parent.postMessage` threw;
+  - `requestIdleCallback` passed no deadline;
+  - `document.fonts` was missing;
+  - `PerformanceObserver.supportedEntryTypes` was missing;
+  - console extras;
+  - iterable Headers.
+- **Patch 75:** MacSurf skipped any classic script over **256 KB**.
+  YouTube's app is one 1.6 MB bundle, so its page stayed an empty black
+  shell. The cap is now 8 MB on the Vita.
+
+### Where claude.ai stands (simulator, 2026-09-24)
+
+- `https://claude.ai/code` loads the app.
+- The app boots React, routes itself client-side to
+  `/login?...returnTo=/code`, and draws the login page's content.
+- The page is **unstyled**. claude.ai's CSS does not reach the page yet.
+- Host RSS is 260 MB for the 64-bit process; the JS heap is 99 MB of it.
+- The remaining console noise is non-fatal:
+  - `detectIncognito cannot determine the browser` (a fingerprint
+    script);
+  - a `Method Not Allowed` from an API call.
+
+### YouTube
+
+- With patch 75, m.youtube.com runs its app and draws its loading
+  skeleton.
+- The skeleton's black blocks are the "black and white" page of run 15.
+  Its colours are CSS custom properties, which are not resolved yet.
+- The feed then stops on a `startsWith` of undefined in the bundle. The
+  stack is truncated in the log: the bundle's URL is 600+ characters.
+
 ## Not done: the gaps left
 
-- **claude.ai/code:** Cloudflare's "Just a moment..." challenge, on the
-  device and for curl. It needs Cloudflare's challenge script to succeed
-  in QuickJS + MacSurf's DOM bridge (doc 10, run 14 results). It is the
-  next big item on the way to the north star.
+- **claude.ai/code:**
+  - Its CSS: the login page draws unstyled. It is the next item on the
+    way to the north star.
+  - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
+    heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
+  - Signing in comes after that.
+- **YouTube:** the `startsWith` failure, and CSS custom properties for
+  its colours.
+- **Wikipedia is 1011 px wide again** under the Chrome UA. The mobile
+  skin now comes from `en.wikipedia.org`, with a different header.
 - **Minerva's page-action labels** ("Language", "Watch", "Edit") still
   draw, clipped.
   - They reproduce statically: the page-actions markup plus Minerva's
