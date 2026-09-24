@@ -1,0 +1,107 @@
+# quickjs: an option not to keep function source text
+#
+# QuickJS keeps the source text of every function for
+# Function.prototype.toString -- one copy per function, nested ones
+# included, so a big bundle's text is stored several times over. On the
+# Vita that was most of the heap claude.ai's 19 MB of ES modules needed
+# (hardware run 16: 84 MB, then out of memory on its dynamic imports).
+# JS_SetStripFunctionSource(true) makes the parser keep none; toString of
+# such a function gives the "[native code]" form, which is what it already
+# gives for any function without source. VitaBrowser's bridge sets it only
+# while compiling scripts of 128 KB or more.
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -47,6 +47,19 @@
+ #include "cutils.h"
+ #include "qjs_list.h"
+ #include "quickjs.h"
++
++/* VitaBrowser: do not keep each function's source text (for
++ * Function.prototype.toString) while this is set. Every function keeps
++ * its own copy, nested ones included, so a large bundle's text is held
++ * several times over: most of the heap claude.ai's 19 MB of modules
++ * needed. The embedder sets it around compiling big scripts; toString then
++ * gives the "[native code]" form. */
++static bool js_strip_function_source;
++
++void JS_SetStripFunctionSource(bool strip)
++{
++    js_strip_function_source = strip;
++}
+ #include "libregexp.h"
+ #include "dtoa.h"
+ 
+@@ -25445,10 +25458,15 @@
+ 
+     /* store the class source code in the constructor. */
+     js_free(ctx, ctor_fd->source);
+-    ctor_fd->source_len = s->buf_ptr - class_start_ptr;
+-    ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr, ctor_fd->source_len);
+-    if (!ctor_fd->source)
+-        goto fail;
++    if (js_strip_function_source) {
++        ctor_fd->source_len = 0;
++        ctor_fd->source = NULL;
++    } else {
++        ctor_fd->source_len = s->buf_ptr - class_start_ptr;
++        ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr, ctor_fd->source_len);
++        if (!ctor_fd->source)
++            goto fail;
++    }
+ 
+     /* consume the '}' */
+     if (next_token(s))
+@@ -37055,10 +37073,15 @@
+             /* save the function source code */
+             /* the end of the function source code is after the last
+                 token of the function source stored into s->last_ptr */
+-            fd->source_len = s->last_ptr - ptr;
+-            fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
+-            if (!fd->source)
+-                goto fail;
++            if (js_strip_function_source) {
++                fd->source_len = 0;
++                fd->source = NULL;
++            } else {
++                fd->source_len = s->last_ptr - ptr;
++                fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
++                if (!fd->source)
++                    goto fail;
++            }
+ 
+             goto done;
+         }
+@@ -37093,10 +37116,15 @@
+         }
+ 
+         /* save the function source code */
+-        fd->source_len = s->buf_ptr - ptr;
+-        fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
+-        if (!fd->source)
+-            goto fail;
++        if (js_strip_function_source) {
++            fd->source_len = 0;
++            fd->source = NULL;
++        } else {
++            fd->source_len = s->buf_ptr - ptr;
++            fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
++            if (!fd->source)
++                goto fail;
++        }
+ 
+         if (next_token(s)) {
+             /* consume the '}' */
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1267,6 +1267,9 @@
+ /* instantiate and evaluate a bytecode function. Only used when
+    reading a script or module with JS_ReadObject() */
+ JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
++/* VitaBrowser (patches/quickjs/02): compile without keeping each
++ * function's source text while set; toString then gives "[native code]". */
++JS_EXTERN void JS_SetStripFunctionSource(bool strip);
+ /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
+    returns a module. */
+ JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
