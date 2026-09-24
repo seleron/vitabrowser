@@ -361,6 +361,13 @@ and fixed by patch 32 (§10).
    - ad and tracker blocking;
    - text drawn in batches;
    - an autotest interaction pass that drives all of it on the device.
+7. **Real websites end to end** (patches 55–58, doc 11):
+   - example.com, Wikipedia (https, mobile skin), Hacker News, CNN Lite and
+     DuckDuckGo Lite load in the simulator over the live network;
+   - fixed: the user agent, body `overflow` going to the viewport, and a
+     leading space in inline elements;
+   - next: SVG, `mask-image`, Minerva's hidden labels, Wikipedia's 1011-px
+     overflow.
 
 ## 9. Corrections to earlier documents
 

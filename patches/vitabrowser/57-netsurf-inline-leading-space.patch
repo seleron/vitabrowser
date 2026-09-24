@@ -1,0 +1,64 @@
+# netsurf: a space leading an inline element's text is kept
+# Generated 2026-09-24
+#
+# box_construct_text strips a text box's leading space and gives it to the
+# box before it (prev->space). After "…</a><span> (site.com)" that box is
+# the span's BOX_INLINE start marker, and layout_line ignored space on
+# inline start boxes in both passes (and layout_minmax_line in the widths),
+# so the space vanished: "Title(site.com)" on every Hacker News row, and
+# the same wherever an element's text starts with a space right after
+# other inline content (<b>a</b><i> b</i>). Upstream has the same code.
+# The space is now taken from an inline start box like from an inline end,
+# measured in the inline's own font.
+# Verified: X-ws cases 1-3 and 5 were missing the space, now all 5 match
+# case 4 (the space outside the element).
+
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 1cd1f3f..d1d1806 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -860,6 +860,15 @@ layout_minmax_line(struct box *first,
+ 						&fixed, &frac);
+ 			if (0 < fixed)
+ 				max += fixed;
++			/* A space leading the inline's text is kept here
++			 * (box_construct_text); see layout_line. */
++			if (b->space != 0 && b->next) {
++				if (b->space == UNKNOWN_WIDTH) {
++					font_func->width(&fstyle, " ", 1,
++							 &b->space);
++				}
++				max += b->space;
++			}
+ 			*line_has_height = true;
+ 			/* \todo  update min width, consider fractional extra */
+ 		} else if (b->type == BOX_INLINE_END) {
+@@ -4256,6 +4265,17 @@ layout_line(struct box *first,
+ 			if (!b->text) {
+ 				b->width = 0;
+ 				space_after = 0;
++				/* box_construct_text gives a text's leading space
++				 * to the box before it, so after "a</b><i> (x"
++				 * the space belongs to <i>'s start box. It used
++				 * to be dropped here: "Title(site.com)" on Hacker
++				 * News. */
++				if (b->type == BOX_INLINE && b->space != 0) {
++					if (b->space == UNKNOWN_WIDTH)
++						font_func->width(&fstyle, " ", 1,
++								 &b->space);
++					space_after = b->space;
++				}
+ 				continue;
+ 			}
+ 
+@@ -4463,7 +4483,9 @@ layout_line(struct box *first,
+ 			if (b->object || b->flags & REPLACE_DIM ||
+ 					b->flags & IFRAME)
+ 				space_after = 0;
+-			else if (b->text || b->type == BOX_INLINE_END) {
++			else if (b->text || b->type == BOX_INLINE_END ||
++					(b->type == BOX_INLINE &&
++					 b->space != 0)) {
+ 				if (b->space == UNKNOWN_WIDTH) {
+ 					font_plot_style_from_css(
+ 							&content->unit_len_ctx,

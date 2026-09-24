@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <errno.h>
@@ -504,6 +505,24 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 	}
 	if (++idle < SETTLE_POLLS)
 		return 1;
+	/* VITA_SIM_MIN_MS: a live page draws nothing while it loads, so give
+	 * each page at least this long before it may count as settled. */
+	{
+		static struct timespec t0;
+		static unsigned int t0_page = ~0u;
+		struct timespec now;
+		const char *m = getenv("VITA_SIM_MIN_MS");
+		long ms;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (t0_page != page) {
+			t0_page = page;
+			t0 = now;
+		}
+		ms = (now.tv_sec - t0.tv_sec) * 1000 +
+			(now.tv_nsec - t0.tv_nsec) / 1000000;
+		if (m != NULL && ms < atol(m))
+			return 1;
+	}
 
 	/* Settled: record this page, then move on. */
 	if (frames == 0) {

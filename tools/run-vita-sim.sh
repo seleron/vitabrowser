@@ -162,6 +162,8 @@ NET-js-fetch-http http://127.0.0.1:$HP/JS-fetch.html
 NET-js-fetch-https https://127.0.0.1:$((HP + 1))/JS-fetch.html
 NET-dns-name http://localhost:$HP/L1-layout-basics.html
 NET-dns-hang http://dead.sim-hang:$HP/L1-layout-basics.html
+CSS-ovf file:///app0:/testpages/CSS-overflow-viewport.html
+CSS-space file:///app0:/testpages/CSS-inline-space.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -331,6 +333,20 @@ grep -c '<a href="https://' "$R/home.html" | sed 's/^/  home page bookmarks: /'
 	[ "$iblk" = "IN block: 2/2 passed" ] && [ -f "$R/IN-zoom125.plot" ] && \
 	[ -f "$R/IN-form-sent.plot" ] && \
 	[ "$(grep -c '<a href="https://' "$R/home.html")" -ge 5 ] || fail "interaction pass"
+
+# Layout found on real sites (docs/phase-0/11), as regression pages among
+# pass N's: body's overflow goes to the viewport (patch 56: the page must be
+# far taller than the screen), and a space leading an inline's text keeps
+# its width (patch 57: each word lands where its space-outside twin does).
+echo "== real-site layout regressions =="
+ext=$(sed -n 's/.*page CSS-ovf settled: .*extent 960x\([0-9]*\).*/\1/p' "$R/log.txt" | head -1)
+echo "  CSS-ovf: page height ${ext:-?} (the screen is 544)"
+sp=$(ls "$R"/*-CSS-space.plot 2>/dev/null | head -1)
+xpos() { sed -n "s/^PLOT TEXT X \([0-9]*\) Y [0-9]* STR $1\$/\1/p" "$sp" | head -1; }
+b1=$(xpos BRAVO1); b2=$(xpos BRAVO2); c1=$(xpos CHARLIE1); c2=$(xpos CHARLIE2)
+echo "  CSS-space: BRAVO at x $b1 / $b2, CHARLIE at x $c1 / $c2"
+[ -n "$ext" ] && [ "$ext" -gt 1500 ] && [ -n "$b1" ] && [ "$b1" = "$b2" ] && \
+	[ -n "$c1" ] && [ "$c1" = "$c2" ] || fail "real-site layout regressions"
 
 # The network probe (frontends/vita/netprobe.c) before pass N: against the
 # local servers every step must succeed, with curl's own verdict logged.
