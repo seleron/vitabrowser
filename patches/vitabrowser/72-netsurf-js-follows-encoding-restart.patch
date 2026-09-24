@@ -1,0 +1,126 @@
+# netsurf: scripts follow the document across an encoding restart
+# Generated 2026-09-24
+#
+# A <meta charset> beyond the first 1024 bytes (claude.ai's is at byte
+# 1185) is found mid-parse; html_process_encoding_change then destroys the
+# document and parses the page again into a new one. The page's JS realm,
+# wired to the first document by js_newthread, went on answering from the
+# abandoned one -- a <head> cut off at that meta, no <body> -- so claude.ai's
+# app threw "Root element #root not found". The HTML handler now calls the
+# new js_thread_rebind_document() after the switch; the QuickJS bridge
+# re-wires the realm as js_newthread does (Duktape and "none" do nothing).
+
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index ca690b8..943aa56 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2218,6 +2218,12 @@ html_process_encoding_change(struct content *c,
+ 
+ 	}
+ 
++	/* VitaBrowser: scripts must see the new document, not the one just
++	 * abandoned (js_thread_rebind_document). */
++	if (html->js_thread != NULL) {
++		js_thread_rebind_document(html->js_thread);
++	}
++
+ 	source_data = content__get_source_data(c, &source_size);
+ 
+ 	/* fixes506: don't feed a NULL/empty buffer to the parser. After
+diff --git a/content/handlers/javascript/duktape/dukky.c b/content/handlers/javascript/duktape/dukky.c
+index a780b00..72abf98 100644
+--- a/content/handlers/javascript/duktape/dukky.c
++++ b/content/handlers/javascript/duktape/dukky.c
+@@ -758,6 +758,12 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
+ #define CTX (thread->ctx)
+ 
+ /* exported interface documented in js.h */
++/* exported interface documented in js.h */
++nserror js_thread_rebind_document(jsthread *thread)
++{
++	return NSERROR_OK;
++}
++
+ nserror js_closethread(jsthread *thread)
+ {
+ 	/* We can always close down a thread, it might just confuse
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+index 55f8e22..c8d2484 100644
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -96,6 +96,15 @@ void js_destroyheap(jsheap *heap);
+  */
+ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **thread);
+ 
++/**
++ * Point a thread at its document again after the HTML handler replaced it
++ * (a <meta charset> found late restarts the parse into a new document).
++ *
++ * \param thread The thread whose doc_priv's document changed
++ * \return NSERROR_OK on success, appropriate error otherwise
++ */
++nserror js_thread_rebind_document(jsthread *thread);
++
+ /**
+  * Close a javascript thread
+  *
+diff --git a/content/handlers/javascript/none/none.c b/content/handlers/javascript/none/none.c
+index 12dbc9a..3316109 100644
+--- a/content/handlers/javascript/none/none.c
++++ b/content/handlers/javascript/none/none.c
+@@ -52,6 +52,12 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
+ 	return NSERROR_NOT_IMPLEMENTED;
+ }
+ 
++/* exported interface documented in js.h */
++nserror js_thread_rebind_document(jsthread *thread)
++{
++	return NSERROR_OK;
++}
++
+ nserror js_closethread(jsthread *thread)
+ {
+ 	return NSERROR_OK;
+diff --git a/content/handlers/javascript/quickjs/js.h b/content/handlers/javascript/quickjs/js.h
+index cf12a4c..ddc9c90 100644
+--- a/content/handlers/javascript/quickjs/js.h
++++ b/content/handlers/javascript/quickjs/js.h
+@@ -84,6 +84,7 @@ void    js_destroyheap(jsheap *heap);
+ 
+ nserror js_newthread(jsheap *heap, void *win_priv,
+ 		void *doc_priv, jsthread **thread);
++nserror js_thread_rebind_document(jsthread *thread);
+ nserror js_closethread(jsthread *thread);
+ void    js_destroythread(jsthread *thread);
+ 
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 5b219df..c4039c5 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -15826,6 +15826,26 @@ nserror js_newthread(struct jsheap *heap, void *win_priv, void *doc_priv,
+ 	return NSERROR_OK;
+ }
+ 
++/* VitaBrowser: the HTML handler replaced the thread's document -- a
++ * <meta charset> past the first 1024 bytes makes it restart the parse
++ * into a new one (html_process_encoding_change) -- so the realm, wired to
++ * the first by js_newthread, would go on seeing the abandoned document:
++ * claude.ai's app found no #root, because its document ended at the meta.
++ * Re-wire the realm exactly as js_newthread does. */
++nserror js_thread_rebind_document(struct jsthread *thread)
++{
++	html_content *htmlc;
++
++	if (thread == NULL || thread->heap == NULL || thread->doc_priv == NULL ||
++			thread->ctx == NULL || thread->ctx != thread->heap->ctx)
++		return NSERROR_BAD_PARAMETER;
++	htmlc = (html_content *)thread->doc_priv;
++	qjs_set_document(thread->heap, htmlc->document);
++	qjs_dom_install(thread->heap->ctx);
++	MS_LOG("qjs: thread document re-wired (encoding change)");
++	return NSERROR_OK;
++}
++
+ nserror js_closethread(struct jsthread *thread)
+ {
+ 	(void)thread;

@@ -1,0 +1,1187 @@
+# netsurf + MacSurf bridge: ES modules load over the network
+# Generated 2026-09-24
+#
+# claude.ai is a Vite app: one <script type="module"> whose static imports
+# reach 66 modules (19 MB), and 2,600 more behind dynamic import(). MacSurf
+# ran an external module as a classic script (SyntaxError at its first
+# `import`), and its module loader knew only inline modules and the Mac's
+# disk cache, so no import could load anywhere else.
+#
+# - script.c: type="module" scripts are flagged (html_script.is_module),
+#   deferred unless async, and run by js_exec_module; inline modules are
+#   deferred too (queued, run after the deferred scripts) and named after
+#   the document so their relative imports resolve.
+# - fetch_get_blocking() (content/fetch.h, curl.c): GET a set of URLs in
+#   parallel (6 at once) on a private curl multi handle -- same user agent,
+#   CA bundle, frontend name lookups, timeouts -- and wait for all of them.
+#   QuickJS links a module graph synchronously, so its sources must be in
+#   hand first. file: URLs are read directly (app0: pages' modules).
+# - macsurf_qjs.c: js_exec_module scans the module's static imports
+#   (`from "x"`, `import "x"`), fetches that level in parallel, scans those,
+#   and so on (claude.ai: 65 modules, 3 levels, ~1 s on a desktop link);
+#   the loader compiles each from that registry and frees its source, and
+#   fetches a dynamic import() -- with its own static graph -- when it runs.
+#   Specifiers resolve with nsurl_join (was: string splicing, so "/x" and
+#   "../x" broke), and the normalized name is js_malloc'd as QuickJS frees
+#   it with js_free. A module's evaluation promise is checked: a throw that
+#   rejects it is logged with its stack (it used to pass as success).
+# - The JS heap cap scales with the pointer size under
+#   MACSURF_WINDOW_SERVICES: 128 MB on the Vita (of its 192 MB heap), 256 MB
+#   in the 64-bit simulator. claude.ai's compiled app is ~99 MB there
+#   (~60 MB on the Vita); at MacSurf's 96 MB every allocation failed and
+#   QuickJS reported it as a bare `null`.
+# testpages/pages/JS-module.html (with js-module-*.js): six checks, from app0:
+# and over http in tools/run-vita-sim.sh.
+
+diff --git a/content/fetch.c b/content/fetch.c
+index 76c9480..4d3095f 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -301,6 +301,24 @@ void fetch_pump(void)
+ 	}
+ }
+ 
++#ifndef WITH_CURL
++/* exported interface documented in content/fetch.h */
++unsigned int fetch_get_blocking(const char *const *urls, unsigned int n,
++		const char *referer, struct fetch_blocking_body *res)
++{
++	unsigned int i;
++
++	(void)urls;
++	(void)referer;
++	for (i = 0; i < n; i++) {
++		res[i].data = NULL;
++		res[i].len = 0;
++		res[i].status = 0;
++	}
++	return 0;
++}
++#endif
++
+ /* exported interface documented in content/fetch.h */
+ void fetch_kick(void *unused)
+ {
+diff --git a/content/fetch.h b/content/fetch.h
+index a43382b..2fb02f6 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -307,6 +307,31 @@ bool fetch_get_tainted_tls(struct fetch *fetch);
+  */
+ bool fetch_get_verifiable(const struct fetch *fetch);
+ 
++/** One body fetched by fetch_get_blocking(). */
++struct fetch_blocking_body {
++	char *data;	/**< the body, NUL-terminated (malloc()ed), or NULL */
++	size_t len;	/**< its length */
++	long status;	/**< the HTTP status; 0 when the fetch failed */
++};
++
++/**
++ * Fetch several URLs with GET, in parallel, and wait for all of them.
++ *
++ * For callers that must have a set of sources synchronously -- an ES module
++ * graph is linked in one go, and QuickJS asks for each import while it
++ * links. Runs its own transfers beside the fetchers' (same user agent, CA
++ * bundle, name lookups and timeouts), so it may be called while other
++ * fetches are in progress; the browser does nothing else meanwhile.
++ *
++ * \param urls     absolute URLs
++ * \param n        how many
++ * \param referer  the Referer to send, or NULL
++ * \param res      n results, filled in; the caller frees each data
++ * \return how many were fetched with a 2xx status
++ */
++unsigned int fetch_get_blocking(const char *const *urls, unsigned int n,
++		const char *referer, struct fetch_blocking_body *res);
++
+ /**
+  * Get the set of file descriptors the fetchers are currently using.
+  *
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 15c730a..e83b4dc 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -2288,3 +2288,252 @@ curl_multi_setopt_failed:
+ 	return NSERROR_INIT_FAILED;
+ #endif
+ }
++
++
++/* ---- fetch_get_blocking(): a set of bodies, synchronously ------------- */
++
++/** Transfers fetch_get_blocking() runs at once. */
++#define BLOCKING_PARALLEL 6
++/** How long it waits for all of them. */
++#define BLOCKING_TIMEOUT_S 120
++
++static size_t
++fetch_blocking_write(char *data, size_t size, size_t nmemb, void *p)
++{
++	struct fetch_blocking_body *b = p;
++	size_t n = size * nmemb;
++	char *m = realloc(b->data, b->len + n + 1);
++
++	if (m == NULL)
++		return 0;	/* ends the transfer with an error */
++	memcpy(m + b->len, data, n);
++	b->len += n;
++	m[b->len] = '\0';
++	b->data = m;
++	return n;
++}
++
++/**
++ * Start transfer i on multi, or report that its host is still being looked
++ * up (WITH_CURL_ASYNC_RESOLVE: curl may not look names up itself).
++ *
++ * 
++eturn 1 started, 0 not yet, -1 failed
++ */
++static int
++fetch_blocking_start(CURLM *multi, const char *url, const char *referer,
++		struct fetch_blocking_body *res, unsigned int i,
++		struct curl_slist **resolve, CURL **handle)
++{
++	CURL *e;
++#ifdef WITH_CURL_ASYNC_RESOLVE
++	char addr[64], entry[400];
++	nsurl *nu;
++	lwc_string *host, *port_s;
++	long port;
++	enum fetch_curl_resolve_result r;
++
++	if (nsurl_create(url, &nu) != NSERROR_OK)
++		return -1;
++	host = nsurl_get_component(nu, NSURL_HOST);
++	if (host == NULL) {
++		nsurl_unref(nu);
++		return -1;
++	}
++	r = fetch_curl_resolve(lwc_string_data(host), addr, sizeof(addr));
++	if (r == FETCH_CURL_RESOLVE_READY && addr[0] != '\0') {
++		port_s = nsurl_get_component(nu, NSURL_PORT);
++		if (port_s != NULL) {
++			port = strtol(lwc_string_data(port_s), NULL, 10);
++			lwc_string_unref(port_s);
++		} else {
++			port = (nsurl_get_scheme_type(nu) ==
++					NSURL_SCHEME_HTTPS) ? 443 : 80;
++		}
++		snprintf(entry, sizeof(entry), "%s:%ld:%s",
++			 lwc_string_data(host), port, addr);
++		*resolve = curl_slist_append(NULL, entry);
++	}
++	lwc_string_unref(host);
++	nsurl_unref(nu);
++	if (r == FETCH_CURL_RESOLVE_PENDING)
++		return 0;
++	if (r == FETCH_CURL_RESOLVE_FAILED ||
++	    (addr[0] != '\0' && *resolve == NULL))
++		return -1;
++#else
++	(void)resolve;
++#endif
++	e = curl_easy_duphandle(fetch_blank_curl);
++	if (e == NULL)
++		return -1;
++	curl_easy_setopt(e, CURLOPT_URL, url);
++	curl_easy_setopt(e, CURLOPT_PRIVATE, (void *)(uintptr_t)i);
++	curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, fetch_blocking_write);
++	curl_easy_setopt(e, CURLOPT_WRITEDATA, &res[i]);
++	curl_easy_setopt(e, CURLOPT_HEADERFUNCTION, NULL);
++	curl_easy_setopt(e, CURLOPT_HEADERDATA, NULL);
++	curl_easy_setopt(e, CURLOPT_NOPROGRESS, 1L);
++	curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 1L);
++	curl_easy_setopt(e, CURLOPT_MAXREDIRS, 5L);
++	curl_easy_setopt(e, CURLOPT_TIMEOUT, (long)BLOCKING_TIMEOUT_S);
++	if (referer != NULL)
++		curl_easy_setopt(e, CURLOPT_REFERER, referer);
++	if (*resolve != NULL)
++		curl_easy_setopt(e, CURLOPT_RESOLVE, *resolve);
++	if (curl_multi_add_handle(multi, e) != CURLM_OK) {
++		curl_easy_cleanup(e);
++		return -1;
++	}
++	*handle = e;
++	return 1;
++}
++
++/**
++ * A file: URL, read directly (the Vita's bundled pages live on app0:, where
++ * the file fetcher, not curl, is what knows the paths).
++ *
++ * \return true if url was a file: URL (res filled in either way)
++ */
++static bool fetch_blocking_file(const char *url, struct fetch_blocking_body *res)
++{
++	nsurl *nu;
++	char *path = NULL;
++	FILE *fp;
++	long len;
++
++	if (strncasecmp(url, "file:", 5) != 0)
++		return false;
++	if (nsurl_create(url, &nu) != NSERROR_OK)
++		return true;
++	if (guit->file->nsurl_to_path(nu, &path) == NSERROR_OK &&
++	    (fp = fopen(path, "rb")) != NULL) {
++		if (fseek(fp, 0, SEEK_END) == 0 && (len = ftell(fp)) >= 0 &&
++		    fseek(fp, 0, SEEK_SET) == 0 &&
++		    (res->data = malloc((size_t)len + 1)) != NULL) {
++			if (fread(res->data, 1, (size_t)len, fp) == (size_t)len) {
++				res->data[len] = '\0';
++				res->len = (size_t)len;
++				res->status = 200;
++			} else {
++				free(res->data);
++				res->data = NULL;
++			}
++		}
++		fclose(fp);
++	}
++	free(path);
++	nsurl_unref(nu);
++	return true;
++}
++
++/* exported interface documented in content/fetch.h */
++unsigned int fetch_get_blocking(const char *const *urls, unsigned int n,
++		const char *referer, struct fetch_blocking_body *res)
++{
++	CURLM *multi;
++	struct curl_slist **resolve;
++	CURL **handle;
++	unsigned char *state;	/* 0 waiting, 1 running, 2 done */
++	unsigned int i, active = 0, left = n, ok = 0;
++	uint64_t t0, now;
++	int running, queued;
++	CURLMsg *msg;
++
++	for (i = 0; i < n; i++) {
++		res[i].data = NULL;
++		res[i].len = 0;
++		res[i].status = 0;
++	}
++	multi = curl_multi_init();
++	resolve = calloc(n, sizeof(*resolve));
++	handle = calloc(n, sizeof(*handle));
++	state = calloc(n, 1);
++	if (multi == NULL || resolve == NULL || handle == NULL ||
++	    state == NULL) {
++		if (multi != NULL)
++			curl_multi_cleanup(multi);
++		free(resolve);
++		free(handle);
++		free(state);
++		return 0;
++	}
++	nsu_getmonotonic_ms(&t0);
++	while (left > 0) {
++		/* Start what may start: at most BLOCKING_PARALLEL at once. */
++		for (i = 0; i < n && active < BLOCKING_PARALLEL; i++) {
++			int r;
++			if (state[i] != 0)
++				continue;
++			if (fetch_blocking_file(urls[i], &res[i])) {
++				if (res[i].status == 200)
++					ok++;
++				state[i] = 2;
++				left--;
++				continue;
++			}
++			r = fetch_blocking_start(multi, urls[i], referer, res,
++					i, &resolve[i], &handle[i]);
++			if (r == 1) {
++				state[i] = 1;
++				active++;
++			} else if (r < 0) {
++				state[i] = 2;
++				left--;
++			}
++		}
++		curl_multi_perform(multi, &running);
++		while ((msg = curl_multi_info_read(multi, &queued)) != NULL) {
++			void *priv = NULL;
++			if (msg->msg != CURLMSG_DONE)
++				continue;
++			curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE,
++					&priv);
++			i = (unsigned int)(uintptr_t)priv;
++			if (msg->data.result == CURLE_OK) {
++				curl_easy_getinfo(msg->easy_handle,
++						CURLINFO_RESPONSE_CODE,
++						&res[i].status);
++			} else {
++				NSLOG(netsurf, INFO, "%s: %s", urls[i],
++				      curl_easy_strerror(msg->data.result));
++			}
++			if (res[i].status >= 200 && res[i].status < 300)
++				ok++;
++			curl_multi_remove_handle(multi, msg->easy_handle);
++			curl_easy_cleanup(msg->easy_handle);
++			handle[i] = NULL;
++			state[i] = 2;
++			active--;
++			left--;
++		}
++		nsu_getmonotonic_ms(&now);
++		if (now - t0 > BLOCKING_TIMEOUT_S * 1000) {
++			NSLOG(netsurf, WARNING, "gave up on %u of %u", left, n);
++			break;
++		}
++		/* Waits for traffic, or 50 ms (a lookup in progress). */
++		if (left > 0)
++			curl_multi_poll(multi, NULL, 0, 50, NULL);
++	}
++	/* Anything unfinished (the time limit): its handle is still on. */
++	for (i = 0; i < n; i++) {
++		if (handle[i] != NULL) {
++			curl_multi_remove_handle(multi, handle[i]);
++			curl_easy_cleanup(handle[i]);
++		}
++		if (state[i] != 2) {
++			free(res[i].data);
++			res[i].data = NULL;
++			res[i].len = 0;
++			res[i].status = 0;
++		}
++		curl_slist_free_all(resolve[i]);
++	}
++	curl_multi_cleanup(multi);
++	free(resolve);
++	free(handle);
++	free(state);
++	return ok;
++}
++
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index d32ffec..76becc8 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -74,6 +74,14 @@ enum html_script_type {
+ /**
+  * Container for scripts used by an HTML document
+  */
++/** An inline <script type="module"> waiting for the parse to finish. */
++struct html_inline_module {
++	struct html_inline_module *next;
++	char *name;	/**< its module name (the document URL + #inline-module-N) */
++	char *source;	/**< its text (malloc()ed) */
++	size_t len;
++};
++
+ struct html_script {
+ 	enum html_script_type type;
+ 	union {
+@@ -98,6 +106,7 @@ struct html_script {
+ 	 * NULL for parser-inserted scripts, which need no such event. */
+ 	struct dom_node *node;
+ 	bool already_started;
++	bool is_module;	/**< type="module": run by js_exec_module */
+ 	bool parser_inserted;
+ 	bool force_async;
+ 	bool ready_exec;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 55bcf12..94d54fe 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -163,6 +163,9 @@ typedef struct html_content {
+ 	struct html_script *scripts;
+ 	/** javascript thread in use */
+ 	struct jsthread *js_thread;
++	/** Inline module scripts met while parsing: deferred, as external
++	 * modules are, and run in order after them (html_script_exec). */
++	struct html_inline_module *inline_modules;
+ 
+ 	/** Number of entries in stylesheet_content. */
+ 	unsigned int stylesheet_count;
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index c908eb9..d44be57 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -94,10 +94,25 @@ struct macos9_unpause_payload {
+ };
+ 
+ 
+-static script_handler_t *select_script_handler(content_type ctype)
++/* A module script (type="module"): its imports are fetched and linked
++ * (js_exec_module) rather than it failing as a classic script. */
++static bool exec_module_handler(struct jsthread *jsthread,
++		const uint8_t *data, size_t size, const char *name)
++{
++	return js_exec_module(jsthread, data, size, name) != 0;
++}
++
++static bool html_run_inline_modules(html_content *c);
++
++/** Set around exec_src_script() for a type="module" script. */
++static bool src_script_is_module;
++
++static script_handler_t *select_script_handler(content_type ctype,
++		const struct html_script *s)
+ {
+ 	if (ctype == CONTENT_JS) {
+-		return js_exec;
++		return (s != NULL && s->is_module) ?
++			exec_module_handler : js_exec;
+ 	}
+ 	return NULL;
+ }
+@@ -198,7 +213,7 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 
+ 			/* ensure script handler for content type */
+ 			script_handler = select_script_handler(
+-					content_get_type(s->data.handle));
++					content_get_type(s->data.handle), s);
+ 			if (script_handler == NULL) {
+ 				/* fixes847 (#167 S1 census gap) - this is a silent
+ 				 * script-execution skip with NO log of any kind
+@@ -290,6 +305,10 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 		}
+ 	}
+ 
++	if (allow_defer && html_run_inline_modules(c)) {
++		have_run_something = true;
++	}
++
+ 	if (have_run_something) {
+ 		return html_proceed_to_done(c);
+ 	}
+@@ -297,6 +316,49 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 	return NSERROR_OK;
+ }
+ 
++/** Keep an inline module for the end of the parse (in document order). */
++static void html_queue_inline_module(html_content *c, const char *name,
++		const char *src, size_t len)
++{
++	struct html_inline_module *m, **tail;
++
++	m = calloc(1, sizeof(*m));
++	if (m == NULL)
++		return;
++	m->name = strdup(name);
++	m->source = malloc(len + 1);
++	if (m->name == NULL || m->source == NULL) {
++		free(m->name);
++		free(m->source);
++		free(m);
++		return;
++	}
++	memcpy(m->source, src, len);
++	m->source[len] = '\0';
++	m->len = len;
++	for (tail = &c->inline_modules; *tail != NULL; tail = &(*tail)->next)
++		;
++	*tail = m;
++}
++
++/** Run the inline modules the parse deferred, after the deferred scripts. */
++static bool html_run_inline_modules(html_content *c)
++{
++	struct html_inline_module *m;
++	bool ran = false;
++
++	while ((m = c->inline_modules) != NULL && c->js_thread != NULL) {
++		c->inline_modules = m->next;
++		js_exec_module(c->js_thread, (const unsigned char *)m->source,
++				m->len, m->name);
++		free(m->name);
++		free(m->source);
++		free(m);
++		ran = true;
++	}
++	return ran;
++}
++
+ /* create new html script entry */
+ static struct html_script *
+ html_process_new_script(html_content *c,
+@@ -807,7 +869,7 @@ convert_script_sync_cb(hlcache_handle *script,
+ 		s->already_started = true;
+ 
+ 		/* attempt to execute script */
+-		script_handler = select_script_handler(content_get_type(s->data.handle));
++		script_handler = select_script_handler(content_get_type(s->data.handle), s);
+ 		if (script_handler != NULL && parent->js_thread != NULL) {
+ 			/* script has a handler */
+ 			const uint8_t *data;
+@@ -990,6 +1052,9 @@ exec_src_script(html_content *c,
+ 		if (exc != DOM_NO_ERR) {
+ 			return DOM_HUBBUB_OK; /* dom error */
+ 		}
++		/* A module script is deferred unless it is async. */
++		if (src_script_is_module)
++			defer = true;
+ 
+ 		if (defer) {
+ 			/* defered script */
+@@ -1008,6 +1073,7 @@ exec_src_script(html_content *c,
+ 		content_broadcast_error(&c->base, NSERROR_NOMEM, NULL);
+ 		return DOM_HUBBUB_NOMEM;
+ 	}
++	nscript->is_module = src_script_is_module;
+ 
+ 	/* fixes869 (#295) - remember the element so html_script_exec can fire
+ 	 * `load` at it (and convert_script_async_cb `error`).  Only worth it for a
+@@ -1135,7 +1201,7 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 		return DOM_HUBBUB_DOM;
+ 	}
+ 
+-	script_handler = select_script_handler(content_factory_type_from_mime_type(lwcmimetype));
++	script_handler = select_script_handler(content_factory_type_from_mime_type(lwcmimetype), NULL);
+ 	lwc_string_unref(lwcmimetype);
+ 
+ 	if (script_handler != NULL) {
+@@ -1269,11 +1335,29 @@ html_process_script(void *ctx, dom_node *node)
+ 						"len=%ld",
+ 						(long)dom_string_byte_length(
+ 							modsrc));
+-					js_exec_module(c->js_thread,
+-						(const unsigned char *)
++					/* Named after the document, so its
++					 * relative imports resolve against it;
++					 * numbered, so each is its own module. */
++					static unsigned int inline_modules;
++					char mname[1024];
++					snprintf(mname, sizeof(mname),
++						"%s#inline-module-%u",
++						nsurl_access(c->base_url),
++						++inline_modules);
++					/* Deferred like an external module
++					 * (html_run_inline_modules) unless
++					 * the parse is done already. */
++					if (c->parse_completed) {
++						js_exec_module(c->js_thread,
++							(const unsigned char *)
++							dom_string_data(modsrc),
++							dom_string_byte_length(modsrc),
++							mname);
++					} else {
++						html_queue_inline_module(c, mname,
+ 							dom_string_data(modsrc),
+-						dom_string_byte_length(modsrc),
+-						"?inline module?");
++							dom_string_byte_length(modsrc));
++					}
+ 					dom_string_unref(modsrc);
+ 				} else {
+ 					macsurf_debug_log_writef(
+@@ -1285,17 +1369,16 @@ html_process_script(void *ctx, dom_node *node)
+ 				return DOM_HUBBUB_OK;
+ 			}
+ 
+-			/* EXTERNAL module: remap and let the regular
+-			 * src-script path handle it. js_exec_module
+-			 * threading through the async callback is
+-			 * deferred; external module scripts get
+-			 * regular-script treatment for now (still a
+-			 * massive improvement over the silent drop). */
++			/* EXTERNAL module: fetched like any script (as
++			 * text/javascript), deferred, and run by
++			 * js_exec_module (select_script_handler). */
+ 			g_script_tags_external++;   /* fixes1239 */
+ 			dom_string_unref(mimetype);
+ 			mimetype = dom_string_ref(
+ 				corestring_dom_text_javascript);
++			src_script_is_module = true;
+ 			err = exec_src_script(c, node, mimetype, src);
++			src_script_is_module = false;
+ 			dom_string_unref(src);
+ 			dom_string_unref(mimetype);
+ 			return err;
+@@ -1317,6 +1400,20 @@ html_process_script(void *ctx, dom_node *node)
+ 	return err;
+ }
+ 
++/** Drop inline modules that never ran (the content is going away). */
++static void html_free_inline_modules(html_content *c)
++{
++	struct html_inline_module *m, *next;
++
++	for (m = c->inline_modules; m != NULL; m = next) {
++		next = m->next;
++		free(m->name);
++		free(m->source);
++		free(m);
++	}
++	c->inline_modules = NULL;
++}
++
+ /* exported internal interface documented in html/html_internal.h */
+ bool html_saw_insecure_scripts(html_content *htmlc)
+ {
+@@ -1349,6 +1446,8 @@ nserror html_script_free(html_content *html)
+ 	unsigned int count = html->scripts_count;
+ 	unsigned int i;
+ 
++	html_free_inline_modules(html);
++
+ 	/* fixes600: DETACH the script list from the content BEFORE releasing
+ 	 * any handle. Releasing a script handle can re-enter teardown
+ 	 * (convert_script_async_cb / llcache_catch_up_all_users can drive a
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index e729cd8..5b219df 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -19,6 +19,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <ctype.h>
+ 
+ #include "utils/ns_errors.h"
+ #include "macos9.h"
+@@ -49,6 +50,7 @@
+  * for the content_get_url() NULL guard (same include set macos9_js_fetch.c
+  * uses for the same guard). */
+ #include "utils/nsurl.h"
++#include "content/fetch.h"
+ #include "content/urldb.h"
+ #include "content/content_protected.h"
+ #include "content/content_factory.h"
+@@ -15097,143 +15099,328 @@ static JSMallocFunctions macsurf_qjs_mf = {
+  * on the JSRuntime in js_newheap.
+  * ================================================================ */
+ 
+-/* Simple linked list of pre-registered module sources (inline scripts
+- * whose text is already available before JS_Eval is called). */
++/* The sources of a page's modules, by URL: the module scripts themselves
++ * and everything their static imports reach, fetched before the graph is
++ * linked (qjs_module_crawl), because QuickJS asks for each import
++ * synchronously while it links. A source is freed once compiled -- QuickJS
++ * keeps the module -- and failed fetches stay as entries with no source,
++ * so they are not tried again. VitaBrowser: MacSurf's loader only knew
++ * inline modules and the Mac's disk cache, so on any other platform every
++ * import failed (claude.ai: 66 modules, 19 MB). */
+ struct module_entry {
+ 	struct module_entry *next;
+ 	char   *name;    /* module URL (malloc'd) */
+-	char   *source;  /* source text (malloc'd, NUL-terminated) */
++	char   *source;  /* source text (malloc'd, NUL-terminated), or NULL */
+ 	size_t  srclen;
++	int     compiled; /* handed to QuickJS (source freed) */
+ };
+ 
+ /* Module registry lives per heap; opaque pointer in the loader. */
+ struct module_registry {
+ 	struct module_entry *head;
++	int nav_seq;	/* the navigation its entries belong to */
++	unsigned int count;
++	size_t bytes;
+ };
+ 
+-/* Normalize: resolve import specifier against base module name.
+- * Returns a malloc'd string that QuickJS will free via JS_FreeCString. */
++/* Caps on what one page's static graph may fetch. */
++#define QJS_MODULE_MAX_COUNT 600
++#define QJS_MODULE_MAX_BYTES (48u * 1024 * 1024)
++
++static void qjs_module_registry_free(struct module_registry *reg);
++
++/* Resolve spec (n bytes) against base, as a browser does: relative, root-
++ * relative and absolute URLs. Bare specifiers ("react") need an import map
++ * and resolve to NULL. Returns a malloc'd URL. */
++static char *qjs_module_resolve(const char *base, const char *spec, size_t n)
++{
++	nsurl *b = NULL, *j = NULL;
++	char *tmp, *out = NULL;
++
++	if (n == 0 || !(spec[0] == '.' || spec[0] == '/' ||
++			(n > 5 && strncmp(spec, "http:", 5) == 0) ||
++			(n > 6 && strncmp(spec, "https:", 6) == 0)))
++		return NULL;
++	tmp = (char *)malloc(n + 1);
++	if (tmp == NULL)
++		return NULL;
++	memcpy(tmp, spec, n);
++	tmp[n] = '\0';
++	if (base != NULL && nsurl_create(base, &b) == NSERROR_OK &&
++			nsurl_join(b, tmp, &j) == NSERROR_OK) {
++		out = strdup(nsurl_access(j));
++	} else if (base == NULL && nsurl_create(tmp, &j) == NSERROR_OK) {
++		out = strdup(nsurl_access(j));
++	}
++	if (j != NULL) nsurl_unref(j);
++	if (b != NULL) nsurl_unref(b);
++	free(tmp);
++	return out;
++}
++
++/* Normalize: resolve an import specifier against the importing module's
++ * URL. QuickJS frees the result with js_free, so it is js_malloc'd. */
+ static char *qjs_module_normalize(JSContext *ctx,
+ 	const char *base_name, const char *name, void *opaque)
+ {
+-	const char *last_slash;
+-	size_t base_len, name_len, dot;
+-	char *result;
+-	(void)opaque; (void)ctx;
++	char *url, *r;
++	size_t n;
++	(void)opaque;
+ 
+ 	if (name == NULL) return NULL;
++	url = qjs_module_resolve(base_name, name, strlen(name));
++	if (url == NULL) {
++		/* A bare specifier: keep it, so the load fails by name. */
++		url = strdup(name);
++		if (url == NULL) return NULL;
++	}
++	n = strlen(url);
++	r = (char *)js_malloc(ctx, n + 1);
++	if (r != NULL) memcpy(r, url, n + 1);
++	free(url);
++	return r;
++}
+ 
+-	/* Absolute URL or already fully qualified */
+-	if (name[0] == '/' || strncmp(name, "http://", 7) == 0 ||
+-			strncmp(name, "https://", 8) == 0) {
+-		return strdup(name);
+-	}
+-
+-	/* Relative: resolve against base_name's directory */
+-	last_slash = base_name ? strrchr(base_name, '/') : NULL;
+-	if (last_slash == NULL) return strdup(name);
+-
+-	base_len = (size_t)(last_slash - base_name) + 1; /* include the / */
+-	name_len = strlen(name);
+-
+-	result = (char *)malloc(base_len + name_len + 1);
+-	if (result == NULL) return NULL;
+-	memcpy(result, base_name, base_len);
+-	memcpy(result + base_len, name, name_len + 1);
+-
+-	/* Append .js if no extension (Node/bundler compat) */
+-	dot = name_len;
+-	while (dot > 0 && name[dot - 1] != '.') dot--;
+-	if (dot == 0 && name_len > 0) {
+-		char *ext = (char *)malloc(base_len + name_len + 4);
+-		if (ext != NULL) {
+-			memcpy(ext, result, base_len + name_len);
+-			memcpy(ext + base_len + name_len, ".js\0", 4);
+-			free(result);
+-			result = ext;
+-		}
++static struct module_entry *qjs_module_find(struct module_registry *reg,
++	const char *name)
++{
++	struct module_entry *e;
++	for (e = reg->head; e != NULL; e = e->next) {
++		if (strcmp(e->name, name) == 0)
++			return e;
+ 	}
+-
+-	return result;
++	return NULL;
+ }
+ 
+-/* Loader: fetch and compile a module given its normalized name.
+- * Checks the pre-registered source list first (inline scripts),
+- * then tries disk cache, then fails. Called synchronously by
+- * QuickJS during JS_ResolveModule / import resolution. */
+-static JSModuleDef *qjs_module_loader(JSContext *ctx,
+-	const char *module_name, void *opaque)
++/* Add name with its source (copied; NULL for a failed fetch). */
++static struct module_entry *qjs_module_register(struct module_registry *reg,
++	const char *name, const char *source, size_t srclen)
+ {
+-	struct module_registry *reg;
+ 	struct module_entry *e;
+-	JSValue val;
++	if (reg == NULL || name == NULL) return NULL;
++	e = qjs_module_find(reg, name);
++	if (e == NULL) {
++		e = (struct module_entry *)calloc(1, sizeof(*e));
++		if (e == NULL) return NULL;
++		e->name = strdup(name);
++		if (e->name == NULL) {
++			free(e);
++			return NULL;
++		}
++		e->next = reg->head;
++		reg->head = e;
++		reg->count++;
++	}
++	if (source != NULL && e->source == NULL && !e->compiled) {
++		e->source = (char *)malloc(srclen + 1);
++		if (e->source != NULL) {
++			memcpy(e->source, source, srclen);
++			e->source[srclen] = '\0';
++			e->srclen = srclen;
++			reg->bytes += srclen;
++		}
++	}
++	return e;
++}
+ 
+-	reg = (struct module_registry *)opaque;
+-
+-	/* 1. Check pre-registered sources (inline scripts) */
+-	if (reg != NULL && module_name != NULL) {
+-		for (e = reg->head; e != NULL; e = e->next) {
+-			if (e->name != NULL &&
+-					strcmp(e->name, module_name) == 0) {
+-				val = JS_Eval(ctx, e->source, e->srclen,
+-					module_name,
+-					JS_EVAL_TYPE_MODULE |
+-					JS_EVAL_FLAG_COMPILE_ONLY);
+-				if (!JS_IsException(val))
+-					return (JSModuleDef *)
+-						JS_VALUE_GET_PTR(val);
+-				JS_FreeValue(ctx, JS_GetException(ctx));
+-				return NULL;
+-			}
++/* Collect the static import specifiers of a module source -- `from "x"`,
++ * `import "x"` -- resolved against url, into urls[] (up to max, skipping
++ * ones the registry has). Textual: a string that merely looks like an
++ * import is fetched too, which is harmless (it fails or goes unused).
++ * import("x") is left alone: dynamic imports load when they run (claude.ai
++ * reaches 2,600 modules, 167 MB, that way). */
++static unsigned int qjs_module_scan(struct module_registry *reg,
++	const char *url, const char *src, size_t len,
++	char **urls, unsigned int n, unsigned int max)
++{
++	size_t i, k, start, end;
++	unsigned int m;
++	char q;
++
++	for (i = 0; i + 6 < len && n < max; i++) {
++		if (src[i] == 'f' && strncmp(src + i, "from", 4) == 0)
++			k = i + 4;
++		else if (src[i] == 'i' && strncmp(src + i, "import", 6) == 0)
++			k = i + 6;
++		else
++			continue;
++		if (i > 0 && (isalnum((unsigned char)src[i - 1]) ||
++				src[i - 1] == '_' || src[i - 1] == '$' ||
++				src[i - 1] == '.'))
++			continue;
++		while (k < len && (src[k] == ' ' || src[k] == '\t' ||
++				src[k] == '\n' || src[k] == '\r'))
++			k++;
++		if (k >= len || (src[k] != '"' && src[k] != '\''))
++			continue;
++		q = src[k];
++		start = k + 1;
++		for (end = start; end < len && src[end] != q &&
++				src[end] != '\n' && end - start < 1024; end++)
++			;
++		if (end >= len || src[end] != q)
++			continue;
++		{
++			char *u = qjs_module_resolve(url, src + start,
++					end - start);
++			if (u == NULL)
++				continue;
++			for (m = 0; m < n && strcmp(urls[m], u) != 0; m++)
++				;
++			if (m < n || qjs_module_find(reg, u) != NULL)
++				free(u);
++			else
++				urls[n++] = u;
+ 		}
++		i = end;
+ 	}
++	return n;
++}
+ 
+-#ifdef __MACOS9__
+-	/* 2. Try disk cache */
+-	{
+-		extern int macos9_cache_lookup(const char *url,
+-			char **body, long *body_len);
+-		char *body = NULL;
+-		long blen = 0;
+-
+-		if (macos9_cache_lookup(module_name, &body, &blen) == 1
+-				&& body != NULL && blen > 0) {
+-			val = JS_Eval(ctx, body, (size_t)blen,
+-				module_name,
+-				JS_EVAL_TYPE_MODULE |
+-				JS_EVAL_FLAG_COMPILE_ONLY);
+-			free(body);
+-			if (!JS_IsException(val))
+-				return (JSModuleDef *)
+-					JS_VALUE_GET_PTR(val);
+-			JS_FreeValue(ctx, JS_GetException(ctx));
++/* Fetch the static import graph below the modules named in urls[0..n)
++ * (sources already registered are scanned, the rest fetched), level by
++ * level, each level's fetches in parallel (fetch_get_blocking). Frees
++ * urls' strings. */
++static void qjs_module_crawl(struct module_registry *reg, char **urls,
++	unsigned int n)
++{
++	char **next;
++	unsigned int level = 0, fetched = 0, failed = 0, i, nn;
++	size_t bytes = 0;
++	extern double macos9_micros(void);
++	double t0 = macos9_micros();
++
++	next = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*next));
++	if (next == NULL) {
++		for (i = 0; i < n; i++) free(urls[i]);
++		return;
++	}
++	while (n > 0) {
++		struct fetch_blocking_body *res;
++		const char **want;
++		unsigned int nw = 0;
++
++		/* Fetch the ones not registered yet. */
++		res = (struct fetch_blocking_body *)calloc(n, sizeof(*res));
++		want = (const char **)calloc(n, sizeof(*want));
++		if (res == NULL || want == NULL) {
++			free(res);
++			free(want);
++			break;
++		}
++		for (i = 0; i < n; i++) {
++			if (qjs_module_find(reg, urls[i]) == NULL)
++				want[nw++] = urls[i];
++		}
++		if (nw > 0)
++			fetch_get_blocking(want, nw, NULL, res);
++		for (i = 0; i < nw; i++) {
++			int good = res[i].data != NULL &&
++				res[i].status >= 200 && res[i].status < 300;
++			qjs_module_register(reg, want[i],
++				good ? res[i].data : NULL, res[i].len);
++			if (good) {
++				fetched++;
++				bytes += res[i].len;
++			} else {
++				failed++;
++				macsurf_debug_log_writef(
++					"LIFE module fetch FAILED status=%ld %s",
++					res[i].status, want[i]);
++			}
++			free(res[i].data);
++		}
++		free(res);
++		free(want);
++		/* Scan every module of this level for the next. */
++		nn = 0;
++		for (i = 0; i < n; i++) {
++			struct module_entry *e = qjs_module_find(reg, urls[i]);
++			if (e != NULL && e->source != NULL &&
++					reg->count < QJS_MODULE_MAX_COUNT &&
++					reg->bytes < QJS_MODULE_MAX_BYTES)
++				nn = qjs_module_scan(reg, e->name, e->source,
++					e->srclen, next, nn,
++					QJS_MODULE_MAX_COUNT);
++			free(urls[i]);
+ 		}
++		memcpy(urls, next, nn * sizeof(*urls));
++		n = nn;
++		level++;
+ 	}
+-#else
+-	(void)ctx;
+-#endif
++	free(next);
++	macsurf_debug_log_writef(
++		"LIFE module graph: %u fetched (%lu KiB), %u failed, %u levels,"
++		" %ld ms; registry %u modules",
++		fetched, (unsigned long)(bytes / 1024), failed, level,
++		(long)((macos9_micros() - t0) / 1000), reg->count);
++}
+ 
+-	return NULL; /* module not found */
++/* Start a crawl from one module URL (copied). */
++static void qjs_module_crawl_from(struct module_registry *reg,
++	const char *url)
++{
++	char **urls = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*urls));
++	if (urls == NULL) return;
++	urls[0] = strdup(url);
++	if (urls[0] != NULL)
++		qjs_module_crawl(reg, urls, 1);
++	free(urls);
+ }
+ 
+-/* Pre-register a module source so the loader can find it during
+- * import resolution. Called before JS_Eval for inline module scripts. */
+-static void qjs_module_register(struct module_registry *reg,
+-	const char *name, const char *source, size_t srclen)
++/* Forget the last page's modules when a new navigation starts. */
++static void qjs_module_registry_for_nav(struct module_registry *reg)
++{
++	if (reg->nav_seq != g_qjs_nav_seq) {
++		qjs_module_registry_free(reg);
++		reg->nav_seq = g_qjs_nav_seq;
++	}
++}
++
++/* Loader: compile a module given its normalized name, from the registry
++ * (qjs_module_crawl put the graph there), else -- a dynamic import(), or
++ * anything the scan missed -- fetch it and its static graph now. */
++static JSModuleDef *qjs_module_loader(JSContext *ctx,
++	const char *module_name, void *opaque)
+ {
++	struct module_registry *reg = (struct module_registry *)opaque;
+ 	struct module_entry *e;
+-	if (reg == NULL || name == NULL || source == NULL) return;
+-	e = (struct module_entry *)calloc(1, sizeof(*e));
+-	if (e == NULL) return;
+-	e->name = strdup(name);
+-	e->source = (char *)malloc(srclen + 1);
+-	if (e->source != NULL) {
+-		memcpy(e->source, source, srclen);
+-		e->source[srclen] = '\0';
+-		e->srclen = srclen;
++	JSValue val;
++
++	if (reg == NULL || module_name == NULL)
++		return NULL;
++	qjs_module_registry_for_nav(reg);
++	e = qjs_module_find(reg, module_name);
++	if (e != NULL && e->compiled) {
++		/* Compiled in an earlier realm: fetch it again. */
++		struct module_entry **pp = &reg->head;
++		while (*pp != e) pp = &(*pp)->next;
++		*pp = e->next;
++		reg->count--;
++		free(e->name);
++		free(e);
++		e = NULL;
++	}
++	if (e == NULL) {
++		/* A dynamic import(), or one the scan missed. */
++		qjs_module_crawl_from(reg, module_name);
++		e = qjs_module_find(reg, module_name);
+ 	}
+-	e->next = reg->head;
+-	reg->head = e;
++	if (e == NULL || e->source == NULL) {
++		JS_ThrowReferenceError(ctx, "could not load module '%s'",
++			module_name);
++		return NULL;
++	}
++	val = JS_Eval(ctx, e->source, e->srclen, module_name,
++		JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
++	reg->bytes -= e->srclen;
++	free(e->source);
++	e->source = NULL;
++	e->srclen = 0;
++	e->compiled = 1;
++	if (JS_IsException(val))
++		return NULL;	/* the SyntaxError stays pending */
++	return (JSModuleDef *)JS_VALUE_GET_PTR(val);
+ }
+ 
+ static void qjs_module_registry_free(struct module_registry *reg)
+@@ -15247,6 +15434,8 @@ static void qjs_module_registry_free(struct module_registry *reg)
+ 		free(e);
+ 	}
+ 	reg->head = NULL;
++	reg->count = 0;
++	reg->bytes = 0;
+ }
+ 
+ nserror js_newheap(int timeout, struct jsheap **out_heap)
+@@ -15354,7 +15543,17 @@ nserror js_newheap(int timeout, struct jsheap **out_heap)
+ 	/* Real OS 9 hardware provides roughly 142 MB free at launch.  Preserve
+ 	 * about 46 MB for the DOM, decoded images, fetch/cache objects, and native
+ 	 * stack instead of allowing bytecode to consume the entire partition. */
++#ifdef MACSURF_WINDOW_SERVICES
++	/* VitaBrowser: claude.ai's React app alone is 19 MB of modules,
++	 * ~99 MB of heap on a 64-bit host once compiled (~60 MB on the
++	 * Vita's 32-bit build). The cap scales with the pointer size so the
++	 * simulator runs out where the Vita would: 128 MB of the Vita's 192 MB
++	 * newlib heap (frontends/vita/main.c), leaving the rest to the DOM,
++	 * boxes, images and fetches. */
++	JS_SetMemoryLimit(heap->rt, (size_t)32 * sizeof(void *) * 1024UL * 1024UL);
++#else
+ 	JS_SetMemoryLimit(heap->rt, 96UL * 1024UL * 1024UL);
++#endif
+ 
+ 	/* fixes593 - the heap-corruption freeze on heavy JS pages (tinkerdifferent:
+ 	 * all scripts still RUN through QuickJS, but a later malloc/free spins on a
+@@ -16473,12 +16672,26 @@ unsigned char js_exec_module(struct jsthread *thread,
+ 	memcpy(src, txt, txtlen);
+ 	src[txtlen] = '\0';
+ 
+-	/* Pre-register this module so imports from OTHER modules
+-	 * can find it via the loader callback. */
++	/* VitaBrowser: fetch the module's static import graph now, in
++	 * parallel, since QuickJS links it synchronously inside JS_Eval
++	 * (the loader then compiles each from the registry). The script
++	 * itself is compiled here, so it is registered as compiled. */
+ 	if (thread->heap != NULL && thread->heap->module_reg != NULL
+ 			&& name != NULL) {
+-		qjs_module_register(thread->heap->module_reg,
+-			name, src, txtlen);
++		struct module_registry *reg = thread->heap->module_reg;
++		char **urls;
++		struct module_entry *me;
++		qjs_module_registry_for_nav(reg);
++		me = qjs_module_register(reg, name, NULL, 0);
++		if (me != NULL) me->compiled = 1;
++		urls = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*urls));
++		if (urls != NULL) {
++			unsigned int n = qjs_module_scan(reg, name, src,
++					txtlen, urls, 0, QJS_MODULE_MAX_COUNT);
++			if (n > 0)
++				qjs_module_crawl(reg, urls, n);
++			free(urls);
++		}
+ 	}
+ 
+ 	/* Compile and execute as a module in one call (same pattern
+@@ -16499,20 +16712,46 @@ unsigned char js_exec_module(struct jsthread *thread,
+ 		free(src);
+ 
+ 		ok = !JS_IsException(val);
+-		if (!ok) diag_script_state = MS_SCR_RUN_FAIL;
++		/* A module's evaluation settles a promise: a throw while it
++		 * ran (or linked) rejects it rather than raising. */
++		if (ok && JS_PromiseState(ctx, val) == JS_PROMISE_REJECTED) {
++			JSValue why = JS_PromiseResult(ctx, val);
++			JSValue st = JS_GetPropertyStr(ctx, why, "stack");
++			const char *sts = JS_ToCString(ctx, st);
++			qjs_log_exc(ctx, why, "exec module rejected",
++				name ? name : "<module>");
++			macsurf_debug_log_writef("LIFE module stack: %.1500s",
++				sts ? sts : "?");
++			if (sts) JS_FreeCString(ctx, sts);
++			JS_FreeValue(ctx, st);
++			JS_FreeValue(ctx, why);
++			diag_script_state = MS_SCR_RUN_FAIL;
++			ok = 0;
++		} else if (!ok) {
++			JSValue exc = JS_GetException(ctx);
++			qjs_log_exc(ctx, exc, "exec module err",
++				name ? name : "<module>");
++			JS_FreeValue(ctx, exc);
++			diag_script_state = MS_SCR_RUN_FAIL;
++		}
+ 		mus = (long)(macos9_micros() - t0);
+ 		/* R1.3 - a module is compiled, resolved and executed in the one
+ 		 * JS_Eval call, so a failure cannot be attributed to a phase
+ 		 * here; the whole time lands in run_us. */
+ 		qjs_census_note(name, (long)txtlen, SCRIPT_CENSUS_MODULE,
+ 				ok ? 1 : 0, ok ? 1 : 0, 0, mus);
+-		if (!ok) {
+-			JSValue exc = JS_GetException(ctx);
+-			qjs_log_exc(ctx, exc, "exec module err",
+-				name ? name : "<module>");
+-			JS_FreeValue(ctx, exc);
+-		}
+ 		JS_FreeValue(ctx, val);
++		{
++			JSMemoryUsage mu;
++			JS_ComputeMemoryUsage(JS_GetRuntime(ctx), &mu);
++			macsurf_debug_log_writef(
++				"LIFE module memory: %lld KiB used, %lld objects,"
++				" %lld functions (%lld KiB bytecode), %lld atoms",
++				(long long)(mu.memory_used_size / 1024),
++				(long long)mu.obj_count, (long long)mu.js_func_count,
++				(long long)(mu.js_func_code_size / 1024),
++				(long long)mu.atom_count);
++		}
+ 		macsurf_debug_log_writef(
+ 			"LIFE qjs exec module done ok=%d us=%ld [%s]",
+ 			(int)ok, mus, name ? name : "<module>");

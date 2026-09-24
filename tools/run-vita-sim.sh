@@ -167,6 +167,9 @@ CSS-space file:///app0:/testpages/CSS-inline-space.html
 IMG-svg file:///app0:/testpages/IMG-svg.html
 CSS-mask file:///app0:/testpages/CSS-mask-icon.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
+JS-apis file:///app0:/testpages/JS-apis.html
+JS-module file:///app0:/testpages/JS-module.html
+JS-module-http http://127.0.0.1:$HP/JS-module.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -220,6 +223,13 @@ for f in "$OUT"/reference/*; do
 	# the home page, bookmarks or the cookie jar).
 	case "$n" in *.plot|log.txt|netsurf.log|autotest.done) ;; *) continue ;; esac
 	if cmp -s "$f" "$NET/$n"; then same=$((same + 1))
+	# netsurf.log is mirrored up to 4 MiB (diag.c ENGINE_NET_CAP) while
+	# the card goes on to 16: past that, the mirror must be its start.
+	elif [ "$n" = netsurf.log ] && [ -f "$NET/$n" ] && \
+		[ "$(stat -c %s "$NET/$n")" -ge 4194304 ] && \
+		cmp -s -n "$(stat -c %s "$NET/$n")" "$f" "$NET/$n"; then
+		same=$((same + 1))
+		echo "  netsurf.log: first $(stat -c %s "$NET/$n") of $(stat -c %s "$f") bytes mirrored (the 4 MiB cap)"
 	else bad=$((bad + 1)); echo "  DIFFERS or missing: $n"; fi
 done
 grep -E '^datagrams' "$NET/receiver.txt" | sed 's/^/  /'
@@ -367,6 +377,24 @@ echo "  CSS-mask: $nblk solid 24x24 blocks (2 expected: the unmasked spans)"
 xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)
 echo "  CSS-overflow-x: page width ${xw:-?} (the screen is 960)"
 [ "$xw" = 960 ] || fail "horizontal overflow"
+
+# The web platform census (patch 73) and ES modules (patches 71, 72): from
+# app0: through the module loader's file path, and over http through
+# fetch_get_blocking's curl transfers.
+echo "== web APIs and ES modules =="
+ap=$(ls "$R"/*-JS-apis.plot 2>/dev/null | head -1)
+apis=$(sed -n 's/.*STR \(APIS: [0-9]*\/[0-9]* present\).*/\1/p' "$ap" 2>/dev/null | head -1)
+beh=$(sed -n 's/.*STR \(behaviour: [0-9]*\/[0-9]* right\).*/\1/p' "$ap" 2>/dev/null | head -1)
+echo "  JS-apis: ${apis:-no summary (script did not run?)}, ${beh:-no behaviour line}"
+napi=$(echo "$apis" | sed -n 's/APIS: \([0-9]*\)\/.*/\1/p')
+[ "${napi:-0}" -ge 149 ] && [ "$beh" = "behaviour: 10/10 right" ] || fail "web API census"
+for m in JS-module JS-module-http; do
+	mp=$(ls "$R"/*-"$m".plot 2>/dev/null | head -1)
+	ms=$(sed -n 's/.*STR \(MODULES: [0-9]*\/[0-9]* passed\).*/\1/p' "$mp" 2>/dev/null | head -1)
+	echo "  $m: ${ms:-no summary (module did not run?)}"
+	[ "$ms" = "MODULES: 6/6 passed" ] || fail "ES modules ($m)"
+done
+
 [ -n "$ext" ] && [ "$ext" -gt 1500 ] && [ -n "$b1" ] && [ "$b1" = "$b2" ] && \
 	[ -n "$c1" ] && [ "$c1" = "$c2" ] && [ "${npath:-0}" -ge 5 ] && \
 	! grep -q LOGO-NOT-DRAWN "$sv" || fail "real-site layout regressions"
