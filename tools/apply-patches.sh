@@ -4,10 +4,28 @@
 # This is the test that the stack is real: every patch must apply to pristine
 # upstream, in manifest order, with no fuzz.
 #
-# Usage: WORK=<WORK>/vitabrowser-work tools/apply-patches.sh [--dry-run]
+# Usage: WORK=<WORK>/vitabrowser-work/applytest tools/apply-patches.sh [--dry-run]
+# (normally run by tools/build-patched.sh, which stages $WORK/applytest).
+#
+# WORK is the directory whose upstream/<lib> trees get PATCHED. It must never
+# be <WORK>/vitabrowser-work itself: those upstream trees are the pristine source
+# that tools/split-patches.py diffs MacSurf against, and that build-patched.sh
+# copies for staging. On 2026-09-25 22:05 this script ran with the old default
+# (WORK=<WORK>/vitabrowser-work) and patched them in place; the next regeneration
+# produced a gutted stack and the staged builds were unreliable (doc 11 §37).
 set -e
-WORK="${WORK:-$HOME/vitabrowser-work}"
+WORK="${WORK:-$HOME/vitabrowser-work/applytest}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+case "$(cd "$WORK" 2>/dev/null && pwd)" in
+"$(cd "$HOME/vitabrowser-work" 2>/dev/null && pwd)")
+	if [ "${ALLOW_PRISTINE_PATCH:-}" != 1 ]; then
+		echo "apply-patches.sh: refusing to patch the pristine trees in" \
+		     "$WORK/upstream (use WORK=$WORK/applytest, or" \
+		     "ALLOW_PRISTINE_PATCH=1 if you really mean it)" >&2
+		exit 2
+	fi
+	;;
+esac
 DRY=""
 [ "$1" = "--dry-run" ] && DRY="--dry-run"
 

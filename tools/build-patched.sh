@@ -44,6 +44,20 @@ SUPPORT="libnsutils libutf8proc libnsgif libnsbmp libnspsl libsvgtiny nsgenbind"
 # the patch set is a function of the compat headers. Editing a header without
 # regenerating leaves stale patches, which fail as redundant-declaration or
 # undeclared-identifier errors that look like code problems. Regenerate first.
+# The pristine upstream trees must be exactly their git HEAD: split-patches.py
+# diffs MacSurf against their working files, and staging copies them. A tree
+# patched in place (doc 11 §37) regenerates a gutted stack and stages stale
+# files, silently. Refuse instead.
+for l in $LIBS netsurf; do
+	if [ -n "$(git -C "$WORK/upstream/$l" status --porcelain 2>/dev/null)" ]; then
+		echo "build-patched.sh: $WORK/upstream/$l is not pristine" \
+		     "($(git -C "$WORK/upstream/$l" status --porcelain | wc -l) changed/untracked" \
+		     "files). Back them up, then: git -C $WORK/upstream/$l checkout -- ." \
+		     "&& git -C $WORK/upstream/$l clean -fd" >&2
+		exit 1
+	fi
+done
+
 echo "== regenerating the patch stack =="
 python3 "$ROOT/tools/split-patches.py" | tail -1
 
@@ -52,9 +66,9 @@ rm -rf "$WORK/applytest/upstream"
 mkdir -p "$WORK/applytest/upstream"
 for l in $LIBS netsurf; do
 	cp -r "$WORK/upstream/$l" "$WORK/applytest/upstream/$l"
-	# The work upstream trees carry local convenience edits (e.g. monkey window
-	# size in netsurf). git apply (used by apply-patches.sh) refuses to patch
-	# files that differ from HEAD, so reset each staged copy to pristine HEAD.
+	# The pristine trees are checked clean above; resetting the staged copy
+	# to HEAD as well is belt and braces (git apply, used by
+	# apply-patches.sh, refuses to patch files that differ from HEAD).
 	git -C "$WORK/applytest/upstream/$l" checkout -- .
 done
 ( cd "$WORK/applytest/upstream/netsurf" && rm -f nsmonkey && \
