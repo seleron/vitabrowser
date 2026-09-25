@@ -1,0 +1,35 @@
+# libcss: media query ranges with the name first (width>=350px)
+#
+# Tailwind v4 writes breakpoints in range syntax: @media (width>=350px).
+# The parser handled the form (mq_parse_range) and the matcher handled
+# bare width (mq_match_feature), but the two disagreed: mq_parse_range
+# always populated the feature's value from name_or_value, which is the
+# feature *name* when the name comes first (width>=350px) -- so the value
+# was stored as the IDENT "width", and mq_match_feature_range_length_op1
+# requires a dimension, so the range never matched. Value-first ranges
+# worked (350px <= width <= 960px), because there name_or_value is the
+# value. Result: every name-first breakpoint rule was dead, so claude.ai's
+# min-[350px]:text-[38px] title drew at 28px even after patch 108 gave
+# @media a real 960x544 viewport.
+#
+# Fix: the value token is name_or_value when the value comes first and
+# value_or_name when the name does (name_first). One conditional; both
+# orderings now get the real value. No API change.
+--- a/src/parse/mq.c
++++ b/src/parse/mq.c
+@@ -416,8 +416,13 @@
+ 		result->value.type = CSS_MQ_VALUE_TYPE_RATIO;
+ 		result->value.data.num_or_ratio = ratio;
+ 	} else {
+-		/* num/dim/ident */
+-		error = mq_populate_value(&result->value, name_or_value);
++		/* num/dim/ident. The value is name_or_value when the value
++		 * comes first (350px <= width <= 960px) and value_or_name
++		 * when the name does (width>=350px); the other is the name.
++		 * (patch 109: it was always name_or_value, which broke the
++		 * name-first form.) */
++		error = mq_populate_value(&result->value,
++				name_first ? value_or_name : name_or_value);
+ 		if (error != CSS_OK) {
+ 			css__mq_feature_destroy(result);
+ 			return error;

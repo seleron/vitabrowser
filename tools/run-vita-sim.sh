@@ -456,12 +456,17 @@ spbx=$(( ${spd1:-0} - ${spc1:-0} )); spby=$(( ${spd2:-0} - ${spc2:-0} ))
 echo "  CSS-spacing: gap $spgap (51); :host var $(rects "$spplot" 120 11) (1); iOS @supports $(rects "$spplot" 133 11)/$(rects "$spplot" 333 11) (1/0)"
 echo "  CSS-spacing: inline calc heights [$sph ] ([ 2 4 6 8 10 ]); button child at +$spbx,+$spby (80|81,15)"
 echo "  CSS-spacing: abs in flex $(rects "$spplot" 170 50) (1); radius+bottom $(rects "$spplot" 11 36) (1); @media $(rects "$spplot" 188 11)/$(rects "$spplot" 88 11) (1/0)"
+# Round 10: range-syntax media queries -- (width>=350px) and the double
+# range apply at the 960-wide viewport, (width>=961px) must not.
+echo "  CSS-spacing: range media $(rects "$spplot" 251 11)/$(rects "$spplot" 253 11) (1/1); width>=961px $(rects "$spplot" 252 11) (0)"
 [ "$spgap" = 51 ] && [ "$(rects "$spplot" 120 11)" = 1 ] &&
 	[ "$(rects "$spplot" 133 11)" = 1 ] && [ "$(rects "$spplot" 333 11)" = 0 ] &&
 	[ "$sph" = " 2 4 6 8 10" ] && { [ "$spbx" = 80 ] || [ "$spbx" = 81 ]; } &&
 	[ "$spby" = 15 ] && [ "$(rects "$spplot" 170 50)" = 1 ] &&
 	[ "$(rects "$spplot" 11 36)" = 1 ] && [ "$(rects "$spplot" 188 11)" = 1 ] &&
-	[ "$(rects "$spplot" 88 11)" = 0 ] || fail "spacing / calc / layout"
+	[ "$(rects "$spplot" 88 11)" = 0 ] &&
+	[ "$(rects "$spplot" 251 11)" = 1 ] && [ "$(rects "$spplot" 253 11)" = 1 ] &&
+	[ "$(rects "$spplot" 252 11)" = 0 ] || fail "spacing / calc / layout"
 # No horizontal overflow (patches 64, 65): an unbreakable URL in break-word
 # text, and a min-width button in Minerva's header arrangement.
 xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)

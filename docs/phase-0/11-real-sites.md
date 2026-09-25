@@ -888,11 +888,9 @@ html.c (0 × 0, so host builds are unchanged), defined by the Vita frontend
 as the screen divided by the current zoom, the value the GETDIMS handler
 would give. The log now reads `media w=960 h=544 unit_ctx vw=960 vh=544`.
 
-**Still open:** Tailwind v4 writes breakpoints in range syntax
-(`@media (width>=350px)`), and libcss parses only `min-`/`max-width`. So
-claude.ai's `min-[350px]:text-[38px]` title still draws at 28px. Plan:
-fold range forms to min-/max- in the CSS rewrite pass, next to its
-`calc()`-in-`@media` fold (round 5 §14).
+**Range syntax, next:** Tailwind v4 writes breakpoints in range syntax
+(`@media (width>=350px)`), which did not apply — round 10 found why and
+fixed it (patch 109).
 
 **Tests.** `CSS-spacing.html` has one block per fix, asserted in
 `run-vita-sim.sh`: `gap: calc()` (51px apart), a `:root,:host` variable,
@@ -907,24 +905,57 @@ missing, the iOS block applied, heights `2` then garbage, the child at
 cards (x 256–704), their padding, the Download button (281–679, 40 px)
 and "Continue with Google" (285–675) are where Chromium puts them, with
 centred labels. Differences left: the title is 28px instead of 38px (range
-media syntax), so everything below it is about 26px higher, and the header
-logo is missing. The reference dumps changed on three pages, all from the
+media syntax — fixed in round 10, patch 109), so everything below it is
+about 26px higher, and the header logo is missing. The reference dumps changed on three pages, all from the
 new shadow painting (L2's `box-shadow: 2px 2px 4px`, PM-shadow,
 PM-shadow-clip); L1 is unchanged.
 
 **Hand-off: run 18** (doc 10).
 
+## Round 10: range-syntax media queries (patch 109)
+
+Round 9 left one styling gap on the claude.ai snapshot: the title's
+`min-[350px]:text-[38px]` (Tailwind v4 range syntax) drew at 28px. This
+round finds the real cause — it is not what round 9 §35 assumed — and
+fixes it in libcss.
+
+### 36. `(width>=350px)` parsed, but with the wrong value (109, libcss)
+
+**The wrong assumption.** Round 9 §35 read "libcss parses only
+min-/max-width", so the plan was a rewrite-pass fold to
+min-/max-width. The simulator disproved the premise:
+`(350px <= width <= 960px)` *applied* while `(width>=350px)` did not —
+the range parser (`mq_parse_range`) and the matcher (`mq_match_feature`,
+which does handle bare `width`) both exist in this libcss.
+
+**The real cause.** In `mq_parse_range` (libcss/src/parse/mq.c), the
+feature's value is populated from `name_or_value` — the first token in
+the parentheses. That is the value when the value comes first
+(`350px <= width <= 960px`), but the feature *name* when the name comes
+first (`width>=350px`). The name-first form therefore stored the IDENT
+"width" as the feature's value; the matcher needs a dimension, so the
+range never matched. One conditional: the value token is
+`name_first ? value_or_name : name_or_value`.
+
+**Verified** (`CSS-spacing.html` gained three blocks, asserted in
+`run-vita-sim.sh`, all at the 960-wide simulator viewport):
+`(width>=350px)` applies (251 px), `(width>=961px)` does not (11 px),
+`(350px <= width <= 960px)` still applies (253 px) — the double range
+regressed when the fix first tried `value_or_name` unconditionally,
+which is how the two-branch form was caught.
+
+**State.** With 109 in, the static claude.ai snapshot's title should
+take the 38px branch on the device (run 18 will show it); the remaining
+round-9 differences were the title shift and the missing header logo.
+
 ## Not done: the gaps left
 
-- **Tailwind v4 range media syntax** (`@media (width>=350px)`, round 9
-  §35): fold to min-/max-width in the rewrite pass. The 0 × 0 media
-  viewport is fixed (108).
 - **Goldens stale:** L2/L3/L4 fail against pre-round-5 goldens;
-  re-baseline `testpages/golden/` after §35 lands.
+  re-baseline `testpages/golden/` after §36 lands.
 - **claude.ai/code:**
-  - Layout: cards, padding and buttons now match Chromium in the
-    simulator (round 9). Left: the title size (range media syntax) and
-    the header logo.
+  - Layout: cards, padding and buttons match Chromium in the simulator
+    (round 9); the title's 38px range-media branch is fixed (109, round 10)
+    and is verified on the device in run 18. Left: the header logo.
   - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.
