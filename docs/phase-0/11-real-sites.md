@@ -606,27 +606,6 @@ now converted directly.
 Browsing now runs at 444 MHz / bus 222, pass D's clocks; the ARM used to
 stay at its boot 333 MHz.
 
-### 23. background-size percentages (patch 84, libcss + netsurf)
-
-Section 5's parser took px only: `CSS_TOKEN_PERCENTAGE` fell into the
-final `else` and the whole declaration was rejected, so `background-size:
-100%` read as `auto`. Each axis is now stored as `-percent` (clamped
-1..100) in the existing int16 slot -- negative, so it keeps its own tag
-next to the cover/contain sentinels instead of colliding with the
-explicit-px values 1..32767 -- and the three tile-size readers in
-`redraw.c` resolve it against the positioning area, per spec (a percent
-on one axis only keeps the image's aspect on the other). `em`/`rem`
-remain deferred.
-
-- **Verified** with `CSS-background-size-pct.html`: five 300x200 boxes
-  with a 100x50 image at `100% 100%`, `50% 50%`, `150%` (width percent,
-  aspect-kept height), `33% 25%` and `auto`. `run-vita-sim.sh` asserts
-  the four `PLOT BITMAP` sizes (300x200, 150x100, 450x225, 99x50); the
-  auto box tiles at the image's 100x50.
-- **Needs device test:** none expected (pixel-identical path to the
-  px/cover/contain sizes already verified in runs 5 and 15), but it will
-  ride along in the next hardware run.
-
 ## Not done: the gaps left
 
 - **claude.ai/code:**
@@ -643,7 +622,7 @@ remain deferred.
 - **Memory:** host RSS peaks at about 78 MB for the Wikipedia article (a
   64-bit process). The Vita's heap budget is 192 MB. The autotest logs
   `mem[...]` per page on the device.
-- **`background-size` percentages** now parse and draw (patch 84);
-  **em/rem** still read as `auto` (MacSurf's parser takes px only).
+- **Percentage and em/rem `background-size`** still read as `auto`
+  (MacSurf's parser takes px only).
 - **`-webkit-mask` with `/ size`** is dropped (libcss's background
   shorthand has no size).
