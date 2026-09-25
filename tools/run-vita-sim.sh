@@ -167,6 +167,8 @@ CSS-space file:///app0:/testpages/CSS-inline-space.html
 IMG-svg file:///app0:/testpages/IMG-svg.html
 CSS-mask file:///app0:/testpages/CSS-mask-icon.html
 CSS-bgsizepct file:///app0:/testpages/CSS-background-size-pct.html
+CSS-iswhere file:///app0:/testpages/CSS-is-where.html
+CSS-bigsheet file:///app0:/testpages/CSS-rewrite-bigsheet.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
@@ -389,6 +391,20 @@ g160=$(awk '/^PLOT RECT/ && $8 - $4 == 160 && $10 - $6 < 20 { print $4 }' "$bp" 
 g320=$(awk '/^PLOT RECT/ && $8 - $4 == 320 && $10 - $6 > 1 && $10 - $6 < 20 { n++ } END { print n + 0 }' "$bp" 2>/dev/null)
 echo "  CSS-bgsizepct gradient: $g160 tile columns of 160, $g320 full-width stripes (2, 0 expected)"
 [ "$g160" = 2 ] && [ "$g320" = 0 ] || fail "background-size percentage gradient"
+# :is() / :where() (patch 91): each case that matches draws one 10px-high
+# block of its own width; 105 must not match, 197-199 must lose.
+iw=$(ls "$R"/*-CSS-iswhere.plot 2>/dev/null | head -1)
+iws=$(awk '/^PLOT RECT/ && $10 - $6 == 10 && $8 - $4 < 300 { print $8 - $4 }' "$iw" 2>/dev/null | sort -n | tr '\n' ' ')
+echo "  CSS-iswhere: block widths [$iws] (101 102 103 104 106 107 108 109 expected)"
+[ "$iws" = "101 102 103 104 106 107 108 109 " ] || fail ":is() / :where()"
+# CSS rewrite on a big sheet (patch 92): inset expands, and calc(1 * -1)
+# folds to an integer so flex order moves the 122-wide item first.
+bs=$(ls "$R"/*-CSS-bigsheet.plot 2>/dev/null | head -1)
+bsf=$(awk '/^PLOT RECT/ && $8 - $4 == 333 && $10 - $6 == 44 { n++ } END { print n + 0 }' "$bs" 2>/dev/null)
+bsa=$(awk '/^PLOT RECT/ && $8 - $4 == 111 && $10 - $6 == 12 { print $4; exit }' "$bs" 2>/dev/null)
+bsb=$(awk '/^PLOT RECT/ && $8 - $4 == 122 && $10 - $6 == 12 { print $4; exit }' "$bs" 2>/dev/null)
+echo "  CSS-bigsheet: inset fill $bsf (1 expected); order: 122-wide at x=${bsb:-?}, 111-wide at x=${bsa:-?} (122 first expected)"
+[ "$bsf" = 1 ] && [ -n "$bsa" ] && [ -n "$bsb" ] && [ "$bsb" -lt "$bsa" ] || fail "CSS rewrite on a big sheet"
 # No horizontal overflow (patches 64, 65): an unbreakable URL in break-word
 # text, and a min-width button in Minerva's header arrangement.
 xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)

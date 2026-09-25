@@ -646,10 +646,82 @@ full-width stripe; the check fails with the gradient branch disabled).
 Em/rem still read
 as `auto`.
 
+## Round 7: claude.ai's buttons (patches 91–93)
+
+The login page's buttons had no fills. The guess was `color-mix()` /
+`oklab`; it was wrong. Each button is a `relative isolate` element holding
+an `absolute -z-[1] inset-0` span with a `bg-fill-primary` span inside.
+Three separate bugs stopped the fill from painting:
+
+### 24. `:is()` and `:where()` never matched (patch 91, libcss)
+
+MacSurf's fixes359 parsed `:is()` / `:where()` / `:has()` by throwing the
+argument away; the matcher then always said no. Tailwind v4 relies on
+them: claude.ai defines its whole palette under `:where(:root,:host)`, so
+every `var(--cds-gray-*)`, and every fill and surface colour built on
+one, resolved to nothing.
+
+- **Parse.** The argument is split at top-level commas. Each alternative
+  goes through `parseSelector` on its own, and alternatives that fail
+  (`:host`, pseudo-elements) are dropped: a forgiving list. The result is
+  stored in a new detail value type, `SELLIST`, owned by the selector.
+- **Specificity.** `:where()` adds 0; `:is()` adds its most specific
+  argument.
+- **Match.** `match_chain_at()` matches one argument as a complex
+  selector with the node as its subject. It checks the subject's element
+  name itself (the rule hash does that for top-level selectors), and it
+  uses neither the reject cache nor the cascade.
+- **`:has()`** still never matches. Its argument skip now counts FUNCTION
+  tokens, though: `a, b:has(:not(.x))` no longer ends the pseudo-class
+  early and drops the whole rule, `a` included.
+
+### 25. The CSS rewrite on a big sheet (patch 92)
+
+- **`inset` never expanded on claude.ai's 1.4 MB sheet.** The inset pass
+  (and the 2-value logical-shorthand pass) grew its buffer only while
+  writing an expansion. Plain copies gave up (`goto grow_fail`) once the
+  fixed 256-byte headroom was used, and that discarded the whole pass. A
+  small test sheet never reached that point, so `inset: 0` worked there
+  and failed on the real site.
+- **`z-index: calc(1 * -1)` was dropped.** The calc folder wrote
+  `-1.0000`, which is not an `<integer>`. Whole-number results now print
+  as integers.
+
+### 26. More network pages (patch 93)
+
+The frontend read at most 16 lines of `nettest.txt` and dropped the rest
+silently. The two new test pages pushed JS-module past the limit, and its
+check reported "module did not run". The limit is now 32, and any lines
+past it are logged.
+
+**Tests.** `CSS-is-where.html` has one block per case (matches,
+forgiving lists, complex arguments, specificity, `:where` inside `:not`,
+`:has` in a list). `CSS-rewrite-bigsheet.html` has a 24-inset sheet with a
+long tail, plus flex `order: calc(1 * -1)`. Both are asserted in
+`run-vita-sim.sh`, and both checks fail with patches 91 and 92 removed.
+
+**State (simulator).** The login page has Claude's off-white surface,
+white cards and a dark "Download" button with white text. The outlined
+buttons (Google, Apple, email) still show no ring: it is
+`box-shadow: inset 0 0 0 1px …`. MacSurf packs a box-shadow into 32 bits
+(8-bit x/y, inset, RGB555), with no blur or spread, so a 1px ring cannot
+be stored, and the Vita never paints an inset shadow. The ring colour is
+`hsl(from var(--cds-neutral-900) h s l / 10%)`, and neither relative
+colours nor `color-mix()` parse yet. Buttons are also 20 px tall, not 24:
+`height: calc(1.5rem * var(--cds-rem-scale,1))` does not resolve in
+layout.
+
+**Debugging.** The simulator got two scratch hooks that are not in any
+patch: `VITA_SIM_EVAL=file.js` runs a script when a screenshot is taken
+(the script leaves its results in localStorage), and
+`VITA_SIM_BOXDUMP=file` writes `box_dump()` with computed styles.
+
 ## Not done: the gaps left
 
 - **claude.ai/code:**
-  - Button fills: probably `color-mix()`, `oklab()` and friends.
+  - Outlined buttons: box-shadow with spread (and an inset painter),
+    `hsl(from …)` relative colours, `color-mix()`; `calc()` with `var()` in
+    `height` (round 7).
   - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.

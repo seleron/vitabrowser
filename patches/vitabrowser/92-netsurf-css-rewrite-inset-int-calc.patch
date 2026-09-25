@@ -1,0 +1,164 @@
+# netsurf: CSS rewrite -- inset on big sheets; integer calc() results
+#
+# Found on claude.ai's login buttons (the fill is an absolute span with
+# 'inset-0' and '-z-[1]'):
+#
+# - The inset expander (and the 2-value logical-shorthand expander) grew
+#   their buffer only when writing an expansion. Plain copies did
+#   'if (out_pos + 1 >= cap) goto grow_fail', and grow_fail drops the whole
+#   pass. Once the expansions used up the fixed 256-byte headroom, copying
+#   the tail of the sheet hit it: claude.ai's 1.4 MB sheet kept every
+#   'inset:' unexpanded, so libcss saw none of them. macsurf__rw_room()
+#   grows instead. Small sheets never hit this, which is why test pages
+#   with 'inset: 0' worked.
+# - The calc() folder printed every result as "%.4f". "-1.0000" is not an
+#   <integer>, so 'z-index: calc(1 * -1)' (Tailwind's -z-[N]) was dropped.
+#   Whole-number results now print as integers.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+index 8ac580a..98e65b2 100644
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -2645,8 +2645,18 @@ macsurf__rewrite_calc_aspect_impl(const char *data, size_t in_size)
+ 			result = result / c;
+ 		}
+ 
+-		rlen = (size_t)sprintf(rep, result_is_pct ? "%.4f%%" : "%.4f",
+-				result);
++		/* VitaBrowser: a whole-number result prints as an integer.
++		 * "-1.0000" is not an <integer>, so `z-index: calc(1 * -1)`
++		 * (Tailwind's -z-[1]) was dropped and read as auto. */
++		if (result == (double)(long)result &&
++				result > -1e9 && result < 1e9)
++			rlen = (size_t)sprintf(rep,
++					result_is_pct ? "%ld%%" : "%ld",
++					(long)result);
++		else
++			rlen = (size_t)sprintf(rep,
++					result_is_pct ? "%.4f%%" : "%.4f",
++					result);
+ 		/* Replace calc(...) [length = close_pos - i + 1] with rep,
+ 		 * pad remainder with spaces. */
+ 		{
+@@ -3725,6 +3735,28 @@ macsurf__rewrite_modern_compat(const char *data, size_t in_size,
+ }
+ 
+ 
++/* VitaBrowser: make room for `need` more bytes at out_pos, growing the
++ * buffer. The inset and logical-shorthand passes used to give up instead
++ * (goto grow_fail -> the whole pass returns NULL) once their expansions
++ * had used up the fixed headroom: claude.ai's 1.4 MB sheet lost every
++ * `inset:` that way. */
++static bool
++macsurf__rw_room(char **out, size_t *cap, size_t out_pos, size_t need)
++{
++	char *grown;
++	size_t newcap;
++
++	if (out_pos + need < *cap)
++		return true;
++	newcap = *cap * 2 + need + 256;
++	grown = (char *)realloc(*out, newcap);
++	if (grown == NULL)
++		return false;
++	*out = grown;
++	*cap = newcap;
++	return true;
++}
++
+ /* fixes191a - inset shorthand expander.
+  *
+  * Rewrite `inset: A [B [C [D]]]` declarations to the four longhands
+@@ -3783,16 +3815,16 @@ macsurf__rewrite_inset_impl(const char *data, size_t in_size, size_t *out_size_p
+ 		 * value scan runs past the comment close and eats the following
+ 		 * rule (fixes801g, same class as the shorthand expander fix). */
+ 		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
+-			if (out_pos + 2 >= cap) goto grow_fail;
++			if (!macsurf__rw_room(&out, &cap, out_pos, 2)) goto grow_fail;
+ 			out[out_pos++] = data[i++];
+ 			out[out_pos++] = data[i++];
+ 			while (i < in_size) {
+-				if (out_pos + 1 >= cap) goto grow_fail;
++				if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 				out[out_pos++] = data[i];
+ 				if (data[i] == '*' && i + 1 < in_size &&
+ 						data[i + 1] == '/') {
+ 					i++;
+-					if (out_pos + 1 >= cap) goto grow_fail;
++					if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 					out[out_pos++] = data[i++];
+ 					break;
+ 				}
+@@ -3803,7 +3835,7 @@ macsurf__rewrite_inset_impl(const char *data, size_t in_size, size_t *out_size_p
+ 
+ 		if (!macsurf__match_prop_name(data, in_size, i,
+ 				NAME, NAME_LEN)) {
+-			if (out_pos + 1 >= cap) goto grow_fail;
++			if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 			out[out_pos++] = data[i++];
+ 			continue;
+ 		}
+@@ -3813,7 +3845,7 @@ macsurf__rewrite_inset_impl(const char *data, size_t in_size, size_t *out_size_p
+ 				data[name_end] == '\n' ||
+ 				data[name_end] == '\r')) name_end++;
+ 		if (name_end >= in_size || data[name_end] != ':') {
+-			if (out_pos + 1 >= cap) goto grow_fail;
++			if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 			out[out_pos++] = data[i++];
+ 			continue;
+ 		}
+@@ -3865,7 +3897,7 @@ macsurf__rewrite_inset_impl(const char *data, size_t in_size, size_t *out_size_p
+ 		if (ntok < 1 || ntok > 4) {
+ 			/* Malformed value -- pass through unchanged. */
+ 			while (i < val_end) {
+-				if (out_pos + 1 >= cap) goto grow_fail;
++				if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 				out[out_pos++] = data[i++];
+ 			}
+ 			continue;
+@@ -4019,16 +4051,16 @@ macsurf__rewrite_logical_shorthands_impl(const char *data, size_t in_size,
+ 		 * comment's close and the following rule while scanning for a
+ 		 * value terminator, dropping the whole rule. */
+ 		if (data[i] == '/' && i + 1 < in_size && data[i + 1] == '*') {
+-			if (out_pos + 2 >= cap) goto grow_fail;
++			if (!macsurf__rw_room(&out, &cap, out_pos, 2)) goto grow_fail;
+ 			out[out_pos++] = data[i++];
+ 			out[out_pos++] = data[i++];
+ 			while (i < in_size) {
+-				if (out_pos + 1 >= cap) goto grow_fail;
++				if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 				out[out_pos++] = data[i];
+ 				if (data[i] == '*' && i + 1 < in_size &&
+ 						data[i + 1] == '/') {
+ 					i++;
+-					if (out_pos + 1 >= cap) goto grow_fail;
++					if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 					out[out_pos++] = data[i++];
+ 					break;
+ 				}
+@@ -4045,7 +4077,7 @@ macsurf__rewrite_logical_shorthands_impl(const char *data, size_t in_size,
+ 			}
+ 		}
+ 		if (matched < 0) {
+-			if (out_pos + 1 >= cap) goto grow_fail;
++			if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 			out[out_pos++] = data[i++];
+ 			continue;
+ 		}
+@@ -4056,7 +4088,7 @@ macsurf__rewrite_logical_shorthands_impl(const char *data, size_t in_size,
+ 				data[name_end] == '\r')) name_end++;
+ 		if (name_end >= in_size || data[name_end] != ':') {
+ 			/* not a shorthand here (e.g. margin-inline-start) */
+-			if (out_pos + 1 >= cap) goto grow_fail;
++			if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 			out[out_pos++] = data[i++];
+ 			continue;
+ 		}
+@@ -4104,7 +4136,7 @@ macsurf__rewrite_logical_shorthands_impl(const char *data, size_t in_size,
+ 		if (ntok < 1) {
+ 			/* malformed -- pass through unchanged */
+ 			while (i < val_end) {
+-				if (out_pos + 1 >= cap) goto grow_fail;
++				if (!macsurf__rw_room(&out, &cap, out_pos, 1)) goto grow_fail;
+ 				out[out_pos++] = data[i++];
+ 			}
+ 			continue;

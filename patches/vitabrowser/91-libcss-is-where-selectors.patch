@@ -1,0 +1,463 @@
+# libcss: :is() and :where() match (forgiving selector lists)
+#
+# MacSurf's fixes359 parsed :is()/:where()/:has() by swallowing the
+# arguments; the matcher never matched them. Tailwind v4 writes a lot of
+# CSS with them -- claude.ai defines its whole colour palette under
+# ':where(:root,:host)' -- so none of it applied (button fills, borders,
+# surfaces all resolved var(--cds-*) to nothing).
+#
+# - parse: the argument is split at top-level commas and each alternative
+#   parsed with parseSelector on its own; alternatives that fail (':host',
+#   pseudo-elements, anything this libcss lacks) are dropped, per the
+#   forgiving-list rule. Stored in a new detail value type, SELLIST
+#   (value_type widened to 2 bits), owned by the selector.
+# - specificity: :where() adds 0, :is() the max of its arguments.
+# - select: match_chain_at() matches one argument as a complex selector
+#   with the node as subject (checks the subject's element name itself,
+#   no reject cache, no cascade); any argument matching matches.
+# - :has() stays V1 (never matches), but its argument skip now counts
+#   FUNCTION tokens, so ':has(:not(.x))' no longer ends the pseudo early
+#   and invalidates the whole rule.
+# - :is()/:where() inside :not() are still rejected at parse (fixes360b).
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 7c3775c..599affa 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <parserutils/utils/stack.h>
+@@ -101,6 +102,9 @@ static css_error parseSimpleSelector(css_language *c,
+ static css_error parseCombinator(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_combinator *result);
++static css_error parseSelectorArgList(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, bool is_is,
++		css_selector_sellist **result);
+ static css_error parseSelector(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_selector **result);
+@@ -1503,8 +1507,31 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 				return error;
+ 
+ 			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
+-		} else if (fun_type == IS_FN || fun_type == WHERE_FN ||
+-				fun_type == HAS_FN) {
++		} else if (fun_type == IS_FN || fun_type == WHERE_FN) {
++			/* VitaBrowser: :is() / :where() take a forgiving list
++			 * of complex selectors, matched in select.c. (MacSurf's
++			 * V1 below swallowed the arguments and never matched,
++			 * which dropped every Tailwind v4 rule written with
++			 * them, e.g. claude.ai's :where(:root,:host) palette.)
++			 */
++			css_selector_sellist *list = NULL;
++
++			error = parseSelectorArgList(c, vector, ctx,
++					fun_type == IS_FN, &list);
++			if (error != CSS_OK)
++				return error;
++
++			qname.name = c->strings[fun_type];
++			detail_value.sellist = list;
++			error = css__stylesheet_selector_detail_init(c->sheet,
++					CSS_SELECTOR_PSEUDO_CLASS, &qname,
++					detail_value,
++					CSS_SELECTOR_DETAIL_VALUE_SELLIST,
++					false, specific);
++			if (error != CSS_OK)
++				css__stylesheet_sellist_destroy(c->sheet, list);
++			return error;
++		} else if (fun_type == HAS_FN) {
+ 			/* fixes359 (#68) / fixes361 (#67) V1: consume tokens
+ 			 * up to the closing `)` and discard them. The
+ 			 * selector itself parses as a known pseudo-class so
+@@ -1519,7 +1546,10 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 			while (depth > 0) {
+ 				token = parserutils_vector_iterate(vector, ctx);
+ 				if (token == NULL) return CSS_INVALID;
+-				if (tokenIsChar(token, '(')) depth++;
++				/* VitaBrowser: a FUNCTION token (":not(") opens a
++				 * level too, or ":has(:not(.x))" closed early. */
++				if (token->type == CSS_TOKEN_FUNCTION ||
++						tokenIsChar(token, '(')) depth++;
+ 				else if (tokenIsChar(token, ')')) depth--;
+ 			}
+ 			/* Already consumed the matching ')'; tag this
+@@ -1654,8 +1684,15 @@ css_error parseAppendSpecific(css_language *c,
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+-	return css__stylesheet_selector_append_specific(c->sheet, parent,
++	error = css__stylesheet_selector_append_specific(c->sheet, parent,
+ 			&specific);
++	/* VitaBrowser: an :is() / :where() list belongs to the selector once
++	 * appended; free it here if that failed. */
++	if (error != CSS_OK &&
++			specific.value_type == CSS_SELECTOR_DETAIL_VALUE_SELLIST)
++		css__stylesheet_sellist_destroy(c->sheet,
++				specific.value.sellist);
++	return error;
+ }
+ 
+ css_error parseSelectorSpecifics(css_language *c,
+@@ -1913,6 +1950,125 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * VitaBrowser: parse the argument of :is() / :where(), up to and including
++ * its closing ')'. The argument is a forgiving selector list: an
++ * alternative that does not parse (:host, a pseudo-element, anything this
++ * libcss lacks) is dropped instead of invalidating the rule.
++ *
++ * \param c       Parsing context
++ * \param vector  Vector of tokens to process
++ * \param ctx     Pointer to vector iteration context, just past the '('
++ * \param is_is   true for :is() (specificity = max of the arguments),
++ *                false for :where() (specificity 0)
++ * \param result  Pointer to location to receive the list
++ * \return CSS_OK on success, CSS_INVALID if the ')' is missing,
++ *         CSS_NOMEM on memory exhaustion
++ */
++css_error parseSelectorArgList(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, bool is_is,
++		css_selector_sellist **result)
++{
++	parserutils_vector *alt = NULL;
++	css_selector_sellist *list;
++	uint32_t cap = 4;
++	int depth = 1;
++	css_error error = CSS_OK;
++
++	list = malloc(sizeof(*list) + (cap - 1) * sizeof(css_selector *));
++	if (list == NULL)
++		return CSS_NOMEM;
++	list->count = 0;
++	list->specificity = 0;
++
++	if (parserutils_vector_create(sizeof(css_token), 16, &alt) !=
++			PARSERUTILS_OK) {
++		free(list);
++		return CSS_NOMEM;
++	}
++
++	while (depth > 0) {
++		const css_token *token = parserutils_vector_iterate(vector, ctx);
++		bool end = false;
++
++		if (token == NULL) {
++			error = CSS_INVALID;
++			break;
++		}
++
++		if (token->type == CSS_TOKEN_FUNCTION || tokenIsChar(token, '('))
++			depth++;
++		else if (tokenIsChar(token, ')'))
++			end = (--depth == 0);
++		else if (depth == 1 && tokenIsChar(token, ','))
++			end = true;
++
++		if (end == false) {
++			if (parserutils_vector_append(alt, (void *) token) !=
++					PARSERUTILS_OK) {
++				error = CSS_NOMEM;
++				break;
++			}
++			continue;
++		}
++
++		/* One alternative is complete: parse it on its own. */
++		{
++			css_selector *sel = NULL;
++			const css_selector_detail *d;
++			int32_t actx = 0;
++			bool ok;
++
++			consumeWhitespace(alt, &actx);
++			ok = parserutils_vector_peek(alt, actx) != NULL &&
++				parseSelector(c, alt, &actx, &sel) == CSS_OK &&
++				parserutils_vector_peek(alt, actx) == NULL;
++
++			/* Pseudo-elements are not valid in :is() */
++			for (d = ok ? &sel->data : NULL; d != NULL;
++					d = d->next ? d + 1 : NULL) {
++				if (d->type == CSS_SELECTOR_PSEUDO_ELEMENT)
++					ok = false;
++			}
++
++			if (ok && list->count == cap) {
++				css_selector_sellist *grown = realloc(list,
++						sizeof(*list) + (cap * 2 - 1) *
++						sizeof(css_selector *));
++				if (grown == NULL) {
++					css__stylesheet_selector_destroy(
++							c->sheet, sel);
++					error = CSS_NOMEM;
++					break;
++				}
++				list = grown;
++				cap *= 2;
++			}
++
++			if (ok) {
++				list->sel[list->count++] = sel;
++				if (is_is && sel->specificity >
++						list->specificity)
++					list->specificity = sel->specificity;
++			} else if (sel != NULL) {
++				css__stylesheet_selector_destroy(c->sheet, sel);
++			}
++
++			parserutils_vector_clear(alt);
++		}
++	}
++
++	parserutils_vector_destroy(alt);
++
++	if (error != CSS_OK) {
++		css__stylesheet_sellist_destroy(c->sheet, list);
++		return error;
++	}
++
++	*result = list;
++	return CSS_OK;
++}
++
+ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+ 		css_rule *rule)
+ {
+diff --git a/src/select/select.c b/src/select/select.c
+index 10a6a99..5540cda 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -159,6 +159,9 @@ static css_error match_details(css_select_ctx *ctx, void *node,
+ static css_error match_detail(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element);
++static css_error match_selector_list(css_select_ctx *ctx, void *node,
++		const css_selector_sellist *list, css_select_state *state,
++		bool *match);
+ static css_error cascade_style(const css_style *style, css_select_state *state);
+ extern uint32_t css__select_share_adoptions;
+ static css_error css_select__resolve_pending_vars(css_select_state *state,
+@@ -2532,6 +2535,82 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 			state);
+ }
+ 
++/**
++ * VitaBrowser: does one complex selector match \a node as its subject?
++ * match_selector_chain() without the cascade and without the reject cache
++ * (which is keyed to the rule being matched, not to an argument of it).
++ */
++static css_error match_chain_at(css_select_ctx *ctx,
++		const css_selector *selector, css_select_state *state,
++		void *node, bool *match)
++{
++	const css_selector *s = selector;
++	void *n = node;
++	bool rejected_by_cache;
++	css_error error;
++
++	*match = false;
++
++	/* The rule hash checks a top-level subject's element name; nothing
++	 * has checked this one's. */
++	if (selector->data.qname.name != ctx->str.universal) {
++		error = state->handler->node_has_name(state->pw, node,
++				&selector->data.qname, match);
++		if (error != CSS_OK || *match == false)
++			return error;
++	}
++
++	error = match_details(ctx, node, &s->data, state, match, NULL);
++	if (error != CSS_OK || *match == false)
++		return error;
++
++	while (s->data.comb != CSS_COMBINATOR_NONE) {
++		void *next_node = NULL;
++
++		if (s->combinator->data.qname.name != ctx->str.universal)
++			error = match_named_combinator(ctx, s->data.comb,
++					s->combinator, state, n, &next_node);
++		else
++			error = match_universal_combinator(ctx, s->data.comb,
++					s->combinator, state, n, false,
++					&rejected_by_cache, &next_node);
++		if (error != CSS_OK)
++			return error;
++
++		if (next_node == NULL) {
++			*match = false;
++			return CSS_OK;
++		}
++
++		s = s->combinator;
++		n = next_node;
++	}
++
++	*match = true;
++	return CSS_OK;
++}
++
++/**
++ * VitaBrowser: :is() / :where() -- \a node matches when any argument does.
++ */
++css_error match_selector_list(css_select_ctx *ctx, void *node,
++		const css_selector_sellist *list, css_select_state *state,
++		bool *match)
++{
++	uint32_t i;
++	css_error error;
++
++	*match = false;
++
++	for (i = 0; i < list->count; i++) {
++		error = match_chain_at(ctx, list->sel[i], state, node, match);
++		if (error != CSS_OK || *match)
++			return error;
++	}
++
++	return CSS_OK;
++}
++
+ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 		const css_selector *selector, css_select_state *state,
+ 		void *node, void **next_node)
+@@ -2952,6 +3031,13 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		} else if (detail->qname.name == ctx->str.checked) {
+ 			error = state->handler->node_is_checked(state->pw,
+ 					node, match);
++		} else if (detail->value_type ==
++				CSS_SELECTOR_DETAIL_VALUE_SELLIST) {
++			/* VitaBrowser: :is() / :where(). The arguments' own
++			 * details taint the node as they match. */
++			error = match_selector_list(ctx, node,
++					detail->value.sellist, state, match);
++			flags = CSS_NODE_FLAGS_NONE;
+ 		} else {
+ 			*match = false;
+ 		}
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 7b6faf7..392ae7f 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -897,6 +897,10 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 					detail->value.string != NULL) {
+ 				lwc_string_unref(detail->value.string);
+ 			}
++			if (detail->value_type ==
++					CSS_SELECTOR_DETAIL_VALUE_SELLIST)
++				css__stylesheet_sellist_destroy(sheet,
++						detail->value.sellist);
+ 
+ 			if (detail->next)
+ 				detail++;
+@@ -915,6 +919,9 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 				detail->value.string != NULL) {
+ 			lwc_string_unref(detail->value.string);
+ 		}
++		if (detail->value_type == CSS_SELECTOR_DETAIL_VALUE_SELLIST)
++			css__stylesheet_sellist_destroy(sheet,
++					detail->value.sellist);
+ 
+ 		if (detail->next)
+ 			detail++;
+@@ -929,6 +936,26 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * VitaBrowser: free an :is() / :where() argument list and its selectors.
++ *
++ * \param sheet  The stylesheet context
++ * \param list   The list to free (may be NULL)
++ */
++void css__stylesheet_sellist_destroy(css_stylesheet *sheet,
++		css_selector_sellist *list)
++{
++	uint32_t i;
++
++	if (list == NULL)
++		return;
++
++	for (i = 0; i < list->count; i++)
++		css__stylesheet_selector_destroy(sheet, list->sel[i]);
++
++	free(list);
++}
++
+ /**
+  * Initialise a selector detail
+  *
+@@ -1014,7 +1041,13 @@ css_error css__stylesheet_selector_append_specific(css_stylesheet *sheet,
+ 
+ 	(*parent) = temp;
+ 
+-	/* Update parent's specificity */
++	/* Update parent's specificity. VitaBrowser: :where() adds nothing and
++	 * :is() its most specific argument, both precomputed by the parser. */
++	if (detail->value_type == CSS_SELECTOR_DETAIL_VALUE_SELLIST) {
++		(*parent)->specificity += detail->value.sellist->specificity;
++		return CSS_OK;
++	}
++
+ 	switch (detail->type) {
+ 	case CSS_SELECTOR_CLASS:
+ 	case CSS_SELECTOR_PSEUDO_CLASS:
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index a98fac0..c936932 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -98,15 +98,28 @@ typedef enum css_combinator {
+ 
+ typedef enum css_selector_detail_value_type {
+ 	CSS_SELECTOR_DETAIL_VALUE_STRING,
+-	CSS_SELECTOR_DETAIL_VALUE_NTH
++	CSS_SELECTOR_DETAIL_VALUE_NTH,
++	CSS_SELECTOR_DETAIL_VALUE_SELLIST	/* VitaBrowser: :is() / :where() */
+ } css_selector_detail_value_type;
+ 
++/**
++ * VitaBrowser: the argument of :is() / :where() -- the complex selectors
++ * that parsed (a forgiving list: the others were dropped). Owned by the
++ * detail that holds it; freed with the selector.
++ */
++typedef struct css_selector_sellist {
++	uint32_t count;			/**< Entries in sel[] (may be 0) */
++	uint32_t specificity;		/**< 0 for :where, the max for :is */
++	css_selector *sel[1];		/**< Subject selectors, count long */
++} css_selector_sellist;
++
+ typedef union css_selector_detail_value {
+ 	lwc_string *string;		/**< Interned string, or NULL */
+ 	struct {
+ 		int32_t a;
+ 		int32_t b;
+ 	} nth;				/**< Data for x = an + b */
++	css_selector_sellist *sellist;	/**< :is() / :where() arguments */
+ } css_selector_detail_value;
+ 
+ typedef struct css_selector_detail {
+@@ -117,7 +130,7 @@ typedef struct css_selector_detail {
+ 		     comb       : 3,		/**< Type of combinator */
+ 		     next       : 1,		/**< Another selector detail
+ 						 * follows */
+-		     value_type : 1,		/**< Type of value field */
++		     value_type : 2,		/**< Type of value field */
+ 		     negate     : 1;		/**< Detail match is inverted */
+ } css_selector_detail;
+ 
+@@ -330,6 +343,9 @@ css_error css__stylesheet_selector_create(css_stylesheet *sheet,
+ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 		css_selector *selector);
+ 
++void css__stylesheet_sellist_destroy(css_stylesheet *sheet,
++		css_selector_sellist *list);
++
+ css_error css__stylesheet_selector_detail_init(css_stylesheet *sheet,
+ 		css_selector_type type, css_qname *qname,
+ 		css_selector_detail_value value,
