@@ -2306,3 +2306,62 @@ The results are in `results-run16\`. Five boots arrived, 0 datagrams lost.
 3. **Wikipedia, YouTube, Hacker News:** note roughly how long each takes
    compared with run 16 (15–25 s).
 
+
+## Run 18 — hand-off: claude.ai's styling (patches 89–108); run 17 folded in
+
+Run 17 was never tested on the device, so run 18 covers its checks too
+(speed: patches 84–88).
+
+**What changed since run 17** (doc 11, rounds 7–9):
+- **89–90:** percentage `background-size`.
+- **91–93:** `:is()` / `:where()` match; `inset` expands on big sheets;
+  integer `calc()` results; up to 32 network pages.
+- **94–100:** Tailwind's variables get their initial values; box-shadow
+  lists with spread (button rings) are painted; `color-mix()`, relative
+  `rgb()`/`hsl()` "from" colours and `oklab()` parse; sub-pixel and
+  translucent borders.
+- **101–108:** Tailwind's spacing scale (`:root,:host` theme, `gap:
+  calc()`), inline `calc()` no longer reads freed memory (104), buttons
+  lay out as flex, absolute children of flex containers, border-radius no
+  longer corrupts `bottom`, and `@media (min-width)` sees the real 960 px
+  viewport.
+
+**Clean checkout:**
+- Applied 191 + the known 2.
+- The simulator suite passes (interaction 22/22, JS-window 11/11, and the
+  new CSS-iswhere, CSS-bigsheet, CSS-shadow, CSS-color and CSS-spacing
+  checks).
+- The Vita cross-build is green.
+- Reference dumps regenerated: 29, of which three changed (L2,
+  PM-shadow, PM-shadow-clip: the new box-shadow painting). L1 is
+  unchanged.
+
+**Hand-off.**
+- SHA256, first 12: `VitaBrowser.vpk` `b5f19587cb08`,
+  `VitaBrowser-ext.vpk` `f7805b3eb469`, `nsvita.elf` `99a780f6a05f`.
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-25-run18/`.
+- `results\` is empty (no run 17 results arrived), so nothing was moved.
+
+**Run 18 on the device:**
+1. **The autotest** (`receive-results.bat`, then SELECT + □):
+   - expect **29/29 dumps SAME**, against the new reference dumps;
+   - **interact: 22/22**: forms submit (patch 88, from run 17);
+   - `clocks[run]` should say arm 444;
+   - pass D's page load average compared with run 16's 1314 ms.
+2. **claude.ai/code, twice.** Open it and wait for the login page (up to
+   5 minutes). Take a screenshot (SELECT + ✕).
+   - **Expected look** (as in the simulator): an off-white page; two white
+     cards with light grey hairline borders; a dark "Download" button with
+     white text; "Continue with Google" / "Apple" / "email" buttons with a
+     grey ring; centred labels. The title is still smaller than on a PC
+     (range media syntax, next).
+   - Then press START (home) and open it again. The second visit should
+     be much faster: `module graph:` should say "65 from the card".
+     `netsurf.log`'s `module compile` and `css rewrite` lines give the
+     times.
+3. **Wikipedia, YouTube, Hacker News:** roughly how long each takes
+   compared with run 16 (15–25 s), and whether anything looks worse than
+   before. Rounded boxes and borders now draw differently.
+4. **Crashes:** patch 104 changes how styles hold `calc()` strings. Any
+   crash, especially on a page with inline `style="…calc(…)"`, should
+   come back with its dump.

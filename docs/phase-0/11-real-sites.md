@@ -812,12 +812,12 @@ match. What still differs is layout: Tailwind spacing is
 icons and labels are not centred. Corners are square and the header logo
 is missing.
 
-## Round 9: Tailwind's spacing scale (patches 101–107)
+## Round 9: Tailwind's spacing scale (patches 101–108)
 
 Round 8 ended with claude.ai's cards without padding, 20-px-tall buttons
 and uncentred icons: Tailwind's whole spacing scale is
 `calc(var(--spacing) * N)`, which did not resolve. Seven fixes, one per
-drop-off point.
+drop-off point, plus the media-query viewport (108).
 
 ### 31. `calc(var(--spacing) * N)` (101, 102, 104)
 
@@ -876,61 +876,55 @@ element with a border-radius had bottom's unit ORed with em (0.5px became
 spans, so they stopped 7px short of the button's bottom edge. The cascade
 now converts the unit first.
 
-**State (simulator).** The staged build is green (nsmonkey 14 MB,
-`css__calc_function` present); `L1-layout-basics` passes its golden.
-`L2-macsurf-css`, `L3-grid` and `L4-flex` no longer match their goldens —
-the goldens predate rounds 5–9 and need re-baselining (the L2 drift is the
-row-gap / border-radius rules now taking effect, not a regression). The
-claude.ai snapshot re-render is the real check and is pending.
+### 35. Media queries saw a 0 × 0 viewport (108)
 
-### 35. In flight: media queries see width 0 (Hermes handover)
+`html_get_dimensions()` asks for the viewport with a `CONTENT_MSG_GETDIMS`
+broadcast during `html_finish_conversion`, before the content is attached
+to a browser window, so nothing answered: `media.width`/`height` and the
+vw/vh viewport were 0 (`MS LIFE VPORT finish: media w=0 h=0`), and every
+`@media (min-width: …)` failed. MacSurf's fallback (fixes612) is Mac-only.
+Patch 108 adds a portable one: a weak `vitabrowser_frontend_viewport()` in
+html.c (0 × 0, so host builds are unchanged), defined by the Vita frontend
+as the screen divided by the current zoom, the value the GETDIMS handler
+would give. The log now reads `media w=960 h=544 unit_ctx vw=960 vh=544`.
 
-Claude's session limit hit while it was on this one; it is the next item.
+**Still open:** Tailwind v4 writes breakpoints in range syntax
+(`@media (width>=350px)`), and libcss parses only `min-`/`max-width`. So
+claude.ai's `min-[350px]:text-[38px]` title still draws at 28px. Plan:
+fold range forms to min-/max- in the CSS rewrite pass, next to its
+`calc()`-in-`@media` fold (round 5 §14).
 
-**Symptom.** The sim logs `MS LIFE VPORT finish: media w=0 h=0` for
-claude.ai: every width media query collapses to the mobile branch. A probe
-page also shows the second half: Tailwind v4 writes breakpoints in range
-syntax, `@media (width>=350px)` / `(width<2000px)`, and libcss only parses
-`min-width` / `max-width` (`@media screen`, `and` and `min-width` all
-worked in the probe; every range form failed).
+**Tests.** `CSS-spacing.html` has one block per fix, asserted in
+`run-vita-sim.sh`: `gap: calc()` (51px apart), a `:root,:host` variable,
+an iOS-only `@supports` that must not apply, five inline `calc()`
+heights, a centred child in an inline-flex button, `inset: 0` in a padded
+flex container, border-radius with `bottom`, and `@media (min-width)`.
+With 101–108 removed, every one of them fails (gap 31, the variable
+missing, the iOS block applied, heights `2` then garbage, the child at
++0,+1, the content-box fill, a short fill, the 88px branch).
 
-**Root cause (confirmed).** `html_get_dimensions()`
-(`content/handlers/html/html.c`, called at line 1726 during
-`html_finish_conversion`) broadcasts `CONTENT_MSG_GETDIMS` while the
-content is not yet attached to a browser window, so the broadcast reaches
-no user and `w`/`h` stay 0 (the fixes612 initialisation). The only
-fallback, `macos9_frontend_viewport()`, is inside `#ifdef __MACOS9__` —
-the Vita has none. The Vita frontend already has
-`vita_window_get_dimensions()` (`frontends/vita/window.c:110`,
-`VITA_SCREEN_WIDTH` × `VITA_SCREEN_HEIGHT`) and the desktop handler
-(`desktop/browser_window.c:1796`) is wired the same way as the monkey
-frontends, so the missing piece is a Vita-side viewport accessor plus a
-non-Mac fallback in `html_get_dimensions()` (or attaching the content
-before conversion — check why the monkey frontend gets a non-zero width
-before choosing).
+**State (static claude.ai DOM snapshot, simulator vs Chromium).** The
+cards (x 256–704), their padding, the Download button (281–679, 40 px)
+and "Continue with Google" (285–675) are where Chromium puts them, with
+centred labels. Differences left: the title is 28px instead of 38px (range
+media syntax), so everything below it is about 26px higher, and the header
+logo is missing. The reference dumps changed on three pages, all from the
+new shadow painting (L2's `box-shadow: 2px 2px 4px`, PM-shadow,
+PM-shadow-clip); L1 is unchanged.
 
-**Plan (two netsurf-side patches, no device test needed):**
-1. Vita viewport fallback for `html_get_dimensions()` so `media.width`
-   reports 960 CSS px; verify with a probe page's min-width branches and
-   the sim log line.
-2. Fold range media syntax in the CSS rewrite pass
-   (`content/handlers/css/css_rewrite.c`) — it already folds `calc()` in
-   `@media` preludes to px (round 5 §14): `width>=X` → `min-width: X`,
-   `width<X` → `max-width: X-1`, `X<width<Y` → both, with rem→px via the
-   default font size. libcss's media parser then needs no change.
+**Hand-off: run 18** (doc 10).
 
 ## Not done: the gaps left
 
-- **Media width 0 + Tailwind v4 range media syntax** (round 9 §35): the
-  two netsurf-side patches above. Blocks every width-based responsive
-  layout on the Vita.
+- **Tailwind v4 range media syntax** (`@media (width>=350px)`, round 9
+  §35): fold to min-/max-width in the rewrite pass. The 0 × 0 media
+  viewport is fixed (108).
 - **Goldens stale:** L2/L3/L4 fail against pre-round-5 goldens;
   re-baseline `testpages/golden/` after §35 lands.
 - **claude.ai/code:**
-  - Layout: `calc(var(--spacing) * N)` in padding, height and gap
-    (Tailwind's whole spacing scale); centring an icon and label in
-    buttons; border-radius — fixed by round 9 (101–107); the sim
-    re-render to prove it is pending.
+  - Layout: cards, padding and buttons now match Chromium in the
+    simulator (round 9). Left: the title size (range media syntax) and
+    the header logo.
   - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.
