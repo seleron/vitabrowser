@@ -812,12 +812,125 @@ match. What still differs is layout: Tailwind spacing is
 icons and labels are not centred. Corners are square and the header logo
 is missing.
 
+## Round 9: Tailwind's spacing scale (patches 101–107)
+
+Round 8 ended with claude.ai's cards without padding, 20-px-tall buttons
+and uncentred icons: Tailwind's whole spacing scale is
+`calc(var(--spacing) * N)`, which did not resolve. Seven fixes, one per
+drop-off point.
+
+### 31. `calc(var(--spacing) * N)` (101, 102, 104)
+
+- **`:host` killed the theme (102).** Tailwind v4 puts its entire theme in
+  `@layer theme{:root,:host{…}}`: `--spacing` (every p-N / m-N / gap-N /
+  h-N utility), the text sizes, fonts and radii. An unknown pseudo-class
+  invalidates the whole selector list, so none of it applied. `:host`,
+  `:host()` and `:host-context()` now parse and never match (there are no
+  shadow roots).
+- **row-gap had no calc (101).** `property_unit_mask[]` had no entry for
+  `CSS_PROP_ROW_GAP`, so `css__parse_calc` rejected every unit for it.
+  The `gap` shorthand parses row-gap first, so `gap: calc(…)` was dropped
+  whole and flex items touched. Every other property that reaches
+  `css__parse_calc` has a mask entry; row-gap now shares column-gap's.
+- **calc() expressions dangled (104).** fixes1159b keeps each calc()
+  expression in a per-property side slot of the computed style as a bare
+  `lwc_string` pointer, "owned by the sheet's string vector". NetSurf
+  destroys an element's inline style sheet right after selecting its
+  style, so every inline `style="…: calc(…)"` — and every calc() a `var()`
+  substitution produced in one — pointed at freed memory: sizes came out
+  as other elements' expressions or 0. The slots now reference-count the
+  expression (helpers in `select/computed.h`).
+
+### 32. `@supports` for features we certainly lack (103)
+
+The at-rule pass kept every `@supports` block unless its condition starts
+with `not`: most features cannot be tested, and Tailwind's `@property`
+fallback depends on being kept (its condition is a Safari/Firefox sniff
+this browser would "fail"). claude.ai also ships
+`@supports (font:-apple-system-body) and (-webkit-touch-callout:default)
+{…}`. The pass now also drops blocks that test features this engine
+definitely lacks.
+
+### 33. Button layout (105, 106)
+
+- **`<button>` display (105).** `box_button()` forced every button to
+  `BOX_INLINE_BLOCK` after box construction had mapped its display (and
+  blockified it inside flex or grid containers). Tailwind buttons are
+  `display: inline-flex; align-items: center; justify-content: center`,
+  so their icon and label laid out as inline flow at the top left. A
+  block, flex or grid box keeps its mapped display.
+- **`position: absolute; inset: 0` inside flex/grid (106).**
+  `layout_absolute()` widens the containing block to its padding box only
+  for BLOCK, INLINE_BLOCK and TABLE_CELL; anything else resolved against
+  the content box. Flex and grid containers are block containers, so
+  every absolutely positioned child of one came out the size of the
+  content box.
+
+### 34. border-radius corrupted the next field (107)
+
+`css__cascade_border_radius` (MacSurf) passed the raw bytecode unit
+(`UNIT_PX` is `0x100`) to `set_border_radius()`, whose 5-bit unit field it
+overflowed into the neighbouring "bottom" field of `i.bits[7]`: any
+element with a border-radius had bottom's unit ORed with em (0.5px became
+0.5em). Tailwind button fills are `absolute inset-[0.5px] rounded-[inherit]`
+spans, so they stopped 7px short of the button's bottom edge. The cascade
+now converts the unit first.
+
+**State (simulator).** The staged build is green (nsmonkey 14 MB,
+`css__calc_function` present); `L1-layout-basics` passes its golden.
+`L2-macsurf-css`, `L3-grid` and `L4-flex` no longer match their goldens —
+the goldens predate rounds 5–9 and need re-baselining (the L2 drift is the
+row-gap / border-radius rules now taking effect, not a regression). The
+claude.ai snapshot re-render is the real check and is pending.
+
+### 35. In flight: media queries see width 0 (Hermes handover)
+
+Claude's session limit hit while it was on this one; it is the next item.
+
+**Symptom.** The sim logs `MS LIFE VPORT finish: media w=0 h=0` for
+claude.ai: every width media query collapses to the mobile branch. A probe
+page also shows the second half: Tailwind v4 writes breakpoints in range
+syntax, `@media (width>=350px)` / `(width<2000px)`, and libcss only parses
+`min-width` / `max-width` (`@media screen`, `and` and `min-width` all
+worked in the probe; every range form failed).
+
+**Root cause (confirmed).** `html_get_dimensions()`
+(`content/handlers/html/html.c`, called at line 1726 during
+`html_finish_conversion`) broadcasts `CONTENT_MSG_GETDIMS` while the
+content is not yet attached to a browser window, so the broadcast reaches
+no user and `w`/`h` stay 0 (the fixes612 initialisation). The only
+fallback, `macos9_frontend_viewport()`, is inside `#ifdef __MACOS9__` —
+the Vita has none. The Vita frontend already has
+`vita_window_get_dimensions()` (`frontends/vita/window.c:110`,
+`VITA_SCREEN_WIDTH` × `VITA_SCREEN_HEIGHT`) and the desktop handler
+(`desktop/browser_window.c:1796`) is wired the same way as the monkey
+frontends, so the missing piece is a Vita-side viewport accessor plus a
+non-Mac fallback in `html_get_dimensions()` (or attaching the content
+before conversion — check why the monkey frontend gets a non-zero width
+before choosing).
+
+**Plan (two netsurf-side patches, no device test needed):**
+1. Vita viewport fallback for `html_get_dimensions()` so `media.width`
+   reports 960 CSS px; verify with a probe page's min-width branches and
+   the sim log line.
+2. Fold range media syntax in the CSS rewrite pass
+   (`content/handlers/css/css_rewrite.c`) — it already folds `calc()` in
+   `@media` preludes to px (round 5 §14): `width>=X` → `min-width: X`,
+   `width<X` → `max-width: X-1`, `X<width<Y` → both, with rem→px via the
+   default font size. libcss's media parser then needs no change.
+
 ## Not done: the gaps left
 
+- **Media width 0 + Tailwind v4 range media syntax** (round 9 §35): the
+  two netsurf-side patches above. Blocks every width-based responsive
+  layout on the Vita.
+- **Goldens stale:** L2/L3/L4 fail against pre-round-5 goldens;
+  re-baseline `testpages/golden/` after §35 lands.
 - **claude.ai/code:**
   - Layout: `calc(var(--spacing) * N)` in padding, height and gap
     (Tailwind's whole spacing scale); centring an icon and label in
-    buttons; border-radius (round 8).
+    buttons; border-radius — fixed by round 9 (101–107); the sim
+    re-render to prove it is pending.
   - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.
