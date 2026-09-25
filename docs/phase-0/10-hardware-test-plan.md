@@ -2334,7 +2334,11 @@ Run 17 was never tested on the device, so run 18 covers its checks too
 - Applied 193 + the known 1 (libhubbub 04, already applied, skipped).
 - The simulator suite passes (interaction 22/22 at both paces, and the
   CSS-iswhere, CSS-bigsheet, CSS-shadow, CSS-color and CSS-spacing
-  checks, now including the three range-media blocks).
+  checks, now including the three range-media blocks). **Caveat:** the
+  range-media sub-check (the 251/253 blocks) flaps — in four back-to-back
+  runs it passed only 1/4 and the *rule that dropped changed per run*,
+  which is a memory-safety signature in `mq_parse_range`, not a CSS-logic
+  bug (doc 11, §36, "Known issue: the range-media check flaps").
 - The Vita cross-build is green.
 
 **Hand-off.**

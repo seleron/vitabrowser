@@ -944,6 +944,22 @@ range never matched. One conditional: the value token is
 regressed when the fix first tried `value_or_name` unconditionally,
 which is how the two-branch form was caught.
 
+**Known issue: the range-media check flaps.** Four back-to-back
+`run-vita-sim.sh` runs (10, 10b, 10c, 10d) at the same tree give
+`range media 0/1`, `1/0`, `1/0`, `1/1` (expected `1/1`) — three failed
+the `CSS-spacing` gate. Critically, *which* of the two rules drops
+varies from run to run (10b/10c lose the 253 double-range, 10 loses the
+251 name-first), while every other check — including `(min-width: 350px)`
+at 188 px — is stable. So `media->width` is a stable 960; the flake is in
+the `mq_parse_range` path specifically. That is a memory-safety
+signature (use-after-free / OOB read that depends on the launch's heap
+layout), not a CSS-logic bug: a logic bug would drop the *same* rule
+every run. Not chased to a fix this session. Repro harness written
+(parses the three `@media` bodies via `css_parse_media_query`, dumps the
+feature tree, loops) — rebuild `libwapcaplet`, `libparserutils` and
+`libcss` with `-fsanitize=address` and run it in a loop to catch it;
+`ASan` should name the freed/over-read pointer directly.
+
 **State.** With 109 in, the static claude.ai snapshot's title should
 take the 38px branch on the device (run 18 will show it); the remaining
 round-9 differences were the title shift and the missing header logo.
