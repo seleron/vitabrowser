@@ -606,6 +606,43 @@ now converted directly.
 Browsing now runs at 444 MHz / bus 222, pass D's clocks; the ARM used to
 stay at its boot 333 MHz.
 
+### 23. background-size percentages (patches 89 + 90) — Hermes fill-in,
+### 02:17–03:35, while Claude was rate-limited
+
+Round 6 §5: the V1 parser (patch 59) took `<length>` px only, so
+`background-size: 100% 100%` (GitHub's dark-theme button fills on
+claude.ai) read as `auto` and painted empty.
+
+**Two implementations were written in parallel and one was reverted.**
+Claude's first pass (commit `04358f9`, patch 84, libcss + netsurf) stored
+`-pct` (1..100) — a clean tag. Hermes's concurrent pass (commit
+`ef026f0`, patches 89 + 90) used an offset, `-(1000+pct)` (code
+`-1100..-1000`), which avoids the 1..100 range entirely and clamps to
+31000%. When the two collided, Claude **reverted its own patch 84**
+(commit `9ccd0f0`) and left 89/90 as canonical. Net state: 89/90 are the
+only percent code in the tree.
+
+- **89 (libcss):** `bg_size__axis()` helper parses one axis — px length
+  (other units fall back to `auto` as V1 did) or percentage stored as
+  `-(1000+P)`, P clamped 0..31000. V1 px handling is byte-for-byte
+  unchanged, so existing bytecode stays valid.
+- **90 (netsurf):** `html_redraw_bg_tile_size()` — the single consumer
+  (drawImage tile loop *and* plot path) — resolves a percent axis
+  against the drawn area (`area_w`/`area_h`) into px before the existing
+  cover/contain/explicit/auto logic. Sub-pixel → 1px; >32767px → 32767.
+
+**Verified on the host:** full clean build green (173 applied, libcss
+ok, netsurf ok, nsmonkey 13.9 MB) plus 131/131
+`test-vita-renderer.sh` checks pass at `9ccd0f0`.
+
+**Device test pending** (morning): the `CSS-background-size-pct.html`
+test page + `run-vita-sim.sh` assertions that Claude's reverted patch 84
+shipped with it are gone from the tree — if a percent regression test is
+wanted, that page (five 300x200 boxes, 100x50 image at `100% 100%`,
+`50% 50%`, `150%`, `33% 25%`, `auto`) needs re-adding; the expected
+`PLOT BITMAP` sizes were 300x200, 150x100, 450x225, 99x50. Em/rem still
+read as `auto`.
+
 ## Not done: the gaps left
 
 - **claude.ai/code:**
@@ -622,7 +659,8 @@ stay at its boot 333 MHz.
 - **Memory:** host RSS peaks at about 78 MB for the Wikipedia article (a
   64-bit process). The Vita's heap budget is 192 MB. The autotest logs
   `mem[...]` per page on the device.
-- **Percentage and em/rem `background-size`** still read as `auto`
-  (MacSurf's parser takes px only).
+- **`background-size` percentages** now parse and draw (patches 89/90,
+  round 6 §23); **em/rem** still read as `auto` (MacSurf's parser takes
+  px only).
 - **`-webkit-mask` with `/ size`** is dropped (libcss's background
   shorthand has no size).
