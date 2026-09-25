@@ -1,0 +1,87 @@
+# netsurf: @media width falls back to the frontend viewport
+#
+# html_get_dimensions() asks for the viewport with a GETDIMS broadcast, but
+# at conversion time the content is not yet attached to a browser window,
+# so nothing answered: media.width/height and the vw/vh unit viewport were
+# 0 x 0 ("LIFE VPORT finish: media w=0 h=0"). Every @media (min-width: ..)
+# failed, so sites got their narrowest layout (claude.ai's
+# "min-[350px]:text-[38px]" title drew at 28px). MacSurf's fixes612 had a
+# Mac-only fallback; this adds a portable one: a weak
+# vitabrowser_frontend_viewport() (0 x 0 by default, so host builds are
+# unchanged) that the Vita frontend defines as the screen divided by the
+# current zoom, as the GETDIMS handler would report.
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 943aa56..0353796 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1496,6 +1496,21 @@ struct nsurl *html_macsurf_font_face_url(struct content *c, lwc_string *family)
+ }
+ 
+ 
++/**
++ * VitaBrowser (patch 108): the frontend's viewport in CSS px (already
++ * divided by the zoom), for when the GETDIMS broadcast reaches no browser
++ * window -- the content is not yet attached when html_get_dimensions()
++ * runs at conversion time. The weak default knows nothing (0 x 0, the old
++ * behaviour); the Vita frontend defines the real one (frontends/vita/
++ * window.c). MacSurf's fixes612 does the same for the Mac below.
++ */
++__attribute__((weak)) void vitabrowser_frontend_viewport(int *vw, int *vh);
++__attribute__((weak)) void vitabrowser_frontend_viewport(int *vw, int *vh)
++{
++	*vw = 0;
++	*vh = 0;
++}
++
+ static void html_get_dimensions(html_content *htmlc)
+ {
+ 	css_fixed device_dpi = nscss_screen_dpi;
+@@ -1533,6 +1548,19 @@ static void html_get_dimensions(html_content *htmlc)
+ 	}
+ #endif
+ 
++#ifndef __MACOS9__
++	/* VitaBrowser (patch 108): GETDIMS delivered nothing, so every
++	 * @media (min-width: ...) failed and vw/vh units were 0 (claude.ai's
++	 * "min-[350px]:text-[38px]" title drew at 28px). */
++	if (w == 0 || h == 0) {
++		int vw = 0;
++		int vh = 0;
++		vitabrowser_frontend_viewport(&vw, &vh);
++		if (w == 0 && vw > 0) w = (unsigned)vw;
++		if (h == 0 && vh > 0) h = (unsigned)vh;
++	}
++#endif
++
+ 	w = css_unit_device2css_px(INTTOFIX(w), device_dpi);
+ 	h = css_unit_device2css_px(INTTOFIX(h), device_dpi);
+ 
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index 95548e1..6bfd3f5 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -346,6 +346,24 @@ void vita_window_log_wide_boxes(struct gui_window *gw, int limit)
+ 		wide_boxes(root, limit, 5);
+ }
+ 
++/**
++ * VitaBrowser (patch 108): the viewport for html_get_dimensions() when its
++ * GETDIMS broadcast reaches no window (see content/handlers/html/html.c):
++ * the screen, divided by the current zoom as the GETDIMS handler does.
++ */
++void vitabrowser_frontend_viewport(int *vw, int *vh);
++void vitabrowser_frontend_viewport(int *vw, int *vh)
++{
++	float scale = 1.0f;
++
++	if (vita_current != NULL && vita_current->bw != NULL)
++		scale = browser_window_get_scale(vita_current->bw);
++	if (scale <= 0.0f)
++		scale = 1.0f;
++	*vw = (int)(VITA_SCREEN_WIDTH / scale);
++	*vh = (int)(VITA_SCREEN_HEIGHT / scale);
++}
++
+ /* exported interface documented in vita/window.h */
+ struct browser_window *vita_window_browser(struct gui_window *gw)
+ {

@@ -171,6 +171,7 @@ CSS-iswhere file:///app0:/testpages/CSS-is-where.html
 CSS-bigsheet file:///app0:/testpages/CSS-rewrite-bigsheet.html
 CSS-shadow file:///app0:/testpages/CSS-box-shadow.html
 CSS-color file:///app0:/testpages/CSS-modern-color.html
+CSS-spacing file:///app0:/testpages/CSS-spacing.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
@@ -435,6 +436,32 @@ for clspec in 101:2 102:1 103: 104:3 105: 106: 107: 108: 109:; do
 done
 echo "  CSS-color: blocks at the expected opacity [$clres ] (9 x 1)"
 [ "$clres" = " 1 1 1 1 1 1 1 1 1" ] || fail "modern colour syntax / at-rules"
+# Tailwind's spacing layer (patches 101-108): gap calc, :root,:host
+# variables, @supports for absent features, inline calc, flex buttons,
+# abs children of flex containers, border-radius vs bottom, @media width.
+spplot=$(ls "$R"/*-CSS-spacing.plot 2>/dev/null | head -1)
+spx() { awk -v w="$1" -v h="$2" '/^PLOT RECT/ && $8 - $4 == w && $10 - $6 == h { print $4, $6; exit }' "$spplot" 2>/dev/null; }
+read -r spa1 spa2 spb1 spb2 <<SPEOF
+$(spx 31 10) $(spx 32 10)
+SPEOF
+spgap=$(( ${spb1:-0} - ${spa1:-0} ))
+sph=""
+for spw in 141 142 143 144 145; do
+	sph="$sph $(awk -v w=$spw '/^PLOT RECT/ && $8 - $4 == w { print $10 - $6; exit }' "$spplot" 2>/dev/null)"
+done
+read -r spc1 spc2 spd1 spd2 <<SPEOF
+$(spx 198 1) $(spx 37 10)
+SPEOF
+spbx=$(( ${spd1:-0} - ${spc1:-0} )); spby=$(( ${spd2:-0} - ${spc2:-0} ))
+echo "  CSS-spacing: gap $spgap (51); :host var $(rects "$spplot" 120 11) (1); iOS @supports $(rects "$spplot" 133 11)/$(rects "$spplot" 333 11) (1/0)"
+echo "  CSS-spacing: inline calc heights [$sph ] ([ 2 4 6 8 10 ]); button child at +$spbx,+$spby (80|81,15)"
+echo "  CSS-spacing: abs in flex $(rects "$spplot" 170 50) (1); radius+bottom $(rects "$spplot" 11 36) (1); @media $(rects "$spplot" 188 11)/$(rects "$spplot" 88 11) (1/0)"
+[ "$spgap" = 51 ] && [ "$(rects "$spplot" 120 11)" = 1 ] &&
+	[ "$(rects "$spplot" 133 11)" = 1 ] && [ "$(rects "$spplot" 333 11)" = 0 ] &&
+	[ "$sph" = " 2 4 6 8 10" ] && { [ "$spbx" = 80 ] || [ "$spbx" = 81 ]; } &&
+	[ "$spby" = 15 ] && [ "$(rects "$spplot" 170 50)" = 1 ] &&
+	[ "$(rects "$spplot" 11 36)" = 1 ] && [ "$(rects "$spplot" 188 11)" = 1 ] &&
+	[ "$(rects "$spplot" 88 11)" = 0 ] || fail "spacing / calc / layout"
 # No horizontal overflow (patches 64, 65): an unbreakable URL in break-word
 # text, and a min-width button in Minerva's header arrangement.
 xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)
