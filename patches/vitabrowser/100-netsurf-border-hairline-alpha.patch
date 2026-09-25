@@ -1,0 +1,258 @@
+# netsurf: borders -- sub-pixel widths snap to 1px, colours keep their
+# alpha, rounded boxes get their real borders
+#
+# claude.ai's cards are drawn with Tailwind's border-[0.5px] in the
+# default border colour (10% black):
+# - FIXTOINT turned the 0.5px width into 0, so the border vanished. A
+#   non-zero width under one device pixel now snaps up to 1px (CSS Values
+#   4; what browsers do). Table cells (table.c) are unchanged.
+# - nscss_color_to_ns() drops alpha, so translucent borders drew solid.
+#   The border colour's alpha now goes into the border plot styles'
+#   opacity (the mechanism rgba backgrounds use), set per plot and reset
+#   to opaque after, so a caller that sets none draws as before; a fully
+#   transparent border colour draws nothing.
+# - A box with a border-radius skipped the border painter: MacSurf drew a
+#   one-colour stroke with the background instead, which never read the
+#   border width, so every rounded element with a border style (all of
+#   them under Tailwind's preflight "border: 0 solid") got a solid 1px
+#   frame, and per-side colours and alpha were lost. Rounded boxes now go
+#   through the border painter like any other (square corners; the Vita
+#   draws square backgrounds too).
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 7e42561..1324f33 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -926,9 +926,16 @@ static inline void layout_find_dimensions(
+ 				/* spec unclear: following Mozilla */
+ 				border[i].width = 0;
+ 			else {
+-				border[i].width = FIXTOINT(css_unit_len2device_px(
++				css_fixed bpx = css_unit_len2device_px(
+ 						style, unit_len_ctx,
+-						value, unit));
++						value, unit);
++				border[i].width = FIXTOINT(bpx);
++				/* VitaBrowser (patch 100): a non-zero width under
++				 * one device pixel snaps up to 1 (CSS Values 4,
++				 * as browsers do); FIXTOINT made Tailwind's
++				 * border-[0.5px] hairlines vanish. */
++				if (border[i].width == 0 && bpx > 0)
++					border[i].width = 1;
+ 				/* Sanity clamp: if computed style / unit ctx is
+ 				 * incompletely initialised, css_unit_len2device_px
+ 				 * can return a huge garbage value and border width
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 467173e..824f334 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1772,17 +1772,9 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 
+ 	if (background && background->style && css_computed_border_radius(background->style, &br_len, &br_unit) == CSS_BORDER_RADIUS_SET) {
+ 	        pstyle_fill_bg.border_radius = br_len * scale;
+-	        if (pstyle_fill_bg.border_radius > 0) {
+-	                css_color bcol;
+-	                css_fixed bw_len = 0;
+-	                css_unit bw_unit = CSS_UNIT_PX;
+-	                if (css_computed_border_top_style(background->style) != CSS_BORDER_STYLE_NONE) {
+-	                        css_computed_border_top_color(background->style, &bcol);
+-	                        pstyle_fill_bg.stroke_type = PLOT_OP_TYPE_SOLID; /* simplify */
+-	                        pstyle_fill_bg.stroke_colour = nscss_color_to_ns(bcol);
+-	                        pstyle_fill_bg.stroke_width = bw_len * scale;
+-	                }
+-	        }
++	        /* VitaBrowser (patch 100): no border stroke here (it
++	         * ignored the border width, per-side colours and alpha);
++	         * redraw_border.c paints rounded boxes' borders. */
+ 	}
+ 	if (background && background->style) {
+ 	        int32_t bsh;
+@@ -2604,17 +2596,9 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 
+ 	if (box && box->style && css_computed_border_radius(box->style, &br_len, &br_unit) == CSS_BORDER_RADIUS_SET) {
+ 	        pstyle_fill_bg.border_radius = br_len * scale;
+-	        if (pstyle_fill_bg.border_radius > 0) {
+-	                css_color bcol;
+-	                css_fixed bw_len = 0;
+-	                css_unit bw_unit = CSS_UNIT_PX;
+-	                if (css_computed_border_top_style(box->style) != CSS_BORDER_STYLE_NONE) {
+-	                        css_computed_border_top_color(box->style, &bcol);
+-	                        pstyle_fill_bg.stroke_type = PLOT_OP_TYPE_SOLID;
+-	                        pstyle_fill_bg.stroke_colour = nscss_color_to_ns(bcol);
+-	                        pstyle_fill_bg.stroke_width = bw_len * scale;
+-	                }
+-	        }
++	        /* VitaBrowser (patch 100): no border stroke here (it
++	         * ignored the border width, per-side colours and alpha);
++	         * redraw_border.c paints rounded boxes' borders. */
+ 	}
+ 	if (box && box->style) {
+ 	        int32_t bsh;
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index 0be0d45..8108f66 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -176,6 +176,18 @@ plot_clipped_rectangle(const struct redraw_context *ctx,
+  * \param ctx current redraw context
+  * \return NSERROR_OK if successful otherwise appropriate error code
+  */
++/* VitaBrowser (patch 100): the alpha of the border colour being plotted.
++ * nscss_color_to_ns() drops it, so a translucent border (Tailwind's
++ * default border colour is 10% black) drew solid. Set by
++ * html_redraw_border_alpha() before each html_redraw_border_plot(). */
++static unsigned int html_redraw_border_cur_alpha = 255;
++
++static colour html_redraw_border_alpha(css_color c)
++{
++	html_redraw_border_cur_alpha = (c >> 24) & 0xff;
++	return nscss_color_to_ns(c);
++}
++
+ static nserror
+ html_redraw_border_plot(const int side,
+ 			const int *p,
+@@ -192,11 +204,28 @@ html_redraw_border_plot(const int side,
+ 	plot_style_t *plot_style_bdr_out;
+ 	nserror res = NSERROR_OK;
+ 	struct rect rect;
++	unsigned int alpha;
+ 
+-	if (c == NS_TRANSPARENT) {
++	/* Take the alpha set for this plot; a call that set none is opaque. */
++	alpha = html_redraw_border_cur_alpha;
++	html_redraw_border_cur_alpha = 255;
++
++	if (c == NS_TRANSPARENT || alpha == 0) {
+ 		return res;
+ 	}
+ 
++	{
++		/* 0 = opaque for the plotters */
++		plot_style_fixed op = alpha >= 255 ? 0 :
++			(plot_style_fixed)(alpha * PLOT_STYLE_SCALE / 255);
++		plot_style_bdr.opacity = op;
++		plot_style_fillbdr.opacity = op;
++		plot_style_fillbdr_dark.opacity = op;
++		plot_style_fillbdr_light.opacity = op;
++		plot_style_fillbdr_ddark.opacity = op;
++		plot_style_fillbdr_dlight.opacity = op;
++	}
++
+ 	plot_style_bdr.stroke_type = PLOT_OP_TYPE_DASH;
+ 	plot_style_bdr.stroke_colour = c;
+ 	plot_style_bdr.stroke_width = (thickness << PLOT_STYLE_RADIX);
+@@ -549,13 +578,15 @@ html_redraw_borders(struct box *box,
+ 	bool square_end_1 = false;
+         bool square_end_2 = false;
+         nserror res;
+-        css_fixed br_len = 0;
+-        css_unit br_unit = CSS_UNIT_PX;
+ 
+-        /* MacSurf: If border_radius is present, html_redraw_background handles the border frame. */
+-        if (box && box->style && css_computed_border_radius(box->style, &br_len, &br_unit) == CSS_BORDER_RADIUS_SET && br_len > 0) {
+-                return true;
+-        }
++        /* VitaBrowser (patch 100): MacSurf returned here for a box with a
++         * border-radius, leaving the border to a one-colour stroke drawn
++         * with the background. That stroke ignored the border width (so
++         * every rounded box with a border style, i.e. every element under
++         * Tailwind's preflight "border: 0 solid", got a 1px frame), the
++         * per-side colours and alpha. The borders are painted here like
++         * any other box's (with square corners, as the Vita draws the
++         * background too). */
+ 
+ 	x = x_parent + box->x;
+ 	y = y_parent + box->y;
+@@ -622,7 +653,7 @@ html_redraw_borders(struct box *box,
+ 				square_end_2 = true;
+ 			}
+ 
+-			col = nscss_color_to_ns(box->border[side].c);
++			col = html_redraw_border_alpha(box->border[side].c);
+ 
+ 			res = html_redraw_border_plot(side,
+ 						      z,
+@@ -663,7 +694,7 @@ html_redraw_borders(struct box *box,
+ 				square_end_2 = true;
+ 			}
+ 
+-			col = nscss_color_to_ns(box->border[side].c);
++			col = html_redraw_border_alpha(box->border[side].c);
+ 
+ 			res = html_redraw_border_plot(side,
+ 						      z,
+@@ -711,7 +742,7 @@ html_redraw_borders(struct box *box,
+ 				square_end_2 = true;
+ 			}
+ 
+-			col = nscss_color_to_ns(box->border[side].c);
++			col = html_redraw_border_alpha(box->border[side].c);
+ 
+ 			res = html_redraw_border_plot(side,
+ 						      z,
+@@ -759,7 +790,7 @@ html_redraw_borders(struct box *box,
+ 				square_end_2 = true;
+ 			}
+ 
+-			col = nscss_color_to_ns(box->border[side].c);
++			col = html_redraw_border_alpha(box->border[side].c);
+ 
+ 			res = html_redraw_border_plot(side,
+ 						      z,
+@@ -816,13 +847,15 @@ html_redraw_inline_borders(struct box *box,
+ 	bool square_end_1;
+ 	bool square_end_2;
+ 	nserror res;
+-        css_fixed br_len = 0;
+-        css_unit br_unit = CSS_UNIT_PX;
+ 
+-        /* MacSurf: If border_radius is present, html_redraw_inline_background handles the border frame. */
+-        if (box && box->style && css_computed_border_radius(box->style, &br_len, &br_unit) == CSS_BORDER_RADIUS_SET && br_len > 0) {
+-                return true;
+-        }
++        /* VitaBrowser (patch 100): MacSurf returned here for a box with a
++         * border-radius, leaving the border to a one-colour stroke drawn
++         * with the background. That stroke ignored the border width (so
++         * every rounded box with a border style, i.e. every element under
++         * Tailwind's preflight "border: 0 solid", got a 1px frame), the
++         * per-side colours and alpha. The borders are painted here like
++         * any other box's (with square corners, as the Vita draws the
++         * background too). */
+ 
+ 	if (scale != 1.0) {
+ 		top *= scale;
+@@ -854,7 +887,7 @@ html_redraw_inline_borders(struct box *box,
+ 	if (left != 0 &&
+ 	    first &&
+ 	    nscss_color_is_transparent(box->border[LEFT].c) == false) {
+-		col = nscss_color_to_ns(box->border[LEFT].c);
++		col = html_redraw_border_alpha(box->border[LEFT].c);
+ 
+ 		z[0] = p[0];	z[1] = p[7];
+ 		z[2] = p[2];	z[3] = p[5];
+@@ -898,7 +931,7 @@ html_redraw_inline_borders(struct box *box,
+ 	if (right != 0 &&
+ 	    last &&
+ 	    nscss_color_is_transparent(box->border[RIGHT].c) == false) {
+-		col = nscss_color_to_ns(box->border[RIGHT].c);
++		col = html_redraw_border_alpha(box->border[RIGHT].c);
+ 
+ 		z[0] = p[6];	z[1] = p[1];
+ 		z[2] = p[4];	z[3] = p[3];
+@@ -941,7 +974,7 @@ html_redraw_inline_borders(struct box *box,
+ 	square_end_2 = (right == 0);
+ 	if (top != 0 &&
+ 	    nscss_color_is_transparent(box->border[TOP].c) == false) {
+-		col = nscss_color_to_ns(box->border[TOP].c);
++		col = html_redraw_border_alpha(box->border[TOP].c);
+ 
+ 		z[0] = p[2];	z[1] = p[3];
+ 		z[2] = p[0];	z[3] = p[1];
+@@ -986,7 +1019,7 @@ html_redraw_inline_borders(struct box *box,
+ 	square_end_2 = (right == 0);
+ 	if (bottom != 0 &&
+ 	    nscss_color_is_transparent(box->border[BOTTOM].c) == false) {
+-		col = nscss_color_to_ns(box->border[BOTTOM].c);
++		col = html_redraw_border_alpha(box->border[BOTTOM].c);
+ 
+ 		z[0] = p[4];	z[1] = p[5];
+ 		z[2] = p[6];	z[3] = p[7];

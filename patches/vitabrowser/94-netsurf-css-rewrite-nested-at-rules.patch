@@ -1,0 +1,132 @@
+# netsurf: CSS rewrite -- nested @supports, escaped quotes
+#
+# Tailwind v4's @property fallback (the --tw-* initial values every
+# shadow, ring and transform utility needs) sits in
+# "@layer properties{@supports (...){*,:before,:after,::backdrop{...}}}".
+# Two bugs kept it, and 20 other @supports blocks on claude.ai, from
+# libcss:
+#
+# - The at-rule pass copies a kept block verbatim, so an @supports nested
+#   in a @layer was never unwrapped and libcss dropped the block whole.
+#   The pass now reruns (up to 4 more times) while at-rules remain.
+# - Escaped quotes outside strings: Tailwind's class
+#   ".\[font-feature-settings\:\'liga\'_1\]" made the at-rule pass (and
+#   the two grid passes, and the calc folder's declaration-end finder)
+#   start a "string" at \' and skip ~400 KB to the next quote, including
+#   every at-rule in it. A backslash and the character after it are now
+#   copied as a pair.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+index 98e65b2..5ec00a6 100644
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -4276,6 +4276,19 @@ macsurf__rewrite_at_rules_impl(const char *data, size_t in_size,
+ 			continue;
+ 		}
+ 
++		/* VitaBrowser: an escaped character outside a string (Tailwind's
++		 * ".\[font-feature-settings\:\'liga\'_1\]") is copied as a
++		 * pair, so an escaped quote cannot open a "string" that swallows
++		 * the next few hundred KB of the sheet. */
++		if (data[i] == '\\' && i + 1 < in_size) {
++			if (!macsurf__rw_room(&out, &cap, out_pos, 2)) {
++				free(out);
++				return NULL;
++			}
++			out[out_pos++] = data[i++];
++			out[out_pos++] = data[i++];
++			continue;
++		}
+ 		/* Skip CSS string literals - same reason as comments. */
+ 		if (data[i] == '"' || data[i] == '\'') {
+ 			char quote = data[i];
+@@ -4478,9 +4491,37 @@ macsurf__rewrite_at_rules(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+ {
+ 	static const char *const keys[] = { "@layer", "@supports", NULL };
++	char *out;
++	char *next;
++	size_t out_size;
++	size_t next_size;
++	int pass;
++
+ 	if (!macsurf__has_any_ci(data, in_size, keys))
+ 		return NULL;
+-	return macsurf__rewrite_at_rules_impl(data, in_size, out_size_p);
++	out = macsurf__rewrite_at_rules_impl(data, in_size, &out_size);
++	if (out == NULL)
++		return NULL;
++
++	/* VitaBrowser: a kept block is copied verbatim, so an @supports
++	 * nested in a @layer (Tailwind v4's @property fallback,
++	 * "@layer properties{@supports (...){*,:before,...{--tw-*:...}}}")
++	 * reached libcss, which drops unknown at-rule blocks whole. Run the
++	 * pass again while it still finds work; nesting deeper than a few
++	 * levels is not seen in practice. */
++	for (pass = 0; pass < 4 &&
++			macsurf__has_any_ci(out, out_size, keys); pass++) {
++		next = macsurf__rewrite_at_rules_impl(out, out_size,
++				&next_size);
++		if (next == NULL)
++			break;
++		free(out);
++		out = next;
++		out_size = next_size;
++	}
++
++	*out_size_p = out_size;
++	return out;
+ }
+ 
+ 
+@@ -4557,6 +4598,11 @@ macsurf__cc_find_decl_end(const char *buf, size_t len, size_t start)
+ 			if (k + 1 < len) k += 2;
+ 			continue;
+ 		}
++		/* VitaBrowser: skip an escaped character as a pair. */
++		if (c == '\\' && k + 1 < len) {
++			k += 2;
++			continue;
++		}
+ 		if (c == '"' || c == '\'') {
+ 			char q = c;
+ 			k++;
+@@ -4791,6 +4837,19 @@ macsurf__rewrite_grid_alignment_impl(const char *data, size_t in_size,
+ 			i = kk;
+ 			continue;
+ 		}
++		/* VitaBrowser: an escaped character outside a string (Tailwind's
++		 * ".\[font-feature-settings\:\'liga\'_1\]") is copied as a
++		 * pair, so an escaped quote cannot open a "string" that swallows
++		 * the next few hundred KB of the sheet. */
++		if (data[i] == '\\' && i + 1 < in_size) {
++			if (!macsurf__rw_room(&out, &cap, out_pos, 2)) {
++				free(out);
++				return NULL;
++			}
++			out[out_pos++] = data[i++];
++			out[out_pos++] = data[i++];
++			continue;
++		}
+ 		if (data[i] == '"' || data[i] == '\'') {
+ 			char quote = data[i];
+ 			size_t kk = i + 1;
+@@ -5104,6 +5163,19 @@ macsurf__rewrite_grid_auto_flow_impl(const char *data, size_t in_size,
+ 			continue;
+ 		}
+ 		/* String pass-through. */
++		/* VitaBrowser: an escaped character outside a string (Tailwind's
++		 * ".\[font-feature-settings\:\'liga\'_1\]") is copied as a
++		 * pair, so an escaped quote cannot open a "string" that swallows
++		 * the next few hundred KB of the sheet. */
++		if (data[i] == '\\' && i + 1 < in_size) {
++			if (!macsurf__rw_room(&out, &cap, out_pos, 2)) {
++				free(out);
++				return NULL;
++			}
++			out[out_pos++] = data[i++];
++			out[out_pos++] = data[i++];
++			continue;
++		}
+ 		if (data[i] == '"' || data[i] == '\'') {
+ 			char quote = data[i];
+ 			size_t kk = i + 1;

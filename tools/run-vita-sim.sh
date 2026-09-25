@@ -169,6 +169,8 @@ CSS-mask file:///app0:/testpages/CSS-mask-icon.html
 CSS-bgsizepct file:///app0:/testpages/CSS-background-size-pct.html
 CSS-iswhere file:///app0:/testpages/CSS-is-where.html
 CSS-bigsheet file:///app0:/testpages/CSS-rewrite-bigsheet.html
+CSS-shadow file:///app0:/testpages/CSS-box-shadow.html
+CSS-color file:///app0:/testpages/CSS-modern-color.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
@@ -405,6 +407,34 @@ bsa=$(awk '/^PLOT RECT/ && $8 - $4 == 111 && $10 - $6 == 12 { print $4; exit }' 
 bsb=$(awk '/^PLOT RECT/ && $8 - $4 == 122 && $10 - $6 == 12 { print $4; exit }' "$bs" 2>/dev/null)
 echo "  CSS-bigsheet: inset fill $bsf (1 expected); order: 122-wide at x=${bsb:-?}, 111-wide at x=${bsa:-?} (122 first expected)"
 [ "$bsf" = 1 ] && [ -n "$bsa" ] && [ -n "$bsb" ] && [ "$bsb" -lt "$bsa" ] || fail "CSS rewrite on a big sheet"
+# box-shadow lists, rings, spread; sub-pixel, translucent and rounded
+# borders (patches 96, 97, 99, 100). rects W H [BUCKET]: how many PLOT RECTs
+# of that size, at that opacity bucket (none = solid).
+rects() {
+	awk -v w="$2" -v h="$3" -v b="${4:-}" '/^PLOT RECT/ && $8 - $4 == w &&
+		$10 - $6 == h && ((b == "" && NF == 10) || $12 == b) { n++ }
+		END { print n + 0 }' "$1" 2>/dev/null
+}
+bxplot=$(ls "$R"/*-CSS-shadow.plot 2>/dev/null | head -1)
+bxs1=$(rects "$bxplot" 222 1); bxs2=$(rects "$bxplot" 239 3); bxs3=$(rects "$bxplot" 244 2)
+bxs4=$(rects "$bxplot" 255 1 2); bxs5=$(awk '/^PLOT RECT/ && $8 - $4 == 266 && $10 - $6 <= 2 { n++ } END { print n + 0 }' "$bxplot" 2>/dev/null)
+bxb1=$(rects "$bxplot" 277 1); bxb2=$(rects "$bxplot" 288 1 2)
+echo "  CSS-shadow: ring $bxs1, spread $bxs2, list+initial $bxs3, hsl(from) ring $bxs4 (2 each); invalid $bxs5 (0)"
+# (MacSurf's old rounded-box frame was a stroke, and the plot stream records
+# fills only, so its absence is not checkable here; bxb2 proves rounded
+# boxes now reach the border painter.)
+echo "  CSS-shadow borders: 0.5px $bxb1 (2), rounded 50% $bxb2 (2)"
+[ "$bxs1" = 2 ] && [ "$bxs2" = 2 ] && [ "$bxs3" = 2 ] && [ "$bxs4" = 2 ] && [ "$bxs5" = 0 ] &&
+	[ "$bxb1" = 2 ] && [ "$bxb2" = 2 ] || fail "box-shadow / borders"
+# Modern colour syntax and at-rules (patches 94, 95, 98, 99): each block
+# drawn once, at the expected opacity bucket.
+clplot=$(ls "$R"/*-CSS-color.plot 2>/dev/null | head -1)
+clres=""
+for clspec in 101:2 102:1 103: 104:3 105: 106: 107: 108: 109:; do
+	clres="$clres $(rects "$clplot" "${clspec%%:*}" 10 "${clspec#*:}")"
+done
+echo "  CSS-color: blocks at the expected opacity [$clres ] (9 x 1)"
+[ "$clres" = " 1 1 1 1 1 1 1 1 1" ] || fail "modern colour syntax / at-rules"
 # No horizontal overflow (patches 64, 65): an unbreakable URL in break-word
 # text, and a min-width button in Minerva's header arrangement.
 xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)

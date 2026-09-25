@@ -1,0 +1,566 @@
+# libcss: box-shadow keeps every visible shadow, with blur and spread
+#
+# MacSurf stored at most 3 shadows, each packed into 32 bits (int8 x/y,
+# inset, RGB555): no blur, no spread, no alpha. Tailwind v4's
+# "box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow),
+#  var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)"
+# puts a 1px ring ("inset 0 0 0 1px <colour>") fifth, after "0 0 #0000"
+# placeholders, so claude.ai's outlined buttons had no border.
+#
+# - parse: every shadow in the list is parsed; invisible ones (an explicit
+#   colour with alpha 0) are dropped and up to CSS_BOX_SHADOW_MAX (8)
+#   kept; all invisible = none. The colour may come first. The per-shadow
+#   inset field is now flags: inset, currentColor (no colour given).
+# - cascade: a new style field, box_shadow_full = [n, n x {x, y, blur,
+#   spread, flags, ARGB}], read with css_computed_box_shadow_full();
+#   deep-copied, compared in the arena, freed with the style. The packed
+#   slots (first three shadows) are filled as before for the old path.
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index e4c9ff2..d43e5f8 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -275,6 +275,20 @@ int32_t css_computed_box_shadow_2(
+ int32_t css_computed_box_shadow_3(
+ 		const css_computed_style *style);
+ 
++/* VitaBrowser: the whole box-shadow list. NULL when box-shadow is none
++ * (or every shadow was invisible). Otherwise an array of
++ * 1 + CSS_BOX_SHADOW_FIELDS * n int32s: n, then per shadow, in paint
++ * order (first = topmost): x offset, y offset, blur, spread (px), flags,
++ * colour (0xAARRGGBB; ignore it when CSS_BOX_SHADOW_FLAG_CURRENT is set
++ * and use the element's color). Owned by the style. */
++#define CSS_BOX_SHADOW_MAX 8
++#define CSS_BOX_SHADOW_FIELDS 6
++#define CSS_BOX_SHADOW_FLAG_INSET	1
++#define CSS_BOX_SHADOW_FLAG_CURRENT	2
++#define CSS_BOX_SHADOW_FLAG_INVISIBLE	4	/* parse-time only */
++const int32_t *css_computed_box_shadow_full(
++		const css_computed_style *style);
++
+ /* fixes364 - horizontal stripe background. Two RGB555 colors packed
+  * into one int32: bit 31 = set flag, bits 15..29 = c2 (high), bits
+  * 0..14 = c1 (low). Mapped from `repeating-linear-gradient(to bottom,
+diff --git a/src/parse/properties/p_box_shadow.c b/src/parse/properties/p_box_shadow.c
+index daf847d..664de20 100644
+--- a/src/parse/properties/p_box_shadow.c
++++ b/src/parse/properties/p_box_shadow.c
+@@ -13,6 +13,8 @@
+ #include "parse/properties/properties.h"
+ #include "parse/properties/utils.h"
+ 
++#include <libcss/computed.h>
++
+ /**
+  * Parse a single shadow record: [inset]? h v [blur] [spread] [color]?
+  *
+@@ -24,8 +26,9 @@ static css_error parse_one_shadow(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_fixed *h_out, css_fixed *v_out,
+ 		css_fixed *blur_out, css_fixed *spread_out,
+-		bool *inset_out, css_color *color_out)
++		int *flags_out, css_color *color_out)
+ {
++	bool have_color = false;
+ 	int32_t saved_ctx = *ctx;
+ 	css_error error;
+ 	const css_token *token;
+@@ -50,6 +53,34 @@ static css_error parse_one_shadow(css_language *c,
+ 		}
+ 	}
+ 
++	/* VitaBrowser: the colour may come first ("#000 0 1px 2px"). */
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token != NULL && token->type != CSS_TOKEN_DIMENSION &&
++			token->type != CSS_TOKEN_NUMBER &&
++			token->type != CSS_TOKEN_CHAR) {
++		int32_t color_ctx = *ctx;
++		if (css__parse_colour_specifier(c, vector, ctx,
++				&color_type, &color) == CSS_OK) {
++			have_color = true;
++			consumeWhitespace(vector, ctx);
++			/* inset may follow the colour too */
++			token = parserutils_vector_peek(vector, *ctx);
++			if (!inset && token != NULL &&
++					token->type == CSS_TOKEN_IDENT) {
++				bool inset_match = false;
++				if (lwc_string_caseless_isequal(token->idata,
++						c->strings[INSET], &inset_match)
++						== lwc_error_ok && inset_match) {
++					inset = true;
++					parserutils_vector_iterate(vector, ctx);
++					consumeWhitespace(vector, ctx);
++				}
++			}
++		} else {
++			*ctx = color_ctx;
++		}
++	}
++
+ 	/* h-offset v-offset (required) */
+ 	error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX, &h, &h_u);
+ 	if (error != CSS_OK) { *ctx = saved_ctx; return error; }
+@@ -96,19 +127,28 @@ static css_error parse_one_shadow(css_language *c,
+ 
+ 	/* Optional color */
+ 	token = parserutils_vector_peek(vector, *ctx);
+-	if (token != NULL && token->type != CSS_TOKEN_CHAR) {
++	if (!have_color && token != NULL && token->type != CSS_TOKEN_CHAR) {
+ 		error = css__parse_colour_specifier(c, vector, ctx,
+ 				&color_type, &color);
+ 		if (error == CSS_OK) {
+-			/* color parsed */
++			have_color = true;
++			consumeWhitespace(vector, ctx);
+ 		}
+ 	}
+ 
++	/* VitaBrowser flags: bit 0 inset; bit 1 the colour is currentColor
++	 * (none given, or the keyword); bit 2 invisible (an explicit colour
++	 * with alpha 0, e.g. Tailwind's "0 0 #0000" placeholders). */
++	*flags_out = (inset ? CSS_BOX_SHADOW_FLAG_INSET : 0);
++	if (!have_color || color_type == COLOR_CURRENT_COLOR)
++		*flags_out |= CSS_BOX_SHADOW_FLAG_CURRENT;
++	else if (color_type == COLOR_TRANSPARENT ||
++			(((uint32_t) color) >> 24) == 0)
++		*flags_out |= CSS_BOX_SHADOW_FLAG_INVISIBLE;
+ 	*h_out = h;
+ 	*v_out = v;
+ 	*blur_out = blur;
+ 	*spread_out = spread;
+-	*inset_out = inset;
+ 	*color_out = color;
+ 	return CSS_OK;
+ }
+@@ -139,10 +179,11 @@ css_error css__parse_box_shadow(css_language *c,
+ 	css_error error;
+ 	const css_token *token;
+ 	enum flag_value flag_value;
+-	css_fixed h[3], v[3], blur[3], spread[3];
+-	bool inset[3];
+-	css_color color[3];
+-	int n = 0;
++	css_fixed h[CSS_BOX_SHADOW_MAX], v[CSS_BOX_SHADOW_MAX];
++	css_fixed blur[CSS_BOX_SHADOW_MAX], spread[CSS_BOX_SHADOW_MAX];
++	int flags[CSS_BOX_SHADOW_MAX];
++	css_color color[CSS_BOX_SHADOW_MAX];
++	int n = 0, i;
+ 
+ 	token = parserutils_vector_peek(vector, *ctx);
+ 	if (token == NULL) return CSS_INVALID;
+@@ -166,86 +207,60 @@ css_error css__parse_box_shadow(css_language *c,
+ 		}
+ 	}
+ 
+-	/* Parse first shadow (required). */
+-	error = parse_one_shadow(c, vector, ctx,
+-			&h[0], &v[0], &blur[0], &spread[0],
+-			&inset[0], &color[0]);
+-	if (error != CSS_OK) { *ctx = orig_ctx; return error; }
+-	n = 1;
++	/* VitaBrowser: parse every shadow; keep up to CSS_BOX_SHADOW_MAX visible
++	 * ones (Tailwind composes five: inset, inset ring, ring offset, ring,
++	 * shadow, most of them "0 0 #0000" placeholders, and the ring was the
++	 * fifth, past MacSurf's limit of 3). */
++	while (1) {
++		css_fixed sh, sv, sb, ss;
++		int sflags;
++		css_color scolor;
+ 
+-	/* Parse additional shadows up to N=3. Each separated by a comma. */
+-	while (n < 3) {
+-		int32_t comma_ctx = *ctx;
+-		consumeWhitespace(vector, ctx);
+-		token = parserutils_vector_peek(vector, *ctx);
+-		if (token == NULL || token->type != CSS_TOKEN_CHAR ||
+-				lwc_string_length(token->idata) != 1 ||
+-				lwc_string_data(token->idata)[0] != ',') {
+-			*ctx = comma_ctx;
+-			break;
+-		}
+-		parserutils_vector_iterate(vector, ctx);
+ 		error = parse_one_shadow(c, vector, ctx,
+-				&h[n], &v[n], &blur[n], &spread[n],
+-				&inset[n], &color[n]);
+-		if (error != CSS_OK) {
+-			/* Bail without rolling back the first shadow - the
+-			 * comma was bad but the first parse is good. */
+-			*ctx = comma_ctx;
+-			break;
++				&sh, &sv, &sb, &ss, &sflags, &scolor);
++		if (error != CSS_OK) { *ctx = orig_ctx; return error; }
++		if ((sflags & CSS_BOX_SHADOW_FLAG_INVISIBLE) == 0 &&
++				n < CSS_BOX_SHADOW_MAX) {
++			h[n] = sh; v[n] = sv; blur[n] = sb; spread[n] = ss;
++			flags[n] = sflags & ~CSS_BOX_SHADOW_FLAG_INVISIBLE;
++			color[n] = scolor;
++			n++;
+ 		}
+-		n++;
+-	}
+ 
+-	/* Skip any further comma-separated shadows beyond N=3 so the
+-	 * declaration parses as a whole even if author CSS has 4+. */
+-	while (1) {
+-		int32_t comma_ctx = *ctx;
+-		css_fixed dh, dv, dblur, dspread;
+-		bool dinset;
+-		css_color dcolor;
+ 		consumeWhitespace(vector, ctx);
+ 		token = parserutils_vector_peek(vector, *ctx);
+-		if (token == NULL || token->type != CSS_TOKEN_CHAR ||
+-				lwc_string_length(token->idata) != 1 ||
+-				lwc_string_data(token->idata)[0] != ',') {
+-			*ctx = comma_ctx;
++		if (token == NULL || !tokenIsChar(token, ','))
+ 			break;
+-		}
+ 		parserutils_vector_iterate(vector, ctx);
+-		error = parse_one_shadow(c, vector, ctx,
+-				&dh, &dv, &dblur, &dspread, &dinset, &dcolor);
+-		if (error != CSS_OK) {
+-			*ctx = comma_ctx;
+-			break;
+-		}
+-		/* Discard. */
++		consumeWhitespace(vector, ctx);
++	}
++
++	/* Anything else left means a part did not parse (an unsupported
++	 * colour, say). The declaration is invalid; checked here because
++	 * the var() re-parse at select time does not check trailing
++	 * tokens, and a skipped colour would otherwise read as
++	 * currentColor. */
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token != NULL && !tokenIsChar(token, '!')) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
+ 	}
+ 
++	/* Nothing visible: the same as none. */
++	if (n == 0)
++		return css__stylesheet_style_appendOPV(result,
++				CSS_PROP_BOX_SHADOW, 0, 0x0000 /* NONE */);
++
+ 	error = css__stylesheet_style_appendOPV(result,
+ 			CSS_PROP_BOX_SHADOW, 0, 0x0080 /* SET */);
+ 	if (error != CSS_OK) return error;
+ 
+-	/* Emit count + first shadow's 6 fields (always). */
+-	error = css__stylesheet_style_vappend(result, 7,
+-			(css_fixed)n,
+-			h[0], v[0], blur[0], spread[0],
+-			(css_fixed)inset[0], (css_fixed)color[0]);
++	error = css__stylesheet_style_vappend(result, 1, (css_fixed) n);
+ 	if (error != CSS_OK) return error;
+-
+-	/* Emit second shadow's 6 fields when n>=2. */
+-	if (n >= 2) {
+-		error = css__stylesheet_style_vappend(result, 6,
+-				h[1], v[1], blur[1], spread[1],
+-				(css_fixed)inset[1], (css_fixed)color[1]);
+-		if (error != CSS_OK) return error;
+-	}
+-
+-	/* fixes362 - emit third shadow's 6 fields when n==3. */
+-	if (n == 3) {
++	for (i = 0; i < n; i++) {
+ 		error = css__stylesheet_style_vappend(result, 6,
+-				h[2], v[2], blur[2], spread[2],
+-				(css_fixed)inset[2], (css_fixed)color[2]);
++				h[i], v[i], blur[i], spread[i],
++				(css_fixed) flags[i], (css_fixed) color[i]);
+ 		if (error != CSS_OK) return error;
+ 	}
+ 
+diff --git a/src/select/arena.c b/src/select/arena.c
+index b4169af..168fd32 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -361,6 +361,17 @@ static inline bool css__arena_style_is_equal(
+ 	if (a->box_shadow_3 != b->box_shadow_3) {
+ 		return false;
+ 	}
++	/* VitaBrowser: the full box-shadow list. */
++	if ((a->box_shadow_full == NULL) != (b->box_shadow_full == NULL)) {
++		return false;
++	}
++	if (a->box_shadow_full != NULL && (a->box_shadow_full[0] !=
++			b->box_shadow_full[0] ||
++			memcmp(a->box_shadow_full, b->box_shadow_full,
++			(1 + CSS_BOX_SHADOW_FIELDS * a->box_shadow_full[0]) *
++			sizeof(int32_t)) != 0)) {
++		return false;
++	}
+ 
+ 	if (!arena__compare_string_list(
+ 			a->cursor,
+diff --git a/src/select/autogenerated_computed.h b/src/select/autogenerated_computed.h
+index fc8d311..ab1e6e2 100644
+--- a/src/select/autogenerated_computed.h
++++ b/src/select/autogenerated_computed.h
+@@ -601,6 +601,11 @@ struct css_computed_style {
+ 	 * in computed.c css_computed_style_destroy. Appended at struct end
+ 	 * per project_libcss_struct_mid_insert_crash. */
+ 	css_computed_transition_data *transition_data;
++	/* VitaBrowser: the full box-shadow list (see
++	 * css_computed_box_shadow_full). NULL when none. Deep-copied in
++	 * css__copy_box_shadow, compared in arena.c, freed in computed.c.
++	 * Appended at struct end per project_libcss_struct_mid_insert_crash. */
++	int32_t *box_shadow_full;
+ };
+ 
+ #endif
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 5a3f7dd..de3a40f 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -232,6 +232,11 @@ css_error css_computed_style_destroy(css_computed_style *style)
+ 	if (style->calc != NULL)
+ 		css_calculator_unref(style->calc);
+ 
++	if (style->box_shadow_full != NULL) {
++		free(style->box_shadow_full);
++		style->box_shadow_full = NULL;
++	}
++
+ 	if (style->transition_data != NULL) {
+ 		css__free_transition_data(style->transition_data);
+ 		style->transition_data = NULL;
+@@ -571,6 +576,11 @@ uint8_t css_computed_box_shadow(const css_computed_style *style,
+ 	return get_box_shadow(style, integer);
+ }
+ 
++const int32_t *css_computed_box_shadow_full(const css_computed_style *style)
++{
++	return style->box_shadow_full;
++}
++
+ int32_t css_computed_box_shadow_2(const css_computed_style *style)
+ {
+ 	return style->box_shadow_2;
+diff --git a/src/select/properties/s_box_shadow.c b/src/select/properties/s_box_shadow.c
+index 957e211..5eb3183 100644
+--- a/src/select/properties/s_box_shadow.c
++++ b/src/select/properties/s_box_shadow.c
+@@ -5,6 +5,9 @@
+  * Copyright 2025 Gemini CLI
+  */
+ 
++#include <stdlib.h>
++#include <string.h>
++
+ #include "bytecode/bytecode.h"
+ #include "bytecode/opcodes.h"
+ #include "select/propset.h"
+@@ -49,102 +52,110 @@ static int32_t box_shadow_pack(css_fixed h, css_fixed v, css_fixed inset, css_co
+         return (int32_t)out;
+ }
+ 
++/* VitaBrowser: replace a style's full box-shadow list (NULL clears it). */
++static void box_shadow_set_full(css_computed_style *style, int32_t *full)
++{
++	if (style->box_shadow_full != NULL)
++		free(style->box_shadow_full);
++	style->box_shadow_full = full;
++}
++
++/* VitaBrowser: a heap copy of a full box-shadow list, or NULL. */
++static int32_t *box_shadow_dup_full(const int32_t *full)
++{
++	int32_t *copy;
++	size_t len;
++
++	if (full == NULL)
++		return NULL;
++	len = (1 + CSS_BOX_SHADOW_FIELDS * (size_t) full[0]) * sizeof(int32_t);
++	copy = malloc(len);
++	if (copy != NULL)
++		memcpy(copy, full, len);
++	return copy;
++}
++
+ css_error css__cascade_box_shadow(uint32_t opv, css_style *style,
+-                css_select_state *state)
++		css_select_state *state)
+ {
+-        uint16_t value = CSS_BOX_SHADOW_INHERIT;
+-        css_fixed h = 0, v = 0, blur = 0, spread = 0, inset = 0;
+-        css_color color = 0;
+-        int32_t packed = 0;
+-        int32_t packed2 = 0; /* fixes361b second shadow */
+-        int32_t packed3 = 0; /* fixes362 third shadow */
+-        css_fixed shadow_count = 0;
+-
+-        if (hasFlagValue(opv) == false) {
+-                switch (getValue(opv)) {
+-                case 0x0000: /* NONE */
+-                        value = CSS_BOX_SHADOW_NONE;
+-                        break;
+-                case 0x0080: /* SET */
+-                        value = CSS_BOX_SHADOW_SET;
+-                        /* fixes361b - bytecode now starts with a count
+-                         * (1 or 2), followed by 6 fields per shadow. */
+-                        shadow_count = *((css_fixed *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_fixed));
+-                        h = *((css_fixed *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_fixed));
+-                        v = *((css_fixed *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_fixed));
+-                        blur = *((css_fixed *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_fixed));
+-                        spread = *((css_fixed *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_fixed));
+-                        inset = *((css_fixed *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_fixed));
+-                        color = *((css_color *) style->bytecode);
+-                        advance_bytecode(style, sizeof(css_color));
+-                        packed = box_shadow_pack(h, v, inset, color);
+-                        if (shadow_count >= 2) {
+-                                css_fixed h2, v2, b2, s2, i2;
+-                                css_color c2;
+-                                h2 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                v2 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                b2 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                s2 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                i2 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                c2 = *((css_color *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_color));
+-                                (void)b2; (void)s2;
+-                                packed2 = box_shadow_pack(h2, v2, i2, c2);
+-                        }
+-                        if (shadow_count >= 3) {
+-                                /* fixes362 - third shadow into outer-
+-                                 * struct box_shadow_3 side channel. */
+-                                css_fixed h3, v3, b3, s3, i3;
+-                                css_color c3;
+-                                h3 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                v3 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                b3 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                s3 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                i3 = *((css_fixed *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_fixed));
+-                                c3 = *((css_color *) style->bytecode);
+-                                advance_bytecode(style, sizeof(css_color));
+-                                (void)b3; (void)s3;
+-                                packed3 = box_shadow_pack(h3, v3, i3, c3);
+-                        }
+-                        break;
+-                }
+-        }
++	uint16_t value = CSS_BOX_SHADOW_INHERIT;
++	int32_t packed[3] = { 0, 0, 0 };
++	int32_t *full = NULL;
++	css_fixed count = 0;
++	css_fixed i;
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case 0x0000: /* NONE */
++			value = CSS_BOX_SHADOW_NONE;
++			break;
++		case 0x0080: /* SET */
++			value = CSS_BOX_SHADOW_SET;
++			/* count, then 6 fields per shadow: h, v, blur, spread
++			 * (css_fixed px), flags, colour. */
++			count = *((css_fixed *) style->bytecode);
++			advance_bytecode(style, sizeof(css_fixed));
++			if (count > 0 && count <= CSS_BOX_SHADOW_MAX)
++				full = malloc((1 + CSS_BOX_SHADOW_FIELDS *
++						(size_t) count) * sizeof(int32_t));
++			if (full != NULL)
++				full[0] = (int32_t) count;
++			for (i = 0; i < count; i++) {
++				css_fixed f[5];
++				css_color colour;
++				int k;
++
++				for (k = 0; k < 5; k++) {
++					f[k] = *((css_fixed *) style->bytecode);
++					advance_bytecode(style, sizeof(css_fixed));
++				}
++				colour = *((css_color *) style->bytecode);
++				advance_bytecode(style, sizeof(css_color));
++
++				/* MacSurf's packed slots: the first three. */
++				if (i < 3)
++					packed[i] = box_shadow_pack(f[0], f[1],
++						f[4] & CSS_BOX_SHADOW_FLAG_INSET,
++						colour);
++				if (full != NULL) {
++					int32_t *o = full + 1 +
++						CSS_BOX_SHADOW_FIELDS * i;
++					o[0] = FIXTOINT(f[0]);
++					o[1] = FIXTOINT(f[1]);
++					o[2] = FIXTOINT(f[2]);
++					o[3] = FIXTOINT(f[3]);
++					o[4] = (int32_t) f[4];
++					o[5] = (int32_t) colour;
++				}
++			}
++			break;
++		}
++	}
++
+ 	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
+ 			getFlagValue(opv))) {
+ 		/* Store second + third shadows in outer-struct side channels.
+ 		 * 0 = unset / no shadow at that slot (won't paint). */
+-		state->computed->box_shadow_2 = packed2;
+-		state->computed->box_shadow_3 = packed3;
+-		return set_box_shadow(state->computed, value, packed);
++		state->computed->box_shadow_2 = packed[1];
++		state->computed->box_shadow_3 = packed[2];
++		box_shadow_set_full(state->computed, full);
++		return set_box_shadow(state->computed, value, packed[0]);
+ 	}
+ 
++	free(full);
+ 	return CSS_OK;
+ }
+ 
+ css_error css__set_box_shadow_from_hint(const css_hint *hint,
+ 		css_computed_style *style)
+ {
++	box_shadow_set_full(style, NULL);
+ 	return set_box_shadow(style, hint->status, hint->data.integer);
+ }
+ 
+ css_error css__initial_box_shadow(css_select_state *state)
+ {
++	box_shadow_set_full(state->computed, NULL);
+ 	return set_box_shadow(state->computed, CSS_BOX_SHADOW_NONE, 0);
+ }
+ 
+@@ -160,9 +171,13 @@ css_error css__copy_box_shadow(
+ 	}
+ 
+ 	/* fixes361b - propagate second shadow alongside the first.
+-	 * fixes362 - propagate third shadow too. */
++	 * fixes362 - propagate third shadow too. VitaBrowser: and the
++	 * full list. */
+ 	to->box_shadow_2 = from->box_shadow_2;
+ 	to->box_shadow_3 = from->box_shadow_3;
++	box_shadow_set_full(to, box_shadow_dup_full(from->box_shadow_full));
++	if (from->box_shadow_full != NULL && to->box_shadow_full == NULL)
++		return CSS_NOMEM;
+ 	return set_box_shadow(to, type, integer);
+ }
+ 
+@@ -175,8 +190,6 @@ css_error css__compose_box_shadow(const css_computed_style *parent,
+ 	const css_computed_style *src =
+ 		(type == CSS_BOX_SHADOW_INHERIT) ? parent : child;
+ 
+-	result->box_shadow_2 = src->box_shadow_2;
+-	result->box_shadow_3 = src->box_shadow_3;
+ 	return css__copy_box_shadow(src, result);
+ }
+ 

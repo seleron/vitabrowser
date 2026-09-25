@@ -1,0 +1,244 @@
+# netsurf: paint box-shadow lists (outer and inset, with spread)
+#
+# Companion to 96-libcss-box-shadow-full-list.patch. html_redraw_box
+# paints css_computed_box_shadow_full():
+#   - outer shadows before the background, as the shadow rect minus the
+#     border box (up to four rects), with the clip widened to the
+#     parent's;
+#   - inset shadows after the background and before the borders, as the
+#     padding box minus the offset, spread-shrunk hole.
+# Colours carry their alpha (and the element's opacity) in the plot
+# style's opacity, so the plotters blend them like rgba backgrounds.
+# Blur is approximated: +blur/2 of spread, alpha x 2/(2+blur). Border
+# radius is ignored. A style with the list skips MacSurf's packed
+# single-shadow path, and box_ink_outset sizes outer shadows from the list.
+diff --git a/content/handlers/html/box_ink.h b/content/handlers/html/box_ink.h
+index aca4e19..3859470 100644
+--- a/content/handlers/html/box_ink.h
++++ b/content/handlers/html/box_ink.h
+@@ -129,7 +129,22 @@ static inline void box_ink_outset(const css_computed_style *style,
+ 		fb = ey - (float)bh / 2.0f + ty + 1.0f;
+ 	}
+ 
+-	if (css_computed_box_shadow(style, &bsh) == CSS_BOX_SHADOW_SET &&
++	if (css_computed_box_shadow_full(style) != NULL) {
++		/* VitaBrowser (patch 97): outer shadows from the full list,
++		 * grown by spread and half the blur as redraw.c paints them. */
++		const int32_t *full = css_computed_box_shadow_full(style);
++		int i;
++		for (i = 0; i < full[0]; i++) {
++			const int32_t *s = full + 1 + CSS_BOX_SHADOW_FIELDS * i;
++			int grow = s[3] + (s[2] > 0 ? s[2] / 2 : 0);
++			if (s[4] & CSS_BOX_SHADOW_FLAG_INSET)
++				continue;
++			if ((float)(grow - s[0]) > fl) fl = (float)(grow - s[0]);
++			if ((float)(grow + s[0]) > fr) fr = (float)(grow + s[0]);
++			if ((float)(grow - s[1]) > ft) ft = (float)(grow - s[1]);
++			if ((float)(grow + s[1]) > fb) fb = (float)(grow + s[1]);
++		}
++	} else if (css_computed_box_shadow(style, &bsh) == CSS_BOX_SHADOW_SET &&
+ 			(((uint32_t)bsh) & 0x8000) == 0) {
+ 		/* Drop shadow (inset paints inside the box). Packed v2:
+ 		 * int8 h in bits 31..24, int8 v in 23..16; the plotters clamp
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 2c9b604..467173e 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1449,6 +1449,124 @@ extern void macos9_background_clip_text_end(void);
+ /* VitaBrowser: forward declarations removed along with the definitions --
+  * see the note at each removal site. */
+ 
++/* VitaBrowser (patch 97): paint the part of `o` outside `h` (device px) as
++ * up to four rectangles. */
++static bool html_redraw_rect_minus(const struct redraw_context *ctx,
++		const plot_style_t *ps, struct rect o, struct rect h)
++{
++	struct rect b;
++
++	if (o.x0 >= o.x1 || o.y0 >= o.y1)
++		return true;
++	if (h.x0 < o.x0) h.x0 = o.x0;
++	if (h.y0 < o.y0) h.y0 = o.y0;
++	if (h.x1 > o.x1) h.x1 = o.x1;
++	if (h.y1 > o.y1) h.y1 = o.y1;
++	if (h.x0 >= h.x1 || h.y0 >= h.y1)
++		return ctx->plot->rectangle(ctx, ps, &o) == NSERROR_OK;
++
++	b = o;
++	b.y1 = h.y0;
++	if (b.y0 < b.y1 && ctx->plot->rectangle(ctx, ps, &b) != NSERROR_OK)
++		return false;
++	b = o;
++	b.y0 = h.y1;
++	if (b.y0 < b.y1 && ctx->plot->rectangle(ctx, ps, &b) != NSERROR_OK)
++		return false;
++	b.y0 = h.y0;
++	b.y1 = h.y1;
++	b.x0 = o.x0;
++	b.x1 = h.x0;
++	if (b.x0 < b.x1 && ctx->plot->rectangle(ctx, ps, &b) != NSERROR_OK)
++		return false;
++	b.x0 = h.x1;
++	b.x1 = o.x1;
++	if (b.x0 < b.x1 && ctx->plot->rectangle(ctx, ps, &b) != NSERROR_OK)
++		return false;
++	return true;
++}
++
++/**
++ * VitaBrowser (patch 97): paint a box's shadows from the full box-shadow
++ * list (css_computed_box_shadow_full). Called twice per box: outer shadows
++ * (inset == false) before the background, outside the border box; inset
++ * shadows after it, inside the padding box. The list's first shadow is on
++ * top, so it is painted last.
++ *
++ * Approximations: blur widens the shadow by half the blur radius and fades
++ * it by 2 / (2 + blur); border-radius is ignored. A 1px ring
++ * ("inset 0 0 0 1px c", Tailwind's ring and shadow-field) is exact.
++ */
++static bool html_redraw_box_shadows(const struct redraw_context *ctx,
++		const css_computed_style *style, float scale, bool inset,
++		const struct rect *border_box, const struct rect *padding_box)
++{
++	const int32_t *full;
++	plot_style_fixed element_op = (plot_style_fixed)PLOT_STYLE_SCALE;
++	css_fixed op_fixed = 0;
++	int i;
++
++	if (style == NULL)
++		return true;
++	full = css_computed_box_shadow_full(style);
++	if (full == NULL)
++		return true;
++	if (css_computed_opacity(style, &op_fixed) == CSS_OPACITY_SET)
++		element_op = (plot_style_fixed)op_fixed;
++
++	for (i = full[0] - 1; i >= 0; i--) {
++		const int32_t *s = full + 1 + CSS_BOX_SHADOW_FIELDS * i;
++		bool is_inset = (s[4] & CSS_BOX_SHADOW_FLAG_INSET) != 0;
++		uint32_t argb = (uint32_t)s[5];
++		unsigned int alpha;
++		int blur = s[2] > 0 ? s[2] : 0;
++		int hx, vy, grow;
++		struct rect o, h;
++		plot_style_t ps;
++
++		if (is_inset != inset)
++			continue;
++		if (s[4] & CSS_BOX_SHADOW_FLAG_CURRENT) {
++			css_color cc = 0;
++			css_computed_color(style, &cc);
++			argb = (uint32_t)cc;
++		}
++		alpha = ((argb >> 24) & 0xff) * 2 / (2 + (unsigned int)blur);
++		if (alpha == 0)
++			continue;
++
++		hx = (int)((float)s[0] * scale);
++		vy = (int)((float)s[1] * scale);
++		grow = (int)((float)(s[3] + blur / 2) * scale);
++
++		memset(&ps, 0, sizeof(ps));
++		ps.fill_type = PLOT_OP_TYPE_SOLID;
++		/* NetSurf colour: R in the low byte. */
++		ps.fill_colour = (colour)(((argb >> 16) & 0xff) |
++				(argb & 0xff00) | ((argb & 0xff) << 16));
++		ps.opacity = (plot_style_fixed)((int64_t)element_op * alpha / 255);
++
++		if (!inset) {
++			o = *border_box;
++			o.x0 += hx - grow;
++			o.x1 += hx + grow;
++			o.y0 += vy - grow;
++			o.y1 += vy + grow;
++			h = *border_box;
++		} else {
++			o = *padding_box;
++			h = *padding_box;
++			h.x0 += hx + grow;
++			h.x1 += hx - grow;
++			h.y0 += vy + grow;
++			h.y1 += vy - grow;
++		}
++		if (!html_redraw_rect_minus(ctx, &ps, o, h))
++			return false;
++	}
++	return true;
++}
++
+ /**
+  * fixes1048 (#280) - resolve the background TILE size from background-size.
+  *
+@@ -1766,7 +1884,10 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 	                                rh_box + 2 * inflate);
+ 	                }
+ 	        }
+-	        if (css_computed_box_shadow(background->style, &bsh) == CSS_BOX_SHADOW_SET) {
++	        /* VitaBrowser: a style with the full list paints its shadows in
++	         * html_redraw_box_shadows (patch 97), not through the plotter. */
++	        if (css_computed_box_shadow_full(background->style) == NULL &&
++	                        css_computed_box_shadow(background->style, &bsh) == CSS_BOX_SHADOW_SET) {
+ 	                /* MacSurf fixes48/200 -- packed v2: h/v/inset/rgb555. */
+ 	                int8_t hoff_px = (int8_t)((((uint32_t)bsh) >> 24) & 0xff);
+ 	                int8_t voff_px = (int8_t)((((uint32_t)bsh) >> 16) & 0xff);
+@@ -2581,7 +2702,8 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 	                                bh_in + 2 * inflate_in);
+ 	                }
+ 	        }
+-	        if (css_computed_box_shadow(box->style, &bsh) == CSS_BOX_SHADOW_SET) {
++	        if (css_computed_box_shadow_full(box->style) == NULL &&
++	                        css_computed_box_shadow(box->style, &bsh) == CSS_BOX_SHADOW_SET) {
+ 	                /* MacSurf fixes48/200 -- packed v2: h/v/inset/rgb555. */
+ 	                int8_t hoff_px = (int8_t)((((uint32_t)bsh) >> 24) & 0xff);
+ 	                int8_t voff_px = (int8_t)((((uint32_t)bsh) >> 16) & 0xff);
+@@ -4832,6 +4954,37 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			empty_cell_hide = true;
+ 		}
+ 
++	/* VitaBrowser (patch 97): outer box-shadows, under the background.
++	 * They paint outside the border box, so the clip widens to the
++	 * parent's (a CSS clip: rect keeps clipping them). */
++	bool shadow_box = !empty_cell_hide && box->style != NULL &&
++			box->type != BOX_TEXT && box->type != BOX_INLINE_END &&
++			box->type != BOX_BR &&
++			(box->gadget != NULL ?
++			 html_redraw_gadget_takes_css_box(box) :
++			 (box->type != BOX_INLINE || box->object ||
++			  box->flags & IFRAME || box->flags & REPLACE_DIM)) &&
++			css_computed_box_shadow_full(box->style) != NULL;
++	struct rect shadow_border_box, shadow_padding_box;
++	if (shadow_box) {
++		shadow_border_box.x0 = x - border_left;
++		shadow_border_box.y0 = y - border_top;
++		shadow_border_box.x1 = x + padding_width + border_right;
++		shadow_border_box.y1 = y + padding_height + border_bottom;
++		shadow_padding_box.x0 = x;
++		shadow_padding_box.y0 = y;
++		shadow_padding_box.x1 = x + padding_width;
++		shadow_padding_box.y1 = y + padding_height;
++		if (!css_clip_rect &&
++				ctx->plot->clip(ctx, clip) != NSERROR_OK)
++			return false;
++		if (!html_redraw_box_shadows(ctx, box->style, scale, false,
++				&shadow_border_box, &shadow_padding_box))
++			return false;
++		if (ctx->plot->clip(ctx, &r) != NSERROR_OK)
++			return false;
++	}
++
+ 	/* bg_box == NULL implies that this box should not have
+ 	* its background rendered. Otherwise filter out linebreaks,
+ 	* optimize away non-differing inlines, only plot background
+@@ -4912,6 +5065,12 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/* VitaBrowser (patch 97): inset box-shadows, over the background and
++	 * under the borders and content. */
++	if (shadow_box && !html_redraw_box_shadows(ctx, box->style, scale,
++			true, &shadow_border_box, &shadow_padding_box))
++		return false;
++
+ 	/* borders for block level content and replaced inlines */
+ 	if (!empty_cell_hide && box->style &&
+ 	    box->type != BOX_TEXT &&

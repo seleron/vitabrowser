@@ -1,0 +1,72 @@
+# libcss: "--x: initial" is the guaranteed-invalid value
+#
+# A custom property set to the CSS-wide keyword initial has its initial
+# value, the guaranteed-invalid value, so var(--x, fallback) uses the
+# fallback. MacSurf's store kept the word "initial" as the value. Tailwind
+# v4's @property fallback sets "--tw-shadow-color:initial" (and ~20 other
+# --tw-* variables) on every element, and its shadows read
+# var(--tw-shadow-color, <colour>): "initial" was substituted as the
+# colour, so every Tailwind box-shadow (claude.ai's button rings) was
+# invalid. Such a binding is now marked invalid (fixes1269's flag: reads as
+# absent, still shadows an inherited binding); the flag is also recomputed
+# when a binding is replaced, which it was not.
+diff --git a/src/parse/custom_properties.c b/src/parse/custom_properties.c
+index 8e7ee77..8b1576b 100644
+--- a/src/parse/custom_properties.c
++++ b/src/parse/custom_properties.c
+@@ -12,6 +12,7 @@
+ #include <ctype.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include <libcss/select.h>
+ 
+@@ -253,6 +254,31 @@ static bool cp_binding_outranked(const css_cp_binding *existing,
+ 	return (origin == CSS_ORIGIN_USER && important != 0);
+ }
+ 
++/* VitaBrowser (patch 99): "--x: initial" sets the property to its initial
++ * value, the guaranteed-invalid value, so var(--x, fallback) must use the
++ * fallback. MacSurf stored the word "initial" as the value instead, and
++ * Tailwind v4's @property fallback ("--tw-shadow-color:initial", used as
++ * var(--tw-shadow-color, <ring colour>)) substituted "initial" into every
++ * box-shadow, invalidating them. */
++static bool cp_tokens_are_initial(const css_cp_token *tokens, uint32_t n)
++{
++	uint32_t i;
++	bool seen = false;
++
++	for (i = 0; i < n; i++) {
++		if (tokens[i].type == CSS_TOKEN_S)
++			continue;
++		if (seen || tokens[i].type != CSS_TOKEN_IDENT ||
++				tokens[i].idata == NULL ||
++				lwc_string_length(tokens[i].idata) != 7 ||
++				strncasecmp(lwc_string_data(tokens[i].idata),
++					"initial", 7) != 0)
++			return false;
++		seen = true;
++	}
++	return seen;
++}
++
+ css_error css__cp_env_add(css_cp_env **env, lwc_string *name,
+ 		const css_cp_token *tokens, uint32_t n,
+ 		uint32_t specificity, uint8_t origin, uint8_t important)
+@@ -282,6 +308,7 @@ css_error css__cp_env_add(css_cp_env **env, lwc_string *name,
+ 			e->items[i].specificity = specificity;
+ 			e->items[i].origin = origin;
+ 			e->items[i].important = important;
++			e->items[i].invalid = cp_tokens_are_initial(tokens, n);
+ 		}
+ 		return CSS_OK;
+ 	}
+@@ -304,6 +331,7 @@ css_error css__cp_env_add(css_cp_env **env, lwc_string *name,
+ 	e->items[e->used].specificity = specificity;
+ 	e->items[e->used].origin = origin;
+ 	e->items[e->used].important = important;
++	e->items[e->used].invalid = cp_tokens_are_initial(tokens, n);
+ 	e->used++;
+ 
+ 	return CSS_OK;

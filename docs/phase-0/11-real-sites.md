@@ -716,12 +716,108 @@ patch: `VITA_SIM_EVAL=file.js` runs a script when a screenshot is taken
 (the script leaves its results in localStorage), and
 `VITA_SIM_BOXDUMP=file` writes `box_dump()` with computed styles.
 
+## Round 8: rings, borders, modern colours (patches 94–100)
+
+Round 7 left claude.ai's outlined buttons without their ring, a
+`box-shadow: inset 0 0 0 1px …` in a relative colour. Getting it to paint
+took seven fixes, found one layer at a time.
+
+### 27. Tailwind's variables never got their initial values (94, 95, 99)
+
+Tailwind v4 composes every shadow from variables:
+`box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), …`.
+Their starting values come from a fallback for browsers without
+`@property`: `@layer properties{@supports (…){*,:before,:after,::backdrop{--tw-shadow:0 0 #0000;…}}}`.
+Three bugs stopped that block from applying:
+
+- **Nested `@supports` (94).** The at-rule pass copied a kept block
+  verbatim, so an `@supports` inside a `@layer` reached libcss, which
+  drops unknown at-rule blocks. The pass now reruns while at-rules remain.
+- **Escaped quotes (94).** The class `.\[font-feature-settings\:\'liga\'_1\]`
+  made the at-rule pass start a "string" at `\'` and skip about 400 KB,
+  including 20 of claude.ai's 34 `@supports` blocks. The same bug was in
+  both grid passes and in the calc folder's declaration-end finder. An
+  escaped character is now copied as a pair.
+- **`::backdrop` (95).** An unknown pseudo-element invalidates the whole
+  selector list. It now parses and never matches, like `::placeholder`.
+- **`--x: initial` (99).** This sets the property to the
+  guaranteed-invalid value, so `var(--x, fallback)` must use the
+  fallback. MacSurf stored the word "initial" instead, and Tailwind's
+  `var(--tw-shadow-color, <colour>)` became `… initial`.
+
+### 28. box-shadow keeps every shadow (96, 97)
+
+- **Parse and store (96).** MacSurf kept at most 3 shadows, packed into
+  32 bits each (8-bit x/y, inset, RGB555), with no blur, spread or alpha.
+  Tailwind's ring is the 5th shadow in its list and is all spread. Now
+  every visible shadow is kept, up to 8, and invisible ones (`0 0 #0000`)
+  are dropped. The list lives in a new style field, read with
+  `css_computed_box_shadow_full()`. It holds x, y, blur, spread, inset and
+  currentColor flags, and ARGB. An unparseable part invalidates the
+  declaration. The `var()` re-parse at select time does not check trailing
+  tokens, and a skipped colour used to read as currentColor.
+- **Paint (97).** `html_redraw_box` paints outer shadows before the
+  background, as the shadow rect minus the border box, with the clip
+  widened to the parent's. Inset shadows go after the background, as
+  bands inside the padding box. Alpha and `opacity` go into the plot
+  opacity, like rgba backgrounds. Blur is approximated (+blur/2 spread,
+  alpha × 2/(2+blur)) and corners are square. `box_ink_outset` sizes outer
+  shadows from the list.
+
+### 29. Colour syntax (98)
+
+`rgb(from C r g b / A)` and `hsl(from C h s l / A)` are supported, with
+channel keywords and literal rgb channels; `calc()` on channels stays
+invalid. So are `color-mix(in srgb | srgb-linear | oklab …)` (lab, lch and
+oklch approximated as oklab, with premultiplied mixing) and
+`oklab(L a b / A)` with `none`. There is no libm: sRGB↔linear uses a table
+and cube roots use Newton's method. Checked by hand against a Python
+reference: red + blue in oklab = (140, 83, 162); #fcfcfb 90% + #0b0b0b in
+oklab = (224, 224, 223). `oklab(0% none none/.1)` gets alpha 25 instead of
+26, because `.1` loses a little as fixed-point.
+
+### 30. Borders (100)
+
+- **Hairlines.** A non-zero width under 1px snaps up to 1px.
+  `border-[0.5px]` used to vanish.
+- **Alpha.** A border colour's alpha now reaches the plotters, so
+  Tailwind's default 10%-black border no longer draws solid.
+- **Rounded boxes.** A box with a border-radius skipped the border
+  painter. MacSurf's stand-in stroke ignored the border width, so every
+  rounded box under Tailwind's preflight `border: 0 solid` got a 1px
+  frame. Rounded boxes now use the normal border painter, with square
+  corners like the Vita's backgrounds.
+- **`apply-patches.sh` sorts numerically.** The glob put `100-*` between
+  `10-*` and `11-*`.
+
+**Tests.** `CSS-box-shadow.html` checks the ring, spread, placeholder list
+with `initial`, a `hsl(from)` ring, an invalid colour, a 0.5px border and
+a rounded translucent border. `CSS-modern-color.html` checks nine
+colour, at-rule, `::backdrop` and `initial` blocks by opacity bucket. With
+94–100 removed, every shadow and border check reads 0, and 7 of 9 colour
+blocks fail. The other two (103, 105) are solid either way. The plot has
+no colours, which is why colour values were checked by hand.
+
+**Reference rendering.** `VITA_SIM_EVAL` can store
+`document.documentElement.outerHTML`. With scripts stripped and the sheets
+fetched from assets-proxy (not Cloudflare-gated), headless Chromium
+renders that DOM locally for a like-for-like comparison. Cloudflare
+started challenging the sim after about 10 claude.ai loads in an hour.
+
+**State (static DOM snapshot, simulator vs Chromium).** The fills,
+off-white surfaces, card hairlines, button rings and the "OR" divider
+match. What still differs is layout: Tailwind spacing is
+`calc(var(--spacing) * N)`, which does not resolve in `padding`,
+`height` or `gap`, so cards have no padding, buttons are 20 px tall, and
+icons and labels are not centred. Corners are square and the header logo
+is missing.
+
 ## Not done: the gaps left
 
 - **claude.ai/code:**
-  - Outlined buttons: box-shadow with spread (and an inset painter),
-    `hsl(from …)` relative colours, `color-mix()`; `calc()` with `var()` in
-    `height` (round 7).
+  - Layout: `calc(var(--spacing) * N)` in padding, height and gap
+    (Tailwind's whole spacing scale); centring an icon and label in
+    buttons; border-radius (round 8).
   - Then the Vita itself: 19 MB over Wi-Fi, a compile of about 60 MB of
     heap on a 444 MHz CPU, and React's first render. Run 16 measures it.
   - Signing in comes after that.

@@ -67,7 +67,9 @@ fi
 # Our own port fixes, applied after the generated MacSurf stack. Named
 # NN-<lib>-<what>.patch and routed to <lib> by that middle field. These use
 # a/ b/ prefixes, so -p1.
-for p in "$ROOT"/patches/vitabrowser/*.patch; do
+# Numeric order: the glob sorts 100-* between 10-* and 11-*, which applied
+# patch 100 before the patches it builds on. (No spaces in these paths.)
+for p in $(ls "$ROOT"/patches/vitabrowser/*.patch | sort -V); do
 	[ -f "$p" ] || continue
 	base=$(basename "$p" .patch)
 	lib=$(echo "$base" | cut -d- -f2)

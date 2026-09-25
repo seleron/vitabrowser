@@ -1,0 +1,521 @@
+# libcss: color-mix(), relative rgb()/hsl() "from" colours, oklab()
+#
+# Tailwind v4 writes most translucent colours with these (claude.ai's
+# sheet: 734 color-mix(), 104 "from" colours, oklab(0% none none/.1));
+# libcss rejected them, dropping the declaration (claude.ai's button
+# ring colour is hsl(from var(--cds-neutral-900) h s l / 10%)).
+#
+# - rgb(from C r g b [/ A]), hsl(from C h s l [/ A]): channel keywords
+#   keep the base colour's channel; rgb() also takes numbers and
+#   percentages. calc() on channels is unsupported (invalid, as before).
+# - color-mix(in SPACE [METHOD hue], C1 [P1], C2 [P2]): CSS Color 5
+#   percentages and premultiplied interpolation, in srgb, srgb-linear/xyz
+#   or oklab (lab, lch and oklch approximated as oklab).
+# - oklab(L a b [/ A]) with none.
+# No libm: an sRGB->linear table (inverted by binary search) and Newton
+# cube roots. currentColor inside these is unresolvable at parse time and
+# stays invalid.
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+index 5bb0451..a2af507 100644
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -928,6 +928,467 @@ static bool parse_hwb(
+ 	return true;
+ }
+ 
++/* ------------------------------------------------------------------ *
++ * VitaBrowser (patch 98): color-mix(), relative rgb()/hsl() "from"
++ * colours, and oklab(). Tailwind v4 writes most of its translucent
++ * colours with them (claude.ai: 734 color-mix, 104 "from" colours).
++ * No libm: sRGB <-> linear goes through a table, cube roots through
++ * Newton steps.
++ * ------------------------------------------------------------------ */
++
++/** sRGB 8-bit channel -> linear light (IEC 61966-2-1). */
++static const float vb_srgb_to_linear[256] = {
++	0.000000000f, 0.000303527f, 0.000607054f, 0.000910581f, 0.001214108f, 0.001517635f,
++	0.001821162f, 0.002124689f, 0.002428216f, 0.002731743f, 0.003035270f, 0.003346536f,
++	0.003676507f, 0.004024717f, 0.004391442f, 0.004776953f, 0.005181517f, 0.005605392f,
++	0.006048833f, 0.006512091f, 0.006995410f, 0.007499032f, 0.008023193f, 0.008568126f,
++	0.009134059f, 0.009721217f, 0.010329823f, 0.010960094f, 0.011612245f, 0.012286488f,
++	0.012983032f, 0.013702083f, 0.014443844f, 0.015208514f, 0.015996293f, 0.016807376f,
++	0.017641954f, 0.018500220f, 0.019382361f, 0.020288563f, 0.021219010f, 0.022173885f,
++	0.023153366f, 0.024157632f, 0.025186860f, 0.026241222f, 0.027320892f, 0.028426040f,
++	0.029556834f, 0.030713444f, 0.031896033f, 0.033104767f, 0.034339807f, 0.035601315f,
++	0.036889450f, 0.038204372f, 0.039546235f, 0.040915197f, 0.042311411f, 0.043735029f,
++	0.045186204f, 0.046665086f, 0.048171824f, 0.049706566f, 0.051269458f, 0.052860647f,
++	0.054480276f, 0.056128490f, 0.057805430f, 0.059511238f, 0.061246054f, 0.063010018f,
++	0.064803267f, 0.066625939f, 0.068478170f, 0.070360096f, 0.072271851f, 0.074213568f,
++	0.076185381f, 0.078187422f, 0.080219820f, 0.082282707f, 0.084376212f, 0.086500462f,
++	0.088655586f, 0.090841711f, 0.093058963f, 0.095307467f, 0.097587347f, 0.099898728f,
++	0.102241733f, 0.104616484f, 0.107023103f, 0.109461711f, 0.111932428f, 0.114435374f,
++	0.116970668f, 0.119538428f, 0.122138772f, 0.124771818f, 0.127437680f, 0.130136477f,
++	0.132868322f, 0.135633330f, 0.138431615f, 0.141263291f, 0.144128471f, 0.147027266f,
++	0.149959790f, 0.152926152f, 0.155926464f, 0.158960835f, 0.162029376f, 0.165132195f,
++	0.168269400f, 0.171441101f, 0.174647404f, 0.177888416f, 0.181164244f, 0.184474995f,
++	0.187820772f, 0.191201683f, 0.194617830f, 0.198069320f, 0.201556254f, 0.205078736f,
++	0.208636870f, 0.212230757f, 0.215860500f, 0.219526200f, 0.223227957f, 0.226965874f,
++	0.230740049f, 0.234550582f, 0.238397574f, 0.242281122f, 0.246201327f, 0.250158285f,
++	0.254152094f, 0.258182853f, 0.262250658f, 0.266355605f, 0.270497791f, 0.274677312f,
++	0.278894263f, 0.283148740f, 0.287440838f, 0.291770650f, 0.296138271f, 0.300543794f,
++	0.304987314f, 0.309468923f, 0.313988713f, 0.318546778f, 0.323143209f, 0.327778098f,
++	0.332451536f, 0.337163615f, 0.341914425f, 0.346704056f, 0.351532600f, 0.356400144f,
++	0.361306780f, 0.366252596f, 0.371237680f, 0.376262123f, 0.381326011f, 0.386429434f,
++	0.391572478f, 0.396755231f, 0.401977780f, 0.407240212f, 0.412542613f, 0.417885071f,
++	0.423267670f, 0.428690497f, 0.434153636f, 0.439657174f, 0.445201195f, 0.450785783f,
++	0.456411023f, 0.462077000f, 0.467783796f, 0.473531496f, 0.479320183f, 0.485149940f,
++	0.491020850f, 0.496932995f, 0.502886458f, 0.508881321f, 0.514917665f, 0.520995573f,
++	0.527115126f, 0.533276404f, 0.539479489f, 0.545724461f, 0.552011402f, 0.558340390f,
++	0.564711506f, 0.571124829f, 0.577580440f, 0.584078418f, 0.590618841f, 0.597201788f,
++	0.603827339f, 0.610495571f, 0.617206562f, 0.623960392f, 0.630757136f, 0.637596874f,
++	0.644479682f, 0.651405637f, 0.658374817f, 0.665387298f, 0.672443157f, 0.679542470f,
++	0.686685312f, 0.693871761f, 0.701101892f, 0.708375780f, 0.715693501f, 0.723055129f,
++	0.730460740f, 0.737910409f, 0.745404210f, 0.752942217f, 0.760524505f, 0.768151147f,
++	0.775822218f, 0.783537792f, 0.791297940f, 0.799102738f, 0.806952258f, 0.814846572f,
++	0.822785754f, 0.830769877f, 0.838799012f, 0.846873232f, 0.854992608f, 0.863157213f,
++	0.871367119f, 0.879622397f, 0.887923118f, 0.896269353f, 0.904661174f, 0.913098652f,
++	0.921581856f, 0.930110858f, 0.938685728f, 0.947306537f, 0.955973353f, 0.964686248f,
++	0.973445290f, 0.982250550f, 0.991102097f, 1.000000000f
++};
++
++static float vb_linear_of(float c)
++{
++	int i = (int)(c * 255.0f + 0.5f);
++	if (i < 0) i = 0;
++	if (i > 255) i = 255;
++	return vb_srgb_to_linear[i];
++}
++
++/** Linear light -> sRGB 8-bit channel: the nearest table entry. */
++static int vb_srgb_of_linear(float l)
++{
++	int lo = 0, hi = 255;
++	if (l <= 0.0f) return 0;
++	if (l >= 1.0f) return 255;
++	while (hi - lo > 1) {
++		int mid = (lo + hi) / 2;
++		if (vb_srgb_to_linear[mid] <= l) lo = mid; else hi = mid;
++	}
++	return (l - vb_srgb_to_linear[lo] < vb_srgb_to_linear[hi] - l) ?
++			lo : hi;
++}
++
++static float vb_cbrt(float x)
++{
++	float y;
++	int i;
++	bool neg = x < 0.0f;
++	if (neg) x = -x;
++	if (x == 0.0f) return 0.0f;
++	y = x > 1.0f ? x / 3.0f + 0.5f : 0.5f + x / 2.0f;
++	for (i = 0; i < 12; i++)
++		y = y - (y * y * y - x) / (3.0f * y * y);
++	return neg ? -y : y;
++}
++
++/** Colour spaces color-mix() interpolates in. */
++enum vb_space { VB_SRGB, VB_LINEAR, VB_OKLAB };
++
++static void vb_to_space(uint32_t argb, enum vb_space sp, float out[3])
++{
++	float r = ((argb >> 16) & 0xff) / 255.0f;
++	float g = ((argb >> 8) & 0xff) / 255.0f;
++	float b = (argb & 0xff) / 255.0f;
++
++	if (sp == VB_SRGB) {
++		out[0] = r; out[1] = g; out[2] = b;
++		return;
++	}
++	r = vb_linear_of(r); g = vb_linear_of(g); b = vb_linear_of(b);
++	if (sp == VB_LINEAR) {
++		out[0] = r; out[1] = g; out[2] = b;
++		return;
++	}
++	{
++		float l = vb_cbrt(0.4122214708f * r + 0.5363325363f * g +
++				0.0514459929f * b);
++		float m = vb_cbrt(0.2119034982f * r + 0.6806995451f * g +
++				0.1073969566f * b);
++		float s = vb_cbrt(0.0883024619f * r + 0.2817188376f * g +
++				0.6299787005f * b);
++		out[0] = 0.2104542553f * l + 0.7936177850f * m -
++				0.0040720468f * s;
++		out[1] = 1.9779984951f * l - 2.4285922050f * m +
++				0.4505937099f * s;
++		out[2] = 0.0259040371f * l + 0.7827717662f * m -
++				0.8086757660f * s;
++	}
++}
++
++static uint32_t vb_from_space(const float in[3], enum vb_space sp,
++		float alpha)
++{
++	int r, g, b, a;
++
++	if (sp == VB_SRGB) {
++		float c[3];
++		int k;
++		for (k = 0; k < 3; k++)
++			c[k] = in[k] < 0.0f ? 0.0f : (in[k] > 1.0f ? 1.0f : in[k]);
++		r = (int)(c[0] * 255.0f + 0.5f);
++		g = (int)(c[1] * 255.0f + 0.5f);
++		b = (int)(c[2] * 255.0f + 0.5f);
++	} else {
++		float lr = in[0], lg = in[1], lb = in[2];
++		if (sp == VB_OKLAB) {
++			float l = in[0] + 0.3963377774f * in[1] +
++					0.2158037573f * in[2];
++			float m = in[0] - 0.1055613458f * in[1] -
++					0.0638541728f * in[2];
++			float s = in[0] - 0.0894841775f * in[1] -
++					1.2914855480f * in[2];
++			l = l * l * l; m = m * m * m; s = s * s * s;
++			lr = 4.0767416621f * l - 3.3077115913f * m +
++					0.2309699292f * s;
++			lg = -1.2684380046f * l + 2.6097574011f * m -
++					0.3413193965f * s;
++			lb = -0.0041960863f * l - 0.7034186147f * m +
++					1.7076147010f * s;
++		}
++		r = vb_srgb_of_linear(lr);
++		g = vb_srgb_of_linear(lg);
++		b = vb_srgb_of_linear(lb);
++	}
++	a = (int)(alpha * 255.0f + 0.5f);
++	if (a < 0) a = 0;
++	if (a > 255) a = 255;
++	return ((uint32_t)a << 24) | ((uint32_t)r << 16) |
++			((uint32_t)g << 8) | (uint32_t)b;
++}
++
++static bool vb_name_is(lwc_string *s, const char *lit)
++{
++	size_t n = lwc_string_length(s), i;
++	const char *d = lwc_string_data(s);
++	for (i = 0; i < n; i++) {
++		char x = d[i];
++		if (lit[i] == '\0') return false;
++		if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
++		if (x != lit[i]) return false;
++	}
++	return lit[n] == '\0';
++}
++
++/** Read a number or percentage token as a float (percent / 100 when
++ * \a pct_scale is 1). \return false for other tokens. */
++static bool vb_read_number(const css_token *t, float pct_scale, float *out,
++		bool *was_pct)
++{
++	size_t consumed = 0;
++	css_fixed v;
++
++	if (t == NULL || (t->type != CSS_TOKEN_NUMBER &&
++			t->type != CSS_TOKEN_PERCENTAGE))
++		return false;
++	v = css__number_from_lwc_string(t->idata, false, &consumed);
++	if (consumed != lwc_string_length(t->idata))
++		return false;
++	*out = FIXTOFLT(v);
++	if (t->type == CSS_TOKEN_PERCENTAGE)
++		*out = *out / 100.0f * pct_scale;
++	if (was_pct != NULL)
++		*was_pct = (t->type == CSS_TOKEN_PERCENTAGE);
++	return true;
++}
++
++/** A nested colour for color-mix() / "from": a real colour value
++ * (currentColor cannot be resolved while parsing). */
++static bool vb_nested_colour(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, uint32_t *argb)
++{
++	uint16_t value = 0;
++	if (css__parse_colour_specifier(c, vector, ctx, &value, argb) !=
++			CSS_OK)
++		return false;
++	if (value == COLOR_CURRENT_COLOR)
++		return false;
++	if (value == COLOR_TRANSPARENT)
++		*argb = 0;
++	return true;
++}
++
++/** Is the next token (after whitespace) the ident "from"? */
++static bool vb_is_relative(const parserutils_vector *vector, int32_t ctx)
++{
++	const css_token *t;
++	consumeWhitespace(vector, &ctx);
++	t = parserutils_vector_peek(vector, ctx);
++	return t != NULL && t->type == CSS_TOKEN_IDENT &&
++			vb_name_is(t->idata, "from");
++}
++
++/**
++ * rgb(from C r g b [/ A]) and hsl(from C h s l [/ A]), after the
++ * FUNCTION token. Channels: the channel's own keyword keeps it; rgb()
++ * also takes numbers / percentages. Anything else (calc() on channels)
++ * is unsupported and invalid. Alpha: a number, a percentage, "alpha"
++ * (keep) or none (0).
++ */
++static bool vb_parse_relative(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, bool hsl, uint32_t *result)
++{
++	static const char *const names_rgb[3] = { "r", "g", "b" };
++	static const char *const names_hsl[3] = { "h", "s", "l" };
++	const char *const *names = hsl ? names_hsl : names_rgb;
++	const css_token *t;
++	uint32_t base;
++	int ch[3];
++	float alpha;
++	int k;
++
++	consumeWhitespace(vector, ctx);
++	parserutils_vector_iterate(vector, ctx);	/* "from" */
++	consumeWhitespace(vector, ctx);
++	if (!vb_nested_colour(c, vector, ctx, &base))
++		return false;
++	ch[0] = (base >> 16) & 0xff;
++	ch[1] = (base >> 8) & 0xff;
++	ch[2] = base & 0xff;
++	alpha = ((base >> 24) & 0xff) / 255.0f;
++
++	for (k = 0; k < 3; k++) {
++		float v;
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t == NULL)
++			return false;
++		if (t->type == CSS_TOKEN_IDENT && vb_name_is(t->idata, names[k]))
++			continue;
++		if (!hsl && vb_read_number(t, 255.0f, &v, NULL)) {
++			if (v < 0.0f) v = 0.0f;
++			if (v > 255.0f) v = 255.0f;
++			ch[k] = (int)(v + 0.5f);
++			continue;
++		}
++		return false;
++	}
++
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t != NULL && tokenIsChar(t, '/')) {
++		float v;
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t != NULL && t->type == CSS_TOKEN_IDENT &&
++				vb_name_is(t->idata, "alpha")) {
++			/* keep */
++		} else if (t != NULL && t->type == CSS_TOKEN_IDENT &&
++				vb_name_is(t->idata, "none")) {
++			alpha = 0.0f;
++		} else if (vb_read_number(t, 1.0f, &v, NULL)) {
++			alpha = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
++		} else {
++			return false;
++		}
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++	}
++	if (t == NULL || !tokenIsChar(t, ')'))
++		return false;
++
++	*result = ((uint32_t)(int)(alpha * 255.0f + 0.5f) << 24) |
++			((uint32_t)ch[0] << 16) | ((uint32_t)ch[1] << 8) |
++			(uint32_t)ch[2];
++	return true;
++}
++
++/**
++ * color-mix(in SPACE [HUE-METHOD hue], C1 [P1], C2 [P2]), after the
++ * FUNCTION token. Premultiplied interpolation per CSS Color 5. Spaces:
++ * srgb (and hsl/hwb, approximated as srgb), srgb-linear / xyz*, and
++ * oklab (also lab, lch and oklch, approximated as oklab: lch-style hue
++ * arcs are not followed).
++ */
++static bool vb_parse_color_mix(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, uint32_t *result)
++{
++	const css_token *t;
++	enum vb_space sp;
++	uint32_t col[2];
++	float pct[2];
++	bool have_pct[2] = { false, false };
++	float v1[3], v2[3], out[3], a1, a2, p1, p2, sum, alpha, mult = 1.0f;
++	int k;
++
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t == NULL || t->type != CSS_TOKEN_IDENT || !vb_name_is(t->idata, "in"))
++		return false;
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t == NULL || t->type != CSS_TOKEN_IDENT)
++		return false;
++	if (vb_name_is(t->idata, "srgb") || vb_name_is(t->idata, "hsl") ||
++			vb_name_is(t->idata, "hwb"))
++		sp = VB_SRGB;
++	else if (vb_name_is(t->idata, "srgb-linear") ||
++			vb_name_is(t->idata, "xyz") ||
++			vb_name_is(t->idata, "xyz-d65") ||
++			vb_name_is(t->idata, "xyz-d50"))
++		sp = VB_LINEAR;
++	else if (vb_name_is(t->idata, "oklab") || vb_name_is(t->idata, "lab") ||
++			vb_name_is(t->idata, "oklch") ||
++			vb_name_is(t->idata, "lch"))
++		sp = VB_OKLAB;
++	else
++		return false;
++
++	/* optional "<shorter|longer|increasing|decreasing> hue" */
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_peek(vector, *ctx);
++	if (t != NULL && t->type == CSS_TOKEN_IDENT) {
++		parserutils_vector_iterate(vector, ctx);
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t == NULL || t->type != CSS_TOKEN_IDENT ||
++				!vb_name_is(t->idata, "hue"))
++			return false;
++		consumeWhitespace(vector, ctx);
++	}
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t == NULL || !tokenIsChar(t, ','))
++		return false;
++
++	for (k = 0; k < 2; k++) {
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_peek(vector, *ctx);
++		if (t != NULL && t->type == CSS_TOKEN_PERCENTAGE) {
++			if (!vb_read_number(t, 1.0f, &pct[k], NULL))
++				return false;
++			have_pct[k] = true;
++			parserutils_vector_iterate(vector, ctx);
++			consumeWhitespace(vector, ctx);
++		}
++		if (!vb_nested_colour(c, vector, ctx, &col[k]))
++			return false;
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_peek(vector, *ctx);
++		if (!have_pct[k] && t != NULL &&
++				t->type == CSS_TOKEN_PERCENTAGE) {
++			if (!vb_read_number(t, 1.0f, &pct[k], NULL))
++				return false;
++			have_pct[k] = true;
++			parserutils_vector_iterate(vector, ctx);
++			consumeWhitespace(vector, ctx);
++		}
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t == NULL || !tokenIsChar(t, k == 0 ? ',' : ')'))
++			return false;
++	}
++
++	/* Percentages (CSS Color 5, 12.1). */
++	if (!have_pct[0] && !have_pct[1]) {
++		p1 = p2 = 0.5f;
++	} else if (!have_pct[1]) {
++		p1 = pct[0];
++		p2 = 1.0f - p1;
++	} else if (!have_pct[0]) {
++		p2 = pct[1];
++		p1 = 1.0f - p2;
++	} else {
++		p1 = pct[0];
++		p2 = pct[1];
++	}
++	if (p1 < 0.0f || p2 < 0.0f)
++		return false;
++	sum = p1 + p2;
++	if (sum <= 0.0f)
++		return false;
++	if (sum < 1.0f)
++		mult = sum;
++	p1 /= sum;
++	p2 /= sum;
++
++	a1 = ((col[0] >> 24) & 0xff) / 255.0f;
++	a2 = ((col[1] >> 24) & 0xff) / 255.0f;
++	vb_to_space(col[0], sp, v1);
++	vb_to_space(col[1], sp, v2);
++	alpha = a1 * p1 + a2 * p2;
++	if (alpha <= 0.0f) {
++		*result = 0;
++		return true;
++	}
++	for (k = 0; k < 3; k++)
++		out[k] = (v1[k] * a1 * p1 + v2[k] * a2 * p2) / alpha;
++	*result = vb_from_space(out, sp, alpha * mult);
++	return true;
++}
++
++/** oklab(L a b [/ A]), after the FUNCTION token. none = 0. */
++static bool vb_parse_oklab(const parserutils_vector *vector, int32_t *ctx,
++		uint32_t *result)
++{
++	const css_token *t;
++	float v[3], alpha = 1.0f;
++	int k;
++
++	for (k = 0; k < 3; k++) {
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t != NULL && t->type == CSS_TOKEN_IDENT &&
++				vb_name_is(t->idata, "none"))
++			v[k] = 0.0f;
++		else if (!vb_read_number(t, k == 0 ? 1.0f : 0.4f, &v[k], NULL))
++			return false;
++	}
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t != NULL && tokenIsChar(t, '/')) {
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t != NULL && t->type == CSS_TOKEN_IDENT &&
++				vb_name_is(t->idata, "none"))
++			alpha = 0.0f;
++		else if (!vb_read_number(t, 1.0f, &alpha, NULL))
++			return false;
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++	}
++	if (t == NULL || !tokenIsChar(t, ')'))
++		return false;
++	if (alpha < 0.0f) alpha = 0.0f;
++	if (alpha > 1.0f) alpha = 1.0f;
++	*result = vb_from_space(v, VB_OKLAB, alpha);
++	return true;
++}
++
+ /**
+  * Parse a colour specifier
+  *
+@@ -1017,7 +1478,30 @@ css_error css__parse_colour_specifier(css_language *c,
+ 		else
+ 			goto invalid;
+ 	} else if (token->type == CSS_TOKEN_FUNCTION) {
+-		if ((lwc_string_caseless_isequal(
++		bool rgbfn = (lwc_string_caseless_isequal(token->idata,
++				c->strings[RGB], &match) == lwc_error_ok &&
++				match) ||
++			(lwc_string_caseless_isequal(token->idata,
++				c->strings[RGBA], &match) == lwc_error_ok &&
++				match);
++		bool hslfn = (lwc_string_caseless_isequal(token->idata,
++				c->strings[HSL], &match) == lwc_error_ok &&
++				match) ||
++			(lwc_string_caseless_isequal(token->idata,
++				c->strings[HSLA], &match) == lwc_error_ok &&
++				match);
++
++		/* VitaBrowser (patch 98) */
++		if ((rgbfn || hslfn) && vb_is_relative(vector, *ctx)) {
++			if (!vb_parse_relative(c, vector, ctx, hslfn, result))
++				goto invalid;
++		} else if (vb_name_is(token->idata, "color-mix")) {
++			if (!vb_parse_color_mix(c, vector, ctx, result))
++				goto invalid;
++		} else if (vb_name_is(token->idata, "oklab")) {
++			if (!vb_parse_oklab(vector, ctx, result))
++				goto invalid;
++		} else if ((lwc_string_caseless_isequal(
+ 				token->idata, c->strings[RGB],
+ 				&match) == lwc_error_ok && match)) {
+ 			if (!parse_rgb(c, vector, ctx, result)) {
