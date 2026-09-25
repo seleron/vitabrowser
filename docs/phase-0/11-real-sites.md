@@ -944,21 +944,71 @@ range never matched. One conditional: the value token is
 regressed when the fix first tried `value_or_name` unconditionally,
 which is how the two-branch form was caught.
 
-**Known issue: the range-media check flaps.** Four back-to-back
-`run-vita-sim.sh` runs (10, 10b, 10c, 10d) at the same tree give
-`range media 0/1`, `1/0`, `1/0`, `1/1` (expected `1/1`) — three failed
-the `CSS-spacing` gate. Critically, *which* of the two rules drops
-varies from run to run (10b/10c lose the 253 double-range, 10 loses the
-251 name-first), while every other check — including `(min-width: 350px)`
-at 188 px — is stable. So `media->width` is a stable 960; the flake is in
-the `mq_parse_range` path specifically. That is a memory-safety
-signature (use-after-free / OOB read that depends on the launch's heap
-layout), not a CSS-logic bug: a logic bug would drop the *same* rule
-every run. Not chased to a fix this session. Repro harness written
-(parses the three `@media` bodies via `css_parse_media_query`, dumps the
-feature tree, loops) — rebuild `libwapcaplet`, `libparserutils` and
-`libcss` with `-fsanitize=address` and run it in a loop to catch it;
-`ASan` should name the freed/over-read pointer directly.
+### 37. The range-media "flake" was a polluted build tree, not libcss
+
+After 109, four back-to-back `run-vita-sim.sh` runs passed the
+range-media sub-check only 1/4, with a different rule dropping each time.
+That looked like a memory-safety bug in `mq_parse_range`. It was not.
+
+**The parser is clean.** `mq_parse_range` and `mq_populate_value` were
+rebuilt with `-fsanitize=address` (libwapcaplet, libparserutils, libcss
+at -O2, in a scratch prefix). A repro parsed `(width>=350px)`,
+`(width>=961px)`, `(350px <= width <= 960px)` and `(min-width: 350px)`
+20,000 times each. Output was byte-identical every iteration, ASan
+reported nothing, and LeakSanitizer found no leaks. The standalone repro
+links against a minimal copy of the compat helpers (`isDigit`,
+`css_error_from_*`, `lwc_string_caseless_hash_value`); the real ones
+live in `compat/macsurf_frontend_stubs.c`, which libcss expects the
+program to supply.
+
+**The build was not built from the committed stack.** On 2026-09-25 at
+22:05, `tools/apply-patches.sh` was run with its default
+`WORK=<WORK>/vitabrowser-work` (its usage line said so). That patched the
+*pristine* trees in `<WORK>/vitabrowser-work/upstream/` in place: 496 files
+across all six libraries. The damage was indirect:
+- `build-patched.sh` regenerates the stack with `split-patches.py`, which
+  diffs MacSurf against those trees' working files. Against polluted
+  trees it emitted a gutted stack; here, the first rebuild applied 83 and
+  failed 109.
+- Staging copies the same trees. `git checkout -- .` resets tracked
+  files, but the untracked files the patches had created stayed.
+- Commit 5b51365 (patch 109) carried a `MANIFEST.md` with counts from
+  such a regeneration (53380/34755 instead of 53520/34615). The
+  previous session's "193 + the known 1" was another symptom: libhubbub
+  04 was "already applied" because upstream already had it.
+
+So the four flaky runs came from binaries built from an undefined mix of
+sources. Exactly which mix cannot be reconstructed. The polluted
+untracked libcss files turn out identical to the correct patched ones,
+so the damage was in the regenerated stack and staging, not in stale
+libcss files.
+
+**Fix.**
+1. The polluted files are backed up
+   (`<WORK>/vitabrowser-work/upstream-pollution-backup-20260925-2205.tar.gz`),
+   and each tree is reset to its git HEAD (`checkout -- .`,
+   `clean -fd`).
+2. A clean `build-patched.sh` now regenerates the committed stack byte
+   for byte (0 repo changes) and applies 192 + the known 2.
+3. Guards (commit f63c4e2): `apply-patches.sh` defaults to
+   `<WORK>/vitabrowser-work/applytest` and refuses the pristine trees unless
+   `ALLOW_PRISTINE_PATCH=1`. `build-patched.sh` refuses to run unless
+   every pristine tree is exactly its HEAD (tested dirty → exit 1,
+   clean → 0).
+
+**Verified.** Ten back-to-back full `run-vita-sim.sh` runs from the clean
+tree: 10/10 pass. Range media is `1/1` with `width>=961px 0` every time,
+and no other check failed. At the old 1-in-4 pass rate, ten passes in a
+row would happen by chance about once in a million. The sim assertions
+are unchanged.
+
+**Found on the way (not fixed): name-first operator inversion.** For
+`(name op value)`, `mq_parse_range` "inverts" the operator (≥ → <, as
+`parse/mq.h` documents: "< becomes >="). That is logical negation, not
+the mirror (≥ should become ≤). So `(width>=350px)` is stored as
+`350 < width` and fails at exactly 350 px. Off-by-equality only. The
+simulator's 960 px viewport and the test blocks do not hit it. A
+follow-up: mirror the operator, with a test block at the boundary.
 
 **State.** With 109 in, the static claude.ai snapshot's title should
 take the 38px branch on the device (run 18 will show it); the remaining
@@ -967,7 +1017,9 @@ round-9 differences were the title shift and the missing header logo.
 ## Not done: the gaps left
 
 - **Goldens stale:** L2/L3/L4 fail against pre-round-5 goldens;
-  re-baseline `testpages/golden/` after §36 lands.
+  re-baseline `testpages/golden/`.
+- **Name-first media range at equality** (§37): `(width>=350px)` fails at
+  exactly 350 px (operator negated instead of mirrored).
 - **claude.ai/code:**
   - Layout: cards, padding and buttons match Chromium in the simulator
     (round 9); the title's 38px range-media branch is fixed (109, round 10)

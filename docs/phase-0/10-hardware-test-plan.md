@@ -2331,21 +2331,25 @@ Run 17 was never tested on the device, so run 18 covers its checks too
   by ordering (doc 11, round 10).
 
 **Clean checkout:**
-- Applied 193 + the known 1 (libhubbub 04, already applied, skipped).
-- The simulator suite passes (interaction 22/22 at both paces, and the
-  CSS-iswhere, CSS-bigsheet, CSS-shadow, CSS-color and CSS-spacing
-  checks, now including the three range-media blocks). **Caveat:** the
-  range-media sub-check (the 251/253 blocks) flaps — in four back-to-back
-  runs it passed only 1/4 and the *rule that dropped changed per run*,
-  which is a memory-safety signature in `mq_parse_range`, not a CSS-logic
-  bug (doc 11, §36, "Known issue: the range-media check flaps").
-- The Vita cross-build is green.
+- Applied 192 + the known 2, from pristine trees (the earlier "193 + the
+  known 1" came from polluted trees; doc 11, §37). Regeneration
+  reproduces the committed stack exactly.
+- The simulator suite passes 10/10 back to back (interaction 22/22 at
+  both paces; CSS-iswhere, CSS-bigsheet, CSS-shadow, CSS-color and
+  CSS-spacing, including the three range-media blocks). The earlier
+  range-media flapping was the polluted build tree, not libcss (doc 11,
+  §37).
+- The Vita cross-build is green. The reference dumps were regenerated
+  and are identical to the handed-off set (29).
 
 **Hand-off.**
-- SHA256, first 12: `VitaBrowser.vpk` `53b2dd45ffe3`,
-  `VitaBrowser-ext.vpk` `147fef97d56e`, `nsvita.elf` `ab91e45a57a4`.
-- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-25-run18/` (refreshed for
-  patch 109; the 11:27 copies were pre-109).
+- SHA256, first 12: `VitaBrowser.vpk` `2db4d4f033b4`,
+  `VitaBrowser-ext.vpk` `2acd370613bc`, `nsvita.elf` `4c7e7398c58a`,
+  built 2026-09-26 00:27 from clean trees at f63c4e2 (patches up to 109).
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-09-25-run18/`. The
+  `53b2dd45ffe3` build recorded here earlier came from polluted trees.
+  It never reached the hand-off folder and is kept in
+  `polluted-build-53b2dd45ffe3/`.
 - `results\` is empty (no run 17 results arrived), so nothing was moved.
 
 **Run 18 on the device:**
