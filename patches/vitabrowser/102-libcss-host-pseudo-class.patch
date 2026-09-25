@@ -1,0 +1,88 @@
+# libcss: :host, :host() and :host-context() are known (never match)
+#
+# An unknown pseudo-class invalidates the whole selector list, and
+# Tailwind v4 puts its entire theme in "@layer theme{:root,:host{...}}":
+# --spacing (every p-N / m-N / gap-N / h-N utility is
+# calc(var(--spacing) * N)), text sizes, fonts, radii. None of it applied,
+# so claude.ai's cards had no padding and its type scale fell back.
+# There are no shadow roots, so these parse and never match; the function
+# forms skip their argument like :has() (V1). Inside :not() they stay
+# rejected, as a never-matching pseudo-class negated would match
+# everything.
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 28b9db2..fabc21c 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -1397,6 +1397,12 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		{ IS_FN, CSS_SELECTOR_PSEUDO_CLASS },     /* fixes359 (#68) */
+ 		{ WHERE_FN, CSS_SELECTOR_PSEUDO_CLASS },  /* fixes359 (#68) */
+ 		{ HAS_FN, CSS_SELECTOR_PSEUDO_CLASS },    /* fixes361 (#67) */
++		/* VitaBrowser (patch 102): shadow-DOM hosts. There are no shadow
++		 * roots, so these never match; unknown, they invalidated whole
++		 * selector lists -- Tailwind v4 defines its theme (--spacing,
++		 * text sizes, fonts, radii) in ":root,:host{...}". */
++		{ HOST, CSS_SELECTOR_PSEUDO_CLASS },
++		{ HOST_CONTEXT, CSS_SELECTOR_PSEUDO_CLASS },
+ 
+ 		{ FIRST_LINE, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ FIRST_LETTER, CSS_SELECTOR_PSEUDO_ELEMENT },
+@@ -1483,7 +1489,11 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 	 * before this round these selectors errored the rule anyway. */
+ 	if (in_not && (pseudo_lut[lut_idx].index == IS_FN ||
+ 			pseudo_lut[lut_idx].index == WHERE_FN ||
+-			pseudo_lut[lut_idx].index == HAS_FN))
++			pseudo_lut[lut_idx].index == HAS_FN ||
++			/* VitaBrowser (patch 102): never-matching, so :not()
++			 * of them would match everything; keep rejecting. */
++			pseudo_lut[lut_idx].index == HOST ||
++			pseudo_lut[lut_idx].index == HOST_CONTEXT))
+ 		return CSS_INVALID;
+ 
+ 	if (token->type == CSS_TOKEN_FUNCTION) {
+@@ -1535,7 +1545,8 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 			if (error != CSS_OK)
+ 				css__stylesheet_sellist_destroy(c->sheet, list);
+ 			return error;
+-		} else if (fun_type == HAS_FN) {
++		} else if (fun_type == HAS_FN || fun_type == HOST ||
++				fun_type == HOST_CONTEXT) {
+ 			/* fixes359 (#68) / fixes361 (#67) V1: consume tokens
+ 			 * up to the closing `)` and discard them. The
+ 			 * selector itself parses as a known pseudo-class so
+@@ -1559,9 +1570,7 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 			/* Already consumed the matching ')'; tag this
+ 			 * selector with the function-name keyword so the
+ 			 * matcher can recognise it and short-circuit. */
+-			qname.name = c->strings[
+-					fun_type == IS_FN ? IS_FN :
+-					fun_type == WHERE_FN ? WHERE_FN : HAS_FN];
++			qname.name = c->strings[fun_type];
+ 			return css__stylesheet_selector_detail_init(c->sheet,
+ 					CSS_SELECTOR_PSEUDO_CLASS, &qname,
+ 					detail_value, value_type,
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 7809a18..3cdfab6 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -571,6 +571,8 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("placeholder"),
+ 	SMAP("file-selector-button"),
+ 	SMAP("backdrop"),	/* VitaBrowser: never matches */
++	SMAP("host"),		/* VitaBrowser: never matches */
++	SMAP("host-context"),	/* VitaBrowser: never matches */
+ 	SMAP("is"),
+ 	SMAP("where"),
+ 	SMAP("has"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 655a3c1..7b79b5b 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -164,7 +164,7 @@ enum {
+ 	SLICE, CLONE,
+ 	SMOOTH, HIGH_QUALITY, CRISP_EDGES, PIXELATED,
+ 	WAVY, FROM_FONT,
+-	MARKER, PLACEHOLDER, FILE_SELECTOR_BUTTON, BACKDROP,
++	MARKER, PLACEHOLDER, FILE_SELECTOR_BUTTON, BACKDROP, HOST, HOST_CONTEXT,
+ 	IS_FN, WHERE_FN, HAS_FN,
+ 	START, END,
+ 	MANUAL, INTER_WORD, INTER_CHARACTER, LAST, FORCE_END, ALLOW_END,

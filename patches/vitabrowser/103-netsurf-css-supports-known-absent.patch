@@ -1,0 +1,210 @@
+# netsurf: CSS rewrite -- @supports blocks for features we certainly lack
+#
+# The at-rule pass keeps every @supports block unless its condition starts
+# with "not": most features cannot be tested, and Tailwind's @property
+# fallback depends on being kept (its condition is a Safari/Firefox sniff
+# this browser would "fail"). claude.ai also ships
+#   @supports (font:-apple-system-body) and (-webkit-touch-callout:default)
+#   {:root{font:-apple-system-body;--cds-rem-scale:calc(16 / 17);...}}
+# for iOS; applied here, it shrank every rem-scaled size by 6% (40px
+# buttons drew 37px, 14px text 13px).
+#
+# The condition is now evaluated three-valued: a (prop: value) feature is
+# FALSE when it names something known to be absent (-webkit-touch-callout,
+# -apple-system* font keywords), otherwise UNKNOWN; and / or / not
+# combine. A definitely FALSE condition drops the block, a definitely TRUE
+# one keeps it, UNKNOWN keeps the old decision. On claude.ai's 1.4 MB sheet
+# the only change is that block.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+index 5ec00a6..9438973 100644
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -4204,6 +4204,170 @@ macsurf__rewrite_logical_shorthands(const char *data, size_t in_size,
+ }
+ 
+ 
++/* VitaBrowser (patch 103): three-valued @supports evaluation.
++ *
++ * The at-rule pass keeps an @supports block unless its condition starts
++ * with "not" -- we cannot test most features, and Tailwind's @property
++ * fallback relies on being kept. But a few features are certainly absent
++ * here, and blocks that require them were applied anyway: claude.ai's
++ * "@supports (font:-apple-system-body) and (-webkit-touch-callout:default)
++ * {:root{--cds-rem-scale:calc(16 / 17)}}" (iOS) shrank every rem-scaled
++ * size on the page by 6%.
++ *
++ * Each (property: value) feature is FALSE when it names something known
++ * to be missing, otherwise UNKNOWN; and / or / not combine three-valued.
++ * Only a definitely FALSE condition drops the block (and a definitely TRUE
++ * one keeps it); UNKNOWN leaves the old decision in place. */
++#define SV_FALSE 0
++#define SV_TRUE 1
++#define SV_UNKNOWN (-1)
++
++static int sv_and(int a, int b)
++{
++	if (a == SV_FALSE || b == SV_FALSE) return SV_FALSE;
++	if (a == SV_TRUE && b == SV_TRUE) return SV_TRUE;
++	return SV_UNKNOWN;
++}
++
++static int sv_or(int a, int b)
++{
++	if (a == SV_TRUE || b == SV_TRUE) return SV_TRUE;
++	if (a == SV_FALSE && b == SV_FALSE) return SV_FALSE;
++	return SV_UNKNOWN;
++}
++
++static int sv_not(int a)
++{
++	return a == SV_UNKNOWN ? SV_UNKNOWN : !a;
++}
++
++static void sv_ws(const char **p, const char *e)
++{
++	while (*p < e && (**p == ' ' || **p == '\t' || **p == '\n' ||
++			**p == '\r'))
++		(*p)++;
++}
++
++static bool sv_word(const char **p, const char *e, const char *w)
++{
++	size_t n = strlen(w);
++	if ((size_t)(e - *p) < n || strncasecmp(*p, w, n) != 0)
++		return false;
++	if (*p + n < e && ((*p)[n] != ' ' && (*p)[n] != '\t' &&
++			(*p)[n] != '\n' && (*p)[n] != '\r' && (*p)[n] != '('))
++		return false;
++	*p += n;
++	return true;
++}
++
++/* One "prop: value" feature. */
++static int sv_decl(const char *s, const char *e)
++{
++	static const char *const absent_props[] = {
++		"-webkit-touch-callout",	/* iOS only */
++		NULL
++	};
++	const char *colon = memchr(s, ':', (size_t)(e - s));
++	const char *pe;
++	int k;
++
++	if (colon == NULL)
++		return SV_UNKNOWN;
++	while (s < colon && (*s == ' ' || *s == '\t')) s++;
++	pe = colon;
++	while (pe > s && (pe[-1] == ' ' || pe[-1] == '\t')) pe--;
++	for (k = 0; absent_props[k] != NULL; k++) {
++		size_t n = strlen(absent_props[k]);
++		if ((size_t)(pe - s) == n &&
++				strncasecmp(s, absent_props[k], n) == 0)
++			return SV_FALSE;
++	}
++	/* Apple system font keywords (font: -apple-system-body ...) */
++	{
++		const char *v;
++		for (v = colon + 1; v + 13 <= e; v++)
++			if (strncasecmp(v, "-apple-system", 13) == 0)
++				return SV_FALSE;
++	}
++	return SV_UNKNOWN;
++}
++
++static int sv_cond(const char **p, const char *e, int depth);
++
++/* The ')' matching the '(' at s, or NULL. */
++static const char *sv_close(const char *s, const char *e)
++{
++	int paren = 0;
++	for (; s < e; s++) {
++		if (*s == '(') paren++;
++		else if (*s == ')' && --paren == 0) return s;
++	}
++	return NULL;
++}
++
++/* "(" condition-or-feature ")", or a function such as selector(...). */
++static int sv_term(const char **p, const char *e, int depth)
++{
++	const char *q, *in, *t;
++	bool colon_top = false;
++	int d = 0;
++
++	sv_ws(p, e);
++	if (*p >= e)
++		return SV_UNKNOWN;
++	if (**p != '(') {
++		/* a function (selector(...), font-tech(...)): unknown */
++		while (*p < e && **p != '(')
++			(*p)++;
++		q = (*p < e) ? sv_close(*p, e) : NULL;
++		*p = q ? q + 1 : e;
++		return SV_UNKNOWN;
++	}
++	q = sv_close(*p, e);
++	if (q == NULL) {
++		*p = e;
++		return SV_UNKNOWN;
++	}
++	in = *p + 1;
++	*p = q + 1;
++
++	t = in;
++	sv_ws(&t, q);
++	if (t < q && (*t == '(' || strncasecmp(t, "not", 3) == 0)) {
++		if (depth >= 16)
++			return SV_UNKNOWN;
++		return sv_cond(&t, q, depth + 1);
++	}
++	for (t = in; t < q; t++) {
++		if (*t == '(') d++;
++		else if (*t == ')') d--;
++		else if (*t == ':' && d == 0) colon_top = true;
++	}
++	return colon_top ? sv_decl(in, q) : SV_UNKNOWN;
++}
++
++static int sv_cond(const char **p, const char *e, int depth)
++{
++	int v;
++
++	sv_ws(p, e);
++	if (sv_word(p, e, "not"))
++		return sv_not(sv_term(p, e, depth));
++	v = sv_term(p, e, depth);
++	for (;;) {
++		sv_ws(p, e);
++		if (*p >= e)
++			break;
++		if (sv_word(p, e, "and"))
++			v = sv_and(v, sv_term(p, e, depth));
++		else if (sv_word(p, e, "or"))
++			v = sv_or(v, sv_term(p, e, depth));
++		else
++			return SV_UNKNOWN;
++	}
++	return v;
++}
++
+ /* fixes273 (Bundle I) - at-rule preprocessor for @supports and @layer.
+  *
+  * libcss in this vintage doesn't parse @supports or @layer rules
+@@ -4454,7 +4618,16 @@ macsurf__rewrite_at_rules_impl(const char *data, size_t in_size,
+ 
+ 			/* Decide whether to keep the inner block. */
+ 			if (is_supports) {
+-				keep_inner = !has_not;
++				/* patch 103: a definitely false condition
++				 * drops the block; otherwise as before. */
++				const char *cp = data + i + name_len;
++				int sv = sv_cond(&cp, data + brace_open, 0);
++				if (sv == SV_FALSE)
++					keep_inner = false;
++				else if (sv == SV_TRUE)
++					keep_inner = true;
++				else
++					keep_inner = !has_not;
+ 			} else {
+ 				keep_inner = true;   /* @layer always flattens */
+ 			}
