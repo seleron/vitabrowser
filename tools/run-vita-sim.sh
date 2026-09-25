@@ -166,6 +166,7 @@ CSS-ovf file:///app0:/testpages/CSS-overflow-viewport.html
 CSS-space file:///app0:/testpages/CSS-inline-space.html
 IMG-svg file:///app0:/testpages/IMG-svg.html
 CSS-mask file:///app0:/testpages/CSS-mask-icon.html
+CSS-bgsizepct file:///app0:/testpages/CSS-background-size-pct.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
@@ -372,6 +373,22 @@ mk=$(ls "$R"/*-CSS-mask.plot 2>/dev/null | head -1)
 nblk=$(awk '/^PLOT RECT/ { if ($8 - $4 == 24 && $10 - $6 == 24) n++ } END { print n + 0 }' "$mk" 2>/dev/null)
 echo "  CSS-mask: $nblk solid 24x24 blocks (2 expected: the unmasked spans)"
 [ "$nblk" = 2 ] || fail "mask-image icons"
+# background-size percentages (patches 89, 90): each of the five 300x200 boxes
+# with the 100x50 image draws its background at the sized tile; the
+# no-repeat boxes each emit one PLOT BITMAP of exactly that size.
+bp=$(ls "$R"/*-CSS-bgsizepct.plot 2>/dev/null | head -1)
+nb1=$(grep -c "^PLOT BITMAP X .* Y .* WIDTH 300 HEIGHT 200$" "$bp" 2>/dev/null || true)
+nb2=$(grep -c "^PLOT BITMAP X .* Y .* WIDTH 150 HEIGHT 100$" "$bp" 2>/dev/null || true)
+nb3=$(grep -c "^PLOT BITMAP X .* Y .* WIDTH 450 HEIGHT 225$" "$bp" 2>/dev/null || true)
+nb4=$(grep -c "^PLOT BITMAP X .* Y .* WIDTH 99 HEIGHT 50$" "$bp" 2>/dev/null || true)
+echo "  CSS-bgsizepct: 100%=$nb1 50%=$nb2 150%=$nb3 33%x25%=$nb4 (1 each expected)"
+[ "${nb1:-0}" = 1 ] && [ "${nb2:-0}" = 1 ] && [ "${nb3:-0}" = 1 ] && [ "${nb4:-0}" = 1 ] || fail "background-size percentages"
+# The 320x200 gradient box at 50% 50% tiles: its stripes are 160 wide in two
+# columns, and none spans the whole 320 (an untiled gradient would).
+g160=$(awk '/^PLOT RECT/ && $8 - $4 == 160 && $10 - $6 < 20 { print $4 }' "$bp" 2>/dev/null | sort -u | wc -l)
+g320=$(awk '/^PLOT RECT/ && $8 - $4 == 320 && $10 - $6 > 1 && $10 - $6 < 20 { n++ } END { print n + 0 }' "$bp" 2>/dev/null)
+echo "  CSS-bgsizepct gradient: $g160 tile columns of 160, $g320 full-width stripes (2, 0 expected)"
+[ "$g160" = 2 ] && [ "$g320" = 0 ] || fail "background-size percentage gradient"
 # No horizontal overflow (patches 64, 65): an unbreakable URL in break-word
 # text, and a min-width button in Minerva's header arrangement.
 xw=$(sed -n 's/.*page CSS-overflow-x settled: .*extent \([0-9]*\)x.*/\1/p' "$R/log.txt" | head -1)
