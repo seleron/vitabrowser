@@ -1,0 +1,124 @@
+# netsurf: resolve background-size percentages against the box
+# Generated 2026-09-24 (Hermes fill-in, patch 84)
+#
+# Companion to the libcss half (same patch number): the three
+# background-size readers in redraw.c only understood the codes
+# 0 (auto), >0 (px), -1 (cover), -2 (contain), so the percent codes
+# the parser now emits (<= -3) would have drawn at the image's
+# natural size. Each reader resolves wc/hc <= -3 as a percentage of
+# the positioning area (a percent on one axis only keeps the image's
+# aspect on the other), per CSS 2.1/Backgrounds spec.
+# See docs/phase-0/11-real-sites.md.
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 2c61bb5..67c3e89 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -381,8 +381,21 @@ static nserror html_redraw_paint_gradient_tiled(
+ 	wc = (int16_t)((bgsz >> 16) & 0xFFFF);
+ 	hc = (int16_t)(bgsz & 0xFFFF);
+ 
+-	/* cover / contain don't tile (they scale to fit). */
+-	if (wc < 0 || hc < 0) {
++	/* cover / contain don't tile (they scale to fit). Percentages
++	 * (patch 84, wc/hc <= -3) tile at the percent of the box. */
++	if (wc <= -3 || hc <= -3) {
++		int pw = r->x1 - r->x0;
++		int ph = r->y1 - r->y0;
++		if (wc <= -3)
++			pw = (int)(((float)pw * (float)(-wc)) / 100.f);
++		if (hc <= -3)
++			ph = (int)(((float)ph * (float)(-hc)) / 100.f);
++		if (pw < 1) pw = 1;
++		if (ph < 1) ph = 1;
++		tile_w = pw;
++		tile_h = ph;
++		goto bgsz_tiling;
++	} else if (wc < 0 || hc < 0) {
+ 		#ifdef __MACOS9__
+ 		macos9_set_gradient_blend(blend_mode, blend_backdrop);
+ 		#endif
+@@ -406,6 +419,7 @@ static nserror html_redraw_paint_gradient_tiled(
+ 		return ctx->plot->rectangle(ctx, &draw_style, r);
+ 	}
+ 
++bgsz_tiling:
+ 	box_w = r->x1 - r->x0;
+ 	box_h = r->y1 - r->y0;
+ 	if (box_w <= 0 || box_h <= 0) {
+@@ -1496,20 +1510,34 @@ static void html_redraw_bg_tile_size(const css_computed_style *style,
+ 			*tile_h = (nat_h * area_w) / nat_w;
+ 		}
+ 	} else {
+-		/* per-axis explicit, or auto preserving aspect from the other */
+-		if (wc > 0) {
++		/* per-axis explicit (px, positive) or percentage (negative,
++		 * patch 84), or auto preserving aspect from the other. */
++		if (wc < -2) {
++			/* percentage of the positioning area */
++			*tile_w = (int)(((float)area_w *
++					(float)(-wc)) / 100.f);
++		} else if (wc > 0) {
+ 			*tile_w = (int)((float)wc * scale);
++		} else if (hc < -2) {
++			*tile_w = (int)((float)nat_w / (float)nat_h *
++					(float)area_h * (float)(-hc) / 100.f);
+ 		} else if (hc > 0) {
+ 			*tile_w = (int)((float)hc * (float)nat_w /
+-					(float)nat_h * scale);
++				(float)nat_h * scale);
+ 		} else {
+ 			*tile_w = (int)ceilf((float)nat_w * scale);
+ 		}
+-		if (hc > 0) {
++		if (hc < -2) {
++			*tile_h = (int)(((float)area_h *
++					(float)(-hc)) / 100.f);
++		} else if (hc > 0) {
+ 			*tile_h = (int)((float)hc * scale);
++		} else if (wc < -2) {
++			*tile_h = (int)((float)nat_h / (float)nat_w *
++					(float)area_w * (float)(-wc) / 100.f);
+ 		} else if (wc > 0) {
+ 			*tile_h = (int)((float)wc * (float)nat_h /
+-					(float)nat_w * scale);
++				(float)nat_w * scale);
+ 		} else {
+ 			*tile_h = (int)ceilf((float)nat_h * scale);
+ 		}
+@@ -2913,6 +2941,36 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 							tile_h = (nat_h *
+ 								box_w) / nat_w;
+ 						}
++					} else if (wc <= -3 || hc <= -3) {
++						/* percentage of the box (patch 84); a percent on
++						 * one axis only keeps the image's aspect on the
++						 * other. */
++						if (wc <= -3) {
++							tile_w = (int)(
++								(float)box_w *
++								(float)(-wc) / 100.f);
++						} else if (hc <= -3) {
++							tile_w = (int)(
++								(float)nat_w /
++								(float)nat_h *
++								(float)box_h *
++								(float)(-hc) / 100.f);
++						} else {
++							tile_w = nat_w;
++						}
++						if (hc <= -3) {
++							tile_h = (int)(
++								(float)box_h *
++								(float)(-hc) / 100.f);
++						} else if (wc <= -3) {
++							tile_h = (int)(
++								(float)nat_h /
++								(float)nat_w *
++								(float)box_w *
++								(float)(-wc) / 100.f);
++						} else {
++							tile_h = nat_h;
++						}
+ 					} else {
+ 						/* per-axis explicit or auto */
+ 						if (wc > 0) {
