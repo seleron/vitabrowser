@@ -1,0 +1,215 @@
+# libcss: background-size now parses <percentage> axes
+# Generated 2026-09-25 (Hermes, while Claude was rate-limited)
+#
+# Run 16 (doc 10/11): claude.ai's button fills are background-image
+# gradients sized with 'background-size: 100% 100%' (GitHub dark theme
+# buttons). The V1 parser (patch 59) only accepted <length> px values,
+# so percentage axes silently fell back to 'auto' (intrinsic size) and
+# the fills rendered empty.
+#
+# Storage (unchanged 2-byte per axis in the int32 scalar):
+#   0       auto
+#   -1      cover
+#   -2      contain
+#   1..32767  px
+#   -1100..-1000  percentage P = -code - 1000 (0..31000)
+# The offset keeps percentage codes clear of all existing ranges; the
+# consumer test is code < -300.
+#
+# bg_size__axis() is the new single-axis helper: length (px, other units
+# fall back to auto as V1) or percentage. V1 px handling is preserved
+# byte-for-byte; existing bytecode stays valid.
+--- /tmp/bgsize-pre2/p_background_size.c	2026-09-25 00:53:44.370274151 +0100
++++ libcss/src/parse/properties/p_background_size.c	2026-09-25 02:46:00.022931700 +0100
+@@ -16,11 +16,14 @@
+  *   background-size: auto <length>         -> (0, px)
+  *
+  * Deferred (V2):
+- *   <percentage>                            -- needs a second 16-bit
+- *                                              tag bit; bias-pack would
+- *                                              push values out of int16.
+  *   comma-separated multi-background lists  -- only the first is kept.
+  *
++ * Percentages (VitaBrowser V2): a per-axis code in -1100..-1000 means the
++ * percentage P = -code - 1000 (0..31000), resolved by the CONSUMER against
++ * the box -- libcss does not own the layout size. The offset keeps percent
++ * codes out of the px (1..32767), auto (0), cover (-1) and contain (-2)
++ * ranges. Consumer test: code < -300.
++ *
+  * Storage in css_computed_style_i.background_size (int32_t scalar,
+  * self-aligning to avoid the fixes151b padding trap):
+  *   bits 31..16: w_code (int16 sign-extended)
+@@ -29,6 +32,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "bytecode/bytecode.h"
+@@ -52,6 +56,65 @@
+ 	return 0;
+ }
+ 
++/* VitaBrowser V2: parse ONE axis after auto/cover/contain have been
++ * excluded. Returns 1 and sets *code (px length, auto, or a percentage
++ * -1100..-1000); returns 0 when the token is neither a length nor a
++ * percentage (caller returns INVALID, which rejects the declaration --
++ * the correct cascade behaviour for an invalid value).
++ *
++ * Units:
++ *   <length>      px in V2 (other units fall back to auto, as V1 did);
++ *   <percentage>  stored as code -(1000+P) (P 0..31000), resolved by the
++ *                 consumer against the box -- libcss does not own the
++ *                 layout size.
++ */
++static int bg_size__axis(css_language *c, const css_token *t, int16_t *code)
++{
++	if (t->type == CSS_TOKEN_PERCENTAGE) {
++		int p;
++		if (t->idata == NULL)
++			return 0;
++		p = (int)atof(lwc_string_data(t->idata));
++		if (p < 0) p = 0;
++		if (p > 31000) p = 31000;
++		*code = (int16_t)(-(1000 + p));
++		return 1;
++	}
++	if (t->type == CSS_TOKEN_DIMENSION || t->type == CSS_TOKEN_NUMBER) {
++		css_fixed length = 0;
++		uint32_t unit = UNIT_PX;
++		size_t consumed = 0;
++		css_error error;
++		if (t->idata == NULL)
++			return 0;
++		length = css__number_from_lwc_string(t->idata, false, &consumed);
++		if (t->type == CSS_TOKEN_DIMENSION) {
++			const char *u = lwc_string_data(t->idata) + consumed;
++			size_t ulen = lwc_string_length(t->idata) - consumed;
++			error = css__parse_unit_keyword(u, ulen, &unit);
++			if (error != CSS_OK)
++				return 0;
++		} else {
++			/* Bare number: treat as px when 0, else invalid. */
++			if (length != 0)
++				return 0;
++			unit = UNIT_PX;
++		}
++		/* V2: only PX is resolved here; other length units fall back to
++		 * auto (as V1 did) so the rest of the cascade still applies. */
++		if (unit == UNIT_PX) {
++			int32_t px = FIXTOINT(length);
++			if (px < 1) px = 1;
++			if (px > 32767) px = 32767;
++			*code = (int16_t)px;
++		} else {
++			*code = BG_SIZE_AUTO;
++		}
++		return 1;
++	}
++	return 0;
++}
++
+ css_error css__parse_background_size(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result)
+@@ -98,45 +161,20 @@
+ 		w_code = BG_SIZE_AUTO;
+ 		got_w = 1;
+ 		parserutils_vector_iterate(vector, ctx);
+-	} else if (token->type == CSS_TOKEN_DIMENSION ||
+-			token->type == CSS_TOKEN_NUMBER) {
+-		css_fixed length = 0;
+-		uint32_t unit = UNIT_PX;
+-		size_t consumed = 0;
+-		if (token->idata == NULL) { *ctx = orig_ctx; return CSS_INVALID; }
+-		length = css__number_from_lwc_string(token->idata, false,
+-				&consumed);
+-		if (token->type == CSS_TOKEN_DIMENSION) {
+-			const char *u = lwc_string_data(token->idata) + consumed;
+-			size_t ulen = lwc_string_length(token->idata) - consumed;
+-			error = css__parse_unit_keyword(u, ulen, &unit);
+-			if (error != CSS_OK) { *ctx = orig_ctx; return error; }
+-		} else {
+-			/* Bare number: treat as px when 0, else invalid. */
+-			if (length != 0) { *ctx = orig_ctx; return CSS_INVALID; }
+-			unit = UNIT_PX;
+-		}
+-		/* Only PX accepted in V1; other units fall back to auto so
+-		 * the rest of the cascade still applies.
+-		 * VitaBrowser: css__parse_unit_keyword gives the BYTECODE unit
+-		 * (UNIT_PX = 0x100 in this libcss), not the public CSS_UNIT_PX
+-		 * (0) this compared with -- written against an older libcss
+-		 * where the two coincided -- so every length read as auto and
+-		 * background-size never applied (docs/phase-0/11). */
+-		if (unit == UNIT_PX) {
+-			int32_t px = FIXTOINT(length);
+-			if (px < 1) px = 1;
+-			if (px > 32767) px = 32767;
+-			w_code = (int16_t)px;
+-		} else {
+-			w_code = BG_SIZE_AUTO;
+-		}
+-		got_w = 1;
+-		parserutils_vector_iterate(vector, ctx);
+ 	} else {
++		int16_t acode;
++		/* VitaBrowser V2: length (px) or percentage; auto stays auto.
++		 * The V1 BYTECODE-unit note (docs/phase-0/11) is preserved in
++		 * bg_size__axis -- UNIT_PX there is the 0x100 bytecode unit. */
++		if (bg_size__axis(c, token, &acode)) {
++			w_code = acode;
++			got_w = 1;
++			parserutils_vector_iterate(vector, ctx);
++		} else {
+ 		*ctx = orig_ctx;
+ 		return CSS_INVALID;
+ 	}
++	}
+ 
+ 	consumeWhitespace(vector, ctx);
+ 
+@@ -146,35 +184,15 @@
+ 			h_code = BG_SIZE_AUTO;
+ 			got_h = 1;
+ 			parserutils_vector_iterate(vector, ctx);
+-		} else if (token->type == CSS_TOKEN_DIMENSION ||
+-				token->type == CSS_TOKEN_NUMBER) {
+-			css_fixed length = 0;
+-			uint32_t unit = UNIT_PX;
+-			size_t consumed = 0;
+-			length = css__number_from_lwc_string(token->idata,
+-					false, &consumed);
+-			if (token->type == CSS_TOKEN_DIMENSION) {
+-				const char *u =
+-					lwc_string_data(token->idata) +
+-					consumed;
+-				size_t ulen = lwc_string_length(token->idata) -
+-					consumed;
+-				error = css__parse_unit_keyword(u, ulen, &unit);
+-				if (error == CSS_OK && unit == UNIT_PX) {
+-					int32_t px = FIXTOINT(length);
+-					if (px < 1) px = 1;
+-					if (px > 32767) px = 32767;
+-					h_code = (int16_t)px;
+-				} else {
+-					h_code = BG_SIZE_AUTO;
+-				}
+-			} else if (length == 0) {
+-				h_code = BG_SIZE_AUTO;
+-			} else {
+-				h_code = BG_SIZE_AUTO;
++		} else {
++			int16_t acode;
++			/* VitaBrowser V2: length (px) or percentage on the height
++			 * axis too (bg_size__axis). */
++			if (bg_size__axis(c, token, &acode)) {
++				h_code = acode;
++				got_h = 1;
++				parserutils_vector_iterate(vector, ctx);
+ 			}
+-			got_h = 1;
+-			parserutils_vector_iterate(vector, ctx);
+ 		}
+ 	}
+ 
