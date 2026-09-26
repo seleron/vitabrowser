@@ -1,0 +1,131 @@
+# netsurf: script-inserted scripts are async and fire load / error; flex ignores abspos children
+#
+# - A <script> that SCRIPT inserted while the document was still parsing was
+#   run as a parser-blocking sync script, and the sync path fires neither
+#   load nor error; element-recording for load events also required
+#   parse_completed. Loaders that insert scripts during parsing -- Google's
+#   module loader, YouTube's, webpack chunks -- waited forever. dom_event.c
+#   now flags its call (html_script_js_inserted) and such scripts are async
+#   (HTML: script-inserted scripts are never parser-blocking), and every
+#   external script's element is recorded, so load fires after it runs and
+#   error when it fails. YouTube gets past its loading skeleton.
+# - flex: an absolutely positioned child is not a flex item (Flexbox 4.1),
+#   but its size was subtracted from the free space: two abspos underline
+#   bars (width: 100%) beside Google's sign-in field wrapper left its
+#   flex-grow nothing -- a 30 px input nobody could tap. Frozen at its own
+#   size and left out of the initial and remaining free space.
+#
+# Test page JS-scriptload.html: 4/4 in tools/run-vita-sim.sh (onload,
+# addEventListener load, onerror for a missing file, async = false); with
+# the async rule disarmed it reports 0/4.
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index 2dc7d489e..034b82807 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -325,7 +325,9 @@ dom_SCRIPT_showed_up(html_content *htmlc, dom_html_script_element *script)
+ 	}
+ 
+ 	macsurf_debug_log_writef("WORK scr showed_up RUN flags=%d", (int)flags);
++	html_script_js_inserted = true;
+ 	res = html_process_script(htmlc, (dom_node *) script);
++	html_script_js_inserted = false;
+ 	if (res == DOM_HUBBUB_OK) {
+ 		macsurf_debug_log_writef("WORK scr showed_up DONE sync");
+ 	} else if (res == (DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED)) {
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 171a48cfb..2d922a589 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -1064,7 +1064,9 @@ static inline int layout_flex__remaining_free_main(
+ 	for (i = line->first; i < item_count; i++) {
+ 		struct flex_item_data *item = &ctx->item.data[i];
+ 
+-		if (item->freeze) {
++		if (lh__box_is_flex_out_of_flow(item->box)) {
++			continue;	/* not a flex item */
++		} else if (item->freeze) {
+ 			remaining_free_main -= item->target_main_size;
+ 		} else {
+ 			remaining_free_main -= item->base_size;
+@@ -1381,6 +1383,17 @@ static bool layout_flex__resolve_line(
+ 	for (i = line->first; i < item_count; i++) {
+ 		struct flex_item_data *item = &ctx->item.data[i];
+ 
++		/* VitaBrowser: an absolutely positioned child is not a flex
++		 * item (CSS Flexbox 4.1): frozen at its own size and left out
++		 * of the free space. It took all of it: Google's sign-in field
++		 * has two abspos underline bars (width: 100%) beside the input
++		 * wrapper, whose flex-grow then got nothing -- a 30 px input. */
++		if (lh__box_is_flex_out_of_flow(item->box)) {
++			item->target_main_size = item->main_size;
++			layout_flex__item_freeze(line, item);
++			continue;
++		}
++
+ 		/* 3. Size inflexible items */
+ 		if (grow) {
+ 			if (item->grow == 0 ||
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 88bdda948..cd127303a 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -359,6 +359,10 @@ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+ 
+ 
+ /* in html/forms.c */
++/** VitaBrowser: set while dom_event.c hands a script that SCRIPT inserted
++ * to html_process_script (not parser-inserted: it runs async). */
++extern bool html_script_js_inserted;
++
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+ 
+ /**
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index d44be57e4..5f456db43 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -1035,8 +1035,13 @@ exec_src_script(html_content *c,
+ 		return DOM_HUBBUB_OK; /* dom error */
+ 	}
+ 
+-	if (c->parse_completed) {
+-		/* After parse completed, all scripts are essentially async */
++	if (c->parse_completed || html_script_js_inserted) {
++		/* After parse completed, all scripts are essentially async.
++		 * VitaBrowser: so is one a SCRIPT inserted (dom_event.c) while
++		 * the document was still parsing: script-inserted scripts never
++		 * block the parser (HTML "parser-inserted" flag). Run as sync,
++		 * it got no load / error event (convert_script_sync_cb fires
++		 * none), so loaders waiting on them hung. */
+ 		async = true;
+ 		defer = false;
+ 	}
+@@ -1080,10 +1085,14 @@ exec_src_script(html_content *c,
+ 	 * JS-INSERTED script: a parser-inserted one has no JS waiting on its
+ 	 * onload, and skipping those keeps a ref off every <script> on every page.
+ 	 * Owned ref; released in html_script_free. */
+-	if (c->parse_completed) {
+-		nscript->node = node;
+-		dom_node_ref(node);
+-	}
++	/* VitaBrowser: every external script, not only those inserted after
++	 * parsing finished. A loader that inserts <script> elements while the
++	 * document is still parsing -- Google's module loader (Wiz: sign-in's
++	 * Next button, YouTube's buttons), webpack chunks -- waited forever
++	 * for a load / error event that never came ("Failed to retrieve
++	 * dependencies of service"). */
++	nscript->node = node;
++	dom_node_ref(node);
+ 
+ 	/* set up child fetch encoding and quirks */
+ 	child.charset = c->encoding;
+@@ -1275,6 +1284,9 @@ void html_script_tag_census_report(void)
+  *
+  *
+  */
++/* exported interface documented in html/private.h */
++bool html_script_js_inserted;
++
+ dom_hubbub_error
+ html_process_script(void *ctx, dom_node *node)
+ {

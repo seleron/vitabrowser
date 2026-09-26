@@ -2434,3 +2434,32 @@ postMessage); email sign-in needs hCaptcha (iframes); YouTube's app stalls
 before requesting its feed (/youtubei) and its buttons' command service
 rejects silently; BBC story grid collapses; Stack Overflow/Reddit block the
 client (Cloudflare challenge / fingerprint).
+
+
+## Run 19 — results (2026-09-26 14:31 and 14:36, PCH-2000)
+
+- Autotest: 28/29 dumps SAME (PM-animation varies), interact 22/22.
+- **The UID fix holds:** no DNS lookup failed in either session;
+  `bitmaps: 88 live, 4136 KB in 1 arenas, 0 refused` (one memblock for
+  all images, where run 18 used one per image).
+- Second session: claude.ai browsing, one screenshot; no crash.
+
+## Run 20 — hand-off: popups, script load events (patches 125–128)
+
+- 125/127: window.open opens a real window over the page (L with no
+  history, or the page, closes it); 126: iframes talk to their parent
+  through postMessage; 128: dynamically inserted scripts fire load/error
+  (module loaders), flex ignores abspos children.
+- Sim suite exit 0 incl. JS-xrealm, JS-popup, JS-scriptload 4/4;
+  cross-build green; reference dumps unchanged except PM-animation.
+- SHA256 first 12: VitaBrowser.vpk 971220428390, VitaBrowser-ext.vpk
+  67254593110b, nsvita.elf faea28224929. Archive
+  <WORK>/vitabrowser-work/hwtest-2026-09-26-run20/. Run 19 results in
+  results-run19\.
+
+**Run 20 on the device:** autotest as usual (expect 28–29/29 SAME,
+interact 22/22); then claude.ai/login -> "Continue with Google": a Google
+sign-in page should replace the view; type your email (tap the field, △)
+and tap Next -- report what happens (Next is known not to advance in the
+simulator yet). L goes back / closes the sign-in window. Also try
+youtube.com and google.com and note what they show.

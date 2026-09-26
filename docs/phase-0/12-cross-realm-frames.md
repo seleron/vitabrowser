@@ -205,3 +205,27 @@ the tree through 125 and checked to apply there.
 2. Email sign-in needs hCaptcha's invisible iframe to run: check with a
    scripted claude.ai session whether its frame now loads and posts back.
 3. A device run with 125+126 folded into the next bulk hand-off (run 20).
+
+
+## Increment 3 — real popups (2026-09-26, patches 127–128)
+
+- **127:** `window.open` opens a real top-level window over its opener
+  (vita/window.c window stack; created and closed from the scheduler);
+  `js_link_opener` links the heaps; opener<->popup postMessage, `closed`,
+  `close()`, the popup's `window.opener` / `window.close()` over the same
+  JSON-only queue. `event.source` is now the receiving realm's own shim for
+  the sender and `origin` is scheme://host[:port]. JS-popup.html 4/4.
+  claude.ai "Continue with Google" opens accounts.google.com "Sign in to
+  continue to Claude" in the popup; the email field takes typing (needed
+  128's flex fix and pointer-events: none in hoisted hit testing).
+- **128:** script-inserted `<script>` elements are async and fire
+  load/error (they ran parser-blocking with no events, so Google's and
+  YouTube's module loaders hung); flex no longer lets abspos children eat
+  free space. JS-scriptload.html 4/4.
+
+**Open:** Google's sign-in "Next" still does nothing: at load its Wiz
+service `nSePib` (viewport, `_.N9a`) fails with "not a function" and every
+dependant service is cancelled. The original throw site is not in the log
+(Wiz rewraps it); next step is a scripted session that hooks `_.GB` /
+`_.N9a` via eval to catch it. YouTube now gets past its loading skeleton
+but still renders a blank feed.

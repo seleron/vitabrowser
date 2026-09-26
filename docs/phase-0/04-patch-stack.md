@@ -248,6 +248,8 @@ evidence.
 | 124 | vita: SVG path fills by scanline, nonzero rule |
 | 125 | polyfill: window.open stub (Hermes) |
 | 126 | cross-realm frames + postMessage, JSON-only across runtimes (doc 12) |
+| 127 | window.open opens a real popup window (window stack, opener bridge) |
+| 128 | script-inserted scripts async + load/error; flex ignores abspos children |
 
 ## 7. Not done / blocked
 

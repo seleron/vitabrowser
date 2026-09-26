@@ -1,0 +1,924 @@
+# netsurf: window.open opens a real popup window (claude.ai "Continue with Google")
+#
+# window.open was a same-realm stub (patch 125), so Google's sign-in popup
+# never loaded. Now:
+#
+# - vita frontend: windows form a stack (window.c); a new one covers the one
+#   it came from and closing it shows that one again. window.open
+#   (js_platform.c macsurf_window_open) creates a top-level browser window
+#   from the scheduler -- never inside the running script or mid main-loop
+#   pass -- links its JS heap to the opener's (js_link_opener) and marks it
+#   a popup. The page's window.close(), the opener's popup.close(), and L
+#   (back) with no history left close it, also from the scheduler. The main
+#   loop takes the top window's browser_window each pass.
+# - bridge (macsurf_qjs.c): jsheap gains opener_heap + popup_id; natives
+#   __vitaWindowOpen / __vitaPopupClosed / __vitaPopupClose /
+#   __vitaCloseSelf / __vitaOpenerId / __vitaPostMessageToPopup /
+#   __vitaPostMessageToOpener, over the same JSON-only queue as patch 126.
+#   MessageEvent.origin is now scheme://host[:port] (was the full URL), and
+#   event.source is the receiving realm's own shim for the sender (the
+#   window window.open returned, iframe.contentWindow, parent, opener) when
+#   it has one -- scripts compare them. Messages carry the sender's label.
+# - polyfill: window.open returns a shim with postMessage / closed / close;
+#   a popup realm gets window.opener and window.close; shims register in
+#   __vitaShimWindows by label. Also iframe.sandbox and
+#   link/a/area/form.relList as token lists over their attributes (Google's
+#   sign-in module threw on iframe.sandbox.supports).
+# - hit testing: a hoisted box with pointer-events: none lets the click
+#   through to what is under it (Google's floating field label).
+#
+# Test page JS-popup.html (+ child): 4/4 in tools/run-vita-sim.sh (handle,
+# source === handle, round trip, the popup closes itself and closed turns
+# true). claude.ai in the simulator: "Continue with Google" opens
+# accounts.google.com "Sign in to continue to Claude" in the popup and the
+# email field takes typing.
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index e1f639368..efc41d6d1 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -711,6 +711,25 @@ static struct box *box_hoist_search(struct box *box, int x_off, int y_off,
+ 				cx += vb_fixed_scroll_x;
+ 				cy += vb_fixed_scroll_y;
+ 			}
++			/* pointer-events: none lets the click through (a
++			 * floating form label over its input, Google's
++			 * sign-in); what is inside may still take it */
++			if (css_computed_pointer_events(c->style) ==
++					CSS_POINTER_EVENTS_NONE) {
++				int32_t nz = INT32_MIN;
++				int nx, ny;
++				struct box *n = box_hoist_search(c,
++					cx - scrollbar_get_offset(c->scroll_x),
++					cy - scrollbar_get_offset(c->scroll_y),
++					x, y, depth + 1, &nz, &nx, &ny);
++				if (n != NULL && (best == NULL || z >= *best_z)) {
++					best = n;
++					*best_z = z;
++					*hx = nx;
++					*hy = ny;
++				}
++				continue;
++			}
+ 			if (css_computed_visibility(c->style) !=
+ 					CSS_VISIBILITY_HIDDEN &&
+ 			    (best == NULL || z >= *best_z) &&
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+index b1640f7eb..33988b7ff 100644
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -138,6 +138,19 @@ void macsurf_window_get_viewport(struct content *c, int *w, int *h);
+ int macsurf_window_dialog(struct content *c, const char *msg, int ask,
+ 		double *blocked_ms);
+ 
++/** window.open: open url (relative to c's) in a new window shown over
++ * c's, from the scheduler. Returns the popup's id (> 0), 0 on failure. */
++int macsurf_window_open(struct content *c, const char *url);
++
++/** Has popup id closed (or never opened)? */
++int macsurf_window_popup_closed(int id);
++
++/** Close popup id (the opener's popup.close()). */
++void macsurf_window_close_popup(int id);
++
++/** window.close() in c's window: closes it when it is a popup. */
++void macsurf_window_close_self(struct content *c);
++
+ /** The directory localStorage files live in, ending in '/', or NULL when
+  * there is none. */
+ const char *macsurf_storage_dir(void);
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 4e0c7c6f0..00a9dfe0d 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -128,6 +128,11 @@ struct jsheap {
+ 	 * tell it IS a frame (and to what name) and the parent realm's
+ 	 * frames[name] / iframe.contentWindow shims can route to it. */
+ 	char *frame_key;
++	/* VitaBrowser: a window.open popup's opener (NULL: none or gone) and
++	 * the id window.open returned there; like parent_heap, only JSON text
++	 * crosses between the two. */
++	struct jsheap *opener_heap;
++	int popup_id;
+ };
+ 
+ struct jsthread {
+@@ -2823,6 +2828,24 @@ static void qjs_xrealm_drain(void)
+ 			/* event.source: a window-like stand-in.  A real cross-realm
+ 			 * window object is unhandable (a JSValue is runtime-specific);
+ 			 * GSI/hCaptcha only use source.toString() / postMessage(). */
++			/* The target realm's own shim window for the sender
++			 * (window.open's return value, iframe.contentWindow,
++			 * window.parent / opener) when it has one: scripts compare
++			 * event.source with the window they hold. */
++			{
++				JSValue reg = JS_GetPropertyStr(tctx, w,
++						"__vitaShimWindows");
++				JSValue sh = JS_UNDEFINED;
++				if (JS_IsObject(reg) && m->source_label != NULL)
++					sh = JS_GetPropertyStr(tctx, reg,
++							m->source_label);
++				JS_FreeValue(tctx, reg);
++				if (JS_IsObject(sh)) {
++					JS_SetPropertyStr(tctx, ev, "source", sh);
++					goto source_done;
++				}
++				JS_FreeValue(tctx, sh);
++			}
+ 			{
+ 				JSValue src = JS_NewObject(tctx);
+ 				JSValue f = JS_NewCFunction(tctx,
+@@ -2839,6 +2862,7 @@ static void qjs_xrealm_drain(void)
+ 								? m->source_label : ""));
+ 				JS_SetPropertyStr(tctx, ev, "source", src);
+ 			}
++		source_done:
+ 			arg = JS_NewArray(tctx);
+ 			JS_SetPropertyStr(tctx, ev, "ports", arg);
+ 			{
+@@ -2906,10 +2930,29 @@ static void qjs_xrealm_layout_walk(struct box *root, int depth,
+ 
+ static const char *qjs_xrealm_origin(JSContext *ctx)
+ {
++	/* MessageEvent.origin: scheme://host[:port] of the sender, which is
++	 * what sign-in scripts compare ("https://accounts.google.com"). */
++	static char buf[300];
+ 	struct content *c = qjs_get_content_for_ctx(ctx);
+ 	struct nsurl *u = c != NULL ? content_get_url(c) : NULL;
+ 	const char *s = u != NULL ? nsurl_access(u) : NULL;
+-	return (s != NULL) ? s : "";
++	const char *p;
++	size_t n;
++
++	if (s == NULL)
++		return "";
++	p = strstr(s, "://");
++	if (p == NULL)
++		return "null";
++	p = strchr(p + 3, '/');
++	n = p != NULL ? (size_t)(p - s) : strlen(s);
++	if (n >= sizeof(buf))
++		n = sizeof(buf) - 1;
++	memcpy(buf, s, n);
++	buf[n] = '\0';
++	if (strncmp(buf, "file:", 5) == 0)
++		return "null";
++	return buf;
+ }
+ 
+ /* __vitaPostMessageToParent(jsonPayload) -- an iframe realm handing a
+@@ -2936,9 +2979,10 @@ qjs_xrealm_post_to_parent(JSContext *ctx, JSValueConst this_val,
+ 	owner = qjs_owner_for_ctx(ctx);
+ 	heap = owner != NULL ? owner->heap : NULL;
+ 	if (heap != NULL && heap->parent_heap != NULL) {
++		/* .source in the parent: its shim for this frame, by name */
+ 		qjs_xrealm_enqueue(heap->parent_heap, payload,
+ 				qjs_xrealm_origin(ctx),
+-				qjs_xrealm_origin(ctx));
++				heap->frame_key != NULL ? heap->frame_key : "");
+ 		ret = JS_TRUE;
+ 	}
+ 	if (payload != NULL) JS_FreeCString(ctx, payload);
+@@ -2999,8 +3043,7 @@ qjs_xrealm_post_to_iframe(JSContext *ctx, JSValueConst this_val,
+ 			     strcmp(o->frame_key, label) == 0) ||
+ 			    (want >= 0 && idx == want) || *label == '\0') {
+ 				qjs_xrealm_enqueue(o, payload,
+-						qjs_xrealm_origin(ctx),
+-						qjs_xrealm_origin(ctx));
++						qjs_xrealm_origin(ctx), "parent");
+ 				ret = JS_TRUE;
+ 				sent = 1;
+ 				break;
+@@ -3022,8 +3065,7 @@ qjs_xrealm_post_to_iframe(JSContext *ctx, JSValueConst this_val,
+ 					strcmp(ifname, label) != 0)
+ 				continue;
+ 			qjs_xrealm_enqueue(ifr.boxes[i]->iframe->jsheap, payload,
+-					qjs_xrealm_origin(ctx),
+-					qjs_xrealm_origin(ctx));
++					qjs_xrealm_origin(ctx), "parent");
+ 			ret = JS_TRUE;
+ 			break;
+ 		}
+@@ -3110,6 +3152,136 @@ void js_link_frame_heaps(struct jsheap *child, struct jsheap *parent,
+ /* Install the native helpers on the realm's global object.  Runs once per
+  * realm, after register_browser_globals, before the polyfill (which builds
+  * the JS shims on top of them). */
++/* exported interface documented in macsurf_qjs.h */
++void js_link_opener(struct jsheap *popup, struct jsheap *opener, int id)
++{
++	if (popup == NULL)
++		return;
++	popup->opener_heap = opener;
++	popup->popup_id = id;
++	macsurf_debug_log_writef("WORK xrealm: popup %d linked (opener=%s)",
++			id, opener != NULL ? "yes" : "no");
++}
++
++#ifdef MACSURF_WINDOW_SERVICES
++static struct jsheap *qjs_xrealm_heap_of(JSContext *ctx)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	return owner != NULL ? owner->heap : NULL;
++}
++
++/* __vitaWindowOpen(url) -> popup id (0: refused). */
++static JSValue qjs_xrealm_window_open(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	const char *url = NULL;
++	int id;
++	(void)this_val;
++	if (argc >= 1 && JS_IsString(argv[0]))
++		url = JS_ToCString(ctx, argv[0]);
++	id = macsurf_window_open(qjs_get_content_for_ctx(ctx),
++			url != NULL ? url : "");
++	if (url != NULL)
++		JS_FreeCString(ctx, url);
++	return JS_NewInt32(ctx, id);
++}
++
++/* __vitaPopupClosed(id) -> bool */
++static JSValue qjs_xrealm_popup_closed(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	int32_t id = 0;
++	(void)this_val;
++	if (argc >= 1)
++		JS_ToInt32(ctx, &id, argv[0]);
++	return JS_NewBool(ctx, macsurf_window_popup_closed(id));
++}
++
++/* __vitaPopupClose(id) */
++static JSValue qjs_xrealm_popup_close(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	int32_t id = 0;
++	(void)this_val;
++	if (argc >= 1)
++		JS_ToInt32(ctx, &id, argv[0]);
++	macsurf_window_close_popup(id);
++	return JS_UNDEFINED;
++}
++
++/* __vitaCloseSelf(): window.close() */
++static JSValue qjs_xrealm_close_self(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)this_val; (void)argc; (void)argv;
++	macsurf_window_close_self(qjs_get_content_for_ctx(ctx));
++	return JS_UNDEFINED;
++}
++
++/* __vitaOpenerId() -> this realm's popup id when it is a popup, else 0 */
++static JSValue qjs_xrealm_opener_id(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct jsheap *heap = qjs_xrealm_heap_of(ctx);
++	(void)this_val; (void)argc; (void)argv;
++	return JS_NewInt32(ctx, heap != NULL ? heap->popup_id : 0);
++}
++
++/* __vitaPostMessageToPopup(id, json) -- opener to its popup */
++static JSValue qjs_xrealm_post_to_popup(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct jsheap *heap = qjs_xrealm_heap_of(ctx), *o;
++	const char *payload;
++	int32_t id = 0;
++	JSValue ret = JS_FALSE;
++	(void)this_val;
++	if (argc < 2 || !JS_IsString(argv[1]))
++		return JS_FALSE;
++	JS_ToInt32(ctx, &id, argv[0]);
++	payload = JS_ToCString(ctx, argv[1]);
++	if (payload == NULL)
++		return JS_FALSE;
++	for (o = g_heap_list; o != NULL && heap != NULL && id > 0;
++	     o = o->next) {
++		if (o->popup_id == id && o->opener_heap == heap &&
++		    strlen(payload) <= 262144) {
++			qjs_xrealm_enqueue(o, payload,
++					qjs_xrealm_origin(ctx), "opener");
++			ret = JS_TRUE;
++			break;
++		}
++	}
++	JS_FreeCString(ctx, payload);
++	return ret;
++}
++
++/* __vitaPostMessageToOpener(json) -- a popup to the window that opened it */
++static JSValue qjs_xrealm_post_to_opener(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct jsheap *heap = qjs_xrealm_heap_of(ctx);
++	const char *payload;
++	char label[24];
++	JSValue ret = JS_FALSE;
++	(void)this_val;
++	if (argc < 1 || !JS_IsString(argv[0]) || heap == NULL ||
++	    heap->opener_heap == NULL)
++		return JS_FALSE;
++	payload = JS_ToCString(ctx, argv[0]);
++	if (payload == NULL)
++		return JS_FALSE;
++	if (strlen(payload) <= 262144) {
++		snprintf(label, sizeof(label), "popup:%d", heap->popup_id);
++		qjs_xrealm_enqueue(heap->opener_heap, payload,
++				qjs_xrealm_origin(ctx), label);
++		ret = JS_TRUE;
++	}
++	JS_FreeCString(ctx, payload);
++	return ret;
++}
++#endif
++
+ void macsurf_qjs_xrealm_register(JSContext *ctx)
+ {
+ 	JSValue global = JS_GetGlobalObject(ctx);
+@@ -3126,6 +3298,30 @@ void macsurf_qjs_xrealm_register(JSContext *ctx)
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_frame_realm_name,
+ 			"__vitaFrameRealmName", 0);
+ 	JS_SetPropertyStr(ctx, global, "__vitaFrameRealmName", f);
++#ifdef MACSURF_WINDOW_SERVICES
++	/* window.open popups (js_link_opener) */
++	JS_SetPropertyStr(ctx, global, "__vitaWindowOpen",
++			JS_NewCFunction(ctx, qjs_xrealm_window_open,
++				"__vitaWindowOpen", 1));
++	JS_SetPropertyStr(ctx, global, "__vitaPopupClosed",
++			JS_NewCFunction(ctx, qjs_xrealm_popup_closed,
++				"__vitaPopupClosed", 1));
++	JS_SetPropertyStr(ctx, global, "__vitaPopupClose",
++			JS_NewCFunction(ctx, qjs_xrealm_popup_close,
++				"__vitaPopupClose", 1));
++	JS_SetPropertyStr(ctx, global, "__vitaCloseSelf",
++			JS_NewCFunction(ctx, qjs_xrealm_close_self,
++				"__vitaCloseSelf", 0));
++	JS_SetPropertyStr(ctx, global, "__vitaOpenerId",
++			JS_NewCFunction(ctx, qjs_xrealm_opener_id,
++				"__vitaOpenerId", 0));
++	JS_SetPropertyStr(ctx, global, "__vitaPostMessageToPopup",
++			JS_NewCFunction(ctx, qjs_xrealm_post_to_popup,
++				"__vitaPostMessageToPopup", 2));
++	JS_SetPropertyStr(ctx, global, "__vitaPostMessageToOpener",
++			JS_NewCFunction(ctx, qjs_xrealm_post_to_opener,
++				"__vitaPostMessageToOpener", 1));
++#endif
+ 	/* JS_SetPropertyStr took ownership of each f: freeing the last one
+ 	 * again left the global pointing at a freed function object, which
+ 	 * the polyfill called once the memory was reused (full sim run:
+@@ -16700,6 +16896,7 @@ void js_destroyheap(struct jsheap *heap)
+ 		struct jsheap *o = g_heap_list;
+ 		while (o != NULL) {
+ 			if (o->parent_heap == heap) o->parent_heap = NULL;
++			if (o->opener_heap == heap) o->opener_heap = NULL;
+ 			o = o->next;
+ 		}
+ 	}
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.h b/content/handlers/javascript/quickjs/macsurf_qjs.h
+index 8fc703594..8c16dcc1b 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.h
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.h
+@@ -82,6 +82,9 @@ void macsurf_qjs_xrealm_register(JSContext *qctx);
+ struct jsheap;
+ void js_link_frame_heaps(struct jsheap *child, struct jsheap *parent,
+ 		const char *frame_name);
++/** A window.open popup's heap: linked to the heap of the realm that opened
++ * it (NULL: gone), under the id window.open returned there. */
++void js_link_opener(struct jsheap *popup, struct jsheap *opener, int id);
+ 
+ #endif /* WITH_QUICKJS */
+ 
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index ae99b5245..cc1d7b880 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1255,6 +1255,38 @@
+ "\tfn(E, 'setPointerCapture', function () {});\n"
+ "\tfn(E, 'releasePointerCapture', function () {});\n"
+ "\tfn(E, 'hasPointerCapture', function () { return false; });\n"
++"\t/* iframe.sandbox and link/a/area/form.relList: DOMTokenLists over\n"
++"\t * their attributes. Google's sign-in module calls\n"
++"\t * iframe.sandbox.supports(...) while it sets up, and a missing\n"
++"\t * sandbox threw there (the Next button then did nothing); loaders\n"
++"\t * ask link.relList.supports('preload'). supports() answers true for\n"
++"\t * the tokens this engine does not reject. */\n"
++"\tfunction tokenList(el, attr) {\n"
++"\t\tfunction get() { return String(el.getAttribute(attr) || '').split(/\\s+/).filter(function (x) { return x; }); }\n"
++"\t\tfunction set(a) { el.setAttribute(attr, a.join(' ')); }\n"
++"\t\tvar t = {\n"
++"\t\t\tadd: function () { var a = get(); for (var i = 0; i < arguments.length; i++) if (a.indexOf(arguments[i]) < 0) a.push(String(arguments[i])); set(a); },\n"
++"\t\t\tremove: function () { var a = get(), r = Array.prototype.slice.call(arguments); set(a.filter(function (x) { return r.indexOf(x) < 0; })); },\n"
++"\t\t\tcontains: function (x) { return get().indexOf(String(x)) >= 0; },\n"
++"\t\t\ttoggle: function (x, f) { var h = t.contains(x); if (f === true || (f === undefined && !h)) { t.add(x); return true; } t.remove(x); return false; },\n"
++"\t\t\treplace: function (a, b) { if (!t.contains(a)) return false; t.remove(a); t.add(b); return true; },\n"
++"\t\t\titem: function (i) { var a = get(); return i < a.length ? a[i] : null; },\n"
++"\t\t\tsupports: function () { return true; },\n"
++"\t\t\tforEach: function (f, th) { get().forEach(function (x, i) { f.call(th, x, i, t); }); },\n"
++"\t\t\ttoString: function () { return String(el.getAttribute(attr) || ''); }\n"
++"\t\t};\n"
++"\t\tObject.defineProperty(t, 'length', { get: function () { return get().length; } });\n"
++"\t\tObject.defineProperty(t, 'value', { get: function () { return String(el.getAttribute(attr) || ''); },\n"
++"\t\t\tset: function (v) { el.setAttribute(attr, String(v)); } });\n"
++"\t\treturn t;\n"
++"\t}\n"
++"\tacc(E, 'sandbox', function () {\n"
++"\t\treturn String(this.tagName).toUpperCase() === 'IFRAME' ? tokenList(this, 'sandbox') : undefined;\n"
++"\t}, function (v) { this.setAttribute('sandbox', String(v)); });\n"
++"\tacc(E, 'relList', function () {\n"
++"\t\tvar t = String(this.tagName).toUpperCase();\n"
++"\t\treturn (t === 'LINK' || t === 'A' || t === 'AREA' || t === 'FORM') ? tokenList(this, 'rel') : undefined;\n"
++"\t});\n"
+ "\t/* form controls */\n"
+ "\tvar I = Object.getPrototypeOf(d.createElement('input'));\n"
+ "\tvar TA = Object.getPrototypeOf(d.createElement('textarea'));\n"
+@@ -2186,6 +2218,9 @@
+ "\t\tw.print = function () {};\n"
+ "\t\tw.moveTo = function () {}; w.moveBy = function () {};\n"
+ "\t\tw.resizeTo = function () {}; w.resizeBy = function () {};\n"
++"\t\t/* the C bridge hands this object as event.source for messages\n"
++"\t\t * from `label` (macsurf_qjs.c qjs_xrealm_drain) */\n"
++"\t\tif (!g.__vitaShimWindows[label]) g.__vitaShimWindows[label] = w;\n"
+ "\t\treturn w;\n"
+ "\t}\n"
+ "\tg.__vitaShimWindow = makeShim;\n"
+@@ -2274,6 +2309,54 @@
+ "\t\town('frames', g);\n"
+ "\t\tif (typeof g.length !== 'number') own('length', 1);\n"
+ "\t}\n"
++"\t/* window.open: a real popup when the frontend can open one. The\n"
++"\t * returned window is a shim here; the popup is its own realm, and\n"
++"\t * the two talk through the JSON bridge (postMessage both ways,\n"
++"\t * closed, close). Google's sign-in (claude.ai) opens its provider\n"
++"\t * page this way and waits for the popup's message. */\n"
++"\tif (typeof __vitaWindowOpen === 'function') {\n"
++"\t\tvar realOpen = function (url, name, features) {\n"
++"\t\t\tvar id = __vitaWindowOpen(url === undefined || url === null ? '' : String(url));\n"
++"\t\t\tif (!id) return null;\n"
++"\t\t\tvar label = 'popup:' + id;\n"
++"\t\t\tvar w = makeShim(label);\n"
++"\t\t\tw.name = name ? String(name) : '';\n"
++"\t\t\tw.opener = g;\n"
++"\t\t\tw.location.href = String(url || 'about:blank');\n"
++"\t\t\tw.location.toString = function () { return w.location.href; };\n"
++"\t\t\ttry {\n"
++"\t\t\t\tObject.defineProperty(w, 'closed', { enumerable: true, configurable: true,\n"
++"\t\t\t\t\tget: function () { return !!__vitaPopupClosed(id); } });\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t\tw.close = function () { __vitaPopupClose(id); };\n"
++"\t\t\tw.postMessage = function (msg) {\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\treturn __vitaPostMessageToPopup(id, JSON.stringify(msg === undefined ? null : msg));\n"
++"\t\t\t\t} catch (e) { return false; }\n"
++"\t\t\t};\n"
++"\t\t\tg.__vitaShimWindows[label] = w;\n"
++"\t\t\treturn w;\n"
++"\t\t};\n"
++"\t\ttry { Object.defineProperty(g, 'open', { value: realOpen, writable: true, configurable: true }); }\n"
++"\t\tcatch (e) { g.open = realOpen; }\n"
++"\t}\n"
++"\t/* This realm IS a popup: window.opener reaches the opener. */\n"
++"\tvar openerId = 0;\n"
++"\ttry { openerId = (typeof __vitaOpenerId === 'function') ? __vitaOpenerId() : 0; } catch (e) { /* */ }\n"
++"\tif (openerId) {\n"
++"\t\tvar op = makeShim('opener');\n"
++"\t\top.postMessage = function (msg) {\n"
++"\t\t\ttry {\n"
++"\t\t\t\treturn __vitaPostMessageToOpener(JSON.stringify(msg === undefined ? null : msg));\n"
++"\t\t\t} catch (e) { return false; }\n"
++"\t\t};\n"
++"\t\ttry { Object.defineProperty(g, 'opener', { value: op, writable: true, configurable: true }); }\n"
++"\t\tcatch (e) { /* */ }\n"
++"\t\tif (typeof __vitaCloseSelf === 'function') {\n"
++"\t\t\ttry { Object.defineProperty(g, 'close', { value: function () { __vitaCloseSelf(); }, writable: true, configurable: true }); }\n"
++"\t\t\tcatch (e) { /* */ }\n"
++"\t\t}\n"
++"\t}\n"
+ "\t/* window.open: ... (unchanged stub below) */\n"
+ "\tif (typeof g.open !== 'function') {\n"
+ "\t\tvar opened = 0;\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 7aee240b7..e2e0ee739 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1254,6 +1254,38 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	fn(E, 'setPointerCapture', function () {});
+ 	fn(E, 'releasePointerCapture', function () {});
+ 	fn(E, 'hasPointerCapture', function () { return false; });
++	/* iframe.sandbox and link/a/area/form.relList: DOMTokenLists over
++	 * their attributes. Google's sign-in module calls
++	 * iframe.sandbox.supports(...) while it sets up, and a missing
++	 * sandbox threw there (the Next button then did nothing); loaders
++	 * ask link.relList.supports('preload'). supports() answers true for
++	 * the tokens this engine does not reject. */
++	function tokenList(el, attr) {
++		function get() { return String(el.getAttribute(attr) || '').split(/\s+/).filter(function (x) { return x; }); }
++		function set(a) { el.setAttribute(attr, a.join(' ')); }
++		var t = {
++			add: function () { var a = get(); for (var i = 0; i < arguments.length; i++) if (a.indexOf(arguments[i]) < 0) a.push(String(arguments[i])); set(a); },
++			remove: function () { var a = get(), r = Array.prototype.slice.call(arguments); set(a.filter(function (x) { return r.indexOf(x) < 0; })); },
++			contains: function (x) { return get().indexOf(String(x)) >= 0; },
++			toggle: function (x, f) { var h = t.contains(x); if (f === true || (f === undefined && !h)) { t.add(x); return true; } t.remove(x); return false; },
++			replace: function (a, b) { if (!t.contains(a)) return false; t.remove(a); t.add(b); return true; },
++			item: function (i) { var a = get(); return i < a.length ? a[i] : null; },
++			supports: function () { return true; },
++			forEach: function (f, th) { get().forEach(function (x, i) { f.call(th, x, i, t); }); },
++			toString: function () { return String(el.getAttribute(attr) || ''); }
++		};
++		Object.defineProperty(t, 'length', { get: function () { return get().length; } });
++		Object.defineProperty(t, 'value', { get: function () { return String(el.getAttribute(attr) || ''); },
++			set: function (v) { el.setAttribute(attr, String(v)); } });
++		return t;
++	}
++	acc(E, 'sandbox', function () {
++		return String(this.tagName).toUpperCase() === 'IFRAME' ? tokenList(this, 'sandbox') : undefined;
++	}, function (v) { this.setAttribute('sandbox', String(v)); });
++	acc(E, 'relList', function () {
++		var t = String(this.tagName).toUpperCase();
++		return (t === 'LINK' || t === 'A' || t === 'AREA' || t === 'FORM') ? tokenList(this, 'rel') : undefined;
++	});
+ 	/* form controls */
+ 	var I = Object.getPrototypeOf(d.createElement('input'));
+ 	var TA = Object.getPrototypeOf(d.createElement('textarea'));
+@@ -2185,6 +2217,9 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		w.print = function () {};
+ 		w.moveTo = function () {}; w.moveBy = function () {};
+ 		w.resizeTo = function () {}; w.resizeBy = function () {};
++		/* the C bridge hands this object as event.source for messages
++		 * from `label` (macsurf_qjs.c qjs_xrealm_drain) */
++		if (!g.__vitaShimWindows[label]) g.__vitaShimWindows[label] = w;
+ 		return w;
+ 	}
+ 	g.__vitaShimWindow = makeShim;
+@@ -2273,6 +2308,54 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		own('frames', g);
+ 		if (typeof g.length !== 'number') own('length', 1);
+ 	}
++	/* window.open: a real popup when the frontend can open one. The
++	 * returned window is a shim here; the popup is its own realm, and
++	 * the two talk through the JSON bridge (postMessage both ways,
++	 * closed, close). Google's sign-in (claude.ai) opens its provider
++	 * page this way and waits for the popup's message. */
++	if (typeof __vitaWindowOpen === 'function') {
++		var realOpen = function (url, name, features) {
++			var id = __vitaWindowOpen(url === undefined || url === null ? '' : String(url));
++			if (!id) return null;
++			var label = 'popup:' + id;
++			var w = makeShim(label);
++			w.name = name ? String(name) : '';
++			w.opener = g;
++			w.location.href = String(url || 'about:blank');
++			w.location.toString = function () { return w.location.href; };
++			try {
++				Object.defineProperty(w, 'closed', { enumerable: true, configurable: true,
++					get: function () { return !!__vitaPopupClosed(id); } });
++			} catch (e) { /* */ }
++			w.close = function () { __vitaPopupClose(id); };
++			w.postMessage = function (msg) {
++				try {
++					return __vitaPostMessageToPopup(id, JSON.stringify(msg === undefined ? null : msg));
++				} catch (e) { return false; }
++			};
++			g.__vitaShimWindows[label] = w;
++			return w;
++		};
++		try { Object.defineProperty(g, 'open', { value: realOpen, writable: true, configurable: true }); }
++		catch (e) { g.open = realOpen; }
++	}
++	/* This realm IS a popup: window.opener reaches the opener. */
++	var openerId = 0;
++	try { openerId = (typeof __vitaOpenerId === 'function') ? __vitaOpenerId() : 0; } catch (e) { /* */ }
++	if (openerId) {
++		var op = makeShim('opener');
++		op.postMessage = function (msg) {
++			try {
++				return __vitaPostMessageToOpener(JSON.stringify(msg === undefined ? null : msg));
++			} catch (e) { return false; }
++		};
++		try { Object.defineProperty(g, 'opener', { value: op, writable: true, configurable: true }); }
++		catch (e) { /* */ }
++		if (typeof __vitaCloseSelf === 'function') {
++			try { Object.defineProperty(g, 'close', { value: function () { __vitaCloseSelf(); }, writable: true, configurable: true }); }
++			catch (e) { /* */ }
++		}
++	}
+ 	/* window.open: ... (unchanged stub below) */
+ 	if (typeof g.open !== 'function') {
+ 		var opened = 0;
+diff --git a/frontends/vita/input.c b/frontends/vita/input.c
+index b0020fddd..f482b8774 100644
+--- a/frontends/vita/input.c
++++ b/frontends/vita/input.c
+@@ -42,6 +42,7 @@
+ #include "vita/plot.h"
+ #include "vita/window.h"
+ #include "vita/input.h"
++#include "vita/js_platform.h"
+ 
+ /** Stick dead zone around the 128 centre. */
+ #define STICK_DEADZONE 24
+@@ -288,6 +289,14 @@ enum vita_browse_action vita_input_browse(struct gui_window *gw,
+ 		vita_diag_log("input: back");
+ 		vita_input_stats.backs++;
+ 		browser_window_history_back(bw, false);
++	} else if ((pressed & SCE_CTRL_LTRIGGER) &&
++		   vita_window_popup_id(gw) != 0) {
++		/* Back past a popup's first page closes it (as a phone
++		 * browser closes the tab a sign-in opened). */
++		vita_diag_log("input: close popup %d",
++			      vita_window_popup_id(gw));
++		vita_popup_close_later(vita_window_popup_id(gw));
++		return VITA_BROWSE_NONE;
+ 	}
+ 	if ((pressed & SCE_CTRL_RTRIGGER) &&
+ 	    browser_window_history_forward_available(bw)) {
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+index 9bcddb53c..9c25b5adc 100644
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -28,6 +28,7 @@
+  */
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -50,6 +51,7 @@
+ #include "desktop/browser_private.h"
+ #include "desktop/browser_history.h"
+ #include "content/handlers/javascript/quickjs/macos9.h"
++#include "content/handlers/javascript/quickjs/macsurf_qjs.h"
+ 
+ #include "vita/diag.h"
+ #include "vita/plot.h"
+@@ -262,6 +264,138 @@ static void js_nav_queue(struct content *c)
+ 	vita_schedule(0, js_nav_run, NULL);
+ }
+ 
++/* ---- window.open: real popup windows -----------------------------------
++ *
++ * window.open(url) opens a second top-level browser window, shown in place
++ * of its opener until it closes (vita/window.c keeps the stack). Sign-in
++ * flows -- Google's for claude.ai -- load the provider in the popup, which
++ * posts the result to window.opener and closes itself; the two realms talk
++ * through the JSON bridge in macsurf_qjs.c (js_link_opener).
++ *
++ * Opening and closing run from the scheduler, never inside the script
++ * that asked: a window (and its JS heap) must not be created or destroyed
++ * while another runtime is executing, nor mid-way through a main-loop
++ * pass that still holds the old window.
++ */
++#define VITA_POPUPS 64
++
++static enum { POPUP_NONE, POPUP_PENDING, POPUP_OPEN, POPUP_CLOSED }
++	popup_state[VITA_POPUPS];
++static int popup_next = 1;
++
++struct popup_req {
++	int id;
++	struct content *opener;
++	nsurl *url;
++	nsurl *referer;
++};
++
++static void popup_open_run(void *p)
++{
++	struct popup_req *req = p;
++	struct browser_window *opener = window_for(req->opener);
++	struct browser_window *nbw = NULL;
++	nserror err;
++
++	err = browser_window_create(BW_CREATE_HISTORY, req->url,
++			req->referer, NULL, &nbw);
++	if (err != NSERROR_OK || nbw == NULL) {
++		vita_diag_log("window.open %d: failed (%d)", req->id, err);
++		popup_state[req->id] = POPUP_CLOSED;
++	} else {
++		vita_window_set_popup(nbw->window, req->id);
++		js_link_opener(nbw->jsheap,
++			       opener != NULL ? opener->jsheap : NULL, req->id);
++		popup_state[req->id] = POPUP_OPEN;
++		vita_diag_log("window.open %d: %s", req->id,
++			      nsurl_access(req->url));
++	}
++	nsurl_unref(req->url);
++	if (req->referer != NULL)
++		nsurl_unref(req->referer);
++	free(req);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++int macsurf_window_open(struct content *c, const char *url)
++{
++	nsurl *base = (c != NULL && c->llcache != NULL) ?
++		content_get_url(c) : NULL;
++	struct popup_req *req;
++	nsurl *joined = NULL;
++	nserror err;
++
++	if (popup_next >= VITA_POPUPS)
++		return 0;
++	if (url == NULL || *url == '\0')
++		url = "about:blank";
++	err = (base != NULL) ? nsurl_join(base, url, &joined) :
++		nsurl_create(url, &joined);
++	if (err != NSERROR_OK)
++		return 0;
++	req = calloc(1, sizeof(*req));
++	if (req == NULL) {
++		nsurl_unref(joined);
++		return 0;
++	}
++	req->id = popup_next++;
++	req->opener = c;
++	req->url = joined;
++	req->referer = base != NULL ? nsurl_ref(base) : NULL;
++	popup_state[req->id] = POPUP_PENDING;
++	vita_schedule(0, popup_open_run, req);
++	return req->id;
++}
++
++/* exported interface documented in quickjs/macos9.h */
++int macsurf_window_popup_closed(int id)
++{
++	if (id <= 0 || id >= VITA_POPUPS)
++		return 1;
++	if (popup_state[id] == POPUP_OPEN && vita_window_for_popup(id) == NULL)
++		popup_state[id] = POPUP_CLOSED;
++	return popup_state[id] == POPUP_CLOSED || popup_state[id] == POPUP_NONE;
++}
++
++static void close_run(void *p)
++{
++	int id = (int)(intptr_t)p;
++	struct gui_window *gw = vita_window_for_popup(id);
++
++	if (gw == NULL)
++		return;
++	vita_diag_log("window %d: closed", id);
++	popup_state[id] = POPUP_CLOSED;
++	browser_window_destroy(vita_window_browser(gw));
++}
++
++/* exported interface documented in vita/js_platform.h */
++void vita_popup_close_later(int id)
++{
++	if (id > 0 && id < VITA_POPUPS)
++		vita_schedule(0, close_run, (void *)(intptr_t)id);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_window_close_popup(int id)
++{
++	vita_popup_close_later(id);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_window_close_self(struct content *c)
++{
++	struct browser_window *bw = window_for(c);
++
++	if (bw == NULL)
++		return;
++	bw = browser_window_get_root(bw);
++	/* Only a popup closes itself (a script may not close the window the
++	 * user opened, as in browsers). */
++	if (bw->window != NULL && vita_window_popup_id(bw->window) != 0)
++		vita_popup_close_later(vita_window_popup_id(bw->window));
++}
++
+ /* exported interface documented in quickjs/macos9.h */
+ char *macsurf_window_location(struct content *c)
+ {
+diff --git a/frontends/vita/js_platform.h b/frontends/vita/js_platform.h
+index 29c8f4e59..cffba79f5 100644
+--- a/frontends/vita/js_platform.h
++++ b/frontends/vita/js_platform.h
+@@ -43,4 +43,7 @@ bool vita_js_nav_pending(void);
+  * autotest, which cannot press buttons). */
+ extern bool vita_js_dialog_auto;
+ 
++/** Close window.open popup id from the scheduler (never mid-pass). */
++void vita_popup_close_later(int id);
++
+ #endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 83d23d092..d70ab86c0 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -1095,7 +1095,7 @@ static void watch_load(struct gui_window *gw)
+ 	}
+ }
+ 
+-static void vita_run(struct browser_window *bw)
++static void vita_run(struct browser_window *bw0)
+ {
+ 	unsigned int last_flush = 0, cookies_saved = 0;
+ 	bool cookies_due = false;
+@@ -1104,6 +1104,9 @@ static void vita_run(struct browser_window *bw)
+ 	vita_input_idle(&prev);
+ 	while (!vita_quit) {
+ 		struct gui_window *gw = vita_window_current();
++		/* the window on top (a popup covers its opener) */
++		struct browser_window *bw = gw != NULL ?
++			vita_window_browser(gw) : bw0;
+ 		enum frame_kind kind;
+ 		bool dump_now = false;
+ 		int step;
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index e94423780..4731ea1d6 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -57,8 +57,13 @@ struct gui_window {
+ 	bool loading;	/**< between START_ and STOP_THROBBER */
+ 	unsigned int new_content;	/**< GW_EVENT_NEW_CONTENT count */
+ 	char title[160];		/**< the page's title, for the HUD */
++	int popup_id;			/**< window.open id; 0: not a popup */
++	struct gui_window *below;	/**< the window this one covers */
+ };
+ 
++/* The windows form a stack: a new one (window.open, a link opened "in a
++ * new window") covers the one it came from, and closing it shows that
++ * one again. vita_current is the top. */
+ static struct gui_window *vita_current;
+ 
+ static struct gui_window *
+@@ -72,18 +77,55 @@ vita_window_create(struct browser_window *bw,
+ 		return NULL;
+ 	gw->bw = bw;
+ 	gw->dirty = true;
+-	/* A new window (a link opened "in a new tab") replaces the view. */
++	/* A new window covers the view until it is closed. */
++	gw->below = vita_current;
+ 	vita_current = gw;
+ 	return gw;
+ }
+ 
+ static void vita_window_destroy(struct gui_window *gw)
+ {
+-	if (vita_current == gw)
+-		vita_current = NULL;
++	struct gui_window *w;
++
++	/* Unlink it from the stack wherever it is. */
++	if (vita_current == gw) {
++		vita_current = gw->below;
++	} else {
++		for (w = vita_current; w != NULL; w = w->below)
++			if (w->below == gw) {
++				w->below = gw->below;
++				break;
++			}
++	}
++	if (vita_current != NULL)
++		vita_current->dirty = true;	/* shown again */
+ 	free(gw);
+ }
+ 
++/* exported interface documented in vita/window.h */
++void vita_window_set_popup(struct gui_window *gw, int id)
++{
++	if (gw != NULL)
++		gw->popup_id = id;
++}
++
++/* exported interface documented in vita/window.h */
++int vita_window_popup_id(struct gui_window *gw)
++{
++	return gw != NULL ? gw->popup_id : 0;
++}
++
++/* exported interface documented in vita/window.h */
++struct gui_window *vita_window_for_popup(int id)
++{
++	struct gui_window *w;
++
++	for (w = vita_current; w != NULL && id != 0; w = w->below)
++		if (w->popup_id == id)
++			return w;
++	return NULL;
++}
++
+ static nserror vita_window_invalidate(struct gui_window *gw,
+ 				      const struct rect *rect)
+ {
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index 08f18e65e..72e1e4f92 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -65,6 +65,15 @@ const char *vita_window_title(struct gui_window *gw);
+ /** The browser window shown in this gui window. */
+ struct browser_window *vita_window_browser(struct gui_window *gw);
+ 
++/** Mark a window as the popup window.open(...) returned id for. */
++void vita_window_set_popup(struct gui_window *gw, int id);
++
++/** A window's window.open id, 0 if it is not a popup. */
++int vita_window_popup_id(struct gui_window *gw);
++
++/** The open popup with this id, or NULL (closed, or never opened). */
++struct gui_window *vita_window_for_popup(int id);
++
+ /**
+  * Log (up to 5 of) the innermost boxes whose right edge passes limit: what
+  * makes a page wider than the screen.
