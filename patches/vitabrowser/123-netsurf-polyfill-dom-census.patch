@@ -1,0 +1,1116 @@
+# netsurf: polyfill -- listener objects, once and signal everywhere; template content; fragment queries; 73 missing DOM APIs
+#
+# - addEventListener dropped listener OBJECTS ({handleEvent}); every
+#   bridge addEventListener is wrapped: objects become stable functions,
+#   once / signal are honoured uniformly.
+# - <template>.content (a fragment holding the children) and
+#   DocumentFragment querySelector/All, getElementById, children, append.
+# - A census of ~250 common APIs found 89 missing; now 16. Among them:
+#   parentElement (!), innerText, localName, namespaceURI, reflected
+#   hidden/lang/dir/tabIndex, the *NS attribute methods, element
+#   scrollTo/scrollBy, the form-control API (defaultValue, form, labels,
+#   selection range, validity / checkValidity / setCustomValidity,
+#   form.requestSubmit / submit / elements), Text length / splitText,
+#   document.importNode / elementFromPoint / styleSheets / characterSet /
+#   compatMode, WheelEvent / TouchEvent / ErrorEvent, File, FileReader,
+#   Option, Audio, DOMMatrix, WebSocket / EventSource / Worker stubs that
+#   fail like a refused connection, and a customElements registry that
+#   upgrades existing and inserted elements (prototype + connectedCallback).
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 3eb06892a..00fa3842a 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1174,6 +1174,544 @@
+ "\t}\n"
+ "})();\n"
+ "\n"
++"/* ---- the DOM surface a census found missing (2026-09-26) ---------------\n"
++" * parentElement (!), innerText, localName, the reflected attributes, the\n"
++" * form-control API, text-node odds, document helpers, window\n"
++" * constructors. Each is added only where the bridge has nothing. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d) return;\n"
++"\tvar el = d.createElement('section'), E = Object.getPrototypeOf(el);\n"
++"\tvar T = Object.getPrototypeOf(d.createTextNode(''));\n"
++"\tfunction acc(o, n, get, set) {\n"
++"\t\tif (!o) return;\n"
++"\t\ttry {\n"
++"\t\t\tvar have = Object.getOwnPropertyDescriptor(o, n);\n"
++"\t\t\tif (have || (n in o && o[n] !== undefined)) return;\n"
++"\t\t} catch (e) { /* the getter itself threw: replace it */ }\n"
++"\t\ttry { Object.defineProperty(o, n, { get: get, set: set, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tfunction fn(o, n, f) {\n"
++"\t\tif (!o || typeof o[n] === 'function') return;\n"
++"\t\ttry { Object.defineProperty(o, n, { value: f, writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tfunction parentEl() { var p = this.parentNode; return p && p.nodeType === 1 ? p : null; }\n"
++"\tvar CP = null;\n"
++"\ttry { CP = Object.getPrototypeOf(d.createComment('')); } catch (e) { /* no native document yet */ }\n"
++"\t[E, T, CP].forEach(function (o) {\n"
++"\t\tacc(o, 'parentElement', parentEl);\n"
++"\t});\n"
++"\tfunction reflect(n, attr, kind) {\n"
++"\t\tacc(E, n, function () {\n"
++"\t\t\tvar v = this.getAttribute(attr);\n"
++"\t\t\tif (kind === 'bool') return v !== null;\n"
++"\t\t\tif (kind === 'int') { var i = parseInt(v, 10); return isNaN(i) ? (attr === 'tabindex' ? -1 : 0) : i; }\n"
++"\t\t\treturn v === null ? '' : v;\n"
++"\t\t}, function (v) {\n"
++"\t\t\tif (kind === 'bool') { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); }\n"
++"\t\t\telse this.setAttribute(attr, String(v));\n"
++"\t\t});\n"
++"\t}\n"
++"\treflect('hidden', 'hidden', 'bool'); reflect('lang', 'lang'); reflect('dir', 'dir');\n"
++"\treflect('tabIndex', 'tabindex', 'int'); reflect('draggable', 'draggable', 'bool');\n"
++"\treflect('slot', 'slot'); reflect('autocomplete', 'autocomplete');\n"
++"\tacc(E, 'localName', function () { return String(this.tagName || '').toLowerCase(); });\n"
++"\tacc(E, 'namespaceURI', function () {\n"
++"\t\tvar t = String(this.tagName || '').toLowerCase();\n"
++"\t\treturn (t === 'svg' || t === 'path' || t === 'g' || t === 'circle' || t === 'rect' ||\n"
++"\t\t\tt === 'use' || t === 'symbol' || t === 'defs' || t === 'polygon' || t === 'line')\n"
++"\t\t\t? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';\n"
++"\t});\n"
++"\tacc(E, 'innerText', function () { return this.textContent; },\n"
++"\t\tfunction (v) { this.textContent = v; });\n"
++"\tacc(E, 'outerText', function () { return this.textContent; });\n"
++"\tacc(E, 'clientTop', function () { return 0; });\n"
++"\tacc(E, 'clientLeft', function () { return 0; });\n"
++"\tacc(E, 'shadowRoot', function () { return null; });\n"
++"\tacc(E, 'assignedSlot', function () { return null; });\n"
++"\tfn(E, 'getAttributeNS', function (ns, n) { return this.getAttribute(n); });\n"
++"\tfn(E, 'setAttributeNS', function (ns, n, v) {\n"
++"\t\tvar i = String(n).indexOf(':');\n"
++"\t\treturn this.setAttribute(i >= 0 && !/^xmlns|^xlink/.test(n) ? n.slice(i + 1) : n, v);\n"
++"\t});\n"
++"\tfn(E, 'removeAttributeNS', function (ns, n) { return this.removeAttribute(n); });\n"
++"\tfn(E, 'hasAttributeNS', function (ns, n) { return this.hasAttribute(n); });\n"
++"\tif (typeof E.matches === 'function') {\n"
++"\t\tfn(E, 'webkitMatchesSelector', E.matches);\n"
++"\t\tfn(E, 'msMatchesSelector', E.matches);\n"
++"\t}\n"
++"\tfunction elScroll(x, y) {\n"
++"\t\tif (x && typeof x === 'object') { y = x.top; x = x.left; }\n"
++"\t\tif (typeof x === 'number' && !isNaN(x)) this.scrollLeft = x;\n"
++"\t\tif (typeof y === 'number' && !isNaN(y)) this.scrollTop = y;\n"
++"\t}\n"
++"\tfn(E, 'scrollTo', elScroll); fn(E, 'scroll', elScroll);\n"
++"\tfn(E, 'scrollBy', function (x, y) {\n"
++"\t\tif (x && typeof x === 'object') { y = x.top; x = x.left; }\n"
++"\t\telScroll.call(this, (this.scrollLeft || 0) + (x || 0), (this.scrollTop || 0) + (y || 0));\n"
++"\t});\n"
++"\tfn(E, 'requestFullscreen', function () { return Promise.reject(new TypeError('fullscreen is not available')); });\n"
++"\tfn(E, 'setPointerCapture', function () {});\n"
++"\tfn(E, 'releasePointerCapture', function () {});\n"
++"\tfn(E, 'hasPointerCapture', function () { return false; });\n"
++"\t/* form controls */\n"
++"\tvar I = Object.getPrototypeOf(d.createElement('input'));\n"
++"\tvar TA = Object.getPrototypeOf(d.createElement('textarea'));\n"
++"\t[I, TA].forEach(function (P) {\n"
++"\t\tacc(P, 'defaultValue', function () { return this.getAttribute('value') || ''; },\n"
++"\t\t\tfunction (v) { this.setAttribute('value', String(v)); });\n"
++"\t\tacc(P, 'form', function () {\n"
++"\t\t\tvar f = this.getAttribute('form');\n"
++"\t\t\tif (f) return d.getElementById(f);\n"
++"\t\t\treturn this.closest ? this.closest('form') : null;\n"
++"\t\t});\n"
++"\t\tacc(P, 'labels', function () {\n"
++"\t\t\tvar out = [], id = this.id, ls = d.getElementsByTagName('label');\n"
++"\t\t\tfor (var i = 0; i < ls.length; i++)\n"
++"\t\t\t\tif ((id && ls[i].getAttribute('for') === id) || (ls[i].contains && ls[i].contains(this))) out.push(ls[i]);\n"
++"\t\t\treturn out;\n"
++"\t\t});\n"
++"\t\tacc(P, 'maxLength', function () { var v = parseInt(this.getAttribute('maxlength'), 10); return isNaN(v) ? -1 : v; },\n"
++"\t\t\tfunction (v) { this.setAttribute('maxlength', String(v)); });\n"
++"\t\tacc(P, 'selectionStart', function () { return this.__vbSelS != null ? this.__vbSelS : String(this.value || '').length; },\n"
++"\t\t\tfunction (v) { this.__vbSelS = v; });\n"
++"\t\tacc(P, 'selectionEnd', function () { return this.__vbSelE != null ? this.__vbSelE : String(this.value || '').length; },\n"
++"\t\t\tfunction (v) { this.__vbSelE = v; });\n"
++"\t\tacc(P, 'selectionDirection', function () { return 'none'; });\n"
++"\t\tfn(P, 'setSelectionRange', function (a, b) { this.__vbSelS = a; this.__vbSelE = b; });\n"
++"\t\tfn(P, 'select', function () { this.__vbSelS = 0; this.__vbSelE = String(this.value || '').length; });\n"
++"\t\tfn(P, 'setRangeText', function (t) { this.value = String(t); });\n"
++"\t\tacc(P, 'willValidate', function () { return !this.disabled; });\n"
++"\t\tacc(P, 'validationMessage', function () { return this.__vbCustomValidity || ''; });\n"
++"\t\tfn(P, 'setCustomValidity', function (m) { this.__vbCustomValidity = String(m || ''); });\n"
++"\t\tacc(P, 'validity', function () {\n"
++"\t\t\tvar v = String(this.value || ''), req = this.hasAttribute && this.hasAttribute('required');\n"
++"\t\t\tvar type = String(this.getAttribute && this.getAttribute('type') || '').toLowerCase();\n"
++"\t\t\tvar missing = !!(req && !v);\n"
++"\t\t\tvar typeMismatch = !!(v && type === 'email' && !/^[^@\\s]+@[^@\\s]+$/.test(v));\n"
++"\t\t\tvar custom = !!this.__vbCustomValidity;\n"
++"\t\t\tvar pat = this.getAttribute && this.getAttribute('pattern'), patMis = false;\n"
++"\t\t\tif (v && pat) { try { patMis = !new RegExp('^(?:' + pat + ')$').test(v); } catch (e) { /* */ } }\n"
++"\t\t\tvar ml = parseInt(this.getAttribute && this.getAttribute('minlength'), 10);\n"
++"\t\t\tvar tooShort = !!(v && !isNaN(ml) && v.length < ml);\n"
++"\t\t\tvar bad = missing || typeMismatch || custom || patMis || tooShort;\n"
++"\t\t\treturn { valueMissing: missing, typeMismatch: typeMismatch, patternMismatch: patMis,\n"
++"\t\t\t\ttooLong: false, tooShort: tooShort, rangeUnderflow: false, rangeOverflow: false,\n"
++"\t\t\t\tstepMismatch: false, badInput: false, customError: custom, valid: !bad };\n"
++"\t\t});\n"
++"\t\tfn(P, 'checkValidity', function () {\n"
++"\t\t\tvar ok = this.validity.valid;\n"
++"\t\t\tif (!ok) { try { this.dispatchEvent(new Event('invalid', { cancelable: true })); } catch (e) { /* */ } }\n"
++"\t\t\treturn ok;\n"
++"\t\t});\n"
++"\t\tfn(P, 'reportValidity', function () { return this.checkValidity(); });\n"
++"\t});\n"
++"\tacc(I, 'valueAsNumber', function () { var n = parseFloat(this.value); return isNaN(n) ? NaN : n; },\n"
++"\t\tfunction (v) { this.value = String(v); });\n"
++"\tacc(I, 'files', function () { return null; });\n"
++"\tvar F = Object.getPrototypeOf(d.createElement('form'));\n"
++"\tfn(F, 'checkValidity', function () {\n"
++"\t\tvar els = this.querySelectorAll('input,textarea,select'), ok = true;\n"
++"\t\tfor (var i = 0; i < els.length; i++) if (els[i].checkValidity && !els[i].checkValidity()) ok = false;\n"
++"\t\treturn ok;\n"
++"\t});\n"
++"\tfn(F, 'reportValidity', function () { return this.checkValidity(); });\n"
++"\tfn(F, 'requestSubmit', function (btn) {\n"
++"\t\t/* script-driven submit: fire the event; if nobody cancels it,\n"
++"\t\t * navigate like a GET/POST form would, through a click on a\n"
++"\t\t * submit control (the engine owns form encoding) */\n"
++"\t\tvar ev = new Event('submit', { bubbles: true, cancelable: true });\n"
++"\t\ttry { ev.submitter = btn || null; } catch (e) { /* */ }\n"
++"\t\tif (this.dispatchEvent(ev) === false || ev.defaultPrevented) return;\n"
++"\t\tfn.nativeSubmit(this);\n"
++"\t});\n"
++"\tfn(F, 'submit', function () { fn.nativeSubmit(this); });\n"
++"\tfn.nativeSubmit = function (form) {\n"
++"\t\tvar b = form.querySelector('button[type=submit],input[type=submit],button:not([type])');\n"
++"\t\tif (!b) {\n"
++"\t\t\tb = d.createElement('input'); b.type = 'submit'; b.style.display = 'none';\n"
++"\t\t\tform.appendChild(b);\n"
++"\t\t}\n"
++"\t\tif (typeof b.click === 'function') b.click();\n"
++"\t};\n"
++"\tacc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });\n"
++"\t/* text nodes */\n"
++"\tacc(T, 'length', function () { return String(this.data || this.nodeValue || '').length; });\n"
++"\tacc(T, 'wholeText', function () { return String(this.data || this.nodeValue || ''); });\n"
++"\tfn(T, 'splitText', function (off) {\n"
++"\t\tvar s = String(this.data), rest = d.createTextNode(s.slice(off));\n"
++"\t\tthis.data = s.slice(0, off);\n"
++"\t\tif (this.parentNode) this.parentNode.insertBefore(rest, this.nextSibling);\n"
++"\t\treturn rest;\n"
++"\t});\n"
++"\t/* document */\n"
++"\tacc(d, 'characterSet', function () { return 'UTF-8'; });\n"
++"\tacc(d, 'charset', function () { return 'UTF-8'; });\n"
++"\tacc(d, 'inputEncoding', function () { return 'UTF-8'; });\n"
++"\tacc(d, 'contentType', function () { return 'text/html'; });\n"
++"\tacc(d, 'compatMode', function () { return 'CSS1Compat'; });\n"
++"\tacc(d, 'dir', function () { return (d.documentElement && d.documentElement.getAttribute('dir')) || ''; });\n"
++"\tacc(d, 'currentScript', function () { return d.__vbCurrentScript || null; });\n"
++"\tacc(d, 'styleSheets', function () {\n"
++"\t\tvar out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');\n"
++"\t\tfor (var i = 0; i < ls.length; i++)\n"
++"\t\t\tout.push({ ownerNode: ls[i], href: ls[i].href || null, disabled: false,\n"
++"\t\t\t\tcssRules: [], rules: [], media: { mediaText: ls[i].media || '' },\n"
++"\t\t\t\tinsertRule: function () { return 0; }, deleteRule: function () {} });\n"
++"\t\treturn out;\n"
++"\t});\n"
++"\tvar adopted = [];\n"
++"\tacc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });\n"
++"\tfn(d, 'importNode', function (n, deep) { return n.cloneNode(!!deep); });\n"
++"\tfn(d, 'adoptNode', function (n) { if (n.parentNode) n.parentNode.removeChild(n); return n; });\n"
++"\tfn(d, 'elementsFromPoint', function (x, y) {\n"
++"\t\t/* geometry walk: every element whose box holds the point, deepest\n"
++"\t\t * last-painted first (tree order approximates paint order) */\n"
++"\t\tvar out = [], all = d.body ? d.body.getElementsByTagName('*') : [];\n"
++"\t\tfor (var i = all.length - 1; i >= 0; i--) {\n"
++"\t\t\tvar r = all[i].getBoundingClientRect();\n"
++"\t\t\tif (r && r.width > 0 && x >= r.left && x < r.right && y >= r.top && y < r.bottom) out.push(all[i]);\n"
++"\t\t}\n"
++"\t\tif (d.body) out.push(d.body);\n"
++"\t\tif (d.documentElement) out.push(d.documentElement);\n"
++"\t\treturn out;\n"
++"\t});\n"
++"\tfn(d, 'elementFromPoint', function (x, y) { var a = d.elementsFromPoint(x, y); return a.length ? a[0] : null; });\n"
++"\t/* window */\n"
++"\tif (g.isSecureContext === undefined) g.isSecureContext = true;\n"
++"\tif (g.origin === undefined) try { g.origin = g.location.origin; } catch (e) { /* */ }\n"
++"\tfn(g, 'print', function () {});\n"
++"\tfunction evtCtor(name, extra) {\n"
++"\t\tif (typeof g[name] === 'function') return;\n"
++"\t\tvar C = function (type, init) {\n"
++"\t\t\tvar e = new Event(type, init);\n"
++"\t\t\tinit = init || {};\n"
++"\t\t\t(extra || []).forEach(function (k) { if (k in init) try { e[k] = init[k]; } catch (x) { /* */ } });\n"
++"\t\t\treturn e;\n"
++"\t\t};\n"
++"\t\tC.prototype = Object.create(Event.prototype);\n"
++"\t\tg[name] = C;\n"
++"\t}\n"
++"\tevtCtor('WheelEvent', ['deltaX', 'deltaY', 'deltaZ', 'deltaMode', 'clientX', 'clientY']);\n"
++"\tevtCtor('TouchEvent', ['touches', 'targetTouches', 'changedTouches']);\n"
++"\tevtCtor('ErrorEvent', ['message', 'filename', 'lineno', 'colno', 'error']);\n"
++"\tevtCtor('PromiseRejectionEvent', ['promise', 'reason']);\n"
++"\tif (typeof g.File !== 'function' && typeof g.Blob === 'function') {\n"
++"\t\tg.File = function (parts, name, opts) {\n"
++"\t\t\tvar b = new Blob(parts, opts);\n"
++"\t\t\ttry { b.name = String(name); b.lastModified = (opts && opts.lastModified) || Date.now(); } catch (e) { /* */ }\n"
++"\t\t\treturn b;\n"
++"\t\t};\n"
++"\t}\n"
++"\tif (typeof g.FileReader !== 'function') {\n"
++"\t\tvar FR = function () { this.readyState = 0; this.result = null; this.error = null; };\n"
++"\t\t['readAsText', 'readAsDataURL', 'readAsArrayBuffer'].forEach(function (m) {\n"
++"\t\t\tFR.prototype[m] = function (blob) {\n"
++"\t\t\t\tvar self = this, p = (m === 'readAsText') ? blob.text() :\n"
++"\t\t\t\t\tblob.arrayBuffer().then(function (ab) {\n"
++"\t\t\t\t\t\tif (m === 'readAsArrayBuffer') return ab;\n"
++"\t\t\t\t\t\tvar u = new Uint8Array(ab), s = '';\n"
++"\t\t\t\t\t\tfor (var i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);\n"
++"\t\t\t\t\t\treturn 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(s);\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\tp.then(function (r) {\n"
++"\t\t\t\t\tself.readyState = 2; self.result = r;\n"
++"\t\t\t\t\tif (self.onload) self.onload({ target: self });\n"
++"\t\t\t\t\tif (self.onloadend) self.onloadend({ target: self });\n"
++"\t\t\t\t}, function (e) {\n"
++"\t\t\t\t\tself.readyState = 2; self.error = e;\n"
++"\t\t\t\t\tif (self.onerror) self.onerror({ target: self });\n"
++"\t\t\t\t});\n"
++"\t\t\t};\n"
++"\t\t});\n"
++"\t\tFR.prototype.abort = function () {};\n"
++"\t\tFR.prototype.addEventListener = function (t, f) { this['on' + t] = f; };\n"
++"\t\tg.FileReader = FR;\n"
++"\t}\n"
++"\tif (typeof g.Option !== 'function') {\n"
++"\t\tg.Option = function (text, value, defSel, sel) {\n"
++"\t\t\tvar o = d.createElement('option');\n"
++"\t\t\tif (text !== undefined) o.textContent = String(text);\n"
++"\t\t\tif (value !== undefined) o.setAttribute('value', String(value));\n"
++"\t\t\tif (sel) o.setAttribute('selected', '');\n"
++"\t\t\treturn o;\n"
++"\t\t};\n"
++"\t}\n"
++"\tif (typeof g.Audio !== 'function') {\n"
++"\t\tg.Audio = function (src) {\n"
++"\t\t\tvar a = d.createElement('audio');\n"
++"\t\t\tif (src) a.setAttribute('src', src);\n"
++"\t\t\ta.play = function () { return Promise.reject(new Error('no audio')); };\n"
++"\t\t\ta.pause = function () {};\n"
++"\t\t\treturn a;\n"
++"\t\t};\n"
++"\t}\n"
++"\t/* No network sockets or workers: construct, then fail the way a\n"
++"\t * refused connection does, so callers fall back instead of throwing. */\n"
++"\tfunction failing(name) {\n"
++"\t\tif (typeof g[name] === 'function') return;\n"
++"\t\tvar C = function (url) {\n"
++"\t\t\tvar self = this;\n"
++"\t\t\tthis.url = String(url); this.readyState = 3; this.onerror = null; this.onclose = null;\n"
++"\t\t\tthis.onmessage = null; this.onopen = null;\n"
++"\t\t\tsetTimeout(function () {\n"
++"\t\t\t\tvar ev = { type: 'error', target: self };\n"
++"\t\t\t\tif (typeof self.onerror === 'function') self.onerror(ev);\n"
++"\t\t\t\tif (self.__l && self.__l.error) self.__l.error.forEach(function (f) { f(ev); });\n"
++"\t\t\t\tvar cl = { type: 'close', code: 1006, reason: '', wasClean: false, target: self };\n"
++"\t\t\t\tif (typeof self.onclose === 'function') self.onclose(cl);\n"
++"\t\t\t\tif (self.__l && self.__l.close) self.__l.close.forEach(function (f) { f(cl); });\n"
++"\t\t\t}, 0);\n"
++"\t\t};\n"
++"\t\tC.prototype.addEventListener = function (t, f) { (this.__l = this.__l || {}); (this.__l[t] = this.__l[t] || []).push(f); };\n"
++"\t\tC.prototype.removeEventListener = function () {};\n"
++"\t\tC.prototype.send = function () {}; C.prototype.close = function () {};\n"
++"\t\tC.prototype.postMessage = function () {}; C.prototype.terminate = function () {};\n"
++"\t\tC.CONNECTING = 0; C.OPEN = 1; C.CLOSING = 2; C.CLOSED = 3;\n"
++"\t\tg[name] = C;\n"
++"\t}\n"
++"\tfailing('WebSocket'); failing('EventSource'); failing('Worker'); failing('SharedWorker');\n"
++"\tif (typeof g.DOMMatrix !== 'function') {\n"
++"\t\tvar M = function (init) {\n"
++"\t\t\tvar v = Array.isArray(init) ? init : [1, 0, 0, 1, 0, 0];\n"
++"\t\t\tthis.a = v[0]; this.b = v[1]; this.c = v[2]; this.d = v[3]; this.e = v[4]; this.f = v[5];\n"
++"\t\t\tthis.m11 = this.a; this.m12 = this.b; this.m21 = this.c; this.m22 = this.d; this.m41 = this.e; this.m42 = this.f;\n"
++"\t\t\tthis.is2D = true; this.isIdentity = this.a === 1 && !this.b && !this.c && this.d === 1 && !this.e && !this.f;\n"
++"\t\t};\n"
++"\t\tg.DOMMatrix = M; g.WebKitCSSMatrix = M; g.DOMMatrixReadOnly = M;\n"
++"\t}\n"
++"\t/* custom elements: a registry, and an upgrade that gives already-\n"
++"\t * present and later-inserted elements the class's prototype and runs\n"
++"\t * connectedCallback (constructors cannot run on existing nodes). */\n"
++"\tif (typeof g.customElements === 'undefined') {\n"
++"\t\tvar defs = {}, waits = {};\n"
++"\t\tfunction upgrade(node) {\n"
++"\t\t\tif (!node || node.nodeType !== 1) return;\n"
++"\t\t\tvar C = defs[String(node.localName || node.tagName || '').toLowerCase()];\n"
++"\t\t\tif (C && !node.__vbUpgraded) {\n"
++"\t\t\t\tnode.__vbUpgraded = true;\n"
++"\t\t\t\ttry { Object.setPrototypeOf(node, C.prototype); } catch (e) { /* */ }\n"
++"\t\t\t\ttry { if (typeof node.connectedCallback === 'function') node.connectedCallback(); } catch (e) {\n"
++"\t\t\t\t\ttry { console.error('customElement ' + node.localName + ' connectedCallback: ' + e); } catch (x) { /* */ } }\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tfunction sweep(root) {\n"
++"\t\t\tvar names = Object.keys(defs);\n"
++"\t\t\tif (!names.length || !root || !root.querySelectorAll) return;\n"
++"\t\t\tvar list = root.querySelectorAll(names.join(','));\n"
++"\t\t\tfor (var i = 0; i < list.length; i++) upgrade(list[i]);\n"
++"\t\t}\n"
++"\t\tg.customElements = {\n"
++"\t\t\tdefine: function (name, C) {\n"
++"\t\t\t\tname = String(name).toLowerCase();\n"
++"\t\t\t\tif (defs[name]) throw new DOMException('\"' + name + '\" has already been defined', 'NotSupportedError');\n"
++"\t\t\t\tdefs[name] = C;\n"
++"\t\t\t\tsweep(d);\n"
++"\t\t\t\tif (waits[name]) { waits[name].forEach(function (r) { r(C); }); delete waits[name]; }\n"
++"\t\t\t},\n"
++"\t\t\tget: function (name) { return defs[String(name).toLowerCase()]; },\n"
++"\t\t\tgetName: function (C) { for (var k in defs) if (defs[k] === C) return k; return null; },\n"
++"\t\t\twhenDefined: function (name) {\n"
++"\t\t\t\tname = String(name).toLowerCase();\n"
++"\t\t\t\tif (defs[name]) return Promise.resolve(defs[name]);\n"
++"\t\t\t\treturn new Promise(function (r) { (waits[name] = waits[name] || []).push(r); });\n"
++"\t\t\t},\n"
++"\t\t\tupgrade: function (root) { upgrade(root); sweep(root); }\n"
++"\t\t};\n"
++"\t\tif (typeof g.MutationObserver === 'function') {\n"
++"\t\t\ttry {\n"
++"\t\t\t\tnew MutationObserver(function (ms) {\n"
++"\t\t\t\t\tif (!Object.keys(defs).length) return;\n"
++"\t\t\t\t\tms.forEach(function (m) {\n"
++"\t\t\t\t\t\tfor (var i = 0; m.addedNodes && i < m.addedNodes.length; i++) {\n"
++"\t\t\t\t\t\t\tupgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t}).observe(d, { childList: true, subtree: true });\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t}\n"
++"})();\n"
++"\n"
++"/* ---- addEventListener: listener objects, once, signal ------------------\n"
++" * The bridge's element addEventListener dropped any listener that is not a\n"
++" * function, so an EventListener OBJECT ({handleEvent}) never ran -- the\n"
++" * pattern of several frameworks. Every addEventListener the bridge defines\n"
++" * is wrapped: an object becomes a stable function (so removeEventListener\n"
++" * finds it), and once / signal are honoured the same way everywhere. */\n"
++"\n"
++"(function () {\n"
++"\tvar objFn = new WeakMap(), onceFn = new WeakMap();\n"
++"\tfunction key(type, capture) { return type + (capture ? '|c' : '|b'); }\n"
++"\tfunction listenerFn(l) {\n"
++"\t\tif (typeof l === 'function') return l;\n"
++"\t\tif (!l || typeof l !== 'object') return null;\n"
++"\t\tvar f = objFn.get(l);\n"
++"\t\tif (!f) {\n"
++"\t\t\tf = function (e) {\n"
++"\t\t\t\tvar h = l.handleEvent;\n"
++"\t\t\t\tif (typeof h === 'function') return h.call(l, e);\n"
++"\t\t\t};\n"
++"\t\t\tobjFn.set(l, f);\n"
++"\t\t}\n"
++"\t\treturn f;\n"
++"\t}\n"
++"\tfunction capOf(o) {\n"
++"\t\treturn (typeof o === 'boolean') ? o : !!(o && typeof o === 'object' && o.capture);\n"
++"\t}\n"
++"\tfunction wrap(t) {\n"
++"\t\tif (!t) return;\n"
++"\t\tvar add = t.addEventListener, rem = t.removeEventListener;\n"
++"\t\tif (typeof add !== 'function' || add.__vitaWrapped) return;\n"
++"\t\tvar nadd = function (type, l, o) {\n"
++"\t\t\tvar f = listenerFn(l), self = this;\n"
++"\t\t\tif (!f) return;\n"
++"\t\t\tvar cap = capOf(o), k = key(String(type), cap);\n"
++"\t\t\tif (o && typeof o === 'object') {\n"
++"\t\t\t\tif (o.signal && o.signal.aborted) return;\n"
++"\t\t\t\tif (o.once) {\n"
++"\t\t\t\t\tvar m = onceFn.get(f);\n"
++"\t\t\t\t\tif (!m) { m = {}; onceFn.set(f, m); }\n"
++"\t\t\t\t\tif (!m[k]) {\n"
++"\t\t\t\t\t\tvar orig = f;\n"
++"\t\t\t\t\t\tvar g = function (e) {\n"
++"\t\t\t\t\t\t\ttry { rem.call(self, type, g, cap); } catch (x) { /* */ }\n"
++"\t\t\t\t\t\t\tdelete m[k];\n"
++"\t\t\t\t\t\t\treturn orig.call(this, e);\n"
++"\t\t\t\t\t\t};\n"
++"\t\t\t\t\t\tm[k] = g;\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\tf = m[k];\n"
++"\t\t\t\t}\n"
++"\t\t\t\tif (o.signal && typeof o.signal.addEventListener === 'function') {\n"
++"\t\t\t\t\tvar fin = f;\n"
++"\t\t\t\t\to.signal.addEventListener('abort', function () {\n"
++"\t\t\t\t\t\ttry { rem.call(self, type, fin, cap); } catch (x) { /* */ }\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t\treturn add.call(this, type, f, o);\n"
++"\t\t};\n"
++"\t\tvar nrem = function (type, l, o) {\n"
++"\t\t\tvar f = listenerFn(l);\n"
++"\t\t\tif (!f) return;\n"
++"\t\t\tvar m = onceFn.get(f), k = key(String(type), capOf(o));\n"
++"\t\t\tif (m && m[k]) { var g = m[k]; delete m[k]; rem.call(this, type, g, o); }\n"
++"\t\t\treturn rem.call(this, type, f, o);\n"
++"\t\t};\n"
++"\t\tnadd.__vitaWrapped = true;\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(t, 'addEventListener', { value: nadd, writable: true, configurable: true });\n"
++"\t\t\tif (typeof rem === 'function')\n"
++"\t\t\t\tObject.defineProperty(t, 'removeEventListener', { value: nrem, writable: true, configurable: true });\n"
++"\t\t} catch (e) { /* exotic object refused */ }\n"
++"\t}\n"
++"\tvar d = g.document, targets = [g, d, g.EventTarget && g.EventTarget.prototype,\n"
++"\t\tg.XMLHttpRequest && g.XMLHttpRequest.prototype,\n"
++"\t\tg.MessagePort && g.MessagePort.prototype,\n"
++"\t\tg.AbortSignal && g.AbortSignal.prototype];\n"
++"\ttry {\n"
++"\t\tvar el = d && d.createElement('section');\n"
++"\t\tfor (var p = el && Object.getPrototypeOf(el); p; p = Object.getPrototypeOf(p))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) targets.push(p);\n"
++"\t\tvar tx = d && d.createTextNode('');\n"
++"\t\tfor (p = tx && Object.getPrototypeOf(tx); p; p = Object.getPrototypeOf(p))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) targets.push(p);\n"
++"\t\tfor (p = d && Object.getPrototypeOf(d); p; p = Object.getPrototypeOf(p))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) targets.push(p);\n"
++"\t} catch (e) { /* */ }\n"
++"\ttargets.forEach(function (t) {\n"
++"\t\tif (t && Object.prototype.hasOwnProperty.call(t, 'addEventListener')) wrap(t);\n"
++"\t});\n"
++"})();\n"
++"\n"
++"/* ---- DocumentFragment: the ParentNode queries ---------------------------\n"
++" * A fragment (createDocumentFragment, template content, cloneNode of one)\n"
++" * had no querySelector / querySelectorAll / getElementById / children. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createDocumentFragment !== 'function') return;\n"
++"\tvar F;\n"
++"\ttry { F = Object.getPrototypeOf(d.createDocumentFragment()); } catch (e) { return; }\n"
++"\tif (!F) return;\n"
++"\tfunction kids(f) {\n"
++"\t\tvar a = [];\n"
++"\t\tfor (var n = f.firstChild; n; n = n.nextSibling) if (n.nodeType === 1) a.push(n);\n"
++"\t\treturn a;\n"
++"\t}\n"
++"\tfunction qsa(f, sel) {\n"
++"\t\tvar out = [];\n"
++"\t\tkids(f).forEach(function (n) {\n"
++"\t\t\ttry { if (n.matches && n.matches(sel)) out.push(n); } catch (e) { /* */ }\n"
++"\t\t\tvar r = n.querySelectorAll ? n.querySelectorAll(sel) : [];\n"
++"\t\t\tfor (var i = 0; i < r.length; i++) out.push(r[i]);\n"
++"\t\t});\n"
++"\t\treturn out;\n"
++"\t}\n"
++"\tfunction def(n, v) {\n"
++"\t\tif (typeof F[n] === 'function') return;\n"
++"\t\ttry { Object.defineProperty(F, n, { value: v, writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tdef('querySelectorAll', function (sel) { return qsa(this, String(sel)); });\n"
++"\tdef('querySelector', function (sel) { var r = qsa(this, String(sel)); return r.length ? r[0] : null; });\n"
++"\tdef('getElementById', function (id) {\n"
++"\t\tvar r = qsa(this, '*');\n"
++"\t\tfor (var i = 0; i < r.length; i++) if (r[i].id === String(id)) return r[i];\n"
++"\t\treturn null;\n"
++"\t});\n"
++"\tdef('append', function () {\n"
++"\t\tfor (var i = 0; i < arguments.length; i++) {\n"
++"\t\t\tvar n = arguments[i];\n"
++"\t\t\tthis.appendChild(typeof n === 'string' ? d.createTextNode(n) : n);\n"
++"\t\t}\n"
++"\t});\n"
++"\tdef('prepend', function () {\n"
++"\t\tvar first = this.firstChild;\n"
++"\t\tfor (var i = 0; i < arguments.length; i++) {\n"
++"\t\t\tvar n = arguments[i];\n"
++"\t\t\tthis.insertBefore(typeof n === 'string' ? d.createTextNode(n) : n, first);\n"
++"\t\t}\n"
++"\t});\n"
++"\tfunction acc(n, get) {\n"
++"\t\tif (n in F) return;\n"
++"\t\ttry { Object.defineProperty(F, n, { get: get, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tacc('children', function () { return kids(this); });\n"
++"\tacc('firstElementChild', function () { var k = kids(this); return k.length ? k[0] : null; });\n"
++"\tacc('lastElementChild', function () { var k = kids(this); return k.length ? k[k.length - 1] : null; });\n"
++"\tacc('childElementCount', function () { return kids(this).length; });\n"
++"})();\n"
++"\n"
++"/* ---- <template>.content -------------------------------------------------\n"
++" * The bridge has no template contents: t.content was undefined, and\n"
++" * component code clones it (t.content.cloneNode(true)). The children move\n"
++" * into a fragment on each read, which also catches innerHTML set later. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d) return;\n"
++"\tvar T = g.HTMLTemplateElement && g.HTMLTemplateElement.prototype;\n"
++"\tvar frags = new WeakMap();\n"
++"\tfunction content() {\n"
++"\t\tif (String(this.tagName).toUpperCase() !== 'TEMPLATE') return undefined;\n"
++"\t\tvar f = frags.get(this);\n"
++"\t\tif (!f) { f = d.createDocumentFragment(); frags.set(this, f); }\n"
++"\t\twhile (this.firstChild) f.appendChild(this.firstChild);\n"
++"\t\treturn f;\n"
++"\t}\n"
++"\tvar targets = [T];\n"
++"\ttry {\n"
++"\t\tvar t = d.createElement('template');\n"
++"\t\ttargets.push(Object.getPrototypeOf(t));\n"
++"\t} catch (e) { /* */ }\n"
++"\ttargets.forEach(function (p) {\n"
++"\t\tif (!p || (Object.getOwnPropertyDescriptor(p, 'content') || {}).get) return;\n"
++"\t\ttry { Object.defineProperty(p, 'content', { get: content, configurable: true }); } catch (e) { /* */ }\n"
++"\t});\n"
++"})();\n"
++"\n"
+ "/* ---- on<event> handler properties on document and window ---------------\n"
+ " * React picks its input-event path with (\"oninput\" in document); false sent\n"
+ " * every keystroke down an old-IE path that threw on each keydown/keyup\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index bc0f4a5d0..35917300d 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1173,6 +1173,544 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ })();
+ 
++/* ---- the DOM surface a census found missing (2026-09-26) ---------------
++ * parentElement (!), innerText, localName, the reflected attributes, the
++ * form-control API, text-node odds, document helpers, window
++ * constructors. Each is added only where the bridge has nothing. */
++
++(function () {
++	var d = g.document;
++	if (!d) return;
++	var el = d.createElement('section'), E = Object.getPrototypeOf(el);
++	var T = Object.getPrototypeOf(d.createTextNode(''));
++	function acc(o, n, get, set) {
++		if (!o) return;
++		try {
++			var have = Object.getOwnPropertyDescriptor(o, n);
++			if (have || (n in o && o[n] !== undefined)) return;
++		} catch (e) { /* the getter itself threw: replace it */ }
++		try { Object.defineProperty(o, n, { get: get, set: set, configurable: true }); } catch (e) { /* */ }
++	}
++	function fn(o, n, f) {
++		if (!o || typeof o[n] === 'function') return;
++		try { Object.defineProperty(o, n, { value: f, writable: true, configurable: true }); } catch (e) { /* */ }
++	}
++	function parentEl() { var p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
++	var CP = null;
++	try { CP = Object.getPrototypeOf(d.createComment('')); } catch (e) { /* no native document yet */ }
++	[E, T, CP].forEach(function (o) {
++		acc(o, 'parentElement', parentEl);
++	});
++	function reflect(n, attr, kind) {
++		acc(E, n, function () {
++			var v = this.getAttribute(attr);
++			if (kind === 'bool') return v !== null;
++			if (kind === 'int') { var i = parseInt(v, 10); return isNaN(i) ? (attr === 'tabindex' ? -1 : 0) : i; }
++			return v === null ? '' : v;
++		}, function (v) {
++			if (kind === 'bool') { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); }
++			else this.setAttribute(attr, String(v));
++		});
++	}
++	reflect('hidden', 'hidden', 'bool'); reflect('lang', 'lang'); reflect('dir', 'dir');
++	reflect('tabIndex', 'tabindex', 'int'); reflect('draggable', 'draggable', 'bool');
++	reflect('slot', 'slot'); reflect('autocomplete', 'autocomplete');
++	acc(E, 'localName', function () { return String(this.tagName || '').toLowerCase(); });
++	acc(E, 'namespaceURI', function () {
++		var t = String(this.tagName || '').toLowerCase();
++		return (t === 'svg' || t === 'path' || t === 'g' || t === 'circle' || t === 'rect' ||
++			t === 'use' || t === 'symbol' || t === 'defs' || t === 'polygon' || t === 'line')
++			? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';
++	});
++	acc(E, 'innerText', function () { return this.textContent; },
++		function (v) { this.textContent = v; });
++	acc(E, 'outerText', function () { return this.textContent; });
++	acc(E, 'clientTop', function () { return 0; });
++	acc(E, 'clientLeft', function () { return 0; });
++	acc(E, 'shadowRoot', function () { return null; });
++	acc(E, 'assignedSlot', function () { return null; });
++	fn(E, 'getAttributeNS', function (ns, n) { return this.getAttribute(n); });
++	fn(E, 'setAttributeNS', function (ns, n, v) {
++		var i = String(n).indexOf(':');
++		return this.setAttribute(i >= 0 && !/^xmlns|^xlink/.test(n) ? n.slice(i + 1) : n, v);
++	});
++	fn(E, 'removeAttributeNS', function (ns, n) { return this.removeAttribute(n); });
++	fn(E, 'hasAttributeNS', function (ns, n) { return this.hasAttribute(n); });
++	if (typeof E.matches === 'function') {
++		fn(E, 'webkitMatchesSelector', E.matches);
++		fn(E, 'msMatchesSelector', E.matches);
++	}
++	function elScroll(x, y) {
++		if (x && typeof x === 'object') { y = x.top; x = x.left; }
++		if (typeof x === 'number' && !isNaN(x)) this.scrollLeft = x;
++		if (typeof y === 'number' && !isNaN(y)) this.scrollTop = y;
++	}
++	fn(E, 'scrollTo', elScroll); fn(E, 'scroll', elScroll);
++	fn(E, 'scrollBy', function (x, y) {
++		if (x && typeof x === 'object') { y = x.top; x = x.left; }
++		elScroll.call(this, (this.scrollLeft || 0) + (x || 0), (this.scrollTop || 0) + (y || 0));
++	});
++	fn(E, 'requestFullscreen', function () { return Promise.reject(new TypeError('fullscreen is not available')); });
++	fn(E, 'setPointerCapture', function () {});
++	fn(E, 'releasePointerCapture', function () {});
++	fn(E, 'hasPointerCapture', function () { return false; });
++	/* form controls */
++	var I = Object.getPrototypeOf(d.createElement('input'));
++	var TA = Object.getPrototypeOf(d.createElement('textarea'));
++	[I, TA].forEach(function (P) {
++		acc(P, 'defaultValue', function () { return this.getAttribute('value') || ''; },
++			function (v) { this.setAttribute('value', String(v)); });
++		acc(P, 'form', function () {
++			var f = this.getAttribute('form');
++			if (f) return d.getElementById(f);
++			return this.closest ? this.closest('form') : null;
++		});
++		acc(P, 'labels', function () {
++			var out = [], id = this.id, ls = d.getElementsByTagName('label');
++			for (var i = 0; i < ls.length; i++)
++				if ((id && ls[i].getAttribute('for') === id) || (ls[i].contains && ls[i].contains(this))) out.push(ls[i]);
++			return out;
++		});
++		acc(P, 'maxLength', function () { var v = parseInt(this.getAttribute('maxlength'), 10); return isNaN(v) ? -1 : v; },
++			function (v) { this.setAttribute('maxlength', String(v)); });
++		acc(P, 'selectionStart', function () { return this.__vbSelS != null ? this.__vbSelS : String(this.value || '').length; },
++			function (v) { this.__vbSelS = v; });
++		acc(P, 'selectionEnd', function () { return this.__vbSelE != null ? this.__vbSelE : String(this.value || '').length; },
++			function (v) { this.__vbSelE = v; });
++		acc(P, 'selectionDirection', function () { return 'none'; });
++		fn(P, 'setSelectionRange', function (a, b) { this.__vbSelS = a; this.__vbSelE = b; });
++		fn(P, 'select', function () { this.__vbSelS = 0; this.__vbSelE = String(this.value || '').length; });
++		fn(P, 'setRangeText', function (t) { this.value = String(t); });
++		acc(P, 'willValidate', function () { return !this.disabled; });
++		acc(P, 'validationMessage', function () { return this.__vbCustomValidity || ''; });
++		fn(P, 'setCustomValidity', function (m) { this.__vbCustomValidity = String(m || ''); });
++		acc(P, 'validity', function () {
++			var v = String(this.value || ''), req = this.hasAttribute && this.hasAttribute('required');
++			var type = String(this.getAttribute && this.getAttribute('type') || '').toLowerCase();
++			var missing = !!(req && !v);
++			var typeMismatch = !!(v && type === 'email' && !/^[^@\s]+@[^@\s]+$/.test(v));
++			var custom = !!this.__vbCustomValidity;
++			var pat = this.getAttribute && this.getAttribute('pattern'), patMis = false;
++			if (v && pat) { try { patMis = !new RegExp('^(?:' + pat + ')$').test(v); } catch (e) { /* */ } }
++			var ml = parseInt(this.getAttribute && this.getAttribute('minlength'), 10);
++			var tooShort = !!(v && !isNaN(ml) && v.length < ml);
++			var bad = missing || typeMismatch || custom || patMis || tooShort;
++			return { valueMissing: missing, typeMismatch: typeMismatch, patternMismatch: patMis,
++				tooLong: false, tooShort: tooShort, rangeUnderflow: false, rangeOverflow: false,
++				stepMismatch: false, badInput: false, customError: custom, valid: !bad };
++		});
++		fn(P, 'checkValidity', function () {
++			var ok = this.validity.valid;
++			if (!ok) { try { this.dispatchEvent(new Event('invalid', { cancelable: true })); } catch (e) { /* */ } }
++			return ok;
++		});
++		fn(P, 'reportValidity', function () { return this.checkValidity(); });
++	});
++	acc(I, 'valueAsNumber', function () { var n = parseFloat(this.value); return isNaN(n) ? NaN : n; },
++		function (v) { this.value = String(v); });
++	acc(I, 'files', function () { return null; });
++	var F = Object.getPrototypeOf(d.createElement('form'));
++	fn(F, 'checkValidity', function () {
++		var els = this.querySelectorAll('input,textarea,select'), ok = true;
++		for (var i = 0; i < els.length; i++) if (els[i].checkValidity && !els[i].checkValidity()) ok = false;
++		return ok;
++	});
++	fn(F, 'reportValidity', function () { return this.checkValidity(); });
++	fn(F, 'requestSubmit', function (btn) {
++		/* script-driven submit: fire the event; if nobody cancels it,
++		 * navigate like a GET/POST form would, through a click on a
++		 * submit control (the engine owns form encoding) */
++		var ev = new Event('submit', { bubbles: true, cancelable: true });
++		try { ev.submitter = btn || null; } catch (e) { /* */ }
++		if (this.dispatchEvent(ev) === false || ev.defaultPrevented) return;
++		fn.nativeSubmit(this);
++	});
++	fn(F, 'submit', function () { fn.nativeSubmit(this); });
++	fn.nativeSubmit = function (form) {
++		var b = form.querySelector('button[type=submit],input[type=submit],button:not([type])');
++		if (!b) {
++			b = d.createElement('input'); b.type = 'submit'; b.style.display = 'none';
++			form.appendChild(b);
++		}
++		if (typeof b.click === 'function') b.click();
++	};
++	acc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });
++	/* text nodes */
++	acc(T, 'length', function () { return String(this.data || this.nodeValue || '').length; });
++	acc(T, 'wholeText', function () { return String(this.data || this.nodeValue || ''); });
++	fn(T, 'splitText', function (off) {
++		var s = String(this.data), rest = d.createTextNode(s.slice(off));
++		this.data = s.slice(0, off);
++		if (this.parentNode) this.parentNode.insertBefore(rest, this.nextSibling);
++		return rest;
++	});
++	/* document */
++	acc(d, 'characterSet', function () { return 'UTF-8'; });
++	acc(d, 'charset', function () { return 'UTF-8'; });
++	acc(d, 'inputEncoding', function () { return 'UTF-8'; });
++	acc(d, 'contentType', function () { return 'text/html'; });
++	acc(d, 'compatMode', function () { return 'CSS1Compat'; });
++	acc(d, 'dir', function () { return (d.documentElement && d.documentElement.getAttribute('dir')) || ''; });
++	acc(d, 'currentScript', function () { return d.__vbCurrentScript || null; });
++	acc(d, 'styleSheets', function () {
++		var out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');
++		for (var i = 0; i < ls.length; i++)
++			out.push({ ownerNode: ls[i], href: ls[i].href || null, disabled: false,
++				cssRules: [], rules: [], media: { mediaText: ls[i].media || '' },
++				insertRule: function () { return 0; }, deleteRule: function () {} });
++		return out;
++	});
++	var adopted = [];
++	acc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });
++	fn(d, 'importNode', function (n, deep) { return n.cloneNode(!!deep); });
++	fn(d, 'adoptNode', function (n) { if (n.parentNode) n.parentNode.removeChild(n); return n; });
++	fn(d, 'elementsFromPoint', function (x, y) {
++		/* geometry walk: every element whose box holds the point, deepest
++		 * last-painted first (tree order approximates paint order) */
++		var out = [], all = d.body ? d.body.getElementsByTagName('*') : [];
++		for (var i = all.length - 1; i >= 0; i--) {
++			var r = all[i].getBoundingClientRect();
++			if (r && r.width > 0 && x >= r.left && x < r.right && y >= r.top && y < r.bottom) out.push(all[i]);
++		}
++		if (d.body) out.push(d.body);
++		if (d.documentElement) out.push(d.documentElement);
++		return out;
++	});
++	fn(d, 'elementFromPoint', function (x, y) { var a = d.elementsFromPoint(x, y); return a.length ? a[0] : null; });
++	/* window */
++	if (g.isSecureContext === undefined) g.isSecureContext = true;
++	if (g.origin === undefined) try { g.origin = g.location.origin; } catch (e) { /* */ }
++	fn(g, 'print', function () {});
++	function evtCtor(name, extra) {
++		if (typeof g[name] === 'function') return;
++		var C = function (type, init) {
++			var e = new Event(type, init);
++			init = init || {};
++			(extra || []).forEach(function (k) { if (k in init) try { e[k] = init[k]; } catch (x) { /* */ } });
++			return e;
++		};
++		C.prototype = Object.create(Event.prototype);
++		g[name] = C;
++	}
++	evtCtor('WheelEvent', ['deltaX', 'deltaY', 'deltaZ', 'deltaMode', 'clientX', 'clientY']);
++	evtCtor('TouchEvent', ['touches', 'targetTouches', 'changedTouches']);
++	evtCtor('ErrorEvent', ['message', 'filename', 'lineno', 'colno', 'error']);
++	evtCtor('PromiseRejectionEvent', ['promise', 'reason']);
++	if (typeof g.File !== 'function' && typeof g.Blob === 'function') {
++		g.File = function (parts, name, opts) {
++			var b = new Blob(parts, opts);
++			try { b.name = String(name); b.lastModified = (opts && opts.lastModified) || Date.now(); } catch (e) { /* */ }
++			return b;
++		};
++	}
++	if (typeof g.FileReader !== 'function') {
++		var FR = function () { this.readyState = 0; this.result = null; this.error = null; };
++		['readAsText', 'readAsDataURL', 'readAsArrayBuffer'].forEach(function (m) {
++			FR.prototype[m] = function (blob) {
++				var self = this, p = (m === 'readAsText') ? blob.text() :
++					blob.arrayBuffer().then(function (ab) {
++						if (m === 'readAsArrayBuffer') return ab;
++						var u = new Uint8Array(ab), s = '';
++						for (var i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
++						return 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(s);
++					});
++				p.then(function (r) {
++					self.readyState = 2; self.result = r;
++					if (self.onload) self.onload({ target: self });
++					if (self.onloadend) self.onloadend({ target: self });
++				}, function (e) {
++					self.readyState = 2; self.error = e;
++					if (self.onerror) self.onerror({ target: self });
++				});
++			};
++		});
++		FR.prototype.abort = function () {};
++		FR.prototype.addEventListener = function (t, f) { this['on' + t] = f; };
++		g.FileReader = FR;
++	}
++	if (typeof g.Option !== 'function') {
++		g.Option = function (text, value, defSel, sel) {
++			var o = d.createElement('option');
++			if (text !== undefined) o.textContent = String(text);
++			if (value !== undefined) o.setAttribute('value', String(value));
++			if (sel) o.setAttribute('selected', '');
++			return o;
++		};
++	}
++	if (typeof g.Audio !== 'function') {
++		g.Audio = function (src) {
++			var a = d.createElement('audio');
++			if (src) a.setAttribute('src', src);
++			a.play = function () { return Promise.reject(new Error('no audio')); };
++			a.pause = function () {};
++			return a;
++		};
++	}
++	/* No network sockets or workers: construct, then fail the way a
++	 * refused connection does, so callers fall back instead of throwing. */
++	function failing(name) {
++		if (typeof g[name] === 'function') return;
++		var C = function (url) {
++			var self = this;
++			this.url = String(url); this.readyState = 3; this.onerror = null; this.onclose = null;
++			this.onmessage = null; this.onopen = null;
++			setTimeout(function () {
++				var ev = { type: 'error', target: self };
++				if (typeof self.onerror === 'function') self.onerror(ev);
++				if (self.__l && self.__l.error) self.__l.error.forEach(function (f) { f(ev); });
++				var cl = { type: 'close', code: 1006, reason: '', wasClean: false, target: self };
++				if (typeof self.onclose === 'function') self.onclose(cl);
++				if (self.__l && self.__l.close) self.__l.close.forEach(function (f) { f(cl); });
++			}, 0);
++		};
++		C.prototype.addEventListener = function (t, f) { (this.__l = this.__l || {}); (this.__l[t] = this.__l[t] || []).push(f); };
++		C.prototype.removeEventListener = function () {};
++		C.prototype.send = function () {}; C.prototype.close = function () {};
++		C.prototype.postMessage = function () {}; C.prototype.terminate = function () {};
++		C.CONNECTING = 0; C.OPEN = 1; C.CLOSING = 2; C.CLOSED = 3;
++		g[name] = C;
++	}
++	failing('WebSocket'); failing('EventSource'); failing('Worker'); failing('SharedWorker');
++	if (typeof g.DOMMatrix !== 'function') {
++		var M = function (init) {
++			var v = Array.isArray(init) ? init : [1, 0, 0, 1, 0, 0];
++			this.a = v[0]; this.b = v[1]; this.c = v[2]; this.d = v[3]; this.e = v[4]; this.f = v[5];
++			this.m11 = this.a; this.m12 = this.b; this.m21 = this.c; this.m22 = this.d; this.m41 = this.e; this.m42 = this.f;
++			this.is2D = true; this.isIdentity = this.a === 1 && !this.b && !this.c && this.d === 1 && !this.e && !this.f;
++		};
++		g.DOMMatrix = M; g.WebKitCSSMatrix = M; g.DOMMatrixReadOnly = M;
++	}
++	/* custom elements: a registry, and an upgrade that gives already-
++	 * present and later-inserted elements the class's prototype and runs
++	 * connectedCallback (constructors cannot run on existing nodes). */
++	if (typeof g.customElements === 'undefined') {
++		var defs = {}, waits = {};
++		function upgrade(node) {
++			if (!node || node.nodeType !== 1) return;
++			var C = defs[String(node.localName || node.tagName || '').toLowerCase()];
++			if (C && !node.__vbUpgraded) {
++				node.__vbUpgraded = true;
++				try { Object.setPrototypeOf(node, C.prototype); } catch (e) { /* */ }
++				try { if (typeof node.connectedCallback === 'function') node.connectedCallback(); } catch (e) {
++					try { console.error('customElement ' + node.localName + ' connectedCallback: ' + e); } catch (x) { /* */ } }
++			}
++		}
++		function sweep(root) {
++			var names = Object.keys(defs);
++			if (!names.length || !root || !root.querySelectorAll) return;
++			var list = root.querySelectorAll(names.join(','));
++			for (var i = 0; i < list.length; i++) upgrade(list[i]);
++		}
++		g.customElements = {
++			define: function (name, C) {
++				name = String(name).toLowerCase();
++				if (defs[name]) throw new DOMException('"' + name + '" has already been defined', 'NotSupportedError');
++				defs[name] = C;
++				sweep(d);
++				if (waits[name]) { waits[name].forEach(function (r) { r(C); }); delete waits[name]; }
++			},
++			get: function (name) { return defs[String(name).toLowerCase()]; },
++			getName: function (C) { for (var k in defs) if (defs[k] === C) return k; return null; },
++			whenDefined: function (name) {
++				name = String(name).toLowerCase();
++				if (defs[name]) return Promise.resolve(defs[name]);
++				return new Promise(function (r) { (waits[name] = waits[name] || []).push(r); });
++			},
++			upgrade: function (root) { upgrade(root); sweep(root); }
++		};
++		if (typeof g.MutationObserver === 'function') {
++			try {
++				new MutationObserver(function (ms) {
++					if (!Object.keys(defs).length) return;
++					ms.forEach(function (m) {
++						for (var i = 0; m.addedNodes && i < m.addedNodes.length; i++) {
++							upgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);
++						}
++					});
++				}).observe(d, { childList: true, subtree: true });
++			} catch (e) { /* */ }
++		}
++	}
++})();
++
++/* ---- addEventListener: listener objects, once, signal ------------------
++ * The bridge's element addEventListener dropped any listener that is not a
++ * function, so an EventListener OBJECT ({handleEvent}) never ran -- the
++ * pattern of several frameworks. Every addEventListener the bridge defines
++ * is wrapped: an object becomes a stable function (so removeEventListener
++ * finds it), and once / signal are honoured the same way everywhere. */
++
++(function () {
++	var objFn = new WeakMap(), onceFn = new WeakMap();
++	function key(type, capture) { return type + (capture ? '|c' : '|b'); }
++	function listenerFn(l) {
++		if (typeof l === 'function') return l;
++		if (!l || typeof l !== 'object') return null;
++		var f = objFn.get(l);
++		if (!f) {
++			f = function (e) {
++				var h = l.handleEvent;
++				if (typeof h === 'function') return h.call(l, e);
++			};
++			objFn.set(l, f);
++		}
++		return f;
++	}
++	function capOf(o) {
++		return (typeof o === 'boolean') ? o : !!(o && typeof o === 'object' && o.capture);
++	}
++	function wrap(t) {
++		if (!t) return;
++		var add = t.addEventListener, rem = t.removeEventListener;
++		if (typeof add !== 'function' || add.__vitaWrapped) return;
++		var nadd = function (type, l, o) {
++			var f = listenerFn(l), self = this;
++			if (!f) return;
++			var cap = capOf(o), k = key(String(type), cap);
++			if (o && typeof o === 'object') {
++				if (o.signal && o.signal.aborted) return;
++				if (o.once) {
++					var m = onceFn.get(f);
++					if (!m) { m = {}; onceFn.set(f, m); }
++					if (!m[k]) {
++						var orig = f;
++						var g = function (e) {
++							try { rem.call(self, type, g, cap); } catch (x) { /* */ }
++							delete m[k];
++							return orig.call(this, e);
++						};
++						m[k] = g;
++					}
++					f = m[k];
++				}
++				if (o.signal && typeof o.signal.addEventListener === 'function') {
++					var fin = f;
++					o.signal.addEventListener('abort', function () {
++						try { rem.call(self, type, fin, cap); } catch (x) { /* */ }
++					});
++				}
++			}
++			return add.call(this, type, f, o);
++		};
++		var nrem = function (type, l, o) {
++			var f = listenerFn(l);
++			if (!f) return;
++			var m = onceFn.get(f), k = key(String(type), capOf(o));
++			if (m && m[k]) { var g = m[k]; delete m[k]; rem.call(this, type, g, o); }
++			return rem.call(this, type, f, o);
++		};
++		nadd.__vitaWrapped = true;
++		try {
++			Object.defineProperty(t, 'addEventListener', { value: nadd, writable: true, configurable: true });
++			if (typeof rem === 'function')
++				Object.defineProperty(t, 'removeEventListener', { value: nrem, writable: true, configurable: true });
++		} catch (e) { /* exotic object refused */ }
++	}
++	var d = g.document, targets = [g, d, g.EventTarget && g.EventTarget.prototype,
++		g.XMLHttpRequest && g.XMLHttpRequest.prototype,
++		g.MessagePort && g.MessagePort.prototype,
++		g.AbortSignal && g.AbortSignal.prototype];
++	try {
++		var el = d && d.createElement('section');
++		for (var p = el && Object.getPrototypeOf(el); p; p = Object.getPrototypeOf(p))
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) targets.push(p);
++		var tx = d && d.createTextNode('');
++		for (p = tx && Object.getPrototypeOf(tx); p; p = Object.getPrototypeOf(p))
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) targets.push(p);
++		for (p = d && Object.getPrototypeOf(d); p; p = Object.getPrototypeOf(p))
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) targets.push(p);
++	} catch (e) { /* */ }
++	targets.forEach(function (t) {
++		if (t && Object.prototype.hasOwnProperty.call(t, 'addEventListener')) wrap(t);
++	});
++})();
++
++/* ---- DocumentFragment: the ParentNode queries ---------------------------
++ * A fragment (createDocumentFragment, template content, cloneNode of one)
++ * had no querySelector / querySelectorAll / getElementById / children. */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createDocumentFragment !== 'function') return;
++	var F;
++	try { F = Object.getPrototypeOf(d.createDocumentFragment()); } catch (e) { return; }
++	if (!F) return;
++	function kids(f) {
++		var a = [];
++		for (var n = f.firstChild; n; n = n.nextSibling) if (n.nodeType === 1) a.push(n);
++		return a;
++	}
++	function qsa(f, sel) {
++		var out = [];
++		kids(f).forEach(function (n) {
++			try { if (n.matches && n.matches(sel)) out.push(n); } catch (e) { /* */ }
++			var r = n.querySelectorAll ? n.querySelectorAll(sel) : [];
++			for (var i = 0; i < r.length; i++) out.push(r[i]);
++		});
++		return out;
++	}
++	function def(n, v) {
++		if (typeof F[n] === 'function') return;
++		try { Object.defineProperty(F, n, { value: v, writable: true, configurable: true }); } catch (e) { /* */ }
++	}
++	def('querySelectorAll', function (sel) { return qsa(this, String(sel)); });
++	def('querySelector', function (sel) { var r = qsa(this, String(sel)); return r.length ? r[0] : null; });
++	def('getElementById', function (id) {
++		var r = qsa(this, '*');
++		for (var i = 0; i < r.length; i++) if (r[i].id === String(id)) return r[i];
++		return null;
++	});
++	def('append', function () {
++		for (var i = 0; i < arguments.length; i++) {
++			var n = arguments[i];
++			this.appendChild(typeof n === 'string' ? d.createTextNode(n) : n);
++		}
++	});
++	def('prepend', function () {
++		var first = this.firstChild;
++		for (var i = 0; i < arguments.length; i++) {
++			var n = arguments[i];
++			this.insertBefore(typeof n === 'string' ? d.createTextNode(n) : n, first);
++		}
++	});
++	function acc(n, get) {
++		if (n in F) return;
++		try { Object.defineProperty(F, n, { get: get, configurable: true }); } catch (e) { /* */ }
++	}
++	acc('children', function () { return kids(this); });
++	acc('firstElementChild', function () { var k = kids(this); return k.length ? k[0] : null; });
++	acc('lastElementChild', function () { var k = kids(this); return k.length ? k[k.length - 1] : null; });
++	acc('childElementCount', function () { return kids(this).length; });
++})();
++
++/* ---- <template>.content -------------------------------------------------
++ * The bridge has no template contents: t.content was undefined, and
++ * component code clones it (t.content.cloneNode(true)). The children move
++ * into a fragment on each read, which also catches innerHTML set later. */
++
++(function () {
++	var d = g.document;
++	if (!d) return;
++	var T = g.HTMLTemplateElement && g.HTMLTemplateElement.prototype;
++	var frags = new WeakMap();
++	function content() {
++		if (String(this.tagName).toUpperCase() !== 'TEMPLATE') return undefined;
++		var f = frags.get(this);
++		if (!f) { f = d.createDocumentFragment(); frags.set(this, f); }
++		while (this.firstChild) f.appendChild(this.firstChild);
++		return f;
++	}
++	var targets = [T];
++	try {
++		var t = d.createElement('template');
++		targets.push(Object.getPrototypeOf(t));
++	} catch (e) { /* */ }
++	targets.forEach(function (p) {
++		if (!p || (Object.getOwnPropertyDescriptor(p, 'content') || {}).get) return;
++		try { Object.defineProperty(p, 'content', { get: content, configurable: true }); } catch (e) { /* */ }
++	});
++})();
++
+ /* ---- on<event> handler properties on document and window ---------------
+  * React picks its input-event path with ("oninput" in document); false sent
+  * every keystroke down an old-IE path that threw on each keydown/keyup

@@ -1,0 +1,390 @@
+# netsurf: position: fixed is sized and placed against the viewport; single-line flex containers sized by top/bottom centre their items
+#
+# - A fixed box's containing block is the viewport, not the nearest
+#   positioned ancestor: YouTube fixes <body> while its consent dialog is
+#   up, and the dialog sized itself to the 891 px body. layout_position_
+#   absolute gives fixed boxes a viewport box at the document origin (redraw
+#   and hit testing add the scroll, patch 112) and places them from their
+#   parent's absolute position.
+# - Only the OUTERMOST fixed box takes the scroll offset (a fixed box inside
+#   a fixed <body> moved twice as far).
+# - layout_flex re-read the container's CSS height (auto) and lost the
+#   definite height layout_absolute set from top + bottom
+#   (VB_DEFINITE_HEIGHT), so a full-screen "align-items: center" overlay left
+#   its dialog at the top.
+# - box_walk_begin / box_walk_end: html_scroll_at_point, contextual content
+#   and file drops walk stacking-aware too (patch 112 did clicks only), so a
+#   drag scrolls a dialog's scrolling middle, not the page behind it.
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index a9c5bf1cc..e1f639368 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -601,6 +601,36 @@ void box_bounds(struct box *box, struct rect *r)
+ int vb_fixed_scroll_x, vb_fixed_scroll_y;
+ struct box *box_walk_limit;
+ bool box_walk_skip_hoisted;
++static struct box *box_walk_first;
++
++/* exported interface documented in html/box_inspect.h */
++struct box *box_walk_begin(struct box *root, int root_x, int root_y,
++		int x, int y, int *box_x, int *box_y)
++{
++	int hx, hy;
++	struct box *h = box_hoisted_at_point(root, root_x, root_y, x, y,
++			&hx, &hy);
++
++	if (h != NULL) {
++		box_walk_limit = h;
++		box_walk_first = h;
++		*box_x = hx;
++		*box_y = hy;
++		return h;
++	}
++	box_walk_skip_hoisted = true;
++	*box_x = root_x;
++	*box_y = root_y;
++	return root;
++}
++
++/* exported interface documented in html/box_inspect.h */
++void box_walk_end(void)
++{
++	box_walk_limit = NULL;
++	box_walk_skip_hoisted = false;
++	box_walk_first = NULL;
++}
+ 
+ /* exported interface documented in html/box_inspect.h */
+ bool box_is_hoisted(const struct box *b)
+@@ -617,6 +647,21 @@ bool box_is_hoisted(const struct box *b)
+ 		css_computed_z_index(b->style, &z) == CSS_Z_INDEX_SET;
+ }
+ 
++/* exported interface documented in html/box_inspect.h */
++bool box_is_outer_fixed(const struct box *b)
++{
++	const struct box *p;
++
++	if (b->style == NULL ||
++	    css_computed_position(b->style) != CSS_POSITION_FIXED)
++		return false;
++	for (p = b->parent; p != NULL; p = p->parent)
++		if (p->style != NULL && css_computed_position(p->style) ==
++				CSS_POSITION_FIXED)
++			return false;
++	return true;
++}
++
+ static int32_t box_hoist_z(const struct box *b)
+ {
+ 	int32_t z = 0;
+@@ -662,8 +707,7 @@ static struct box *box_hoist_search(struct box *box, int x_off, int y_off,
+ 
+ 		if (box_is_hoisted(c)) {
+ 			int32_t z = box_hoist_z(c);
+-			if (css_computed_position(c->style) ==
+-					CSS_POSITION_FIXED) {
++			if (box_is_outer_fixed(c)) {
+ 				cx += vb_fixed_scroll_x;
+ 				cy += vb_fixed_scroll_y;
+ 			}
+@@ -736,6 +780,19 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 
+ 	assert(box);
+ 
++	/* box_walk_begin: the walk yields its hoisted start box itself
++	 * first (box_at_point normally starts with the start's children) */
++	if (box_walk_first != NULL && box_walk_first == box) {
++		box_walk_first = NULL;
++		if (box_contains_point(unit_len_ctx, box, x - *box_x,
++				y - *box_y, &physically)) {
++			*box_x -= scrollbar_get_offset(box->scroll_x);
++			*box_y -= scrollbar_get_offset(box->scroll_y);
++			return box;
++		}
++		return NULL;
++	}
++
+ 	skip_children = false;
+ 	while ((box = box_next_xy(box, box_x, box_y, skip_children))) {
+ 		if (box_walk_skip_hoisted && box_is_hoisted(box)) {
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index 19d4e4e8e..f5cf39aa2 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -89,7 +89,20 @@ extern int vb_fixed_scroll_x, vb_fixed_scroll_y;
+ extern struct box *box_walk_limit;
+ extern bool box_walk_skip_hoisted;
+ 
++/**
++ * Start a box_at_point() walk the stacking-aware way: from the topmost
++ * hoisted box under the point (which the first box_at_point() call then
++ * yields itself), else from root with hoisted subtrees skipped.
++ * box_walk_end() when the walk is done.
++ */
++struct box *box_walk_begin(struct box *root, int root_x, int root_y,
++		int x, int y, int *box_x, int *box_y);
++void box_walk_end(void);
++
+ bool box_is_hoisted(const struct box *b);
++/** position: fixed with no fixed ancestor: the one that takes the scroll
++ * offset (a fixed box inside a fixed <body> moves with it) */
++bool box_is_outer_fixed(const struct box *b);
+ struct box *box_hoisted_at_point(struct box *root, int root_x, int root_y,
+ 		int x, int y, int *hx, int *hy);
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 0353796fb..9033f24d5 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6265,6 +6265,8 @@ html_get_contextual_content(struct content *c, int x, int y,
+ 	struct box *next;
+ 	int box_x = 0, box_y = 0;
+ 
++	/* VitaBrowser: what is painted on top first (box_inspect.h) */
++	box = box_walk_begin(box, box_x, box_y, x, y, &box_x, &box_y);
+ 	while ((next = box_at_point(&html->unit_len_ctx, box, x, y,
+ 			&box_x, &box_y)) != NULL) {
+ 		box = next;
+@@ -6323,7 +6325,7 @@ html_get_contextual_content(struct content *c, int x, int y,
+ 			}
+ 		}
+ 	}
+-	return NSERROR_OK;
++	{ box_walk_end(); return NSERROR_OK; }
+ }
+ 
+ 
+@@ -6349,6 +6351,8 @@ html_scroll_at_point(struct content *c, int x, int y, int scrx, int scry)
+ 
+ 	/* TODO: invert order; visit deepest box first */
+ 
++	/* VitaBrowser: what is painted on top first (box_inspect.h) */
++	box = box_walk_begin(box, box_x, box_y, x, y, &box_x, &box_y);
+ 	while ((next = box_at_point(&html->unit_len_ctx, box, x, y,
+ 			&box_x, &box_y)) != NULL) {
+ 		box = next;
+@@ -6365,7 +6369,7 @@ html_scroll_at_point(struct content *c, int x, int y, int scrx, int scry)
+ 							   (x - box_x) * scale,
+ 							   (y - box_y) * scale,
+ 							   scrx, scry) == true)
+-				return true;
++				{ box_walk_end(); return true; }
+ 		}
+ 
+ 		/* Pass into textarea widget */
+@@ -6374,13 +6378,13 @@ html_scroll_at_point(struct content *c, int x, int y, int scrx, int scry)
+ 				box->gadget->type == GADGET_TEXTBOX) &&
+ 				textarea_scroll(box->gadget->data.text.ta,
+ 						scrx, scry) == true)
+-			return true;
++			{ box_walk_end(); return true; }
+ 
+ 		/* Pass into object */
+ 		if (box->object != NULL && content_scroll_at_point(
+ 				box->object, x - box_x, y - box_y,
+ 				scrx, scry) == true)
+-			return true;
++			{ box_walk_end(); return true; }
+ 
+ 		/* Handle box scrollbars */
+ 		if (box->scroll_y && scrollbar_scroll(box->scroll_y, scry))
+@@ -6390,10 +6394,10 @@ html_scroll_at_point(struct content *c, int x, int y, int scrx, int scry)
+ 			handled_scroll = true;
+ 
+ 		if (handled_scroll == true)
+-			return true;
++			{ box_walk_end(); return true; }
+ 	}
+ 
+-	return false;
++	{ box_walk_end(); return false; }
+ }
+ 
+ /** Helper for file gadgets to store their filename unencoded on the
+@@ -6498,6 +6502,8 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 	int box_x = 0, box_y = 0;
+ 
+ 	/* Scan box tree for boxes that can handle drop */
++	/* VitaBrowser: what is painted on top first (box_inspect.h) */
++	box = box_walk_begin(box, box_x, box_y, x, y, &box_x, &box_y);
+ 	while ((next = box_at_point(&html->unit_len_ctx, box, x, y,
+ 			&box_x, &box_y)) != NULL) {
+ 		box = next;
+@@ -6508,17 +6514,17 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 
+ 		if (box->iframe) {
+ 			float scale = browser_window_get_scale(box->iframe);
+-			return browser_window_drop_file_at_point(
++			{ box_walk_end(); return browser_window_drop_file_at_point(
+ 				box->iframe,
+ 				(x - box_x) * scale,
+ 				(y - box_y) * scale,
+-				file);
++				file); }
+ 		}
+ 
+ 		if (box->object &&
+ 		    content_drop_file_at_point(box->object,
+ 					x - box_x, y - box_y, file) == true)
+-			return true;
++			{ box_walk_end(); return true; }
+ 
+ 		if (box->gadget) {
+ 			switch (box->gadget->type) {
+@@ -6540,11 +6546,11 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 
+ 	if (!file_box && !text_box)
+ 		/* No box capable of handling drop */
+-		return false;
++		{ box_walk_end(); return false; }
+ 
+ 	if (file == NULL)
+ 		/* There is a box capable of handling drop here */
+-		return true;
++		{ box_walk_end(); return true; }
+ 
+ 	/* Handle the drop */
+ 	if (file_box) {
+@@ -6566,7 +6572,7 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 		fp = fopen(file, "rb");
+ 		if (fp == NULL) {
+ 			/* Couldn't open file, but drop was for us */
+-			return true;
++			{ box_walk_end(); return true; }
+ 		}
+ 
+ 		/* Get filesize */
+@@ -6577,7 +6583,7 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 		if ((long)file_len == -1) {
+ 			/* unable to get file length, but drop was for us */
+ 			fclose(fp);
+-			return true;
++			{ box_walk_end(); return true; }
+ 		}
+ 
+ 		/* Allocate buffer for file data */
+@@ -6585,7 +6591,7 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 		if (buffer == NULL) {
+ 			/* No memory, but drop was for us */
+ 			fclose(fp);
+-			return true;
++			{ box_walk_end(); return true; }
+ 		}
+ 
+ 		/* Stick file into buffer */
+@@ -6593,7 +6599,7 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 			/* Failed, but drop was for us */
+ 			free(buffer);
+ 			fclose(fp);
+-			return true;
++			{ box_walk_end(); return true; }
+ 		}
+ 
+ 		/* Done with file */
+@@ -6613,7 +6619,7 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 			      messages_get_errorcode(ret));
+ 			assert(ret != NSERROR_BAD_ENCODING);
+ 			free(buffer);
+-			return true;
++			{ box_walk_end(); return true; }
+ 		}
+ 
+ 		/* Done with buffer */
+@@ -6634,7 +6640,7 @@ static bool html_drop_file_at_point(struct content *c, int x, int y, char *file)
+ 		free(utf8_buff);
+ 	}
+ 
+-	return true;
++	{ box_walk_end(); return true; }
+ }
+ 
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 6d3505447..1f3b9ab8f 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -6875,6 +6875,9 @@ layout_absolute(struct box *box,
+ }
+ 
+ 
++/* VitaBrowser: the viewport, for position: fixed (layout_position_absolute) */
++static int vb_viewport_w, vb_viewport_h;
++
+ /**
+  * Recursively layout and position absolutely positioned boxes.
+  *
+@@ -6912,7 +6915,29 @@ layout_position_absolute(struct box *box,
+ 						CSS_POSITION_ABSOLUTE ||
+ 				 css_computed_position(c->style) ==
+ 						CSS_POSITION_FIXED)) {
+-			if (!layout_absolute(c, containing_block,
++			if (css_computed_position(c->style) ==
++					CSS_POSITION_FIXED && vb_viewport_w > 0 &&
++					vb_viewport_h > 0) {
++				/* VitaBrowser: a fixed box's containing
++				 * block is the viewport, not the nearest
++				 * positioned ancestor (YouTube fixes <body>
++				 * while its consent dialog is up, and the
++				 * dialog sized itself to the 891 px body).
++				 * The viewport sits at the document origin;
++				 * redraw and hit testing add the scroll. */
++				struct box vp;
++				int ax = 0, ay = 0;
++
++				memset(&vp, 0, sizeof(vp));
++				vp.type = BOX_BLOCK;
++				vp.style = content->layout->style;
++				vp.width = vb_viewport_w;
++				vp.height = vb_viewport_h;
++				vp.flags = VB_DEFINITE_HEIGHT;
++				box_coords(box, &ax, &ay);
++				if (!layout_absolute(c, &vp, ax, ay, content))
++					return false;
++			} else if (!layout_absolute(c, containing_block,
+ 					cx, cy, content))
+ 				return false;
+ 			if (!layout_position_absolute(c, c, 0, 0, content))
+@@ -7488,6 +7513,9 @@ bool layout_document(html_content *content, int width, int height)
+ 			width, height, nsurl_access(content_get_url(
+ 					&content->base)));
+ 
++	vb_viewport_w = width;
++	vb_viewport_h = height;
++
+ 	/* fixes171 - capture the URL so the watchdog breadcrumb can
+ 	 * tag crash records with the page being laid out. */
+ 	{
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 4db6f786c..171a48cfb 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -2274,11 +2274,23 @@ static bool layout_flex_inner(struct box *flex, int available_width,
+ 			flex, ctx->horizontal ? "horizontal" : "vertical",
+ 			available_width, flex->width);
+ 
+-	layout_find_dimensions(
+-			ctx->unit_len_ctx, available_width, -1,
+-			flex, flex->style, NULL, &flex->height,
+-			NULL, NULL, &max_height, &min_height,
+-			flex->margin, flex->padding, flex->border);
++	{
++		/* VitaBrowser: an absolutely positioned container sized by
++		 * top + bottom already has its definite height
++		 * (layout_absolute, VB_DEFINITE_HEIGHT); the CSS height is
++		 * auto, and re-reading it lost that, so a fixed full-screen
++		 * "align-items: center" overlay left its dialog at the top. */
++		int preset_h = flex->height;
++
++		layout_find_dimensions(
++				ctx->unit_len_ctx, available_width, -1,
++				flex, flex->style, NULL, &flex->height,
++				NULL, NULL, &max_height, &min_height,
++				flex->margin, flex->padding, flex->border);
++		if ((flex->flags & VB_DEFINITE_HEIGHT) &&
++				flex->height == AUTO && preset_h != AUTO)
++			flex->height = preset_h;
++	}
+ 
+ 	/* fixes1301 (#167, C0) - Test 96 proved .xpvvgw5's OWN min-height
+ 	 * calc() resolves to a sane 600px in isolation, but the real box

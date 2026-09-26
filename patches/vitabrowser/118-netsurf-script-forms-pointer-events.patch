@@ -1,0 +1,226 @@
+# netsurf: clicks and taps reach script-built forms and pointer-event buttons; key events from the IME
+#
+# - A submit control that script inserted into a <form> (React renders the
+#   whole claude.ai login form) was never associated with it: "form can not
+#   be submitted" and no submit event. The click now finds the control's
+#   <form> ancestor and, for a form created after parsing, makes its
+#   struct form on demand (html_forms_form_for_node), so the submit event
+#   fires and a page can cancel it.
+# - A tap dispatches pointerdown / pointerup around the mouse events, with
+#   the pointer fields (pointerId, pointerType, isPrimary, pressure): mobile
+#   sites (YouTube) listen for pointer events, not click.
+diff --git a/content/handlers/html/forms.c b/content/handlers/html/forms.c
+index 4669154e9..b8a65b378 100644
+--- a/content/handlers/html/forms.c
++++ b/content/handlers/html/forms.c
+@@ -122,6 +122,24 @@ out:
+ 	return ret;
+ }
+ 
++/* documented in private.h */
++struct form *html_forms_form_for_node(struct form **forms,
++		const char *docenc, dom_node *node)
++{
++	struct form *f;
++
++	for (f = *forms; f != NULL; f = f->prev)
++		if (f->node == (void *)node)
++			return f;
++	/* A form script created after the document was parsed. */
++	f = parse_form_element(docenc, node);
++	if (f == NULL)
++		return NULL;
++	f->prev = *forms;
++	*forms = f;
++	return f;
++}
++
+ /* documented in html_internal.h */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc)
+ {
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 33d56292b..9c49ee24b 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -27,6 +27,7 @@
+ #include <assert.h>
+ #include <stdbool.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include <dom/dom.h>
+ 
+@@ -939,8 +940,9 @@ get_mouse_action_node(html_content *html,
+ 				x, y, &hx, &hy);
+ 		if (h != NULL) {
+ 			box = h;
+-			box_x = hx;
+-			box_y = hy;
++			/* as box_at_point leaves it: minus its own scroll */
++			box_x = hx - scrollbar_get_offset(h->scroll_x);
++			box_y = hy - scrollbar_get_offset(h->scroll_y);
+ 			box_walk_limit = h;
+ 		} else {
+ 			box_walk_skip_hoisted = true;
+@@ -1064,8 +1066,7 @@ get_mouse_action_node(html_content *html,
+ 		/* iterate to next box */
+ 		box = box_at_point(&html->unit_len_ctx, box, x, y, &box_x, &box_y);
+ 	} while (box != NULL);
+-	box_walk_limit = NULL;
+-	box_walk_skip_hoisted = false;
++	box_walk_end();
+ 
+ 	/* use of box_x, box_y, or content below this point is probably a
+ 	 * mistake; they will refer to the last box returned by box_at_point */
+@@ -1134,6 +1135,45 @@ get_mouse_action_node(html_content *html,
+ /**
+  * process mouse activity on a form gadget
+  */
++/**
++ * VitaBrowser: the form a control's DOM node sits in (its form="" owner or
++ * nearest <form> ancestor), as NetSurf knows it, or NULL.
++ */
++static struct form *vb_form_for_node(html_content *html, void *node)
++{
++	dom_node *n = node, *next;
++	struct form *f;
++	dom_exception exc;
++
++	if (n == NULL)
++		return NULL;
++	dom_node_ref(n);
++	while (n != NULL) {
++		dom_string *name = NULL;
++		bool is_form = false;
++
++		if (dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
++		    name != NULL) {
++			is_form = dom_string_length(name) == 4 &&
++				strncasecmp(dom_string_data(name), "form",
++					4) == 0;
++			dom_string_unref(name);
++		}
++		if (is_form) {
++			f = html_forms_form_for_node(&html->forms,
++					html->encoding, n);
++			dom_node_unref(n);
++			return f;
++		}
++		exc = dom_node_get_parent_node(n, &next);
++		dom_node_unref(n);
++		if (exc != DOM_NO_ERR)
++			return NULL;
++		n = next;
++	}
++	return NULL;
++}
++
+ static nserror
+ gadget_mouse_action(html_content *html,
+ 		    browser_mouse_state mouse,
+@@ -1216,6 +1256,13 @@ gadget_mouse_action(html_content *html,
+ 		fallthrough;
+ 
+ 	case GADGET_SUBMIT:
++		/* VitaBrowser: a control that script inserted into a form
++		 * (React renders the whole login form) was never associated
++		 * with it, so "Continue with email" said "form can not be
++		 * submitted" and no submit event reached the page. */
++		if (mas->gadget.control->form == NULL)
++			mas->gadget.control->form = vb_form_for_node(html,
++					mas->gadget.control->node);
+ 		if (mas->gadget.control->form) {
+ 			static char status_buffer[200];
+ 
+@@ -1908,6 +1955,12 @@ mouse_action_drag_none(html_content *html,
+ 		macsurf_qjs_set_event_detail(x, y,
+ 				(mouse & BROWSER_MOUSE_CLICK_2) ? 2 : 0, 0, 0);
+ 
++		/* VitaBrowser: a click on the Vita is a whole press and
++		 * release; pages built on pointer events (YouTube's mobile
++		 * buttons) need pointerdown/pointerup around it. */
++		if (macsurf_qjs_event_type_live("pointerdown"))
++			(void) fire_generic_dom_event(corestring_dom_pointerdown,
++					mas.node, true, true);
+ 		if (mouse & (BROWSER_MOUSE_PRESS_1 | BROWSER_MOUSE_PRESS_2)) {
+ 			if (macsurf_qjs_event_type_live("mousedown")) {
+ 				(void) fire_generic_dom_event(
+@@ -1996,6 +2049,9 @@ mouse_action_drag_none(html_content *html,
+ 		 * physical click is therefore approximate; what matters is that
+ 		 * handlers bound to mouseup run at all, which they previously did
+ 		 * not. */
++		if (macsurf_qjs_event_type_live("pointerup"))
++			(void) fire_generic_dom_event(corestring_dom_pointerup,
++					mas.node, true, true);
+ 		if (macsurf_qjs_event_type_live("mouseup")) {
+ 			(void) fire_generic_dom_event(corestring_dom_mouseup,
+ 					mas.node, true, true);
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 94d54fe00..88bdda948 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -360,6 +360,14 @@ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+ 
+ /* in html/forms.c */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
++
++/**
++ * VitaBrowser: the form for a <form> node, creating it when script added
++ * the form after the document was parsed (html_forms_get_forms only saw
++ * the forms of the parsed document).
++ */
++struct form *html_forms_form_for_node(struct form **forms,
++		const char *docenc, dom_node *node);
+ struct form_control *html_forms_get_control_for_node(struct form *forms,
+ 		dom_node *node);
+ 
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index b7fe632db..894318cfa 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -7276,10 +7276,31 @@ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ 	{
+ 		const char *t = dom_string_data(type_ds);
+ 		size_t tl = (size_t)dom_string_length(type_ds);
++		int is_pointer = (tl >= 7 && strncmp(t, "pointer", 7) == 0);
+ 		int is_mouse = (tl >= 5 && strncmp(t, "mouse", 5) == 0) ||
+ 			(tl == 5 && strncmp(t, "click", 5) == 0) ||
+ 			(tl == 8 && strncmp(t, "dblclick", 8) == 0) ||
+-			(tl == 11 && strncmp(t, "contextmenu", 11) == 0);
++			(tl == 11 && strncmp(t, "contextmenu", 11) == 0) ||
++			is_pointer;
++		/* VitaBrowser: pointer events carry the mouse fields plus
++		 * their own (mobile sites -- YouTube's buttons -- listen for
++		 * pointerdown/pointerup, not click). */
++		if (is_pointer) {
++			JS_SetPropertyStr(ctx, evobj, "pointerId",
++					JS_NewInt32(ctx, 1));
++			JS_SetPropertyStr(ctx, evobj, "pointerType",
++					JS_NewString(ctx, "mouse"));
++			JS_SetPropertyStr(ctx, evobj, "isPrimary",
++					JS_NewBool(ctx, 1));
++			JS_SetPropertyStr(ctx, evobj, "width",
++					JS_NewInt32(ctx, 1));
++			JS_SetPropertyStr(ctx, evobj, "height",
++					JS_NewInt32(ctx, 1));
++			JS_SetPropertyStr(ctx, evobj, "pressure",
++					JS_NewFloat64(ctx, (tl == 11 &&
++					strncmp(t, "pointerdown", 11) == 0) ?
++					0.5 : 0.0));
++		}
+ 		int is_key = (tl >= 3 && strncmp(t, "key", 3) == 0);
+ 		if (is_mouse) {
+ 			JS_SetPropertyStr(ctx, evobj, "clientX",
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 96b994f18..b70ac51dc 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -285,6 +285,8 @@ CORESTRING_DOM_STRING(mousemove);
+ CORESTRING_DOM_STRING(mouseout);
+ CORESTRING_DOM_STRING(mouseover);
+ CORESTRING_DOM_STRING(mouseup);
++CORESTRING_DOM_STRING(pointerdown);
++CORESTRING_DOM_STRING(pointerup);
+ CORESTRING_DOM_STRING(mousewheel);
+ CORESTRING_DOM_STRING(name);
+ CORESTRING_DOM_STRING(nohref);
