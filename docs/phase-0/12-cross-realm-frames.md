@@ -1,0 +1,148 @@
+# 12 — claude.ai sign-in: cross-realm frames + postMessage (Increment 2)
+
+Checkpoint handed from Hermes (local agent) to Claude (lynx session) on
+2026-09-26. Hermes implemented the C bridge + polyfill; a reproducible
+segfault in the full sim run is blocking. **Your job: find and fix the
+crash, then finalize (patch 126 + commit).**
+
+## What's done and works
+
+Increment 1 (`window.open` stub) is committed: repo patch
+`125-netsurf-window-open.patch` (commit `ff425a1`).
+
+Increment 2 is fully implemented in the **applied tree**
+(`<WORK>/vitabrowser-work/applytest/upstream/netsurf`), builds clean, but the
+full 18-page sim run segfaults (see below). Changed files:
+
+1. `content/handlers/javascript/quickjs/macsurf_qjs.c` — cross-realm
+   postMessage bridge (new `## VitaBrowser: cross-realm postMessage`
+   section after `qjs_set_content`):
+   - `struct jsheap` gained `parent_heap` + `frame_name` (linked per realm).
+   - Serialized message queue (`qjs_xrealm_msg`, `s_msg_head`/`tail`);
+     **only C `char*` JSON crosses JSRuntime boundaries** — never a
+     `JSValue` (hard constraint from the Vita crash post-mortems:
+     fixes 861/875/888/1070/1117b).
+   - Natives: `__vitaPostMessageToParent`, `__vitaPostMessageToIframe`,
+     `__vitaIframeContentDocKey`, `__vitaFrameRealmName` (registered in
+     `macsurf_qjs_xrealm_register`, called from the context-setup chain
+     after `register_browser_globals`).
+   - `macsurf_qjs_drain_xrealm()` builds a real `MessageEvent` **in C in
+     the target runtime** (type/data/source/originalTarget; `event.source`
+     is a stand-in object with `toString`/`postMessage`/`close` no-ops and
+     a `__vitaSourceLabel` getter) and dispatches it via
+     `window.dispatchEvent` in the target realm. Called from
+     `macsurf_qjs_pump_all()` after the heap-count log line.
+   - `js_link_frame_heaps(child, parent, name)` export (declared in
+     `macsurf_qjs.h`); `destroyheap` clears other realms' dangling
+     `parent_heap` back-refs before unself.
+   - Includes added: `netsurf/browser_window.h` then
+     `desktop/browser_private.h` (for full `browser_window` field access).
+   - Forward decl of `qjs_get_node` added at the top of the xrealm
+     section (it's defined further down in the file).
+2. `desktop/frames.c` — includes `macsurf_qjs.h`; calls
+   `js_link_frame_heaps(window->jsheap, bw->jsheap, window->name)` at both
+   iframe creation sites (the `/* linking */` blocks).
+3. `content/handlers/javascript/quickjs/vita_polyfill.js` — new window
+   IIFE (replaces the old minimal one) with per-realm shim windows:
+   `parent`/`top` shims in iframe realms (detected via
+   `__vitaFrameRealmName()`), `window.frames` shim + `iframe.contentWindow`
+   / `iframe.contentDocument` in the top realm. Shim `postMessage`
+   JSON-serializes the payload and calls the C natives. `window.open`
+   stub retained.
+4. `vita_polyfill.inc` — regenerated with
+   `tools/gen-vita-polyfill.py vita_polyfill.js vita_polyfill.inc`.
+
+## Build & verify commands (proven this session)
+
+```sh
+cd <REPO>
+WORK=<WORK>/vitabrowser-work tools/run-vita-sim.sh        # engine + frontend + 18 shots
+# full build log: <WORK>/vitabrowser-work/vita-sim/build.log
+# screenshot run cwd: <WORK>/vitabrowser-work/vita-sim/run  (VITA_SIM_PAGES=18)
+# single page:  cd <WORK>/vitabrowser-work/vita-sim/run && timeout 60 \
+#   <WORK>/vitabrowser-work/applytest/upstream/netsurf/nsvita-sim file:///app0:/testpages/JS-dom.html
+```
+
+## THE BUG (your task)
+
+`tools/run-vita-sim.sh` exits **139 (SIGSEGV)** during the screenshot
+phase, on the **first page** (L1-layout-basics) while "Fetching, Loading"
+is showing — i.e. before/iframes exist, queue is empty. Reproduced 3x.
+
+Already established:
+- Build is clean (no compile/link errors).
+- Individual page runs (L1, JS-dom, JS-fetch, JS-window) **do not crash**
+  in single-page mode. Only the full 18-page run crashes.
+- `node --check` passes on the new polyfill.
+- Fault: wild jump, `rip≈0x58597f6bc978`, `si_addr` same value (jump to
+  garbage). Binary is PIE; no gdb/sudo on this box.
+
+### Tools left for you
+
+- `tools/segvtrace.c` (new, in this repo) — SIGSEGV/SIGBUS/SIGABRT
+  handler with maps + backtrace + RIP/RSP. Build and use:
+  ```sh
+  gcc -shared -fPIC -O1 -o /tmp/segvtrace.so tools/segvtrace.c
+  cd <WORK>/vitabrowser-work/vita-sim/run
+  LD_PRELOAD=/tmp/segvtrace.so timeout 900 \
+    <WORK>/vitabrowser-work/applytest/upstream/netsurf/nsvita-sim
+  # output: /tmp/segv-trace.out — read the maps section, find the
+  # nsvita-sim PIE base, then: addr2line -fC -e nsvita-sim $((0xRIP - 0xBASE))
+  ```
+- Suggested bisect order (applied tree `<WORK>/vitabrowser-work/applytest/upstream/netsurf`;
+  **do NOT `git stash`/`git checkout` — the tree is the whole uncommitted
+  VitaBrowser patch stack, only touch these 4 files**):
+  1. Comment out ONLY the `macsurf_qjs_drain_xrealm();` call in
+     `macsurf_qjs_pump_all` → rebuild → full run. If clean, the drain
+     path (even empty-queue) or a registration-time issue is the cause.
+  2. Revert ONLY `vita_polyfill.js` to the pre-Increment-2 window IIFE
+     (see `git -C <REPO> show
+     ff425a1:patches/vitabrowser/125-netsurf-window-open.patch` for the
+     prior polyfill shape) + regenerate `.inc` → rebuild → full run.
+  3. If both individually clean, bisect the polyfill additions in halves
+     (parent/top shims vs frames/contentWindow shims).
+- Likely suspects to check first: `macsurf_qjs_xrealm_register` (runs at
+  every context setup — check `JS_NewObject`/function-define failures
+  aren't ignored), the polyfill IIFE (QuickJS build here may lack `Proxy`
+  — `host-quickjs` has **no Proxy support**; make sure the new polyfill
+  doesn't use `Proxy` — it currently doesn't, keep it that way), and any
+  use of `qjs_get_node` before its definition (forward decl added —
+  verify signature match `static dom_node *qjs_get_node(JSValue v)`).
+
+## After the crash is fixed
+
+1. Full `tools/run-vita-sim.sh` → expect **exit 1 with 0 diff failures**
+   (exit 1 is the script's normal "pages differ" code, not a crash —
+   check `shots/` and the log).
+2. Verify the bridge with a top-level eval page: add a temp test page
+   `testpages/pages/JS-xrealm.html` with an iframe (local
+   `file:///app0:/testpages/` URL) that `postMessage`s parent↔child and
+   logs; confirm `console.log` output in the debug log
+   (`ux0:data/VitaBrowser/...` debug log under the run dir).
+3. Generate the patch the way 125 was done:
+   `tools/gen-netsurf-patch.py <name>` (or the same manual `git diff`
+   export used for 125 — check `patches/vitabrowser/125-*` for the
+   format), name it `126-netsurf-cross-realm-frames-postmessage.patch`,
+   update the patch-stack doc (`docs/phase-0/04-patch-stack.md` table),
+   commit in the repo: `Polyfill 126: cross-realm frames + postMessage
+   (claude.ai GSI completion)`.
+4. Update THIS doc: root cause, fix, final verify results, "What's
+   next".
+
+## Constraints
+
+- No sudo. No `git stash`/`checkout` in the applied tree (full
+  uncommitted stack).
+- Only C `char*`/JSON may cross JSRuntimes. Never share a `JSValue`
+  across realms (Vita ABA/cross-RT free crashes).
+- No `Proxy` in polyfill (host QuickJS build lacks it).
+- Keep the polyfill `.inc` regenerated with every `.js` change.
+- Document each step here, commit per finished task in the repo.
+- At a natural checkpoint, STOP with a short done/next summary.
+
+## What's next (for the resume prompt)
+
+1. Symbolize the segv (segvtrace + addr2line with PIE base).
+2. Bisect per the 3-step plan above.
+3. Fix, verify full run + JS-xrealm.html eval check.
+4. Patch 126 + commit + doc update.
