@@ -1,0 +1,82 @@
+# netsurf (vita frontend, simulator only): VITA_SIM_SCRIPT commands that need the engine
+#
+# tools/vita-sim/vitasim.c gained a scripted session (VITA_SIM_SCRIPT: settle,
+# wait, tap, drag, press, stick, type, nav, eval, shot, quit) to replay what a
+# person did on the Vita. "nav URL" and "eval FILE" need the engine: the
+# frontend asks vitasim_take_command() each pass. eval runs the file's
+# JavaScript in the page through browser_window_exec, deferred to a timer:
+# exec appends a <script> to the body and runs it inside that mutation, where
+# the bridge refuses further DOM changes (exception 7). console.log output
+# lands in netsurf.log as "[js] ...". VITA_HOST_SIM builds only.
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index d94eb664b..4c6d15b31 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -873,6 +873,57 @@ static void draw_overlay(void)
+ #ifdef VITA_HOST_SIM
+ /* tools/vita-sim: write the page as drawn so far to a PNG. */
+ void vitasim_snapshot(const char *name);
++
++/* tools/vita-sim VITA_SIM_SCRIPT: the commands that need the engine,
++ * "nav URL" and "eval FILE" (JavaScript run in the current page). */
++const char *vitasim_take_command(void);
++
++static void vitasim_command(struct browser_window *bw)
++{
++	const char *cmd = vitasim_take_command();
++
++	if (cmd == NULL)
++		return;
++	if (strncmp(cmd, "nav ", 4) == 0) {
++		nsurl *url;
++		if (nsurl_create(cmd + 4, &url) == NSERROR_OK) {
++			vita_stats.nav_ms = vita_diag_ms();
++			browser_window_navigate(bw, url, NULL,
++				BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
++			nsurl_unref(url);
++		}
++	} else if (strncmp(cmd, "eval ", 5) == 0) {
++		FILE *fp = fopen(cmd + 5, "rb");
++		char *src;
++		long n;
++		bool ok;
++
++		if (fp == NULL) {
++			vita_diag_log("sim eval: cannot open %s", cmd + 5);
++			return;
++		}
++		fseek(fp, 0, SEEK_END);
++		n = ftell(fp);
++		fseek(fp, 0, SEEK_SET);
++		/* browser_window_exec runs the text as a <script> appended
++		 * to the body, inside that mutation, where the bridge refuses
++		 * further DOM changes (exception 7): defer it to a timer. */
++		static const char pre[] = "setTimeout(function(){\n";
++		static const char post[] = "\n},0);";
++		src = malloc(sizeof(pre) + (size_t)n + sizeof(post));
++		if (src != NULL && fread(src + sizeof(pre) - 1, 1, (size_t)n,
++					 fp) == (size_t)n) {
++			memcpy(src, pre, sizeof(pre) - 1);
++			memcpy(src + sizeof(pre) - 1 + n, post, sizeof(post));
++			n += sizeof(pre) - 1 + sizeof(post) - 1;
++			ok = browser_window_exec(bw, src, (size_t)n);
++			vita_diag_log("sim eval: %s -> %s", cmd + 5,
++				      ok ? "ran" : "FAILED");
++		}
++		free(src);
++		fclose(fp);
++	}
++}
+ #endif
+ 
+ /**
+@@ -1053,6 +1104,9 @@ static void vita_run(struct browser_window *bw)
+ 		}
+ 		/* A URL sent from a phone or PC (vita/remote.c). */
+ 		vita_remote_poll(gw);
++#ifdef VITA_HOST_SIM
++		vitasim_command(bw);
++#endif
+ 
+ 		/* The pad, or the interaction pass's script in its place. */
+ 		if (vita_autotest == AT_INTERACT) {

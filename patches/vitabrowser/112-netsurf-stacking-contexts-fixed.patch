@@ -1,0 +1,657 @@
+# netsurf: stacking contexts across levels; position: fixed stays put; clicks hit what is on top
+#
+# MacSurf's CSS 2.1 Appendix E painting only sorted SIBLINGS: a fixed or
+# z-indexed element inside a plain wrapper painted in DOM order, under every
+# later sibling of the wrapper. That is the usual shape of a modal (Google's
+# and YouTube's consent dialogs: div[role=dialog] > div.scrim{fixed;z-index}
+# + div.dialog{fixed;z-index}) and of most dropdowns, so dialogs drew under
+# the page they cover.
+#
+# - redraw.c: a positioned box with an explicit z-index, or any fixed box, is
+#   "hoisted": its nearest stacking context (the root, or a box the
+#   classifier calls one) collects it from its whole subtree and paints it in
+#   its z phase (negative before the flow, zero/auto and positive after, in
+#   tree order within a z), with the coordinates its parent would have given
+#   it; its non-stacking-context parent skips it. Growable vector, no caps.
+# - position: fixed boxes are painted vb_fixed_scroll_x/y (the viewport
+#   scroll, set by the frontend: vita/window.c) further on, so they stay in
+#   the viewport instead of scrolling away with the page.
+# - box_inspect.c / interaction.c: hit testing finds the topmost hoisted box
+#   under the point (highest z, then last in tree order, nested ones
+#   preferred, fixed offset included) and walks only its subtree
+#   (box_walk_limit); with none, the walk skips hoisted subtrees
+#   (box_walk_skip_hoisted). Before, page content after a modal in the DOM
+#   won clicks aimed at the modal.
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index b7b5a2584..a9c5bf1cc 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <stdio.h>
++#include <stdint.h>
+ #include <dom/dom.h>
+ 
+ #include "utils/utils.h"
+@@ -325,6 +326,8 @@ box_next_xy(struct box *b, int *x, int *y, bool skip_children)
+ 	}
+ 
+  skip_children:
++	if (b == box_walk_limit)
++		return NULL;
+ 	tx = *x; ty = *y;
+ 	n = box_move_xy(b, BOX_WALK_NEXT_FLOAT_SIBLING, &tx, &ty);
+ 	if (n) {
+@@ -345,8 +348,12 @@ box_next_xy(struct box *b, int *x, int *y, bool skip_children)
+ 
+ 	/* Go to next sibling, or nearest ancestor with next sibling. */
+ 	while (b) {
++		if (b == box_walk_limit)
++			return NULL;	/* the walk stays in this subtree */
+ 		while (!b->next && b->parent) {
+ 			b = box_move_xy(b, BOX_WALK_PARENT, x, y);
++			if (b == box_walk_limit)
++				return NULL;
+ 			if (box_is_float(b)) {
+ 				/* Go on to next float, if there is one */
+ 				goto skip_children;
+@@ -591,6 +598,132 @@ void box_bounds(struct box *box, struct rect *r)
+ }
+ 
+ 
++int vb_fixed_scroll_x, vb_fixed_scroll_y;
++struct box *box_walk_limit;
++bool box_walk_skip_hoisted;
++
++/* exported interface documented in html/box_inspect.h */
++bool box_is_hoisted(const struct box *b)
++{
++	int32_t z;
++	uint8_t pos;
++
++	if (b->style == NULL)
++		return false;
++	pos = css_computed_position(b->style);
++	if (pos == CSS_POSITION_STATIC)
++		return false;
++	return pos == CSS_POSITION_FIXED ||
++		css_computed_z_index(b->style, &z) == CSS_Z_INDEX_SET;
++}
++
++static int32_t box_hoist_z(const struct box *b)
++{
++	int32_t z = 0;
++
++	if (css_computed_z_index(b->style, &z) != CSS_Z_INDEX_SET)
++		z = 0;
++	return z;
++}
++
++/* Does the point (relative to b's border-box origin) hit b's area? */
++static bool box_hoist_hit(const struct box *b, int x, int y)
++{
++	int w = b->padding[LEFT] + b->width + b->padding[RIGHT] +
++			b->border[RIGHT].width;
++	int h = b->padding[TOP] + b->height + b->padding[BOTTOM] +
++			b->border[BOTTOM].width;
++
++	if (x >= -b->border[LEFT].width && x < w &&
++	    y >= -b->border[TOP].width && y < h)
++		return true;
++	/* overflow visible: descendants poking out count too */
++	if (box_overflow_x(b) == CSS_OVERFLOW_VISIBLE &&
++	    box_overflow_y(b) == CSS_OVERFLOW_VISIBLE &&
++	    x >= b->descendant_x0 && x < b->descendant_x1 &&
++	    y >= b->descendant_y0 && y < b->descendant_y1)
++		return true;
++	return false;
++}
++
++/* The topmost hit among the hoisted boxes below box, whose children sit
++ * at x_off / y_off: painted last = highest z, then last in tree order.
++ * Stacking contexts that are not hoisted (opacity, transform) are walked
++ * through; close enough for hit testing. */
++static struct box *box_hoist_search(struct box *box, int x_off, int y_off,
++		int x, int y, int depth, int32_t *best_z, int *hx, int *hy)
++{
++	struct box *c, *best = NULL;
++
++	if (depth > 200)
++		return NULL;
++	for (c = box->children; c; c = c->next) {
++		int cx = x_off + c->x, cy = y_off + c->y;
++
++		if (box_is_hoisted(c)) {
++			int32_t z = box_hoist_z(c);
++			if (css_computed_position(c->style) ==
++					CSS_POSITION_FIXED) {
++				cx += vb_fixed_scroll_x;
++				cy += vb_fixed_scroll_y;
++			}
++			if (css_computed_visibility(c->style) !=
++					CSS_VISIBILITY_HIDDEN &&
++			    (best == NULL || z >= *best_z) &&
++			    box_hoist_hit(c, x - cx, y - cy)) {
++				int32_t nz = INT32_MIN;
++				int nx, ny;
++				struct box *n;
++
++				best = c;
++				*best_z = z;
++				*hx = cx;
++				*hy = cy;
++				/* something hoisted inside it paints above */
++				n = box_hoist_search(c,
++					cx - scrollbar_get_offset(c->scroll_x),
++					cy - scrollbar_get_offset(c->scroll_y),
++					x, y, depth + 1, &nz, &nx, &ny);
++				if (n != NULL) {
++					best = n;
++					*hx = nx;
++					*hy = ny;
++				}
++			}
++			continue;
++		}
++		if (c->children != NULL && c->gadget == NULL) {
++			int32_t nz = INT32_MIN;
++			int nx, ny;
++			struct box *n = box_hoist_search(c,
++				cx - scrollbar_get_offset(c->scroll_x),
++				cy - scrollbar_get_offset(c->scroll_y),
++				x, y, depth + 1, &nz, &nx, &ny);
++			if (n != NULL && (best == NULL || nz >= *best_z)) {
++				best = n;
++				*best_z = nz;
++				*hx = nx;
++				*hy = ny;
++			}
++		}
++	}
++	return best;
++}
++
++/* exported interface documented in html/box_inspect.h */
++struct box *box_hoisted_at_point(struct box *root, int root_x, int root_y,
++		int x, int y, int *hx, int *hy)
++{
++	int32_t z = INT32_MIN;
++
++	if (root == NULL)
++		return NULL;
++	return box_hoist_search(root,
++			root_x - scrollbar_get_offset(root->scroll_x),
++			root_y - scrollbar_get_offset(root->scroll_y),
++			x, y, 0, &z, hx, hy);
++}
++
+ /* Exported function documented in html/box.h */
+ struct box *
+ box_at_point(const css_unit_ctx *unit_len_ctx,
+@@ -605,6 +738,10 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 
+ 	skip_children = false;
+ 	while ((box = box_next_xy(box, box_x, box_y, skip_children))) {
++		if (box_walk_skip_hoisted && box_is_hoisted(box)) {
++			skip_children = true;
++			continue;
++		}
+ 		if (box_contains_point(unit_len_ctx, box, x - *box_x, y - *box_y,
+ 				       &physically)) {
+ 			*box_x -= scrollbar_get_offset(box->scroll_x);
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index d6da95426..19d4e4e8e 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -70,6 +70,30 @@ void box_bounds(struct box *box, struct rect *r);
+ struct box *box_at_point(const css_unit_ctx *unit_len_ctx, struct box *box, const int x, const int y, int *box_x, int *box_y);
+ 
+ 
++/**
++ * VitaBrowser: stacking-aware hit testing (see redraw.c's "stacking
++ * contexts across levels").
++ *
++ * A "hoisted" box -- position: fixed, or positioned with an explicit
++ * z-index -- is painted by its nearest stacking context above the flow,
++ * and fixed boxes are painted vb_fixed_scroll_x/y further on, so they stay
++ * put while the page scrolls. box_at_point() walks in tree order, so page
++ * content that follows a modal in the DOM won clicks aimed at the modal.
++ *
++ * box_hoisted_at_point() finds the topmost hoisted box whose area holds
++ * the point (with its absolute position, fixed offset included). A walk
++ * that sets box_walk_limit to it stays inside its subtree; a walk that
++ * sets box_walk_skip_hoisted ignores every hoisted subtree.
++ */
++extern int vb_fixed_scroll_x, vb_fixed_scroll_y;
++extern struct box *box_walk_limit;
++extern bool box_walk_skip_hoisted;
++
++bool box_is_hoisted(const struct box *b);
++struct box *box_hoisted_at_point(struct box *root, int root_x, int root_y,
++		int x, int y, int *hx, int *hy);
++
++
+ /**
+  * Find a box based upon its id attribute.
+  *
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 03b31b83d..33d56292b 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -929,6 +929,24 @@ get_mouse_action_node(html_content *html,
+ 	box_x = box->margin[LEFT];
+ 	box_y = box->margin[TOP];
+ 
++	/* VitaBrowser: what is painted on top gets the click. A modal,
++	 * dropdown or fixed bar (hoisted: see box_inspect.h) under the point
++	 * takes it, and the walk stays inside it; otherwise the walk skips
++	 * every hoisted subtree, which is not where it was painted. */
++	{
++		int hx, hy;
++		struct box *h = box_hoisted_at_point(box, box_x, box_y,
++				x, y, &hx, &hy);
++		if (h != NULL) {
++			box = h;
++			box_x = hx;
++			box_y = hy;
++			box_walk_limit = h;
++		} else {
++			box_walk_skip_hoisted = true;
++		}
++	}
++
+ 	do {
+ 		/* skip hidden boxes */
+ 		if ((box->style != NULL) &&
+@@ -1046,6 +1064,8 @@ get_mouse_action_node(html_content *html,
+ 		/* iterate to next box */
+ 		box = box_at_point(&html->unit_len_ctx, box, x, y, &box_x, &box_y);
+ 	} while (box != NULL);
++	box_walk_limit = NULL;
++	box_walk_skip_hoisted = false;
+ 
+ 	/* use of box_x, box_y, or content below this point is probably a
+ 	 * mistake; they will refer to the last box returned by box_at_point */
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 824f33448..db968a38d 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -4257,6 +4257,136 @@ static html_redraw_sc_class html_redraw_box_classify(const struct box *c,
+ 	return HRBSC_NONE;
+ }
+ 
++/*
++ * VitaBrowser: stacking contexts across levels.
++ *
++ * MacSurf's sibling-level bucketing (above) left "positioned descendants of
++ * a non-SC parent" painting in their parent's flow: a fixed or z-indexed
++ * element inside a plain wrapper painted in DOM order, under every later
++ * sibling of the wrapper. That is the usual shape of a modal (Google's
++ * consent dialog: div[role=dialog] > div.scrim{position:fixed;z-index:9997}
++ * + div{position:fixed;z-index:9998}) and of most dropdowns, so dialogs
++ * drew UNDER the page they cover.
++ *
++ * Now a positioned box with an explicit z-index, or any fixed box, is
++ * "hoisted": painted by its nearest ancestor stacking context (the root, or
++ * a box html_redraw_box_classify() calls a stacking context) in that
++ * context's z phases, with the coordinates its own parent would have given
++ * it. Its parent, not being a stacking context, skips it. Clipping by
++ * intermediate overflow boxes is not applied to hoisted boxes (a real
++ * browser clips them only when the overflow box is also their containing
++ * block). Opacity and transform stacking contexts stay in flow.
++ */
++struct hrb_entry {
++	struct box *b;
++	int x, y;		/* the x_parent / y_parent to draw it with */
++	int32_t z;
++	int cls;		/* html_redraw_sc_class */
++};
++
++static bool html_redraw_box_hoisted(const struct box *c)
++{
++	int32_t z;
++	uint8_t pos;
++
++	if (c->style == NULL)
++		return false;
++	pos = css_computed_position(c->style);
++	if (pos == CSS_POSITION_STATIC)
++		return false;
++	return pos == CSS_POSITION_FIXED ||
++		css_computed_z_index(c->style, &z) == CSS_Z_INDEX_SET;
++}
++
++static bool html_redraw_box_is_sc_root(const struct box *box)
++{
++	int32_t z;
++
++	return box->parent == NULL ||
++		html_redraw_box_classify(box, &z) != HRBSC_NONE;
++}
++
++struct hrb_buckets {
++	struct hrb_entry *e;
++	int n, size;
++};
++
++/* Note c (drawn with x_parent/y_parent = x, y) for its z phase. */
++static void hrb_add(struct hrb_buckets *bk, struct box *c, int x, int y,
++		html_redraw_sc_class cls, int32_t z)
++{
++	if (bk->n == bk->size) {
++		int size = bk->size ? bk->size * 2 : 16;
++		struct hrb_entry *e = realloc(bk->e, size * sizeof(*e));
++		if (e == NULL)
++			return;	/* out of memory: this box goes unpainted */
++		bk->e = e;
++		bk->size = size;
++	}
++	bk->e[bk->n].b = c;
++	bk->e[bk->n].x = x;
++	bk->e[bk->n].y = y;
++	bk->e[bk->n].z = (cls == HRBSC_ZERO || cls == HRBSC_NONE) ? 0 : z;
++	bk->e[bk->n].cls = cls;
++	bk->n++;
++}
++
++/* Collect the hoisted boxes below box (whose children are drawn with
++ * x_off / y_off), not descending into stacking contexts. */
++static void hrb_collect(struct hrb_buckets *bk, struct box *box,
++		int x_off, int y_off, int depth)
++{
++	struct box *c;
++	int32_t z;
++	html_redraw_sc_class cls;
++
++	if (depth > 200)
++		return;
++	for (c = box->children; c; c = c->next) {
++		cls = html_redraw_box_classify(c, &z);
++		if (html_redraw_box_hoisted(c)) {
++			hrb_add(bk, c, x_off, y_off, cls, z);
++			continue;
++		}
++		if (cls != HRBSC_NONE)
++			continue;	/* its own stacking context */
++		if (c->children == NULL || c->gadget != NULL ||
++		    (c->flags & SVG_INLINE))
++			continue;
++		hrb_collect(bk, c,
++			x_off + c->x - scrollbar_get_offset(c->scroll_x),
++			y_off + c->y - scrollbar_get_offset(c->scroll_y),
++			depth + 1);
++	}
++}
++
++/* position: fixed stays put while the page scrolls (box_inspect.h) */
++static inline int hrb_fixed_dx(const struct box *b)
++{
++	return (b->style != NULL && css_computed_position(b->style) ==
++			CSS_POSITION_FIXED) ? vb_fixed_scroll_x : 0;
++}
++
++static inline int hrb_fixed_dy(const struct box *b)
++{
++	return (b->style != NULL && css_computed_position(b->style) ==
++			CSS_POSITION_FIXED) ? vb_fixed_scroll_y : 0;
++}
++
++static void hrb_sort(struct hrb_entry *e, int n)
++{
++	int i, j;
++
++	/* stable insertion sort by z ascending: negative z first, then z 0
++	 * and z:auto in tree order, then positive z */
++	for (i = 1; i < n; i++) {
++		struct hrb_entry t = e[i];
++		for (j = i - 1; j >= 0 && e[j].z > t.z; j--)
++			e[j + 1] = e[j];
++		e[j + 1] = t;
++	}
++}
++
+ static bool html_redraw_box_children(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, float scale,
+@@ -4264,129 +4394,92 @@ static bool html_redraw_box_children(const html_content *html, struct box *box,
+ 		const struct redraw_context *ctx)
+ {
+ 	struct box *c;
+-	struct box *flow_buf[MACOS9_Z_BUF * 2];   /* non-SC in DOM order */
+-	struct box *neg_buf[MACOS9_Z_BUF];
+-	int32_t neg_z[MACOS9_Z_BUF];
+-	struct box *zero_buf[MACOS9_Z_BUF];
+-	struct box *pos_buf[MACOS9_Z_BUF];
+-	int32_t pos_z[MACOS9_Z_BUF];
+-	int flow_n = 0, neg_n = 0, zero_n = 0, pos_n = 0;
++	struct hrb_buckets bk = { NULL, 0, 0 };
++	bool sc_root = html_redraw_box_is_sc_root(box);
+ 	int32_t zval = 0;
+-	int i, j;
++	int i, first_nonneg;
+ 	int x_off, y_off;
++	bool ok = true;
+ 
+ 	x_off = x_parent + box->x - scrollbar_get_offset(box->scroll_x);
+ 	y_off = y_parent + box->y - scrollbar_get_offset(box->scroll_y);
+ 
+-	/* Pass 1: classify all non-float children into four buckets.
+-	 * Defer all paint so negative-z paints first per CSS 2.1 (b). */
+-	for (c = box->children; c; c = c->next) {
+-		html_redraw_sc_class cls;
+-
+-		if (c->type == BOX_FLOAT_LEFT || c->type == BOX_FLOAT_RIGHT)
+-			continue;
+-
+-		cls = html_redraw_box_classify(c, &zval);
++	/* Pass 1 (stacking context roots only): the direct stacking-context
++	 * children and every hoisted descendant, into z buckets, in tree
++	 * order. */
++	if (sc_root) {
++		for (c = box->children; c; c = c->next) {
++			html_redraw_sc_class cls;
+ 
+-		if (cls == HRBSC_NEG) {
+-			if (neg_n < MACOS9_Z_BUF) {
+-				neg_buf[neg_n] = c;
+-				neg_z[neg_n] = zval;
+-				neg_n++;
+-				continue;
+-			}
+-		} else if (cls == HRBSC_ZERO) {
+-			if (zero_n < MACOS9_Z_BUF) {
+-				zero_buf[zero_n] = c;
+-				zero_n++;
++			if (c->type == BOX_FLOAT_LEFT ||
++			    c->type == BOX_FLOAT_RIGHT)
+ 				continue;
+-			}
+-		} else if (cls == HRBSC_POS) {
+-			if (pos_n < MACOS9_Z_BUF) {
+-				pos_buf[pos_n] = c;
+-				pos_z[pos_n] = zval;
+-				pos_n++;
++			cls = html_redraw_box_classify(c, &zval);
++			if (cls != HRBSC_NONE || html_redraw_box_hoisted(c)) {
++				hrb_add(&bk, c, x_off, y_off, cls, zval);
+ 				continue;
+ 			}
++			if (c->children != NULL && c->gadget == NULL &&
++			    !(c->flags & SVG_INLINE))
++				hrb_collect(&bk, c,
++					x_off + c->x -
++					scrollbar_get_offset(c->scroll_x),
++					y_off + c->y -
++					scrollbar_get_offset(c->scroll_y), 1);
+ 		}
+-
+-		/* HRBSC_NONE (or bucket overflow): in-flow / phase (c)+(e). */
+-		if (flow_n < (int)(sizeof(flow_buf) / sizeof(flow_buf[0]))) {
+-			flow_buf[flow_n++] = c;
+-		} else {
+-			/* Out of all buckets - paint immediately as last resort. */
+-			if (!html_redraw_box(html, c, x_off, y_off,
+-					clip, scale,
+-					current_background_color, ctx))
+-				return false;
+-		}
+-	}
+-
+-	/* Pass 2-a: stable bubble sort negatives by z ascending. */
+-	for (i = 0; i < neg_n - 1; i++) {
+-		for (j = 0; j < neg_n - 1 - i; j++) {
+-			if (neg_z[j] > neg_z[j + 1]) {
+-				int32_t tv = neg_z[j];
+-				struct box *tb = neg_buf[j];
+-				neg_z[j] = neg_z[j + 1];
+-				neg_buf[j] = neg_buf[j + 1];
+-				neg_z[j + 1] = tv;
+-				neg_buf[j + 1] = tb;
+-			}
+-		}
+-	}
+-	/* Pass 2-b: stable bubble sort positives by z ascending. */
+-	for (i = 0; i < pos_n - 1; i++) {
+-		for (j = 0; j < pos_n - 1 - i; j++) {
+-			if (pos_z[j] > pos_z[j + 1]) {
+-				int32_t tv = pos_z[j];
+-				struct box *tb = pos_buf[j];
+-				pos_z[j] = pos_z[j + 1];
+-				pos_buf[j] = pos_buf[j + 1];
+-				pos_z[j + 1] = tv;
+-				pos_buf[j + 1] = tb;
+-			}
++		for (c = box->float_children; c; c = c->next_float) {
++			if (c->children != NULL)
++				hrb_collect(&bk, c,
++					x_off + c->x -
++					scrollbar_get_offset(c->scroll_x),
++					y_off + c->y -
++					scrollbar_get_offset(c->scroll_y), 1);
+ 		}
++		hrb_sort(bk.e, bk.n);
+ 	}
++	for (first_nonneg = 0; first_nonneg < bk.n &&
++			bk.e[first_nonneg].z < 0; first_nonneg++)
++		;
+ 
+-	/* CSS 2.1 Appendix E paint order at the sibling level:
++	/* CSS 2.1 Appendix E paint order:
+ 	 *   (b) negative-z stacking contexts (most negative first)
+-	 *   (c)+(d)+(e) non-SC children in DOM order, then floats
+-	 *   (f) zero-z stacking contexts (DOM order)
++	 *   (c)+(d)+(e) in-flow children in DOM order, then floats
++	 *   (f) zero-z stacking contexts and positioned z:auto (tree order)
+ 	 *   (g) positive-z stacking contexts (least positive first)
+ 	 */
++	for (i = 0; ok && i < first_nonneg; i++)
++		ok = html_redraw_box(html, bk.e[i].b,
++				bk.e[i].x + hrb_fixed_dx(bk.e[i].b),
++				bk.e[i].y + hrb_fixed_dy(bk.e[i].b),
++				clip, scale, current_background_color, ctx);
+ 
+-	for (i = 0; i < neg_n; i++) {
+-		if (!html_redraw_box(html, neg_buf[i], x_off, y_off,
+-				clip, scale, current_background_color, ctx))
+-			return false;
+-	}
+-
+-	for (i = 0; i < flow_n; i++) {
+-		if (!html_redraw_box(html, flow_buf[i], x_off, y_off,
+-				clip, scale, current_background_color, ctx))
+-			return false;
+-	}
+-
+-	for (c = box->float_children; c; c = c->next_float) {
+-		if (!html_redraw_box(html, c, x_off, y_off,
+-				clip, scale, current_background_color, ctx))
+-			return false;
++	for (c = box->children; ok && c; c = c->next) {
++		if (c->type == BOX_FLOAT_LEFT || c->type == BOX_FLOAT_RIGHT)
++			continue;
++		if (sc_root) {
++			if (html_redraw_box_classify(c, &zval) != HRBSC_NONE ||
++			    html_redraw_box_hoisted(c))
++				continue;	/* bucketed above */
++		} else if (html_redraw_box_hoisted(c)) {
++			continue;	/* the stacking context paints it */
++		}
++		ok = html_redraw_box(html, c, x_off, y_off, clip, scale,
++				current_background_color, ctx);
+ 	}
+ 
+-	for (i = 0; i < zero_n; i++) {
+-		if (!html_redraw_box(html, zero_buf[i], x_off, y_off,
+-				clip, scale, current_background_color, ctx))
+-			return false;
++	for (c = box->float_children; ok && c; c = c->next_float) {
++		ok = html_redraw_box(html, c, x_off, y_off,
++				clip, scale, current_background_color, ctx);
+ 	}
+ 
+-	for (i = 0; i < pos_n; i++) {
+-		if (!html_redraw_box(html, pos_buf[i], x_off, y_off,
+-				clip, scale, current_background_color, ctx))
+-			return false;
+-	}
++	for (i = first_nonneg; ok && i < bk.n; i++)
++		ok = html_redraw_box(html, bk.e[i].b,
++				bk.e[i].x + hrb_fixed_dx(bk.e[i].b),
++				bk.e[i].y + hrb_fixed_dy(bk.e[i].b),
++				clip, scale, current_background_color, ctx);
+ 
+-	return true;
++	free(bk.e);
++	return ok;
+ }
+ 
+ /**
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index 6bfd3f551..e94423780 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -183,6 +183,8 @@ bool vita_window_needs_redraw(struct gui_window *gw)
+ 	return gw != NULL && gw->dirty && browser_window_redraw_ready(gw->bw);
+ }
+ 
++static void sync_fixed(struct gui_window *gw);
++
+ /* exported interface documented in vita/window.h */
+ void vita_window_redraw(struct gui_window *gw)
+ {
+@@ -198,10 +200,26 @@ void vita_window_redraw(struct gui_window *gw)
+ 	vita_plot_set_clip(clip.x0, clip.y0, clip.x1, clip.y1);
+ 	/* The origin of the content on the canvas moves opposite to the
+ 	 * scroll offset. */
++	sync_fixed(gw);
+ 	browser_window_redraw(gw->bw, -gw->scrollx, -gw->scrolly, &clip, &ctx);
+ 	gw->dirty = false;
+ }
+ 
++/* content/handlers/html/box_inspect.h: position: fixed boxes are painted
++ * and hit-tested this far from where layout put them (document px), so
++ * they stay in place while the page scrolls. */
++extern int vb_fixed_scroll_x, vb_fixed_scroll_y;
++
++static void sync_fixed(struct gui_window *gw)
++{
++	float scale = browser_window_get_scale(gw->bw);
++
++	if (scale <= 0.0f)
++		scale = 1.0f;
++	vb_fixed_scroll_x = (int)(gw->scrollx / scale);
++	vb_fixed_scroll_y = (int)(gw->scrolly / scale);
++}
++
+ /* exported interface documented in vita/window.h */
+ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy)
+ {
+@@ -231,6 +249,7 @@ void vita_window_scroll_by(struct gui_window *gw, int dx, int dy)
+ 		gw->scrolly = dy;
+ 		gw->dirty = true;
+ 	}
++	sync_fixed(gw);
+ }
+ 
+ /* exported interface documented in vita/window.h */

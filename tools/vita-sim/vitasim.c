@@ -448,6 +448,193 @@ static void write_png(const char *path, const uint32_t *px)
 #define SETTLE_POLLS 60
 #define MAX_POLLS 20000
 
+
+/* ---- VITA_SIM_SCRIPT: a scripted session ------------------------------
+ *
+ * One command per line, run in order, one step per main-loop pass:
+ *   settle [MIN_MS]   wait until no frame for ~1 s (and MIN_MS since start)
+ *   wait MS           wall-clock wait
+ *   tap X Y           finger down and up at screen X,Y (a click)
+ *   drag X0 Y0 X1 Y1  finger drag (a scroll)
+ *   press B [B ...]   hold buttons for one pass (CROSS CIRCLE SQUARE
+ *                     TRIANGLE START SELECT L R UP DOWN LEFT RIGHT)
+ *   stick X Y         park the pointer: left stick (0-255) for one pass
+ *   type TEXT         the next text entry (TRIANGLE) returns TEXT
+ *   nav URL           navigate (frontend: vitasim_take_command)
+ *   eval FILE         run FILE's JavaScript in the page (console.log goes
+ *                     to netsurf.log as "[js] ...")
+ *   shot NAME         write the last shown frame to $VITA_SIM_OUT/NAME.png
+ *   quit              SELECT + START
+ * '#' starts a comment. Used to reproduce what a person did on the Vita.
+ */
+static FILE *script_fp;
+static int script_touch, script_tx, script_ty;
+static char script_cmd[1100];
+static int script_cmd_ready;
+
+const char *vitasim_take_command(void);
+const char *vitasim_take_command(void)
+{
+	if (!script_cmd_ready)
+		return NULL;
+	script_cmd_ready = 0;
+	return script_cmd;
+}
+
+static long now_ms(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+static unsigned int button_bit(const char *b)
+{
+	static const struct { const char *n; unsigned int bit; } map[] = {
+		{ "CROSS", SCE_CTRL_CROSS }, { "CIRCLE", SCE_CTRL_CIRCLE },
+		{ "SQUARE", SCE_CTRL_SQUARE }, { "TRIANGLE", SCE_CTRL_TRIANGLE },
+		{ "START", SCE_CTRL_START }, { "SELECT", SCE_CTRL_SELECT },
+		{ "L", SCE_CTRL_LTRIGGER }, { "R", SCE_CTRL_RTRIGGER },
+		{ "UP", SCE_CTRL_UP }, { "DOWN", SCE_CTRL_DOWN },
+		{ "LEFT", SCE_CTRL_LEFT }, { "RIGHT", SCE_CTRL_RIGHT },
+	};
+	size_t i;
+	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+		if (strcmp(map[i].n, b) == 0)
+			return map[i].bit;
+	fprintf(stderr, "vitasim: script: unknown button %s\n", b);
+	exit(7);
+}
+
+static int script_step(SceCtrlData *pad)
+{
+	static char line[1100];
+	static int have;		/* line holds a command in progress */
+	static long t0;
+	static unsigned int phase, idle, last_frames;
+	static int dx0, dy0, dx1, dy1;
+	char *arg;
+
+	if (script_fp == NULL) {
+		script_fp = fopen(getenv("VITA_SIM_SCRIPT"), "r");
+		if (script_fp == NULL) {
+			fprintf(stderr, "vitasim: cannot open script\n");
+			exit(3);
+		}
+	}
+	if (frames != last_frames) {
+		last_frames = frames;
+		idle = 0;
+	} else {
+		idle++;
+	}
+	while (!have) {
+		char *e;
+		if (fgets(line, sizeof(line), script_fp) == NULL) {
+			strcpy(line, "quit");
+		}
+		e = line + strlen(line);
+		while (e > line && (e[-1] == '\n' || e[-1] == '\r' ||
+				    e[-1] == ' '))
+			*--e = '\0';
+		if (line[0] == '\0' || line[0] == '#')
+			continue;
+		have = 1;
+		phase = 0;
+		t0 = now_ms();
+		printf("vitasim: script: %s\n", line);
+		fflush(stdout);
+	}
+	arg = strchr(line, ' ');
+	arg = arg ? arg + 1 : line + strlen(line);
+
+	if (strncmp(line, "settle", 6) == 0) {
+		long min = atol(arg);
+		if (phase == 0) { idle = 0; phase = 1; }
+		if (idle >= SETTLE_POLLS && now_ms() - t0 >= min)
+			have = 0;
+		if (now_ms() - t0 > 600000) {
+			fprintf(stderr, "vitasim: script: settle timed out\n");
+			have = 0;
+		}
+		return 1;
+	}
+	if (strncmp(line, "wait ", 5) == 0) {
+		if (now_ms() - t0 >= atol(arg))
+			have = 0;
+		return 1;
+	}
+	if (strncmp(line, "tap ", 4) == 0) {
+		/* down for two passes, up: under TAP_MAX_MS at any pace */
+		if (phase < 2) {
+			sscanf(arg, "%d %d", &script_tx, &script_ty);
+			script_touch = 1;
+			phase++;
+		} else {
+			script_touch = 0;
+			have = 0;
+		}
+		return 1;
+	}
+	if (strncmp(line, "drag ", 5) == 0) {
+		if (phase == 0)
+			sscanf(arg, "%d %d %d %d", &dx0, &dy0, &dx1, &dy1);
+		if (phase <= 10) {
+			script_touch = 1;
+			script_tx = dx0 + (dx1 - dx0) * (int)phase / 10;
+			script_ty = dy0 + (dy1 - dy0) * (int)phase / 10;
+			phase++;
+		} else {
+			script_touch = 0;
+			have = 0;
+		}
+		return 1;
+	}
+	if (strncmp(line, "press ", 6) == 0) {
+		char buf[200], *tok, *save = NULL;
+		snprintf(buf, sizeof(buf), "%s", arg);
+		for (tok = strtok_r(buf, " ", &save); tok != NULL;
+		     tok = strtok_r(NULL, " ", &save))
+			pad->buttons |= button_bit(tok);
+		have = 0;
+		return 1;
+	}
+	if (strncmp(line, "stick ", 6) == 0) {
+		int x = 128, y = 128;
+		sscanf(arg, "%d %d", &x, &y);
+		pad->lx = (unsigned char)x;
+		pad->ly = (unsigned char)y;
+		have = 0;
+		return 1;
+	}
+	if (strncmp(line, "type ", 5) == 0) {
+		setenv("VITA_SIM_TYPE", arg, 1);
+		have = 0;
+		return 1;
+	}
+	if (strncmp(line, "nav ", 4) == 0 || strncmp(line, "eval ", 5) == 0) {
+		snprintf(script_cmd, sizeof(script_cmd), "%s", line);
+		script_cmd_ready = 1;
+		have = 0;
+		return 1;
+	}
+	if (strncmp(line, "shot ", 5) == 0) {
+		const char *out = getenv("VITA_SIM_OUT");
+		char path[1024];
+		snprintf(path, sizeof(path), "%s/%s.png", out ? out : ".", arg);
+		write_png(path, shown);
+		printf("vitasim: script: wrote %s\n", path);
+		have = 0;
+		return 1;
+	}
+	if (strcmp(line, "quit") == 0) {
+		pad->buttons = SCE_CTRL_SELECT | SCE_CTRL_START;
+		return 1;
+	}
+	fprintf(stderr, "vitasim: script: unknown command: %s\n", line);
+	exit(7);
+}
+
 int sceCtrlSetSamplingMode(SceCtrlPadInputMode mode) { (void)mode; return 0; }
 
 int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
@@ -474,6 +661,8 @@ int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad, int count)
 		if (slow > 0)
 			usleep((useconds_t)slow * 1000);
 	}
+	if (getenv("VITA_SIM_SCRIPT") != NULL)
+		return script_step(pad);
 	if (++polls > MAX_POLLS) {
 		fprintf(stderr, "vitasim: timed out on page %u\n", page);
 		exit(4);
@@ -592,6 +781,11 @@ int sceTouchPeek(uint32_t port, SceTouchData *pData, uint32_t nBufs)
 	(void)port;
 	(void)nBufs;
 	memset(pData, 0, sizeof(*pData));
+	if (script_touch) {
+		pData->reportNum = 1;
+		pData->report[0].x = (uint16_t)(script_tx * 2);
+		pData->report[0].y = (uint16_t)(script_ty * 2);
+	}
 	return 1;
 }
 

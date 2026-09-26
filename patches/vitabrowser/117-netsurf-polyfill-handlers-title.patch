@@ -1,0 +1,220 @@
+# netsurf: polyfill -- on<event> handlers on document and window, document.title, element interfaces keep the element prototype
+#
+# - React picks its input-event path with ("oninput" in document); false sent
+#   every keystroke down an old-IE path that threw "cannot read property 'tag'
+#   of null" on each keydown/keyup (claude.ai's email field). Elements had the
+#   on<event> properties, document and window did not; the missing ones are
+#   now accessors over addEventListener.
+# - document.title only returned what script had assigned; it now falls back
+#   to the <title> element.
+# - The stand-in constructors for element interfaces the bridge lacks
+#   (HTMLTitleElement and ~60 more) chained straight to HTMLElement.prototype,
+#   skipping the bridge's element class prototype that carries textContent,
+#   innerHTML and ~140 more: <title>.textContent was undefined. They now
+#   chain through it.
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index d04317012..3eb06892a 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1174,6 +1174,74 @@
+ "\t}\n"
+ "})();\n"
+ "\n"
++"/* ---- on<event> handler properties on document and window ---------------\n"
++" * React picks its input-event path with (\"oninput\" in document); false sent\n"
++" * every keystroke down an old-IE path that threw on each keydown/keyup\n"
++" * (claude.ai's email field). Elements have them; document and window did\n"
++" * not. A missing one becomes an accessor over addEventListener. */\n"
++"\n"
++"(function () {\n"
++"\tvar ev = ('input change click dblclick contextmenu keydown keyup keypress ' +\n"
++"\t\t'focus blur focusin focusout submit reset scroll wheel select ' +\n"
++"\t\t'mousedown mouseup mousemove mouseover mouseout mouseenter mouseleave ' +\n"
++"\t\t'pointerdown pointerup pointermove pointercancel pointerover pointerout ' +\n"
++"\t\t'pointerenter pointerleave touchstart touchend touchmove touchcancel ' +\n"
++"\t\t'selectionchange selectstart beforeinput compositionstart ' +\n"
++"\t\t'compositionupdate compositionend animationstart animationend ' +\n"
++"\t\t'animationiteration transitionend transitionstart transitionrun ' +\n"
++"\t\t'copy cut paste drag dragstart dragend dragover dragenter dragleave drop ' +\n"
++"\t\t'load error resize visibilitychange invalid toggle').split(' ');\n"
++"\tfunction add(o, list) {\n"
++"\t\tif (!o || typeof o.addEventListener !== 'function') return;\n"
++"\t\tlist.forEach(function (t) {\n"
++"\t\t\tvar k = 'on' + t, h = null;\n"
++"\t\t\tif (k in o) return;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tObject.defineProperty(o, k, { configurable: true, enumerable: true,\n"
++"\t\t\t\t\tget: function () { return h; },\n"
++"\t\t\t\t\tset: function (f) {\n"
++"\t\t\t\t\t\tif (h) o.removeEventListener(t, h);\n"
++"\t\t\t\t\t\th = (typeof f === 'function') ? f : null;\n"
++"\t\t\t\t\t\tif (h) o.addEventListener(t, h);\n"
++"\t\t\t\t\t} });\n"
++"\t\t\t} catch (e) { /* exotic object refused */ }\n"
++"\t\t});\n"
++"\t}\n"
++"\tadd(g.document, ev);\n"
++"\tadd(g, ev.concat(['message', 'messageerror', 'popstate', 'hashchange',\n"
++"\t\t'pageshow', 'pagehide', 'beforeunload', 'unload', 'online',\n"
++"\t\t'offline', 'storage', 'orientationchange', 'unhandledrejection',\n"
++"\t\t'rejectionhandled']));\n"
++"})();\n"
++"\n"
++"/* ---- document.title from <title> ---------------------------------------\n"
++" * The bridge's getter only knew what script had assigned. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d) return;\n"
++"\tvar p = d, desc;\n"
++"\twhile (p && !(desc = Object.getOwnPropertyDescriptor(p, 'title')))\n"
++"\t\tp = Object.getPrototypeOf(p);\n"
++"\tvar get = desc && desc.get, set = desc && desc.set;\n"
++"\ttry {\n"
++"\t\tObject.defineProperty(d, 'title', { configurable: true, enumerable: true,\n"
++"\t\t\tget: function () {\n"
++"\t\t\t\tvar v = get ? get.call(d) : '';\n"
++"\t\t\t\tif (v) return v;\n"
++"\t\t\t\tvar t = d.getElementsByTagName('title')[0];\n"
++"\t\t\t\tif (!t) return '';\n"
++"\t\t\t\tvar c = t.firstChild ? t.firstChild.nodeValue : t.textContent;\n"
++"\t\t\t\treturn String(c || '').replace(/[ \\t\\n\\r\\f]+/g, ' ').trim();\n"
++"\t\t\t},\n"
++"\t\t\tset: function (v) {\n"
++"\t\t\t\tif (set) set.call(d, v);\n"
++"\t\t\t\tvar t = d.getElementsByTagName('title')[0];\n"
++"\t\t\t\tif (t) t.textContent = String(v);\n"
++"\t\t\t} });\n"
++"\t} catch (e) { /* */ }\n"
++"})();\n"
++"\n"
+ "/* ---- the element interfaces the bridge has no constructor for ----------\n"
+ " * `x instanceof HTMLObjectElement` throws when the name is undefined\n"
+ " * (YouTube's app shell). Each missing one becomes a constructor whose\n"
+@@ -1209,12 +1277,22 @@
+ "\t\tSVGCircleElement: 'circle', SVGRectElement: 'rect', SVGTextElement: 'text',\n"
+ "\t\tSVGGraphicsElement: 'svg path g use circle rect text line polygon polyline ellipse image'\n"
+ "\t};\n"
++"\t/* The bridge's element class prototype (textContent, innerHTML and\n"
++"\t * ~140 more) sits between a tag's prototype and HTMLElement.prototype;\n"
++"\t * chaining straight to HTMLElement.prototype skipped it, so every\n"
++"\t * <title> (a tag the bridge has no constructor for) had no textContent. */\n"
++"\tvar base = HE.prototype;\n"
++"\ttry {\n"
++"\t\tvar probe = g.document && g.document.createElement('section');\n"
++"\t\tvar bp = probe && Object.getPrototypeOf(probe);\n"
++"\t\tif (bp && 'textContent' in bp) base = bp;\n"
++"\t} catch (e) { /* */ }\n"
+ "\tObject.keys(map).forEach(function (name) {\n"
+ "\t\tif (typeof g[name] === 'function') return;\n"
+ "\t\tvar tags = map[name] ? map[name].split(' ') : [];\n"
+ "\t\tvar C = function () { throw new TypeError('Illegal constructor'); };\n"
+ "\t\ttry { Object.defineProperty(C, 'name', { value: name }); } catch (e) { /* */ }\n"
+-"\t\tC.prototype = Object.create(HE.prototype);\n"
++"\t\tC.prototype = Object.create(base);\n"
+ "\t\tC.prototype.constructor = C;\n"
+ "\t\tObject.defineProperty(C, Symbol.hasInstance, { value: function (x) {\n"
+ "\t\t\tif (!x || typeof x !== 'object' || x.nodeType !== 1) return false;\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 18f6cc42c..bc0f4a5d0 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1173,6 +1173,74 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ })();
+ 
++/* ---- on<event> handler properties on document and window ---------------
++ * React picks its input-event path with ("oninput" in document); false sent
++ * every keystroke down an old-IE path that threw on each keydown/keyup
++ * (claude.ai's email field). Elements have them; document and window did
++ * not. A missing one becomes an accessor over addEventListener. */
++
++(function () {
++	var ev = ('input change click dblclick contextmenu keydown keyup keypress ' +
++		'focus blur focusin focusout submit reset scroll wheel select ' +
++		'mousedown mouseup mousemove mouseover mouseout mouseenter mouseleave ' +
++		'pointerdown pointerup pointermove pointercancel pointerover pointerout ' +
++		'pointerenter pointerleave touchstart touchend touchmove touchcancel ' +
++		'selectionchange selectstart beforeinput compositionstart ' +
++		'compositionupdate compositionend animationstart animationend ' +
++		'animationiteration transitionend transitionstart transitionrun ' +
++		'copy cut paste drag dragstart dragend dragover dragenter dragleave drop ' +
++		'load error resize visibilitychange invalid toggle').split(' ');
++	function add(o, list) {
++		if (!o || typeof o.addEventListener !== 'function') return;
++		list.forEach(function (t) {
++			var k = 'on' + t, h = null;
++			if (k in o) return;
++			try {
++				Object.defineProperty(o, k, { configurable: true, enumerable: true,
++					get: function () { return h; },
++					set: function (f) {
++						if (h) o.removeEventListener(t, h);
++						h = (typeof f === 'function') ? f : null;
++						if (h) o.addEventListener(t, h);
++					} });
++			} catch (e) { /* exotic object refused */ }
++		});
++	}
++	add(g.document, ev);
++	add(g, ev.concat(['message', 'messageerror', 'popstate', 'hashchange',
++		'pageshow', 'pagehide', 'beforeunload', 'unload', 'online',
++		'offline', 'storage', 'orientationchange', 'unhandledrejection',
++		'rejectionhandled']));
++})();
++
++/* ---- document.title from <title> ---------------------------------------
++ * The bridge's getter only knew what script had assigned. */
++
++(function () {
++	var d = g.document;
++	if (!d) return;
++	var p = d, desc;
++	while (p && !(desc = Object.getOwnPropertyDescriptor(p, 'title')))
++		p = Object.getPrototypeOf(p);
++	var get = desc && desc.get, set = desc && desc.set;
++	try {
++		Object.defineProperty(d, 'title', { configurable: true, enumerable: true,
++			get: function () {
++				var v = get ? get.call(d) : '';
++				if (v) return v;
++				var t = d.getElementsByTagName('title')[0];
++				if (!t) return '';
++				var c = t.firstChild ? t.firstChild.nodeValue : t.textContent;
++				return String(c || '').replace(/[ \t\n\r\f]+/g, ' ').trim();
++			},
++			set: function (v) {
++				if (set) set.call(d, v);
++				var t = d.getElementsByTagName('title')[0];
++				if (t) t.textContent = String(v);
++			} });
++	} catch (e) { /* */ }
++})();
++
+ /* ---- the element interfaces the bridge has no constructor for ----------
+  * `x instanceof HTMLObjectElement` throws when the name is undefined
+  * (YouTube's app shell). Each missing one becomes a constructor whose
+@@ -1208,12 +1276,22 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		SVGCircleElement: 'circle', SVGRectElement: 'rect', SVGTextElement: 'text',
+ 		SVGGraphicsElement: 'svg path g use circle rect text line polygon polyline ellipse image'
+ 	};
++	/* The bridge's element class prototype (textContent, innerHTML and
++	 * ~140 more) sits between a tag's prototype and HTMLElement.prototype;
++	 * chaining straight to HTMLElement.prototype skipped it, so every
++	 * <title> (a tag the bridge has no constructor for) had no textContent. */
++	var base = HE.prototype;
++	try {
++		var probe = g.document && g.document.createElement('section');
++		var bp = probe && Object.getPrototypeOf(probe);
++		if (bp && 'textContent' in bp) base = bp;
++	} catch (e) { /* */ }
+ 	Object.keys(map).forEach(function (name) {
+ 		if (typeof g[name] === 'function') return;
+ 		var tags = map[name] ? map[name].split(' ') : [];
+ 		var C = function () { throw new TypeError('Illegal constructor'); };
+ 		try { Object.defineProperty(C, 'name', { value: name }); } catch (e) { /* */ }
+-		C.prototype = Object.create(HE.prototype);
++		C.prototype = Object.create(base);
+ 		C.prototype.constructor = C;
+ 		Object.defineProperty(C, Symbol.hasInstance, { value: function (x) {
+ 			if (!x || typeof x !== 'object' || x.nodeType !== 1) return false;

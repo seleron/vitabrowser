@@ -1,0 +1,375 @@
+# netsurf: percentage and calc() heights and offsets; floated flex/grid; replaced boxes in flex
+#
+# - Absolutely positioned boxes with top + bottom and height auto have a
+#   DEFINITE height (CSS 2.1 10.6.4), but it was only worked out after their
+#   children were laid out, so every percentage height inside saw AUTO.
+#   layout_absolute now settles it first and flags the box
+#   (VB_DEFINITE_HEIGHT); layout_find_dimensions and min/max-height accept
+#   such a containing block, and position: fixed counts as absolute there.
+# - height, min-height and max-height resolve percentages and calc() through
+#   css_unit_len2device_px_ref against the containing block (calc() with no
+#   percentage resolves without one). top/right/bottom/left likewise, so
+#   "left: calc(50% - 10px)" centres.
+#   Google's consent dialog (inline-block, height: calc(100% - 64px) inside a
+#   fixed top:0/bottom:0 box) was 0 px tall and invisible.
+# - A floated display: flex / grid box went to layout_block_context, which
+#   asserts on a grid (bbc.com, rte.ie aborted); it now gets layout_flex /
+#   layout_grid like the inline variants.
+# - A replaced box with given dimensions (an inline <svg>) inside a flex row
+#   returned from layout_block_context with height AUTO, and
+#   layout_calculate_descendant_bboxes asserted (duckduckgo.com, x.com
+#   aborted): it now takes the intrinsic ratio, else square.
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index b81fcf313..ef3d322e7 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -98,6 +98,10 @@ typedef enum {
+ 					 * viewport takes (CSS 2.1 11.1.1):
+ 					 * the box's own used overflow is
+ 					 * visible (box_overflow_x/y) */
++	VB_DEFINITE_HEIGHT = 1 << 17,	/* VitaBrowser: an absolutely
++					 * positioned box whose height comes
++					 * from top + bottom: percentage
++					 * heights inside resolve against it */
+ 	LINK_DOWNLOAD = 1 << 15	/* fixes1063 (#114): enclosing <a> has `download`;
+ 				 * propagates with href so an inline TEXT box,
+ 				 * which carries no DOM node of its own, still
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 0c7dec4a8..6d3505447 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -3574,10 +3574,12 @@ static bool layout_apply_minmax_height(
+ 	bool updated = false;
+ 
+ 	/* Find containing block for percentage heights */
+-	if (box->style != NULL && css_computed_position(box->style) ==
+-			CSS_POSITION_ABSOLUTE) {
++	if (box->style != NULL && container != NULL &&
++			(css_computed_position(box->style) ==
++				CSS_POSITION_ABSOLUTE ||
++			 css_computed_position(box->style) ==
++				CSS_POSITION_FIXED)) {
+ 		/* Box is absolutely positioned */
+-		assert(container);
+ 		containing_block = container;
+ 	} else if (box->float_container && box->style != NULL &&
+ 			(css_computed_float(box->style) == CSS_FLOAT_LEFT ||
+@@ -3605,65 +3607,40 @@ static bool layout_apply_minmax_height(
+ 					&value, &unit);
+ 		}
+ 
++		/* VitaBrowser: percentages and calc() share one path; the
++		 * reference is the containing block's height when that is
++		 * definite (CSS 2.1 10.5), else none (a calc() without a
++		 * percentage still resolves). */
++		int ref = -1;
++
++		if (containing_block && containing_block->height != AUTO &&
++				(css_computed_position(box->style) ==
++					CSS_POSITION_ABSOLUTE ||
++				 css_computed_position(box->style) ==
++					CSS_POSITION_FIXED ||
++				 htype == CSS_HEIGHT_SET ||
++				 (containing_block->flags & VB_DEFINITE_HEIGHT)))
++			ref = containing_block->height;
++
+ 		/* max-height */
+ 		if (css_computed_max_height(box->style, &value, &unit) ==
+-				CSS_MAX_HEIGHT_SET) {
+-			if (unit == CSS_UNIT_PCT) {
+-				if (containing_block &&
+-					containing_block->height != AUTO &&
+-					(css_computed_position(box->style) ==
+-							CSS_POSITION_ABSOLUTE ||
+-						htype == CSS_HEIGHT_SET)) {
+-					/* Box is absolutely positioned or its
+-					 * containing block has a valid
+-					 * specified height. (CSS 2.1
+-					 * Section 10.5) */
+-					h = FPCT_OF_INT_TOINT(value,
+-						containing_block->height);
+-					if (h < box->height) {
+-						box->height = h;
+-						updated = true;
+-					}
+-				}
+-			} else {
+-				h = FIXTOINT(css_unit_len2device_px(
+-						box->style, unit_len_ctx,
+-						value, unit));
+-				if (h < box->height) {
+-					box->height = h;
+-					updated = true;
+-				}
++				CSS_MAX_HEIGHT_SET &&
++		    css_unit_len2device_px_ref(box->style, unit_len_ctx,
++				value, unit, ref, &h)) {
++			if (h < box->height) {
++				box->height = h;
++				updated = true;
+ 			}
+ 		}
+ 
+ 		/* min-height */
+ 		if (ns_computed_min_height(box->style, &value, &unit) ==
+-				CSS_MIN_HEIGHT_SET) {
+-			if (unit == CSS_UNIT_PCT) {
+-				if (containing_block &&
+-					containing_block->height != AUTO &&
+-					(css_computed_position(box->style) ==
+-							CSS_POSITION_ABSOLUTE ||
+-						htype == CSS_HEIGHT_SET)) {
+-					/* Box is absolutely positioned or its
+-					 * containing block has a valid
+-					 * specified height. (CSS 2.1
+-					 * Section 10.5) */
+-					h = FPCT_OF_INT_TOINT(value,
+-						containing_block->height);
+-					if (h > box->height) {
+-						box->height = h;
+-						updated = true;
+-					}
+-				}
+-			} else {
+-				h = FIXTOINT(css_unit_len2device_px(
+-						box->style, unit_len_ctx,
+-						value, unit));
+-				if (h > box->height) {
+-					box->height = h;
+-					updated = true;
+-				}
++				CSS_MIN_HEIGHT_SET &&
++		    css_unit_len2device_px_ref(box->style, unit_len_ctx,
++				value, unit, ref, &h)) {
++			if (h > box->height) {
++				box->height = h;
++				updated = true;
+ 			}
+ 		}
+ 	}
+@@ -3989,12 +3966,16 @@ static bool layout_float(struct box *b, int width, html_content *content)
+ 		return true;
+ 	}
+ 	layout_float_find_dimensions(&content->unit_len_ctx, width, b->style, b);
++	/* VitaBrowser: a FLOATED flex or grid container (BOX_FLEX /
++	 * BOX_GRID) gets its own layout too; layout_block_context asserted
++	 * on the grid (BBC, RTE). */
+ 	if (b->type == BOX_TABLE || b->type == BOX_INLINE_FLEX ||
+-	    b->type == BOX_INLINE_GRID) {
++	    b->type == BOX_INLINE_GRID || b->type == BOX_FLEX ||
++	    b->type == BOX_GRID) {
+ 		if (b->type == BOX_TABLE) {
+ 			if (!layout_table(b, width, content))
+ 				return false;
+-		} else if (b->type == BOX_INLINE_FLEX) {
++		} else if (b->type == BOX_INLINE_FLEX || b->type == BOX_FLEX) {
+ 			if (!layout_flex(b, width, content))
+ 				return false;
+ 		} else {
+@@ -5345,6 +5326,17 @@ static bool layout_block_context_inner(
+ 		}
+ 		return true;
+ 	} else if (block->flags & REPLACE_DIM) {
++		/* VitaBrowser: a flex item's height may still be AUTO here
++		 * (an inline <svg> in a flex row, DuckDuckGo and X), and
++		 * nothing later fills it in: use the intrinsic ratio, else
++		 * square. */
++		if (block->height == AUTO) {
++			if (block->obj_w > 0 && block->obj_h > 0)
++				block->height = block->width * block->obj_h /
++						block->obj_w;
++			else
++				block->height = block->width;
++		}
+ 		return true;
+ 	}
+ 
+@@ -6413,14 +6405,11 @@ layout_compute_offsets(const css_unit_ctx *unit_len_ctx,
+ 	/* left */
+ 	type = css_computed_left(box->style, &value, &unit);
+ 	if (type == CSS_LEFT_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*left = FPCT_OF_INT_TOINT(value,
+-					containing_block->width);
+-		} else {
+-			*left = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
+-		}
++		/* VitaBrowser: percentages and calc() (e.g. centring with
++		 * calc(50% - 10px)) against the containing block. */
++		if (!css_unit_len2device_px_ref(box->style, unit_len_ctx,
++				value, unit, containing_block->width, left))
++			*left = AUTO;
+ 	} else {
+ 		*left = AUTO;
+ 	}
+@@ -6428,14 +6417,11 @@ layout_compute_offsets(const css_unit_ctx *unit_len_ctx,
+ 	/* right */
+ 	type = css_computed_right(box->style, &value, &unit);
+ 	if (type == CSS_RIGHT_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*right = FPCT_OF_INT_TOINT(value,
+-					containing_block->width);
+-		} else {
+-			*right = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
+-		}
++		/* VitaBrowser: percentages and calc() (e.g. centring with
++		 * calc(50% - 10px)) against the containing block. */
++		if (!css_unit_len2device_px_ref(box->style, unit_len_ctx,
++				value, unit, containing_block->width, right))
++			*right = AUTO;
+ 	} else {
+ 		*right = AUTO;
+ 	}
+@@ -6443,14 +6429,11 @@ layout_compute_offsets(const css_unit_ctx *unit_len_ctx,
+ 	/* top */
+ 	type = css_computed_top(box->style, &value, &unit);
+ 	if (type == CSS_TOP_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*top = FPCT_OF_INT_TOINT(value,
+-					containing_block->height);
+-		} else {
+-			*top = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
+-		}
++		/* VitaBrowser: percentages and calc() (e.g. centring with
++		 * calc(50% - 10px)) against the containing block. */
++		if (!css_unit_len2device_px_ref(box->style, unit_len_ctx,
++				value, unit, containing_block->height, top))
++			*top = AUTO;
+ 	} else {
+ 		*top = AUTO;
+ 	}
+@@ -6458,14 +6441,11 @@ layout_compute_offsets(const css_unit_ctx *unit_len_ctx,
+ 	/* bottom */
+ 	type = css_computed_bottom(box->style, &value, &unit);
+ 	if (type == CSS_BOTTOM_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*bottom = FPCT_OF_INT_TOINT(value,
+-					containing_block->height);
+-		} else {
+-			*bottom = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
+-		}
++		/* VitaBrowser: percentages and calc() (e.g. centring with
++		 * calc(50% - 10px)) against the containing block. */
++		if (!css_unit_len2device_px_ref(box->style, unit_len_ctx,
++				value, unit, containing_block->height, bottom))
++			*bottom = AUTO;
+ 	} else {
+ 		*bottom = AUTO;
+ 	}
+@@ -6735,6 +6715,23 @@ layout_absolute(struct box *box,
+ 	}
+ 	box->width = width;
+ 	box->height = height;
++	box->flags &= ~VB_DEFINITE_HEIGHT;
++	/* VitaBrowser: top + bottom with height auto is a DEFINITE height
++	 * (CSS 2.1 10.6.4) and children's percentage heights resolve against
++	 * it (a full-screen modal's "height: calc(100% - 64px)" dialog box).
++	 * The height was only worked out after the children were laid out,
++	 * so they all saw AUTO. Settle it first; 10.6.4 below computes the
++	 * same value again. */
++	if (height == AUTO && top != AUTO && bottom != AUTO &&
++			containing_block->height != AUTO) {
++		int h = containing_block->height - top - bottom -
++				(margin[TOP] == AUTO ? 0 : margin[TOP]) -
++				(margin[BOTTOM] == AUTO ? 0 : margin[BOTTOM]) -
++				border[TOP].width - padding[TOP] -
++				padding[BOTTOM] - border[BOTTOM].width;
++		box->height = h < 0 ? 0 : h;
++		box->flags |= VB_DEFINITE_HEIGHT;
++	}
+ 
+ 	if (box->type == BOX_BLOCK || box->type == BOX_INLINE_BLOCK ||
+ 			box->object || box->flags & IFRAME) {
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 1324f33cf..26bc24206 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -397,6 +397,13 @@ static inline enum css_align_self_e lh__box_align_self(
+  * \param fixed    increased by sum of fixed margin, border, and padding
+  * \param frac     increased by sum of fractional margin and padding
+  */
++/** VitaBrowser: is this a calc-family unit (calc/min/max/clamp)? */
++static inline bool vb_unit_is_calc(css_unit unit)
++{
++	return unit == CSS_UNIT_CALC || unit == CSS_UNIT_MIN ||
++		unit == CSS_UNIT_MAX || unit == CSS_UNIT_CLAMP;
++}
++
+ static inline void calculate_mbp_width(
+ 		const css_unit_ctx *unit_len_ctx,
+ 		const css_computed_style *style,
+@@ -610,12 +617,16 @@ static inline void layout_find_dimensions(
+ 		htype = css_computed_height(style, &value, &unit);
+ 
+ 		if (htype == CSS_HEIGHT_SET) {
+-			if (unit == CSS_UNIT_PCT) {
+-				enum css_height_e cbhtype;
+-
+-				if (css_computed_position(box->style) ==
+-						CSS_POSITION_ABSOLUTE &&
+-						box->parent) {
++			if (unit == CSS_UNIT_PCT || vb_unit_is_calc(unit)) {
++				enum css_height_e cbhtype = CSS_HEIGHT_AUTO;
++				int ref = -1, px;
++
++				if ((css_computed_position(box->style) ==
++						CSS_POSITION_ABSOLUTE ||
++				     css_computed_position(box->style) ==
++						CSS_POSITION_FIXED) &&
++						box->parent &&
++						box->float_container) {
+ 					/* Box is absolutely positioned */
+ 					assert(box->float_container);
+ 					containing_block = box->float_container;
+@@ -657,25 +668,34 @@ static inline void layout_find_dimensions(
+ 					containing_block->height != AUTO &&
+ 					(css_computed_position(box->style) ==
+ 							CSS_POSITION_ABSOLUTE ||
+-						cbhtype == CSS_HEIGHT_SET)) {
++						css_computed_position(box->style) ==
++							CSS_POSITION_FIXED ||
++						cbhtype == CSS_HEIGHT_SET ||
++						(containing_block->flags &
++							VB_DEFINITE_HEIGHT))) {
+ 					/* Box is absolutely positioned or its
+ 					 * containing block has a valid
+ 					 * specified height.
+ 					 * (CSS 2.1 Section 10.5) */
+-					*height = FPCT_OF_INT_TOINT(value,
+-						containing_block->height);
++					ref = containing_block->height;
+ 				} else if ((!box->parent ||
+ 						!box->parent->parent) &&
+ 						viewport_height >= 0) {
+ 					/* If root element or it's child
+ 					 * (HTML or BODY) */
+-					*height = FPCT_OF_INT_TOINT(value,
+-							viewport_height);
+-				} else {
+-					/* precentage height not permissible
+-					 * treat height as auto */
+-					*height = AUTO;
++					ref = viewport_height;
+ 				}
++				/* VitaBrowser: calc() resolves against the
++				 * same reference as a percentage; one with no
++				 * percentage in it resolves without one.
++				 * Otherwise the height is not permissible:
++				 * treat it as auto. */
++				if (css_unit_len2device_px_ref(style,
++						unit_len_ctx, value, unit,
++						ref, &px))
++					*height = px;
++				else
++					*height = AUTO;
+ 			} else {
+ 				*height = FIXTOINT(css_unit_len2device_px(
+ 						style, unit_len_ctx,

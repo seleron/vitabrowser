@@ -1,0 +1,45 @@
+# netsurf: element geometry for scripts, always (MACSURF_JS_GEOMETRY 1)
+#
+# MacSurf switched getBoundingClientRect / offsetWidth / clientHeight off for
+# load-time scripts on the G3 (MACSURF_JS_GEOMETRY 0): outside click handlers
+# every element measured 0x0 and offsetWidth was undefined. Measuring code
+# (consent dialogs, menus, virtual lists, React layout effects) computed NaN.
+# The Vita can afford the measurement, so it is on.
+#
+# With it on, google.com crashed: DOMContentLoaded runs inside
+# html_box_convert_done with the content locked, a measurement there forced
+# a synchronous rebuild, and content__reformat asserted !locked.
+# macos9_reconvert_flush_now now declines while the content is locked and
+# retries after the burst, like its other busy cases.
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+index f745502bc..43e14bdad 100644
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -770,6 +770,14 @@ macos9_reconvert_flush_now(void *cv)
+ 	if (g_sync_us >= MACOS9_SYNC_BUDGET_US) {
+ 		g_sync_r_budget++; g_sync_declined++; return 0;
+ 	}
++	/* VitaBrowser: DOMContentLoaded runs inside html_box_convert_done,
++	 * with the content locked; a rebuild there reformats a locked content
++	 * (content__reformat asserts). Busy: retry after the burst. */
++	if (c->locked) {
++		g_sync_r_busy++; g_sync_declined++;
++		macos9_reconvert_sync_retry();
++		return 0;
++	}
+ 
+ 	in_flush = 1;
+ 	t0 = macos9_micros();
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 79865354a..b7fe632db 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -407,7 +407,7 @@ double macsurf_qjs_get_now(void);
+  * guard / retry infrastructure stays in the binary and is re-enabled by
+  * flipping this one define back to 1. */
+ #ifndef MACSURF_JS_GEOMETRY
+-#define MACSURF_JS_GEOMETRY 0
++#define MACSURF_JS_GEOMETRY 1
+ #endif
+ /* fixes1141 - AUDIT ON for the hardware baseline round. Enables per-script
+  * timing, failure reasons, audit budgets, and the LIFE js done ok lines.

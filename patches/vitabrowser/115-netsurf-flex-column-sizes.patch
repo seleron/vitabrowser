@@ -1,0 +1,131 @@
+# netsurf: flexbox columns size their items
+#
+# Upstream's flex layout applied the resolved main size only to row items
+# (b->width); in a column, flex-grow and flex-shrink computed sizes nothing
+# used, so a dialog's "flex: 1; min-height: 0; overflow: auto" middle kept its
+# content height and pushed the footer (YouTube's and Google's consent
+# buttons) off the dialog.
+#
+# - place_line_items_main sets a column item's height from its target size.
+# - A column with height auto but a max-height is indefinite until its
+#   content outgrows the max-height; then that is the space its items shrink
+#   into (max_main_limit / main_limited).
+# - CSS Flexbox 4.5 in a column: with min-height auto and overflow visible an
+#   item may not shrink below its content (content_main); only a scroll
+#   container or min-height: 0 gives way.
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 820bac601..4db6f786c 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -181,6 +181,9 @@ struct flex_item_data {
+ 	int target_main_size;
+ 	int base_size;
+ 	int main_size;
++	/* VitaBrowser: a column item's laid-out content height (outer), or
++	 * -1: its automatic minimum size when min-height is auto */
++	int content_main;
+ 	size_t line;
+ 
+ 	bool freeze;
+@@ -221,6 +224,10 @@ struct flex_ctx {
+ 
+ 	int available_main;
+ 	int available_cross;
++	/* VitaBrowser: an auto-height column's max-height (content box),
++	 * or -1; main_limited once a line has shrunk to it */
++	int max_main_limit;
++	bool main_limited;
+ 
+ 	bool horizontal;
+ 	bool main_reversed;
+@@ -658,6 +665,7 @@ static inline bool layout_flex__base_and_main_sizes(
+ 			 * container. */
+ 			b->height = 0;
+ 		}
++		item->content_main = b->height + delta_outer_main;
+ 	}
+ 
+ 	if (item->base_size == AUTO) {
+@@ -1169,6 +1177,25 @@ static inline int layout_flex__get_min_max_violations(
+ 			}
+ 		}
+ 
++		/* VitaBrowser: CSS Flexbox 4.5 in a column. With min-height
++		 * auto and overflow visible, an item may not shrink below its
++		 * content (a dialog's header): only a scroll container (or
++		 * min-height: 0) gives way. */
++		if (!ctx->horizontal && item->content_main > 0 &&
++				target_main_size < item->content_main &&
++				item->box->style != NULL &&
++				css_computed_min_height_is_auto(item->box->style) &&
++				css_computed_overflow_y(item->box->style) ==
++					CSS_OVERFLOW_VISIBLE) {
++			int auto_min = item->content_main;
++			if (item->max_main > 0 && auto_min > item->max_main)
++				auto_min = item->max_main;
++			if (target_main_size < auto_min) {
++				target_main_size = auto_min;
++				item->min_violation = true;
++			}
++		}
++
+ 		if (target_main_size < 0) {
+ 			target_main_size = 0;
+ 			item->min_violation = true;
+@@ -1326,6 +1353,13 @@ static bool layout_flex__resolve_line(
+ 	 * used line already freezes a zero-grow/zero-shrink item. Every
+ 	 * other call site of this function -- any container with a real,
+ 	 * definite available_main -- is completely unaffected. */
++	if (available_main == AUTO && ctx->max_main_limit >= 0 &&
++			line->main_size > ctx->max_main_limit) {
++		available_main = ctx->max_main_limit - line->gap_total;
++		if (available_main < 0)
++			available_main = 0;
++		ctx->main_limited = true;
++	}
+ 	if (available_main == AUTO) {
+ 		for (i = line->first; i < item_count; i++) {
+ 			struct flex_item_data *item = &ctx->item.data[i];
+@@ -1588,6 +1622,25 @@ static bool layout_flex__place_line_items_main(
+ 			}
+ 		}
+ 
++		/* VitaBrowser: a column's items take their resolved main size
++		 * too. Upstream only applied it to row items (b->width above),
++		 * so in a column flex-grow and flex-shrink computed sizes that
++		 * nothing used: a dialog's "flex: 1; overflow: auto" middle
++		 * kept its content height and pushed the footer (YouTube's and
++		 * Google's consent buttons) off the dialog. */
++		if (!ctx->horizontal && !lh__box_is_flex_out_of_flow(b) &&
++				item->target_main_size != AUTO &&
++				item->target_main_size >= 0 &&
++				item->target_main_size <= FLEX_SAFE_MAX &&
++				(ctx->available_main != AUTO ||
++				 ctx->main_limited)) {
++			int h = item->target_main_size -
++					lh__delta_outer_main(ctx->flex, b);
++			if (h < 0)
++				h = 0;
++			b->height = h;
++		}
++
+ 		box_size_main = lh__box_size_main(ctx->horizontal, b);
+ 		box_pos_main = ctx->horizontal ? &b->x : &b->y;
+ 
+@@ -2333,6 +2386,16 @@ static bool layout_flex_inner(struct box *flex, int available_width,
+ 		}
+ 	}
+ 
++	/* VitaBrowser: a column with height auto but a max-height is
++	 * indefinite until its content outgrows the max-height; then that
++	 * is the space its items shrink into (a dialog capped by max-height
++	 * with a scrolling middle). */
++	ctx->max_main_limit = -1;
++	ctx->main_limited = false;
++	if (!ctx->horizontal && ctx->available_main == AUTO &&
++			max_height >= 0 && max_height <= FLEX_SAFE_MAX)
++		ctx->max_main_limit = max_height;
++
+ 	NSLOG(flex, DEEPDEBUG, "box %p: available_main: %i",
+ 			flex, ctx->available_main);
+ 	NSLOG(flex, DEEPDEBUG, "box %p: available_cross: %i",

@@ -1,0 +1,140 @@
+# libcss: css_unit_len2device_px_ref (percentages and calc() against a reference); css_computed_min_height_is_auto
+#
+# - css_unit_len2device_px() resolves calc() with no reference size, so any
+#   calc() containing a percentage -- "height: calc(100% - 64px)" -- came out
+#   0. css_unit_len2device_px_ref() takes what 100% means and returns false
+#   when a percentage needs a reference that is unknown.
+# - css_computed_min_height() turns min-height: auto into 0 unless the
+#   ELEMENT is a flex container, but the automatic minimum size belongs to
+#   flex ITEMS. css_computed_min_height_is_auto() reports the raw value.
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index d43e5f8..1ba1c60 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -669,6 +669,8 @@ uint8_t css_computed_writing_mode(
+ uint8_t css_computed_font_style(
+ 		const css_computed_style *style);
+ 
++bool css_computed_min_height_is_auto(const css_computed_style *style);
++
+ uint8_t css_computed_min_height(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+diff --git a/include/libcss/unit.h b/include/libcss/unit.h
+index 67194c1..1e0f2b1 100644
+--- a/include/libcss/unit.h
++++ b/include/libcss/unit.h
+@@ -13,6 +13,7 @@ extern "C"
+ {
+ #endif
+ 
++#include <stdbool.h>
+ #include <libcss/types.h>
+ 
+ /**
+@@ -148,6 +149,29 @@ css_fixed css_unit_len2device_px(
+ 		const css_fixed length,
+ 		const css_unit unit);
+ 
++/**
++ * VitaBrowser: a length that may be a percentage or a calc-family value
++ * (calc/min/max/clamp), resolved against a reference size.
++ *
++ * css_unit_len2device_px() resolves calc() with no reference, so any
++ * calc() containing a percentage -- "calc(100% - 64px)" -- comes out 0.
++ *
++ * \param[in]  style   the style the length came from (holds calc slots)
++ * \param[in]  ctx     unit conversion context
++ * \param[in]  length  the length as the computed-style accessor gave it
++ * \param[in]  unit    its unit
++ * \param[in]  ref_px  what 100% means, in device px; negative if unknown
++ * \param[out] px      the resolved length in device px
++ * \return true if resolved; false if it needs an unknown reference
++ */
++bool css_unit_len2device_px_ref(
++		const css_computed_style *style,
++		const css_unit_ctx *ctx,
++		const css_fixed length,
++		const css_unit unit,
++		int ref_px,
++		int *px);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 3e4dfe8..32a04c0 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -1314,6 +1314,18 @@ uint8_t css_computed_font_style(const css_computed_style *style)
+ 	return get_font_style(style);
+ }
+ 
++/* VitaBrowser: whether min-height is literally auto, whatever the
++ * element's own display (css_computed_min_height turns auto into 0 unless
++ * the ELEMENT is a flex container, but the automatic minimum size belongs
++ * to flex ITEMS). */
++bool css_computed_min_height_is_auto(const css_computed_style *style)
++{
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++
++	return get_min_height(style, &length, &unit) == CSS_MIN_HEIGHT_AUTO;
++}
++
+ uint8_t css_computed_min_height(const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit)
+ {
+diff --git a/src/select/unit.c b/src/select/unit.c
+index 0909360..430c4f1 100644
+--- a/src/select/unit.c
++++ b/src/select/unit.c
+@@ -482,6 +482,48 @@ css_fixed css_unit_len2device_px(
+ 	return FMUL(length, TRUNCATEFIX(px_per_unit));
+ }
+ 
++/* Exported function, documented in libcss/unit.h. */
++bool css_unit_len2device_px_ref(
++		const css_computed_style *style,
++		const css_unit_ctx *ctx,
++		const css_fixed length,
++		const css_unit unit,
++		int ref_px,
++		int *px)
++{
++	if (unit == CSS_UNIT_PCT) {
++		if (ref_px < 0)
++			return false;
++		*px = FIXTOINT(FDIV(FMUL(length, INTTOFIX(ref_px)),
++				INTTOFIX(100)));
++		return true;
++	}
++	if (unit == CSS_UNIT_CALC || unit == CSS_UNIT_MIN ||
++			unit == CSS_UNIT_MAX || unit == CSS_UNIT_CLAMP) {
++		/* The length is the calc slot number (fixes1159b). As in
++		 * css_computed_width_px, the calculator works in the units
++		 * of the reference it is given. */
++		lwc_string *expr;
++		css_unit u = CSS_UNIT_PX;
++		css_fixed v = 0;
++		uint32_t slot = (uint32_t)length;
++
++		if (style == NULL || style->calc == NULL ||
++				slot >= MACSURF_CALC_SLOT_COUNT)
++			return false;
++		expr = style->macsurf_calc_expr[slot];
++		if (expr == NULL)
++			return false;
++		if (css_calculator_calculate(style->calc, ctx, ref_px,
++				expr, style, &u, &v) != CSS_OK)
++			return false;
++		*px = FIXTOINT(v);
++		return true;
++	}
++	*px = FIXTOINT(css_unit_len2device_px(style, ctx, length, unit));
++	return true;
++}
++
+ /**
+  * Get font size from a computed style.
+  *
