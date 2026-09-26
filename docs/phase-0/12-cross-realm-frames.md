@@ -146,3 +146,62 @@ Already established:
 2. Bisect per the 3-step plan above.
 3. Fix, verify full run + JS-xrealm.html eval check.
 4. Patch 126 + commit + doc update.
+
+
+## Resolution (2026-09-26, Claude)
+
+**Root cause of the SIGSEGV.** gdb (a user-local build exists:
+`~/opt/gdb/gdb.sh` -- no sudo needed, so segvtrace was not required) on the
+18-page run: the fault is in QuickJS's call dispatch
+(`rt->class_array[p->class_id].call`) during `qjs_vita_polyfill` of the
+first page's realm, on an object whose class_id (100) no runtime
+registered -- freed memory. `macsurf_qjs_xrealm_register` did
+`JS_SetPropertyStr(ctx, global, "__vitaFrameRealmName", f);
+JS_FreeValue(ctx, f);` -- SetPropertyStr had already taken the reference,
+so the global kept a freed function object and the polyfill's
+`__vitaFrameRealmName()` jumped through it once the memory was reused
+(single-page runs got lucky). The bisect plan was not needed.
+
+**Also fixed before shipping** (found by review, each would have crashed or
+misbehaved on first real use):
+- drain: the target's global object stored as target AND currentTarget
+  without references (over-released on every message); on JS_NewObject
+  failure ev/w were aliased and both freed; the queue tail was recomputed
+  as `&head->next` (a reply enqueued by a listener could be lost); a
+  queued message could outlive its jsheap (now `qjs_xrealm_purge` in
+  destroyheap).
+- `__vitaPostMessageToIframe` found the child only through layout boxes
+  (absent when the first message goes): now by the heap link (frame name,
+  else index), layout as fallback.
+- MessageEvent.data was the JSON text: now `JS_ParseJSON` in the target
+  realm, and shims always stringify (strings stay strings).
+- polyfill: shim `parent/top/self/frames/window` were read from `w` inside
+  its own initializer (undefined), also in the window.open stub;
+  `window.frames` used `new Proxy` (now index getters refreshed on use);
+  `contentWindow`/`contentDocument` were defined on the prototype shared by
+  every element (now iframe-only).
+
+Note: the pre-existing getComputedStyle wrapper (patch 73) does use Proxy
+and works in this build's QuickJS; the "no Proxy" rule is kept for new code.
+
+**Verification.** `tools/run-vita-sim.sh` exit 0 (not 1: no page differs),
+including the new check `JS-xrealm: XREALM: 4/4 passed` (child to parent
+object, parent to child round trip, a string stays a string,
+event.source.postMessage). Disarm: skipping the JSON parse makes the page
+report 0/4 (the suite check fails); restored 4/4. Interaction 22/22 at the
+Vita's pace; 25/25 pages identical at both paces.
+
+**Patch:** `126-netsurf-cross-realm-frames-postmessage.patch` (5 files:
+macsurf_qjs.c/.h, vita_polyfill.js/.inc, desktop/frames.c), diffed against
+the tree through 125 and checked to apply there.
+
+## What's next
+
+1. claude.ai "Continue with Google" end to end: window.open still returns a
+   same-realm stub, so GSI's popup never loads accounts.google.com. Next
+   increment: a real popup = a second browser window (own realm, shown
+   full-screen, closed back to the opener), whose `window.opener` is a shim
+   over this same JSON bridge (opener_heap alongside parent_heap).
+2. Email sign-in needs hCaptcha's invisible iframe to run: check with a
+   scripted claude.ai session whether its frame now loads and posts back.
+3. A device run with 125+126 folded into the next bulk hand-off (run 20).

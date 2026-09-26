@@ -1,0 +1,1193 @@
+# netsurf: cross-realm frames + postMessage (claude.ai Google sign-in completion, Increment 2)
+#
+# An iframe's document runs in its own JSRuntime. The two now talk through
+# postMessage, carrying only C strings (JSON) between runtimes -- a JSValue
+# never crosses (the Vita cross-runtime free crashes, fixes 861/875/888/
+# 1070/1117b):
+#
+# - macsurf_qjs.c: jsheap gains parent_heap + frame_key (frames.c links a
+#   frame's heap to its parent's, js_link_frame_heaps). Natives
+#   __vitaPostMessageToParent / __vitaPostMessageToIframe /
+#   __vitaIframeContentDocKey / __vitaFrameRealmName queue JSON text; the
+#   pump (macsurf_qjs_pump_all) drains it into the target realm, where the
+#   MessageEvent is built in C (data = JSON.parse of the text, origin,
+#   source stand-in with postMessage/close) and dispatched with the realm's
+#   own window.dispatchEvent. A child is found by its heap link (frame name,
+#   else index), layout boxes only as a fallback. destroyheap clears
+#   back-links and purges messages queued for the dying realm.
+# - vita_polyfill.js: per-realm shim windows (parent/top in a frame realm;
+#   window.frames and iframe.contentWindow / contentDocument in the top
+#   realm); shims JSON-encode every message.
+#
+# Written by Hermes (local agent); finished here. The full sim run crashed
+# (SIGSEGV, a jump through a garbage class slot): macsurf_qjs_xrealm_register
+# freed __vitaFrameRealmName after JS_SetPropertyStr had taken ownership, so
+# the global kept a freed function that the polyfill called once the memory
+# was reused. Also fixed before it shipped: the drain stored the global
+# object twice without a reference (over-release every message) and aliased
+# ev/w on failure (double free), recomputed the queue tail wrongly, and could
+# deliver into a freed heap; the shims' self-references were undefined
+# (read inside their own initializer); window.frames used Proxy (absent from
+# the host QuickJS: the rest of the window setup aborted); contentWindow was
+# installed on the prototype all elements share; data arrived as JSON text.
+# Test page JS-xrealm.html + js-xrealm-child.html: 4/4 in tools/
+# run-vita-sim.sh (child to parent, round trip, string stays string,
+# event.source.postMessage).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 894318cfa..4e0c7c6f0 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -44,6 +44,15 @@
+ #include "content/handlers/html/box.h"
+ #include "content/handlers/html/box_inspect.h"
+ #include "content/handlers/html/box_construct.h"
++/* cross-realm frame bridge (window.parent / iframe.contentWindow /
++ * postMessage): struct browser_window's jsheap/name/parent fields for
++ * resolving an iframe realm's parent and child windows from the box tree.
++ * frontends/vita/js_platform.c already pulls browser_private.h in from a
++ * non-desktop directory, so the include path is established.  The browser_
++ * window enums/typedefs it uses come from netsurf/browser_window.h, which
++ * must be included first (frontends/vita/js_platform.c does the same). */
++#include "netsurf/browser_window.h"
++#include "desktop/browser_private.h"
+ /* fixes1013 - corestring_dom_scroll / _resize for the scroll/resize fan-out. */
+ #include "utils/corestrings.h"
+ #include "utils/libdom.h"
+@@ -105,6 +114,20 @@ struct jsheap {
+ 	 * imports. The module loader callback checks this list before trying the
+ 	 * disk cache.  Populated by js_exec_module for inline scripts. */
+ 	struct module_registry *module_reg;
++	/* VitaBrowser: the parent browsing context's heap, for an iframe
++	 * realm (set from frames.c when the iframe browser window is created,
++	 * where both the child and parent heaps already exist).  Enables the
++	 * cross-realm window.parent / iframe.contentWindow postMessage bridge:
++	 * only C char* JSON ever crosses the runtime boundary here -- never a
++	 * QuickJS JSValue, which is runtime-specific and would be exactly the
++	 * cross-RT free the fixes861/875/888/1070/1117b post-mortems forbid. */
++	struct jsheap *parent_heap;
++	/* The iframe name (empty for the top-level realm, NULL until the name is
++	 * known).  frames.c sets it when the iframe browser window is created;
++	 * __vitaFrameRealmName() exposes it to the polyfill so a frame realm can
++	 * tell it IS a frame (and to what name) and the parent realm's
++	 * frames[name] / iframe.contentWindow shims can route to it. */
++	char *frame_key;
+ };
+ 
+ struct jsthread {
+@@ -2610,6 +2633,506 @@ static void qjs_set_content(struct jsheap *heap, struct content *c)
+ 	}
+ }
+ 
++/* =========================================================================
++ * VitaBrowser: cross-realm postMessage (iframe <-> parent).
++ *
++ * Every browsing context owns its OWN QuickJS JSRuntime (js_newheap runs per
++ * browser_window AND per iframe), so a parent window object cannot be handed
++ * to an iframe realm: a QuickJS JSValue is runtime-specific, and crossing
++ * one is the exact class of bug the fixes861/875/888/1070/1117b crash
++ * post-mortems document (a rt_OLD value freed against rt_NEW walks rt_NEW's
++ * shape table into unmapped memory).  The only safe currency across runtimes
++ * is a C char*.
++ *
++ * So: the JS side serializes the message (JSON) and hands it to a native
++ * function invoked with the SENDER'S ctx (which owns the payload JSValue).
++ * C copies it to a heap char* -- the sole cross-realm transfer -- and
++ * enqueues.  macsurf_qjs_pump_all() drains the queue and, in the TARGET
++ * realm, evaluates a dispatch built entirely inside that realm (fresh
++ * string, fresh MessageEvent, dispatch; every value freed against the
++ * target runtime).  The MessageEvent's `source` is the target realm's OWN
++ * shim window for the peer frame, fetched from its globals by name.
++ *
++ * This is what Google Sign-In / hCaptcha / OAuth flows need: a real
++ * postMessage round-trip between the top document and an iframe.
++ * Deliberately minimal: JSON-serializable data, one hop, parent<->child.
++ * ====================================================================== */
++/* Forward: defined further down (element wrapper section); the xrealm
++ * natives below read the DOM node from their `this` through it. */
++static dom_node *qjs_get_node(JSValueConst val);
++struct qjs_xrealm_msg {
++	struct jsheap *dest;		/* realm to deliver into (validated at drain) */
++	char *payload;			/* JSON text, C-owned */
++	char *origin;			/* sender document URL (MessageEvent.origin) */
++	char *source_label;		/* name of the peer shim window for .source */
++	struct qjs_xrealm_msg *next;
++};
++#define QJS_XREALM_QUEUE_MAX 32
++static struct qjs_xrealm_msg *g_qjs_xrealm_head = NULL;
++static struct qjs_xrealm_msg **g_qjs_xrealm_tail = &g_qjs_xrealm_head;
++static int g_qjs_xrealm_count = 0;
++
++static void qjs_xrealm_enqueue(struct jsheap *dest, const char *payload,
++		const char *origin, const char *source_label)
++{
++	struct qjs_xrealm_msg *m;
++	if (payload == NULL || dest == NULL) return;
++	if (g_qjs_xrealm_count >= QJS_XREALM_QUEUE_MAX) {
++		macsurf_debug_log_writef("WORK xrealm: queue full, drop");
++		return;
++	}
++	m = calloc(1, sizeof(*m));
++	if (m == NULL) return;
++	m->dest = dest;
++	m->payload = strdup(payload);
++	m->origin = origin != NULL ? strdup(origin) : NULL;
++	m->source_label = source_label != NULL ? strdup(source_label) : NULL;
++	if (m->payload == NULL) {
++		free(m->origin); free(m->source_label); free(m); return;
++	}
++	*g_qjs_xrealm_tail = m;
++	g_qjs_xrealm_tail = &m->next;
++	g_qjs_xrealm_count++;
++	macsurf_debug_log_writef("WORK xrealm: queue +1 (count=%d)",
++			g_qjs_xrealm_count);
++}
++
++/* A realm is going away: drop the messages addressed to it, before its
++ * jsheap is freed (the queue holds raw pointers). */
++static void qjs_xrealm_purge(struct jsheap *heap)
++{
++	struct qjs_xrealm_msg **pp = &g_qjs_xrealm_head, *m;
++
++	g_qjs_xrealm_tail = &g_qjs_xrealm_head;
++	while ((m = *pp) != NULL) {
++		if (m->dest == heap) {
++			*pp = m->next;
++			g_qjs_xrealm_count--;
++			free(m->payload); free(m->origin);
++			free(m->source_label); free(m);
++			continue;
++		}
++		g_qjs_xrealm_tail = &m->next;
++		pp = &m->next;
++	}
++}
++
++/* --- MessageEvent helpers (all run in the TARGET realm) ------------------ */
++
++/* No-op method: postMessage/close/stopPropagation on the event.source
++ * stand-in.  Never throws. */
++static JSValue
++qjs_xrealm_noop_fn(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)ctx; (void)this_val; (void)argc; (void)argv;
++	return JS_UNDEFINED;
++}
++
++/* preventDefault() on the C-built MessageEvent: flips defaultPrevented. */
++static JSValue
++qjs_xrealm_preventdefault_fn(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)argc; (void)argv;
++	if (JS_IsObject(this_val)) {
++		JS_SetPropertyStr(ctx, this_val, "defaultPrevented", JS_TRUE);
++	}
++	return JS_UNDEFINED;
++}
++
++/* toString() on the event.source stand-in: returns __vitaSourceLabel. */
++static JSValue
++qjs_xrealm_label_tostring_fn(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)argc; (void)argv;
++	if (JS_IsObject(this_val)) {
++		JSValue l = JS_GetPropertyStr(ctx, this_val, "__vitaSourceLabel");
++		if (!JS_IsException(l) && JS_IsString(l)) {
++			return l; /* caller owns the reference */
++		}
++		if (!JS_IsException(l)) JS_FreeValue(ctx, l);
++	}
++	return JS_NewString(ctx, "");
++}
++
++/* Deliver queued messages into their target realms.  Called from
++ * macsurf_qjs_pump_all().  The event object is built entirely in C inside
++ * the TARGET runtime (a JSValue never crosses a runtime boundary); the
++ * page-controlled payload arrives as a JS_NewString argument, never
++ * spliced into source text.  Trust level of a timer callback: pump_all
++ * runs on the event loop, between page tasks. */
++static void qjs_xrealm_drain(void)
++{
++	struct qjs_xrealm_msg *m;
++	while ((m = g_qjs_xrealm_head) != NULL) {
++		struct jsheap *dest = m->dest;
++		g_qjs_xrealm_head = m->next;
++		g_qjs_xrealm_count--;
++		/* the tail moves only when the queue empties (a listener
++		 * below may enqueue a reply onto the live tail) */
++		if (g_qjs_xrealm_head == NULL)
++			g_qjs_xrealm_tail = &g_qjs_xrealm_head;
++		if (dest == NULL || dest->ctx == NULL) {
++			/* destination realm gone (navigation/teardown) */
++			free(m->payload); free(m->origin);
++			free(m->source_label); free(m);
++			continue;
++		}
++		{
++			JSContext *tctx = dest->ctx;
++			JSValue ev, w, s, arg, res, exc;
++			int delivered = 0;
++			/* Build the MessageEvent in the target runtime. */
++			ev = JS_NewObject(tctx);
++			if (JS_IsException(ev)) {
++				JS_FreeValue(tctx, JS_GetException(tctx));
++				free(m->payload); free(m->origin);
++				free(m->source_label); free(m);
++				continue;
++			}
++			w = JS_GetGlobalObject(tctx);
++			JS_SetPropertyStr(tctx, ev, "type", JS_NewString(tctx, "message"));
++			/* JS_SetPropertyStr takes a reference: w is still ours */
++			JS_SetPropertyStr(tctx, ev, "target", JS_DupValue(tctx, w));
++			JS_SetPropertyStr(tctx, ev, "currentTarget",
++					JS_DupValue(tctx, w));
++			JS_SetPropertyStr(tctx, ev, "bubbles", JS_FALSE);
++			JS_SetPropertyStr(tctx, ev, "cancelable", JS_FALSE);
++			JS_SetPropertyStr(tctx, ev, "composed", JS_FALSE);
++			JS_SetPropertyStr(tctx, ev, "defaultPrevented", JS_FALSE);
++			/* The payload: JSON text (the sender's shim always
++			 * stringifies), parsed into a fresh value IN the target
++			 * runtime -- the structured-clone result the page expects.
++			 * Unparseable text arrives as a string. */
++			{
++				const char *pl = m->payload != NULL ? m->payload : "null";
++				arg = JS_ParseJSON(tctx, pl, strlen(pl), "<xrealm>");
++				if (JS_IsException(arg)) {
++					JS_FreeValue(tctx, JS_GetException(tctx));
++					arg = JS_NewString(tctx, pl);
++				}
++			}
++			JS_SetPropertyStr(tctx, ev, "data", arg);
++			{
++				JSValue o = JS_NewString(tctx,
++						m->origin != NULL ? m->origin : "");
++				JS_SetPropertyStr(tctx, ev, "origin", o);
++			}
++			/* event.source: a window-like stand-in.  A real cross-realm
++			 * window object is unhandable (a JSValue is runtime-specific);
++			 * GSI/hCaptcha only use source.toString() / postMessage(). */
++			{
++				JSValue src = JS_NewObject(tctx);
++				JSValue f = JS_NewCFunction(tctx,
++						qjs_xrealm_noop_fn, "postMessage", 1);
++				JS_SetPropertyStr(tctx, src, "postMessage", f);
++				f = JS_NewCFunction(tctx, qjs_xrealm_noop_fn, "close", 0);
++				JS_SetPropertyStr(tctx, src, "close", f);
++				JS_SetPropertyStr(tctx, src, "toString",
++						JS_NewCFunction(tctx,
++							qjs_xrealm_label_tostring_fn, "toString", 0));
++				JS_SetPropertyStr(tctx, src, "__vitaSourceLabel",
++						JS_NewString(tctx,
++							m->source_label != NULL
++								? m->source_label : ""));
++				JS_SetPropertyStr(tctx, ev, "source", src);
++			}
++			arg = JS_NewArray(tctx);
++			JS_SetPropertyStr(tctx, ev, "ports", arg);
++			{
++				JSValue f = JS_NewCFunction(tctx, qjs_xrealm_noop_fn,
++						"stopPropagation", 0);
++				JS_SetPropertyStr(tctx, ev, "stopPropagation", f);
++			}
++			{
++				JSValue f = JS_NewCFunction(tctx,
++						qjs_xrealm_preventdefault_fn, "preventDefault", 0);
++				JS_SetPropertyStr(tctx, ev, "preventDefault", f);
++			}
++			/* dispatch: the target realm's own window.dispatchEvent. */
++			{
++				JSValue d = JS_GetPropertyStr(tctx, w, "dispatchEvent");
++				if (!JS_IsException(d) && JS_IsFunction(tctx, d)) {
++					res = JS_Call(tctx, d, w, 1, &ev);
++					if (JS_IsException(res)) {
++						exc = JS_GetException(tctx);
++						qjs_log_exc(tctx, exc, "xrealm", "<xrealm-dispatch>");
++						JS_FreeValue(tctx, exc);
++					}
++					JS_FreeValue(tctx, res);
++					delivered = 1;
++				}
++				JS_FreeValue(tctx, d);
++			}
++			JS_FreeValue(tctx, ev);
++			JS_FreeValue(tctx, w);
++			if (!delivered) {
++				macsurf_debug_log_writef("WORK xrealm: no dispatchEvent, drop");
++			}
++		}
++		free(m->payload); free(m->origin); free(m->source_label); free(m);
++	}
++}
++
++/* --- native senders ------------------------------------------------------
++ * Invoked from the polyfill's shim windows.  Each runs in the SENDER'S
++ * runtime (the JSValue payload is freed here, against that runtime -- never
++ * in the destination), and only the C char* payload crosses realms. */
++
++/* Walk a realm's layout box tree collecting every box with a live iframe
++ * window (capped).  Layout is only rebuilt during the reconvert window,
++ * which pump_all's freeze gate keeps clear of JS execution, so the tree is
++ * stable for the duration of a page task. */
++#define QJS_XREALM_MAX_IFRAMES 16
++struct qjs_xrealm_iframes {
++	struct box *boxes[QJS_XREALM_MAX_IFRAMES];
++	int n;
++};
++static void qjs_xrealm_layout_walk(struct box *root, int depth,
++		struct qjs_xrealm_iframes *out)
++{
++	struct box *b;
++	if (root == NULL || depth > 512) return;
++	b = root;
++	while (b != NULL) {
++		if (b->iframe != NULL && out->n < QJS_XREALM_MAX_IFRAMES)
++			out->boxes[out->n++] = b;
++		qjs_xrealm_layout_walk(b->children, depth + 1, out);
++		b = b->next;
++	}
++}
++
++static const char *qjs_xrealm_origin(JSContext *ctx)
++{
++	struct content *c = qjs_get_content_for_ctx(ctx);
++	struct nsurl *u = c != NULL ? content_get_url(c) : NULL;
++	const char *s = u != NULL ? nsurl_access(u) : NULL;
++	return (s != NULL) ? s : "";
++}
++
++/* __vitaPostMessageToParent(jsonPayload) -- an iframe realm handing a
++ * message to its parent browsing context. */
++static JSValue
++qjs_xrealm_post_to_parent(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	const char *payload = NULL;
++	struct jsheap *heap;
++	struct qjs_realm_owner *owner;
++	JSValue ret = JS_UNDEFINED;
++	(void)this_val; (void)argc;
++	if (argc >= 1 && JS_IsString(argv[0])) {
++		payload = JS_ToCString(ctx, argv[0]);
++		if (payload == NULL) return JS_FALSE;
++		if (strlen(payload) > 262144) {
++			/* oversized: drop (a real browser would queue it; a
++			 * 256 KiB postMessage is not a sign-in flow) */
++			JS_FreeCString(ctx, payload);
++			return JS_FALSE;
++		}
++	}
++	owner = qjs_owner_for_ctx(ctx);
++	heap = owner != NULL ? owner->heap : NULL;
++	if (heap != NULL && heap->parent_heap != NULL) {
++		qjs_xrealm_enqueue(heap->parent_heap, payload,
++				qjs_xrealm_origin(ctx),
++				qjs_xrealm_origin(ctx));
++		ret = JS_TRUE;
++	}
++	if (payload != NULL) JS_FreeCString(ctx, payload);
++	return ret;
++}
++
++/* __vitaPostMessageToIframe(frameLabel, jsonPayload) -- the parent realm
++ * delivering into a named child frame (frameLabel === "" targets the first
++ * iframe, matching the Phase-0 single-frame surface).  frameLabel is the
++ * label the CHILD realm's __vitaShimWindow() will resolve the .source of
++ * the incoming MessageEvent to: the parent realm's name for itself, so the
++ * iframe's `event.source` is a window-like object, per spec. */
++static JSValue
++qjs_xrealm_post_to_iframe(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	const char *label = NULL, *payload = NULL;
++	struct jsheap *heap;
++	struct qjs_realm_owner *owner;
++	struct content *c;
++	JSValue ret = JS_FALSE;
++	int sent = 0;
++	(void)this_val;
++	if (argc >= 2 && JS_IsString(argv[0]) && JS_IsString(argv[1])) {
++		label = JS_ToCString(ctx, argv[0]);
++		payload = JS_ToCString(ctx, argv[1]);
++		if (label == NULL || payload == NULL) {
++			if (label) JS_FreeCString(ctx, label);
++			if (payload) JS_FreeCString(ctx, payload);
++			return JS_FALSE;
++		}
++		if (strlen(payload) > 262144) {
++			JS_FreeCString(ctx, label);
++			JS_FreeCString(ctx, payload);
++			return JS_FALSE;
++		}
++	}
++	if (label == NULL || payload == NULL) return JS_FALSE;
++	owner = qjs_owner_for_ctx(ctx);
++	heap = owner != NULL ? owner->heap : NULL;
++	c = owner != NULL ? owner->content : NULL;
++	/* The child realms this heap parents, by the frame name frames.c
++	 * linked them with (js_link_frame_heaps); for an unnamed frame the
++	 * label is its index among them. Independent of layout, which may
++	 * not have built the iframe boxes yet when the first message goes. */
++	if (heap != NULL) {
++		struct jsheap *o;
++		int idx = 0, want = -1;
++		const char *q;
++		for (q = label; *q >= '0' && *q <= '9'; q++)
++			;
++		if (*label != '\0' && *q == '\0')
++			want = atoi(label);
++		for (o = g_heap_list; o != NULL; o = o->next) {
++			if (o->parent_heap != heap)
++				continue;
++			if ((o->frame_key != NULL && *o->frame_key != '\0' &&
++			     strcmp(o->frame_key, label) == 0) ||
++			    (want >= 0 && idx == want) || *label == '\0') {
++				qjs_xrealm_enqueue(o, payload,
++						qjs_xrealm_origin(ctx),
++						qjs_xrealm_origin(ctx));
++				ret = JS_TRUE;
++				sent = 1;
++				break;
++			}
++			idx++;
++		}
++	}
++	if (!sent && heap != NULL && c != NULL &&
++			content_get_type(c) == CONTENT_HTML) {
++		struct html_content *htmlc = (struct html_content *)c;
++		struct qjs_xrealm_iframes ifr;
++		int i;
++		memset(&ifr, 0, sizeof(ifr));
++		qjs_xrealm_layout_walk(htmlc->layout, 0, &ifr);
++		for (i = 0; i < ifr.n; i++) {
++			const char *ifname = ifr.boxes[i]->iframe->name != NULL
++				? ifr.boxes[i]->iframe->name : "";
++			if (ifr.boxes[i]->iframe->jsheap == NULL ||
++					strcmp(ifname, label) != 0)
++				continue;
++			qjs_xrealm_enqueue(ifr.boxes[i]->iframe->jsheap, payload,
++					qjs_xrealm_origin(ctx),
++					qjs_xrealm_origin(ctx));
++			ret = JS_TRUE;
++			break;
++		}
++	}
++	JS_FreeCString(ctx, (char *)label);
++	JS_FreeCString(ctx, (char *)payload);
++	return ret;
++}
++
++/* __vitaIframeContentDocKey(iframeElement) -> a stable per-iframe key
++ * ("" if the element is not an iframe with a live window).  The polyfill
++ * pairs the key with the child realm's document at load time (the realm
++ * installs itself in __vitaDocByIframe) so contentDocument can return the
++ * child document object of the CHILD realm -- built there, used here, no
++ * value crosses. */
++static JSValue
++qjs_xrealm_iframe_doc_key(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	dom_node *node;
++	struct qjs_realm_owner *owner;
++	struct content *c;
++	struct qjs_xrealm_iframes ifr;
++	int i;
++	JSValue ret = JS_NewString(ctx, "");
++	(void)this_val; (void)argc; (void)argv;
++	node = qjs_get_node(this_val);
++	if (node == NULL) return ret;
++	owner = qjs_owner_for_ctx(ctx);
++	c = owner != NULL ? owner->content : NULL;
++	if (owner == NULL || c == NULL ||
++			content_get_type(c) != CONTENT_HTML)
++		return ret;
++	memset(&ifr, 0, sizeof(ifr));
++	qjs_xrealm_layout_walk(((struct html_content *)c)->layout, 0, &ifr);
++	for (i = 0; i < ifr.n; i++) {
++		if (ifr.boxes[i]->node != node) continue;
++		JS_FreeValue(ctx, ret);
++		ret = JS_NewString(ctx, ifr.boxes[i]->iframe->name != NULL
++				? ifr.boxes[i]->iframe->name : "");
++		return ret;
++	}
++	return ret;
++}
++
++/* __vitaFrameRealmName() -> the frame key of THIS realm, or null if it is
++ * the top-level browsing context.  The polyfill uses it to decide that it
++ * is inside an iframe and to build window.parent / window.top / frames
++ * shims that route through the bridge. */
++static JSValue
++qjs_xrealm_frame_realm_name(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct jsheap *heap;
++	struct qjs_realm_owner *owner;
++	JSValue ret = JS_NULL;
++	(void)this_val; (void)argc; (void)argv;
++	owner = qjs_owner_for_ctx(ctx);
++	heap = owner != NULL ? owner->heap : NULL;
++	if (heap != NULL && heap->frame_key != NULL) {
++		ret = JS_NewString(ctx, heap->frame_key);
++	}
++	return ret;
++}
++
++/* Called from desktop/frames.c where both the iframe window's heap and its
++ * parent window's heap exist.  Establishes the parent link (heap->
++ * parent_heap) the cross-realm postMessage bridge needs, and records the
++ * frame key (__vitaFrameRealmName) for the polyfill.  A no-op on error
++ * paths: the bridge degrades to the pre-bridge behaviour (parent ===
++ * self, postMessage dropped), never a crash. */
++void js_link_frame_heaps(struct jsheap *child, struct jsheap *parent,
++		const char *frame_name)
++{
++	if (child == NULL) return;
++	child->parent_heap = parent;
++	free(child->frame_key);
++	child->frame_key = frame_name != NULL ? strdup(frame_name) : NULL;
++	macsurf_debug_log_writef("WORK xrealm: link frame '%s' (parent=%s)",
++			frame_name != NULL ? frame_name : "(unnamed)",
++			parent != NULL ? "yes" : "no");
++}
++
++/* Install the native helpers on the realm's global object.  Runs once per
++ * realm, after register_browser_globals, before the polyfill (which builds
++ * the JS shims on top of them). */
++void macsurf_qjs_xrealm_register(JSContext *ctx)
++{
++	JSValue global = JS_GetGlobalObject(ctx);
++	JSValue f;
++	f = JS_NewCFunction(ctx, qjs_xrealm_post_to_parent,
++			"__vitaPostMessageToParent", 1);
++	JS_SetPropertyStr(ctx, global, "__vitaPostMessageToParent", f);
++	f = JS_NewCFunction(ctx, qjs_xrealm_post_to_iframe,
++			"__vitaPostMessageToIframe", 2);
++	JS_SetPropertyStr(ctx, global, "__vitaPostMessageToIframe", f);
++	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_doc_key,
++			"__vitaIframeContentDocKey", 1);
++	JS_SetPropertyStr(ctx, global, "__vitaIframeContentDocKey", f);
++	f = JS_NewCFunction(ctx, qjs_xrealm_frame_realm_name,
++			"__vitaFrameRealmName", 0);
++	JS_SetPropertyStr(ctx, global, "__vitaFrameRealmName", f);
++	/* JS_SetPropertyStr took ownership of each f: freeing the last one
++	 * again left the global pointing at a freed function object, which
++	 * the polyfill called once the memory was reused (full sim run:
++	 * SIGSEGV, a jump through a garbage class slot). */
++	JS_FreeValue(ctx, global);
++}
++
+ /* Host parser hooks do not receive a JSContext, but they do receive the
+  * native node they are binding. Resolve its owner document back to the realm
+  * record instead of compiling an iframe's inline handler in whichever heap
+@@ -15025,6 +15548,7 @@ static JSContext *qjs_build_context(struct jsheap *heap,
+ 
+ 	MS_LOG("qjs: setup_globals");   macsurf_qjs_setup_globals(ctx);
+ 	MS_LOG("qjs: browser_globals"); register_browser_globals(ctx);
++	MS_LOG("qjs: xrealm_register"); macsurf_qjs_xrealm_register(ctx);
+ 	MS_LOG("qjs: dom_install");     qjs_dom_install(ctx);
+ 	MS_LOG("qjs: vita_polyfill");   qjs_vita_polyfill(ctx);
+ 	macsurf_debug_log_writef("LIFE realm built: %ld us",
+@@ -16168,6 +16692,20 @@ void js_destroyheap(struct jsheap *heap)
+ 	/* fixes541: release any wrappers whose finalizer JS_FreeContext did not
+ 	 * run (obj->method reference cycles); both halves, then clear. */
+ 	qjs_wrap_drain(heap->rt);
++	/* cross-realm frame bridge: no live heap may keep pointing at a realm
++	 * that is going away (a child's parent_heap dangling into freed memory
++	 * is the same class of bug as the g_heap_list entries below).  Clear
++	 * every back-reference and free the frame key BEFORE the unlink. */
++	{
++		struct jsheap *o = g_heap_list;
++		while (o != NULL) {
++			if (o->parent_heap == heap) o->parent_heap = NULL;
++			o = o->next;
++		}
++	}
++	free(heap->frame_key);
++	heap->frame_key = NULL;
++	qjs_xrealm_purge(heap);	/* queued messages hold raw heap pointers */
+ 	/* fixes888 (#304) - unlink BEFORE JS_FreeRuntime, not after. The runtime
+ 	 * teardown runs finalizers, and anything they touch that scans g_heap_list
+ 	 * must not find this heap: its ctx is already gone and its rt is in the
+@@ -17786,6 +18324,11 @@ void macsurf_qjs_pump_all(void)
+ 		s_last_heaps = heaps;
+ 		macsurf_debug_log_writef("WORK pump heaps=%d", heaps);
+ 	}
++	/* cross-realm postMessage: deliver queued iframe<->parent messages into
++	 * their target realms.  Runs on every unfrozen pump, which is the same
++	 * cadence timers run at (a queued message delivered on the next event
++	 * loop pass is spec-conformant -- postMessage is always async). */
++	qjs_xrealm_drain();
+ 	while (h != NULL) {
+ 		struct jsheap *next = h->next;
+ 		if (h->ctx != NULL) {
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.h b/content/handlers/javascript/quickjs/macsurf_qjs.h
+index c16c5d640..8fc703594 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.h
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.h
+@@ -73,6 +73,16 @@ struct content *qjs_get_content_for_ctx(JSContext *ctx);
+ /* console.log append (used by DOM bindings). */
+ void macsurf_qjs_console_append(const char *line);
+ 
++/* Cross-realm frame bridge (window.parent / iframe.contentWindow /
++ * postMessage): install the native helpers on a fresh realm's globals
++ * (before the polyfill runs), and link an iframe realm to its parent
++ * realm.  Both are no-ops when their preconditions don't hold; see
++ * macsurf_qjs.c for the runtime-boundary safety notes. */
++void macsurf_qjs_xrealm_register(JSContext *qctx);
++struct jsheap;
++void js_link_frame_heaps(struct jsheap *child, struct jsheap *parent,
++		const char *frame_name);
++
+ #endif /* WITH_QUICKJS */
+ 
+ #endif /* MACSURF_QJS_H */
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 8770115a9..ae99b5245 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2122,8 +2122,20 @@
+ "\tdefine(g, 'getComputedStyle', vgcs);\n"
+ "})();\n"
+ "\n"
+-"/* ---- window: a top-level browsing context ------------------------------ */\n"
+-"\n"
++"/* ---- window: the browsing context(s) ------------------------------------\n"
++" * Each iframe is its own realm (its own QuickJS runtime), so a cross-realm\n"
++" * reference can never be a shared object -- a JSValue is runtime-specific\n"
++" * and handing one across runtimes is the exact class of bug the crash\n"
++" * post-mortems (fixes861/875/888/1070/1117b) document.  Every window the\n"
++" * page sees for ANOTHER realm is therefore a shim: a plain object in THIS\n"
++" * realm that looks like a window and whose postMessage() serializes to\n"
++" * JSON and hands the string to a C bridge function.  The C side enqueues\n"
++" * it and dispatches a real MessageEvent in the peer realm on the next\n"
++" * pump (see macsurf_qjs.c, \"cross-realm postMessage\").  Only C char* ever\n"
++" * crosses the runtime boundary.  The natives exist only when the frame\n"
++" * heap is linked (desktop/frames.c: js_link_frame_heaps); without them the\n"
++" * shims degrade to the old behaviour (parent === self, postMessage\n"
++" * dropped) -- never a crash. */\n"
+ "(function () {\n"
+ "\tfunction own(name, v) {\n"
+ "\t\ttry {\n"
+@@ -2131,22 +2143,138 @@
+ "\t\t\t\tObject.defineProperty(g, name, { value: v, writable: true, configurable: true, enumerable: true });\n"
+ "\t\t} catch (e) { /* */ }\n"
+ "\t}\n"
+-"\t/* The page is never framed here: it is its own parent and top. */\n"
+-"\town('parent', g); own('top', g); own('frames', g);\n"
+-"\town('opener', null); own('frameElement', null);\n"
+-"\town('closed', false); own('name', '');\n"
+-"\tif (typeof g.length !== 'number') own('length', 0);\n"
+-"\t/* window.open: the browser has one browsing context, so a popup cannot\n"
+-"\t * really open.  Google Sign-In (and other auth flows) call\n"
+-"\t * window.open(url, name, features) and then postMessage the result back\n"
+-"\t * to window.opener; with window.open undefined the flow dies with\n"
+-"\t * \"TypeError: window.open is not a function\" before any iframe is even\n"
+-"\t * reached.  Returning a same-realm window stub lets those scripts run to\n"
+-"\t * completion instead of throwing.  The stub is a window-shaped object, not\n"
+-"\t * a real second realm: navigation (href/replace/assign) does nothing and\n"
+-"\t * postMessage is dropped, so a sign-in that needs the popup to load and\n"
+-"\t * reply cannot complete -- a genuinely openable popup window is a larger\n"
+-"\t * feature (a second realm plus a rendered region). */\n"
++"\n"
++"\t/* Is this realm inside an iframe?  frames.c records the frame key on\n"
++"\t * the heap before the document (and this polyfill) run. */\n"
++"\tvar frameKey = null;\n"
++"\ttry { frameKey = (typeof __vitaFrameRealmName === 'function') ? __vitaFrameRealmName() : null; } catch (e) { /* */ }\n"
++"\n"
++"\tg.__vitaShimWindows = {};\n"
++"\tif (frameKey !== null) g.__vitaShimWindows[frameKey] = g;\n"
++"\n"
++"\t/* A shim window for the realm named `label`, living in THIS realm. */\n"
++"\tfunction makeShim(label) {\n"
++"\t\tvar w = {\n"
++"\t\t\tclosed: false, name: label,\n"
++"\t\t\touterWidth: 800, outerHeight: 600, innerWidth: 800, innerHeight: 600,\n"
++"\t\t\tscreenX: 0, screenY: 0, pageX: 0, pageY: 0, scrollX: 0, scrollY: 0,\n"
++"\t\t\t__vitaLabel: label,\n"
++"\t\t\ttoString: function () { return '[object Window]'; }\n"
++"\t\t};\n"
++"\t\t/* (inside its own initializer w is still undefined) */\n"
++"\t\tw.parent = w; w.top = w; w.self = w; w.frames = w; w.window = w;\n"
++"\t\tw.location = { href: '', origin: '', protocol: '', host: '', hostname: '',\n"
++"\t\t\tport: '', pathname: '/', search: '', hash: '',\n"
++"\t\t\tassign: function () {}, replace: function () {}, reload: function () {},\n"
++"\t\t\ttoString: function () { return ''; } };\n"
++"\t\tw.addEventListener = function () {};\n"
++"\t\tw.removeEventListener = function () {};\n"
++"\t\tw.postMessage = function (msg) {\n"
++"\t\t\ttry {\n"
++"\t\t\t\t/* Always JSON: the C side parses it back in the target\n"
++"\t\t\t\t * realm, so strings and objects both arrive as sent. */\n"
++"\t\t\t\tvar data = JSON.stringify(msg === undefined ? null : msg);\n"
++"\t\t\t\tif (frameKey === null && typeof __vitaPostMessageToIframe === 'function')\n"
++"\t\t\t\t\treturn __vitaPostMessageToIframe(String(label), String(data));\n"
++"\t\t\t\tif (frameKey !== null && typeof __vitaPostMessageToParent === 'function')\n"
++"\t\t\t\t\treturn __vitaPostMessageToParent(String(data));\n"
++"\t\t\t} catch (e) { /* drop, never throw */ }\n"
++"\t\t\treturn false;\n"
++"\t\t};\n"
++"\t\tw.focus = function () {}; w.blur = function () {};\n"
++"\t\tw.close = function () { w.closed = true; };\n"
++"\t\tw.print = function () {};\n"
++"\t\tw.moveTo = function () {}; w.moveBy = function () {};\n"
++"\t\tw.resizeTo = function () {}; w.resizeBy = function () {};\n"
++"\t\treturn w;\n"
++"\t}\n"
++"\tg.__vitaShimWindow = makeShim;\n"
++"\n"
++"\t/* A cross-realm window can never expose the peer's document object\n"
++"\t * (runtime-specific), so iframe.contentDocument is a thin null wrapper\n"
++"\t * in the top realm: a cross-realm live child DOM is out of scope for\n"
++"\t * Phase 0 (the sign-in flows route through postMessage, not DOM reach-\n"
++"\t * in). */\n"
++"\tfunction shimDoc(label) {\n"
++"\t\treturn {\n"
++"\t\t\tdocumentURI: '', documentElement: null, body: null, head: null,\n"
++"\t\t\tgetElementById: function () { return null; },\n"
++"\t\t\tquerySelector: function () { return null; },\n"
++"\t\t\tquerySelectorAll: function () { return []; },\n"
++"\t\t\tcreateElement: function () { return null; }\n"
++"\t\t};\n"
++"\t}\n"
++"\n"
++"\tif (frameKey === null) {\n"
++"\t\t/* Top-level browsing context. */\n"
++"\t\town('parent', g); own('top', g); own('opener', null); own('frameElement', null);\n"
++"\t\town('closed', false); own('name', '');\n"
++"\t\t/* window.frames: one shim per iframe in the document, by name (or\n"
++"\t\t * index for unnamed frames).  Built lazily and cheaply. */\n"
++"\t\tvar framesShim = {\n"
++"\t\t\t__vitaLabels: {},\n"
++"\t\t\tpostMessage: function (msg) {\n"
++"\t\t\t\t/* window.postMessage on the top: same-realm (nothing crosses). */\n"
++"\t\t\t\treturn false;\n"
++"\t\t\t},\n"
++"\t\t\ttoString: function () { return '[object Window]'; }\n"
++"\t\t};\n"
++"\t\tObject.defineProperty(framesShim, 'length', {\n"
++"\t\t\tenumerable: true, configurable: true,\n"
++"\t\t\tget: function () {\n"
++"\t\t\t\tvar ifr = g.document && g.document.querySelectorAll ? g.document.querySelectorAll('iframe') : null;\n"
++"\t\t\t\tif (!ifr || !ifr.length) return 0;\n"
++"\t\t\t\tif (framesShim.__vitaRefresh) framesShim.__vitaRefresh();\n"
++"\t\t\t\tfor (var i = 0; i < ifr.length; i++) {\n"
++"\t\t\t\t\tvar n = ifr[i] && ifr[i].name ? String(ifr[i].name) : ('' + i);\n"
++"\t\t\t\t\tif (framesShim.__vitaLabels[n] === undefined)\n"
++"\t\t\t\t\t\tframesShim.__vitaLabels[n] = makeShim(n);\n"
++"\t\t\t\t}\n"
++"\t\t\t\treturn ifr.length;\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t\t/* frames[i]: index getters, (re)defined whenever the frame list\n"
++"\t\t * is consulted (no Proxy: the host QuickJS build has none, and\n"
++"\t\t * one here aborted the rest of this window setup). */\n"
++"\t\tvar framesDefined = 0;\n"
++"\t\tframesShim.__vitaRefresh = function () {\n"
++"\t\t\tvar ifr = g.document && g.document.querySelectorAll ? g.document.querySelectorAll('iframe') : null;\n"
++"\t\t\tvar n = ifr ? ifr.length : 0;\n"
++"\t\t\tfor (var i = framesDefined; i < n; i++) (function (i) {\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\tObject.defineProperty(framesShim, '' + i, { enumerable: true, configurable: true,\n"
++"\t\t\t\t\t\tget: function () {\n"
++"\t\t\t\t\t\t\tvar list = g.document.querySelectorAll('iframe');\n"
++"\t\t\t\t\t\t\tif (i >= list.length) return undefined;\n"
++"\t\t\t\t\t\t\tvar nm = list[i] && list[i].name ? String(list[i].name) : ('' + i);\n"
++"\t\t\t\t\t\t\treturn framesShim.__vitaLabels[nm] || (framesShim.__vitaLabels[nm] = makeShim(nm));\n"
++"\t\t\t\t\t\t} });\n"
++"\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t})(i);\n"
++"\t\t\tif (n > framesDefined) framesDefined = n;\n"
++"\t\t\treturn n;\n"
++"\t\t};\n"
++"\t\town('frames', framesShim);\n"
++"\t\tif (g.document && g.document.addEventListener) {\n"
++"\t\t\ttry { g.document.addEventListener('DOMContentLoaded', function () { framesShim.__vitaRefresh(); }); } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\tif (typeof g.length !== 'number') own('length', 0);\n"
++"\t\town('__vitaIframeDocKey',\n"
++"\t\t\ttypeof __vitaIframeContentDocKey === 'function' ? __vitaIframeContentDocKey : function () { return ''; });\n"
++"\t} else {\n"
++"\t\t/* Inside an iframe: parent/top are shims into the parent realm.\n"
++"\t\t * `top` resolves to the same shim as `parent` (Phase 0 has exactly\n"
++"\t\t * two levels; deeper nesting would need a top-level heap link the\n"
++"\t\t * bridge does not build yet). */\n"
++"\t\tvar parentShim = makeShim('parent');\n"
++"\t\town('parent', parentShim); own('top', parentShim);\n"
++"\t\town('opener', null); own('frameElement', null);\n"
++"\t\town('closed', false); own('name', '');\n"
++"\t\t/* window.frames in a frame realm: just self. */\n"
++"\t\town('frames', g);\n"
++"\t\tif (typeof g.length !== 'number') own('length', 1);\n"
++"\t}\n"
++"\t/* window.open: ... (unchanged stub below) */\n"
+ "\tif (typeof g.open !== 'function') {\n"
+ "\t\tvar opened = 0;\n"
+ "\t\tdefine(g, 'open', function (url, name, features) {\n"
+@@ -2164,10 +2292,10 @@
+ "\t\t\t\tpageX: 0, pageY: 0,\n"
+ "\t\t\t\tscrollX: 0, scrollY: 0,\n"
+ "\t\t\t\topener: g,\n"
+-"\t\t\t\tparent: w, top: w, self: w, frames: w, window: w,\n"
+ "\t\t\t\torigin: (g.location && g.location.origin) || '',\n"
+ "\t\t\t\ttoString: function () { return '[object Window]'; }\n"
+ "\t\t\t};\n"
++"\t\t\tw.parent = w; w.top = w; w.self = w; w.frames = w; w.window = w;\n"
+ "\t\t\tw.location = { href: String(url), origin: w.origin,\n"
+ "\t\t\t\tprotocol: '', host: '', hostname: '', port: '',\n"
+ "\t\t\t\tpathname: '/', search: '', hash: '',\n"
+@@ -2184,6 +2312,60 @@
+ "\t\t\treturn w;\n"
+ "\t\t});\n"
+ "\t}\n"
++"\t/* iframe.contentWindow / iframe.contentDocument: the element's access\n"
++"\t * to the child realm.  contentWindow is a shim window in THIS realm\n"
++"\t * whose postMessage reaches the child (one shim per element, cached).\n"
++"\t * The label (iframe name, or the index among the document's iframes for\n"
++"\t * unnamed frames) is what the C sender matches the child box by.  Only\n"
++"\t * installed in the TOP realm: a child realm cannot address its own\n"
++"\t * iframe element cross-realm. */\n"
++"\tif (frameKey === null) {\n"
++"\t\tvar d0 = g.document;\n"
++"\t\tif (d0 && typeof d0.createElement === 'function') {\n"
++"\t\t\tvar I = null;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tvar probe0 = d0.createElement('iframe');\n"
++"\t\t\t\tI = probe0 && Object.getPrototypeOf(probe0);\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t\tif (I && I !== Object.prototype) {\n"
++"\t\t\t\tvar winCache = new WeakMap();\n"
++"\t\t\t\tfunction labelOf(el) {\n"
++"\t\t\t\t\tif (el && el.name) return String(el.name);\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tvar ifr = d0.querySelectorAll ? d0.querySelectorAll('iframe') : null;\n"
++"\t\t\t\t\t\tif (ifr) for (var i = 0; i < ifr.length; i++) if (ifr[i] === el) return '' + i;\n"
++"\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t\treturn '0';\n"
++"\t\t\t\t}\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\tObject.defineProperty(I, 'contentWindow', {\n"
++"\t\t\t\t\t\tenumerable: true, configurable: true,\n"
++"\t\t\t\t\t\tget: function () {\n"
++"\t\t\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\t\t\tif (frameKey !== null) return null;\n"
++"\t\t\t\t\t\t\t\t/* I may be the prototype every element\n"
++"\t\t\t\t\t\t\t\t * shares: only an iframe has a window */\n"
++"\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
++"\t\t\t\t\t\t\t\tvar w = winCache.get(this);\n"
++"\t\t\t\t\t\t\t\tif (!w) { w = makeShim(labelOf(this)); winCache.set(this, w); }\n"
++"\t\t\t\t\t\t\t\treturn w;\n"
++"\t\t\t\t\t\t\t} catch (e) { return null; }\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t\tObject.defineProperty(I, 'contentDocument', {\n"
++"\t\t\t\t\t\tenumerable: true, configurable: true,\n"
++"\t\t\t\t\t\tget: function () {\n"
++"\t\t\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\t\t\tif (frameKey !== null) return null;\n"
++"\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
++"\t\t\t\t\t\t\t\treturn shimDoc(labelOf(this));\n"
++"\t\t\t\t\t\t\t} catch (e) { return null; }\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t}\n"
+ "\t/* requestIdleCallback hands its callback an IdleDeadline. */\n"
+ "\tvar ric = g.requestIdleCallback, ids = {}, next = 1;\n"
+ "\tdefine(g, 'requestIdleCallback', function (fn, opts) {\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 5b5d579ee..7aee240b7 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2121,8 +2121,20 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	define(g, 'getComputedStyle', vgcs);
+ })();
+ 
+-/* ---- window: a top-level browsing context ------------------------------ */
+-
++/* ---- window: the browsing context(s) ------------------------------------
++ * Each iframe is its own realm (its own QuickJS runtime), so a cross-realm
++ * reference can never be a shared object -- a JSValue is runtime-specific
++ * and handing one across runtimes is the exact class of bug the crash
++ * post-mortems (fixes861/875/888/1070/1117b) document.  Every window the
++ * page sees for ANOTHER realm is therefore a shim: a plain object in THIS
++ * realm that looks like a window and whose postMessage() serializes to
++ * JSON and hands the string to a C bridge function.  The C side enqueues
++ * it and dispatches a real MessageEvent in the peer realm on the next
++ * pump (see macsurf_qjs.c, "cross-realm postMessage").  Only C char* ever
++ * crosses the runtime boundary.  The natives exist only when the frame
++ * heap is linked (desktop/frames.c: js_link_frame_heaps); without them the
++ * shims degrade to the old behaviour (parent === self, postMessage
++ * dropped) -- never a crash. */
+ (function () {
+ 	function own(name, v) {
+ 		try {
+@@ -2130,22 +2142,138 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				Object.defineProperty(g, name, { value: v, writable: true, configurable: true, enumerable: true });
+ 		} catch (e) { /* */ }
+ 	}
+-	/* The page is never framed here: it is its own parent and top. */
+-	own('parent', g); own('top', g); own('frames', g);
+-	own('opener', null); own('frameElement', null);
+-	own('closed', false); own('name', '');
+-	if (typeof g.length !== 'number') own('length', 0);
+-	/* window.open: the browser has one browsing context, so a popup cannot
+-	 * really open.  Google Sign-In (and other auth flows) call
+-	 * window.open(url, name, features) and then postMessage the result back
+-	 * to window.opener; with window.open undefined the flow dies with
+-	 * "TypeError: window.open is not a function" before any iframe is even
+-	 * reached.  Returning a same-realm window stub lets those scripts run to
+-	 * completion instead of throwing.  The stub is a window-shaped object, not
+-	 * a real second realm: navigation (href/replace/assign) does nothing and
+-	 * postMessage is dropped, so a sign-in that needs the popup to load and
+-	 * reply cannot complete -- a genuinely openable popup window is a larger
+-	 * feature (a second realm plus a rendered region). */
++
++	/* Is this realm inside an iframe?  frames.c records the frame key on
++	 * the heap before the document (and this polyfill) run. */
++	var frameKey = null;
++	try { frameKey = (typeof __vitaFrameRealmName === 'function') ? __vitaFrameRealmName() : null; } catch (e) { /* */ }
++
++	g.__vitaShimWindows = {};
++	if (frameKey !== null) g.__vitaShimWindows[frameKey] = g;
++
++	/* A shim window for the realm named `label`, living in THIS realm. */
++	function makeShim(label) {
++		var w = {
++			closed: false, name: label,
++			outerWidth: 800, outerHeight: 600, innerWidth: 800, innerHeight: 600,
++			screenX: 0, screenY: 0, pageX: 0, pageY: 0, scrollX: 0, scrollY: 0,
++			__vitaLabel: label,
++			toString: function () { return '[object Window]'; }
++		};
++		/* (inside its own initializer w is still undefined) */
++		w.parent = w; w.top = w; w.self = w; w.frames = w; w.window = w;
++		w.location = { href: '', origin: '', protocol: '', host: '', hostname: '',
++			port: '', pathname: '/', search: '', hash: '',
++			assign: function () {}, replace: function () {}, reload: function () {},
++			toString: function () { return ''; } };
++		w.addEventListener = function () {};
++		w.removeEventListener = function () {};
++		w.postMessage = function (msg) {
++			try {
++				/* Always JSON: the C side parses it back in the target
++				 * realm, so strings and objects both arrive as sent. */
++				var data = JSON.stringify(msg === undefined ? null : msg);
++				if (frameKey === null && typeof __vitaPostMessageToIframe === 'function')
++					return __vitaPostMessageToIframe(String(label), String(data));
++				if (frameKey !== null && typeof __vitaPostMessageToParent === 'function')
++					return __vitaPostMessageToParent(String(data));
++			} catch (e) { /* drop, never throw */ }
++			return false;
++		};
++		w.focus = function () {}; w.blur = function () {};
++		w.close = function () { w.closed = true; };
++		w.print = function () {};
++		w.moveTo = function () {}; w.moveBy = function () {};
++		w.resizeTo = function () {}; w.resizeBy = function () {};
++		return w;
++	}
++	g.__vitaShimWindow = makeShim;
++
++	/* A cross-realm window can never expose the peer's document object
++	 * (runtime-specific), so iframe.contentDocument is a thin null wrapper
++	 * in the top realm: a cross-realm live child DOM is out of scope for
++	 * Phase 0 (the sign-in flows route through postMessage, not DOM reach-
++	 * in). */
++	function shimDoc(label) {
++		return {
++			documentURI: '', documentElement: null, body: null, head: null,
++			getElementById: function () { return null; },
++			querySelector: function () { return null; },
++			querySelectorAll: function () { return []; },
++			createElement: function () { return null; }
++		};
++	}
++
++	if (frameKey === null) {
++		/* Top-level browsing context. */
++		own('parent', g); own('top', g); own('opener', null); own('frameElement', null);
++		own('closed', false); own('name', '');
++		/* window.frames: one shim per iframe in the document, by name (or
++		 * index for unnamed frames).  Built lazily and cheaply. */
++		var framesShim = {
++			__vitaLabels: {},
++			postMessage: function (msg) {
++				/* window.postMessage on the top: same-realm (nothing crosses). */
++				return false;
++			},
++			toString: function () { return '[object Window]'; }
++		};
++		Object.defineProperty(framesShim, 'length', {
++			enumerable: true, configurable: true,
++			get: function () {
++				var ifr = g.document && g.document.querySelectorAll ? g.document.querySelectorAll('iframe') : null;
++				if (!ifr || !ifr.length) return 0;
++				if (framesShim.__vitaRefresh) framesShim.__vitaRefresh();
++				for (var i = 0; i < ifr.length; i++) {
++					var n = ifr[i] && ifr[i].name ? String(ifr[i].name) : ('' + i);
++					if (framesShim.__vitaLabels[n] === undefined)
++						framesShim.__vitaLabels[n] = makeShim(n);
++				}
++				return ifr.length;
++			}
++		});
++		/* frames[i]: index getters, (re)defined whenever the frame list
++		 * is consulted (no Proxy: the host QuickJS build has none, and
++		 * one here aborted the rest of this window setup). */
++		var framesDefined = 0;
++		framesShim.__vitaRefresh = function () {
++			var ifr = g.document && g.document.querySelectorAll ? g.document.querySelectorAll('iframe') : null;
++			var n = ifr ? ifr.length : 0;
++			for (var i = framesDefined; i < n; i++) (function (i) {
++				try {
++					Object.defineProperty(framesShim, '' + i, { enumerable: true, configurable: true,
++						get: function () {
++							var list = g.document.querySelectorAll('iframe');
++							if (i >= list.length) return undefined;
++							var nm = list[i] && list[i].name ? String(list[i].name) : ('' + i);
++							return framesShim.__vitaLabels[nm] || (framesShim.__vitaLabels[nm] = makeShim(nm));
++						} });
++				} catch (e) { /* */ }
++			})(i);
++			if (n > framesDefined) framesDefined = n;
++			return n;
++		};
++		own('frames', framesShim);
++		if (g.document && g.document.addEventListener) {
++			try { g.document.addEventListener('DOMContentLoaded', function () { framesShim.__vitaRefresh(); }); } catch (e) { /* */ }
++		}
++		if (typeof g.length !== 'number') own('length', 0);
++		own('__vitaIframeDocKey',
++			typeof __vitaIframeContentDocKey === 'function' ? __vitaIframeContentDocKey : function () { return ''; });
++	} else {
++		/* Inside an iframe: parent/top are shims into the parent realm.
++		 * `top` resolves to the same shim as `parent` (Phase 0 has exactly
++		 * two levels; deeper nesting would need a top-level heap link the
++		 * bridge does not build yet). */
++		var parentShim = makeShim('parent');
++		own('parent', parentShim); own('top', parentShim);
++		own('opener', null); own('frameElement', null);
++		own('closed', false); own('name', '');
++		/* window.frames in a frame realm: just self. */
++		own('frames', g);
++		if (typeof g.length !== 'number') own('length', 1);
++	}
++	/* window.open: ... (unchanged stub below) */
+ 	if (typeof g.open !== 'function') {
+ 		var opened = 0;
+ 		define(g, 'open', function (url, name, features) {
+@@ -2163,10 +2291,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				pageX: 0, pageY: 0,
+ 				scrollX: 0, scrollY: 0,
+ 				opener: g,
+-				parent: w, top: w, self: w, frames: w, window: w,
+ 				origin: (g.location && g.location.origin) || '',
+ 				toString: function () { return '[object Window]'; }
+ 			};
++			w.parent = w; w.top = w; w.self = w; w.frames = w; w.window = w;
+ 			w.location = { href: String(url), origin: w.origin,
+ 				protocol: '', host: '', hostname: '', port: '',
+ 				pathname: '/', search: '', hash: '',
+@@ -2183,6 +2311,60 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			return w;
+ 		});
+ 	}
++	/* iframe.contentWindow / iframe.contentDocument: the element's access
++	 * to the child realm.  contentWindow is a shim window in THIS realm
++	 * whose postMessage reaches the child (one shim per element, cached).
++	 * The label (iframe name, or the index among the document's iframes for
++	 * unnamed frames) is what the C sender matches the child box by.  Only
++	 * installed in the TOP realm: a child realm cannot address its own
++	 * iframe element cross-realm. */
++	if (frameKey === null) {
++		var d0 = g.document;
++		if (d0 && typeof d0.createElement === 'function') {
++			var I = null;
++			try {
++				var probe0 = d0.createElement('iframe');
++				I = probe0 && Object.getPrototypeOf(probe0);
++			} catch (e) { /* */ }
++			if (I && I !== Object.prototype) {
++				var winCache = new WeakMap();
++				function labelOf(el) {
++					if (el && el.name) return String(el.name);
++					try {
++						var ifr = d0.querySelectorAll ? d0.querySelectorAll('iframe') : null;
++						if (ifr) for (var i = 0; i < ifr.length; i++) if (ifr[i] === el) return '' + i;
++					} catch (e) { /* */ }
++					return '0';
++				}
++				try {
++					Object.defineProperty(I, 'contentWindow', {
++						enumerable: true, configurable: true,
++						get: function () {
++							try {
++								if (frameKey !== null) return null;
++								/* I may be the prototype every element
++								 * shares: only an iframe has a window */
++								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
++								var w = winCache.get(this);
++								if (!w) { w = makeShim(labelOf(this)); winCache.set(this, w); }
++								return w;
++							} catch (e) { return null; }
++						}
++					});
++					Object.defineProperty(I, 'contentDocument', {
++						enumerable: true, configurable: true,
++						get: function () {
++							try {
++								if (frameKey !== null) return null;
++								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
++								return shimDoc(labelOf(this));
++							} catch (e) { return null; }
++						}
++					});
++				} catch (e) { /* */ }
++			}
++		}
++	}
+ 	/* requestIdleCallback hands its callback an IdleDeadline. */
+ 	var ric = g.requestIdleCallback, ids = {}, next = 1;
+ 	define(g, 'requestIdleCallback', function (fn, opts) {
+diff --git a/desktop/frames.c b/desktop/frames.c
+index b1a6ac54d..53a11ea44 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -41,6 +41,8 @@
+ #include "desktop/frames.h"
+ #include "desktop/scrollbar.h"
+ 
++#include "content/handlers/javascript/quickjs/macsurf_qjs.h"
++
+ /** maximum frame resize margin */
+ #define FRAME_RESIZE 6
+ 
+@@ -265,6 +267,12 @@ nserror browser_window_create_iframes(struct browser_window *bw)
+ 		window->parent = bw;
+ 		window->box->iframe = window;
+ 
++		/* Cross-realm frame bridge: link this iframe realm to its
++		 * parent's realm (window.parent / postMessage).  Degrades
++		 * gracefully if the parent has no JS heap. */
++		js_link_frame_heaps(window->jsheap, bw->jsheap,
++				window->name != NULL ? window->name : "");
++
+ 		/* iframe dimensions */
+ 		box_bounds(window->box, &rect);
+ 
+@@ -672,6 +680,11 @@ browser_window_create_frameset_internal(struct browser_window *bw,
+ 			/* linking */
+ 			window->parent = bw;
+ 
++			/* Cross-realm frame bridge (frameset frame): link this
++			 * frame's realm to its parent's realm. */
++			js_link_frame_heaps(window->jsheap, bw->jsheap,
++					window->name != NULL ? window->name : "");
++
+ 			if (window->name)
+ 				NSLOG(netsurf, INFO, "Created frame '%s'",
+ 				      window->name);

@@ -176,6 +176,7 @@ CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
 JS-module-http http://127.0.0.1:$HP/JS-module.html
+JS-xrealm file:///app0:/testpages/JS-xrealm.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -483,6 +484,12 @@ beh=$(sed -n 's/.*STR \(behaviour: [0-9]*\/[0-9]* right\).*/\1/p' "$ap" 2>/dev/n
 echo "  JS-apis: ${apis:-no summary (script did not run?)}, ${beh:-no behaviour line}"
 napi=$(echo "$apis" | sed -n 's/APIS: \([0-9]*\)\/.*/\1/p')
 [ "${napi:-0}" -ge 149 ] && [ "$beh" = "behaviour: 10/10 right" ] || fail "web API census"
+# Cross-realm frames (patch 126): an iframe is its own JS runtime; the two
+# talk through postMessage, which crosses as JSON text only.
+xp=$(ls "$R"/*-JS-xrealm.plot 2>/dev/null | head -1)
+xs=$(sed -n 's/.*STR \(XREALM: [0-9]*\/[0-9]* passed\).*/\1/p' "$xp" 2>/dev/null | tail -1)
+echo "  JS-xrealm: ${xs:-no summary (script did not run?)}"
+[ "$xs" = "XREALM: 4/4 passed" ] || fail "cross-realm postMessage"
 for m in JS-module JS-module-http; do
 	mp=$(ls "$R"/*-"$m".plot 2>/dev/null | head -1)
 	ms=$(sed -n 's/.*STR \(MODULES: [0-9]*\/[0-9]* passed\).*/\1/p' "$mp" 2>/dev/null | head -1)
