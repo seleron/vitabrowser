@@ -1,0 +1,449 @@
+# netsurf: tap a text field to type; stale focus crash; document.compareDocumentPosition; ordered script-inserted scripts; SVG aspect ratio
+#
+# Hardware run 20 (Google sign-in in the claude.ai popup) and its replay:
+#
+# - vita: a tap or CROSS click that lands in a text field opens the keyboard
+#   (browser_window_get_features says CTX_FORM_TEXT under the point), as on
+#   a phone. The field showed "Click to edit this field" and the user tapped
+#   it again and again: nothing said TRIANGLE opens the keyboard. Off while
+#   the autotest drives the controls.
+# - html_keypress: the focus owner is a raw box pointer that a script-driven
+#   relayout frees; the next key was dispatched to freed memory (simulator
+#   SIGSEGV after Google replaced its form). A focused box no longer in the
+#   tree loses the focus.
+# - polyfill: document.compareDocumentPosition / document.contains (elements
+#   had them). Google's "is it in the page" test threw there, failing its
+#   viewport service and every service behind it, the Next button's among
+#   them ("Failed to retrieve dependencies of service ...": 137 -> 0).
+# - script-inserted scripts without an async attribute run in insertion
+#   order (HTML's async = false list; the bridge cannot tell set-false from
+#   untouched): Google's loader inserts dependent bundles back to back and a
+#   small one ran before the big one it calls into ("not a function").
+# - inline <svg>: scaled per its viewBox to fit and centred
+#   (preserveAspectRatio's default) instead of stretched to the box.
+#
+# Still open: Google's sign-in "Next" -- the click reaches Google's event
+# contract on <html> (trusted, button 0) with the email in the field, and
+# its modules now load without errors, but no request is sent (doc 12).
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 76becc8b1..780ac5262 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -107,6 +107,9 @@ struct html_script {
+ 	struct dom_node *node;
+ 	bool already_started;
+ 	bool is_module;	/**< type="module": run by js_exec_module */
++	/** VitaBrowser: script-inserted: runs in insertion order among the
++	 * other script-inserted scripts (see html_script_exec) */
++	bool ordered;
+ 	bool parser_inserted;
+ 	bool force_async;
+ 	bool ready_exec;
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 9c49ee24b..81777f270 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -2302,11 +2302,44 @@ html_mouse_action(struct content *c,
+  * \param  key	The UCS4 character codepoint
+  * \return true if key handled, false otherwise
+  */
++/* Is b a box of the tree under root? (bounded) */
++static bool vb_box_in_tree(const struct box *root, const struct box *b,
++		int depth)
++{
++	const struct box *c;
++
++	if (root == b)
++		return true;
++	if (depth > 400)
++		return false;
++	for (c = root->children; c != NULL; c = c->next)
++		if (vb_box_in_tree(c, b, depth + 1))
++			return true;
++	return false;
++}
++
+ bool html_keypress(struct content *c, uint32_t key)
+ {
+ 	html_content *html = (html_content *) c;
+ 	struct selection *sel = html->sel;
+ 
++	/* VitaBrowser: the focus owner is a raw box pointer, and a relayout
++	 * that script triggered (Google's sign-in replacing its form after
++	 * Next) frees the box tree it pointed into: the next key dispatched
++	 * to freed memory (simulator SIGSEGV in fire_dom_keyboard_event).
++	 * A focused box that is no longer in the tree loses the focus. */
++	if ((html->focus_type == HTML_FOCUS_TEXTAREA ||
++	     html->focus_type == HTML_FOCUS_CONTENT) &&
++	    (html->layout == NULL ||
++	     !vb_box_in_tree(html->layout,
++			html->focus_type == HTML_FOCUS_TEXTAREA ?
++				html->focus_owner.textarea :
++				html->focus_owner.content, 0))) {
++		html->focus_type = HTML_FOCUS_SELF;
++		html->focus_owner.self = true;
++		return false;
++	}
++
+ 	/** \todo
+ 	 * At the moment, the front end interface for keypress only gives
+ 	 * us a UCS4 key value.  This doesn't doesn't have all the information
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 5f456db43..f12bc6b4e 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -195,10 +195,29 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 		return NSERROR_BAD_PARAMETER;
+ 	}
+ 
++	/* VitaBrowser: script-inserted scripts run in insertion order: one
++	 * that arrives before an earlier one waits for it (Google's module
++	 * loader inserts dependent bundles back to back; run as they
++	 * arrived, a later bundle called functions an earlier one had not
++	 * defined yet). A failed or finished one no longer holds the queue. */
++	bool ordered_blocked = false;
++
+ 	for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
+ 		if (s->already_started) {
+ 			continue;
+ 		}
++		if (s->ordered && s->type == HTML_SCRIPT_ASYNC) {
++			if (ordered_blocked)
++				continue;
++			if (s->data.handle != NULL &&
++			    content_get_status(s->data.handle) !=
++					CONTENT_STATUS_DONE &&
++			    content_get_status(s->data.handle) !=
++					CONTENT_STATUS_ERROR) {
++				ordered_blocked = true;
++				continue;
++			}
++		}
+ 
+ 		if ((s->type == HTML_SCRIPT_ASYNC) ||
+ 		    (allow_defer && (s->type == HTML_SCRIPT_DEFER))) {
+@@ -996,6 +1015,7 @@ exec_src_script(html_content *c,
+ 	hlcache_child_context child;
+ 	struct html_script *nscript;
+ 	bool async;
++	bool async_attr = false;
+ 	bool defer;
+ 	enum html_script_type script_type;
+ 	hlcache_handle_callback script_cb;
+@@ -1031,6 +1051,7 @@ exec_src_script(html_content *c,
+ 	 * value. Note setting the values to "false" still makes them true!
+ 	 */
+ 	exc = dom_element_has_attribute(node, corestring_dom_async, &async);
++	async_attr = (exc == DOM_NO_ERR && async);
+ 	if (exc != DOM_NO_ERR) {
+ 		return DOM_HUBBUB_OK; /* dom error */
+ 	}
+@@ -1079,6 +1100,13 @@ exec_src_script(html_content *c,
+ 		return DOM_HUBBUB_NOMEM;
+ 	}
+ 	nscript->is_module = src_script_is_module;
++	/* script-inserted, and not marked async: HTML's "async = false"
++	 * list, which runs in insertion order. The bridge cannot tell a
++	 * script whose async was set false from one never touched (both
++	 * lack the attribute); ordering the untouched ones too only delays
++	 * one behind a slower earlier one. Google's loader sets async =
++	 * false and needs the order. */
++	nscript->ordered = html_script_js_inserted && !async_attr;
+ 
+ 	/* fixes869 (#295) - remember the element so html_script_exec can fire
+ 	 * `load` at it (and convert_script_async_cb `error`).  Only worth it for a
+diff --git a/content/handlers/html/vb_inline_svg.c b/content/handlers/html/vb_inline_svg.c
+index a7cb10dca..ab8ddf087 100644
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -121,6 +121,7 @@ struct ser {
+ 	struct sbuf out;
+ 	char color[8];		/* "#rrggbb": what currentColor means */
+ 	char *refs[16];		/* ids that <use> elements point at */
++	float vb_w, vb_h;	/* the root's viewBox size, 0 if none */
+ 	int nrefs;
+ 	int nodes;
+ };
+@@ -223,6 +224,22 @@ static void ser_node(struct ser *z, dom_node *n, int depth, bool root)
+ 				has_xmlns = true;
+ 			if (dstr_eq(an, "href") || dstr_eq(an, "xlink:href"))
+ 				note_ref(z, av);
++			if (root && dstr_eq(an, "viewBox") && av != NULL) {
++				float a0, a1, a2, a3;
++				char tmp[80];
++				size_t tn = vn < sizeof(tmp) - 1 ? vn : sizeof(tmp) - 1;
++				size_t q;
++				memcpy(tmp, vp, tn);
++				tmp[tn] = '\0';
++				for (q = 0; q < tn; q++)
++					if (tmp[q] == ',')
++						tmp[q] = ' ';
++				if (sscanf(tmp, "%f %f %f %f", &a0, &a1, &a2,
++						&a3) == 4 && a2 > 0 && a3 > 0) {
++					z->vb_w = a2;
++					z->vb_h = a3;
++				}
++			}
+ 			sb_str(&z->out, " ");
+ 			sb_add(&z->out, dom_string_data(an),
+ 			       dom_string_byte_length(an));
+@@ -296,11 +313,12 @@ static struct vb_svg_entry {
+ 	unsigned long seq;
+ 	unsigned long used;
+ 	struct svgtiny_diagram *d;	/* NULL: parse failed, don't retry */
++	int dx, dy;			/* where the drawing sits in the box */
+ } cache[VB_SVG_CACHE];
+ static unsigned long cache_clock;
+ 
+ static struct svgtiny_diagram *diagram_for(struct box *box, int w, int h,
+-		const html_content *html)
++		const html_content *html, int *dx, int *dy)
+ {
+ 	struct vb_svg_entry *e, *victim = &cache[0];
+ 	struct ser z;
+@@ -313,6 +331,8 @@ static struct svgtiny_diagram *diagram_for(struct box *box, int w, int h,
+ 		    e->h == h && e->seq == macsurf_reconvert_seq &&
+ 		    e->used != 0) {
+ 			e->used = ++cache_clock;
++			*dx = e->dx;
++			*dy = e->dy;
+ 			return e->d;
+ 		}
+ 		if (e->used < victim->used)
+@@ -340,6 +360,27 @@ static struct svgtiny_diagram *diagram_for(struct box *box, int w, int h,
+ 	victim->used = ++cache_clock;
+ 	victim->d = NULL;
+ 
++	/* preserveAspectRatio's default, xMidYMid meet: the viewBox scaled
++	 * to fit the box and centred, not stretched to fill it (the
++	 * claude.ai wordmark and Google's G came out distorted) */
++	victim->dx = victim->dy = 0;
++	if (z.vb_w > 0 && z.vb_h > 0) {
++		float sc = (float)w / z.vb_w;
++		if ((float)h / z.vb_h < sc)
++			sc = (float)h / z.vb_h;
++		if (sc > 0) {
++			int nw = (int)(z.vb_w * sc + 0.5f);
++			int nh = (int)(z.vb_h * sc + 0.5f);
++			if (nw > 0 && nh > 0) {
++				victim->dx = (w - nw) / 2;
++				victim->dy = (h - nh) / 2;
++				w = nw;
++				h = nh;
++			}
++		}
++	}
++	*dx = victim->dx;
++	*dy = victim->dy;
+ 	if (!z.out.oom && z.out.s != NULL) {
+ 		struct svgtiny_diagram *d = svgtiny_create();
+ 		if (d != NULL) {
+@@ -367,16 +408,19 @@ bool vb_inline_svg_paint(struct box *box, int x, int y, int width,
+ 	if (box == NULL || box->node == NULL || width <= 0 || height <= 0 ||
+ 	    width > 4096 || height > 4096)
+ 		return true;
+-	d = diagram_for(box, width, height, html);
+-	if (d == NULL || d->width <= 0 || d->height <= 0)
+-		return true;
+-
+-	transform[0] = (float)width / (float)d->width;
+-	transform[1] = 0;
+-	transform[2] = 0;
+-	transform[3] = (float)height / (float)d->height;
+-	transform[4] = x;
+-	transform[5] = y;
++	{
++		int dx = 0, dy = 0;
++		d = diagram_for(box, width, height, html, &dx, &dy);
++		if (d == NULL || d->width <= 0 || d->height <= 0)
++			return true;
++		/* the diagram was parsed at its drawn size */
++		transform[0] = 1;
++		transform[1] = 0;
++		transform[2] = 0;
++		transform[3] = 1;
++		transform[4] = x + dx;
++		transform[5] = y + dy;
++	}
+ 
+ #define BGR(c) (((svgtiny_RED((c))) | (svgtiny_GREEN((c)) << 8) | \
+ 		 (svgtiny_BLUE((c)) << 16)))
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index cc1d7b880..e21a5d079 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1395,6 +1395,24 @@
+ "\t});\n"
+ "\tvar adopted = [];\n"
+ "\tacc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });\n"
++"\t/* document.compareDocumentPosition / contains: elements had them,\n"
++"\t * the document did not. Google's sign-in tests \"is it in the page\"\n"
++"\t * with ownerDocument.compareDocumentPosition(el) & 16, and the throw\n"
++"\t * failed its viewport service and, through it, every service the Next\n"
++"\t * button needs (hardware run 20: Next did nothing). */\n"
++"\tfunction docContains(n) {\n"
++"\t\tif (!n) return false;\n"
++"\t\tif (n === d) return true;\n"
++"\t\tvar r = d.documentElement;\n"
++"\t\treturn !!(r && (n === r || (typeof r.contains === 'function' && r.contains(n))));\n"
++"\t}\n"
++"\tfn(d, 'contains', docContains);\n"
++"\tfn(d, 'compareDocumentPosition', function (other) {\n"
++"\t\tif (other === d) return 0;\n"
++"\t\t/* CONTAINED_BY | FOLLOWING for a node in the document;\n"
++"\t\t * DISCONNECTED | IMPLEMENTATION_SPECIFIC | FOLLOWING otherwise */\n"
++"\t\treturn docContains(other) ? 20 : 37;\n"
++"\t});\n"
+ "\tfn(d, 'importNode', function (n, deep) { return n.cloneNode(!!deep); });\n"
+ "\tfn(d, 'adoptNode', function (n) { if (n.parentNode) n.parentNode.removeChild(n); return n; });\n"
+ "\tfn(d, 'elementsFromPoint', function (x, y) {\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index e2e0ee739..ec3dff7e1 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1394,6 +1394,24 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	});
+ 	var adopted = [];
+ 	acc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });
++	/* document.compareDocumentPosition / contains: elements had them,
++	 * the document did not. Google's sign-in tests "is it in the page"
++	 * with ownerDocument.compareDocumentPosition(el) & 16, and the throw
++	 * failed its viewport service and, through it, every service the Next
++	 * button needs (hardware run 20: Next did nothing). */
++	function docContains(n) {
++		if (!n) return false;
++		if (n === d) return true;
++		var r = d.documentElement;
++		return !!(r && (n === r || (typeof r.contains === 'function' && r.contains(n))));
++	}
++	fn(d, 'contains', docContains);
++	fn(d, 'compareDocumentPosition', function (other) {
++		if (other === d) return 0;
++		/* CONTAINED_BY | FOLLOWING for a node in the document;
++		 * DISCONNECTED | IMPLEMENTATION_SPECIFIC | FOLLOWING otherwise */
++		return docContains(other) ? 20 : 37;
++	});
+ 	fn(d, 'importNode', function (n, deep) { return n.cloneNode(!!deep); });
+ 	fn(d, 'adoptNode', function (n) { if (n.parentNode) n.parentNode.removeChild(n); return n; });
+ 	fn(d, 'elementsFromPoint', function (x, y) {
+diff --git a/frontends/vita/input.c b/frontends/vita/input.c
+index f482b8774..6609b4ca9 100644
+--- a/frontends/vita/input.c
++++ b/frontends/vita/input.c
+@@ -43,6 +43,7 @@
+ #include "vita/window.h"
+ #include "vita/input.h"
+ #include "vita/js_platform.h"
++#include "vita/chrome.h"
+ 
+ /** Stick dead zone around the 128 centre. */
+ #define STICK_DEADZONE 24
+@@ -67,6 +68,7 @@ static struct {
+ 	bool cross_down;		/**< CROSS pressed on the page */
+ 	int cross_x, cross_y;		/**< ...here (window coordinates) */
+ 	bool touching;			/**< a finger is down */
++	bool open_keyboard;		/**< a click landed in a text field */
+ 	bool dragging;			/**< ...and has moved past TAP_SLOP */
+ 	int touch_x0, touch_y0;		/**< where it went down */
+ 	int touch_x, touch_y;		/**< where it was last pass */
+@@ -145,6 +147,31 @@ static void scroll_at(struct gui_window *gw, int sx, int sy, int dx, int dy)
+ 		vita_window_scroll_by(gw, dx, dy);
+ }
+ 
++/* A tap or CROSS click that lands in a text field opens the keyboard, as
++ * on a phone. Hardware run 20: tapping Google's email field placed the
++ * caret, but nothing said the keyboard needs TRIANGLE, so the field could
++ * never be filled. Off while the autotest drives the controls. */
++bool vita_input_auto_keyboard = true;
++
++static void note_text_field(struct gui_window *gw, int x, int y)
++{
++	struct browser_window_features f;
++	struct browser_window *bw = vita_window_browser(gw);
++
++	if (!vita_input_auto_keyboard || bw == NULL)
++		return;
++	/* the element under the tap itself (the caret may still sit in a
++	 * field the page just left, when a button was tapped) */
++	memset(&f, 0, sizeof(f));
++	if (browser_window_get_features(bw, x, y, &f) != NSERROR_OK ||
++	    f.form_features != CTX_FORM_TEXT)
++		return;
++	if (vita_chrome_editing(gw)) {
++		st.open_keyboard = true;
++		vita_diag_log("input: text field, opening the keyboard");
++	}
++}
++
+ /** A click at a screen position: press and release in one go. */
+ static void click_at(struct gui_window *gw, int sx, int sy)
+ {
+@@ -157,6 +184,7 @@ static void click_at(struct gui_window *gw, int sx, int sy)
+ 	browser_window_mouse_click(bw, BROWSER_MOUSE_CLICK_1, x, y);
+ 	browser_window_mouse_track(bw, 0, x, y);
+ 	vita_input_stats.clicks++;
++	note_text_field(gw, x, y);
+ }
+ 
+ /** The front panel: tap = click, drag = scroll with the finger. */
+@@ -233,6 +261,7 @@ static void pointer_step(struct gui_window *gw, const struct vita_input *in,
+ 		browser_window_mouse_track(bw, 0, x, y);
+ 		st.cross_down = false;
+ 		vita_input_stats.clicks++;
++		note_text_field(gw, x, y);
+ 	}
+ }
+ 
+@@ -306,8 +335,10 @@ enum vita_browse_action vita_input_browse(struct gui_window *gw,
+ 	}
+ 	if (pressed & SCE_CTRL_SQUARE)
+ 		vita_input_set_zoom(gw, st.zoom + 1);
+-	if (pressed & SCE_CTRL_TRIANGLE)
++	if ((pressed & SCE_CTRL_TRIANGLE) || st.open_keyboard) {
++		st.open_keyboard = false;
+ 		return VITA_BROWSE_ENTER_TEXT;
++	}
+ 	if (pressed & SCE_CTRL_START)
+ 		return VITA_BROWSE_HOME;
+ 	return VITA_BROWSE_NONE;
+diff --git a/frontends/vita/input.h b/frontends/vita/input.h
+index 4895b591b..ce0ddd217 100644
+--- a/frontends/vita/input.h
++++ b/frontends/vita/input.h
+@@ -94,4 +94,8 @@ struct vita_input_stats {
+ };
+ extern struct vita_input_stats vita_input_stats;
+ 
++/** Open the keyboard when a tap lands in a text field (on; the autotest
++ * turns it off while it drives the controls). */
++extern bool vita_input_auto_keyboard;
++
+ #endif
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index d70ab86c0..1b1d4721c 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -610,6 +610,7 @@ static bool autotest_begin_pass(struct browser_window *bw, unsigned int i)
+ 		vita_netprobe_run(http, https, vita_diag_log);
+ 	}
+ 	vita_autotest = AT_SETTLE;
++	vita_input_auto_keyboard = false;
+ 	set_message(0, "AUTOTEST pass %c page 1/%u - do not touch",
+ 		    vita_passes[i].tag, pass_end(i) - pass_first(i));
+ 	open_test_page(bw, pass_first(i));
+@@ -685,6 +686,7 @@ static void autotest_next(struct browser_window *bw)
+ {
+ 	if (vita_page + 1 < pass_end(vita_pass)) {
+ 		vita_autotest = AT_SETTLE;
++	vita_input_auto_keyboard = false;
+ 		set_message(0, "AUTOTEST pass %c page %u/%u - do not touch",
+ 			    vita_passes[vita_pass].tag,
+ 			    vita_page + 2 - pass_first(vita_pass),
+@@ -707,6 +709,7 @@ static void autotest_next(struct browser_window *bw)
+ static void autotest_finish(void)
+ {
+ 	vita_autotest = AT_OFF;
++	vita_input_auto_keyboard = true;
+ 	vita_js_dialog_auto = false;
+ 	apply_run_profile();
+ 	vita_diag_font_metrics();

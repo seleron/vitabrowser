@@ -229,3 +229,20 @@ dependant service is cancelled. The original throw site is not in the log
 (Wiz rewraps it); next step is a scripted session that hooks `_.GB` /
 `_.N9a` via eval to catch it. YouTube now gets past its loading skeleton
 but still renders a blank feed.
+
+
+## Run 20 + patch 129 (2026-09-26)
+
+On the device the popup opened and closed as designed. Replaying the
+sign-in in the simulator with a temporary QuickJS hook (print the stack at
+every "not a function"; host-only, removed) found two root causes, both
+fixed in 129: document.compareDocumentPosition was missing (Google's
+viewport service threw; 137 dependency failures -> 0) and script-inserted
+bundles ran out of insertion order. Google's modules now load cleanly.
+
+**Still open:** tapping Next: the click reaches Google's event contract on
+`<html>` (capture, trusted, button 0, email present) but no action runs
+and nothing is requested. Next step: hook the contract's dispatcher
+(`jsaction` handler on documentElement) in an eval session to see whether
+it finds `click:cOuCgd` on the button and why the controller (`soHxf`)
+does not handle it.

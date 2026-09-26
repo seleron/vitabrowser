@@ -250,6 +250,7 @@ evidence.
 | 126 | cross-realm frames + postMessage, JSON-only across runtimes (doc 12) |
 | 127 | window.open opens a real popup window (window stack, opener bridge) |
 | 128 | script-inserted scripts async + load/error; flex ignores abspos children |
+| 129 | tap a text field to type; stale-focus crash; document.compareDocumentPosition; ordered inserted scripts; SVG aspect |
 
 ## 7. Not done / blocked
 

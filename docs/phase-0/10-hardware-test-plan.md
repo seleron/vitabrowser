@@ -2463,3 +2463,26 @@ sign-in page should replace the view; type your email (tap the field, △)
 and tap Next -- report what happens (Next is known not to advance in the
 simulator yet). L goes back / closes the sign-in window. Also try
 youtube.com and google.com and note what they show.
+
+
+## Run 20 — results (2026-09-26 21:02 and 21:18, PCH-2000)
+
+- Autotest 28/29 SAME, interact 22/22, 0 DNS failures, 1 texture arena.
+- claude.ai "Continue with Google" opened Google's sign-in over the page
+  (window.open 1) and L closed it. The email field was tapped repeatedly
+  but no keyboard opened (TRIANGLE is needed; nothing said so), so Next
+  had nothing to send. The wordmark and button icons were distorted.
+- google.com: logo right, rest unchanged; youtube.com: blank feed.
+
+## Run 21 — hand-off: tap-to-type, Google loader fixes (patch 129)
+
+- Tapping a text field opens the keyboard; a stale focused box no longer
+  crashes typing; document.compareDocumentPosition (Google's services
+  load: 137 dependency failures -> 0); script-inserted scripts run in
+  insertion order; inline SVG keeps its aspect ratio.
+- Known: Google's Next still sends nothing in the simulator (doc 12).
+- Sim suite exit 0; cross-build green; dumps unchanged except PM-animation.
+- SHA256 first 12: VitaBrowser.vpk 0813631586f0, VitaBrowser-ext.vpk
+  c9fa2e7b1752, nsvita.elf fd7a30cccc19. Archive
+  <WORK>/vitabrowser-work/hwtest-2026-09-26-run21/. Run 20 results in
+  results-run20\.
