@@ -2377,3 +2377,60 @@ Run 17 was never tested on the device, so run 18 covers its checks too
    109 changes how range media queries are stored. Any crash, especially
    on a page with `@media (width>=…)` or inline `style="…calc(…)"`,
    should come back with its dump.
+
+
+## Run 18 — results (2026-09-26 12:14–12:34, PCH-2000, 3.65 HENkaku)
+
+- Autotest: 28/29 dumps SAME (PM-animation is time-varying), interact
+  22/22, clocks[run] arm 444, pass A–D page loads 998–1244 ms.
+- claude.ai/code: first visit 263 s to the login page, second 46 s (module
+  cache works). Buttons "did nothing": "Continue with Google" calls
+  window.open (missing; Google's GSI threw TypeError), "Continue with email"
+  had no form association and React's keydown path crashed ("oninput" in
+  document was false).
+- **Sites that "did not open" (adverts.ie, gmail.com, later even
+  lite.cnn.com): every DNS lookup failed in 0 ms with 0x8002450D =
+  SCE_KERNEL_ERROR_UID_RL_OVERFLOW.** Each image was its own vita2d texture
+  = one kernel memblock (UID), 256 KB CDRAM each; browsing image-heavy pages
+  exhausted the process's UIDs.
+- Google/YouTube: consent dialogs unusable (painted under the page,
+  collapsed, fixed-in-document, not scrollable). adverts.ie separately
+  returns a Cloudflare 403 to EVERY client on this home IP (curl, headless
+  Chromium too) — not a browser problem.
+- netsurf.log hit its 4 MiB cap at 12:21, so the manual part has log.txt
+  only.
+
+## Run 19 — hand-off: pooled textures (UID fix), consent walls, stacking, inline SVG (patches 110–124)
+
+Found and verified in the simulator with the new scripted sessions
+(VITA_SIM_SCRIPT: tap/drag/eval/nav/shot; patch 110) against headless
+Chromium references at 960x544:
+
+- **122: image textures from 8 MB pooled arenas (texpool.c) — the DNS /
+  "sites don't open" fix.** log.txt: "bitmaps: N live, KB in arenas,
+  refused" after each load. Consent answer cookie SOCS=CAI seeded for
+  Google/YouTube (no consent wall).
+- 111 JS geometry always on; 112/120 stacking contexts across levels,
+  position: fixed against the viewport and staying put, clicks and drags
+  hit what is on top; 113/114 % and calc() heights/offsets; 115 flex
+  columns size their items; 116 drag scrolls the box under the finger;
+  117/123 DOM surface (census 89 -> 16 missing: parentElement, innerText,
+  form validity API, template.content, listener objects, customElements…);
+  118 script-built forms submit, pointer events on taps; 119 rem; 121
+  inline <svg> painted; 124 SVG path fills by scanline (holes, concave).
+- texpool.c and pathfill.c were written by the local pi agent (work orders
+  T1/T3, host-tested incl. ASan soak/fuzz, reviewed, disarm-verified).
+- Clean-ish checkout: applied on top of the staged thru-109 tree; sim
+  suite green (interaction 22/22 at the Vita's pace, 25/25 pages identical
+  at both paces), cross-build green. Reference dumps unchanged except the
+  time-varying PM-animation.
+- SHA256 first 12: VitaBrowser.vpk b5a3f7ba32b9, VitaBrowser-ext.vpk
+  3d711f6f593d, nsvita.elf 162f20b4f6f5. Archive
+  <WORK>/vitabrowser-work/hwtest-2026-09-26-run19/. Run 18 results moved to
+  results-run18\.
+
+Still open: claude.ai Google sign-in needs popups (window.open + opener
+postMessage); email sign-in needs hCaptcha (iframes); YouTube's app stalls
+before requesting its feed (/youtubei) and its buttons' command service
+rejects silently; BBC story grid collapses; Stack Overflow/Reddit block the
+client (Cloudflare challenge / fingerprint).

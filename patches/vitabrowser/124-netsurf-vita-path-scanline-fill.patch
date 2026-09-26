@@ -1,0 +1,499 @@
+# netsurf (vita frontend): SVG path fills by scanline with the nonzero rule (pathfill.c)
+#
+# The path plotter filled each subpath as a triangle fan from its first
+# point, exact only for convex shapes: concave icons were blobs and holes
+# (the inside of an "o", a ring) were filled in -- visible now that inline
+# SVG paints (patch 121; Google's logo). vita_plot_path now flattens every
+# subpath first, fills the whole path once through a scanline filler with
+# the nonzero rule (so a hole wound the other way stays empty), merges spans
+# that repeat on the next row into rectangles, and strokes each subpath as
+# before.
+#
+# pathfill.c was written by the local pi agent (work order T3; host-tested
+# against a brute-force winding-number reference: 18 checks incl. 2000
+# fuzzed shapes, under ASan/UBSan; a winding disarm fails 3 of them) and
+# reviewed; the crossing x is clamped before its int conversion. The file
+# list in frontends/vita/Makefile is in patch 122.
+diff --git a/frontends/vita/pathfill.c b/frontends/vita/pathfill.c
+new file mode 100644
+index 000000000..6b342cbe8
+--- /dev/null
++++ b/frontends/vita/pathfill.c
+@@ -0,0 +1,171 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Vita frontend: scanline polygon filler for SVG paths (vita/pathfill.h).
++ * Written by the local pi agent from work order T3 (host-tested against a
++ * brute-force winding reference: 18 checks incl. 2000 fuzzed shapes, under
++ * ASan/UBSan) and reviewed.
++ */
++
++#include "vita/pathfill.h"
++#include <stdlib.h>
++#include <math.h>
++
++#define MAX_POINTS 1000000
++
++typedef struct {
++    float ax, ay, bx, by;   /* original endpoints (non-horizontal edge) */
++    float ymin, ymax;       /* min / max y, half-open interval for cy */
++    int   delta;            /* winding contribution: +1 up, -1 down */
++} Edge;
++
++typedef struct {
++    int px;      /* pixel index of the crossing: ceil(x - 0.5) */
++    int delta;   /* winding delta of the edge that made it */
++} Cross;
++
++static int cmp_cross(const void *a, const void *b)
++{
++    const Cross *ca = (const Cross *)a;
++    const Cross *cb = (const Cross *)b;
++    if (ca->px < cb->px) return -1;
++    if (ca->px > cb->px) return 1;
++    return 0;
++}
++
++static int is_finite(float v)
++{
++    return !(v != v || v == INFINITY || v == -INFINITY);
++}
++
++int polyfill(const float *xy, const int *counts, int nsub,
++             enum polyfill_rule rule,
++             int cx0, int cy0, int cx1, int cy1,
++             polyfill_span_fn fn, void *ctx)
++{
++    if (nsub <= 0 || cx0 >= cx1 || cy0 >= cy1)
++        return 0;
++
++    /* Total point count guard: beyond the cap report memory failure. */
++    long total = 0;
++    for (int i = 0; i < nsub; i++) {
++        if (counts[i] < 0) return 0; /* defensive: never index past xy */
++        total += counts[i];
++    }
++    if (total > MAX_POINTS)
++        return -1;
++
++    size_t cap = (size_t)(total > 0 ? total : 1);
++    Edge  *edges = malloc(cap * sizeof(Edge));
++    Cross *cross = malloc(cap * sizeof(Cross));
++    if (!edges || !cross) {
++        free(edges);
++        free(cross);
++        return -1;
++    }
++
++    int nedges = 0;
++    float gmin = 1e30f, gmax = -1e30f;
++
++    const float *p = xy;
++    for (int i = 0; i < nsub; i++) {
++        int n = counts[i];
++        if (n < 3) { p += n * 2; continue; }
++
++        /* Ignore the whole subpath if any coordinate is NaN/inf. */
++        int ok = 1;
++        for (int k = 0; k < n; k++) {
++            if (!is_finite(p[k*2]) || !is_finite(p[k*2+1])) { ok = 0; break; }
++        }
++        if (!ok) { p += n * 2; continue; }
++
++        for (int k = 0; k < n; k++) {
++            const float *a = p + k * 2;
++            const float *b = p + ((k + 1) % n) * 2;
++            if (a[1] == b[1]) continue; /* skip horizontal edges */
++
++            Edge e;
++            e.ax = a[0]; e.ay = a[1];
++            e.bx = b[0]; e.by = b[1];
++            if (e.by < e.ay) { e.ymin = e.by; e.ymax = e.ay; e.delta = +1; }
++            else             { e.ymin = e.ay; e.ymax = e.by; e.delta = -1; }
++            edges[nedges++] = e;
++            if (e.ymin < gmin) gmin = e.ymin;
++            if (e.ymax > gmax) gmax = e.ymax;
++        }
++        p += n * 2;
++    }
++
++    if (nedges == 0) { free(edges); free(cross); return 0; }
++
++    /* Rows whose centre cy = py+0.5 falls inside [gmin, gmax). */
++    int row_lo = (int)ceilf(gmin - 0.5f);
++    int row_hi = (int)floorf(gmax - 0.5f);
++    if (row_lo < cy0) row_lo = cy0;
++    if (row_hi >= cy1) row_hi = cy1 - 1;
++
++    for (int py = row_lo; py <= row_hi; py++) {
++        float cy = (float)py + 0.5f;
++        int nc = 0;
++
++        for (int i = 0; i < nedges; i++) {
++            Edge *e = &edges[i];
++            if (e->ymin <= cy && cy < e->ymax) {
++                float x = e->ax + (e->bx - e->ax) * (cy - e->ay) / (e->by - e->ay);
++                if (x < -1e6f) x = -1e6f;   /* keep the int conversion defined */
++                if (x > 1e6f) x = 1e6f;
++                int px = (int)ceilf(x - 0.5f);
++                cross[nc].px = px;
++                cross[nc].delta = e->delta;
++                nc++;
++            }
++        }
++
++        if (nc == 0)
++            continue;
++
++        qsort(cross, (size_t)nc, sizeof(Cross), cmp_cross);
++
++        int w = 0;
++        int span_start = -1;
++
++        for (int i = 0; i < nc; i++) {
++            int neww = w + cross[i].delta;
++            int was_in = (rule == POLYFILL_NONZERO) ? (w != 0) : (w & 1);
++            int is_in  = (rule == POLYFILL_NONZERO) ? (neww != 0) : (neww & 1);
++
++            if (was_in && !is_in) {
++                int x0 = span_start, x1 = cross[i].px;
++                if (x0 < cx0) x0 = cx0;
++                if (x1 > cx1) x1 = cx1;
++                if (x0 < x1)
++                    fn(ctx, py, x0, x1);
++                span_start = -1;
++            } else if (!was_in && is_in) {
++                span_start = cross[i].px;
++            }
++            w = neww;
++        }
++    }
++
++    free(edges);
++    free(cross);
++    return 0;
++}
+diff --git a/frontends/vita/pathfill.h b/frontends/vita/pathfill.h
+new file mode 100644
+index 000000000..9dfc1e9bf
+--- /dev/null
++++ b/frontends/vita/pathfill.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef POLYFILL_H
++#define POLYFILL_H
++
++#include <stddef.h>
++
++enum polyfill_rule { POLYFILL_NONZERO = 0, POLYFILL_EVENODD = 1 };
++
++/* Receives one span: pixels x0 .. x1-1 on row y (x0 < x1). */
++typedef void (*polyfill_span_fn)(void *ctx, int y, int x0, int x1);
++
++/*
++ * Fill a shape made of nsub closed polygons ("subpaths").
++ * xy holds every point, x then y, subpath after subpath; counts[i]
++ * is the number of points in subpath i (each subpath is implicitly
++ * closed: its last point joins its first). A subpath with fewer than
++ * 3 points contributes nothing. Coordinates are floats in pixels.
++ *
++ * A pixel (px, py) is inside when its CENTRE (px + 0.5, py + 0.5) is
++ * inside the shape under the fill rule. Edges are treated half-open
++ * so that a centre lying exactly on an edge belongs to exactly one of
++ * two shapes sharing that edge: a point is inside if the ray to the
++ * right crosses edges with winding != 0 (nonzero) / odd count
++ * (evenodd), counting an edge from (x0,y0) to (x1,y1) when
++ * min(y0,y1) <= cy < max(y0,y1).
++ *
++ * Only pixels inside the clip rectangle [cx0, cx1) x [cy0, cy1) are
++ * reported. Spans on a row are reported left to right, never
++ * overlapping, adjacent spans merged. Rows are reported top to
++ * bottom.
++ *
++ * Returns 0 on success, -1 if memory ran out (nothing more is
++ * reported after that).
++ */
++int polyfill(const float *xy, const int *counts, int nsub,
++             enum polyfill_rule rule,
++             int cx0, int cy0, int cx1, int cy1,
++             polyfill_span_fn fn, void *ctx);
++
++#endif /* POLYFILL_H */
+diff --git a/frontends/vita/plot.c b/frontends/vita/plot.c
+index f3213e663..afb490951 100644
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -36,6 +36,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
+ 
+@@ -48,6 +49,7 @@
+ #include "vita/plot_geom.h"
+ #include "vita/bitmap.h"
+ #include "vita/plot.h"
++#include "vita/pathfill.h"
+ #include "vita/diag.h"
+ #include "vita/text.h"
+ 
+@@ -578,18 +580,99 @@ static void path_xform(const float t[6], float x, float y, float *ox,
+ 	*oy = t[1] * x + t[3] * y + t[5];
+ }
+ 
+-/** Paint one flattened path segment list (fill then stroke). */
+-static void path_flush(const plot_style_t *style, float *xy, unsigned int n,
+-		       bool closed)
++/* SVG paths: a fill covers the WHOLE path (every subpath together, so a
++ * hole wound the other way stays empty: the inside of an "o", a ring),
++ * by the nonzero rule, through the scanline filler (vita/pathfill.c).
++ * The old fan per subpath was exact only for convex shapes: concave icons
++ * came out as blobs. Spans that repeat on the next row merge into one
++ * rectangle, so an icon costs a few draws, not one per pixel row. */
++
++#define PATH_PENDING 16
++
++struct span_merge {
++	int x0[PATH_PENDING], x1[PATH_PENDING], y0[PATH_PENDING],
++		y1[PATH_PENDING];
++	int n;
++	colour c;
++};
++
++static void span_flush_one(struct span_merge *m, int i)
+ {
+-	if (n < 2)
+-		return;
+-	if (style->fill_type != PLOT_OP_TYPE_NONE && n >= 3)
+-		vita_plot_fan(xy, n, vita_plot_rgba(style->fill_colour,
+-						    VITA_BUCKET_SOLID));
+-	if (style->stroke_type != PLOT_OP_TYPE_NONE)
+-		stroke_polyline(xy, n, closed, stroke_px(style),
+-				style->stroke_colour);
++	vita_plot_fill_rect(m->x0[i], m->y0[i], m->x1[i], m->y1[i], m->c,
++			    VITA_BUCKET_SOLID);
++	m->n--;
++	m->x0[i] = m->x0[m->n]; m->x1[i] = m->x1[m->n];
++	m->y0[i] = m->y0[m->n]; m->y1[i] = m->y1[m->n];
++}
++
++static void span_cb(void *ctx, int y, int x0, int x1)
++{
++	struct span_merge *m = ctx;
++	int i;
++
++	for (i = 0; i < m->n; i++) {
++		if (m->y1[i] < y) {		/* a row was skipped: done */
++			span_flush_one(m, i--);
++			continue;
++		}
++		if (m->x0[i] == x0 && m->x1[i] == x1 && m->y1[i] == y) {
++			m->y1[i] = y + 1;
++			return;
++		}
++	}
++	if (m->n == PATH_PENDING)
++		span_flush_one(m, 0);
++	m->x0[m->n] = x0; m->x1[m->n] = x1;
++	m->y0[m->n] = y; m->y1[m->n] = y + 1;
++	m->n++;
++}
++
++struct path_pts {
++	float *xy;		/* all subpaths' points */
++	int *counts;		/* points per subpath */
++	bool *closed;
++	unsigned int n, size;	/* points */
++	int nsub, subsize;
++};
++
++static bool pts_point(struct path_pts *pp, float x, float y)
++{
++	if (pp->nsub == 0 || pp->n >= 65536)
++		return false;
++	if (pp->n == pp->size) {
++		unsigned int size = pp->size ? pp->size * 2 : 256;
++		float *xy = realloc(pp->xy, size * 2 * sizeof(float));
++		if (xy == NULL)
++			return false;
++		pp->xy = xy;
++		pp->size = size;
++	}
++	pp->xy[pp->n * 2] = x;
++	pp->xy[pp->n * 2 + 1] = y;
++	pp->n++;
++	pp->counts[pp->nsub - 1]++;
++	return true;
++}
++
++static bool pts_subpath(struct path_pts *pp)
++{
++	if (pp->nsub == pp->subsize) {
++		int size = pp->subsize ? pp->subsize * 2 : 16;
++		int *c = realloc(pp->counts, size * sizeof(int));
++		bool *cl;
++		if (c == NULL)
++			return false;
++		pp->counts = c;
++		cl = realloc(pp->closed, size * sizeof(bool));
++		if (cl == NULL)
++			return false;
++		pp->closed = cl;
++		pp->subsize = size;
++	}
++	pp->counts[pp->nsub] = 0;
++	pp->closed[pp->nsub] = false;
++	pp->nsub++;
++	return true;
+ }
+ 
+ static nserror
+@@ -599,66 +682,84 @@ vita_plot_path(const struct redraw_context *ctx,
+ 	       unsigned int n,
+ 	       const float transform[6])
+ {
+-	/* SVG paths: flatten Beziers to polylines, one subpath at a time.
+-	 * Fills are fans, exact only for convex subpaths. */
+-	float xy[256 * 2];
+-	unsigned int count = 0;
++	struct path_pts pp;
+ 	unsigned int i = 0;
+ 	float cx = 0, cy = 0;
+-	bool closed = false;
++	int k;
+ 
++	(void)ctx;
+ 	trace("PATH VERTICIES %u WIDTH %f", n,
+ 	      plot_style_fixed_to_float(pstyle->stroke_width));
++	memset(&pp, 0, sizeof(pp));
+ 	while (i < n) {
+ 		int cmd = (int)p[i];
+ 		if (cmd == PLOTTER_PATH_MOVE && i + 2 < n) {
+-			path_flush(pstyle, xy, count, closed);
+-			count = 0;
+-			closed = false;
++			if (!pts_subpath(&pp))
++				break;
+ 			path_xform(transform, p[i + 1], p[i + 2], &cx, &cy);
+-			xy[0] = cx;
+-			xy[1] = cy;
+-			count = 1;
++			pts_point(&pp, cx, cy);
+ 			i += 3;
+ 		} else if (cmd == PLOTTER_PATH_LINE && i + 2 < n) {
++			if (pp.nsub == 0 && !pts_subpath(&pp))
++				break;
+ 			path_xform(transform, p[i + 1], p[i + 2], &cx, &cy);
+-			if (count < 256) {
+-				xy[count * 2] = cx;
+-				xy[count * 2 + 1] = cy;
+-				count++;
+-			}
++			pts_point(&pp, cx, cy);
+ 			i += 3;
+ 		} else if (cmd == PLOTTER_PATH_BEZIER && i + 6 < n) {
+ 			float x1, y1, x2, y2, x3, y3;
+ 			int s;
++			if (pp.nsub == 0 && !pts_subpath(&pp))
++				break;
+ 			path_xform(transform, p[i + 1], p[i + 2], &x1, &y1);
+ 			path_xform(transform, p[i + 3], p[i + 4], &x2, &y2);
+ 			path_xform(transform, p[i + 5], p[i + 6], &x3, &y3);
+ 			for (s = 1; s <= VITA_BEZIER_SEGMENTS; s++) {
+ 				float t = (float)s / VITA_BEZIER_SEGMENTS;
+ 				float u = 1.0f - t;
+-				float bx = u * u * u * cx + 3 * u * u * t * x1 +
+-					3 * u * t * t * x2 + t * t * t * x3;
+-				float by = u * u * u * cy + 3 * u * u * t * y1 +
+-					3 * u * t * t * y2 + t * t * t * y3;
+-				if (count < 256) {
+-					xy[count * 2] = bx;
+-					xy[count * 2 + 1] = by;
+-					count++;
+-				}
++				pts_point(&pp, u * u * u * cx + 3 * u * u * t * x1 +
++					  3 * u * t * t * x2 + t * t * t * x3,
++					  u * u * u * cy + 3 * u * u * t * y1 +
++					  3 * u * t * t * y2 + t * t * t * y3);
+ 			}
+ 			cx = x3;
+ 			cy = y3;
+ 			i += 7;
+ 		} else if (cmd == PLOTTER_PATH_CLOSE) {
+-			closed = true;
++			if (pp.nsub > 0)
++				pp.closed[pp.nsub - 1] = true;
+ 			i += 1;
+ 		} else {
+ 			/* Malformed or truncated path: stop, keep what we have. */
+ 			break;
+ 		}
+ 	}
+-	path_flush(pstyle, xy, count, closed);
++
++	if (pstyle->fill_type != PLOT_OP_TYPE_NONE && pp.n >= 3 &&
++	    !vita_clip_empty) {
++		struct span_merge m;
++		m.n = 0;
++		m.c = pstyle->fill_colour;
++		vita_plot_calls++;
++		(void)polyfill(pp.xy, pp.counts, pp.nsub, POLYFILL_NONZERO,
++			       vita_clip.x0, vita_clip.y0, vita_clip.x1,
++			       vita_clip.y1, span_cb, &m);
++		while (m.n > 0)
++			span_flush_one(&m, 0);
++	}
++	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
++		unsigned int at = 0;
++		for (k = 0; k < pp.nsub; k++) {
++			if (pp.counts[k] >= 2)
++				stroke_polyline(pp.xy + at * 2,
++						(unsigned int)pp.counts[k],
++						pp.closed[k], stroke_px(pstyle),
++						pstyle->stroke_colour);
++			at += (unsigned int)pp.counts[k];
++		}
++	}
++	free(pp.xy);
++	free(pp.counts);
++	free(pp.closed);
+ 	return NSERROR_OK;
+ }
+ 
