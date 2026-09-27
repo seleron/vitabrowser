@@ -34,13 +34,22 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
     # /sse: a text/event-stream with the events the page checks, then the
     #   server closes the connection (the page's close() must stop the
     #   client before it would reconnect).
+    def stream_start(self, ctype):
+        # Chunked framing is HTTP/1.1: answered as the handler's default
+        # HTTP/1.0, curl would pass the chunk-size lines through as body.
+        # One response per connection, so nothing else needs keep-alive.
+        self.protocol_version = "HTTP/1.1"
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def do_GET(self):
         if self.path == "/progress-stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
+            self.stream_start("text/plain")
             for i in range(20):
                 self.wfile.write(("%08x\r\n" % len("chunk%d " % i))
                                  .encode() + ("chunk%d " % i).encode()
@@ -51,11 +60,7 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             self.wfile.flush()
             return
         if self.path == "/sse":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
+            self.stream_start("text/event-stream")
             events = [
                 "data: 1\n\n",
                 "data: 2\n\n",
