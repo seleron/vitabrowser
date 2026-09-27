@@ -55,9 +55,9 @@ implementations — adequacy per site is an empirical question.
 | localStorage, sessionStorage (R6) | present | 10 / 6 references |
 | history.pushState | present | 2 references |
 | canvas `measureText` | partial | `qjs_canvas_measure_text_width` routes through the real hardware-measured font path |
-| **EventSource / SSE** (R3) | **ABSENT** | **0 references** |
+| **EventSource / SSE** (R3) | **REAL (Patch 131, 2026-09-27)** | was 0 references; now a spec parser in `vita_polyfill.js` on the native slot -- see B1 |
 | **WebSocket** (R3) | **ABSENT, deliberate** | only a comment: globals "stay absent until they can provide storage, transport, or byte semantics" |
-| **XHR streaming** (R3) | **ABSENT** | `macos9_js_fetch.c:314` sets `readyState` directly to `4`. No `readyState 3`, no `onprogress` — responses are all-or-nothing |
+| **XHR streaming** (R3) | **REAL (Patch 131, 2026-09-27)** | was: `macos9_js_fetch.c:314` set `readyState` directly to `4`. Now readyState 2/3 + `progress` per scheduler pass. `fetch()` bodies still arrive whole -- see B1 |
 | IndexedDB, Cache Storage, File/FileReader, object URLs, Notifications | deliberately absent | same design rule: absent beats fake, so feature detection picks a working path |
 
 Encouraging context: MacSurf's own fix commentary references debugging against
@@ -84,6 +84,16 @@ WebSocket is a larger job and may not be required if SSE suffices.
 
 **Action: do not copy `macos9_js_fetch.c`'s completion-only model.** This is the
 single most important v1 decision that protects the end goal.
+
+**Status (2026-09-27, Patch 131, doc 13):** XHR streaming and `EventSource`
+are done. The simulator's S5 gate (`JS-streaming`) passes 7/7 over http and
+https, and the full suite exits 0. **Still open for claude.ai:** streaming
+`fetch()` bodies. Modern apps read SSE through
+`fetch(...).then(r => r.body.getReader())`, and `Response.body` still
+resolves only at DONE. The native half is already in place
+(`__xhrNativeTake` with discard), so this is the next increment: resolve
+`fetch()` at HEADERS_RECEIVED with a `ReadableStream` body fed by progress
+ticks. WebSocket is still absent.
 
 ### B2 — Auth and bot protection (R4, R5)
 
@@ -136,7 +146,7 @@ Progressively harder pages, each a real checkpoint:
 | S2 | a WordPress / news page | CSS cascade, images, floats |
 | S3 | a jQuery-driven page | JS execution, DOM mutation |
 | S4 | any ES-module SPA bundle that boots | R1, R2 |
-| S5 | **a page that streams via SSE** | **B1 — the gate** |
+| S5 | **a page that streams via SSE** | **B1 — the gate** (simulator: PASS, Patch 131) |
 | S6 | an authenticated session behind OAuth | B2 |
 | S7 | `claude.ai/code` | everything |
 

@@ -6,7 +6,7 @@ mid-flight: its C/JS edits existed only in the desktop's applied tree
 design. The desktop was offline, so this session rebuilt everything from
 the repository and GitHub, then re-did Patch 131 from scratch. This
 document records what that took, because a from-scratch rebuild had never
-been done before and it found three problems.
+been done before and it found four problems.
 
 ## 1. Reproducing the work tree: `tools/bootstrap-work.sh`
 
@@ -67,6 +67,31 @@ binary (it needs the prefix and the patched tree), so this is cosmetic. It
 does mean the golden-plotstream checks (doc 03) have not run since the
 QuickJS bridge landed.
 
+### Finding 4: the simulator linked the wrong libparserutils, so every page was blank
+
+The first full suite run here (exit 1) failed only at
+`21-NET-https-rogue: LOADED OR MISSING`. The real failure was much bigger:
+**every** page, `file:` ones included, failed in `html_create` with
+`DOM_HUBBUB_HUBBUB_ERR_BADENCODING` (215 "content create FAILED" in
+netsurf.log). `run-vita-sim.sh` builds a `WITHOUT_ICONV_FILTER`
+libparserutils overlay because the stand-in libc's `iconv_open` always
+fails, as newlib's does on the Vita. It relied on `PKG_CONFIG_PATH` order to
+link that overlay, but pkgconf 1.8 (Ubuntu 24.04) prints the engine
+prefix's `-L` first, so the iconv libparserutils was linked instead. The
+network checks compare NET pages with L1, and two blank pages compare
+equal, so they passed. Only the rogue-certificate check, which looks for
+a page title, noticed.
+
+Fix: the overlay leads `LDFLAGS` (which the frontend Makefile appends to),
+and the suite now fails if the first page run has any failed content
+creation. An `nm` check for glibc `iconv` was tried first and dropped: it
+cannot tell the two libraries apart, because NetSurf's `utils/utf8.c`
+references iconv itself.
+
+It is unknown whether the desktop's pkg-config ordered these the other way,
+or whether its runs had the same blind spot. Its reported JS and
+interaction passes suggest pages did render there.
+
 ### Script changes for sandboxed machines
 
 - `build-patched.sh`: `SKIP_REGEN=1` builds the committed stack as-is
@@ -83,3 +108,64 @@ Full recipe on a new machine:
     tools/bootstrap-work.sh
     SKIP_REGEN=1 tools/build-patched.sh   # nsmonkey link failure is expected
     CA_BUNDLE_LOCAL=/etc/ssl/certs/ca-certificates.crt tools/run-vita-sim.sh
+
+## 2. Patch 131: streaming transport (B1 / S5)
+
+Rewritten from scratch; the design is in the patch header
+(`patches/vitabrowser/131-netsurf-streaming-xhr-eventsource.patch`). In
+short: FETCH_DATA schedules one de-duplicated progress tick per scheduler
+pass, JS pulls new bytes with `__xhrNativeTake(id, discard)` (cut at a
+UTF-8 boundary), XHR walks OPENED→HEADERS_RECEIVED→LOADING→DONE with
+`progress` events, and `EventSource` is a spec parser with reconnect and
+`Last-Event-ID`.
+
+Two bugs in the committed test setup meant the gate could never have
+passed:
+
+- `JS-streaming.html` compared `readyState`, a number, with the strings
+  `'1'`/`'2'`/`'3'`, so rows 1 and 3 could never pass.
+- `httpd.py` sent `Transfer-Encoding: chunked` on Python's default HTTP/1.0
+  status line. curl de-chunks only HTTP/1.1, so the chunk framing would have
+  reached the page as body.
+
+A third was timing: the autotest dumps a page after 0.7 s without a
+repaint (`VITA_SETTLE_MS`), and the page only repainted when a row changed.
+Run 5 therefore dumped it before `close()` at 5 s over http (6/7), and
+before any result over https (no summary line). The page now closes the
+source as soon as rows 4–6 pass and ticks a line until every row has
+resolved. The engine was deliberately not changed here: an open
+EventSource must not stop a real page from ever counting as settled.
+
+Unit checks outside the simulator: the EventSource parser against mocked
+natives in Node (13/13: CRLF/CR/LF splits across chunks, BOM, comments,
+multi-line data, `id` reset, `retry`, reconnect with Last-Event-ID, 500 and
+wrong Content-Type fail for good, `close()` inside a handler stops
+dispatch); the UTF-8 cut on 1–4-byte sequences.
+
+### Result: full simulator suite, exit 0 (run 6)
+
+| Check | Result |
+|---|---|
+| streaming (JS-streaming, http + https) | **7/7, 7/7** |
+| fetch()/XHR (JS-fetch ×3) | 5/5 each |
+| JS-dom / JS-window | 13/13 / 11/11 |
+| interaction pass | 27/27 |
+| network pages | http + https plot as L1; rogue certificate refused ("Privacy error") |
+| web APIs | 158/176 present, behaviour 10/10; xrealm, popup, scriptload 4/4; modules 6/6 ×2 |
+| real-site layout regressions, clip modes, netlog mirror, DNS, probes, slow pace | all pass |
+
+Not yet on hardware. The previous session's hand-off also listed a "fetch
+summary missing" regression and an unexplained 12:07 crash. Both came
+from the lost in-progress 131 edits, and neither reproduces with this
+implementation (JS-fetch 5/5 on all three pages, no crash in six runs).
+
+## 3. Next
+
+1. **Streaming `fetch()` bodies**: resolve `fetch()` at HEADERS_RECEIVED
+   with a `ReadableStream` `Response.body` fed by progress ticks (discarding
+   takes). That is how claude.ai reads its event stream; XHR and
+   EventSource alone do not cover it.
+2. Hardware run of the 131 build: JS-streaming over the Vita's own
+   network (`tools/build-vita.sh`, needs vitaSDK; not available in the cloud
+   session).
+3. `nsmonkey` link (finding 3), to bring back the golden plot streams.
