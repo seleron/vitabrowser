@@ -535,8 +535,21 @@ static int script_step(SceCtrlData *pad)
 		}
 		e = line + strlen(line);
 		while (e > line && (e[-1] == '\n' || e[-1] == '\r' ||
-				    e[-1] == ' '))
+			    e[-1] == ' '))
 			*--e = '\0';
+		if (line[0] != '\0') {
+			/* A trailing comment: cut at the first ' #' (a
+			 * '#' at the start of the line is handled below;
+			 * arguments never contain '#'). */
+			e = line;
+			while ((e = strchr(e, '#')) != NULL) {
+				if (e == line || e[-1] == ' ') {
+					*e = '\0';
+					break;
+				}
+				e++;
+			}
+		}
 		if (line[0] == '\0' || line[0] == '#')
 			continue;
 		have = 1;
