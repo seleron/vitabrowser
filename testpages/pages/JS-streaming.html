@@ -20,18 +20,32 @@ p { margin: 3px 0; padding: 2px 6px; }
 <p id="r5" class="wait">5 EventSource named event + lastEventId: waiting</p>
 <p id="r6" class="wait">6 EventSource multi-line data: waiting</p>
 <p id="r7" class="wait">7 EventSource close(): waiting</p>
+<p id="tick">t=0.0 s</p>
 <script>
 /* Streaming transport (Patch 131, S5/B1): XHR delivers progress mid-
  * transfer (readyState 2/3 + progress events), and EventSource is a real
  * text/event-stream client. The server streams with small delays so the
  * progress is not one delivery: see httpd.py's /sse endpoint. */
-var passed = 0, total = 7;
+var passed = 0, total = 7, resolved = {};
+/* The autotest dumps a page once it has not repainted for 0.7 s, and
+ * this page only repaints when a row changes -- so it "settled" in the
+ * gaps between results (before the first one over https). Tick a line
+ * until every row has resolved (or 10 s), so the dump is the result. */
+var t0 = Date.now();
+var ticker = setInterval(function () {
+  var done = 0;
+  for (var k in resolved) done++;
+  document.getElementById('tick').textContent =
+      't=' + ((Date.now() - t0) / 1000).toFixed(1) + ' s, ' + done + '/' + total + ' resolved';
+  if (done >= total || Date.now() - t0 > 10000) clearInterval(ticker);
+}, 250);
 function pass(n, what, detail) {
   var p = document.getElementById('r' + n);
   if (!p || p.className === 'pass') return;
   p.textContent = n + ' ' + what + ': PASS' + (detail ? ' (' + detail + ')' : '');
   p.className = 'pass';
   passed++;
+  resolved[n] = 1;
   var s = document.getElementById('sum');
   s.textContent = 'JS streaming: ' + passed + '/' + total + ' passed';
   s.className = passed === total ? 'pass' : 'wait';
@@ -40,6 +54,7 @@ function pass(n, what, detail) {
 function fail(n, what, why) {
   var p = document.getElementById('r' + n);
   if (p && p.className !== 'pass') p.textContent = n + ' ' + what + ': FAIL ' + why;
+  resolved[n] = 1;
   console.log('JS-stream row ' + n + ' failed: ' + why);
 }
 
@@ -118,6 +133,7 @@ function makeES() {
   es.addEventListener('multi', function (e) {
     if (e.data === 'line1\nline2') {
       pass(6, 'EventSource multi-line data');
+      es.__checkClose();
     } else {
       fail(6, 'EventSource multi-line data', 'data=' + JSON.stringify(e.data));
     }
@@ -132,28 +148,41 @@ function makeES() {
     if (all) {
       pass(4, 'EventSource open + message',
            'open=' + openCount + ' sum=' + sum);
+      es.__checkClose();
     }
   }
   function checkNamed() {
     if (seen['tick'] && seen['tickId'] === '42') {
       pass(5, 'EventSource named event + lastEventId',
            'id=' + seen['tickId'] + ' es.lastEventId=' + es.lastEventId);
+      es.__checkClose();
     }
   }
   /* Row 7: close() must stop the stream and set readyState to CLOSED.
-   * The server keeps the SSE open, so close() (here, at 5 s) is what ends
-   * the connection; every event has arrived long before (by ~2.4 s). */
-  setTimeout(function () {
+   * The server keeps the SSE open, so close() is what ends the
+   * connection: as soon as rows 4-6 have their events (by ~2.4 s), or
+   * at 8 s if they never come. */
+  var closed = false;
+  function closeNow() {
+    if (closed) return;
+    closed = true;
     if (!es) { fail(7, 'EventSource close()', 'no es'); return; }
+    var msgs = 0;
+    es.addEventListener('message', function () { msgs++; });
     es.close();
     setTimeout(function () {
-      if (es.readyState === 2) {
+      if (es.readyState === 2 && msgs === 0) {
         pass(7, 'EventSource close()', 'readyState=2');
       } else {
-        fail(7, 'EventSource close()', 'readyState=' + es.readyState);
+        fail(7, 'EventSource close()', 'readyState=' + es.readyState +
+            ' events after close=' + msgs);
       }
     }, 200);
-  }, 5000);
+  }
+  es.__checkClose = function () {
+    if (resolved[4] && resolved[5] && resolved[6]) closeNow();
+  };
+  setTimeout(closeNow, 8000);
   if (typeof EventSource === 'undefined') {
     fail(4, 'EventSource open + message', 'EventSource undefined');
     fail(5, 'EventSource named event + lastEventId', 'EventSource undefined');

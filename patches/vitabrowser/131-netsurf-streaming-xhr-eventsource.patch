@@ -1,0 +1,778 @@
+# netsurf: streaming transport -- XHR readyState 2/3 + progress, EventSource
+#
+# North-star blocker B1 (docs/north-star.md): responses reached JS only on
+# completion (macos9_js_fetch.c set readyState straight to 4) and there was
+# no EventSource, so nothing that streams -- SSE, progress bars, token-by-
+# token model output -- could work.
+#
+# - macos9_js_fetch.c: FETCH_DATA schedules one progress tick per scheduler
+#   pass (de-duplicated with macos9_sched_is_queued; a pass can carry many
+#   curl writes). The tick sets status (always from the live fetch: after a
+#   redirect it still held the 3xx), headers and responseURL, and calls the
+#   object's __onNativeProgress(received). xhr_deliver runs a still-queued
+#   tick first, so JS always sees 2 and 3 before 4.
+# - __xhrNativeTake(id, discard): the body bytes since the last take, cut
+#   at a UTF-8 boundary while the fetch is live (a split character would
+#   decode to U+FFFD on both sides). JS pulls, so a page that never reads a
+#   partial body copies nothing; discard=1 compacts the native buffer, so a
+#   long-lived stream never grows towards the 4 MiB XHR cap.
+# - XMLHttpRequest: open() fires readystatechange (OPENED); progress ticks
+#   move to HEADERS_RECEIVED then LOADING with the partial responseText and
+#   a progress event; DONE fires progress before load. lengthComputable /
+#   total come from Content-Length (they were loaded>0 / loaded, telling a
+#   progress bar it knew a stream's size). fetch()'s own XHR skips partial
+#   copies (it resolves at DONE; streaming Response.body is the next step).
+# - EventSource (vita_polyfill.js), replacing the always-failing stub: the
+#   spec's parser (CRLF/LF/CR, BOM, comments, data joining, event, id with
+#   Last-Event-ID on reconnect, retry), open on a 200 text/event-stream,
+#   reconnect after the server closes, fail for good on an HTTP error or a
+#   wrong Content-Type, close() aborts the native slot.
+#
+# testpages/pages/JS-streaming.html (NET-js-streaming{,-https}) checks all
+# seven behaviours over http and https against tools/vita-sim/httpd.py's
+# /progress-stream and /sse.
+diff --git a/content/handlers/javascript/quickjs/macos9_js_fetch.c b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+index b0a43035b..29e13a9b1 100644
+--- a/content/handlers/javascript/quickjs/macos9_js_fetch.c
++++ b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+@@ -112,11 +112,23 @@ struct qjs_xhr_slot {
+ 	int redirect_hops;
+ 	int is_error;			/* network-level failure, not an HTTP status */
+ 	int beacon;			/* sendBeacon slot: no JS delivery, no ctx */
++
++	/* VitaBrowser (Patch 131, streaming): the body reaches JS while it
++	 * arrives, not only on completion. taken = resp_buf bytes already
++	 * handed to JS by __xhrNativeTake; received = body bytes seen in
++	 * total (resp_len drops when a discarding take compacts the
++	 * buffer, received never does). */
++	long taken;
++	long received;
+ };
+ 
+ static struct qjs_xhr_slot s_xhr_arena[QJS_XHR_MAX];
+ static int s_xhr_next_id = 1;
+ 
++/* Patch 131: xhr_deliver runs a pending progress tick first. */
++static void xhr_progress(void *p);
++static void xhr_progress_run(struct qjs_xhr_slot *s);
++
+ static void
+ xhr_free_req_headers(struct qjs_xhr_slot *s)
+ {
+@@ -301,6 +313,16 @@ xhr_deliver(void *p)
+ 	ctx = s->ctx;
+ 	if (ctx == NULL) { xhr_slot_release(s); return; }
+ 
++	/* Patch 131: the progress tick for the last bytes may still be
++	 * queued behind this delivery (or a small body arrived in the same
++	 * pass as its end): run it first, so JS always sees HEADERS_RECEIVED
++	 * and LOADING before DONE, as the spec orders them. */
++	if (macos9_sched_is_queued(xhr_progress, s)) {
++		macos9_schedule(-1, xhr_progress, s);
++		if (!s->is_error && !s->resp_poisoned && !s->hdr_poisoned)
++			xhr_progress_run(s);
++	}
++
+ 	body = (s->resp_buf != NULL) ? s->resp_buf : "";
+ 	hdrs = (s->hdr_buf != NULL) ? s->hdr_buf : "";
+ 	url_str = (s->url != NULL) ? nsurl_access(s->url) : "";
+@@ -360,6 +382,132 @@ xhr_deliver(void *p)
+ 	xhr_slot_release(s);
+ }
+ 
++/* ---- streaming progress (Patch 131) ----
++ *
++ * XHR readyState 2/3 + progress events and EventSource both need the body
++ * while it arrives. FETCH_DATA schedules one progress tick per scheduler
++ * pass (de-duplicated: a pass can carry many curl writes), which sets
++ * status and headers and calls the object's __onNativeProgress(received).
++ * The JS side pulls the new bytes itself with __xhrNativeTake, so nothing
++ * is copied for a page that never looks at a partial body, and a
++ * long-lived stream (EventSource) can discard what it has consumed
++ * instead of growing towards the byte cap.
++ *
++ * Same rule as xhr_deliver: never called from inside xhr_fetch_cb. */
++static void
++xhr_progress_run(struct qjs_xhr_slot *s)
++{
++	JSContext *ctx = s->ctx;
++	JSValue fn, ret;
++	double prevdl;
++
++	/* Always from the live fetch: after a redirect, status still holds
++	 * the 3xx that was followed. */
++	if (s->fetch != NULL) {
++		long code = fetch_http_code(s->fetch);
++		if (code > 0) s->status = (int) code;
++	}
++	JS_SetPropertyStr(ctx, s->xhr_obj, "status", JS_NewInt32(ctx, s->status));
++	JS_SetPropertyStr(ctx, s->xhr_obj, "__responseHeadersRaw",
++			JS_NewString(ctx, s->hdr_buf != NULL ? s->hdr_buf : ""));
++	if (s->url != NULL)
++		JS_SetPropertyStr(ctx, s->xhr_obj, "responseURL",
++				JS_NewString(ctx, nsurl_access(s->url)));
++
++	fn = JS_GetPropertyStr(ctx, s->xhr_obj, "__onNativeProgress");
++	if (JS_IsFunction(ctx, fn)) {
++		JSValue arg = JS_NewFloat64(ctx, (double) s->received);
++		prevdl = macsurf_qjs_deadline_push_ms(
++				macsurf_qjs_default_timeout_ms());
++		ret = JS_Call(ctx, fn, s->xhr_obj, 1, &arg);
++		macsurf_qjs_deadline_pop(prevdl);
++		if (JS_IsException(ret)) {
++			JSValue exc = JS_GetException(ctx);
++			const char *m = JS_ToCString(ctx, exc);
++			macsurf_debug_log_writef("LIFE qjs xhr progress threw: %s",
++					m ? m : "?");
++			if (m) JS_FreeCString(ctx, m);
++			JS_FreeValue(ctx, exc);
++		}
++		JS_FreeValue(ctx, ret);
++		JS_FreeValue(ctx, arg);
++	}
++	JS_FreeValue(ctx, fn);
++}
++
++static void
++xhr_progress(void *p)
++{
++	struct qjs_xhr_slot *s = (struct qjs_xhr_slot *) p;
++
++	if (s == NULL || !s->used || s->beacon || s->ctx == NULL) return;
++	/* A slot released and reused between schedule and run is a
++	 * different request: release cancels its owner's callbacks, so
++	 * this is belt and braces. */
++	xhr_progress_run(s);
++}
++
++/* Length of the longest prefix of b[0..len) that does not end inside a
++ * UTF-8 sequence, so a take never splits a character across two JS
++ * strings (each half would decode to U+FFFD). */
++static long
++xhr_utf8_safe_len(const char *b, long len)
++{
++	long i = len, back = 0;
++	unsigned char c;
++
++	while (i > 0 && back < 4) {
++		c = (unsigned char) b[i - 1];
++		if ((c & 0xC0) != 0x80) {
++			long need = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 :
++					(c >= 0xC0) ? 2 : 1;
++			/* back continuation bytes follow the lead at i-1 */
++			return (back + 1 >= need) ? len : i - 1;
++		}
++		i--; back++;
++	}
++	return len;
++}
++
++/* __xhrNativeTake(id, discard): the body bytes received since the last
++ * take, as a string ('' when none, null for an unknown slot). discard=1
++ * drops them from the buffer afterwards (streams that never need the
++ * whole body); otherwise the buffer keeps everything for the final
++ * responseText. */
++static JSValue
++qjs_xhr_native_take(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_xhr_slot *s;
++	int32_t id = 0, discard = 0;
++	long avail, n;
++	JSValue str;
++
++	(void) this_val;
++	if (argc < 1) return JS_NULL;
++	JS_ToInt32(ctx, &id, argv[0]);
++	if (argc > 1) discard = JS_ToBool(ctx, argv[1]);
++	s = xhr_slot_find(id);
++	if (s == NULL || s->beacon) return JS_NULL;
++	avail = s->resp_len - s->taken;
++	if (avail <= 0 || s->resp_buf == NULL) return JS_NewString(ctx, "");
++	/* A finished fetch has no more bytes coming: hand over the tail even
++	 * if it is a broken sequence. */
++	n = (s->fetch_live) ?
++		xhr_utf8_safe_len(s->resp_buf + s->taken, avail) : avail;
++	if (n <= 0) return JS_NewString(ctx, "");
++	str = JS_NewStringLen(ctx, s->resp_buf + s->taken, (size_t) n);
++	s->taken += n;
++	if (discard) {
++		memmove(s->resp_buf, s->resp_buf + s->taken,
++				(size_t) (s->resp_len - s->taken));
++		s->resp_len -= s->taken;
++		s->taken = 0;
++		s->resp_buf[s->resp_len] = '\0';
++	}
++	return str;
++}
++
+ /* ---- redirect target resolution + method downgrade ---- */
+ 
+ static void
+@@ -451,6 +599,7 @@ xhr_follow_redirect(struct qjs_xhr_slot *s, const char *target)
+ 
+ 	s->resp_len = 0; s->resp_poisoned = 0;
+ 	s->hdr_len = 0; s->hdr_poisoned = 0;
++	s->taken = 0; s->received = 0;
+ 
+ 	if (xhr_start_fetch(s) != 0) {
+ 		s->is_error = 1;
+@@ -479,6 +628,11 @@ xhr_fetch_cb(const fetch_msg *msg, void *pw)
+ 		long l = (long) msg->data.header_or_data.len;
+ 		xhr_accum(&s->resp_buf, &s->resp_len, &s->resp_cap,
+ 				QJS_XHR_MAX_BYTES, &s->resp_poisoned, b, l);
++		if (l > 0) s->received += l;
++		/* Patch 131: one progress tick per scheduler pass. */
++		if (!s->beacon && s->ctx != NULL &&
++		    !macos9_sched_is_queued(xhr_progress, s))
++			macos9_schedule(0, xhr_progress, s);
+ 		break;
+ 	}
+ 	case FETCH_REDIRECT: {
+@@ -831,6 +985,10 @@ macos9_js_fetch_install(JSContext *ctx, JSValueConst global)
+ 	JS_SetPropertyStr(ctx, global, "__xhrNativeAbort",
+ 			JS_NewCFunction(ctx, qjs_xhr_native_abort,
+ 					"__xhrNativeAbort", 1));
++	/* Patch 131: incremental body reads (XHR LOADING, EventSource). */
++	JS_SetPropertyStr(ctx, global, "__xhrNativeTake",
++			JS_NewCFunction(ctx, qjs_xhr_native_take,
++					"__xhrNativeTake", 2));
+ 	/* navigator.sendBeacon backend. */
+ 	JS_SetPropertyStr(ctx, global, "__beaconSend",
+ 			JS_NewCFunction(ctx, qjs_beacon_send,
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 139effbfa..a1046cbba 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -13205,9 +13205,13 @@ static void register_browser_globals(JSContext *ctx)
+ 		"XMLHttpRequest.prototype.open=function(method,url,async){"
+ 			"this._method=String(method||'GET');this._url=String(url||'');"
+ 			"this._async=(async===false)?false:true;"
+-			"this.readyState=1;"
++			"this.readyState=1;this._partial='';"
+ 			"if(typeof __workLogXHR==='function')"
+ 				"__workLogXHR('open',this._method,this._url);"
++			/* Patch 131: open() fires readystatechange (OPENED), as
++			 * every browser does; a handler assigned before open()
++			 * sees the whole 1-2-3-4 ladder. */
++			"this._fire('readystatechange');"
+ 		"};"
+ 		"XMLHttpRequest.prototype.setRequestHeader=function(k,v){"
+ 			"this._reqHeaders.push(String(k)+': '+String(v));};"
+@@ -13240,12 +13244,17 @@ static void register_browser_globals(JSContext *ctx)
+ 		/* VitaBrowser: handlers get an event (e.target.responseText is the
+ 		 * common idiom; they were called with no argument) and run over a
+ 		 * snapshot so one removing itself cannot skip the next. */
+-		"XMLHttpRequest.prototype._fire=function(type){"
++		"XMLHttpRequest.prototype._fire=function(type,loaded){"
+ 			"var t='on'+type,x=this,ev;"
+ 			"try{ev=new Event(type);}catch(e){ev={type:type,preventDefault:function(){},stopPropagation:function(){}};}"
+ 			"try{ev.target=x;ev.currentTarget=x;ev.srcElement=x;}catch(e){}"
+-			"var tot=0;try{tot=(typeof x.responseText==='string'&&x.responseText.length)||0;}catch(e){}"
+-			"try{ev.lengthComputable=tot>0;ev.loaded=tot;ev.total=tot;}catch(e){}"
++			"var got=loaded;if(got===undefined){got=0;try{got=(typeof x.responseText==='string'&&x.responseText.length)||0;}catch(e){}}"
++			/* Patch 131: total is the Content-Length (0 when the body
++			 * is chunked or close-delimited), and lengthComputable
++			 * says whether there is one -- not loaded>0, which told a
++			 * progress bar it knew the size of a stream. */
++			"var tot=0;try{var cl=x.getResponseHeader('content-length');if(cl!==null&&/^\\d+$/.test(cl))tot=+cl;}catch(e){}"
++			"try{ev.lengthComputable=tot>0;ev.loaded=got;ev.total=tot;}catch(e){}"
+ 			"if(typeof x[t]==='function'){try{x[t].call(x,ev);}catch(e){}}"
+ 			"var a=x._listeners[type];"
+ 			"if(a){a=a.slice();for(var i=0;i<a.length;i++){try{a[i].call(x,ev);}catch(e){}}}"
+@@ -13254,11 +13263,35 @@ static void register_browser_globals(JSContext *ctx)
+ 			"var ok=this.status>=200&&this.status<300;"
+ 			"if(typeof __workLogXHR==='function')"
+ 				"__workLogXHR('complete',this._method,this._url);"
++			"this._partial='';"
+ 			"this._fire('readystatechange');"
+ 			"if(this.status===0){this._fire('error');}"
+-			"else{this._fire('load');}"
++			"else{this._fire('progress');this._fire('load');}"
+ 			"this._fire('loadend');"
+ 		"};"
++		/* Patch 131 (streaming): the C side calls this once per
++		 * scheduler pass while body bytes arrive (received = bytes so
++		 * far). HEADERS_RECEIVED once, then LOADING with the partial
++		 * responseText and a progress event. fetch()'s own XHR (_fetch)
++		 * waits for DONE, and an XHR nobody listens to mid-transfer
++		 * skips the copy -- responseText is complete at DONE anyway. */
++		"XMLHttpRequest.prototype.__onNativeProgress=function(received){"
++			"if(this._slotId<0||this.readyState>=4)return;"
++			"if(this.readyState<2){this.readyState=2;this._fire('readystatechange');}"
++			"if(this._fetch)return;"
++			"var L=this._listeners,want=typeof this.onprogress==='function'||"
++				"typeof this.onreadystatechange==='function'||"
++				"(L.progress&&L.progress.length>0)||"
++				"(L.readystatechange&&L.readystatechange.length>0);"
++			"if(!want){this.readyState=3;return;}"
++			"var c=__xhrNativeTake(this._slotId,0);"
++			"if(typeof c==='string'&&c.length)this._partial+=c;"
++			"this.responseText=this._partial;"
++			"if(this.responseType===''||this.responseType==='text')this.response=this._partial;"
++			"this.readyState=3;"
++			"this._fire('readystatechange');"
++			"this._fire('progress',received);"
++		"};"
+ 		/* FormData bodies are not native-fetch-layer aware -- __xhrNativeSend
+ 		 * just JS_ToCString()s whatever it is handed. Encode multipart/form-data
+ 		 * here in JS (spec boundary format) rather than teaching the native
+@@ -13526,7 +13559,7 @@ static void register_browser_globals(JSContext *ctx)
+ 				"return Promise.reject(opts.signal.reason);}"
+ 			"return new Promise(function(resolve,reject){"
+ 				"try{"
+-					"var xhr=new XMLHttpRequest();"
++					"var xhr=new XMLHttpRequest();xhr._fetch=1;"
+ 					"xhr.open(opts.method||'GET',url,true);"
+ 					"if(opts.headers){"
+ 						"if(typeof opts.headers.forEach==='function'){"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index e72c4e64c..8e24466c0 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1501,6 +1501,220 @@
+ "\t\t\treturn a;\n"
+ "\t\t};\n"
+ "\t}\n"
++"\t/* ---- EventSource (HTML \"Server-sent events\", Patch 131) ----\n"
++"\t * A real text/event-stream client on the native XHR slot\n"
++"\t * (macos9_js_fetch.c): the C side calls __onNativeProgress once per\n"
++"\t * scheduler pass while bytes arrive, and this pulls them with\n"
++"\t * __xhrNativeTake(id, 1), which also drops them from the native\n"
++"\t * buffer, so a long-lived stream never grows towards the XHR byte cap.\n"
++"\t * The parser is the spec's: lines end in CRLF, LF or CR; data lines\n"
++"\t * join with LF; a blank line dispatches; `id` sets lastEventId (and\n"
++"\t * rides the reconnect as Last-Event-ID); `retry` sets the delay. A\n"
++"\t * dropped connection reconnects; an HTTP error or a wrong\n"
++"\t * Content-Type fails the source for good, as the spec requires. */\n"
++"\tif (typeof g.__xhrNativeSend === 'function' &&\n"
++"\t    typeof g.__xhrNativeTake === 'function') {\n"
++"\t\tvar ES = function EventSource(url, init) {\n"
++"\t\t\tif (!(this instanceof ES))\n"
++"\t\t\t\tthrow new TypeError(\"Failed to construct 'EventSource': Please use the 'new' operator\");\n"
++"\t\t\tvar a = d.createElement('a');\n"
++"\t\t\ta.href = String(url);\n"
++"\t\t\tthis.url = a.href || String(url);\n"
++"\t\t\tthis.withCredentials = !!(init && init.withCredentials);\n"
++"\t\t\tthis.readyState = 0;\n"
++"\t\t\tthis.lastEventId = '';\n"
++"\t\t\tthis.onopen = null; this.onmessage = null; this.onerror = null;\n"
++"\t\t\tthis.__l = {};\n"
++"\t\t\tthis.__retry = 3000;\n"
++"\t\t\tthis.__slot = -1;\n"
++"\t\t\tthis.__timer = 0;\n"
++"\t\t\tthis.__connect();\n"
++"\t\t};\n"
++"\t\tES.CONNECTING = 0; ES.OPEN = 1; ES.CLOSED = 2;\n"
++"\t\tES.prototype.CONNECTING = 0; ES.prototype.OPEN = 1; ES.prototype.CLOSED = 2;\n"
++"\t\tES.prototype.addEventListener = function (t, f) {\n"
++"\t\t\tif (typeof f !== 'function' && !(f && typeof f.handleEvent === 'function')) return;\n"
++"\t\t\tvar a = this.__l[t] || (this.__l[t] = []);\n"
++"\t\t\tif (a.indexOf(f) < 0) a.push(f);\n"
++"\t\t};\n"
++"\t\tES.prototype.removeEventListener = function (t, f) {\n"
++"\t\t\tvar a = this.__l[t], i;\n"
++"\t\t\tif (a && (i = a.indexOf(f)) >= 0) a.splice(i, 1);\n"
++"\t\t};\n"
++"\t\tES.prototype.dispatchEvent = function (ev) {\n"
++"\t\t\tvar t = ev.type, h = this['on' + t], a, i;\n"
++"\t\t\ttry { ev.target = this; ev.currentTarget = this; ev.srcElement = this; } catch (e) {}\n"
++"\t\t\tif (typeof h === 'function') {\n"
++"\t\t\t\ttry { h.call(this, ev); } catch (e) { report(e); }\n"
++"\t\t\t}\n"
++"\t\t\ta = (this.__l[t] || []).slice();\n"
++"\t\t\tfor (i = 0; i < a.length; i++) {\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\tif (typeof a[i] === 'function') a[i].call(this, ev);\n"
++"\t\t\t\t\telse a[i].handleEvent(ev);\n"
++"\t\t\t\t} catch (e) { report(e); }\n"
++"\t\t\t}\n"
++"\t\t\treturn true;\n"
++"\t\t};\n"
++"\t\tfunction report(e) {\n"
++"\t\t\tif (typeof g.reportError === 'function') {\n"
++"\t\t\t\ttry { g.reportError(e); return; } catch (e2) {}\n"
++"\t\t\t}\n"
++"\t\t\ttry { console.log('EventSource handler threw: ' + e); } catch (e3) {}\n"
++"\t\t}\n"
++"\t\tfunction simple(type) {\n"
++"\t\t\tvar ev;\n"
++"\t\t\ttry { ev = new Event(type); } catch (e) { ev = { type: type }; }\n"
++"\t\t\treturn ev;\n"
++"\t\t}\n"
++"\t\tES.prototype.__connect = function () {\n"
++"\t\t\tvar self = this, hdrs = ['Accept: text/event-stream', 'Cache-Control: no-cache'];\n"
++"\t\t\tif (this.lastEventId !== '') hdrs.push('Last-Event-ID: ' + this.lastEventId);\n"
++"\t\t\tthis.__buf = '';\n"
++"\t\t\tthis.__data = ''; this.__event = ''; this.__hasData = false;\n"
++"\t\t\tthis.__pendingId = null;\n"
++"\t\t\tthis.__bom = true;\n"
++"\t\t\t/* The sink the native layer delivers to; a fresh one per\n"
++"\t\t\t * connection, so a late tick from a dead one finds it detached. */\n"
++"\t\t\tvar sink = {\n"
++"\t\t\t\tstatus: 0, __responseHeadersRaw: '', readyState: 1,\n"
++"\t\t\t\t__onNativeProgress: function () { self.__progress(sink); },\n"
++"\t\t\t\t__onNativeComplete: function () { self.__complete(sink); }\n"
++"\t\t\t};\n"
++"\t\t\tthis.__sink = sink;\n"
++"\t\t\tsink.id = g.__xhrNativeSend(sink, 'GET', this.url, null, hdrs, true);\n"
++"\t\t\tthis.__slot = sink.id;\n"
++"\t\t\tif (sink.id < 0) {\n"
++"\t\t\t\tsetTimeout(function () { if (self.__sink === sink) self.__fail(); }, 0);\n"
++"\t\t\t}\n"
++"\t\t};\n"
++"\t\tfunction header(raw, name) {\n"
++"\t\t\tvar lines = String(raw || '').split(/\\r\\n|\\n/), i, c;\n"
++"\t\t\tfor (i = 0; i < lines.length; i++) {\n"
++"\t\t\t\tc = lines[i].indexOf(':');\n"
++"\t\t\t\tif (c > 0 && lines[i].slice(0, c).trim().toLowerCase() === name)\n"
++"\t\t\t\t\treturn lines[i].slice(c + 1).trim();\n"
++"\t\t\t}\n"
++"\t\t\treturn null;\n"
++"\t\t}\n"
++"\t\tES.prototype.__progress = function (sink) {\n"
++"\t\t\tif (this.__sink !== sink || this.readyState === 2) return;\n"
++"\t\t\tif (this.readyState === 0) {\n"
++"\t\t\t\tvar ct = (header(sink.__responseHeadersRaw, 'content-type') || '').toLowerCase();\n"
++"\t\t\t\tif (sink.status !== 200 || ct.split(';')[0].trim() !== 'text/event-stream') {\n"
++"\t\t\t\t\tthis.__fail();\n"
++"\t\t\t\t\treturn;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tthis.readyState = 1;\n"
++"\t\t\t\tthis.dispatchEvent(simple('open'));\n"
++"\t\t\t\tif (this.__sink !== sink || this.readyState !== 1) return;\t/* closed in onopen */\n"
++"\t\t\t}\n"
++"\t\t\tvar chunk = g.__xhrNativeTake(sink.id, 1);\n"
++"\t\t\tif (typeof chunk === 'string' && chunk.length) this.__feed(chunk);\n"
++"\t\t};\n"
++"\t\tES.prototype.__feed = function (chunk) {\n"
++"\t\t\tvar buf = this.__buf + chunk, start = 0, i, c, line;\n"
++"\t\t\tif (this.__bom) {\n"
++"\t\t\t\tif (buf.length === 0) return;\n"
++"\t\t\t\tif (buf.charCodeAt(0) === 0xFEFF) buf = buf.slice(1);\n"
++"\t\t\t\tthis.__bom = false;\n"
++"\t\t\t}\n"
++"\t\t\tfor (i = 0; i < buf.length; i++) {\n"
++"\t\t\t\tc = buf.charCodeAt(i);\n"
++"\t\t\t\tif (c !== 10 && c !== 13) continue;\n"
++"\t\t\t\t/* A CR at the very end may be half of a CRLF: wait. */\n"
++"\t\t\t\tif (c === 13 && i + 1 === buf.length) break;\n"
++"\t\t\t\tline = buf.slice(start, i);\n"
++"\t\t\t\tif (c === 13 && buf.charCodeAt(i + 1) === 10) i++;\n"
++"\t\t\t\tstart = i + 1;\n"
++"\t\t\t\tthis.__line(line);\n"
++"\t\t\t\tif (this.readyState === 2) return;\n"
++"\t\t\t}\n"
++"\t\t\tthis.__buf = buf.slice(start);\n"
++"\t\t};\n"
++"\t\tES.prototype.__line = function (line) {\n"
++"\t\t\tvar c, field, value;\n"
++"\t\t\tif (line === '') { this.__dispatch(); return; }\n"
++"\t\t\tif (line.charCodeAt(0) === 58) return;\t/* ':' comment */\n"
++"\t\t\tc = line.indexOf(':');\n"
++"\t\t\tif (c < 0) { field = line; value = ''; }\n"
++"\t\t\telse {\n"
++"\t\t\t\tfield = line.slice(0, c);\n"
++"\t\t\t\tvalue = line.slice(c + 1);\n"
++"\t\t\t\tif (value.charCodeAt(0) === 32) value = value.slice(1);\n"
++"\t\t\t}\n"
++"\t\t\tif (field === 'data') {\n"
++"\t\t\t\tthis.__data += value + '\\n';\n"
++"\t\t\t\tthis.__hasData = true;\n"
++"\t\t\t} else if (field === 'event') {\n"
++"\t\t\t\tthis.__event = value;\n"
++"\t\t\t} else if (field === 'id') {\n"
++"\t\t\t\tif (value.indexOf('\\0') < 0) this.__pendingId = value;\n"
++"\t\t\t} else if (field === 'retry') {\n"
++"\t\t\t\tif (/^\\d+$/.test(value)) this.__retry = parseInt(value, 10);\n"
++"\t\t\t}\n"
++"\t\t};\n"
++"\t\tES.prototype.__dispatch = function () {\n"
++"\t\t\tvar type, data, ev;\n"
++"\t\t\tif (this.__pendingId !== null) {\n"
++"\t\t\t\tthis.lastEventId = this.__pendingId;\n"
++"\t\t\t\tthis.__pendingId = null;\n"
++"\t\t\t}\n"
++"\t\t\tif (!this.__hasData) { this.__event = ''; return; }\n"
++"\t\t\tdata = this.__data.slice(0, -1);\n"
++"\t\t\ttype = this.__event || 'message';\n"
++"\t\t\tthis.__data = ''; this.__event = ''; this.__hasData = false;\n"
++"\t\t\tif (typeof g.MessageEvent === 'function')\n"
++"\t\t\t\tev = new g.MessageEvent(type, { data: data, origin: originOf(this.url) });\n"
++"\t\t\telse\n"
++"\t\t\t\tev = { type: type, data: data, origin: originOf(this.url) };\n"
++"\t\t\ttry { ev.lastEventId = this.lastEventId; } catch (e) {}\n"
++"\t\t\tthis.dispatchEvent(ev);\n"
++"\t\t};\n"
++"\t\tfunction originOf(u) {\n"
++"\t\t\tvar m = /^([a-z][a-z0-9+.-]*:\\/\\/[^\\/?#]*)/i.exec(u);\n"
++"\t\t\treturn m ? m[1] : '';\n"
++"\t\t}\n"
++"\t\t/* The response ended (the server closed, or the network failed):\n"
++"\t\t * an established stream reconnects after `retry` ms; one that\n"
++"\t\t * never opened fails for good. */\n"
++"\t\tES.prototype.__complete = function (sink) {\n"
++"\t\t\tif (this.__sink !== sink || this.readyState === 2) return;\n"
++"\t\t\tvar tail = g.__xhrNativeTake(sink.id, 1);\n"
++"\t\t\tif (this.readyState === 1 && typeof tail === 'string' && tail.length) this.__feed(tail);\n"
++"\t\t\tif (this.readyState === 2) return;\n"
++"\t\t\tthis.__sink = null;\n"
++"\t\t\tthis.__slot = -1;\n"
++"\t\t\tif (this.readyState === 0 && sink.status !== 0) { this.__fail(); return; }\n"
++"\t\t\tvar self = this;\n"
++"\t\t\tthis.readyState = 0;\n"
++"\t\t\tthis.dispatchEvent(simple('error'));\n"
++"\t\t\tif (this.readyState === 2) return;\n"
++"\t\t\tthis.__timer = setTimeout(function () {\n"
++"\t\t\t\tself.__timer = 0;\n"
++"\t\t\t\tif (self.readyState === 0) self.__connect();\n"
++"\t\t\t}, this.__retry);\n"
++"\t\t};\n"
++"\t\tES.prototype.__fail = function () {\n"
++"\t\t\tthis.__stop();\n"
++"\t\t\tthis.readyState = 2;\n"
++"\t\t\tthis.dispatchEvent(simple('error'));\n"
++"\t\t};\n"
++"\t\tES.prototype.__stop = function () {\n"
++"\t\t\tif (this.__slot >= 0) {\n"
++"\t\t\t\ttry { g.__xhrNativeAbort(this.__slot); } catch (e) {}\n"
++"\t\t\t}\n"
++"\t\t\tthis.__slot = -1;\n"
++"\t\t\tthis.__sink = null;\n"
++"\t\t\tif (this.__timer) { clearTimeout(this.__timer); this.__timer = 0; }\n"
++"\t\t};\n"
++"\t\tES.prototype.close = function () {\n"
++"\t\t\tthis.__stop();\n"
++"\t\t\tthis.readyState = 2;\n"
++"\t\t};\n"
++"\t\tg.EventSource = ES;\n"
++"\t}\n"
++"\n"
+ "\t/* No network sockets or workers: construct, then fail the way a\n"
+ "\t * refused connection does, so callers fall back instead of throwing. */\n"
+ "\tfunction failing(name) {\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 8b6e5ef5e..cc673256b 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1500,6 +1500,220 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			return a;
+ 		};
+ 	}
++	/* ---- EventSource (HTML "Server-sent events", Patch 131) ----
++	 * A real text/event-stream client on the native XHR slot
++	 * (macos9_js_fetch.c): the C side calls __onNativeProgress once per
++	 * scheduler pass while bytes arrive, and this pulls them with
++	 * __xhrNativeTake(id, 1), which also drops them from the native
++	 * buffer, so a long-lived stream never grows towards the XHR byte cap.
++	 * The parser is the spec's: lines end in CRLF, LF or CR; data lines
++	 * join with LF; a blank line dispatches; `id` sets lastEventId (and
++	 * rides the reconnect as Last-Event-ID); `retry` sets the delay. A
++	 * dropped connection reconnects; an HTTP error or a wrong
++	 * Content-Type fails the source for good, as the spec requires. */
++	if (typeof g.__xhrNativeSend === 'function' &&
++	    typeof g.__xhrNativeTake === 'function') {
++		var ES = function EventSource(url, init) {
++			if (!(this instanceof ES))
++				throw new TypeError("Failed to construct 'EventSource': Please use the 'new' operator");
++			var a = d.createElement('a');
++			a.href = String(url);
++			this.url = a.href || String(url);
++			this.withCredentials = !!(init && init.withCredentials);
++			this.readyState = 0;
++			this.lastEventId = '';
++			this.onopen = null; this.onmessage = null; this.onerror = null;
++			this.__l = {};
++			this.__retry = 3000;
++			this.__slot = -1;
++			this.__timer = 0;
++			this.__connect();
++		};
++		ES.CONNECTING = 0; ES.OPEN = 1; ES.CLOSED = 2;
++		ES.prototype.CONNECTING = 0; ES.prototype.OPEN = 1; ES.prototype.CLOSED = 2;
++		ES.prototype.addEventListener = function (t, f) {
++			if (typeof f !== 'function' && !(f && typeof f.handleEvent === 'function')) return;
++			var a = this.__l[t] || (this.__l[t] = []);
++			if (a.indexOf(f) < 0) a.push(f);
++		};
++		ES.prototype.removeEventListener = function (t, f) {
++			var a = this.__l[t], i;
++			if (a && (i = a.indexOf(f)) >= 0) a.splice(i, 1);
++		};
++		ES.prototype.dispatchEvent = function (ev) {
++			var t = ev.type, h = this['on' + t], a, i;
++			try { ev.target = this; ev.currentTarget = this; ev.srcElement = this; } catch (e) {}
++			if (typeof h === 'function') {
++				try { h.call(this, ev); } catch (e) { report(e); }
++			}
++			a = (this.__l[t] || []).slice();
++			for (i = 0; i < a.length; i++) {
++				try {
++					if (typeof a[i] === 'function') a[i].call(this, ev);
++					else a[i].handleEvent(ev);
++				} catch (e) { report(e); }
++			}
++			return true;
++		};
++		function report(e) {
++			if (typeof g.reportError === 'function') {
++				try { g.reportError(e); return; } catch (e2) {}
++			}
++			try { console.log('EventSource handler threw: ' + e); } catch (e3) {}
++		}
++		function simple(type) {
++			var ev;
++			try { ev = new Event(type); } catch (e) { ev = { type: type }; }
++			return ev;
++		}
++		ES.prototype.__connect = function () {
++			var self = this, hdrs = ['Accept: text/event-stream', 'Cache-Control: no-cache'];
++			if (this.lastEventId !== '') hdrs.push('Last-Event-ID: ' + this.lastEventId);
++			this.__buf = '';
++			this.__data = ''; this.__event = ''; this.__hasData = false;
++			this.__pendingId = null;
++			this.__bom = true;
++			/* The sink the native layer delivers to; a fresh one per
++			 * connection, so a late tick from a dead one finds it detached. */
++			var sink = {
++				status: 0, __responseHeadersRaw: '', readyState: 1,
++				__onNativeProgress: function () { self.__progress(sink); },
++				__onNativeComplete: function () { self.__complete(sink); }
++			};
++			this.__sink = sink;
++			sink.id = g.__xhrNativeSend(sink, 'GET', this.url, null, hdrs, true);
++			this.__slot = sink.id;
++			if (sink.id < 0) {
++				setTimeout(function () { if (self.__sink === sink) self.__fail(); }, 0);
++			}
++		};
++		function header(raw, name) {
++			var lines = String(raw || '').split(/\r\n|\n/), i, c;
++			for (i = 0; i < lines.length; i++) {
++				c = lines[i].indexOf(':');
++				if (c > 0 && lines[i].slice(0, c).trim().toLowerCase() === name)
++					return lines[i].slice(c + 1).trim();
++			}
++			return null;
++		}
++		ES.prototype.__progress = function (sink) {
++			if (this.__sink !== sink || this.readyState === 2) return;
++			if (this.readyState === 0) {
++				var ct = (header(sink.__responseHeadersRaw, 'content-type') || '').toLowerCase();
++				if (sink.status !== 200 || ct.split(';')[0].trim() !== 'text/event-stream') {
++					this.__fail();
++					return;
++				}
++				this.readyState = 1;
++				this.dispatchEvent(simple('open'));
++				if (this.__sink !== sink || this.readyState !== 1) return;	/* closed in onopen */
++			}
++			var chunk = g.__xhrNativeTake(sink.id, 1);
++			if (typeof chunk === 'string' && chunk.length) this.__feed(chunk);
++		};
++		ES.prototype.__feed = function (chunk) {
++			var buf = this.__buf + chunk, start = 0, i, c, line;
++			if (this.__bom) {
++				if (buf.length === 0) return;
++				if (buf.charCodeAt(0) === 0xFEFF) buf = buf.slice(1);
++				this.__bom = false;
++			}
++			for (i = 0; i < buf.length; i++) {
++				c = buf.charCodeAt(i);
++				if (c !== 10 && c !== 13) continue;
++				/* A CR at the very end may be half of a CRLF: wait. */
++				if (c === 13 && i + 1 === buf.length) break;
++				line = buf.slice(start, i);
++				if (c === 13 && buf.charCodeAt(i + 1) === 10) i++;
++				start = i + 1;
++				this.__line(line);
++				if (this.readyState === 2) return;
++			}
++			this.__buf = buf.slice(start);
++		};
++		ES.prototype.__line = function (line) {
++			var c, field, value;
++			if (line === '') { this.__dispatch(); return; }
++			if (line.charCodeAt(0) === 58) return;	/* ':' comment */
++			c = line.indexOf(':');
++			if (c < 0) { field = line; value = ''; }
++			else {
++				field = line.slice(0, c);
++				value = line.slice(c + 1);
++				if (value.charCodeAt(0) === 32) value = value.slice(1);
++			}
++			if (field === 'data') {
++				this.__data += value + '\n';
++				this.__hasData = true;
++			} else if (field === 'event') {
++				this.__event = value;
++			} else if (field === 'id') {
++				if (value.indexOf('\0') < 0) this.__pendingId = value;
++			} else if (field === 'retry') {
++				if (/^\d+$/.test(value)) this.__retry = parseInt(value, 10);
++			}
++		};
++		ES.prototype.__dispatch = function () {
++			var type, data, ev;
++			if (this.__pendingId !== null) {
++				this.lastEventId = this.__pendingId;
++				this.__pendingId = null;
++			}
++			if (!this.__hasData) { this.__event = ''; return; }
++			data = this.__data.slice(0, -1);
++			type = this.__event || 'message';
++			this.__data = ''; this.__event = ''; this.__hasData = false;
++			if (typeof g.MessageEvent === 'function')
++				ev = new g.MessageEvent(type, { data: data, origin: originOf(this.url) });
++			else
++				ev = { type: type, data: data, origin: originOf(this.url) };
++			try { ev.lastEventId = this.lastEventId; } catch (e) {}
++			this.dispatchEvent(ev);
++		};
++		function originOf(u) {
++			var m = /^([a-z][a-z0-9+.-]*:\/\/[^\/?#]*)/i.exec(u);
++			return m ? m[1] : '';
++		}
++		/* The response ended (the server closed, or the network failed):
++		 * an established stream reconnects after `retry` ms; one that
++		 * never opened fails for good. */
++		ES.prototype.__complete = function (sink) {
++			if (this.__sink !== sink || this.readyState === 2) return;
++			var tail = g.__xhrNativeTake(sink.id, 1);
++			if (this.readyState === 1 && typeof tail === 'string' && tail.length) this.__feed(tail);
++			if (this.readyState === 2) return;
++			this.__sink = null;
++			this.__slot = -1;
++			if (this.readyState === 0 && sink.status !== 0) { this.__fail(); return; }
++			var self = this;
++			this.readyState = 0;
++			this.dispatchEvent(simple('error'));
++			if (this.readyState === 2) return;
++			this.__timer = setTimeout(function () {
++				self.__timer = 0;
++				if (self.readyState === 0) self.__connect();
++			}, this.__retry);
++		};
++		ES.prototype.__fail = function () {
++			this.__stop();
++			this.readyState = 2;
++			this.dispatchEvent(simple('error'));
++		};
++		ES.prototype.__stop = function () {
++			if (this.__slot >= 0) {
++				try { g.__xhrNativeAbort(this.__slot); } catch (e) {}
++			}
++			this.__slot = -1;
++			this.__sink = null;
++			if (this.__timer) { clearTimeout(this.__timer); this.__timer = 0; }
++		};
++		ES.prototype.close = function () {
++			this.__stop();
++			this.readyState = 2;
++		};
++		g.EventSource = ES;
++	}
++
+ 	/* No network sockets or workers: construct, then fail the way a
+ 	 * refused connection does, so callers fall back instead of throwing. */
+ 	function failing(name) {
