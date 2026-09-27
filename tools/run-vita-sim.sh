@@ -91,11 +91,24 @@ export PKG_CONFIG_PATH="$WORK/host-curl/lib/pkgconfig:$WORK/host-freetype/lib/pk
 export CFLAGS="-I$P/include/libutf8proc -I$ROOT/compat \
 -include macsurf_core_decls.h -Wno-error=unused-variable -Wno-error=comment -Wno-error=nested-externs -Wno-error=redundant-decls -Wno-error=missing-prototypes -Wno-error=implicit-function-declaration -Wno-error=int-conversion -DVITABROWSER_ENGINE_TRACE"
 rm -f "$NS/nsvita-sim"	# the overlay changed under it; force the relink
+# The overlay's -L must come first on the link line. PKG_CONFIG_PATH order
+# is not enough: pkgconf (1.8, Ubuntu 24.04) emits the engine prefix's -L
+# before the overlay's, so the link took the prefix's iconv libparserutils,
+# whose iconv_open always fails against the stand-in libc -- every page
+# died with BADENCODING and the L1-vs-NET comparisons below passed on two
+# blank pages. LDFLAGS from the environment is kept by the frontend
+# Makefile's `+=`, ahead of everything pkg-config adds.
+export LDFLAGS="-L$OV/lib${LDFLAGS:+ $LDFLAGS}"
 ( cd "$NS" && make TARGET=vita VITA_HOST_SIM=YES \
 	VITA_SIM_INCLUDE="$ROOT/tools/vita-stub" VITA_SIM_LIB="$OUT/libvitasim.a" \
 	VITA_SIM_QUICKJS="$WORK/host-quickjs" \
 	-j4 > "$OUT/build.log" 2>&1 ) \
   || { echo "  build FAILED"; grep -m8 -E 'error|undefined' "$OUT/build.log"; exit 1; }
+# The overlay references no iconv at all; a glibc iconv reference means
+# the prefix's libparserutils was linked instead (see LDFLAGS above).
+if nm "$NS/nsvita-sim" | grep -q ' U iconv@'; then
+	fail "nsvita-sim links the iconv libparserutils, not the overlay"
+fi
 echo "  nsvita-sim ok"
 
 echo "== app0: bundle =="
