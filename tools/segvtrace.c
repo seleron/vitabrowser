@@ -40,6 +40,18 @@ static void handler(int sig, siginfo_t *si, void *uctx_void)
 		 (unsigned long)rip);
 	fprintf(f_out, "=== END FAULT ===\n");
 	fflush(f_out);
+	/* Also to stderr (unbuffered by default): the fault loop above shows
+	 * the process must die here, so print the caller backtrace once and
+	 * terminate -- SA_NODEFER is set so this handler cannot re-enter, and
+	 * without it the same page fault re-triggers this handler forever. */
+	fprintf(stderr, "\n=== SEGVTRACE rip=%#lx rsp=%#lx fault=%p ===\n",
+		(unsigned long)rip, (unsigned long)rsp, (void *)si->si_addr);
+	if (syms)
+		for (int i = 0; i < n; i++)
+			fprintf(stderr, "[%02d] %s\n", i, syms[i]);
+	fflush(stderr);
+	signal(sig, SIG_DFL);
+	_exit(139);
 }
 
 __attribute__((constructor))
@@ -51,7 +63,7 @@ static void init(void)
 	memset(&sa, 0, sizeof sa);
 	sigemptyset(&sa.sa_mask);
 	sa.sa_sigaction = handler;
-	sa.sa_flags = SA_SIGINFO;
+	sa.sa_flags = SA_SIGINFO | SA_NODEFER;
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
 	sigaction(SIGABRT, &sa, NULL);
