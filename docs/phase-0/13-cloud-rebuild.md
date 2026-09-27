@@ -231,7 +231,10 @@ edge.
 `build-patched.sh` completes with nsmonkey; `check-patched-streams.sh`
 flags only PM-shadow-clip, with exactly the expected change (clip X1
 951 → 500); `test-vita-renderer.sh` passes 102/102 and 30/30; and
-`run-vita-sim.sh` on the 219-patch build: in progress at the time of writing (updated below when it finishes).
+`run-vita-sim.sh` **exits 0**: JS-fetch-stream 8/8 and JS-streaming 7/7
+(each over http and https), JS-fetch 5/5 ×3, JS-dom 13/13, JS-window 11/11,
+interaction 27/27 (also at the Vita's pace), APIs 161/176 with behaviour
+10/10, xrealm 4/4, and modules 6/6.
 
 ## 5. Next
 
