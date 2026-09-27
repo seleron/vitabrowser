@@ -19,12 +19,62 @@ import http.server
 import ssl
 import sys
 import threading
+import time
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("httpd %s %s\n" % (self.server.server_port,
                                             fmt % args))
+
+    # Patch 131 (S5/B1): streaming endpoints for JS-streaming.html.
+    # /progress-stream: a body in several chunks, no Content-Length (so
+    #   XHR onprogress has lengthComputable=false and the progress is real,
+    #   not one delivery).
+    # /sse: a text/event-stream with the events the page checks, then the
+    #   server closes the connection (the page's close() must stop the
+    #   client before it would reconnect).
+    def do_GET(self):
+        if self.path == "/progress-stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            for i in range(20):
+                self.wfile.write(("%08x\r\n" % len("chunk%d " % i))
+                                 .encode() + ("chunk%d " % i).encode()
+                                 + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.05)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        if self.path == "/sse":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            events = [
+                "data: 1\n\n",
+                "data: 2\n\n",
+                "data: 3\n\n",
+                "data: 4\n\n",
+                "data: 5\n\n",
+                "event: tick\nid: 42\ndata: hello\n\n",
+                "event: multi\ndata: line1\ndata: line2\n\n",
+            ]
+            for ev in events:
+                body = ev.encode()
+                self.wfile.write(("%08x\r\n" % len(body)).encode()
+                                 + body + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.3)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        return super().do_GET()
 
 
 def serve(port, directory, cert=None, key=None):

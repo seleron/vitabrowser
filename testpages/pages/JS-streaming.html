@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS streaming</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+</head>
+<body>
+<p id="sum" class="wait">JS streaming: script did not run</p>
+<p id="r1" class="wait">1 XHR readyState 3 progress: waiting</p>
+<p id="r2" class="wait">2 XHR onprogress (loaded, lengthComputable): waiting</p>
+<p id="r3" class="wait">3 XHR readystatechange ladder 1→2→3→4: waiting</p>
+<p id="r4" class="wait">4 EventSource open + message: waiting</p>
+<p id="r5" class="wait">5 EventSource named event + lastEventId: waiting</p>
+<p id="r6" class="wait">6 EventSource multi-line data: waiting</p>
+<p id="r7" class="wait">7 EventSource close(): waiting</p>
+<script>
+/* Streaming transport (Patch 131, S5/B1): XHR delivers progress mid-
+ * transfer (readyState 2/3 + progress events), and EventSource is a real
+ * text/event-stream client. The server streams with small delays so the
+ * progress is not one delivery: see httpd.py's /sse endpoint. */
+var passed = 0, total = 7;
+function pass(n, what, detail) {
+  var p = document.getElementById('r' + n);
+  if (!p || p.className === 'pass') return;
+  p.textContent = n + ' ' + what + ': PASS' + (detail ? ' (' + detail + ')' : '');
+  p.className = 'pass';
+  passed++;
+  var s = document.getElementById('sum');
+  s.textContent = 'JS streaming: ' + passed + '/' + total + ' passed';
+  s.className = passed === total ? 'pass' : 'wait';
+  console.log('JS-stream row ' + n + ' passed ' + (detail || ''));
+}
+function fail(n, what, why) {
+  var p = document.getElementById('r' + n);
+  if (p && p.className !== 'pass') p.textContent = n + ' ' + what + ': FAIL ' + why;
+  console.log('JS-stream row ' + n + ' failed: ' + why);
+}
+
+/* ---- XHR progress ---- */
+var ladder = [];
+var sawState3 = 0, sawProgress = 0, progLoaded = 0, progLC = false, progTotal = 0;
+var x = new XMLHttpRequest();
+x.open('GET', '/progress-stream');
+x.onreadystatechange = function () {
+  ladder.push(x.readyState);
+  if (x.readyState === 3) {
+    sawState3 = 1;
+    progLoaded = x.responseText ? x.responseText.length : 0;
+  }
+};
+x.onprogress = function (e) {
+  sawProgress = 1;
+  progLoaded = e.loaded;
+  progLC = e.lengthComputable;
+  progTotal = e.total;
+};
+x.onload = function () {
+  /* The ladder must be 1 -> 2 -> 3 -> 4 (repeated 3s are allowed). */
+  var okLadder = (ladder[0] || '') === '1' &&
+                 ladder.indexOf('2') > 0 &&
+                 ladder.indexOf('3') > ladder.indexOf('2') &&
+                 ladder[ladder.length - 1] === 4;
+  if (sawState3 && sawProgress && okLadder) {
+    pass(1, 'XHR readyState 3 progress', 'ladder ' + ladder.join(',') +
+        ' loaded@3=' + x.responseText.length);
+  } else {
+    fail(1, 'XHR readyState 3 progress',
+        'ladder=' + ladder.join(',') + ' state3=' + sawState3 +
+        ' progress=' + sawProgress);
+  }
+  if (sawProgress && progLC === false && progTotal === 0) {
+    /* The stream has no Content-Length: lengthComputable must be false. */
+    pass(2, 'XHR onprogress (loaded, lengthComputable)',
+        'loaded=' + progLoaded + ' lc=false total=0');
+  } else {
+    fail(2, 'XHR onprogress', 'loaded=' + progLoaded +
+        ' lc=' + progLC + ' total=' + progTotal);
+  }
+};
+x.onerror = function () { fail(1, 'XHR readyState 3 progress', 'onerror'); };
+x.send();
+
+/* ---- EventSource ---- */
+var es = null;
+function makeES() {
+  es = new EventSource('/sse');
+  var seen = {};
+  var openCount = 0;
+  es.onopen = function () { openCount++; };
+  es.addEventListener('message', function (e) {
+    seen['message:' + e.data] = (seen['message:' + e.data] || 0) + 1;
+    checkMessage();
+  });
+  es.addEventListener('tick', function (e) {
+    seen['tick'] = 1;
+    seen['tickId'] = e.lastEventId;
+    checkNamed();
+  });
+  /* multi-line data event */
+  es.addEventListener('multi', function (e) {
+    if (e.data === 'line1\nline2') {
+      pass(6, 'EventSource multi-line data');
+    } else {
+      fail(6, 'EventSource multi-line data', 'data=' + JSON.stringify(e.data));
+    }
+  });
+  function checkMessage() {
+    /* 1..5 arrive as message events with numeric data. */
+    var all = true, sum = 0;
+    for (var i = 1; i <= 5; i++) {
+      if (!seen['message:' + i]) { all = false; break; }
+      sum += i;
+    }
+    if (all) {
+      pass(4, 'EventSource open + message',
+           'open=' + openCount + ' sum=' + sum);
+    }
+  }
+  function checkNamed() {
+    if (seen['tick'] && seen['tickId'] === '42') {
+      pass(5, 'EventSource named event + lastEventId',
+           'id=' + seen['tickId'] + ' es.lastEventId=' + es.lastEventId);
+    }
+  }
+  /* Row 7: close() must stop the stream and set readyState to CLOSED. */
+  setTimeout(function () {
+    if (!es) { fail(7, 'EventSource close()', 'no es'); return; }
+    es.close();
+    setTimeout(function () {
+      if (es.readyState === 2) {
+        pass(7, 'EventSource close()', 'readyState=2');
+      } else {
+        fail(7, 'EventSource close()', 'readyState=' + es.readyState);
+      }
+    }, 200);
+  }, 4000);
+  if (typeof EventSource === 'undefined') {
+    fail(4, 'EventSource open + message', 'EventSource undefined');
+    fail(5, 'EventSource named event + lastEventId', 'EventSource undefined');
+    fail(6, 'EventSource multi-line data', 'EventSource undefined');
+    fail(7, 'EventSource close()', 'EventSource undefined');
+  }
+}
+/* file: has no /sse; run it there and the rows FAIL by timeout (the page
+ * is only asserted when served over http/https). */
+makeES();
+</script>
+</body>
+</html>

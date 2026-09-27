@@ -179,6 +179,8 @@ JS-module-http http://127.0.0.1:$HP/JS-module.html
 JS-xrealm file:///app0:/testpages/JS-xrealm.html
 JS-popup file:///app0:/testpages/JS-popup.html
 JS-scriptload file:///app0:/testpages/JS-scriptload.html
+NET-js-streaming http://127.0.0.1:$HP/JS-streaming.html
+NET-js-streaming-https https://127.0.0.1:$((HP + 1))/JS-streaming.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -300,6 +302,23 @@ for port in "$HP" $((HP + 1)); do
 	[ "$c" -ge 4 ] || jsf_bad=$((jsf_bad + 1))
 done
 [ "$jsf_bad" -eq 0 ]
+
+# Streaming transport (Patch 131, S5/B1): XHR progress (readyState 2/3,
+# onprogress) and a real EventSource over the local server's /sse and
+# /progress-stream endpoints. Each row of JS-streaming.html turns PASS only
+# on real mid-transfer delivery / real SSE events.
+echo "== streaming: XHR progress + EventSource (JS-streaming) =="
+jss_bad=0
+for f in "$R"/NET-js-streaming*.plot; do
+	[ -f "$f" ] || { echo "  missing: $f"; jss_bad=$((jss_bad + 1)); continue; }
+	n=${f##*/}
+	r=$(sed -n 's/.*STR \(JS streaming: [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
+	echo "  $n: ${r:-no summary line (script did not run?)}"
+	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
+	[ "$r" = "JS streaming: 7/7 passed" ] || jss_bad=$((jss_bad + 1))
+done
+[ "$(ls "$R"/NET-js-streaming*.plot 2>/dev/null | wc -l)" -eq 2 ] || jss_bad=$((jss_bad + 1))
+[ "$jss_bad" -eq 0 ]
 
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
 # JS-window navigates itself three times (relative location.href,
