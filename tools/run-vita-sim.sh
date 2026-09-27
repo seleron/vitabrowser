@@ -104,11 +104,6 @@ export LDFLAGS="-L$OV/lib${LDFLAGS:+ $LDFLAGS}"
 	VITA_SIM_QUICKJS="$WORK/host-quickjs" \
 	-j4 > "$OUT/build.log" 2>&1 ) \
   || { echo "  build FAILED"; grep -m8 -E 'error|undefined' "$OUT/build.log"; exit 1; }
-# The overlay references no iconv at all; a glibc iconv reference means
-# the prefix's libparserutils was linked instead (see LDFLAGS above).
-if nm "$NS/nsvita-sim" | grep -q ' U iconv@'; then
-	fail "nsvita-sim links the iconv libparserutils, not the overlay"
-fi
 echo "  nsvita-sim ok"
 
 echo "== app0: bundle =="
@@ -153,6 +148,14 @@ echo "== run: $PAGES pages =="
 ( cd "$OUT/run" && VITA_SIM_OUT="$OUT/shots" VITA_SIM_PAGES="$PAGES" \
 	timeout 300 "$NS/nsvita-sim" file:///app0:/testpages/L1-layout-basics.html )
 ls "$OUT"/shots
+# Every page must have parsed. With the wrong libparserutils linked (see
+# LDFLAGS above) each one fails with BADENCODING and draws nothing, and
+# the later comparisons of blank against blank would pass. (A symbol
+# check cannot tell: NetSurf's utils/utf8.c references iconv itself.)
+NSLOG="$OUT/run/ux0:data/VitaBrowser/netsurf.log"
+[ -f "$NSLOG" ] || fail "no netsurf.log from the page run"
+nfail=$(grep -c 'hlcache content create FAILED' "$NSLOG" || true)
+[ "$nfail" -eq 0 ] || fail "$nfail contents failed to create (parser/charset?)"
 
 echo "== autotest run (reference dumps) =="
 rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
