@@ -36,6 +36,7 @@ gcc -std=c99 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter \
 	"$ROOT/tools/test_vita_plotter.c" \
 	"$NS/frontends/vita/plot_geom.c" \
 	"$NS/frontends/vita/plot.c" \
+	"$NS/frontends/vita/pathfill.c" \
 	"$NS/frontends/vita/replay.c" \
 	"$OUT-monkey.o" -lm
 "$OUT" "$ROOT"

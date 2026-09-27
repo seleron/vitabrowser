@@ -952,28 +952,58 @@ static int ink_visible(const char *stream, const char *op, int x0, int y0,
  * widens the background-paint clip. Checked on the patched-engine captures,
  * which tools/check-patched-streams.sh keeps in step with the live engine.
  */
+/*
+ * All of a shadow's strips drawn, each fully inside the clip in force (1);
+ * all drawn but at least one cut by its clip (0); any missing (-1).
+ * Patch 97 paints an outer shadow as the strips outside its box (spec:
+ * the shadow is clipped out of the border box), not one rect under it,
+ * so a shadow is checked strip by strip.
+ */
+static int strips_visible(const char *stream, const int (*r)[4], int n)
+{
+	char op[96];
+	int i, all = 1, v;
+
+	for (i = 0; i < n; i++) {
+		snprintf(op, sizeof(op), "PLOT RECT X0 %d Y0 %d X1 %d Y1 %d",
+			 r[i][0], r[i][1], r[i][2], r[i][3]);
+		v = ink_visible(stream, op, r[i][0], r[i][1], r[i][2], r[i][3]);
+		if (v < 0)
+			return -1;
+		if (v == 0)
+			all = 0;
+	}
+	return all;
+}
+
 static void test_ink_clip(const char *root)
 {
 	char path[1024];
 	char *s;
+	/* box (10,10)-(210,90), 8px 8px: its right strip and corner. The
+	 * bottom strip is under the next box's background and not drawn. */
+	static const int drop[][4] = { { 210, 18, 218, 90 }, { 210, 90, 218, 98 } };
+	/* 10px 10px shadows: bottom strip (with the corner), right strip */
+	static const int lastc[][4] = { { 20, 70, 220, 80 }, { 210, 20, 220, 70 } };
+	static const int card[][4] = { { 20, 160, 220, 170 }, { 210, 110, 220, 160 } };
+	static const int clipd[][4] = { { 310, 70, 510, 80 }, { 500, 20, 510, 70 } };
 
 	snprintf(path, sizeof(path), "%s/testpages/patched-streams/PM-shadow.plot", root);
 	s = slurp(path);
-	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 18 Y0 18 X1 218 Y1 98",
-				       18, 18, 218, 98) == 1,
+	CHECK(s != NULL && strips_visible(s, drop, 2) == 1,
 	      "PM-shadow: 8px drop shadow fully inside its clip");
 	free(s);
 
 	snprintf(path, sizeof(path), "%s/testpages/patched-streams/PM-shadow-clip.plot", root);
 	s = slurp(path);
-	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 20 Y0 20 X1 220 Y1 80",
-				       20, 20, 220, 80) == 1,
+	CHECK(s != NULL && strips_visible(s, lastc, 2) == 1,
 	      "PM-shadow-clip: last child's shadow survives the parent clip (part A)");
-	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 20 Y0 110 X1 220 Y1 170",
-				       20, 110, 220, 170) == 1,
+	CHECK(s != NULL && strips_visible(s, card, 2) == 1,
 	      "PM-shadow-clip: overflow:hidden box keeps its own shadow (part B)");
-	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 310 Y0 20 X1 510 Y1 80",
-				       310, 20, 510, 80) == 0,
+	/* Only the clip rect's bottom edge is checked: its right edge is not
+	 * applied (the clip in force runs to x 951, not 500) -- a known gap,
+	 * docs/phase-0/13-cloud-rebuild.md. */
+	CHECK(s != NULL && strips_visible(s, clipd, 2) == 0,
 	      "PM-shadow-clip: a CSS clip rect still clips the shadow (control)");
 	free(s);
 
