@@ -59,6 +59,19 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return
+        if self.path == "/split-utf8":
+            # Patch 132: UTF-8 split mid-character across chunks, so a
+            # fetch() body reader must decode with {stream: true}.
+            self.stream_start("text/plain; charset=utf-8")
+            body = "caf\u00e9 ok \u2713".encode("utf-8")
+            for part in (body[:4], body[4:9], body[9:11], body[11:]):
+                self.wfile.write(("%08x\r\n" % len(part)).encode()
+                                 + part + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.1)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
         if self.path == "/sse":
             self.stream_start("text/event-stream")
             events = [

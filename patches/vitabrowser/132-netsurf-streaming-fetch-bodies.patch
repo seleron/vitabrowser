@@ -1,0 +1,1505 @@
+# netsurf: streaming fetch() bodies -- ReadableStream, Response.body, fetch at first bytes
+#
+# North-star B1, part 2. Apps read an event stream as
+# fetch(url).then(r => r.body.getReader()) (the Anthropic SDK, every
+# "stream the tokens" UI). The bridge's fetch() resolved only at DONE with
+# a text-only Response: no body, no arrayBuffer, and no ReadableStream in
+# the engine at all.
+#
+# - macos9_js_fetch.c: __xhrNativeTakeBytes(id, discard), the new body
+#   bytes as an ArrayBuffer (exact bytes: no UTF-8 decode, binary safe),
+#   and __redirects on the slot's JS object (Response.redirected; comparing
+#   URLs misfires on normalisation).
+# - vita_polyfill.js, each only where nothing better exists:
+#   ReadableStream (default reader, read/cancel/releaseLock/closed, pull
+#   sources, async iteration with cancel on break, tee, pipeTo,
+#   pipeThrough, ReadableStream.from), a minimal WritableStream and
+#   TransformStream, TextDecoderStream / TextEncoderStream.
+# - Response: body is a ReadableStream of Uint8Array (lazily made for
+#   string / bytes / Blob bodies); text, json, bytes, arrayBuffer, blob,
+#   formData (url-encoded), clone (tees a streamed body), bodyUsed,
+#   Response.error / json / redirect; Content-Type from the body kind.
+# - fetch(): the request starts at call time (after reading a Blob or
+#   stream body), resolves at the first body bytes (or at DONE for an
+#   empty body), feeds response.body from the progress ticks with
+#   discarding takes, closes it at DONE, errors it with TypeError on a
+#   network failure. reader.cancel() and AbortSignal abort the native
+#   fetch; an abort after resolution errors the body with the signal's
+#   reason. Headers and statusText come from the slot's raw header block.
+#   A body on GET/HEAD rejects, as the spec says.
+#
+# Known limits: request bodies go to the fetcher as a string (a binary
+# upload is decoded as UTF-8); no backpressure (the network fills the
+# queue as fast as it arrives); fetch resolves at the first body byte, not
+# at the header block.
+#
+# testpages/pages/JS-fetch-stream.html (NET-js-fetch-stream{,-https}).
+diff --git a/content/handlers/javascript/quickjs/macos9_js_fetch.c b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+index 29e13a9b1..85358283c 100644
+--- a/content/handlers/javascript/quickjs/macos9_js_fetch.c
++++ b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+@@ -344,6 +344,8 @@ xhr_deliver(void *p)
+ 			JS_NewString(ctx, url_str));
+ 	JS_SetPropertyStr(ctx, s->xhr_obj, "__responseHeadersRaw",
+ 			JS_NewString(ctx, hdrs));
++	JS_SetPropertyStr(ctx, s->xhr_obj, "__redirects",
++			JS_NewInt32(ctx, s->redirect_hops));
+ 
+ 	macsurf_debug_log_writef(
+ 			"LIFE xhr deliver status=%d err=%d bytes=%ld url=%s",
+@@ -413,6 +415,10 @@ xhr_progress_run(struct qjs_xhr_slot *s)
+ 	if (s->url != NULL)
+ 		JS_SetPropertyStr(ctx, s->xhr_obj, "responseURL",
+ 				JS_NewString(ctx, nsurl_access(s->url)));
++	/* Patch 132: redirects followed, for fetch()'s Response.redirected
++	 * (comparing URLs misfires on normalisation, e.g. an added '/'). */
++	JS_SetPropertyStr(ctx, s->xhr_obj, "__redirects",
++			JS_NewInt32(ctx, s->redirect_hops));
+ 
+ 	fn = JS_GetPropertyStr(ctx, s->xhr_obj, "__onNativeProgress");
+ 	if (JS_IsFunction(ctx, fn)) {
+@@ -508,6 +514,39 @@ qjs_xhr_native_take(JSContext *ctx, JSValueConst this_val,
+ 	return str;
+ }
+ 
++/* __xhrNativeTakeBytes(id, discard) (Patch 132): as __xhrNativeTake, but
++ * the exact bytes as an ArrayBuffer -- no UTF-8 decode, so no boundary
++ * cut and binary bodies survive. Streaming fetch() feeds Response.body
++ * (a stream of Uint8Array) from this. null for an unknown slot. */
++static JSValue
++qjs_xhr_native_take_bytes(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_xhr_slot *s;
++	int32_t id = 0, discard = 0;
++	long n;
++	JSValue ab;
++
++	(void) this_val;
++	if (argc < 1) return JS_NULL;
++	JS_ToInt32(ctx, &id, argv[0]);
++	if (argc > 1) discard = JS_ToBool(ctx, argv[1]);
++	s = xhr_slot_find(id);
++	if (s == NULL || s->beacon) return JS_NULL;
++	n = s->resp_len - s->taken;
++	if (n <= 0 || s->resp_buf == NULL)
++		return JS_NewArrayBufferCopy(ctx, NULL, 0);
++	ab = JS_NewArrayBufferCopy(ctx, (const uint8_t *) s->resp_buf + s->taken,
++			(size_t) n);
++	s->taken += n;
++	if (discard) {
++		s->resp_len = 0;
++		s->taken = 0;
++		s->resp_buf[0] = '\0';
++	}
++	return ab;
++}
++
+ /* ---- redirect target resolution + method downgrade ---- */
+ 
+ static void
+@@ -989,6 +1028,10 @@ macos9_js_fetch_install(JSContext *ctx, JSValueConst global)
+ 	JS_SetPropertyStr(ctx, global, "__xhrNativeTake",
+ 			JS_NewCFunction(ctx, qjs_xhr_native_take,
+ 					"__xhrNativeTake", 2));
++	/* Patch 132: the same as bytes (streaming fetch() bodies). */
++	JS_SetPropertyStr(ctx, global, "__xhrNativeTakeBytes",
++			JS_NewCFunction(ctx, qjs_xhr_native_take_bytes,
++					"__xhrNativeTakeBytes", 2));
+ 	/* navigator.sendBeacon backend. */
+ 	JS_SetPropertyStr(ctx, global, "__beaconSend",
+ 			JS_NewCFunction(ctx, qjs_beacon_send,
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 8e24466c0..ca0568657 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -605,6 +605,692 @@
+ "\tObject.defineProperty(HP, Symbol.toStringTag, { value: 'Headers', configurable: true });\n"
+ "}\n"
+ "\n"
++"/* ---- Streams, Response bodies, streaming fetch() (Patch 132) ----------\n"
++" * North-star B1, part 2. Apps read an event stream as\n"
++" * fetch(url).then(r => r.body.getReader()) -- the Anthropic SDK, and every\n"
++" * \"stream the tokens\" UI, included. The bridge's fetch() resolved only at\n"
++" * DONE with a text-only Response (no body, no arrayBuffer). Here:\n"
++" * ReadableStream (default reader, async iteration, tee, pipeTo /\n"
++" * pipeThrough), a minimal WritableStream / TransformStream, the\n"
++" * TextDecoderStream / TextEncoderStream pair, a Response whose body is a\n"
++" * stream of Uint8Array, and a fetch() that resolves at the first body\n"
++" * bytes and feeds the body from the native slot's progress ticks\n"
++" * (__xhrNativeTakeBytes, macos9_js_fetch.c). Each is installed only where\n"
++" * nothing better exists. */\n"
++"\n"
++"function isFn(f) { return typeof f === 'function'; }\n"
++"function later(fn) { Promise.resolve().then(fn); }\n"
++"function settle(p, fn) { return Promise.resolve(p).then(function () {}, fn); }\n"
++"\n"
++"var RS = isFn(g.ReadableStream) ? g.ReadableStream : null;\n"
++"if (!RS) {\n"
++"\tRS = function ReadableStream(src, strategy) {\n"
++"\t\tvar self = this, hwm;\n"
++"\t\tsrc = src || {};\n"
++"\t\tstrategy = strategy || {};\n"
++"\t\thwm = strategy.highWaterMark === undefined ? 1 : Number(strategy.highWaterMark);\n"
++"\t\tdefine(this, '_src', src);\n"
++"\t\tdefine(this, '_hwm', hwm >= 0 ? hwm : 1);\n"
++"\t\tdefine(this, '_q', []);\n"
++"\t\tdefine(this, '_reqs', []);\n"
++"\t\tdefine(this, '_state', 'readable');\n"
++"\t\tdefine(this, '_closeReq', false);\n"
++"\t\tdefine(this, '_err', undefined);\n"
++"\t\tdefine(this, '_reader', null);\n"
++"\t\tdefine(this, '_disturbed', false);\n"
++"\t\tdefine(this, '_pulling', false);\n"
++"\t\tdefine(this, '_pullAgain', false);\n"
++"\t\tdefine(this, '_started', false);\n"
++"\t\tvar c = {\n"
++"\t\t\tenqueue: function (chunk) {\n"
++"\t\t\t\tif (self._state !== 'readable' || self._closeReq)\n"
++"\t\t\t\t\tthrow new TypeError('The stream is not in a state that permits enqueue');\n"
++"\t\t\t\tif (self._reqs.length) self._reqs.shift().resolve({ value: chunk, done: false });\n"
++"\t\t\t\telse self._q.push(chunk);\n"
++"\t\t\t},\n"
++"\t\t\tclose: function () {\n"
++"\t\t\t\tif (self._state !== 'readable' || self._closeReq)\n"
++"\t\t\t\t\tthrow new TypeError('The stream is not in a state that permits close');\n"
++"\t\t\t\tself._closeReq = true;\n"
++"\t\t\t\tif (!self._q.length) rsClose(self);\n"
++"\t\t\t},\n"
++"\t\t\terror: function (e) { rsError(self, e); }\n"
++"\t\t};\n"
++"\t\tObject.defineProperty(c, 'desiredSize', { get: function () {\n"
++"\t\t\treturn self._state === 'errored' ? null :\n"
++"\t\t\t\tself._state === 'closed' ? 0 : self._hwm - self._q.length;\n"
++"\t\t} });\n"
++"\t\tdefine(this, '_ctrl', c);\n"
++"\t\tvar r;\n"
++"\t\ttry { r = isFn(src.start) ? src.start(c) : undefined; }\n"
++"\t\tcatch (e) { rsError(this, e); return; }\n"
++"\t\tPromise.resolve(r).then(function () {\n"
++"\t\t\tself._started = true;\n"
++"\t\t\trsPull(self);\n"
++"\t\t}, function (e) { rsError(self, e); });\n"
++"\t};\n"
++"\tvar rsClose = function (s) {\n"
++"\t\tif (s._state !== 'readable') return;\n"
++"\t\ts._state = 'closed';\n"
++"\t\twhile (s._reqs.length) s._reqs.shift().resolve({ value: undefined, done: true });\n"
++"\t\tif (s._reader) s._reader._closedResolve();\n"
++"\t};\n"
++"\tvar rsError = function (s, e) {\n"
++"\t\tif (s._state !== 'readable') return;\n"
++"\t\ts._state = 'errored';\n"
++"\t\ts._err = e;\n"
++"\t\ts._q.length = 0;\n"
++"\t\twhile (s._reqs.length) s._reqs.shift().reject(e);\n"
++"\t\tif (s._reader) s._reader._closedReject(e);\n"
++"\t};\n"
++"\tvar rsPull = function (s) {\n"
++"\t\tif (!s._started || s._state !== 'readable' || s._closeReq || !isFn(s._src.pull)) return;\n"
++"\t\tif (s._q.length >= s._hwm && !s._reqs.length) return;\n"
++"\t\tif (s._pulling) { s._pullAgain = true; return; }\n"
++"\t\ts._pulling = true;\n"
++"\t\tvar r;\n"
++"\t\ttry { r = s._src.pull(s._ctrl); } catch (e) { rsError(s, e); return; }\n"
++"\t\tPromise.resolve(r).then(function () {\n"
++"\t\t\ts._pulling = false;\n"
++"\t\t\tif (s._pullAgain) { s._pullAgain = false; rsPull(s); }\n"
++"\t\t\telse if (s._reqs.length) rsPull(s);\n"
++"\t\t}, function (e) { rsError(s, e); });\n"
++"\t};\n"
++"\tvar rsCancel = function (s, reason) {\n"
++"\t\ts._disturbed = true;\n"
++"\t\tif (s._state === 'closed') return Promise.resolve();\n"
++"\t\tif (s._state === 'errored') return Promise.reject(s._err);\n"
++"\t\ts._q.length = 0;\n"
++"\t\trsClose(s);\n"
++"\t\tvar r;\n"
++"\t\ttry { r = isFn(s._src.cancel) ? s._src.cancel(reason) : undefined; }\n"
++"\t\tcatch (e) { return Promise.reject(e); }\n"
++"\t\treturn Promise.resolve(r).then(function () {});\n"
++"\t};\n"
++"\tvar Reader = function ReadableStreamDefaultReader(stream) {\n"
++"\t\tif (!(stream instanceof RS)) throw new TypeError('not a ReadableStream');\n"
++"\t\tif (stream._reader) throw new TypeError('ReadableStream is locked');\n"
++"\t\tvar self = this;\n"
++"\t\tdefine(this, '_s', stream);\n"
++"\t\tstream._reader = this;\n"
++"\t\tdefine(this, '_closed', new Promise(function (res, rej) {\n"
++"\t\t\tdefine(self, '_closedResolve', res);\n"
++"\t\t\tdefine(self, '_closedReject', rej);\n"
++"\t\t}));\n"
++"\t\tthis._closed.catch(function () {});\n"
++"\t\tif (stream._state === 'closed') this._closedResolve();\n"
++"\t\telse if (stream._state === 'errored') this._closedReject(stream._err);\n"
++"\t};\n"
++"\tReader.prototype.read = function () {\n"
++"\t\tvar s = this._s;\n"
++"\t\tif (!s) return Promise.reject(new TypeError('The reader has been released'));\n"
++"\t\ts._disturbed = true;\n"
++"\t\tif (s._q.length) {\n"
++"\t\t\tvar v = s._q.shift();\n"
++"\t\t\tif (s._closeReq && !s._q.length) rsClose(s);\n"
++"\t\t\telse rsPull(s);\n"
++"\t\t\treturn Promise.resolve({ value: v, done: false });\n"
++"\t\t}\n"
++"\t\tif (s._state === 'closed') return Promise.resolve({ value: undefined, done: true });\n"
++"\t\tif (s._state === 'errored') return Promise.reject(s._err);\n"
++"\t\treturn new Promise(function (resolve, reject) {\n"
++"\t\t\ts._reqs.push({ resolve: resolve, reject: reject });\n"
++"\t\t\trsPull(s);\n"
++"\t\t});\n"
++"\t};\n"
++"\tReader.prototype.cancel = function (reason) {\n"
++"\t\treturn this._s ? rsCancel(this._s, reason) :\n"
++"\t\t\tPromise.reject(new TypeError('The reader has been released'));\n"
++"\t};\n"
++"\tReader.prototype.releaseLock = function () {\n"
++"\t\tvar s = this._s;\n"
++"\t\tif (!s) return;\n"
++"\t\tvar e = new TypeError('The reader has been released');\n"
++"\t\twhile (s._reqs.length) s._reqs.shift().reject(e);\n"
++"\t\tif (s._state === 'readable') this._closedReject(e);\n"
++"\t\ts._reader = null;\n"
++"\t\tthis._s = null;\n"
++"\t};\n"
++"\tObject.defineProperty(Reader.prototype, 'closed', { get: function () { return this._closed; } });\n"
++"\tRS.prototype.getReader = function (opts) {\n"
++"\t\tif (opts && opts.mode === 'byob')\n"
++"\t\t\tthrow new TypeError('BYOB readers are not supported');\n"
++"\t\treturn new Reader(this);\n"
++"\t};\n"
++"\tRS.prototype.cancel = function (reason) {\n"
++"\t\tif (this._reader) return Promise.reject(new TypeError('ReadableStream is locked'));\n"
++"\t\treturn rsCancel(this, reason);\n"
++"\t};\n"
++"\tObject.defineProperty(RS.prototype, 'locked', { get: function () { return !!this._reader; } });\n"
++"\tRS.prototype.values = function (opts) {\n"
++"\t\tvar reader = this.getReader(), keep = !!(opts && opts.preventCancel);\n"
++"\t\tvar it = {\n"
++"\t\t\tnext: function () {\n"
++"\t\t\t\treturn reader.read().then(function (r) {\n"
++"\t\t\t\t\tif (r.done) reader.releaseLock();\n"
++"\t\t\t\t\treturn r;\n"
++"\t\t\t\t});\n"
++"\t\t\t},\n"
++"\t\t\t'return': function (v) {\n"
++"\t\t\t\tvar p = keep ? Promise.resolve() : reader.cancel();\n"
++"\t\t\t\treturn p.then(function () {\n"
++"\t\t\t\t\treader.releaseLock();\n"
++"\t\t\t\t\treturn { value: v, done: true };\n"
++"\t\t\t\t});\n"
++"\t\t\t}\n"
++"\t\t};\n"
++"\t\tif (typeof Symbol !== 'undefined' && Symbol.asyncIterator)\n"
++"\t\t\tit[Symbol.asyncIterator] = function () { return it; };\n"
++"\t\treturn it;\n"
++"\t};\n"
++"\tif (typeof Symbol !== 'undefined' && Symbol.asyncIterator)\n"
++"\t\tRS.prototype[Symbol.asyncIterator] = RS.prototype.values;\n"
++"\tRS.prototype.tee = function () {\n"
++"\t\tvar reader = this.getReader(), c1, c2, n = 0, reason = [];\n"
++"\t\tfunction pump() {\n"
++"\t\t\treturn reader.read().then(function (r) {\n"
++"\t\t\t\tif (r.done) {\n"
++"\t\t\t\t\ttry { c1.close(); } catch (e) {}\n"
++"\t\t\t\t\ttry { c2.close(); } catch (e) {}\n"
++"\t\t\t\t\treturn;\n"
++"\t\t\t\t}\n"
++"\t\t\t\ttry { c1.enqueue(r.value); } catch (e) {}\n"
++"\t\t\t\ttry { c2.enqueue(r.value); } catch (e) {}\n"
++"\t\t\t\treturn pump();\n"
++"\t\t\t}, function (e) { c1.error(e); c2.error(e); });\n"
++"\t\t}\n"
++"\t\tfunction cancelOne(r) {\n"
++"\t\t\treason.push(r);\n"
++"\t\t\tif (++n === 2) return reader.cancel(reason);\n"
++"\t\t}\n"
++"\t\tvar b1 = new RS({ start: function (c) { c1 = c; }, cancel: cancelOne });\n"
++"\t\tvar b2 = new RS({ start: function (c) { c2 = c; }, cancel: cancelOne });\n"
++"\t\tpump();\n"
++"\t\treturn [b1, b2];\n"
++"\t};\n"
++"\tRS.prototype.pipeTo = function (dest, opts) {\n"
++"\t\tvar reader = this.getReader(), writer = dest.getWriter();\n"
++"\t\topts = opts || {};\n"
++"\t\treturn new Promise(function (resolve, reject) {\n"
++"\t\t\tfunction fail(e) {\n"
++"\t\t\t\tif (!opts.preventAbort) settle(writer.abort(e));\n"
++"\t\t\t\treader.releaseLock(); writer.releaseLock();\n"
++"\t\t\t\treject(e);\n"
++"\t\t\t}\n"
++"\t\t\tif (opts.signal) {\n"
++"\t\t\t\tif (opts.signal.aborted) { reader.cancel(opts.signal.reason); fail(opts.signal.reason); return; }\n"
++"\t\t\t\topts.signal.addEventListener('abort', function () {\n"
++"\t\t\t\t\tif (!opts.preventCancel) settle(reader.cancel(opts.signal.reason));\n"
++"\t\t\t\t\tfail(opts.signal.reason);\n"
++"\t\t\t\t});\n"
++"\t\t\t}\n"
++"\t\t\t(function step() {\n"
++"\t\t\t\treader.read().then(function (r) {\n"
++"\t\t\t\t\tif (r.done) {\n"
++"\t\t\t\t\t\tvar p = opts.preventClose ? Promise.resolve() : writer.close();\n"
++"\t\t\t\t\t\treturn p.then(function () {\n"
++"\t\t\t\t\t\t\treader.releaseLock(); writer.releaseLock(); resolve();\n"
++"\t\t\t\t\t\t});\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\treturn writer.write(r.value).then(step);\n"
++"\t\t\t\t}).then(null, fail);\n"
++"\t\t\t})();\n"
++"\t\t});\n"
++"\t};\n"
++"\tRS.prototype.pipeThrough = function (pair, opts) {\n"
++"\t\tsettle(this.pipeTo(pair.writable, opts));\n"
++"\t\treturn pair.readable;\n"
++"\t};\n"
++"\tRS.from = function (iterable) {\n"
++"\t\tvar it = iterable[typeof Symbol !== 'undefined' && Symbol.asyncIterator &&\n"
++"\t\t\titerable[Symbol.asyncIterator] ? Symbol.asyncIterator : Symbol.iterator]();\n"
++"\t\treturn new RS({\n"
++"\t\t\tpull: function (c) {\n"
++"\t\t\t\treturn Promise.resolve(it.next()).then(function (r) {\n"
++"\t\t\t\t\tif (r.done) c.close(); else c.enqueue(r.value);\n"
++"\t\t\t\t});\n"
++"\t\t\t},\n"
++"\t\t\tcancel: function (r) { if (isFn(it['return'])) return it['return'](r); }\n"
++"\t\t}, { highWaterMark: 0 });\n"
++"\t};\n"
++"\tdefine(g, 'ReadableStream', RS);\n"
++"\tdefine(g, 'ReadableStreamDefaultReader', Reader);\n"
++"}\n"
++"\n"
++"if (!isFn(g.WritableStream)) {\n"
++"\tvar WS = function WritableStream(sink) {\n"
++"\t\tsink = sink || {};\n"
++"\t\tvar self = this;\n"
++"\t\tdefine(this, '_sink', sink);\n"
++"\t\tdefine(this, '_writer', null);\n"
++"\t\tdefine(this, '_state', 'writable');\n"
++"\t\tdefine(this, '_err', undefined);\n"
++"\t\tvar c = { error: function (e) { if (self._state === 'writable') { self._state = 'errored'; self._err = e; } } };\n"
++"\t\tdefine(this, '_ctrl', c);\n"
++"\t\tdefine(this, '_chain', Promise.resolve(isFn(sink.start) ? sink.start(c) : undefined));\n"
++"\t};\n"
++"\tvar Writer = function WritableStreamDefaultWriter(stream) {\n"
++"\t\tif (stream._writer) throw new TypeError('WritableStream is locked');\n"
++"\t\tvar self = this;\n"
++"\t\tdefine(this, '_s', stream);\n"
++"\t\tstream._writer = this;\n"
++"\t\tdefine(this, '_closed', new Promise(function (res, rej) {\n"
++"\t\t\tdefine(self, '_closedResolve', res);\n"
++"\t\t\tdefine(self, '_closedReject', rej);\n"
++"\t\t}));\n"
++"\t\tthis._closed.catch(function () {});\n"
++"\t};\n"
++"\tvar wsStep = function (s, fn) {\n"
++"\t\tvar p = s._chain.then(function () {\n"
++"\t\t\tif (s._state === 'errored') throw s._err;\n"
++"\t\t\treturn fn();\n"
++"\t\t});\n"
++"\t\ts._chain = p.then(null, function (e) {\n"
++"\t\t\tif (s._state === 'writable') { s._state = 'errored'; s._err = e; }\n"
++"\t\t});\n"
++"\t\treturn p;\n"
++"\t};\n"
++"\tWriter.prototype.write = function (chunk) {\n"
++"\t\tvar s = this._s;\n"
++"\t\tif (!s) return Promise.reject(new TypeError('The writer has been released'));\n"
++"\t\tif (s._state !== 'writable') return Promise.reject(s._err || new TypeError('The stream is closed'));\n"
++"\t\treturn wsStep(s, function () {\n"
++"\t\t\treturn isFn(s._sink.write) ? s._sink.write(chunk, s._ctrl) : undefined;\n"
++"\t\t}).then(function () {});\n"
++"\t};\n"
++"\tWriter.prototype.close = function () {\n"
++"\t\tvar s = this._s, w = this;\n"
++"\t\tif (!s) return Promise.reject(new TypeError('The writer has been released'));\n"
++"\t\tif (s._state !== 'writable') return Promise.reject(s._err || new TypeError('The stream is closed'));\n"
++"\t\treturn wsStep(s, function () {\n"
++"\t\t\treturn isFn(s._sink.close) ? s._sink.close() : undefined;\n"
++"\t\t}).then(function () { s._state = 'closed'; w._closedResolve(); });\n"
++"\t};\n"
++"\tWriter.prototype.abort = function (reason) {\n"
++"\t\tvar s = this._s;\n"
++"\t\tif (!s) return Promise.reject(new TypeError('The writer has been released'));\n"
++"\t\tif (s._state === 'writable') { s._state = 'errored'; s._err = reason; }\n"
++"\t\tthis._closedReject(reason);\n"
++"\t\treturn Promise.resolve(isFn(s._sink.abort) ? s._sink.abort(reason) : undefined).then(function () {});\n"
++"\t};\n"
++"\tWriter.prototype.releaseLock = function () {\n"
++"\t\tif (this._s) { this._s._writer = null; this._s = null; }\n"
++"\t};\n"
++"\tObject.defineProperty(Writer.prototype, 'closed', { get: function () { return this._closed; } });\n"
++"\tObject.defineProperty(Writer.prototype, 'ready', { get: function () { return Promise.resolve(); } });\n"
++"\tObject.defineProperty(Writer.prototype, 'desiredSize', { get: function () { return 1; } });\n"
++"\tWS.prototype.getWriter = function () { return new Writer(this); };\n"
++"\tWS.prototype.abort = function (r) { return this.getWriter().abort(r); };\n"
++"\tWS.prototype.close = function () {\n"
++"\t\tvar w = this.getWriter();\n"
++"\t\treturn w.close().then(function () { w.releaseLock(); });\n"
++"\t};\n"
++"\tObject.defineProperty(WS.prototype, 'locked', { get: function () { return !!this._writer; } });\n"
++"\tdefine(g, 'WritableStream', WS);\n"
++"\tdefine(g, 'WritableStreamDefaultWriter', Writer);\n"
++"}\n"
++"\n"
++"if (!isFn(g.TransformStream)) {\n"
++"\tvar TS = function TransformStream(t) {\n"
++"\t\tt = t || {};\n"
++"\t\tvar rc, self = this;\n"
++"\t\tvar readable = new g.ReadableStream({ start: function (c) { rc = c; } }, { highWaterMark: 0 });\n"
++"\t\tvar tc = {\n"
++"\t\t\tenqueue: function (chunk) { rc.enqueue(chunk); },\n"
++"\t\t\terror: function (e) { rc.error(e); },\n"
++"\t\t\tterminate: function () { try { rc.close(); } catch (e) {} }\n"
++"\t\t};\n"
++"\t\tObject.defineProperty(tc, 'desiredSize', { get: function () { return rc.desiredSize; } });\n"
++"\t\tvar started = Promise.resolve(isFn(t.start) ? t.start(tc) : undefined);\n"
++"\t\tvar writable = new g.WritableStream({\n"
++"\t\t\twrite: function (chunk) {\n"
++"\t\t\t\treturn started.then(function () {\n"
++"\t\t\t\t\tif (isFn(t.transform)) return t.transform(chunk, tc);\n"
++"\t\t\t\t\ttc.enqueue(chunk);\n"
++"\t\t\t\t});\n"
++"\t\t\t},\n"
++"\t\t\tclose: function () {\n"
++"\t\t\t\treturn started.then(function () {\n"
++"\t\t\t\t\treturn isFn(t.flush) ? t.flush(tc) : undefined;\n"
++"\t\t\t\t}).then(function () { try { rc.close(); } catch (e) {} });\n"
++"\t\t\t},\n"
++"\t\t\tabort: function (e) { rc.error(e); }\n"
++"\t\t});\n"
++"\t\tdefine(self, 'readable', readable);\n"
++"\t\tdefine(self, 'writable', writable);\n"
++"\t};\n"
++"\tdefine(g, 'TransformStream', TS);\n"
++"}\n"
++"\n"
++"if (!isFn(g.TextDecoderStream)) {\n"
++"\tvar TDS = function TextDecoderStream(label, opts) {\n"
++"\t\tvar d = new g.TextDecoder(label, opts);\n"
++"\t\tvar ts = new g.TransformStream({\n"
++"\t\t\ttransform: function (chunk, c) {\n"
++"\t\t\t\tvar s = d.decode(chunk, { stream: true });\n"
++"\t\t\t\tif (s) c.enqueue(s);\n"
++"\t\t\t},\n"
++"\t\t\tflush: function (c) {\n"
++"\t\t\t\tvar s = d.decode();\n"
++"\t\t\t\tif (s) c.enqueue(s);\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t\tdefine(this, 'readable', ts.readable);\n"
++"\t\tdefine(this, 'writable', ts.writable);\n"
++"\t\tdefine(this, 'encoding', d.encoding);\n"
++"\t};\n"
++"\tdefine(g, 'TextDecoderStream', TDS);\n"
++"}\n"
++"if (!isFn(g.TextEncoderStream)) {\n"
++"\tvar TES = function TextEncoderStream() {\n"
++"\t\tvar e = new g.TextEncoder();\n"
++"\t\tvar ts = new g.TransformStream({\n"
++"\t\t\ttransform: function (chunk, c) { c.enqueue(e.encode(String(chunk))); }\n"
++"\t\t});\n"
++"\t\tdefine(this, 'readable', ts.readable);\n"
++"\t\tdefine(this, 'writable', ts.writable);\n"
++"\t\tdefine(this, 'encoding', 'utf-8');\n"
++"\t};\n"
++"\tdefine(g, 'TextEncoderStream', TES);\n"
++"}\n"
++"\n"
++"/* A body as bytes: what Response and fetch() both need. */\n"
++"function concatBytes(parts, n) {\n"
++"\tvar out = new Uint8Array(n), off = 0, i;\n"
++"\tfor (i = 0; i < parts.length; i++) { out.set(parts[i], off); off += parts[i].length; }\n"
++"\treturn out;\n"
++"}\n"
++"function chunkBytes(v) {\n"
++"\tif (v instanceof Uint8Array) return v;\n"
++"\tif (v instanceof ArrayBuffer) return new Uint8Array(v);\n"
++"\tif (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);\n"
++"\tif (typeof v === 'string') return utf8Encode(v);\n"
++"\tthrow new TypeError('Received non-Uint8Array chunk');\n"
++"}\n"
++"function readAllBytes(stream) {\n"
++"\tvar reader = stream.getReader(), parts = [], n = 0;\n"
++"\treturn (function step() {\n"
++"\t\treturn reader.read().then(function (r) {\n"
++"\t\t\tif (r.done) return concatBytes(parts, n);\n"
++"\t\t\tvar b = chunkBytes(r.value);\n"
++"\t\t\tparts.push(b); n += b.length;\n"
++"\t\t\treturn step();\n"
++"\t\t});\n"
++"\t})();\n"
++"}\n"
++"\n"
++"/* Body extraction (Fetch \"extract a body\"): what init.body may be, and the\n"
++" * Content-Type it implies. Kept as text when it is text, so the common\n"
++" * cases (JSON, forms) never round-trip through bytes. */\n"
++"function extractBody(body) {\n"
++"\tif (body === undefined || body === null) return null;\n"
++"\tif (body instanceof g.ReadableStream) return { stream: body };\n"
++"\tif (typeof body === 'string') return { text: body, type: 'text/plain;charset=UTF-8' };\n"
++"\tif (isFn(g.URLSearchParams) && body instanceof g.URLSearchParams)\n"
++"\t\treturn { text: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };\n"
++"\tif (body instanceof ArrayBuffer || ArrayBuffer.isView(body))\n"
++"\t\treturn { bytes: new Uint8Array(chunkBytes(body)) };\n"
++"\tif (isFn(g.FormData) && body instanceof g.FormData && g.XMLHttpRequest &&\n"
++"\t    isFn(g.XMLHttpRequest.prototype._encodeFormData)) {\n"
++"\t\tvar enc = g.XMLHttpRequest.prototype._encodeFormData(body);\n"
++"\t\treturn { text: enc.body, type: enc.contentType };\n"
++"\t}\n"
++"\tif (isFn(g.Blob) && body instanceof g.Blob)\n"
++"\t\treturn { blob: body, type: body.type || '' };\n"
++"\treturn { text: String(body), type: 'text/plain;charset=UTF-8' };\n"
++"}\n"
++"\n"
++"var Resp = function Response(body, init) {\n"
++"\tinit = init || {};\n"
++"\tvar status = init.status === undefined ? 200 : Number(init.status);\n"
++"\tif (status !== 0 && (status < 200 || status > 599))\n"
++"\t\tthrow new RangeError(\"Failed to construct 'Response': The status provided (\" + status + ') is outside the range [200, 599].');\n"
++"\tdefine(this, '_status', status);\n"
++"\tdefine(this, '_statusText', init.statusText === undefined ? '' : String(init.statusText));\n"
++"\tdefine(this, '_headers', new g.Headers(init.headers));\n"
++"\tdefine(this, '_b', extractBody(body));\n"
++"\tdefine(this, '_used', false);\n"
++"\tdefine(this, '_stream', this._b && this._b.stream ? this._b.stream : null);\n"
++"\tif (this._b && this._b.type && !this._headers.has('content-type'))\n"
++"\t\tthis._headers.set('content-type', this._b.type);\n"
++"\tthis.url = init.url || '';\n"
++"\tthis.type = init.type || 'default';\n"
++"\tthis.redirected = !!init.redirected;\n"
++"};\n"
++"Object.defineProperty(Resp.prototype, 'status', { get: function () { return this._status; } });\n"
++"Object.defineProperty(Resp.prototype, 'statusText', { get: function () { return this._statusText; } });\n"
++"Object.defineProperty(Resp.prototype, 'ok', { get: function () { return this._status >= 200 && this._status < 300; } });\n"
++"Object.defineProperty(Resp.prototype, 'headers', { get: function () { return this._headers; } });\n"
++"Object.defineProperty(Resp.prototype, 'body', { get: function () {\n"
++"\tvar b = this._b;\n"
++"\tif (!b) return null;\n"
++"\tif (!this._stream) {\n"
++"\t\tvar once = b.text !== undefined ? utf8Encode(b.text) : b.bytes || null, blob = b.blob;\n"
++"\t\tthis._stream = new g.ReadableStream({\n"
++"\t\t\tstart: function (c) {\n"
++"\t\t\t\tif (blob) {\n"
++"\t\t\t\t\treturn blob.arrayBuffer().then(function (ab) {\n"
++"\t\t\t\t\t\tc.enqueue(new Uint8Array(ab)); c.close();\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t}\n"
++"\t\t\t\tif (once && once.length) c.enqueue(once);\n"
++"\t\t\t\tc.close();\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t}\n"
++"\treturn this._stream;\n"
++"} });\n"
++"Object.defineProperty(Resp.prototype, 'bodyUsed', { get: function () {\n"
++"\treturn this._used || !!(this._stream && this._stream._disturbed);\n"
++"} });\n"
++"Resp.prototype._take = function () {\n"
++"\tif (this.bodyUsed || (this._stream && this._stream.locked))\n"
++"\t\treturn Promise.reject(new TypeError('Body is unusable: Body has already been read'));\n"
++"\tthis._used = true;\n"
++"\tvar b = this._b;\n"
++"\tif (!b) return Promise.resolve({ bytes: new Uint8Array(0) });\n"
++"\tif (this._stream) return readAllBytes(this._stream).then(function (u) { return { bytes: u }; });\n"
++"\tif (b.text !== undefined) return Promise.resolve({ text: b.text });\n"
++"\tif (b.blob) return b.blob.arrayBuffer().then(function (ab) { return { bytes: new Uint8Array(ab) }; });\n"
++"\treturn Promise.resolve({ bytes: b.bytes });\n"
++"};\n"
++"Resp.prototype.text = function () {\n"
++"\treturn this._take().then(function (r) {\n"
++"\t\treturn r.text !== undefined ? r.text : new g.TextDecoder().decode(r.bytes);\n"
++"\t});\n"
++"};\n"
++"Resp.prototype.json = function () {\n"
++"\treturn this.text().then(function (t) { return JSON.parse(t); });\n"
++"};\n"
++"Resp.prototype.bytes = function () {\n"
++"\treturn this._take().then(function (r) {\n"
++"\t\treturn r.text !== undefined ? utf8Encode(r.text) : r.bytes;\n"
++"\t});\n"
++"};\n"
++"Resp.prototype.arrayBuffer = function () {\n"
++"\treturn this.bytes().then(function (u) {\n"
++"\t\treturn u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ?\n"
++"\t\t\tu.buffer : u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);\n"
++"\t});\n"
++"};\n"
++"Resp.prototype.blob = function () {\n"
++"\tvar type = this._headers.get('content-type') || '';\n"
++"\tif (!isFn(g.Blob)) return Promise.reject(new TypeError('Blob is not supported'));\n"
++"\treturn this.bytes().then(function (u) { return new g.Blob([u], { type: type }); });\n"
++"};\n"
++"Resp.prototype.formData = function () {\n"
++"\tvar type = (this._headers.get('content-type') || '').toLowerCase();\n"
++"\tif (!isFn(g.FormData) || type.indexOf('application/x-www-form-urlencoded') !== 0)\n"
++"\t\treturn Promise.reject(new TypeError('formData() supports url-encoded bodies only'));\n"
++"\treturn this.text().then(function (t) {\n"
++"\t\tvar fd = new g.FormData(), q = new g.URLSearchParams(t);\n"
++"\t\tq.forEach(function (v, k) { fd.append(k, v); });\n"
++"\t\treturn fd;\n"
++"\t});\n"
++"};\n"
++"Resp.prototype.clone = function () {\n"
++"\tif (this.bodyUsed) throw new TypeError(\"Failed to execute 'clone' on 'Response': Response body is already used\");\n"
++"\tvar body = null;\n"
++"\tif (this._b) {\n"
++"\t\tif (this._stream || this._b.stream) {\n"
++"\t\t\tvar pair = this.body.tee();\n"
++"\t\t\tthis._stream = pair[0];\n"
++"\t\t\tbody = pair[1];\n"
++"\t\t} else {\n"
++"\t\t\tbody = this._b.text !== undefined ? this._b.text : this._b.blob || this._b.bytes;\n"
++"\t\t}\n"
++"\t}\n"
++"\tvar r = new Resp(body, { status: this._status, statusText: this._statusText,\n"
++"\t\theaders: this._headers, url: this.url, type: this.type });\n"
++"\tr.redirected = this.redirected;\n"
++"\treturn r;\n"
++"};\n"
++"Resp.error = function () {\n"
++"\tvar r = new Resp(null, { status: 0 });\n"
++"\tr.type = 'error';\n"
++"\treturn r;\n"
++"};\n"
++"Resp.json = function (data, init) {\n"
++"\tinit = init || {};\n"
++"\tvar h = new g.Headers(init.headers);\n"
++"\tif (!h.has('content-type')) h.set('content-type', 'application/json');\n"
++"\treturn new Resp(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h });\n"
++"};\n"
++"Resp.redirect = function (url, status) {\n"
++"\tstatus = status === undefined ? 302 : status;\n"
++"\tif ([301, 302, 303, 307, 308].indexOf(status) < 0) throw new RangeError('Invalid status code');\n"
++"\treturn new Resp(null, { status: status, headers: { location: String(url) } });\n"
++"};\n"
++"define(g, 'Response', Resp);\n"
++"\n"
++"/* Headers from the native slot's raw block (\"Name: value\" lines after the\n"
++" * status line), and the status text from that status line. */\n"
++"function rawHeaders(raw) {\n"
++"\tvar h = new g.Headers(), lines = String(raw || '').split(/\\r\\n|\\n/), i, c, st = '';\n"
++"\tfor (i = 0; i < lines.length; i++) {\n"
++"\t\tif (/^HTTP\\/\\d/.test(lines[i])) {\n"
++"\t\t\t/* a redirect's hops each start a block: keep the last */\n"
++"\t\t\th = new g.Headers();\n"
++"\t\t\tst = lines[i].replace(/^HTTP\\/\\S+\\s+\\d+\\s*/, '');\n"
++"\t\t\tcontinue;\n"
++"\t\t}\n"
++"\t\tc = lines[i].indexOf(':');\n"
++"\t\tif (c > 0) {\n"
++"\t\t\ttry { h.append(lines[i].slice(0, c).trim(), lines[i].slice(c + 1).trim()); } catch (e) {}\n"
++"\t\t}\n"
++"\t}\n"
++"\treturn { headers: h, statusText: st };\n"
++"}\n"
++"\n"
++"if (isFn(g.__xhrNativeSend) && isFn(g.__xhrNativeTakeBytes)) {\n"
++"\tg.fetch = function fetch(input, init) {\n"
++"\t\tinit = init || {};\n"
++"\t\tvar url, method, headers, body, signal;\n"
++"\t\tif (input && typeof input === 'object' && input.url !== undefined) {\n"
++"\t\t\turl = String(input.url);\n"
++"\t\t\tmethod = init.method !== undefined ? init.method : input.method;\n"
++"\t\t\theaders = init.headers !== undefined ? init.headers : input.headers;\n"
++"\t\t\tbody = init.body !== undefined ? init.body : input.body;\n"
++"\t\t\tsignal = init.signal !== undefined ? init.signal : input.signal;\n"
++"\t\t} else {\n"
++"\t\t\turl = String(input);\n"
++"\t\t\tmethod = init.method; headers = init.headers; body = init.body; signal = init.signal;\n"
++"\t\t}\n"
++"\t\tmethod = String(method || 'GET').toUpperCase();\n"
++"\t\tif (signal && signal.aborted) return Promise.reject(abortReason(signal));\n"
++"\t\tvar h = new g.Headers(headers), list = [], b = extractBody(body);\n"
++"\t\tif ((method === 'GET' || method === 'HEAD') && b)\n"
++"\t\t\treturn Promise.reject(new TypeError(\"Failed to execute 'fetch': Request with GET/HEAD method cannot have body.\"));\n"
++"\t\tif (b && b.type && !h.has('content-type')) h.set('content-type', b.type);\n"
++"\t\th.forEach(function (v, k) { list.push(k + ': ' + v); });\n"
++"\t\t/* The request starts now, as in a browser, unless the body has to\n"
++"\t\t * be read first (a Blob or a stream). The native layer sends a\n"
++"\t\t * string body. */\n"
++"\t\tif (!b) return start(null);\n"
++"\t\tif (b.text !== undefined) return start(b.text);\n"
++"\t\tif (b.bytes) return start(new g.TextDecoder().decode(b.bytes));\n"
++"\t\treturn (b.blob ? b.blob.text() :\n"
++"\t\t\treadAllBytes(b.stream).then(function (u) { return new g.TextDecoder().decode(u); }))\n"
++"\t\t\t.then(start);\n"
++"\n"
++"\t\tfunction start(payload) {\n"
++"\t\t\treturn new Promise(function (resolve, reject) {\n"
++"\t\t\t\tvar ctrl, resolved = false, done = false, id = -1;\n"
++"\t\t\t\tvar stream = new g.ReadableStream({\n"
++"\t\t\t\t\tstart: function (c) { ctrl = c; },\n"
++"\t\t\t\t\tcancel: function () { finish(); }\n"
++"\t\t\t\t}, { highWaterMark: 0 });\n"
++"\t\t\t\tfunction finish() {\n"
++"\t\t\t\t\tif (done) return;\n"
++"\t\t\t\t\tdone = true;\n"
++"\t\t\t\t\tif (id >= 0) { try { g.__xhrNativeAbort(id); } catch (e) {} }\n"
++"\t\t\t\t}\n"
++"\t\t\t\tfunction respond() {\n"
++"\t\t\t\t\tresolved = true;\n"
++"\t\t\t\t\tvar rh = rawHeaders(sink.__responseHeadersRaw);\n"
++"\t\t\t\t\tvar st = sink.status, nobody = method === 'HEAD' ||\n"
++"\t\t\t\t\t\tst === 204 || st === 205 || st === 304;\n"
++"\t\t\t\t\tvar r = new Resp(nobody ? null : stream, {\n"
++"\t\t\t\t\t\tstatus: st, statusText: rh.statusText, headers: rh.headers });\n"
++"\t\t\t\t\tr.url = sink.responseURL || url;\n"
++"\t\t\t\t\tr.type = 'basic';\n"
++"\t\t\t\t\tr.redirected = (sink.__redirects | 0) > 0;\n"
++"\t\t\t\t\tif (typeof g.__workLogFetch === 'function') g.__workLogFetch(url, r.ok, st);\n"
++"\t\t\t\t\tresolve(r);\n"
++"\t\t\t\t}\n"
++"\t\t\t\tfunction pump() {\n"
++"\t\t\t\t\tvar ab = g.__xhrNativeTakeBytes(id, 1);\n"
++"\t\t\t\t\tif (ab && ab.byteLength) {\n"
++"\t\t\t\t\t\ttry { ctrl.enqueue(new Uint8Array(ab)); } catch (e) {}\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t}\n"
++"\t\t\t\tvar sink = {\n"
++"\t\t\t\t\tstatus: 0, __responseHeadersRaw: '', responseURL: '', __redirects: 0,\n"
++"\t\t\t\t\t__onNativeProgress: function () {\n"
++"\t\t\t\t\t\tif (done) return;\n"
++"\t\t\t\t\t\tif (!resolved) respond();\n"
++"\t\t\t\t\t\tpump();\n"
++"\t\t\t\t\t},\n"
++"\t\t\t\t\t__onNativeComplete: function () {\n"
++"\t\t\t\t\t\tif (done) return;\n"
++"\t\t\t\t\t\tif (sink.status !== 0) pump();\n"
++"\t\t\t\t\t\tdone = true;\n"
++"\t\t\t\t\t\tif (sink.status === 0) {\n"
++"\t\t\t\t\t\t\tvar err = new TypeError('Failed to fetch');\n"
++"\t\t\t\t\t\t\tif (!resolved) reject(err);\n"
++"\t\t\t\t\t\t\telse { try { ctrl.error(err); } catch (e) {} }\n"
++"\t\t\t\t\t\t\treturn;\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t\tif (!resolved) respond();\n"
++"\t\t\t\t\t\ttry { ctrl.close(); } catch (e) {}\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t};\n"
++"\t\t\t\tif (signal) {\n"
++"\t\t\t\t\tsignal.addEventListener('abort', function () {\n"
++"\t\t\t\t\t\tif (done) return;\n"
++"\t\t\t\t\t\tfinish();\n"
++"\t\t\t\t\t\tvar e = abortReason(signal);\n"
++"\t\t\t\t\t\tif (!resolved) reject(e);\n"
++"\t\t\t\t\t\telse { try { ctrl.error(e); } catch (x) {} }\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t}\n"
++"\t\t\t\tid = g.__xhrNativeSend(sink, method, url, payload, list, true);\n"
++"\t\t\t\tif (id < 0) {\n"
++"\t\t\t\t\tdone = true;\n"
++"\t\t\t\t\treject(new TypeError('Failed to fetch'));\n"
++"\t\t\t\t}\n"
++"\t\t\t});\n"
++"\t\t}\n"
++"\t};\n"
++"}\n"
++"function abortReason(signal) {\n"
++"\tif (signal.reason !== undefined) return signal.reason;\n"
++"\tvar e;\n"
++"\ttry { e = new g.DOMException('The operation was aborted.', 'AbortError'); }\n"
++"\tcatch (x) { e = new Error('The operation was aborted.'); e.name = 'AbortError'; }\n"
++"\treturn e;\n"
++"}\n"
++"\n"
+ "/* ---- Intl (en-US; QuickJS has none) ----------------------------------- */\n"
+ "\n"
+ "var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index cc673256b..ca24327a6 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -604,6 +604,692 @@ if (g.Headers) {
+ 	Object.defineProperty(HP, Symbol.toStringTag, { value: 'Headers', configurable: true });
+ }
+ 
++/* ---- Streams, Response bodies, streaming fetch() (Patch 132) ----------
++ * North-star B1, part 2. Apps read an event stream as
++ * fetch(url).then(r => r.body.getReader()) -- the Anthropic SDK, and every
++ * "stream the tokens" UI, included. The bridge's fetch() resolved only at
++ * DONE with a text-only Response (no body, no arrayBuffer). Here:
++ * ReadableStream (default reader, async iteration, tee, pipeTo /
++ * pipeThrough), a minimal WritableStream / TransformStream, the
++ * TextDecoderStream / TextEncoderStream pair, a Response whose body is a
++ * stream of Uint8Array, and a fetch() that resolves at the first body
++ * bytes and feeds the body from the native slot's progress ticks
++ * (__xhrNativeTakeBytes, macos9_js_fetch.c). Each is installed only where
++ * nothing better exists. */
++
++function isFn(f) { return typeof f === 'function'; }
++function later(fn) { Promise.resolve().then(fn); }
++function settle(p, fn) { return Promise.resolve(p).then(function () {}, fn); }
++
++var RS = isFn(g.ReadableStream) ? g.ReadableStream : null;
++if (!RS) {
++	RS = function ReadableStream(src, strategy) {
++		var self = this, hwm;
++		src = src || {};
++		strategy = strategy || {};
++		hwm = strategy.highWaterMark === undefined ? 1 : Number(strategy.highWaterMark);
++		define(this, '_src', src);
++		define(this, '_hwm', hwm >= 0 ? hwm : 1);
++		define(this, '_q', []);
++		define(this, '_reqs', []);
++		define(this, '_state', 'readable');
++		define(this, '_closeReq', false);
++		define(this, '_err', undefined);
++		define(this, '_reader', null);
++		define(this, '_disturbed', false);
++		define(this, '_pulling', false);
++		define(this, '_pullAgain', false);
++		define(this, '_started', false);
++		var c = {
++			enqueue: function (chunk) {
++				if (self._state !== 'readable' || self._closeReq)
++					throw new TypeError('The stream is not in a state that permits enqueue');
++				if (self._reqs.length) self._reqs.shift().resolve({ value: chunk, done: false });
++				else self._q.push(chunk);
++			},
++			close: function () {
++				if (self._state !== 'readable' || self._closeReq)
++					throw new TypeError('The stream is not in a state that permits close');
++				self._closeReq = true;
++				if (!self._q.length) rsClose(self);
++			},
++			error: function (e) { rsError(self, e); }
++		};
++		Object.defineProperty(c, 'desiredSize', { get: function () {
++			return self._state === 'errored' ? null :
++				self._state === 'closed' ? 0 : self._hwm - self._q.length;
++		} });
++		define(this, '_ctrl', c);
++		var r;
++		try { r = isFn(src.start) ? src.start(c) : undefined; }
++		catch (e) { rsError(this, e); return; }
++		Promise.resolve(r).then(function () {
++			self._started = true;
++			rsPull(self);
++		}, function (e) { rsError(self, e); });
++	};
++	var rsClose = function (s) {
++		if (s._state !== 'readable') return;
++		s._state = 'closed';
++		while (s._reqs.length) s._reqs.shift().resolve({ value: undefined, done: true });
++		if (s._reader) s._reader._closedResolve();
++	};
++	var rsError = function (s, e) {
++		if (s._state !== 'readable') return;
++		s._state = 'errored';
++		s._err = e;
++		s._q.length = 0;
++		while (s._reqs.length) s._reqs.shift().reject(e);
++		if (s._reader) s._reader._closedReject(e);
++	};
++	var rsPull = function (s) {
++		if (!s._started || s._state !== 'readable' || s._closeReq || !isFn(s._src.pull)) return;
++		if (s._q.length >= s._hwm && !s._reqs.length) return;
++		if (s._pulling) { s._pullAgain = true; return; }
++		s._pulling = true;
++		var r;
++		try { r = s._src.pull(s._ctrl); } catch (e) { rsError(s, e); return; }
++		Promise.resolve(r).then(function () {
++			s._pulling = false;
++			if (s._pullAgain) { s._pullAgain = false; rsPull(s); }
++			else if (s._reqs.length) rsPull(s);
++		}, function (e) { rsError(s, e); });
++	};
++	var rsCancel = function (s, reason) {
++		s._disturbed = true;
++		if (s._state === 'closed') return Promise.resolve();
++		if (s._state === 'errored') return Promise.reject(s._err);
++		s._q.length = 0;
++		rsClose(s);
++		var r;
++		try { r = isFn(s._src.cancel) ? s._src.cancel(reason) : undefined; }
++		catch (e) { return Promise.reject(e); }
++		return Promise.resolve(r).then(function () {});
++	};
++	var Reader = function ReadableStreamDefaultReader(stream) {
++		if (!(stream instanceof RS)) throw new TypeError('not a ReadableStream');
++		if (stream._reader) throw new TypeError('ReadableStream is locked');
++		var self = this;
++		define(this, '_s', stream);
++		stream._reader = this;
++		define(this, '_closed', new Promise(function (res, rej) {
++			define(self, '_closedResolve', res);
++			define(self, '_closedReject', rej);
++		}));
++		this._closed.catch(function () {});
++		if (stream._state === 'closed') this._closedResolve();
++		else if (stream._state === 'errored') this._closedReject(stream._err);
++	};
++	Reader.prototype.read = function () {
++		var s = this._s;
++		if (!s) return Promise.reject(new TypeError('The reader has been released'));
++		s._disturbed = true;
++		if (s._q.length) {
++			var v = s._q.shift();
++			if (s._closeReq && !s._q.length) rsClose(s);
++			else rsPull(s);
++			return Promise.resolve({ value: v, done: false });
++		}
++		if (s._state === 'closed') return Promise.resolve({ value: undefined, done: true });
++		if (s._state === 'errored') return Promise.reject(s._err);
++		return new Promise(function (resolve, reject) {
++			s._reqs.push({ resolve: resolve, reject: reject });
++			rsPull(s);
++		});
++	};
++	Reader.prototype.cancel = function (reason) {
++		return this._s ? rsCancel(this._s, reason) :
++			Promise.reject(new TypeError('The reader has been released'));
++	};
++	Reader.prototype.releaseLock = function () {
++		var s = this._s;
++		if (!s) return;
++		var e = new TypeError('The reader has been released');
++		while (s._reqs.length) s._reqs.shift().reject(e);
++		if (s._state === 'readable') this._closedReject(e);
++		s._reader = null;
++		this._s = null;
++	};
++	Object.defineProperty(Reader.prototype, 'closed', { get: function () { return this._closed; } });
++	RS.prototype.getReader = function (opts) {
++		if (opts && opts.mode === 'byob')
++			throw new TypeError('BYOB readers are not supported');
++		return new Reader(this);
++	};
++	RS.prototype.cancel = function (reason) {
++		if (this._reader) return Promise.reject(new TypeError('ReadableStream is locked'));
++		return rsCancel(this, reason);
++	};
++	Object.defineProperty(RS.prototype, 'locked', { get: function () { return !!this._reader; } });
++	RS.prototype.values = function (opts) {
++		var reader = this.getReader(), keep = !!(opts && opts.preventCancel);
++		var it = {
++			next: function () {
++				return reader.read().then(function (r) {
++					if (r.done) reader.releaseLock();
++					return r;
++				});
++			},
++			'return': function (v) {
++				var p = keep ? Promise.resolve() : reader.cancel();
++				return p.then(function () {
++					reader.releaseLock();
++					return { value: v, done: true };
++				});
++			}
++		};
++		if (typeof Symbol !== 'undefined' && Symbol.asyncIterator)
++			it[Symbol.asyncIterator] = function () { return it; };
++		return it;
++	};
++	if (typeof Symbol !== 'undefined' && Symbol.asyncIterator)
++		RS.prototype[Symbol.asyncIterator] = RS.prototype.values;
++	RS.prototype.tee = function () {
++		var reader = this.getReader(), c1, c2, n = 0, reason = [];
++		function pump() {
++			return reader.read().then(function (r) {
++				if (r.done) {
++					try { c1.close(); } catch (e) {}
++					try { c2.close(); } catch (e) {}
++					return;
++				}
++				try { c1.enqueue(r.value); } catch (e) {}
++				try { c2.enqueue(r.value); } catch (e) {}
++				return pump();
++			}, function (e) { c1.error(e); c2.error(e); });
++		}
++		function cancelOne(r) {
++			reason.push(r);
++			if (++n === 2) return reader.cancel(reason);
++		}
++		var b1 = new RS({ start: function (c) { c1 = c; }, cancel: cancelOne });
++		var b2 = new RS({ start: function (c) { c2 = c; }, cancel: cancelOne });
++		pump();
++		return [b1, b2];
++	};
++	RS.prototype.pipeTo = function (dest, opts) {
++		var reader = this.getReader(), writer = dest.getWriter();
++		opts = opts || {};
++		return new Promise(function (resolve, reject) {
++			function fail(e) {
++				if (!opts.preventAbort) settle(writer.abort(e));
++				reader.releaseLock(); writer.releaseLock();
++				reject(e);
++			}
++			if (opts.signal) {
++				if (opts.signal.aborted) { reader.cancel(opts.signal.reason); fail(opts.signal.reason); return; }
++				opts.signal.addEventListener('abort', function () {
++					if (!opts.preventCancel) settle(reader.cancel(opts.signal.reason));
++					fail(opts.signal.reason);
++				});
++			}
++			(function step() {
++				reader.read().then(function (r) {
++					if (r.done) {
++						var p = opts.preventClose ? Promise.resolve() : writer.close();
++						return p.then(function () {
++							reader.releaseLock(); writer.releaseLock(); resolve();
++						});
++					}
++					return writer.write(r.value).then(step);
++				}).then(null, fail);
++			})();
++		});
++	};
++	RS.prototype.pipeThrough = function (pair, opts) {
++		settle(this.pipeTo(pair.writable, opts));
++		return pair.readable;
++	};
++	RS.from = function (iterable) {
++		var it = iterable[typeof Symbol !== 'undefined' && Symbol.asyncIterator &&
++			iterable[Symbol.asyncIterator] ? Symbol.asyncIterator : Symbol.iterator]();
++		return new RS({
++			pull: function (c) {
++				return Promise.resolve(it.next()).then(function (r) {
++					if (r.done) c.close(); else c.enqueue(r.value);
++				});
++			},
++			cancel: function (r) { if (isFn(it['return'])) return it['return'](r); }
++		}, { highWaterMark: 0 });
++	};
++	define(g, 'ReadableStream', RS);
++	define(g, 'ReadableStreamDefaultReader', Reader);
++}
++
++if (!isFn(g.WritableStream)) {
++	var WS = function WritableStream(sink) {
++		sink = sink || {};
++		var self = this;
++		define(this, '_sink', sink);
++		define(this, '_writer', null);
++		define(this, '_state', 'writable');
++		define(this, '_err', undefined);
++		var c = { error: function (e) { if (self._state === 'writable') { self._state = 'errored'; self._err = e; } } };
++		define(this, '_ctrl', c);
++		define(this, '_chain', Promise.resolve(isFn(sink.start) ? sink.start(c) : undefined));
++	};
++	var Writer = function WritableStreamDefaultWriter(stream) {
++		if (stream._writer) throw new TypeError('WritableStream is locked');
++		var self = this;
++		define(this, '_s', stream);
++		stream._writer = this;
++		define(this, '_closed', new Promise(function (res, rej) {
++			define(self, '_closedResolve', res);
++			define(self, '_closedReject', rej);
++		}));
++		this._closed.catch(function () {});
++	};
++	var wsStep = function (s, fn) {
++		var p = s._chain.then(function () {
++			if (s._state === 'errored') throw s._err;
++			return fn();
++		});
++		s._chain = p.then(null, function (e) {
++			if (s._state === 'writable') { s._state = 'errored'; s._err = e; }
++		});
++		return p;
++	};
++	Writer.prototype.write = function (chunk) {
++		var s = this._s;
++		if (!s) return Promise.reject(new TypeError('The writer has been released'));
++		if (s._state !== 'writable') return Promise.reject(s._err || new TypeError('The stream is closed'));
++		return wsStep(s, function () {
++			return isFn(s._sink.write) ? s._sink.write(chunk, s._ctrl) : undefined;
++		}).then(function () {});
++	};
++	Writer.prototype.close = function () {
++		var s = this._s, w = this;
++		if (!s) return Promise.reject(new TypeError('The writer has been released'));
++		if (s._state !== 'writable') return Promise.reject(s._err || new TypeError('The stream is closed'));
++		return wsStep(s, function () {
++			return isFn(s._sink.close) ? s._sink.close() : undefined;
++		}).then(function () { s._state = 'closed'; w._closedResolve(); });
++	};
++	Writer.prototype.abort = function (reason) {
++		var s = this._s;
++		if (!s) return Promise.reject(new TypeError('The writer has been released'));
++		if (s._state === 'writable') { s._state = 'errored'; s._err = reason; }
++		this._closedReject(reason);
++		return Promise.resolve(isFn(s._sink.abort) ? s._sink.abort(reason) : undefined).then(function () {});
++	};
++	Writer.prototype.releaseLock = function () {
++		if (this._s) { this._s._writer = null; this._s = null; }
++	};
++	Object.defineProperty(Writer.prototype, 'closed', { get: function () { return this._closed; } });
++	Object.defineProperty(Writer.prototype, 'ready', { get: function () { return Promise.resolve(); } });
++	Object.defineProperty(Writer.prototype, 'desiredSize', { get: function () { return 1; } });
++	WS.prototype.getWriter = function () { return new Writer(this); };
++	WS.prototype.abort = function (r) { return this.getWriter().abort(r); };
++	WS.prototype.close = function () {
++		var w = this.getWriter();
++		return w.close().then(function () { w.releaseLock(); });
++	};
++	Object.defineProperty(WS.prototype, 'locked', { get: function () { return !!this._writer; } });
++	define(g, 'WritableStream', WS);
++	define(g, 'WritableStreamDefaultWriter', Writer);
++}
++
++if (!isFn(g.TransformStream)) {
++	var TS = function TransformStream(t) {
++		t = t || {};
++		var rc, self = this;
++		var readable = new g.ReadableStream({ start: function (c) { rc = c; } }, { highWaterMark: 0 });
++		var tc = {
++			enqueue: function (chunk) { rc.enqueue(chunk); },
++			error: function (e) { rc.error(e); },
++			terminate: function () { try { rc.close(); } catch (e) {} }
++		};
++		Object.defineProperty(tc, 'desiredSize', { get: function () { return rc.desiredSize; } });
++		var started = Promise.resolve(isFn(t.start) ? t.start(tc) : undefined);
++		var writable = new g.WritableStream({
++			write: function (chunk) {
++				return started.then(function () {
++					if (isFn(t.transform)) return t.transform(chunk, tc);
++					tc.enqueue(chunk);
++				});
++			},
++			close: function () {
++				return started.then(function () {
++					return isFn(t.flush) ? t.flush(tc) : undefined;
++				}).then(function () { try { rc.close(); } catch (e) {} });
++			},
++			abort: function (e) { rc.error(e); }
++		});
++		define(self, 'readable', readable);
++		define(self, 'writable', writable);
++	};
++	define(g, 'TransformStream', TS);
++}
++
++if (!isFn(g.TextDecoderStream)) {
++	var TDS = function TextDecoderStream(label, opts) {
++		var d = new g.TextDecoder(label, opts);
++		var ts = new g.TransformStream({
++			transform: function (chunk, c) {
++				var s = d.decode(chunk, { stream: true });
++				if (s) c.enqueue(s);
++			},
++			flush: function (c) {
++				var s = d.decode();
++				if (s) c.enqueue(s);
++			}
++		});
++		define(this, 'readable', ts.readable);
++		define(this, 'writable', ts.writable);
++		define(this, 'encoding', d.encoding);
++	};
++	define(g, 'TextDecoderStream', TDS);
++}
++if (!isFn(g.TextEncoderStream)) {
++	var TES = function TextEncoderStream() {
++		var e = new g.TextEncoder();
++		var ts = new g.TransformStream({
++			transform: function (chunk, c) { c.enqueue(e.encode(String(chunk))); }
++		});
++		define(this, 'readable', ts.readable);
++		define(this, 'writable', ts.writable);
++		define(this, 'encoding', 'utf-8');
++	};
++	define(g, 'TextEncoderStream', TES);
++}
++
++/* A body as bytes: what Response and fetch() both need. */
++function concatBytes(parts, n) {
++	var out = new Uint8Array(n), off = 0, i;
++	for (i = 0; i < parts.length; i++) { out.set(parts[i], off); off += parts[i].length; }
++	return out;
++}
++function chunkBytes(v) {
++	if (v instanceof Uint8Array) return v;
++	if (v instanceof ArrayBuffer) return new Uint8Array(v);
++	if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
++	if (typeof v === 'string') return utf8Encode(v);
++	throw new TypeError('Received non-Uint8Array chunk');
++}
++function readAllBytes(stream) {
++	var reader = stream.getReader(), parts = [], n = 0;
++	return (function step() {
++		return reader.read().then(function (r) {
++			if (r.done) return concatBytes(parts, n);
++			var b = chunkBytes(r.value);
++			parts.push(b); n += b.length;
++			return step();
++		});
++	})();
++}
++
++/* Body extraction (Fetch "extract a body"): what init.body may be, and the
++ * Content-Type it implies. Kept as text when it is text, so the common
++ * cases (JSON, forms) never round-trip through bytes. */
++function extractBody(body) {
++	if (body === undefined || body === null) return null;
++	if (body instanceof g.ReadableStream) return { stream: body };
++	if (typeof body === 'string') return { text: body, type: 'text/plain;charset=UTF-8' };
++	if (isFn(g.URLSearchParams) && body instanceof g.URLSearchParams)
++		return { text: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
++	if (body instanceof ArrayBuffer || ArrayBuffer.isView(body))
++		return { bytes: new Uint8Array(chunkBytes(body)) };
++	if (isFn(g.FormData) && body instanceof g.FormData && g.XMLHttpRequest &&
++	    isFn(g.XMLHttpRequest.prototype._encodeFormData)) {
++		var enc = g.XMLHttpRequest.prototype._encodeFormData(body);
++		return { text: enc.body, type: enc.contentType };
++	}
++	if (isFn(g.Blob) && body instanceof g.Blob)
++		return { blob: body, type: body.type || '' };
++	return { text: String(body), type: 'text/plain;charset=UTF-8' };
++}
++
++var Resp = function Response(body, init) {
++	init = init || {};
++	var status = init.status === undefined ? 200 : Number(init.status);
++	if (status !== 0 && (status < 200 || status > 599))
++		throw new RangeError("Failed to construct 'Response': The status provided (" + status + ') is outside the range [200, 599].');
++	define(this, '_status', status);
++	define(this, '_statusText', init.statusText === undefined ? '' : String(init.statusText));
++	define(this, '_headers', new g.Headers(init.headers));
++	define(this, '_b', extractBody(body));
++	define(this, '_used', false);
++	define(this, '_stream', this._b && this._b.stream ? this._b.stream : null);
++	if (this._b && this._b.type && !this._headers.has('content-type'))
++		this._headers.set('content-type', this._b.type);
++	this.url = init.url || '';
++	this.type = init.type || 'default';
++	this.redirected = !!init.redirected;
++};
++Object.defineProperty(Resp.prototype, 'status', { get: function () { return this._status; } });
++Object.defineProperty(Resp.prototype, 'statusText', { get: function () { return this._statusText; } });
++Object.defineProperty(Resp.prototype, 'ok', { get: function () { return this._status >= 200 && this._status < 300; } });
++Object.defineProperty(Resp.prototype, 'headers', { get: function () { return this._headers; } });
++Object.defineProperty(Resp.prototype, 'body', { get: function () {
++	var b = this._b;
++	if (!b) return null;
++	if (!this._stream) {
++		var once = b.text !== undefined ? utf8Encode(b.text) : b.bytes || null, blob = b.blob;
++		this._stream = new g.ReadableStream({
++			start: function (c) {
++				if (blob) {
++					return blob.arrayBuffer().then(function (ab) {
++						c.enqueue(new Uint8Array(ab)); c.close();
++					});
++				}
++				if (once && once.length) c.enqueue(once);
++				c.close();
++			}
++		});
++	}
++	return this._stream;
++} });
++Object.defineProperty(Resp.prototype, 'bodyUsed', { get: function () {
++	return this._used || !!(this._stream && this._stream._disturbed);
++} });
++Resp.prototype._take = function () {
++	if (this.bodyUsed || (this._stream && this._stream.locked))
++		return Promise.reject(new TypeError('Body is unusable: Body has already been read'));
++	this._used = true;
++	var b = this._b;
++	if (!b) return Promise.resolve({ bytes: new Uint8Array(0) });
++	if (this._stream) return readAllBytes(this._stream).then(function (u) { return { bytes: u }; });
++	if (b.text !== undefined) return Promise.resolve({ text: b.text });
++	if (b.blob) return b.blob.arrayBuffer().then(function (ab) { return { bytes: new Uint8Array(ab) }; });
++	return Promise.resolve({ bytes: b.bytes });
++};
++Resp.prototype.text = function () {
++	return this._take().then(function (r) {
++		return r.text !== undefined ? r.text : new g.TextDecoder().decode(r.bytes);
++	});
++};
++Resp.prototype.json = function () {
++	return this.text().then(function (t) { return JSON.parse(t); });
++};
++Resp.prototype.bytes = function () {
++	return this._take().then(function (r) {
++		return r.text !== undefined ? utf8Encode(r.text) : r.bytes;
++	});
++};
++Resp.prototype.arrayBuffer = function () {
++	return this.bytes().then(function (u) {
++		return u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ?
++			u.buffer : u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
++	});
++};
++Resp.prototype.blob = function () {
++	var type = this._headers.get('content-type') || '';
++	if (!isFn(g.Blob)) return Promise.reject(new TypeError('Blob is not supported'));
++	return this.bytes().then(function (u) { return new g.Blob([u], { type: type }); });
++};
++Resp.prototype.formData = function () {
++	var type = (this._headers.get('content-type') || '').toLowerCase();
++	if (!isFn(g.FormData) || type.indexOf('application/x-www-form-urlencoded') !== 0)
++		return Promise.reject(new TypeError('formData() supports url-encoded bodies only'));
++	return this.text().then(function (t) {
++		var fd = new g.FormData(), q = new g.URLSearchParams(t);
++		q.forEach(function (v, k) { fd.append(k, v); });
++		return fd;
++	});
++};
++Resp.prototype.clone = function () {
++	if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
++	var body = null;
++	if (this._b) {
++		if (this._stream || this._b.stream) {
++			var pair = this.body.tee();
++			this._stream = pair[0];
++			body = pair[1];
++		} else {
++			body = this._b.text !== undefined ? this._b.text : this._b.blob || this._b.bytes;
++		}
++	}
++	var r = new Resp(body, { status: this._status, statusText: this._statusText,
++		headers: this._headers, url: this.url, type: this.type });
++	r.redirected = this.redirected;
++	return r;
++};
++Resp.error = function () {
++	var r = new Resp(null, { status: 0 });
++	r.type = 'error';
++	return r;
++};
++Resp.json = function (data, init) {
++	init = init || {};
++	var h = new g.Headers(init.headers);
++	if (!h.has('content-type')) h.set('content-type', 'application/json');
++	return new Resp(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h });
++};
++Resp.redirect = function (url, status) {
++	status = status === undefined ? 302 : status;
++	if ([301, 302, 303, 307, 308].indexOf(status) < 0) throw new RangeError('Invalid status code');
++	return new Resp(null, { status: status, headers: { location: String(url) } });
++};
++define(g, 'Response', Resp);
++
++/* Headers from the native slot's raw block ("Name: value" lines after the
++ * status line), and the status text from that status line. */
++function rawHeaders(raw) {
++	var h = new g.Headers(), lines = String(raw || '').split(/\r\n|\n/), i, c, st = '';
++	for (i = 0; i < lines.length; i++) {
++		if (/^HTTP\/\d/.test(lines[i])) {
++			/* a redirect's hops each start a block: keep the last */
++			h = new g.Headers();
++			st = lines[i].replace(/^HTTP\/\S+\s+\d+\s*/, '');
++			continue;
++		}
++		c = lines[i].indexOf(':');
++		if (c > 0) {
++			try { h.append(lines[i].slice(0, c).trim(), lines[i].slice(c + 1).trim()); } catch (e) {}
++		}
++	}
++	return { headers: h, statusText: st };
++}
++
++if (isFn(g.__xhrNativeSend) && isFn(g.__xhrNativeTakeBytes)) {
++	g.fetch = function fetch(input, init) {
++		init = init || {};
++		var url, method, headers, body, signal;
++		if (input && typeof input === 'object' && input.url !== undefined) {
++			url = String(input.url);
++			method = init.method !== undefined ? init.method : input.method;
++			headers = init.headers !== undefined ? init.headers : input.headers;
++			body = init.body !== undefined ? init.body : input.body;
++			signal = init.signal !== undefined ? init.signal : input.signal;
++		} else {
++			url = String(input);
++			method = init.method; headers = init.headers; body = init.body; signal = init.signal;
++		}
++		method = String(method || 'GET').toUpperCase();
++		if (signal && signal.aborted) return Promise.reject(abortReason(signal));
++		var h = new g.Headers(headers), list = [], b = extractBody(body);
++		if ((method === 'GET' || method === 'HEAD') && b)
++			return Promise.reject(new TypeError("Failed to execute 'fetch': Request with GET/HEAD method cannot have body."));
++		if (b && b.type && !h.has('content-type')) h.set('content-type', b.type);
++		h.forEach(function (v, k) { list.push(k + ': ' + v); });
++		/* The request starts now, as in a browser, unless the body has to
++		 * be read first (a Blob or a stream). The native layer sends a
++		 * string body. */
++		if (!b) return start(null);
++		if (b.text !== undefined) return start(b.text);
++		if (b.bytes) return start(new g.TextDecoder().decode(b.bytes));
++		return (b.blob ? b.blob.text() :
++			readAllBytes(b.stream).then(function (u) { return new g.TextDecoder().decode(u); }))
++			.then(start);
++
++		function start(payload) {
++			return new Promise(function (resolve, reject) {
++				var ctrl, resolved = false, done = false, id = -1;
++				var stream = new g.ReadableStream({
++					start: function (c) { ctrl = c; },
++					cancel: function () { finish(); }
++				}, { highWaterMark: 0 });
++				function finish() {
++					if (done) return;
++					done = true;
++					if (id >= 0) { try { g.__xhrNativeAbort(id); } catch (e) {} }
++				}
++				function respond() {
++					resolved = true;
++					var rh = rawHeaders(sink.__responseHeadersRaw);
++					var st = sink.status, nobody = method === 'HEAD' ||
++						st === 204 || st === 205 || st === 304;
++					var r = new Resp(nobody ? null : stream, {
++						status: st, statusText: rh.statusText, headers: rh.headers });
++					r.url = sink.responseURL || url;
++					r.type = 'basic';
++					r.redirected = (sink.__redirects | 0) > 0;
++					if (typeof g.__workLogFetch === 'function') g.__workLogFetch(url, r.ok, st);
++					resolve(r);
++				}
++				function pump() {
++					var ab = g.__xhrNativeTakeBytes(id, 1);
++					if (ab && ab.byteLength) {
++						try { ctrl.enqueue(new Uint8Array(ab)); } catch (e) {}
++					}
++				}
++				var sink = {
++					status: 0, __responseHeadersRaw: '', responseURL: '', __redirects: 0,
++					__onNativeProgress: function () {
++						if (done) return;
++						if (!resolved) respond();
++						pump();
++					},
++					__onNativeComplete: function () {
++						if (done) return;
++						if (sink.status !== 0) pump();
++						done = true;
++						if (sink.status === 0) {
++							var err = new TypeError('Failed to fetch');
++							if (!resolved) reject(err);
++							else { try { ctrl.error(err); } catch (e) {} }
++							return;
++						}
++						if (!resolved) respond();
++						try { ctrl.close(); } catch (e) {}
++					}
++				};
++				if (signal) {
++					signal.addEventListener('abort', function () {
++						if (done) return;
++						finish();
++						var e = abortReason(signal);
++						if (!resolved) reject(e);
++						else { try { ctrl.error(e); } catch (x) {} }
++					});
++				}
++				id = g.__xhrNativeSend(sink, method, url, payload, list, true);
++				if (id < 0) {
++					done = true;
++					reject(new TypeError('Failed to fetch'));
++				}
++			});
++		}
++	};
++}
++function abortReason(signal) {
++	if (signal.reason !== undefined) return signal.reason;
++	var e;
++	try { e = new g.DOMException('The operation was aborted.', 'AbortError'); }
++	catch (x) { e = new Error('The operation was aborted.'); e.name = 'AbortError'; }
++	return e;
++}
++
+ /* ---- Intl (en-US; QuickJS has none) ----------------------------------- */
+ 
+ var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',

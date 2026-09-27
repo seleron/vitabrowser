@@ -197,6 +197,8 @@ JS-popup file:///app0:/testpages/JS-popup.html
 JS-scriptload file:///app0:/testpages/JS-scriptload.html
 NET-js-streaming http://127.0.0.1:$HP/JS-streaming.html
 NET-js-streaming-https https://127.0.0.1:$((HP + 1))/JS-streaming.html
+NET-js-fetch-stream http://127.0.0.1:$HP/JS-fetch-stream.html
+NET-js-fetch-stream-https https://127.0.0.1:$((HP + 1))/JS-fetch-stream.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -336,6 +338,23 @@ for f in "$R"/*NET-js-streaming*.plot; do
 done
 [ "$(ls "$R"/*NET-js-streaming*.plot 2>/dev/null | wc -l)" -eq 2 ] || jss_bad=$((jss_bad + 1))
 [ "$jss_bad" -eq 0 ]
+
+# Streaming fetch() bodies (Patch 132, B1 part 2): Response.body as a
+# ReadableStream fed while the response arrives -- getReader, for await,
+# a character split across chunks, SSE parsed from a body, pipeThrough a
+# TextDecoderStream, abort mid-stream, clone/json/arrayBuffer.
+echo "== streaming fetch() bodies (JS-fetch-stream) =="
+jfs_bad=0
+for f in "$R"/*NET-js-fetch-stream*.plot; do
+	[ -f "$f" ] || { echo "  missing: $f"; jfs_bad=$((jfs_bad + 1)); continue; }
+	n=${f##*/}
+	r=$(sed -n 's/.*STR \(JS fetch stream: [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
+	echo "  $n: ${r:-no summary line (script did not run?)}"
+	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
+	[ "$r" = "JS fetch stream: 8/8 passed" ] || jfs_bad=$((jfs_bad + 1))
+done
+[ "$(ls "$R"/*NET-js-fetch-stream*.plot 2>/dev/null | wc -l)" -eq 2 ] || jfs_bad=$((jfs_bad + 1))
+[ "$jfs_bad" -eq 0 ]
 
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
 # JS-window navigates itself three times (relative location.href,

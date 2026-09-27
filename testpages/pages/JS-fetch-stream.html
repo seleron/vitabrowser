@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS fetch stream</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+</head>
+<body>
+<p id="sum" class="wait">JS fetch stream: script did not run</p>
+<p id="r1" class="wait">1 fetch resolves before the body ends: waiting</p>
+<p id="r2" class="wait">2 body.getReader() chunks (Uint8Array, text): waiting</p>
+<p id="r3" class="wait">3 for await over response.body: waiting</p>
+<p id="r4" class="wait">4 UTF-8 split across chunks (text() + reader): waiting</p>
+<p id="r5" class="wait">5 SSE read through fetch + reader.cancel(): waiting</p>
+<p id="r6" class="wait">6 pipeThrough(new TextDecoderStream()): waiting</p>
+<p id="r7" class="wait">7 AbortController mid-stream: waiting</p>
+<p id="r8" class="wait">8 Response API (clone tee, json, arrayBuffer): waiting</p>
+<p id="tick">t=0.0 s</p>
+<script>
+/* Streaming fetch() bodies (Patch 132, B1 part 2): the way modern apps
+ * read an event stream -- fetch(url).then(r => r.body.getReader()). Served
+ * by tools/vita-sim/httpd.py: /progress-stream (20 chunks, 50 ms apart),
+ * /split-utf8 (a character split across chunks), /sse (events 300 ms
+ * apart, then held open). No arrow functions or async/await here, so a
+ * syntax gap cannot hide a transport result. */
+var passed = 0, total = 8, resolved = {};
+var t0 = Date.now();
+/* The autotest dumps a page after 0.7 s without a repaint: tick until
+ * every row has resolved (or 10 s), so the dump is the result. */
+var ticker = setInterval(function () {
+  var done = 0;
+  for (var k in resolved) done++;
+  document.getElementById('tick').textContent =
+      't=' + ((Date.now() - t0) / 1000).toFixed(1) + ' s, ' + done + '/' + total + ' resolved';
+  if (done >= total || Date.now() - t0 > 10000) clearInterval(ticker);
+}, 250);
+function pass(n, what, detail) {
+  var p = document.getElementById('r' + n);
+  if (!p || resolved[n]) return;
+  resolved[n] = 1;
+  p.textContent = n + ' ' + what + ': PASS' + (detail ? ' (' + detail + ')' : '');
+  p.className = 'pass';
+  passed++;
+  var s = document.getElementById('sum');
+  s.textContent = 'JS fetch stream: ' + passed + '/' + total + ' passed';
+  s.className = passed === total ? 'pass' : 'wait';
+}
+function fail(n, what, why) {
+  var p = document.getElementById('r' + n);
+  if (!p || resolved[n]) return;
+  resolved[n] = 1;
+  p.textContent = n + ' ' + what + ': FAIL ' + why;
+}
+function check(n, what, cond, detail, why) {
+  if (cond) pass(n, what, detail); else fail(n, what, why || detail);
+}
+var EXPECT = '';
+for (var i = 0; i < 20; i++) EXPECT += 'chunk' + i + ' ';
+var SPLIT = 'café ok ✓';
+function readAll(reader, onChunk) {
+  return reader.read().then(function (r) {
+    if (r.done) return;
+    onChunk(r.value);
+    return readAll(reader, onChunk);
+  });
+}
+function guard(n, what) {
+  return function (e) { fail(n, what, 'threw ' + (e && e.name) + ': ' + (e && e.message)); };
+}
+
+if (typeof ReadableStream === 'undefined') {
+  for (var j = 1; j <= total; j++) fail(j, 'streams', 'ReadableStream undefined');
+}
+
+/* 1 + 2: resolution before the end, then chunked reading. */
+var ended = false;
+fetch('/progress-stream').then(function (r) {
+  var atResolve = Date.now() - t0;
+  if (!r.body || typeof r.body.getReader !== 'function') {
+    fail(1, 'fetch resolves before the body ends', 'no body stream');
+    fail(2, 'body.getReader() chunks', 'no body stream');
+    return;
+  }
+  var reader = r.body.getReader(), dec = new TextDecoder(), text = '', chunks = 0, allU8 = true;
+  return readAll(reader, function (v) {
+    chunks++;
+    if (!(v instanceof Uint8Array)) allU8 = false;
+    text += dec.decode(v, { stream: true });
+  }).then(function () {
+    var atEnd = Date.now() - t0;
+    /* 20 chunks 50 ms apart: a body delivered only at the end arrives as
+     * one chunk, and resolution would come with it. */
+    check(1, 'fetch resolves before the body ends', chunks >= 3 && atEnd - atResolve >= 300,
+        'resolved at ' + atResolve + ' ms, body ended at ' + atEnd + ' ms, ' + chunks + ' chunks',
+        'resolved ' + atResolve + ' ms, ended ' + atEnd + ' ms, chunks=' + chunks);
+    check(2, 'body.getReader() chunks (Uint8Array, text)', allU8 && text === EXPECT && r.status === 200,
+        chunks + ' chunks, ' + text.length + ' chars',
+        'u8=' + allU8 + ' len=' + text.length + ' status=' + r.status);
+  });
+}).then(null, guard(1, 'fetch resolves before the body ends'));
+
+/* 3: async iteration (the Anthropic SDK's path). Driven by hand through
+ * Symbol.asyncIterator, the same protocol `for await` uses. */
+fetch('/progress-stream').then(function (r) {
+  var it = r.body[Symbol.asyncIterator](), dec = new TextDecoder(), text = '', n = 0;
+  function step() {
+    return it.next().then(function (x) {
+      if (x.done) return;
+      n++;
+      text += dec.decode(x.value, { stream: true });
+      return step();
+    });
+  }
+  return step().then(function () {
+    check(3, 'for await over response.body', text === EXPECT && n >= 3,
+        n + ' chunks', 'n=' + n + ' len=' + text.length);
+  });
+}).then(null, guard(3, 'for await over response.body'));
+
+/* 4: a character split across chunks, both ways. */
+Promise.all([
+  fetch('/split-utf8').then(function (r) { return r.text(); }),
+  fetch('/split-utf8').then(function (r) {
+    var reader = r.body.getReader(), dec = new TextDecoder(), s = '', n = 0;
+    return readAll(reader, function (v) { n++; s += dec.decode(v, { stream: true }); })
+      .then(function () { return { s: s + dec.decode(), n: n }; });
+  })
+]).then(function (res) {
+  check(4, 'UTF-8 split across chunks (text() + reader)',
+      res[0] === SPLIT && res[1].s === SPLIT,
+      res[1].n + ' chunks',
+      'text=' + JSON.stringify(res[0]) + ' reader=' + JSON.stringify(res[1].s));
+}).then(null, guard(4, 'UTF-8 split across chunks'));
+
+/* 5: an event stream parsed by hand from fetch, as SSE client libraries do;
+ * cancel() ends the held-open stream. */
+fetch('/sse', { headers: { Accept: 'text/event-stream' } }).then(function (r) {
+  var reader = r.body.getReader(), dec = new TextDecoder(), buf = '', data = [], tickId = null;
+  var ev = { event: '', data: [], id: null };
+  function line(l) {
+    if (l === '') {
+      if (ev.data.length) {
+        if (ev.event === 'tick') tickId = ev.id;
+        else if (!ev.event) data.push(ev.data.join('\n'));
+      }
+      ev = { event: '', data: [], id: null };
+      return;
+    }
+    var c = l.indexOf(':'), f = c < 0 ? l : l.slice(0, c), v = c < 0 ? '' : l.slice(c + 1).replace(/^ /, '');
+    if (f === 'data') ev.data.push(v);
+    else if (f === 'event') ev.event = v;
+    else if (f === 'id') ev.id = v;
+  }
+  function step() {
+    return reader.read().then(function (x) {
+      if (x.done) return 'ended';
+      buf += dec.decode(x.value, { stream: true });
+      var k;
+      while ((k = buf.indexOf('\n')) >= 0) { line(buf.slice(0, k)); buf = buf.slice(k + 1); }
+      if (data.length >= 5 && tickId !== null) return 'enough';
+      return step();
+    });
+  }
+  return step().then(function (why) {
+    return reader.cancel().then(function () {
+      check(5, 'SSE read through fetch + reader.cancel()',
+          why === 'enough' && data.join(',') === '1,2,3,4,5' && tickId === '42',
+          'data ' + data.join(',') + ', tick id ' + tickId,
+          'why=' + why + ' data=' + data.join(',') + ' tick=' + tickId);
+    });
+  });
+}).then(null, guard(5, 'SSE read through fetch + reader.cancel()'));
+
+/* 6: the decoder as a stream stage. */
+fetch('/split-utf8').then(function (r) {
+  if (typeof TextDecoderStream === 'undefined') { fail(6, 'pipeThrough', 'TextDecoderStream undefined'); return; }
+  var reader = r.body.pipeThrough(new TextDecoderStream()).getReader(), s = '', allStr = true;
+  return readAll(reader, function (v) { if (typeof v !== 'string') allStr = false; s += v; })
+    .then(function () {
+      check(6, 'pipeThrough(new TextDecoderStream())', allStr && s === SPLIT,
+          JSON.stringify(s), 'strings=' + allStr + ' s=' + JSON.stringify(s));
+    });
+}).then(null, guard(6, 'pipeThrough(new TextDecoderStream())'));
+
+/* 7: abort a body mid-stream: the pending read rejects with AbortError. */
+var ac = typeof AbortController === 'function' ? new AbortController() : null;
+if (!ac) fail(7, 'AbortController mid-stream', 'no AbortController');
+else fetch('/sse', { signal: ac.signal }).then(function (r) {
+  var reader = r.body.getReader();
+  return reader.read().then(function (first) {
+    ac.abort();
+    return readAll(reader, function () {}).then(function () {
+      fail(7, 'AbortController mid-stream', 'body ended normally');
+    }, function (e) {
+      check(7, 'AbortController mid-stream', e && e.name === 'AbortError' && !first.done,
+          'read rejected: ' + e.name, 'err=' + (e && e.name));
+    });
+  });
+}).then(null, guard(7, 'AbortController mid-stream'));
+
+/* 8: the Response surface pages use besides the body. */
+fetch('/progress-stream').then(function (r) {
+  var c = r.clone();
+  return Promise.all([r.text(), c.text(),
+      Response.json({ a: 1 }).json(),
+      new Response('héllo').arrayBuffer()]).then(function (v) {
+    check(8, 'Response API (clone tee, json, arrayBuffer)',
+        v[0] === EXPECT && v[1] === EXPECT && v[2].a === 1 && v[3].byteLength === 6 &&
+        r.bodyUsed === true && r instanceof Response,
+        'clone ' + v[1].length + ' chars, json a=' + v[2].a + ', bytes ' + v[3].byteLength,
+        'r=' + v[0].length + ' c=' + v[1].length + ' a=' + v[2].a + ' ab=' + v[3].byteLength +
+        ' used=' + r.bodyUsed);
+  });
+}).then(null, guard(8, 'Response API'));
+</script>
+</body>
+</html>
