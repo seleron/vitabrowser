@@ -23,6 +23,16 @@ if [ -f "$F" ] && echo "$SHA  $F" | sha256sum -c --status; then
 	echo "== CA bundle (Mozilla, $DATE): $F =="
 	exit 0
 fi
+# CA_BUNDLE_LOCAL=/etc/ssl/certs/ca-certificates.crt stands in for the
+# pinned file on a machine that cannot reach curl.se (a sandboxed CI or
+# cloud runner). Simulator runs only: the local test pages use their own
+# test CA, but live-site HTTPS then verifies against the host's roots, not
+# the Vita's -- never package a VPK built this way.
+if [ -n "${CA_BUNDLE_LOCAL:-}" ]; then
+	cp "$CA_BUNDLE_LOCAL" "$F"
+	echo "== CA bundle: $CA_BUNDLE_LOCAL (NOT the pinned Mozilla $DATE file) =="
+	exit 0
+fi
 curl -sSfL -o "$F.tmp" "https://curl.se/ca/cacert-$DATE.pem"
 echo "$SHA  $F.tmp" | sha256sum -c --status || \
 	{ echo "  CHECKSUM MISMATCH: cacert-$DATE.pem"; rm -f "$F.tmp"; exit 1; }

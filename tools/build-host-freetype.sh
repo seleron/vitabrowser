@@ -31,7 +31,10 @@ echo "== host FreeType $VER -> $PREFIX =="
 mkdir -p "$SRC"
 T="$SRC/freetype-$VER.tar.xz"
 if ! { [ -f "$T" ] && echo "$SHA  $T" | sha256sum -c --status; }; then
-	curl -sSfL -o "$T" "https://download.savannah.gnu.org/releases/freetype/freetype-$VER.tar.xz"
+	# SourceForge carries the same release tarball (the checksum below is
+	# the check), for machines that cannot reach savannah.
+	curl -sSfL -o "$T" "https://download.savannah.gnu.org/releases/freetype/freetype-$VER.tar.xz" || \
+	curl -sSfL -o "$T" "https://download.sourceforge.net/freetype/freetype-$VER.tar.xz"
 	echo "$SHA  $T" | sha256sum -c --status || { echo "  CHECKSUM MISMATCH"; rm -f "$T"; exit 1; }
 fi
 rm -rf "$SRC/freetype-$VER"

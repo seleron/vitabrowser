@@ -58,8 +58,15 @@ for l in $LIBS netsurf; do
 	fi
 done
 
-echo "== regenerating the patch stack =="
-python3 "$ROOT/tools/split-patches.py" | tail -1
+# SKIP_REGEN=1 builds the committed stack as-is: for a machine whose trees
+# were set up by tools/bootstrap-work.sh (no MacSurf diff of its own to
+# trust), or to test exactly what the repo holds.
+if [ "${SKIP_REGEN:-}" = 1 ]; then
+	echo "== using the committed patch stack (SKIP_REGEN=1) =="
+else
+	echo "== regenerating the patch stack =="
+	python3 "$ROOT/tools/split-patches.py" | tail -1
+fi
 
 echo "== staging clean upstream trees =="
 rm -rf "$WORK/applytest/upstream"
