@@ -159,13 +159,47 @@ summary missing" regression and an unexplained 12:07 crash. Both came
 from the lost in-progress 131 edits, and neither reproduces with this
 implementation (JS-fetch 5/5 on all three pages, no crash in six runs).
 
-## 3. Next
+## 3. Patch 132: streaming `fetch()` bodies (B1, part 2)
 
-1. **Streaming `fetch()` bodies**: resolve `fetch()` at HEADERS_RECEIVED
-   with a `ReadableStream` `Response.body` fed by progress ticks (discarding
-   takes). That is how claude.ai reads its event stream; XHR and
-   EventSource alone do not cover it.
-2. Hardware run of the 131 build: JS-streaming over the Vita's own
-   network (`tools/build-vita.sh`, needs vitaSDK; not available in the cloud
-   session).
+claude.ai, like the Anthropic SDK, reads its event stream with
+`fetch(url).then(r => r.body.getReader())`. Before this patch the engine had
+no `ReadableStream`, and `fetch()` resolved only at DONE with a text-only
+`Response`. The design is in the patch header
+(`patches/vitabrowser/132-netsurf-streaming-fetch-bodies.patch`):
+
+- a native `__xhrNativeTakeBytes`, returning exact bytes;
+- streams in the polyfill;
+- a `Response` whose body is a stream of `Uint8Array`;
+- a `fetch()` that starts the request at call time, resolves at the first
+  body bytes and feeds the body from the Patch 131 progress ticks. Cancel
+  and abort stop the native fetch.
+
+The Node harness caught one real issue before the simulator ran: the
+request started a microtask late for every body. It now starts
+synchronously unless the body has to be read first (a Blob or a stream).
+
+### Result: full simulator suite, exit 0 (run 7)
+
+| Check | Result |
+|---|---|
+| **JS-fetch-stream (http + https)** | **8/8, 8/8**: resolves before the body ends (20 chunks), Uint8Array chunks, for-await, a character split across chunks, SSE parsed from a body + `cancel()`, `pipeThrough(TextDecoderStream)`, abort mid-stream → AbortError, clone tee / json / arrayBuffer |
+| JS-streaming (http + https) | 7/7, 7/7 |
+| JS-fetch ×3 (the old fetch() gate, now on the new fetch) | 5/5 each |
+| interaction (and at the Vita's pace) | 27/27, 27/27 |
+| web APIs | 161/176 present (was 158), behaviour 10/10 |
+| everything else | as run 6 |
+
+Stack: 217/217 patches apply to pristine pinned upstream, and the staged
+result is byte-identical to the tree that was tested.
+
+## 4. Next
+
+1. **Hardware run** of the 131 + 132 build: JS-streaming and
+   JS-fetch-stream over the Vita's own network (`tools/build-vita.sh`
+   needs vitaSDK, which the cloud session does not have).
+2. **B2 (auth / bot protection)**: the GSI flow reaches Google's "unusual
+   traffic" captcha from a datacenter IP (doc 12, build-loop-state). Only
+   a device on a residential IP can say whether it is still a wall.
 3. `nsmonkey` link (finding 3), to bring back the golden plot streams.
+4. Resolve `fetch()` at the header block rather than at the first body
+   byte (only matters for a server that sends headers and then waits).

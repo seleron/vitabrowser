@@ -57,7 +57,8 @@ implementations — adequacy per site is an empirical question.
 | canvas `measureText` | partial | `qjs_canvas_measure_text_width` routes through the real hardware-measured font path |
 | **EventSource / SSE** (R3) | **REAL (Patch 131, 2026-09-27)** | was 0 references; now a spec parser in `vita_polyfill.js` on the native slot -- see B1 |
 | **WebSocket** (R3) | **ABSENT, deliberate** | only a comment: globals "stay absent until they can provide storage, transport, or byte semantics" |
-| **XHR streaming** (R3) | **REAL (Patch 131, 2026-09-27)** | was: `macos9_js_fetch.c:314` set `readyState` directly to `4`. Now readyState 2/3 + `progress` per scheduler pass. `fetch()` bodies still arrive whole -- see B1 |
+| **XHR streaming** (R3) | **REAL (Patch 131, 2026-09-27)** | was: `macos9_js_fetch.c:314` set `readyState` directly to `4`. Now readyState 2/3 + `progress` per scheduler pass |
+| **fetch() body streaming** (R3) | **REAL (Patch 132, 2026-09-27)** | `ReadableStream` / `TransformStream` / `TextDecoderStream`; `Response.body` fed while the response arrives -- see B1 |
 | IndexedDB, Cache Storage, File/FileReader, object URLs, Notifications | deliberately absent | same design rule: absent beats fake, so feature detection picks a working path |
 
 Encouraging context: MacSurf's own fix commentary references debugging against
@@ -85,15 +86,15 @@ WebSocket is a larger job and may not be required if SSE suffices.
 **Action: do not copy `macos9_js_fetch.c`'s completion-only model.** This is the
 single most important v1 decision that protects the end goal.
 
-**Status (2026-09-27, Patch 131, doc 13):** XHR streaming and `EventSource`
-are done. The simulator's S5 gate (`JS-streaming`) passes 7/7 over http and
-https, and the full suite exits 0. **Still open for claude.ai:** streaming
-`fetch()` bodies. Modern apps read SSE through
-`fetch(...).then(r => r.body.getReader())`, and `Response.body` still
-resolves only at DONE. The native half is already in place
-(`__xhrNativeTake` with discard), so this is the next increment: resolve
-`fetch()` at HEADERS_RECEIVED with a `ReadableStream` body fed by progress
-ticks. WebSocket is still absent.
+**Status (2026-09-27, Patches 131 + 132, doc 13): B1 over HTTP is done.**
+XHR streaming, `EventSource`, and streaming `fetch()` bodies all work
+(`Response.body` as a `ReadableStream`, `getReader` / `for await` /
+`pipeThrough(new TextDecoderStream())`, with abort). The simulator gates
+JS-streaming 7/7 and JS-fetch-stream 8/8 pass over http and https, and the
+full suite exits 0. Remaining limits: request bodies are sent as strings,
+there is no backpressure, and WebSocket is still absent (claude.ai streams
+over SSE, so it is not on the critical path). The next blocker is B2
+(auth / bot protection), which needs the real Vita on a residential IP.
 
 ### B2 — Auth and bot protection (R4, R5)
 
