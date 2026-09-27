@@ -1000,11 +1000,15 @@ static void test_ink_clip(const char *root)
 	      "PM-shadow-clip: last child's shadow survives the parent clip (part A)");
 	CHECK(s != NULL && strips_visible(s, card, 2) == 1,
 	      "PM-shadow-clip: overflow:hidden box keeps its own shadow (part B)");
-	/* Only the clip rect's bottom edge is checked: its right edge is not
-	 * applied (the clip in force runs to x 951, not 500) -- a known gap,
-	 * docs/phase-0/13-cloud-rebuild.md. */
-	CHECK(s != NULL && strips_visible(s, clipd, 2) == 0,
+	/* not fully visible: cut by the clip, or culled as outside it */
+	CHECK(s != NULL && strips_visible(s, clipd, 2) != 1,
 	      "PM-shadow-clip: a CSS clip rect still clips the shadow (control)");
+	/* ...on its right edge too: rect(0, 200px, 60px, 0) at left 300 is
+	 * x 300..500. libcss read the right (and top) unit as em until
+	 * patch 134, so the clip ran to the viewport and this strip showed. */
+	CHECK(s != NULL && ink_visible(s, "PLOT RECT X0 500 Y0 20 X1 510 Y1 70",
+				       500, 20, 510, 70) != 1,
+	      "PM-shadow-clip: the clip rect's right edge cuts the right strip");
 	free(s);
 
 	snprintf(path, sizeof(path), "%s/testpages/patched-streams/PM-animation.plot", root);
