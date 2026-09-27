@@ -246,3 +246,52 @@ and nothing is requested. Next step: hook the contract's dispatcher
 (`jsaction` handler on documentElement) in an eval session to see whether
 it finds `click:cOuCgd` on the button and why the controller (`soHxf`)
 does not handle it.
+
+## Patch 130 — the event model (2026-09-27, Claude + Hermes)
+
+Hardware run 21 replayed the sign-in: the click reached Google's event
+contract but no action ran. Not a per-button bug — the engine was missing
+the event model every framework's buttons are built on:
+
+- **Tap sequence** (interaction.c): a tap now fires pointerdown, mousedown,
+  focus-move, pointerup, mouseup, click, in order. mousedown needed a PRESS
+  flag the click path never carried (so it never fired); pointerup/mouseup
+  came after click; nothing moved focus, so `document.activeElement` stayed
+  null and no focus/blur event reached a page.
+- **Focus model** (vita_polyfill.js `__vbTapFocus` + `macsurf_qjs_tap_focus`):
+  `element.focus()/blur()` were no-ops. A tap now focuses the focusable
+  element under it (a form control even under an overlay like a floating
+  label); a `<label>` hands focus to its control and toggles a
+  checkbox/radio; anything else clears focus. `change` on a text field
+  fires on losing focus with a new value, not per keystroke.
+- **Native event interfaces** (macsurf_qjs.c `qjs_event_iface` + polyfill
+  subclasses): native events carried the right constructor (a native click
+  reached page code as a plain Event — `e instanceof MouseEvent` false —
+  so Google's event contract dropped it), with `which`, `relatedTarget`,
+  `offsetX/Y`, key names and codes; FocusEvent/InputEvent had no
+  `preventDefault`; no interface had `prototype.constructor`.
+- **Caret hand-over** (interaction.c): a page that relayouts on focus
+  (Google's fields) rebuilt the field's box between tap and keyboard; the
+  caret now goes to the same control's new box.
+- **`document.currentScript`**: the getter-only polyfill accessor made the
+  engine's per-script assignment throw; it is now settable.
+- **`readystatechange`** at interactive + complete, and **window load**
+  (compat/macsurf_config.h `MACSURF_JS_FIRE_LOAD` 1): Google's Wiz waits
+  for readyState 'complete' to finish building the controller behind
+  "Next"; it never came, and no page ever saw `window load`.
+- **Snapshot dispatch** for document/window/`XMLHttpRequest` handlers
+  (a `{once:true}` listener removing itself skipped the next).
+- Also in the same tree (46): re-read `vita_window_current()` in the main
+  loop after a scheduled run, so a popup that just closed doesn't leave a
+  dangling `gw`.
+
+Result (simulator, run-21 scenario): Next posts `batchexecute?rpcids=MI613e`
+and Google answers ("Couldn't find this account" for the test address), as
+in Chromium. `IN-events.html` (taps scripted by position) checks the whole
+model; disarms of the once-snapshot (7) and caret hand-over (3, 4) fail it.
+
+**Verification (Hermes, after Claude's weekly limit):** full
+`tools/run-vita-sim.sh` **exit 0** — 27/27 interaction (IN-events
+`r=ok`), 25/25 pages, 68/68 frames, 4/4 xrealm/popup/scriptload, 6/6
+modules, JS-window 4/4 passes; no segv (the recurring one was the
+`macsurf_storage_fname` off-by-one, commit `5a5ee52`, ASAN-verified).

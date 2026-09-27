@@ -1,0 +1,928 @@
+# netsurf: one event model for every button and field -- tap sequence, focus, typed events, readystatechange, window load
+#
+# Hardware run 21: in the claude.ai Google sign-in the code went in but
+# "Next" did nothing. Not a per-button bug; the engine lacked pieces of the
+# event model every framework builds its buttons on:
+#
+# - interaction: a tap fires pointerdown, mousedown, (focus moves),
+#   pointerup, mouseup, click, in that order. mousedown needed a PRESS flag
+#   the click path never carries, so it never fired; pointerup/mouseup came
+#   after click. A mousedown handler that cancels keeps focus where it is.
+# - focus (vita_polyfill.js, macsurf_qjs_tap_focus): element.focus() and
+#   blur() were no-ops and document.activeElement never moved; no
+#   focus/blur/focusin/focusout ever reached a page. A tap now focuses the
+#   focusable element under it (a form control even under an overlay such as
+#   a floating label), a <label> hands focus to its control and toggles a
+#   checkbox/radio, anything else clears focus; events carry relatedTarget.
+#   `change` on a text field fires when it loses focus with a new value, not
+#   per keystroke (box_textarea.c).
+# - native events get their interface: MouseEvent / PointerEvent /
+#   KeyboardEvent / FocusEvent / InputEvent / WheelEvent, with which,
+#   relatedTarget, offsetX/Y, key names and codes; FocusEvent and InputEvent
+#   were plain objects without preventDefault, and no interface had
+#   prototype.constructor.
+# - html_keypress: a page that relayouts on focus (Google's fields) rebuilt
+#   the field's box and textarea between the tap and the keyboard's text;
+#   the caret is now handed to the same control's new box instead of the
+#   keys going nowhere.
+# - document.currentScript: the polyfill's getter-only accessor made the
+#   engine's own per-script assignment throw (and leave the exception
+#   pending) -- currentScript was null for every script.
+# - readystatechange fires at document for 'interactive' and 'complete'.
+#   Google's Wiz builds a controller whose optional children are absent by
+#   waiting for it while readyState is 'loading'; it never came, so the
+#   sign-in page's nav controller -- the one behind "Next" -- never existed.
+# - window load (compat/macsurf_config.h MACSURF_JS_FIRE_LOAD, repo side):
+#   on. No page ever saw window load or readyState 'complete'.
+# - document/window dispatchEvent run a snapshot of the listeners with this
+#   set (a {once:true} listener removing itself skipped the next one);
+#   XMLHttpRequest handlers get an event (e.target.responseText) over a
+#   snapshot.
+#
+# Result (simulator, the run-21 scenario): Next posts
+# batchexecute?rpcids=MI613e and Google answers ("Couldn't find this
+# account" for the test address), as in Chromium. IN-events (interaction
+# pass) checks all of it by tapping; disarms of the once-snapshot (7) and
+# the caret hand-over (3, 4) fail it.
+diff --git a/content/handlers/html/box_textarea.c b/content/handlers/html/box_textarea.c
+index 96a0917a3..d009ffda6 100644
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -281,19 +281,15 @@ static void box_textarea_callback(void *data, struct textarea_msg *msg)
+ 		 * form_gadget_sync_with_dom), so by this point e.target.value reads
+ 		 * correctly from a handler -- the events were the only missing part.
+ 		 *
+-		 * Both fire because sites bind to either; `input` is the per-keystroke
+-		 * one and `change` is nominally on commit, but this frontend has no
+-		 * separate commit signal, so firing both here is the honest
+-		 * approximation. Gated, so a page with no listeners pays nothing. */
++		 * `input` is the per-keystroke event. VitaBrowser: `change` is the
++		 * commit one and fires when the field loses focus with a new value
++		 * (vita_polyfill.js focus model), not per keystroke. Gated, so a
++		 * page with no listeners pays nothing. */
+ 		if (box != NULL && box->node != NULL) {
+ 			if (macsurf_qjs_event_type_live("input")) {
+ 				(void) fire_generic_dom_event(corestring_dom_input,
+ 						box->node, true, false);
+ 			}
+-			if (macsurf_qjs_event_type_live("change")) {
+-				(void) fire_generic_dom_event(corestring_dom_change,
+-						box->node, true, false);
+-			}
+ 		}
+ 		break;
+ 	}
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 81777f270..e0e8e3d32 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -50,6 +50,7 @@
+ #include "desktop/scrollbar.h"
+ #include "desktop/selection.h"
+ #include "desktop/textarea.h"
++#include "utils/utf8.h"
+ #include "desktop/download.h"
+ #include "javascript/js.h"
+ #include "desktop/gui_internal.h"
+@@ -1956,17 +1957,42 @@ mouse_action_drag_none(html_content *html,
+ 				(mouse & BROWSER_MOUSE_CLICK_2) ? 2 : 0, 0, 0);
+ 
+ 		/* VitaBrowser: a click on the Vita is a whole press and
+-		 * release; pages built on pointer events (YouTube's mobile
+-		 * buttons) need pointerdown/pointerup around it. */
+-		if (macsurf_qjs_event_type_live("pointerdown"))
+-			(void) fire_generic_dom_event(corestring_dom_pointerdown,
+-					mas.node, true, true);
+-		if (mouse & (BROWSER_MOUSE_PRESS_1 | BROWSER_MOUSE_PRESS_2)) {
+-			if (macsurf_qjs_event_type_live("mousedown")) {
++		 * release, delivered as one CLICK, so the whole sequence a
++		 * browser fires for a tap is fired here, in its order:
++		 * pointerdown, mousedown, focus moves, pointerup, mouseup,
++		 * click. mousedown used to need a PRESS flag the click path
++		 * never carries, so it never fired; and nothing moved focus, so
++		 * document.activeElement stayed null and no focus/blur event
++		 * ever reached a page. Frameworks that drive buttons from that
++		 * sequence (Google's Material buttons, the sign-in "Next") saw
++		 * a click out of nowhere. A mousedown handler cancelling the
++		 * event keeps focus where it is, as in a browser. */
++		{
++			bool md_ok = true;
++			if (macsurf_qjs_event_type_live("pointerdown"))
+ 				(void) fire_generic_dom_event(
++					corestring_dom_pointerdown, mas.node,
++					true, true);
++			if (macsurf_qjs_event_type_live("mousedown"))
++				md_ok = fire_generic_dom_event(
+ 					corestring_dom_mousedown, mas.node,
+ 					true, true);
+-			}
++			/* A tap that reached a form control focuses the
++			 * control, even when the event target is an overlay
++			 * above it (a floating label). */
++			if (md_ok)
++				macsurf_qjs_tap_focus(mas.gadget.control != NULL &&
++						mas.gadget.control->node != NULL
++						? mas.gadget.control->node
++						: mas.node);
++			if (macsurf_qjs_event_type_live("pointerup"))
++				(void) fire_generic_dom_event(
++					corestring_dom_pointerup, mas.node,
++					true, true);
++			if (macsurf_qjs_event_type_live("mouseup"))
++				(void) fire_generic_dom_event(
++					corestring_dom_mouseup, mas.node,
++					true, true);
+ 		}
+ 
+ 		/* fixes989 - this IS the dispatch, and its return value IS the
+@@ -2043,19 +2069,6 @@ mouse_action_drag_none(html_content *html,
+ 				href[0] ? href : "-");
+ 		}
+ 
+-		/* mouseup follows click here rather than preceding it because this
+-		 * frontend delivers CLICK as a single combined event -- there is no
+-		 * separate release callback to hang it off. Ordering within one
+-		 * physical click is therefore approximate; what matters is that
+-		 * handlers bound to mouseup run at all, which they previously did
+-		 * not. */
+-		if (macsurf_qjs_event_type_live("pointerup"))
+-			(void) fire_generic_dom_event(corestring_dom_pointerup,
+-					mas.node, true, true);
+-		if (macsurf_qjs_event_type_live("mouseup")) {
+-			(void) fire_generic_dom_event(corestring_dom_mouseup,
+-					mas.node, true, true);
+-		}
+ 		if ((mouse & BROWSER_MOUSE_DOUBLE_CLICK) &&
+ 		    macsurf_qjs_event_type_live("dblclick")) {
+ 			(void) fire_generic_dom_event(corestring_dom_dblclick,
+@@ -2318,11 +2331,56 @@ static bool vb_box_in_tree(const struct box *root, const struct box *b,
+ 	return false;
+ }
+ 
++/* VitaBrowser: the DOM node of the text field that last took the caret,
++ * so a relayout that rebuilt its box can hand the caret to the new box. */
++static html_content *vb_focus_html = NULL;
++static void *vb_focus_node = NULL;
++
++/* The box in the tree under b whose form control is node's, if any. */
++static struct box *vb_find_field_box(struct box *b, void *node, int depth)
++{
++	struct box *c, *r;
++
++	if (b->gadget != NULL && b->gadget->node == node &&
++	    b->gadget->data.text.ta != NULL &&
++	    (b->gadget->type == GADGET_TEXTBOX ||
++	     b->gadget->type == GADGET_PASSWORD ||
++	     b->gadget->type == GADGET_TEXTAREA))
++		return b;
++	if (depth > 400)
++		return NULL;
++	for (c = b->children; c != NULL; c = c->next)
++		if ((r = vb_find_field_box(c, node, depth + 1)) != NULL)
++			return r;
++	return NULL;
++}
++
+ bool html_keypress(struct content *c, uint32_t key)
+ {
+ 	html_content *html = (html_content *) c;
+ 	struct selection *sel = html->sel;
+ 
++	/* VitaBrowser: a page reacting to focus (Google's text fields float
++	 * their label) rebuilds the box tree between the tap that placed the
++	 * caret and the first key. The field is the same DOM node with a new
++	 * box and a new textarea: put the caret at the end of it there, and
++	 * the key goes where the user is typing instead of nowhere. */
++	if (html->focus_type == HTML_FOCUS_TEXTAREA && html->layout != NULL &&
++	    vb_focus_html == html && vb_focus_node != NULL &&
++	    !vb_box_in_tree(html->layout, html->focus_owner.textarea, 0)) {
++		struct box *nb = vb_find_field_box(html->layout,
++				vb_focus_node, 0);
++		if (nb != NULL) {
++			unsigned int len = 0;
++			const char *t = textarea_data(nb->gadget->data.text.ta,
++					&len);
++			html->focus_owner.textarea = nb;
++			(void) textarea_set_caret(nb->gadget->data.text.ta,
++					t != NULL ? (int) utf8_bounded_length(t,
++							len) : 0);
++		}
++	}
++
+ 	/* VitaBrowser: the focus owner is a raw box pointer, and a relayout
+ 	 * that script triggered (Google's sign-in replacing its form after
+ 	 * Next) frees the box tree it pointed into: the next key dispatched
+@@ -2578,6 +2636,9 @@ void html_set_focus(html_content *html, html_focus_type focus_type,
+ 
+ 	case HTML_FOCUS_TEXTAREA:
+ 		box_coords(focus_owner.textarea, &x_off, &y_off);
++		vb_focus_html = html;
++		vb_focus_node = focus_owner.textarea->gadget != NULL ?
++				focus_owner.textarea->gadget->node : NULL;
+ 		break;
+ 	}
+ 
+diff --git a/content/handlers/html/macsurf_frontend_stubs.c b/content/handlers/html/macsurf_frontend_stubs.c
+index 4f855d46f..f794e07db 100644
+--- a/content/handlers/html/macsurf_frontend_stubs.c
++++ b/content/handlers/html/macsurf_frontend_stubs.c
+@@ -369,6 +369,11 @@ __attribute__((weak)) void macsurf_qjs_clear_event_detail(void)
+ {
+ }
+ 
++__attribute__((weak)) void macsurf_qjs_tap_focus(struct dom_node *node)
++{
++	(void) node;
++}
++
+ __attribute__((weak)) void macos9_animation_register(void)
+ {
+ }
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index cd127303a..9962ac3aa 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -413,6 +413,9 @@ nserror html_css_fetcher_add_item(dom_string *data, struct nsurl *base_url,
+ int macsurf_qjs_event_type_live(const char *type);
+ void macsurf_qjs_set_event_detail(int x, int y, int button, int key, int mods);
+ void macsurf_qjs_clear_event_detail(void);
++/* VitaBrowser: move focus as a tap on node would (vita_polyfill.js). */
++struct dom_node;
++void macsurf_qjs_tap_focus(struct dom_node *node);
+ 
+ bool fire_generic_dom_event(dom_string *type, dom_node *target,
+ 		    bool bubbles, bool cancelable);
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 00a9dfe0d..9cabd6ed3 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -7009,6 +7009,37 @@ void macsurf_qjs_fire_resize(void)
+ 			(dom_node *) g_qjs_document, true, false);
+ }
+ 
++/* VitaBrowser: focus follows a tap. A browser moves focus to the
++ * focusable element under the pointer on mousedown (and blurs the old one),
++ * firing blur/focusout/focus/focusin; frameworks read document.activeElement
++ * and bind to those events (Google's text fields and buttons, React forms).
++ * The focus model lives in vita_polyfill.js (__vbTapFocus); this hands it
++ * the tapped node. */
++void macsurf_qjs_tap_focus(dom_node *node);
++void macsurf_qjs_tap_focus(dom_node *node)
++{
++	JSContext *ctx;
++	JSValue global, fnv, arg, ret;
++
++	if (node == NULL) return;
++	ctx = qjs_ctx_for_dom_node(node);
++	if (ctx == NULL) return;
++	global = JS_GetGlobalObject(ctx);
++	fnv = JS_GetPropertyStr(ctx, global, "__vbTapFocus");
++	if (JS_IsFunction(ctx, fnv)) {
++		qjs_geom_settle_begin();
++		macsurf_dom_node_ref(node);   /* qjs_wrap_any_node consumes one */
++		arg = qjs_wrap_any_node(ctx, node);
++		ret = JS_Call(ctx, fnv, global, 1, (JSValueConst *)&arg);
++		if (JS_IsException(ret))
++			JS_FreeValue(ctx, JS_GetException(ctx));
++		JS_FreeValue(ctx, ret);
++		JS_FreeValue(ctx, arg);
++	}
++	JS_FreeValue(ctx, fnv);
++	JS_FreeValue(ctx, global);
++}
++
+ void macsurf_qjs_clear_event_detail(void)
+ {
+ 	g_qjs_ev_x = g_qjs_ev_y = g_qjs_ev_button = 0;
+@@ -7859,6 +7890,31 @@ struct qjs_synth_ev_slot {
+ };
+ static struct qjs_synth_ev_slot *g_synth_ev_stack = NULL;
+ 
++
++/* VitaBrowser: which event interface a native event of this type gets. */
++static const char *qjs_event_iface(const char *t, size_t n)
++{
++#define VB_IS(lit) (n == sizeof(lit) - 1 && memcmp(t, lit, n) == 0)
++	if (n >= 7 && memcmp(t, "pointer", 7) == 0)
++		return "PointerEvent";
++	if ((n >= 5 && memcmp(t, "mouse", 5) == 0) || VB_IS("click") ||
++	    VB_IS("dblclick") || VB_IS("contextmenu") || VB_IS("auxclick"))
++		return "MouseEvent";
++	if (VB_IS("wheel"))
++		return "WheelEvent";
++	if (n >= 3 && memcmp(t, "key", 3) == 0)
++		return "KeyboardEvent";
++	if (VB_IS("focus") || VB_IS("blur") || VB_IS("focusin") ||
++	    VB_IS("focusout"))
++		return "FocusEvent";
++	if (VB_IS("input") || VB_IS("beforeinput"))
++		return "InputEvent";
++	if (n >= 5 && memcmp(t, "touch", 5) == 0)
++		return "TouchEvent";
++#undef VB_IS
++	return "Event";
++}
++
+ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ {
+ 	dom_event_target *ct = NULL;
+@@ -7940,7 +7996,18 @@ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ 		evobj = JS_DupValue(ctx, g_synth_ev_stack->jsev);
+ 	} else {
+ 		JSValue global = JS_GetGlobalObject(ctx);
+-		JSValue ctor = JS_GetPropertyStr(ctx, global, "Event");
++		/* VitaBrowser: the event interface the type calls for, not
++		 * always Event. A native click reached page code as a plain Event
++		 * (`e instanceof MouseEvent` false), so frameworks that route
++		 * clicks by interface -- Google's event contract (every Google
++		 * button, the sign-in "Next") -- dropped it. */
++		JSValue ctor = JS_GetPropertyStr(ctx, global,
++				qjs_event_iface(dom_string_data(type_ds),
++					(size_t)dom_string_length(type_ds)));
++		if (!JS_IsFunction(ctx, ctor)) {
++			JS_FreeValue(ctx, ctor);
++			ctor = JS_GetPropertyStr(ctx, global, "Event");
++		}
+ 		evobj = JS_UNDEFINED;
+ 		if (JS_IsFunction(ctx, ctor)) {
+ 			JSValue targ[1];
+@@ -8038,20 +8105,79 @@ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ 					JS_NewInt32(ctx, g_qjs_ev_button));
+ 			JS_SetPropertyStr(ctx, evobj, "buttons",
+ 					JS_NewInt32(ctx, g_qjs_ev_button ? 1 : 0));
++			/* the legacy fields old and minified code still reads */
++			JS_SetPropertyStr(ctx, evobj, "which",
++					JS_NewInt32(ctx, g_qjs_ev_button + 1));
++			JS_SetPropertyStr(ctx, evobj, "relatedTarget", JS_NULL);
++			JS_SetPropertyStr(ctx, evobj, "offsetX",
++					JS_NewInt32(ctx, 0));
++			JS_SetPropertyStr(ctx, evobj, "offsetY",
++					JS_NewInt32(ctx, 0));
++			JS_SetPropertyStr(ctx, evobj, "movementX",
++					JS_NewInt32(ctx, 0));
++			JS_SetPropertyStr(ctx, evobj, "movementY",
++					JS_NewInt32(ctx, 0));
+ 			JS_SetPropertyStr(ctx, evobj, "detail", JS_NewInt32(ctx, 1));
+ 		} else if (is_key) {
++			/* VitaBrowser: the key's name and code as a browser
++			 * gives them: Enter submits, Backspace deletes. NetSurf
++			 * passes UCS4 plus NS_KEY_* for the special keys; the key
++			 * name was empty for every non-printable one. */
+ 			char kb[8];
+-			int n = 0;
+-			if (g_qjs_ev_key >= 32 && g_qjs_ev_key < 127) {
+-				kb[n++] = (char)g_qjs_ev_key;
++			const char *kname = NULL, *kcode = NULL;
++			int kc = g_qjs_ev_key;
++			switch (g_qjs_ev_key) {
++			case 13: case 10: kname = "Enter"; kcode = "Enter"; kc = 13; break;
++			case 8: kname = "Backspace"; kcode = "Backspace"; break;
++			case 9: kname = "Tab"; kcode = "Tab"; break;
++			case 27: kname = "Escape"; kcode = "Escape"; break;
++			case 28: kname = "ArrowLeft"; kcode = "ArrowLeft"; kc = 37; break;
++			case 29: kname = "ArrowRight"; kcode = "ArrowRight"; kc = 39; break;
++			case 30: kname = "ArrowUp"; kcode = "ArrowUp"; kc = 38; break;
++			case 31: kname = "ArrowDown"; kcode = "ArrowDown"; kc = 40; break;
++			case 127: kname = "Delete"; kcode = "Delete"; kc = 46; break;
++			case 32: kname = " "; kcode = "Space"; break;
++			default: break;
+ 			}
+-			kb[n] = '\0';
+-			JS_SetPropertyStr(ctx, evobj, "key", JS_NewString(ctx, kb));
+-			JS_SetPropertyStr(ctx, evobj, "code", JS_NewString(ctx, kb));
++			if (kname == NULL) {
++				int n = 0;
++				unsigned int u = (unsigned int)g_qjs_ev_key;
++				/* UTF-8 for the printable character */
++				if (u >= 32 && u < 0x80) {
++					kb[n++] = (char)u;
++				} else if (u >= 0x80 && u < 0x800) {
++					kb[n++] = (char)(0xc0 | (u >> 6));
++					kb[n++] = (char)(0x80 | (u & 0x3f));
++				} else if (u >= 0x800 && u < 0x10000) {
++					kb[n++] = (char)(0xe0 | (u >> 12));
++					kb[n++] = (char)(0x80 | ((u >> 6) & 0x3f));
++					kb[n++] = (char)(0x80 | (u & 0x3f));
++				}
++				kb[n] = '\0';
++				kname = kb;
++				/* legacy keyCode: the upper-case letter / digit */
++				if (u >= 'a' && u <= 'z')
++					kc = (int)(u - 32);
++			}
++			JS_SetPropertyStr(ctx, evobj, "key", JS_NewString(ctx, kname));
++			if (kcode == NULL) {
++				static char cb[16];
++				unsigned int u = (unsigned int)g_qjs_ev_key;
++				if (u >= 'a' && u <= 'z')
++					snprintf(cb, sizeof(cb), "Key%c", (char)(u - 32));
++				else if (u >= 'A' && u <= 'Z')
++					snprintf(cb, sizeof(cb), "Key%c", (char)u);
++				else if (u >= '0' && u <= '9')
++					snprintf(cb, sizeof(cb), "Digit%c", (char)u);
++				else
++					cb[0] = '\0';
++				kcode = cb;
++			}
++			JS_SetPropertyStr(ctx, evobj, "code", JS_NewString(ctx, kcode));
+ 			JS_SetPropertyStr(ctx, evobj, "keyCode",
+-					JS_NewInt32(ctx, g_qjs_ev_key));
++					JS_NewInt32(ctx, kc));
+ 			JS_SetPropertyStr(ctx, evobj, "which",
+-					JS_NewInt32(ctx, g_qjs_ev_key));
++					JS_NewInt32(ctx, kc));
+ 			JS_SetPropertyStr(ctx, evobj, "charCode",
+ 					JS_NewInt32(ctx, g_qjs_ev_key));
+ 		}
+@@ -12432,7 +12558,14 @@ static void register_browser_globals(JSContext *ctx)
+ 					   "t==='readystatechange'||t==='pageshow'){"
+ 						"try{if(typeof __msLife==='function')"
+ 							"__msLife('docevt type='+t+' n='+n);}catch(_){}}"
+-					"if(L)L.forEach(function(f){try{f(ev);}catch(e){"
++					/* VitaBrowser: over a snapshot, with this=document
++					 * and target set. A {once:true} listener removes
++					 * itself mid-dispatch; iterating the live array then
++					 * skipped the listener after it (Google's Wiz waits
++					 * for readystatechange that way, several at once). */
++					"if(ev&&ev.target==null){try{ev.target=document;}catch(_){}}"
++					"try{if(ev)ev.currentTarget=document;}catch(_){}"
++					"if(L)L.slice().forEach(function(f){try{f.call(document,ev);}catch(e){"
+ 						"try{if(typeof __msLife==='function')"
+ 							"__msLife('docevt THREW type='+t+': '+"
+ 								"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"
+@@ -12747,7 +12880,10 @@ static void register_browser_globals(JSContext *ctx)
+ 			   "t==='pageshow'){"
+ 				"try{if(typeof __msLife==='function')"
+ 					"__msLife('winevt type='+t+' n='+n);}catch(_){}}"
+-			"if(arr)arr.forEach(function(f){try{f(ev);}catch(e){"
++			/* VitaBrowser: snapshot + this=window (see document's). */
++			"var W=this;"
++			"if(ev&&ev.target==null){try{ev.target=W;}catch(_){}}"
++			"if(arr)arr.slice().forEach(function(f){try{f.call(W,ev);}catch(e){"
+ 				"try{if(typeof __msLife==='function')"
+ 					"__msLife('winevt THREW type='+t+': '+"
+ 						"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"
+@@ -13083,11 +13219,18 @@ static void register_browser_globals(JSContext *ctx)
+ 			"var a=this._listeners[type];if(!a)return;"
+ 			"var i=a.indexOf(fn);if(i>=0)a.splice(i,1);"
+ 		"};"
++		/* VitaBrowser: handlers get an event (e.target.responseText is the
++		 * common idiom; they were called with no argument) and run over a
++		 * snapshot so one removing itself cannot skip the next. */
+ 		"XMLHttpRequest.prototype._fire=function(type){"
+-			"var t='on'+type;"
+-			"if(typeof this[t]==='function'){try{this[t]();}catch(e){}}"
+-			"var a=this._listeners[type];"
+-			"if(a)for(var i=0;i<a.length;i++){try{a[i]();}catch(e){}}"
++			"var t='on'+type,x=this,ev;"
++			"try{ev=new Event(type);}catch(e){ev={type:type,preventDefault:function(){},stopPropagation:function(){}};}"
++			"try{ev.target=x;ev.currentTarget=x;ev.srcElement=x;}catch(e){}"
++			"var tot=0;try{tot=(typeof x.responseText==='string'&&x.responseText.length)||0;}catch(e){}"
++			"try{ev.lengthComputable=tot>0;ev.loaded=tot;ev.total=tot;}catch(e){}"
++			"if(typeof x[t]==='function'){try{x[t].call(x,ev);}catch(e){}}"
++			"var a=x._listeners[type];"
++			"if(a){a=a.slice();for(var i=0;i<a.length;i++){try{a[i].call(x,ev);}catch(e){}}}"
+ 		"};"
+ 		"XMLHttpRequest.prototype.__onNativeComplete=function(){"
+ 			"var ok=this.status>=200&&this.status<300;"
+@@ -18144,6 +18287,12 @@ unsigned char js_fire_dom_ready(struct jsthread *thread, struct dom_document *do
+ 		"if(document.__ms_ready_fired)return;"
+ 		"document.__ms_ready_fired=true;"
+ 		"document.readyState='interactive';"
++		/* VitaBrowser: each readyState change fires readystatechange
++		 * first (HTML "update the current document readiness"). Google's
++		 * Wiz waits on it to finish building a controller whose optional
++		 * children are absent while readyState is 'loading' -- without
++		 * it the sign-in form's buttons never got their controllers. */
++		"try{document.dispatchEvent(new Event('readystatechange'));}catch(e){}"
+ 		"try{document.dispatchEvent(new Event('DOMContentLoaded'));}catch(e){}"
+ 		"try{if(typeof window!=='undefined')"
+ 		"window.dispatchEvent(new Event('DOMContentLoaded'));}catch(e){}"
+@@ -18207,6 +18356,7 @@ unsigned char js_fire_window_load(struct jsthread *thread, struct dom_document *
+ 		"if(document.__ms_load_fired)return;"
+ 		"document.__ms_load_fired=true;"
+ 		"document.readyState='complete';"
++		"try{document.dispatchEvent(new Event('readystatechange'));}catch(e){}"
+ 		"try{document.dispatchEvent(new Event('load'));}catch(e){}"
+ 		"try{if(typeof window!=='undefined')"
+ 		"window.dispatchEvent(new Event('load'));}catch(e){}"
+@@ -18316,7 +18466,10 @@ void js_set_current_script(struct jsthread *thread, struct dom_node *node)
+ 		macsurf_dom_node_ref(node);	/* the wrap CONSUMES a ref */
+ 		el = qjs_wrap_element(ctx, (dom_element *)node);
+ 	}
+-	JS_SetPropertyStr(ctx, doc, "currentScript", el);
++	/* VitaBrowser: never leave a failed assignment's exception pending
++	 * for whatever runs next in this realm. */
++	if (JS_SetPropertyStr(ctx, doc, "currentScript", el) < 0)
++		JS_FreeValue(ctx, JS_GetException(ctx));
+ 
+ 	JS_FreeValue(ctx, doc);
+ 	JS_FreeValue(ctx, global);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index e21a5d079..e72c4e64c 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1384,7 +1384,11 @@
+ "\tacc(d, 'contentType', function () { return 'text/html'; });\n"
+ "\tacc(d, 'compatMode', function () { return 'CSS1Compat'; });\n"
+ "\tacc(d, 'dir', function () { return (d.documentElement && d.documentElement.getAttribute('dir')) || ''; });\n"
+-"\tacc(d, 'currentScript', function () { return d.__vbCurrentScript || null; });\n"
++"\t/* The engine assigns document.currentScript around each script\n"
++"\t * (js_set_current_script): a getter alone made that assignment throw\n"
++"\t * and left currentScript null for every script. */\n"
++"\tacc(d, 'currentScript', function () { return d.__vbCurrentScript || null; },\n"
++"\t\tfunction (v) { d.__vbCurrentScript = v || null; });\n"
+ "\tacc(d, 'styleSheets', function () {\n"
+ "\t\tvar out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');\n"
+ "\t\tfor (var i = 0; i < ls.length; i++)\n"
+@@ -3127,5 +3131,176 @@
+ "\tdefine(g, 'IDBFactory', function IDBFactory() {});\n"
+ "})();\n"
+ "\n"
++"/* ---- event interfaces: real subclasses of Event -------------------------\n"
++" * The bridge's FocusEvent and InputEvent returned plain objects with no\n"
++" * preventDefault, and none of its constructors had prototype.constructor,\n"
++" * so a native input event reached `e.preventDefault()` as a TypeError and\n"
++" * `e.constructor === MouseEvent` was false. Native events are built with\n"
++" * these (macsurf_qjs.c, qjs_event_iface). TouchEvent is left undefined on\n"
++" * purpose: pages take its presence to mean touch events will come, and\n"
++" * this browser sends mouse events. */\n"
++"\n"
++"(function () {\n"
++"\tvar Ev = g.Event;\n"
++"\tif (typeof Ev !== 'function' || !Ev.prototype) return;\n"
++"\tfunction isEvent(C) {\n"
++"\t\treturn typeof C === 'function' && C.prototype &&\n"
++"\t\t\t(C === Ev || Ev.prototype.isPrototypeOf(C.prototype));\n"
++"\t}\n"
++"\tfunction sub(name, base, init) {\n"
++"\t\tif (isEvent(g[name])) return;\n"
++"\t\tvar C = function (type, opts) {\n"
++"\t\t\tbase.call(this, type, opts);\n"
++"\t\t\tinit.call(this, opts || {});\n"
++"\t\t};\n"
++"\t\tC.prototype = Object.create(base.prototype);\n"
++"\t\ttry { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tdefine(g, name, C);\n"
++"\t}\n"
++"\tvar UI = isEvent(g.UIEvent) ? g.UIEvent : Ev;\n"
++"\tvar ME = isEvent(g.MouseEvent) ? g.MouseEvent : UI;\n"
++"\tsub('FocusEvent', UI, function (o) { this.relatedTarget = o.relatedTarget || null; });\n"
++"\tsub('InputEvent', UI, function (o) {\n"
++"\t\tthis.data = o.data === undefined ? null : o.data;\n"
++"\t\tthis.inputType = o.inputType || '';\n"
++"\t\tthis.isComposing = !!o.isComposing;\n"
++"\t\tthis.dataTransfer = null;\n"
++"\t});\n"
++"\tsub('CompositionEvent', UI, function (o) { this.data = o.data || ''; });\n"
++"\tsub('WheelEvent', ME, function (o) {\n"
++"\t\tthis.deltaX = o.deltaX || 0; this.deltaY = o.deltaY || 0;\n"
++"\t\tthis.deltaZ = o.deltaZ || 0; this.deltaMode = o.deltaMode || 0;\n"
++"\t});\n"
++"\t['Event', 'CustomEvent', 'UIEvent', 'MouseEvent', 'PointerEvent', 'KeyboardEvent',\n"
++"\t\t'FocusEvent', 'InputEvent', 'CompositionEvent', 'WheelEvent'].forEach(function (n) {\n"
++"\t\tvar C = g[n];\n"
++"\t\tif (isEvent(C) && C.prototype.constructor !== C) define(C.prototype, 'constructor', C);\n"
++"\t});\n"
++"})();\n"
++"\n"
++"/* ---- focus: element.focus()/blur(), and a tap moves focus ---------------\n"
++" * element.focus() was a no-op, so document.activeElement never changed and\n"
++" * no focus/blur/focusin/focusout event reached a page. A tap now focuses the\n"
++" * focusable element under it (macsurf_qjs_tap_focus, from interaction.c,\n"
++" * after mousedown), or clears focus, as a browser does; blur fires on the\n"
++" * old element, then focus on the new, with relatedTarget. `change` on a text\n"
++" * field fires when it loses focus with a different value (it used to fire\n"
++" * per keystroke, box_textarea.c). A tap on a <label> activates its control. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof g.Event !== 'function') return;\n"
++"\tvar NATIVE = /^(INPUT|SELECT|TEXTAREA|BUTTON|IFRAME|SUMMARY)$/;\n"
++"\tvar DISABLES = /^(INPUT|SELECT|TEXTAREA|BUTTON)$/;\n"
++"\tfunction tagOf(el) { return el && el.tagName ? String(el.tagName).toUpperCase() : ''; }\n"
++"\tfunction inputType(el) { return String((el.getAttribute && el.getAttribute('type')) || '').toLowerCase(); }\n"
++"\tfunction focusable(el) {\n"
++"\t\tif (!el || el.nodeType !== 1 || !el.getAttribute) return false;\n"
++"\t\tvar t = tagOf(el);\n"
++"\t\tif (DISABLES.test(t) && el.hasAttribute('disabled')) return false;\n"
++"\t\tif (t === 'INPUT' && inputType(el) === 'hidden') return false;\n"
++"\t\tif (el.hasAttribute('tabindex') || NATIVE.test(t)) return true;\n"
++"\t\tif ((t === 'A' || t === 'AREA') && el.hasAttribute('href')) return true;\n"
++"\t\tvar ce = el.getAttribute('contenteditable');\n"
++"\t\treturn ce !== null && String(ce).toLowerCase() !== 'false';\n"
++"\t}\n"
++"\tfunction connected(el) { return !!el && el.isConnected !== false; }\n"
++"\tfunction isTextField(el) {\n"
++"\t\tvar t = tagOf(el);\n"
++"\t\tif (t === 'TEXTAREA') return true;\n"
++"\t\treturn t === 'INPUT' && !/^(checkbox|radio|button|submit|reset|image|file|hidden)$/.test(inputType(el));\n"
++"\t}\n"
++"\tfunction fire(el, type, bubbles, related) {\n"
++"\t\tvar e;\n"
++"\t\ttry { e = new g.FocusEvent(type, { bubbles: bubbles, relatedTarget: related || null }); }\n"
++"\t\tcatch (x) { e = new g.Event(type, { bubbles: bubbles }); }\n"
++"\t\ttry { el.dispatchEvent(e); } catch (x) { /* a handler threw: the next one still runs */ }\n"
++"\t}\n"
++"\tfunction fireSimple(el, type) {\n"
++"\t\ttry { el.dispatchEvent(new g.Event(type, { bubbles: true })); } catch (x) { /* */ }\n"
++"\t}\n"
++"\tvar cur = null, depth = 0;\n"
++"\tfunction setFocus(el) {\n"
++"\t\tif (el === cur || depth > 4) return;\n"
++"\t\tdepth++;\n"
++"\t\tvar prev = cur;\n"
++"\t\tcur = el;\n"
++"\t\td.__vitaFocus = el;\n"
++"\t\tif (prev && connected(prev)) {\n"
++"\t\t\tif (isTextField(prev) && prev.__vbFocusValue !== undefined &&\n"
++"\t\t\t\t\tString(prev.value == null ? '' : prev.value) !== prev.__vbFocusValue)\n"
++"\t\t\t\tfireSimple(prev, 'change');\n"
++"\t\t\tprev.__vbFocusValue = undefined;\n"
++"\t\t\tfire(prev, 'blur', false, el);\n"
++"\t\t\tfire(prev, 'focusout', true, el);\n"
++"\t\t}\n"
++"\t\t/* a blur handler may have moved focus elsewhere already */\n"
++"\t\tif (el && cur === el) {\n"
++"\t\t\tel.__vbFocusValue = isTextField(el) ? String(el.value == null ? '' : el.value) : undefined;\n"
++"\t\t\tfire(el, 'focus', false, prev);\n"
++"\t\t\tif (cur === el) fire(el, 'focusin', true, prev);\n"
++"\t\t}\n"
++"\t\tdepth--;\n"
++"\t}\n"
++"\tfunction focusFn() { if (focusable(this) && connected(this)) setFocus(this); }\n"
++"\tfunction blurFn() { if (cur === this) setFocus(null); }\n"
++"\tvar seen = [], hit = false;\n"
++"\t['section', 'div', 'span', 'input', 'textarea', 'select', 'button', 'a', 'iframe'].forEach(function (t) {\n"
++"\t\tvar o;\n"
++"\t\ttry { o = Object.getPrototypeOf(d.createElement(t)); } catch (x) { return; }\n"
++"\t\tfor (; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {\n"
++"\t\t\tif (seen.indexOf(o) >= 0) continue;\n"
++"\t\t\tseen.push(o);\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(o, 'focus')) { define(o, 'focus', focusFn); hit = true; }\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(o, 'blur')) define(o, 'blur', blurFn);\n"
++"\t\t}\n"
++"\t});\n"
++"\tif (!hit && seen.length) { define(seen[0], 'focus', focusFn); define(seen[0], 'blur', blurFn); }\n"
++"\ttry {\n"
++"\t\tObject.defineProperty(d, 'activeElement', { configurable: true,\n"
++"\t\t\tget: function () { return cur && connected(cur) ? cur : (d.body || null); } });\n"
++"\t} catch (x) { /* */ }\n"
++"\n"
++"\tfunction labelControl(label) {\n"
++"\t\tvar f = label.getAttribute('for');\n"
++"\t\tif (f) return d.getElementById(f);\n"
++"\t\tvar c = label.querySelector && label.querySelector('input,select,textarea,button');\n"
++"\t\treturn c || null;\n"
++"\t}\n"
++"\t/* The tap as a browser handles it: the nearest focusable element takes\n"
++"\t * focus; a <label> hands it to its control (and toggles a checkbox or\n"
++"\t * radio, which then gets its own click, input and change); anything\n"
++"\t * else clears focus. */\n"
++"\tdefine(g, '__vbTapFocus', function (n) {\n"
++"\t\tvar el, label = null;\n"
++"\t\tfor (el = n; el && el.nodeType === 1; el = el.parentNode) {\n"
++"\t\t\tif (focusable(el)) { setFocus(el); return; }\n"
++"\t\t\tif (!label && tagOf(el) === 'LABEL') label = el;\n"
++"\t\t}\n"
++"\t\tvar c = label && labelControl(label);\n"
++"\t\tif (c && focusable(c)) {\n"
++"\t\t\tvar t = inputType(c);\n"
++"\t\t\tif (tagOf(c) === 'INPUT' && (t === 'checkbox' || t === 'radio')) {\n"
++"\t\t\t\tsetFocus(c);\n"
++"\t\t\t\tif (t === 'checkbox') c.checked = !c.checked; else c.checked = true;\n"
++"\t\t\t\ttry { c.dispatchEvent(new g.MouseEvent('click', { bubbles: true, cancelable: true })); } catch (x) { /* */ }\n"
++"\t\t\t\ttry { c.dispatchEvent(new g.InputEvent('input', { bubbles: true })); } catch (x) { /* */ }\n"
++"\t\t\t\tfireSimple(c, 'change');\n"
++"\t\t\t\treturn;\n"
++"\t\t\t}\n"
++"\t\t\tsetFocus(c);\n"
++"\t\t\treturn;\n"
++"\t\t}\n"
++"\t\tsetFocus(null);\n"
++"\t});\n"
++"\t/* Typing always happens in the focused field: a field typed into\n"
++"\t * without a tap the focus model saw (the on-screen keyboard opened\n"
++"\t * another way) takes focus before its first input event is handled. */\n"
++"\tif (d.addEventListener) d.addEventListener('input', function (e) {\n"
++"\t\tvar t = e && e.target;\n"
++"\t\tif (e.isTrusted && t && t !== cur && focusable(t)) setFocus(t);\n"
++"\t}, true);\n"
++"})();\n"
++"\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index ec3dff7e1..8b6e5ef5e 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1383,7 +1383,11 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	acc(d, 'contentType', function () { return 'text/html'; });
+ 	acc(d, 'compatMode', function () { return 'CSS1Compat'; });
+ 	acc(d, 'dir', function () { return (d.documentElement && d.documentElement.getAttribute('dir')) || ''; });
+-	acc(d, 'currentScript', function () { return d.__vbCurrentScript || null; });
++	/* The engine assigns document.currentScript around each script
++	 * (js_set_current_script): a getter alone made that assignment throw
++	 * and left currentScript null for every script. */
++	acc(d, 'currentScript', function () { return d.__vbCurrentScript || null; },
++		function (v) { d.__vbCurrentScript = v || null; });
+ 	acc(d, 'styleSheets', function () {
+ 		var out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');
+ 		for (var i = 0; i < ls.length; i++)
+@@ -3126,4 +3130,175 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	define(g, 'IDBFactory', function IDBFactory() {});
+ })();
+ 
++/* ---- event interfaces: real subclasses of Event -------------------------
++ * The bridge's FocusEvent and InputEvent returned plain objects with no
++ * preventDefault, and none of its constructors had prototype.constructor,
++ * so a native input event reached `e.preventDefault()` as a TypeError and
++ * `e.constructor === MouseEvent` was false. Native events are built with
++ * these (macsurf_qjs.c, qjs_event_iface). TouchEvent is left undefined on
++ * purpose: pages take its presence to mean touch events will come, and
++ * this browser sends mouse events. */
++
++(function () {
++	var Ev = g.Event;
++	if (typeof Ev !== 'function' || !Ev.prototype) return;
++	function isEvent(C) {
++		return typeof C === 'function' && C.prototype &&
++			(C === Ev || Ev.prototype.isPrototypeOf(C.prototype));
++	}
++	function sub(name, base, init) {
++		if (isEvent(g[name])) return;
++		var C = function (type, opts) {
++			base.call(this, type, opts);
++			init.call(this, opts || {});
++		};
++		C.prototype = Object.create(base.prototype);
++		try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) { /* */ }
++		define(g, name, C);
++	}
++	var UI = isEvent(g.UIEvent) ? g.UIEvent : Ev;
++	var ME = isEvent(g.MouseEvent) ? g.MouseEvent : UI;
++	sub('FocusEvent', UI, function (o) { this.relatedTarget = o.relatedTarget || null; });
++	sub('InputEvent', UI, function (o) {
++		this.data = o.data === undefined ? null : o.data;
++		this.inputType = o.inputType || '';
++		this.isComposing = !!o.isComposing;
++		this.dataTransfer = null;
++	});
++	sub('CompositionEvent', UI, function (o) { this.data = o.data || ''; });
++	sub('WheelEvent', ME, function (o) {
++		this.deltaX = o.deltaX || 0; this.deltaY = o.deltaY || 0;
++		this.deltaZ = o.deltaZ || 0; this.deltaMode = o.deltaMode || 0;
++	});
++	['Event', 'CustomEvent', 'UIEvent', 'MouseEvent', 'PointerEvent', 'KeyboardEvent',
++		'FocusEvent', 'InputEvent', 'CompositionEvent', 'WheelEvent'].forEach(function (n) {
++		var C = g[n];
++		if (isEvent(C) && C.prototype.constructor !== C) define(C.prototype, 'constructor', C);
++	});
++})();
++
++/* ---- focus: element.focus()/blur(), and a tap moves focus ---------------
++ * element.focus() was a no-op, so document.activeElement never changed and
++ * no focus/blur/focusin/focusout event reached a page. A tap now focuses the
++ * focusable element under it (macsurf_qjs_tap_focus, from interaction.c,
++ * after mousedown), or clears focus, as a browser does; blur fires on the
++ * old element, then focus on the new, with relatedTarget. `change` on a text
++ * field fires when it loses focus with a different value (it used to fire
++ * per keystroke, box_textarea.c). A tap on a <label> activates its control. */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof g.Event !== 'function') return;
++	var NATIVE = /^(INPUT|SELECT|TEXTAREA|BUTTON|IFRAME|SUMMARY)$/;
++	var DISABLES = /^(INPUT|SELECT|TEXTAREA|BUTTON)$/;
++	function tagOf(el) { return el && el.tagName ? String(el.tagName).toUpperCase() : ''; }
++	function inputType(el) { return String((el.getAttribute && el.getAttribute('type')) || '').toLowerCase(); }
++	function focusable(el) {
++		if (!el || el.nodeType !== 1 || !el.getAttribute) return false;
++		var t = tagOf(el);
++		if (DISABLES.test(t) && el.hasAttribute('disabled')) return false;
++		if (t === 'INPUT' && inputType(el) === 'hidden') return false;
++		if (el.hasAttribute('tabindex') || NATIVE.test(t)) return true;
++		if ((t === 'A' || t === 'AREA') && el.hasAttribute('href')) return true;
++		var ce = el.getAttribute('contenteditable');
++		return ce !== null && String(ce).toLowerCase() !== 'false';
++	}
++	function connected(el) { return !!el && el.isConnected !== false; }
++	function isTextField(el) {
++		var t = tagOf(el);
++		if (t === 'TEXTAREA') return true;
++		return t === 'INPUT' && !/^(checkbox|radio|button|submit|reset|image|file|hidden)$/.test(inputType(el));
++	}
++	function fire(el, type, bubbles, related) {
++		var e;
++		try { e = new g.FocusEvent(type, { bubbles: bubbles, relatedTarget: related || null }); }
++		catch (x) { e = new g.Event(type, { bubbles: bubbles }); }
++		try { el.dispatchEvent(e); } catch (x) { /* a handler threw: the next one still runs */ }
++	}
++	function fireSimple(el, type) {
++		try { el.dispatchEvent(new g.Event(type, { bubbles: true })); } catch (x) { /* */ }
++	}
++	var cur = null, depth = 0;
++	function setFocus(el) {
++		if (el === cur || depth > 4) return;
++		depth++;
++		var prev = cur;
++		cur = el;
++		d.__vitaFocus = el;
++		if (prev && connected(prev)) {
++			if (isTextField(prev) && prev.__vbFocusValue !== undefined &&
++					String(prev.value == null ? '' : prev.value) !== prev.__vbFocusValue)
++				fireSimple(prev, 'change');
++			prev.__vbFocusValue = undefined;
++			fire(prev, 'blur', false, el);
++			fire(prev, 'focusout', true, el);
++		}
++		/* a blur handler may have moved focus elsewhere already */
++		if (el && cur === el) {
++			el.__vbFocusValue = isTextField(el) ? String(el.value == null ? '' : el.value) : undefined;
++			fire(el, 'focus', false, prev);
++			if (cur === el) fire(el, 'focusin', true, prev);
++		}
++		depth--;
++	}
++	function focusFn() { if (focusable(this) && connected(this)) setFocus(this); }
++	function blurFn() { if (cur === this) setFocus(null); }
++	var seen = [], hit = false;
++	['section', 'div', 'span', 'input', 'textarea', 'select', 'button', 'a', 'iframe'].forEach(function (t) {
++		var o;
++		try { o = Object.getPrototypeOf(d.createElement(t)); } catch (x) { return; }
++		for (; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
++			if (seen.indexOf(o) >= 0) continue;
++			seen.push(o);
++			if (Object.prototype.hasOwnProperty.call(o, 'focus')) { define(o, 'focus', focusFn); hit = true; }
++			if (Object.prototype.hasOwnProperty.call(o, 'blur')) define(o, 'blur', blurFn);
++		}
++	});
++	if (!hit && seen.length) { define(seen[0], 'focus', focusFn); define(seen[0], 'blur', blurFn); }
++	try {
++		Object.defineProperty(d, 'activeElement', { configurable: true,
++			get: function () { return cur && connected(cur) ? cur : (d.body || null); } });
++	} catch (x) { /* */ }
++
++	function labelControl(label) {
++		var f = label.getAttribute('for');
++		if (f) return d.getElementById(f);
++		var c = label.querySelector && label.querySelector('input,select,textarea,button');
++		return c || null;
++	}
++	/* The tap as a browser handles it: the nearest focusable element takes
++	 * focus; a <label> hands it to its control (and toggles a checkbox or
++	 * radio, which then gets its own click, input and change); anything
++	 * else clears focus. */
++	define(g, '__vbTapFocus', function (n) {
++		var el, label = null;
++		for (el = n; el && el.nodeType === 1; el = el.parentNode) {
++			if (focusable(el)) { setFocus(el); return; }
++			if (!label && tagOf(el) === 'LABEL') label = el;
++		}
++		var c = label && labelControl(label);
++		if (c && focusable(c)) {
++			var t = inputType(c);
++			if (tagOf(c) === 'INPUT' && (t === 'checkbox' || t === 'radio')) {
++				setFocus(c);
++				if (t === 'checkbox') c.checked = !c.checked; else c.checked = true;
++				try { c.dispatchEvent(new g.MouseEvent('click', { bubbles: true, cancelable: true })); } catch (x) { /* */ }
++				try { c.dispatchEvent(new g.InputEvent('input', { bubbles: true })); } catch (x) { /* */ }
++				fireSimple(c, 'change');
++				return;
++			}
++			setFocus(c);
++			return;
++		}
++		setFocus(null);
++	});
++	/* Typing always happens in the focused field: a field typed into
++	 * without a tap the focus model saw (the on-screen keyboard opened
++	 * another way) takes focus before its first input event is handled. */
++	if (d.addEventListener) d.addEventListener('input', function (e) {
++		var t = e && e.target;
++		if (e.isTrusted && t && t !== cur && focusable(t)) setFocus(t);
++	}, true);
++})();
++
+ })(this);
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+index b95a4d388..deeaaca71 100644
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -121,6 +121,16 @@ static const struct step {
+ 	  C_EDITING, NULL, 0, NULL },
+ 	{ "tap the submit button", A_TAP, NULL, 200, 225, 0, 0, 0,
+ 	  C_URL, "IN-target.html?via=form&q=hello+vita", 0, "IN-form-sent" },
++	{ "open IN-events", A_OPEN, T "IN-events.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-events.html", 0, NULL },
++	{ "tap a field that relayouts on focus", A_TAP, NULL, 300, 120, 0, 0,
++	  0, C_EDITING, NULL, 0, NULL },
++	{ "text reaches the relaid-out field", A_TYPE, "hello", 0, 0, 0, 0, 0,
++	  C_EDITING, NULL, 0, NULL },
++	{ "tap a label", A_TAP, NULL, 130, 200, 0, 0, 0,
++	  C_URL, "IN-events.html", 0, NULL },
++	{ "a tap's events, focus, change, readyState", A_TAP, NULL, 200, 285,
++	  0, 0, 0, C_URL, "IN-target.html?via=events&r=ok", 0, NULL },
+ 	{ "a typed URL opens", A_TYPE, T "IN-target.html?via=typed",
+ 	  0, 0, 0, 0, 0, C_URL, "IN-target.html?via=typed", 0, NULL },
+ 	{ "a URL pushed to the LAN listener opens", A_REMOTE,

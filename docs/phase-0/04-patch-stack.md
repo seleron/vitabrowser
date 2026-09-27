@@ -251,6 +251,7 @@ evidence.
 | 127 | window.open opens a real popup window (window stack, opener bridge) |
 | 128 | script-inserted scripts async + load/error; flex ignores abspos children |
 | 129 | tap a text field to type; stale-focus crash; document.compareDocumentPosition; ordered inserted scripts; SVG aspect |
+| 130 | one event model for every button/field: tap sequence order, focus model (tap/label/blur, change on commit), native event interfaces, key names, readystatechange, window load (doc 12) |
 
 ## 7. Not done / blocked
 

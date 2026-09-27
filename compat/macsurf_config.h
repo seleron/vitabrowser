@@ -10,13 +10,15 @@
 #define VITABROWSER_MACSURF_CONFIG_H
 
 /*
- * Whether the DOM fires a synthetic load event through the JS bridge.
- * MacSurf gates this because their bridge needed it; ours is not wired up
- * yet (compat/macsurf_compat.c's js_fire_* are no-ops), so leave it off
- * until the Vita frontend provides a real jsthread.
+ * Whether the DOM fires the window load event (readyState 'complete')
+ * through the JS bridge. Off while the bridge was not wired up; on since
+ * patch 130: the QuickJS bridge runs every page and script geometry is
+ * real (patch 111), and without it no page ever saw window load or
+ * readyState 'complete' -- $(window).on('load'), onload initialisers and
+ * readyState polling all waited forever.
  */
 #ifndef MACSURF_JS_FIRE_LOAD
-#define MACSURF_JS_FIRE_LOAD 0
+#define MACSURF_JS_FIRE_LOAD 1
 #endif
 
 #endif /* VITABROWSER_MACSURF_CONFIG_H */
