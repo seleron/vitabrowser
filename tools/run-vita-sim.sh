@@ -196,6 +196,7 @@ HTTPD=$!
 	--exit-when-done --timeout 1000 ) > "$OUT/netlog-receiver.log" 2>&1 &
 RX=$!
 ( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
+	VITA_SETTLE_EXTRA_MS="${VITA_SETTLE_EXTRA_MS:-7000}" \
 	timeout 900 "$NS/nsvita-sim" )
 wait $RX || true
 kill $HTTPD 2>/dev/null || true
@@ -309,7 +310,7 @@ done
 # on real mid-transfer delivery / real SSE events.
 echo "== streaming: XHR progress + EventSource (JS-streaming) =="
 jss_bad=0
-for f in "$R"/NET-js-streaming*.plot; do
+for f in "$R"/*NET-js-streaming*.plot; do
 	[ -f "$f" ] || { echo "  missing: $f"; jss_bad=$((jss_bad + 1)); continue; }
 	n=${f##*/}
 	r=$(sed -n 's/.*STR \(JS streaming: [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
@@ -317,7 +318,7 @@ for f in "$R"/NET-js-streaming*.plot; do
 	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
 	[ "$r" = "JS streaming: 7/7 passed" ] || jss_bad=$((jss_bad + 1))
 done
-[ "$(ls "$R"/NET-js-streaming*.plot 2>/dev/null | wc -l)" -eq 2 ] || jss_bad=$((jss_bad + 1))
+[ "$(ls "$R"/*NET-js-streaming*.plot 2>/dev/null | wc -l)" -eq 2 ] || jss_bad=$((jss_bad + 1))
 [ "$jss_bad" -eq 0 ]
 
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):

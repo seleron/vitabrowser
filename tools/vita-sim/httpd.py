@@ -71,8 +71,17 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
                                  + body + b"\r\n")
                 self.wfile.flush()
                 time.sleep(0.3)
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            # Keep the stream open: a real SSE connection is long-lived.
+            # Closing it here makes the client fire "error" + reconnect
+            # (the C layer treats a server close as a failed stream), so
+            # the page's own close() must be what ends it. httpd is a
+            # daemon killed at the end of the run, so this handler just
+            # parks until the connection dies (client close() -> RST).
+            try:
+                while True:
+                    time.sleep(1.0)
+            except Exception:
+                pass
             return
         return super().do_GET()
 
