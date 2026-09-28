@@ -2486,3 +2486,29 @@ youtube.com and google.com and note what they show.
   c9fa2e7b1752, nsvita.elf fd7a30cccc19. Archive
   <WORK>/vitabrowser-work/hwtest-2026-09-26-run21/. Run 20 results in
   results-run20\.
+
+## Run 22 — hand-off: event model, streaming, History, storage (patches 130-140)
+
+- Built at 72192dc on the desktop from a clean restage (223 applied + the
+  two known collisions, doc 08 §1; build-patched.sh now tolerates exactly
+  those two instead of stopping). New since run 21: 130 one event model
+  for buttons/fields (Google sign-in Next posts in the simulator), 131-132
+  streaming XHR/EventSource/fetch bodies, 133-134 nsmonkey + libcss clip
+  rect units, 135 fetch() resolves at headers, 136-138 History pushState,
+  139 autotest page cap 48, 140 URLSearchParams request bodies.
+- Sim suite exit 0 (History 30/30, storage 15/15, mutation 7/7, streaming
+  7/7, fetch stream 8/8, fetch body 4/4, interaction 27/27, also at the
+  Vita's pace). Reference dumps regenerated (31): JS-dom now "window load:
+  fired" (130), PM-shadow-clip (134), example.com got longer (new -bottom
+  dumps), PM-animation time-varying.
+- SHA256 first 12: VitaBrowser.vpk 3ffca1e7dba9, VitaBrowser-ext.vpk
+  39c25713279c, nsvita.elf 496367a4acfc. Archive
+  <WORK>/vitabrowser-work/hwtest-2026-09-28-run22/. Run 21 results in
+  results-run21\.
+
+**Run 22 on the device:** autotest as usual (expect ~30/31 SAME,
+interact 27/27). Then claude.ai/login -> "Continue with Google": tap the
+email field (the keyboard should open), type, tap Next -- report whether
+the password page appears or Google shows its "unusual traffic" captcha
+(the simulator hits the captcha from a datacenter-flagged fingerprint;
+your home IP is the real test, doc 13 B2).
