@@ -123,6 +123,24 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             return
         return super().do_GET()
 
+    def do_POST(self):
+        if self.path == "/echo":
+            # Patch 140: echo the request body back for fetch/XHR body tests.
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length > 0 else b""
+            ctype = self.headers.get("Content-Type", "")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("X-Echo-Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            return
+        self.send_response(404)
+        self.end_headers()
+
 
 def serve(port, directory, cert=None, key=None):
     handler = functools.partial(Quiet, directory=directory)

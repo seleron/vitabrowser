@@ -207,6 +207,8 @@ NET-js-storage-http http://127.0.0.1:$HP/JS-storage.html
 NET-js-storage-https https://127.0.0.1:$((HP + 1))/JS-storage.html
 NET-js-mutation-http http://127.0.0.1:$HP/JS-mutation.html
 NET-js-mutation-https https://127.0.0.1:$((HP + 1))/JS-mutation.html
+NET-js-fetch-body-http http://127.0.0.1:$HP/JS-fetch-body.html
+NET-js-fetch-body-https https://127.0.0.1:$((HP + 1))/JS-fetch-body.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -423,6 +425,23 @@ for f in "$R"/*NET-js-storage*.plot "$R"/*NET-js-mutation*.plot; do
 done
 [ "$(ls "$R"/*NET-js-storage*.plot "$R"/*NET-js-mutation*.plot 2>/dev/null | wc -l)" -eq 4 ] || sm_bad=$((sm_bad + 1))
 [ "$sm_bad" -eq 0 ]
+
+# Fetch/XHR request bodies (Patch 140): URLSearchParams serializes to
+# x-www-form-urlencoded, FormData text fields to multipart. The /echo
+# endpoint returns the raw body for verification.
+echo "== fetch request bodies (JS-fetch-body) =="
+fb_bad=0
+for f in "$R"/*NET-js-fetch-body*.plot; do
+	[ -f "$f" ] || { echo "  missing: $f"; fb_bad=$((fb_bad + 1)); continue; }
+	n=${f##*/}
+	r=$(sed -n 's/.*STR \(JS fetch body: [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
+	echo "  $n: ${r:-no summary line (script did not run?)}"
+	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
+	sed -n 's/.*STR \(JS fetch body: [0-9]*\/[0-9]* passed FAILS: .*\)/\1/p' "$f" | head -1 | sed 's/^/  /'
+	[ "$r" = "JS fetch body: 4/4 passed" ] || fb_bad=$((fb_bad + 1))
+done
+[ "$(ls "$R"/*NET-js-fetch-body*.plot 2>/dev/null | wc -l)" -eq 2 ] || fb_bad=$((fb_bad + 1))
+[ "$fb_bad" -eq 0 ]
 
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
 # JS-window navigates itself three times (relative location.href,
