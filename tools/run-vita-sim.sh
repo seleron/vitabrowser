@@ -391,11 +391,9 @@ for f in "$R"/*NET-js-history*.plot; do
 	r=$(sed -n 's/.*STR \(JS history: [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
 	echo "  $n: ${r:-no summary line (script did not run?)}"
 	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
-	# KNOWN ISSUE (patch 136): 29/30. Assertion 20 (forward() at JS stack end
-# must keep state) fails; the native call is correctly skipped (verified via
-# debug) but the test harness shows inconsistent DOM output. Core Phase B
-# functionality (pushState/back/forward/popstate) verified by 29 assertions.
-[ "$r" = "JS history: 29/30 passed" ] || jh_bad=$((jh_bad + 1))
+	# The page appends " FAILS: <names>" to the summary when red; surface it.
+	sed -n 's/.*STR \(JS history: [0-9]*\/[0-9]* passed FAILS: .*\)/\1/p' "$f" | head -1 | sed 's/^/  /'
+	[ "$r" = "JS history: 30/30 passed" ] || jh_bad=$((jh_bad + 1))
 done
 [ "$(ls "$R"/*NET-js-history*.plot 2>/dev/null | wc -l)" -eq 2 ] || jh_bad=$((jh_bad + 1))
 [ "$jh_bad" -eq 0 ]
