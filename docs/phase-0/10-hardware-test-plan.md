@@ -2512,3 +2512,63 @@ email field (the keyboard should open), type, tap Next -- report whether
 the password page appears or Google shows its "unusual traffic" captcha
 (the simulator hits the captcha from a datacenter-flagged fingerprint;
 your home IP is the real test, doc 13 B2).
+
+
+## Run 22 — results (2026-09-28 21:43 and 21:51, PCH-2000)
+
+- Autotest: 31/31 dumps SAME (net-20260928-214336).
+- Manual session (net-20260928-215156): claude.ai/code took 200 s to
+  redirect to /login (54 s of it compiling 91 new dynamic modules, 4.2 MB,
+  with the main loop blocked). Google sign-in: the popup opened, the email
+  went in (tap-to-type works), Next did nothing -- no request at all within
+  the 9 s the engine log still covered.
+- START pressed in the popup loaded home IN the popup; claude.ai opened from
+  there never rendered (title set at 19 s, nothing after 150 s).
+- The engine log's 4 MB network mirror ended at 434 s: half of it was
+  layout debug traces.
+
+Causes (reproduced in the simulator):
+1. Next: Google runs its BotGuard VM in a hidden same-origin iframe
+   (/_/bscframe) that the page makes with createElement; the engine never
+   loaded script-made frames, so the frame's load event never came and its
+   contentWindow had no eval. BotGuard retried 4 x 6.2 s, the lookup went
+   out with "FNL..." instead of a token, Google answered [9], the page
+   stayed greyed out. Timer chains also ran one link per frame.
+2. The second claude.ai was a second copy of the app beside the first
+   (~78 MB of JS heap each, ~155 MB free on the Vita).
+3. Found on the way: claude.ai "Continue with email" crashed the simulator
+   (use-after-free in the click's submit path when React re-renders
+   during the click).
+
+## Run 23 — hand-off: patches 141-144
+
+- 141 timers + microtasks run in rounds (500-link chain 9.1 s -> 5 ms).
+- 142 START closes popups and goes home in the main window; mem[page done]
+  per load in log.txt; engine log without the layout traces.
+- 143 script-made same-origin frames fire load and get a same-realm
+  contentWindow with eval. In the simulator BotGuard now produces its
+  token and Next reaches Google's verdict: "Couldn't sign you in -- this
+  browser or app may not be secure" (/v3/signin/rejected). Headless Chrome
+  gets the same page: this is Google refusing the browser, not a bug left
+  in the flow.
+- 144 the click/submit use-after-free.
+- Known, not fixed: claude.ai email login stops at its invisible hCaptcha,
+  which needs real cross-origin script-made frames (the engine still loads
+  only parsed frames).
+- Clean restage (225 + 4 patches, the 2 known collisions), streams 4/4,
+  sim suite exit 0 (FRAMELOCAL 6/6, interaction 29/29 incl. the rebuild
+  step, all earlier gates), cross-build green; reference dumps 31, all
+  identical to run 22's.
+- SHA256 first 12: VitaBrowser.vpk 81fb7fb2c28a, VitaBrowser-ext.vpk
+  cf7a2a2c541b, nsvita.elf 89c9472bc83f. Archive
+  <WORK>/vitabrowser-work/hwtest-2026-09-28-run23/. Run 22 results in
+  results-run22\.
+
+**Run 23 on the device:** start receive-results.bat; autotest (expect
+31/31 SAME, interact 29/29). Then claude.ai/login -> "Continue with
+Google", tap the email field, type, tap Next, and wait up to a minute:
+expect Google's "Couldn't sign you in" page (or, if Google accepts this
+connection, the password page). Then press START (the popup should close
+and home appear in the main window) and open claude.ai again: it should
+render as the first time did (slow: minutes). log.txt now has a
+mem[page done] line per load.
