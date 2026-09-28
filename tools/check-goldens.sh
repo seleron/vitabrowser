@@ -22,7 +22,12 @@ for page in "$PAGES"/*.html; do
 	[ -f "$gold" ] || { echo "SKIP $name (no golden -- create with tools/plotstream.py)"; continue; }
 	python3 "$ROOT/tools/plotstream.py" --monkey "$MONKEY" \
 		--url "file://$page" --load-wait 6 --out "$TMP/$name.plot" 2>/dev/null
-	if diff -u "$gold" "$TMP/$name.plot" > "$TMP/$name.diff"; then
+	# Skip the header's URL line: it embeds the checkout's absolute path,
+	# so it differs on every machine. The op-count line below it is still
+	# compared.
+	tail -n +2 "$gold" > "$TMP/$name.gold"
+	tail -n +2 "$TMP/$name.plot" > "$TMP/$name.cap"
+	if diff -u "$TMP/$name.gold" "$TMP/$name.cap" > "$TMP/$name.diff"; then
 		echo "PASS $name"
 	else
 		echo "FAIL $name"
