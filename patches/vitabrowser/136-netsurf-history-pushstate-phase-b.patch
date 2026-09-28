@@ -1,0 +1,499 @@
+# netsurf: History API Phase B -- pushState/replaceState keep a real session stack
+#
+# North-star SPA milestone (doc 13 section 5 follow-up). Phase A (fixes1198)
+# only updated the URL bar and history.state: pushState created no entry,
+# history.length stayed 0, and back()/forward() could not return to a pushed
+# URL. Now the bridge keeps a real same-document session stack in JS:
+#
+# - pushState() appends an entry (dropping forward entries), replaceState()
+#   rewrites the current one; entry 0 is the real document load. The realm is
+#   rebuilt on real navigation, so the stack never outlives its document.
+# - back()/forward()/go() (native, macsurf_qjs.c) walk the JS stack first;
+#   each step fires popstate with the entry's state. Past the stack's ends
+#   they fall back to the native history walk (go() carries any remaining
+#   delta; go(0) still reloads).
+# - The physical L/R buttons (frontends/vita/input.c) consult the JS stack
+#   first via macsurf_qjs_history_traverse(), then native history, then the
+#   popup-close fallback, preserving the old priority order.
+# - history.length is the native entry count (new __nativeLength, via
+#   browser_window_history_enumerate) plus the JS entries; history.state is
+#   the current entry's state.
+# - location.href (hence pathname/search/hash, which parse it) reflects the
+#   shown URL until a real navigation clears the override.
+# - URLs resolve against the document URL with a small JS resolver (there is
+#   no URL constructor in the bridge); cross-origin pushState/replaceState
+#   throws SecurityError via DOMException.
+#
+# Test: testpages/pages/JS-history.html (30 synchronous assertions: stack
+# push/back/forward/truncation/replaceState, popstate payloads, length and
+# state, location reflection, SecurityError, go(-1)/go(2)), gated over HTTP
+# and HTTPS in tools/run-vita-sim.sh.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index a1046cb..3153860 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1383,6 +1383,62 @@ static JSValue qjs_location_reload(JSContext *ctx, JSValueConst this_val,
+ 	return JS_UNDEFINED;
+ }
+ 
++/* History API Phase B (Patch 136): evaluate history.__traverse(delta) in
++ * ctx. The JS shim keeps the pushState session entries; this returns true
++ * when one was shown (popstate already fired), false when the step leaves
++ * the JS stack and the caller must navigate natively. Never throws: any
++ * failure means "not consumed". */
++static bool qjs_history_traverse_step(JSContext *ctx, int delta)
++{
++	char src[48];
++	JSValue v;
++	int n = 0;
++
++	if (ctx == NULL || (delta != -1 && delta != 1))
++		return false;
++	snprintf(src, sizeof(src), "history.__traverse(%d)", delta);
++	v = JS_Eval(ctx, src, strlen(src), "<history>", JS_EVAL_TYPE_GLOBAL);
++	if (JS_IsException(v)) {
++		JS_FreeValue(ctx, v);
++		return false;
++	}
++	if (JS_ToInt32(ctx, &n, v) != 0)
++		n = 0;
++	JS_FreeValue(ctx, v);
++	return n != 0;
++}
++
++/* Query a boolean from the history shim. Used to decide whether a
++ * forward step past the JS stack is a no-op (pushState cleared forward
++ * entries) or a native navigation. */
++static bool qjs_history_js_bool(JSContext *ctx, const char *expr)
++{
++	JSValue v;
++	bool r = false;
++	if (ctx == NULL || expr == NULL)
++		return false;
++	v = JS_Eval(ctx, expr, strlen(expr), "<history>", JS_EVAL_TYPE_GLOBAL);
++	if (!JS_IsException(v))
++		r = JS_ToBool(ctx, v);
++	JS_FreeValue(ctx, v);
++	return r;
++}
++
++/* Physical back/forward buttons (frontends/vita/input.c) reach the JS
++ * stack through the realm owner list: content -> ctx. */
++bool macsurf_qjs_history_traverse(struct content *c, int delta)
++{
++	struct qjs_realm_owner *o;
++
++	if (c == NULL || (delta != -1 && delta != 1))
++		return false;
++	for (o = g_qjs_realm_owners; o != NULL; o = o->next) {
++		if (o->content == c && o->ctx != NULL)
++			return qjs_history_traverse_step(o->ctx, delta);
++	}
++	return false;
++}
++
+ static JSValue qjs_history_back(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+@@ -1393,7 +1449,10 @@ static JSValue qjs_history_back(JSContext *ctx, JSValueConst this_val,
+ 		if (win != NULL) macos9_window_back(win);
+ 	}
+ #elif defined(MACSURF_WINDOW_SERVICES)
+-	macsurf_window_history(qjs_get_content_for_ctx(ctx), -1);
++	/* Phase B: a pushState entry behind us is shown in JS (with popstate);
++	 * only a step past the JS stack walks the native history. */
++	if (!qjs_history_traverse_step(ctx, -1))
++		macsurf_window_history(qjs_get_content_for_ctx(ctx), -1);
+ #endif
+ 	return JS_UNDEFINED;
+ }
+@@ -1408,7 +1467,18 @@ static JSValue qjs_history_forward(JSContext *ctx, JSValueConst this_val,
+ 		if (win != NULL) macos9_window_forward(win);
+ 	}
+ #elif defined(MACSURF_WINDOW_SERVICES)
+-	macsurf_window_history(qjs_get_content_for_ctx(ctx), 1);
++	/* Phase B: traverse the pushState stack first (popstate fired by the
++	 * shim). Forward past the last JS entry is a no-op when pushState
++	 * entries exist (they cleared the forward entries); otherwise walk
++	 * the native history. */
++	if (!qjs_history_traverse_step(ctx, 1)) {
++		bool atEnd = qjs_history_js_bool(ctx,
++		    "history.__atForwardEnd?history.__atForwardEnd():false");
++		bool hasPS = qjs_history_js_bool(ctx,
++		    "history.__hasPushState?history.__hasPushState():false");
++		if (!(atEnd && hasPS))
++			macsurf_window_history(qjs_get_content_for_ctx(ctx), 1);
++	}
+ #endif
+ 	return JS_UNDEFINED;
+ }
+@@ -1434,10 +1504,37 @@ static JSValue qjs_history_go(JSContext *ctx, JSValueConst this_val,
+ 	}
+ #elif defined(MACSURF_WINDOW_SERVICES)
+ 	{
+-		/* go(), go(0): reload, per the HTML standard. */
++		/* go(), go(0): reload, per the HTML standard. Otherwise walk the
++		 * JS pushState stack step by step; the first step past it goes
++		 * native with whatever delta remains. */
+ 		double d = 0.0;
+ 		if (argc > 0) JS_ToFloat64(ctx, &d, argv[0]);
+-		macsurf_window_history(qjs_get_content_for_ctx(ctx), (int)d);
++		{
++			int delta = (int)d;
++			if (delta == 0) {
++				/* go(), go(0): reload, per the HTML standard. */
++				macsurf_window_history(
++					qjs_get_content_for_ctx(ctx), 0);
++			} else {
++				int step = (delta < 0) ? -1 : 1;
++				while (delta != 0 &&
++				       qjs_history_traverse_step(ctx, step))
++					delta -= step;
++				if (delta != 0) {
++					/* Forward past the JS end is a no-op with pushState
++					 * entries; back past entry 0 (or any step with no
++					 * pushState) goes native. */
++					bool atEnd = qjs_history_js_bool(ctx,
++					    "history.__atForwardEnd?history.__atForwardEnd():false");
++					bool hasPS = qjs_history_js_bool(ctx,
++					    "history.__hasPushState?history.__hasPushState():false");
++					if (!(delta > 0 && atEnd && hasPS))
++						macsurf_window_history(
++							qjs_get_content_for_ctx(ctx),
++							delta);
++				}
++			}
++		}
+ 	}
+ #else
+ 	(void)argc; (void)argv;
+@@ -1474,6 +1571,20 @@ static JSValue qjs_history_set_url_display(JSContext *ctx, JSValueConst this_val
+ 	return JS_UNDEFINED;
+ }
+ 
++/* Phase B: native session-history entry count for the history.length
++ * getter (which adds the JS pushState entries to this). */
++static JSValue qjs_history_native_length(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)this_val; (void)argc; (void)argv;
++#ifdef MACSURF_WINDOW_SERVICES
++	return JS_NewInt32(ctx,
++		macsurf_window_history_length(qjs_get_content_for_ctx(ctx)));
++#else
++	return JS_NewInt32(ctx, 1);
++#endif
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Timer subsystem                                                      */
+ /* ------------------------------------------------------------------ */
+@@ -13746,29 +13857,134 @@ static void register_browser_globals(JSContext *ctx)
+ 	qjs_set_func(ctx, history_obj, "forward", qjs_history_forward, 0);
+ 	qjs_set_func(ctx, history_obj, "go",      qjs_history_go,      1);
+ 	qjs_set_func(ctx, history_obj, "__setUrlDisplay", qjs_history_set_url_display, 1);
++	qjs_set_func(ctx, history_obj, "__nativeLength", qjs_history_native_length, 0);
+ 	JS_SetPropertyStr(ctx, history_obj, "length", JS_NewInt32(ctx, 0));
+ 	JS_SetPropertyStr(ctx, global, "history", history_obj);
+ 
+-	/* pushState/replaceState Phase A (fixes1198): update the URL bar and
+-	 * history.state without navigating. No session-history entry is
+-	 * pushed, so history.length stays 0 and back()/forward() cannot
+-	 * return to a pushState URL yet -- that (plus popstate) is Phase B. */
++	/* History API Phase B (Patch 136): pushState/replaceState keep a real
++	 * same-document session stack. Entry 0 is the real document load;
++	 * pushState() appends (dropping forward entries), replaceState()
++	 * rewrites the current entry. back()/forward()/go() (native, above)
++	 * and the physical L/R buttons (via history.__traverse) walk the JS
++	 * stack first -- each step fires popstate with the entry's state --
++	 * and only navigate natively past its ends. history.length is the
++	 * native entry count plus the JS entries; history.state is the
++	 * current entry's state; location.href (hence pathname/search/hash)
++	 * reflects the shown URL until a real navigation clears it. URLs are
++	 * resolved against the document URL (no URL constructor in the
++	 * bridge) and cross-origin pushState/replaceState throws
++	 * SecurityError. The realm is rebuilt on real navigation, so the
++	 * stack never outlives its document. */
+ 	macsurf_qjs__safe_eval(ctx,
+ 		"(function(){"
+ 		"  if(typeof history==='undefined')return;"
+-		"  var _state=null;"
+-		"  history.pushState=history.pushState||function(s,t,u){"
+-		"    _state=s;"
+-		"    if(u!==undefined&&u!==null)history.__setUrlDisplay(String(u));"
+-		"  };"
+-		"  history.replaceState=history.replaceState||function(s,t,u){"
+-		"    _state=s;"
+-		"    if(u!==undefined&&u!==null)history.__setUrlDisplay(String(u));"
+-		"  };"
+-		"  Object.defineProperty(history,'state',{"
+-		"    get:function(){return _state;},"
+-		"    configurable:true"
+-		"  });"
++		"  var _docUrl='';"
++		"  try{_docUrl=String(location.href);}catch(e){}"
++		"  var _entries=[{state:null,url:_docUrl}];"
++		"  var _idx=0;"
++		"  var _shownUrl=null;"
++		"  function _resolve(u){"
++		"    u=String(u);"
++		"    var m=/^([A-Za-z][A-Za-z0-9+.-]*):/.exec(u);"
++		"    if(m)return u;"
++		"    var b=/^([A-Za-z][A-Za-z0-9+.-]*:\\/\\/[^\\/?#]*)([^?#]*)(\\?[^#]*)?/.exec(_docUrl);"
++		"    if(!b)return null;"
++		"    var origin=b[1],bpath=b[2]||'/',bquery=b[3]||'';"
++		"    if(u.slice(0,2)==='//')return origin.split('://')[0]+':'+u;"
++		"    var path=u,query='',frag='';"
++		"    var hi=path.indexOf('#');"
++		"    if(hi>=0){frag=path.slice(hi);path=path.slice(0,hi);}"
++		"    var qi=path.indexOf('?');"
++		"    if(qi>=0){query=path.slice(qi);path=path.slice(0,qi);}"
++		"    if(path.charAt(0)==='/'){}"
++		"    else if(path===''){path=bpath;if(!query)query=bquery;}"
++		"    else path=bpath.slice(0,bpath.lastIndexOf('/')+1)+path;"
++		"    var segs=path.split('/'),out=[],i,s;"
++		"    for(i=0;i<segs.length;i++){"
++		"      s=segs[i];"
++		"      if(s==='.')continue;"
++		"      else if(s==='..'){if(out.length>1)out.pop();}"
++		"      else out.push(s);"
++		"    }"
++		"    path=out.join('/');"
++		"    if(path.charAt(0)!=='/')path='/'+path;"
++		"    return origin+path+query+frag;"
++		"  }"
++		"  function _originOf(u){"
++		"    var m=/^([A-Za-z][A-Za-z0-9+.-]*):\\/\\/([^\\/?#]*)/.exec(u);"
++		"    return m?(m[1].toLowerCase()+'://'+m[2].toLowerCase()):null;"
++		"  }"
++		"  function _secErr(msg){"
++		"    try{return new DOMException(msg,'SecurityError');}"
++		"    catch(e){var x=new Error(msg);x.name='SecurityError';return x;}"
++		"  }"
++		"  function _pushReplace(s,u,isPush){"
++		"    var url=_entries[_idx].url;"
++		"    if(u!==undefined&&u!==null){"
++		"      url=_resolve(u);"
++		"      if(url===null)throw _secErr('bad URL');"
++		"      if(_originOf(url)!==_originOf(_docUrl))throw _secErr('cross-origin');"
++		"    }"
++		"    if(isPush){"
++		"      _entries.length=_idx+1;"
++		"      _entries.push({state:s,url:url});"
++		"      _idx=_entries.length-1;"
++		"    }else{"
++		"      _entries[_idx]={state:s,url:url};"
++		"    }"
++		"    _shownUrl=url;"
++		"    try{history.__setUrlDisplay(url);}catch(e){}"
++		"  }"
++		"  function _firePop(e){"
++		"    var ev=null;"
++		"    try{ev=new Event('popstate');}catch(err){return;}"
++		"    try{ev.state=e.state;}catch(err2){}"
++		"    try{window.dispatchEvent(ev);}catch(err3){}"
++		"  }"
++		"  function _show(e){"
++		"    _shownUrl=e.url;"
++		"    try{history.__setUrlDisplay(e.url);}catch(err){}"
++		"    _firePop(e);"
++		"  }"
++		"  function _step(d){"
++				"    if(j<0||j>=_entries.length)return 0;"
++		"    _idx=j;"
++		"    _show(_entries[_idx]);"
++		"    return 1;"
++		"  }"
++		"  history.__traverse=function(d){return _step(d<0?-1:1);};"
++		"  history.__atForwardEnd=function(){return _idx===_entries.length-1;};"
++		"  history.__hasPushState=function(){return _entries.length>1;};"
++		"  history.pushState=function(s,t,u){_pushReplace(s,u,true);};"
++		"  history.replaceState=function(s,t,u){_pushReplace(s,u,false);};"
++		"  try{"
++		"    var _d=Object.getOwnPropertyDescriptor(location,'href');"
++		"    if(_d&&_d.get&&_d.configurable!==false){"
++		"      var _hg=_d.get,_hs=_d.set;"
++		"      Object.defineProperty(location,'href',{"
++		"        get:function(){return _shownUrl!==null?_shownUrl:_hg.call(location);},"
++		"        set:function(v){_shownUrl=null;_hs.call(location,String(v));},"
++		"        configurable:true"
++		"      });"
++		"    }"
++		"  }catch(e){}"
++		"  try{"
++		"    Object.defineProperty(history,'state',{"
++		"      get:function(){return _entries[_idx].state;},"
++		"      configurable:true"
++		"    });"
++		"  }catch(e){}"
++		"  try{"
++		"    Object.defineProperty(history,'length',{"
++		"      get:function(){"
++		"        var n=1;"
++		"        try{if(history.__nativeLength)n=history.__nativeLength()||1;}"
++		"        catch(e2){}"
++		"        return n+_entries.length-1;"
++		"      },"
++		"      configurable:true"
++		"    });"
++		"  }catch(e){}"
+ 		"  history.scrollRestoration=history.scrollRestoration||'auto';"
+ 		"})();");
+ 
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+index 33988b7..b89e764 100644
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -33,6 +33,7 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ 
+ #include "utils/errors.h"
+ 
+@@ -121,6 +122,15 @@ void macsurf_window_navigate(struct content *c, const char *url, int replace);
+ /** Session history: delta < 0 back, > 0 forward, 0 reload. */
+ void macsurf_window_history(struct content *c, int delta);
+ 
++/** Number of native session-history entries (Patch 136: the JS
++ * history.length getter adds the pushState entries to this). */
++int macsurf_window_history_length(struct content *c);
++
++/** Traverse one step of c's realm JS pushState stack (Patch 136).
++ * Returns true when a pushState entry was shown (popstate fired);
++ * the caller falls back to native history navigation when false. */
++bool macsurf_qjs_history_traverse(struct content *c, int delta);
++
+ /** document.title was set. */
+ void macsurf_window_set_title(struct content *c, const char *title);
+ 
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+index 9c25b5a..ce20d68 100644
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -457,6 +457,45 @@ void macsurf_window_history(struct content *c, int delta)
+ 	js_nav_queue(c);
+ }
+ 
++static bool history_length_cb(const struct browser_window *bw,
++		int x0, int y0, int x1, int y1,
++		const struct history_entry *entry, void *user_data)
++{
++	(void)bw; (void)x0; (void)y0; (void)x1; (void)y1; (void)entry;
++	(*(int *)user_data)++;
++	return true;
++}
++
++/* exported interface documented in quickjs/macos9.h: native session-history
++ * entry count for the JS history.length getter (Patch 136). */
++int macsurf_window_history_length(struct content *c)
++{
++	struct browser_window *bw = window_for(c);
++	struct browser_window *root;
++	int n = 0;
++
++	if (bw == NULL)
++		return 1;
++	root = browser_window_get_root(bw);
++	if (root == NULL)
++		return 1;
++	browser_window_history_enumerate(root, history_length_cb, &n);
++	return (n > 0) ? n : 1;
++}
++
++/* exported interface documented in vita/js_platform.h: the physical L/R
++ * history buttons traverse the JS pushState stack first (Patch 136). */
++bool vita_history_traverse_js(struct browser_window *bw, int delta)
++{
++	struct content *c = NULL;
++
++	if (bw != NULL && bw->current_content != NULL)
++		c = hlcache_handle_get_content(bw->current_content);
++	if (c == NULL)
++		return false;
++	return macsurf_qjs_history_traverse(c, delta);
++}
++
+ /* exported interface documented in vita/js_platform.h */
+ bool vita_js_nav_pending(void)
+ {
+diff --git a/frontends/vita/js_platform.h b/frontends/vita/js_platform.h
+index cffba79..a5e5336 100644
+--- a/frontends/vita/js_platform.h
++++ b/frontends/vita/js_platform.h
+@@ -27,6 +27,8 @@
+ 
+ #include <stdbool.h>
+ 
++struct browser_window;
++
+ /** Set the bridge's services up; call before netsurf_init(). */
+ void vita_js_platform_init(void);
+ 
+@@ -39,6 +41,11 @@ extern unsigned long vita_js_random_failures;
+ /** Is a script's navigation or history step queued and not yet run? */
+ bool vita_js_nav_pending(void);
+ 
++/** Traverse the current page's JS pushState stack one step (Patch 136):
++ * true when a pushState entry was shown (popstate fired); false when the
++ * step leaves the JS stack and the caller should navigate natively. */
++bool vita_history_traverse_js(struct browser_window *bw, int delta);
++
+ /** Answer alert() / confirm() at once with OK instead of asking (the
+  * autotest, which cannot press buttons). */
+ extern bool vita_js_dialog_auto;
+diff --git a/frontends/vita/input.c b/frontends/vita/input.c
+index 6609b4c..b0afde2 100644
+--- a/frontends/vita/input.c
++++ b/frontends/vita/input.c
+@@ -313,25 +313,37 @@ enum vita_browse_action vita_input_browse(struct gui_window *gw,
+ 	if (dx != 0 || dy != 0)
+ 		scroll_at(gw, (int)st.x, (int)st.y, dx, dy);
+ 
+-	if ((pressed & SCE_CTRL_LTRIGGER) &&
+-	    browser_window_history_back_available(bw)) {
+-		vita_diag_log("input: back");
+-		vita_input_stats.backs++;
+-		browser_window_history_back(bw, false);
+-	} else if ((pressed & SCE_CTRL_LTRIGGER) &&
+-		   vita_window_popup_id(gw) != 0) {
++	if (pressed & SCE_CTRL_LTRIGGER) {
++		/* Phase B: a pushState entry behind us is traversed in JS first
++		 * (popstate fired); only past the JS stack does L walk the
++		 * native history, and only with no history at all does it
++		 * close a popup. */
++		if (vita_history_traverse_js(bw, -1)) {
++			vita_diag_log("input: back (pushState)");
++			vita_input_stats.backs++;
++		} else if (browser_window_history_back_available(bw)) {
++			vita_diag_log("input: back");
++			vita_input_stats.backs++;
++			browser_window_history_back(bw, false);
++		} else if (vita_window_popup_id(gw) != 0) {
+ 		/* Back past a popup's first page closes it (as a phone
+ 		 * browser closes the tab a sign-in opened). */
+ 		vita_diag_log("input: close popup %d",
+ 			      vita_window_popup_id(gw));
+ 		vita_popup_close_later(vita_window_popup_id(gw));
+ 		return VITA_BROWSE_NONE;
++		}
+ 	}
+-	if ((pressed & SCE_CTRL_RTRIGGER) &&
+-	    browser_window_history_forward_available(bw)) {
+-		vita_diag_log("input: forward");
+-		vita_input_stats.forwards++;
+-		browser_window_history_forward(bw, false);
++	if (pressed & SCE_CTRL_RTRIGGER) {
++		/* Phase B: like L, but forward through the pushState stack. */
++		if (vita_history_traverse_js(bw, 1)) {
++			vita_diag_log("input: forward (pushState)");
++			vita_input_stats.forwards++;
++		} else if (browser_window_history_forward_available(bw)) {
++			vita_diag_log("input: forward");
++			vita_input_stats.forwards++;
++			browser_window_history_forward(bw, false);
++		}
+ 	}
+ 	if (pressed & SCE_CTRL_SQUARE)
+ 		vita_input_set_zoom(gw, st.zoom + 1);
