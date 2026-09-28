@@ -1,0 +1,131 @@
+# netsurf: run every due timer and microtask before the next frame (bounded)
+#
+# Hardware run 22 / Google sign-in: QuickJS timers fired one generation per
+# main-loop pass, and microtasks 256 per pass, so every link of a
+# setTimeout(fn, 1) chain (requestIdleCallback, schedulers, Google's BotGuard
+# VM) cost a whole frame: 500 links took 9.1 s in the simulator (Chrome: 1-4
+# ms apart), 5000 chained promise jobs 310 ms.
+#
+# macsurf_qjs_pump_all now repeats "fire due timers, drain microtasks" per
+# heap while work is due, for up to QJS_PUMP_BUDGET_MS (10 ms), stopping if a
+# callback starts a reconvert (JS must not run during one) or tears the heap
+# down. A timer due within QJS_TIMER_SLACK_MS (1 ms) counts as due.
+# Simulator: 500 links 9.1 s -> 5 ms, 5000 jobs 310 -> 4 ms.
+# Test: JS-frame-local.html case 6 (300 links under 1.5 s).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index b74fe35a5..bdb79a5cd 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1597,6 +1597,8 @@ static JSValue qjs_history_native_length(JSContext *ctx, JSValueConst this_val,
+  * 256 clears any realistic startup chain (hackaday's loader is ~6 deep) in one
+  * pass while bounding the worst case. */
+ #define QJS_MAX_JOBS_PER_PUMP 256
++/* VitaBrowser: time one pump may spend on one heap's due timers and jobs. */
++#define QJS_PUMP_BUDGET_MS 10.0
+ 
+ /* fixes877 - was 64, which is low for a page running several libraries at once
+  * (jQuery + a carousel + an analytics shim will each hold intervals), and every
+@@ -2070,6 +2072,23 @@ void macsurf_qjs_timer_stats(long *created, long *fires, long *due,
+ 	}
+ }
+ 
++/* VitaBrowser: timers due within this much of now fire in the current pass,
++ * so a setTimeout(fn, 1) chain does not wait a whole extra main-loop pass per
++ * link (see qjs_pump_heap_due). */
++#define QJS_TIMER_SLACK_MS 1.0
++
++/* Does this context own a timer that is due (within the slack)? */
++static int qjs_timers_due(JSContext *qctx, double now)
++{
++	int i;
++	for (i = 0; i < QJS_MAX_TIMERS; i++) {
++		if (qjs_timer_owned_by(&s_timer_arena[i], qctx) &&
++		    s_timer_arena[i].expiry_ms <= now + QJS_TIMER_SLACK_MS)
++			return 1;
++	}
++	return 0;
++}
++
+ void macsurf_qjs_run_timers(struct jscontext *ctx)
+ {
+ 	double now;
+@@ -2104,7 +2123,7 @@ void macsurf_qjs_run_timers(struct jscontext *ctx)
+ 		 * address would otherwise be JS_DupValue'd + JS_Call'd against the
+ 		 * WRONG runtime. */
+ 		if (qjs_timer_owned_by(&s_timer_arena[i], qctx)) {
+-			if (s_timer_arena[i].expiry_ms <= now) {
++			if (s_timer_arena[i].expiry_ms <= now + QJS_TIMER_SLACK_MS) {
+ 				due_idx[ndue] = i;
+ 				due_id[ndue] = s_timer_arena[i].id;
+ 				ndue++;
+@@ -18881,6 +18900,9 @@ void js_event_cleanup(struct jsthread *thread, struct dom_event *evt)
+  * Walking the list is safe against a callback creating a heap (new heaps are
+  * prepended, so `h` and its tail stay valid) but NOT against one destroying a
+  * heap mid-walk, so read `next` BEFORE running the timers. */
++static void qjs_pump_heap_once(struct jsheap *h);
++static void qjs_pump_heap_due(struct jsheap *h);
++
+ void macsurf_qjs_pump_all(void)
+ {
+ 	struct jsheap *h = g_heap_list;
+@@ -18960,6 +18982,23 @@ void macsurf_qjs_pump_all(void)
+ 	qjs_xrealm_drain();
+ 	while (h != NULL) {
+ 		struct jsheap *next = h->next;
++		qjs_pump_heap_due(h);
++		/* a callback may have torn heaps down: re-find the successor */
++		{
++			struct jsheap *c;
++			for (c = g_heap_list; c != NULL && c != h; c = c->next)
++				;
++			if (c != NULL)
++				next = h->next;
++		}
++		h = next;
++	}
++}
++
++/* One round for one heap: fire its due timers, then drain its microtasks. */
++static void qjs_pump_heap_once(struct jsheap *h)
++{
++	{
+ 		if (h->ctx != NULL) {
+ 			struct jscontext tmp;
+ 			tmp.qctx = h->ctx;
+@@ -19040,7 +19079,35 @@ void macsurf_qjs_pump_all(void)
+ 				g_job_pump_cap_hits++;
+ 			}
+ 		}
+-		h = next;
++	}
++}
++
++/* VitaBrowser: a browser runs every task that is due before it paints again.
++ * One timer generation + one job batch per main-loop pass made a
++ * setTimeout(fn, 1) chain cost a whole frame per link (500 links: 9.1 s in
++ * the simulator; Chrome runs them 1-4 ms apart), so Google's BotGuard VM,
++ * which yields through requestIdleCallback, never finished inside its 6 s
++ * window and sign-in went out without its token. Repeat rounds while this
++ * heap has due timers or pending jobs, within QJS_PUMP_BUDGET_MS, and stop
++ * if a callback started a reconvert (JS must not run during one) or tore
++ * the heap down. */
++static void qjs_pump_heap_due(struct jsheap *h)
++{
++	extern int macsurf_reconvert_in_progress;
++	double t0 = macsurf_qjs_get_now();
++	struct jsheap *c;
++
++	for (;;) {
++		qjs_pump_heap_once(h);
++		for (c = g_heap_list; c != NULL && c != h; c = c->next)
++			;
++		if (c == NULL || macsurf_reconvert_in_progress ||
++		    macsurf_qjs_get_now() - t0 >= QJS_PUMP_BUDGET_MS)
++			return;
++		if (!(h->ctx != NULL &&
++		      qjs_timers_due(h->ctx, macsurf_qjs_get_now())) &&
++		    !(h->rt != NULL && JS_IsJobPending(h->rt)))
++			return;
+ 	}
+ }
+ 

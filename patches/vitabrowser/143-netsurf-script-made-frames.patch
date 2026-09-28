@@ -1,0 +1,317 @@
+# netsurf: script-made same-origin frames fire load and get a same-realm contentWindow
+#
+# Hardware run 22: Google sign-in "Next" did nothing. Google's page makes a
+# hidden same-origin iframe (/_/bscframe), waits for its load event, and
+# runs its BotGuard VM with iframe.contentWindow.eval. The engine loads only
+# the frames it parses: a script-made frame was never fetched, never fired
+# load, and its contentWindow (the cross-realm shim) had no eval. BotGuard
+# retried 4 x 6.2 s and the email lookup went out with "FNL..." instead of a
+# token; Google answered [9] and the page stayed greyed out.
+#
+# document.createElement('iframe') marks its element (macsurf_qjs.c
+# qjs_create_element); the parser never goes through it, so parsed frames
+# are unchanged. When a marked frame whose src is blank or same-origin enters
+# the document, the engine's node-inserted handler (dom_event.c ->
+# js_frame_inserted) asks vita_polyfill.js to fire its load event
+# (dispatchEvent: listeners and onload once each), and its contentWindow is a
+# window in THIS realm with its own eval (indirect, global scope), parent,
+# frameElement and a detached document, so writing into the frame cannot
+# touch the page. Cross-origin script-made frames are unchanged (no load).
+# The window is kept on the element, not in a WeakMap: it points back at
+# the element, and a WeakMap value holding its own key is never collected
+# (QuickJS asserted at exit).
+#
+# Simulator result: BotGuard produces its token and Next now reaches
+# Google's verdict, "Couldn't sign you in -- this browser or app may not be
+# secure" (/v3/signin/rejected; headless Chrome gets the same).
+# Test: JS-frame-local.html cases 1-5 (over http).
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index 034b82807..ee864a139 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -687,6 +687,19 @@ dom_default_action_DOMNodeInserted_cb(struct dom_event *evt, void *pw)
+ 			html_process_inserted_title(htmlc, (dom_node *)node);
+ 			break;
+ 
++#ifdef WITH_QUICKJS
++		case DOM_HTML_ELEMENT_TYPE_IFRAME:
++			/* VitaBrowser: script-made frames get their load event
++			 * from the polyfill (macsurf_qjs.c js_frame_inserted) */
++			if (htmlc->js_thread != NULL) {
++				extern void js_frame_inserted(jsthread *thread,
++						struct dom_node *node);
++				js_frame_inserted(htmlc->js_thread,
++						(struct dom_node *)node);
++			}
++			break;
++#endif
++
+ 		default:
+ 			break;
+ 		}
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index bdb79a5cd..e339c60ff 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -19,6 +19,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include <ctype.h>
+ #include <sys/stat.h>
+ #include <dirent.h>
+@@ -10676,8 +10677,17 @@ static JSValue qjs_create_element(JSContext *ctx, JSValueConst this_val,
+ 		JS_FreeCString(ctx, tag);
+ 		return JS_NULL;
+ 	}
+-	JS_FreeCString(ctx, tag);
+-	obj = qjs_wrap_element_full(ctx, el);
++	/* VitaBrowser: mark a script-made iframe. The engine loads only
++	 * the frames the parser makes; vita_polyfill.js gives a script-made
++	 * same-origin one a load event and a same-realm window. */
++	{
++		int is_iframe = strcasecmp(tag, "iframe") == 0;
++		JS_FreeCString(ctx, tag);
++		obj = qjs_wrap_element_full(ctx, el);
++		if (is_iframe && JS_IsObject(obj))
++			JS_DefinePropertyValueStr(ctx, obj, "__vitaMadeFrame",
++					JS_TRUE, JS_PROP_CONFIGURABLE);
++	}
+ 	qjs_dom_make_trace("elem", ctx, doc, qjs_get_node(obj), obj);
+ 	return obj;
+ }
+@@ -18773,6 +18783,43 @@ void js_set_current_script(struct jsthread *thread, struct dom_node *node)
+ 	JS_FreeValue(ctx, global);
+ }
+ 
++/* VitaBrowser: an <iframe> entered the document (dom_event.c). The engine
++ * loads only the frames the parser makes; vita_polyfill.js's
++ * __vitaFrameInserted gives a script-made same-origin one its load event. */
++void js_frame_inserted(struct jsthread *thread, struct dom_node *node)
++{
++	JSContext *ctx;
++	JSValue g, hook;
++
++	if (thread == NULL || thread->ctx == NULL || node == NULL) return;
++	{
++		struct content *c = (struct content *)thread->doc_priv;
++		dom_document *doc = NULL;
++		bool live;
++		macsurf_dom_node_get_owner_document(node, &doc);
++		live = qjs_thread_is_live_for_dispatch(thread, c, doc);
++		if (doc) macsurf_dom_node_unref((dom_node *)doc);
++		if (!live) return;
++	}
++	ctx = thread->ctx;
++	g = JS_GetGlobalObject(ctx);
++	hook = JS_GetPropertyStr(ctx, g, "__vitaFrameInserted");
++	if (JS_IsFunction(ctx, hook)) {
++		JSValue el, r;
++		macsurf_dom_node_ref(node);	/* the wrap consumes this one */
++		el = qjs_wrap_element(ctx, (dom_element *)node);
++		if (!JS_IsNull(el) && !JS_IsUndefined(el)) {
++			r = JS_Call(ctx, hook, g, 1, (JSValueConst *)&el);
++			if (JS_IsException(r))
++				JS_FreeValue(ctx, JS_GetException(ctx));
++			JS_FreeValue(ctx, r);
++		}
++		JS_FreeValue(ctx, el);
++	}
++	JS_FreeValue(ctx, hook);
++	JS_FreeValue(ctx, g);
++}
++
+ unsigned char js_fire_script_load(struct jsthread *thread,
+ 		struct dom_node *node, int ok)
+ {
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index ca0568657..af5074734 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -3342,6 +3342,74 @@
+ "\t\t\t\t\t} catch (e) { /* */ }\n"
+ "\t\t\t\t\treturn '0';\n"
+ "\t\t\t\t}\n"
++"\t\t\t\t/* Script-made iframes: the engine loads frames it\n"
++"\t\t\t\t * parses, never one a script creates (no fetch, no\n"
++"\t\t\t\t * load event, no window). Google's sign-in waits for\n"
++"\t\t\t\t * the load event of a hidden same-origin iframe\n"
++"\t\t\t\t * (/_/bscframe) and runs its BotGuard VM with that\n"
++"\t\t\t\t * frame's contentWindow.eval; without either, Next\n"
++"\t\t\t\t * sends no token and hangs (hardware run 22). For a\n"
++"\t\t\t\t * same-origin or blank script-made frame, fire load\n"
++"\t\t\t\t * once it is in the document, and give it a window in\n"
++"\t\t\t\t * THIS realm: its own eval (indirect, global scope)\n"
++"\t\t\t\t * and a detached document, so writing into the frame\n"
++"\t\t\t\t * cannot touch the page. Parsed and cross-origin\n"
++"\t\t\t\t * frames are unchanged. */\n"
++"\t\t\t\t/* document.createElement('iframe') marks its element\n"
++"\t\t\t\t * (macsurf_qjs.c qjs_create_element); the parser never\n"
++"\t\t\t\t * goes through it. */\n"
++"\t\t\t\tfunction scriptMade(el) {\n"
++"\t\t\t\t\treturn !!(el && el.__vitaMadeFrame);\n"
++"\t\t\t\t}\n"
++"\t\t\t\tfunction sameOrigin(el) {\n"
++"\t\t\t\t\tvar src = el.getAttribute ? el.getAttribute('src') : null;\n"
++"\t\t\t\t\tif (!src || src === 'about:blank') return true;\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tvar u = new URL(src, String(g.location.href));\n"
++"\t\t\t\t\t\treturn u.origin === g.location.origin;\n"
++"\t\t\t\t\t} catch (e) { return false; }\n"
++"\t\t\t\t}\n"
++"\t\t\t\tfunction localFrame(el) {\n"
++"\t\t\t\t\treturn scriptMade(el) && sameOrigin(el);\n"
++"\t\t\t\t}\n"
++"\t\t\t\tfunction localWindow(el) {\n"
++"\t\t\t\t\t/* kept on the element, not in a WeakMap: w points\n"
++"\t\t\t\t\t * back at el, and a WeakMap value that holds its own\n"
++"\t\t\t\t\t * key is never collected (QuickJS asserted at exit) */\n"
++"\t\t\t\t\tvar w = el.__vitaLocalWin, doc = null;\n"
++"\t\t\t\t\tif (w) return w;\n"
++"\t\t\t\t\tw = Object.create(g);\n"
++"\t\t\t\t\ttry { doc = g.document.implementation.createHTMLDocument(''); } catch (e) { /* */ }\n"
++"\t\t\t\t\tw.eval = function (src) { return (0, g.eval)(src); };\n"
++"\t\t\t\t\tw.window = w; w.self = w; w.frames = w;\n"
++"\t\t\t\t\tw.parent = g; w.top = g.top || g; w.frameElement = el;\n"
++"\t\t\t\t\tw.document = doc;\n"
++"\t\t\t\t\tw.postMessage = function () { return false; };\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tObject.defineProperty(el, '__vitaLocalWin', { value: w,\n"
++"\t\t\t\t\t\t\tconfigurable: true, enumerable: false });\n"
++"\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t\treturn w;\n"
++"\t\t\t\t}\n"
++"\t\t\t\t/* Load: once per frame, after it enters the document\n"
++"\t\t\t\t * (macsurf_qjs.c js_frame_inserted, from the engine's\n"
++"\t\t\t\t * node-inserted handler). dispatchEvent fires the\n"
++"\t\t\t\t * listeners and the onload handler once each, as\n"
++"\t\t\t\t * js_fire_script_load does. */\n"
++"\t\t\t\tg.__vitaFrameInserted = function (el) {\n"
++"\t\t\t\t\tif (!localFrame(el) || el.__vitaLoadSent) return;\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tObject.defineProperty(el, '__vitaLoadSent', { value: true,\n"
++"\t\t\t\t\t\t\tconfigurable: true, enumerable: false });\n"
++"\t\t\t\t\t} catch (e) { return; }\n"
++"\t\t\t\t\tsetTimeout(function () {\n"
++"\t\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\t\tel.dispatchEvent({ type: 'load', target: el, currentTarget: el,\n"
++"\t\t\t\t\t\t\t\tbubbles: false, cancelable: false, defaultPrevented: false,\n"
++"\t\t\t\t\t\t\t\tpreventDefault: function () {}, stopPropagation: function () {} });\n"
++"\t\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t\t}, 0);\n"
++"\t\t\t\t};\n"
+ "\t\t\t\ttry {\n"
+ "\t\t\t\t\tObject.defineProperty(I, 'contentWindow', {\n"
+ "\t\t\t\t\t\tenumerable: true, configurable: true,\n"
+@@ -3351,6 +3419,7 @@
+ "\t\t\t\t\t\t\t\t/* I may be the prototype every element\n"
+ "\t\t\t\t\t\t\t\t * shares: only an iframe has a window */\n"
+ "\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
++"\t\t\t\t\t\t\t\tif (localFrame(this)) return localWindow(this);\n"
+ "\t\t\t\t\t\t\t\tvar w = winCache.get(this);\n"
+ "\t\t\t\t\t\t\t\tif (!w) { w = makeShim(labelOf(this)); winCache.set(this, w); }\n"
+ "\t\t\t\t\t\t\t\treturn w;\n"
+@@ -3363,6 +3432,7 @@
+ "\t\t\t\t\t\t\ttry {\n"
+ "\t\t\t\t\t\t\t\tif (frameKey !== null) return null;\n"
+ "\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
++"\t\t\t\t\t\t\t\tif (localFrame(this)) return localWindow(this).document;\n"
+ "\t\t\t\t\t\t\t\treturn shimDoc(labelOf(this));\n"
+ "\t\t\t\t\t\t\t} catch (e) { return null; }\n"
+ "\t\t\t\t\t\t}\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index ca24327a6..cbe853633 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -3341,6 +3341,74 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 					} catch (e) { /* */ }
+ 					return '0';
+ 				}
++				/* Script-made iframes: the engine loads frames it
++				 * parses, never one a script creates (no fetch, no
++				 * load event, no window). Google's sign-in waits for
++				 * the load event of a hidden same-origin iframe
++				 * (/_/bscframe) and runs its BotGuard VM with that
++				 * frame's contentWindow.eval; without either, Next
++				 * sends no token and hangs (hardware run 22). For a
++				 * same-origin or blank script-made frame, fire load
++				 * once it is in the document, and give it a window in
++				 * THIS realm: its own eval (indirect, global scope)
++				 * and a detached document, so writing into the frame
++				 * cannot touch the page. Parsed and cross-origin
++				 * frames are unchanged. */
++				/* document.createElement('iframe') marks its element
++				 * (macsurf_qjs.c qjs_create_element); the parser never
++				 * goes through it. */
++				function scriptMade(el) {
++					return !!(el && el.__vitaMadeFrame);
++				}
++				function sameOrigin(el) {
++					var src = el.getAttribute ? el.getAttribute('src') : null;
++					if (!src || src === 'about:blank') return true;
++					try {
++						var u = new URL(src, String(g.location.href));
++						return u.origin === g.location.origin;
++					} catch (e) { return false; }
++				}
++				function localFrame(el) {
++					return scriptMade(el) && sameOrigin(el);
++				}
++				function localWindow(el) {
++					/* kept on the element, not in a WeakMap: w points
++					 * back at el, and a WeakMap value that holds its own
++					 * key is never collected (QuickJS asserted at exit) */
++					var w = el.__vitaLocalWin, doc = null;
++					if (w) return w;
++					w = Object.create(g);
++					try { doc = g.document.implementation.createHTMLDocument(''); } catch (e) { /* */ }
++					w.eval = function (src) { return (0, g.eval)(src); };
++					w.window = w; w.self = w; w.frames = w;
++					w.parent = g; w.top = g.top || g; w.frameElement = el;
++					w.document = doc;
++					w.postMessage = function () { return false; };
++					try {
++						Object.defineProperty(el, '__vitaLocalWin', { value: w,
++							configurable: true, enumerable: false });
++					} catch (e) { /* */ }
++					return w;
++				}
++				/* Load: once per frame, after it enters the document
++				 * (macsurf_qjs.c js_frame_inserted, from the engine's
++				 * node-inserted handler). dispatchEvent fires the
++				 * listeners and the onload handler once each, as
++				 * js_fire_script_load does. */
++				g.__vitaFrameInserted = function (el) {
++					if (!localFrame(el) || el.__vitaLoadSent) return;
++					try {
++						Object.defineProperty(el, '__vitaLoadSent', { value: true,
++							configurable: true, enumerable: false });
++					} catch (e) { return; }
++					setTimeout(function () {
++						try {
++							el.dispatchEvent({ type: 'load', target: el, currentTarget: el,
++								bubbles: false, cancelable: false, defaultPrevented: false,
++								preventDefault: function () {}, stopPropagation: function () {} });
++						} catch (e) { /* */ }
++					}, 0);
++				};
+ 				try {
+ 					Object.defineProperty(I, 'contentWindow', {
+ 						enumerable: true, configurable: true,
+@@ -3350,6 +3418,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 								/* I may be the prototype every element
+ 								 * shares: only an iframe has a window */
+ 								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
++								if (localFrame(this)) return localWindow(this);
+ 								var w = winCache.get(this);
+ 								if (!w) { w = makeShim(labelOf(this)); winCache.set(this, w); }
+ 								return w;
+@@ -3362,6 +3431,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 							try {
+ 								if (frameKey !== null) return null;
+ 								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
++								if (localFrame(this)) return localWindow(this).document;
+ 								return shimDoc(labelOf(this));
+ 							} catch (e) { return null; }
+ 						}

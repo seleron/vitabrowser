@@ -1,0 +1,154 @@
+# netsurf: START closes popups and goes home in the main window; memory per load; quieter engine log
+#
+# Hardware run 22: START pressed in Google's sign-in popup loaded home IN the
+# popup; claude.ai opened from there ran as a second copy of the app beside
+# the first one (the login page under the popup). Each claude.ai realm holds
+# ~78 MB of JS heap and the Vita had ~155 MB free: the second never rendered.
+#
+# - START closes every popup (vita_window_popup_ids) and opens home in the
+#   bottom window (vita_window_main), which frees the page there.
+# - log.txt gets a mem[page done] line after every load (free user memory,
+#   malloc heap in use), so memory pressure shows up in device logs.
+# - The engine log sink drops MacSurf's layout/reconvert debug traces
+#   (LAYOUTPHASE, WORK reconvert, FLEXITEMCALL, MCOL, FBVAR, ...) by prefix,
+#   before formatting: they were half of run 22's 4 MB network mirror, which
+#   ran out before the part of the session that mattered.
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+index deb8d4e3c..a06d30848 100644
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -812,11 +812,33 @@ void vita_diag_engine_flush(void)
+  * log, so the navigation / fetch traces MacSurf left in the core are
+  * visible on the device.
+  */
++/* MacSurf's layout/reconvert debug traces: thousands of lines per page,
++ * half of run 22's 4 MB network mirror, which then ended before the part
++ * that mattered. Dropped by prefix, before any formatting. */
++static const char *const engine_noise[] = {
++	"LAYOUTPHASE", "FLEXPHASE", "LAYOUT_CRUMB", "WORK reconvert", "MCOL ",
++	"LIFE FLEXITEMCALL", "LIFE FBVAR", "LIFE FBBG", "svg_box", "img diag",
++	"LIFE imgdims", "LIFE img ctor", "LIFE obj fetch", "html_reformat",
++	"reformat: ", "reconvert: ", "box: convert_xml", "TALLOC-INFO",
++	"LIFE objects relinked", "LIFE VPORT", "LIFE reconvert"
++};
++
++static bool engine_is_noise(const char *s)
++{
++	size_t i;
++
++	for (i = 0; i < sizeof(engine_noise) / sizeof(engine_noise[0]); i++)
++		if (strncmp(s, engine_noise[i], strlen(engine_noise[i])) == 0)
++			return true;
++	return false;
++}
++
+ void macsurf_debug_log_write(const char *msg)
+ {
+ 	/* MacSurf's MS_LOG: bridge traces and the page's console.log. The
+ 	 * compat fallback wrote to stderr, which the Vita discards. */
+-	if (engine_log == NULL || !verbose_log || msg == NULL)
++	if (engine_log == NULL || !verbose_log || msg == NULL ||
++	    engine_is_noise(msg))
+ 		return;
+ 	fprintf(engine_log, "MS %s\n", msg);
+ }
+@@ -825,7 +847,7 @@ void macsurf_debug_log_writef(const char *fmt, ...)
+ {
+ 	va_list ap;
+ 
+-	if (engine_log == NULL || !verbose_log)
++	if (engine_log == NULL || !verbose_log || engine_is_noise(fmt))
+ 		return;
+ 	fputs("MS ", engine_log);
+ 	va_start(ap, fmt);
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index d4059c597..7d4ab70a5 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -502,9 +502,24 @@ static int vita_controls(struct gui_window *gw, struct browser_window *bw,
+ 	case VITA_BROWSE_ENTER_TEXT:
+ 		vita_chrome_text_entry(gw);
+ 		break;
+-	case VITA_BROWSE_HOME:
+-		vita_chrome_open(gw, VITA_HOME_URL, "home");
++	case VITA_BROWSE_HOME: {
++		/* START means "go home", not "load home in this popup": run
++		 * 22 pressed it in Google's sign-in popup, opened claude.ai
++		 * from there, and that second copy of the app ran beside the
++		 * first one under the popup -- over the Vita's memory, so it
++		 * never rendered. Close the popups; home replaces the page
++		 * in the main window, which frees it. */
++		int ids[8], n, i;
++		struct gui_window *m = vita_window_main();
++
++		n = vita_window_popup_ids(ids, 8);
++		for (i = 0; i < n; i++) {
++			vita_diag_log("input: home closes popup %d", ids[i]);
++			vita_popup_close_later(ids[i]);
++		}
++		vita_chrome_open(m != NULL ? m : gw, VITA_HOME_URL, "home");
+ 		break;
++	}
+ 	default:
+ 		break;
+ 	}
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index 4731ea1d6..a328eb40d 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -115,6 +115,28 @@ int vita_window_popup_id(struct gui_window *gw)
+ 	return gw != NULL ? gw->popup_id : 0;
+ }
+ 
++/* exported interface documented in vita/window.h */
++struct gui_window *vita_window_main(void)
++{
++	struct gui_window *w = vita_current;
++
++	while (w != NULL && w->below != NULL)
++		w = w->below;
++	return w;
++}
++
++/* exported interface documented in vita/window.h */
++int vita_window_popup_ids(int *ids, int max)
++{
++	struct gui_window *w;
++	int n = 0;
++
++	for (w = vita_current; w != NULL && n < max; w = w->below)
++		if (w->popup_id != 0)
++			ids[n++] = w->popup_id;
++	return n;
++}
++
+ /* exported interface documented in vita/window.h */
+ struct gui_window *vita_window_for_popup(int id)
+ {
+@@ -176,6 +198,9 @@ static nserror vita_window_event(struct gui_window *gw,
+ 	case GW_EVENT_STOP_THROBBER:
+ 		gw->loading = false;
+ 		gw->dirty = true;
++		/* Memory after every load: two script-heavy pages at once
++		 * (a popup over its opener) ran out of it silently (run 22). */
++		vita_diag_memory("page done");
+ 		break;
+ 	case GW_EVENT_UPDATE_EXTENT:
+ 		/* Re-clamp the scroll offset to the new extent. */
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+index 72e1e4f92..67a0eb809 100644
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -74,6 +74,12 @@ int vita_window_popup_id(struct gui_window *gw);
+ /** The open popup with this id, or NULL (closed, or never opened). */
+ struct gui_window *vita_window_for_popup(int id);
+ 
++/** The window at the bottom of the stack: the one the user browses in. */
++struct gui_window *vita_window_main(void);
++
++/** Up to max ids of the open popups, top first; returns how many. */
++int vita_window_popup_ids(int *ids, int max);
++
+ /**
+  * Log (up to 5 of) the innermost boxes whose right edge passes limit: what
+  * makes a page wider than the screen.

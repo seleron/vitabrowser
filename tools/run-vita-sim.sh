@@ -209,6 +209,7 @@ NET-js-mutation-http http://127.0.0.1:$HP/JS-mutation.html
 NET-js-mutation-https https://127.0.0.1:$((HP + 1))/JS-mutation.html
 NET-js-fetch-body-http http://127.0.0.1:$HP/JS-fetch-body.html
 NET-js-fetch-body-https https://127.0.0.1:$((HP + 1))/JS-fetch-body.html
+NET-js-frame-local http://127.0.0.1:$HP/JS-frame-local.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -443,6 +444,17 @@ done
 [ "$(ls "$R"/*NET-js-fetch-body*.plot 2>/dev/null | wc -l)" -eq 2 ] || fb_bad=$((fb_bad + 1))
 [ "$fb_bad" -eq 0 ]
 
+# Script-made frames (Patch 143) and timer chains (Patch 141): a same-
+# origin or blank frame a script makes fires load and has a same-realm
+# contentWindow with eval (Google's BotGuard runs in one); a cross-origin
+# one gets no made-up load; 300 chained setTimeout(fn, 1) finish quickly.
+echo "== script-made frames + timer chains (JS-frame-local) =="
+fl=$(ls "$R"/*NET-js-frame-local.plot 2>/dev/null | head -1)
+flr=$(sed -n 's/.*STR \(FRAMELOCAL: [0-9]*\/[0-9]* passed\).*/\1/p' "$fl" 2>/dev/null | head -1)
+echo "  JS-frame-local: ${flr:-no summary line (script did not run?)}"
+[ -n "$fl" ] && grep -o 'STR [0-9]* [^:]*: waiting.*' "$fl" | sed 's/^STR /  /'
+[ "$flr" = "FRAMELOCAL: 6/6 passed" ] || fail "script-made frames / timer chains"
+
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
 # JS-window navigates itself three times (relative location.href,
 # location.replace, history.back) carrying its state in localStorage, then
@@ -496,6 +508,7 @@ grep -c '<a href="https://' "$R/home.html" | sed 's/^/  home page bookmarks: /'
 [ -n "$isum" ] && [ "${isum%/*}" = "${isum#*/}" ] && \
 	[ "$iblk" = "IN block: 2/2 passed" ] && [ -f "$R/IN-zoom125.plot" ] && \
 	[ -f "$R/IN-form-sent.plot" ] && \
+	grep -q 'a submit whose click rebuilds the page: PASS' "$R/log.txt" && \
 	[ "$(grep -c '<a href="https://' "$R/home.html")" -ge 5 ] || fail "interaction pass"
 
 # Layout found on real sites (docs/phase-0/11), as regression pages among

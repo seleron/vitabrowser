@@ -1,0 +1,143 @@
+# netsurf: a click whose events rebuild the layout no longer submits through freed controls
+#
+# Found replaying claude.ai "Continue with email" in the simulator: segfault
+# in the submit path. The click's pointer/mouse/click events run page JS;
+# React re-renders and reads layout, which rebuilds the box tree on the spot
+# and frees the boxes and form controls the click state points into. The
+# submit then read mas.gadget.control->form from freed memory.
+#
+# mouse_action_drag_none keeps what the action needs across the events: a
+# reference on the link URL, copies of the target names, and a reference on
+# the form control's DOM node. If the layout was rebuilt meanwhile
+# (macsurf_reconvert_seq or html->layout changed), the box pointers are
+# dropped and the control is found again in the new tree; if the new tree
+# has no control for it yet (it is rebuilt over several passes), the submit
+# event still goes to the button's <form> (script-driven forms do their work
+# there and cancel the native submit).
+# Test: interaction step "a submit whose click rebuilds the page"
+# (IN-rebuild.html).
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index e0e8e3d32..36ebd505b 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1901,6 +1901,24 @@ mouse_action_drag_none(html_content *html,
+ 		content_broadcast(c, CONTENT_MSG_POINTER, &msg_data);
+ 	}
+ 
++	/* VitaBrowser: the click's own events run page JS, and a handler
++	 * that reads layout (React re-rendering the claude.ai login form)
++	 * rebuilds the box tree on the spot -- freeing the boxes and form
++	 * controls `mas` points into. The submit that followed read
++	 * mas.gadget.control->form from freed memory (a crash on "Continue
++	 * with email"). Keep what the action needs past the events: the
++	 * link URL (a reference), the target names (copies) and the form
++	 * control's DOM node, which re-finds the control in the new tree. */
++	extern unsigned long macsurf_reconvert_seq;
++	unsigned long click_seq = macsurf_reconvert_seq;
++	void *click_layout = html->layout;
++	nsurl *click_url = mas.link.url != NULL ? nsurl_ref(mas.link.url) : NULL;
++	char *click_ltarget = mas.link.target != NULL ?
++			strdup(mas.link.target) : NULL;
++	dom_node *click_ctl = (mas.gadget.control != NULL &&
++			mas.gadget.control->node != NULL) ?
++			dom_node_ref(mas.gadget.control->node) : NULL;
++
+ 	/* fire dom click event */
+ 	if (mouse & BROWSER_MOUSE_CLICK_1) {
+ 		int js_default_prevented = 0;
+@@ -2109,6 +2127,68 @@ mouse_action_drag_none(html_content *html,
+ 		}
+ 	}
+ 
++	if (macsurf_reconvert_seq != click_seq ||
++	    (void *)html->layout != click_layout) {
++		macsurf_debug_log_writef("LIFE CLICK the page rebuilt its "
++				"layout during the click's events: action %d "
++				"re-resolved", (int)mas.result.action);
++		mas.link.box = NULL;
++		mas.link.url = click_url;
++		mas.link.target = click_ltarget;
++		mas.gadget.box = NULL;
++		mas.gadget.target = NULL;
++		if (mas.result.action == ACTION_SUBMIT) {
++			struct form_control *nc = click_ctl != NULL ?
++				html_forms_get_control_for_node(html->forms,
++						click_ctl) : NULL;
++			if (nc == NULL || nc->form == NULL) {
++				/* The new tree has no control for it yet (it
++				 * is rebuilt over several passes). Still give
++				 * the page its submit event at the button's
++				 * form: script-driven forms (React) do their
++				 * work there and cancel the native submit. */
++				dom_node *n = dom_node_ref(click_ctl), *up;
++				bool sent = false;
++				while (n != NULL) {
++					dom_string *name = NULL;
++					dom_node_type t;
++					if (dom_node_get_node_type(n, &t) == DOM_NO_ERR &&
++					    t == DOM_ELEMENT_NODE &&
++					    dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
++					    name != NULL) {
++						/* by name: script-made elements carry
++						 * no HTML tag type */
++						bool is_form = dom_string_length(name) == 4 &&
++							strncasecmp(dom_string_data(name),
++								"form", 4) == 0;
++						dom_string_unref(name);
++						if (is_form) {
++							(void) fire_generic_dom_event(
++								corestring_dom_submit, n,
++								true, true);
++							sent = true;
++							dom_node_unref(n);
++							break;
++						}
++					}
++					up = NULL;
++					if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR)
++						up = NULL;
++					dom_node_unref(n);
++					n = up;
++				}
++				macsurf_debug_log_writef("LIFE CLICK submit "
++						"button's control not rebuilt yet: "
++						"%s", sent ? "submit event sent to "
++						"its form" : "no form, nothing sent");
++				mas.result.action = ACTION_NONE;
++			} else {
++				mas.gadget.control = nc;
++				mas.gadget.target = nc->form->target;
++			}
++		}
++	}
++
+ 	/* deferred actions that can cause this browser_window to be destroyed
+ 	 * and must therefore be done after set_status/pointer
+ 	 */
+@@ -2242,6 +2322,11 @@ mouse_action_drag_none(html_content *html,
+ 		break;
+ 	}
+ 
++	if (click_url != NULL)
++		nsurl_unref(click_url);
++	free(click_ltarget);
++	if (click_ctl != NULL)
++		dom_node_unref(click_ctl);
+ 	return res;
+ }
+ 
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+index deeaaca71..ddbe70cc1 100644
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -131,6 +131,10 @@ static const struct step {
+ 	  C_URL, "IN-events.html", 0, NULL },
+ 	{ "a tap's events, focus, change, readyState", A_TAP, NULL, 200, 285,
+ 	  0, 0, 0, C_URL, "IN-target.html?via=events&r=ok", 0, NULL },
++	{ "open IN-rebuild", A_OPEN, T "IN-rebuild.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-rebuild.html", 0, NULL },
++	{ "a submit whose click rebuilds the page", A_TAP, NULL, 250, 140,
++	  0, 0, 0, C_URL, "IN-target.html?via=rebuild&r=ok", 0, NULL },
+ 	{ "a typed URL opens", A_TYPE, T "IN-target.html?via=typed",
+ 	  0, 0, 0, 0, 0, C_URL, "IN-target.html?via=typed", 0, NULL },
+ 	{ "a URL pushed to the LAN listener opens", A_REMOTE,
