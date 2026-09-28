@@ -25,10 +25,15 @@ for fix in "$FIX"/*.plot; do
 	name=$(basename "$fix" .plot)
 	python3 "$ROOT/tools/plotstream.py" --monkey "$MONKEY" \
 		--url "file://$PAGES/$name.html" --load-wait 6 --out "$TMP/$name.plot" 2>/dev/null
+	# Normalize the machine-specific source-path header (first line:
+	# "# plotstream file:///abs/path/...") before diffing, so the check
+	# compares plot ops, not checkout locations.
+	sed '1s|^# plotstream file://.*|# plotstream|' "$fix" > "$TMP/$name.fix.norm"
+	sed '1s|^# plotstream file://.*|# plotstream|' "$TMP/$name.plot" > "$TMP/$name.new.norm"
 	if [ -n "$UPDATE" ]; then
 		cp "$TMP/$name.plot" "$fix"
 		echo "UPDATED $name"
-	elif diff -u "$fix" "$TMP/$name.plot" > "$TMP/$name.diff"; then
+	elif diff -u "$TMP/$name.fix.norm" "$TMP/$name.new.norm" > "$TMP/$name.diff"; then
 		echo "PASS $name"
 	else
 		echo "FAIL $name"

@@ -203,6 +203,10 @@ NET-js-fetch-headers http://127.0.0.1:$HP/JS-fetch-headers.html
 NET-js-fetch-headers-https https://127.0.0.1:$((HP + 1))/JS-fetch-headers.html
 NET-js-history-http http://127.0.0.1:$HP/JS-history.html
 NET-js-history-https https://127.0.0.1:$((HP + 1))/JS-history.html
+NET-js-storage-http http://127.0.0.1:$HP/JS-storage.html
+NET-js-storage-https https://127.0.0.1:$((HP + 1))/JS-storage.html
+NET-js-mutation-http http://127.0.0.1:$HP/JS-mutation.html
+NET-js-mutation-https https://127.0.0.1:$((HP + 1))/JS-mutation.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -397,6 +401,28 @@ for f in "$R"/*NET-js-history*.plot; do
 done
 [ "$(ls "$R"/*NET-js-history*.plot 2>/dev/null | wc -l)" -eq 2 ] || jh_bad=$((jh_bad + 1))
 [ "$jh_bad" -eq 0 ]
+
+# Web Storage (localStorage per-origin persistence via __storageSave /
+# __storageLoad; sessionStorage per-page in-memory) and MutationObserver
+# (records queued by native mutation, delivered async). Both pages are
+# async (mutation delivery, storage is sync but the page ticks), checked
+# over HTTP and HTTPS.
+echo "== storage + mutation observer (JS-storage, JS-mutation) =="
+sm_bad=0
+for f in "$R"/*NET-js-storage*.plot "$R"/*NET-js-mutation*.plot; do
+	[ -f "$f" ] || { echo "  missing: $f"; sm_bad=$((sm_bad + 1)); continue; }
+	n=${f##*/}
+	r=$(sed -n 's/.*STR \(JS \(storage\|mutation\): [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
+	echo "  $n: ${r:-no summary line (script did not run?)}"
+	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
+	sed -n 's/.*STR \(JS \(storage\|mutation\): [0-9]*\/[0-9]* passed FAILS: .*\)/\1/p' "$f" | head -1 | sed 's/^/  /'
+	case "$n" in
+		*storage*) [ "$r" = "JS storage: 15/15 passed" ] || sm_bad=$((sm_bad + 1)) ;;
+		*mutation*) [ "$r" = "JS mutation: 7/7 passed" ] || sm_bad=$((sm_bad + 1)) ;;
+	esac
+done
+[ "$(ls "$R"/*NET-js-storage*.plot "$R"/*NET-js-mutation*.plot 2>/dev/null | wc -l)" -eq 4 ] || sm_bad=$((sm_bad + 1))
+[ "$sm_bad" -eq 0 ]
 
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
 # JS-window navigates itself three times (relative location.href,
