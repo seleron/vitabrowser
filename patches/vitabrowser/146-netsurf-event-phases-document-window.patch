@@ -1,0 +1,168 @@
+# netsurf: DOM event phases for document and window; one defaultPrevented; spec defaults
+#
+# Found replaying claude.ai's email form and pinned by JS-event-order.html
+# (roadmap WS-B1). Elements dispatched correctly through libdom, but:
+#
+# - document and window keep their listeners in JS shims that registered
+#   with libdom once per TYPE (not per capture flag) and fired ALL their
+#   listeners on every visit: a listener added without capture ran while
+#   capturing, before the target, and never while bubbling. They now keep
+#   each listener's capture flag, register per (type, capture), and fire
+#   only the listeners of the phase libdom is in (all at the target).
+#   removeEventListener matches the capture flag.
+# - the native listener callback set defaultPrevented = false on every
+#   node the event visited, so a later listener never saw an earlier
+#   preventDefault. It now reads libdom's flag.
+# - el.dispatchEvent defaulted bubbles and cancelable to TRUE; the spec
+#   (and `new Event(t)`) says false. el.click() now asks for
+#   {bubbles: true, cancelable: true} explicitly.
+# Order now: window capture, document capture, ancestors, target,
+# ancestors bubbling, document bubbling, window bubbling.
+# Test: JS-event-order.html 5/5.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index e339c60ff..1bfb79a27 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -6759,7 +6759,10 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		 * synthetic click on a link navigating would be a surprising
+ 		 * side effect to introduce here, and no page tested needs it. */
+ 		"P.click=function(){"
++		/* VitaBrowser: a click bubbles and can be cancelled (it
++		 * relied on dispatchEvent's old always-bubble default) */
+ 		"if(this.dispatchEvent)this.dispatchEvent({type:'click',"
++		"bubbles:true,cancelable:true,"
+ 		"target:this,currentTarget:this,"
+ 		"preventDefault:function(){},stopPropagation:function(){}});};"
+ 		/* fixes878 - the node-oriented traversal surface used to be hardcoded
+@@ -8175,8 +8178,14 @@ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ 		if (dom_event_get_event_phase(evt, &ph) == DOM_NO_ERR)
+ 			JS_SetPropertyStr(ctx, evobj, "eventPhase",
+ 					JS_NewInt32(ctx, (int)ph));
++		/* VitaBrowser: libdom's flag, not false on every node the
++		 * event visits -- a listener further along must see an
++		 * earlier preventDefault (claude.ai's form: the target
++		 * cancelled, the root saw defaultPrevented false). */
++		b = false;
++		(void)dom_event_is_default_prevented(evt, &b);
+ 		JS_SetPropertyStr(ctx, evobj, "defaultPrevented",
+-				JS_NewBool(ctx, 0));
++				JS_NewBool(ctx, b));
+ 		JS_SetPropertyStr(ctx, evobj, "timeStamp",
+ 				JS_NewFloat64(ctx, macsurf_qjs_get_now()));
+ 		/* isTrusted is TRUE only here -- this is the native UI path.
+@@ -8724,7 +8733,9 @@ static JSValue qjs_el_dispatch_event_data(JSContext *ctx,
+ 	dom_string *tds;
+ 	dom_event *evt = NULL;
+ 	bool ok_flag = true;
+-	bool bubbles = true, cancelable = true;
++	/* VitaBrowser: the spec's defaults (new Event(t) neither bubbles
++	 * nor cancels); true here made every non-bubbling event bubble. */
++	bool bubbles = false, cancelable = false;
+ 	struct qjs_synth_ev_slot slot;
+ 	(void)this_val; (void)magic;
+ 
+@@ -12660,17 +12671,29 @@ static void register_browser_globals(JSContext *ctx)
+ 			 * handler 4 times. Elements already guard this with
+ 			 * `fresh` in qjs_el_add_event_listener_data; document and
+ 			 * window share the document node, so they share one gate. */
++			/* VitaBrowser: per (type, capture), as elements do:
++			 * registered once per type, libdom knew the document
++			 * under whichever phase came first, so its (and window's)
++			 * listeners ran in that phase only -- document and window
++			 * bubble listeners fired while CAPTURING, before the
++			 * target, and never while bubbling. */
+ 			"document._reg={};"
++			"document.__msCap=function(opt){"
++				"return opt===true||!!(opt&&typeof opt==='object'&&opt.capture);};"
+ 			"document.__msRegOnce=function(t,opt){"
+-				"if(document._reg[t])return;"
+-				"document._reg[t]=1;"
++				"var k=t+(document.__msCap(opt)?'\001C':'\001B');"
++				"if(document._reg[k])return;"
++				"document._reg[k]=1;"
+ 				"if(typeof document.__msRegDocEvent==='function'){"
+ 					"try{document.__msRegDocEvent(t,opt);}catch(e){}}};"
+ 			"document.addEventListener=document.addEventListener||"
+ 				"function(t,fn,opt){"
+ 					"if(!document._listeners)document._listeners={};"
+ 					"if(!document._listeners[t])document._listeners[t]=[];"
++					"if(!document._listenersC)document._listenersC={};"
++					"if(!document._listenersC[t])document._listenersC[t]=[];"
+ 					"document._listeners[t].push(fn);"
++					"document._listenersC[t].push(document.__msCap(opt));"
+ 					/* fixes1249 (#167) - the real Facebook bundle has
+ 					 * AT LEAST 5-6 distinct DOMContentLoaded listener
+ 					 * registration sites (a messenger health tracker, a
+@@ -12698,9 +12721,12 @@ static void register_browser_globals(JSContext *ctx)
+ 					"}catch(e){}}"
+ 					"document.__msRegOnce(t,opt);};"
+ 			"document.removeEventListener=document.removeEventListener||"
+-				"function(t,fn){"
++				"function(t,fn,opt){"
+ 					"var L=document._listeners&&document._listeners[t];if(!L)return;"
+-					"for(var i=0;i<L.length;i++)if(L[i]===fn){L.splice(i,1);return;}};"
++					"var C=(document._listenersC&&document._listenersC[t])||[];"
++					"var cap=document.__msCap(opt);"
++					"for(var i=0;i<L.length;i++)if(L[i]===fn&&!!C[i]===cap){"
++						"L.splice(i,1);C.splice(i,1);return;}};"
+ 			/* fixes1236 (#167) - had ZERO diagnostics and a fully silent
+ 			 * catch(e){} -- a document-level listener that threw left no
+ 			 * trace anywhere. window.dispatchEvent (below, same fix round)
+@@ -12723,7 +12749,15 @@ static void register_browser_globals(JSContext *ctx)
+ 					 * for readystatechange that way, several at once). */
+ 					"if(ev&&ev.target==null){try{ev.target=document;}catch(_){}}"
+ 					"try{if(ev)ev.currentTarget=document;}catch(_){}"
+-					"if(L)L.slice().forEach(function(f){try{f.call(document,ev);}catch(e){"
++					/* VitaBrowser: the phase libdom is in (the native
++					 * listener callback sets it): capture listeners while
++					 * capturing, the others while bubbling, all at the
++					 * target or for a direct call. */
++					"var ph=(ev&&ev.eventPhase)|0;"
++					"var C=(document._listenersC&&document._listenersC[t])||[];"
++					"if(L)L.slice().forEach(function(f,i){"
++					"if((ph===1&&!C[i])||(ph===3&&C[i]))return;"
++					"try{f.call(document,ev);}catch(e){"
+ 						"try{if(typeof __msLife==='function')"
+ 							"__msLife('docevt THREW type='+t+': '+"
+ 								"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"
+@@ -12986,7 +13020,10 @@ static void register_browser_globals(JSContext *ctx)
+ 		 * input at all. */
+ 		"this.addEventListener=function(t,fn,opt){"
+ 			"if(!this._winListeners[t])this._winListeners[t]=[];"
++			"if(!this._winListenersC)this._winListenersC={};"
++			"if(!this._winListenersC[t])this._winListenersC[t]=[];"
+ 			"this._winListeners[t].push(fn);"
++			"this._winListenersC[t].push(opt===true||!!(opt&&typeof opt==='object'&&opt.capture));"
+ 			/* fixes1249 (#167) - same fingerprint as document's
+ 			 * addEventListener (see its comment); window is the OTHER
+ 			 * side of the exact same "which of 5-6 candidate
+@@ -12999,9 +13036,12 @@ static void register_browser_globals(JSContext *ctx)
+ 			"if(typeof document!=='undefined'&&"
+ 			   "typeof document.__msRegOnce==='function'){"
+ 				"try{document.__msRegOnce(t,opt);}catch(e){}}};"
+-		"this.removeEventListener=function(t,fn){"
++		"this.removeEventListener=function(t,fn,opt){"
+ 			"var arr=this._winListeners[t];if(!arr)return;"
+-			"for(var i=0;i<arr.length;i++)if(arr[i]===fn){arr.splice(i,1);return;}};"
++			"var C=(this._winListenersC&&this._winListenersC[t])||[];"
++			"var cap=opt===true||!!(opt&&typeof opt==='object'&&opt.capture);"
++			"for(var i=0;i<arr.length;i++)if(arr[i]===fn&&!!C[i]===cap){"
++				"arr.splice(i,1);C.splice(i,1);return;}};"
+ 		/* fixes863 (#289 probe) - this used to be a bare
+ 		 *     if(arr)arr.forEach(function(f){try{f(ev);}catch(e){}});
+ 		 * so a window listener that THREW was swallowed in total silence,
+@@ -13041,7 +13081,13 @@ static void register_browser_globals(JSContext *ctx)
+ 			/* VitaBrowser: snapshot + this=window (see document's). */
+ 			"var W=this;"
+ 			"if(ev&&ev.target==null){try{ev.target=W;}catch(_){}}"
+-			"if(arr)arr.slice().forEach(function(f){try{f.call(W,ev);}catch(e){"
++			/* VitaBrowser: phase-filtered, as document's */
++			"var ph=(ev&&ev.eventPhase)|0;"
++			"var C=(W._winListenersC&&W._winListenersC[t])||[];"
++			"try{if(ev)ev.currentTarget=W;}catch(_){}"
++			"if(arr)arr.slice().forEach(function(f,i){"
++			"if((ph===1&&!C[i])||(ph===3&&C[i]))return;"
++			"try{f.call(W,ev);}catch(e){"
+ 				"try{if(typeof __msLife==='function')"
+ 					"__msLife('winevt THREW type='+t+': '+"
+ 						"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"

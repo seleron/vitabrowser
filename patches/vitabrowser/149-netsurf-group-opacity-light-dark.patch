@@ -1,0 +1,247 @@
+# netsurf: group opacity (opacity:0 hides what it covers) and light-dark()
+#
+# - CSS opacity applies to an element and everything it paints, and
+#   multiplies down the tree; the redraw applied it to background fills
+#   only, so opacity:0 -- how most sites hide menus, tooltips, inactive
+#   slides, and example.com five of its six languages -- hid nothing.
+#   html_redraw_box now composes each box's opacity (incl. the animation
+#   override) for its subtree, skips a subtree whose composed opacity is 0,
+#   and background fills take their ancestors' factor times their own. A
+#   box sharing its style with the one that last composed (a block's own
+#   text) is not counted twice. Partial opacity on text, borders and images
+#   still paints opaque.
+# - light-dark(A, B) -> A in the CSS rewrite pass (the page renders in the
+#   light scheme); libcss dropped the whole declaration (example.com's grey
+#   background, Tailwind v4 themes).
+# - redraw.c: inline grids clip like other containers (patch 147's area).
+# Test: CSS-opacity-group.html (hidden text absent from the plot, the
+# light-dark box filled).
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+index 94389730b..7c36f4e74 100644
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -5992,6 +5992,77 @@ static char *vita_rewrite_media_calc(const char *data, size_t len,
+ 	return out;
+ }
+ 
++/* VitaBrowser: light-dark(A, B) -> A. The page renders in the light
++ * scheme (no prefers-color-scheme: dark), so the first colour is the
++ * one a browser shows; libcss does not know the function and dropped
++ * the whole declaration (example.com's grey background, Tailwind v4
++ * themes). NULL when the sheet has none. */
++static char *vita_rewrite_light_dark(const char *d, size_t n, size_t *out_len)
++{
++	static const char key[] = "light-dark(";
++	const size_t kl = sizeof(key) - 1;
++	char *out = NULL;
++	size_t i = 0, o = 0;
++	bool any = false;
++
++	for (i = 0; i + kl <= n; i++) {
++		if ((d[i] == 'l' || d[i] == 'L') &&
++		    strncasecmp(d + i, key, kl) == 0 &&
++		    (i == 0 || !(isalnum((unsigned char)d[i - 1]) ||
++				 d[i - 1] == '-' || d[i - 1] == '_'))) {
++			any = true;
++			break;
++		}
++	}
++	if (!any)
++		return NULL;
++	out = malloc(n + 1);
++	if (out == NULL)
++		return NULL;
++	i = 0;
++	while (i < n) {
++		if (i + kl <= n && (d[i] == 'l' || d[i] == 'L') &&
++		    strncasecmp(d + i, key, kl) == 0 &&
++		    (i == 0 || !(isalnum((unsigned char)d[i - 1]) ||
++				 d[i - 1] == '-' || d[i - 1] == '_'))) {
++			size_t a = i + kl, j = a, comma = 0, close = 0;
++			int depth = 0;
++			char q = 0;
++			for (; j < n; j++) {
++				char c = d[j];
++				if (q) {
++					if (c == '\\' && j + 1 < n)
++						j++;
++					else if (c == q)
++						q = 0;
++					continue;
++				}
++				if (c == '"' || c == '\'') q = c;
++				else if (c == '(') depth++;
++				else if (c == ')') {
++					if (depth == 0) { close = j; break; }
++					depth--;
++				} else if (c == ',' && depth == 0 && !comma)
++					comma = j;
++			}
++			if (close == 0 || comma == 0) {
++				/* malformed: copy verbatim */
++				out[o++] = d[i++];
++				continue;
++			}
++			while (a < comma && isspace((unsigned char)d[a])) a++;
++			memcpy(out + o, d + a, comma - a);
++			o += comma - a;
++			i = close + 1;
++			continue;
++		}
++		out[o++] = d[i++];
++	}
++	out[o] = '\0';
++	*out_len = o;
++	return out;
++}
++
+ /* exported interface documented in content/handlers/css/css_rewrite.h */
+ char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size)
+ {
+@@ -6030,6 +6101,21 @@ char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size)
+ 	if (in_size > (size_t)0x7fffffff)
+ 		return NULL;
+ 
++	/* VitaBrowser: light-dark() resolves to its light colour */
++	{
++		size_t ld_len = 0;
++		char *ld = vita_rewrite_light_dark(data, in_size, &ld_len);
++		if (ld != NULL) {
++			char *r = macsurf_css_rewrite(ld, ld_len, out_size);
++			if (r == NULL) {
++				*out_size = ld_len;
++				return ld;
++			}
++			free(ld);
++			return r;
++		}
++	}
++
+ 	/* VitaBrowser: calc() in @media preludes, before anything else. */
+ 	{
+ 		size_t mq_len = 0;
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 6f188ec05..4e8d96ea5 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -152,6 +152,9 @@ extern void macos9_animation_register_rect(int x, int y, int w, int h);
+  * with one shared clock (TickCount) for all animated elements on the
+  * page. No per-element start offset in this round.
+  */
++/* group opacity of the ancestors (defined with html_redraw_box) */
++static plot_style_fixed g_group_parent;
++
+ static int32_t macsurf_anim_opacity_resolve_plot_fixed(int32_t packed)
+ {
+ 	int32_t from_v = packed & 0xff;
+@@ -1791,6 +1794,11 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 	        } else {
+ 	                pstyle_fill_bg.opacity = (plot_style_fixed)PLOT_STYLE_SCALE;
+ 	        }
++	        /* VitaBrowser: times the ancestors' opacity (group opacity,
++	         * see html_redraw_box) */
++	        pstyle_fill_bg.opacity = (plot_style_fixed)(((int64_t)
++	                        pstyle_fill_bg.opacity * g_group_parent) /
++	                        PLOT_STYLE_SCALE);
+ 	        {
+ 	                int32_t anim_packed = 0;
+ 	                if (css_computed_macsurf_animation_opacity(
+@@ -2613,6 +2621,9 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 	        } else {
+ 	                pstyle_fill_bg.opacity = (plot_style_fixed)PLOT_STYLE_SCALE;
+ 	        }
++	        pstyle_fill_bg.opacity = (plot_style_fixed)(((int64_t)
++	                        pstyle_fill_bg.opacity * g_group_parent) /
++	                        PLOT_STYLE_SCALE);
+ 	        {
+ 	                int32_t anim_packed_il = 0;
+ 	                if (css_computed_macsurf_animation_opacity(
+@@ -4538,11 +4549,71 @@ static bool macsurf_box_node_is_canvas(struct box *box)
+ 
+ 
+ 
++/* VitaBrowser: group opacity. CSS opacity applies to an element and
++ * everything it paints, and multiplies down the tree; the redraw applied
++ * it to background fills only, so opacity:0 (how most sites hide menus,
++ * tooltips and inactive slides -- example.com hides five of its six
++ * languages with it) hid nothing. html_redraw_box composes each box's
++ * opacity into g_group_opacity for its subtree and skips a subtree whose
++ * composed opacity is 0; fills take the ancestors' factor
++ * (g_group_parent) times their own. A box sharing its style with the box
++ * that last composed (a block's own text) is not counted twice. Text,
++ * borders and images at partial opacity still paint opaque. */
++static plot_style_fixed g_group_opacity = (plot_style_fixed)PLOT_STYLE_SCALE;
++static plot_style_fixed g_group_parent = (plot_style_fixed)PLOT_STYLE_SCALE;
++static const css_computed_style *g_group_style = NULL;
++
++static bool html_redraw_box_inner(const html_content *html, struct box *box,
++		int x_parent, int y_parent,
++		const struct rect *clip, const float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx);
++
+ bool html_redraw_box(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+ 		colour current_background_color,
+ 		const struct redraw_context *ctx)
++{
++	plot_style_fixed saved = g_group_opacity, saved_parent = g_group_parent;
++	const css_computed_style *saved_style = g_group_style;
++	bool ok;
++
++	if (box->style != NULL && box->style != g_group_style) {
++		css_fixed op = 0;
++		int32_t anim = 0;
++		plot_style_fixed own = (plot_style_fixed)PLOT_STYLE_SCALE;
++		if (css_computed_opacity(box->style, &op) == CSS_OPACITY_SET)
++			own = (plot_style_fixed)op;
++		if (css_computed_macsurf_animation_opacity(box->style, &anim) ==
++				CSS_MACSURF_ANIMATION_OPACITY_SET)
++			own = (plot_style_fixed)
++				macsurf_anim_opacity_resolve_plot_fixed(anim);
++		g_group_parent = saved;
++		if (own < (plot_style_fixed)PLOT_STYLE_SCALE)
++			g_group_opacity = (plot_style_fixed)(((int64_t)saved *
++					own) / PLOT_STYLE_SCALE);
++		g_group_style = box->style;
++		if (g_group_opacity <= 0) {
++			g_group_opacity = saved;
++			g_group_parent = saved_parent;
++			g_group_style = saved_style;
++			return true;	/* fully transparent: paints nothing */
++		}
++	}
++	ok = html_redraw_box_inner(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx);
++	g_group_opacity = saved;
++	g_group_parent = saved_parent;
++	g_group_style = saved_style;
++	return ok;
++}
++
++static bool html_redraw_box_inner(const html_content *html, struct box *box,
++		int x_parent, int y_parent,
++		const struct rect *clip, const float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx)
+ {
+ 	const struct plotter_table *plot = ctx->plot;
+ 	int x, y;
+@@ -5479,6 +5550,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		     box->type == BOX_FLEX ||
+ 		     box->type == BOX_INLINE_FLEX ||
+ 		     box->type == BOX_GRID ||
++		     box->type == BOX_INLINE_GRID ||
+ 		     box->object)) {
+ 			if (ctx->plot->clip(ctx, &r) != NSERROR_OK)
+ 				return false;
+@@ -5750,7 +5822,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	if (box->type == BOX_BLOCK || box->type == BOX_INLINE_BLOCK ||
+ 			box->type == BOX_TABLE_CELL || box->type == BOX_INLINE ||
+ 			box->type == BOX_FLEX || box->type == BOX_INLINE_FLEX ||
+-			box->type == BOX_GRID)
++			box->type == BOX_GRID || box->type == BOX_INLINE_GRID)
+ 		if (ctx->plot->clip(ctx, clip) != NSERROR_OK)
+ 			return false;
+ 

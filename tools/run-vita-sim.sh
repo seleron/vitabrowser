@@ -189,6 +189,9 @@ CSS-shadow file:///app0:/testpages/CSS-box-shadow.html
 CSS-color file:///app0:/testpages/CSS-modern-color.html
 CSS-spacing file:///app0:/testpages/CSS-spacing.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
+CSS-inline-grid file:///app0:/testpages/CSS-inline-grid.html
+CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
+JS-event-order file:///app0:/testpages/JS-event-order.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
 JS-module-http http://127.0.0.1:$HP/JS-module.html
@@ -210,6 +213,7 @@ NET-js-mutation-https https://127.0.0.1:$((HP + 1))/JS-mutation.html
 NET-js-fetch-body-http http://127.0.0.1:$HP/JS-fetch-body.html
 NET-js-fetch-body-https https://127.0.0.1:$((HP + 1))/JS-fetch-body.html
 NET-js-frame-local http://127.0.0.1:$HP/JS-frame-local.html
+NET-js-interfaces http://127.0.0.1:$HP/JS-interfaces.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -443,6 +447,34 @@ for f in "$R"/*NET-js-fetch-body*.plot; do
 done
 [ "$(ls "$R"/*NET-js-fetch-body*.plot 2>/dev/null | wc -l)" -eq 2 ] || fb_bad=$((fb_bad + 1))
 [ "$fb_bad" -eq 0 ]
+
+# Event dispatch order (Patch 145/146: capture -> target -> bubble with
+# document and window in the right phases, one defaultPrevented, no
+# bubbling for non-bubbling events), display: inline-grid as an inline
+# box (Patch 147: github.com crashed), group opacity + light-dark()
+# (Patch 149; checked in the plot: hidden text must not be drawn).
+echo "== event order, inline-grid, group opacity =="
+eo=$(ls "$R"/*-JS-event-order.plot 2>/dev/null | head -1)
+eor=$(sed -n 's/.*STR \(EVORDER: [0-9]*\/[0-9]* passed\).*/\1/p' "$eo" 2>/dev/null | head -1)
+echo "  JS-event-order: ${eor:-no summary}"
+[ -n "$eo" ] && grep -o 'STR [0-9]* [^:]*: .*(want.*' "$eo" | sed 's/^STR /  /'
+ig=$(ls "$R"/*-CSS-inline-grid.plot 2>/dev/null | head -1)
+igr=$(sed -n 's/.*STR \(INLINEGRID: [0-9]*\/[0-9]* passed\).*/\1/p' "$ig" 2>/dev/null | head -1)
+echo "  CSS-inline-grid: ${igr:-no summary}"
+op=$(ls "$R"/*-CSS-opacity.plot 2>/dev/null | head -1)
+op_shown=$(grep -c 'STR SHOWNMARK' "$op" 2>/dev/null || true)
+op_half=$(grep -c 'STR HALFMARK' "$op" 2>/dev/null || true)
+op_hidden=$(grep -c 'HIDDENSPANMARK\|HIDDENBLOCKMARK' "$op" 2>/dev/null || true)
+op_ldbox=$(awk '/PLOT RECT/ { if ($8 - $4 == 200 && $10 - $6 == 30) n++ } END { print n+0 }' "$op" 2>/dev/null)
+echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1)"
+ifp=$(ls "$R"/*NET-js-interfaces.plot 2>/dev/null | head -1)
+ifr=$(sed -n 's/.*STR \(IFACES: [0-9]*\/[0-9]* passed\).*/\1/p' "$ifp" 2>/dev/null | head -1)
+echo "  JS-interfaces: ${ifr:-no summary}"
+[ -n "$ifp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL.*' "$ifp" | sed 's/^STR /  /' || true; }
+[ "$ifr" = "IFACES: 8/8 passed" ] && \
+[ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
+	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
+	[ "${op_ldbox:-0}" -ge 1 ] || fail "event order / inline-grid / group opacity"
 
 # Script-made frames (Patch 143) and timer chains (Patch 141): a same-
 # origin or blank frame a script makes fires load and has a same-realm

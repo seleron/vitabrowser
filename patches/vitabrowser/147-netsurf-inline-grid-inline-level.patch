@@ -1,0 +1,321 @@
+# netsurf: display: inline-grid is an inline-level box
+#
+# github.com crashed the simulator (and would crash the Vita: asserts are
+# compiled in) at layout_minmax_block_inner's assert(0): a <button> with
+# display: inline-grid sat directly in its block. Box construction put an
+# inline-grid box straight into the block instead of an inline container:
+# every "inline-level atomic box" check named inline-block and inline-flex
+# but not inline-grid. Added it wherever inline-flex is handled: box
+# construction (7 sites, incl. blockification in a flex container),
+# normalisation (as grids are, box_normalise_flex), line layout and min/max
+# measurement, and the inline-flow helper.
+#
+# Two sizing fixes so an inline grid shrinks to fit like a browser's:
+# - a grid's intrinsic width is a ROW of its tracks (a px track's size, or
+#   its first-row item's width) plus column gaps, not its widest item;
+# - layout_grid keeps the shrink-to-fit width layout_float gave an inline
+#   or floated grid with width:auto instead of re-resolving it to the line.
+# (The redraw clip lines for inline grids are in patch 149.)
+# Test: CSS-inline-grid.html 4/4; scorecard github 0 (crash) -> 67.
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index c635a272a..4866d4439 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -677,7 +677,8 @@ box_construct_generate(struct box_construct_ctx *ctx,
+ 	if (box->type != BOX_BLOCK &&
+ 			box->type != BOX_INLINE &&
+ 			box->type != BOX_INLINE_BLOCK &&
+-			box->type != BOX_INLINE_FLEX)
++			box->type != BOX_INLINE_FLEX &&
++			box->type != BOX_INLINE_GRID)
+ 		return;
+ 
+ 	/* fixes140f: inline parent dispatched before it was added
+@@ -687,7 +688,8 @@ box_construct_generate(struct box_construct_ctx *ctx,
+ 	 * parents and inline parents that ARE wired drop through. */
+ 	if ((box->type == BOX_INLINE ||
+ 			box->type == BOX_INLINE_BLOCK ||
+-			box->type == BOX_INLINE_FLEX) &&
++			box->type == BOX_INLINE_FLEX ||
++			box->type == BOX_INLINE_GRID) &&
+ 			box->parent == NULL)
+ 		return;
+ 
+@@ -899,7 +901,8 @@ box_construct_generate(struct box_construct_ctx *ctx,
+ 		 * parents and inline parents that ARE wired drop through. */
+ 		if ((box->type == BOX_INLINE ||
+ 				box->type == BOX_INLINE_BLOCK ||
+-				box->type == BOX_INLINE_FLEX) &&
++				box->type == BOX_INLINE_FLEX ||
++				box->type == BOX_INLINE_GRID) &&
+ 				box->parent == NULL) {
+ 			return;
+ 		}
+@@ -1102,7 +1105,8 @@ box_construct_generate(struct box_construct_ctx *ctx,
+ 
+ 		if ((box->type == BOX_INLINE ||
+ 				box->type == BOX_INLINE_BLOCK ||
+-				box->type == BOX_INLINE_FLEX) &&
++				box->type == BOX_INLINE_FLEX ||
++				box->type == BOX_INLINE_GRID) &&
+ 				box->parent != NULL) {
+ 			/* fixes140f: inline parent. The BOX_INLINE itself
+ 			 * is just a start marker in the parent's
+@@ -1128,7 +1132,8 @@ box_construct_generate(struct box_construct_ctx *ctx,
+ 			}
+ 		} else if (box->type == BOX_INLINE ||
+ 				box->type == BOX_INLINE_BLOCK ||
+-				box->type == BOX_INLINE_FLEX) {
++				box->type == BOX_INLINE_FLEX ||
++				box->type == BOX_INLINE_GRID) {
+ 			/* Inline parent but box not yet wired into its
+ 			 * inline_container -- this can happen if ::before
+ 			 * is dispatched before the inline is added to the
+@@ -1476,6 +1481,9 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			case BOX_INLINE_FLEX:
+ 				box->type = BOX_FLEX;
+ 				break;
++			case BOX_INLINE_GRID:
++				box->type = BOX_GRID;
++				break;
+ 			case BOX_INLINE_BLOCK:
+ 				box->type = BOX_BLOCK;
+ 				break;
+@@ -1603,6 +1611,7 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			 box->type == BOX_BR ||
+ 			 box->type == BOX_INLINE_BLOCK ||
+ 			 box->type == BOX_INLINE_FLEX ||
++			 box->type == BOX_INLINE_GRID ||
+ 			 (box__style_is_float(box) &&
+ 			  !box__containing_block_is_flex(&props))) &&
+ 			props.node_is_root == false) {
+@@ -1721,6 +1730,7 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	if (box->type != BOX_CONTENTS) {
+ 		if (box->type == BOX_INLINE || box->type == BOX_BR ||
+ 				box->type == BOX_INLINE_FLEX ||
++				box->type == BOX_INLINE_GRID ||
+ 				box->type == BOX_INLINE_BLOCK) {
+ 			/* Inline container must exist, as we'll have
+ 			 * created it above if it didn't */
+diff --git a/content/handlers/html/box_normalise.c b/content/handlers/html/box_normalise.c
+index faf62e7a5..b251bd51b 100644
+--- a/content/handlers/html/box_normalise.c
++++ b/content/handlers/html/box_normalise.c
+@@ -242,6 +242,7 @@ box_normalise_table_row(struct box *row,
+ 		case BOX_INLINE:
+ 		case BOX_INLINE_END:
+ 		case BOX_INLINE_FLEX:
++		case BOX_INLINE_GRID:
+ 		case BOX_INLINE_BLOCK:
+ 		case BOX_FLOAT_LEFT:
+ 		case BOX_FLOAT_RIGHT:
+@@ -385,6 +386,7 @@ box_normalise_table_row_group(struct box *row_group,
+ 		case BOX_INLINE:
+ 		case BOX_INLINE_END:
+ 		case BOX_INLINE_FLEX:
++		case BOX_INLINE_GRID:
+ 		case BOX_INLINE_BLOCK:
+ 		case BOX_FLOAT_LEFT:
+ 		case BOX_FLOAT_RIGHT:
+@@ -728,6 +730,7 @@ box_normalise_table(struct box *table, const struct box *root, html_content * c)
+ 		case BOX_INLINE:
+ 		case BOX_INLINE_END:
+ 		case BOX_INLINE_FLEX:
++		case BOX_INLINE_GRID:
+ 		case BOX_INLINE_BLOCK:
+ 		case BOX_FLOAT_LEFT:
+ 		case BOX_FLOAT_RIGHT:
+@@ -1032,6 +1035,12 @@ box_normalise_inline_container(struct box *cont,
+ 			if (box_normalise_flex(child, root, c) == false)
+ 				return false;
+ 			break;
++		case BOX_INLINE_GRID:
++			/* VitaBrowser: an inline grid in a line is normalised
++			 * as grids are (box_normalise_flex) */
++			if (box_normalise_flex(child, root, c) == false)
++				return false;
++			break;
+ 		case BOX_FLOAT_LEFT:
+ 		case BOX_FLOAT_RIGHT:
+ 			/* ok */
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 1f3b9ab8f..8d791c2da 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -837,7 +837,8 @@ layout_minmax_line(struct box *first,
+ 			continue;
+ 		}
+ 
+-		if (b->type == BOX_INLINE_BLOCK || b->type == BOX_INLINE_FLEX) {
++		if (b->type == BOX_INLINE_BLOCK || b->type == BOX_INLINE_FLEX ||
++				b->type == BOX_INLINE_GRID) {
+ 			layout_minmax_block(b, font_func, content);
+ 			if (min < b->min_width)
+ 				min = b->min_width;
+@@ -1328,7 +1329,8 @@ static void layout_minmax_block_inner(
+ 	/* set whether the minimum width is of any interest for this box */
+ 	if (((block->parent && lh__box_is_float_box(block->parent)) ||
+ 			block->type == BOX_INLINE_BLOCK ||
+-			block->type == BOX_INLINE_FLEX) &&
++			block->type == BOX_INLINE_FLEX ||
++			block->type == BOX_INLINE_GRID) &&
+ 			wtype != CSS_WIDTH_SET) {
+ 		/* box shrinks to fit; need minimum width */
+ 		block->flags |= NEED_MIN;
+@@ -1581,6 +1583,82 @@ static void layout_minmax_block_inner(
+ 		}
+ 	}
+ 
++	/* VitaBrowser: a grid's intrinsic width is a ROW of its items side
++	 * by side (plus the column gaps), not its widest item. Block
++	 * treatment made a shrink-to-fit grid (inline-grid, a floated grid:
++	 * GitHub's buttons) one column wide. Approximated from the first
++	 * row's in-flow items. */
++	if ((block->type == BOX_GRID || block->type == BOX_INLINE_GRID) &&
++			block->style != NULL) {
++		int32_t packed = 0;
++		int cols = 1;
++		if (css_computed_macsurf_grid(block->style, &packed) ==
++				CSS_MACSURF_GRID_SET)
++			cols = (int)(((uint32_t)packed >> 16) & 0xffff);
++		if (cols > 1) {
++			int n = 0, rmin = 0, rmax = 0, gap = 0;
++			css_fixed gl = 0;
++			css_unit gu = CSS_UNIT_PX;
++			const int32_t *tracks =
++				css_computed_macsurf_grid_tracks(block->style);
++			struct box *c = block->children;
++			/* per column: a px track is its size (layout_grid.c
++			 * packing: unit in bits 31..28, 2 = px, 5 = minmax
++			 * px floor), any other track its first-row item */
++			for (n = 0; n < cols && n < 8; n++) {
++				int tmin = 0, tmax = 0, unit = -1, val = 0;
++				while (c != NULL && c->style != NULL &&
++				       (css_computed_position(c->style) ==
++						CSS_POSITION_ABSOLUTE ||
++					css_computed_position(c->style) ==
++						CSS_POSITION_FIXED))
++					c = c->next;
++				if (c != NULL) {
++					if (c->min_width > 0)
++						tmin = c->min_width;
++					if (c->max_width > 0 && c->max_width !=
++							UNKNOWN_MAX_WIDTH)
++						tmax = c->max_width;
++					c = c->next;
++				}
++				if (tracks != NULL && tracks[n] != 0) {
++					unit = (int)(((uint32_t)tracks[n] >> 28)
++							& 0xF);
++					val = (int)((uint32_t)tracks[n] &
++							0x0FFFFFFFU);
++					if (val & 0x08000000)
++						val |= (int)0xF0000000;
++				}
++				if (unit == 2) {
++					tmin = tmax = val;
++				} else if (unit == 5 && val > 0) {
++					if (tmin < val)
++						tmin = val;
++					if (tmax < val)
++						tmax = val;
++				}
++				rmin += tmin;
++				rmax += tmax;
++			}
++			if (n > 1 && css_computed_column_gap(block->style,
++					&gl, &gu) == CSS_COLUMN_GAP_SET) {
++				gap = FIXTOINT(css_unit_len2device_px(
++						block->style,
++						&content->unit_len_ctx, gl, gu));
++				if (gap < 0)
++					gap = 0;
++				rmin += gap * (n - 1);
++				rmax += gap * (n - 1);
++			}
++			if (rmin > min)
++				min = rmin;
++			if (rmax > max)
++				max = rmax;
++			if (max < min)
++				max = min;
++		}
++	}
++
+ 	if (max < min) {
+ 		box_dump(stderr, block, 0, true);
+ 		assert(0);
+@@ -4225,7 +4303,8 @@ layout_line(struct box *first,
+ 		x += space_after;
+ 
+ 		if (b->type == BOX_INLINE_BLOCK ||
+-		    b->type == BOX_INLINE_FLEX) {
++		    b->type == BOX_INLINE_FLEX ||
++		    b->type == BOX_INLINE_GRID) {
+ 			if (b->max_width != UNKNOWN_WIDTH)
+ 				if (!layout_float(b, *width, content))
+ 					return false;
+@@ -4484,7 +4563,8 @@ layout_line(struct box *first,
+ 
+ 			if ((b->type == BOX_INLINE && !b->inline_end) ||
+ 					b->type == BOX_INLINE_BLOCK ||
+-					b->type == BOX_INLINE_FLEX) {
++					b->type == BOX_INLINE_FLEX ||
++					b->type == BOX_INLINE_GRID) {
+ 				b->x += b->margin[LEFT] + b->border[LEFT].width;
+ 				x = b->x + b->padding[LEFT] + b->width +
+ 						b->padding[RIGHT] +
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index 1d3bff9ae..7eb2b91bb 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -605,12 +605,31 @@ static bool layout_grid_inner(struct box *grid, int available_width,
+ 	if (cols < 1) cols = 1;
+ 	(void)rows;  /* V1: auto-rows only. */
+ 
+-	/* Container dimensions. layout_find_dimensions resolves auto
+-	 * widths, margins, padding, borders from CSS. */
+-	layout_find_dimensions(unit_len_ctx, available_width, -1,
+-			grid, grid->style, NULL, &grid->height,
+-			NULL, NULL, &max_height, &min_height,
+-			grid->margin, grid->padding, grid->border);
++	/* VitaBrowser: an inline-grid (or floated grid) with width:auto
++	 * arrives already shrink-to-fit sized by layout_float; keep that
++	 * width -- re-resolving auto below made every inline grid as wide
++	 * as its line. */
++	{
++		int stf = grid->width;
++		enum css_width_e wt;
++		css_fixed wl = 0;
++		css_unit wu = CSS_UNIT_PX;
++		bool shrink = (grid->type == BOX_INLINE_GRID ||
++				(grid->parent != NULL &&
++				 lh__box_is_float_box(grid->parent))) &&
++				stf > 0 && stf != AUTO &&
++				stf != UNKNOWN_WIDTH;
++		wt = css_computed_width(grid->style, &wl, &wu);
++
++		/* Container dimensions. layout_find_dimensions resolves
++		 * auto widths, margins, padding, borders from CSS. */
++		layout_find_dimensions(unit_len_ctx, available_width, -1,
++				grid, grid->style, NULL, &grid->height,
++				NULL, NULL, &max_height, &min_height,
++				grid->margin, grid->padding, grid->border);
++		if (shrink && wt == CSS_WIDTH_AUTO)
++			grid->width = stf;
++	}
+ 
+ 	container_width = grid->width;
+ 	if (container_width <= 0) {
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 26bc24206..cfc6be957 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -126,6 +126,7 @@ static inline bool lh__box_is_inline_flow(const struct box *b)
+ {
+ 	return b->type == BOX_INLINE ||
+ 	       b->type == BOX_INLINE_FLEX ||
++	       b->type == BOX_INLINE_GRID ||
+ 	       b->type == BOX_INLINE_BLOCK ||
+ 	       b->type == BOX_TEXT ||
+ 	       b->type == BOX_INLINE_END;

@@ -1,0 +1,368 @@
+# netsurf: DOM interface objects shaped as the spec's; URL-shaped objects stringify to their URL
+#
+# Found by the scorecard's JS error census (roadmap WS-B3):
+# - "cannot read property 'prototype' of undefined" on BBC, the Guardian
+#   (Sourcepoint's consent script patches [Element, CharacterData,
+#   DocumentType].prototype), old.reddit (its web-components polyfill takes
+#   Node.prototype.appendChild) and MDN (Lit reads Document.prototype).
+#   Elements here carry their methods on per-tag prototypes and several
+#   interface constructors did not exist. Now every method/accessor an
+#   element, text node or document has is also on its spec interface
+#   prototype (Node, Element, CharacterData, EventTarget -- the same native
+#   functions, so .call() on any node works and a page patching those
+#   prototypes stays harmless), and the missing interfaces exist as
+#   "Illegal constructor" functions with the live objects' prototypes set
+#   so instanceof holds: Document, HTMLDocument, DocumentType,
+#   ProcessingInstruction, CDATASection, StyleSheet (CSSStyleSheet's
+#   parent), CSSStyleRule, Location, Navigator, Screen, Performance, Crypto,
+#   CustomElementRegistry, Storage. SubtleCrypto stays absent (absent beats
+#   fake).
+# - "TypeError: Invalid URL: [object Object]" on Wikipedia, ArchWiki, the
+#   Python docs and MDN: location and <a>/<area> stringified to
+#   "[object Object]", so new URL(location) threw, and document.baseURI was
+#   undefined. They stringify to their href now; document.baseURI (honouring
+#   <base href>), document.URL and document.documentURI are defined.
+# Test: JS-interfaces.html 8/8.
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index af5074734..6b94147c2 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -4272,5 +4272,167 @@
+ "\t}, true);\n"
+ "})();\n"
+ "\n"
++"\n"
++"/* ---- URL-shaped objects stringify to their URL ------------------------\n"
++" * `new URL(location)`, `String(link)`, `'' + document.location` and\n"
++" * `document.baseURI` are how scripts get the page's URL; here location and\n"
++" * <a>/<area> stringified to \"[object Object]\" and baseURI was undefined,\n"
++" * so `new URL(...)` threw \"Invalid URL\" (MediaWiki's startup module on\n"
++" * Wikipedia and ArchWiki, Python's docs, MDN). */\n"
++"(function () {\n"
++"\tvar loc = g.location;\n"
++"\tfunction hrefOf(o) { try { return String(o.href); } catch (e) { return ''; } }\n"
++"\tif (loc && typeof loc === 'object') {\n"
++"\t\ttry {\n"
++"\t\t\tif (String(loc) === '[object Object]') {\n"
++"\t\t\t\tObject.defineProperty(loc, 'toString', { value: function () { return hrefOf(this); },\n"
++"\t\t\t\t\tconfigurable: true, writable: true, enumerable: false });\n"
++"\t\t\t\tObject.defineProperty(loc, 'valueOf', { value: function () { return this; },\n"
++"\t\t\t\t\tconfigurable: true, writable: true, enumerable: false });\n"
++"\t\t\t}\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t}\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\t['a', 'area'].forEach(function (tag) {\n"
++"\t\ttry {\n"
++"\t\t\tvar P = Object.getPrototypeOf(d.createElement(tag));\n"
++"\t\t\tif (P && P !== Object.prototype &&\n"
++"\t\t\t    !Object.prototype.hasOwnProperty.call(P, 'toString'))\n"
++"\t\t\t\tObject.defineProperty(P, 'toString', { value: function () { return hrefOf(this); },\n"
++"\t\t\t\t\tconfigurable: true, writable: true, enumerable: false });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t});\n"
++"\tfunction baseURI() {\n"
++"\t\tvar b = null;\n"
++"\t\ttry { b = d.querySelector && d.querySelector('base[href]'); } catch (e) { /* */ }\n"
++"\t\tvar h = hrefOf(g.location);\n"
++"\t\tif (b) {\n"
++"\t\t\ttry { return new g.URL(b.getAttribute('href'), h).href; } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\treturn h;\n"
++"\t}\n"
++"\t[['baseURI', baseURI], ['URL', function () { return hrefOf(g.location); }],\n"
++"\t ['documentURI', function () { return hrefOf(g.location); }]].forEach(function (p) {\n"
++"\t\ttry {\n"
++"\t\t\tvar cur;\n"
++"\t\t\ttry { cur = d[p[0]]; } catch (e) { cur = undefined; }\n"
++"\t\t\tif (typeof cur !== 'string' || cur === '')\n"
++"\t\t\t\tObject.defineProperty(d, p[0], { get: p[1], configurable: true, enumerable: true });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t});\n"
++"})();\n"
++"\n"
++"/* ---- DOM interface objects shaped as the spec's ------------------------\n"
++" * Elements here carry their methods on per-tag prototypes, and several\n"
++" * interface constructors did not exist at all. Libraries read or patch the\n"
++" * interface prototypes -- Reddit's web-components polyfill takes\n"
++" * Node.prototype.appendChild, Sourcepoint's consent script (BBC, the\n"
++" * Guardian) patches [Element, CharacterData, DocumentType].prototype, Lit\n"
++" * (MDN) reads Document.prototype -- and threw \"cannot read property\n"
++" * 'prototype' of undefined\", taking the script down.\n"
++" * 1. Every method/accessor an element, text or document node has is also\n"
++" *    reachable on its spec interface prototype (Node, Element,\n"
++" *    CharacterData): the same native functions, so .call() on any node\n"
++" *    works; a page patching those prototypes stays harmless.\n"
++" * 2. Missing constructors exist (\"Illegal constructor\", as in browsers),\n"
++" *    with the real objects' prototypes set so instanceof holds. */\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tfunction illegal(name, parent) {\n"
++"\t\tvar F = function () { throw new TypeError('Illegal constructor'); };\n"
++"\t\ttry { Object.defineProperty(F, 'name', { value: name }); } catch (e) { /* */ }\n"
++"\t\tF.prototype = Object.create(parent ? parent.prototype : Object.prototype);\n"
++"\t\tObject.defineProperty(F.prototype, 'constructor', { value: F, writable: true, configurable: true });\n"
++"\t\ttry { Object.defineProperty(F.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tdefine(g, name, F);\n"
++"\t\treturn F;\n"
++"\t}\n"
++"\t/* copy what `sample`'s prototype chain has, and `to` lacks, onto `to` */\n"
++"\tfunction lift(sample, to, stop) {\n"
++"\t\tvar p = sample ? Object.getPrototypeOf(sample) : null, seen = {};\n"
++"\t\tif (!to) return;\n"
++"\t\twhile (p && p !== stop && p !== Object.prototype) {\n"
++"\t\t\tObject.getOwnPropertyNames(p).forEach(function (k) {\n"
++"\t\t\t\tif (k === 'constructor' || seen[k]) return;\n"
++"\t\t\t\tseen[k] = 1;\n"
++"\t\t\t\tif (Object.prototype.hasOwnProperty.call(to, k)) return;\n"
++"\t\t\t\tvar desc = Object.getOwnPropertyDescriptor(p, k);\n"
++"\t\t\t\tif (!desc) return;\n"
++"\t\t\t\ttry { Object.defineProperty(to, k, desc); } catch (e) { /* */ }\n"
++"\t\t\t});\n"
++"\t\t\tp = Object.getPrototypeOf(p);\n"
++"\t\t}\n"
++"\t}\n"
++"\tvar el = null, tx = null;\n"
++"\ttry { el = d.createElement('div'); tx = d.createTextNode(''); } catch (e) { /* */ }\n"
++"\tvar NODE = ['appendChild', 'insertBefore', 'removeChild', 'replaceChild', 'cloneNode',\n"
++"\t\t'contains', 'hasChildNodes', 'getRootNode', 'isEqualNode', 'isSameNode',\n"
++"\t\t'compareDocumentPosition', 'normalize', 'lookupNamespaceURI', 'lookupPrefix',\n"
++"\t\t'isDefaultNamespace', 'addEventListener', 'removeEventListener', 'dispatchEvent'];\n"
++"\tif (g.Node && g.Node.prototype && el) {\n"
++"\t\t/* Node gets only Node's members (not Element's) */\n"
++"\t\tvar tmp = {};\n"
++"\t\tlift(el, tmp, g.Node.prototype);\n"
++"\t\tNODE.forEach(function (k) {\n"
++"\t\t\tif (k in tmp && !Object.prototype.hasOwnProperty.call(g.Node.prototype, k)) {\n"
++"\t\t\t\ttry { Object.defineProperty(g.Node.prototype, k, Object.getOwnPropertyDescriptor(tmp, k)); } catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t}\n"
++"\tif (g.Element && g.Element.prototype && el) lift(el, g.Element.prototype, g.Element.prototype);\n"
++"\tif (g.CharacterData && g.CharacterData.prototype && tx) lift(tx, g.CharacterData.prototype, g.CharacterData.prototype);\n"
++"\tif (g.EventTarget && g.EventTarget.prototype && el)\n"
++"\t\t['addEventListener', 'removeEventListener', 'dispatchEvent'].forEach(function (k) {\n"
++"\t\t\tif (!Object.prototype.hasOwnProperty.call(g.EventTarget.prototype, k) && typeof el[k] === 'function')\n"
++"\t\t\t\ttry { Object.defineProperty(g.EventTarget.prototype, k, { value: el[k], writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t});\n"
++"\n"
++"\t/* missing interfaces; the live objects get their prototypes */\n"
++"\tvar N = g.Node;\n"
++"\tfunction adopt(obj, F) {\n"
++"\t\tif (!obj || typeof obj !== 'object') return;\n"
++"\t\ttry {\n"
++"\t\t\tvar own = Object.getPrototypeOf(obj);\n"
++"\t\t\t/* keep what the object's current prototype provides */\n"
++"\t\t\tif (own && own !== Object.prototype && own !== F.prototype)\n"
++"\t\t\t\tObject.setPrototypeOf(F.prototype, own);\n"
++"\t\t\tObject.setPrototypeOf(obj, F.prototype);\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t}\n"
++"\tif (!g.Document) {\n"
++"\t\tvar Doc = illegal('Document', N);\n"
++"\t\tadopt(d, Doc);\n"
++"\t\tif (!g.HTMLDocument) {\n"
++"\t\t\tvar HD = illegal('HTMLDocument', Doc);\n"
++"\t\t\tadopt(d, HD);\n"
++"\t\t}\n"
++"\t\tif (N && N.prototype) lift(el, Doc.prototype, N.prototype);\n"
++"\t}\n"
++"\tif (!g.DocumentType) illegal('DocumentType', N);\n"
++"\tif (!g.ProcessingInstruction) illegal('ProcessingInstruction', g.CharacterData || N);\n"
++"\tif (!g.CDATASection) illegal('CDATASection', g.Text || g.CharacterData || N);\n"
++"\tif (!g.StyleSheet) illegal('StyleSheet', null);\n"
++"\tif (g.CSSStyleSheet && g.CSSStyleSheet.prototype && g.StyleSheet &&\n"
++"\t    Object.getPrototypeOf(g.CSSStyleSheet.prototype) === Object.prototype)\n"
++"\t\ttry { Object.setPrototypeOf(g.CSSStyleSheet.prototype, g.StyleSheet.prototype); } catch (e) { /* */ }\n"
++"\tif (!g.CSSStyleRule) illegal('CSSStyleRule', g.CSSRule || null);\n"
++"\t[['Location', 'location'], ['Navigator', 'navigator'], ['Screen', 'screen'],\n"
++"\t ['Performance', 'performance'], ['Crypto', 'crypto'],\n"
++"\t ['CustomElementRegistry', 'customElements'], ['Storage', null]].forEach(function (p) {\n"
++"\t\tif (g[p[0]]) return;\n"
++"\t\tvar F = illegal(p[0], null);\n"
++"\t\tif (p[1]) adopt(g[p[1]], F);\n"
++"\t});\n"
++"\t/* Storage: instanceof for both stores, without touching their prototypes\n"
++"\t * (their key access is own properties) */\n"
++"\tif (g.Storage && typeof Symbol === 'function' && Symbol.hasInstance)\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(g.Storage, Symbol.hasInstance, { value: function (o) {\n"
++"\t\t\t\treturn o != null && (o === g.localStorage || o === g.sessionStorage);\n"
++"\t\t\t} });\n"
++"\t\t} catch (e) { /* */ }\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index cbe853633..97d78a155 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -4271,4 +4271,166 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	}, true);
+ })();
+ 
++
++/* ---- URL-shaped objects stringify to their URL ------------------------
++ * `new URL(location)`, `String(link)`, `'' + document.location` and
++ * `document.baseURI` are how scripts get the page's URL; here location and
++ * <a>/<area> stringified to "[object Object]" and baseURI was undefined,
++ * so `new URL(...)` threw "Invalid URL" (MediaWiki's startup module on
++ * Wikipedia and ArchWiki, Python's docs, MDN). */
++(function () {
++	var loc = g.location;
++	function hrefOf(o) { try { return String(o.href); } catch (e) { return ''; } }
++	if (loc && typeof loc === 'object') {
++		try {
++			if (String(loc) === '[object Object]') {
++				Object.defineProperty(loc, 'toString', { value: function () { return hrefOf(this); },
++					configurable: true, writable: true, enumerable: false });
++				Object.defineProperty(loc, 'valueOf', { value: function () { return this; },
++					configurable: true, writable: true, enumerable: false });
++			}
++		} catch (e) { /* */ }
++	}
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	['a', 'area'].forEach(function (tag) {
++		try {
++			var P = Object.getPrototypeOf(d.createElement(tag));
++			if (P && P !== Object.prototype &&
++			    !Object.prototype.hasOwnProperty.call(P, 'toString'))
++				Object.defineProperty(P, 'toString', { value: function () { return hrefOf(this); },
++					configurable: true, writable: true, enumerable: false });
++		} catch (e) { /* */ }
++	});
++	function baseURI() {
++		var b = null;
++		try { b = d.querySelector && d.querySelector('base[href]'); } catch (e) { /* */ }
++		var h = hrefOf(g.location);
++		if (b) {
++			try { return new g.URL(b.getAttribute('href'), h).href; } catch (e) { /* */ }
++		}
++		return h;
++	}
++	[['baseURI', baseURI], ['URL', function () { return hrefOf(g.location); }],
++	 ['documentURI', function () { return hrefOf(g.location); }]].forEach(function (p) {
++		try {
++			var cur;
++			try { cur = d[p[0]]; } catch (e) { cur = undefined; }
++			if (typeof cur !== 'string' || cur === '')
++				Object.defineProperty(d, p[0], { get: p[1], configurable: true, enumerable: true });
++		} catch (e) { /* */ }
++	});
++})();
++
++/* ---- DOM interface objects shaped as the spec's ------------------------
++ * Elements here carry their methods on per-tag prototypes, and several
++ * interface constructors did not exist at all. Libraries read or patch the
++ * interface prototypes -- Reddit's web-components polyfill takes
++ * Node.prototype.appendChild, Sourcepoint's consent script (BBC, the
++ * Guardian) patches [Element, CharacterData, DocumentType].prototype, Lit
++ * (MDN) reads Document.prototype -- and threw "cannot read property
++ * 'prototype' of undefined", taking the script down.
++ * 1. Every method/accessor an element, text or document node has is also
++ *    reachable on its spec interface prototype (Node, Element,
++ *    CharacterData): the same native functions, so .call() on any node
++ *    works; a page patching those prototypes stays harmless.
++ * 2. Missing constructors exist ("Illegal constructor", as in browsers),
++ *    with the real objects' prototypes set so instanceof holds. */
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	function illegal(name, parent) {
++		var F = function () { throw new TypeError('Illegal constructor'); };
++		try { Object.defineProperty(F, 'name', { value: name }); } catch (e) { /* */ }
++		F.prototype = Object.create(parent ? parent.prototype : Object.prototype);
++		Object.defineProperty(F.prototype, 'constructor', { value: F, writable: true, configurable: true });
++		try { Object.defineProperty(F.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }
++		define(g, name, F);
++		return F;
++	}
++	/* copy what `sample`'s prototype chain has, and `to` lacks, onto `to` */
++	function lift(sample, to, stop) {
++		var p = sample ? Object.getPrototypeOf(sample) : null, seen = {};
++		if (!to) return;
++		while (p && p !== stop && p !== Object.prototype) {
++			Object.getOwnPropertyNames(p).forEach(function (k) {
++				if (k === 'constructor' || seen[k]) return;
++				seen[k] = 1;
++				if (Object.prototype.hasOwnProperty.call(to, k)) return;
++				var desc = Object.getOwnPropertyDescriptor(p, k);
++				if (!desc) return;
++				try { Object.defineProperty(to, k, desc); } catch (e) { /* */ }
++			});
++			p = Object.getPrototypeOf(p);
++		}
++	}
++	var el = null, tx = null;
++	try { el = d.createElement('div'); tx = d.createTextNode(''); } catch (e) { /* */ }
++	var NODE = ['appendChild', 'insertBefore', 'removeChild', 'replaceChild', 'cloneNode',
++		'contains', 'hasChildNodes', 'getRootNode', 'isEqualNode', 'isSameNode',
++		'compareDocumentPosition', 'normalize', 'lookupNamespaceURI', 'lookupPrefix',
++		'isDefaultNamespace', 'addEventListener', 'removeEventListener', 'dispatchEvent'];
++	if (g.Node && g.Node.prototype && el) {
++		/* Node gets only Node's members (not Element's) */
++		var tmp = {};
++		lift(el, tmp, g.Node.prototype);
++		NODE.forEach(function (k) {
++			if (k in tmp && !Object.prototype.hasOwnProperty.call(g.Node.prototype, k)) {
++				try { Object.defineProperty(g.Node.prototype, k, Object.getOwnPropertyDescriptor(tmp, k)); } catch (e) { /* */ }
++			}
++		});
++	}
++	if (g.Element && g.Element.prototype && el) lift(el, g.Element.prototype, g.Element.prototype);
++	if (g.CharacterData && g.CharacterData.prototype && tx) lift(tx, g.CharacterData.prototype, g.CharacterData.prototype);
++	if (g.EventTarget && g.EventTarget.prototype && el)
++		['addEventListener', 'removeEventListener', 'dispatchEvent'].forEach(function (k) {
++			if (!Object.prototype.hasOwnProperty.call(g.EventTarget.prototype, k) && typeof el[k] === 'function')
++				try { Object.defineProperty(g.EventTarget.prototype, k, { value: el[k], writable: true, configurable: true }); } catch (e) { /* */ }
++		});
++
++	/* missing interfaces; the live objects get their prototypes */
++	var N = g.Node;
++	function adopt(obj, F) {
++		if (!obj || typeof obj !== 'object') return;
++		try {
++			var own = Object.getPrototypeOf(obj);
++			/* keep what the object's current prototype provides */
++			if (own && own !== Object.prototype && own !== F.prototype)
++				Object.setPrototypeOf(F.prototype, own);
++			Object.setPrototypeOf(obj, F.prototype);
++		} catch (e) { /* */ }
++	}
++	if (!g.Document) {
++		var Doc = illegal('Document', N);
++		adopt(d, Doc);
++		if (!g.HTMLDocument) {
++			var HD = illegal('HTMLDocument', Doc);
++			adopt(d, HD);
++		}
++		if (N && N.prototype) lift(el, Doc.prototype, N.prototype);
++	}
++	if (!g.DocumentType) illegal('DocumentType', N);
++	if (!g.ProcessingInstruction) illegal('ProcessingInstruction', g.CharacterData || N);
++	if (!g.CDATASection) illegal('CDATASection', g.Text || g.CharacterData || N);
++	if (!g.StyleSheet) illegal('StyleSheet', null);
++	if (g.CSSStyleSheet && g.CSSStyleSheet.prototype && g.StyleSheet &&
++	    Object.getPrototypeOf(g.CSSStyleSheet.prototype) === Object.prototype)
++		try { Object.setPrototypeOf(g.CSSStyleSheet.prototype, g.StyleSheet.prototype); } catch (e) { /* */ }
++	if (!g.CSSStyleRule) illegal('CSSStyleRule', g.CSSRule || null);
++	[['Location', 'location'], ['Navigator', 'navigator'], ['Screen', 'screen'],
++	 ['Performance', 'performance'], ['Crypto', 'crypto'],
++	 ['CustomElementRegistry', 'customElements'], ['Storage', null]].forEach(function (p) {
++		if (g[p[0]]) return;
++		var F = illegal(p[0], null);
++		if (p[1]) adopt(g[p[1]], F);
++	});
++	/* Storage: instanceof for both stores, without touching their prototypes
++	 * (their key access is own properties) */
++	if (g.Storage && typeof Symbol === 'function' && Symbol.hasInstance)
++		try {
++			Object.defineProperty(g.Storage, Symbol.hasInstance, { value: function (o) {
++				return o != null && (o === g.localStorage || o === g.sessionStorage);
++			} });
++		} catch (e) { /* */ }
++})();
+ })(this);

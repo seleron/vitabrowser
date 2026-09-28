@@ -1,0 +1,102 @@
+# libcss: CSS gap census (every distinct dropped declaration, when asked)
+#
+# With css_gap_census set, each distinct declaration libcss drops -- an
+# unknown property, a value its handler rejects, or trailing junk -- is
+# logged once as "CSSGAP <why> <property>: <value head>". tools/scorecard
+# turns these into cssgaps.md, ranked by how many real sites hit each gap,
+# so CSS work is chosen by use rather than found one page at a time
+# (docs/roadmap.md WS-A). Off by default; only the simulator sets it
+# (patch 151).
+diff --git a/src/parse/language.c b/src/parse/language.c
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -2200,6 +2200,60 @@
+  * Property parsing functions						      *
+  ******************************************************************************/
+ 
++/* VitaBrowser: CSS gap census. With css_gap_census set (the simulator's
++ * VITA_CSSGAP=1; never on the Vita), every distinct declaration libcss
++ * drops is logged once as "CSSGAP <why> <property>: <value head>", so the
++ * features real sites use and we lack can be counted across the
++ * scorecard's sites instead of found one page at a time. */
++int css_gap_census = 0;
++
++static void css__gap_note(const char *why, const css_token *property,
++		const parserutils_vector *vector, int32_t start)
++{
++	static uint32_t seen[4096];
++	extern void macsurf_debug_log_writef(const char *fmt, ...);
++	char buf[96];
++	size_t o = 0;
++	int32_t k = start;
++	const css_token *t;
++	uint32_t h = 2166136261u;
++	const char *pn;
++	size_t i, slot;
++
++	if (!css_gap_census || property == NULL || property->idata == NULL)
++		return;
++	pn = lwc_string_data(property->idata);
++	while ((t = parserutils_vector_iterate(vector, &k)) != NULL &&
++			o + 2 < sizeof(buf)) {
++		const char *d = NULL;
++		size_t n = 0;
++		if (t->idata != NULL) {
++			d = lwc_string_data(t->idata);
++			n = lwc_string_length(t->idata);
++		} else if (t->data.data != NULL) {
++			d = (const char *)t->data.data;
++			n = t->data.len;
++		}
++		if (t->type == CSS_TOKEN_S) { buf[o++] = ' '; continue; }
++		for (i = 0; i < n && o + 2 < sizeof(buf); i++)
++			buf[o++] = d[i];
++		if (t->type == CSS_TOKEN_FUNCTION && o + 2 < sizeof(buf))
++			buf[o++] = '(';
++	}
++	buf[o] = '\0';
++	/* dedupe on property + the value's first word */
++	for (i = 0; pn[i] != '\0'; i++) { h ^= (unsigned char)pn[i]; h *= 16777619u; }
++	for (i = 0; buf[i] != '\0' && buf[i] != ' ' && buf[i] != '('; i++) {
++		h ^= (unsigned char)buf[i]; h *= 16777619u;
++	}
++	if (h == 0) h = 1;
++	for (slot = h & 4095; seen[slot] != 0; slot = (slot + 1) & 4095)
++		if (seen[slot] == h)
++			return;
++	seen[slot] = h;
++	macsurf_debug_log_writef("CSSGAP %s %s: %s", why, pn, buf);
++}
++
+ css_error parseProperty(css_language *c, const css_token *property,
+ 		const parserutils_vector *vector, int32_t *ctx, css_rule *rule)
+ {
+@@ -2270,8 +2324,10 @@
+ 
+ 	/* Find property index (the mask properties map to background ones) */
+ 	i = css__property_id(c, property->idata, &mask_image);
+-	if (i < 0)
++	if (i < 0) {
++		css__gap_note("property", property, vector, *ctx);
+ 		return CSS_INVALID;
++	}
+ 
+ 	/* If the value references var(), we cannot compile to bytecode now
+ 	 * (the referenced custom property may live in a later stylesheet,
+@@ -2334,6 +2390,8 @@
+ 	if (error == CSS_OK && mask_image)
+ 		error = css__mask_image_hides_colour(vector, value_ctx, style);
+ 	if (error != CSS_OK) {
++		if (error == CSS_INVALID)
++			css__gap_note("value", property, vector, value_ctx);
+ 		css__stylesheet_style_destroy(style);
+ 		return error;
+ 	}
+@@ -2350,6 +2408,7 @@
+ 	token = parserutils_vector_iterate(vector, ctx);
+ 	if (token != NULL) {
+ 		/* Trailing junk, so discard declaration */
++		css__gap_note("junk", property, vector, value_ctx);
+                 css__stylesheet_style_destroy(style);
+ 		return CSS_INVALID;
+ 	}

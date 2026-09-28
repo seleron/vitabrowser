@@ -1,0 +1,222 @@
+# netsurf: a preload scanner for scripts and stylesheets
+#
+# A parser-blocking <script src> was fetched only when the parser reached
+# it, and the parser waited, so a page paid one network round trip per
+# script, in series: make.wordpress.org/core (150+ scripts) never left
+# "Processing" in 18 s. Browsers scan ahead of the parser and fetch at once.
+#
+# html_process_data now scans each chunk of source as it arrives (a tag
+# split across chunks is carried over) for <script src> with a JavaScript
+# type, <link rel=stylesheet> and <link rel=preload as=script|style>, and
+# starts a plain llcache fetch for each (http/https, at most 256 a page,
+# not while 64 fetches are already active). No content objects; each handle
+# is released when its fetch ends, which leaves a cacheable response in the
+# cache where the parser's own request finds it ("Found fresh").
+# Scorecard: wpblog 26 -> 53 (loads in 6.4 s).
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 58376a7f4..ff7844cdf 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -27,12 +27,14 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <strings.h>
++#include <ctype.h>
+ #include <stdlib.h>
+ #include <nsutils/time.h>
+ 
+ #include "utils/utils.h"
+ #include "utils/config.h"
+ #include "utils/corestrings.h"
++#include "content/llcache.h"
+ #include "utils/http.h"
+ #include "utils/libdom.h"
+ #include "utils/log.h"
+@@ -2283,6 +2285,161 @@ html_process_encoding_change(struct content *c,
+  * Process data for CONTENT_HTML.
+  */
+ 
++/* ---- VitaBrowser: preload scanner ----------------------------------
++ *
++ * A parser-blocking <script src> is fetched only when the parser reaches
++ * it, and the parser waits for it, so a page with many of them paid one
++ * network round trip per script in series: make.wordpress.org/core has
++ * 92 and never left "Processing" in 18 s. Browsers scan the HTML ahead of
++ * the parser and fetch those URLs at once. This does the same on each
++ * chunk of source as it arrives (the whole page usually arrives while the
++ * parser is still blocked at its first script): <script src> with a
++ * JavaScript type, <link rel=stylesheet> and <link rel=preload
++ * as=script|style>. Plain llcache fetches, no content objects; each
++ * handle is released when its fetch ends, which leaves a cacheable
++ * response in the cache for the parser's own request to find. */
++#define HTML_PRELOAD_MAX 256
++
++/* case-insensitive substring (strcasestr is not in every libc) */
++static const char *html_ci_find(const char *h, const char *n)
++{
++	size_t nl = strlen(n);
++	for (; *h != '\0'; h++)
++		if (strncasecmp(h, n, nl) == 0)
++			return h;
++	return NULL;
++}
++
++static nserror html_preload_cb(llcache_handle *handle,
++		const llcache_event *event, void *pw)
++{
++	(void)pw;
++	if (event->type == LLCACHE_EVENT_DONE ||
++	    event->type == LLCACHE_EVENT_ERROR)
++		llcache_handle_release(handle);
++	return NSERROR_OK;
++}
++
++/* value of attribute `name` inside the tag text [t, e), copied to out */
++static bool html_preload_attr(const char *t, const char *e, const char *name,
++		char *out, size_t max)
++{
++	size_t nl = strlen(name);
++	const char *p = t;
++	while (p + nl < e) {
++		if (strncasecmp(p, name, nl) == 0 &&
++		    (p == t || isspace((unsigned char)p[-1]))) {
++			const char *q = p + nl;
++			size_t n = 0;
++			while (q < e && isspace((unsigned char)*q)) q++;
++			if (q >= e || *q != '=') { p++; continue; }
++			q++;
++			while (q < e && isspace((unsigned char)*q)) q++;
++			if (q < e && (*q == '"' || *q == '\'')) {
++				char quote = *q++;
++				while (q < e && *q != quote && n + 1 < max)
++					out[n++] = *q++;
++			} else {
++				while (q < e && !isspace((unsigned char)*q) &&
++				       *q != '>' && n + 1 < max)
++					out[n++] = *q++;
++			}
++			out[n] = '\0';
++			return true;
++		}
++		p++;
++	}
++	return false;
++}
++
++static void html_preload_url(html_content *html, const char *ref)
++{
++	nsurl *base = content_get_url(&html->base), *u = NULL;
++	llcache_handle *h = NULL;
++	const char *s;
++	if (html->preload_n >= HTML_PRELOAD_MAX || ref[0] == '\0' ||
++	    base == NULL)
++		return;
++	if (nsurl_join(base, ref, &u) != NSERROR_OK)
++		return;
++	s = nsurl_access(u);
++	if (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0) {
++		if (llcache_handle_retrieve(u, 0, base, NULL,
++				html_preload_cb, NULL, &h) == NSERROR_OK) {
++			html->preload_n++;
++			NSLOG(netsurf, INFO, "preload %s", s);
++		}
++	}
++	nsurl_unref(u);
++}
++
++static void html_preload_tag(html_content *html, const char *t, const char *e,
++		bool script)
++{
++	char v[512], rel[64], as[16], type[64];
++	if (script) {
++		if (!html_preload_attr(t, e, "src", v, sizeof v))
++			return;
++		if (html_preload_attr(t, e, "type", type, sizeof type) &&
++		    type[0] != '\0' && html_ci_find(type, "javascript") == NULL &&
++		    strcasecmp(type, "module") != 0 &&
++		    html_ci_find(type, "ecmascript") == NULL)
++			return;
++		html_preload_url(html, v);
++		return;
++	}
++	if (!html_preload_attr(t, e, "href", v, sizeof v) ||
++	    !html_preload_attr(t, e, "rel", rel, sizeof rel))
++		return;
++	if ((html_ci_find(rel, "stylesheet") != NULL &&
++	     html_ci_find(rel, "alternate") == NULL) ||
++	    (html_ci_find(rel, "preload") != NULL &&
++	     html_preload_attr(t, e, "as", as, sizeof as) &&
++	     (strcasecmp(as, "script") == 0 || strcasecmp(as, "style") == 0)))
++		html_preload_url(html, v);
++}
++
++static void html_preload_scan(html_content *html, const char *data,
++		unsigned int size)
++{
++	char *buf;
++	const char *p, *end;
++	size_t n;
++	if (html->preload_n >= HTML_PRELOAD_MAX || data == NULL || size == 0)
++		return;
++	n = html->preload_tail_len + size;
++	buf = malloc(n + 1);
++	if (buf == NULL)
++		return;
++	memcpy(buf, html->preload_tail, html->preload_tail_len);
++	memcpy(buf + html->preload_tail_len, data, size);
++	buf[n] = '\0';
++	p = buf;
++	end = buf + n;
++	while (p < end && html->preload_n < HTML_PRELOAD_MAX) {
++		const char *lt = memchr(p, '<', end - p), *gt;
++		bool script;
++		if (lt == NULL) { p = end; break; }
++		if (end - lt >= 7 && strncasecmp(lt, "<script", 7) == 0)
++			script = true;
++		else if (end - lt >= 5 && strncasecmp(lt, "<link", 5) == 0)
++			script = false;
++		else { p = lt + 1; continue; }
++		gt = memchr(lt, '>', end - lt);
++		if (gt == NULL) { p = lt; break; }	/* split: keep */
++		html_preload_tag(html, lt, gt, script);
++		p = gt + 1;
++	}
++	/* keep an unfinished tag for the next chunk */
++	html->preload_tail_len = 0;
++	if (p < end && (size_t)(end - p) < sizeof html->preload_tail &&
++	    *p == '<') {
++		html->preload_tail_len = (unsigned int)(end - p);
++		memcpy(html->preload_tail, p, html->preload_tail_len);
++	}
++	free(buf);
++}
++
+ static bool
+ html_process_data(struct content *c, const char *data, unsigned int size)
+ {
+@@ -2290,6 +2447,9 @@ html_process_data(struct content *c, const char *data, unsigned int size)
+ 	dom_hubbub_error dom_ret;
+ 	nserror err = NSERROR_OK; /* assume its all going to be ok */
+ 
++	if (html->base.active < 64)	/* not while the page has 64 fetches */
++		html_preload_scan(html, data, size);
++
+ 	MS_LOG("html process data");
+ 	macos9_html_bytes_processed += size;
+ 	if (macos9_html_head_len == 0 && data != NULL && size > 0) {
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 9962ac3aa..dce977c16 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -95,6 +95,11 @@ typedef struct html_content {
+ 	struct content base;
+ 
+ 	dom_hubbub_parser *parser; /**< Parser object handle */
++	/** VitaBrowser preload scanner (html.c): fetches started, and the
++	 * unscanned tail of the previous chunk (a tag split across two) */
++	unsigned int preload_n;
++	unsigned int preload_tail_len;
++	char preload_tail[384];
+ 	bool parse_completed; /**< Whether the parse has been completed */
+ 	bool conversion_begun; /**< Whether or not the conversion has begun */
+ 	bool stylesheets_discovered; /**< Whether explicit <style>/<link> walker has run */
