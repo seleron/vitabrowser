@@ -92,7 +92,12 @@ for p in $(ls "$ROOT"/patches/vitabrowser/*.patch | sort -V); do
 	base=$(basename "$p" .patch)
 	lib=$(echo "$base" | cut -d- -f2)
 	tree="$WORK/upstream/$lib"
-	[ -d "$tree" ] || { echo "SKIP $base (no $lib tree)"; continue; }
+	# A name that routes nowhere is a failure, not a skip: 139 and 140
+	# were once named NN-vita-* / NN-xhr-*, and every restage dropped them
+	# silently (build-patched.sh shows only this script's last lines).
+	[ -d "$tree" ] || { echo "FAIL vitabrowser/$base: no '$lib' tree" \
+		"(name it NN-<libwapcaplet|libparserutils|libhubbub|libcss|libdom|netsurf>-what.patch)"; \
+		bad=$((bad + 1)); continue; }
 	if apply_patch "$tree" -p1 "$p" > /tmp/patchlog.$$ 2>&1; then
 		ok=$((ok + 1))
 	else

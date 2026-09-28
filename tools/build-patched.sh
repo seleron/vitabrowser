@@ -82,7 +82,16 @@ done
   make clean TARGET=monkey >/dev/null 2>&1 || true )
 
 echo "== applying the stack =="
-WORK="$WORK/applytest" "$ROOT/tools/apply-patches.sh" | tail -2
+# Not `| tail`: a pipeline's status is its last command's, so a failed
+# patch let the build carry on with the patch missing. Show every FAIL
+# line and the count, and stop on any.
+if ! WORK="$WORK/applytest" "$ROOT/tools/apply-patches.sh" \
+		> "$WORK/applytest/apply.log" 2>&1; then
+	grep -A6 '^FAIL' "$WORK/applytest/apply.log"
+	tail -1 "$WORK/applytest/apply.log"
+	exit 1
+fi
+tail -1 "$WORK/applytest/apply.log"
 
 echo "== building libraries =="
 rm -rf "$P"
