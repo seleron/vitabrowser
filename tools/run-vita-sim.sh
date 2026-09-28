@@ -199,6 +199,8 @@ NET-js-streaming http://127.0.0.1:$HP/JS-streaming.html
 NET-js-streaming-https https://127.0.0.1:$((HP + 1))/JS-streaming.html
 NET-js-fetch-stream http://127.0.0.1:$HP/JS-fetch-stream.html
 NET-js-fetch-stream-https https://127.0.0.1:$((HP + 1))/JS-fetch-stream.html
+NET-js-fetch-headers http://127.0.0.1:$HP/JS-fetch-headers.html
+NET-js-fetch-headers-https https://127.0.0.1:$((HP + 1))/JS-fetch-headers.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -355,6 +357,24 @@ for f in "$R"/*NET-js-fetch-stream*.plot; do
 done
 [ "$(ls "$R"/*NET-js-fetch-stream*.plot 2>/dev/null | wc -l)" -eq 2 ] || jfs_bad=$((jfs_bad + 1))
 [ "$jfs_bad" -eq 0 ]
+
+# fetch() resolves at the header block (Patch 135): /slow-headers sends a
+# complete header block, waits 2 s, then the body. The page asserts the
+# promise resolved >= 1 s before the first body byte, that status/headers
+# were available at resolve time, and that the body reader stayed pending
+# until bytes arrived.
+echo "== fetch() resolves at headers (JS-fetch-headers) =="
+jfh_bad=0
+for f in "$R"/*NET-js-fetch-headers*.plot; do
+	[ -f "$f" ] || { echo "  missing: $f"; jfh_bad=$((jfh_bad + 1)); continue; }
+	n=${f##*/}
+	r=$(sed -n 's/.*STR \(JS fetch headers: [0-9]*\/[0-9]* passed\).*/\1/p' "$f" | head -1)
+	echo "  $n: ${r:-no summary line (script did not run?)}"
+	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
+	[ "$r" = "JS fetch headers: 3/3 passed" ] || jfh_bad=$((jfh_bad + 1))
+done
+[ "$(ls "$R"/*NET-js-fetch-headers*.plot 2>/dev/null | wc -l)" -eq 2 ] || jfh_bad=$((jfh_bad + 1))
+[ "$jfh_bad" -eq 0 ]
 
 # The bridge's window services (MACSURF_WINDOW_SERVICES, vita/js_platform.c):
 # JS-window navigates itself three times (relative location.href,

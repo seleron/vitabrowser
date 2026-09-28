@@ -101,6 +101,26 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 pass
             return
+        if self.path == "/slow-headers":
+            # Patch 135: fetch() must resolve at the header block, not at
+            # the first body byte. Send a complete header block, flush it,
+            # wait 2 s (long enough to prove promise settlement), then send
+            # the body. JS-fetch-headers.html asserts the promise resolved
+            # >= 1 s before the first body byte arrived.
+            self.protocol_version = "HTTP/1.1"
+            self.close_connection = True
+            body = b"hello world"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("X-Slow-Test", "yes")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(2.0)
+            self.wfile.write(body)
+            self.wfile.flush()
+            return
         return super().do_GET()
 
 

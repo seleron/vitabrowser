@@ -1,0 +1,200 @@
+# netsurf: resolve fetch() at the header block, not the first body byte
+#
+# North-star B1 follow-up (doc 13 section 5, item 3). Until now the first
+# progress tick -- and with it fetch()'s promise resolution and XHR's
+# HEADERS_RECEIVED -- waited for the first body byte: only FETCH_DATA
+# scheduled xhr_progress. A server that sends its headers and then waits
+# (an SSE endpoint holding the stream, a slow-start API) left the fetch()
+# promise pending for no reason: the Response (status + headers) is fully
+# determined at the end of the header block.
+#
+# The fetchers deliver the header block line by line as FETCH_HEADER and
+# the block ends with the empty line. When it arrives, the bridge now
+# schedules the same progress tick FETCH_DATA would: it sets
+# status/headers on the JS object and calls __onNativeProgress, so
+# fetch() resolves and the body then streams in through the existing
+# __xhrNativeTakeBytes pump. No JS-side change: the polyfill already
+# resolves on the first progress tick.
+#
+# fetch_http_code() is not set until the first body byte (or completion),
+# so the status is parsed from the accumulated status line (last one wins:
+# 1xx interim blocks and redirect hops each contribute one) and stored in
+# s->status for the deferred tick, which only overwrites it when
+# fetch_http_code() is > 0.
+#
+# Two cases do not tick early: 1xx interim responses (more header blocks
+# follow) and 3xx with a Location header (the fetcher follows the redirect
+# itself; ticking now would resolve fetch() with the 3xx instead of the
+# final response, whose block ticks). One early tick per response; the
+# redirect path resets the flag. Non-HTTP fetchers (no status line, no
+# empty terminator) are untouched.
+#
+# Test: testpages/pages/JS-fetch-headers.html + the /slow-headers endpoint
+# in tools/vita-sim/httpd.py (headers, flush, 2 s wait, then the body),
+# gated in tools/run-vita-sim.sh over HTTP and HTTPS.
+diff --git a/content/handlers/javascript/quickjs/macos9_js_fetch.c b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+@@ -112,6 +112,10 @@
+ 	int redirect_hops;
+ 	int is_error;			/* network-level failure, not an HTTP status */
+ 	int beacon;			/* sendBeacon slot: no JS delivery, no ctx */
++	int headers_tick;		/* Patch 135: the header-block-end progress
++					 * tick has fired for the current response
++					 * (xhr_follow_redirect resets it for the
++					 * next hop) */
+ 
+ 	/* VitaBrowser (Patch 131, streaming): the body reaches JS while it
+ 	 * arrives, not only on completion. taken = resp_buf bytes already
+@@ -639,6 +643,7 @@
+ 	s->resp_len = 0; s->resp_poisoned = 0;
+ 	s->hdr_len = 0; s->hdr_poisoned = 0;
+ 	s->taken = 0; s->received = 0;
++	s->headers_tick = 0;	/* Patch 135: a new response is coming */
+ 
+ 	if (xhr_start_fetch(s) != 0) {
+ 		s->is_error = 1;
+@@ -646,6 +651,134 @@
+ 	}
+ }
+ 
++/* ---- Patch 135: resolve fetch() at the header block ----
++ *
++ * Until now the first progress tick -- and with it fetch()'s promise
++ * resolution and XHR's HEADERS_RECEIVED -- waited for the first body byte:
++ * only FETCH_DATA scheduled xhr_progress. A server that sends its headers
++ * and then waits (an SSE endpoint holding the stream, a slow-start API)
++ * left the fetch() promise pending for no reason: the Response (status +
++ * headers) is fully determined at the end of the header block.
++ *
++ * The fetchers deliver the header block line by line as FETCH_HEADER; the
++ * block ends with the empty line. When it arrives, schedule the same
++ * progress tick FETCH_DATA would: it sets status/headers on the JS object
++ * and calls __onNativeProgress, so fetch() resolves and the body then
++ * streams in through the existing __xhrNativeTakeBytes pump.
++ *
++ * fetch_http_code() is not set until the first body byte (or completion),
++ * so the status is parsed from the accumulated status line here; the
++ * deferred tick keeps it (its fetch_http_code() read is still 0 that
++ * early, and xhr_progress_run only overwrites s->status when it is > 0).
++ *
++ * Two cases must NOT tick:
++ *  - 1xx interim responses: more header blocks follow; wait for final.
++ *  - 3xx with a Location header: the fetcher follows the redirect itself
++ *    (FETCH_REDIRECT); ticking now would resolve fetch() with the 3xx
++ *    instead of the final response. The final response's block ticks.
++ */
++static int
++xhr_header_line_empty(const unsigned char *b, long l)
++{
++	long i;
++
++	for (i = 0; i < l; i++)
++		if (b[i] != '\r' && b[i] != '\n')
++			return 0;
++	return 1;
++}
++
++/* Status code from the accumulated header block, or 0. The LAST status
++ * line wins: 1xx interim blocks and redirect hops each contribute one. */
++static int
++xhr_header_block_status(struct qjs_xhr_slot *s)
++{
++	const char *p, *last = NULL, *sp;
++	long v;
++
++	if (s->hdr_buf == NULL)
++		return 0;
++	p = s->hdr_buf;
++	if (strncmp(p, "HTTP/", 5) == 0)
++		last = p;
++	while ((p = strstr(p, "\r\nHTTP/")) != NULL) {
++		last = p + 2;
++		p += 2;
++	}
++	if (last == NULL)
++		return 0;
++	sp = strchr(last + 5, ' ');
++	if (sp == NULL)
++		return 0;
++	v = strtol(sp + 1, NULL, 10);
++	if (v < 100 || v > 599)
++		return 0;
++	return (int) v;
++}
++
++/* True if the accumulated block carries a Location: header -- the fetcher's
++ * own redirect condition is 3xx + Location (fetch_curl_process_headers).
++ * Compared case-insensitively without <strings.h>; bounded reads only. */
++static int
++xhr_header_block_has_location(struct qjs_xhr_slot *s)
++{
++	static const char want[] = "location:";
++	const char *p, *end;
++	size_t i;
++	int at_line_start;
++
++	if (s->hdr_buf == NULL || s->hdr_len <= 0)
++		return 0;
++	end = s->hdr_buf + s->hdr_len;
++	/* Skip the status line. */
++	p = strstr(s->hdr_buf, "\r\n");
++	if (p == NULL)
++		return 0;
++	p += 2;
++	at_line_start = 1;
++	while (p + (sizeof(want) - 1) <= end) {
++		if (at_line_start) {
++			for (i = 0; i < sizeof(want) - 1; i++) {
++				char c = p[i];
++				if (c >= 'A' && c <= 'Z')
++					c += 'a' - 'A';
++				if (c != want[i])
++					break;
++			}
++			if (i == sizeof(want) - 1)
++				return 1;
++			at_line_start = 0;
++		}
++		if (p[0] == '\n')
++			at_line_start = 1;
++		p++;
++	}
++	return 0;
++}
++
++static void
++xhr_header_block_done(struct qjs_xhr_slot *s)
++{
++	int code;
++
++	if (s == NULL || !s->used || s->headers_tick)
++		return;
++	code = xhr_header_block_status(s);
++	if (code <= 0)
++		return;			/* not an HTTP response: no early tick */
++	if (code >= 100 && code < 200)
++		return;			/* interim: wait for the final block */
++	if (code >= 300 && code < 400 && xhr_header_block_has_location(s))
++		return;			/* redirect: the final response ticks */
++	/* One early tick per response; the redirect path resets the flag. */
++	s->headers_tick = 1;
++	s->status = code;
++
++	if (!s->beacon && s->ctx != NULL &&
++	    !macos9_sched_is_queued(xhr_progress, s))
++		macos9_schedule(0, xhr_progress, s);
++}
++
+ /* ---- fetch_start() callback ---- */
+ 
+ static void
+@@ -660,6 +793,10 @@
+ 		const unsigned char *b = msg->data.header_or_data.buf;
+ 		long l = (long) msg->data.header_or_data.len;
+ 		xhr_accum_header_line(s, b, l);
++		/* Patch 135: the empty line ends the header block -- resolve
++		 * fetch() at the headers, not at the first body byte. */
++		if (xhr_header_line_empty(b, l))
++			xhr_header_block_done(s);
+ 		break;
+ 	}
+ 	case FETCH_DATA: {

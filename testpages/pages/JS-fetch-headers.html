@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS fetch headers</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+</head>
+<body>
+<p id="sum" class="wait">JS fetch headers: script did not run</p>
+<p id="r1" class="wait">1 fetch() resolves before the first body byte: waiting</p>
+<p id="r2" class="wait">2 status and headers available at resolve time: waiting</p>
+<p id="r3" class="wait">3 body reader pending until bytes arrive, then full body: waiting</p>
+<p id="tick">t=0.0 s</p>
+<script>
+/* fetch() must resolve at the header block, not at the first body byte
+ * (Patch 135). Served by tools/vita-sim/httpd.py: /slow-headers sends a
+ * complete header block, flushes, waits 2 s, then sends the body. No arrow
+ * functions or async/await here, so a syntax gap cannot hide a transport
+ * result. */
+var passed = 0, total = 3, resolved = {};
+var t0 = Date.now();
+/* The autotest dumps a page after 0.7 s without a repaint: tick until
+ * every row has resolved (or 12 s), so the dump is the result. */
+var ticker = setInterval(function () {
+  var done = 0;
+  for (var k in resolved) done++;
+  document.getElementById('tick').textContent =
+      't=' + ((Date.now() - t0) / 1000).toFixed(1) + ' s, ' + done + '/' + total + ' resolved';
+  if (done >= total || Date.now() - t0 > 12000) clearInterval(ticker);
+}, 250);
+function pass(n, what, detail) {
+  var p = document.getElementById('r' + n);
+  if (!p || resolved[n]) return;
+  resolved[n] = 1;
+  p.textContent = n + ' ' + what + ': PASS' + (detail ? ' (' + detail + ')' : '');
+  p.className = 'pass';
+  passed++;
+  var s = document.getElementById('sum');
+  s.textContent = 'JS fetch headers: ' + passed + '/' + total + ' passed';
+  s.className = passed === total ? 'pass' : 'wait';
+}
+function fail(n, what, why) {
+  var p = document.getElementById('r' + n);
+  if (!p || resolved[n]) return;
+  resolved[n] = 1;
+  p.textContent = n + ' ' + what + ': FAIL ' + why;
+}
+function check(n, what, cond, detail, why) {
+  if (cond) pass(n, what, detail); else fail(n, what, why || detail);
+}
+function guard(n, what) {
+  return function (e) { fail(n, what, 'threw ' + (e && e.name) + ': ' + (e && e.message)); };
+}
+
+var tResolve = 0, tFirstByte = 0, statusAtResolve = 0, hdrAtResolve = null;
+
+fetch('/slow-headers').then(function (r) {
+  tResolve = Date.now();
+  statusAtResolve = r.status;
+  try { hdrAtResolve = r.headers.get('x-slow-test'); } catch (e) { hdrAtResolve = 'threw'; }
+  /* 1: the promise must settle at the headers, a full second before the
+   * server's 2 s body wait is over. */
+  /* 2: status and headers are already there at resolve time. */
+  check(2, 'status and headers available at resolve time',
+        statusAtResolve === 200 && hdrAtResolve === 'yes',
+        'status=' + statusAtResolve + ' x-slow-test=' + hdrAtResolve,
+        'status=' + statusAtResolve + ' x-slow-test=' + hdrAtResolve);
+  var reader = r.body.getReader();
+  var firstReadResolved = false;
+  var first = reader.read().then(function (chunk) {
+    firstReadResolved = true;
+    tFirstByte = Date.now();
+    return chunk;
+  });
+  /* 3a: 0.5 s after resolve the first read() must still be pending --
+   * the server has not sent any body byte yet. */
+  setTimeout(function () {
+    check(3, 'body reader pending until bytes arrive, then full body',
+          firstReadResolved === false, null,
+          'first read() resolved ' + (tFirstByte - tResolve) + ' ms after resolve');
+    first.then(function (c0) {
+      var parts = [];
+      if (c0 && !c0.done) parts.push(c0.value);
+      function pump() {
+        return reader.read().then(function (c) {
+          if (c.done) return parts;
+          parts.push(c.value);
+          return pump();
+        });
+      }
+      return pump();
+    }).then(function (parts) {
+      var total = 0, i, all, off;
+      for (i = 0; i < parts.length; i++) total += parts[i].length;
+      all = new Uint8Array(total); off = 0;
+      for (i = 0; i < parts.length; i++) { all.set(parts[i], off); off += parts[i].length; }
+      var text = '';
+      for (i = 0; i < all.length; i++) text += String.fromCharCode(all[i]);
+      var gap = tFirstByte - tResolve;
+      check(1, 'fetch() resolves before the first body byte',
+            gap >= 1000 && text === 'hello world',
+            'resolved ' + gap + ' ms before first byte, body=' + JSON.stringify(text),
+            'gap=' + gap + ' ms body=' + JSON.stringify(text));
+      /* row 3 was about pending-ness; re-check it passed with the body. */
+      if (!resolved[3]) check(3, 'body reader pending until bytes arrive, then full body',
+                              text === 'hello world', 'body ok',
+                              'body=' + JSON.stringify(text));
+    }, guard(1, 'body read')).catch(guard(1, 'body read'));
+  }, 500);
+}, guard(1, 'fetch')).catch(guard(1, 'fetch'));
+</script>
+</body>
+</html>
