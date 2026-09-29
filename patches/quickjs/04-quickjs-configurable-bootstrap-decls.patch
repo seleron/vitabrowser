@@ -1,0 +1,79 @@
+# quickjs: host bootstrap scripts may declare configurable globals
+#
+# A top-level `function f(){}` or `var v` in a global script creates a
+# NON-configurable property of the global object (as the spec says for
+# scripts). The VitaBrowser bridge defines much of the web platform that
+# way in its bootstrap scripts -- requestAnimationFrame,
+# cancelAnimationFrame, Event and friends, MutationObserver /
+# ResizeObserver / IntersectionObserver, DOMParser, FormData,
+# XMLHttpRequest -- all of which browsers expose as configurable (WebIDL).
+# A page that wraps one of them with Object.defineProperty then throws
+# "property is not configurable": google.com's main script does so for
+# requestAnimationFrame (its AsyncContext instrumentation), and the throw,
+# inside a try whose catch is not wired up in that bundle, stopped the
+# whole script (no "Trending searches", scorecard text recall 0.18).
+#
+# JS_SetGlobalDeclsConfigurable(ctx, on): while on, global var and
+# function definitions are configurable, as they already are for eval
+# code. The host turns it on for its own bootstrap only; page scripts keep
+# the standard behaviour. Read at run time, so cached bytecode is fine.
+diff --git a/quickjs.c b/quickjs.c
+index d675a37..2e57c54 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -498,6 +498,11 @@ struct JSContext {
+     JSGCObjectHeader header; /* must come first */
+     JSRuntime *rt;
+     struct list_head link;
++    /* VitaBrowser: global var / function declarations made while set are
++       configurable (the host's own bootstrap scripts, whose globals the
++       web platform defines as configurable: requestAnimationFrame,
++       XMLHttpRequest, ...). JS_SetGlobalDeclsConfigurable. */
++    bool global_decls_configurable;
+ 
+     uint16_t binary_object_count;
+     uint32_t binary_object_size : 31;
+@@ -11382,6 +11387,8 @@ static int JS_DefineGlobalVar(JSContext *ctx, JSAtom prop, int def_flags)
+         p = JS_VALUE_GET_OBJ(ctx->global_obj);
+         flags = JS_PROP_ENUMERABLE | JS_PROP_WRITABLE |
+             (def_flags & JS_PROP_CONFIGURABLE);
++        if (ctx->global_decls_configurable)
++            flags |= JS_PROP_CONFIGURABLE;
+         val = JS_UNDEFINED;
+     }
+     prs = find_own_property1(p, prop);
+@@ -11408,6 +11415,8 @@ static int JS_DefineGlobalFunction(JSContext *ctx, JSAtom prop,
+ 
+     p = JS_VALUE_GET_OBJ(ctx->global_obj);
+     prs = find_own_property1(p, prop);
++    if (ctx->global_decls_configurable)
++        def_flags |= JS_PROP_CONFIGURABLE;
+     flags = JS_PROP_HAS_VALUE | JS_PROP_THROW;
+     if (!prs || (prs->flags & JS_PROP_CONFIGURABLE)) {
+         flags |= JS_PROP_ENUMERABLE | JS_PROP_WRITABLE | def_flags |
+@@ -30011,6 +30020,11 @@ int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name,
+     return -1;
+ }
+ 
++void JS_SetGlobalDeclsConfigurable(JSContext *ctx, bool on)
++{
++    ctx->global_decls_configurable = on;
++}
++
+ void JS_SetModuleDeferFunc(JSRuntime *rt, JSModuleDeferFunc *func)
+ {
+     rt->module_defer_func = func;
+diff --git a/quickjs.h b/quickjs.h
+index f89afac..bd11b41 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1230,6 +1230,9 @@ typedef int JSModuleDeferFunc(JSContext *ctx, const char *basename,
+                               JSValueConst *argv, JSJobFunc *job,
+                               void *opaque);
+ JS_EXTERN void JS_SetModuleDeferFunc(JSRuntime *rt, JSModuleDeferFunc *func);
++/* VitaBrowser: make global var / function declarations configurable while
++   on (host bootstrap scripts; page scripts keep the standard behaviour). */
++JS_EXTERN void JS_SetGlobalDeclsConfigurable(JSContext *ctx, bool on);
+ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                             int argc, JSValueConst *argv);
+ 
