@@ -90,6 +90,12 @@ email".
 2. Lazy sub-resources (images below the fold), incremental reflow.
 *Acceptance:* claude.ai reaches /login in < 60 s on hardware with input
 responsive throughout; scorecard `Done s` per tier.
+*Status (2026-09-29):* item 1 done for dynamic `import()` (patch 159 +
+patches/quickjs/03): the graph is fetched with non-blocking transfers and
+compiled in 12 ms slices between frames (sim: claude.ai's longest slice
+151 ms; JS-module-async.html proves timers run while a graph loads).
+Static `<script type=module>` graphs still load in one go (on the Vita
+mostly from the card, ~8 s): next.
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

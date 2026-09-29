@@ -1,0 +1,74 @@
+# quickjs: a host hook to let a dynamic import() wait
+#
+# QuickJS loads an import()'s module graph synchronously, from inside the
+# job the call queues: the embedder's loader must return each module on
+# the spot. VitaBrowser fetched and compiled claude.ai's 91 dynamic
+# modules that way, and the browser froze for ~54 s on the Vita (hardware
+# run 22). JS_SetModuleDeferFunc() registers a host function asked first
+# when an import() job runs; if it keeps the job (it holds the arguments
+# and returns nonzero), the host fetches the graph without blocking,
+# compiles it in slices between frames, then re-queues the same job with
+# JS_EnqueueJob -- which now finds every module loaded. The import()'s
+# promise just stays pending meanwhile.
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -355,6 +355,7 @@
+     } u;
+     JSModuleCheckSupportedImportAttributes *module_check_attrs;
+     void *module_loader_opaque;
++    JSModuleDeferFunc *module_defer_func; /* VitaBrowser */
+     /* timestamp for internal use in module evaluation */
+     int64_t module_async_evaluation_next_timestamp;
+ 
+@@ -30010,6 +30011,11 @@
+     return -1;
+ }
+ 
++void JS_SetModuleDeferFunc(JSRuntime *rt, JSModuleDeferFunc *func)
++{
++    rt->module_defer_func = func;
++}
++
+ void JS_SetModuleLoaderFunc(JSRuntime *rt,
+                             JSModuleNormalizeFunc *module_normalize,
+                             JSModuleLoaderFunc *module_loader, void *opaque)
+@@ -31213,6 +31219,16 @@
+     if (!filename)
+         goto exception;
+ 
++    /* VitaBrowser: the host may keep this job until the graph is ready */
++    if (ctx->rt->module_defer_func &&
++        ctx->rt->module_defer_func(ctx, basename, filename, argc, argv,
++                                   js_dynamic_import_job,
++                                   ctx->rt->module_loader_opaque)) {
++        JS_FreeCString(ctx, filename);
++        JS_FreeCString(ctx, basename);
++        return JS_UNDEFINED;
++    }
++
+     JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs, attributes);
+     JS_FreeCString(ctx, filename);
+     JS_FreeCString(ctx, basename);
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1218,6 +1218,18 @@
+ /* JS Job support */
+ 
+ typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
++/* VitaBrowser: a host may make a dynamic import() wait for it (fetch the
++ * module graph without blocking, compile it in slices). Called when an
++ * import() job runs, with the importer's name and the specifier; nonzero
++ * means the host has kept argc/argv (JS_DupValue) and will call
++ * JS_EnqueueJob(ctx, job, argc, argv) itself once the graph is ready --
++ * the job then runs again and finds it loaded. 0: load now, as without a
++ * host. */
++typedef int JSModuleDeferFunc(JSContext *ctx, const char *basename,
++                              const char *filename, int argc,
++                              JSValueConst *argv, JSJobFunc *job,
++                              void *opaque);
++JS_EXTERN void JS_SetModuleDeferFunc(JSRuntime *rt, JSModuleDeferFunc *func);
+ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                             int argc, JSValueConst *argv);
+ 

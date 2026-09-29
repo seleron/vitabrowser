@@ -1,0 +1,1064 @@
+# netsurf: import() loads its module graph between frames (no more freeze)
+#
+# Roadmap WS-C1. QuickJS loads an import()'s graph synchronously inside
+# the job the call queues, and the bridge's loader fetched (blocking curl)
+# and compiled all of it there: claude.ai's 91 dynamic modules froze the
+# Vita for ~54 s (hardware run 22) -- no frames, no input.
+#
+# - patches/quickjs/03 adds JS_SetModuleDeferFunc: the host may keep an
+#   import() job and re-queue it (JS_EnqueueJob) when its graph is loaded.
+# - fetch.h/fetch.c/curl.c: fetch_get_set_{start,step,body,free}, the
+#   non-blocking twin of fetch_get_blocking (same transfers, 8 at a time,
+#   each step returns at once).
+# - macsurf_qjs.c: qjs_module_defer keeps the job; a pipeline per import
+#   root (qjs_modload) then, a few steps per event-loop pass:
+#   FETCH the graph level by level with fetch_get_set (card hits
+#   registered at once; a module another pipeline is fetching is carried to
+#   the next level instead of fetched twice), COMPILE the fetched modules
+#   one after another in 12 ms slices (each lands in the realm's loaded
+#   list, so QuickJS does not ask the loader again; not while another
+#   pipeline on the registry still fetches, as compiling frees the text it
+#   may not have scanned yet), then re-queue the jobs. A failed root is
+#   handed back to QuickJS, which rejects as before. Pipelines die with
+#   their realm (navigation, teardown). The blocking crawl and the loader
+#   now share qjs_crawl_level_{want,take,next} and qjs_module_compile_entry
+#   with it.
+# - import() from a classic (inline) script resolves against the document
+#   URL, as in browsers (qjs_module_base): './x.js' could not load at all.
+# Sim, claude.ai/code: its import() graphs load asynchronously, the longest
+# compile slice 151 ms, the redirect to /login at 6.4 s (as before).
+# Test: JS-module-async.html 4/4 (timers run while the graph loads).
+diff --git a/content/fetch.h b/content/fetch.h
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -333,6 +333,22 @@
+ 		const char *referer, struct fetch_blocking_body *res);
+ 
+ /**
++ * The same set of GETs without blocking (VitaBrowser: a module graph
++ * fetched between frames). fetch_get_set_start() begins; each
++ * fetch_get_set_step() moves the transfers on without waiting and returns
++ * true once all have ended; fetch_get_set_body(set, i) is result i (the
++ * caller may take its data, setting it NULL); fetch_get_set_free() ends
++ * any still running.
++ */
++struct fetch_get_set;
++struct fetch_get_set *fetch_get_set_start(const char *const *urls,
++		unsigned int n, const char *referer);
++bool fetch_get_set_step(struct fetch_get_set *set);
++struct fetch_blocking_body *fetch_get_set_body(struct fetch_get_set *set,
++		unsigned int i);
++void fetch_get_set_free(struct fetch_get_set *set);
++
++/**
+  * Get the set of file descriptors the fetchers are currently using.
+  *
+  * This obtains the file descriptors the fetch system is using to
+diff --git a/content/fetch.c b/content/fetch.c
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -302,6 +302,45 @@
+ }
+ 
+ #ifndef WITH_CURL
++/* no transfers without curl: every body fails at once */
++struct fetch_get_set {
++	unsigned int n;
++	struct fetch_blocking_body res[1];
++};
++
++/* exported interface documented in content/fetch.h */
++struct fetch_get_set *fetch_get_set_start(const char *const *urls,
++		unsigned int n, const char *referer)
++{
++	struct fetch_get_set *set = calloc(1, sizeof(*set) +
++			(n > 0 ? n : 1) * sizeof(set->res[0]));
++	(void)urls;
++	(void)referer;
++	if (set != NULL)
++		set->n = n;
++	return set;
++}
++
++/* exported interface documented in content/fetch.h */
++bool fetch_get_set_step(struct fetch_get_set *set)
++{
++	(void)set;
++	return true;
++}
++
++/* exported interface documented in content/fetch.h */
++struct fetch_blocking_body *fetch_get_set_body(struct fetch_get_set *set,
++		unsigned int i)
++{
++	return (set != NULL && i < set->n) ? &set->res[i] : NULL;
++}
++
++/* exported interface documented in content/fetch.h */
++void fetch_get_set_free(struct fetch_get_set *set)
++{
++	free(set);
++}
++
+ /* exported interface documented in content/fetch.h */
+ unsigned int fetch_get_blocking(const char *const *urls, unsigned int n,
+ 		const char *referer, struct fetch_blocking_body *res)
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -2460,6 +2460,169 @@
+ 	return true;
+ }
+ 
++/* ---- fetch_get_set: the same, without blocking ----------------------- */
++
++/** Transfers one set runs at once (several sets may run together). */
++#define SET_PARALLEL 8
++
++struct fetch_get_set {
++	CURLM *multi;
++	unsigned int n, active, left;
++	char **urls;
++	char *referer;
++	struct curl_slist **resolve;
++	CURL **handle;
++	unsigned char *state;	/* 0 waiting, 1 running, 2 done */
++	struct fetch_blocking_body *res;
++	uint64_t t0;
++};
++
++/* exported interface documented in content/fetch.h */
++void fetch_get_set_free(struct fetch_get_set *set)
++{
++	unsigned int i;
++
++	if (set == NULL)
++		return;
++	for (i = 0; i < set->n; i++) {
++		if (set->handle != NULL && set->handle[i] != NULL) {
++			curl_multi_remove_handle(set->multi, set->handle[i]);
++			curl_easy_cleanup(set->handle[i]);
++		}
++		if (set->resolve != NULL && set->resolve[i] != NULL)
++			curl_slist_free_all(set->resolve[i]);
++		if (set->res != NULL)
++			free(set->res[i].data);
++		if (set->urls != NULL)
++			free(set->urls[i]);
++	}
++	if (set->multi != NULL)
++		curl_multi_cleanup(set->multi);
++	free(set->urls);
++	free(set->referer);
++	free(set->resolve);
++	free(set->handle);
++	free(set->state);
++	free(set->res);
++	free(set);
++}
++
++/* exported interface documented in content/fetch.h */
++struct fetch_get_set *fetch_get_set_start(const char *const *urls,
++		unsigned int n, const char *referer)
++{
++	struct fetch_get_set *set = calloc(1, sizeof(*set));
++	unsigned int i;
++
++	if (set == NULL)
++		return NULL;
++	set->n = n;
++	set->left = n;
++	set->multi = curl_multi_init();
++	set->urls = calloc(n + 1, sizeof(*set->urls));
++	set->resolve = calloc(n + 1, sizeof(*set->resolve));
++	set->handle = calloc(n + 1, sizeof(*set->handle));
++	set->state = calloc(n + 1, 1);
++	set->res = calloc(n + 1, sizeof(*set->res));
++	set->referer = referer != NULL ? strdup(referer) : NULL;
++	if (set->multi == NULL || set->urls == NULL || set->resolve == NULL ||
++	    set->handle == NULL || set->state == NULL || set->res == NULL) {
++		fetch_get_set_free(set);
++		return NULL;
++	}
++	for (i = 0; i < n; i++) {
++		set->urls[i] = strdup(urls[i]);
++		if (set->urls[i] == NULL) {
++			set->state[i] = 2;	/* counts as failed */
++			set->left--;
++		}
++	}
++	nsu_getmonotonic_ms(&set->t0);
++	return set;
++}
++
++/* exported interface documented in content/fetch.h */
++bool fetch_get_set_step(struct fetch_get_set *set)
++{
++	unsigned int i;
++	int running, queued;
++	CURLMsg *msg;
++	uint64_t now;
++
++	if (set == NULL || set->left == 0)
++		return true;
++	for (i = 0; i < set->n && set->active < SET_PARALLEL; i++) {
++		int r;
++		if (set->state[i] != 0)
++			continue;
++		if (fetch_blocking_file(set->urls[i], &set->res[i])) {
++			set->state[i] = 2;
++			set->left--;
++			continue;
++		}
++		r = fetch_blocking_start(set->multi, set->urls[i],
++				set->referer, set->res, i, &set->resolve[i],
++				&set->handle[i]);
++		if (r == 1) {
++			set->state[i] = 1;
++			set->active++;
++		} else if (r < 0) {
++			set->state[i] = 2;
++			set->left--;
++		}
++	}
++	curl_multi_perform(set->multi, &running);
++	while ((msg = curl_multi_info_read(set->multi, &queued)) != NULL) {
++		void *priv = NULL;
++		if (msg->msg != CURLMSG_DONE)
++			continue;
++		curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
++		i = (unsigned int)(uintptr_t)priv;
++		if (msg->data.result == CURLE_OK)
++			curl_easy_getinfo(msg->easy_handle,
++					CURLINFO_RESPONSE_CODE,
++					&set->res[i].status);
++		else
++			NSLOG(netsurf, INFO, "%s: %s", set->urls[i],
++			      curl_easy_strerror(msg->data.result));
++		curl_multi_remove_handle(set->multi, msg->easy_handle);
++		curl_easy_cleanup(msg->easy_handle);
++		set->handle[i] = NULL;
++		set->state[i] = 2;
++		set->active--;
++		set->left--;
++	}
++	nsu_getmonotonic_ms(&now);
++	if (set->left > 0 && now - set->t0 > BLOCKING_TIMEOUT_S * 1000) {
++		NSLOG(netsurf, WARNING, "gave up on %u of %u", set->left,
++		      set->n);
++		for (i = 0; i < set->n; i++) {
++			if (set->handle[i] != NULL) {
++				curl_multi_remove_handle(set->multi,
++						set->handle[i]);
++				curl_easy_cleanup(set->handle[i]);
++				set->handle[i] = NULL;
++			}
++			if (set->state[i] != 2) {
++				free(set->res[i].data);
++				set->res[i].data = NULL;
++				set->res[i].len = 0;
++				set->res[i].status = 0;
++				set->state[i] = 2;
++			}
++		}
++		set->left = 0;
++	}
++	return set->left == 0;
++}
++
++/* exported interface documented in content/fetch.h */
++struct fetch_blocking_body *fetch_get_set_body(struct fetch_get_set *set,
++		unsigned int i)
++{
++	return (set != NULL && i < set->n) ? &set->res[i] : NULL;
++}
++
+ /* exported interface documented in content/fetch.h */
+ unsigned int fetch_get_blocking(const char *const *urls, unsigned int n,
+ 		const char *referer, struct fetch_blocking_body *res)
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -16541,6 +16541,24 @@
+ 
+ /* Normalize: resolve an import specifier against the importing module's
+  * URL. QuickJS frees the result with js_free, so it is js_malloc'd. */
++/* The base an import specifier resolves against: the importing module's
++ * URL, or -- for a classic script, whose name is not a URL ("?inline
++ * script?") -- the document's, as in browsers. VitaBrowser: import() from
++ * an inline script could not resolve './x.js' at all. Returns base, or a
++ * pointer into the page URL (valid while the content lives). */
++static const char *qjs_module_base(JSContext *ctx, const char *base)
++{
++	struct qjs_realm_owner *owner;
++	if (base != NULL && (strstr(base, "://") != NULL ||
++			     strncmp(base, "file:", 5) == 0))
++		return base;
++	owner = qjs_owner_for_ctx(ctx);
++	if (owner != NULL && owner->content != NULL &&
++	    content_get_url(owner->content) != NULL)
++		return nsurl_access(content_get_url(owner->content));
++	return base;
++}
++
+ static char *qjs_module_normalize(JSContext *ctx,
+ 	const char *base_name, const char *name, void *opaque)
+ {
+@@ -16549,7 +16567,8 @@
+ 	(void)opaque;
+ 
+ 	if (name == NULL) return NULL;
+-	url = qjs_module_resolve(base_name, name, strlen(name));
++	url = qjs_module_resolve(qjs_module_base(ctx, base_name), name,
++		strlen(name));
+ 	if (url == NULL) {
+ 		/* A bare specifier: keep it, so the load fails by name. */
+ 		url = strdup(name);
+@@ -16850,6 +16869,120 @@
+ 	return next[n] != NULL ? n + 1 : n;
+ }
+ 
++/* One level of a module graph, in three steps shared by the blocking
++ * crawl below and the non-blocking one (qjs_modload, dynamic import()).
++ *
++ * 1. Of urls[0..n), register the hash-named ones the card has (neither
++ *    fetched nor parsed) and list the rest, not registered yet, in want. */
++static unsigned int qjs_crawl_level_want(struct module_registry *reg,
++	char **urls, unsigned int n, const char **want, unsigned int *cached)
++{
++	unsigned int i, nw = 0;
++	for (i = 0; i < n; i++) {
++		if (qjs_module_find(reg, urls[i]) != NULL)
++			continue;
++#ifdef MACSURF_JSCACHE_DIR
++		/* Hash-named and cached: neither fetched nor parsed. */
++		if (qjs_url_immutable(urls[i])) {
++			struct module_entry tmp;
++			uint32_t sl, sh;
++			memset(&tmp, 0, sizeof(tmp));
++			if (qjs_jscache_load(urls[i], &tmp, &sl, &sh)) {
++				struct module_entry *ce =
++					qjs_module_register(reg,
++						urls[i], NULL, 0);
++				if (ce != NULL) {
++					ce->bc = tmp.bc;
++					ce->bc_len = tmp.bc_len;
++					ce->imports = tmp.imports;
++					ce->imports_len = tmp.imports_len;
++					(*cached)++;
++					continue;
++				}
++				free(tmp.bc);
++				free(tmp.imports);
++			}
++		}
++#endif
++		want[nw++] = urls[i];
++	}
++	return nw;
++}
++
++/* 2. Register what was fetched for want[0..nw) (res[i]; each data is
++ *    freed), reusing card bytecode where the text is unchanged. */
++static void qjs_crawl_level_take(struct module_registry *reg,
++	const char **want, unsigned int nw, struct fetch_blocking_body *res,
++	unsigned int *fetched, unsigned int *failed, size_t *bytes)
++{
++	unsigned int i;
++	for (i = 0; i < nw; i++) {
++		int good = res[i].data != NULL &&
++			res[i].status >= 200 && res[i].status < 300;
++		struct module_entry *fe = qjs_module_register(reg,
++			want[i], good ? res[i].data : NULL, res[i].len);
++		if (good) {
++			(*fetched)++;
++			*bytes += res[i].len;
++#ifdef MACSURF_JSCACHE_DIR
++			/* The same text compiled before: reuse it. */
++			if (fe != NULL && fe->source != NULL) {
++				uint32_t sl, sh;
++				struct module_entry tmp;
++				memset(&tmp, 0, sizeof(tmp));
++				if (qjs_jscache_load(want[i], &tmp, &sl, &sh) &&
++				    sl == fe->srclen &&
++				    sh == qjs_fnv32(fe->source, fe->srclen)) {
++					fe->bc = tmp.bc;
++					fe->bc_len = tmp.bc_len;
++					fe->imports = tmp.imports;
++					fe->imports_len = tmp.imports_len;
++				} else {
++					free(tmp.bc);
++					free(tmp.imports);
++				}
++			}
++#else
++			(void)fe;
++#endif
++		} else {
++			(*failed)++;
++			macsurf_debug_log_writef(
++				"LIFE module fetch FAILED status=%ld %s",
++				res[i].status, want[i]);
++		}
++		free(res[i].data);
++		res[i].data = NULL;
++	}
++}
++
++/* 3. The next level: the imports of every module of urls[0..n) (saved
++ *    ones for card entries, scanned text for the rest), into next (up to
++ *    QJS_MODULE_MAX_COUNT). Frees urls' strings. */
++static unsigned int qjs_crawl_level_next(struct module_registry *reg,
++	char **urls, unsigned int n, char **next)
++{
++	unsigned int i, nn = 0;
++	for (i = 0; i < n; i++) {
++		struct module_entry *e = qjs_module_find(reg, urls[i]);
++		if (e != NULL && e->imports != NULL) {
++			/* from the cache: its saved imports */
++			const char *u = e->imports;
++			while (u < e->imports + e->imports_len) {
++				nn = qjs_module_add_next(reg, u, next, nn,
++					QJS_MODULE_MAX_COUNT);
++				u += strlen(u) + 1;
++			}
++		} else if (e != NULL && e->source != NULL &&
++				reg->count < QJS_MODULE_MAX_COUNT &&
++				reg->bytes < QJS_MODULE_MAX_BYTES)
++			nn = qjs_module_scan(reg, e->name, e->source,
++				e->srclen, next, nn, QJS_MODULE_MAX_COUNT);
++		free(urls[i]);
++	}
++	return nn;
++}
++
+ /* Fetch the static import graph below the modules named in urls[0..n)
+  * (sources already registered are scanned, the rest fetched), level by
+  * level, each level's fetches in parallel (fetch_get_blocking). Frees
+@@ -16858,122 +16991,39 @@
+ 	unsigned int n)
+ {
+ 	char **next;
+-	unsigned int level = 0, fetched = 0, failed = 0, cached = 0, i, nn;
++	unsigned int level = 0, fetched = 0, failed = 0, cached = 0, nn;
+ 	size_t bytes = 0;
+ 	extern double macos9_micros(void);
+ 	double t0 = macos9_micros();
+ 
+ 	next = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*next));
+ 	if (next == NULL) {
++		unsigned int i;
+ 		for (i = 0; i < n; i++) free(urls[i]);
+ 		return;
+ 	}
+ 	while (n > 0) {
+ 		struct fetch_blocking_body *res;
+ 		const char **want;
+-		unsigned int nw = 0;
++		unsigned int nw;
+ 
+-		/* Fetch the ones not registered yet. */
+ 		res = (struct fetch_blocking_body *)calloc(n, sizeof(*res));
+ 		want = (const char **)calloc(n, sizeof(*want));
+ 		if (res == NULL || want == NULL) {
++			unsigned int i;
+ 			free(res);
+ 			free(want);
++			for (i = 0; i < n; i++) free(urls[i]);
+ 			break;
+ 		}
+-		for (i = 0; i < n; i++) {
+-			if (qjs_module_find(reg, urls[i]) != NULL)
+-				continue;
+-#ifdef MACSURF_JSCACHE_DIR
+-			/* Hash-named and cached: neither fetched nor parsed. */
+-			if (qjs_url_immutable(urls[i])) {
+-				struct module_entry tmp;
+-				uint32_t sl, sh;
+-				memset(&tmp, 0, sizeof(tmp));
+-				if (qjs_jscache_load(urls[i], &tmp, &sl, &sh)) {
+-					struct module_entry *ce =
+-						qjs_module_register(reg,
+-							urls[i], NULL, 0);
+-					if (ce != NULL) {
+-						ce->bc = tmp.bc;
+-						ce->bc_len = tmp.bc_len;
+-						ce->imports = tmp.imports;
+-						ce->imports_len =
+-							tmp.imports_len;
+-						cached++;
+-						continue;
+-					}
+-					free(tmp.bc);
+-					free(tmp.imports);
+-				}
+-			}
+-#endif
+-			want[nw++] = urls[i];
+-		}
++		nw = qjs_crawl_level_want(reg, urls, n, want, &cached);
+ 		if (nw > 0)
+ 			fetch_get_blocking(want, nw, NULL, res);
+-		for (i = 0; i < nw; i++) {
+-			int good = res[i].data != NULL &&
+-				res[i].status >= 200 && res[i].status < 300;
+-			struct module_entry *fe = qjs_module_register(reg,
+-				want[i], good ? res[i].data : NULL, res[i].len);
+-			if (good) {
+-				fetched++;
+-				bytes += res[i].len;
+-#ifdef MACSURF_JSCACHE_DIR
+-				/* The same text compiled before: reuse it. */
+-				if (fe != NULL && fe->source != NULL) {
+-					uint32_t sl, sh;
+-					struct module_entry tmp;
+-					memset(&tmp, 0, sizeof(tmp));
+-					if (qjs_jscache_load(want[i], &tmp, &sl,
+-							&sh) &&
+-					    sl == fe->srclen &&
+-					    sh == qjs_fnv32(fe->source,
+-							fe->srclen)) {
+-						fe->bc = tmp.bc;
+-						fe->bc_len = tmp.bc_len;
+-						fe->imports = tmp.imports;
+-						fe->imports_len =
+-							tmp.imports_len;
+-					} else {
+-						free(tmp.bc);
+-						free(tmp.imports);
+-					}
+-				}
+-#else
+-				(void)fe;
+-#endif
+-			} else {
+-				failed++;
+-				macsurf_debug_log_writef(
+-					"LIFE module fetch FAILED status=%ld %s",
+-					res[i].status, want[i]);
+-			}
+-			free(res[i].data);
+-		}
++		qjs_crawl_level_take(reg, want, nw, res, &fetched, &failed,
++			&bytes);
+ 		free(res);
+ 		free(want);
+-		/* Scan every module of this level for the next. */
+-		nn = 0;
+-		for (i = 0; i < n; i++) {
+-			struct module_entry *e = qjs_module_find(reg, urls[i]);
+-			if (e != NULL && e->imports != NULL) {
+-				/* from the cache: its saved imports */
+-				const char *u = e->imports;
+-				while (u < e->imports + e->imports_len) {
+-					nn = qjs_module_add_next(reg, u, next,
+-						nn, QJS_MODULE_MAX_COUNT);
+-					u += strlen(u) + 1;
+-				}
+-			} else if (e != NULL && e->source != NULL &&
+-					reg->count < QJS_MODULE_MAX_COUNT &&
+-					reg->bytes < QJS_MODULE_MAX_BYTES)
+-				nn = qjs_module_scan(reg, e->name, e->source,
+-					e->srclen, next, nn,
+-					QJS_MODULE_MAX_COUNT);
+-			free(urls[i]);
+-		}
++		nn = qjs_crawl_level_next(reg, urls, n, next);
+ 		memcpy(urls, next, nn * sizeof(*urls));
+ 		n = nn;
+ 		level++;
+@@ -17007,35 +17057,16 @@
+ 	}
+ }
+ 
+-/* Loader: compile a module given its normalized name, from the registry
+- * (qjs_module_crawl put the graph there), else -- a dynamic import(), or
+- * anything the scan missed -- fetch it and its static graph now. */
+-static JSModuleDef *qjs_module_loader(JSContext *ctx,
+-	const char *module_name, void *opaque)
++/* Compile registry entry e (named module_name) in ctx: its card bytecode,
++ * else its text; the result is a QuickJS module, now in ctx's loaded list.
++ * NULL with an exception pending on failure. Used by the loader and, one
++ * entry per slice, by the non-blocking import() pipeline (qjs_modload). */
++static JSModuleDef *qjs_module_compile_entry(JSContext *ctx,
++	struct module_registry *reg, struct module_entry *e,
++	const char *module_name)
+ {
+-	struct module_registry *reg = (struct module_registry *)opaque;
+-	struct module_entry *e;
+ 	JSValue val;
+ 
+-	if (reg == NULL || module_name == NULL)
+-		return NULL;
+-	qjs_module_registry_for_nav(reg);
+-	e = qjs_module_find(reg, module_name);
+-	if (e != NULL && e->compiled) {
+-		/* Compiled in an earlier realm: fetch it again. */
+-		struct module_entry **pp = &reg->head;
+-		while (*pp != e) pp = &(*pp)->next;
+-		*pp = e->next;
+-		reg->count--;
+-		free(e->name);
+-		free(e);
+-		e = NULL;
+-	}
+-	if (e == NULL) {
+-		/* A dynamic import(), or one the scan missed. */
+-		qjs_module_crawl_from(reg, module_name);
+-		e = qjs_module_find(reg, module_name);
+-	}
+ 	if (e != NULL && e->bc != NULL) {
+ 		/* From the card (or compiled on an earlier visit). */
+ 		extern double macos9_micros(void);
+@@ -17137,6 +17168,417 @@
+ 	return (JSModuleDef *)JS_VALUE_GET_PTR(val);
+ }
+ 
++/* Loader: compile a module given its normalized name, from the registry
++ * (qjs_module_crawl put the graph there), else -- a dynamic import(), or
++ * anything the scan missed -- fetch it and its static graph now. */
++static JSModuleDef *qjs_module_loader(JSContext *ctx,
++	const char *module_name, void *opaque)
++{
++	struct module_registry *reg = (struct module_registry *)opaque;
++	struct module_entry *e;
++
++	if (reg == NULL || module_name == NULL)
++		return NULL;
++	qjs_module_registry_for_nav(reg);
++	e = qjs_module_find(reg, module_name);
++	if (e != NULL && e->compiled) {
++		/* Compiled in an earlier realm: fetch it again. */
++		struct module_entry **pp = &reg->head;
++		while (*pp != e) pp = &(*pp)->next;
++		*pp = e->next;
++		reg->count--;
++		free(e->name);
++		free(e);
++		e = NULL;
++	}
++	if (e == NULL) {
++		/* A dynamic import(), or one the scan missed. */
++		qjs_module_crawl_from(reg, module_name);
++		e = qjs_module_find(reg, module_name);
++	}
++	return qjs_module_compile_entry(ctx, reg, e, module_name);
++}
++
++
++/* ---- VitaBrowser: import() without freezing the browser ---------------
++ *
++ * QuickJS loads an import()'s graph synchronously inside the job the call
++ * queues, and the loader above fetched and compiled all of it there:
++ * claude.ai's 91 dynamic modules froze the Vita for ~54 s (hardware run
++ * 22), no frames, no input. patches/quickjs/03 lets the host keep the job
++ * instead (qjs_module_defer). A pipeline per import root then, one step
++ * per event-loop pass (qjs_modload_pump):
++ *   FETCH    the graph level by level with fetch_get_set (non-blocking;
++ *            card hits registered at once, as the blocking crawl does),
++ *   COMPILE  the fetched modules one after another while the pass's
++ *            QJS_MODLOAD_SLICE_MS lasts (each lands in the realm's loaded
++ *            list, so QuickJS will not ask the loader for it again),
++ *   READY    re-queue the kept jobs; they now find the graph loaded.
++ * The import()'s promise stays pending meanwhile; the page keeps painting
++ * and taking input between steps. */
++#define QJS_MODLOAD_MAX 16
++#define QJS_MODLOAD_JOBS 8
++#define QJS_MODLOAD_SLICE_MS 12.0
++#define QJS_MODLOAD_STEP_MS 4.0
++
++struct qjs_modload {
++	struct qjs_modload *next;
++	JSContext *ctx;
++	struct module_registry *reg;
++	int nav_seq;
++	char *root;
++	int phase;			/* 0 fetch, 1 compile */
++	char **urls;			/* this level (QJS_MODULE_MAX_COUNT) */
++	unsigned int n;
++	char **carry;			/* in flight elsewhere: next level */
++	unsigned int ncarry;
++	const char **want;		/* its fetches */
++	unsigned int nw;
++	struct fetch_get_set *set;
++	unsigned int fetched, failed, cached, compiled, levels, steps;
++	size_t bytes;
++	double t0, longest_ms;
++	int njobs;
++	struct {
++		JSJobFunc *job;
++		int argc;
++		JSValue argv[6];
++	} jobs[QJS_MODLOAD_JOBS];
++};
++static struct qjs_modload *g_modloads = NULL;
++
++static void qjs_modload_free(struct qjs_modload *m, int free_values)
++{
++	unsigned int i;
++	int j, k;
++	if (m->set != NULL)
++		fetch_get_set_free(m->set);
++	if (m->urls != NULL) {
++		for (i = 0; i < m->n; i++) free(m->urls[i]);
++		free(m->urls);
++	}
++	free(m->want);
++	if (m->carry != NULL) {
++		for (i = 0; i < m->ncarry; i++) free(m->carry[i]);
++		free(m->carry);
++	}
++	if (free_values)
++		for (j = 0; j < m->njobs; j++)
++			for (k = 0; k < m->jobs[j].argc; k++)
++				JS_FreeValue(m->ctx, m->jobs[j].argv[k]);
++	free(m->root);
++	free(m);
++}
++
++/* Is url being fetched right now by a pipeline other than m on its
++ * registry? */
++static int qjs_modload_in_flight(struct qjs_modload *m, const char *url)
++{
++	struct qjs_modload *o;
++	unsigned int i;
++	for (o = g_modloads; o != NULL; o = o->next) {
++		if (o == m || o->reg != m->reg || o->set == NULL)
++			continue;
++		for (i = 0; i < o->nw; i++)
++			if (strcmp(o->want[i], url) == 0)
++				return 1;
++	}
++	return 0;
++}
++
++/* JSModuleDeferFunc (patches/quickjs/03): keep an import() job whose graph
++ * is not loaded yet. */
++static int qjs_module_defer(JSContext *ctx, const char *basename,
++	const char *filename, int argc, JSValueConst *argv, JSJobFunc *job,
++	void *opaque)
++{
++	struct module_registry *reg = (struct module_registry *)opaque;
++	struct module_entry *e;
++	struct qjs_modload *m;
++	char *url;
++	int k, count = 0;
++
++	if (reg == NULL || argc > 6 || filename == NULL)
++		return 0;
++	qjs_module_registry_for_nav(reg);
++	url = qjs_module_resolve(qjs_module_base(ctx, basename), filename,
++		strlen(filename));
++	if (url == NULL)
++		return 0;		/* bare specifier: fails as before */
++	e = qjs_module_find(reg, url);
++	if (e != NULL && (e->compiled ||
++			  (e->source == NULL && e->bc == NULL))) {
++		/* loaded -- or its fetch failed: import it now (the
++		 * loader reports the failure as before) */
++		free(url);
++		return 0;
++	}
++	for (m = g_modloads; m != NULL; m = m->next, count++)
++		if (m->ctx == ctx && strcmp(m->root, url) == 0)
++			break;
++	if (m == NULL) {
++		if (count >= QJS_MODLOAD_MAX) {
++			free(url);
++			return 0;	/* too many at once: load inline */
++		}
++		m = (struct qjs_modload *)calloc(1, sizeof(*m));
++		if (m == NULL) {
++			free(url);
++			return 0;
++		}
++		m->urls = (char **)calloc(QJS_MODULE_MAX_COUNT,
++			sizeof(*m->urls));
++		m->carry = (char **)calloc(QJS_MODULE_MAX_COUNT,
++			sizeof(*m->carry));
++		m->root = strdup(url);
++		if (m->urls == NULL || m->root == NULL || m->carry == NULL) {
++			free(m->carry);
++			free(m->urls);
++			free(m->root);
++			free(m);
++			free(url);
++			return 0;
++		}
++		m->urls[0] = strdup(url);
++		m->n = m->urls[0] != NULL ? 1 : 0;
++		m->ctx = ctx;
++		m->reg = reg;
++		m->nav_seq = g_qjs_nav_seq;
++		{
++			extern double macos9_micros(void);
++			m->t0 = macos9_micros();
++		}
++		m->next = g_modloads;
++		g_modloads = m;
++	}
++	free(url);
++	if (m->njobs >= QJS_MODLOAD_JOBS)
++		return 0;
++	m->jobs[m->njobs].job = job;
++	m->jobs[m->njobs].argc = argc;
++	for (k = 0; k < argc; k++)
++		m->jobs[m->njobs].argv[k] = JS_DupValue(ctx, argv[k]);
++	m->njobs++;
++	return 1;
++}
++
++/* One step of pipeline m; returns 1 when it is finished. */
++static int qjs_modload_step(struct qjs_modload *m)
++{
++	extern double macos9_micros(void);
++	if (m->phase == 0) {
++		if (m->set == NULL) {
++			if (m->n == 0) {
++				m->phase = 1;
++				macsurf_debug_log_writef(
++					"LIFE module graph (async): %u fetched "
++					"(%lu KiB), %u from the card, %u failed, "
++					"%u levels, %ld ms; registry %u modules",
++					m->fetched,
++					(unsigned long)(m->bytes / 1024),
++					m->cached, m->failed, m->levels,
++					(long)((macos9_micros() - m->t0) / 1000),
++					m->reg->count);
++				return 0;
++			}
++			free(m->want);
++			m->want = (const char **)calloc(m->n, sizeof(*m->want));
++			if (m->want == NULL)
++				return 1;
++			m->nw = qjs_crawl_level_want(m->reg, m->urls, m->n,
++				m->want, &m->cached);
++			/* one fetch per module: a URL another pipeline is
++			 * fetching now is not fetched again here; it is
++			 * carried to this pipeline's next level, where it is
++			 * registered and gets scanned (claude.ai's import()
++			 * graphs share most of their modules) */
++			{
++				unsigned int i, w = 0;
++				m->ncarry = 0;
++				for (i = 0; i < m->nw; i++) {
++					if (qjs_modload_in_flight(m, m->want[i]) &&
++					    m->ncarry < QJS_MODULE_MAX_COUNT) {
++						char *c = strdup(m->want[i]);
++						if (c != NULL)
++							m->carry[m->ncarry++] = c;
++						continue;
++					}
++					m->want[w++] = m->want[i];
++				}
++				m->nw = w;
++			}
++			if (m->nw > 0) {
++				m->set = fetch_get_set_start(m->want, m->nw,
++					NULL);
++				if (m->set == NULL)
++					return 1;
++				return 0;
++			}
++		} else {
++			unsigned int i;
++			struct fetch_blocking_body *res;
++			if (!fetch_get_set_step(m->set))
++				return 0;
++			res = (struct fetch_blocking_body *)calloc(m->nw,
++				sizeof(*res));
++			if (res == NULL)
++				return 1;
++			for (i = 0; i < m->nw; i++) {
++				struct fetch_blocking_body *b =
++					fetch_get_set_body(m->set, i);
++				if (b != NULL) {
++					res[i] = *b;
++					b->data = NULL;	/* now ours */
++				}
++			}
++			qjs_crawl_level_take(m->reg, m->want, m->nw, res,
++				&m->fetched, &m->failed, &m->bytes);
++			free(res);
++			fetch_get_set_free(m->set);
++			m->set = NULL;
++		}
++		/* this level is in: on to the next */
++		{
++			char **next = (char **)calloc(QJS_MODULE_MAX_COUNT,
++				sizeof(*next));
++			unsigned int nn;
++			if (next == NULL)
++				return 1;
++			nn = qjs_crawl_level_next(m->reg, m->urls, m->n, next);
++			{
++				unsigned int i;
++				/* carried URLs: look again next level
++				 * (registered by then, or still in flight) */
++				for (i = 0; i < m->ncarry; i++) {
++					unsigned int k;
++					int dup = 0;
++					for (k = 0; k < nn; k++)
++						if (strcmp(next[k],
++							   m->carry[i]) == 0)
++							dup = 1;
++					if (!dup && nn < QJS_MODULE_MAX_COUNT)
++						next[nn++] = m->carry[i];
++					else
++						free(m->carry[i]);
++				}
++				m->ncarry = 0;
++			}
++			free(m->urls);
++			m->urls = next;
++			m->n = nn;
++			m->levels++;
++		}
++		return 0;
++	}
++	/* compile: whatever the registry has fetched and not compiled, one
++	 * after another while the slice lasts -- but not while another
++	 * pipeline on this registry still fetches: compiling frees a
++	 * module's text, which that one may not have scanned for its next
++	 * level yet */
++	{
++		double t0 = macos9_micros();
++		struct qjs_modload *o;
++		for (o = g_modloads; o != NULL; o = o->next)
++			if (o != m && o->reg == m->reg && o->phase == 0)
++				return 0;
++		for (;;) {
++			struct module_entry *e;
++			JSModuleDef *def;
++			double t1;
++			for (e = m->reg->head; e != NULL; e = e->next)
++				if (!e->compiled &&
++				    (e->source != NULL || e->bc != NULL))
++					break;
++			if (e == NULL) {
++				macsurf_debug_log_writef(
++					"LIFE module compile (async): %u in %u "
++					"steps, longest %ld ms; import() of %s "
++					"ready after %ld ms",
++					m->compiled, m->steps,
++					(long)m->longest_ms, m->root,
++					(long)((macos9_micros() - m->t0) / 1000));
++				return 1;
++			}
++			t1 = macos9_micros();
++			def = qjs_module_compile_entry(m->ctx, m->reg, e,
++				e->name);
++			if (def == NULL)
++				/* stays pending in ctx; the import() that
++				 * links it will report it */
++				JS_FreeValue(m->ctx, JS_GetException(m->ctx));
++			m->compiled++;
++			t1 = (macos9_micros() - t1) / 1000.0;
++			if (t1 > m->longest_ms)
++				m->longest_ms = t1;
++			if ((macos9_micros() - t0) / 1000.0 >=
++					QJS_MODLOAD_SLICE_MS)
++				break;
++		}
++		m->steps++;
++		return 0;
++	}
++}
++
++/* A realm is going away (navigation, teardown): drop its pipelines,
++ * releasing their import() jobs against the still-live ctx -- kept, they
++ * held the promise functions past JS_FreeRuntime (a leak assert at exit). */
++static void qjs_modload_drop_ctx(JSContext *ctx)
++{
++	struct qjs_modload **pp = &g_modloads;
++	while (*pp != NULL) {
++		struct qjs_modload *m = *pp;
++		if (m->ctx == ctx) {
++			*pp = m->next;
++			qjs_modload_free(m, 1);
++			continue;
++		}
++		pp = &m->next;
++	}
++}
++
++/* Run every pipeline one step; called once per event-loop pass from
++ * macsurf_qjs_pump_all. A finished one re-queues its import() jobs. */
++static void qjs_modload_pump(void)
++{
++	struct qjs_modload **pp = &g_modloads;
++	while (*pp != NULL) {
++		struct qjs_modload *m = *pp;
++		int live = qjs_ctx_live_rt(m->ctx) != NULL;
++		int done;
++		if (!live || m->nav_seq != g_qjs_nav_seq) {
++			*pp = m->next;
++			/* a dead realm's values went with it */
++			qjs_modload_free(m, live);
++			continue;
++		}
++		{
++			/* a finished level starts the next at once: a few
++			 * steps while QJS_MODLOAD_STEP_MS lasts */
++			extern double macos9_micros(void);
++			double t0 = macos9_micros();
++			int k;
++			done = 0;
++			for (k = 0; k < 8 && !done; k++) {
++				done = qjs_modload_step(m);
++				if ((macos9_micros() - t0) / 1000.0 >=
++						QJS_MODLOAD_STEP_MS)
++					break;
++			}
++		}
++		if (done) {
++			int j;
++			*pp = m->next;
++			for (j = 0; j < m->njobs; j++)
++				JS_EnqueueJob(m->ctx, m->jobs[j].job,
++					m->jobs[j].argc,
++					(JSValueConst *)m->jobs[j].argv);
++			qjs_modload_free(m, 1);
++			continue;
++		}
++		pp = &m->next;
++	}
++}
++
+ static void qjs_module_registry_free(struct module_registry *reg)
+ {
+ 	struct module_entry *e, *next;
+@@ -17299,6 +17741,8 @@
+ 			qjs_module_normalize,
+ 			qjs_module_loader,
+ 			(void *)heap->module_reg);
++		/* VitaBrowser: import() waits for a non-blocking load */
++		JS_SetModuleDeferFunc(heap->rt, qjs_module_defer);
+ 	}
+ 
+ 	/* Register element class before any context is created */
+@@ -17368,6 +17812,7 @@
+ 	 * the refs against the still-live ctx, then free the ctx). */
+ 	if (heap->ctx != NULL) {
+ 		qjs_flush_timers(heap->ctx);
++		qjs_modload_drop_ctx(heap->ctx);
+ 		macos9_js_fetch_flush(heap->ctx);
+ 	}
+ 	if (heap->ctx != NULL) {
+@@ -17451,6 +17896,7 @@
+ 		html_content_set_diag_context((struct content *)htmlc,
+ 			(unsigned long)g_qjs_nav_seq, win_priv);
+ 		qjs_flush_timers(heap->ctx);
++		qjs_modload_drop_ctx(heap->ctx);
+ 		/* fixes846 (#167 S3) - same load-bearing ordering as the timer
+ 		 * flush above: abort every in-flight XHR and free its dup'd
+ 		 * JSValue against the OLD context before it's freed, or a
+@@ -19073,6 +19519,8 @@
+ 	 * cadence timers run at (a queued message delivered on the next event
+ 	 * loop pass is spec-conformant -- postMessage is always async). */
+ 	qjs_xrealm_drain();
++	/* VitaBrowser: move non-blocking import() loads on (qjs_modload) */
++	qjs_modload_pump();
+ 	while (h != NULL) {
+ 		struct jsheap *next = h->next;
+ 		qjs_pump_heap_due(h);
