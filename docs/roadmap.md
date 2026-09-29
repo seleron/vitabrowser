@@ -142,6 +142,17 @@ Found on the way (patch 164, a correctness fix, not WS-C): without iconv
 stylesheet were dropped when the data ended in the pass that filled the
 4 KB UTF-8 buffer -- a page's last script never ran, a stylesheet lost its
 last rule (JS-parse-tail.html).
+The parked google main-script error (scorecard next-item since r2) got its
+first fix (patches/quickjs/04 + patch 167, the glue): the host's own
+bootstrap globals (function declarations and `var` hoists installed by the
+VitaBrowser realm build) were `configurable: false`, so a page that wraps
+one with `Object.defineProperty` -- google's rAF polyfill does exactly this
+-- threw and killed the bundle. The flag is ON around the realm build only
+(page scripts see the standard frozen declarations again). Verified: full
+gate green, and in the sim google's bundle now gets PAST the defineProperty
+wall and reports 3 later JS errors (`at $ra {{0}}:307:407`) where r3 died
+before its error reporter even ran; visible text is unchanged (0.184), so a
+deeper error is now the blocker -- next step is decoding that frame.
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

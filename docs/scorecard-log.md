@@ -109,3 +109,39 @@ the device run will show (run 27).
 Lowest tier: **search** (google 40.9: text recall 0.21; ddglite's
 reference is blocked for Chrome). Next by the roadmap's rule: google.com's
 main script error (hidden inside `_DumpException`), parked since r2.
+
+---
+
+## r4-google — the parked google main-script error, revisited (2026-09-29, post-166)
+
+Single-site re-score of the search tier (`--only google --reuse-ref r3`) after
+committing the configurable-bootstrap-decls patch (quickjs 04 + glue 167).
+Full gate green first (run-vita-sim: interaction 31/31, Vita-pace 25/25, all
+module/xfail suites pass), engine symbol `JS_SetGlobalDeclsConfigurable`
+confirmed in the rebuilt libquickjs.a **and** the sim binary (not a stale
+build).
+
+| tier | site | score | Δ | text | visual |
+|---|---|---|---|---|---|
+| search | google | 40.8 | -0.1 | 0.184 | 0.439 |
+
+Score and visible text are **flat** (40.9→40.8 is live-site noise; text recall
+0.184 identical). But the log tells a different story — the patch **did**
+move the failure:
+
+- **r3 (pre):** google's main bundle dies *before its JS-error reporter
+  boots* — 0 `jsel` beacons. It hard-fails on the `Object.defineProperty`
+  wrap over a non-configurable host bootstrap global (the rAF-style polyfill
+  trap).
+- **r4 (post):** the bundle now **survives that wall and reports 3 JS
+  errors** (`atyp=i jsel=2`), all landing at `$ra ({{0}}:307:407)` — a
+  minified frame, one tailing through `<eval>` / `apply (native)`. A **second,
+  deeper** wall is now the blocker.
+
+Net: the bootstrap-decls fix is a genuine partial win — it removed the first
+throw and let the bundle run further — but it did not change visible text
+because a later `jsel=2` error kills the search UX before content paints. The
+next investigation is decoding `$ra` at bundle column 307:407 (needs the
+google main bundle's source map or a de-minified read of that frame). This is
+parked WS-F/B2 territory, not a regression: nothing in the gate moved, load
+time 1.7→2.1 s is noise.
