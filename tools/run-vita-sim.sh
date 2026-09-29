@@ -223,6 +223,7 @@ NET-js-module-static-async http://127.0.0.1:$HP/JS-module-static-async.html
 NET-js-module-dedupe http://127.0.0.1:$HP/JS-module-dedupe.html
 NET-js-lazyimg http://127.0.0.1:$HP/JS-lazyimg.html
 NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html
+NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -545,6 +546,14 @@ rs_local=$(printf '%s\n' "$rsl" | grep -c 'LIFE relayout local: [+-][0-9]* px in
 rs_full=$(printf '%s\n' "$rsl" | grep -c 'LIFE relayout local: full reflow instead' || true)
 rs_max=$(printf '%s\n' "$rsl" | sed -n 's/.*LIFE relayout local: [+-][0-9]* px in \([0-9]*\) us.*/\1/p' | sort -n | tail -1)
 echo "  JS-reflow-stall engine: ${rs_local} local relayouts (longest ${rs_max:-?} us), ${rs_full} fell back to full"
+# Patch 164: the last 64 characters of a 4097-4160-byte document or
+# stylesheet were dropped (libparserutils without iconv): the page's only
+# script and its stylesheet's last rule sit there.
+ptp=$(ls "$R"/*NET-js-parse-tail.plot 2>/dev/null | head -1)
+ptr=$(sed -n 's/.*STR \(PARSETAIL: [0-9]*\/[0-9]* passed\).*/\1/p' "$ptp" 2>/dev/null | head -1)
+echo "  JS-parse-tail: ${ptr:-no summary}"
+[ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
+[ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \

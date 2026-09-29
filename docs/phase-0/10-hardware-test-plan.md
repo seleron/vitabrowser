@@ -2760,4 +2760,14 @@ SHA256 first 12: VitaBrowser.vpk d50862126f84, VitaBrowser-ext.vpk
   reflow instead (reason ...)" when it fell back; "LIFE reformat #N:
   layout M ms" lines time every full layout (send a few with the results:
   they are the Vita's real layout costs).
+- Patch 164 (libparserutils, correctness): the end of a document or
+  stylesheet could be dropped -- up to its last 64 characters, when the
+  data ended in the conversion pass that filled the parser's 4 KB buffer
+  (a one-piece 4097-4160-byte file; the end of any stream in the same
+  position). A page's last <script> then never ran and a stylesheet lost
+  its last rule. The Vita's build (no iconv) had it; the fix writes out
+  what the input filter still holds. Sim: JS-parse-tail.html 2/2 (both
+  files 4130 bytes). On the device: pages whose last script or last CSS
+  rule was missing before (a footer's styling, an analytics or init
+  script at the end of <body>) may now behave differently.
 

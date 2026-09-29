@@ -122,6 +122,11 @@ image with no size (margins collapse through its empty block), floats or
 positioned boxes in the way, and every script DOM change (a whole-tree
 rebuild: ~0.4 s for 5000 paragraphs on the host) -- that last one is the
 next WS-C item. Then re-score `Done s` per tier.
+Found on the way (patch 164, a correctness fix, not WS-C): without iconv
+(the Vita's libparserutils) the last <=64 characters of a document or
+stylesheet were dropped when the data ended in the pass that filled the
+4 KB UTF-8 buffer -- a page's last script never ran, a stylesheet lost its
+last rule (JS-parse-tail.html).
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that
