@@ -121,6 +121,12 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             self.wfile.flush()
             return
+        if self.path.startswith("/slow/"):
+            # Patch 160 (WS-C1): a file served after 1 s, so a module graph
+            # has a transfer that takes real time. JS-module-static-async
+            # proves timers keep running while it is in flight.
+            time.sleep(1.0)
+            self.path = self.path[len("/slow"):]
         return super().do_GET()
 
     def do_POST(self):

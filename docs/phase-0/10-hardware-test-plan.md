@@ -2639,3 +2639,18 @@ while it loads -- the frame counter and the pointer should keep moving
 instead of the screen freezing for most of a minute. log.txt/netsurf.log
 lines "module graph (async)" and "module compile (async) ... longest N ms"
 give the device numbers (sim: longest slice 151 ms).
+
+## Since run 25 — queued for run 26 (not built yet)
+
+- Patch 160 (WS-C1, second half): `<script type=module>` graphs, external
+  and inline, now load like import() graphs: non-blocking transfers,
+  compiled in 12 ms slices, before the page's deferred scripts run
+  (DOMContentLoaded waits for them, as in browsers). Inline modules also
+  run in document order with the deferred scripts, no longer after all of
+  them. Sim: JS-module-static-async.html 5/5 (a blocking load freezes
+  timers for 2 s there; now the longest gap is 17 ms).
+- On the device: open a page with module scripts (claude.ai's first
+  screen) and watch the HUD while it loads; netsurf.log lines "module
+  prefetch: N imports of ..." then "module compile (async) ... module
+  script of ... ready after N ms" give the device numbers. Before, the
+  static graph took ~8 s with no frames (mostly card reads).

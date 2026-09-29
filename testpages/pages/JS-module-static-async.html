@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS static modules without freezing (script not run)</title>
+<!-- Roadmap WS-C1, patch 160: a static <script type=module> graph (external
+     and inline) is fetched with non-blocking transfers and compiled in
+     slices before the page's deferred scripts run, instead of inside one
+     blocking crawl at script execution. Each graph has a leaf served after
+     1 s (httpd /slow/), so a blocking crawl stalls the loop for >= 1 s.
+     1: the external module graph has the right value (1+2 + 3+4 + 10 = 20).
+     2: the inline module graph has the right value (5 + 17 - 7 = 15).
+     3: timers ran while the graphs loaded: the longest gap between
+        setTimeout ticks, and from the last one to DOMContentLoaded, is
+        < 600 ms (a blocking crawl freezes for the slow leaf's whole
+        second).
+     4: the slow leaves were really waited for (>= 900 ms from the first
+        tick to DOMContentLoaded; guards against a cached/fast serve
+        making check 3 pass vacuously).
+     5: order kept: the external module ran before the inline one, both
+        before the deferred classic script after them, and all three before
+        DOMContentLoaded. -->
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+<script>
+(function () {
+	var N = 5, k = 0, last = Date.now();
+	window.modstatic = { order: [], ticks: 0, maxgap: 0, t0: last };
+	var S = window.modstatic;
+	(function tick() {
+		var now = Date.now();
+		if (now - last > S.maxgap) S.maxgap = now - last;
+		last = now;
+		S.ticks++;
+		if (S.order.indexOf('dcl') < 0) setTimeout(tick, 0);
+	})();
+	S.t = function (n, ok, text) {
+		var p = document.getElementById('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		document.getElementById('sum').textContent = 'MODSTATIC: ' + k + '/' + N + ' passed';
+		document.title = 'JS static modules without freezing (' + k + '/' + N + ')';
+	};
+	document.addEventListener('DOMContentLoaded', function () {
+		S.order.push('dcl');
+		/* A blocking crawl freezes between the last tick and the module
+		 * body, so the time from the last tick to now counts too. */
+		S.gap = Math.max(S.maxgap, Date.now() - last);
+		S.elapsed = Date.now() - S.t0;
+		document.getElementById('sum').textContent = 'MODSTATIC: 0/' + N + ' passed';
+		var ext = S.ext, inl = S.inl;
+		S.t(1, ext === 20, 'external graph value: ' + ext);
+		S.t(2, inl === 15, 'inline graph value: ' + inl);
+		S.t(3, S.ticks > 1 && S.gap < 600, 'timers while loading: ' + S.ticks +
+			' ticks, longest gap ' + S.gap + ' ms');
+		S.t(4, S.elapsed >= 900, 'slow leaves waited for: ' + S.elapsed + ' ms');
+		S.t(5, S.order.join(',') === 'ext,inl,defer,dcl', 'order: ' + S.order.join(','));
+	});
+})();
+</script>
+<script type="module" src="js-modstatic-root.js"></script>
+<script type="module">
+import { slowb } from "./slow/js-modstatic-slowb.js";
+import { mid2 } from "./js-modstatic-mid2.js";
+window.modstatic.inl = slowb + mid2 - 7;
+window.modstatic.order.push('inl');
+</script>
+<script defer src="js-modstatic-defer.js"></script>
+</head>
+<body>
+<p id="sum" class="wait">MODSTATIC: script did not run</p>
+<p id="r1" class="wait">1 waiting</p><p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p><p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+</body>
+</html>

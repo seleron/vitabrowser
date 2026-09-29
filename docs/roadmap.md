@@ -94,8 +94,13 @@ responsive throughout; scorecard `Done s` per tier.
 patches/quickjs/03): the graph is fetched with non-blocking transfers and
 compiled in 12 ms slices between frames (sim: claude.ai's longest slice
 151 ms; JS-module-async.html proves timers run while a graph loads).
-Static `<script type=module>` graphs still load in one go (on the Vita
-mostly from the card, ~8 s): next.
+Static `<script type=module>` graphs (external and inline) load the same
+way since patch 160: prefetched as soon as the script's text is known, the
+conversion (deferred scripts, then DOMContentLoaded) waits for them, so
+order is unchanged (JS-module-static-async.html: longest timer gap 17 ms,
+2035 ms without the prefetch). Item 1 is done in the sim; device numbers
+come with run 26. Next in WS-C: measure duplicate fetches across
+pipelines, then item 2.
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

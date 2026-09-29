@@ -219,6 +219,7 @@ NET-js-fetch-body-https https://127.0.0.1:$((HP + 1))/JS-fetch-body.html
 NET-js-frame-local http://127.0.0.1:$HP/JS-frame-local.html
 NET-js-interfaces http://127.0.0.1:$HP/JS-interfaces.html
 NET-js-module-async http://127.0.0.1:$HP/JS-module-async.html
+NET-js-module-static-async http://127.0.0.1:$HP/JS-module-static-async.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -483,12 +484,19 @@ echo "  CSS-census: ${cnr:-no summary}"
 inp=$(ls "$R"/*-CSS-intrinsic.plot 2>/dev/null | head -1)
 inr=$(sed -n 's/.*STR \(INTRINSIC: [0-9]*\/[0-9]* passed\).*/\1/p' "$inp" 2>/dev/null | head -1)
 echo "  CSS-intrinsic: ${inr:-no summary}"
-[ "$inr" = "INTRINSIC: 5/5 passed" ] && \
-[ "$cnr" = "CENSUS: 5/5 passed" ] && \
 map=$(ls "$R"/*NET-js-module-async.plot 2>/dev/null | head -1)
 mar=$(sed -n 's/.*STR \(MODASYNC: [0-9]*\/[0-9]* passed\).*/\1/p' "$map" 2>/dev/null | head -1)
 echo "  JS-module-async: ${mar:-no summary}"
 [ -n "$map" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$map" | sed 's/^STR /  /' || true; }
+# Patch 160: static module graphs (external + inline) load between frames,
+# and inline modules run in document order with the deferred scripts.
+msp=$(ls "$R"/*NET-js-module-static-async.plot 2>/dev/null | head -1)
+msr=$(sed -n 's/.*STR \(MODSTATIC: [0-9]*\/[0-9]* passed\).*/\1/p' "$msp" 2>/dev/null | head -1)
+echo "  JS-module-static-async: ${msr:-no summary}"
+[ -n "$msp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$msp" | sed 's/^STR /  /' || true; }
+[ "$inr" = "INTRINSIC: 5/5 passed" ] && \
+[ "$cnr" = "CENSUS: 5/5 passed" ] && \
+[ "$msr" = "MODSTATIC: 5/5 passed" ] && \
 [ "$mar" = "MODASYNC: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \

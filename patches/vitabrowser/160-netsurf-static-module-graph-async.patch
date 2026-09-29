@@ -1,0 +1,397 @@
+# netsurf: <script type=module> graphs load between frames too
+#
+# Roadmap WS-C1, second half (patch 159 did import()). A static module
+# graph was still fetched (blocking curl) and compiled inside
+# js_exec_module when the conversion ran the script: on the Vita ~8 s with
+# no frames or input, mostly reading the card.
+#
+# - macsurf_qjs.c: js_module_prefetch() starts a qjs_modload pipeline (the
+#   one import() uses: non-blocking fetch_get_set transfers, compile in
+#   12 ms slices) for a module script's static imports as soon as its text
+#   is known; js_module_prefetch_pending() says whether one of the realm's
+#   is still loading. qjs_modload_new() is shared with qjs_module_defer.
+# - script.c: prefetch an external module when its fetch is done (before
+#   active drops, so the conversion sees it pending) and an inline module
+#   when the parser queues it.
+# - html.c: html_can_begin_conversion() holds the conversion (which runs
+#   the deferred and module scripts, then DOMContentLoaded) while a
+#   prefetch is pending, re-polled every 30 ms, so script and event order
+#   is unchanged; js_exec_module then finds the graph compiled and only
+#   links and runs it. Every transfer keeps its 120 s timeout, so the hold
+#   is bounded (browsers also delay DOMContentLoaded for module graphs).
+# - script.c/html.h: inline modules now run in document order WITH the
+#   deferred scripts (each remembers how many scripts precede it) instead
+#   of after all of them.
+# Test: JS-module-static-async.html 5/5 (httpd /slow/ serves one leaf of
+# each graph after 1 s). Disarmed (no prefetch): longest timer gap 2035 ms,
+# check 3 fails; armed: 17 ms, and both graphs load in parallel (1.2 s
+# instead of 2.2 s). Without the order fix check 5 read ext,defer,inl.
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index ff7844c..970ddb7 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2550,6 +2550,23 @@ static bool html_convert(struct content *c)
+ 	return true;
+ }
+ 
++#ifdef WITH_QUICKJS
++extern bool js_module_prefetch_pending(struct jsthread *thread);
++
++/* VitaBrowser: re-drive the conversion while a module script's static
++ * graph loads between frames (js_module_prefetch): nothing else calls it
++ * back when that finishes. Cancelled in html_destroy. */
++static void html_module_prefetch_poll(void *p)
++{
++	html_content *htmlc = p;
++
++	if (macos9_content_is_live(&htmlc->base) == 0 || htmlc->aborted ||
++	    htmlc->conversion_begun)
++		return;
++	html_begin_conversion(htmlc);
++}
++#endif
++
+ /* Exported interface documented in html_internal.h */
+ bool html_can_begin_conversion(html_content *htmlc)
+ {
+@@ -2568,6 +2585,16 @@ bool html_can_begin_conversion(html_content *htmlc)
+ 	if (htmlc->base.active != 0)
+ 		return false;
+ 
++#ifdef WITH_QUICKJS
++	/* a module script's graph still loading: its script cannot run yet,
++	 * and the scripts and DOMContentLoaded after it wait with it */
++	if (htmlc->js_thread != NULL &&
++	    js_module_prefetch_pending(htmlc->js_thread)) {
++		guit->misc->schedule(30, html_module_prefetch_poll, htmlc);
++		return false;
++	}
++#endif
++
+ 	for (i = 0; i != htmlc->stylesheet_count; i++) {
+ 		/* Cannot begin conversion if the stylesheets are modified */
+ 		if (htmlc->stylesheets[i].modified)
+@@ -6067,6 +6094,10 @@ static void html_destroy(struct content *c)
+ 	html_content *html = (html_content *) c;
+ 	struct form *f, *g;
+ 
++#ifdef WITH_QUICKJS
++	guit->misc->schedule(-1, html_module_prefetch_poll, c);
++#endif
++
+ #ifdef __MACOS9__
+ 	if (html->ms_diag_doc_id != 0) {
+ 		ms_diag_document_close(html->ms_diag_doc_id);
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 780ac52..d08c95c 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -80,6 +80,7 @@ struct html_inline_module {
+ 	char *name;	/**< its module name (the document URL + #inline-module-N) */
+ 	char *source;	/**< its text (malloc()ed) */
+ 	size_t len;
++	unsigned int before;	/**< scripts ahead of it in the document */
+ };
+ 
+ struct html_script {
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index f7d507f..dee0816 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -23,6 +23,7 @@
+ 
+ #include <assert.h>
+ #include <ctype.h>
++#include <limits.h>
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <string.h>
+@@ -102,7 +103,15 @@ static bool exec_module_handler(struct jsthread *jsthread,
+ 	return js_exec_module(jsthread, data, size, name) != 0;
+ }
+ 
+-static bool html_run_inline_modules(html_content *c);
++static bool html_run_inline_modules(html_content *c, unsigned int upto);
++
++#ifdef WITH_QUICKJS
++/* VitaBrowser: a module script's static graph loads ahead of it, between
++ * frames (macsurf_qjs.c js_module_prefetch; html.c holds the conversion
++ * while it is pending) */
++extern void js_module_prefetch(struct jsthread *thread, const char *name,
++		const char *src, size_t len);
++#endif
+ 
+ /** Set around exec_src_script() for a type="module" script. */
+ static bool src_script_is_module;
+@@ -203,6 +212,15 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 	bool ordered_blocked = false;
+ 
+ 	for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
++		/* Inline modules run in document order with the deferred
++		 * scripts (external modules are deferred scripts), not after
++		 * all of them. */
++		if (allow_defer && c->inline_modules != NULL &&
++				c->inline_modules->before <= i &&
++				html_run_inline_modules(c, i)) {
++			have_run_something = true;
++			s = &(c->scripts[i]);
++		}
+ 		if (s->already_started) {
+ 			continue;
+ 		}
+@@ -324,7 +342,7 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 		}
+ 	}
+ 
+-	if (allow_defer && html_run_inline_modules(c)) {
++	if (allow_defer && html_run_inline_modules(c, UINT_MAX)) {
+ 		have_run_something = true;
+ 	}
+ 
+@@ -355,18 +373,21 @@ static void html_queue_inline_module(html_content *c, const char *name,
+ 	memcpy(m->source, src, len);
+ 	m->source[len] = '\0';
+ 	m->len = len;
++	m->before = c->scripts_count;
+ 	for (tail = &c->inline_modules; *tail != NULL; tail = &(*tail)->next)
+ 		;
+ 	*tail = m;
+ }
+ 
+-/** Run the inline modules the parse deferred, after the deferred scripts. */
+-static bool html_run_inline_modules(html_content *c)
++/** Run the inline modules the parse deferred that come before script
++ * entry \a upto in the document (all of them for UINT_MAX). */
++static bool html_run_inline_modules(html_content *c, unsigned int upto)
+ {
+ 	struct html_inline_module *m;
+ 	bool ran = false;
+ 
+-	while ((m = c->inline_modules) != NULL && c->js_thread != NULL) {
++	while ((m = c->inline_modules) != NULL && c->js_thread != NULL &&
++			m->before <= upto) {
+ 		c->inline_modules = m->next;
+ 		js_exec_module(c->js_thread, (const unsigned char *)m->source,
+ 				m->len, m->name);
+@@ -560,6 +581,20 @@ convert_script_defer_cb(hlcache_handle *script,
+ 	case CONTENT_MSG_DONE:
+ 		NSLOG(netsurf, INFO, "script %d done '%s'", i,
+ 		      nsurl_access(hlcache_handle_get_url(script)));
++#ifdef WITH_QUICKJS
++		/* a module script: start loading its static imports now,
++		 * before the conversion runs it (and before active drops to
++		 * 0, so the conversion sees the prefetch pending) */
++		if (s->is_module && parent->js_thread != NULL) {
++			const uint8_t *mdata;
++			size_t msize = 0;
++			mdata = content_get_source_data(script, &msize);
++			if (mdata != NULL && msize > 0)
++				js_module_prefetch(parent->js_thread,
++					nsurl_access(hlcache_handle_get_url(script)),
++					(const char *)mdata, msize);
++		}
++#endif
+ 		parent->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
+ 
+@@ -1403,6 +1438,14 @@ html_process_script(void *ctx, dom_node *node)
+ 						html_queue_inline_module(c, mname,
+ 							dom_string_data(modsrc),
+ 							dom_string_byte_length(modsrc));
++#ifdef WITH_QUICKJS
++						if (c->js_thread != NULL)
++							js_module_prefetch(
++								c->js_thread, mname,
++								dom_string_data(modsrc),
++								dom_string_byte_length(
++									modsrc));
++#endif
+ 					}
+ 					dom_string_unref(modsrc);
+ 				} else {
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index cc81f46..8cc3b8b 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -17228,6 +17228,7 @@ struct qjs_modload {
+ 	int nav_seq;
+ 	char *root;
+ 	int phase;			/* 0 fetch, 1 compile */
++	int prefetch;			/* a static graph, no jobs (js_module_prefetch) */
+ 	char **urls;			/* this level (QJS_MODULE_MAX_COUNT) */
+ 	unsigned int n;
+ 	char **carry;			/* in flight elsewhere: next level */
+@@ -17270,6 +17271,43 @@ static void qjs_modload_free(struct qjs_modload *m, int free_values)
+ 	free(m);
+ }
+ 
++/* A new pipeline for root in ctx, starting from the level urls[0..n)
++ * (QJS_MODULE_MAX_COUNT-sized, taken over; freed on failure). */
++static struct qjs_modload *qjs_modload_new(JSContext *ctx,
++	struct module_registry *reg, const char *root, char **urls,
++	unsigned int n)
++{
++	struct qjs_modload *m = (struct qjs_modload *)calloc(1, sizeof(*m));
++	unsigned int i;
++	if (m != NULL) {
++		m->carry = (char **)calloc(QJS_MODULE_MAX_COUNT,
++			sizeof(*m->carry));
++		m->root = strdup(root);
++	}
++	if (m == NULL || m->carry == NULL || m->root == NULL) {
++		if (m != NULL) {
++			free(m->carry);
++			free(m->root);
++			free(m);
++		}
++		for (i = 0; i < n; i++) free(urls[i]);
++		free(urls);
++		return NULL;
++	}
++	m->urls = urls;
++	m->n = n;
++	m->ctx = ctx;
++	m->reg = reg;
++	m->nav_seq = g_qjs_nav_seq;
++	{
++		extern double macos9_micros(void);
++		m->t0 = macos9_micros();
++	}
++	m->next = g_modloads;
++	g_modloads = m;
++	return m;
++}
++
+ /* Is url being fetched right now by a pipeline other than m on its
+  * registry? */
+ static int qjs_modload_in_flight(struct qjs_modload *m, const char *url)
+@@ -17317,39 +17355,22 @@ static int qjs_module_defer(JSContext *ctx, const char *basename,
+ 		if (m->ctx == ctx && strcmp(m->root, url) == 0)
+ 			break;
+ 	if (m == NULL) {
++		char **urls;
+ 		if (count >= QJS_MODLOAD_MAX) {
+ 			free(url);
+ 			return 0;	/* too many at once: load inline */
+ 		}
+-		m = (struct qjs_modload *)calloc(1, sizeof(*m));
+-		if (m == NULL) {
++		urls = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*urls));
++		if (urls == NULL || (urls[0] = strdup(url)) == NULL) {
++			free(urls);
+ 			free(url);
+ 			return 0;
+ 		}
+-		m->urls = (char **)calloc(QJS_MODULE_MAX_COUNT,
+-			sizeof(*m->urls));
+-		m->carry = (char **)calloc(QJS_MODULE_MAX_COUNT,
+-			sizeof(*m->carry));
+-		m->root = strdup(url);
+-		if (m->urls == NULL || m->root == NULL || m->carry == NULL) {
+-			free(m->carry);
+-			free(m->urls);
+-			free(m->root);
+-			free(m);
++		m = qjs_modload_new(ctx, reg, url, urls, 1);
++		if (m == NULL) {
+ 			free(url);
+ 			return 0;
+ 		}
+-		m->urls[0] = strdup(url);
+-		m->n = m->urls[0] != NULL ? 1 : 0;
+-		m->ctx = ctx;
+-		m->reg = reg;
+-		m->nav_seq = g_qjs_nav_seq;
+-		{
+-			extern double macos9_micros(void);
+-			m->t0 = macos9_micros();
+-		}
+-		m->next = g_modloads;
+-		g_modloads = m;
+ 	}
+ 	free(url);
+ 	if (m->njobs >= QJS_MODLOAD_JOBS)
+@@ -17492,10 +17513,12 @@ static int qjs_modload_step(struct qjs_modload *m)
+ 			if (e == NULL) {
+ 				macsurf_debug_log_writef(
+ 					"LIFE module compile (async): %u in %u "
+-					"steps, longest %ld ms; import() of %s "
++					"steps, longest %ld ms; %s of %s "
+ 					"ready after %ld ms",
+ 					m->compiled, m->steps,
+-					(long)m->longest_ms, m->root,
++					(long)m->longest_ms,
++					m->prefetch ? "module script" : "import()",
++					m->root,
+ 					(long)((macos9_micros() - m->t0) / 1000));
+ 				return 1;
+ 			}
+@@ -17536,6 +17559,68 @@ static void qjs_modload_drop_ctx(JSContext *ctx)
+ 	}
+ }
+ 
++/* VitaBrowser: a static module graph (<script type=module>) loads the
++ * same way, ahead of its script. The page's conversion (which runs the
++ * deferred and module scripts, then fires DOMContentLoaded) waits while
++ * js_module_prefetch_pending() -- html.c polls it -- so the order of
++ * scripts and events is unchanged; js_exec_module then finds the graph
++ * fetched and compiled and only links and runs it. The root itself is
++ * compiled by js_exec_module (it is marked compiled here, as there). */
++void js_module_prefetch(struct jsthread *thread, const char *name,
++	const char *src, size_t len);
++void js_module_prefetch(struct jsthread *thread, const char *name,
++	const char *src, size_t len)
++{
++	struct module_registry *reg;
++	struct module_entry *me;
++	struct qjs_modload *m;
++	char **urls;
++	unsigned int n, count = 0;
++
++	if (!qjs_thread_ctx_live(thread) || thread->heap == NULL ||
++	    thread->heap->module_reg == NULL || name == NULL ||
++	    src == NULL || len == 0)
++		return;
++	reg = thread->heap->module_reg;
++	qjs_module_registry_for_nav(reg);
++	for (m = g_modloads; m != NULL; m = m->next, count++)
++		if (m->ctx == thread->ctx && strcmp(m->root, name) == 0)
++			return;		/* already on its way */
++	if (count >= QJS_MODLOAD_MAX)
++		return;
++	me = qjs_module_register(reg, name, NULL, 0);
++	if (me != NULL)
++		me->compiled = 1;
++	urls = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*urls));
++	if (urls == NULL)
++		return;
++	n = qjs_module_scan(reg, name, src, len, urls, 0,
++		QJS_MODULE_MAX_COUNT);
++	if (n == 0) {
++		free(urls);
++		return;
++	}
++	m = qjs_modload_new(thread->ctx, reg, name, urls, n);
++	if (m != NULL) {
++		m->prefetch = 1;
++		macsurf_debug_log_writef("LIFE module prefetch: %u imports "
++			"of %s", n, name);
++	}
++}
++
++/* Is a static module graph of this realm still loading? */
++bool js_module_prefetch_pending(struct jsthread *thread);
++bool js_module_prefetch_pending(struct jsthread *thread)
++{
++	struct qjs_modload *m;
++	if (thread == NULL || thread->ctx == NULL)
++		return false;
++	for (m = g_modloads; m != NULL; m = m->next)
++		if (m->ctx == thread->ctx && m->prefetch)
++			return true;
++	return false;
++}
++
+ /* Run every pipeline one step; called once per event-loop pass from
+  * macsurf_qjs_pump_all. A finished one re-queues its import() jobs. */
+ static void qjs_modload_pump(void)
