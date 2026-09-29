@@ -2611,3 +2611,31 @@ Then, as time allows: open github.com (it crashed before), example.com
 VitaShell, ux0:download/ should hold vita-test.bin. claude.ai + Google
 sign-in as in run 23 (expect Google's "Couldn't sign you in"); START in
 the popup returns to home in the main window.
+
+## Run 25 — hand-off: import() without the freeze (WS-C1; replaces untested run 24)
+
+Run 24 was not run on the device; run 25 is run 24 (patches 141-158, see
+above) plus roadmap WS-C1:
+
+- patches/quickjs/03 + patch 159: a dynamic import() no longer freezes
+  the browser while its module graph loads. The graph is fetched with
+  non-blocking transfers and compiled in 12 ms slices between frames;
+  the import()'s promise waits. Run 22 froze ~54 s on claude.ai (91
+  dynamic modules). Also: import() from an inline script resolves
+  against the page URL.
+
+Clean restage, streams 4/4, sim suite exit 0 (MODASYNC 4/4, interaction
+31/31 incl. downloads, also at the Vita's pace), cross-build green (the
+Vita's libquickjs carries JS_SetModuleDeferFunc). Reference dumps 31, all
+identical to run 24's.
+SHA256 first 12: VitaBrowser.vpk 515596c64c7b, VitaBrowser-ext.vpk
+23861905f3c8, nsvita.elf 708cfc1f5777. Archive
+<WORK>/vitabrowser-work/hwtest-2026-09-29-run25/.
+
+**Run 25 on the device:** the run 24 checklist (autotest ~30/31 SAME,
+interact 31/31, ux0:download/vita-test.bin; github.com, example.com,
+make.wordpress.org/core), plus: open claude.ai and watch the status/HUD
+while it loads -- the frame counter and the pointer should keep moving
+instead of the screen freezing for most of a minute. log.txt/netsurf.log
+lines "module graph (async)" and "module compile (async) ... longest N ms"
+give the device numbers (sim: longest slice 151 ms).
