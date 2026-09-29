@@ -221,6 +221,7 @@ NET-js-interfaces http://127.0.0.1:$HP/JS-interfaces.html
 NET-js-module-async http://127.0.0.1:$HP/JS-module-async.html
 NET-js-module-static-async http://127.0.0.1:$HP/JS-module-static-async.html
 NET-js-module-dedupe http://127.0.0.1:$HP/JS-module-dedupe.html
+NET-js-lazyimg http://127.0.0.1:$HP/JS-lazyimg.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -502,11 +503,21 @@ mdp=$(ls "$R"/*NET-js-module-dedupe.plot 2>/dev/null | head -1)
 mdr=$(sed -n 's/.*STR \(MODDUP: [0-9]*\/[0-9]* passed\).*/\1/p' "$mdp" 2>/dev/null | head -1)
 echo "  JS-module-dedupe: ${mdr:-no summary}"
 [ -n "$mdp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$mdp" | sed 's/^STR /  /' || true; }
+# Patch 162: the viewport-gated lazy-image drain (fixes738's queue, wired
+# into the Vita frontend after every frame). The page proves it with
+# httpd /fetch-count: at load only the 10-image eager budget is fetched;
+# scrolling brings the six below-the-fold images in exactly once;
+# scrolling back refetches nothing (16 GETs total).
+lzp=$(ls "$R"/*NET-js-lazyimg.plot 2>/dev/null | head -1)
+lzr=$(sed -n 's/.*STR \(LAZYIMG: [0-9]*\/[0-9]* passed\).*/\1/p' "$lzp" 2>/dev/null | head -1)
+echo "  JS-lazyimg: ${lzr:-no summary}"
+[ -n "$lzp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$lzp" | sed 's/^STR /  /' || true; }
 [ "$inr" = "INTRINSIC: 5/5 passed" ] && \
 [ "$cnr" = "CENSUS: 5/5 passed" ] && \
 [ "$mdr" = "MODDUP: 5/5 passed" ] && \
 [ "$msr" = "MODSTATIC: 5/5 passed" ] && \
 [ "$mar" = "MODASYNC: 4/4 passed" ] && \
+[ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
