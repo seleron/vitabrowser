@@ -2640,7 +2640,7 @@ instead of the screen freezing for most of a minute. log.txt/netsurf.log
 lines "module graph (async)" and "module compile (async) ... longest N ms"
 give the device numbers (sim: longest slice 151 ms).
 
-## Since run 25 — queued for run 26 (not built yet)
+## Run 26 — what changed since run 25 (patches 160-162)
 
 - Patch 160 (WS-C1, second half): `<script type=module>` graphs, external
   and inline, now load like import() graphs: non-blocking transfers,
@@ -2683,4 +2683,65 @@ give the device numbers (sim: longest slice 151 ms).
   netsurf.log "Retrieve ...png" lines for the lower images come after the
   scroll, not at load. fixes738's earlier version crashed a G3 on a stale
   box: watch for a crash while scrolling a page as images arrive (the
-  "RECON LAZY" log lines name the node if it does).
+  "LIFE img lazy ..." log lines show the last drain before it, if it
+  does).
+
+## Run 26 — hand-off: module graphs, one module per URL, lazy images (replaces untested run 25)
+
+Run 25 was not run on the device (results\ is empty), so run 26 carries
+all of its untested work: run 25 = patches 141-159 + patches/quickjs/03
+(non-blocking import()), and run 26 adds 160-162 (see the section above):
+static `<script type=module>` graphs loaded between frames (160), one
+fetch and one evaluation per module URL (161), below-the-fold images
+fetched when scrolled near (162).
+
+Built at ba8c5b5 (pushed): clean restage (245 applied + the two known
+collisions), streams 4/4, sim suite exit 0 (MODASYNC 4/4, MODSTATIC 5/5,
+MODDUP 5/5, LAZYIMG 4/4, interaction 31/31, also at the Vita's pace),
+cross-build green. Reference autotest: interact 31/31, js 18/18; the 31
+reference dumps are identical to run 25's.
+SHA256 first 12: VitaBrowser.vpk d50862126f84, VitaBrowser-ext.vpk
+5cfa007c2cca, nsvita.elf 90f4b790dbb0. Archive
+<WORK>/vitabrowser-work/hwtest-2026-09-29-run26/.
+
+**Run 26 on the device:**
+
+1. Autotest as usual: ~30/31 SAME against the new reference-dumps (the
+   pages did not change since run 25), interact 31/31, js 18/18,
+   ux0:download/vita-test.bin present.
+2. claude.ai (WS-C1 acceptance: reaches /login in < 60 s with input
+   responsive throughout). Watch the HUD while it loads: the frame
+   counter and pointer must keep moving (run 22 froze ~54 s). Then
+   report from netsurf.log:
+   - "module compile (async) ... longest N ms" for each graph -- the
+     longest slice on the device (sim 151 ms; much more than ~500 ms
+     means the 12 ms slice budget needs a per-module cap);
+   - "module prefetch: ..." then "... module script of ... ready after
+     N ms" -- the static graph's load time (before: ~8 s frozen, mostly
+     card reads);
+   - "module graph (async): ... N fetched by another load (P passes
+     waiting) ... R refetched so far" -- R should stay 0; any "LIFE
+     module refetch:" line names a URL fetched twice;
+   - the time of the "js nav: .../login" line (sim 6.5 s).
+3. Lazy images (162). JS-lazyimg.html itself cannot run on the device
+   (it needs the simulator's local server for /fetch-count and its
+   root-relative images). Use a long image page instead, e.g.
+   en.m.wikipedia.org/wiki/Solar_System or any forum thread with many
+   pictures: it should reach Done sooner than before; scroll down
+   steadily and then fast with the stick -- the lower images should
+   appear within a moment of coming into view. netsurf.log shows the
+   drain as "LIFE img lazy fetched=N kept=K scroll=Y vh=H" lines (one per
+   frame that fetched something), and the "Retrieve ...(jpg|png|webp)"
+   lines for images past the first 10 come after the scroll, not at
+   load.
+   **Crash watch:** an earlier version of this lazy-image code crashed
+   on a stale box pointer (fixes674b, G3). Scroll the page while images
+   are still arriving, zoom in and out once, and go back/forward while
+   it loads. If the browser crashes, send netsurf.log as it is: the last
+   "LIFE img lazy ..." line gives the scroll position of the last drain
+   before the crash.
+4. Memory: note the "mem[...]" lines in log.txt after claude.ai and
+   after the image page (compare run 22's mem[page done] for the same
+   sites). Deferred images should lower the image page's peak; the
+   module registry now keeps one copy per URL.
+
