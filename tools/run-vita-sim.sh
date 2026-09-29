@@ -537,6 +537,18 @@ iblk=$(sed -n 's/.*STR \(IN block: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/IN-block.
 echo "  IN-block dump: ${iblk:-missing}"
 grep -h 'font: .* batched draws' "$R/log.txt" | tail -1 | sed 's/^\[[^]]*\] /  /'
 grep -c '<a href="https://' "$R/home.html" | sed 's/^/  home page bookmarks: /'
+# A download (vita/download.c): the tap saves to ux0:download/, and the
+# saved file must be byte-for-byte the bundled target -- not truncated,
+# not renamed to " (2)", not the page itself.
+echo "== downloads (ux0:download/) =="
+DLSAVED="$OUT/run/ux0:download/vita-test.bin"
+echo "  saved: $DLSAVED ($(stat -c %s "$DLSAVED" 2>/dev/null || echo missing) bytes, target 1024)"
+if [ -f "$DLSAVED" ] && cmp -s "$DLSAVED" "$ROOT/testpages/pages/IN-download-target.bin"; then
+	echo "  vita-test.bin: byte-identical to the bundled target"
+else
+	echo "  vita-test.bin: DIFFERS from the target (or missing)"; fail "downloads"
+fi
+grep -E 'download: (saved|FAILED)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /' | cut -c1-120
 [ -n "$isum" ] && [ "${isum%/*}" = "${isum#*/}" ] && \
 	[ "$iblk" = "IN block: 2/2 passed" ] && [ -f "$R/IN-zoom125.plot" ] && \
 	[ -f "$R/IN-form-sent.plot" ] && \

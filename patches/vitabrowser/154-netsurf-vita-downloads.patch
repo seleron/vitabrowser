@@ -1,0 +1,458 @@
+# netsurf: downloads to ux0:download/ (Vita frontend)
+#
+# A response the engine does not display (a VPK, a zip, <a download>) is
+# saved to ux0:download/ -- the folder VitaShell and other file managers
+# show -- under its Content-Disposition or URL name, made safe for the
+# card and unique ("name (2).ext" if taken). Progress and the result go to
+# the on-screen message line and log.txt; a failed download removes its
+# partial file. The home page lists what is on the card.
+#
+# New vita/download.c|h (a gui_download_table): the engine's
+# browser_window_download() drives .create/.data/.error/.done. The message
+# line is vita_show_message() (vita/main.c, the old diag-only path),
+# registered through the frontend table as .download. interact.c gains a
+# C_DOWNLOAD step: open IN-download.html, tap the <a download> box, and
+# check ux0:download/vita-test.bin is 1024 bytes and starts with its
+# magic string (tools/run-vita-sim.sh re-checks it byte for byte against
+# the bundled testpages target). Verified in the sim: the saved file is
+# byte-identical to testpages/IN-download-target.bin.
+#
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+index 1af0766..581c40e 100644
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -81,7 +81,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+ 	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
+ 	qjs_hooks.c js_platform.c netprobe.c resolve.c input.c chrome.c \
+-	remote.c interact.c texpool.c pathfill.c
++	remote.c interact.c texpool.c pathfill.c download.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+index 90c3f73..400855e 100644
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -28,6 +28,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
++#include <dirent.h>
+ 
+ #ifdef __vita__
+ #include <psp2/common_dialog.h>
+@@ -49,6 +50,8 @@
+ #include "vita/window.h"
+ #include "vita/chrome.h"
+ 
++#define VITA_DOWNLOAD_DIR_NAME "ux0:download"
++
+ /** Room for the keyboard's longest text in UTF-8. */
+ #define TEXT_MAX (2048 * 3 + 1)
+ 
+@@ -232,8 +235,32 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 	if (bm != NULL)
+ 		fclose(bm);
+ 	fputs("</div>\n<p class=\"hint\">Bookmarks: "
+-	      VITA_BOOKMARKS_FILE "</p>\n<h2>Test pages</h2>\n"
+-	      "<div class=\"tests\">\n", fp);
++	      VITA_BOOKMARKS_FILE "</p>\n", fp);
++	/* Downloads (vita/download.c): what is in ux0:download/ */
++	{
++		DIR *dd = opendir(VITA_DOWNLOAD_DIR_NAME);
++		struct dirent *de;
++		unsigned int nd = 0;
++		while (dd != NULL && (de = readdir(dd)) != NULL && nd < 30) {
++			size_t dl = strlen(de->d_name);
++			if (de->d_name[0] == '.')
++				continue;
++			if (nd++ == 0)
++				fputs("<h2>Downloads</h2>\n<div class=\"tests\">\n",
++				      fp);
++			fputs("<a href=\"file:///" VITA_DOWNLOAD_DIR_NAME "/", fp);
++			put_escaped(fp, de->d_name, dl);
++			fputs("\">", fp);
++			put_escaped(fp, de->d_name, dl);
++			fputs("</a>\n", fp);
++		}
++		if (dd != NULL)
++			closedir(dd);
++		if (nd > 0)
++			fputs("</div>\n<p class=\"hint\">Saved in "
++			      VITA_DOWNLOAD_DIR_NAME "/</p>\n", fp);
++	}
++	fputs("<h2>Test pages</h2>\n<div class=\"tests\">\n", fp);
+ 	for (i = 0; i < n; i++) {
+ 		fprintf(fp, "<a href=\"file:///app0:/testpages/%s.html\">",
+ 			test_pages[i]);
+diff --git a/frontends/vita/download.c b/frontends/vita/download.c
+new file mode 100644
+index 0000000..550cefc
+--- /dev/null
++++ b/frontends/vita/download.c
+@@ -0,0 +1,203 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Downloads to the memory card (brief Phase 1 item 9).
++ *
++ * A response the engine does not display (a VPK, a zip, <a download>) is
++ * saved to ux0:download/ -- the folder VitaShell and other file managers
++ * show -- under its Content-Disposition or URL name, made safe for the
++ * card and unique ("name (2).ext"). Progress and the result go to the
++ * on-screen message line and log.txt; a failed download removes its
++ * partial file. The list of saved files is on the home page.
++ */
++
++#include <errno.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#include "utils/errors.h"
++#include "utils/nsurl.h"
++#include "netsurf/download.h"
++#include "desktop/download.h"
++
++#include "vita/diag.h"
++#include "vita/download.h"
++
++#ifndef VITA_DOWNLOAD_DIR
++#define VITA_DOWNLOAD_DIR "ux0:download/"
++#endif
++
++struct gui_download_window {
++	download_context *ctx;
++	FILE *fp;
++	char name[128];
++	char path[256];
++	unsigned long long got, total;
++	unsigned int last_ms;
++};
++
++unsigned int vita_downloads_done;	/**< completed this session */
++char vita_download_last[256];		/**< path of the last one saved */
++
++/* one file name, safe on the card: no path separators, no drive colon, no
++ * control characters, not empty */
++static void safe_name(const char *in, char *out, size_t max)
++{
++	size_t o = 0;
++	const char *p;
++
++	if (in == NULL)
++		in = "";
++	/* last path component only */
++	for (p = in; *p != '\0'; p++)
++		if (*p == '/' || *p == '\\')
++			in = p + 1;
++	for (p = in; *p != '\0' && o + 1 < max; p++) {
++		unsigned char c = (unsigned char)*p;
++		if (c < 0x20 || c == ':' || c == '*' || c == '?' ||
++		    c == '"' || c == '<' || c == '>' || c == '|')
++			c = '_';
++		out[o++] = (char)c;
++	}
++	while (o > 0 && (out[o - 1] == '.' || out[o - 1] == ' '))
++		o--;
++	out[o] = '\0';
++	if (o == 0)
++		snprintf(out, max, "download");
++}
++
++/* VITA_DOWNLOAD_DIR + name, "name (2).ext" if taken */
++static void unique_path(const char *name, char *path, size_t max)
++{
++	const char *dot = strrchr(name, '.');
++	size_t stem = dot != NULL && dot != name ? (size_t)(dot - name)
++						  : strlen(name);
++	struct stat st;
++	int n;
++
++	snprintf(path, max, "%s%s", VITA_DOWNLOAD_DIR, name);
++	for (n = 2; stat(path, &st) == 0 && n < 1000; n++)
++		snprintf(path, max, "%s%.*s (%d)%s", VITA_DOWNLOAD_DIR,
++			 (int)stem, name, n, dot != NULL && dot != name ?
++			 dot : "");
++}
++
++static struct gui_download_window *
++vita_download_create(download_context *ctx, struct gui_window *parent)
++{
++	struct gui_download_window *dw;
++	nsurl *url = download_context_get_url(ctx);
++
++	(void)parent;
++	dw = calloc(1, sizeof(*dw));
++	if (dw == NULL)
++		return NULL;
++	dw->ctx = ctx;
++	dw->total = download_context_get_total_length(ctx);
++	safe_name(download_context_get_filename(ctx), dw->name,
++		  sizeof(dw->name));
++	mkdir(VITA_DOWNLOAD_DIR, 0777);
++	unique_path(dw->name, dw->path, sizeof(dw->path));
++	dw->fp = fopen(dw->path, "wb");
++	if (dw->fp == NULL) {
++		vita_diag_log("download: cannot create %s (errno %d)",
++			      dw->path, errno);
++		vita_show_message(4000, "download failed: cannot write %s",
++			     dw->path);
++		free(dw);
++		return NULL;
++	}
++	vita_diag_log("download: %s -> %s (%llu bytes, %s)",
++		      url != NULL ? nsurl_access(url) : "?", dw->path,
++		      dw->total, download_context_get_mime_type(ctx));
++	vita_show_message(0, "downloading %s...", dw->name);
++	dw->last_ms = vita_diag_ms();
++	return dw;
++}
++
++static nserror vita_download_data(struct gui_download_window *dw,
++		const char *data, unsigned int size)
++{
++	unsigned int now;
++
++	if (dw == NULL || dw->fp == NULL)
++		return NSERROR_SAVE_FAILED;
++	if (size > 0 && fwrite(data, 1, size, dw->fp) != size) {
++		vita_diag_log("download: write failed on %s (errno %d)",
++			      dw->path, errno);
++		return NSERROR_SAVE_FAILED;
++	}
++	dw->got += size;
++	now = vita_diag_ms();
++	if (now - dw->last_ms >= 500) {
++		dw->last_ms = now;
++		if (dw->total > 0)
++			vita_show_message(0, "downloading %s: %llu%% (%llu KiB)",
++				     dw->name, dw->got * 100 / dw->total,
++				     dw->got / 1024);
++		else
++			vita_show_message(0, "downloading %s: %llu KiB", dw->name,
++				     dw->got / 1024);
++	}
++	return NSERROR_OK;
++}
++
++static void vita_download_error(struct gui_download_window *dw,
++		const char *msg)
++{
++	if (dw == NULL)
++		return;
++	if (dw->fp != NULL) {
++		fclose(dw->fp);
++		dw->fp = NULL;
++		remove(dw->path);
++	}
++	vita_diag_log("download: %s failed: %s", dw->path,
++		      msg != NULL ? msg : "?");
++	vita_show_message(5000, "download failed: %s", msg != NULL ? msg : "?");
++	free(dw);
++}
++
++static void vita_download_done(struct gui_download_window *dw)
++{
++	if (dw == NULL)
++		return;
++	if (dw->fp != NULL)
++		fclose(dw->fp);
++	vita_downloads_done++;
++	snprintf(vita_download_last, sizeof(vita_download_last), "%s",
++		 dw->path);
++	vita_diag_log("download: saved %s (%llu bytes)", dw->path, dw->got);
++	vita_show_message(5000, "saved %s", dw->path);
++	free(dw);
++}
++
++static struct gui_download_table download_table = {
++	.create = vita_download_create,
++	.data = vita_download_data,
++	.error = vita_download_error,
++	.done = vita_download_done,
++};
++
++struct gui_download_table *vita_download_table = &download_table;
+diff --git a/frontends/vita/download.h b/frontends/vita/download.h
+new file mode 100644
+index 0000000..cd3b6ca
+--- /dev/null
++++ b/frontends/vita/download.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/** \file Downloads to ux0:download/ (vita/download.c). */
++
++#ifndef NETSURF_VITA_DOWNLOAD_H
++#define NETSURF_VITA_DOWNLOAD_H
++
++extern struct gui_download_table *vita_download_table;
++
++/** Downloads completed this session, and the last one's path. */
++extern unsigned int vita_downloads_done;
++extern char vita_download_last[256];
++
++/** The on-screen message line (vita/main.c): ms 0 = until replaced. */
++void vita_show_message(unsigned int ms, const char *fmt, ...)
++	__attribute__((format(printf, 2, 3)));
++
++#endif
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+index ddbe70c..b56860b 100644
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -25,6 +25,7 @@
+  * the page to settle (at least SETTLE_MIN_MS after acting), then checks.
+  */
+ 
++#include <errno.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -71,6 +72,7 @@ enum check {
+ 	C_REMOTE,	/**< a pushed URL was opened, and the URL ends expect */
+ 	C_COOKIE,	/**< the saved jar holds the listener's cookie */
+ 	C_TYPED,	/**< vita_chrome_typed_url() turns text into URLs */
++	C_DOWNLOAD,	/**< the download named expect is on the card, intact */
+ 	C_NONE,		/**< nothing to check */
+ };
+ 
+@@ -144,6 +146,10 @@ static const struct step {
+ 	{ "cookies are saved to the card", A_REMOTE,
+ 	  "/cookie", 0, 0, 0, 0, 0,
+ 	  C_COOKIE, NULL, 0, NULL },
++	{ "open IN-download", A_OPEN, T "IN-download.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-download.html", 0, NULL },
++	{ "a download link tap saves, no navigate", A_TAP, NULL, 250, 140,
++	  0, 0, 0, C_DOWNLOAD, "vita-test.bin", 0, NULL },
+ 	{ "START goes home", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_START,
+ 	  C_URL, "VitaBrowser/home.html", 0, NULL },
+ };
+@@ -233,6 +239,37 @@ static bool cookie_ok(char *detail, size_t max)
+ 	return strstr(buf, "vbtest") != NULL;
+ }
+ 
++static bool download_ok(const char *name, char *detail, size_t max)
++{
++	/* vita/download.c saves to ux0:download/ (cwd-relative, as the
++	 * WIP's VITA_DOWNLOAD_DIR). The gate in tools/run-vita-sim.sh
++	 * re-checks the whole file byte for byte against the bundled
++	 * testpages target; here only the shape is checked. */
++	char path[256];
++	FILE *fp;
++	char buf[32];
++	long sz = 0;
++
++	snprintf(path, sizeof path, "ux0:download/%s", name);
++	fp = fopen(path, "rb");
++	if (fp == NULL) {
++		snprintf(detail, max, "%s missing (card: errno %d)",
++			 path, errno);
++		return false;
++	}
++	if (fseek(fp, 0, SEEK_END) != 0 || (sz = ftell(fp)) < 0)
++		sz = 0;
++	rewind(fp);
++	if (fread(buf, 1, sizeof buf - 1, fp) == 0)
++		buf[0] = '\0';
++	buf[sizeof buf - 1] = '\0';
++	fclose(fp);
++	snprintf(detail, max, "%s: %ld bytes, starts \"%s\"",
++		 name, sz, buf);
++	return sz == 1024 && strncmp(buf, "VitaBrowser-download-ok ",
++					  24) == 0;
++}
++
+ /** Check the step just settled; log it. */
+ static void check(struct gui_window *gw, const struct step *s)
+ {
+@@ -274,7 +311,10 @@ static void check(struct gui_window *gw, const struct step *s)
+ 		ok = cookie_ok(detail, sizeof(detail));
+ 		break;
+ 	case C_TYPED:
+-		ok = typed_ok(detail, sizeof(detail));
++		ok = typed_ok(detail, sizeof detail);
++		break;
++	case C_DOWNLOAD:
++		ok = download_ok(s->expect, detail, sizeof detail);
+ 		break;
+ 	case C_NONE:
+ 		ok = true;
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 8f7ccb9..e0d3efa 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -68,6 +68,7 @@
+ #include "vita/net.h"
+ #include "vita/netlog.h"
+ #include "vita/js_platform.h"
++#include "vita/download.h"
+ #include "vita/resolve.h"
+ #include "vita/input.h"
+ #include "vita/chrome.h"
+@@ -346,6 +347,19 @@ static void set_message(unsigned int ms, const char *fmt, ...)
+ 	vita_overlay_dirty = true;
+ }
+ 
++/* exported interface documented in vita/download.h */
++void vita_show_message(unsigned int ms, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(vita_message, sizeof(vita_message), fmt, ap);
++	va_end(ap);
++	vita_message_until = ms ? vita_diag_ms() + ms : 0;
++	vita_diag_log("screen: %s", vita_message);
++	vita_overlay_dirty = true;
++}
++
+ /** Navigate the window to bundled test page `idx`. */
+ static nserror open_test_page(struct browser_window *bw, unsigned int idx)
+ {
+@@ -1281,6 +1295,7 @@ int main(int argc, char **argv)
+ 		.window = vita_window_table,
+ 		.fetch = vita_fetch_table,
+ 		.file = vita_file_table,
++		.download = vita_download_table,
+ 		.bitmap = vita_bitmap_table,
+ 		.layout = vita_layout_table,
+ 	};
