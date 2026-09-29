@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS DOM stall (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+#res { position: fixed; top: 0; left: 0; right: 0; background: #fff; }
+#big p { margin: 2px 0; }
+</style>
+<script>
+(function () {
+	var S = { maxgap: 0, ticks: 0, on: false }, N = 5, k = 0, last = Date.now();
+	(function tick() {
+		var now = Date.now(), g = now - last;
+		last = now;
+		if (S.on) { S.ticks++; if (g > S.maxgap) S.maxgap = g; }
+		setTimeout(tick, 0);
+	})();
+	function $(id) { return document.getElementById(id); }
+	var res = [];
+	function t(n, ok, text) {
+		res.push([n, ok, text]);
+	}
+	function show() {
+		var i, r, p;
+		for (i = 0; i < res.length; i++) {
+			r = res[i]; p = $('r' + r[0]);
+			p.textContent = r[0] + ' ' + r[2] + (r[1] ? '' : ' FAIL');
+			if (r[1]) { p.className = 'pass'; k++; }
+		}
+		$('sum').textContent = 'DOMSTALL: ' + k + '/' + N + ' passed';
+		document.title = 'JS DOM stall (' + k + '/' + N + ')';
+	}
+	document.addEventListener('DOMContentLoaded', function () {
+		var h = [], i;
+		for (i = 0; i < 5000; i++)
+			h.push('<p id="p' + i + '">Paragraph ' + i + ' with <b>some</b> ' +
+				'inline <i>text</i> that <span>wraps</span> in the layout, ' +
+				'<a href="#">a link</a> and more words to fill it.</p>');
+		$('big').innerHTML = h.join('');
+	});
+	/* each step: start measuring, mutate, wait for the rebuild (debounced
+	 * 0.4 s after the last change), check, stop measuring */
+	var steps = [
+		['same-length text', true, function () {
+			$('p2500').firstChild.nodeValue = 'Paragraph 2500 WITH';
+		}, function () {
+			return $('p2500').textContent.indexOf('WITH') >= 0;
+		}],
+		['longer text (wraps)', true, function () {
+			$('p2501').textContent = new Array(40).join('longer words ');
+		}, function () {
+			return $('p2501').getBoundingClientRect().height > 40 &&
+				$('p2502').getBoundingClientRect().top >=
+				$('p2501').getBoundingClientRect().bottom - 1;
+		}],
+		['innerHTML with inline markup', true, function () {
+			$('p2504').innerHTML = 'new <b>bold</b> and <a href="#x">link</a>';
+		}, function () {
+			return $('p2504').querySelector('b') !== null &&
+				$('p2504').getBoundingClientRect().height > 10;
+		}],
+		/* a new block: still the full rebuild (reported, not bounded) */
+		['appended paragraph', false, function () {
+			var p = document.createElement('p');
+			p.id = 'added';
+			p.textContent = 'an added paragraph';
+			$('p2502').parentNode.insertBefore(p, $('p2503'));
+		}, function () {
+			var a = $('added').getBoundingClientRect();
+			return a.height > 10 &&
+				$('p2503').getBoundingClientRect().top >= a.bottom - 1;
+		}]
+	];
+	/* the changed stretch still stacks: no overlaps */
+	function ordered() {
+		var ids = [], i, prev = null, r, el;
+		for (i = 2495; i <= 2510; i++) {
+			ids.push('p' + i);
+			if (i === 2502) ids.push('added');
+		}
+		for (i = 0; i < ids.length; i++) {
+			el = $(ids[i]);
+			if (!el) return 'missing ' + ids[i];
+			r = el.getBoundingClientRect();
+			if (prev && r.top < prev.bottom - 1) return 'overlap at ' + ids[i];
+			prev = r;
+		}
+		return 'ok';
+	}
+	var gaps = [];
+	function run(i) {
+		if (i >= steps.length) {
+			var worst = Math.max.apply(null, gaps), o = ordered();
+			t(5, o === 'ok' && worst < 60, 'text changes: longest gap ' +
+				worst + ' ms; paragraphs stack: ' + o);
+			show();
+			return;
+		}
+		S.maxgap = 0; S.ticks = 0; S.on = true;
+		steps[i][2]();
+		setTimeout(function () {
+			S.on = false;
+			if (steps[i][1]) gaps.push(S.maxgap);
+			t(i + 1, steps[i][3](), steps[i][0] + ': longest gap ' +
+				S.maxgap + ' ms');
+			setTimeout(function () { run(i + 1); }, 100);
+		}, 600);
+	}
+	var started = false, lastH = -1;
+	function settled() {
+		var sh = document.body.scrollHeight;
+		if (sh < 100000 || sh !== lastH) {
+			lastH = sh;
+			setTimeout(settled, 100);
+			return;
+		}
+		setTimeout(function () { run(0); }, 300);
+	}
+	window.addEventListener('load', function () {
+		if (started) return;
+		started = true;
+		setTimeout(settled, 100);
+	});
+})();
+</script>
+</head>
+<body>
+<!-- Roadmap WS-C, script-driven DOM changes (patch 165). A script changes
+     one paragraph of 5000; each change used to rebuild the whole box tree
+     and lay the page out again (~0.26 s here on the host, several seconds
+     on the Vita). Now a change inside a block of inline content rebuilds
+     only that block's boxes and lays out only its lines
+     (html_reconvert_local), moving what follows.
+     1: a text node's data changed (same length): shown.
+     2: textContent made longer: the paragraph wraps taller and the next
+        one moves below it.
+     3: innerHTML with inline markup (<b>, <a>): built.
+     4: a new paragraph inserted: laid out between its neighbours (still
+        the full rebuild; its gap is reported, not bounded).
+     5: the three text changes each stalled the main loop < 60 ms (sim:
+        ~23 ms; 257-1496 ms with the full rebuild), and paragraphs
+        2495-2510 plus the new one stack without overlapping.
+     The results are position: fixed so the autotest's dumps show them,
+     and no step leaves the page idle for a second (the autotest would
+     take it as settled and move on): each change is measured for 0.6 s
+     (the rebuild runs ~0.4 s after it, debounced). -->
+<div id="res">
+<p id="sum" class="wait">DOMSTALL: script did not run</p>
+<p id="r1" class="wait">1 waiting</p><p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p><p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+</div>
+<div id="big"></div>
+</body>
+</html>

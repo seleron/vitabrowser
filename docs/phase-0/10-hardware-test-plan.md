@@ -2770,4 +2770,17 @@ SHA256 first 12: VitaBrowser.vpk d50862126f84, VitaBrowser-ext.vpk
   files 4130 bytes). On the device: pages whose last script or last CSS
   rule was missing before (a footer's styling, an analytics or init
   script at the end of <body>) may now behave differently.
+- Patch 165 (WS-C, script-driven DOM changes, first part): a script that
+  changes the text of a paragraph (textContent, innerHTML with inline
+  markup, a text node's data) used to rebuild the whole page's boxes and
+  lay it all out again -- 0.26-1.5 s in the sim on a 5000-paragraph page,
+  seconds on the Vita. Now only that paragraph is rebuilt and laid out
+  (sim: ~23 ms, positions identical). Also fixes a double free in
+  box_free (styles freed by box_free_box and again by the box's talloc
+  destructor), which any box_free on a styled box could hit. On the
+  device: live-updating pages (a chat, a timer, a counter, a "loading..."
+  label that turns into text) should update without the page freezing;
+  netsurf.log "LIFE rebuild local: rebuilt and laid out +N px in M us" per
+  change, "LIFE rebuild local: declined (reason)" when it took the full
+  path.
 

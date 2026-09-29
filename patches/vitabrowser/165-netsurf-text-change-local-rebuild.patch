@@ -1,0 +1,712 @@
+# netsurf: a script's text change rebuilds and lays out only its block
+#
+# Roadmap WS-C, script-driven DOM changes (first part). Measured on a page
+# of 5000 paragraphs (JS-dom-stall.html): every script change to one
+# paragraph's text queued a rebuild of the whole box tree plus a full
+# layout (macos9_reconvert_cb -> html_reconvert) -- 257-1496 ms of stall on
+# the host, seconds on the Vita.
+#
+# - html.c: html_reconvert_local(). For a change inside a block whose
+#   content is inline (one inline container; textContent, innerHTML with
+#   plain inline markup, a text node's data, an inline child added or
+#   removed) it takes the block's old boxes out, releases the rebuilt
+#   elements' libcss node data (as html_reconvert_reset_css_state does for
+#   the whole tree), builds the block's children again and normalises
+#   them, frees the old boxes, and lays out just the new lines
+#   (layout_relayout_line), moving what follows; if that declines, the
+#   whole page is laid out -- but its boxes are not rebuilt. It declines
+#   (logged, "LIFE rebuild local: declined (...)") for anything else: a
+#   block that is not one inline container, generated content, objects,
+#   form controls, non-inline tags in the new content (allow-list), find
+#   in page, frames; on a build failure it restores the old boxes and
+#   their DOM backlinks. (Its log lines avoid the "LIFE reconvert" prefix,
+#   which the Vita frontend drops as noise.)
+# - box_construct.c: box_rebuild_children() -- the full build's element /
+#   text construction in document order, bounded to one element's
+#   children (next_node_within).
+# - layout.c: layout_relayout_core() shared by layout_relayout_object
+#   (patch 163) and the new layout_relayout_line (a rebuilt inline
+#   container with its predecessor's height and flags).
+# - macos9_reconvert.c: macos9_reconvert_try_local() -- a batch that is
+#   one text edit (one element, one kind) is offered to
+#   html_reconvert_local first, in the debounced callback and in the
+#   synchronous flush a geometry read triggers.
+# - box_manipulate.c: box_free_box no longer frees a box's styles and
+#   scroll bars itself; box_talloc_destructor (run by its talloc_free)
+#   frees them and clears the pointers. Freed in both, they were
+#   destroyed twice -- box_free crashed on any box with styles (found by
+#   the first local rebuild). A clone's shared styles are unhooked first.
+# - frontends/vita/main.c: VITA_NET_PAGES_MAX 52 -> 64 (the suite's list
+#   reached 52).
+# Sim: the three text changes stall ~23 ms (was 257-1496 ms; the local
+# work is ~2.7 ms, mostly checking what follows); positions identical to
+# the full path (checked element by element with the local path off).
+# A new block (a paragraph inserted) is still the full rebuild (255 ms).
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 4866d44..e807ce2 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3289,3 +3289,113 @@ box_construct_sched_pins(void (*cb)(void *), void *p, struct content *target)
+ 	ctx = (struct box_construct_ctx *) p;
+ 	return (struct content *) ctx->content == target;
+ }
++
++
++/* ---- VitaBrowser: rebuild one element's children ----------------------
++ *
++ * Roadmap WS-C, script-driven DOM changes. A script that changes a
++ * paragraph's text used to cost a rebuild of the whole box tree and a full
++ * layout (~0.26 s on the host for 5000 paragraphs, seconds on the Vita).
++ * html_reconvert_local takes the old children out of the element's box and
++ * calls this to build them again from the DOM, the way the full build
++ * does (box_construct_element / box_construct_text in document order), but
++ * without leaving the element: next_node_within is next_node that stops
++ * when it climbs back to it. */
++
++static dom_node *
++next_node_within(struct box_construct_ctx *ctx, dom_node *n,
++		html_content *content, bool convert_children, dom_node *stop)
++{
++	dom_node *next = NULL;
++	bool has_children = false;
++	dom_exception err;
++
++	err = dom_node_has_child_nodes(n, &has_children);
++	if (err != DOM_NO_ERR) {
++		dom_node_unref(n);
++		return NULL;
++	}
++	if (convert_children && has_children) {
++		err = dom_node_get_first_child(n, &next);
++		dom_node_unref(n);
++		return err == DOM_NO_ERR ? next : NULL;
++	}
++	err = dom_node_get_next_sibling(n, &next);
++	if (err != DOM_NO_ERR) {
++		dom_node_unref(n);
++		return NULL;
++	}
++	if (box_for_node(n) != NULL)
++		box_construct_element_after(ctx, n, content);
++	if (next != NULL) {
++		dom_node_unref(n);
++		return next;
++	}
++	/* last child: climb, finishing each element left, up to stop */
++	while (true) {
++		dom_node *parent = NULL;
++		err = dom_node_get_parent_node(n, &parent);
++		dom_node_unref(n);
++		if (err != DOM_NO_ERR || parent == NULL)
++			return NULL;
++		if (parent == stop) {
++			dom_node_unref(parent);
++			return NULL;
++		}
++		if (box_for_node(parent) != NULL)
++			box_construct_element_after(ctx, parent, content);
++		err = dom_node_get_next_sibling(parent, &next);
++		if (err != DOM_NO_ERR) {
++			dom_node_unref(parent);
++			return NULL;
++		}
++		if (next != NULL) {
++			dom_node_unref(parent);
++			return next;
++		}
++		n = parent;
++	}
++}
++
++/* exported function documented in html/box_construct.h */
++bool box_rebuild_children(html_content *c, dom_node *element)
++{
++	struct box_construct_ctx ctx;
++	dom_node *n = NULL;
++	dom_exception err;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.content = c;
++	ctx.root_box = c->layout;
++	ctx.bctx = c->bctx;
++
++	err = dom_node_get_first_child(element, &n);
++	if (err != DOM_NO_ERR)
++		return false;
++	while (n != NULL) {
++		dom_node_type type;
++		bool convert_children = true;
++
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR) {
++			dom_node_unref(n);
++			return false;
++		}
++		ctx.n = n;
++		if (type == DOM_ELEMENT_NODE) {
++			if (!box_construct_element(&ctx, &convert_children)) {
++				dom_node_unref(n);
++				return false;
++			}
++		} else if (type == DOM_TEXT_NODE) {
++			if (!box_construct_text(&ctx)) {
++				dom_node_unref(n);
++				return false;
++			}
++			convert_children = false;
++		} else {
++			convert_children = false;
++		}
++		n = next_node_within(&ctx, n, c, convert_children, element);
++	}
++	return true;
++}
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index e892f5c..31818bd 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -142,6 +142,18 @@ css_select_results *html_svg_get_style(const struct html_content *c,
+  */
+ struct box *box_for_node(struct dom_node *node);
+ 
++/**
++ * VitaBrowser: build the boxes for element's children again, into its
++ * existing box, whose old children the caller has taken out
++ * (html_reconvert_local). Does not normalise.
++ *
++ * \param c        the page
++ * \param element  the element whose box gets the new children
++ * \return true on success, false on failure (the box's children are then
++ *         whatever was built; the caller discards them)
++ */
++bool box_rebuild_children(struct html_content *c, struct dom_node *element);
++
+ /**
+  * Extract a URL from a relative link, handling junk like whitespace and
+  * attempting to read a real URL from "javascript:" links.
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index fb37080..fd14d04 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -379,12 +379,12 @@ void box_free_box(struct box *box)
+ 			form_free_control(box->gadget);
+ 			box->gadget = NULL;
+ 		}
+-		if (box->scroll_x != NULL)
+-			scrollbar_destroy(box->scroll_x);
+-		if (box->scroll_y != NULL)
+-			scrollbar_destroy(box->scroll_y);
+-		if (box->styles != NULL)
+-			css_select_results_destroy(box->styles);
++		/* VitaBrowser: styles and scroll bars are left to
++		 * box_talloc_destructor, which talloc_free(box) below runs
++		 * and which frees them (and the bars' data) and clears the
++		 * pointers. Freed here too, without clearing, they were
++		 * destroyed twice -- any box_free crashed on a box with
++		 * styles (html_reconvert_local found it). */
+ 		/* fixes1268c (#167) - release this box's reference to its
+ 		 * custom-property environment. Guarded by !CLONE alongside
+ 		 * styles: a CLONE box shares both with its original and must
+@@ -393,6 +393,10 @@ void box_free_box(struct box *box)
+ 			css_custom_env_unref(box->custom_env);
+ 			box->custom_env = NULL;
+ 		}
++	} else {
++		/* a clone shares its original's styles: the destructor must
++		 * not free them */
++		box->styles = NULL;
+ 	}
+ 
+ 	talloc_free(box);
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index f4ce17b..a62810a 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -206,6 +206,8 @@ done:
+ #include "html/interaction.h"
+ #include "html/box.h"
+ #include "html/box_construct.h"
++#include "html/box_manipulate.h"
++#include "html/box_normalise.h"
+ #include "html/box_inspect.h"
+ #include "html/form_internal.h"
+ #include "html/imagemap.h"
+@@ -6143,6 +6145,289 @@ bool html_relayout_object_local(html_content *htmlc, struct box *box)
+ 	return true;
+ }
+ 
++/* ---- VitaBrowser: a script's text change, rebuilt locally ---------------
++ *
++ * Roadmap WS-C, script-driven DOM changes. A script that changes the text
++ * of a paragraph (textContent, innerHTML with inline markup, a text node's
++ * data, a child appended or removed) queued a rebuild of the whole box tree
++ * and a full layout (macos9_reconvert_cb): ~0.26 s on the host for a page
++ * of 5000 paragraphs, seconds on the Vita, for one changed line.
++ * html_reconvert_local rebuilds only the boxes of the block that holds the
++ * change -- a block whose content is inline (one inline container of text
++ * and inline elements) -- and lays out just its lines (layout_relayout_line,
++ * the late-image path), moving what follows. Anything else declines (-1)
++ * and the full reconvert runs as before. */
++
++/* tags whose boxes are plain inline boxes: no objects, controls, quotes */
++static bool html_rl_inline_tag(dom_node *n)
++{
++	static const char *const ok[] = {
++		"a", "abbr", "b", "bdi", "bdo", "br", "cite", "code", "data",
++		"del", "dfn", "em", "font", "i", "ins", "kbd", "mark", "s",
++		"samp", "small", "span", "strong", "sub", "sup", "time", "u",
++		"var", "wbr", NULL
++	};
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; ok[i] != NULL; i++)
++		if (dom_string_byte_length(name) == strlen(ok[i]) &&
++		    strncasecmp(dom_string_data(name), ok[i],
++				strlen(ok[i])) == 0) {
++			found = true;
++			break;
++		}
++	dom_string_unref(name);
++	return found;
++}
++
++/* are all of element's descendant elements plain inline ones? */
++static bool html_rl_inline_subtree(dom_node *element)
++{
++	dom_node *n = NULL, *next;
++	unsigned int count = 0;
++
++	if (dom_node_get_first_child(element, &n) != DOM_NO_ERR)
++		return false;
++	while (n != NULL) {
++		dom_node_type type;
++		bool down = false;
++		if (++count > 2000 ||
++		    dom_node_get_node_type(n, &type) != DOM_NO_ERR) {
++			dom_node_unref(n);
++			return false;
++		}
++		if (type == DOM_ELEMENT_NODE) {
++			if (!html_rl_inline_tag(n)) {
++				dom_node_unref(n);
++				return false;
++			}
++			down = true;
++		}
++		next = NULL;
++		if (down && dom_node_get_first_child(n, &next) == DOM_NO_ERR &&
++		    next != NULL) {
++			dom_node_unref(n);
++			n = next;
++			continue;
++		}
++		/* next sibling, or the next of an ancestor below element */
++		while (n != NULL) {
++			dom_node *parent = NULL;
++			next = NULL;
++			if (dom_node_get_next_sibling(n, &next) == DOM_NO_ERR &&
++			    next != NULL) {
++				dom_node_unref(n);
++				n = next;
++				break;
++			}
++			if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR ||
++			    parent == NULL) {
++				dom_node_unref(n);
++				return false;
++			}
++			dom_node_unref(n);
++			if (parent == element) {
++				dom_node_unref(parent);
++				n = NULL;
++				break;
++			}
++			n = parent;
++		}
++	}
++	return true;
++}
++
++/* point every node of a box subtree back at its box (a rollback) */
++static void html_rl_relink(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->node != NULL) {
++			void *old = NULL;
++			(void) dom_node_set_user_data(b->node,
++					corestring_dom___ns_key_box_node_data,
++					b, NULL, &old);
++		}
++		html_rl_relink(b->children);
++	}
++}
++
++int html_reconvert_local(struct content *base_c, void *vnode);
++int html_reconvert_local(struct content *base_c, void *vnode)
++{
++	extern double macos9_micros(void);
++	extern const char *layout_relayout_why;
++	html_content *c = (html_content *) base_c;
++	dom_node *element = NULL, *n;
++	struct box *block, *old_ic, *new_ic, *b, *next, *layout;
++	unsigned int objects_before, old_flags;
++	int old_x, old_y, old_h, delta = 0;
++	bool local;
++	double t0, t1;
++	static unsigned long done_n, relaid_n;
++
++#define RL_NO(why) do { macsurf_debug_log_writef( \
++		"LIFE rebuild local: declined (%s)", (why)); return -1; } while (0)
++	if (c == NULL || vnode == NULL || c->layout == NULL ||
++	    c->document == NULL || c->aborted)
++		return -1;
++	if (c->reflowing || c->box_conversion_context != NULL ||
++	    macsurf_reconvert_in_progress != 0 || macos9_paint_gw != NULL ||
++	    base_c->locked)
++		RL_NO("busy");
++	if (base_c->status != CONTENT_STATUS_READY &&
++	    base_c->status != CONTENT_STATUS_DONE)
++		RL_NO("not loaded");
++	if (base_c->textsearch.context != NULL)
++		RL_NO("find in page is open");
++	if (c->iframe != NULL)
++		RL_NO("page has frames");
++	t0 = macos9_micros();
++
++	/* the nearest element with a block box: the one to rebuild */
++	n = vnode;
++	dom_node_ref(n);
++	while (n != NULL) {
++		dom_node_type type;
++		dom_node *parent = NULL;
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			b = box_for_node(n);
++			if (b != NULL && b->type == BOX_BLOCK) {
++				element = n;
++				break;
++			}
++			if (b != NULL && b->type != BOX_INLINE) {
++				dom_node_unref(n);	/* a table cell, ... */
++				RL_NO("nearest box is not a block");
++			}
++		}
++		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR) {
++			dom_node_unref(n);
++			RL_NO("dom error");
++		}
++		dom_node_unref(n);
++		n = parent;
++	}
++	if (element == NULL)
++		RL_NO("no block box above the change");
++	block = box_for_node(element);
++	old_ic = block->children;
++
++	/* a block of inline content: one inline container, nothing generated,
++	 * no objects or controls, now or after the change */
++	if (block->object != NULL || block->gadget != NULL ||
++	    block->list_marker != NULL || block->float_children != NULL ||
++	    block->iframe != NULL || block->styles == NULL ||
++	    block->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE] != NULL ||
++	    block->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL ||
++	    old_ic == NULL || old_ic->next != NULL ||
++	    old_ic->type != BOX_INLINE_CONTAINER) {
++		dom_node_unref(element);
++		RL_NO("block is not one line container of plain content");
++	}
++	if (!html_rl_inline_subtree(element)) {
++		dom_node_unref(element);
++		RL_NO("new content is not plain inline elements");
++	}
++	for (b = old_ic->children; b != NULL; b = b->next)
++		if (b->object != NULL || b->gadget != NULL || b->iframe != NULL) {
++			dom_node_unref(element);
++			RL_NO("old content has an object or control");
++		}
++
++	/* build the block's children again */
++	old_x = old_ic->x;
++	old_y = old_ic->y;
++	old_h = old_ic->height;
++	old_flags = old_ic->flags;
++	objects_before = c->num_objects;
++	/* as html_reconvert_reset_css_state does for the whole tree: the
++	 * rebuilt elements' cached libcss node data holds styles owned by
++	 * the old boxes, which style sharing would hand to the new ones */
++	{
++		dom_node *ch = NULL, *nx = NULL;
++		if (dom_node_get_first_child(element, &ch) == DOM_NO_ERR)
++			while (ch != NULL) {
++				(void) html_reconvert_reset_node_data_walk(ch, 1);
++				nx = NULL;
++				dom_node_get_next_sibling(ch, &nx);
++				dom_node_unref(ch);
++				ch = nx;
++			}
++	}
++	block->children = block->last = NULL;
++	old_ic->parent = NULL;
++	if (!box_rebuild_children(c, element) ||
++	    !box_normalise_block(block, c->layout, c) ||
++	    c->num_objects != objects_before) {
++		/* back to the old boxes; the full reconvert takes it from
++		 * here */
++		for (b = block->children; b != NULL; b = next) {
++			next = b->next;
++			box_free(b);
++		}
++		block->children = block->last = old_ic;
++		old_ic->parent = block;
++		html_rl_relink(old_ic);
++		dom_node_unref(element);
++		macsurf_debug_log_writef("LIFE rebuild local: rebuild "
++			"declined, full reconvert");
++		return -1;
++	}
++	dom_node_unref(element);
++	box_free(old_ic);	/* backlinks only where they are still its */
++
++	/* lay out just the new lines if we can, else the page (the tree is
++	 * whole again either way: no full rebuild) */
++	for (b = block; b != NULL; b = b->parent)
++		b->max_width = UNKNOWN_MAX_WIDTH;
++	new_ic = block->children;
++	local = false;
++	if (new_ic != NULL && new_ic->next == NULL &&
++	    new_ic->type == BOX_INLINE_CONTAINER) {
++		new_ic->x = old_x;
++		new_ic->y = old_y;
++		local = layout_relayout_line(c, new_ic, old_h, old_flags,
++				&delta);
++	}
++	if (!local) {
++		macsurf_debug_log_writef("LIFE rebuild local: rebuilt, full "
++			"layout (%s)", new_ic == NULL ? "empty now" :
++			layout_relayout_why);
++		content__reformat(base_c, false, base_c->available_width,
++				base_c->available_height);
++		done_n++;
++		return 0;
++	}
++	t1 = macos9_micros();
++	done_n++;
++	relaid_n++;
++
++	layout = c->layout;
++	base_c->width = layout->x + layout->padding[LEFT] + layout->width +
++		layout->padding[RIGHT] + layout->border[RIGHT].width +
++		layout->margin[RIGHT];
++	base_c->height = layout->y + layout->padding[TOP] + layout->height +
++		layout->padding[BOTTOM] + layout->border[BOTTOM].width +
++		layout->margin[BOTTOM];
++	if (base_c->width < layout->x + layout->descendant_x1)
++		base_c->width = layout->x + layout->descendant_x1;
++	if (base_c->height < layout->y + layout->descendant_y1)
++		base_c->height = layout->y + layout->descendant_y1;
++	selection_reinit(c->sel);
++	macsurf_debug_log_writef("LIFE rebuild local: rebuilt and laid out "
++		"%+d px in %ld us, page %dx%d (%lu local, %lu relaid)", delta,
++		(long)(t1 - t0), base_c->width, base_c->height, done_n,
++		relaid_n);
++	guit->misc->schedule(0, html_relayout_notify, c);
++	return 0;
++#undef RL_NO
++}
++
+ static void html_free_layout(html_content *htmlc)
+ {
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 7f9ffb0..9e6cb89 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -7892,8 +7892,11 @@ static void lr_descendant_bbox_shallow(const css_unit_ctx *unit_len_ctx,
+ const char *layout_relayout_why = "";
+ #define LR_NO(why) do { layout_relayout_why = (why); return false; } while (0)
+ 
+-/* exported function documented in html/layout.h */
+-bool layout_relayout_object(html_content *content, struct box *box,
++/* The shared core: an object's box (box), or a rebuilt inline container
++ * (new_ic) that replaced one of new_old_h px with the flags
++ * new_old_flags (html_reconvert_local, a script's text change). */
++static bool layout_relayout_core(html_content *content, struct box *box,
++		struct box *new_ic, int new_old_h, unsigned int new_old_flags,
+ 		int *delta_out)
+ {
+ 	struct box *chain[LR_MAX_DEPTH];
+@@ -7905,9 +7908,15 @@ bool layout_relayout_object(html_content *content, struct box *box,
+ 
+ 	if (delta_out != NULL)
+ 		*delta_out = 0;
+-	if (doc == NULL || box == NULL || box->parent == NULL)
++	if (doc == NULL)
+ 		LR_NO("no layout");
+-	if (box->type == BOX_BLOCK && box->object != NULL) {
++	if (new_ic != NULL) {
++		ic = new_ic;
++		if (ic->type != BOX_INLINE_CONTAINER || ic->parent == NULL)
++			LR_NO("rebuilt box is not a line container");
++	} else if (box == NULL || box->parent == NULL) {
++		LR_NO("no layout");
++	} else if (box->type == BOX_BLOCK && box->object != NULL) {
+ 		/* an image that is a block (display: block): its own box is
+ 		 * what changes size */
+ 		css_fixed len = 0;
+@@ -7976,6 +7985,8 @@ bool layout_relayout_object(html_content *content, struct box *box,
+ 	 * anywhere on the chain, only a full layout gets it right. */
+ 	for (i = 0; i < n; i++)
+ 		fl[i] = chain[i]->flags & (HAS_HEIGHT | MAKE_HEIGHT);
++	if (new_ic != NULL)
++		fl[0] = new_old_flags & (HAS_HEIGHT | MAKE_HEIGHT);
+ 	macsurf_layout_watchdog_reset();
+ 	layout_minmax_block(doc, content->font_func, content);
+ 	for (i = 0; i < n; i++)
+@@ -7997,7 +8008,7 @@ bool layout_relayout_object(html_content *content, struct box *box,
+ 		delta = ic->height + ic->padding[TOP] + ic->padding[BOTTOM] +
+ 			ic->border[TOP].width + ic->border[BOTTOM].width - old_h;
+ 	} else {
+-		old_h = ic->height;
++		old_h = new_ic != NULL ? new_old_h : ic->height;
+ 		ic->width = ic->parent->width;
+ 		if (!layout_inline_container(ic, ic->width, ic->parent, 0, 0,
+ 				content))
+@@ -8021,3 +8032,18 @@ bool layout_relayout_object(html_content *content, struct box *box,
+ 		*delta_out = delta;
+ 	return true;
+ }
++
++/* exported function documented in html/layout.h */
++bool layout_relayout_object(html_content *content, struct box *box,
++		int *delta_out)
++{
++	return layout_relayout_core(content, box, NULL, 0, 0, delta_out);
++}
++
++/* exported function documented in html/layout.h */
++bool layout_relayout_line(html_content *content, struct box *ic,
++		int old_h, unsigned int old_flags, int *delta_out)
++{
++	return layout_relayout_core(content, NULL, ic, old_h, old_flags,
++			delta_out);
++}
+diff --git a/content/handlers/html/layout.h b/content/handlers/html/layout.h
+index c562773..9246a92 100644
+--- a/content/handlers/html/layout.h
++++ b/content/handlers/html/layout.h
+@@ -57,12 +57,28 @@ void html_minmax_invalidate_tree(struct box *box);
+  * \param content   the page (laid out)
+  * \param box       the object's box
+  * \param delta_out the change in height, or NULL
+- * eturn true if done; false if the case needs a full layout (nothing
++ * 
++eturn true if done; false if the case needs a full layout (nothing
+  *         has been changed then, except possibly the container's lines)
+  */
+ bool layout_relayout_object(struct html_content *content, struct box *box,
+ 		int *delta_out);
+ 
++/**
++ * VitaBrowser: the same for an inline container that was built again (a
++ * script changed its block's text): lay it out, move what follows by the
++ * change in height.
++ *
++ * \param content   the page (laid out)
++ * \param ic        the new inline container, at the old one's x/y
++ * \param old_h     the old container's height
++ * \param old_flags the old container's flags (HAS_HEIGHT / MAKE_HEIGHT)
++ * \param delta_out the change in height, or NULL
++ * \return true if done; false if the page needs a full layout
++ */
++bool layout_relayout_line(struct html_content *content, struct box *ic,
++		int old_h, unsigned int old_flags, int *delta_out);
++
+ unsigned int layout_multicol_segment_count(const struct box *box);
+ bool layout_multicol_segment_bounds(const struct box *box,
+ 		unsigned int index, int *top, int *bottom);
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+index 43e14bd..211da09 100644
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -679,6 +679,31 @@ macos9_reconvert_sync_reset(void)
+ #define RECONVERT_SYNC_RETRY_MS 80
+ 
+ static void macos9_reconvert_cb(void *p);	/* defined below */
++
++/* VitaBrowser (roadmap WS-C, script-driven DOM changes): a batch that is
++ * ONE text edit -- textContent / innerHTML / a text node's data / a child
++ * appended, inserted or removed, all on one element -- is first offered to
++ * html_reconvert_local, which rebuilds and lays out just the block that
++ * holds it. 1 = done (the slot is answered), 0 = do the full rebuild. */
++static int macos9_reconvert_try_local(int i, struct content *c)
++{
++	extern int html_reconvert_local(struct content *c, void *node);
++
++	if (g_pending[i].multi || g_pending[i].node == NULL)
++		return 0;
++	switch (g_pending[i].kind) {
++	case MACOS9_DOMMUT_TEXTCONTENT:
++	case MACOS9_DOMMUT_INNERHTML:
++	case MACOS9_DOMMUT_APPENDCHILD:
++	case MACOS9_DOMMUT_REMOVECHILD:
++	case MACOS9_DOMMUT_INSERTBEFORE:
++	case MACOS9_DOMMUT_CHARDATA:
++		break;
++	default:
++		return 0;
++	}
++	return html_reconvert_local(c, g_pending[i].node) == 0;
++}
+ static void macos9_reconvert_schedule_pending(void);
+ 
+ static void
+@@ -781,7 +806,16 @@ macos9_reconvert_flush_now(void *cv)
+ 
+ 	in_flush = 1;
+ 	t0 = macos9_micros();
+-	rc = html_reconvert_content(c);	/* SYNCHRONOUS -- see fixes903 */
++	/* VitaBrowser: one text edit rebuilds just its block (WS-C) */
++	rc = -1;
++	for (i = 0; i < RECONVERT_MAX_PENDING; i++)
++		if (g_pending[i].c == c) {
++			if (macos9_reconvert_try_local(i, c))
++				rc = 0;
++			break;
++		}
++	if (rc != 0)
++		rc = html_reconvert_content(c);	/* SYNCHRONOUS -- see fixes903 */
+ 	in_flush = 0;
+ 
+ 	if (rc != 0) {
+@@ -1029,6 +1063,15 @@ macos9_reconvert_cb(void *p)
+ 			busy = 1;
+ 			continue;
+ 		}
++		/* VitaBrowser: one text edit rebuilds just its block (WS-C) */
++		if (macos9_reconvert_try_local(i, c)) {
++			if (have_render_scope) ms_diag_render_leave(&render_scope,
++				MS_RRES_DONE, MS_SREASON_NONE);
++			macos9_reconvert_slot_clear(i);
++			g_consecutive_cosmetic = 0;
++			macos9_reconvert_census_dump();
++			continue;
++		}
+ 		rc = html_reconvert_content(c);	/* 0 = queued, !=0 = busy */
+ 		macsurf_debug_log_writef(
+ 			"LIFE reconvert: html_reconvert_content rc=%d c=%p", rc,
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 42a87a7..6dc56cf 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -135,7 +135,7 @@ static const char *const vita_local_pages[] = {
+  * reach them too. The defaults, or ux0:data/VitaBrowser/nettest.txt with
+  * one "name url" per line (the simulator points them at a local server).
+  */
+-#define VITA_NET_PAGES_MAX 52
++#define VITA_NET_PAGES_MAX 64
+ static const char *const vita_net_defaults[][2] = {
+ 	{ "NET-http-example", "http://example.com/" },
+ 	{ "NET-https-example", "https://example.com/" },
