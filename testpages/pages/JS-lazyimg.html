@@ -17,8 +17,10 @@
      Driven by events, not a clock: the autotest settles a page once
      nothing has drawn (or loaded) for ~1 s, dumps it, scrolls a long page
      to the BOTTOM and settles again; the gate reads that -bottom dump.
-     Each step below draws something (a result line, a scroll) within
-     ~0.4 s of the last, so the bottom settle waits for the whole sequence.
+     After the bottom scroll every step scrolls within ~0.2-0.4 s, so the
+     page keeps drawing and the bottom settle waits for the sequence; the
+     results are written once, at the end (each write costs a rebuild, and
+     written step by step they stretched it past the 1-s settle window).
      1: at the load event, at the top (scrollY < 100): images 1-10 (the
         eager budget) fetched exactly once, 11-16 (below the fold) not
         at all.
@@ -46,17 +48,32 @@ img { display: block; width: 120px; height: 80px; }
 	var i;
 	for (i = 1; i <= 16; i++)
 		IMG.push('/lazyimg-' + (i < 10 ? '0' : '') + i + '.png');
+	/* results are kept and written once, at the end: each DOM write
+	 * here costs a rebuild, and spread over the steps they stretched the
+	 * sequence past the autotest's 1-s settle window (run on 2026-09-29:
+	 * step 4 missed the bottom dump) */
+	var res = [];
 	function t(n, ok, text) {
-		var p = document.getElementById('r' + n);
-		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
-		if (!ok) return;
-		p.className = 'pass';
-		k++;
+		res.push([n, ok, text]);
+	}
+	function show() {
+		var i, r, p;
+		for (i = 0; i < res.length; i++) {
+			r = res[i];
+			p = document.getElementById('r' + r[0]);
+			p.textContent = r[0] + ' ' + r[2] + (r[1] ? '' : ' FAIL');
+			if (r[1]) {
+				p.className = 'pass';
+				k++;
+			}
+		}
 		document.getElementById('sum').textContent =
 			'LAZYIMG: ' + k + '/' + N + ' passed';
 		document.title = 'JS lazy images below the fold (' + k + '/' + N + ')';
 	}
-	function fail(n) { return function (e) { t(n, false, 'rejected: ' + e); }; }
+	function fail(n) {
+		return function (e) { t(n, false, 'rejected: ' + e); show(); };
+	}
 	function counts() {
 		return fetch('/fetch-count?prefix=/lazyimg-').then(function (r) {
 			return r.json();
@@ -95,7 +112,7 @@ img { display: block; width: 120px; height: 80px; }
 				t(2, ok, 'at bottom (scrollY=' + (window.scrollY || 0) +
 					'): 11-16 fetched once by the drain: ' + s);
 				window.scrollTo(0, 0);
-				later(400, step3);
+				later(200, step3);
 			}).catch(fail(2));
 		});
 	}
@@ -106,9 +123,9 @@ img { display: block; width: 120px; height: 80px; }
 				if (got(c, i) !== 1) ok = false;
 			t(3, ok, 'after scroll to top: all 16 still exactly 1');
 			window.scrollTo(0, 2400);
-			later(400, function () {
+			later(200, function () {
 				window.scrollTo(0, 0);
-				later(400, step4);
+				later(200, step4);
 			});
 		}).catch(fail(3));
 	}
@@ -119,6 +136,7 @@ img { display: block; width: 120px; height: 80px; }
 				total += got(c, i);
 			t(4, total === 16, 'total GETs after re-scroll: ' + total +
 				' (16)');
+			show();
 		}).catch(fail(4));
 	}
 })();

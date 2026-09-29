@@ -2783,4 +2783,13 @@ SHA256 first 12: VitaBrowser.vpk d50862126f84, VitaBrowser-ext.vpk
   netsurf.log "LIFE rebuild local: rebuilt and laid out +N px in M us" per
   change, "LIFE rebuild local: declined (reason)" when it took the full
   path.
+- Patch 166 (WS-C, script-driven DOM changes, second part): a paragraph a
+  script inserts, appends or removes (a new chat message, a feed item, a
+  status line that disappears) no longer rebuilds the whole page: the
+  block is built alone and placed among its neighbours (sim: ~5-7 ms of
+  work instead of 250-273 ms of stall on 5000 paragraphs, positions
+  identical). On the device: pages that add paragraphs as you use them
+  should not freeze for each one; netsurf.log "LIFE rebuild local: blocks
+  placed (N added, M removed) ..." per batch, "declined (reason)" when it
+  took the full path (lists and nested blocks still do).
 

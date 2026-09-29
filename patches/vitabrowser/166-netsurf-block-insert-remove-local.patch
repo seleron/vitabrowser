@@ -1,0 +1,774 @@
+# netsurf: a block a script inserts or removes is placed locally
+#
+# Roadmap WS-C, script-driven DOM changes, second part (patch 165 did text
+# edits). Measured on JS-dom-stall.html (5000 paragraphs): a paragraph
+# inserted, appended at the end or removed by a script cost a rebuild of
+# the whole box tree and a full layout -- 250-273 ms of stall on the host.
+#
+# - html.c: html_rl_block_change(), from html_reconvert_local when the
+#   changed element's box holds blocks. It reconciles the element's DOM
+#   children with its box children: boxes whose element left are unlinked
+#   and freed (not if they hold objects, controls, frames or list
+#   markers); new elements (allow-listed block tags whose content is
+#   plain inline markup) are built (box_build_element), moved after the
+#   box of their nearest earlier element and normalised; each change is
+#   placed by layout_relayout_block. Anything it cannot take declines
+#   (logged) to the full rebuild; a placement it cannot do exactly after
+#   the boxes changed lays out the whole page instead (no rebuild).
+# - layout.c: layout_relayout_block() places the new block (or accounts
+#   for the removed one) as layout_block_context would: y = bottom of the
+#   block before + its top border + the collapsed margin (the previous
+#   block's bottom margin accumulated before its own top margin); what
+#   follows moves by the difference, the parent and ancestors grow. Only
+#   between blocks the arithmetic stands on (plain, static, unfloated,
+#   uncleared, overflow visible, MAKE_HEIGHT so margins do not collapse
+#   through them); at the parent's first or last place only when the
+#   margin shared with the parent is unchanged.
+# - box_construct.c: box_build_element() -- one new element's boxes, its
+#   children bounded to it (box_build_children, shared with
+#   box_rebuild_children).
+# - macsurf_qjs.c: a mutation of a node that is not in the document is
+#   not recorded: it has no boxes to rebuild, and recording it (a new
+#   paragraph's text set before insertion) made the batch "multi", which
+#   sent the insertion itself to the full rebuild.
+# Sim: inserted / appended / removed paragraph placed in 5-7 ms of work,
+# the longest stall of the whole test 24 ms (was 250-273 ms). Geometry
+# identical to the full path: all 5001 blocks of the test page, and all
+# 311 of a stress page (first-place and last-place inserts and removals,
+# ten appends in one batch, two removals, and the declines: a nested
+# block, a list, a paragraph holding an image).
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index e807ce2..bd40939 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3357,20 +3357,13 @@ next_node_within(struct box_construct_ctx *ctx, dom_node *n,
+ 	}
+ }
+ 
+-/* exported function documented in html/box_construct.h */
+-bool box_rebuild_children(html_content *c, dom_node *element)
++/* build element's children, in document order, without leaving it */
++static bool box_build_children(struct box_construct_ctx *ctx,
++		html_content *c, dom_node *element)
+ {
+-	struct box_construct_ctx ctx;
+ 	dom_node *n = NULL;
+-	dom_exception err;
+-
+-	memset(&ctx, 0, sizeof(ctx));
+-	ctx.content = c;
+-	ctx.root_box = c->layout;
+-	ctx.bctx = c->bctx;
+ 
+-	err = dom_node_get_first_child(element, &n);
+-	if (err != DOM_NO_ERR)
++	if (dom_node_get_first_child(element, &n) != DOM_NO_ERR)
+ 		return false;
+ 	while (n != NULL) {
+ 		dom_node_type type;
+@@ -3380,14 +3373,14 @@ bool box_rebuild_children(html_content *c, dom_node *element)
+ 			dom_node_unref(n);
+ 			return false;
+ 		}
+-		ctx.n = n;
++		ctx->n = n;
+ 		if (type == DOM_ELEMENT_NODE) {
+-			if (!box_construct_element(&ctx, &convert_children)) {
++			if (!box_construct_element(ctx, &convert_children)) {
+ 				dom_node_unref(n);
+ 				return false;
+ 			}
+ 		} else if (type == DOM_TEXT_NODE) {
+-			if (!box_construct_text(&ctx)) {
++			if (!box_construct_text(ctx)) {
+ 				dom_node_unref(n);
+ 				return false;
+ 			}
+@@ -3395,7 +3388,39 @@ bool box_rebuild_children(html_content *c, dom_node *element)
+ 		} else {
+ 			convert_children = false;
+ 		}
+-		n = next_node_within(&ctx, n, c, convert_children, element);
++		n = next_node_within(ctx, n, c, convert_children, element);
+ 	}
+ 	return true;
+ }
++
++/* exported function documented in html/box_construct.h */
++bool box_rebuild_children(html_content *c, dom_node *element)
++{
++	struct box_construct_ctx ctx;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.content = c;
++	ctx.root_box = c->layout;
++	ctx.bctx = c->bctx;
++	return box_build_children(&ctx, c, element);
++}
++
++/* exported function documented in html/box_construct.h */
++bool box_build_element(html_content *c, dom_node *element)
++{
++	struct box_construct_ctx ctx;
++	bool convert_children = true;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.content = c;
++	ctx.root_box = c->layout;
++	ctx.bctx = c->bctx;
++	ctx.n = element;
++	if (!box_construct_element(&ctx, &convert_children))
++		return false;
++	if (convert_children && !box_build_children(&ctx, c, element))
++		return false;
++	if (box_for_node(element) != NULL)
++		box_construct_element_after(&ctx, element, c);
++	return true;
++}
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 31818bd..6e6dad1 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -154,6 +154,16 @@ struct box *box_for_node(struct dom_node *node);
+  */
+ bool box_rebuild_children(struct html_content *c, struct dom_node *element);
+ 
++/**
++ * VitaBrowser: build the boxes for an element (and its children) that is
++ * new in the DOM; its block box is added at the end of its containing
++ * block's children, where the caller moves it to its place
++ * (html_reconvert_local). Does not normalise.
++ *
++ * \return true on success, false on failure
++ */
++bool box_build_element(struct html_content *c, struct dom_node *element);
++
+ /**
+  * Extract a URL from a relative link, handling junk like whitespace and
+  * attempting to read a real URL from "javascript:" links.
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index a62810a..632d791 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6255,6 +6255,318 @@ static void html_rl_relink(struct box *b)
+ 	}
+ }
+ 
++/* ---- blocks a script inserted or removed ---------------------------- */
++
++/* block elements a script commonly adds as one paragraph of text */
++static bool html_rl_block_tag(dom_node *n)
++{
++	static const char *const ok[] = {
++		"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "section",
++		"article", "header", "footer", "aside", "nav", "main",
++		"address", "blockquote", NULL
++	};
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; ok[i] != NULL; i++)
++		if (dom_string_byte_length(name) == strlen(ok[i]) &&
++		    strncasecmp(dom_string_data(name), ok[i],
++				strlen(ok[i])) == 0) {
++			found = true;
++			break;
++		}
++	dom_string_unref(name);
++	return found;
++}
++
++/* does a box subtree hold anything that others point at (an object's
++ * entry, a form control, a frame)? */
++static bool html_rl_subtree_referenced(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->object != NULL || b->gadget != NULL ||
++		    b->iframe != NULL || b->list_marker != NULL)
++			return true;
++		if (html_rl_subtree_referenced(b->children))
++			return true;
++	}
++	return false;
++}
++
++static bool html_rl_text_is_space(dom_node *n)
++{
++	dom_string *data = NULL;
++	const char *d;
++	size_t i, len;
++	bool space = true;
++
++	if (dom_characterdata_get_data(n, &data) != DOM_NO_ERR)
++		return false;
++	if (data == NULL)
++		return true;
++	d = dom_string_data(data);
++	len = dom_string_byte_length(data);
++	for (i = 0; i < len; i++)
++		if (d[i] != ' ' && d[i] != '\t' && d[i] != '\n' &&
++		    d[i] != '\r' && d[i] != '\f') {
++			space = false;
++			break;
++		}
++	dom_string_unref(data);
++	return space;
++}
++
++static void html_rl_unlink(struct box *b)
++{
++	struct box *parent = b->parent;
++
++	if (parent != NULL) {
++		if (parent->children == b)
++			parent->children = b->next;
++		if (parent->last == b)
++			parent->last = b->prev;
++	}
++	if (b->prev != NULL)
++		b->prev->next = b->next;
++	if (b->next != NULL)
++		b->next->prev = b->prev;
++	b->prev = b->next = NULL;
++	b->parent = NULL;
++}
++
++static void html_rl_link_after(struct box *parent, struct box *after,
++		struct box *b)
++{
++	if (after != NULL) {
++		box_insert_sibling(after, b);
++		return;
++	}
++	b->parent = parent;
++	b->prev = NULL;
++	b->next = parent->children;
++	if (parent->children != NULL)
++		parent->children->prev = b;
++	else
++		parent->last = b;
++	parent->children = b;
++}
++
++static void html_rl_invalidate(struct box *b)
++{
++	for (; b != NULL; b = b->parent)
++		b->max_width = UNKNOWN_MAX_WIDTH;
++}
++
++#define HTML_RL_MAX_CHANGES 16
++
++/* A script inserted and/or removed blocks among parent's block children:
++ * build (or unlink) just those and place them (layout_relayout_block).
++ * 0 done, -1 declined (nothing changed). */
++static int html_rl_block_change(html_content *c, dom_node *pnode,
++		struct box *pbox, double t0)
++{
++	extern double macos9_micros(void);
++	extern const char *layout_relayout_why;
++	struct content *base_c = &c->base;
++	struct box *removed[HTML_RL_MAX_CHANGES];
++	dom_node *added[HTML_RL_MAX_CHANGES];
++	unsigned int nrem = 0, nadd = 0, i, local_n = 0;
++	struct box *b, *layout;
++	dom_node *n = NULL, *next;
++	bool full = false;
++	int delta, total = 0;
++	const char *why = NULL;
++	static unsigned long block_n;
++
++#define RL_BNO(w) do { macsurf_debug_log_writef( \
++		"LIFE rebuild local: declined (%s)", (w)); goto decline; } while (0)
++
++	/* the boxes: blocks only; which ones lost their element */
++	for (b = pbox->children; b != NULL; b = b->next) {
++		dom_node *parent = NULL;
++		if (b->type != BOX_BLOCK || b->node == NULL)
++			RL_BNO("parent holds more than blocks");
++		if (dom_node_get_parent_node(b->node, &parent) != DOM_NO_ERR)
++			RL_BNO("dom error");
++		if (parent != NULL)
++			dom_node_unref(parent);
++		if (parent != pnode) {
++			if (nrem == HTML_RL_MAX_CHANGES ||
++			    html_rl_subtree_referenced(b->children) ||
++			    b->object != NULL || b->gadget != NULL ||
++			    b->iframe != NULL || b->list_marker != NULL)
++				RL_BNO("removed block holds objects or controls");
++			removed[nrem++] = b;
++		}
++	}
++	/* the elements: new ones have no box yet */
++	if (dom_node_get_first_child(pnode, &n) != DOM_NO_ERR)
++		RL_BNO("dom error");
++	while (n != NULL) {
++		dom_node_type type;
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR) {
++			dom_node_unref(n);
++			RL_BNO("dom error");
++		}
++		if (type == DOM_TEXT_NODE && !html_rl_text_is_space(n)) {
++			dom_node_unref(n);
++			RL_BNO("text among the blocks");
++		}
++		if (type == DOM_ELEMENT_NODE) {
++			b = box_for_node(n);
++			if (b == NULL) {
++				if (nadd == HTML_RL_MAX_CHANGES ||
++				    !html_rl_block_tag(n) ||
++				    !html_rl_inline_subtree(n)) {
++					dom_node_unref(n);
++					RL_BNO("new element is not a plain "
++						"block of text");
++				}
++				added[nadd++] = n;
++				dom_node_ref(n);
++			} else if (b->parent != pbox) {
++				dom_node_unref(n);
++				RL_BNO("an element moved in from elsewhere");
++			}
++		}
++		next = NULL;
++		if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(n);
++		n = next;
++	}
++	if (nadd == 0 && nrem == 0)
++		RL_BNO("no inserted or removed block found");
++
++	/* removals first */
++	for (i = 0; i < nrem; i++) {
++		struct layout_removed_block rb;
++		struct box *prev = removed[i]->prev, *nx = removed[i]->next;
++		rb.y = removed[i]->y;
++		rb.border_top = removed[i]->border[TOP].width;
++		rb.bottom = removed[i]->y + removed[i]->padding[TOP] +
++			removed[i]->height + removed[i]->padding[BOTTOM] +
++			removed[i]->border[BOTTOM].width;
++		rb.margin_top = removed[i]->margin[TOP];
++		rb.margin_bottom = removed[i]->margin[BOTTOM];
++		html_rl_unlink(removed[i]);
++		box_free(removed[i]);
++		html_rl_invalidate(pbox);
++		if (!full && layout_relayout_block(c, pbox, prev, NULL, nx,
++				&rb, &delta)) {
++			total += delta;
++			local_n++;
++		} else if (!full) {
++			full = true;
++			why = layout_relayout_why;
++		}
++	}
++
++	/* then the new blocks, in document order */
++	for (i = 0; i < nadd; i++) {
++		struct box *nb, *after = NULL;
++		dom_node *sib = NULL, *prevsib = NULL;
++		unsigned int objects_before = c->num_objects;
++
++		(void) html_reconvert_reset_node_data_walk(added[i], 0);
++		if (!box_build_element(c, added[i])) {
++			nb = box_for_node(added[i]);
++			if (nb != NULL) {
++				html_rl_unlink(nb);
++				box_free(nb);
++			}
++			for (; i < nadd; i++)
++				dom_node_unref(added[i]);
++			macsurf_debug_log_writef("LIFE rebuild local: "
++				"building a new block failed, full reconvert");
++			return -1;	/* the full rebuild starts from the DOM */
++		}
++		nb = box_for_node(added[i]);
++		if (nb == NULL) {		/* display: none */
++			dom_node_unref(added[i]);
++			continue;
++		}
++		/* after the box of the nearest earlier element with one */
++		sib = added[i];
++		dom_node_ref(sib);
++		while (after == NULL) {
++			prevsib = NULL;
++			if (dom_node_get_previous_sibling(sib, &prevsib) !=
++					DOM_NO_ERR || prevsib == NULL)
++				break;
++			dom_node_unref(sib);
++			sib = prevsib;
++			b = box_for_node(sib);
++			if (b != NULL && b->parent == pbox && b != nb)
++				after = b;
++		}
++		dom_node_unref(sib);
++		dom_node_unref(added[i]);
++		if (nb->parent != pbox) {
++			full = true;		/* built somewhere unexpected */
++			why = why != NULL ? why : "new block not in its parent";
++			continue;
++		}
++		html_rl_unlink(nb);
++		html_rl_link_after(pbox, after, nb);
++		if (!box_normalise_block(nb, c->layout, c)) {
++			full = true;
++			why = why != NULL ? why : "normalise failed";
++			continue;
++		}
++		if (c->num_objects != objects_before) {
++			full = true;
++			why = why != NULL ? why : "new block fetches objects";
++		}
++		html_rl_invalidate(nb);
++		if (!full && layout_relayout_block(c, pbox, nb->prev, nb,
++				nb->next, NULL, &delta)) {
++			total += delta;
++			local_n++;
++		} else if (!full) {
++			full = true;
++			why = layout_relayout_why;
++		}
++	}
++
++	block_n++;
++	if (full) {
++		macsurf_debug_log_writef("LIFE rebuild local: blocks rebuilt "
++			"(%u added, %u removed), full layout (%s)", nadd, nrem,
++			why != NULL ? why : "?");
++		content__reformat(base_c, false, base_c->available_width,
++				base_c->available_height);
++		return 0;
++	}
++	layout = c->layout;
++	base_c->width = layout->x + layout->padding[LEFT] + layout->width +
++		layout->padding[RIGHT] + layout->border[RIGHT].width +
++		layout->margin[RIGHT];
++	base_c->height = layout->y + layout->padding[TOP] + layout->height +
++		layout->padding[BOTTOM] + layout->border[BOTTOM].width +
++		layout->margin[BOTTOM];
++	if (base_c->width < layout->x + layout->descendant_x1)
++		base_c->width = layout->x + layout->descendant_x1;
++	if (base_c->height < layout->y + layout->descendant_y1)
++		base_c->height = layout->y + layout->descendant_y1;
++	selection_reinit(c->sel);
++	macsurf_debug_log_writef("LIFE rebuild local: blocks placed (%u "
++		"added, %u removed) %+d px in %ld us, page %dx%d (%lu so far)",
++		nadd, nrem, total, (long)(macos9_micros() - t0),
++		base_c->width, base_c->height, block_n);
++	guit->misc->schedule(0, html_relayout_notify, c);
++	return 0;
++
++decline:
++	for (i = 0; i < nadd; i++)
++		dom_node_unref(added[i]);
++	return -1;
++#undef RL_BNO
++}
++
+ int html_reconvert_local(struct content *base_c, void *vnode);
+ int html_reconvert_local(struct content *base_c, void *vnode)
+ {
+@@ -6317,6 +6629,15 @@ int html_reconvert_local(struct content *base_c, void *vnode)
+ 	block = box_for_node(element);
+ 	old_ic = block->children;
+ 
++	/* blocks inserted or removed among blocks (a paragraph added to a
++	 * list of paragraphs) */
++	if (old_ic != NULL && old_ic->type == BOX_BLOCK &&
++	    block->object == NULL && block->gadget == NULL) {
++		int r = html_rl_block_change(c, element, block, t0);
++		dom_node_unref(element);
++		return r;
++	}
++
+ 	/* a block of inline content: one inline container, nothing generated,
+ 	 * no objects or controls, now or after the change */
+ 	if (block->object != NULL || block->gadget != NULL ||
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 9e6cb89..73cd9b3 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -8047,3 +8047,209 @@ bool layout_relayout_line(html_content *content, struct box *ic,
+ 	return layout_relayout_core(content, NULL, ic, old_h, old_flags,
+ 			delta_out);
+ }
++
++
++/* ---- VitaBrowser: a block inserted or removed by a script -------------
++ *
++ * Roadmap WS-C, script-driven DOM changes, second part. A paragraph a
++ * script inserts or removes among other blocks cost a rebuild of the whole
++ * box tree and a full layout (~0.25 s on the host for 5000 paragraphs).
++ * html_reconvert_local builds just the new block's boxes (or unlinks the
++ * removed one) and calls this to place it exactly as layout_block_context
++ * would -- a block's y is the bottom of the one before, plus its top
++ * border, plus the collapsed margin (the previous block's bottom margin
++ * accumulated before its own top margin: lr_collapse) -- and to move what
++ * follows. Only for blocks the arithmetic stands on (lr_margin_block):
++ * plain, static, unfloated, uncleared, overflow visible, whose first line
++ * has height (MAKE_HEIGHT: margins do not collapse through them). At the
++ * parent's first or last place the margins shared with the parent must be
++ * unchanged. */
++
++static void lr_acc(int *pos, int *neg, int m)
++{
++	if (*pos < m)
++		*pos = m;
++	else if (*neg < -m)
++		*neg = -m;
++}
++
++static int lr_collapse(int above, int below)
++{
++	int pos = 0, neg = 0;
++	lr_acc(&pos, &neg, above);
++	lr_acc(&pos, &neg, below);
++	return pos - neg;
++}
++
++static int lr_bottom(const struct box *b)
++{
++	return b->y + b->padding[TOP] + b->height + b->padding[BOTTOM] +
++		b->border[BOTTOM].width;
++}
++
++static bool lr_margin_block(const struct box *b)
++{
++	if (!lr_plain_block(b) || !(b->flags & MAKE_HEIGHT) ||
++	    !(b->flags & HAS_HEIGHT))
++		return false;
++	if (css_computed_position(b->style) != CSS_POSITION_STATIC ||
++	    css_computed_clear(b->style) != CSS_CLEAR_NONE ||
++	    css_computed_float(b->style) != CSS_FLOAT_NONE ||
++	    box_overflow_x(b) != CSS_OVERFLOW_VISIBLE ||
++	    box_overflow_y(b) != CSS_OVERFLOW_VISIBLE)
++		return false;
++	return true;
++}
++
++/* exported function documented in html/layout.h */
++bool layout_relayout_block(html_content *content, struct box *parent,
++		struct box *prev, struct box *nb, struct box *next,
++		const struct layout_removed_block *removed, int *delta_out)
++{
++	struct box *chain[LR_MAX_DEPTH];
++	unsigned int fl[LR_MAX_DEPTH];
++	struct box *b, *c, *ic = NULL, *doc = content->layout;
++	unsigned int n = 0, i;
++	int delta;
++
++	if (delta_out != NULL)
++		*delta_out = 0;
++	if (doc == NULL || parent == NULL)
++		LR_NO("no layout");
++	if ((nb == NULL) == (removed == NULL))
++		LR_NO("bad call");
++	if (prev == NULL && next == NULL)
++		LR_NO("parent had no other block");
++
++	/* the parent and its ancestors: plain blocks up to the root */
++	for (b = parent; b != NULL; b = b->parent) {
++		if (n == LR_MAX_DEPTH || !lr_plain_block(b))
++			LR_NO("ancestor not a plain block");
++		chain[n++] = b;
++	}
++	if (chain[n - 1] != doc)
++		LR_NO("not in the document");
++
++	/* what moves */
++	for (c = next; c != NULL; c = c->next)
++		if (lr_subtree_unsafe(c))
++			LR_NO("positioned box or iframe after it");
++	for (i = 0; i + 1 < n; i++)
++		for (c = chain[i]->next; c != NULL; c = c->next)
++			if (lr_subtree_unsafe(c))
++				LR_NO("positioned box or iframe after it");
++	if (doc->height < vb_viewport_h)
++		LR_NO("page shorter than the screen");
++
++	/* min/max widths (and so MAKE_HEIGHT / HAS_HEIGHT) again, as
++	 * layout_document would; the new block gets its flags here */
++	for (i = 0; i < n; i++)
++		fl[i] = chain[i]->flags & (HAS_HEIGHT | MAKE_HEIGHT);
++	macsurf_layout_watchdog_reset();
++	layout_minmax_block(doc, content->font_func, content);
++	for (i = 0; i < n; i++)
++		if ((chain[i]->flags & (HAS_HEIGHT | MAKE_HEIGHT)) != fl[i])
++			LR_NO("margin collapsing changes");
++
++	if ((prev != NULL && !lr_margin_block(prev)) ||
++	    (next != NULL && !lr_margin_block(next)))
++		LR_NO("neighbouring block not plain");
++
++	if (nb != NULL) {
++		if (!lr_margin_block(nb))
++			LR_NO("new block not plain");
++		ic = nb->children;
++		if (ic == NULL || ic->next != NULL ||
++		    ic->type != BOX_INLINE_CONTAINER)
++			LR_NO("new block is not one line container");
++		for (c = ic->children; c != NULL; c = c->next) {
++			switch (c->type) {
++			case BOX_INLINE:
++			case BOX_TEXT:
++			case BOX_INLINE_END:
++			case BOX_BR:
++				break;
++			default:
++				LR_NO("new block's line has more than text");
++			}
++			if ((c->style != NULL &&
++			     css_computed_position(c->style) !=
++					CSS_POSITION_STATIC) ||
++			    c->iframe != NULL || c->children != NULL ||
++			    c->object != NULL)
++				LR_NO("new block's line has more than text");
++		}
++	}
++
++	/* where it goes, and how far what follows moves */
++	if (nb != NULL) {
++		/* its own layout, as layout_block_context does for a block
++		 * holding one inline container */
++		layout_block_find_dimensions(&content->unit_len_ctx,
++				parent->width, vb_viewport_h, 0, 0, nb);
++		if (nb->height != AUTO)
++			LR_NO("new block has a height");
++		nb->x = parent->padding[LEFT] + nb->margin[LEFT] +
++			nb->border[LEFT].width;
++		ic->x = nb->padding[LEFT];
++		ic->y = nb->padding[TOP];
++		ic->width = nb->width;
++		if (!layout_inline_container(ic, nb->width, nb, 0, 0, content))
++			LR_NO("line layout failed");
++		nb->height = ic->height;
++		if (prev != NULL) {
++			nb->y = lr_bottom(prev) + nb->border[TOP].width +
++				lr_collapse(prev->margin[BOTTOM],
++					nb->margin[TOP]);
++		} else {
++			/* first: the margin it shares with the parent is the
++			 * old first block's */
++			if (nb->margin[TOP] != next->margin[TOP])
++				LR_NO("new first block's top margin differs");
++			nb->y = next->y - next->border[TOP].width +
++				nb->border[TOP].width;
++		}
++		layout_calculate_descendant_bboxes(&content->unit_len_ctx, nb);
++		if (next != NULL) {
++			delta = lr_bottom(nb) + next->border[TOP].width +
++				lr_collapse(nb->margin[BOTTOM],
++					next->margin[TOP]) - next->y;
++		} else {
++			if (nb->margin[BOTTOM] != prev->margin[BOTTOM])
++				LR_NO("new last block's bottom margin differs");
++			delta = lr_bottom(nb) - lr_bottom(prev);
++		}
++	} else if (next != NULL) {
++		int y;
++		if (prev != NULL) {
++			y = lr_bottom(prev) + next->border[TOP].width +
++				lr_collapse(prev->margin[BOTTOM],
++					next->margin[TOP]);
++		} else {
++			if (next->margin[TOP] != removed->margin_top)
++				LR_NO("removed first block's top margin differs");
++			y = removed->y - removed->border_top +
++				next->border[TOP].width;
++		}
++		delta = y - next->y;
++	} else {
++		if (removed->margin_bottom != prev->margin[BOTTOM])
++			LR_NO("removed last block's bottom margin differs");
++		delta = lr_bottom(prev) - removed->bottom;
++	}
++
++	/* move what follows, grow the parent and its ancestors */
++	for (c = next; c != NULL; c = c->next)
++		c->y += delta;
++	for (i = 0; i + 1 < n; i++)
++		for (c = chain[i]->next; c != NULL; c = c->next)
++			c->y += delta;
++	for (i = 0; i < n; i++)
++		chain[i]->height += delta;
++	for (i = 0; i < n; i++)
++		lr_descendant_bbox_shallow(&content->unit_len_ctx, chain[i]);
++
++	if (delta_out != NULL)
++		*delta_out = delta;
++	return true;
++}
+diff --git a/content/handlers/html/layout.h b/content/handlers/html/layout.h
+index 9246a92..3fbc38f 100644
+--- a/content/handlers/html/layout.h
++++ b/content/handlers/html/layout.h
+@@ -79,6 +79,34 @@ bool layout_relayout_object(struct html_content *content, struct box *box,
+ bool layout_relayout_line(struct html_content *content, struct box *ic,
+ 		int old_h, unsigned int old_flags, int *delta_out);
+ 
++/** Where a block a script removed sat (layout_relayout_block). */
++struct layout_removed_block {
++	int y;			/**< its y */
++	int border_top;		/**< its top border */
++	int bottom;		/**< the bottom of its border box */
++	int margin_top;
++	int margin_bottom;
++};
++
++/**
++ * VitaBrowser: place a block a script inserted (nb, already linked into
++ * parent's children between prev and next) or account for one it
++ * removed (removed; prev and next are its old neighbours), exactly as a
++ * full layout would, and move what follows.
++ *
++ * \param content   the page (laid out)
++ * \param parent    the parent block
++ * \param prev      the block before the change, or NULL
++ * \param nb        the new block, or NULL
++ * \param next      the block after the change, or NULL
++ * \param removed   the removed block's geometry, or NULL
++ * \param delta_out how far what follows moved, or NULL
++ * \return true if done; false if the page needs a full layout
++ */
++bool layout_relayout_block(struct html_content *content, struct box *parent,
++		struct box *prev, struct box *nb, struct box *next,
++		const struct layout_removed_block *removed, int *delta_out);
++
+ unsigned int layout_multicol_segment_count(const struct box *box);
+ bool layout_multicol_segment_bounds(const struct box *box,
+ 		unsigned int index, int *top, int *bottom);
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 2ce4eb4..3c5cfcb 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -3603,9 +3603,27 @@ static dom_string *qjs_make_domstr(const char *s)
+ static void qjs_mark_dom_dirty(JSContext *ctx, void *node, int kind)
+ {
+ 	struct content *content = qjs_get_content_for_ctx(ctx);
+-	if (content != NULL) {
+-		macos9_js_mark_dom_dirty_node(content, node, kind);
++	if (content == NULL)
++		return;
++	/* VitaBrowser: a node not in the document has no boxes, so its
++	 * change needs no rebuild -- and recording it made the batch
++	 * "multi" (a new paragraph's text set before it is inserted), which
++	 * sent the insertion itself to the full rebuild. */
++	if (node != NULL) {
++		struct dom_document *doc = NULL;
++		bool in_doc = true;
++		if (dom_node_get_owner_document((dom_node *) node, &doc) ==
++				DOM_NO_ERR && doc != NULL) {
++			if ((void *) doc != node &&
++			    dom_node_contains((dom_node *) doc,
++					(dom_node *) node, &in_doc) != DOM_NO_ERR)
++				in_doc = true;
++			dom_node_unref(doc);
++		}
++		if (!in_doc)
++			return;
+ 	}
++	macos9_js_mark_dom_dirty_node(content, node, kind);
+ }
+ 
+ /* ---- QuickJS class for element wrappers ---- */

@@ -557,6 +557,8 @@ echo "  JS-parse-tail: ${ptr:-no summary}"
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
 # < 60 ms of stall, and the engine log shows them done locally.
+# Patch 166: the same for a paragraph inserted, appended and removed
+# (layout_relayout_block): placed locally, < 60 ms each.
 dsp=$(ls "$R"/*NET-js-dom-stall-bottom.plot 2>/dev/null | head -1)
 dsr=$(sed -n 's/.*STR \(DOMSTALL: [0-9]*\/[0-9]* passed\).*/\1/p' "$dsp" 2>/dev/null | head -1)
 if [ -z "$dsr" ]; then
@@ -569,8 +571,10 @@ dsl=$(awk '/page [0-9]*\/[0-9]* NET-js-dom-stall: navigate/ {on=1; next}
 	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
 	on' "$R/netsurf.log" 2>/dev/null)
 ds_local=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: rebuilt and laid out' || true)
-echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally"
-[ "$dsr" = "DOMSTALL: 5/5 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
+ds_blocks=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: blocks placed' || true)
+echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_blocks} block changes placed locally"
+[ "$dsr" = "DOMSTALL: 7/7 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
+[ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \

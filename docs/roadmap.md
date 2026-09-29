@@ -128,11 +128,15 @@ layout -- 257-1496 ms of stall on the host. A change inside a block of
 inline content (textContent, innerHTML with inline markup, a text node's
 data, an inline child added or removed) now rebuilds only that block's
 boxes and lays out only its lines: ~23 ms of stall (2.7 ms of work),
-positions identical to the full path (JS-dom-stall.html). Still the full
-rebuild: inserting or removing a block (a new paragraph: 255 ms), changes
-under tables/flex/floats, objects and form controls. Next in WS-C: block
-insertion/removal (placing a new block among its siblings, with margin
-collapsing), then re-score `Done s` per tier.
+positions identical to the full path (JS-dom-stall.html). Block
+insertion/removal (patch 166): a paragraph a script inserts, appends or
+removes among other blocks is now built alone and placed with the
+layout's own margin collapsing (5-7 ms of work, stall 24 ms instead of
+250-273 ms; all 5001 blocks identical to the full path, and a stress page
+of first/last-place edits, batched appends and removals). Still the full
+rebuild: lists (markers), nested blocks, floats/tables/flex around the
+change, objects and form controls. WS-C's script-change items are done in
+the sim; next: re-score `Done s` per tier.
 Found on the way (patch 164, a correctness fix, not WS-C): without iconv
 (the Vita's libparserutils) the last <=64 characters of a document or
 stylesheet were dropped when the data ended in the pass that filled the
