@@ -2793,3 +2793,29 @@ SHA256 first 12: VitaBrowser.vpk d50862126f84, VitaBrowser-ext.vpk
   placed (N added, M removed) ..." per batch, "declined (reason)" when it
   took the full path (lists and nested blocks still do).
 
+
+## Run 27 — hand-off (2026-09-30 00:21)
+
+Built from `9302294` (patches 164-167). VPK:
+`3b9422b0 VitaBrowser.vpk` / `3647d73d VitaBrowser-ext.vpk`
+(archive `<WORK>/vitabrowser-work/hwtest-2026-09-30-run27/`).
+Same install flow as run 26; the standard autotest
+(SELECT + □) plus this run's focus list:
+
+- **google.com — THE test.** r3 (run 24-26 builds) hard-failed its main
+  script before the JS-error reporter even booted; r4 (this build, sim)
+  gets PAST that failure (3 JS errors reported now, at a later point in
+  the bundle). So the sim says the `Object.defineProperty` wall is down —
+  the question the Vita answers is whether it's real there too.
+  On the device: does google.com render more than the r3 build did?
+  (r3 on-device: the page came up, the search box was there, but the
+  page's scripts died early.) If it's better: note what's there now;
+  if it's the same: the sim/device divergence IS the finding (send the
+  netsurf.log — the `MS [js]` lines are the evidence either way).
+- Everything else is the run 26 list still open: the long-image page
+  scroll (patch 165/166 local relayout — the Vita-pace gate is green in
+  sim, this is its first on-device look), a page with a script at the
+  very end of the document (patch 164), and any site where text changes
+  live (patch 165).
+- Watch as always: `refused` stays 0 in log.txt; new DIFFs in
+  receiver.txt; any .dmp from ux0:data/.
