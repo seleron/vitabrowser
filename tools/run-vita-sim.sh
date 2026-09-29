@@ -243,6 +243,13 @@ wait $RX || true
 kill $HTTPD 2>/dev/null || true
 cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
 rm -f "$OUT/reference/netlog.cfg" "$OUT/reference/nettest.txt"
+# Every nettest.txt line must reach the autotest: past the frontend's
+# VITA_NET_PAGES_MAX the rest are dropped with only a log line, and the
+# dropped pages' gates then fail as "no summary" (JS-lazyimg, 2026-09-29).
+if grep -q 'nettest.txt: [0-9]* pages ignored' "$OUT/reference/log.txt"; then
+	grep -h 'nettest.txt: [0-9]* pages ignored' "$OUT/reference/log.txt" | sed 's/^/  /'
+	fail "network page list longer than VITA_NET_PAGES_MAX (frontends/vita/main.c)"
+fi
 ls "$OUT/reference" | head -40
 
 # The autotest renders every page once per pass (frontends/vita/main.c
@@ -507,8 +514,9 @@ echo "  JS-module-dedupe: ${mdr:-no summary}"
 # into the Vita frontend after every frame). The page proves it with
 # httpd /fetch-count: at load only the 10-image eager budget is fetched;
 # scrolling brings the six below-the-fold images in exactly once;
-# scrolling back refetches nothing (16 GETs total).
-lzp=$(ls "$R"/*NET-js-lazyimg.plot 2>/dev/null | head -1)
+# scrolling back refetches nothing (16 GETs total). Read from the -bottom
+# dump: checks 2-4 run after the autotest's scroll to the bottom.
+lzp=$(ls "$R"/*NET-js-lazyimg-bottom.plot 2>/dev/null | head -1)
 lzr=$(sed -n 's/.*STR \(LAZYIMG: [0-9]*\/[0-9]* passed\).*/\1/p' "$lzp" 2>/dev/null | head -1)
 echo "  JS-lazyimg: ${lzr:-no summary}"
 [ -n "$lzp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$lzp" | sed 's/^STR /  /' || true; }

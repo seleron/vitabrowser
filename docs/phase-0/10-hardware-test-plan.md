@@ -2657,8 +2657,10 @@ give the device numbers (sim: longest slice 151 ms).
 - Patch 161 (WS-C duplicate-module measurement, closed in the sim): with
   the 159/160 pipelines running in parallel, the same module URL was
   fetched and evaluated once per load that wanted it (a module in a static
-  graph AND import()ed: 2; the same import() twice: 2; the same
-  `<script type=module src>` twice: 2). Now each URL is one card in the
+  graph AND import()ed, or a module script AND an early import() of it:
+  fetched 2, evaluated 2 -- two instances of one module; the same
+  `<script type=module src>` twice: evaluated 2. The same import() twice
+  was already shared). Now each URL is one card in the
   module registry: the page's own fetch registers it first, the parallel
   import()s WAIT for that instead of fetching again, and a module script
   whose URL is already known is not fetched at all (it runs from the
@@ -2669,3 +2671,16 @@ give the device numbers (sim: longest slice 151 ms).
   device: the "LIFE module refetch" log lines (there should be none for a
   URL that loads once) and the per-graph summary line carry the refetch
   count.
+- Patch 162 (WS-C item 2, lazy sub-resources): images past the first 10
+  of a page are fetched when scrolled near instead of all at load. The
+  fixes738 queue is drained after every frame (it was never called), and
+  the parser's speculative fetch of every `<img>` -- which had loaded all
+  of a page's images at once, so the queue never held anything -- keeps to
+  the same 10. Sim: JS-lazyimg.html 4/4 (1-10 at load, 11-16 only after
+  the scroll, each exactly once). On the device: a long image page (a
+  forum thread, an image-heavy article) should reach Done sooner and use
+  less memory; scroll down and the lower images appear within a moment;
+  netsurf.log "Retrieve ...png" lines for the lower images come after the
+  scroll, not at load. fixes738's earlier version crashed a G3 on a stale
+  box: watch for a crash while scrolling a page as images arrive (the
+  "RECON LAZY" log lines name the node if it does).

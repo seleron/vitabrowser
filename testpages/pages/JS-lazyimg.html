@@ -14,22 +14,22 @@
      16 paths) under a 2000 px spacer, each rendered 80 px tall, so the
      deferred ones (11-16) start ~2930 px down and the viewport (544 px)
      + drain margin (600 px) at scroll 0 only reaches y~1144.
-     The autotest settles the page at the TOP, dumps, then (long page)
-     scrolls to the BOTTOM and settles again before moving on; the gate
-     reads the BOTTOM dump's plot, so every check must be written to the
-     DOM before that bottom settle. Sequence, with scroll guards on each
-     sample (window.scrollY is in content px):
-     1: at the top (scrollY < 100), images 1-10 (the eager budget) are
-        fetched exactly once and images 11-16 (below the fold) have NOT
-        been fetched.
-     2: at the bottom (scrollY > 2000, the autotest's long-page scroll),
-        images 11-16 are each fetched exactly once (the drain ran on the
-        bottom's repaint).
-     3: after scrolling back to the top, nothing is fetched again: all
-        16 counts are still exactly 1.
-     4: after scrolling the 11-16 band into view once more (scrollTo
-        0,2400) and back to the top, the total across the 16 files is
-        16 GETs: every image fetched exactly once over the whole session. -->
+     Driven by events, not a clock: the autotest settles a page once
+     nothing has drawn (or loaded) for ~1 s, dumps it, scrolls a long page
+     to the BOTTOM and settles again; the gate reads that -bottom dump.
+     Each step below draws something (a result line, a scroll) within
+     ~0.4 s of the last, so the bottom settle waits for the whole sequence.
+     1: at the load event, at the top (scrollY < 100): images 1-10 (the
+        eager budget) fetched exactly once, 11-16 (below the fold) not
+        at all.
+     2: once the autotest has scrolled to the bottom (scrollY > 2000,
+        polled): images 11-16 each fetched exactly once (the drain ran
+        on the bottom's repaint).
+     3: after the page scrolls back to the top: nothing fetched again,
+        all 16 counts still exactly 1.
+     4: after scrolling the 11-16 band into view once more (a frame
+        drawn there) and back: 16 GETs in total, every image fetched
+        exactly once over the whole session. -->
 <style>
 body { font-family: sans-serif; font-size: 16px; margin: 10px; }
 p { margin: 3px 0; padding: 2px 6px; }
@@ -63,71 +63,64 @@ img { display: block; width: 120px; height: 80px; }
 		});
 	}
 	function got(c, i) { return c[IMG[i - 1]] || 0; }
-	document.addEventListener('DOMContentLoaded', function () {
+	function later(ms, f) { setTimeout(f, ms); }
+	window.addEventListener('load', function () {
 		document.getElementById('sum').textContent =
 			'LAZYIMG: 0/' + N + ' passed';
-		/* sample 1: at the top, after the eager fetches. The autotest
-		 * settles the page at the top ~1 s after load and only THEN
-		 * scrolls the long page to the bottom, so a 1.2 s sample is
-		 * safely before the bottom scroll. */
-		setTimeout(function () {
-			counts().then(function (c) {
-				var eagerOk = true, lazyOk = true;
-				var i;
-				var sy = (window.scrollY || 0);
-				for (i = 1; i <= 10; i++)
-					if (got(c, i) !== 1) eagerOk = false;
-				for (i = 11; i <= 16; i++)
-					if (got(c, i) !== 0) lazyOk = false;
-				t(1, sy < 100 && eagerOk && lazyOk,
-					'at top (scrollY=' + sy + '): 1-10 fetched once, ' +
-					'11-16 (below fold) not fetched (11=' + got(c, 11) +
-					' 16=' + got(c, 16) + ')');
-				/* sample 2: the autotest's long-page bottom scroll has
-				 * happened by now (it settles the top ~1 s after load,
-				 * dumps, then scrolls the ~3000 px page to the bottom);
-				 * the drain fetched 11-16 on that bottom's repaint. */
-				setTimeout(function () {
-					counts().then(function (c) {
-						var ok = true;
-						var i, s = '', sy2 = (window.scrollY || 0);
-						for (i = 11; i <= 16; i++) {
-							if (got(c, i) !== 1) ok = false;
-							s += i + '=' + got(c, i) + ' ';
-						}
-						t(2, sy2 > 2000 && ok,
-							'at bottom (scrollY=' + sy2 + '): 11-16 ' +
-							'fetched once by the drain: ' + s);
-						/* scroll back to the top: nothing may refetch */
-						window.scrollTo(0, 0);
-						setTimeout(function () {
-							counts().then(function (c) {
-								var ok = true, i;
-								for (i = 1; i <= 16; i++)
-									if (got(c, i) !== 1) ok = false;
-								t(3, ok, 'after scroll to top: all 16 ' +
-									'still exactly 1');
-								/* scroll the 11-16 band into view once
-								 * more, then back: fetch nothing new */
-								window.scrollTo(0, 2400);
-								window.scrollTo(0, 0);
-								setTimeout(function () {
-									counts().then(function (c) {
-										var total = 0, i;
-										for (i = 1; i <= 16; i++)
-											total += got(c, i);
-										t(4, total === 16,
-											'total GETs after re-scroll: ' +
-											total + ' (16)');
-									}).catch(fail(4));
-								}, 1200);
-							}).catch(fail(3));
-						}, 1200);
-					}).catch(fail(2));
-				}, 2500);
-			}).catch(fail(1));
-		}, 1200);
+		var sy = (window.scrollY || 0);
+		counts().then(function (c) {
+			var eagerOk = true, lazyOk = true, i;
+			for (i = 1; i <= 10; i++)
+				if (got(c, i) !== 1) eagerOk = false;
+			for (i = 11; i <= 16; i++)
+				if (got(c, i) !== 0) lazyOk = false;
+			t(1, sy < 100 && eagerOk && lazyOk,
+				'at top (scrollY=' + sy + '): 1-10 fetched once (' +
+				'1=' + got(c, 1) + ' 10=' + got(c, 10) + '), 11-16 not (' +
+				'11=' + got(c, 11) + ' 16=' + got(c, 16) + ')');
+			waitBottom();
+		}).catch(fail(1));
 	});
+	/* the autotest's long-page scroll, polled (a poll draws nothing, so
+	 * the top still settles and is dumped first) */
+	function waitBottom() {
+		if ((window.scrollY || 0) <= 2000) { later(100, waitBottom); return; }
+		later(400, function () {
+			counts().then(function (c) {
+				var ok = true, i, s = '';
+				for (i = 11; i <= 16; i++) {
+					if (got(c, i) !== 1) ok = false;
+					s += i + '=' + got(c, i) + ' ';
+				}
+				t(2, ok, 'at bottom (scrollY=' + (window.scrollY || 0) +
+					'): 11-16 fetched once by the drain: ' + s);
+				window.scrollTo(0, 0);
+				later(400, step3);
+			}).catch(fail(2));
+		});
+	}
+	function step3() {
+		counts().then(function (c) {
+			var ok = true, i;
+			for (i = 1; i <= 16; i++)
+				if (got(c, i) !== 1) ok = false;
+			t(3, ok, 'after scroll to top: all 16 still exactly 1');
+			window.scrollTo(0, 2400);
+			later(400, function () {
+				window.scrollTo(0, 0);
+				later(400, step4);
+			});
+		}).catch(fail(3));
+	}
+	function step4() {
+		counts().then(function (c) {
+			var total = 0, i;
+			for (i = 1; i <= 16; i++)
+				total += got(c, i);
+			t(4, total === 16, 'total GETs after re-scroll: ' + total +
+				' (16)');
+		}).catch(fail(4));
+	}
 })();
 </script>
 </head>

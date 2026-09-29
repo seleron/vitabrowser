@@ -106,7 +106,14 @@ static graph AND import()ed, the same import() twice, the same src twice,
 and a module script AND an import() of it all share one registry card; the
 page fetch registers first and the import()s wait for it. Server-side
 proof via httpd /fetch-count (9/9 files fetched once, all in flight at
-once). Next in WS-C: item 2 (lazy sub-resources, incremental reflow).
+once). Item 2, lazy sub-resources, is closed in the sim (patch 162):
+images past the first 10 of a page load when scrolled near (the
+fixes738 queue is now drained after every frame, and the parser's
+speculative `<img>` fetch, which had fetched every image at load and made
+the queue moot, keeps to the same 10); JS-lazyimg.html 4/4 via httpd
+/fetch-count (3/4 without the fetch budget, 1/4 without the drain).
+Device verification in run 26. Next in WS-C: incremental reflow, then
+re-score `Done s` per tier.
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

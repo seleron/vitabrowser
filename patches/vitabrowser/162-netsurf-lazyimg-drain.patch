@@ -1,0 +1,131 @@
+# netsurf: below-the-fold images load when scrolled to (lazy-image drain)
+#
+# Roadmap WS-C item 2 (lazy sub-resources). fixes738 queues every <img>
+# past the page's eager budget (10) at box construction
+# (content/handlers/html/box_special.c) and fetches an entry once its box
+# is within the viewport + margin -- but nothing on the Vita called the
+# drain, macsurf_lazyimg_viewport_changed(), so image 11 onwards of a
+# page was never fetched at all.
+#
+# - frontends/vita/window.c: after every frame's browser_window_redraw,
+#   call the drain with the scroll offset and screen height in document
+#   (CSS) px (divided by the zoom, as sync_fixed does). The drain holds
+#   DOM nodes, not boxes, walks only DONE contents and drops dead ones.
+# - dom_event.c / html.c / private.h: the parser's speculative fetch of
+#   every inserted <img> (upstream html_process_inserted_img) now has the
+#   same 10-image budget (img_spec_budget). It fetched each image as it
+#   was parsed, before box_image could defer it, so the queue was moot:
+#   every image of every page was fetched at load and the drain only ever
+#   re-requested cached ones (found by this patch's own test: 11-16 were
+#   requested at 0.09 s, before layout).
+# - frontends/vita/main.c: VITA_NET_PAGES_MAX 48 -> 52. nettest.txt had
+#   grown to 49 pages, so the last one (the lazy-image gate) was dropped
+#   with only a log line; run-vita-sim.sh now fails on that line.
+# Test: JS-lazyimg.html (16 images below a 2000 px spacer; the page asks
+# httpd /fetch-count; event-driven, read from the -bottom dump): at load
+# 1-10 fetched once and 11-16 not at all, after the scroll to the bottom
+# 11-16 fetched once, back at the top nothing refetches, scrolling the
+# band again keeps the total at 16. 4/4; without the speculative budget
+# 3/4 (11-16 fetched at load), without the drain 1/4 (never fetched).
+# Note: a below-the-fold <img> (and so its onload) now loads only when
+# scrolled near, as with loading=lazy.
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index ee864a1..946bf6d 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -130,6 +130,14 @@ static bool html_process_inserted_img(html_content *htmlc, dom_node *node)
+ 		return true;
+ 	}
+ 
++	/* VitaBrowser: only the first images in document order (the eager
++	 * budget box_image fetches anyway); the rest wait for the lazy-image
++	 * drain to fetch them when scrolled near. */
++	if (htmlc->img_spec_budget <= 0) {
++		return true;
++	}
++	htmlc->img_spec_budget--;
++
+ 	exc = dom_element_get_attribute(node, corestring_dom_src, &src);
+ 	if (exc != DOM_NO_ERR || src == NULL) {
+ 		return true;
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 970ddb7..b814869 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1849,6 +1849,7 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	c->num_objects = 0;
+ 	c->object_list = NULL;
+ 	c->img_eager_budget = 10;	/* fixes932 - eager above-the-fold images */
++	c->img_spec_budget = 10;	/* ...and speculative fetches of them */
+ 	c->forms = NULL;
+ 	c->imagemaps = NULL;
+ 	c->bw = NULL;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index dce977c..f88492c 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -256,6 +256,11 @@ typedef struct html_content {
+ 	 * so a reconvert (budget already 0) defers everything, as it should.
+ 	 */
+ 	int img_eager_budget;
++	/** VitaBrowser: the same N for the parser's speculative <img> fetch
++	 * (dom_event.c html_process_inserted_img). Without it every <img> was
++	 * fetched as it was parsed, before box_image could defer it, and the
++	 * lazy-image queue only ever re-requested cached images. */
++	int img_spec_budget;
+ 	unsigned long ms_diag_doc_id;
+ 	unsigned long ms_diag_frame_id;
+ 
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index e0d3efa..42a87a7 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -135,7 +135,7 @@ static const char *const vita_local_pages[] = {
+  * reach them too. The defaults, or ux0:data/VitaBrowser/nettest.txt with
+  * one "name url" per line (the simulator points them at a local server).
+  */
+-#define VITA_NET_PAGES_MAX 48
++#define VITA_NET_PAGES_MAX 52
+ static const char *const vita_net_defaults[][2] = {
+ 	{ "NET-http-example", "http://example.com/" },
+ 	{ "NET-https-example", "https://example.com/" },
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index a328eb4..624aeb1 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -45,6 +45,13 @@
+ #include "content/handlers/html/box_inspect.h"
+ #include "content/handlers/html/html_save.h"
+ 
++/* content/handlers/html/box_special.c (fixes738): the viewport-gated
++ * lazy-image drain. box_image defers every image past the page's eager
++ * budget into a queue; this fetches the entries whose box is within
++ * viewport + margin and leaves the rest for a later scroll. Called after
++ * every frame's redraw, in content (CSS) pixels. */
++extern void macsurf_lazyimg_viewport_changed(int scroll_y, int viewport_h);
++
+ #include "vita/diag.h"
+ #include "vita/plot.h"
+ #include "vita/window.h"
+@@ -269,6 +276,21 @@ void vita_window_redraw(struct gui_window *gw)
+ 	 * scroll offset. */
+ 	sync_fixed(gw);
+ 	browser_window_redraw(gw->bw, -gw->scrollx, -gw->scrolly, &clip, &ctx);
++	/* fixes738's lazy-image queue drains here: after the box tree is
++	 * painted, fetch whatever the viewport (plus the drain's margin)
++	 * now reaches, so below-the-fold images load on the first scroll
++	 * that brings them near instead of sitting queued forever. The
++	 * scroll offset is in screen px; the drain compares against
++	 * document (CSS) px, so undo the zoom the same way sync_fixed
++	 * does. */
++	{
++		float scale = browser_window_get_scale(gw->bw);
++		if (scale <= 0.0f)
++			scale = 1.0f;
++		macsurf_lazyimg_viewport_changed(
++				(int)(gw->scrolly / scale),
++				(int)(VITA_SCREEN_HEIGHT / scale));
++	}
+ 	gw->dirty = false;
+ }
+ 
