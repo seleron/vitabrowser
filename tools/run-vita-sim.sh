@@ -222,6 +222,7 @@ NET-js-module-async http://127.0.0.1:$HP/JS-module-async.html
 NET-js-module-static-async http://127.0.0.1:$HP/JS-module-static-async.html
 NET-js-module-dedupe http://127.0.0.1:$HP/JS-module-dedupe.html
 NET-js-lazyimg http://127.0.0.1:$HP/JS-lazyimg.html
+NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -525,6 +526,27 @@ echo "  JS-lazyimg: ${lzr:-no summary}"
 [ "$mdr" = "MODDUP: 5/5 passed" ] && \
 [ "$msr" = "MODSTATIC: 5/5 passed" ] && \
 [ "$mar" = "MODASYNC: 4/4 passed" ] && \
+# Patch 163: a late image re-lays out only its own lines (WS-C2b). The
+# page measures the main loop while four images land at the bottom of a
+# 5000-paragraph page (full layout 50-75 ms here); the engine's log for
+# that page must show only local relayouts, each under a frame (16 ms).
+rsp=$(ls "$R"/*NET-js-reflow-stall-bottom.plot 2>/dev/null | head -1)
+rsr=$(sed -n 's/.*STR \(REFLOW: [0-9]*\/[0-9]* passed\).*/\1/p' "$rsp" 2>/dev/null | head -1)
+if [ -z "$rsr" ]; then
+	rsp=$(ls "$R"/*NET-js-reflow-stall.plot 2>/dev/null | head -1)
+	rsr=$(sed -n 's/.*STR \(REFLOW: [0-9]*\/[0-9]* passed\).*/\1/p' "$rsp" 2>/dev/null | head -1)
+fi
+echo "  JS-reflow-stall: ${rsr:-no summary}"
+[ -n "$rsp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$rsp" | sed 's/^STR /  /' || true; }
+rsl=$(awk '/page [0-9]*\/[0-9]* NET-js-reflow-stall: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null)
+rs_local=$(printf '%s\n' "$rsl" | grep -c 'LIFE relayout local: [+-][0-9]* px in' || true)
+rs_full=$(printf '%s\n' "$rsl" | grep -c 'LIFE relayout local: full reflow instead' || true)
+rs_max=$(printf '%s\n' "$rsl" | sed -n 's/.*LIFE relayout local: [+-][0-9]* px in \([0-9]*\) us.*/\1/p' | sort -n | tail -1)
+echo "  JS-reflow-stall engine: ${rs_local} local relayouts (longest ${rs_max:-?} us), ${rs_full} fell back to full"
+[ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
+[ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \

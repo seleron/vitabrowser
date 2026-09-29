@@ -112,8 +112,16 @@ fixes738 queue is now drained after every frame, and the parser's
 speculative `<img>` fetch, which had fetched every image at load and made
 the queue moot, keeps to the same 10); JS-lazyimg.html 4/4 via httpd
 /fetch-count (3/4 without the fetch budget, 1/4 without the drain).
-Device verification in run 26. Next in WS-C: incremental reflow, then
-re-score `Done s` per tier.
+Device verification in run 26. Incremental reflow for late objects is
+closed in the sim too (patch 163): an image that arrives after layout
+re-lays out only its own lines and moves what follows, instead of a full
+layout_document per batch (JS-reflow-stall.html: 6-14 us per relayout,
+longest main-loop gap 38-40 ms instead of 98-109 ms on 5000 paragraphs;
+positions identical to a full layout's). Still full: a display: block
+image with no size (margins collapse through its empty block), floats or
+positioned boxes in the way, and every script DOM change (a whole-tree
+rebuild: ~0.4 s for 5000 paragraphs on the host) -- that last one is the
+next WS-C item. Then re-score `Done s` per tier.
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

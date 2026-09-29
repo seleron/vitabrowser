@@ -2745,3 +2745,19 @@ SHA256 first 12: VitaBrowser.vpk d50862126f84, VitaBrowser-ext.vpk
    sites). Deferred images should lower the image page's peak; the
    module registry now keeps one copy per URL.
 
+## Since run 26 — queued for run 27 (not built yet)
+
+- Patch 163 (WS-C item 2 part B, incremental reflow): an image that
+  arrives after the page is laid out (a lazy image scrolled into view, a
+  slow server) now re-lays out only its own lines and moves what follows,
+  instead of laying out the whole page again for every batch. Sim: 6-14 us
+  per image instead of a 50-75 ms full layout on a 5000-paragraph page
+  (JS-reflow-stall.html; positions identical to a full layout's).
+- On the device: scroll down a long page with many images (a forum
+  thread, a long article) and watch for hitches as images appear -- there
+  should be none from layout. netsurf.log has one "LIFE relayout local:
+  +N px in M us" line per placed image and "LIFE relayout local: full
+  reflow instead (reason ...)" when it fell back; "LIFE reformat #N:
+  layout M ms" lines time every full layout (send a few with the results:
+  they are the Vita's real layout costs).
+

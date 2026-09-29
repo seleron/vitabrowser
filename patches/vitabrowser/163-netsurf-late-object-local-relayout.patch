@@ -1,0 +1,574 @@
+# netsurf: a late image re-lays out only its own lines (incremental reflow)
+#
+# Roadmap WS-C item 2 part B. An object that arrives after the page is
+# laid out (patch 162's lazy drain, a slow server) cost a full
+# layout_document of the whole page each time a batch landed -- 50-75 ms
+# on the host for a 5000-paragraph page, several hundred ms on the Vita,
+# while the user scrolls.
+#
+# - layout.c: layout_relayout_object() lays out again only the object's
+#   inline container (or, for an image that is display: block, the block
+#   itself), moves every later sibling of every ancestor down by the change
+#   in height, grows the ancestors and refreshes their descendant bboxes.
+#   It says no -- the caller does the full reflow -- whenever the result
+#   could differ from a full layout: floats in the formatting context,
+#   inline-blocks or positioned boxes in the line, an ancestor that is not
+#   a plain auto-height block (table, flex, grid, float, abs, multicol,
+#   min/max height, list marker), margin collapsing that changes (the
+#   HAS_HEIGHT / MAKE_HEIGHT flags from the min/max pass, which it redoes
+#   as layout_document would), an absolutely positioned box offset from a
+#   containing block outside what moves, a fixed box, iframes, a page
+#   shorter than the screen. layout_relayout_why names the reason.
+# - html.c: html_relayout_object_local() runs it on a DONE page, updates
+#   the page size as html_reformat does and tells the window from the
+#   scheduler (html_relayout_notify: inside the object's broadcast a nested
+#   REFORMAT is dropped). html_reformat logs each full layout's duration
+#   ("LIFE reformat #N: layout M ms") and clears late_reflow_pending.
+# - object.c: the three places that reflowed the whole page for a late
+#   object try the local relayout first; the guaranteed reflow at
+#   active==0 is skipped for an object already placed, one sized by CSS
+#   (REPLACE_DIM: nothing moved) or one only starting to load, unless a
+#   full reflow is still owed (late_reflow_pending, private.h).
+# Sim, JS-reflow-stall.html (4 dimensionless images arriving at the bottom
+# of 5000 paragraphs): local relayouts 6-14 us each; longest main-loop
+# gap 38-40 ms (the rest of the object callbacks) instead of 98-109 ms;
+# every position identical to a full layout's (checked element by element
+# with the local path switched off). A display: block image with no size
+# is an empty block that margins collapse through, so it still takes the
+# full path when it arrives.
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index b814869..f4ce17b 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1850,6 +1850,7 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	c->object_list = NULL;
+ 	c->img_eager_budget = 10;	/* fixes932 - eager above-the-fold images */
+ 	c->img_spec_budget = 10;	/* ...and speculative fetches of them */
++	c->late_reflow_pending = false;
+ 	c->forms = NULL;
+ 	c->imagemaps = NULL;
+ 	c->bw = NULL;
+@@ -5952,6 +5953,7 @@ static void html_reformat(struct content *c, int width, int height)
+ 
+ 	htmlc->reflowing = false;
+ 	htmlc->had_initial_layout = true;
++	htmlc->late_reflow_pending = false;
+ 
+ 	/* calculate next reflow time at three times what it took to reflow */
+ 	nsu_getmonotonic_ms(&ms_after);
+@@ -5966,6 +5968,9 @@ static void html_reformat(struct content *c, int width, int height)
+ 	}
+ #endif
+ 
++	macsurf_debug_log_writef("LIFE reformat #%ld: layout %ld ms (%dx%d)",
++		macos9_html_reformat_seq, (long)(ms_after - ms_before),
++		c->width, c->height);
+ 	ms_interval = (ms_after - ms_before) * 3;
+ 	if (ms_interval < (nsoption_uint(min_reflow_period) * 10)) {
+ 		ms_interval = nsoption_uint(min_reflow_period) * 10;
+@@ -6064,6 +6069,80 @@ static void html_destroy_iframe(struct content_html_iframe *iframe)
+ }
+ 
+ 
++/* VitaBrowser: tell the page's users its layout changed. From the
++ * scheduler: html_relayout_object_local runs inside an object's broadcast,
++ * where content_broadcast drops a nested REFORMAT (not replay-safe), so
++ * the window would neither repaint nor learn the new size. One per burst
++ * (a new schedule replaces the pending one); cancelled in html_destroy. */
++static void html_relayout_notify(void *p)
++{
++	html_content *htmlc = p;
++	union content_msg_data data;
++
++	if (macos9_content_is_live(&htmlc->base) == 0 || htmlc->aborted)
++		return;
++	data.background = false;
++	content_broadcast(&htmlc->base, CONTENT_MSG_REFORMAT, &data);
++}
++
++/* VitaBrowser (roadmap WS-C item 2 part B): an object that arrived after
++ * the page was laid out (a lazy image, a slow server) changes only its own
++ * lines and moves what follows: lay out just that (layout_relayout_object)
++ * instead of the whole page. The page's size and the frontend follow as
++ * after html_reformat. False: the caller does the full reflow. */
++bool html_relayout_object_local(html_content *htmlc, struct box *box)
++{
++	extern const char *layout_relayout_why;
++	extern double macos9_micros(void);
++	struct content *c = &htmlc->base;
++	struct box *layout;
++	double t0, t1;
++	int delta = 0;
++	static unsigned long done_n, no_n;
++
++	if (htmlc->layout == NULL || htmlc->reflowing ||
++	    !htmlc->had_initial_layout || htmlc->aborted ||
++	    c->status != CONTENT_STATUS_DONE || c->locked ||
++	    htmlc->iframe != NULL || htmlc->late_reflow_pending)
++		return false;
++	t0 = macos9_micros();
++	if (!layout_relayout_object(htmlc, box, &delta)) {
++		no_n++;
++		macsurf_debug_log_writef("LIFE relayout local: full reflow "
++			"instead (%s; box type %d in %d; %lu local, %lu full "
++			"so far)", layout_relayout_why, (int)box->type,
++			box->parent != NULL ? (int)box->parent->type : -1,
++			done_n, no_n);
++		return false;
++	}
++	t1 = macos9_micros();
++	done_n++;
++
++	layout = htmlc->layout;
++	c->width = layout->x + layout->padding[LEFT] + layout->width +
++		layout->padding[RIGHT] + layout->border[RIGHT].width +
++		layout->margin[RIGHT];
++	c->height = layout->y + layout->padding[TOP] + layout->height +
++		layout->padding[BOTTOM] + layout->border[BOTTOM].width +
++		layout->margin[BOTTOM];
++	if (layout->descendant_x1 > 1000000)
++		layout->descendant_x1 = 1000000;
++	if (layout->descendant_y1 > 1000000)
++		layout->descendant_y1 = 1000000;
++	if (c->width < layout->x + layout->descendant_x1)
++		c->width = layout->x + layout->descendant_x1;
++	if (c->height < layout->y + layout->descendant_y1)
++		c->height = layout->y + layout->descendant_y1;
++	selection_reinit(htmlc->sel);
++
++	macsurf_debug_log_writef("LIFE relayout local: %+d px in %ld us, "
++		"page %dx%d (%lu local, %lu full so far)", delta,
++		(long)(t1 - t0), c->width, c->height, done_n, no_n);
++
++	guit->misc->schedule(0, html_relayout_notify, htmlc);
++	return true;
++}
++
+ static void html_free_layout(html_content *htmlc)
+ {
+ 
+@@ -6098,6 +6177,7 @@ static void html_destroy(struct content *c)
+ #ifdef WITH_QUICKJS
+ 	guit->misc->schedule(-1, html_module_prefetch_poll, c);
+ #endif
++	guit->misc->schedule(-1, html_relayout_notify, c);
+ 
+ #ifdef __MACOS9__
+ 	if (html->ms_diag_doc_id != 0) {
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 8d791c2..7f9ffb0 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -7745,3 +7745,279 @@ bool layout_document(html_content *content, int width, int height)
+ 
+ 	return ret;
+ }
++
++
++/* ---- VitaBrowser: local relayout for a late replaced element ----------
++ *
++ * Roadmap WS-C item 2 part B. An image that arrives after the page is laid
++ * out (patch 162's lazy drain, a slow server) used to cost a full
++ * layout_document of the whole page -- one synchronous burst, hundreds of
++ * ms on the Vita for a long page, every time a batch of images landed.
++ * Most such images sit in plain block flow: then only the line boxes of
++ * their inline container change, and everything after them just moves
++ * down by the change in height. layout_relayout_object() does exactly that
++ * and nothing more, and says no (the caller does the full reflow) as soon
++ * as anything could make the result differ from a full layout: floats in
++ * the block formatting context, a non-block or shrink-to-fit ancestor
++ * (inline-block, table, flex, grid, float, abs, multicol), a fixed or
++ * min/max height, a list marker, collapsing through a zero-height box,
++ * positioned boxes that a height change would move, iframes. */
++
++static bool lr_position_offset(const struct box *b)
++{
++	css_fixed len = 0;
++	css_unit unit = CSS_UNIT_PX;
++	return css_computed_top(b->style, &len, &unit) != CSS_TOP_AUTO ||
++		css_computed_bottom(b->style, &len, &unit) != CSS_BOTTOM_AUTO;
++}
++
++/* Would moving subtree s down move something full layout would have left
++ * in place? An absolutely positioned box offset (top/bottom) from a
++ * containing block outside s, any fixed box so offset, or an iframe
++ * (positioned by the frontend from the layout). */
++static bool lr_subtree_unsafe(struct box *s)
++{
++	struct box *b = s;
++
++	while (b != NULL) {
++		if (b->iframe != NULL)
++			return true;
++		if (b->style != NULL) {
++			uint8_t pos = css_computed_position(b->style);
++			if (pos == CSS_POSITION_FIXED && lr_position_offset(b))
++				return true;
++			if (pos == CSS_POSITION_ABSOLUTE && lr_position_offset(b)) {
++				struct box *cb = NULL, *u;
++				for (u = b->parent; u != NULL; u = u->parent)
++					if (u->style != NULL &&
++					    css_computed_position(u->style) !=
++						CSS_POSITION_STATIC) {
++						cb = u;
++						break;
++					}
++				/* safe only if cb is s or inside it */
++				for (u = cb; u != NULL && u != s; u = u->parent)
++					;
++				if (cb == NULL || u == NULL)
++					return true;
++			}
++		}
++		/* next in document order, without leaving s */
++		if (b->children != NULL) {
++			b = b->children;
++			continue;
++		}
++		while (b != s && b->next == NULL)
++			b = b->parent;
++		if (b == s)
++			break;
++		b = b->next;
++	}
++	return false;
++}
++
++/* Is b a plain in-flow block whose height is its content's? */
++static bool lr_plain_block(const struct box *b)
++{
++	css_fixed len = 0;
++	css_unit unit = CSS_UNIT_PX;
++	int32_t count = 0;
++
++	if (b->type != BOX_BLOCK || b->object != NULL || b->style == NULL ||
++	    b->float_children != NULL || b->list_marker != NULL ||
++	    b->iframe != NULL)
++		return false;
++	switch (css_computed_position(b->style)) {
++	case CSS_POSITION_ABSOLUTE:
++	case CSS_POSITION_FIXED:
++		return false;
++	default:
++		break;
++	}
++	if (css_computed_height(b->style, &len, &unit) != CSS_HEIGHT_AUTO)
++		return false;
++	if (css_computed_min_height(b->style, &len, &unit) ==
++			CSS_MIN_HEIGHT_SET && len != 0)
++		return false;
++	if (css_computed_max_height(b->style, &len, &unit) !=
++			CSS_MAX_HEIGHT_NONE)
++		return false;
++	if (css_computed_column_count(b->style, &count) ==
++			CSS_COLUMN_COUNT_SET && count > 1)
++		return false;
++	return true;
++}
++
++/* A box's descendant bbox from its children's (already correct) ones:
++ * layout_calculate_descendant_bboxes for one box, without descending. */
++static void lr_descendant_bbox_shallow(const css_unit_ctx *unit_len_ctx,
++		struct box *box)
++{
++	struct box *child;
++
++	layout_get_box_bbox(unit_len_ctx, box,
++			&box->descendant_x0, &box->descendant_y0,
++			&box->descendant_x1, &box->descendant_y1);
++	for (child = box->children; child; child = child->next) {
++		bool ox_hidden, oy_hidden;
++		int sx0, sx1, sy0, sy1;
++		if (child->type == BOX_FLOAT_LEFT ||
++				child->type == BOX_FLOAT_RIGHT)
++			continue;
++		ox_hidden = box->style != NULL &&
++				(box_overflow_x(box) == CSS_OVERFLOW_HIDDEN ||
++				 box_overflow_x(box) == CSS_OVERFLOW_CLIP);
++		oy_hidden = box->style != NULL &&
++				(box_overflow_y(box) == CSS_OVERFLOW_HIDDEN ||
++				 box_overflow_y(box) == CSS_OVERFLOW_CLIP);
++		if (ox_hidden && oy_hidden)
++			continue;
++		sx0 = box->descendant_x0; sx1 = box->descendant_x1;
++		sy0 = box->descendant_y0; sy1 = box->descendant_y1;
++		layout_update_descendant_bbox(unit_len_ctx, box, child, 0, 0);
++		if (ox_hidden) {
++			box->descendant_x0 = sx0;
++			box->descendant_x1 = sx1;
++		}
++		if (oy_hidden) {
++			box->descendant_y0 = sy0;
++			box->descendant_y1 = sy1;
++		}
++	}
++}
++
++#define LR_MAX_DEPTH 256
++
++/* why the last layout_relayout_object() said no (for the log) */
++const char *layout_relayout_why = "";
++#define LR_NO(why) do { layout_relayout_why = (why); return false; } while (0)
++
++/* exported function documented in html/layout.h */
++bool layout_relayout_object(html_content *content, struct box *box,
++		int *delta_out)
++{
++	struct box *chain[LR_MAX_DEPTH];
++	unsigned int fl[LR_MAX_DEPTH];
++	bool block_mode = false;
++	struct box *ic, *b, *c, *doc = content->layout;
++	unsigned int n = 0, i;
++	int old_h, delta;
++
++	if (delta_out != NULL)
++		*delta_out = 0;
++	if (doc == NULL || box == NULL || box->parent == NULL)
++		LR_NO("no layout");
++	if (box->type == BOX_BLOCK && box->object != NULL) {
++		/* an image that is a block (display: block): its own box is
++		 * what changes size */
++		css_fixed len = 0;
++		css_unit unit = CSS_UNIT_PX;
++		if (content_get_type(box->object) != CONTENT_IMAGE)
++			LR_NO("block object is not an image");
++		if (box->style == NULL ||
++		    css_computed_position(box->style) != CSS_POSITION_STATIC ||
++		    (css_computed_min_height(box->style, &len, &unit) ==
++				CSS_MIN_HEIGHT_SET && len != 0) ||
++		    css_computed_max_height(box->style, &len, &unit) !=
++				CSS_MAX_HEIGHT_NONE)
++			LR_NO("block image with position or min/max height");
++		block_mode = true;
++		ic = box;
++	} else {
++		ic = box->parent;
++		if (ic->type != BOX_INLINE_CONTAINER)
++			LR_NO("not inline or block");
++	}
++
++	/* 1. the inline container: nothing in it that full layout places
++	 * from outside the line boxes */
++	for (c = block_mode ? NULL : ic->children; c != NULL; c = c->next) {
++		switch (c->type) {
++		case BOX_INLINE:
++		case BOX_TEXT:
++		case BOX_INLINE_END:
++		case BOX_BR:
++			break;
++		default:
++			LR_NO("line has a float or inline-block");
++		}
++		if (c->style != NULL &&
++		    css_computed_position(c->style) != CSS_POSITION_STATIC)
++			LR_NO("positioned inline");
++		if (c->iframe != NULL || c->children != NULL)
++			LR_NO("inline with children");
++	}
++
++	/* 2. the ancestors: plain blocks up to the root */
++	chain[n++] = ic;
++	for (b = ic->parent; b != NULL; b = b->parent) {
++		if (n == LR_MAX_DEPTH || !lr_plain_block(b))
++			LR_NO("ancestor not a plain block");
++		chain[n++] = b;
++	}
++	if (chain[n - 1] != doc)
++		LR_NO("not in the document");
++
++	/* 3. what moves: every later sibling of every chain box */
++	for (i = 0; i + 1 < n; i++)
++		for (c = chain[i]->next; c != NULL; c = c->next)
++			if (lr_subtree_unsafe(c))
++				LR_NO("positioned box or iframe after it");
++
++	/* the page must stay taller than the viewport (html/body fill it
++	 * otherwise, layout_document) */
++	if (doc->height < vb_viewport_h)
++		LR_NO("page shorter than the screen");
++
++	/* 4. min/max widths again (html_object_done invalidated the chain's),
++	 * as layout_document would. They also decide margin collapsing
++	 * (HAS_HEIGHT / MAKE_HEIGHT: an empty line that now has an image
++	 * stops margins collapsing through its block): if that changed
++	 * anywhere on the chain, only a full layout gets it right. */
++	for (i = 0; i < n; i++)
++		fl[i] = chain[i]->flags & (HAS_HEIGHT | MAKE_HEIGHT);
++	macsurf_layout_watchdog_reset();
++	layout_minmax_block(doc, content->font_func, content);
++	for (i = 0; i < n; i++)
++		if ((chain[i]->flags & (HAS_HEIGHT | MAKE_HEIGHT)) != fl[i])
++			LR_NO("margin collapsing changes");
++
++	/* 5. lay out the inline container (or the image block) again */
++	if (block_mode) {
++		/* as layout_block_context does for a block: its size from the
++		 * object, its margins, then x from them; y is unchanged */
++		old_h = ic->height + ic->padding[TOP] + ic->padding[BOTTOM] +
++			ic->border[TOP].width + ic->border[BOTTOM].width;
++		layout_block_find_dimensions(&content->unit_len_ctx,
++				ic->parent->width, vb_viewport_h, 0, 0, ic);
++		ic->x = ic->parent->padding[LEFT] + ic->margin[LEFT] +
++			ic->border[LEFT].width;
++		if (!layout_block_object(ic))
++			LR_NO("block object layout failed");
++		delta = ic->height + ic->padding[TOP] + ic->padding[BOTTOM] +
++			ic->border[TOP].width + ic->border[BOTTOM].width - old_h;
++	} else {
++		old_h = ic->height;
++		ic->width = ic->parent->width;
++		if (!layout_inline_container(ic, ic->width, ic->parent, 0, 0,
++				content))
++			LR_NO("line layout failed");
++		delta = ic->height - old_h;
++	}
++	layout_calculate_descendant_bboxes(&content->unit_len_ctx, ic);
++
++	/* 6. move the rest down, grow the ancestors, refresh their bboxes */
++	if (delta != 0) {
++		for (i = 0; i + 1 < n; i++)
++			for (c = chain[i]->next; c != NULL; c = c->next)
++				c->y += delta;
++		for (i = 1; i < n; i++)
++			chain[i]->height += delta;
++	}
++	for (i = 1; i < n; i++)
++		lr_descendant_bbox_shallow(&content->unit_len_ctx, chain[i]);
++
++	if (delta_out != NULL)
++		*delta_out = delta;
++	return true;
++}
+diff --git a/content/handlers/html/layout.h b/content/handlers/html/layout.h
+index ebd2d9a..c562773 100644
+--- a/content/handlers/html/layout.h
++++ b/content/handlers/html/layout.h
+@@ -49,6 +49,20 @@ bool layout_document(struct html_content *content, int width, int height);
+  * (at 0) while images/fonts were still settling. */
+ void html_minmax_invalidate_tree(struct box *box);
+ 
++/**
++ * VitaBrowser: lay out again only what an object box's new size changes --
++ * its inline container's lines -- and move everything after it by the
++ * change in height. For an image that arrives after the page's layout.
++ *
++ * \param content   the page (laid out)
++ * \param box       the object's box
++ * \param delta_out the change in height, or NULL
++ * eturn true if done; false if the case needs a full layout (nothing
++ *         has been changed then, except possibly the container's lines)
++ */
++bool layout_relayout_object(struct html_content *content, struct box *box,
++		int *delta_out);
++
+ unsigned int layout_multicol_segment_count(const struct box *box);
+ bool layout_multicol_segment_bounds(const struct box *box,
+ 		unsigned int index, int *top, int *bottom);
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 665a242..4dfa6ae 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -439,6 +439,7 @@ html_object_callback(hlcache_handle *object,
+ 	html_content *c;
+ 	int x, y;
+ 	struct box *box;
++	bool relaid = false;	/* placed by html_relayout_object_local */
+ 
+ 	/* fixes535: this hlcache callback carries a content_html_object whose
+ 	 * owning content is o->parent.  The reliable cancellation is the object
+@@ -491,12 +492,20 @@ html_object_callback(hlcache_handle *object,
+ 				 * display during load is already handled by the throttled
+ 				 * incremental_reflow branch below (>=250ms). Collapses the
+ 				 * storm to ~2-3 reflows. */
+-				macsurf_debug_log_writef(
+-					"reformat: trig=obj-size active=%d",
+-					(int)c->base.active);
+-				content__reformat(&c->base, false,
++				/* VitaBrowser: on a laid-out page, only the
++				 * object's own lines (WS-C2b) */
++				if (!o->background && box != NULL &&
++				    c->base.status == CONTENT_STATUS_DONE &&
++				    html_relayout_object_local(c, box)) {
++					relaid = true;
++				} else {
++					macsurf_debug_log_writef(
++						"reformat: trig=obj-size active=%d",
++						(int)c->base.active);
++					content__reformat(&c->base, false,
+ 						c->base.available_width,
+ 						c->base.available_height);
++				}
+ 			}
+ 		}
+ 		break;
+@@ -809,9 +818,24 @@ html_object_callback(hlcache_handle *object,
+ 		 * leaving the image box collapsed (vertically squished) until
+ 		 * the next navigation. Its intrinsic dimensions are known at
+ 		 * convert, so one reflow here sizes the box. active==0 keeps
+-		 * this coalesced (fires once per completed batch -- no storm). */
+-		content__reformat(&c->base, false, c->base.available_width,
+-				c->base.available_height);
++		 * this coalesced (fires once per completed batch -- no storm).
++		 *
++		 * VitaBrowser (WS-C2b): on a page already laid out (DONE), an
++		 * object placed by html_relayout_object_local, one whose box
++		 * had its size from CSS (REPLACE_DIM: nothing moved) or one only
++		 * starting to load (LOADING: not attached yet) needs no full
++		 * layout unless an earlier one is still owed. */
++		if (c->base.status == CONTENT_STATUS_DONE &&
++		    !c->late_reflow_pending && !o->background && box != NULL &&
++		    (relaid || (box->flags & REPLACE_DIM) ||
++		     event->type == CONTENT_MSG_LOADING ||
++		     html_relayout_object_local(c, box))) {
++			/* placed */
++		} else {
++			content__reformat(&c->base, false,
++					c->base.available_width,
++					c->base.available_height);
++		}
+ 		/* fixes1015 - THE READY->DONE TRANSITION EVERY REAL PAGE TAKES,
+ 		 * and it skipped the `load` event for its entire existence. On any
+ 		 * page with images, base.active stays >0 until the last object
+@@ -831,7 +855,15 @@ html_object_callback(hlcache_handle *object,
+ 		   box != NULL &&
+ 		   !(box->flags & REPLACE_DIM) &&
+ 		   (c->base.status == CONTENT_STATUS_READY ||
+-		    c->base.status == CONTENT_STATUS_DONE)) {
++		    c->base.status == CONTENT_STATUS_DONE) &&
++		   !relaid &&
++		   !(c->base.status == CONTENT_STATUS_DONE && !o->background &&
++		     html_relayout_object_local(c, box))) {
++		/* VitaBrowser (WS-C2b): a late object on a laid-out page that
++		 * html_relayout_object_local could not place: a full reflow is
++		 * owed (the guaranteed one at active==0 must not skip it). */
++		if (c->base.status == CONTENT_STATUS_DONE)
++			c->late_reflow_pending = true;
+ 		/* #235: a macintoshgarden-style <img> with no width/height
+ 		 * attrs and no CSS dimensions links box->object via
+ 		 * CONTENT_MSG_READY (content_can_reformat is true for it) and
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index f88492c..e1ec8b3 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -261,6 +261,10 @@ typedef struct html_content {
+ 	 * fetched as it was parsed, before box_image could defer it, and the
+ 	 * lazy-image queue only ever re-requested cached images. */
+ 	int img_spec_budget;
++	/** VitaBrowser: a late object needed a full reflow that has not run
++	 * yet (html_relayout_object_local could not place it); cleared by
++	 * every full layout (html_reformat). */
++	bool late_reflow_pending;
+ 	unsigned long ms_diag_doc_id;
+ 	unsigned long ms_diag_frame_id;
+ 
+@@ -299,6 +303,10 @@ void html_finish_conversion(html_content *htmlc);
+  */
+ bool html_can_begin_conversion(html_content *htmlc);
+ 
++/* VitaBrowser: re-lay out only what a late object's box changes (html.c);
++ * false when the page needs a full reflow instead. */
++bool html_relayout_object_local(html_content *htmlc, struct box *box);
++
+ 
+ /**
+  * Begin conversion of an HTML document

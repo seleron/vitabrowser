@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS reflow stall (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+#res { position: fixed; top: 0; left: 0; right: 0; background: #fff; }
+.top img { width: 12px; height: 12px; }
+#big p { margin: 2px 0; }
+</style>
+<script>
+/* WS-C2b: late images must not stall the main loop (header below). */
+(function () {
+	var S = { gaps: [], maxgap: 0, ticks: 0, phase: 'load' }, N = 3, k = 0;
+	var last = Date.now();
+	(function tick() {
+		var now = Date.now(), g = now - last;
+		last = now;
+		if (S.phase === 'arrive') {
+			S.ticks++;
+			if (g > S.maxgap) S.maxgap = g;
+			if (g > 30) S.gaps.push(g);
+		}
+		if (S.phase !== 'done') setTimeout(tick, 0);
+	})();
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'REFLOW: ' + k + '/' + N + ' passed';
+		document.title = 'JS reflow stall (' + k + '/' + N + ')';
+	}
+	function late() { return document.querySelectorAll('#late img'); }
+	function arrived() {
+		var im = late(), n = 0, i;
+		for (i = 0; i < im.length; i++)
+			if (im[i].getBoundingClientRect().height >= 70) n++;
+		return n;
+	}
+	function ordered() {
+		var el = document.querySelectorAll('#late img, #late p, #foot');
+		var i, prev = null, r;
+		for (i = 0; i < el.length; i++) {
+			r = el[i].getBoundingClientRect();
+			if (prev && r.top < prev.bottom - 1) return 'overlap at ' + i;
+			prev = r;
+		}
+		return 'ok';
+	}
+	document.addEventListener('DOMContentLoaded', function () {
+		var h = [], i;
+		for (i = 0; i < 5000; i++)
+			h.push('<p>Paragraph ' + i + ' with <b>some</b> inline <i>text' +
+				'</i> that <span>wraps</span> in the layout, <a href="#">' +
+				'a link</a> and more words to fill the line out.</p>');
+		$('big').innerHTML = h.join('');
+		h = [];
+		for (i = 1; i <= 4; i++)
+			h.push('<img src="/slow/lazyimg-' + (i < 10 ? '0' : '') + i +
+				'.png?late' + i + '"><p>after image ' + i + '</p>');
+		$('late').innerHTML = h.join('');
+	});
+	/* measure only once settled (the DOMContentLoaded build rebuilds
+	 * the box tree; load fires again): tall, same height twice */
+	var started = false, lastH = -1;
+	function settled() {
+		var sh = document.body.scrollHeight;
+		if (sh < 100000 || sh !== lastH) {
+			lastH = sh;
+			setTimeout(settled, 100);
+			return;
+		}
+		(function bottom() {
+			if ((window.scrollY || 0) < 1000) {
+				window.scrollTo(0, document.body.scrollHeight);
+				setTimeout(bottom, 100);
+				return;
+			}
+			setTimeout(measure, 500);
+		})();
+	}
+	/* window: 0.5 s after the scroll to 0.3 s after the last image */
+	function measure() {
+		if (arrived() > 0) {
+			S.phase = 'done';
+			t(3, false, 'images arrived before the window: not measured');
+			return;
+		}
+		S.phase = 'arrive';
+		S.t0 = Date.now();
+		(function wait() {
+			var n = arrived();
+			if (n < 4 && Date.now() - S.t0 < 5000) {
+				setTimeout(wait, 100);
+				return;
+			}
+			setTimeout(function () {
+				S.phase = 'done';
+				t(1, n === 4, 'late images laid out: ' + n + '/4');
+				t(2, ordered() === 'ok', 'what followed moved: ' +
+					ordered());
+				t(3, S.ticks > 1 && S.maxgap < 60, 'no stall: ' +
+					S.ticks + ' ticks, longest gap ' + S.maxgap +
+					' ms (gaps > 30 ms: ' + (S.gaps.join(' ') || 'none') +
+					')');
+			}, 300);
+		})();
+	}
+	window.addEventListener('load', function () {
+		if (started) return;
+		started = true;
+		setTimeout(settled, 100);
+	});
+})();
+</script>
+</head>
+<body>
+<!-- Roadmap WS-C item 2 part B (patch 163): an image that arrives after
+     the page is laid out (patch 162's lazy drain) re-lays out only its own
+     lines and moves what follows (layout_relayout_object), instead of a
+     full layout_document of the whole page each time -- 50-75 ms here on
+     the host for 5000 paragraphs, several hundred ms on the Vita, while
+     the user scrolls.
+     The page scrolls itself to the bottom once it has settled; 4 images
+     without dimensions (their lines start 0 px tall, then 80) are served
+     there after 1 s (httpd /slow/), so their arrival is measured apart
+     from the jump's own frame.
+     1: all 4 laid out at their 80 px height.
+     2: what followed each image moved: images, paragraphs and the footer
+        do not overlap (the local result is the full layout's: checked
+        position by position in the sim when this was written).
+     3: no stall while they arrive: the longest gap between setTimeout(0)
+        ticks is < 60 ms (sim: 38-39 ms with the local relayout, 98-99 ms
+        with full layouts). The gate also checks the engine's log: every
+        local relayout < 16 ms, no fallback to a full one.
+     All the page's script is in the one <head> script, which builds the
+     paragraphs and images at DOMContentLoaded: a parser-inserted script
+     late in an earlier, longer version of this page was never run
+     (<WORK>/vitabrowser-work/bugrepro-script-skip, backlog). DOM writes wait
+     for the results: on this page each rebuilds the box tree. The results
+     are position: fixed, so the autotest's dumps (taken at the bottom,
+     and only of what is on screen) show them. -->
+<div id="res">
+<p id="sum" class="wait">REFLOW: script did not run</p>
+<p id="r1" class="wait">1 waiting</p><p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+</div>
+<div class="top">
+<img src="/lazyimg-01.png?rs"><img src="/lazyimg-02.png?rs"><img src="/lazyimg-03.png?rs">
+<img src="/lazyimg-04.png?rs"><img src="/lazyimg-05.png?rs"><img src="/lazyimg-06.png?rs">
+<img src="/lazyimg-07.png?rs"><img src="/lazyimg-08.png?rs"><img src="/lazyimg-09.png?rs">
+<img src="/lazyimg-10.png?rs">
+</div>
+<div id="big"></div>
+<div id="late"></div>
+<p id="foot">footer after the late images</p>
+</body>
+</html>
