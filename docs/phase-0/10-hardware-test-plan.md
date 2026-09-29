@@ -2572,3 +2572,42 @@ connection, the password page). Then press START (the popup should close
 and home appear in the main window) and open claude.ai again: it should
 render as the first time did (slow: minutes). log.txt now has a
 mem[page done] line per load.
+
+## Run 24 — hand-off: the first roadmap batch (patches 145-158; replaces untested run 23)
+
+Run 23 was never run on the device; run 24 includes all of it (141-144)
+plus the first work chosen by the scorecard (docs/roadmap.md,
+docs/scorecard-log.md):
+
+- 145-146 DOM event order: document/window listeners in the right phase,
+  one defaultPrevented per event, non-bubbling events do not bubble.
+- 147 display: inline-grid is inline (github.com crashed).
+- 148 preload scanner: scripts and stylesheets fetched in parallel ahead
+  of the parser (make.wordpress.org never finished loading).
+- 149 opacity:0 hides what it covers; light-dark() colours.
+- 150/151 CSS gap census (simulator only).
+- 152 "Done (Ns)" load time no longer shows the clock.
+- 153 DOM interface objects (Document, Node.prototype...), String(location).
+- 154 downloads to ux0:download/ (home page lists them).
+- 155 old.reddit.com segfault leaving the page.
+- 156 CSS census rewrites (text-align start/end, flex start/end, -webkit-
+  aliases, text-decoration, -webkit-box).
+- 157 script.text (WordPress).
+- 158 width/min-width/max-width: min-/max-/fit-content.
+
+Clean restage (all patches + the 2 known collisions), streams 4/4, sim
+suite exit 0 (interaction 31/31 incl. the download step, also at the
+Vita's pace), cross-build green. Reference dumps 31: example.com's four
+changed (one language, grey background), PM-animation time-varying.
+SHA256 first 12: VitaBrowser.vpk f5758db0822d, VitaBrowser-ext.vpk
+dd8b99fb65cb, nsvita.elf f6902ba5845e. Archive
+<WORK>/vitabrowser-work/hwtest-2026-09-29-run24/. Scorecard (sim, 21 sites):
+65.3 -> 68.5.
+
+**Run 24 on the device:** start receive-results.bat; autotest (expect
+~30/31 SAME, interact 31/31 -- step 30 saves ux0:download/vita-test.bin).
+Then, as time allows: open github.com (it crashed before), example.com
+(one language at a time), make.wordpress.org/core (loads now); in
+VitaShell, ux0:download/ should hold vita-test.bin. claude.ai + Google
+sign-in as in run 23 (expect Google's "Couldn't sign you in"); START in
+the popup returns to home in the main window.
