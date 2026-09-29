@@ -159,6 +159,8 @@ nfail=$(grep -c 'hlcache content create FAILED' "$NSLOG" || true)
 
 echo "== autotest run (reference dumps) =="
 rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
+# the download gate checks this run's file, not one an earlier run left
+rm -rf "$OUT/run/ux0:download"
 if ss -Hlun 2>/dev/null | grep -q ":${NETLOG_PORT:-45199} "; then
 	fail "something already listens on UDP ${NETLOG_PORT:-45199} (a stale receiver?)"
 fi
