@@ -479,7 +479,7 @@ cnr=$(sed -n 's/.*STR \(CENSUS: [0-9]*\/[0-9]* passed\).*/\1/p' "$cnp" 2>/dev/nu
 echo "  CSS-census: ${cnr:-no summary}"
 [ -n "$cnp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$cnp" | sed 's/^STR /  /' || true; }
 [ "$cnr" = "CENSUS: 5/5 passed" ] && \
-[ "$ifr" = "IFACES: 8/8 passed" ] && \
+[ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
 	[ "${op_ldbox:-0}" -ge 1 ] || fail "event order / inline-grid / group opacity"
