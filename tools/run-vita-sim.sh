@@ -194,6 +194,7 @@ CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 CSS-inline-grid file:///app0:/testpages/CSS-inline-grid.html
 CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
 CSS-census file:///app0:/testpages/CSS-census.html
+CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
 JS-event-order file:///app0:/testpages/JS-event-order.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
@@ -478,6 +479,10 @@ cnp=$(ls "$R"/*-CSS-census.plot 2>/dev/null | head -1)
 cnr=$(sed -n 's/.*STR \(CENSUS: [0-9]*\/[0-9]* passed\).*/\1/p' "$cnp" 2>/dev/null | head -1)
 echo "  CSS-census: ${cnr:-no summary}"
 [ -n "$cnp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$cnp" | sed 's/^STR /  /' || true; }
+inp=$(ls "$R"/*-CSS-intrinsic.plot 2>/dev/null | head -1)
+inr=$(sed -n 's/.*STR \(INTRINSIC: [0-9]*\/[0-9]* passed\).*/\1/p' "$inp" 2>/dev/null | head -1)
+echo "  CSS-intrinsic: ${inr:-no summary}"
+[ "$inr" = "INTRINSIC: 5/5 passed" ] && \
 [ "$cnr" = "CENSUS: 5/5 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \

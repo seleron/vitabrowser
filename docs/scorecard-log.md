@@ -41,3 +41,37 @@ reference is left out of the tier means; a wall on our side is "blocked",
 not a layout failure), `--rescore`, and the **gap census** (patches
 150-151): every distinct CSS declaration libcss drops and every JS error
 message, ranked by number of sites (`cssgaps.md`, `jsgaps.md`).
+
+## 2026-09-29 ~03:30 — patches 145-157 (run `score/r2`, reference = base)
+
+| tier | base | r2 |
+|---|---|---|
+| static | 81.3 | 82.0 |
+| wiki | 83.7 | 83.8 |
+| news | 75.7 | 71.4 * |
+| forum | 57.4 | 49.1 * |
+| wordpress | 51.5 | 64.6 |
+| jquery | 86.9 | 86.9 |
+| docs | 76.1 | 76.2 |
+| search | 42.3 | 42.0 |
+| spa | 36.4 | 58.7 |
+| **all** | **65.3** | **68.5** |
+
+\* **Stale reference, not a regression.** News and forum front pages change
+hourly; against a fresh Chrome capture (`score/fresh-news`) Hacker News is
+91.8, BBC 71.8, RTÉ 83.2, the Guardian 70.3 -- at or above base. **Rule:
+news/forum sites need a fresh reference every run** (static/wiki/docs can
+reuse one).
+
+Gains: github 0 (crash) -> 67 (patch 147), wpblog 26 -> 53 (148),
+old.reddit no longer segfaults leaving the page (155; it is a bot wall
+either way). The census's top JS errors (`Invalid URL`, `prototype of
+undefined`, WordPress `JSON.parse(script.text)`) are gone (153, 157).
+
+Census, what is left at the top (cssgaps.md): per-corner
+`border-*-radius` (10 sites; libcss has one radius -- needs 4 properties
+through cascade and the painter), intrinsic widths (`fit-content` 8,
+`max-content` 7: parser only, patch 158), `height: fit-content` (7, not
+modelled), `backdrop-filter`, `cursor`, `-webkit-appearance`,
+`color-scheme` (no visible effect here; ignore), `clip-path: inset` (6),
+`grid-template-rows: 1fr` (5).
