@@ -193,6 +193,7 @@ CSS-spacing file:///app0:/testpages/CSS-spacing.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 CSS-inline-grid file:///app0:/testpages/CSS-inline-grid.html
 CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
+CSS-census file:///app0:/testpages/CSS-census.html
 JS-event-order file:///app0:/testpages/JS-event-order.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
@@ -473,6 +474,11 @@ ifp=$(ls "$R"/*NET-js-interfaces.plot 2>/dev/null | head -1)
 ifr=$(sed -n 's/.*STR \(IFACES: [0-9]*\/[0-9]* passed\).*/\1/p' "$ifp" 2>/dev/null | head -1)
 echo "  JS-interfaces: ${ifr:-no summary}"
 [ -n "$ifp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL.*' "$ifp" | sed 's/^STR /  /' || true; }
+cnp=$(ls "$R"/*-CSS-census.plot 2>/dev/null | head -1)
+cnr=$(sed -n 's/.*STR \(CENSUS: [0-9]*\/[0-9]* passed\).*/\1/p' "$cnp" 2>/dev/null | head -1)
+echo "  CSS-census: ${cnr:-no summary}"
+[ -n "$cnp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$cnp" | sed 's/^STR /  /' || true; }
+[ "$cnr" = "CENSUS: 5/5 passed" ] && \
 [ "$ifr" = "IFACES: 8/8 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \

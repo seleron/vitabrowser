@@ -1,0 +1,325 @@
+# netsurf: CSS census rewrites (text-align start/end, flex start/end, -webkit- aliases, text-decoration, -webkit-box)
+#
+# The first batch chosen by the scorecard's gap census (tools/scorecard
+# cssgaps.md, docs/scorecard-log.md; site counts of 21): declarations libcss
+# dropped, rewritten in css_rewrite.c to forms it keeps --
+#   text-align: start|end -> left|right (9, 6 sites);
+#   align-items/align-self/align-content/justify-content (and -webkit-):
+#     start|end|self-start|self-end -> flex-start|flex-end (6);
+#   -webkit-<standard property> -> <standard> for transform(-origin),
+#     transition*, flex*, align/justify, box-sizing, box-shadow,
+#     border-radius, animation*, text-decoration, column-count/gap (5-7);
+#   text-decoration-line -> text-decoration, and text-decoration keeps its
+#     line keywords only ("underline dotted 1px" was dropped whole) (8, 6);
+#   display: -webkit-box|-webkit-inline-box -> block|inline-block,
+#     -webkit-flex|-ms-flexbox|-webkit-inline-flex -> flex|inline-flex (8).
+# A candidate is a declaration only if its value ends at ';' or '}' before
+# any '{'; comments and strings are skipped; NULL (no copy) when nothing
+# changed.
+# Test: CSS-census.html 5/5.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+index 7c36f4e74..7306853cb 100644
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -6063,6 +6063,279 @@ static char *vita_rewrite_light_dark(const char *d, size_t n, size_t *out_len)
+ 	return out;
+ }
+ 
++/* ---- VitaBrowser: census rewrites --------------------------------------
++ * Declarations libcss drops, chosen by the scorecard's gap census
++ * (docs/roadmap.md WS-A, tools/scorecard cssgaps.md: how many of 21 real
++ * sites use each), rewritten to forms it keeps:
++ *   text-align: start|end            -> left|right            (9, 6 sites)
++ *   align- and justify- properties: start, end, self-start, self-end
++ *                                    -> flex-start|flex-end    (6)
++ *   -webkit-<standard property>      -> <standard property>    (5-7 each)
++ *   text-decoration-line: x          -> text-decoration: x     (8)
++ *   text-decoration: <line> <more>   -> text-decoration: <line> (6)
++ *   display: -webkit-box|-webkit-inline-box -> block|inline-block (8)
++ *   display: -webkit-flex|-ms-flexbox|-webkit-inline-flex -> flex|inline-flex
++ * A candidate is a declaration only if its value ends at ';' or '}' before
++ * any '{' (so "a:hover{" is left alone). NULL when nothing changed. */
++struct vita_buf { char *p; size_t n, cap; bool ok; };
++
++static void vb_put(struct vita_buf *b, const char *d, size_t n)
++{
++	if (!b->ok)
++		return;
++	if (b->n + n + 1 > b->cap) {
++		size_t cap = (b->cap + n) * 2 + 64;
++		char *np = realloc(b->p, cap);
++		if (np == NULL) { b->ok = false; return; }
++		b->p = np;
++		b->cap = cap;
++	}
++	memcpy(b->p + b->n, d, n);
++	b->n += n;
++}
++
++static bool vita_ident_ch(char c)
++{
++	return isalnum((unsigned char)c) || c == '-' || c == '_';
++}
++
++static bool vita_word_is(const char *w, size_t n, const char *lit)
++{
++	return strlen(lit) == n && strncasecmp(w, lit, n) == 0;
++}
++
++/* rewrite one value's keywords word by word through map(), into b */
++static bool vita_map_words(struct vita_buf *b, const char *v, size_t vn,
++		const char *(*map)(const char *w, size_t n))
++{
++	size_t i = 0;
++	bool changed = false;
++	while (i < vn) {
++		if (vita_ident_ch(v[i]) && (i == 0 || !vita_ident_ch(v[i - 1]))) {
++			size_t j = i;
++			const char *m;
++			while (j < vn && vita_ident_ch(v[j])) j++;
++			m = (j < vn && v[j] == '(') ? NULL : map(v + i, j - i);
++			if (m != NULL) {
++				vb_put(b, m, strlen(m));
++				changed = true;
++			} else {
++				vb_put(b, v + i, j - i);
++			}
++			i = j;
++		} else {
++			vb_put(b, v + i, 1);
++			i++;
++		}
++	}
++	return changed;
++}
++
++static const char *vita_map_text_align(const char *w, size_t n)
++{
++	if (vita_word_is(w, n, "start")) return "left";
++	if (vita_word_is(w, n, "end")) return "right";
++	return NULL;
++}
++
++static const char *vita_map_align(const char *w, size_t n)
++{
++	if (vita_word_is(w, n, "start") || vita_word_is(w, n, "self-start"))
++		return "flex-start";
++	if (vita_word_is(w, n, "end") || vita_word_is(w, n, "self-end"))
++		return "flex-end";
++	return NULL;
++}
++
++static const char *vita_map_display(const char *w, size_t n)
++{
++	if (vita_word_is(w, n, "-webkit-box")) return "block";
++	if (vita_word_is(w, n, "-webkit-inline-box")) return "inline-block";
++	if (vita_word_is(w, n, "-webkit-flex") ||
++	    vita_word_is(w, n, "-ms-flexbox")) return "flex";
++	if (vita_word_is(w, n, "-webkit-inline-flex") ||
++	    vita_word_is(w, n, "-ms-inline-flexbox")) return "inline-flex";
++	return NULL;
++}
++
++/* -webkit- prefixed properties whose standard form libcss knows */
++static bool vita_unprefix_ok(const char *base, size_t n)
++{
++	static const char *const std[] = {
++		"transform", "transform-origin", "transition",
++		"transition-property", "transition-duration",
++		"transition-timing-function", "transition-delay",
++		"align-items", "align-self", "align-content",
++		"justify-content", "flex", "flex-direction", "flex-wrap",
++		"flex-flow", "flex-grow", "flex-shrink", "flex-basis", "order",
++		"box-sizing", "box-shadow", "border-radius", "animation",
++		"animation-name", "animation-duration", "animation-delay",
++		"animation-iteration-count", "animation-timing-function",
++		"text-decoration", "column-count", "column-gap", NULL
++	};
++	int i;
++	for (i = 0; std[i] != NULL; i++)
++		if (vita_word_is(base, n, std[i]))
++			return true;
++	return false;
++}
++
++static char *vita_rewrite_census(const char *d, size_t n, size_t *out_len)
++{
++	struct vita_buf b = { NULL, 0, 0, true };
++	size_t i = 0, copied = 0;
++	bool changed = false;
++	int depth = 0;
++	char q = 0;
++
++	while (i < n) {
++		char c = d[i];
++		if (q) {
++			if (c == '\\' && i + 1 < n) i++;
++			else if (c == q) q = 0;
++			i++;
++			continue;
++		}
++		if (c == '"' || c == '\'') { q = c; i++; continue; }
++		if (c == '/' && i + 1 < n && d[i + 1] == '*') {
++			/* bounded: the sheet need not end in NUL */
++			for (i += 2; i + 1 < n &&
++			     !(d[i] == '*' && d[i + 1] == '/'); i++)
++				;
++			i = i + 1 < n ? i + 2 : n;
++			continue;
++		}
++		if (c == '}' && depth > 0) depth--;
++		if (c == '{' || c == ';' || (c == '}' )) {
++			size_t p0, p1, v0, v1, k;
++			int pd = 0;
++			if (c == '{') depth++;
++			i++;
++			if (depth == 0)
++				continue;
++			p0 = i;
++			while (p0 < n && isspace((unsigned char)d[p0])) p0++;
++			p1 = p0;
++			while (p1 < n && vita_ident_ch(d[p1])) p1++;
++			if (p1 == p0) continue;
++			k = p1;
++			while (k < n && isspace((unsigned char)d[k])) k++;
++			if (k >= n || d[k] != ':') continue;
++			v0 = k + 1;
++			/* value: to ';' or '}' at depth 0, no '{' first */
++			for (v1 = v0; v1 < n; v1++) {
++				char vc = d[v1];
++				if (vc == '"' || vc == '\'') {
++					char vq = vc;
++					for (v1++; v1 < n && d[v1] != vq; v1++)
++						if (d[v1] == '\\') v1++;
++					continue;
++				}
++				if (vc == '(') pd++;
++				else if (vc == ')' && pd > 0) pd--;
++				else if (pd == 0 && (vc == ';' || vc == '}' ||
++						     vc == '{'))
++					break;
++			}
++			if (v1 >= n || d[v1] == '{')
++				continue;
++			{
++				const char *pn = d + p0;
++				size_t pl = p1 - p0;
++				struct vita_buf vb = { NULL, 0, 0, true };
++				bool ch = false;
++				const char *newprop = NULL;
++				size_t newpl = 0;
++				if (pl > 8 && strncasecmp(pn, "-webkit-", 8) == 0 &&
++				    vita_unprefix_ok(pn + 8, pl - 8)) {
++					newprop = pn + 8;
++					newpl = pl - 8;
++				}
++				if (vita_word_is(pn, pl, "text-align"))
++					ch = vita_map_words(&vb, d + v0, v1 - v0,
++							vita_map_text_align);
++				else if (vita_word_is(pn, pl, "align-items") ||
++					 vita_word_is(pn, pl, "align-self") ||
++					 vita_word_is(pn, pl, "align-content") ||
++					 vita_word_is(pn, pl, "justify-content") ||
++					 vita_word_is(pn, pl, "-webkit-align-items") ||
++					 vita_word_is(pn, pl, "-webkit-justify-content"))
++					ch = vita_map_words(&vb, d + v0, v1 - v0,
++							vita_map_align);
++				else if (vita_word_is(pn, pl, "display"))
++					ch = vita_map_words(&vb, d + v0, v1 - v0,
++							vita_map_display);
++				else if (vita_word_is(pn, pl, "text-decoration") ||
++					 vita_word_is(pn, pl, "text-decoration-line") ||
++					 vita_word_is(pn, pl, "-webkit-text-decoration")) {
++					/* keep the line keywords (and !important) */
++					size_t a = v0, kept = 0;
++					bool imp = false;
++					while (a < v1) {
++						size_t z;
++						if (!vita_ident_ch(d[a]) && d[a] != '!') { a++; continue; }
++						z = a + 1;
++						while (z < v1 && vita_ident_ch(d[z])) z++;
++						if (d[a] == '!') { imp = true; a = z; continue; }
++						if (vita_word_is(d + a, z - a, "none") ||
++						    vita_word_is(d + a, z - a, "underline") ||
++						    vita_word_is(d + a, z - a, "overline") ||
++						    vita_word_is(d + a, z - a, "line-through") ||
++						    vita_word_is(d + a, z - a, "blink")) {
++							vb_put(&vb, " ", 1);
++							vb_put(&vb, d + a, z - a);
++							kept++;
++						}
++						a = z;
++					}
++					if (imp) vb_put(&vb, " !important", 11);
++					ch = kept > 0 && (vb.n != v1 - v0 ||
++						strncmp(vb.p, d + v0, vb.n) != 0 ||
++						!vita_word_is(pn, pl, "text-decoration"));
++					if (kept > 0 && !vita_word_is(pn, pl,
++							"text-decoration")) {
++						newprop = "text-decoration";
++						newpl = 15;
++					} else if (kept == 0) {
++						ch = false;
++					}
++				}
++				if (ch || newprop != NULL) {
++					vb_put(&b, d + copied, p0 - copied);
++					if (newprop != NULL)
++						vb_put(&b, newprop, newpl);
++					else
++						vb_put(&b, pn, pl);
++					vb_put(&b, d + p1, v0 - p1);
++					if (ch && vb.ok && vb.p != NULL)
++						vb_put(&b, vb.p, vb.n);
++					else
++						vb_put(&b, d + v0, v1 - v0);
++					copied = v1;
++					changed = true;
++				}
++				free(vb.p);
++			}
++			i = v1;
++			continue;
++		}
++		i++;
++	}
++	if (!changed || !b.ok) {
++		free(b.p);
++		return NULL;
++	}
++	vb_put(&b, d + copied, n - copied);
++	vb_put(&b, "", 0);
++	if (!b.ok) {
++		free(b.p);
++		return NULL;
++	}
++	b.p[b.n] = '\0';
++	*out_len = b.n;
++	return b.p;
++}
++
+ /* exported interface documented in content/handlers/css/css_rewrite.h */
+ char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size)
+ {
+@@ -6101,6 +6374,21 @@ char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size)
+ 	if (in_size > (size_t)0x7fffffff)
+ 		return NULL;
+ 
++	/* VitaBrowser: the census rewrites (vita_rewrite_census) */
++	{
++		size_t cs_len = 0;
++		char *cs = vita_rewrite_census(data, in_size, &cs_len);
++		if (cs != NULL) {
++			char *r = macsurf_css_rewrite(cs, cs_len, out_size);
++			if (r == NULL) {
++				*out_size = cs_len;
++				return cs;
++			}
++			free(cs);
++			return r;
++		}
++	}
++
+ 	/* VitaBrowser: light-dark() resolves to its light colour */
+ 	{
+ 		size_t ld_len = 0;
