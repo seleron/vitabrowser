@@ -1,0 +1,577 @@
+# netsurf: one fetch and one evaluation per module URL, across
+# parallel loads
+#
+# Roadmap WS-C, duplicate-fetch measurement (the task left in flight at
+# the 05:18 session-limit banner): with the 159/160 pipelines running in
+# parallel, the same module URL was being fetched -- and evaluated --
+# once per load that wanted it (a module in a static graph AND
+# import()ed: 2 fetches; the same import() twice: 2; the same <script
+# type=module src> twice: 2; a module script AND import() of it: 2).
+#
+# - macsurf_qjs.c: the module card (module_entry) records the page
+#   fetch: js_module_page_fetch() marks the URL the page is fetching
+#   itself (a <script type=module src>) and clears it on completion;
+#   non-blocking loads (import() graphs) WAIT for the page
+#   fetch instead of fetching the URL a second time, and a blocking
+#   crawl finds the card registered and uses it. js_module_known()
+#   says the registry already has (or is loading) the URL.
+#   g_module_refetches counts the fetches that found their URL
+#   registered by the time they got to it; the count is logged per
+#   fetch and in every graph summary line (the visible count).
+#   Compiled bytes are cached on the card (the card entry is now
+#   written for external modules only: an inline module
+#   name is not stable across visits). The registry stays the
+#   single source of truth -- two loads of the same URL get the same
+#   module namespace, as before.
+# - script.c: a <script type=module src> whose URL is already known
+#   (import()ed earlier, the same src twice) is not fetched again:
+#   it queues as an inline placeholder and runs from the registry in
+#   its turn among the deferred scripts (HTML module-map semantics:
+#   the URL, not the element, identifies the module). A module script
+#   the page itself fetches registers its page fetch first, so the
+#   parallel import()s of the same URL wait for it.
+# Test: JS-module-dedupe.html 5/5, gated in run-vita-sim.sh (httpd
+# /fetch-count reports GET counts per path, so the page asserts the
+# server saw each of its 9 module files fetched exactly once, with
+# both shared leaves served after 1 s so every load is in flight at
+# once). Full gate exit 0.
+--- a/content/handlers/html/script.c	2026-09-29 05:32:04.204589576 +0100
++++ b/content/handlers/html/script.c	2026-09-29 05:16:54.621074636 +0100
+@@ -111,6 +111,12 @@
+  * while it is pending) */
+ extern void js_module_prefetch(struct jsthread *thread, const char *name,
+ 		const char *src, size_t len);
++/* ...and one module per URL: the page's own fetch of a module script is
++ * waited for by the other loads, and a module script whose URL the page
++ * has (or is loading) already is not fetched again */
++extern void js_module_page_fetch(struct jsthread *thread, const char *url,
++		int on);
++extern bool js_module_known(struct jsthread *thread, const char *url);
+ #endif
+ 
+ /** Set around exec_src_script() for a type="module" script. */
+@@ -593,6 +599,8 @@
+ 				js_module_prefetch(parent->js_thread,
+ 					nsurl_access(hlcache_handle_get_url(script)),
+ 					(const char *)mdata, msize);
++			js_module_page_fetch(parent->js_thread,
++				nsurl_access(hlcache_handle_get_url(script)), 0);
+ 		}
+ #endif
+ 		parent->base.active--;
+@@ -611,6 +619,11 @@
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++#ifdef WITH_QUICKJS
++		if (s->is_module && parent->js_thread != NULL)
++			js_module_page_fetch(parent->js_thread,
++				nsurl_access(hlcache_handle_get_url(script)), 0);
++#endif
+ 
+ 		g_spipe_x_total++;
+ 		if (macsurf_spipe_budget_take()) {
+@@ -1134,6 +1147,24 @@
+ 		}
+ 	}
+ 
++#ifdef WITH_QUICKJS
++	/* VitaBrowser: a module script whose URL this page already has or
++	 * is already loading (an import() of it, the same src twice) is that
++	 * module (HTML's module map): not fetched again, it runs from the
++	 * registry in its turn among the deferred scripts. */
++	if (src_script_is_module && script_type == HTML_SCRIPT_DEFER &&
++	    c->js_thread != NULL &&
++	    js_module_known(c->js_thread, nsurl_access(joined))) {
++		macsurf_debug_log_writef("LIFE script: module %s known, "
++			"not fetched again", nsurl_access(joined));
++		html_queue_inline_module(c, nsurl_access(joined), "", 0);
++		js_module_prefetch(c->js_thread, nsurl_access(joined),
++			NULL, 0);
++		nsurl_unref(joined);
++		return DOM_HUBBUB_OK;
++	}
++#endif
++
+ 	nscript = html_process_new_script(c, mimetype, script_type);
+ 	if (nscript == NULL) {
+ 		nsurl_unref(joined);
+@@ -1192,6 +1223,11 @@
+ 			(long) c->scripts_count, (int) ns_error,
+ 			nsurl_access(joined));
+ 	}
++#ifdef WITH_QUICKJS
++	else if (src_script_is_module && script_type == HTML_SCRIPT_DEFER &&
++		 c->js_thread != NULL)
++		js_module_page_fetch(c->js_thread, nsurl_access(joined), 1);
++#endif
+ 
+ 	nsurl_unref(joined);
+ 
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c	2026-09-29 05:32:04.204589576 +0100
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c	2026-09-29 05:16:54.619352325 +0100
+@@ -16487,6 +16487,9 @@
+ 	char   *source;  /* source text (malloc'd, NUL-terminated), or NULL */
+ 	size_t  srclen;
+ 	int     compiled; /* handed to QuickJS (source freed) */
++	int     page_fetch; /* the page's own fetch of it (a <script
++			     * type=module src>) is on its way: loads wait
++			     * for that instead of fetching it again */
+ 	/* VitaBrowser module cache: bytecode read from MACSURF_JSCACHE_DIR
+ 	 * (source may then be NULL: not fetched at all) and the static
+ 	 * import URLs it was saved with (NUL-separated). */
+@@ -16620,6 +16623,8 @@
+ 			reg->bytes += srclen;
+ 		}
+ 	}
++	if (source != NULL)
++		e->page_fetch = 0;
+ 	return e;
+ }
+ 
+@@ -16869,6 +16874,10 @@
+ 	return next[n] != NULL ? n + 1 : n;
+ }
+ 
++/* Module fetches that found their URL already registered (fetched twice);
++ * logged per fetch and in every graph's summary line. */
++static unsigned int g_module_refetches = 0;
++
+ /* One level of a module graph, in three steps shared by the blocking
+  * crawl below and the non-blocking one (qjs_modload, dynamic import()).
+  *
+@@ -16879,7 +16888,12 @@
+ {
+ 	unsigned int i, nw = 0;
+ 	for (i = 0; i < n; i++) {
+-		if (qjs_module_find(reg, urls[i]) != NULL)
++		struct module_entry *r = qjs_module_find(reg, urls[i]);
++		/* registered -- unless all there is of it is the page's own
++		 * fetch on its way (the non-blocking loads wait for that;
++		 * a blocking crawl cannot) */
++		if (r != NULL && !(r->page_fetch && r->source == NULL &&
++				r->bc == NULL && !r->compiled))
+ 			continue;
+ #ifdef MACSURF_JSCACHE_DIR
+ 		/* Hash-named and cached: neither fetched nor parsed. */
+@@ -16919,7 +16933,15 @@
+ 	for (i = 0; i < nw; i++) {
+ 		int good = res[i].data != NULL &&
+ 			res[i].status >= 200 && res[i].status < 300;
+-		struct module_entry *fe = qjs_module_register(reg,
++		struct module_entry *fe;
++		/* want[] holds only unregistered URLs: one registered by now
++		 * was fetched twice (another load got it meanwhile) */
++		if (qjs_module_find(reg, want[i]) != NULL) {
++			g_module_refetches++;
++			macsurf_debug_log_writef("LIFE module refetch: %s "
++				"(%u so far)", want[i], g_module_refetches);
++		}
++		fe = qjs_module_register(reg,
+ 			want[i], good ? res[i].data : NULL, res[i].len);
+ 		if (good) {
+ 			(*fetched)++;
+@@ -17118,7 +17140,10 @@
+ 		g_mod_compile_us += macos9_micros() - t0;
+ 		g_mod_compiled++;
+ #ifdef MACSURF_JSCACHE_DIR
+-		if (!JS_IsException(val)) {
++		/* (not an inline module: its name is not stable across
++		 * visits, the card entry would never be read) */
++		if (!JS_IsException(val) &&
++		    strstr(module_name, "#inline-module-") == NULL) {
+ 			/* Save it, with its imports for the next crawl. */
+ 			size_t bclen = 0;
+ 			uint8_t *bc = JS_WriteObject(ctx, &bclen, val,
+@@ -17191,8 +17216,10 @@
+ 		free(e);
+ 		e = NULL;
+ 	}
+-	if (e == NULL) {
+-		/* A dynamic import(), or one the scan missed. */
++	if (e == NULL || (e->page_fetch && e->source == NULL &&
++			e->bc == NULL)) {
++		/* A dynamic import(), or one the scan missed (or needed now,
++		 * while the page's own fetch of it is still on its way). */
+ 		qjs_module_crawl_from(reg, module_name);
+ 		e = qjs_module_find(reg, module_name);
+ 	}
+@@ -17237,6 +17264,10 @@
+ 	unsigned int nw;
+ 	struct fetch_get_set *set;
+ 	unsigned int fetched, failed, cached, compiled, levels, steps;
++	int waiting;			/* this pass: all in flight elsewhere */
++	unsigned int waits;		/* passes spent waiting */
++	uint32_t *shared_h;		/* hashes of URLs another load fetched */
++	unsigned int nshared;
+ 	size_t bytes;
+ 	double t0, longest_ms;
+ 	int njobs;
+@@ -17267,10 +17298,31 @@
+ 		for (j = 0; j < m->njobs; j++)
+ 			for (k = 0; k < m->jobs[j].argc; k++)
+ 				JS_FreeValue(m->ctx, m->jobs[j].argv[k]);
++	free(m->shared_h);
+ 	free(m->root);
+ 	free(m);
+ }
+ 
++/* Remember (once) that url of this graph was fetched by another load. */
++static void qjs_modload_note_shared(struct qjs_modload *m, const char *url)
++{
++	uint32_t h = 2166136261u;
++	unsigned int i;
++	for (; *url; url++)
++		h = (h ^ (unsigned char)*url) * 16777619u;
++	if (m->shared_h == NULL) {
++		m->shared_h = (uint32_t *)calloc(QJS_MODULE_MAX_COUNT,
++			sizeof(*m->shared_h));
++		if (m->shared_h == NULL)
++			return;
++	}
++	for (i = 0; i < m->nshared; i++)
++		if (m->shared_h[i] == h)
++			return;
++	if (m->nshared < QJS_MODULE_MAX_COUNT)
++		m->shared_h[m->nshared++] = h;
++}
++
+ /* A new pipeline for root in ctx, starting from the level urls[0..n)
+  * (QJS_MODULE_MAX_COUNT-sized, taken over; freed on failure). */
+ static struct qjs_modload *qjs_modload_new(JSContext *ctx,
+@@ -17313,7 +17365,11 @@
+ static int qjs_modload_in_flight(struct qjs_modload *m, const char *url)
+ {
+ 	struct qjs_modload *o;
++	struct module_entry *e = qjs_module_find(m->reg, url);
+ 	unsigned int i;
++	if (e != NULL && e->page_fetch && e->source == NULL &&
++	    e->bc == NULL && !e->compiled)
++		return 1;	/* the page is fetching it (a module script) */
+ 	for (o = g_modloads; o != NULL; o = o->next) {
+ 		if (o == m || o->reg != m->reg || o->set == NULL)
+ 			continue;
+@@ -17345,7 +17401,8 @@
+ 		return 0;		/* bare specifier: fails as before */
+ 	e = qjs_module_find(reg, url);
+ 	if (e != NULL && (e->compiled ||
+-			  (e->source == NULL && e->bc == NULL))) {
++			  (e->source == NULL && e->bc == NULL &&
++			   !e->page_fetch))) {
+ 		/* loaded -- or its fetch failed: import it now (the
+ 		 * loader reports the failure as before) */
+ 		free(url);
+@@ -17394,12 +17451,15 @@
+ 				macsurf_debug_log_writef(
+ 					"LIFE module graph (async): %u fetched "
+ 					"(%lu KiB), %u from the card, %u failed, "
+-					"%u levels, %ld ms; registry %u modules",
++					"%u fetched by another load (%u passes "
++					"waiting), %u levels, %ld ms; registry %u "
++					"modules, %u refetched so far",
+ 					m->fetched,
+ 					(unsigned long)(m->bytes / 1024),
+-					m->cached, m->failed, m->levels,
++					m->cached, m->failed, m->nshared,
++					m->waits, m->levels,
+ 					(long)((macos9_micros() - m->t0) / 1000),
+-					m->reg->count);
++					m->reg->count, g_module_refetches);
+ 				return 0;
+ 			}
+ 			free(m->want);
+@@ -17422,11 +17482,26 @@
+ 						char *c = strdup(m->want[i]);
+ 						if (c != NULL)
+ 							m->carry[m->ncarry++] = c;
++						qjs_modload_note_shared(m,
++							m->want[i]);
+ 						continue;
+ 					}
+ 					m->want[w++] = m->want[i];
+ 				}
+ 				m->nw = w;
++				/* the whole level is in flight elsewhere: the
++				 * next level would be this one again, so wait
++				 * for it (one look per event-loop pass) instead
++				 * of spinning through empty levels */
++				if (w == 0 && m->ncarry > 0 &&
++				    m->ncarry == m->n) {
++					for (i = 0; i < m->ncarry; i++)
++						free(m->carry[i]);
++					m->ncarry = 0;
++					m->waiting = 1;
++					m->waits++;
++					return 0;
++				}
+ 			}
+ 			if (m->nw > 0) {
+ 				m->set = fetch_get_set_start(m->want, m->nw,
+@@ -17564,8 +17639,13 @@
+  * deferred and module scripts, then fires DOMContentLoaded) waits while
+  * js_module_prefetch_pending() -- html.c polls it -- so the order of
+  * scripts and events is unchanged; js_exec_module then finds the graph
+- * fetched and compiled and only links and runs it. The root itself is
+- * compiled by js_exec_module (it is marked compiled here, as there). */
++ * fetched and compiled and only links and runs it.
++ *
++ * With src, the script's text is registered (its URL then counts as
++ * loaded for every other load) and the graph below it is fetched. Without
++ * src, the module script's URL is one this page already has or is already
++ * loading (an import() of it, the same src twice: js_module_known): its
++ * graph is walked from the top, waiting for whatever is in flight. */
+ void js_module_prefetch(struct jsthread *thread, const char *name,
+ 	const char *src, size_t len);
+ void js_module_prefetch(struct jsthread *thread, const char *name,
+@@ -17578,24 +17658,37 @@
+ 	unsigned int n, count = 0;
+ 
+ 	if (!qjs_thread_ctx_live(thread) || thread->heap == NULL ||
+-	    thread->heap->module_reg == NULL || name == NULL ||
+-	    src == NULL || len == 0)
++	    thread->heap->module_reg == NULL || name == NULL)
+ 		return;
+ 	reg = thread->heap->module_reg;
+ 	qjs_module_registry_for_nav(reg);
++	/* the text first: a load waiting for the page's fetch of this URL
++	 * goes on from it */
++	me = src != NULL && len > 0 ?
++		qjs_module_register(reg, name, src, len) : NULL;
+ 	for (m = g_modloads; m != NULL; m = m->next, count++)
+-		if (m->ctx == thread->ctx && strcmp(m->root, name) == 0)
+-			return;		/* already on its way */
++		if (m->ctx == thread->ctx && strcmp(m->root, name) == 0) {
++			/* already on its way (an import() of it): the
++			 * conversion waits for it too */
++			m->prefetch = 1;
++			return;
++		}
+ 	if (count >= QJS_MODLOAD_MAX)
+ 		return;
+-	me = qjs_module_register(reg, name, NULL, 0);
+-	if (me != NULL)
+-		me->compiled = 1;
+ 	urls = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*urls));
+ 	if (urls == NULL)
+ 		return;
+-	n = qjs_module_scan(reg, name, src, len, urls, 0,
+-		QJS_MODULE_MAX_COUNT);
++	if (src != NULL && len > 0) {
++		if (me == NULL || me->source == NULL) {
++			free(urls);	/* compiled already, or no memory */
++			return;
++		}
++		n = qjs_module_scan(reg, name, src, len, urls, 0,
++			QJS_MODULE_MAX_COUNT);
++	} else {
++		urls[0] = strdup(name);
++		n = urls[0] != NULL ? 1 : 0;
++	}
+ 	if (n == 0) {
+ 		free(urls);
+ 		return;
+@@ -17604,7 +17697,7 @@
+ 	if (m != NULL) {
+ 		m->prefetch = 1;
+ 		macsurf_debug_log_writef("LIFE module prefetch: %u imports "
+-			"of %s", n, name);
++			"of %s%s", n, name, src == NULL ? " (by name)" : "");
+ 	}
+ }
+ 
+@@ -17621,6 +17714,63 @@
+ 	return false;
+ }
+ 
++/* The page starts (on != 0) or ends its own fetch of a module script's
++ * URL. While it is on its way the non-blocking loads wait for it instead
++ * of fetching the URL a second time. */
++void js_module_page_fetch(struct jsthread *thread, const char *url, int on);
++void js_module_page_fetch(struct jsthread *thread, const char *url, int on)
++{
++	struct module_registry *reg;
++	struct module_entry *e;
++	if (!qjs_thread_ctx_live(thread) || thread->heap == NULL ||
++	    thread->heap->module_reg == NULL || url == NULL)
++		return;
++	reg = thread->heap->module_reg;
++	qjs_module_registry_for_nav(reg);
++	e = qjs_module_find(reg, url);
++	if (!on) {
++		if (e != NULL)
++			e->page_fetch = 0;
++		return;
++	}
++	if (e == NULL)
++		e = qjs_module_register(reg, url, NULL, 0);
++	if (e != NULL && e->source == NULL && e->bc == NULL && !e->compiled)
++		e->page_fetch = 1;
++}
++
++/* Does this page have the module at url, or is something loading it? A
++ * module script with that src is then not fetched again: it is the same
++ * module (HTML's module map) and runs once. */
++bool js_module_known(struct jsthread *thread, const char *url);
++bool js_module_known(struct jsthread *thread, const char *url)
++{
++	struct module_registry *reg;
++	struct module_entry *e;
++	struct qjs_modload *m;
++	unsigned int i;
++	if (!qjs_thread_ctx_live(thread) || thread->heap == NULL ||
++	    thread->heap->module_reg == NULL || url == NULL)
++		return false;
++	reg = thread->heap->module_reg;
++	qjs_module_registry_for_nav(reg);
++	e = qjs_module_find(reg, url);
++	if (e != NULL && (e->source != NULL || e->bc != NULL ||
++			  e->compiled || e->page_fetch))
++		return true;
++	for (m = g_modloads; m != NULL; m = m->next) {
++		if (m->reg != reg)
++			continue;
++		if (strcmp(m->root, url) == 0)
++			return true;
++		if (m->set != NULL)
++			for (i = 0; i < m->nw; i++)
++				if (strcmp(m->want[i], url) == 0)
++					return true;
++	}
++	return false;
++}
++
+ /* Run every pipeline one step; called once per event-loop pass from
+  * macsurf_qjs_pump_all. A finished one re-queues its import() jobs. */
+ static void qjs_modload_pump(void)
+@@ -17643,7 +17793,8 @@
+ 			double t0 = macos9_micros();
+ 			int k;
+ 			done = 0;
+-			for (k = 0; k < 8 && !done; k++) {
++			m->waiting = 0;
++			for (k = 0; k < 8 && !done && !m->waiting; k++) {
+ 				done = qjs_modload_step(m);
+ 				if ((macos9_micros() - t0) / 1000.0 >=
+ 						QJS_MODLOAD_STEP_MS)
+@@ -18935,6 +19086,8 @@
+ 	JSContext *ctx;
+ 	char *src;
+ 	int ok;
++	int by_map = 0;
++	char *stub = NULL, *stubname = NULL;
+ 	struct ms_diag_scope diag_script_scope;
+ 	int diag_script_state = MS_SCR_DONE;
+ 
+@@ -18944,7 +19097,9 @@
+ 			name ? name : "(anon)");
+ 		return 0;
+ 	}
+-	if (txt == NULL || txtlen == 0) return 1;
++	if (txt == NULL)
++		txtlen = 0;
++	if (txtlen == 0 && name == NULL) return 1;
+ 	ctx = thread->ctx;
+ 
+ 	/* #265 - module execution is a JS execution burst like js_exec:
+@@ -18959,22 +19114,50 @@
+ 			name ? name : "(anon)", (long)txtlen);
+ 		return 0;
+ 	}
+-	memcpy(src, txt, txtlen);
++	if (txtlen > 0)
++		memcpy(src, txt, txtlen);
+ 	src[txtlen] = '\0';
+ 
+ 	/* VitaBrowser: fetch the module's static import graph now, in
+ 	 * parallel, since QuickJS links it synchronously inside JS_Eval
+-	 * (the loader then compiles each from the registry). The script
+-	 * itself is compiled here, so it is registered as compiled. */
++	 * (the loader then compiles each from the registry) -- normally
++	 * js_module_prefetch has loaded it already.
++	 *
++	 * The script itself runs through the module map, as an
++	 * `import "<its URL>"`: its text is registered under its URL and the
++	 * loader compiles it from there, unless this realm has that module
++	 * already (an import() of it, the same src twice, another script's
++	 * graph), which then runs ONCE, as in browsers. Evaluated as its own
++	 * module under the same name, it ran twice and every importer saw a
++	 * different instance. Without text (txtlen 0) the module is one
++	 * js_module_known named. A name the URL resolver would rewrite keeps
++	 * the old direct evaluation. */
+ 	if (thread->heap != NULL && thread->heap->module_reg != NULL
+ 			&& name != NULL) {
+ 		struct module_registry *reg = thread->heap->module_reg;
+ 		char **urls;
+ 		struct module_entry *me;
++		char *r = qjs_module_resolve(NULL, name, strlen(name));
+ 		qjs_module_registry_for_nav(reg);
+-		me = qjs_module_register(reg, name, NULL, 0);
+-		if (me != NULL) me->compiled = 1;
+-		urls = (char **)calloc(QJS_MODULE_MAX_COUNT, sizeof(*urls));
++		by_map = (r == NULL || strcmp(r, name) == 0) &&
++			strchr(name, '"') == NULL &&
++			strchr(name, '\\') == NULL &&
++			strchr(name, '\n') == NULL;
++		free(r);
++		if (by_map && txtlen > 0) {
++			me = qjs_module_register(reg, name, src, txtlen);
++		} else if (by_map) {
++			me = qjs_module_find(reg, name);
++		} else {
++			me = qjs_module_register(reg, name, NULL, 0);
++			if (me != NULL) me->compiled = 1;
++		}
++		if (me == NULL && txtlen == 0) {
++			free(src);
++			return 1;
++		}
++		urls = txtlen > 0 ? (char **)calloc(QJS_MODULE_MAX_COUNT,
++			sizeof(*urls)) : NULL;
+ 		if (urls != NULL) {
+ 			unsigned int n = qjs_module_scan(reg, name, src,
+ 					txtlen, urls, 0, QJS_MODULE_MAX_COUNT);
+@@ -18984,6 +19167,24 @@
+ 		}
+ 	}
+ 
++	if (txtlen == 0 && !by_map) {
++		free(src);
++		return 1;
++	}
++	if (by_map) {
++		size_t nl = strlen(name);
++		stub = (char *)malloc(nl + 16);
++		stubname = (char *)malloc(nl + 16);
++		if (stub == NULL || stubname == NULL) {
++			free(stub);
++			free(stubname);
++			free(src);
++			return 0;
++		}
++		snprintf(stub, nl + 16, "import \"%s\";\n", name);
++		snprintf(stubname, nl + 16, "%s#script", name);
++	}
++
+ 	/* Compile and execute as a module in one call (same pattern
+ 	 * as js_exec's JS_EVAL_TYPE_GLOBAL).  JS_EVAL_TYPE_MODULE
+ 	 * compiles with strict mode + import/export, resolves
+@@ -18996,10 +19197,16 @@
+ 		ms_diag_script_enter(&diag_script_scope,
+ 			(unsigned long)g_qjs_nav_seq, MS_SCRIPT_MODULE, name);
+ 		ms_diag_task_set_script(g_qjs_task_id, diag_script_scope.my_id);
+-		val = JS_Eval(ctx, src, txtlen,
+-			name ? name : "<module>",
+-			JS_EVAL_TYPE_MODULE);
++		if (by_map)
++			val = JS_Eval(ctx, stub, strlen(stub), stubname,
++				JS_EVAL_TYPE_MODULE);
++		else
++			val = JS_Eval(ctx, src, txtlen,
++				name ? name : "<module>",
++				JS_EVAL_TYPE_MODULE);
+ 		free(src);
++		free(stub);
++		free(stubname);
+ 
+ 		ok = !JS_IsException(val);
+ 		/* A module's evaluation settles a promise: a throw while it

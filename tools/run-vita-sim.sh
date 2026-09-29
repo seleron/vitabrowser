@@ -220,6 +220,7 @@ NET-js-frame-local http://127.0.0.1:$HP/JS-frame-local.html
 NET-js-interfaces http://127.0.0.1:$HP/JS-interfaces.html
 NET-js-module-async http://127.0.0.1:$HP/JS-module-async.html
 NET-js-module-static-async http://127.0.0.1:$HP/JS-module-static-async.html
+NET-js-module-dedupe http://127.0.0.1:$HP/JS-module-dedupe.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -494,8 +495,16 @@ msp=$(ls "$R"/*NET-js-module-static-async.plot 2>/dev/null | head -1)
 msr=$(sed -n 's/.*STR \(MODSTATIC: [0-9]*\/[0-9]* passed\).*/\1/p' "$msp" 2>/dev/null | head -1)
 echo "  JS-module-static-async: ${msr:-no summary}"
 [ -n "$msp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$msp" | sed 's/^STR /  /' || true; }
+# Patch 161: one fetch and one evaluation per module URL across parallel
+# loads (static graph, import() twice, module script + import(), same src
+# twice); the page asks httpd for its own GET counts (/fetch-count).
+mdp=$(ls "$R"/*NET-js-module-dedupe.plot 2>/dev/null | head -1)
+mdr=$(sed -n 's/.*STR \(MODDUP: [0-9]*\/[0-9]* passed\).*/\1/p' "$mdp" 2>/dev/null | head -1)
+echo "  JS-module-dedupe: ${mdr:-no summary}"
+[ -n "$mdp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$mdp" | sed 's/^STR /  /' || true; }
 [ "$inr" = "INTRINSIC: 5/5 passed" ] && \
 [ "$cnr" = "CENSUS: 5/5 passed" ] && \
+[ "$mdr" = "MODDUP: 5/5 passed" ] && \
 [ "$msr" = "MODSTATIC: 5/5 passed" ] && \
 [ "$mar" = "MODASYNC: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \

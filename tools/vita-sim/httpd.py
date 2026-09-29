@@ -16,10 +16,18 @@ Runs until killed. Stdlib only.
 import argparse
 import functools
 import http.server
+import json
 import ssl
 import sys
 import threading
 import time
+
+
+# GETs per path (query dropped), shared by every server in this process:
+# /fetch-count?prefix=P answers {path: count} for the paths under P, so a
+# page can see its own duplicate fetches (JS-module-dedupe.html).
+GETS = {}
+GETS_LOCK = threading.Lock()
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -48,6 +56,24 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/fetch-count":
+            prefix = ""
+            if "?prefix=" in self.path:
+                prefix = self.path.split("?prefix=", 1)[1]
+            with GETS_LOCK:
+                counts = {k: v for k, v in GETS.items()
+                          if k.startswith(prefix)}
+            body = json.dumps(counts, sort_keys=True).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        with GETS_LOCK:
+            GETS[path] = GETS.get(path, 0) + 1
         if self.path == "/progress-stream":
             self.stream_start("text/plain")
             for i in range(20):

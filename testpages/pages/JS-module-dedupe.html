@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS module fetch dedupe (script not run)</title>
+<!-- Roadmap WS-C: every module URL is fetched and evaluated ONCE, however
+     many loads want it at the same time (the qjs_modload pipelines of
+     patches 159/160 run in parallel). Loads here, all overlapping:
+     a static graph (js-moddup-a.js), import() of b twice, import() of c,
+     import() of the shared leaf directly, and e both import()ed early and
+     a <script type=module src> of the page, f and g module scripts where
+     g imports f, g twice on the page; b and c share a dynamic-only
+     leaf d; a, b, c and the page share the leaf "shared". Both shared
+     leaves are served after 1 s (httpd /slow/) so every load is in flight
+     at once. After DOMContentLoaded: import() of a (already loaded by the
+     static graph), of b again, and of shared spelled ./x/../slow/...
+     1: values right (a 3, b 15, c 25, e 101, g 8; f ran before g).
+     2: import() of the same URL (twice at once, and again later) gives the
+        same namespace.
+     3: one "shared" module for everyone: the token object it exports is
+        the same in a (static), b, the page's import() and the respelled
+        import().
+     4: every module was evaluated once.
+     5: the server saw each of the 9 module files fetched exactly once
+        (httpd /fetch-count). -->
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+<script>
+(function () {
+	var N = 5, k = 0;
+	var M = window.moddup = { evals: {}, order: [] };
+	function t(n, ok, text) {
+		var p = document.getElementById('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		document.getElementById('sum').textContent = 'MODDUP: ' + k + '/' + N + ' passed';
+		document.title = 'JS module fetch dedupe (' + k + '/' + N + ')';
+	}
+	function fail(n) { return function (e) { t(n, false, 'rejected: ' + e); }; }
+	var first = Promise.all([
+		import('./js-moddup-b.js'),
+		import('./js-moddup-b.js'),
+		import('./js-moddup-c.js'),
+		import('./slow/js-moddup-shared.js'),
+		import('./js-moddup-e.js')
+	]);
+	document.addEventListener('DOMContentLoaded', function () {
+		document.getElementById('sum').textContent = 'MODDUP: 0/' + N + ' passed';
+		first.then(function (r1) {
+			return Promise.all([
+				import('./js-moddup-a.js'),
+				import('./js-moddup-b.js'),
+				import('./x/../slow/js-moddup-shared.js')
+			]).then(function (r2) {
+				var b = r1[0], b2 = r1[1], c = r1[2], s = r1[3], e = r1[4];
+				var a2 = r2[0], b3 = r2[1], s2 = r2[2];
+				t(1, M.a === 3 && b.v === 15 && c.v === 25 && a2.a === 3 &&
+					e.ev === 101 && M.g === 8 &&
+					M.order.join(',') === 'f,g', 'values: a ' + M.a +
+					', b ' + b.v + ', c ' + c.v + ', e ' + e.ev +
+					', g ' + M.g + ', order ' + M.order.join(','));
+				t(2, b === b2 && b === b3, 'same import() twice: ' +
+					(b === b2) + ', later: ' + (b === b3));
+				t(3, s.token === M.tokA && s.token === b.tok &&
+					s2 === s, 'one shared module: static ' +
+					(s.token === M.tokA) + ', b ' + (s.token === b.tok) +
+					', respelled ' + (s2 === s));
+				var names = Object.keys(M.evals).sort(), once = names.length === 9;
+				names.forEach(function (n) { if (M.evals[n] !== 1) once = false; });
+				t(4, once, 'evaluated once: ' + names.map(function (n) {
+					return n + '=' + M.evals[n]; }).join(' '));
+				return fetch('/fetch-count?prefix=/').then(function (r) {
+					return r.json();
+				}).then(function (cnt) {
+					var files = Object.keys(cnt).filter(function (p) {
+						return p.indexOf('js-moddup-') >= 0; }).sort();
+					var ok = files.length === 9;
+					files.forEach(function (p) { if (cnt[p] !== 1) ok = false; });
+					t(5, ok, 'server fetches: ' + files.map(function (p) {
+						return p.replace(/^.*js-moddup-/, '') + '=' + cnt[p];
+					}).join(' '));
+				});
+			});
+		}).catch(fail(1));
+	});
+})();
+</script>
+<script type="module" src="js-moddup-a.js"></script>
+<script type="module" src="js-moddup-e.js"></script>
+<script type="module" src="js-moddup-f.js"></script>
+<script type="module" src="js-moddup-g.js"></script>
+<script type="module" src="js-moddup-g.js"></script>
+</head>
+<body>
+<p id="sum" class="wait">MODDUP: script did not run</p>
+<p id="r1" class="wait">1 waiting</p><p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p><p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+</body>
+</html>

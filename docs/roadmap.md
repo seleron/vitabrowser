@@ -99,8 +99,14 @@ way since patch 160: prefetched as soon as the script's text is known, the
 conversion (deferred scripts, then DOMContentLoaded) waits for them, so
 order is unchanged (JS-module-static-async.html: longest timer gap 17 ms,
 2035 ms without the prefetch). Item 1 is done in the sim; device numbers
-come with run 26. Next in WS-C: measure duplicate fetches across
-pipelines, then item 2.
+come with run 26. Duplicate-fetch measurement is closed (patch 161,
+JS-module-dedupe.html 5/5 + full gate): with the parallel pipelines, each
+module URL is now fetched and evaluated exactly once -- a module in a
+static graph AND import()ed, the same import() twice, the same src twice,
+and a module script AND an import() of it all share one registry card; the
+page fetch registers first and the import()s wait for it. Server-side
+proof via httpd /fetch-count (9/9 files fetched once, all in flight at
+once). Next in WS-C: item 2 (lazy sub-resources, incremental reflow).
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

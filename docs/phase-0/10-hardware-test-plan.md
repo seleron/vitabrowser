@@ -2654,3 +2654,18 @@ give the device numbers (sim: longest slice 151 ms).
   prefetch: N imports of ..." then "module compile (async) ... module
   script of ... ready after N ms" give the device numbers. Before, the
   static graph took ~8 s with no frames (mostly card reads).
+- Patch 161 (WS-C duplicate-module measurement, closed in the sim): with
+  the 159/160 pipelines running in parallel, the same module URL was
+  fetched and evaluated once per load that wanted it (a module in a static
+  graph AND import()ed: 2; the same import() twice: 2; the same
+  `<script type=module src>` twice: 2). Now each URL is one card in the
+  module registry: the page's own fetch registers it first, the parallel
+  import()s WAIT for that instead of fetching again, and a module script
+  whose URL is already known is not fetched at all (it runs from the
+  registry in its document order). Sim: JS-module-dedupe.html 5/5, with
+  both shared leaves served after 1 s so all 9 loads are in flight at
+  once, and httpd's /fetch-count endpoint proving the server saw each of
+  the 9 module files fetched exactly once. Full gate exit 0. On the
+  device: the "LIFE module refetch" log lines (there should be none for a
+  URL that loads once) and the per-graph summary line carry the refetch
+  count.
