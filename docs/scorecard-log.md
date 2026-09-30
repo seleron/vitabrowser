@@ -23,6 +23,26 @@ it out of the header's flex flow. Patch 182 makes `set_quirks_mode()` a no-op
 for a fragment (a fragment is parsed in its context document's mode). Gate:
 CSS-account-bar ACCTBAR 3/5 (cases 1-3 = the mode fix pass).
 
+## 2026-09-30 10:55 — Patch 183: flex align-items: center, oversized item
+
+Runs `<WORK>/vitabrowser-work/score/r17-183` (google) and `r17b-news-183` (news
+tier), fresh Chrome refs. Before = the r16 tree (patch 182 only).
+
+| site | before | after | text | visual | JS err |
+|---|---|---|---|---|---|
+| google | 81.2 | **81.3** | 1.0 | 0.53 | 0 |
+| news tier | 77.9 | 77.2 | 1.0 | ~0.43 | 0-3 |
+
+Root cause: a flex line's USED cross size was max(item cross); an item
+taller than its fixed-height container (64px in 48px) grew the line to
+64, cross_free_space became 0, and align-items: center degenerated to
+flex-start (item pinned to the top, its bottom 16px past the row). CSS
+Flexbox 9.4.5: with a definite container cross size the item does not
+grow the line; centering uses the USED size, so the item overflows
+equally both ways (md at -8, Sign-in 4-44) -- as Chromium does.
+Guarded by available_cross != AUTO, so only fixed-height rows change.
+Gate: ACCTBAR 3/5 -> **5/5**; FLEXHDR 6/6; full gate clean.
+
 ## 2026-09-28 23:30 — baseline (patches up to 144)
 
 Run `<WORK>/vitabrowser-work/score/base` (21 sites, reference from headless

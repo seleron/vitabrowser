@@ -246,10 +246,13 @@ selectors matched case-insensitively and og.css's
 gb_e), pulling it out of the header's flex flow. The fragment
 now keeps the context document's mode (CSS-account-bar.html
 cases 1-3). google 64.8 → 81.2 (text 0.658 → 1.0, scorecard
-r16-google-182). Still off, next: the 64px apps/Sign-in group in
-the 48px header row -- Chromium lets `align-items: center`
-overflow a taller item equally both ways (top −8px); we clamp it
-to the top (CSS-account-bar.html cases 4-5).
+r16-google-182). Fixed, patch 183 (same day): the flex line's USED cross size was
+max(item cross), so the 64px item GREW the 48px line to 64, the
+center free space became 0, and align-items: center degenerated to
+flex-start. With a definite container cross size the item no longer
+grows the line (CSS Flexbox 9.4.5); centering uses the USED size and
+the item overflows −8/+8 as in Chromium (CSS-account-bar.html 5/5,
+FLEXHDR 6/6, full gate clean). The whole account-bar task is done.
 Then the trending list itself (patches 171-172, same night): a temporary
 QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
 Closure's safe-CSS builder reads `.sheet` of a `<style>` in
