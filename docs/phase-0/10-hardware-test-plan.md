@@ -2900,4 +2900,11 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
 - Patch 179 (libdom): setting the text of a detached text node crashed
   the browser (rte.ie did, 4 s into loading, in the sim). Watch for
   crashes on news sites that were fine before 171 -- none should remain.
+- Patches 180-181 (layout): `flex: 1 0 auto` and calc() line-heights now
+  apply; a page that opens with a flex or grid container no longer shifts
+  down by the next block's margin; border-box min-height. **Expected
+  autotest DIFFs: 03-L3-grid and 04-L4-flex** against the old
+  reference-dumps -- their first row moves from y 12 to y 0 (Chromium's
+  position); the next hand-off ships new reference dumps. On the device:
+  google.com's header shows ALL / IMAGES.
 

@@ -231,7 +231,16 @@ Vue 2's microtask shim); and that shim never ran here anyway, because the
 bridge's MutationObserver produced no characterData records (fixed in
 178, with the missing appendData/insertData/... ). Full scorecard: all 21
 sites load; news sites re-scored on fresh Chrome refs at or above r3.
-Next: the flex bug behind google's header.
+Google's header (patches 180-181, 2026-09-30): four engine bugs on plain
+CSS -- libcss dropped `flex: 1 0 auto` (the 0 parsed as a basis), dropped
+calc() line-heights, margins collapsed THROUGH flex/grid containers
+(<body> pulled 10px up by the footer's -10px margin), a stretched nested
+flex container fell back to its content height, and min-/max-height
+ignored box-sizing: border-box. ALL/IMAGES now show in the header, the
+apps + Sign-in group sits at the right edge (CSS-flex-header.html 6/6 as
+Chromium). Still off: google's account-bar internals put Sign-in just
+below the header, partly past the right edge (absolutely positioned
+gb_* containers) -- next if google stays the priority.
 Then the trending list itself (patches 171-172, same night): a temporary
 QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
 Closure's safe-CSS builder reads `.sheet` of a `<style>` in

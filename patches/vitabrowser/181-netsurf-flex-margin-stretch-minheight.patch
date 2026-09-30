@@ -1,0 +1,141 @@
+# netsurf: flex/grid containers end margin collapsing; stretched nested flex items keep their size; border-box min/max-height
+# Generated 2026-09-30
+#
+# google.com's header, continued (after patch 180):
+# - layout.c layout_next_margin_block(): a flex or grid container
+#   establishes its own formatting context, so margins never collapse
+#   THROUGH it (CSS 2.1 8.3.1). The walk went past an auto-height one and
+#   took the NEXT block's top margin: google's footer (margin-top: -10px,
+#   after the 808px #gb-main column) pulled <body> 10px above the page
+#   top, the header's tabs under the toolbar; any page opening with a flex
+#   or grid container was shifted by the following block's margin
+#   (L3-grid and L4-flex: their first row moves from y 12 to y 0, where
+#   Chromium has it).
+# - layout_flex.c: a flex/grid container stretched on the cross axis kept
+#   its content height after its relayout -- google's tab row stayed 17px
+#   in the 48px header. The stretched size is its used size (9.4.11).
+# - layout.c layout_apply_minmax_height() and layout_internal.h
+#   (layout_find_dimensions): box-sizing: border-box applies to
+#   min-height / max-height as it did to height and the widths; google's
+#   Sign-in (border-box, min-height 40px, padding 10px) was 60px tall.
+# Test: CSS-flex-header.html 6/6 (Chromium 6/6): spacer grows, last item
+# as wide as its content, tabs stretched to the row, body at the top,
+# calc() line-height, border-box min-height. Scorecard: google 63.0 ->
+# 64.8, archwiki +3.2; bbc/rte unchanged against the pre-180 build on the
+# same fresh references; guardian's nav bar now at Chromium's y (its
+# visual score reads lower against a cookie-dialog reference).
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 73cd9b3..3cc3bd1 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1895,8 +1895,15 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 			}
+ 
+ 			/* Check whether box is the box current margin collapses
+-			 * to */
+-			if (box->flags & MAKE_HEIGHT ||
++			 * to. VitaBrowser: a flex or grid container establishes
++			 * its own formatting context, so margins never collapse
++			 * THROUGH it (CSS 2.1 8.3.1); the walk went past an auto
++			 * height one and took the next block's top margin --
++			 * google's footer (margin-top: -10px, after the 808px
++			 * #gb-main flex column) pulled <body> 10px above the
++			 * page top, its header drawn behind the toolbar. */
++			if (box->type == BOX_FLEX || box->type == BOX_GRID ||
++					box->flags & MAKE_HEIGHT ||
+ 					box->border[TOP].width ||
+ 					box->padding[TOP] ||
+ 					(box->style &&
+@@ -3700,11 +3707,24 @@ static bool layout_apply_minmax_height(
+ 				 (containing_block->flags & VB_DEFINITE_HEIGHT)))
+ 			ref = containing_block->height;
+ 
++		/* VitaBrowser: with box-sizing: border-box, min-/max-height
++		 * bound the border box -- box->height is the content box, so
++		 * take the vertical padding and borders off the limit.
++		 * Google's Sign-in (border-box, min-height 40px, padding 10px)
++		 * came out 60px tall. */
++		int mbp = 0;
++		if (css_computed_box_sizing(box->style) ==
++				CSS_BOX_SIZING_BORDER_BOX)
++			mbp = box->padding[TOP] + box->padding[BOTTOM] +
++				box->border[TOP].width +
++				box->border[BOTTOM].width;
++
+ 		/* max-height */
+ 		if (css_computed_max_height(box->style, &value, &unit) ==
+ 				CSS_MAX_HEIGHT_SET &&
+ 		    css_unit_len2device_px_ref(box->style, unit_len_ctx,
+ 				value, unit, ref, &h)) {
++			h = h > mbp ? h - mbp : 0;
+ 			if (h < box->height) {
+ 				box->height = h;
+ 				updated = true;
+@@ -3716,6 +3736,7 @@ static bool layout_apply_minmax_height(
+ 				CSS_MIN_HEIGHT_SET &&
+ 		    css_unit_len2device_px_ref(box->style, unit_len_ctx,
+ 				value, unit, ref, &h)) {
++			h = h > mbp ? h - mbp : 0;
+ 			if (h > box->height) {
+ 				box->height = h;
+ 				updated = true;
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 2d922a5..fb51d7a 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -1910,12 +1910,26 @@ static void layout_flex__place_line_items_cross(struct flex_ctx *ctx,
+ 				 * leaves the image at its intrinsic
+ 				 * aspect-preserving size; the FLEX_START
+ 				 * positioning below still places it. */
++				int stretched;
+ 				*box_size_cross += cross_free_space;
++				stretched = *box_size_cross;
+ 
+ 				/* Relayout children for stretch. */
+ 				if (!layout_flex_item(ctx, item, b->width)) {
+ 					return;
+ 				}
++				/* VitaBrowser: the stretched size is the item's used
++				 * cross size (CSS Flexbox 9.4.11). A nested flex or
++				 * grid container's relayout set its auto height back
++				 * to its content's: google's ALL/IMAGES tab row (a
++				 * flex container in the 48px header) stayed 17px
++				 * tall, its links above the header's middle. */
++				if (*box_size_cross < stretched &&
++				    (b->type == BOX_FLEX ||
++				     b->type == BOX_INLINE_FLEX ||
++				     b->type == BOX_GRID ||
++				     b->type == BOX_INLINE_GRID))
++					*box_size_cross = stretched;
+ 			}
+ 			fallthrough;
+ 		case CSS_ALIGN_SELF_FLEX_START:
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index cfc6be9..9e967f8 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -861,6 +861,11 @@ static inline void layout_find_dimensions(
+ 				*max_height = FIXTOINT(css_unit_len2device_px(
+ 						style, unit_len_ctx,
+ 						value, unit));
++				/* VitaBrowser: box-sizing applies to max-height
++				 * as to height and the widths */
++				layout_handle_box_sizing(unit_len_ctx, box,
++						available_width, false,
++						max_height);
+ 			}
+ 		} else {
+ 			/* Inadmissible */
+@@ -883,6 +888,12 @@ static inline void layout_find_dimensions(
+ 				*min_height = FIXTOINT(css_unit_len2device_px(
+ 						style, unit_len_ctx,
+ 						value, unit));
++				/* VitaBrowser: and to min-height -- google's
++				 * Sign-in (border-box, min-height 40px, 10px
++				 * padding) came out 60px tall */
++				layout_handle_box_sizing(unit_len_ctx, box,
++						available_width, false,
++						min_height);
+ 			}
+ 		} else {
+ 			/* Inadmissible */

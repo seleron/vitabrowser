@@ -1,0 +1,144 @@
+# libcss: `flex: <grow> <shrink> <basis>` keeps its shrink; line-height takes a constant calc()
+# Generated 2026-09-30
+#
+# Both found on google.com's header (ALL/IMAGES tabs, apps, Sign-in):
+# - src/parse/properties/flex.c: the shorthand parser tried grow, then
+#   BASIS, then shrink. In `flex: 1 0 auto` the 0 was taken as a unitless
+#   zero basis, `auto` then fit nothing and the whole declaration was
+#   dropped: the header's spacer (flex: 1 0 auto) never grew and the
+#   right-hand group sat against the tabs. The grammar is
+#   <flex-grow> <flex-shrink>? || <flex-basis>: a number right after the
+#   grow factor is now parsed as the shrink factor. (`flex: 1 1 auto`
+#   only worked because 1 fails as a basis.)
+# - src/select/properties/line_height.c: a calc() line-height was dropped
+#   at cascade ("TODO": line-height has no calc slot). A calc() of px
+#   lengths and plain numbers (+ - * /) is now folded to a length or a
+#   number -- google's tab links use line-height: calc(48px - 0*12px) to
+#   centre their text in the 48px header. %, font-relative units and
+#   min()/max()/clamp() are still ignored, as before.
+# Test: CSS-flex-header.html (cases 1 and 5; Chromium 6/6).
+diff --git a/src/parse/properties/flex.c b/src/parse/properties/flex.c
+index 7c6bbfb..b2f41cd 100644
+--- a/src/parse/properties/flex.c
++++ b/src/parse/properties/flex.c
+@@ -126,6 +126,19 @@ css_error css__parse_flex(css_language *c,
+ 			   (error = css__parse_flex_grow(c, vector,
+ 				ctx, grow_style)) == CSS_OK) {
+ 			grow = false;
++			/* VitaBrowser: <flex-grow> <flex-shrink>? || <flex-basis>
++			 * -- a number right after the grow factor is the shrink
++			 * factor. It was tried as a basis first, where a unitless
++			 * 0 is a length: `flex: 1 0 auto` became grow 1, basis 0,
++			 * then `auto` fit nothing and the whole declaration was
++			 * dropped (google's header spacer took no room). */
++			consumeWhitespace(vector, ctx);
++			token = parserutils_vector_peek(vector, *ctx);
++			if (shrink && token != NULL &&
++			    token->type == CSS_TOKEN_NUMBER &&
++			    css__parse_flex_shrink(c, vector, ctx,
++					shrink_style) == CSS_OK)
++				shrink = false;
+ 		} else if ((basis) && 
+ 			   (error = css__parse_flex_basis(c, vector, 
+ 				ctx, basis_style)) == CSS_OK) {
+diff --git a/src/select/properties/line_height.c b/src/select/properties/line_height.c
+index 8d6c858..b9ed427 100644
+--- a/src/select/properties/line_height.c
++++ b/src/select/properties/line_height.c
+@@ -11,9 +11,73 @@
+ #include "select/propget.h"
+ #include "utils/utils.h"
+ 
++#include "stylesheet.h"
+ #include "select/properties/properties.h"
+ #include "select/properties/helpers.h"
+ 
++/* VitaBrowser: fold a calc() of px lengths and plain numbers (+ - * /) to
++ * a length or a number. line-height has no calc slot, so its calc() was
++ * dropped ("TODO"); google's tab links set line-height: calc(48px -
++ * 0*12px) to centre their text in the 48px header. Anything else (%,
++ * font-relative units, min/max/clamp) is still ignored, as before. */
++static bool lh_fold_calc(lwc_string *expr, uint16_t *type, css_fixed *out)
++{
++	css_code_t *code = (css_code_t *)(void *)lwc_string_data(expr);
++	css_fixed v[8];
++	bool num[8];
++	int sp = 0;
++
++	while (*code != CALC_FINISH) {
++		css_code_t op = *code++;
++		switch (op) {
++		case CALC_PUSH_VALUE: {
++			css_fixed x = (css_fixed)*code++;
++			uint32_t u = (uint32_t)*code++;
++			if (u != UNIT_PX || sp >= 8)
++				return false;
++			v[sp] = x;
++			num[sp++] = false;
++			break;
++		}
++		case CALC_PUSH_NUMBER:
++			if (sp >= 8)
++				return false;
++			v[sp] = (css_fixed)*code++;
++			num[sp++] = true;
++			break;
++		case CALC_ADD:
++		case CALC_SUBTRACT:
++			if (sp < 2 || num[sp - 1] != num[sp - 2])
++				return false;
++			v[sp - 2] = op == CALC_ADD ?
++				css_add_fixed(v[sp - 2], v[sp - 1]) :
++				css_subtract_fixed(v[sp - 2], v[sp - 1]);
++			sp--;
++			break;
++		case CALC_MULTIPLY:
++			if (sp < 2 || (!num[sp - 1] && !num[sp - 2]))
++				return false;
++			v[sp - 2] = css_multiply_fixed(v[sp - 2], v[sp - 1]);
++			num[sp - 2] = num[sp - 2] && num[sp - 1];
++			sp--;
++			break;
++		case CALC_DIVIDE:
++			if (sp < 2 || !num[sp - 1] || v[sp - 1] == 0)
++				return false;
++			v[sp - 2] = css_divide_fixed(v[sp - 2], v[sp - 1]);
++			sp--;
++			break;
++		default:
++			return false;
++		}
++	}
++	if (sp != 1 || v[0] < 0)
++		return false;
++	*out = v[0];
++	*type = num[0] ? CSS_LINE_HEIGHT_NUMBER : CSS_LINE_HEIGHT_DIMENSION;
++	return true;
++}
++
+ css_error css__cascade_line_height(uint32_t opv, css_style *style,
+ 		css_select_state *state)
+ {
+@@ -38,10 +102,19 @@ css_error css__cascade_line_height(uint32_t opv, css_style *style,
+ 		case LINE_HEIGHT_NORMAL:
+ 			value = CSS_LINE_HEIGHT_NORMAL;
+ 			break;
+-		case LINE_HEIGHT_CALC:
++		case LINE_HEIGHT_CALC: {
++			uint32_t snum;
++			lwc_string *expr = NULL;
+ 			advance_bytecode(style, sizeof(unit));
+-			advance_bytecode(style, sizeof(unit)); /* TODO */
+-			return CSS_OK;
++			snum = *((uint32_t *) style->bytecode);
++			advance_bytecode(style, sizeof(snum));
++			if (css__stylesheet_string_get(style->sheet, snum,
++					&expr) != CSS_OK || expr == NULL ||
++			    !lh_fold_calc(expr, &value, &val))
++				return CSS_OK;	/* not foldable: ignored */
++			unit = UNIT_PX;
++			break;
++		}
+ 		default:
+ 			assert(0 && "Invalid value");
+ 			break;
