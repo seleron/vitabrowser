@@ -239,6 +239,7 @@ NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
+NET-css-account-bar http://127.0.0.1:$HP/CSS-account-bar.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -636,6 +637,13 @@ fhp=$(ls "$R"/*NET-css-flex-header*.plot 2>/dev/null)
 fhr=$(sed -n 's/.*STR \(FLEXHDR: [0-9]*\/[0-9]* passed\).*/\1/p' $fhp 2>/dev/null | head -1)
 echo "  CSS-flex-header: ${fhr:-no summary}"
 [ -n "$fhp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $fhp | sort -u | sed 's/^STR /  /'
+# Account bar (Patch 182): a script innerHTML on a standards-mode page
+# must not switch the page into quirks; the absolutely-positioned
+# sign-in button stays top-right, live class matching stays case-sensitive.
+abp=$(ls "$R"/*NET-css-account-bar*.plot 2>/dev/null)
+abr=$(sed -n 's/.*STR \(ACCTBAR: [0-9]*\/[0-9]* passed\).*/\1/p' $abp 2>/dev/null | head -1)
+echo "  CSS-account-bar: ${abr:-no summary}"
+[ -n "$abp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $abp | sort -u | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -667,6 +675,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
 [ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
 [ "$slr" = "SELECTORS: 85/85 passed" ] && \
+[ "$abr" = "ACCTBAR: 5/5 passed" ] && \
 [ "$cdr" = "CHARDATA: 5/5 passed" ] && \
 [ "$fhr" = "FLEXHDR: 6/6 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \

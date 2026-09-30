@@ -4,6 +4,25 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-09-30 10:35 — Patch 182: innerHTML no longer flips the document to quirks
+
+Run `<WORK>/vitabrowser-work/score/r16-google-182` (google, fresh Chrome ref).
+Before = `r14` (patches up to 181).
+
+| site | before | after | text | visual | JS err |
+|---|---|---|---|---|---|
+| google | 64.8 | **81.2** | 0.658 → **1.0** | 0.505 → 0.530 | 0 → 0 |
+
+Root cause: libdom's fragment (innerHTML) parser starts in the treebuilder's
+"initial" insertion mode, sees no doctype, and asked for QUIRKS mode -- via
+`set_quirks_mode()` -- on the *live page's* document. One `innerHTML` during
+parse (google sets it before its header is parsed) turned the whole page
+quirks; quirks matches class selectors case-insensitively, so og.css's
+`.gb_E {position: absolute}` captured the account bar (class `gb_e`) and pulled
+it out of the header's flex flow. Patch 182 makes `set_quirks_mode()` a no-op
+for a fragment (a fragment is parsed in its context document's mode). Gate:
+CSS-account-bar ACCTBAR 3/5 (cases 1-3 = the mode fix pass).
+
 ## 2026-09-28 23:30 — baseline (patches up to 144)
 
 Run `<WORK>/vitabrowser-work/score/base` (21 sites, reference from headless

@@ -238,9 +238,18 @@ calc() line-heights, margins collapsed THROUGH flex/grid containers
 flex container fell back to its content height, and min-/max-height
 ignored box-sizing: border-box. ALL/IMAGES now show in the header, the
 apps + Sign-in group sits at the right edge (CSS-flex-header.html 6/6 as
-Chromium). Still off: google's account-bar internals put Sign-in just
-below the header, partly past the right edge (absolutely positioned
-gb_* containers) -- next if google stays the priority.
+Chromium). Fixed, patch 182 (2026-09-30): the root cause was libdom -- a
+script `innerHTML` during parse flipped the LIVE document into
+quirks mode (the fragment parser sees no doctype), so class
+selectors matched case-insensitively and og.css's
+.gb_E {position: absolute} captured the account bar (class
+gb_e), pulling it out of the header's flex flow. The fragment
+now keeps the context document's mode (CSS-account-bar.html
+cases 1-3). google 64.8 → 81.2 (text 0.658 → 1.0, scorecard
+r16-google-182). Still off, next: the 64px apps/Sign-in group in
+the 48px header row -- Chromium lets `align-items: center`
+overflow a taller item equally both ways (top −8px); we clamp it
+to the top (CSS-account-bar.html cases 4-5).
 Then the trending list itself (patches 171-172, same night): a temporary
 QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
 Closure's safe-CSS builder reads `.sheet` of a `<style>` in
