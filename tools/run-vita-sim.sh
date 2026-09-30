@@ -236,6 +236,8 @@ NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
 NET-js-block-class-stall http://127.0.0.1:$HP/JS-block-class-stall.html
 NET-js-block-class-sibling http://127.0.0.1:$HP/JS-block-class-sibling.html
 NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
+NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
+NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -614,6 +616,18 @@ lnr=$(sed -n 's/.*STR \(LISTNEST: [0-9]*\/[0-9]* passed\).*/\1/p' $lnp 2>/dev/nu
 lnl=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (a list item or nested blocks)' "$R/netsurf.log" || true)
 echo "  JS-list-nested-stall: ${lnr:-no summary}; ${lnl} list/nested changes built alone"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
+# Selectors (Patch 178): matches / closest / querySelector(All) against
+# Chromium's answers for 85 cases (JS-selectors.html carries them).
+slp=$(ls "$R"/*NET-js-selectors*.plot 2>/dev/null)
+slr=$(sed -n 's/.*STR \(SELECTORS: [0-9]*\/[0-9]* passed\).*/\1/p' $slp 2>/dev/null | head -1)
+echo "  JS-selectors: ${slr:-no summary}"
+[ "$slr" = "SELECTORS: 85/85 passed" ] || { [ -n "$slp" ] && grep -aho 'STR [^"]*(want[^"]*' $slp | head -3 | sed 's/^STR /  /'; }
+# Character data (Patch 179): a detached text node's data set no longer
+# crashes libdom; CharacterData edits; characterData mutation records.
+cdp=$(ls "$R"/*NET-js-chardata*.plot 2>/dev/null)
+cdr=$(sed -n 's/.*STR \(CHARDATA: [0-9]*\/[0-9]* passed\).*/\1/p' $cdp 2>/dev/null | head -1)
+echo "  JS-chardata: ${cdr:-no summary}"
+[ -n "$cdp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $cdp | sort -u | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -644,6 +658,8 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$bcr" = "BLOCKCLASS: 7/7 passed" ] && [ "${bcl:-0}" -ge 6 ] && \
 [ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
 [ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
+[ "$slr" = "SELECTORS: 85/85 passed" ] && \
+[ "$cdr" = "CHARDATA: 5/5 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \

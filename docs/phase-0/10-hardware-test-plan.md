@@ -2890,4 +2890,14 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
   should still number correctly after an insertion. netsurf.log: "LIFE
   rebuild local: blocks rebuilt (N added, M removed), full layout (a list
   item or nested blocks)".
+- Patch 178 (selector engine): element.matches / closest /
+  querySelector(All) now answer as Chromium does (85/85 cases) -- sites
+  that route clicks with `event.target.closest('.btn')` or
+  `matches(':scope > li')`, or query `:first-child` / `:nth-child()` /
+  `:is()`, behave correctly (before, `:hover`/`:first-child` "matched"
+  everything and `div > p` nothing). Also characterData MutationObserver
+  records, which core-js / Vue 2 use to schedule work.
+- Patch 179 (libdom): setting the text of a detached text node crashed
+  the browser (rte.ie did, 4 s into loading, in the sim). Watch for
+  crashes on news sites that were fine before 171 -- none should remain.
 

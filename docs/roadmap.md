@@ -221,6 +221,17 @@ for `:root`, pseudo-elements, `:hover`, `:first-child`, `:nth-child()` on
 any element and false for `body > div` / `:is()`; querySelectorAll finds
 nothing for `:root`, `:first-child`, `:nth-child()`, `:is()` (Chromium
 comparison on example.com, 9 of 14 selectors wrong).
+Selector engine DONE (patch 178, 2026-09-30): a Selectors-4 parser and
+matcher behind matches/closest/querySelector(All) -- JS-selectors.html
+85/85 against Chromium's answers for the same document (14/82 before).
+Found by the full scorecard while verifying it (patch 179): rte.ie
+crashed 4 s in -- libdom segfaulted dispatching DOMSubtreeModified at the
+NULL parent of a detached text node whose data a script set (core-js /
+Vue 2's microtask shim); and that shim never ran here anyway, because the
+bridge's MutationObserver produced no characterData records (fixed in
+178, with the missing appendData/insertData/... ). Full scorecard: all 21
+sites load; news sites re-scored on fresh Chrome refs at or above r3.
+Next: the flex bug behind google's header.
 Then the trending list itself (patches 171-172, same night): a temporary
 QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
 Closure's safe-CSS builder reads `.sheet` of a `<style>` in

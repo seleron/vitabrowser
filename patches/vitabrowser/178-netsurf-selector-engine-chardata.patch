@@ -1,0 +1,1508 @@
+# netsurf (MacSurf bridge): a real selector engine for matches / closest / querySelector(All); CharacterData edits and records
+# Generated 2026-09-30
+#
+# The bridge's matches() was a regex over tag/#id/.class/[attr] that
+# skipped every ':' part -- :root, :hover, :first-child and ::before
+# matched EVERY element -- and knew no combinators (`body > div` matched
+# nothing); the native querySelectorAll found nothing for :root,
+# :first-child, :nth-child() or :is(). Measured against Chromium on the
+# same document: 14 of 82 cases right before, 82/82 (now 85/85) after.
+#
+# vita_polyfill.js:
+# - A Selectors-4 parser and right-to-left matcher: the four combinators,
+#   attribute operators and the i/s flags, :not/:is/:where/:matches/:has,
+#   :nth-child/-last-child(an+b [of S]), the -of-type family, :root,
+#   :scope, :empty, :checked, :disabled/:enabled, :required/:optional,
+#   :read-only/:read-write, :placeholder-shown, :link/:any-link, :focus /
+#   :focus-within / :focus-visible (document.activeElement), :target,
+#   :lang, :dir, :defined; pseudo-elements never match; an invalid or
+#   unknown selector throws SyntaxError. matches()/closest() always use
+#   it; querySelector(All) keep the native engine for a plain selector
+#   (tags, #ids, .classes, combinators) and otherwise take native
+#   candidates for the rightmost compound's tag/#id/.class part and filter
+#   them. The document's querySelector(All) are wrapped per method: the
+#   bridge installs them again on its second pass over a context
+#   (qjs_dom_install runs twice), and a document is walked from its root
+#   element.
+# - CharacterData's appendData / insertData / deleteData / replaceData /
+#   substringData (missing), and characterData MutationObserver records:
+#   the bridge queued childList records only, so a text node watched with
+#   {characterData: true} -- core-js's and Vue 2's microtask shim -- never
+#   reported. The data / nodeValue / textContent setters of text and
+#   comment nodes queue one; delivery honours characterData and the
+#   *OldValue options.
+# - Range.createContextualFragment parses through a detached <div> of the
+#   page's own document instead of a <template>.
+# Tests: JS-selectors.html 85/85 (the expected list is Chromium's output
+# for the page, pasted), JS-chardata.html 5/5 (with patch 179; Chromium
+# 5/5). Full scorecard: every site loads; bbc/rte/hackernews re-scored
+# against fresh Chrome references at or above r3; youtube's lower text
+# recall is the same with the pre-178 polyfill.
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 74d595a..28972b9 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2619,13 +2619,13 @@
+ "\t\t\tSHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024 });\n"
+ "\t}\n"
+ "\n"
+-"\t/* Range.createContextualFragment: parse into a fragment (inert: a\n"
+-"\t * <template>'s content when the bridge has one, else a detached div) */\n"
++"\t/* Range.createContextualFragment: parse into a fragment through a\n"
++"\t * detached <div> of this document (its innerHTML runs no scripts),\n"
++"\t * so the nodes are this document's without an adoption step */\n"
+ "\tfunction fragmentOf(html) {\n"
+-"\t\tvar f = d.createDocumentFragment(), holder = d.createElement('template'), src;\n"
++"\t\tvar f = d.createDocumentFragment(), holder = d.createElement('div');\n"
+ "\t\tholder.innerHTML = String(html);\n"
+-"\t\tsrc = holder.content && holder.content.childNodes ? holder.content : holder;\n"
+-"\t\twhile (src.firstChild) f.appendChild(src.firstChild);\n"
++"\t\twhile (holder.firstChild) f.appendChild(holder.firstChild);\n"
+ "\t\treturn f;\n"
+ "\t}\n"
+ "\tif (typeof d.createRange === 'function') {\n"
+@@ -2700,6 +2700,595 @@
+ "\t}\n"
+ "})();\n"
+ "\n"
++"/* ---- the selector engine: matches, closest, querySelector(All) ---------\n"
++" * The bridge's matches() was a regex over tag/#id/.class/[attr] that\n"
++" * skipped every ':' part -- :root, :hover, :first-child and ::before\n"
++" * matched EVERY element -- and knew no combinators (`body > div` matched\n"
++" * nothing); the native querySelectorAll found nothing for :root,\n"
++" * :first-child, :nth-child() or :is(). This is a Selectors-4 parser and\n"
++" * right-to-left matcher: combinators, attribute operators and flags,\n"
++" * :not/:is/:where/:has, the structural pseudo-classes (an+b [of S]),\n"
++" * :root/:scope/:empty, the form and link states, :focus through\n"
++" * activeElement; pseudo-elements never match, and an invalid or unknown\n"
++" * selector throws SyntaxError as browsers do. matches()/closest() always\n"
++" * use it; querySelector(All) keep the native engine for a plain selector\n"
++" * and otherwise take its candidates for the rightmost compound's\n"
++" * tag/#id/.class part and filter them here. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tvar E = Object.getPrototypeOf(d.createElement('section'));\n"
++"\tif (!E) return;\n"
++"\n"
++"\tfunction bad(sel) {\n"
++"\t\tvar e;\n"
++"\t\ttry { e = new g.DOMException(\"'\" + sel + \"' is not a valid selector.\", 'SyntaxError'); }\n"
++"\t\tcatch (x) { e = new Error(\"'\" + sel + \"' is not a valid selector.\"); e.name = 'SyntaxError'; }\n"
++"\t\treturn e;\n"
++"\t}\n"
++"\n"
++"\t/* ---- parsing ---- */\n"
++"\tvar cache = {}, cacheN = 0;\n"
++"\tfunction parse(sel) {\n"
++"\t\tsel = String(sel);\n"
++"\t\tif (Object.prototype.hasOwnProperty.call(cache, sel)) return cache[sel];\n"
++"\t\tvar p = { s: sel, i: 0 };\n"
++"\t\tvar list = parseList(p, false);\n"
++"\t\tskipWs(p);\n"
++"\t\tif (p.i < p.s.length) throw bad(sel);\n"
++"\t\tif (cacheN++ > 500) { cache = {}; cacheN = 0; }\n"
++"\t\tcache[sel] = list;\n"
++"\t\treturn list;\n"
++"\t}\n"
++"\tfunction skipWs(p) {\n"
++"\t\tvar c;\n"
++"\t\twhile (p.i < p.s.length) {\n"
++"\t\t\tc = p.s.charCodeAt(p.i);\n"
++"\t\t\tif (c === 32 || c === 9 || c === 10 || c === 13 || c === 12) { p.i++; continue; }\n"
++"\t\t\tif (c === 47 && p.s.charCodeAt(p.i + 1) === 42) {\n"
++"\t\t\t\tvar e = p.s.indexOf('*/', p.i + 2);\n"
++"\t\t\t\tp.i = e < 0 ? p.s.length : e + 2;\n"
++"\t\t\t\tcontinue;\n"
++"\t\t\t}\n"
++"\t\t\tbreak;\n"
++"\t\t}\n"
++"\t}\n"
++"\tfunction ident(p) {\n"
++"\t\tvar out = '', c, s = p.s;\n"
++"\t\twhile (p.i < s.length) {\n"
++"\t\t\tc = s.charAt(p.i);\n"
++"\t\t\tif (/[A-Za-z0-9_\\-\\u0080-\\uffff]/.test(c)) { out += c; p.i++; continue; }\n"
++"\t\t\tif (c === '\\\\') {\n"
++"\t\t\t\tvar m = /^\\\\([0-9a-fA-F]{1,6})\\s?/.exec(s.slice(p.i));\n"
++"\t\t\t\tif (m) { out += String.fromCodePoint(parseInt(m[1], 16) || 0xFFFD); p.i += m[0].length; }\n"
++"\t\t\t\telse if (p.i + 1 < s.length) { out += s.charAt(p.i + 1); p.i += 2; }\n"
++"\t\t\t\telse throw bad(s);\n"
++"\t\t\t\tcontinue;\n"
++"\t\t\t}\n"
++"\t\t\tbreak;\n"
++"\t\t}\n"
++"\t\treturn out;\n"
++"\t}\n"
++"\tfunction str(p) {\n"
++"\t\tvar q = p.s.charAt(p.i), out = '', c;\n"
++"\t\tp.i++;\n"
++"\t\twhile (p.i < p.s.length) {\n"
++"\t\t\tc = p.s.charAt(p.i);\n"
++"\t\t\tif (c === q) { p.i++; return out; }\n"
++"\t\t\tif (c === '\\\\') { out += p.s.charAt(p.i + 1); p.i += 2; continue; }\n"
++"\t\t\tout += c; p.i++;\n"
++"\t\t}\n"
++"\t\tthrow bad(p.s);\n"
++"\t}\n"
++"\t/* a comma list of complex selectors; relative: each may start with a\n"
++"\t * combinator (:has) */\n"
++"\tfunction parseList(p, relative) {\n"
++"\t\tvar list = [];\n"
++"\t\tfor (;;) {\n"
++"\t\t\tskipWs(p);\n"
++"\t\t\tlist.push(parseComplex(p, relative));\n"
++"\t\t\tskipWs(p);\n"
++"\t\t\tif (p.s.charAt(p.i) !== ',') break;\n"
++"\t\t\tp.i++;\n"
++"\t\t}\n"
++"\t\treturn list;\n"
++"\t}\n"
++"\t/* complex: [compound, comb, compound, comb, ...], matched from the\n"
++"\t * end; comb is ' ', '>', '+' or '~'. lead: the relative combinator. */\n"
++"\tfunction parseComplex(p, relative) {\n"
++"\t\tvar parts = [], lead = null, c;\n"
++"\t\tskipWs(p);\n"
++"\t\tc = p.s.charAt(p.i);\n"
++"\t\tif (relative && (c === '>' || c === '+' || c === '~')) { lead = c; p.i++; skipWs(p); }\n"
++"\t\telse if (relative) lead = ' ';\n"
++"\t\tparts.push(parseCompound(p));\n"
++"\t\tfor (;;) {\n"
++"\t\t\tvar before = p.i;\n"
++"\t\t\tskipWs(p);\n"
++"\t\t\tc = p.s.charAt(p.i);\n"
++"\t\t\tif (c === '>' || c === '+' || c === '~') {\n"
++"\t\t\t\tp.i++; skipWs(p);\n"
++"\t\t\t\tparts.push(c); parts.push(parseCompound(p));\n"
++"\t\t\t\tcontinue;\n"
++"\t\t\t}\n"
++"\t\t\tif (p.i > before && p.i < p.s.length && c !== ',' && c !== ')') {\n"
++"\t\t\t\tparts.push(' '); parts.push(parseCompound(p));\n"
++"\t\t\t\tcontinue;\n"
++"\t\t\t}\n"
++"\t\t\tp.i = before;\n"
++"\t\t\tbreak;\n"
++"\t\t}\n"
++"\t\treturn { parts: parts, lead: lead };\n"
++"\t}\n"
++"\tfunction parseCompound(p) {\n"
++"\t\tvar cp = { tag: null, id: null, cls: [], attrs: [], pseudo: [], pel: false }, c, start = p.i, name;\n"
++"\t\tc = p.s.charAt(p.i);\n"
++"\t\tif (c === '*') { p.i++; }\n"
++"\t\telse if (/[A-Za-z_\\\\\\u0080-\\uffff-]/.test(c)) { cp.tag = ident(p).toLowerCase(); }\n"
++"\t\tif (p.s.charAt(p.i) === '|') {\t\t/* ns|tag: the namespace is ignored */\n"
++"\t\t\tp.i++;\n"
++"\t\t\tif (p.s.charAt(p.i) === '*') { p.i++; cp.tag = null; }\n"
++"\t\t\telse cp.tag = ident(p).toLowerCase();\n"
++"\t\t}\n"
++"\t\tfor (;;) {\n"
++"\t\t\tc = p.s.charAt(p.i);\n"
++"\t\t\tif (c === '#') { p.i++; name = ident(p); if (!name) throw bad(p.s); cp.id = name; continue; }\n"
++"\t\t\tif (c === '.') { p.i++; name = ident(p); if (!name) throw bad(p.s); cp.cls.push(name); continue; }\n"
++"\t\t\tif (c === '[') { p.i++; cp.attrs.push(parseAttr(p)); continue; }\n"
++"\t\t\tif (c === ':') {\n"
++"\t\t\t\tp.i++;\n"
++"\t\t\t\tif (p.s.charAt(p.i) === ':') { p.i++; ident(p); skipArgs(p); cp.pel = true; continue; }\n"
++"\t\t\t\tcp.pseudo.push(parsePseudo(p));\n"
++"\t\t\t\tcontinue;\n"
++"\t\t\t}\n"
++"\t\t\tbreak;\n"
++"\t\t}\n"
++"\t\tif (p.i === start) throw bad(p.s);\n"
++"\t\treturn cp;\n"
++"\t}\n"
++"\tfunction skipArgs(p) {\n"
++"\t\tif (p.s.charAt(p.i) !== '(') return;\n"
++"\t\tvar depth = 0;\n"
++"\t\twhile (p.i < p.s.length) {\n"
++"\t\t\tvar c = p.s.charAt(p.i++);\n"
++"\t\t\tif (c === '(') depth++;\n"
++"\t\t\telse if (c === ')' && --depth === 0) return;\n"
++"\t\t}\n"
++"\t\tthrow bad(p.s);\n"
++"\t}\n"
++"\tfunction parseAttr(p) {\n"
++"\t\tvar a = { name: '', op: null, val: '', ci: false };\n"
++"\t\tskipWs(p);\n"
++"\t\tif (p.s.charAt(p.i) === '*' && p.s.charAt(p.i + 1) === '|') p.i += 2;\n"
++"\t\ta.name = ident(p).toLowerCase();\n"
++"\t\tif (p.s.charAt(p.i) === '|' && p.s.charAt(p.i + 1) !== '=') { p.i++; a.name = ident(p).toLowerCase(); }\n"
++"\t\tif (!a.name) throw bad(p.s);\n"
++"\t\tskipWs(p);\n"
++"\t\tvar c = p.s.charAt(p.i);\n"
++"\t\tif (c === ']') { p.i++; return a; }\n"
++"\t\tif (c === '=') { a.op = '='; p.i++; }\n"
++"\t\telse if ('~|^$*'.indexOf(c) >= 0 && c && p.s.charAt(p.i + 1) === '=') { a.op = c + '='; p.i += 2; }\n"
++"\t\telse throw bad(p.s);\n"
++"\t\tskipWs(p);\n"
++"\t\tc = p.s.charAt(p.i);\n"
++"\t\ta.val = (c === '\"' || c === \"'\") ? str(p) : ident(p);\n"
++"\t\tskipWs(p);\n"
++"\t\tc = p.s.charAt(p.i);\n"
++"\t\tif (c === 'i' || c === 'I') { a.ci = true; p.i++; skipWs(p); }\n"
++"\t\telse if (c === 's' || c === 'S') { p.i++; skipWs(p); }\n"
++"\t\tif (p.s.charAt(p.i) !== ']') throw bad(p.s);\n"
++"\t\tp.i++;\n"
++"\t\treturn a;\n"
++"\t}\n"
++"\tvar LEGACY_PEL = /^(before|after|first-line|first-letter)$/;\n"
++"\tvar SIMPLE = /^(root|scope|empty|first-child|last-child|only-child|first-of-type|last-of-type|only-of-type|checked|disabled|enabled|required|optional|read-only|read-write|link|any-link|visited|hover|active|focus|focus-within|focus-visible|target|defined|placeholder-shown|indeterminate|default|valid|invalid|in-range|out-of-range|autofill|-webkit-autofill|user-invalid|user-valid|modal|fullscreen|playing|paused|open|closed|popover-open|blank|target-within|local-link|current|past|future)$/;\n"
++"\tfunction parsePseudo(p) {\n"
++"\t\tvar name = ident(p).toLowerCase(), ps = { name: name };\n"
++"\t\tif (!name) throw bad(p.s);\n"
++"\t\tif (LEGACY_PEL.test(name)) return { name: '::' };\n"
++"\t\tif (p.s.charAt(p.i) !== '(') {\n"
++"\t\t\tif (!SIMPLE.test(name)) throw bad(p.s);\n"
++"\t\t\treturn ps;\n"
++"\t\t}\n"
++"\t\tp.i++;\n"
++"\t\tskipWs(p);\n"
++"\t\tswitch (name) {\n"
++"\t\tcase 'not': case 'is': case 'matches': case 'where': case '-webkit-any': case 'any':\n"
++"\t\t\tps.list = parseList(p, false);\n"
++"\t\t\tbreak;\n"
++"\t\tcase 'has':\n"
++"\t\t\tps.list = parseList(p, true);\n"
++"\t\t\tbreak;\n"
++"\t\tcase 'nth-child': case 'nth-last-child': case 'nth-of-type': case 'nth-last-of-type':\n"
++"\t\t\tps.nth = parseNth(p);\n"
++"\t\t\tskipWs(p);\n"
++"\t\t\tif ((name === 'nth-child' || name === 'nth-last-child') &&\n"
++"\t\t\t    /^of\\s/i.test(p.s.slice(p.i))) {\n"
++"\t\t\t\tp.i += 2; skipWs(p);\n"
++"\t\t\t\tps.of = parseList(p, false);\n"
++"\t\t\t}\n"
++"\t\t\tbreak;\n"
++"\t\tcase 'lang': case 'dir': {\n"
++"\t\t\tvar c = p.s.charAt(p.i);\n"
++"\t\t\tps.arg = (c === '\"' || c === \"'\") ? str(p) : ident(p);\n"
++"\t\t\tif (!ps.arg) throw bad(p.s);\n"
++"\t\t\tbreak;\n"
++"\t\t}\n"
++"\t\tcase 'host': case 'host-context': case 'state': case 'part':\n"
++"\t\t\tskipArgs({ s: '(' + p.s.slice(p.i), i: 0 });\n"
++"\t\t\tps.never = true;\n"
++"\t\t\twhile (p.i < p.s.length && p.s.charAt(p.i) !== ')') p.i++;\n"
++"\t\t\tbreak;\n"
++"\t\tdefault:\n"
++"\t\t\tthrow bad(p.s);\n"
++"\t\t}\n"
++"\t\tskipWs(p);\n"
++"\t\tif (p.s.charAt(p.i) !== ')') throw bad(p.s);\n"
++"\t\tp.i++;\n"
++"\t\treturn ps;\n"
++"\t}\n"
++"\tfunction parseNth(p) {\n"
++"\t\tvar m = /^(?:(odd)|(even)|([+-]?\\d*)?n\\s*(?:([+-])\\s*(\\d+))?|([+-]?\\d+))/i.exec(p.s.slice(p.i));\n"
++"\t\tif (!m || !m[0]) throw bad(p.s);\n"
++"\t\tp.i += m[0].length;\n"
++"\t\tif (m[1]) return [2, 1];\n"
++"\t\tif (m[2]) return [2, 0];\n"
++"\t\tif (m[6] !== undefined) return [0, parseInt(m[6], 10)];\n"
++"\t\tvar a = m[3] === undefined || m[3] === '' || m[3] === '+' ? 1 : m[3] === '-' ? -1 : parseInt(m[3], 10);\n"
++"\t\tvar b = m[5] ? parseInt(m[5], 10) * (m[4] === '-' ? -1 : 1) : 0;\n"
++"\t\treturn [a, b];\n"
++"\t}\n"
++"\n"
++"\t/* ---- matching ---- */\n"
++"\tfunction parentEl(n) { var q = n.parentNode; return q && q.nodeType === 1 ? q : null; }\n"
++"\tfunction prevEl(n) { var q = n.previousSibling; while (q && q.nodeType !== 1) q = q.previousSibling; return q; }\n"
++"\tfunction nextEl(n) { var q = n.nextSibling; while (q && q.nodeType !== 1) q = q.nextSibling; return q; }\n"
++"\tfunction lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }\n"
++"\tfunction nthOk(ab, pos) {\n"
++"\t\tvar a = ab[0], b = ab[1];\n"
++"\t\tif (a === 0) return pos === b;\n"
++"\t\tvar k = (pos - b) / a;\n"
++"\t\treturn k >= 0 && Math.floor(k) === k;\n"
++"\t}\n"
++"\tfunction position(n, last, type, of, ctx) {\n"
++"\t\tvar pos = 1, q = last ? nextEl(n) : prevEl(n), t = type ? lname(n) : null;\n"
++"\t\twhile (q) {\n"
++"\t\t\tif ((!t || lname(q) === t) && (!of || matchList(q, of, ctx))) pos++;\n"
++"\t\t\tq = last ? nextEl(q) : prevEl(q);\n"
++"\t\t}\n"
++"\t\treturn pos;\n"
++"\t}\n"
++"\tfunction isRoot(n) {\n"
++"\t\tvar pn = n.parentNode;\n"
++"\t\tif (pn && pn.nodeType === 9) return true;\n"
++"\t\tif (n.ownerDocument && n.ownerDocument.documentElement === n) return true;\n"
++"\t\treturn !!n.__vbDocRoot;\n"
++"\t}\n"
++"\tvar FORM = /^(input|button|select|textarea|optgroup|option|fieldset)$/;\n"
++"\tfunction disabled(n) {\n"
++"\t\tvar t = lname(n);\n"
++"\t\tif (!FORM.test(t)) return false;\n"
++"\t\tif (n.hasAttribute('disabled')) return true;\n"
++"\t\tfor (var q = parentEl(n); q; q = parentEl(q)) {\n"
++"\t\t\tvar qt = lname(q);\n"
++"\t\t\tif (qt === 'fieldset' && q.hasAttribute('disabled')) return true;\n"
++"\t\t\tif (t === 'option' && qt === 'optgroup' && q.hasAttribute('disabled')) return true;\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t}\n"
++"\tfunction textInput(n) {\n"
++"\t\tvar t = lname(n);\n"
++"\t\tif (t === 'textarea') return true;\n"
++"\t\tif (t !== 'input') return false;\n"
++"\t\tvar ty = String(n.getAttribute('type') || 'text').toLowerCase();\n"
++"\t\treturn /^(text|search|url|tel|email|password|number|date|month|week|time|datetime-local)$/.test(ty);\n"
++"\t}\n"
++"\tfunction pseudoOk(n, ps, ctx) {\n"
++"\t\tswitch (ps.name) {\n"
++"\t\tcase '::': return false;\n"
++"\t\tcase 'root': return isRoot(n);\n"
++"\t\tcase 'scope': return ctx.scope ? n === ctx.scope : isRoot(n);\n"
++"\t\tcase 'empty':\n"
++"\t\t\tfor (var c = n.firstChild; c; c = c.nextSibling)\n"
++"\t\t\t\tif (c.nodeType === 1 || ((c.nodeType === 3 || c.nodeType === 4) && c.data !== '')) return false;\n"
++"\t\t\treturn true;\n"
++"\t\tcase 'first-child': return !prevEl(n);\n"
++"\t\tcase 'last-child': return !nextEl(n);\n"
++"\t\tcase 'only-child': return !prevEl(n) && !nextEl(n);\n"
++"\t\tcase 'first-of-type': return position(n, false, true, null, ctx) === 1;\n"
++"\t\tcase 'last-of-type': return position(n, true, true, null, ctx) === 1;\n"
++"\t\tcase 'only-of-type': return position(n, false, true, null, ctx) === 1 && position(n, true, true, null, ctx) === 1;\n"
++"\t\tcase 'nth-child': return (!ps.of || matchList(n, ps.of, ctx)) && nthOk(ps.nth, position(n, false, false, ps.of, ctx));\n"
++"\t\tcase 'nth-last-child': return (!ps.of || matchList(n, ps.of, ctx)) && nthOk(ps.nth, position(n, true, false, ps.of, ctx));\n"
++"\t\tcase 'nth-of-type': return nthOk(ps.nth, position(n, false, true, null, ctx));\n"
++"\t\tcase 'nth-last-of-type': return nthOk(ps.nth, position(n, true, true, null, ctx));\n"
++"\t\tcase 'not': return !matchList(n, ps.list, ctx);\n"
++"\t\tcase 'is': case 'matches': case 'where': case '-webkit-any': case 'any': return matchList(n, ps.list, ctx);\n"
++"\t\tcase 'has': return hasMatch(n, ps.list, ctx);\n"
++"\t\tcase 'checked': {\n"
++"\t\t\tvar t = lname(n);\n"
++"\t\t\tif (t === 'input') {\n"
++"\t\t\t\tvar ty = String(n.getAttribute('type') || '').toLowerCase();\n"
++"\t\t\t\treturn (ty === 'checkbox' || ty === 'radio') && !!n.checked;\n"
++"\t\t\t}\n"
++"\t\t\treturn t === 'option' && !!n.selected;\n"
++"\t\t}\n"
++"\t\tcase 'disabled': return disabled(n);\n"
++"\t\tcase 'enabled': return FORM.test(lname(n)) && !disabled(n);\n"
++"\t\tcase 'required': return /^(input|select|textarea)$/.test(lname(n)) && n.hasAttribute('required');\n"
++"\t\tcase 'optional': return /^(input|select|textarea)$/.test(lname(n)) && !n.hasAttribute('required');\n"
++"\t\tcase 'read-write': return (textInput(n) && !n.hasAttribute('readonly') && !disabled(n)) || n.isContentEditable === true;\n"
++"\t\tcase 'read-only': return !((textInput(n) && !n.hasAttribute('readonly') && !disabled(n)) || n.isContentEditable === true);\n"
++"\t\tcase 'placeholder-shown': return textInput(n) && n.hasAttribute('placeholder') && String(n.value || '') === '';\n"
++"\t\tcase 'link': case 'any-link': return /^(a|area)$/.test(lname(n)) && n.hasAttribute('href');\n"
++"\t\tcase 'focus': case 'focus-visible': return d.activeElement === n && n !== d.body;\n"
++"\t\tcase 'focus-within': {\n"
++"\t\t\tvar ae = d.activeElement;\n"
++"\t\t\tif (!ae || ae === d.body) return false;\n"
++"\t\t\tfor (var q = ae; q; q = q.parentNode) if (q === n) return true;\n"
++"\t\t\treturn false;\n"
++"\t\t}\n"
++"\t\tcase 'target': {\n"
++"\t\t\tvar h = '';\n"
++"\t\t\ttry { h = decodeURIComponent(String(g.location.hash || '').slice(1)); } catch (x) { /* */ }\n"
++"\t\t\treturn !!h && (n.getAttribute('id') === h || (lname(n) === 'a' && n.getAttribute('name') === h));\n"
++"\t\t}\n"
++"\t\tcase 'defined': return true;\n"
++"\t\tcase 'lang': {\n"
++"\t\t\tfor (var q2 = n; q2 && q2.nodeType === 1; q2 = q2.parentNode) {\n"
++"\t\t\t\tvar l = q2.getAttribute('lang');\n"
++"\t\t\t\tif (l !== null) {\n"
++"\t\t\t\t\tl = l.toLowerCase(); var w = ps.arg.toLowerCase();\n"
++"\t\t\t\t\treturn l === w || l.indexOf(w + '-') === 0;\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t\treturn false;\n"
++"\t\t}\n"
++"\t\tcase 'dir': {\n"
++"\t\t\tfor (var q3 = n; q3 && q3.nodeType === 1; q3 = q3.parentNode) {\n"
++"\t\t\t\tvar dv = q3.getAttribute('dir');\n"
++"\t\t\t\tif (dv === 'rtl' || dv === 'ltr') return dv === String(ps.arg).toLowerCase();\n"
++"\t\t\t}\n"
++"\t\t\treturn String(ps.arg).toLowerCase() === 'ltr';\n"
++"\t\t}\n"
++"\t\tcase 'default': return (lname(n) === 'option' && n.hasAttribute('selected')) ||\n"
++"\t\t\t(lname(n) === 'input' && n.hasAttribute('checked'));\n"
++"\t\tcase 'open': return n.hasAttribute('open');\n"
++"\t\tcase 'closed': return /^(details|dialog)$/.test(lname(n)) && !n.hasAttribute('open');\n"
++"\t\tcase 'valid': return FORM.test(lname(n)) && !(n.hasAttribute('required') && String(n.value || '') === '');\n"
++"\t\tcase 'invalid': return FORM.test(lname(n)) && n.hasAttribute('required') && String(n.value || '') === '';\n"
++"\t\tdefault: return false;\t/* hover, active, visited, indeterminate, ... */\n"
++"\t\t}\n"
++"\t}\n"
++"\tfunction attrOk(n, a) {\n"
++"\t\tvar v = n.getAttribute(a.name);\n"
++"\t\tif (v === null) return false;\n"
++"\t\tif (!a.op) return true;\n"
++"\t\tvar w = a.val;\n"
++"\t\tif (a.ci) { v = v.toLowerCase(); w = w.toLowerCase(); }\n"
++"\t\tswitch (a.op) {\n"
++"\t\tcase '=': return v === w;\n"
++"\t\tcase '~=': return w !== '' && !/\\s/.test(w) && (' ' + v.replace(/\\s+/g, ' ') + ' ').indexOf(' ' + w + ' ') >= 0;\n"
++"\t\tcase '|=': return v === w || v.indexOf(w + '-') === 0;\n"
++"\t\tcase '^=': return w !== '' && v.indexOf(w) === 0;\n"
++"\t\tcase '$=': return w !== '' && v.length >= w.length && v.lastIndexOf(w) === v.length - w.length;\n"
++"\t\tcase '*=': return w !== '' && v.indexOf(w) >= 0;\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t}\n"
++"\tfunction compoundOk(n, cp, ctx) {\n"
++"\t\tif (cp.pel) return false;\n"
++"\t\tif (cp.tag && lname(n) !== cp.tag) return false;\n"
++"\t\tif (cp.id !== null && n.getAttribute('id') !== cp.id) return false;\n"
++"\t\tif (cp.cls.length) {\n"
++"\t\t\tvar c = ' ' + String(n.getAttribute('class') || '').replace(/\\s+/g, ' ') + ' ';\n"
++"\t\t\tfor (var i = 0; i < cp.cls.length; i++) if (c.indexOf(' ' + cp.cls[i] + ' ') < 0) return false;\n"
++"\t\t}\n"
++"\t\tfor (var j = 0; j < cp.attrs.length; j++) if (!attrOk(n, cp.attrs[j])) return false;\n"
++"\t\tfor (var k = 0; k < cp.pseudo.length; k++) if (!pseudoOk(n, cp.pseudo[k], ctx)) return false;\n"
++"\t\treturn true;\n"
++"\t}\n"
++"\t/* parts[idx] matched against n; then the combinator to its left */\n"
++"\tfunction complexOk(n, parts, idx, ctx) {\n"
++"\t\tif (!compoundOk(n, parts[idx], ctx)) return false;\n"
++"\t\tif (idx === 0) return true;\n"
++"\t\tvar comb = parts[idx - 1], q;\n"
++"\t\tswitch (comb) {\n"
++"\t\tcase '>': q = parentEl(n); return !!q && complexOk(q, parts, idx - 2, ctx);\n"
++"\t\tcase '+': q = prevEl(n); return !!q && complexOk(q, parts, idx - 2, ctx);\n"
++"\t\tcase '~':\n"
++"\t\t\tfor (q = prevEl(n); q; q = prevEl(q)) if (complexOk(q, parts, idx - 2, ctx)) return true;\n"
++"\t\t\treturn false;\n"
++"\t\tdefault:\n"
++"\t\t\tfor (q = parentEl(n); q; q = parentEl(q)) if (complexOk(q, parts, idx - 2, ctx)) return true;\n"
++"\t\t\treturn false;\n"
++"\t\t}\n"
++"\t}\n"
++"\tfunction matchList(n, list, ctx) {\n"
++"\t\tfor (var i = 0; i < list.length; i++)\n"
++"\t\t\tif (complexOk(n, list[i].parts, list[i].parts.length - 1, ctx)) return true;\n"
++"\t\treturn false;\n"
++"\t}\n"
++"\t/* :has(rel): some element related to n by rel's lead combinator\n"
++"\t * matches rel, with n as the anchor */\n"
++"\tfunction hasMatch(n, list, ctx) {\n"
++"\t\tfor (var i = 0; i < list.length; i++) {\n"
++"\t\t\tvar rel = list[i], parts = rel.parts, last = parts.length - 1, found = false;\n"
++"\t\t\tvar anchored = function (m) {\n"
++"\t\t\t\t/* m matches the whole relative selector anchored at n */\n"
++"\t\t\t\tvar sub = { scope: n };\n"
++"\t\t\t\treturn relOk(m, parts, last, rel.lead, n, sub);\n"
++"\t\t\t};\n"
++"\t\t\tif (rel.lead === '+' || rel.lead === '~') {\n"
++"\t\t\t\tfor (var s = nextEl(n); s && !found; s = nextEl(s)) {\n"
++"\t\t\t\t\tfound = anchored(s);\n"
++"\t\t\t\t\tif (rel.lead === '+' && parts.length === 1) break;\n"
++"\t\t\t\t}\n"
++"\t\t\t} else {\n"
++"\t\t\t\twalk(n, function (m) { if (!found && anchored(m)) found = true; return found; });\n"
++"\t\t\t}\n"
++"\t\t\tif (found) return true;\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t}\n"
++"\t/* like complexOk, but the leftmost compound must stand in the lead\n"
++"\t * relation to anchor */\n"
++"\tfunction relOk(m, parts, idx, lead, anchor, ctx) {\n"
++"\t\tif (!compoundOk(m, parts[idx], ctx)) return false;\n"
++"\t\tif (idx === 0) {\n"
++"\t\t\tswitch (lead) {\n"
++"\t\t\tcase '>': return parentEl(m) === anchor;\n"
++"\t\t\tcase '+': return prevEl(m) === anchor;\n"
++"\t\t\tcase '~':\n"
++"\t\t\t\tfor (var q = prevEl(m); q; q = prevEl(q)) if (q === anchor) return true;\n"
++"\t\t\t\treturn false;\n"
++"\t\t\tdefault:\n"
++"\t\t\t\tfor (var r = parentEl(m); r; r = parentEl(r)) if (r === anchor) return true;\n"
++"\t\t\t\treturn false;\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tvar comb = parts[idx - 1], q2;\n"
++"\t\tswitch (comb) {\n"
++"\t\tcase '>': q2 = parentEl(m); return !!q2 && relOk(q2, parts, idx - 2, lead, anchor, ctx);\n"
++"\t\tcase '+': q2 = prevEl(m); return !!q2 && relOk(q2, parts, idx - 2, lead, anchor, ctx);\n"
++"\t\tcase '~':\n"
++"\t\t\tfor (q2 = prevEl(m); q2; q2 = prevEl(q2)) if (relOk(q2, parts, idx - 2, lead, anchor, ctx)) return true;\n"
++"\t\t\treturn false;\n"
++"\t\tdefault:\n"
++"\t\t\tfor (q2 = parentEl(m); q2 && q2 !== anchor; q2 = parentEl(q2))\n"
++"\t\t\t\tif (relOk(q2, parts, idx - 2, lead, anchor, ctx)) return true;\n"
++"\t\t\treturn false;\n"
++"\t\t}\n"
++"\t}\n"
++"\t/* the elements under root (a document: its root element and those\n"
++"\t * under it -- the bridge's document has no childNodes walk) in\n"
++"\t * document order; stop when f is true */\n"
++"\tfunction each(root, f) {\n"
++"\t\tif (root.nodeType === 9) {\n"
++"\t\t\tvar de = root.documentElement;\n"
++"\t\t\treturn !!de && (f(de) || walk(de, f));\n"
++"\t\t}\n"
++"\t\treturn walk(root, f);\n"
++"\t}\n"
++"\t/* descendant elements of root in document order; stop when f is true */\n"
++"\tfunction walk(root, f) {\n"
++"\t\tvar n = root.firstChild;\n"
++"\t\twhile (n) {\n"
++"\t\t\tif (n.nodeType === 1 && f(n)) return true;\n"
++"\t\t\tif (n.firstChild && n.nodeType === 1) { n = n.firstChild; continue; }\n"
++"\t\t\twhile (n && !n.nextSibling) {\n"
++"\t\t\t\tn = n.parentNode;\n"
++"\t\t\t\tif (!n || n === root) return false;\n"
++"\t\t\t}\n"
++"\t\t\tn = n && n.nextSibling;\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t}\n"
++"\n"
++"\t/* ---- the API ---- */\n"
++"\t/* a selector the native engine answers correctly: tags, #ids,\n"
++"\t * .classes and the four combinators -- no ':', no [attr], no escapes */\n"
++"\tfunction plain(sel) {\n"
++"\t\treturn /^[\\sA-Za-z0-9_\\-#.,>+~*]*$/.test(sel) && !/(^|[,>+~\\s])[+~>]|[+~>]\\s*($|,)/.test(sel.trim());\n"
++"\t}\n"
++"\t/* the rightmost compound's tag/#id/.class part, for native candidates */\n"
++"\tfunction seed(list) {\n"
++"\t\tvar out = [];\n"
++"\t\tfor (var i = 0; i < list.length; i++) {\n"
++"\t\t\tvar cp = list[i].parts[list[i].parts.length - 1], s = cp.tag || '*';\n"
++"\t\t\tif (cp.pel) continue;\n"
++"\t\t\tif (cp.id !== null && /^[A-Za-z_][\\w-]*$/.test(cp.id)) s += '#' + cp.id;\n"
++"\t\t\tfor (var k = 0; k < cp.cls.length; k++) if (/^[A-Za-z_][\\w-]*$/.test(cp.cls[k])) s += '.' + cp.cls[k];\n"
++"\t\t\tout.push(s);\n"
++"\t\t}\n"
++"\t\treturn out;\n"
++"\t}\n"
++"\tfunction listOf(a) {\n"
++"\t\ttry { Object.defineProperty(a, 'item', { value: function (i) { return this[i] || null; }, configurable: true }); } catch (e) { /* */ }\n"
++"\t\treturn a;\n"
++"\t}\n"
++"\tfunction inOrder(root, set) {\n"
++"\t\t/* several seeds: merge in document order */\n"
++"\t\tvar out = [];\n"
++"\t\teach(root, function (m) { if (set.has(m)) out.push(m); return false; });\n"
++"\t\treturn out;\n"
++"\t}\n"
++"\tfunction jsQuery(root, sel, first, nat) {\n"
++"\t\tvar list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;\n"
++"\t\tif (!seeds.length) return first ? null : listOf([]);\n"
++"\t\tfor (i = 0; i < seeds.length; i++) {\n"
++"\t\t\tvar cand = null;\n"
++"\t\t\ttry { cand = nat ? nat.call(root, seeds[i]) : null; } catch (e) { cand = null; }\n"
++"\t\t\tif (!cand) {\n"
++"\t\t\t\tcand = [];\n"
++"\t\t\t\teach(root, function (m) { cand.push(m); return false; });\n"
++"\t\t\t}\n"
++"\t\t\tfor (k = 0; k < cand.length; k++) {\n"
++"\t\t\t\tvar m = cand[k];\n"
++"\t\t\t\tif (seeds.length > 1 && seen.has(m)) continue;\n"
++"\t\t\t\tif (matchList(m, list, ctx)) {\n"
++"\t\t\t\t\tif (first && seeds.length === 1) return m;\n"
++"\t\t\t\t\tall.push(m);\n"
++"\t\t\t\t\tseen.add(m);\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tout = seeds.length > 1 ? inOrder(root, seen) : all;\n"
++"\t\tif (first) return out[0] || null;\n"
++"\t\treturn listOf(out);\n"
++"\t}\n"
++"\tfunction matches(sel) {\n"
++"\t\tif (arguments.length === 0) throw new TypeError(\"Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.\");\n"
++"\t\treturn matchList(this, parse(sel), { scope: this });\n"
++"\t}\n"
++"\tfunction closest(sel) {\n"
++"\t\tvar list = parse(sel), ctx = { scope: this };\n"
++"\t\tfor (var n = this; n && n.nodeType === 1; n = n.parentNode)\n"
++"\t\t\tif (matchList(n, list, ctx)) return n;\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\t/* The bridge installs the document's querySelector(All) again after\n"
++"\t * this file's first run (qjs_dom_install runs twice per context, and\n"
++"\t * this file with it): wrap whatever native is there, once. */\n"
++"\tfunction nativeOf(f) { return f && f.__vbNat ? f.__vbNat : f; }\n"
++"\tfunction wrapQuery(o) {\n"
++"\t\tif (!o) return;\n"
++"\t\tvar qa = o.querySelectorAll, q1 = o.querySelector;\n"
++"\t\tif (typeof qa === 'function' && !qa.__vbNat) {\n"
++"\t\t\tvar natAll = qa, wa = function (sel) {\n"
++"\t\t\t\tsel = String(sel);\n"
++"\t\t\t\tparse(sel);\t/* an invalid selector throws SyntaxError */\n"
++"\t\t\t\tif (plain(sel)) return natAll.call(this, sel);\n"
++"\t\t\t\treturn jsQuery(this, sel, false, natAll);\n"
++"\t\t\t};\n"
++"\t\t\twa.__vbNat = natAll;\n"
++"\t\t\tdefine(o, 'querySelectorAll', wa);\n"
++"\t\t}\n"
++"\t\tif (typeof q1 === 'function' && !q1.__vbNat) {\n"
++"\t\t\tvar nat1 = q1, all = nativeOf(o.querySelectorAll), w1 = function (sel) {\n"
++"\t\t\t\tsel = String(sel);\n"
++"\t\t\t\tparse(sel);\n"
++"\t\t\t\tif (plain(sel)) return nat1.call(this, sel);\n"
++"\t\t\t\treturn jsQuery(this, sel, true, all);\n"
++"\t\t\t};\n"
++"\t\t\tw1.__vbNat = nat1;\n"
++"\t\t\tdefine(o, 'querySelector', w1);\n"
++"\t\t}\n"
++"\t}\n"
++"\tif (!E.matches || !E.matches.__vbSel) {\n"
++"\t\tmatches.__vbSel = true;\n"
++"\t\tdefine(E, 'matches', matches);\n"
++"\t\tdefine(E, 'webkitMatchesSelector', matches);\n"
++"\t\tdefine(E, 'msMatchesSelector', matches);\n"
++"\t\tdefine(E, 'closest', closest);\n"
++"\t}\n"
++"\twrapQuery(E);\n"
++"\twrapQuery(d);\n"
++"\ttry { wrapQuery(Object.getPrototypeOf(d.createDocumentFragment())); } catch (e) { /* */ }\n"
++"\tdefine(g, '__vbSelectorMatch', function (el, sel) { return matchList(el, parse(sel), { scope: el }); });\n"
++"})();\n"
++"\n"
+ "/* ---- the DOM surface a census found missing (2026-09-26) ---------------\n"
+ " * parentElement (!), innerText, localName, the reflected attributes, the\n"
+ " * form-control API, text-node odds, document helpers, window\n"
+@@ -2976,6 +3565,114 @@
+ "\t\tif (this.parentNode) this.parentNode.insertBefore(rest, this.nextSibling);\n"
+ "\t\treturn rest;\n"
+ "\t});\n"
++"\t/* CharacterData's editing methods (appendData ... substringData):\n"
++"\t * the bridge had none; each is a string edit of .data */\n"
++"\tfunction cdIndex(d, off) {\n"
++"\t\toff = off >>> 0;\n"
++"\t\tif (off > d.length) {\n"
++"\t\t\tvar e;\n"
++"\t\t\ttry { e = new g.DOMException('The offset ' + off + ' is greater than the node\\'s length (' + d.length + ').', 'IndexSizeError'); }\n"
++"\t\t\tcatch (x) { e = new Error('IndexSizeError'); }\n"
++"\t\t\tthrow e;\n"
++"\t\t}\n"
++"\t\treturn off;\n"
++"\t}\n"
++"\t/* characterData mutation records: the bridge's MutationObserver only\n"
++"\t * ever got childList records (queued by its native insert/remove), so\n"
++"\t * a text node watched with {characterData: true} -- the microtask shim\n"
++"\t * of core-js and Vue 2's nextTick toggles one -- never reported, and\n"
++"\t * those libraries' callbacks never ran. The data / nodeValue /\n"
++"\t * textContent setters of text and comment nodes now queue one. */\n"
++"\tfunction queueCD(node, old) {\n"
++"\t\tvar obs = g.__msMutObservers, q = g.__msQueueMutation;\n"
++"\t\tif (!obs || !obs.length || typeof q !== 'function') return;\n"
++"\t\ttry { q('characterData', node, null, null, null, old); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tfunction findAcc(o, n) {\n"
++"\t\tfor (var p = o; p; p = Object.getPrototypeOf(p)) {\n"
++"\t\t\tvar dsc = Object.getOwnPropertyDescriptor(p, n);\n"
++"\t\t\tif (dsc) return dsc;\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\t/* wrapped per setter, not per prototype: the bridge installs its\n"
++"\t * accessors again on its second pass over a context */\n"
++"\t[T, CP].forEach(function (o) {\n"
++"\t\tif (!o) return;\n"
++"\t\t['data', 'nodeValue', 'textContent'].forEach(function (n) {\n"
++"\t\t\tvar dsc = findAcc(o, n);\n"
++"\t\t\tif (!dsc || typeof dsc.set !== 'function' || typeof dsc.get !== 'function' || dsc.set.__vbCD) return;\n"
++"\t\t\tvar setter = function (v) {\n"
++"\t\t\t\tvar old = null;\n"
++"\t\t\t\ttry { old = dsc.get.call(this); } catch (e) { /* */ }\n"
++"\t\t\t\tdsc.set.call(this, v);\n"
++"\t\t\t\tqueueCD(this, old);\n"
++"\t\t\t};\n"
++"\t\t\tsetter.__vbCD = true;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tObject.defineProperty(o, n, { configurable: true, enumerable: dsc.enumerable,\n"
++"\t\t\t\t\tget: dsc.get, set: setter });\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t});\n"
++"\t/* delivery that honours characterData (and the *OldValue options) */\n"
++"\tif (typeof g.__msDeliverMutations === 'function' && !g.__msDeliverMutations.__vbCD) {\n"
++"\t\tvar deliver = function () {\n"
++"\t\t\tvar list = g.__msMutObservers, pending = g.__msMutPending.splice(0), i, j, k;\n"
++"\t\t\tg.__msMutScheduled = false;\n"
++"\t\t\tif (!list || !list.length || !pending.length) return;\n"
++"\t\t\tfor (i = 0; i < list.length; i++) {\n"
++"\t\t\t\tvar ob = list[i];\n"
++"\t\t\t\tif (!ob._targets || !ob._targets.length) continue;\n"
++"\t\t\t\tvar recs = [];\n"
++"\t\t\t\tfor (j = 0; j < pending.length; j++) {\n"
++"\t\t\t\t\tvar rec = pending[j], hit = null;\n"
++"\t\t\t\t\tfor (k = 0; k < ob._targets.length; k++) {\n"
++"\t\t\t\t\t\tvar w = ob._targets[k], root = w.node, op = w.opts || {};\n"
++"\t\t\t\t\t\tif (rec.type === 'childList' && !op.childList) continue;\n"
++"\t\t\t\t\t\tif (rec.type === 'attributes' && !op.attributes && !op.attributeFilter && !op.attributeOldValue) continue;\n"
++"\t\t\t\t\t\tif (rec.type === 'attributes' && op.attributeFilter && op.attributeFilter.indexOf(rec.attributeName) < 0) continue;\n"
++"\t\t\t\t\t\tif (rec.type === 'characterData' && !op.characterData && !op.characterDataOldValue) continue;\n"
++"\t\t\t\t\t\tif (root === rec.target || (op.subtree && root && root.contains && root.contains(rec.target))) { hit = op; break; }\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\tif (!hit) continue;\n"
++"\t\t\t\t\tvar keepOld = (rec.type === 'characterData' && hit.characterDataOldValue) ||\n"
++"\t\t\t\t\t\t(rec.type === 'attributes' && hit.attributeOldValue);\n"
++"\t\t\t\t\tvar r = {}; for (var key in rec) r[key] = rec[key];\n"
++"\t\t\t\t\tif (!keepOld) r.oldValue = null;\n"
++"\t\t\t\t\trecs.push(r);\n"
++"\t\t\t\t}\n"
++"\t\t\t\tif (recs.length) try { ob._cb(recs, ob); } catch (e) {\n"
++"\t\t\t\t\ttry { g.__msLife('MUTOBS callback THREW ' + ((e && e.message) || e)); } catch (x) { /* */ }\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t};\n"
++"\t\tdeliver.__vbCD = true;\n"
++"\t\tg.__msDeliverMutations = deliver;\n"
++"\t}\n"
++"\t[T, CP].forEach(function (o) {\n"
++"\t\tfn(o, 'appendData', function (s) { this.data = String(this.data) + String(s); });\n"
++"\t\tfn(o, 'insertData', function (off, s) {\n"
++"\t\t\tvar d = String(this.data);\n"
++"\t\t\toff = cdIndex(d, off);\n"
++"\t\t\tthis.data = d.slice(0, off) + String(s) + d.slice(off);\n"
++"\t\t});\n"
++"\t\tfn(o, 'deleteData', function (off, n) {\n"
++"\t\t\tvar d = String(this.data);\n"
++"\t\t\toff = cdIndex(d, off);\n"
++"\t\t\tthis.data = d.slice(0, off) + d.slice(off + (n >>> 0));\n"
++"\t\t});\n"
++"\t\tfn(o, 'replaceData', function (off, n, s) {\n"
++"\t\t\tvar d = String(this.data);\n"
++"\t\t\toff = cdIndex(d, off);\n"
++"\t\t\tthis.data = d.slice(0, off) + String(s) + d.slice(off + (n >>> 0));\n"
++"\t\t});\n"
++"\t\tfn(o, 'substringData', function (off, n) {\n"
++"\t\t\tvar d = String(this.data);\n"
++"\t\t\toff = cdIndex(d, off);\n"
++"\t\t\treturn d.substr(off, n >>> 0);\n"
++"\t\t});\n"
++"\t});\n"
+ "\t/* document */\n"
+ "\tacc(d, 'characterSet', function () { return 'UTF-8'; });\n"
+ "\tacc(d, 'charset', function () { return 'UTF-8'; });\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 86fc9d0..eb57c25 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2618,13 +2618,13 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024 });
+ 	}
+ 
+-	/* Range.createContextualFragment: parse into a fragment (inert: a
+-	 * <template>'s content when the bridge has one, else a detached div) */
++	/* Range.createContextualFragment: parse into a fragment through a
++	 * detached <div> of this document (its innerHTML runs no scripts),
++	 * so the nodes are this document's without an adoption step */
+ 	function fragmentOf(html) {
+-		var f = d.createDocumentFragment(), holder = d.createElement('template'), src;
++		var f = d.createDocumentFragment(), holder = d.createElement('div');
+ 		holder.innerHTML = String(html);
+-		src = holder.content && holder.content.childNodes ? holder.content : holder;
+-		while (src.firstChild) f.appendChild(src.firstChild);
++		while (holder.firstChild) f.appendChild(holder.firstChild);
+ 		return f;
+ 	}
+ 	if (typeof d.createRange === 'function') {
+@@ -2699,6 +2699,595 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ })();
+ 
++/* ---- the selector engine: matches, closest, querySelector(All) ---------
++ * The bridge's matches() was a regex over tag/#id/.class/[attr] that
++ * skipped every ':' part -- :root, :hover, :first-child and ::before
++ * matched EVERY element -- and knew no combinators (`body > div` matched
++ * nothing); the native querySelectorAll found nothing for :root,
++ * :first-child, :nth-child() or :is(). This is a Selectors-4 parser and
++ * right-to-left matcher: combinators, attribute operators and flags,
++ * :not/:is/:where/:has, the structural pseudo-classes (an+b [of S]),
++ * :root/:scope/:empty, the form and link states, :focus through
++ * activeElement; pseudo-elements never match, and an invalid or unknown
++ * selector throws SyntaxError as browsers do. matches()/closest() always
++ * use it; querySelector(All) keep the native engine for a plain selector
++ * and otherwise take its candidates for the rightmost compound's
++ * tag/#id/.class part and filter them here. */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	var E = Object.getPrototypeOf(d.createElement('section'));
++	if (!E) return;
++
++	function bad(sel) {
++		var e;
++		try { e = new g.DOMException("'" + sel + "' is not a valid selector.", 'SyntaxError'); }
++		catch (x) { e = new Error("'" + sel + "' is not a valid selector."); e.name = 'SyntaxError'; }
++		return e;
++	}
++
++	/* ---- parsing ---- */
++	var cache = {}, cacheN = 0;
++	function parse(sel) {
++		sel = String(sel);
++		if (Object.prototype.hasOwnProperty.call(cache, sel)) return cache[sel];
++		var p = { s: sel, i: 0 };
++		var list = parseList(p, false);
++		skipWs(p);
++		if (p.i < p.s.length) throw bad(sel);
++		if (cacheN++ > 500) { cache = {}; cacheN = 0; }
++		cache[sel] = list;
++		return list;
++	}
++	function skipWs(p) {
++		var c;
++		while (p.i < p.s.length) {
++			c = p.s.charCodeAt(p.i);
++			if (c === 32 || c === 9 || c === 10 || c === 13 || c === 12) { p.i++; continue; }
++			if (c === 47 && p.s.charCodeAt(p.i + 1) === 42) {
++				var e = p.s.indexOf('*/', p.i + 2);
++				p.i = e < 0 ? p.s.length : e + 2;
++				continue;
++			}
++			break;
++		}
++	}
++	function ident(p) {
++		var out = '', c, s = p.s;
++		while (p.i < s.length) {
++			c = s.charAt(p.i);
++			if (/[A-Za-z0-9_\-\u0080-\uffff]/.test(c)) { out += c; p.i++; continue; }
++			if (c === '\\') {
++				var m = /^\\([0-9a-fA-F]{1,6})\s?/.exec(s.slice(p.i));
++				if (m) { out += String.fromCodePoint(parseInt(m[1], 16) || 0xFFFD); p.i += m[0].length; }
++				else if (p.i + 1 < s.length) { out += s.charAt(p.i + 1); p.i += 2; }
++				else throw bad(s);
++				continue;
++			}
++			break;
++		}
++		return out;
++	}
++	function str(p) {
++		var q = p.s.charAt(p.i), out = '', c;
++		p.i++;
++		while (p.i < p.s.length) {
++			c = p.s.charAt(p.i);
++			if (c === q) { p.i++; return out; }
++			if (c === '\\') { out += p.s.charAt(p.i + 1); p.i += 2; continue; }
++			out += c; p.i++;
++		}
++		throw bad(p.s);
++	}
++	/* a comma list of complex selectors; relative: each may start with a
++	 * combinator (:has) */
++	function parseList(p, relative) {
++		var list = [];
++		for (;;) {
++			skipWs(p);
++			list.push(parseComplex(p, relative));
++			skipWs(p);
++			if (p.s.charAt(p.i) !== ',') break;
++			p.i++;
++		}
++		return list;
++	}
++	/* complex: [compound, comb, compound, comb, ...], matched from the
++	 * end; comb is ' ', '>', '+' or '~'. lead: the relative combinator. */
++	function parseComplex(p, relative) {
++		var parts = [], lead = null, c;
++		skipWs(p);
++		c = p.s.charAt(p.i);
++		if (relative && (c === '>' || c === '+' || c === '~')) { lead = c; p.i++; skipWs(p); }
++		else if (relative) lead = ' ';
++		parts.push(parseCompound(p));
++		for (;;) {
++			var before = p.i;
++			skipWs(p);
++			c = p.s.charAt(p.i);
++			if (c === '>' || c === '+' || c === '~') {
++				p.i++; skipWs(p);
++				parts.push(c); parts.push(parseCompound(p));
++				continue;
++			}
++			if (p.i > before && p.i < p.s.length && c !== ',' && c !== ')') {
++				parts.push(' '); parts.push(parseCompound(p));
++				continue;
++			}
++			p.i = before;
++			break;
++		}
++		return { parts: parts, lead: lead };
++	}
++	function parseCompound(p) {
++		var cp = { tag: null, id: null, cls: [], attrs: [], pseudo: [], pel: false }, c, start = p.i, name;
++		c = p.s.charAt(p.i);
++		if (c === '*') { p.i++; }
++		else if (/[A-Za-z_\\\u0080-\uffff-]/.test(c)) { cp.tag = ident(p).toLowerCase(); }
++		if (p.s.charAt(p.i) === '|') {		/* ns|tag: the namespace is ignored */
++			p.i++;
++			if (p.s.charAt(p.i) === '*') { p.i++; cp.tag = null; }
++			else cp.tag = ident(p).toLowerCase();
++		}
++		for (;;) {
++			c = p.s.charAt(p.i);
++			if (c === '#') { p.i++; name = ident(p); if (!name) throw bad(p.s); cp.id = name; continue; }
++			if (c === '.') { p.i++; name = ident(p); if (!name) throw bad(p.s); cp.cls.push(name); continue; }
++			if (c === '[') { p.i++; cp.attrs.push(parseAttr(p)); continue; }
++			if (c === ':') {
++				p.i++;
++				if (p.s.charAt(p.i) === ':') { p.i++; ident(p); skipArgs(p); cp.pel = true; continue; }
++				cp.pseudo.push(parsePseudo(p));
++				continue;
++			}
++			break;
++		}
++		if (p.i === start) throw bad(p.s);
++		return cp;
++	}
++	function skipArgs(p) {
++		if (p.s.charAt(p.i) !== '(') return;
++		var depth = 0;
++		while (p.i < p.s.length) {
++			var c = p.s.charAt(p.i++);
++			if (c === '(') depth++;
++			else if (c === ')' && --depth === 0) return;
++		}
++		throw bad(p.s);
++	}
++	function parseAttr(p) {
++		var a = { name: '', op: null, val: '', ci: false };
++		skipWs(p);
++		if (p.s.charAt(p.i) === '*' && p.s.charAt(p.i + 1) === '|') p.i += 2;
++		a.name = ident(p).toLowerCase();
++		if (p.s.charAt(p.i) === '|' && p.s.charAt(p.i + 1) !== '=') { p.i++; a.name = ident(p).toLowerCase(); }
++		if (!a.name) throw bad(p.s);
++		skipWs(p);
++		var c = p.s.charAt(p.i);
++		if (c === ']') { p.i++; return a; }
++		if (c === '=') { a.op = '='; p.i++; }
++		else if ('~|^$*'.indexOf(c) >= 0 && c && p.s.charAt(p.i + 1) === '=') { a.op = c + '='; p.i += 2; }
++		else throw bad(p.s);
++		skipWs(p);
++		c = p.s.charAt(p.i);
++		a.val = (c === '"' || c === "'") ? str(p) : ident(p);
++		skipWs(p);
++		c = p.s.charAt(p.i);
++		if (c === 'i' || c === 'I') { a.ci = true; p.i++; skipWs(p); }
++		else if (c === 's' || c === 'S') { p.i++; skipWs(p); }
++		if (p.s.charAt(p.i) !== ']') throw bad(p.s);
++		p.i++;
++		return a;
++	}
++	var LEGACY_PEL = /^(before|after|first-line|first-letter)$/;
++	var SIMPLE = /^(root|scope|empty|first-child|last-child|only-child|first-of-type|last-of-type|only-of-type|checked|disabled|enabled|required|optional|read-only|read-write|link|any-link|visited|hover|active|focus|focus-within|focus-visible|target|defined|placeholder-shown|indeterminate|default|valid|invalid|in-range|out-of-range|autofill|-webkit-autofill|user-invalid|user-valid|modal|fullscreen|playing|paused|open|closed|popover-open|blank|target-within|local-link|current|past|future)$/;
++	function parsePseudo(p) {
++		var name = ident(p).toLowerCase(), ps = { name: name };
++		if (!name) throw bad(p.s);
++		if (LEGACY_PEL.test(name)) return { name: '::' };
++		if (p.s.charAt(p.i) !== '(') {
++			if (!SIMPLE.test(name)) throw bad(p.s);
++			return ps;
++		}
++		p.i++;
++		skipWs(p);
++		switch (name) {
++		case 'not': case 'is': case 'matches': case 'where': case '-webkit-any': case 'any':
++			ps.list = parseList(p, false);
++			break;
++		case 'has':
++			ps.list = parseList(p, true);
++			break;
++		case 'nth-child': case 'nth-last-child': case 'nth-of-type': case 'nth-last-of-type':
++			ps.nth = parseNth(p);
++			skipWs(p);
++			if ((name === 'nth-child' || name === 'nth-last-child') &&
++			    /^of\s/i.test(p.s.slice(p.i))) {
++				p.i += 2; skipWs(p);
++				ps.of = parseList(p, false);
++			}
++			break;
++		case 'lang': case 'dir': {
++			var c = p.s.charAt(p.i);
++			ps.arg = (c === '"' || c === "'") ? str(p) : ident(p);
++			if (!ps.arg) throw bad(p.s);
++			break;
++		}
++		case 'host': case 'host-context': case 'state': case 'part':
++			skipArgs({ s: '(' + p.s.slice(p.i), i: 0 });
++			ps.never = true;
++			while (p.i < p.s.length && p.s.charAt(p.i) !== ')') p.i++;
++			break;
++		default:
++			throw bad(p.s);
++		}
++		skipWs(p);
++		if (p.s.charAt(p.i) !== ')') throw bad(p.s);
++		p.i++;
++		return ps;
++	}
++	function parseNth(p) {
++		var m = /^(?:(odd)|(even)|([+-]?\d*)?n\s*(?:([+-])\s*(\d+))?|([+-]?\d+))/i.exec(p.s.slice(p.i));
++		if (!m || !m[0]) throw bad(p.s);
++		p.i += m[0].length;
++		if (m[1]) return [2, 1];
++		if (m[2]) return [2, 0];
++		if (m[6] !== undefined) return [0, parseInt(m[6], 10)];
++		var a = m[3] === undefined || m[3] === '' || m[3] === '+' ? 1 : m[3] === '-' ? -1 : parseInt(m[3], 10);
++		var b = m[5] ? parseInt(m[5], 10) * (m[4] === '-' ? -1 : 1) : 0;
++		return [a, b];
++	}
++
++	/* ---- matching ---- */
++	function parentEl(n) { var q = n.parentNode; return q && q.nodeType === 1 ? q : null; }
++	function prevEl(n) { var q = n.previousSibling; while (q && q.nodeType !== 1) q = q.previousSibling; return q; }
++	function nextEl(n) { var q = n.nextSibling; while (q && q.nodeType !== 1) q = q.nextSibling; return q; }
++	function lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }
++	function nthOk(ab, pos) {
++		var a = ab[0], b = ab[1];
++		if (a === 0) return pos === b;
++		var k = (pos - b) / a;
++		return k >= 0 && Math.floor(k) === k;
++	}
++	function position(n, last, type, of, ctx) {
++		var pos = 1, q = last ? nextEl(n) : prevEl(n), t = type ? lname(n) : null;
++		while (q) {
++			if ((!t || lname(q) === t) && (!of || matchList(q, of, ctx))) pos++;
++			q = last ? nextEl(q) : prevEl(q);
++		}
++		return pos;
++	}
++	function isRoot(n) {
++		var pn = n.parentNode;
++		if (pn && pn.nodeType === 9) return true;
++		if (n.ownerDocument && n.ownerDocument.documentElement === n) return true;
++		return !!n.__vbDocRoot;
++	}
++	var FORM = /^(input|button|select|textarea|optgroup|option|fieldset)$/;
++	function disabled(n) {
++		var t = lname(n);
++		if (!FORM.test(t)) return false;
++		if (n.hasAttribute('disabled')) return true;
++		for (var q = parentEl(n); q; q = parentEl(q)) {
++			var qt = lname(q);
++			if (qt === 'fieldset' && q.hasAttribute('disabled')) return true;
++			if (t === 'option' && qt === 'optgroup' && q.hasAttribute('disabled')) return true;
++		}
++		return false;
++	}
++	function textInput(n) {
++		var t = lname(n);
++		if (t === 'textarea') return true;
++		if (t !== 'input') return false;
++		var ty = String(n.getAttribute('type') || 'text').toLowerCase();
++		return /^(text|search|url|tel|email|password|number|date|month|week|time|datetime-local)$/.test(ty);
++	}
++	function pseudoOk(n, ps, ctx) {
++		switch (ps.name) {
++		case '::': return false;
++		case 'root': return isRoot(n);
++		case 'scope': return ctx.scope ? n === ctx.scope : isRoot(n);
++		case 'empty':
++			for (var c = n.firstChild; c; c = c.nextSibling)
++				if (c.nodeType === 1 || ((c.nodeType === 3 || c.nodeType === 4) && c.data !== '')) return false;
++			return true;
++		case 'first-child': return !prevEl(n);
++		case 'last-child': return !nextEl(n);
++		case 'only-child': return !prevEl(n) && !nextEl(n);
++		case 'first-of-type': return position(n, false, true, null, ctx) === 1;
++		case 'last-of-type': return position(n, true, true, null, ctx) === 1;
++		case 'only-of-type': return position(n, false, true, null, ctx) === 1 && position(n, true, true, null, ctx) === 1;
++		case 'nth-child': return (!ps.of || matchList(n, ps.of, ctx)) && nthOk(ps.nth, position(n, false, false, ps.of, ctx));
++		case 'nth-last-child': return (!ps.of || matchList(n, ps.of, ctx)) && nthOk(ps.nth, position(n, true, false, ps.of, ctx));
++		case 'nth-of-type': return nthOk(ps.nth, position(n, false, true, null, ctx));
++		case 'nth-last-of-type': return nthOk(ps.nth, position(n, true, true, null, ctx));
++		case 'not': return !matchList(n, ps.list, ctx);
++		case 'is': case 'matches': case 'where': case '-webkit-any': case 'any': return matchList(n, ps.list, ctx);
++		case 'has': return hasMatch(n, ps.list, ctx);
++		case 'checked': {
++			var t = lname(n);
++			if (t === 'input') {
++				var ty = String(n.getAttribute('type') || '').toLowerCase();
++				return (ty === 'checkbox' || ty === 'radio') && !!n.checked;
++			}
++			return t === 'option' && !!n.selected;
++		}
++		case 'disabled': return disabled(n);
++		case 'enabled': return FORM.test(lname(n)) && !disabled(n);
++		case 'required': return /^(input|select|textarea)$/.test(lname(n)) && n.hasAttribute('required');
++		case 'optional': return /^(input|select|textarea)$/.test(lname(n)) && !n.hasAttribute('required');
++		case 'read-write': return (textInput(n) && !n.hasAttribute('readonly') && !disabled(n)) || n.isContentEditable === true;
++		case 'read-only': return !((textInput(n) && !n.hasAttribute('readonly') && !disabled(n)) || n.isContentEditable === true);
++		case 'placeholder-shown': return textInput(n) && n.hasAttribute('placeholder') && String(n.value || '') === '';
++		case 'link': case 'any-link': return /^(a|area)$/.test(lname(n)) && n.hasAttribute('href');
++		case 'focus': case 'focus-visible': return d.activeElement === n && n !== d.body;
++		case 'focus-within': {
++			var ae = d.activeElement;
++			if (!ae || ae === d.body) return false;
++			for (var q = ae; q; q = q.parentNode) if (q === n) return true;
++			return false;
++		}
++		case 'target': {
++			var h = '';
++			try { h = decodeURIComponent(String(g.location.hash || '').slice(1)); } catch (x) { /* */ }
++			return !!h && (n.getAttribute('id') === h || (lname(n) === 'a' && n.getAttribute('name') === h));
++		}
++		case 'defined': return true;
++		case 'lang': {
++			for (var q2 = n; q2 && q2.nodeType === 1; q2 = q2.parentNode) {
++				var l = q2.getAttribute('lang');
++				if (l !== null) {
++					l = l.toLowerCase(); var w = ps.arg.toLowerCase();
++					return l === w || l.indexOf(w + '-') === 0;
++				}
++			}
++			return false;
++		}
++		case 'dir': {
++			for (var q3 = n; q3 && q3.nodeType === 1; q3 = q3.parentNode) {
++				var dv = q3.getAttribute('dir');
++				if (dv === 'rtl' || dv === 'ltr') return dv === String(ps.arg).toLowerCase();
++			}
++			return String(ps.arg).toLowerCase() === 'ltr';
++		}
++		case 'default': return (lname(n) === 'option' && n.hasAttribute('selected')) ||
++			(lname(n) === 'input' && n.hasAttribute('checked'));
++		case 'open': return n.hasAttribute('open');
++		case 'closed': return /^(details|dialog)$/.test(lname(n)) && !n.hasAttribute('open');
++		case 'valid': return FORM.test(lname(n)) && !(n.hasAttribute('required') && String(n.value || '') === '');
++		case 'invalid': return FORM.test(lname(n)) && n.hasAttribute('required') && String(n.value || '') === '';
++		default: return false;	/* hover, active, visited, indeterminate, ... */
++		}
++	}
++	function attrOk(n, a) {
++		var v = n.getAttribute(a.name);
++		if (v === null) return false;
++		if (!a.op) return true;
++		var w = a.val;
++		if (a.ci) { v = v.toLowerCase(); w = w.toLowerCase(); }
++		switch (a.op) {
++		case '=': return v === w;
++		case '~=': return w !== '' && !/\s/.test(w) && (' ' + v.replace(/\s+/g, ' ') + ' ').indexOf(' ' + w + ' ') >= 0;
++		case '|=': return v === w || v.indexOf(w + '-') === 0;
++		case '^=': return w !== '' && v.indexOf(w) === 0;
++		case '$=': return w !== '' && v.length >= w.length && v.lastIndexOf(w) === v.length - w.length;
++		case '*=': return w !== '' && v.indexOf(w) >= 0;
++		}
++		return false;
++	}
++	function compoundOk(n, cp, ctx) {
++		if (cp.pel) return false;
++		if (cp.tag && lname(n) !== cp.tag) return false;
++		if (cp.id !== null && n.getAttribute('id') !== cp.id) return false;
++		if (cp.cls.length) {
++			var c = ' ' + String(n.getAttribute('class') || '').replace(/\s+/g, ' ') + ' ';
++			for (var i = 0; i < cp.cls.length; i++) if (c.indexOf(' ' + cp.cls[i] + ' ') < 0) return false;
++		}
++		for (var j = 0; j < cp.attrs.length; j++) if (!attrOk(n, cp.attrs[j])) return false;
++		for (var k = 0; k < cp.pseudo.length; k++) if (!pseudoOk(n, cp.pseudo[k], ctx)) return false;
++		return true;
++	}
++	/* parts[idx] matched against n; then the combinator to its left */
++	function complexOk(n, parts, idx, ctx) {
++		if (!compoundOk(n, parts[idx], ctx)) return false;
++		if (idx === 0) return true;
++		var comb = parts[idx - 1], q;
++		switch (comb) {
++		case '>': q = parentEl(n); return !!q && complexOk(q, parts, idx - 2, ctx);
++		case '+': q = prevEl(n); return !!q && complexOk(q, parts, idx - 2, ctx);
++		case '~':
++			for (q = prevEl(n); q; q = prevEl(q)) if (complexOk(q, parts, idx - 2, ctx)) return true;
++			return false;
++		default:
++			for (q = parentEl(n); q; q = parentEl(q)) if (complexOk(q, parts, idx - 2, ctx)) return true;
++			return false;
++		}
++	}
++	function matchList(n, list, ctx) {
++		for (var i = 0; i < list.length; i++)
++			if (complexOk(n, list[i].parts, list[i].parts.length - 1, ctx)) return true;
++		return false;
++	}
++	/* :has(rel): some element related to n by rel's lead combinator
++	 * matches rel, with n as the anchor */
++	function hasMatch(n, list, ctx) {
++		for (var i = 0; i < list.length; i++) {
++			var rel = list[i], parts = rel.parts, last = parts.length - 1, found = false;
++			var anchored = function (m) {
++				/* m matches the whole relative selector anchored at n */
++				var sub = { scope: n };
++				return relOk(m, parts, last, rel.lead, n, sub);
++			};
++			if (rel.lead === '+' || rel.lead === '~') {
++				for (var s = nextEl(n); s && !found; s = nextEl(s)) {
++					found = anchored(s);
++					if (rel.lead === '+' && parts.length === 1) break;
++				}
++			} else {
++				walk(n, function (m) { if (!found && anchored(m)) found = true; return found; });
++			}
++			if (found) return true;
++		}
++		return false;
++	}
++	/* like complexOk, but the leftmost compound must stand in the lead
++	 * relation to anchor */
++	function relOk(m, parts, idx, lead, anchor, ctx) {
++		if (!compoundOk(m, parts[idx], ctx)) return false;
++		if (idx === 0) {
++			switch (lead) {
++			case '>': return parentEl(m) === anchor;
++			case '+': return prevEl(m) === anchor;
++			case '~':
++				for (var q = prevEl(m); q; q = prevEl(q)) if (q === anchor) return true;
++				return false;
++			default:
++				for (var r = parentEl(m); r; r = parentEl(r)) if (r === anchor) return true;
++				return false;
++			}
++		}
++		var comb = parts[idx - 1], q2;
++		switch (comb) {
++		case '>': q2 = parentEl(m); return !!q2 && relOk(q2, parts, idx - 2, lead, anchor, ctx);
++		case '+': q2 = prevEl(m); return !!q2 && relOk(q2, parts, idx - 2, lead, anchor, ctx);
++		case '~':
++			for (q2 = prevEl(m); q2; q2 = prevEl(q2)) if (relOk(q2, parts, idx - 2, lead, anchor, ctx)) return true;
++			return false;
++		default:
++			for (q2 = parentEl(m); q2 && q2 !== anchor; q2 = parentEl(q2))
++				if (relOk(q2, parts, idx - 2, lead, anchor, ctx)) return true;
++			return false;
++		}
++	}
++	/* the elements under root (a document: its root element and those
++	 * under it -- the bridge's document has no childNodes walk) in
++	 * document order; stop when f is true */
++	function each(root, f) {
++		if (root.nodeType === 9) {
++			var de = root.documentElement;
++			return !!de && (f(de) || walk(de, f));
++		}
++		return walk(root, f);
++	}
++	/* descendant elements of root in document order; stop when f is true */
++	function walk(root, f) {
++		var n = root.firstChild;
++		while (n) {
++			if (n.nodeType === 1 && f(n)) return true;
++			if (n.firstChild && n.nodeType === 1) { n = n.firstChild; continue; }
++			while (n && !n.nextSibling) {
++				n = n.parentNode;
++				if (!n || n === root) return false;
++			}
++			n = n && n.nextSibling;
++		}
++		return false;
++	}
++
++	/* ---- the API ---- */
++	/* a selector the native engine answers correctly: tags, #ids,
++	 * .classes and the four combinators -- no ':', no [attr], no escapes */
++	function plain(sel) {
++		return /^[\sA-Za-z0-9_\-#.,>+~*]*$/.test(sel) && !/(^|[,>+~\s])[+~>]|[+~>]\s*($|,)/.test(sel.trim());
++	}
++	/* the rightmost compound's tag/#id/.class part, for native candidates */
++	function seed(list) {
++		var out = [];
++		for (var i = 0; i < list.length; i++) {
++			var cp = list[i].parts[list[i].parts.length - 1], s = cp.tag || '*';
++			if (cp.pel) continue;
++			if (cp.id !== null && /^[A-Za-z_][\w-]*$/.test(cp.id)) s += '#' + cp.id;
++			for (var k = 0; k < cp.cls.length; k++) if (/^[A-Za-z_][\w-]*$/.test(cp.cls[k])) s += '.' + cp.cls[k];
++			out.push(s);
++		}
++		return out;
++	}
++	function listOf(a) {
++		try { Object.defineProperty(a, 'item', { value: function (i) { return this[i] || null; }, configurable: true }); } catch (e) { /* */ }
++		return a;
++	}
++	function inOrder(root, set) {
++		/* several seeds: merge in document order */
++		var out = [];
++		each(root, function (m) { if (set.has(m)) out.push(m); return false; });
++		return out;
++	}
++	function jsQuery(root, sel, first, nat) {
++		var list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;
++		if (!seeds.length) return first ? null : listOf([]);
++		for (i = 0; i < seeds.length; i++) {
++			var cand = null;
++			try { cand = nat ? nat.call(root, seeds[i]) : null; } catch (e) { cand = null; }
++			if (!cand) {
++				cand = [];
++				each(root, function (m) { cand.push(m); return false; });
++			}
++			for (k = 0; k < cand.length; k++) {
++				var m = cand[k];
++				if (seeds.length > 1 && seen.has(m)) continue;
++				if (matchList(m, list, ctx)) {
++					if (first && seeds.length === 1) return m;
++					all.push(m);
++					seen.add(m);
++				}
++			}
++		}
++		out = seeds.length > 1 ? inOrder(root, seen) : all;
++		if (first) return out[0] || null;
++		return listOf(out);
++	}
++	function matches(sel) {
++		if (arguments.length === 0) throw new TypeError("Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
++		return matchList(this, parse(sel), { scope: this });
++	}
++	function closest(sel) {
++		var list = parse(sel), ctx = { scope: this };
++		for (var n = this; n && n.nodeType === 1; n = n.parentNode)
++			if (matchList(n, list, ctx)) return n;
++		return null;
++	}
++	/* The bridge installs the document's querySelector(All) again after
++	 * this file's first run (qjs_dom_install runs twice per context, and
++	 * this file with it): wrap whatever native is there, once. */
++	function nativeOf(f) { return f && f.__vbNat ? f.__vbNat : f; }
++	function wrapQuery(o) {
++		if (!o) return;
++		var qa = o.querySelectorAll, q1 = o.querySelector;
++		if (typeof qa === 'function' && !qa.__vbNat) {
++			var natAll = qa, wa = function (sel) {
++				sel = String(sel);
++				parse(sel);	/* an invalid selector throws SyntaxError */
++				if (plain(sel)) return natAll.call(this, sel);
++				return jsQuery(this, sel, false, natAll);
++			};
++			wa.__vbNat = natAll;
++			define(o, 'querySelectorAll', wa);
++		}
++		if (typeof q1 === 'function' && !q1.__vbNat) {
++			var nat1 = q1, all = nativeOf(o.querySelectorAll), w1 = function (sel) {
++				sel = String(sel);
++				parse(sel);
++				if (plain(sel)) return nat1.call(this, sel);
++				return jsQuery(this, sel, true, all);
++			};
++			w1.__vbNat = nat1;
++			define(o, 'querySelector', w1);
++		}
++	}
++	if (!E.matches || !E.matches.__vbSel) {
++		matches.__vbSel = true;
++		define(E, 'matches', matches);
++		define(E, 'webkitMatchesSelector', matches);
++		define(E, 'msMatchesSelector', matches);
++		define(E, 'closest', closest);
++	}
++	wrapQuery(E);
++	wrapQuery(d);
++	try { wrapQuery(Object.getPrototypeOf(d.createDocumentFragment())); } catch (e) { /* */ }
++	define(g, '__vbSelectorMatch', function (el, sel) { return matchList(el, parse(sel), { scope: el }); });
++})();
++
+ /* ---- the DOM surface a census found missing (2026-09-26) ---------------
+  * parentElement (!), innerText, localName, the reflected attributes, the
+  * form-control API, text-node odds, document helpers, window
+@@ -2975,6 +3564,114 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		if (this.parentNode) this.parentNode.insertBefore(rest, this.nextSibling);
+ 		return rest;
+ 	});
++	/* CharacterData's editing methods (appendData ... substringData):
++	 * the bridge had none; each is a string edit of .data */
++	function cdIndex(d, off) {
++		off = off >>> 0;
++		if (off > d.length) {
++			var e;
++			try { e = new g.DOMException('The offset ' + off + ' is greater than the node\'s length (' + d.length + ').', 'IndexSizeError'); }
++			catch (x) { e = new Error('IndexSizeError'); }
++			throw e;
++		}
++		return off;
++	}
++	/* characterData mutation records: the bridge's MutationObserver only
++	 * ever got childList records (queued by its native insert/remove), so
++	 * a text node watched with {characterData: true} -- the microtask shim
++	 * of core-js and Vue 2's nextTick toggles one -- never reported, and
++	 * those libraries' callbacks never ran. The data / nodeValue /
++	 * textContent setters of text and comment nodes now queue one. */
++	function queueCD(node, old) {
++		var obs = g.__msMutObservers, q = g.__msQueueMutation;
++		if (!obs || !obs.length || typeof q !== 'function') return;
++		try { q('characterData', node, null, null, null, old); } catch (e) { /* */ }
++	}
++	function findAcc(o, n) {
++		for (var p = o; p; p = Object.getPrototypeOf(p)) {
++			var dsc = Object.getOwnPropertyDescriptor(p, n);
++			if (dsc) return dsc;
++		}
++		return null;
++	}
++	/* wrapped per setter, not per prototype: the bridge installs its
++	 * accessors again on its second pass over a context */
++	[T, CP].forEach(function (o) {
++		if (!o) return;
++		['data', 'nodeValue', 'textContent'].forEach(function (n) {
++			var dsc = findAcc(o, n);
++			if (!dsc || typeof dsc.set !== 'function' || typeof dsc.get !== 'function' || dsc.set.__vbCD) return;
++			var setter = function (v) {
++				var old = null;
++				try { old = dsc.get.call(this); } catch (e) { /* */ }
++				dsc.set.call(this, v);
++				queueCD(this, old);
++			};
++			setter.__vbCD = true;
++			try {
++				Object.defineProperty(o, n, { configurable: true, enumerable: dsc.enumerable,
++					get: dsc.get, set: setter });
++			} catch (e) { /* */ }
++		});
++	});
++	/* delivery that honours characterData (and the *OldValue options) */
++	if (typeof g.__msDeliverMutations === 'function' && !g.__msDeliverMutations.__vbCD) {
++		var deliver = function () {
++			var list = g.__msMutObservers, pending = g.__msMutPending.splice(0), i, j, k;
++			g.__msMutScheduled = false;
++			if (!list || !list.length || !pending.length) return;
++			for (i = 0; i < list.length; i++) {
++				var ob = list[i];
++				if (!ob._targets || !ob._targets.length) continue;
++				var recs = [];
++				for (j = 0; j < pending.length; j++) {
++					var rec = pending[j], hit = null;
++					for (k = 0; k < ob._targets.length; k++) {
++						var w = ob._targets[k], root = w.node, op = w.opts || {};
++						if (rec.type === 'childList' && !op.childList) continue;
++						if (rec.type === 'attributes' && !op.attributes && !op.attributeFilter && !op.attributeOldValue) continue;
++						if (rec.type === 'attributes' && op.attributeFilter && op.attributeFilter.indexOf(rec.attributeName) < 0) continue;
++						if (rec.type === 'characterData' && !op.characterData && !op.characterDataOldValue) continue;
++						if (root === rec.target || (op.subtree && root && root.contains && root.contains(rec.target))) { hit = op; break; }
++					}
++					if (!hit) continue;
++					var keepOld = (rec.type === 'characterData' && hit.characterDataOldValue) ||
++						(rec.type === 'attributes' && hit.attributeOldValue);
++					var r = {}; for (var key in rec) r[key] = rec[key];
++					if (!keepOld) r.oldValue = null;
++					recs.push(r);
++				}
++				if (recs.length) try { ob._cb(recs, ob); } catch (e) {
++					try { g.__msLife('MUTOBS callback THREW ' + ((e && e.message) || e)); } catch (x) { /* */ }
++				}
++			}
++		};
++		deliver.__vbCD = true;
++		g.__msDeliverMutations = deliver;
++	}
++	[T, CP].forEach(function (o) {
++		fn(o, 'appendData', function (s) { this.data = String(this.data) + String(s); });
++		fn(o, 'insertData', function (off, s) {
++			var d = String(this.data);
++			off = cdIndex(d, off);
++			this.data = d.slice(0, off) + String(s) + d.slice(off);
++		});
++		fn(o, 'deleteData', function (off, n) {
++			var d = String(this.data);
++			off = cdIndex(d, off);
++			this.data = d.slice(0, off) + d.slice(off + (n >>> 0));
++		});
++		fn(o, 'replaceData', function (off, n, s) {
++			var d = String(this.data);
++			off = cdIndex(d, off);
++			this.data = d.slice(0, off) + String(s) + d.slice(off + (n >>> 0));
++		});
++		fn(o, 'substringData', function (off, n) {
++			var d = String(this.data);
++			off = cdIndex(d, off);
++			return d.substr(off, n >>> 0);
++		});
++	});
+ 	/* document */
+ 	acc(d, 'characterSet', function () { return 'UTF-8'; });
+ 	acc(d, 'charset', function () { return 'UTF-8'; });
