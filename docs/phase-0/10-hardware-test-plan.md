@@ -2908,3 +2908,28 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
   position); the next hand-off ships new reference dumps. On the device:
   google.com's header shows ALL / IMAGES.
 
+
+### Run 28 (2026-09-30, patches up to 183)
+
+Built by Hermes solo (no Claude). The VPKs in this dir are the ones to
+flash (SHA256 prefixes: VitaBrowser.vpk `4367c1466764`,
+VitaBrowser-ext.vpk `78212c91f2ab`).
+
+What to check on the device:
+- **google.com**: the account bar (apps grid + Sign in) now sits INSIDE
+  the header row, at its right edge, vertically centred (Sign-in 4px from
+  the row top) -- runs 24-27 had it below the header and/or pulled out of
+  flow. This is the run-27 "second wall" area: patch 182 (an innerHTML
+  during parse no longer flips the page to quirks, so class selectors stay
+  case-sensitive) + patch 183 (a 64px flex item in the 48px row now
+  overflows 8px above/below like Chromium, instead of clamping to the
+  top). Sim: google 64.8 -> 81.3, text recall 1.0, 0 JS errors.
+- **autotest**: 30/31 expected (the download-to-card test failed on run
+ 27; it passed in the sim this morning, so watch whether it passes on
+  hardware now). **Expected DIFFs vs the current reference dumps:
+  03-L3-grid and 04-L4-flex** (patches 180-183 moved the first flex/grid
+  row from y12 to y0, Chromium's position) -- those are the intended
+  changes, not regressions. All other plots should be identical.
+- No crashes/dumps expected; the libdom fragment change (182) is the only
+  one that touches parsing of arbitrary page content, so watch for any
+  site that suddenly renders its header differently.
