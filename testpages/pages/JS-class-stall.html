@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS class stall (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+#res { position: fixed; top: 0; left: 0; right: 0; background: #fff; }
+#big p { margin: 2px 0; }
+#big span.hot { color: rgb(255, 0, 0); }
+#big span.huge { font-size: 32px; }
+#big p.blue { color: rgb(0, 0, 255); }
+</style>
+<script>
+(function () {
+	var S = { maxgap: 0, ticks: 0, on: false }, N = 7, k = 0;
+	function now() { return self.performance ? performance.now() : Date.now(); }
+	var last = now();
+	(function tick() {
+		var t = now(), g = t - last;
+		last = t;
+		if (S.on) { S.ticks++; if (g > S.maxgap) S.maxgap = g; }
+		setTimeout(tick, 0);
+	})();
+	function $(id) { return document.getElementById(id); }
+	var res = [];
+	function t(n, ok, text) { res.push([n, ok, text]); }
+	function show() {
+		var i, r, p;
+		for (i = 0; i < res.length; i++) {
+			r = res[i]; p = $('r' + r[0]);
+			p.textContent = r[0] + ' ' + r[2] + (r[1] ? '' : ' FAIL');
+			if (r[1]) { p.className = 'pass'; k++; }
+		}
+		$('sum').textContent = 'CLASSSTALL: ' + k + '/' + N + ' passed';
+		document.title = 'JS class stall (' + k + '/' + N + ')';
+	}
+	document.addEventListener('DOMContentLoaded', function () {
+		var h = [], i;
+		for (i = 0; i < 5000; i++)
+			h.push('<p id="p' + i + '">Paragraph ' + i + ' with <b>some</b> ' +
+				'inline <i>text</i> that <span id="s' + i + '">wraps</span> in the layout, ' +
+				'<a href="#">a link</a> and more words to fill it.</p>');
+		$('big').innerHTML = h.join('');
+	});
+	function colour(el) { return String(getComputedStyle(el).color).replace(/\s+/g, ''); }
+	var RED = 'rgb(255,0,0)', BLUE = 'rgb(0,0,255)';
+	/* [name, bounded?, change, check] */
+	var steps = [
+		['span class on', true, function () { $('s2500').className = 'hot'; },
+			function () { return colour($('s2500')) === RED; }],
+		['span class off', true, function () { $('s2500').className = ''; },
+			function () { return colour($('s2500')) !== RED; }],
+		['span class on again', true, function () { $('s2500').className = 'hot'; },
+			function () { return colour($('s2500')) === RED; }],
+		['span class off again', true, function () { $('s2500').className = ''; },
+			function () { return colour($('s2500')) !== RED; }],
+		['span grows the line', true, function () { $('s2501').className = 'huge'; },
+			function () {
+				var a = $('p2501').getBoundingClientRect();
+				return a.height > 40 && $('p2502').getBoundingClientRect().top >= a.bottom - 1;
+			}],
+		['block class (full path allowed)', false, function () { $('p2600').className = 'blue'; },
+			function () { return colour($('p2600')) === BLUE; }]
+	];
+	function stack(from, to) {
+		var i, prev = null, r;
+		for (i = from; i <= to; i++) {
+			r = $('p' + i).getBoundingClientRect();
+			if (prev && r.top < prev.bottom - 1) return 'overlap at p' + i;
+			prev = r;
+		}
+		return 'ok';
+	}
+	var gaps = [];
+	function run(i) {
+		if (i >= steps.length) {
+			var worst = Math.round(Math.max.apply(null, gaps)), o = stack(2495, 2510);
+			t(7, o === 'ok' && worst < 60, 'bounded class changes: longest gap ' +
+				worst + ' ms; paragraphs stack: ' + o);
+			show();
+			return;
+		}
+		S.maxgap = 0; S.ticks = 0; S.on = true;
+		steps[i][2]();
+		setTimeout(function () {
+			var ok = steps[i][3]();
+			setTimeout(function () {
+				S.on = false;
+				if (steps[i][1]) gaps.push(S.maxgap);
+				t(i + 1, ok, steps[i][0] + ': longest gap ' + Math.round(S.maxgap) + ' ms');
+				setTimeout(function () { run(i + 1); }, 100);
+			}, 50);
+		}, 600);
+	}
+	var started = false, lastH = -1;
+	function settled() {
+		var sh = document.body.scrollHeight;
+		if (sh < 100000 || sh !== lastH) {
+			lastH = sh;
+			setTimeout(settled, 100);
+			return;
+		}
+		setTimeout(function () { run(0); }, 300);
+	}
+	window.addEventListener('load', function () {
+		if (started) return;
+		started = true;
+		setTimeout(settled, 100);
+	});
+})();
+</script>
+</head>
+<body>
+<!-- Roadmap WS-C, script-driven class changes (patch 173). A script sets
+     the class of an element among 5000 paragraphs. A class change was
+     routed to the full box-tree rebuild (~0.25 s here, seconds on the
+     Vita) and, after two such rebuilds in a row with nothing structural
+     between them, SUPPRESSED (fixes1135) -- the page kept its old look.
+     A class change on an inline-level element now rebuilds only the
+     block that holds it, re-cascading its content (the patch 165 path).
+     1-4: a span's class toggled on, off, on, off: each shown (3 and 4 were
+          the suppressed ones).
+     5: a class that makes the span 32px: its paragraph grows and what
+        follows moves down.
+     6: a class change on a paragraph (a block) is shown -- still the full
+        rebuild, not timed.
+     7: steps 1-5 bounded (longest main-loop gap < 60 ms) and the
+        paragraphs around them still stack. -->
+<div id="res">
+<p id="sum" class="wait">CLASSSTALL: script did not run</p>
+<p id="r1" class="wait">1 waiting</p><p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p><p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p><p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+</div>
+<div style="height: 240px"></div>
+<div id="big"></div>
+</body></html>

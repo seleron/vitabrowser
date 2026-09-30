@@ -2863,4 +2863,14 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
 - Patch 172 (simulator only): the host build's performance.now() clock is
   monotonic (WSL steps the wall clock ~2.2 s every ~34 s, which made
   JS-dom-stall flaky). No effect on the Vita build.
+- Patch 173 (WS-C, class changes): a script setting the class of a span,
+  link or label (menus, tabs, toggles, "active" states) rebuilt the whole
+  page -- seconds on the Vita -- and after two in a row the next one was
+  skipped (the page kept its old look). Now only the paragraph holding it
+  is rebuilt (sim: 24-27 ms instead of 258-282 ms). On the device: UI that
+  highlights or toggles as you use it should respond without a freeze and
+  should not get "stuck" after a few toggles. netsurf.log: "LIFE rebuild
+  local: rebuilt and laid out ..." per class change; "declined (class
+  change on an element with a block-level box)" for the ones that still
+  take the full rebuild.
 

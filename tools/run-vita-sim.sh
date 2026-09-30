@@ -232,6 +232,7 @@ NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-innertext http://127.0.0.1:$HP/JS-innertext.html
 NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
+NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -577,6 +578,16 @@ szp=$(ls "$R"/*NET-js-sanitize.plot 2>/dev/null | head -1)
 szr=$(sed -n 's/.*STR \(SANITIZE: [0-9]*\/[0-9]* passed\).*/\1/p' "$szp" 2>/dev/null | head -1)
 echo "  JS-sanitize: ${szr:-no summary}"
 [ -n "$szp" ] && grep -a 'FAIL (want' "$szp" | sed 's/.*STR /  /' | cut -c1-160
+# Class changes (Patch 173): a class set on an inline-level element among
+# 5000 paragraphs rebuilds its block only; the page times it, the engine
+# log must show the local rebuilds (and the block-level one declined).
+csp2=$(ls "$R"/*NET-js-class-stall.plot 2>/dev/null | head -1)
+clr=$(sed -n 's/.*STR \(CLASSSTALL: [0-9]*\/[0-9]* passed\).*/\1/p' "$csp2" 2>/dev/null | head -1)
+cll=$(awk '/page [0-9]*\/[0-9]* NET-js-class-stall: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -c 'LIFE rebuild local: rebuilt and laid out' || true)
+echo "  JS-class-stall: ${clr:-no summary}; ${cll} class changes rebuilt locally"
+[ -n "$csp2" ] && grep -ao 'STR [0-9] [^"]*FAIL' "$csp2" | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -603,6 +614,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
 [ "$itr" = "INNERTEXT: 8/8 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
+[ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \

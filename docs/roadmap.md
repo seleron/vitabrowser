@@ -137,6 +137,15 @@ of first/last-place edits, batched appends and removals). Still the full
 rebuild: lists (markers), nested blocks, floats/tables/flex around the
 change, objects and form controls. WS-C's script-change items are done in
 the sim; next: re-score `Done s` per tier.
+Class changes (patch 173, 2026-09-30): a class set on an inline-level
+element (a span, a link, a label -- the usual UI state toggle) was a full
+rebuild (258-282 ms here) and, the third time in a row, suppressed
+(fixes1135: the page kept its old look). It now rebuilds only the block
+holding it through the patch 165 path: 24-27 ms, geometry identical
+(hash of 588 values against the unpatched build). Still the full rebuild:
+a class change on an element whose own box is block-level (its box's
+style must be recomputed) -- the next WS-C item, with lists and nested
+blocks.
 Found on the way (patch 164, a correctness fix, not WS-C): without iconv
 (the Vita's libparserutils) the last <=64 characters of a document or
 stylesheet were dropped when the data ended in the pass that filled the

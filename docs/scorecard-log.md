@@ -192,3 +192,7 @@ footer words that run together ("PrivacyTerms": our innerText does not
 yet treat flex items as blocks). A fresh Chrome reference would score the
 trend text as matching.
 
+r7-google (patch 173 on top, regression check): 55.9, text 0.50, visual
+0.459, 0 JS errors -- no regression (the text change is the live trend
+list moving against the r3 reference).
+

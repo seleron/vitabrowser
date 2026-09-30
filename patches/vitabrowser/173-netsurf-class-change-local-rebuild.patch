@@ -1,0 +1,95 @@
+# netsurf: a class change on an inline-level element rebuilds only its block (WS-C)
+# Generated 2026-09-30
+#
+# Roadmap WS-C, script-driven changes, next item. A class set by script --
+# the most common UI state change on the web -- was routed to the full
+# box-tree rebuild and layout: 258-282 ms of main-loop stall here on 5000
+# paragraphs, seconds on the Vita. And after two such rebuilds in a row
+# with nothing structural between them, the next was SUPPRESSED
+# (fixes1135 animation-churn cap): the page kept its old look.
+#
+# - html.c: html_reconvert_local_class(), the patch 165 path for a class
+#   change. The block holding the element gets its inline content built
+#   again, which cascades the element and everything else in the block
+#   afresh (their libcss node data is reset first, as for a text change),
+#   and only its lines are laid out. Declined (logged, full rebuild) when
+#   the changed element's own box is block-level: that box's own style
+#   would stay stale. If the new class makes the content something other
+#   than one line container of plain inline boxes (a span turned
+#   display:block), the rebuilt tree gets a full layout instead --
+#   still no full rebuild.
+# - macos9_reconvert.c: SETATTR_CLASS marks go to that path; a local
+#   success resets the cosmetic counter, so class toggles are no longer
+#   suppressed.
+# Measured before/after on JS-class-stall.html (a span's class toggled
+# four times, then a 32px class): 258-282 ms -> 24-27 ms of longest gap;
+# a paragraph's own class change is declined and still takes the full
+# rebuild (277 ms). Geometry identical to the full path: a hash of 588
+# values (paragraphs 2490-2620 and the spans around the changes) matched
+# the unpatched build's exactly, twice each.
+# Test: JS-class-stall.html 7/7 (Chromium 7/7) + >= 5 local rebuilds in the
+# engine log.
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 632d791..df1d8de 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6567,8 +6567,28 @@ decline:
+ #undef RL_BNO
+ }
+ 
++static int html_reconvert_local_change(struct content *base_c, void *vnode,
++		bool class_change);
++
+ int html_reconvert_local(struct content *base_c, void *vnode);
+ int html_reconvert_local(struct content *base_c, void *vnode)
++{
++	return html_reconvert_local_change(base_c, vnode, false);
++}
++
++/* A class change (patch 173). One on an inline-level element is rebuilt
++ * like a text change: the block holding it gets its inline content built
++ * again, which cascades the element and everything in the block afresh.
++ * One on an element whose own box is a block would leave that box's own
++ * style stale, so it takes the full rebuild. */
++int html_reconvert_local_class(struct content *base_c, void *vnode);
++int html_reconvert_local_class(struct content *base_c, void *vnode)
++{
++	return html_reconvert_local_change(base_c, vnode, true);
++}
++
++static int html_reconvert_local_change(struct content *base_c, void *vnode,
++		bool class_change)
+ {
+ 	extern double macos9_micros(void);
+ 	extern const char *layout_relayout_why;
+@@ -6608,6 +6628,12 @@ int html_reconvert_local(struct content *base_c, void *vnode)
+ 		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+ 		    type == DOM_ELEMENT_NODE) {
+ 			b = box_for_node(n);
++			if (class_change && n == vnode && b != NULL &&
++			    b->type != BOX_INLINE) {
++				dom_node_unref(n);
++				RL_NO("class change on an element with a "
++				      "block-level box");
++			}
+ 			if (b != NULL && b->type == BOX_BLOCK) {
+ 				element = n;
+ 				break;
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+index 211da09..a30515b 100644
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -688,9 +688,13 @@ static void macos9_reconvert_cb(void *p);	/* defined below */
+ static int macos9_reconvert_try_local(int i, struct content *c)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
++	extern int html_reconvert_local_class(struct content *c, void *node);
+ 
+ 	if (g_pending[i].multi || g_pending[i].node == NULL)
+ 		return 0;
++	/* a class change on an inline-level element: its block (patch 173) */
++	if (g_pending[i].kind == MACOS9_DOMMUT_SETATTR_CLASS)
++		return html_reconvert_local_class(c, g_pending[i].node) == 0;
+ 	switch (g_pending[i].kind) {
+ 	case MACOS9_DOMMUT_TEXTCONTENT:
+ 	case MACOS9_DOMMUT_INNERHTML:
