@@ -235,6 +235,7 @@ NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
 NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
 NET-js-block-class-stall http://127.0.0.1:$HP/JS-block-class-stall.html
 NET-js-block-class-sibling http://127.0.0.1:$HP/JS-block-class-sibling.html
+NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -605,6 +606,14 @@ bsd=$(grep -c 'declined (page CSS has sibling combinators)' "$R/netsurf.log" || 
 echo "  JS-block-class-stall: ${bcr:-no summary}; ${bcl} blocks restyled locally"
 echo "  JS-block-class-sibling: ${bsr:-no summary}; ${bsd} declined for sibling combinators"
 [ -n "$bcp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $bcp | sort -u | sed 's/^STR /  /'
+# Lists and nested blocks (Patch 176): a list item or a block of blocks a
+# script adds or removes is built alone and the page laid out once (no
+# full box-tree rebuild): markers renumbered, margins collapsed through.
+lnp=$(ls "$R"/*NET-js-list-nested-stall*.plot 2>/dev/null)
+lnr=$(sed -n 's/.*STR \(LISTNEST: [0-9]*\/[0-9]* passed\).*/\1/p' $lnp 2>/dev/null | head -1)
+lnl=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (a list item or nested blocks)' "$R/netsurf.log" || true)
+echo "  JS-list-nested-stall: ${lnr:-no summary}; ${lnl} list/nested changes built alone"
+[ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -634,6 +643,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
 [ "$bcr" = "BLOCKCLASS: 7/7 passed" ] && [ "${bcl:-0}" -ge 6 ] && \
 [ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
+[ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \

@@ -157,6 +157,15 @@ getBoundingClientRect / offsetTop / offsetLeft put a bordered box a
 border's width too low and too far right. Still the full rebuild:
 lists (markers, numbering), nested blocks (a new div holding paragraphs),
 floats/tables/flex around the change, pages with sibling combinators.
+Lists and nested blocks (patch 176, 2026-09-30): a list item or a block
+of blocks a script adds or removes is built alone and the page laid out
+once (markers renumbered, margins collapsed through the nesting exactly):
+179-189 ms -> 45-46 ms on a 2500+2500 page, geometry identical (616-value
+hash). What remains of WS-C's script-change list: floats/tables/flex
+around a change, objects and form controls, class changes on pages whose
+CSS has sibling combinators; and a whole-page layout is still ~30 ms per
+list/nested change (a local placement for those would need the list
+numbering and through-collapsing done locally).
 Found on the way (patch 164, a correctness fix, not WS-C): without iconv
 (the Vita's libparserutils) the last <=64 characters of a document or
 stylesheet were dropped when the data ended in the pass that filled the

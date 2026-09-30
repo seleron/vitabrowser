@@ -1,0 +1,159 @@
+# netsurf: a list item or a block of blocks a script adds or removes is built alone (WS-C)
+# Generated 2026-09-30
+#
+# Roadmap WS-C, after patches 166 and 173-174. A <li> appended to a feed
+# or list, an item inserted into a numbered list, a "card" div holding
+# paragraphs inserted among others: each was the full box-tree rebuild
+# (179-189 ms here on a 2500-paragraph + 2500-item page, seconds on the
+# Vita). Placing them with patch 166's local margin arithmetic would be
+# wrong: an <ol> renumbers every item after the change, and margins
+# collapse through a nested block from its children.
+#
+# html.c, html_rl_block_change(): such an element (a list item, or a plain
+# block whose subtree holds plain blocks and lists -- html_rl_list_tag,
+# html_rl_subtree_tags(n, true)) is now accepted, built alone
+# (box_build_element) and linked in place, and the page is laid out once
+# (content__reformat: the layout numbers the markers and collapses the
+# margins exactly as it always does). The same for removing a list item
+# (its marker box no longer declines -- html_rl_subtree_objects) or a
+# block of blocks. Objects, controls and frames still decline.
+# Measured on JS-list-nested-stall.html (appended/inserted/removed list
+# item, item inserted into an <ol>, a div of two paragraphs inserted and
+# removed): 179-189 ms -> 45-46 ms of longest gap (the layout is ~30 ms
+# of it). Geometry identical to the unpatched build: a hash of 616 values
+# (paragraphs, list items and numbered items around the changes); the
+# <ol> markers read 1-31 in order after the insertion (plot dump).
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 9f8f6e2..08dc4cf 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6184,8 +6184,12 @@ static bool html_rl_inline_tag(dom_node *n)
+ 	return found;
+ }
+ 
+-/* are all of element's descendant elements plain inline ones? */
+-static bool html_rl_inline_subtree(dom_node *element)
++static bool html_rl_block_tag(dom_node *n);
++static bool html_rl_list_tag(dom_node *n);
++
++/* are all of element's descendant elements plain inline ones -- or, with
++ * blocks_too, plain inline, block or list ones (patch 176)? */
++static bool html_rl_subtree_tags(dom_node *element, bool blocks_too)
+ {
+ 	dom_node *n = NULL, *next;
+ 	unsigned int count = 0;
+@@ -6201,7 +6205,9 @@ static bool html_rl_inline_subtree(dom_node *element)
+ 			return false;
+ 		}
+ 		if (type == DOM_ELEMENT_NODE) {
+-			if (!html_rl_inline_tag(n)) {
++			if (!html_rl_inline_tag(n) &&
++			    !(blocks_too && (html_rl_block_tag(n) ||
++					     html_rl_list_tag(n)))) {
+ 				dom_node_unref(n);
+ 				return false;
+ 			}
+@@ -6241,6 +6247,11 @@ static bool html_rl_inline_subtree(dom_node *element)
+ 	return true;
+ }
+ 
++static bool html_rl_inline_subtree(dom_node *element)
++{
++	return html_rl_subtree_tags(element, false);
++}
++
+ /* point every node of a box subtree back at its box (a rollback) */
+ static void html_rl_relink(struct box *b)
+ {
+@@ -6282,6 +6293,40 @@ static bool html_rl_block_tag(dom_node *n)
+ 	return found;
+ }
+ 
++/* list items and lists (patch 176) */
++static bool html_rl_list_tag(dom_node *n)
++{
++	static const char *const ok[] = { "li", "ul", "ol", NULL };
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; ok[i] != NULL; i++)
++		if (dom_string_byte_length(name) == strlen(ok[i]) &&
++		    strncasecmp(dom_string_data(name), ok[i],
++				strlen(ok[i])) == 0) {
++			found = true;
++			break;
++		}
++	dom_string_unref(name);
++	return found;
++}
++
++/* like html_rl_subtree_referenced, but a list marker is no reason: the
++ * full layout that follows numbers the markers again (patch 176) */
++static bool html_rl_subtree_objects(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->object != NULL || b->gadget != NULL || b->iframe != NULL)
++			return true;
++		if (html_rl_subtree_objects(b->children))
++			return true;
++	}
++	return false;
++}
++
+ /* does a box subtree hold anything that others point at (an object's
+  * entry, a form control, a frame)? */
+ static bool html_rl_subtree_referenced(struct box *b)
+@@ -6395,10 +6440,21 @@ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 			dom_node_unref(parent);
+ 		if (parent != pnode) {
+ 			if (nrem == HTML_RL_MAX_CHANGES ||
+-			    html_rl_subtree_referenced(b->children) ||
++			    html_rl_subtree_objects(b->children) ||
+ 			    b->object != NULL || b->gadget != NULL ||
+-			    b->iframe != NULL || b->list_marker != NULL)
++			    b->iframe != NULL)
+ 				RL_BNO("removed block holds objects or controls");
++			/* a list item, or a block of blocks: the page is laid
++			 * out whole afterwards (markers renumbered, margins
++			 * collapsed through the nesting) */
++			if (b->list_marker != NULL ||
++			    html_rl_subtree_referenced(b->children) ||
++			    (b->children != NULL &&
++			     b->children->type == BOX_BLOCK)) {
++				full = true;
++				why = why != NULL ? why :
++					"a list item or nested blocks";
++			}
+ 			removed[nrem++] = b;
+ 		}
+ 	}
+@@ -6418,12 +6474,23 @@ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		if (type == DOM_ELEMENT_NODE) {
+ 			b = box_for_node(n);
+ 			if (b == NULL) {
++				bool plain = html_rl_block_tag(n) &&
++					html_rl_inline_subtree(n);
+ 				if (nadd == HTML_RL_MAX_CHANGES ||
+-				    !html_rl_block_tag(n) ||
+-				    !html_rl_inline_subtree(n)) {
++				    (!plain &&
++				     !((html_rl_block_tag(n) ||
++					html_rl_list_tag(n)) &&
++				       html_rl_subtree_tags(n, true)))) {
+ 					dom_node_unref(n);
+ 					RL_BNO("new element is not a plain "
+-						"block of text");
++						"block, list item or block of "
++						"blocks");
++				}
++				if (!plain) {
++					/* built alone, laid out whole */
++					full = true;
++					why = why != NULL ? why :
++						"a list item or nested blocks";
+ 				}
+ 				added[nadd++] = n;
+ 				dom_node_ref(n);

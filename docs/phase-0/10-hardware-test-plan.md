@@ -2883,4 +2883,11 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
 - Patch 175: element positions read by scripts (getBoundingClientRect,
   offsetTop/Left) were off by the border width for bordered elements --
   menus/tooltips positioned from them may now line up better.
+- Patch 176 (WS-C, lists and nested blocks): a list item added to or
+  removed from a list (feeds, chat, comment threads), or a "card" div of
+  paragraphs, no longer rebuilds the whole page -- only the new subtree is
+  built, then one layout (sim: 45 ms instead of 185 ms). Numbered lists
+  should still number correctly after an insertion. netsurf.log: "LIFE
+  rebuild local: blocks rebuilt (N added, M removed), full layout (a list
+  item or nested blocks)".
 
