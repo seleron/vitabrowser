@@ -43,6 +43,37 @@ equally both ways (md at -8, Sign-in 4-44) -- as Chromium does.
 Guarded by available_cross != AUTO, so only fixed-height rows change.
 Gate: ACCTBAR 3/5 -> **5/5**; FLEXHDR 6/6; full gate clean.
 
+## 2026-09-30 11:20 — full 21-site scorecard, patches up to 183
+
+Run `<WORK>/vitabrowser-work/score/r18-full-183` (all 21 sites, fresh Chrome
+refs). Baseline for comparison = the patch-144 run at the top of this
+file (all 65.3). Patches 182-183 introduced **no cross-site regression**:
+every loaded site is at or above its baseline; the two forum "blocked"
+states are external anti-bot (stackoverflow, old.reddit), not ours.
+
+| tier | baseline (144) | now (183) |
+|---|---|---|
+| static | 81.3 | 82.0 |
+| wiki | 83.7 | 87.2 |
+| news | 75.7 | 79.5 |
+| forum | 57.4 | 54.1* |
+| wordpress | 51.5 | 61.1 |
+| jquery | 86.9 | 87.0 |
+| docs | 76.1 | 81.8 |
+| search | 42.3 | **81.3** |
+| spa | 36.4 | 59.9 |
+| **all** | **65.3** | **73.6** |
+
+*forum's drop is the two blocked sites, not a layout change (hackernews,
+the one that loads, is 87.7).
+
+`Done s` per tier (WS-C's outstanding measurement), mean over the loaded
+sites: static 0.4, wiki 1.8, news 3.1, forum 0.8 (hackernews only),
+wordpress 4.2, jquery 0.5, docs 1.4, search 1.3, spa 2.7. The two slowest
+loaded pages are make.wordpress.org/core (5.9 s, 150+ scripts) and the
+guardian (4.6 s) -- both script-DOM-change heavy, i.e. exactly the
+WS-C incremental-reflow work.
+
 ## 2026-09-28 23:30 — baseline (patches up to 144)
 
 Run `<WORK>/vitabrowser-work/score/base` (21 sites, reference from headless

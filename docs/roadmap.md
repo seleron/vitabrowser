@@ -136,7 +136,11 @@ layout's own margin collapsing (5-7 ms of work, stall 24 ms instead of
 of first/last-place edits, batched appends and removals). Still the full
 rebuild: lists (markers), nested blocks, floats/tables/flex around the
 change, objects and form controls. WS-C's script-change items are done in
-the sim; next: re-score `Done s` per tier.
+the sim. Re-scored `Done s` per tier 2026-09-30 (patches up to 183,
+scorecard r18-full-183): all 21 sites, all-tier mean 65.3 -> 73.6,
+search 42.3 -> 81.3, no cross-site regression; the two slowest
+loaded pages (make.wordpress.org/core 5.9 s, the guardian 4.6 s)
+are script-DOM-change heavy -- the incremental-reflow work below.
 Class changes (patch 173, 2026-09-30): a class set on an inline-level
 element (a span, a link, a label -- the usual UI state toggle) was a full
 rebuild (258-282 ms here) and, the third time in a row, suppressed
