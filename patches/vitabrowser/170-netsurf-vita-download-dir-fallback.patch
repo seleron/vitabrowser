@@ -1,0 +1,296 @@
+# netsurf (vita frontend): downloads fall back to ux0:data/VitaBrowser/downloads/
+# Generated 2026-09-30
+#
+# Hardware run 27, the first device run of the download test: "download:
+# cannot create ux0:download/vita-test.bin (errno 2)", interaction 30/31.
+# Every VitaBrowser VPK is a safe eboot (frontends/vita/Makefile:
+# vita-make-fself -s), and a safe app is kept out of most of ux0:, so
+# sceIoMkdir("ux0:/download") fails (its result was not checked) and the
+# fopen gets ENOENT. (Not the trailing slash: VitaSDK newlib's mkdir runs
+# the path through __realpath, which drops it -- checked by running the
+# libc's own __realpath under an emulator: "ux0:download/" ->
+# "ux0:/download", the form ux0:data/VitaBrowser/ takes too.) ux0:data/
+# is inside the sandbox; log.txt is written there.
+#
+# - download.c: vita_download_dirs[] = ux0:download/, then
+#   ux0:data/VitaBrowser/downloads/; each is made without its trailing
+#   slash and checked to be a directory (a failure is logged: "download:
+#   cannot make ..."), then the file is opened there. A build that may
+#   write ux0:download/ still saves there.
+# - chrome.c: the home page lists the files in both folders.
+# - interact.c: the download check looks in both folders and names the
+#   path it found.
+# tools/run-vita-sim.sh now models the sandbox (ux0:download is made a
+# plain file), so the simulator takes the device's path and the gate
+# checks the fallback file byte for byte.
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+index 400855e..307ff84 100644
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -49,6 +49,7 @@
+ #include "vita/remote.h"
+ #include "vita/window.h"
+ #include "vita/chrome.h"
++#include "vita/download.h"
+ 
+ #define VITA_DOWNLOAD_DIR_NAME "ux0:download"
+ 
+@@ -236,29 +237,38 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 		fclose(bm);
+ 	fputs("</div>\n<p class=\"hint\">Bookmarks: "
+ 	      VITA_BOOKMARKS_FILE "</p>\n", fp);
+-	/* Downloads (vita/download.c): what is in ux0:download/ */
++	/* Downloads (vita/download.c): what is in its folders */
+ 	{
+-		DIR *dd = opendir(VITA_DOWNLOAD_DIR_NAME);
+-		struct dirent *de;
+-		unsigned int nd = 0;
+-		while (dd != NULL && (de = readdir(dd)) != NULL && nd < 30) {
+-			size_t dl = strlen(de->d_name);
+-			if (de->d_name[0] == '.')
+-				continue;
+-			if (nd++ == 0)
+-				fputs("<h2>Downloads</h2>\n<div class=\"tests\">\n",
+-				      fp);
+-			fputs("<a href=\"file:///" VITA_DOWNLOAD_DIR_NAME "/", fp);
+-			put_escaped(fp, de->d_name, dl);
+-			fputs("\">", fp);
+-			put_escaped(fp, de->d_name, dl);
+-			fputs("</a>\n", fp);
++		unsigned int nd = 0, k;
++		for (k = 0; k < VITA_DOWNLOAD_DIRS; k++) {
++			const char *dir = vita_download_dirs[k];
++			DIR *dd = opendir(dir);
++			struct dirent *de;
++			unsigned int here = 0;
++			while (dd != NULL && (de = readdir(dd)) != NULL &&
++			       nd < 30) {
++				size_t dl = strlen(de->d_name);
++				if (de->d_name[0] == '.')
++					continue;
++				if (nd++ == 0)
++					fputs("<h2>Downloads</h2>\n"
++					      "<div class=\"tests\">\n", fp);
++				here++;
++				fprintf(fp, "<a href=\"file:///%s", dir);
++				put_escaped(fp, de->d_name, dl);
++				fputs("\">", fp);
++				put_escaped(fp, de->d_name, dl);
++				fputs("</a>\n", fp);
++			}
++			if (dd != NULL)
++				closedir(dd);
++			if (here > 0)
++				fprintf(fp, "<!-- saved in %s -->\n", dir);
+ 		}
+-		if (dd != NULL)
+-			closedir(dd);
+ 		if (nd > 0)
+ 			fputs("</div>\n<p class=\"hint\">Saved in "
+-			      VITA_DOWNLOAD_DIR_NAME "/</p>\n", fp);
++			      VITA_DOWNLOAD_DIR_NAME "/ or "
++			      VITA_DIAG_DIR "downloads/</p>\n", fp);
+ 	}
+ 	fputs("<h2>Test pages</h2>\n<div class=\"tests\">\n", fp);
+ 	for (i = 0; i < n; i++) {
+diff --git a/frontends/vita/download.c b/frontends/vita/download.c
+index 550cefc..c347801 100644
+--- a/frontends/vita/download.c
++++ b/frontends/vita/download.c
+@@ -22,8 +22,9 @@
+  *
+  * A response the engine does not display (a VPK, a zip, <a download>) is
+  * saved to ux0:download/ -- the folder VitaShell and other file managers
+- * show -- under its Content-Disposition or URL name, made safe for the
+- * card and unique ("name (2).ext"). Progress and the result go to the
++ * show -- or, where the app may not write there, ux0:data/VitaBrowser/
++ * downloads/, under its Content-Disposition or URL name, made safe for
++ * the card and unique ("name (2).ext"). Progress and the result go to the
+  * on-screen message line and log.txt; a failed download removes its
+  * partial file. The list of saved files is on the home page.
+  */
+@@ -57,6 +58,16 @@ struct gui_download_window {
+ 	unsigned int last_ms;
+ };
+ 
++/* Where a download may go, in order. Every VitaBrowser VPK is a safe
++ * eboot (vita-make-fself -s), and a safe app is kept out of most of ux0::
++ * sceIoMkdir("ux0:download") fails and the fopen gets ENOENT (hardware
++ * run 27, the first run of the download test on a Vita). ux0:data/ is
++ * inside that sandbox (it holds log.txt), so a download falls back to it;
++ * an unsafe build still saves to ux0:download/. */
++const char *const vita_download_dirs[VITA_DOWNLOAD_DIRS] = {
++	VITA_DOWNLOAD_DIR, VITA_DIAG_DIR "downloads/"
++};
++
+ unsigned int vita_downloads_done;	/**< completed this session */
+ char vita_download_last[256];		/**< path of the last one saved */
+ 
+@@ -87,8 +98,9 @@ static void safe_name(const char *in, char *out, size_t max)
+ 		snprintf(out, max, "download");
+ }
+ 
+-/* VITA_DOWNLOAD_DIR + name, "name (2).ext" if taken */
+-static void unique_path(const char *name, char *path, size_t max)
++/* dir + name, "name (2).ext" if taken */
++static void unique_path(const char *dir, const char *name, char *path,
++			size_t max)
+ {
+ 	const char *dot = strrchr(name, '.');
+ 	size_t stem = dot != NULL && dot != name ? (size_t)(dot - name)
+@@ -96,18 +108,44 @@ static void unique_path(const char *name, char *path, size_t max)
+ 	struct stat st;
+ 	int n;
+ 
+-	snprintf(path, max, "%s%s", VITA_DOWNLOAD_DIR, name);
++	snprintf(path, max, "%s%s", dir, name);
+ 	for (n = 2; stat(path, &st) == 0 && n < 1000; n++)
+-		snprintf(path, max, "%s%.*s (%d)%s", VITA_DOWNLOAD_DIR,
++		snprintf(path, max, "%s%.*s (%d)%s", dir,
+ 			 (int)stem, name, n, dot != NULL && dot != name ?
+ 			 dot : "");
+ }
+ 
++/* dir (with its trailing slash) exists as a directory, made if need be */
++static bool dir_ready(const char *dir)
++{
++	char d[128];
++	size_t n = strlen(dir);
++	struct stat st;
++
++	if (n < 2 || n >= sizeof(d))
++		return false;
++	memcpy(d, dir, n - 1);
++	d[n - 1] = '\0';
++	if (stat(d, &st) == 0) {
++		if (S_ISDIR(st.st_mode))
++			return true;
++		vita_diag_log("download: cannot make %s (a file has the name)",
++			      d);
++		return false;
++	}
++	if (mkdir(d, 0777) != 0 && errno != EEXIST) {
++		vita_diag_log("download: cannot make %s (errno %d)", d, errno);
++		return false;
++	}
++	return stat(d, &st) == 0 && S_ISDIR(st.st_mode);
++}
++
+ static struct gui_download_window *
+ vita_download_create(download_context *ctx, struct gui_window *parent)
+ {
+ 	struct gui_download_window *dw;
+ 	nsurl *url = download_context_get_url(ctx);
++	unsigned int i;
+ 
+ 	(void)parent;
+ 	dw = calloc(1, sizeof(*dw));
+@@ -117,14 +155,21 @@ vita_download_create(download_context *ctx, struct gui_window *parent)
+ 	dw->total = download_context_get_total_length(ctx);
+ 	safe_name(download_context_get_filename(ctx), dw->name,
+ 		  sizeof(dw->name));
+-	mkdir(VITA_DOWNLOAD_DIR, 0777);
+-	unique_path(dw->name, dw->path, sizeof(dw->path));
+-	dw->fp = fopen(dw->path, "wb");
++	for (i = 0; i < VITA_DOWNLOAD_DIRS && dw->fp == NULL; i++) {
++		if (!dir_ready(vita_download_dirs[i]))
++			continue;
++		unique_path(vita_download_dirs[i], dw->name, dw->path,
++			    sizeof(dw->path));
++		dw->fp = fopen(dw->path, "wb");
++		if (dw->fp == NULL)
++			vita_diag_log("download: cannot create %s (errno %d)",
++				      dw->path, errno);
++	}
+ 	if (dw->fp == NULL) {
+-		vita_diag_log("download: cannot create %s (errno %d)",
+-			      dw->path, errno);
+-		vita_show_message(4000, "download failed: cannot write %s",
+-			     dw->path);
++		vita_diag_log("download: FAILED %s: no folder could take it",
++			      dw->name);
++		vita_show_message(4000, "download failed: cannot save %s",
++			     dw->name);
+ 		free(dw);
+ 		return NULL;
+ 	}
+diff --git a/frontends/vita/download.h b/frontends/vita/download.h
+index cd3b6ca..4728b45 100644
+--- a/frontends/vita/download.h
++++ b/frontends/vita/download.h
+@@ -16,13 +16,18 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+-/** \file Downloads to ux0:download/ (vita/download.c). */
++/** \file Downloads to the memory card (vita/download.c). */
+ 
+ #ifndef NETSURF_VITA_DOWNLOAD_H
+ #define NETSURF_VITA_DOWNLOAD_H
+ 
+ extern struct gui_download_table *vita_download_table;
+ 
++/** Where downloads go, in order: ux0:download/, then (a safe eboot may
++ * not write there) ux0:data/VitaBrowser/downloads/. Trailing slashes. */
++#define VITA_DOWNLOAD_DIRS 2
++extern const char *const vita_download_dirs[VITA_DOWNLOAD_DIRS];
++
+ /** Downloads completed this session, and the last one's path. */
+ extern unsigned int vita_downloads_done;
+ extern char vita_download_last[256];
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+index b56860b..5b602e5 100644
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -38,6 +38,7 @@
+ 
+ #include "vita/chrome.h"
+ #include "vita/diag.h"
++#include "vita/download.h"
+ #include "vita/input.h"
+ #include "vita/remote.h"
+ #include "vita/resolve.h"
+@@ -241,20 +242,25 @@ static bool cookie_ok(char *detail, size_t max)
+ 
+ static bool download_ok(const char *name, char *detail, size_t max)
+ {
+-	/* vita/download.c saves to ux0:download/ (cwd-relative, as the
+-	 * WIP's VITA_DOWNLOAD_DIR). The gate in tools/run-vita-sim.sh
++	/* vita/download.c saves to ux0:download/ or, where a safe eboot may
++	 * not write there (every VPK), ux0:data/VitaBrowser/downloads/
++	 * (cwd-relative in the simulator). The gate in tools/run-vita-sim.sh
+ 	 * re-checks the whole file byte for byte against the bundled
+ 	 * testpages target; here only the shape is checked. */
+ 	char path[256];
+-	FILE *fp;
++	FILE *fp = NULL;
+ 	char buf[32];
+ 	long sz = 0;
++	unsigned int k;
+ 
+-	snprintf(path, sizeof path, "ux0:download/%s", name);
+-	fp = fopen(path, "rb");
++	for (k = 0; k < VITA_DOWNLOAD_DIRS && fp == NULL; k++) {
++		snprintf(path, sizeof path, "%s%s", vita_download_dirs[k], name);
++		fp = fopen(path, "rb");
++	}
+ 	if (fp == NULL) {
+-		snprintf(detail, max, "%s missing (card: errno %d)",
+-			 path, errno);
++		snprintf(detail, max, "%s missing from %s and %s (errno %d)",
++			 name, vita_download_dirs[0], vita_download_dirs[1],
++			 errno);
+ 		return false;
+ 	}
+ 	if (fseek(fp, 0, SEEK_END) != 0 || (sz = ftell(fp)) < 0)
+@@ -264,8 +270,8 @@ static bool download_ok(const char *name, char *detail, size_t max)
+ 		buf[0] = '\0';
+ 	buf[sizeof buf - 1] = '\0';
+ 	fclose(fp);
+-	snprintf(detail, max, "%s: %ld bytes, starts \"%s\"",
+-		 name, sz, buf);
++	snprintf(detail, max, "%.100s: %ld bytes, starts \"%.24s\"",
++		 path, sz, buf);
+ 	return sz == 1024 && strncmp(buf, "VitaBrowser-download-ok ",
+ 					  24) == 0;
+ }

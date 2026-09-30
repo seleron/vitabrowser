@@ -1,0 +1,146 @@
+# netsurf: a stylesheet that changes after load restyles the page
+# Generated 2026-09-30
+#
+# Found by JS-cssom.html (patch 168): a rule deleted after load stayed
+# applied. Two faults in content/handlers/html/css.c:
+#
+# - html_stylesheet_from_domnode: a <style> with no text left
+#   (textContent = '', its text node removed, deleteRule of its last rule)
+#   returned "no new sheet", and html_css_process_modified_style kept the
+#   OLD one. It now becomes an empty sheet like any other edit.
+# - The selection context is made once, in html_finish_conversion, from
+#   the sheets present then ("Ignoring style change: NS layout is
+#   static"). A <style> that a script adds, edits or empties later
+#   (CSSOM, CSS-in-JS, google's per-module CSS) or a late <link> got a new
+#   sheet, but every rebuild went on cascading against the old context,
+#   and the rebuild the DOM change scheduled had run before the new
+#   sheet finished anyway. Now, when a sheet finishes after the page is
+#   laid out, the context is remade from the current sheets once every
+#   sheet has settled (none modified, none still loading/parsing -- the
+#   fixes1193 race) and a rebuild is scheduled (macos9_js_mark_dom_dirty,
+#   debounced). Style lookups read c->select_ctx per element, so the swap
+#   between scheduler callbacks is safe; computed styles do not point
+#   into the context.
+# - html_css_process_modified_style: the old sheet is taken out of the
+#   live context before it is released; the context held it, and the
+#   release could free it under the next cascade.
+# Test: JS-cssom.html check 5 (deleteRule after load) -- width 123 stayed
+# before, the rule's removal now shows.
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 0bc3884..9ec3d30 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -44,6 +44,54 @@
+ #include "html/private.h"
+ #include "html/css.h"
+ 
++#ifdef WITH_QUICKJS
++/* javascript/quickjs/macos9_reconvert.c: schedule a (debounced) rebuild */
++extern void macos9_js_mark_dom_dirty(struct content *c);
++#endif
++
++/**
++ * Every stylesheet has settled: none awaiting reprocessing, none still
++ * loading or parsing (a selection context must not read a sheet whose
++ * selector hash is still being built -- fixes1193).
++ */
++static bool html_css_sheets_settled(html_content *c)
++{
++	unsigned int i;
++
++	for (i = 0; i != c->stylesheet_count; i++) {
++		if (c->stylesheets[i].modified)
++			return false;
++		if (c->stylesheets[i].sheet != NULL &&
++		    content_get_status(c->stylesheets[i].sheet) !=
++				CONTENT_STATUS_DONE)
++			return false;
++	}
++	return true;
++}
++
++/**
++ * The selection context is made once, when the page finishes converting
++ * (html_finish_conversion), from the sheets it has then. A sheet that
++ * changes or arrives later -- a <style> a script adds, edits or empties
++ * (CSSOM insertRule/deleteRule, CSS-in-JS, google's per-module CSS), a
++ * late <link> -- never reached it: every rebuild cascaded against the
++ * old rules. Remake it from the current sheets once they have settled.
++ * Style lookups read c->select_ctx per element, so swapping it between
++ * scheduler callbacks is safe; computed styles do not point into it.
++ */
++static void html_css_refresh_selection_context(html_content *c)
++{
++	css_select_ctx *fresh = NULL;
++
++	if (c->select_ctx == NULL || !html_css_sheets_settled(c))
++		return;
++	if (html_css_new_selection_context(c, &fresh) != NSERROR_OK ||
++	    fresh == NULL)
++		return;
++	css_select_ctx_destroy(c->select_ctx);
++	c->select_ctx = fresh;
++}
++
+ static nsurl *html_default_stylesheet_url;
+ static nsurl *html_adblock_stylesheet_url;
+ static nsurl *html_quirks_stylesheet_url;
+@@ -136,6 +184,22 @@ html_convert_css_callback(hlcache_handle *css,
+ 		break;
+ 	}
+ 
++	/* A sheet that finishes after the page is laid out -- a <style> a
++	 * script added, edited or emptied (CSSOM insertRule/deleteRule,
++	 * CSS-in-JS, google's per-module CSS), a late <link> -- has to
++	 * re-cascade: the rebuild its DOM change scheduled ran before this
++	 * sheet was ready, against the old selection context, and nothing
++	 * restyled after. */
++	if ((event->type == CONTENT_MSG_DONE ||
++	     event->type == CONTENT_MSG_ERROR) &&
++	    parent->conversion_begun && parent->layout != NULL &&
++	    !parent->aborted) {
++		html_css_refresh_selection_context(parent);
++#ifdef WITH_QUICKJS
++		macos9_js_mark_dom_dirty(&parent->base);
++#endif
++	}
++
+ 	if (html_can_begin_conversion(parent)) {
+ 		html_begin_conversion(parent);
+ 	}
+@@ -161,10 +225,17 @@ html_stylesheet_from_domnode(html_content *c,
+ 	child.quirks = c->base.quirks;
+ 
+ 	exc = dom_node_get_text_content(node, &style);
+-	if ((exc != DOM_NO_ERR) || (style == NULL)) {
++	if (exc != DOM_NO_ERR) {
+ 		NSLOG(netsurf, INFO, "No text content");
+ 		return NSERROR_OK;
+ 	}
++	/* A <style> a script emptied (textContent = '', its text node
++	 * removed, CSSOM deleteRule of the last rule) has no text at all:
++	 * it becomes an empty sheet, replacing its old one like any other
++	 * edit. Returning no sheet here kept the old rules applied. */
++	if (style == NULL &&
++	    dom_string_create((const uint8_t *)"", 0, &style) != DOM_NO_ERR)
++		return NSERROR_NOMEM;
+ 
+ 	error = html_css_fetcher_add_item(style, c->base_url, &key);
+ 	if (error != NSERROR_OK) {
+@@ -278,6 +349,16 @@ html_css_process_modified_style(html_content *c, struct html_stylesheet *s)
+ 		if (s->sheet != NULL) {
+ 			switch (content_get_status(s->sheet)) {
+ 			case CONTENT_STATUS_DONE:
++				/* the live selection context holds this sheet:
++				 * take it out before the release frees it (the
++				 * context is remade when the new one is in) */
++				if (c->select_ctx != NULL) {
++					css_stylesheet *old =
++						nscss_get_stylesheet(s->sheet);
++					if (old != NULL)
++						(void)css_select_ctx_remove_sheet(
++							c->select_ctx, old);
++				}
+ 				break;
+ 			default:
+ 				hlcache_handle_abort(s->sheet);

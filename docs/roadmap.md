@@ -153,6 +153,26 @@ gate green, and in the sim google's bundle now gets PAST the defineProperty
 wall and reports 3 later JS errors (`at $ra {{0}}:307:407`) where r3 died
 before its error reporter even ran; visible text is unchanged (0.184), so a
 deeper error is now the blocker -- next step is decoding that frame.
+The second wall is decoded (2026-09-30, patches 168-169): `$ra`/`ysa` at
+307:407 is google's `_F_installCss` self-check -- every module appends its
+CSS in a `<style>` ending in `sentinel{}` and checks the CSSOM saw it --
+and our `document.styleSheets` was a stub (cssRules always `[]`,
+insertRule a no-op): error "oc" per module, non-fatal. Patch 168 gives a
+working CSSOM (parsed cssRules, insertRule/deleteRule, rule.style, one
+sheet per `<style>`), a real DOMException (the bridge's was an empty
+stub) and a rendered-text innerText (it was textContent: google's
+body.innerText was 30 KB of its own CSS, which is also why the scorecard
+saw none of its words). Patch 169 makes a stylesheet that changes after
+load restyle at all: the selection context was frozen at load, so no
+post-load CSS change -- CSSOM, CSS-in-JS, a late `<link>` -- ever applied.
+Sim: google reports 0 JS errors (24 beacons before), score 40.8 -> 45.5
+(text 0.184 -> 0.289). Still missing: the "Trending searches" list -- its
+DOM is built but stays hidden (`.WrKXc` needs class `pne3Yd`, which the
+component adds only when its `/complete/search?client=mweb-insp` result
+has rows; the XHR returns 200 / 6.9 KB, so the parse or the callback is
+the next thing to trace) -- and the mobile header (ALL / IMAGES).
+Also seen: `#gb-main` gets `style="min-height:undefinedpx"` (a viewport
+height the bridge answers `undefined` for).
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that
@@ -162,8 +182,9 @@ failing, page cache caps, crash triage.
 an out-of-memory page shows an error page.
 
 ### WS-E The browser itself (Phase 1 items 9–10, Phase 2 item 14)
-Downloads to `ux0:/download/` (Content-Disposition names, progress,
-downloads page), history page, find in page, error pages, settings page,
+Downloads to `ux0:/download/`, or `ux0:data/VitaBrowser/downloads/` where
+the safe eboot may not write there (patch 170; every VPK is safe), with
+Content-Disposition names, progress, downloads page, history page, find in page, error pages, settings page,
 desktop/mobile UA toggle.
 *Acceptance:* interaction-pass steps for each; device checklist.
 

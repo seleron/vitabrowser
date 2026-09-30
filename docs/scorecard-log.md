@@ -145,3 +145,32 @@ next investigation is decoding `$ra` at bundle column 307:407 (needs the
 google main bundle's source map or a de-minified read of that frame). This is
 parked WS-F/B2 territory, not a regression: nothing in the gate moved, load
 time 1.7→2.1 s is noise.
+
+## r5-google — the second wall (2026-09-30, patches 168-170)
+
+`--only google --reuse-ref r3`, after the full gate went green (exit 0:
+CSSOM 8/8, INNERTEXT 8/8, DOMSTALL 7/7, REFLOW 3/3, interaction 31/31).
+
+| tier | site | score | Δ vs r4 | text | visual |
+|---|---|---|---|---|---|
+| search | google | 45.5 | +4.7 | 0.289 | 0.438 |
+
+- The r4 errors (`$ra {{0}}:307:407`, 24 `error=` beacon lines in
+  netsurf.log; `ysa 313:407`, error "zc", on the device in run 27) were
+  google's `_F_installCss` CSSOM self-check against our stub
+  `document.styleSheets`. With patch 168's CSSOM there are **0** beacons.
+- The text gain is mostly a **measurement fix**: the scorecard reads
+  `document.body.innerText`, which was `textContent` -- google keeps its
+  `<style>` blocks in `<body>`, so our "visible text" was the first 30 KB
+  of its CSS and none of the page's words counted. innerText is now the
+  rendered text (patch 168). Every site's text is read the same way, and
+  hidden/CSS text could only ever *raise* recall, so the next full re-score
+  may move other sites' text down a little: that is the measurement getting
+  honest, not a regression. Re-baseline all tiers before comparing.
+- Still missing vs Chrome: the "Trending searches" list (built in the DOM,
+  hidden until the component adds class `pne3Yd`, which it does only when
+  its `/complete/search?client=mweb-insp` result has rows -- the XHR returns
+  200 / 6.9 KB, so the response parse or callback is next) and the
+  ALL / IMAGES header. Footer links read "PrivacyTerms": flex items are
+  blockified in browsers, our innerText uses the unblockified display.
+

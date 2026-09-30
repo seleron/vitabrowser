@@ -159,8 +159,12 @@ nfail=$(grep -c 'hlcache content create FAILED' "$NSLOG" || true)
 
 echo "== autotest run (reference dumps) =="
 rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
-# the download gate checks this run's file, not one an earlier run left
+# the download gate checks this run's file, not one an earlier run left.
+# ux0:download is made a plain FILE: every VPK is a safe eboot, which cannot
+# create ux0:download/ (hardware run 27, errno 2), so the simulator takes
+# the device's path -- the fallback to ux0:data/VitaBrowser/downloads/.
 rm -rf "$OUT/run/ux0:download"
+: > "$OUT/run/ux0:download"
 if ss -Hlun 2>/dev/null | grep -q ":${NETLOG_PORT:-45199} "; then
 	fail "something already listens on UDP ${NETLOG_PORT:-45199} (a stale receiver?)"
 fi
@@ -225,6 +229,8 @@ NET-js-lazyimg http://127.0.0.1:$HP/JS-lazyimg.html
 NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html
 NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
+NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
+NET-js-innertext http://127.0.0.1:$HP/JS-innertext.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -553,6 +559,17 @@ echo "  JS-reflow-stall engine: ${rs_local} local relayouts (longest ${rs_max:-?
 ptp=$(ls "$R"/*NET-js-parse-tail.plot 2>/dev/null | head -1)
 ptr=$(sed -n 's/.*STR \(PARSETAIL: [0-9]*\/[0-9]* passed\).*/\1/p' "$ptp" 2>/dev/null | head -1)
 echo "  JS-parse-tail: ${ptr:-no summary}"
+# CSSOM (Patch 168): styleSheets / cssRules parsed from the sheet's text,
+# Google's sentinel check, insertRule / deleteRule / rule.style restyling.
+csp=$(ls "$R"/*NET-js-cssom.plot 2>/dev/null | head -1)
+csr=$(sed -n 's/.*STR \(CSSOM: [0-9]*\/[0-9]* passed\).*/\1/p' "$csp" 2>/dev/null | head -1)
+echo "  JS-cssom: ${csr:-no summary}"
+[ -n "$csp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$csp" | sed 's/^STR /  /'
+# innerText (Patch 168): the rendered text, not textContent.
+itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
+itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
+echo "  JS-innertext: ${itr:-no summary}"
+[ -n "$itp" ] && grep -o 'STR [0-9] [^"]*FAIL[^"]*' "$itp" | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -576,6 +593,8 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$dsr" = "DOMSTALL: 7/7 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
+[ "$csr" = "CSSOM: 8/8 passed" ] && \
+[ "$itr" = "INNERTEXT: 8/8 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
@@ -645,11 +664,12 @@ iblk=$(sed -n 's/.*STR \(IN block: [0-9]*\/[0-9]* passed\).*/\1/p' "$R/IN-block.
 echo "  IN-block dump: ${iblk:-missing}"
 grep -h 'font: .* batched draws' "$R/log.txt" | tail -1 | sed 's/^\[[^]]*\] /  /'
 grep -c '<a href="https://' "$R/home.html" | sed 's/^/  home page bookmarks: /'
-# A download (vita/download.c): the tap saves to ux0:download/, and the
-# saved file must be byte-for-byte the bundled target -- not truncated,
+# A download (vita/download.c): the tap saves to ux0:data/VitaBrowser/
+# downloads/ (ux0:download/ is out of a safe eboot's reach; see above), and
+# the saved file must be byte-for-byte the bundled target -- not truncated,
 # not renamed to " (2)", not the page itself.
-echo "== downloads (ux0:download/) =="
-DLSAVED="$OUT/run/ux0:download/vita-test.bin"
+echo "== downloads (ux0:data/VitaBrowser/downloads/, ux0:download/ refused) =="
+DLSAVED="$OUT/run/ux0:data/VitaBrowser/downloads/vita-test.bin"
 echo "  saved: $DLSAVED ($(stat -c %s "$DLSAVED" 2>/dev/null || echo missing) bytes, target 1024)"
 if [ -f "$DLSAVED" ] && cmp -s "$DLSAVED" "$ROOT/testpages/pages/IN-download-target.bin"; then
 	echo "  vita-test.bin: byte-identical to the bundled target"
@@ -657,6 +677,7 @@ else
 	echo "  vita-test.bin: DIFFERS from the target (or missing)"; fail "downloads"
 fi
 grep -E 'download: (saved|FAILED)' "$R/log.txt" | sed 's/^\[[^]]*\] /  /' | cut -c1-120
+grep -q 'download: cannot make ux0:download' "$R/log.txt" || fail "downloads: ux0:download was not refused first"
 [ -n "$isum" ] && [ "${isum%/*}" = "${isum#*/}" ] && \
 	[ "$iblk" = "IN block: 2/2 passed" ] && [ -f "$R/IN-zoom125.plot" ] && \
 	[ -f "$R/IN-form-sent.plot" ] && \

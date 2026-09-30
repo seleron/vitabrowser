@@ -1,0 +1,1299 @@
+# netsurf (MacSurf bridge): a working CSSOM, a real DOMException, rendered innerText
+# Generated 2026-09-30
+#
+# Google's "second wall" (hardware run 27: jserror at ysa {{0}}:313:407,
+# sim r4: $ra {{0}}:307:407). Every module google loads calls
+# _F_installCss(css): it appends a <style> with the module's CSS, which
+# ends in a `sentinel{}` rule, and checks the CSSOM saw it -- the sheet in
+# document.styleSheets whose ownerNode is that <style> must have cssRules,
+# the last a CSSStyleRule with selectorText "sentinel". The bridge's
+# document.styleSheets built fresh objects with cssRules always [] and
+# insertRule a no-op, so the check reported error "oc" ("zc" in the device
+# build) for every module. The report is non-fatal (_.$e), but the same
+# stub meant CSS-in-JS (emotion, styled-components, JSS: rules added with
+# insertRule) got no styling at all.
+#
+# vita_polyfill.js:
+# - CSSOM: one CSSStyleSheet per <style>/<link rel=stylesheet>, kept on
+#   the element (document.styleSheets[i] === el.sheet); StyleSheet,
+#   CSSStyleSheet, CSSRule + CSSStyleRule, CSSMediaRule, CSSSupportsRule,
+#   CSSImportRule, CSSFontFaceRule, CSSPageRule, CSSKeyframesRule/
+#   CSSKeyframeRule, CSSNamespaceRule, CSSLayer*Rule, CSSContainerRule,
+#   CSSGroupingRule, CSSConditionRule, with the CSSRule type constants.
+#   cssRules is parsed on demand from the <style>'s text by a brace/
+#   string/comment-aware scan (regex-driven: nested group rules,
+#   keyframes, at-statements) and re-parsed when the text changes; <link>
+#   sheets keep an empty list (the engine holds their text).
+#   insertRule/deleteRule (sheet and group rules; IndexSizeError,
+#   SyntaxError), addRule/removeRule, appendRule/findRule, rule.style
+#   (getPropertyValue/setProperty/removeProperty/cssText; camelCase where
+#   Proxy exists). Changes are written back as the <style>'s text once
+#   per microtask -- the engine restyles that like any script edit of a
+#   <style> (patch 169 makes that restyle happen after load) -- so a
+#   burst of inserts is one restyle. selectorText "a, b" and keyText
+#   "0%"/"100%" read as browsers serialize them. No replace()/
+#   replaceSync(): Lit and others would then use constructable sheets +
+#   adoptedStyleSheets, which the engine does not render.
+# - DOMException: the bridge's is an empty stub (macsurf_qjs.c's list of
+#   constructors), so every `new DOMException(msg, 'AbortError')` in this
+#   file had no name, message or code. Replaced only when the one there
+#   loses its name; codes and the *_ERR constants.
+# - innerText / outerText were textContent: <style>/<script> text, hidden
+#   and display:none subtrees came along and nothing marked a line.
+#   google.com keeps its <style> blocks in <body>: its body.innerText was
+#   30 KB of CSS, and the scorecard (which reads visible text this way)
+#   saw none of the page's words. Now the rendered text: script, style,
+#   template, noscript, [hidden] and box-less (display:none) subtrees are
+#   left out -- the bridge's __gcsNative answers a display only for an
+#   element with a box --, block boxes start and end lines, <br> breaks
+#   one, <p> is set off by a blank line, table cells by tabs, white space
+#   collapses outside <pre>/<textarea>.
+# Tests: JS-cssom.html 8/8 (with patch 169), JS-innertext.html 8/8; both
+# pages also 8/8 in Chromium, and the innerText implementation itself was
+# run in Chromium against the same cases.
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index c7792f6..9e2aefb 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -14,6 +14,43 @@
+ "\t\tconfigurable: true, enumerable: false });\n"
+ "}\n"
+ "\n"
++"/* ---- DOMException ------------------------------------------------------\n"
++" * The bridge's is an empty stub (macsurf_qjs.c's list of constructors),\n"
++" * so `new DOMException(msg, 'AbortError')` -- this file makes several --\n"
++" * had no name, message or code, and `e.name === 'AbortError'` tests\n"
++" * failed. Replaced only when the one there loses its name. */\n"
++"(function () {\n"
++"\tvar have = g.DOMException, ok = false;\n"
++"\ttry { ok = typeof have === 'function' && new have('m', 'SyntaxError').name === 'SyntaxError'; } catch (e) { /* */ }\n"
++"\tif (ok) return;\n"
++"\tvar codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,\n"
++"\t\tInvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,\n"
++"\t\tNotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11, SyntaxError: 12,\n"
++"\t\tInvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15,\n"
++"\t\tTypeMismatchError: 17, SecurityError: 18, NetworkError: 19, AbortError: 20,\n"
++"\t\tURLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,\n"
++"\t\tInvalidNodeTypeError: 24, DataCloneError: 25 };\n"
++"\tfunction DOMException(message, name) {\n"
++"\t\tif (!(this instanceof DOMException))\n"
++"\t\t\tthrow new TypeError(\"Constructor DOMException requires 'new'\");\n"
++"\t\tvar n = name === undefined ? 'Error' : String(name);\n"
++"\t\tdefine(this, 'message', message === undefined ? '' : String(message));\n"
++"\t\tdefine(this, 'name', n);\n"
++"\t\tdefine(this, 'code', codes[n] || 0);\n"
++"\t\ttry { define(this, 'stack', new Error(this.message).stack); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tDOMException.prototype = Object.create(Error.prototype);\n"
++"\tdefine(DOMException.prototype, 'constructor', DOMException);\n"
++"\ttry { Object.defineProperty(DOMException.prototype, Symbol.toStringTag, { value: 'DOMException', configurable: true }); } catch (e) { /* */ }\n"
++"\tdefine(DOMException.prototype, 'toString', function () { return this.name + ': ' + this.message; });\n"
++"\tObject.keys(codes).forEach(function (k) {\n"
++"\t\tvar c = k.replace(/Error$/, '').replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase() + '_ERR';\n"
++"\t\tDOMException[c] = codes[k];\n"
++"\t\tDOMException.prototype[c] = codes[k];\n"
++"\t});\n"
++"\tdefine(g, 'DOMException', DOMException);\n"
++"})();\n"
++"\n"
+ "/* ---- URLSearchParams (WHATWG URL section 6) ---------------------------------- */\n"
+ "\n"
+ "function formDecode(s) {\n"
+@@ -1860,6 +1897,476 @@
+ "\t}\n"
+ "})();\n"
+ "\n"
++"/* ---- CSSOM: document.styleSheets, cssRules, insertRule ------------------\n"
++" * The bridge gave document.styleSheets as fresh objects with cssRules\n"
++" * always [] and insertRule a no-op. Google installs each module's CSS in a\n"
++" * <style> and checks that the sheet's last rule is its `sentinel` rule\n"
++" * (error \"oc\" on every module), and CSS-in-JS libraries (emotion,\n"
++" * styled-components, JSS) that add rules with insertRule got no styling at\n"
++" * all. Each <style> now has one sheet whose rules are parsed from its text\n"
++" * on demand; insertRule / deleteRule / rule.style edits are kept in the\n"
++" * sheet and written back as the element's text once per microtask, which\n"
++" * the engine restyles like any script edit of a <style>. <link> sheets\n"
++" * keep an empty rule list (the engine holds their text, not the page). */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\n"
++"\tfunction klass(name, parent, ctor) {\n"
++"\t\tvar F = ctor || function () { throw new TypeError('Illegal constructor'); };\n"
++"\t\ttry { Object.defineProperty(F, 'name', { value: name }); } catch (e) { /* */ }\n"
++"\t\tF.prototype = Object.create(parent ? parent.prototype : Object.prototype);\n"
++"\t\tObject.defineProperty(F.prototype, 'constructor', { value: F, writable: true, configurable: true });\n"
++"\t\ttry { Object.defineProperty(F.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tdefine(g, name, F);\n"
++"\t\treturn F;\n"
++"\t}\n"
++"\tfunction getter(o, n, get, set) {\n"
++"\t\tObject.defineProperty(o, n, { get: get, set: set, configurable: true, enumerable: true });\n"
++"\t}\n"
++"\tfunction domErr(msg, name) {\n"
++"\t\ttry { return new g.DOMException(msg, name); } catch (e) { var x = new Error(msg); x.name = name; return x; }\n"
++"\t}\n"
++"\n"
++"\tvar CSSRule = klass('CSSRule', null);\n"
++"\tvar K = { STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5,\n"
++"\t\tPAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, NAMESPACE_RULE: 10, SUPPORTS_RULE: 12 };\n"
++"\tObject.keys(K).forEach(function (k) { CSSRule[k] = K[k]; CSSRule.prototype[k] = K[k]; });\n"
++"\tvar Grouping = klass('CSSGroupingRule', CSSRule);\n"
++"\tvar Condition = klass('CSSConditionRule', Grouping);\n"
++"\tvar StyleRule = klass('CSSStyleRule', CSSRule);\n"
++"\tvar MediaRule = klass('CSSMediaRule', Condition);\n"
++"\tvar SupportsRule = klass('CSSSupportsRule', Condition);\n"
++"\tvar ImportRule = klass('CSSImportRule', CSSRule);\n"
++"\tvar FontFaceRule = klass('CSSFontFaceRule', CSSRule);\n"
++"\tvar PageRule = klass('CSSPageRule', Grouping);\n"
++"\tvar KeyframesRule = klass('CSSKeyframesRule', CSSRule);\n"
++"\tvar KeyframeRule = klass('CSSKeyframeRule', CSSRule);\n"
++"\tvar NamespaceRule = klass('CSSNamespaceRule', CSSRule);\n"
++"\tvar LayerBlock = klass('CSSLayerBlockRule', Grouping);\n"
++"\tvar LayerStatement = klass('CSSLayerStatementRule', CSSRule);\n"
++"\tvar ContainerRule = klass('CSSContainerRule', Condition);\n"
++"\tvar StyleSheet = klass('StyleSheet', null);\n"
++"\tvar CSSStyleSheet = klass('CSSStyleSheet', StyleSheet, function CSSStyleSheet() {\n"
++"\t\tif (!(this instanceof CSSStyleSheet)) throw new TypeError(\"Constructor CSSStyleSheet requires 'new'\");\n"
++"\t\tinitSheet(this, null);\n"
++"\t});\n"
++"\tvar DeclBase = typeof g.CSSStyleDeclaration === 'function' ? g.CSSStyleDeclaration : null;\n"
++"\n"
++"\t/* ---- parsing: a brace/string/comment-aware scan, no tokenizer ---- */\n"
++"\tvar TOK = /[\"'{}()\\[\\];\\\\]|\\/\\*/g;\n"
++"\tfunction skipStr(s, i, q) {\n"
++"\t\tfor (i++; i < s.length; i++) {\n"
++"\t\t\tvar c = s.charCodeAt(i);\n"
++"\t\t\tif (c === 92) i++;\n"
++"\t\t\telse if (c === q || c === 10) return i + 1;\n"
++"\t\t}\n"
++"\t\treturn s.length;\n"
++"\t}\n"
++"\t/* first depth-0 '{' ';' or '}' at or after i (end if none) */\n"
++"\tfunction stopAt(s, i, end) {\n"
++"\t\tvar depth = 0, m;\n"
++"\t\tTOK.lastIndex = i;\n"
++"\t\twhile ((m = TOK.exec(s)) && m.index < end) {\n"
++"\t\t\tvar k = m.index, c = s.charCodeAt(k);\n"
++"\t\t\tif (c === 34 || c === 39) { TOK.lastIndex = skipStr(s, k, c); continue; }\n"
++"\t\t\tif (c === 47) { var e = s.indexOf('*/', k + 2); TOK.lastIndex = e < 0 ? s.length : e + 2; continue; }\n"
++"\t\t\tif (c === 92) { TOK.lastIndex = k + 2; continue; }\n"
++"\t\t\tif (c === 40 || c === 91) depth++;\n"
++"\t\t\telse if (c === 41 || c === 93) { if (depth > 0) depth--; }\n"
++"\t\t\telse if (depth === 0) return k;\n"
++"\t\t}\n"
++"\t\treturn end;\n"
++"\t}\n"
++"\t/* s[i] is '{': index just past its matching '}' (end if unclosed) */\n"
++"\tfunction closeOf(s, i, end) {\n"
++"\t\tvar depth = 0, m;\n"
++"\t\tTOK.lastIndex = i;\n"
++"\t\twhile ((m = TOK.exec(s)) && m.index < end) {\n"
++"\t\t\tvar k = m.index, c = s.charCodeAt(k);\n"
++"\t\t\tif (c === 34 || c === 39) { TOK.lastIndex = skipStr(s, k, c); continue; }\n"
++"\t\t\tif (c === 47) { var e = s.indexOf('*/', k + 2); TOK.lastIndex = e < 0 ? s.length : e + 2; continue; }\n"
++"\t\t\tif (c === 92) { TOK.lastIndex = k + 2; continue; }\n"
++"\t\t\tif (c === 123) depth++;\n"
++"\t\t\telse if (c === 125 && --depth === 0) return k + 1;\n"
++"\t\t}\n"
++"\t\treturn end;\n"
++"\t}\n"
++"\tfunction clean(t) {\n"
++"\t\treturn t.replace(/\\/\\*[\\s\\S]*?\\*\\//g, '').replace(/\\s+/g, ' ').trim();\n"
++"\t}\n"
++"\tvar SKIP = /(?:\\s+|\\/\\*[\\s\\S]*?(?:\\*\\/|$)|<!--|-->)+/y;\n"
++"\tfunction parseList(s, i, end, sheet, parent, kf) {\n"
++"\t\tvar out = [];\n"
++"\t\twhile (i < end) {\n"
++"\t\t\tSKIP.lastIndex = i;\n"
++"\t\t\tif (SKIP.test(s)) i = SKIP.lastIndex;\n"
++"\t\t\tif (i >= end) break;\n"
++"\t\t\tvar c = s.charCodeAt(i);\n"
++"\t\t\tif (c === 59 || c === 125) { i++; continue; }\n"
++"\t\t\tvar stop = stopAt(s, i, end), prelude = clean(s.slice(i, stop));\n"
++"\t\t\tif (stop >= end || s.charCodeAt(stop) !== 123) {\n"
++"\t\t\t\t/* a statement (@import ...;) -- anything else without a block is dropped */\n"
++"\t\t\t\tif (prelude.charAt(0) === '@') {\n"
++"\t\t\t\t\tvar st = makeRule(prelude, null, 0, 0, sheet, parent, false);\n"
++"\t\t\t\t\tif (st) { st._text = prelude + ';'; out.push(st); }\n"
++"\t\t\t\t}\n"
++"\t\t\t\ti = stop + 1;\n"
++"\t\t\t\tcontinue;\n"
++"\t\t\t}\n"
++"\t\t\tvar close = closeOf(s, stop, end);\n"
++"\t\t\tvar r = makeRule(prelude, s, stop + 1, s.charCodeAt(close - 1) === 125 ? close - 1 : close,\n"
++"\t\t\t\tsheet, parent, kf);\n"
++"\t\t\tif (r) { r._text = s.slice(i, close).trim(); out.push(r); }\n"
++"\t\t\ti = close;\n"
++"\t\t}\n"
++"\t\treturn listOf(out);\n"
++"\t}\n"
++"\tfunction listOf(a) {\n"
++"\t\tdefine(a, 'item', function (i) { return this[i] || null; });\n"
++"\t\treturn a;\n"
++"\t}\n"
++"\tfunction base(C, type, sheet, parent) {\n"
++"\t\tvar r = Object.create(C.prototype);\n"
++"\t\tdefine(r, '_sheet', sheet); define(r, '_parent', parent);\n"
++"\t\tdefine(r, '_text', ''); define(r, '_dirty', false);\n"
++"\t\tdefine(r, 'type', type);\n"
++"\t\treturn r;\n"
++"\t}\n"
++"\t/* keyText reads \"0%\" / \"100%\" for from / to, as in browsers */\n"
++"\tfunction keyOf(k) {\n"
++"\t\treturn k.split(/\\s*,\\s*/).map(function (x) {\n"
++"\t\t\tx = x.toLowerCase();\n"
++"\t\t\treturn x === 'from' ? '0%' : x === 'to' ? '100%' : x;\n"
++"\t\t}).join(', ');\n"
++"\t}\n"
++"\tfunction makeRule(prelude, s, b0, b1, sheet, parent, kf) {\n"
++"\t\tvar r, at = /^@(-[a-z]+-)?([a-z-]+)\\s*/i.exec(prelude), name = at ? at[2].toLowerCase() : '',\n"
++"\t\t\trest = at ? prelude.slice(at[0].length) : '';\n"
++"\t\tif (kf) {\n"
++"\t\t\tr = base(KeyframeRule, 8, sheet, parent);\n"
++"\t\t\tdefine(r, '_key', keyOf(prelude));\n"
++"\t\t\tdefine(r, '_body', s.slice(b0, b1));\n"
++"\t\t\treturn r;\n"
++"\t\t}\n"
++"\t\tif (!at) {\n"
++"\t\t\tr = base(StyleRule, 1, sheet, parent);\n"
++"\t\t\t/* \"a ,b\" reads back as \"a, b\", as browsers serialize it */\n"
++"\t\t\tdefine(r, '_sel', /[\"']/.test(prelude) ? prelude : prelude.replace(/\\s*,\\s*/g, ', '));\n"
++"\t\t\tdefine(r, '_body', s.slice(b0, b1));\n"
++"\t\t\treturn r;\n"
++"\t\t}\n"
++"\t\tif (s === null) {\n"
++"\t\t\tif (name === 'import') {\n"
++"\t\t\t\tr = base(ImportRule, 3, sheet, parent);\n"
++"\t\t\t\tvar h = /^(?:url\\(\\s*)?([\"']?)([^\"')\\s]*)\\1\\s*\\)?\\s*/.exec(rest);\n"
++"\t\t\t\tdefine(r, '_href', h ? h[2] : '');\n"
++"\t\t\t\tdefine(r, '_media', rest.slice(h ? h[0].length : 0));\n"
++"\t\t\t\treturn r;\n"
++"\t\t\t}\n"
++"\t\t\tif (name === 'namespace') {\n"
++"\t\t\t\tr = base(NamespaceRule, 10, sheet, parent);\n"
++"\t\t\t\tvar ns = /^(?:([^\\s\"'(]+)\\s+)?(?:url\\(\\s*)?([\"']?)([^\"')\\s]*)\\2/.exec(rest);\n"
++"\t\t\t\tdefine(r, '_prefix', ns && ns[1] || ''); define(r, '_uri', ns ? ns[3] : '');\n"
++"\t\t\t\treturn r;\n"
++"\t\t\t}\n"
++"\t\t\tif (name === 'charset') return null;\n"
++"\t\t\tif (name === 'layer') { r = base(LayerStatement, 0, sheet, parent); define(r, '_cond', rest); return r; }\n"
++"\t\t\treturn null;\n"
++"\t\t}\n"
++"\t\tswitch (name) {\n"
++"\t\tcase 'media': r = base(MediaRule, 4, sheet, parent); break;\n"
++"\t\tcase 'supports': r = base(SupportsRule, 12, sheet, parent); break;\n"
++"\t\tcase 'container': r = base(ContainerRule, 0, sheet, parent); break;\n"
++"\t\tcase 'layer': r = base(LayerBlock, 0, sheet, parent); break;\n"
++"\t\tcase 'document': case 'scope': case 'starting-style': r = base(Grouping, 0, sheet, parent); break;\n"
++"\t\tcase 'keyframes':\n"
++"\t\t\tr = base(KeyframesRule, 7, sheet, parent);\n"
++"\t\t\tdefine(r, '_name', rest);\n"
++"\t\t\tdefine(r, '_rules', parseList(s, b0, b1, sheet, r, true));\n"
++"\t\t\treturn r;\n"
++"\t\tcase 'font-face':\n"
++"\t\t\tr = base(FontFaceRule, 5, sheet, parent);\n"
++"\t\t\tdefine(r, '_body', s.slice(b0, b1));\n"
++"\t\t\treturn r;\n"
++"\t\tcase 'page':\n"
++"\t\t\tr = base(PageRule, 6, sheet, parent);\n"
++"\t\t\tdefine(r, '_sel', rest);\n"
++"\t\t\tdefine(r, '_body', s.slice(b0, b1));\n"
++"\t\t\tdefine(r, '_rules', listOf([]));\n"
++"\t\t\treturn r;\n"
++"\t\tdefault: return null;\n"
++"\t\t}\n"
++"\t\tdefine(r, '_at', prelude.slice(0, at[0].length).trim());\n"
++"\t\tdefine(r, '_cond', rest);\n"
++"\t\tdefine(r, '_rules', parseList(s, b0, b1, sheet, r, false));\n"
++"\t\treturn r;\n"
++"\t}\n"
++"\n"
++"\t/* ---- declarations ---- */\n"
++"\tfunction parseDecls(body) {\n"
++"\t\tvar out = [], i = 0, n = body.length;\n"
++"\t\twhile (i < n) {\n"
++"\t\t\tvar semi = stopAt(body, i, n);\n"
++"\t\t\tif (semi < n && body.charCodeAt(semi) === 123) semi = closeOf(body, semi, n); /* nested rule: skip */\n"
++"\t\t\tvar part = body.slice(i, semi), colon = part.indexOf(':');\n"
++"\t\t\ti = semi + 1;\n"
++"\t\t\tif (colon < 0) continue;\n"
++"\t\t\tvar name = clean(part.slice(0, colon)), value = clean(part.slice(colon + 1)), imp = false;\n"
++"\t\t\tvar bang = /\\s*!\\s*important$/i.exec(value);\n"
++"\t\t\tif (bang) { imp = true; value = value.slice(0, bang.index); }\n"
++"\t\t\tif (!name || name.indexOf('{') >= 0) continue;\n"
++"\t\t\tif (name.slice(0, 2) !== '--') name = name.toLowerCase();\n"
++"\t\t\tfor (var k = 0; k < out.length; k++) if (out[k][0] === name) { out.splice(k, 1); break; }\n"
++"\t\t\tout.push([name, value, imp]);\n"
++"\t\t}\n"
++"\t\treturn out;\n"
++"\t}\n"
++"\tfunction hyphen(p) {\n"
++"\t\tif (p === 'cssFloat') return 'float';\n"
++"\t\treturn p.replace(/[A-Z]/g, function (m) { return '-' + m.toLowerCase(); }).replace(/^(webkit|moz|ms)-/, '-$1-');\n"
++"\t}\n"
++"\tfunction Decl(rule) {\n"
++"\t\tdefine(this, '_rule', rule);\n"
++"\t\tdefine(this, '_list', null);\n"
++"\t}\n"
++"\tDecl.prototype = Object.create(DeclBase ? DeclBase.prototype : Object.prototype);\n"
++"\tfunction decls(o) {\n"
++"\t\tif (!o._list) o._list = parseDecls(o._rule._body || '');\n"
++"\t\treturn o._list;\n"
++"\t}\n"
++"\tfunction touch(rule) {\n"
++"\t\tfor (var r = rule; r; r = r._parent) r._dirty = true;\n"
++"\t\tif (rule._sheet) schedule(rule._sheet);\n"
++"\t}\n"
++"\tObject.defineProperties(Decl.prototype, {\n"
++"\t\tlength: { get: function () { return decls(this).length; }, configurable: true },\n"
++"\t\tcssText: {\n"
++"\t\t\tget: function () {\n"
++"\t\t\t\treturn decls(this).map(function (e) {\n"
++"\t\t\t\t\treturn e[0] + ': ' + e[1] + (e[2] ? ' !important' : '') + ';';\n"
++"\t\t\t\t}).join(' ');\n"
++"\t\t\t},\n"
++"\t\t\tset: function (v) { this._list = parseDecls(String(v)); touch(this._rule); },\n"
++"\t\t\tconfigurable: true\n"
++"\t\t},\n"
++"\t\tparentRule: { get: function () { return this._rule; }, configurable: true }\n"
++"\t});\n"
++"\tdefine(Decl.prototype, 'item', function (i) { var e = decls(this)[i]; return e ? e[0] : ''; });\n"
++"\tdefine(Decl.prototype, 'getPropertyValue', function (n) {\n"
++"\t\tn = String(n); if (n.slice(0, 2) !== '--') n = n.toLowerCase();\n"
++"\t\tvar l = decls(this);\n"
++"\t\tfor (var i = 0; i < l.length; i++) if (l[i][0] === n) return l[i][1];\n"
++"\t\treturn '';\n"
++"\t});\n"
++"\tdefine(Decl.prototype, 'getPropertyPriority', function (n) {\n"
++"\t\tvar l = decls(this);\n"
++"\t\tfor (var i = 0; i < l.length; i++) if (l[i][0] === n) return l[i][2] ? 'important' : '';\n"
++"\t\treturn '';\n"
++"\t});\n"
++"\tdefine(Decl.prototype, 'setProperty', function (n, v, p) {\n"
++"\t\tn = String(n); if (n.slice(0, 2) !== '--') n = n.toLowerCase();\n"
++"\t\tif (v === null || v === undefined || String(v) === '') { this.removeProperty(n); return; }\n"
++"\t\tvar l = decls(this), e = [n, String(v).trim(), String(p || '').toLowerCase() === 'important'];\n"
++"\t\tfor (var i = 0; i < l.length; i++) if (l[i][0] === n) { l[i] = e; touch(this._rule); return; }\n"
++"\t\tl.push(e);\n"
++"\t\ttouch(this._rule);\n"
++"\t});\n"
++"\tdefine(Decl.prototype, 'removeProperty', function (n) {\n"
++"\t\tvar l = decls(this);\n"
++"\t\tfor (var i = 0; i < l.length; i++) if (l[i][0] === n) {\n"
++"\t\t\tvar old = l[i][1];\n"
++"\t\t\tl.splice(i, 1);\n"
++"\t\t\ttouch(this._rule);\n"
++"\t\t\treturn old;\n"
++"\t\t}\n"
++"\t\treturn '';\n"
++"\t});\n"
++"\tfunction styleOf(r) {\n"
++"\t\tif (!r._style) {\n"
++"\t\t\tvar o = new Decl(r);\n"
++"\t\t\t/* rule.style.color = ... (camelCase), where Proxy exists */\n"
++"\t\t\tif (typeof Proxy === 'function')\n"
++"\t\t\t\to = new Proxy(o, {\n"
++"\t\t\t\t\tget: function (t, k) {\n"
++"\t\t\t\t\t\tif (typeof k !== 'string' || k in t) return t[k];\n"
++"\t\t\t\t\t\tif (/^\\d+$/.test(k)) return t.item(+k);\n"
++"\t\t\t\t\t\treturn t.getPropertyValue(hyphen(k));\n"
++"\t\t\t\t\t},\n"
++"\t\t\t\t\tset: function (t, k, v) {\n"
++"\t\t\t\t\t\tif (typeof k !== 'string' || k in t) { t[k] = v; return true; }\n"
++"\t\t\t\t\t\tt.setProperty(hyphen(k), v);\n"
++"\t\t\t\t\t\treturn true;\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t});\n"
++"\t\t\tdefine(r, '_style', o);\n"
++"\t\t}\n"
++"\t\treturn r._style;\n"
++"\t}\n"
++"\n"
++"\t/* ---- rule surfaces ---- */\n"
++"\tgetter(CSSRule.prototype, 'parentStyleSheet', function () { return this._sheet || null; });\n"
++"\tgetter(CSSRule.prototype, 'parentRule', function () { return this._parent || null; });\n"
++"\tgetter(CSSRule.prototype, 'cssText', function () { return ruleText(this); }, function () { /* ignored, as in browsers */ });\n"
++"\tfunction ruleText(r) {\n"
++"\t\tif (!r._dirty && r._text) return r._text;\n"
++"\t\tswitch (r.type) {\n"
++"\t\tcase 1: return r._sel + ' { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';\n"
++"\t\tcase 8: return r._key + ' { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';\n"
++"\t\tcase 5: return '@font-face { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';\n"
++"\t\tcase 7: return '@keyframes ' + r._name + ' {\\n' + r._rules.map(ruleText).join('\\n') + '\\n}';\n"
++"\t\t}\n"
++"\t\tif (r._rules) return (r._at + ' ' + r._cond).trim() + ' {\\n' + r._rules.map(ruleText).join('\\n') + '\\n}';\n"
++"\t\treturn r._text;\n"
++"\t}\n"
++"\tgetter(StyleRule.prototype, 'selectorText', function () { return this._sel; },\n"
++"\t\tfunction (v) { v = clean(String(v)); if (v) { this._sel = v; touch(this); } });\n"
++"\t[StyleRule, FontFaceRule, PageRule, KeyframeRule].forEach(function (C) {\n"
++"\t\tgetter(C.prototype, 'style', function () { return styleOf(this); },\n"
++"\t\t\tfunction (v) { styleOf(this).cssText = v; });\n"
++"\t});\n"
++"\tgetter(PageRule.prototype, 'selectorText', function () { return this._sel; });\n"
++"\tgetter(KeyframeRule.prototype, 'keyText', function () { return this._key; },\n"
++"\t\tfunction (v) { this._key = keyOf(clean(String(v))); touch(this); });\n"
++"\tfunction mediaList(text) {\n"
++"\t\tvar m = String(text || '').trim(), parts = m ? m.split(/\\s*,\\s*/) : [];\n"
++"\t\tvar o = { mediaText: m, length: parts.length, toString: function () { return m; } };\n"
++"\t\tfor (var i = 0; i < parts.length; i++) o[i] = parts[i];\n"
++"\t\to.item = function (i) { return parts[i] || null; };\n"
++"\t\treturn o;\n"
++"\t}\n"
++"\tgetter(Condition.prototype, 'conditionText', function () { return this._cond; });\n"
++"\tgetter(MediaRule.prototype, 'media', function () { return mediaList(this._cond); });\n"
++"\tgetter(LayerBlock.prototype, 'name', function () { return this._cond; });\n"
++"\tgetter(LayerStatement.prototype, 'nameList', function () { return this._cond.split(/\\s*,\\s*/); });\n"
++"\tgetter(ImportRule.prototype, 'href', function () { return this._href; });\n"
++"\tgetter(ImportRule.prototype, 'media', function () { return mediaList(this._media); });\n"
++"\tgetter(ImportRule.prototype, 'styleSheet', function () { return null; });\n"
++"\tgetter(NamespaceRule.prototype, 'prefix', function () { return this._prefix; });\n"
++"\tgetter(NamespaceRule.prototype, 'namespaceURI', function () { return this._uri; });\n"
++"\tgetter(KeyframesRule.prototype, 'name', function () { return this._name; },\n"
++"\t\tfunction (v) { this._name = String(v); touch(this); });\n"
++"\t[Grouping, KeyframesRule].forEach(function (C) {\n"
++"\t\tgetter(C.prototype, 'cssRules', function () { return this._rules; });\n"
++"\t});\n"
++"\tfunction parseOne(text, sheet, parent, kf) {\n"
++"\t\tvar t = String(text), l = parseList(t, 0, t.length, sheet, parent, kf);\n"
++"\t\tif (l.length !== 1) throw domErr(\"Failed to parse the rule '\" + t + \"'.\", 'SyntaxError');\n"
++"\t\treturn l[0];\n"
++"\t}\n"
++"\tfunction insertInto(owner, list, text, index, sheet, kf) {\n"
++"\t\tindex = index === undefined ? 0 : index >>> 0;\n"
++"\t\tif (index > list.length) throw domErr('The index provided (' + index + ') is larger than the maximum index (' + list.length + ').', 'IndexSizeError');\n"
++"\t\tvar r = parseOne(text, sheet, owner, kf);\n"
++"\t\tlist.splice(index, 0, r);\n"
++"\t\tif (owner) touch(owner); else if (sheet) schedule(sheet);\n"
++"\t\treturn index;\n"
++"\t}\n"
++"\tfunction deleteFrom(owner, list, index, sheet) {\n"
++"\t\tindex = index >>> 0;\n"
++"\t\tif (index >= list.length) throw domErr('The index provided (' + index + ') is outside the range [0, ' + list.length + ').', 'IndexSizeError');\n"
++"\t\tlist.splice(index, 1);\n"
++"\t\tif (owner) touch(owner); else if (sheet) schedule(sheet);\n"
++"\t}\n"
++"\tdefine(Grouping.prototype, 'insertRule', function (t, i) { return insertInto(this, this._rules, t, i, this._sheet, false); });\n"
++"\tdefine(Grouping.prototype, 'deleteRule', function (i) { deleteFrom(this, this._rules, i, this._sheet); });\n"
++"\tdefine(KeyframesRule.prototype, 'appendRule', function (t) { insertInto(this, this._rules, t, this._rules.length, this._sheet, true); });\n"
++"\tdefine(KeyframesRule.prototype, 'findRule', function (k) {\n"
++"\t\tk = keyOf(clean(String(k)));\n"
++"\t\tfor (var i = this._rules.length - 1; i >= 0; i--) if (this._rules[i]._key === k) return this._rules[i];\n"
++"\t\treturn null;\n"
++"\t});\n"
++"\tdefine(KeyframesRule.prototype, 'deleteRule', function (k) {\n"
++"\t\tvar r = this.findRule(k);\n"
++"\t\tif (r) deleteFrom(this, this._rules, this._rules.indexOf(r), this._sheet);\n"
++"\t});\n"
++"\n"
++"\t/* ---- sheets ---- */\n"
++"\tfunction initSheet(sh, owner) {\n"
++"\t\tdefine(sh, '_owner', owner);\n"
++"\t\tdefine(sh, '_rules', listOf([]));\n"
++"\t\tdefine(sh, '_src', null);\n"
++"\t\tdefine(sh, '_pending', false);\n"
++"\t\tdefine(sh, '_disabled', false);\n"
++"\t}\n"
++"\tfunction isStyle(n) { return String(n && (n.localName || n.tagName) || '').toLowerCase() === 'style'; }\n"
++"\tfunction sync(sh) {\n"
++"\t\tvar o = sh._owner;\n"
++"\t\tif (!o || !isStyle(o) || sh._pending) return sh._rules;\n"
++"\t\tvar t = String(o.textContent || '');\n"
++"\t\tif (t !== sh._src) { sh._src = t; sh._rules = parseList(t, 0, t.length, sh, null, false); }\n"
++"\t\treturn sh._rules;\n"
++"\t}\n"
++"\tvar later = typeof g.queueMicrotask === 'function' ? function (f) { g.queueMicrotask(f); }\n"
++"\t\t: function (f) { Promise.resolve().then(f); };\n"
++"\tfunction schedule(sh) {\n"
++"\t\tif (sh._pending || !sh._owner || !isStyle(sh._owner)) return;\n"
++"\t\tsh._pending = true;\n"
++"\t\tlater(function () {\n"
++"\t\t\tsh._pending = false;\n"
++"\t\t\tvar t = sh._rules.map(ruleText).join('\\n');\n"
++"\t\t\tsh._src = t;\n"
++"\t\t\ttry { sh._owner.textContent = t; } catch (e) { /* */ }\n"
++"\t\t\tsh._src = String(sh._owner.textContent || '');\n"
++"\t\t});\n"
++"\t}\n"
++"\tgetter(StyleSheet.prototype, 'type', function () { return 'text/css'; });\n"
++"\tgetter(StyleSheet.prototype, 'ownerNode', function () { return this._owner || null; });\n"
++"\tgetter(StyleSheet.prototype, 'href', function () {\n"
++"\t\tvar o = this._owner;\n"
++"\t\treturn o && !isStyle(o) ? (o.href || o.getAttribute('href') || null) : null;\n"
++"\t});\n"
++"\tgetter(StyleSheet.prototype, 'title', function () {\n"
++"\t\treturn this._owner && this._owner.getAttribute('title') || null;\n"
++"\t});\n"
++"\tgetter(StyleSheet.prototype, 'media', function () {\n"
++"\t\treturn mediaList(this._owner && this._owner.getAttribute('media'));\n"
++"\t});\n"
++"\tgetter(StyleSheet.prototype, 'disabled', function () { return this._disabled; },\n"
++"\t\tfunction (v) { this._disabled = !!v; });\n"
++"\tgetter(StyleSheet.prototype, 'parentStyleSheet', function () { return null; });\n"
++"\tgetter(CSSStyleSheet.prototype, 'ownerRule', function () { return null; });\n"
++"\tgetter(CSSStyleSheet.prototype, 'cssRules', function () { return sync(this); });\n"
++"\tgetter(CSSStyleSheet.prototype, 'rules', function () { return sync(this); });\n"
++"\tdefine(CSSStyleSheet.prototype, 'insertRule', function (t, i) {\n"
++"\t\treturn insertInto(null, sync(this), t, i, this, false);\n"
++"\t});\n"
++"\tdefine(CSSStyleSheet.prototype, 'deleteRule', function (i) { deleteFrom(null, sync(this), i, this); });\n"
++"\tdefine(CSSStyleSheet.prototype, 'addRule', function (sel, style, i) {\n"
++"\t\tvar l = sync(this);\n"
++"\t\tinsertInto(null, l, sel + ' { ' + (style || '') + ' }', i === undefined ? l.length : i, this, false);\n"
++"\t\treturn -1;\n"
++"\t});\n"
++"\tdefine(CSSStyleSheet.prototype, 'removeRule', function (i) { deleteFrom(null, sync(this), i || 0, this); });\n"
++"\n"
++"\t/* one sheet per owner, kept on the element (it points back at it) */\n"
++"\tfunction sheetOf(n) {\n"
++"\t\tvar sh = n.__vbSheet;\n"
++"\t\tif (!sh) {\n"
++"\t\t\tsh = Object.create(CSSStyleSheet.prototype);\n"
++"\t\t\tinitSheet(sh, n);\n"
++"\t\t\ttry { define(n, '__vbSheet', sh); } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\treturn sh;\n"
++"\t}\n"
++"\tfunction isSheetOwner(n) {\n"
++"\t\tvar t = String(n && (n.localName || n.tagName) || '').toLowerCase();\n"
++"\t\tif (t === 'style') return true;\n"
++"\t\treturn t === 'link' && /(^|\\s)stylesheet(\\s|$)/i.test(n.getAttribute('rel') || '');\n"
++"\t}\n"
++"\tObject.defineProperty(d, 'styleSheets', { configurable: true, enumerable: true, get: function () {\n"
++"\t\tvar out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');\n"
++"\t\tfor (var i = 0; i < ls.length; i++) out.push(sheetOf(ls[i]));\n"
++"\t\treturn listOf(out);\n"
++"\t} });\n"
++"\tvar E = Object.getPrototypeOf(d.createElement('section'));\n"
++"\tif (E && !('sheet' in E))\n"
++"\t\tObject.defineProperty(E, 'sheet', { configurable: true, get: function () {\n"
++"\t\t\treturn isSheetOwner(this) && d.documentElement && d.documentElement.contains(this) ? sheetOf(this) : null;\n"
++"\t\t} });\n"
++"})();\n"
++"\n"
+ "/* ---- the DOM surface a census found missing (2026-09-26) ---------------\n"
+ " * parentElement (!), innerText, localName, the reflected attributes, the\n"
+ " * form-control API, text-node odds, document helpers, window\n"
+@@ -1909,9 +2416,79 @@
+ "\t\t\tt === 'use' || t === 'symbol' || t === 'defs' || t === 'polygon' || t === 'line')\n"
+ "\t\t\t? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';\n"
+ "\t});\n"
+-"\tacc(E, 'innerText', function () { return this.textContent; },\n"
++"\t/* innerText is the RENDERED text, not textContent: <script>,\n"
++"\t * <style>, <template>, <noscript> and [hidden] / display:none\n"
++"\t * subtrees are left out, a block box starts and ends a line, <br>\n"
++"\t * breaks one, a <p> is set off by a blank line, table cells by tabs,\n"
++"\t * and white space collapses outside <pre>/<textarea> (the HTML\n"
++"\t * \"rendered text collection steps\", in brief). google.com keeps its\n"
++"\t * <style> blocks in <body>: its innerText was 30 KB of CSS. */\n"
++"\tvar IT_SKIP = /^(SCRIPT|STYLE|TEMPLATE|NOSCRIPT|HEAD|TITLE|META|LINK|BASE|IFRAME|VIDEO|AUDIO|CANVAS|MAP|DATALIST)$/;\n"
++"\tvar IT_BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|CENTER|DD|DETAILS|DIALOG|DIR|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HGROUP|HR|LEGEND|LI|MAIN|MENU|NAV|OL|P|PRE|SECTION|SUMMARY|TABLE|CAPTION|TBODY|THEAD|TFOOT|TR|UL|BODY|HTML)$/;\n"
++"\tvar IT_BLOCKDISP = /^(block|list-item|table|flex|grid|flow-root|table-row|table-caption|table-row-group|table-header-group|table-footer-group)$/;\n"
++"\t/* the element's display from its box; null: it has no box -- it or\n"
++"\t * an ancestor is display:none (the bridge's getComputedStyle has no\n"
++"\t * cascade for a boxless element, so it cannot say \"none\" itself) */\n"
++"\tfunction itDisplay(el) {\n"
++"\t\ttry {\n"
++"\t\t\tvar nat = g.__gcsNative;\n"
++"\t\t\tif (typeof nat === 'function') {\n"
++"\t\t\t\tvar o = nat(el);\n"
++"\t\t\t\treturn o && o.display ? String(o.display) : null;\n"
++"\t\t\t}\n"
++"\t\t\tvar f = g.getComputedStyle, v = f && f(el).display;\n"
++"\t\t\tif (v) return String(v);\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t\treturn '';\n"
++"\t}\n"
++"\tfunction renderedText(root) {\n"
++"\t\tvar s = '', pend = 0, rd = itDisplay(root), boxed = rd !== null;\n"
++"\t\tfunction put(t, pre) {\n"
++"\t\t\tif (!t) return;\n"
++"\t\t\tif (!pre) {\n"
++"\t\t\t\tt = t.replace(/[ \\t\\n\\r\\f]+/g, ' ');\n"
++"\t\t\t\tif (t === ' ' && (s === '' || /[ \\n]$/.test(s) || pend)) return;\n"
++"\t\t\t}\n"
++"\t\t\tif (pend) {\n"
++"\t\t\t\tif (s !== '') s = s.replace(/ +$/, '') + (pend > 1 ? '\\n\\n' : '\\n');\n"
++"\t\t\t\tpend = 0;\n"
++"\t\t\t}\n"
++"\t\t\tif (!pre && (s === '' || /[ \\n]$/.test(s))) t = t.replace(/^ /, '');\n"
++"\t\t\ts += t;\n"
++"\t\t}\n"
++"\t\tfunction walk(n, pre) {\n"
++"\t\t\tvar ch = n.childNodes, i, c, tag, d, block, cell;\n"
++"\t\t\tfor (i = 0; ch && i < ch.length; i++) {\n"
++"\t\t\t\tc = ch[i];\n"
++"\t\t\t\tif (c.nodeType === 3) { put(String(c.data), pre); continue; }\n"
++"\t\t\t\tif (c.nodeType !== 1) continue;\n"
++"\t\t\t\ttag = String(c.tagName || '').toUpperCase();\n"
++"\t\t\t\tif (IT_SKIP.test(tag) || (c.hasAttribute && c.hasAttribute('hidden'))) continue;\n"
++"\t\t\t\tif (tag === 'BR') { pend = 0; s = s.replace(/ +$/, '') + '\\n'; continue; }\n"
++"\t\t\t\t/* no box under a laid-out root: not rendered; with\n"
++"\t\t\t\t * no layout to ask, go by tag */\n"
++"\t\t\t\td = boxed ? itDisplay(c) : '';\n"
++"\t\t\t\tif (d === null || d === 'none') continue;\n"
++"\t\t\t\tblock = d ? IT_BLOCKDISP.test(d) : IT_BLOCK.test(tag);\n"
++"\t\t\t\tcell = d ? d === 'table-cell' : (tag === 'TD' || tag === 'TH');\n"
++"\t\t\t\tif (tag === 'P') pend = Math.max(pend, s === '' ? 0 : 2);\n"
++"\t\t\t\telse if (block && s !== '') pend = Math.max(pend, 1);\n"
++"\t\t\t\twalk(c, pre || tag === 'PRE' || tag === 'TEXTAREA');\n"
++"\t\t\t\tif (tag === 'P') pend = Math.max(pend, 2);\n"
++"\t\t\t\telse if (block) pend = Math.max(pend, 1);\n"
++"\t\t\t\tif (cell) {\n"
++"\t\t\t\t\tvar nx = c.nextElementSibling;\n"
++"\t\t\t\t\tif (nx && /^(TD|TH)$/.test(String(nx.tagName).toUpperCase())) put('\\t', true);\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tif (rd === 'none') return String(root.textContent || '');\n"
++"\t\twalk(root, String(root.tagName || '').toUpperCase() === 'PRE');\n"
++"\t\treturn s.replace(/ +$/, '');\n"
++"\t}\n"
++"\tacc(E, 'innerText', function () { return renderedText(this); },\n"
+ "\t\tfunction (v) { this.textContent = v; });\n"
+-"\tacc(E, 'outerText', function () { return this.textContent; });\n"
++"\tacc(E, 'outerText', function () { return renderedText(this); });\n"
+ "\tacc(E, 'clientTop', function () { return 0; });\n"
+ "\tacc(E, 'clientLeft', function () { return 0; });\n"
+ "\tacc(E, 'shadowRoot', function () { return null; });\n"
+@@ -2075,14 +2652,7 @@
+ "\t * and left currentScript null for every script. */\n"
+ "\tacc(d, 'currentScript', function () { return d.__vbCurrentScript || null; },\n"
+ "\t\tfunction (v) { d.__vbCurrentScript = v || null; });\n"
+-"\tacc(d, 'styleSheets', function () {\n"
+-"\t\tvar out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');\n"
+-"\t\tfor (var i = 0; i < ls.length; i++)\n"
+-"\t\t\tout.push({ ownerNode: ls[i], href: ls[i].href || null, disabled: false,\n"
+-"\t\t\t\tcssRules: [], rules: [], media: { mediaText: ls[i].media || '' },\n"
+-"\t\t\t\tinsertRule: function () { return 0; }, deleteRule: function () {} });\n"
+-"\t\treturn out;\n"
+-"\t});\n"
++"\t/* document.styleSheets: the CSSOM section above */\n"
+ "\tvar adopted = [];\n"
+ "\tacc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });\n"
+ "\t/* document.compareDocumentPosition / contains: elements had them,\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 862067c..3d3a856 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -13,6 +13,43 @@ function define(obj, name, value) {
+ 		configurable: true, enumerable: false });
+ }
+ 
++/* ---- DOMException ------------------------------------------------------
++ * The bridge's is an empty stub (macsurf_qjs.c's list of constructors),
++ * so `new DOMException(msg, 'AbortError')` -- this file makes several --
++ * had no name, message or code, and `e.name === 'AbortError'` tests
++ * failed. Replaced only when the one there loses its name. */
++(function () {
++	var have = g.DOMException, ok = false;
++	try { ok = typeof have === 'function' && new have('m', 'SyntaxError').name === 'SyntaxError'; } catch (e) { /* */ }
++	if (ok) return;
++	var codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
++		InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
++		NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11, SyntaxError: 12,
++		InvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15,
++		TypeMismatchError: 17, SecurityError: 18, NetworkError: 19, AbortError: 20,
++		URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
++		InvalidNodeTypeError: 24, DataCloneError: 25 };
++	function DOMException(message, name) {
++		if (!(this instanceof DOMException))
++			throw new TypeError("Constructor DOMException requires 'new'");
++		var n = name === undefined ? 'Error' : String(name);
++		define(this, 'message', message === undefined ? '' : String(message));
++		define(this, 'name', n);
++		define(this, 'code', codes[n] || 0);
++		try { define(this, 'stack', new Error(this.message).stack); } catch (e) { /* */ }
++	}
++	DOMException.prototype = Object.create(Error.prototype);
++	define(DOMException.prototype, 'constructor', DOMException);
++	try { Object.defineProperty(DOMException.prototype, Symbol.toStringTag, { value: 'DOMException', configurable: true }); } catch (e) { /* */ }
++	define(DOMException.prototype, 'toString', function () { return this.name + ': ' + this.message; });
++	Object.keys(codes).forEach(function (k) {
++		var c = k.replace(/Error$/, '').replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase() + '_ERR';
++		DOMException[c] = codes[k];
++		DOMException.prototype[c] = codes[k];
++	});
++	define(g, 'DOMException', DOMException);
++})();
++
+ /* ---- URLSearchParams (WHATWG URL section 6) ---------------------------------- */
+ 
+ function formDecode(s) {
+@@ -1859,6 +1896,476 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ })();
+ 
++/* ---- CSSOM: document.styleSheets, cssRules, insertRule ------------------
++ * The bridge gave document.styleSheets as fresh objects with cssRules
++ * always [] and insertRule a no-op. Google installs each module's CSS in a
++ * <style> and checks that the sheet's last rule is its `sentinel` rule
++ * (error "oc" on every module), and CSS-in-JS libraries (emotion,
++ * styled-components, JSS) that add rules with insertRule got no styling at
++ * all. Each <style> now has one sheet whose rules are parsed from its text
++ * on demand; insertRule / deleteRule / rule.style edits are kept in the
++ * sheet and written back as the element's text once per microtask, which
++ * the engine restyles like any script edit of a <style>. <link> sheets
++ * keep an empty rule list (the engine holds their text, not the page). */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++
++	function klass(name, parent, ctor) {
++		var F = ctor || function () { throw new TypeError('Illegal constructor'); };
++		try { Object.defineProperty(F, 'name', { value: name }); } catch (e) { /* */ }
++		F.prototype = Object.create(parent ? parent.prototype : Object.prototype);
++		Object.defineProperty(F.prototype, 'constructor', { value: F, writable: true, configurable: true });
++		try { Object.defineProperty(F.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }
++		define(g, name, F);
++		return F;
++	}
++	function getter(o, n, get, set) {
++		Object.defineProperty(o, n, { get: get, set: set, configurable: true, enumerable: true });
++	}
++	function domErr(msg, name) {
++		try { return new g.DOMException(msg, name); } catch (e) { var x = new Error(msg); x.name = name; return x; }
++	}
++
++	var CSSRule = klass('CSSRule', null);
++	var K = { STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5,
++		PAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, NAMESPACE_RULE: 10, SUPPORTS_RULE: 12 };
++	Object.keys(K).forEach(function (k) { CSSRule[k] = K[k]; CSSRule.prototype[k] = K[k]; });
++	var Grouping = klass('CSSGroupingRule', CSSRule);
++	var Condition = klass('CSSConditionRule', Grouping);
++	var StyleRule = klass('CSSStyleRule', CSSRule);
++	var MediaRule = klass('CSSMediaRule', Condition);
++	var SupportsRule = klass('CSSSupportsRule', Condition);
++	var ImportRule = klass('CSSImportRule', CSSRule);
++	var FontFaceRule = klass('CSSFontFaceRule', CSSRule);
++	var PageRule = klass('CSSPageRule', Grouping);
++	var KeyframesRule = klass('CSSKeyframesRule', CSSRule);
++	var KeyframeRule = klass('CSSKeyframeRule', CSSRule);
++	var NamespaceRule = klass('CSSNamespaceRule', CSSRule);
++	var LayerBlock = klass('CSSLayerBlockRule', Grouping);
++	var LayerStatement = klass('CSSLayerStatementRule', CSSRule);
++	var ContainerRule = klass('CSSContainerRule', Condition);
++	var StyleSheet = klass('StyleSheet', null);
++	var CSSStyleSheet = klass('CSSStyleSheet', StyleSheet, function CSSStyleSheet() {
++		if (!(this instanceof CSSStyleSheet)) throw new TypeError("Constructor CSSStyleSheet requires 'new'");
++		initSheet(this, null);
++	});
++	var DeclBase = typeof g.CSSStyleDeclaration === 'function' ? g.CSSStyleDeclaration : null;
++
++	/* ---- parsing: a brace/string/comment-aware scan, no tokenizer ---- */
++	var TOK = /["'{}()\[\];\\]|\/\*/g;
++	function skipStr(s, i, q) {
++		for (i++; i < s.length; i++) {
++			var c = s.charCodeAt(i);
++			if (c === 92) i++;
++			else if (c === q || c === 10) return i + 1;
++		}
++		return s.length;
++	}
++	/* first depth-0 '{' ';' or '}' at or after i (end if none) */
++	function stopAt(s, i, end) {
++		var depth = 0, m;
++		TOK.lastIndex = i;
++		while ((m = TOK.exec(s)) && m.index < end) {
++			var k = m.index, c = s.charCodeAt(k);
++			if (c === 34 || c === 39) { TOK.lastIndex = skipStr(s, k, c); continue; }
++			if (c === 47) { var e = s.indexOf('*/', k + 2); TOK.lastIndex = e < 0 ? s.length : e + 2; continue; }
++			if (c === 92) { TOK.lastIndex = k + 2; continue; }
++			if (c === 40 || c === 91) depth++;
++			else if (c === 41 || c === 93) { if (depth > 0) depth--; }
++			else if (depth === 0) return k;
++		}
++		return end;
++	}
++	/* s[i] is '{': index just past its matching '}' (end if unclosed) */
++	function closeOf(s, i, end) {
++		var depth = 0, m;
++		TOK.lastIndex = i;
++		while ((m = TOK.exec(s)) && m.index < end) {
++			var k = m.index, c = s.charCodeAt(k);
++			if (c === 34 || c === 39) { TOK.lastIndex = skipStr(s, k, c); continue; }
++			if (c === 47) { var e = s.indexOf('*/', k + 2); TOK.lastIndex = e < 0 ? s.length : e + 2; continue; }
++			if (c === 92) { TOK.lastIndex = k + 2; continue; }
++			if (c === 123) depth++;
++			else if (c === 125 && --depth === 0) return k + 1;
++		}
++		return end;
++	}
++	function clean(t) {
++		return t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\s+/g, ' ').trim();
++	}
++	var SKIP = /(?:\s+|\/\*[\s\S]*?(?:\*\/|$)|<!--|-->)+/y;
++	function parseList(s, i, end, sheet, parent, kf) {
++		var out = [];
++		while (i < end) {
++			SKIP.lastIndex = i;
++			if (SKIP.test(s)) i = SKIP.lastIndex;
++			if (i >= end) break;
++			var c = s.charCodeAt(i);
++			if (c === 59 || c === 125) { i++; continue; }
++			var stop = stopAt(s, i, end), prelude = clean(s.slice(i, stop));
++			if (stop >= end || s.charCodeAt(stop) !== 123) {
++				/* a statement (@import ...;) -- anything else without a block is dropped */
++				if (prelude.charAt(0) === '@') {
++					var st = makeRule(prelude, null, 0, 0, sheet, parent, false);
++					if (st) { st._text = prelude + ';'; out.push(st); }
++				}
++				i = stop + 1;
++				continue;
++			}
++			var close = closeOf(s, stop, end);
++			var r = makeRule(prelude, s, stop + 1, s.charCodeAt(close - 1) === 125 ? close - 1 : close,
++				sheet, parent, kf);
++			if (r) { r._text = s.slice(i, close).trim(); out.push(r); }
++			i = close;
++		}
++		return listOf(out);
++	}
++	function listOf(a) {
++		define(a, 'item', function (i) { return this[i] || null; });
++		return a;
++	}
++	function base(C, type, sheet, parent) {
++		var r = Object.create(C.prototype);
++		define(r, '_sheet', sheet); define(r, '_parent', parent);
++		define(r, '_text', ''); define(r, '_dirty', false);
++		define(r, 'type', type);
++		return r;
++	}
++	/* keyText reads "0%" / "100%" for from / to, as in browsers */
++	function keyOf(k) {
++		return k.split(/\s*,\s*/).map(function (x) {
++			x = x.toLowerCase();
++			return x === 'from' ? '0%' : x === 'to' ? '100%' : x;
++		}).join(', ');
++	}
++	function makeRule(prelude, s, b0, b1, sheet, parent, kf) {
++		var r, at = /^@(-[a-z]+-)?([a-z-]+)\s*/i.exec(prelude), name = at ? at[2].toLowerCase() : '',
++			rest = at ? prelude.slice(at[0].length) : '';
++		if (kf) {
++			r = base(KeyframeRule, 8, sheet, parent);
++			define(r, '_key', keyOf(prelude));
++			define(r, '_body', s.slice(b0, b1));
++			return r;
++		}
++		if (!at) {
++			r = base(StyleRule, 1, sheet, parent);
++			/* "a ,b" reads back as "a, b", as browsers serialize it */
++			define(r, '_sel', /["']/.test(prelude) ? prelude : prelude.replace(/\s*,\s*/g, ', '));
++			define(r, '_body', s.slice(b0, b1));
++			return r;
++		}
++		if (s === null) {
++			if (name === 'import') {
++				r = base(ImportRule, 3, sheet, parent);
++				var h = /^(?:url\(\s*)?(["']?)([^"')\s]*)\1\s*\)?\s*/.exec(rest);
++				define(r, '_href', h ? h[2] : '');
++				define(r, '_media', rest.slice(h ? h[0].length : 0));
++				return r;
++			}
++			if (name === 'namespace') {
++				r = base(NamespaceRule, 10, sheet, parent);
++				var ns = /^(?:([^\s"'(]+)\s+)?(?:url\(\s*)?(["']?)([^"')\s]*)\2/.exec(rest);
++				define(r, '_prefix', ns && ns[1] || ''); define(r, '_uri', ns ? ns[3] : '');
++				return r;
++			}
++			if (name === 'charset') return null;
++			if (name === 'layer') { r = base(LayerStatement, 0, sheet, parent); define(r, '_cond', rest); return r; }
++			return null;
++		}
++		switch (name) {
++		case 'media': r = base(MediaRule, 4, sheet, parent); break;
++		case 'supports': r = base(SupportsRule, 12, sheet, parent); break;
++		case 'container': r = base(ContainerRule, 0, sheet, parent); break;
++		case 'layer': r = base(LayerBlock, 0, sheet, parent); break;
++		case 'document': case 'scope': case 'starting-style': r = base(Grouping, 0, sheet, parent); break;
++		case 'keyframes':
++			r = base(KeyframesRule, 7, sheet, parent);
++			define(r, '_name', rest);
++			define(r, '_rules', parseList(s, b0, b1, sheet, r, true));
++			return r;
++		case 'font-face':
++			r = base(FontFaceRule, 5, sheet, parent);
++			define(r, '_body', s.slice(b0, b1));
++			return r;
++		case 'page':
++			r = base(PageRule, 6, sheet, parent);
++			define(r, '_sel', rest);
++			define(r, '_body', s.slice(b0, b1));
++			define(r, '_rules', listOf([]));
++			return r;
++		default: return null;
++		}
++		define(r, '_at', prelude.slice(0, at[0].length).trim());
++		define(r, '_cond', rest);
++		define(r, '_rules', parseList(s, b0, b1, sheet, r, false));
++		return r;
++	}
++
++	/* ---- declarations ---- */
++	function parseDecls(body) {
++		var out = [], i = 0, n = body.length;
++		while (i < n) {
++			var semi = stopAt(body, i, n);
++			if (semi < n && body.charCodeAt(semi) === 123) semi = closeOf(body, semi, n); /* nested rule: skip */
++			var part = body.slice(i, semi), colon = part.indexOf(':');
++			i = semi + 1;
++			if (colon < 0) continue;
++			var name = clean(part.slice(0, colon)), value = clean(part.slice(colon + 1)), imp = false;
++			var bang = /\s*!\s*important$/i.exec(value);
++			if (bang) { imp = true; value = value.slice(0, bang.index); }
++			if (!name || name.indexOf('{') >= 0) continue;
++			if (name.slice(0, 2) !== '--') name = name.toLowerCase();
++			for (var k = 0; k < out.length; k++) if (out[k][0] === name) { out.splice(k, 1); break; }
++			out.push([name, value, imp]);
++		}
++		return out;
++	}
++	function hyphen(p) {
++		if (p === 'cssFloat') return 'float';
++		return p.replace(/[A-Z]/g, function (m) { return '-' + m.toLowerCase(); }).replace(/^(webkit|moz|ms)-/, '-$1-');
++	}
++	function Decl(rule) {
++		define(this, '_rule', rule);
++		define(this, '_list', null);
++	}
++	Decl.prototype = Object.create(DeclBase ? DeclBase.prototype : Object.prototype);
++	function decls(o) {
++		if (!o._list) o._list = parseDecls(o._rule._body || '');
++		return o._list;
++	}
++	function touch(rule) {
++		for (var r = rule; r; r = r._parent) r._dirty = true;
++		if (rule._sheet) schedule(rule._sheet);
++	}
++	Object.defineProperties(Decl.prototype, {
++		length: { get: function () { return decls(this).length; }, configurable: true },
++		cssText: {
++			get: function () {
++				return decls(this).map(function (e) {
++					return e[0] + ': ' + e[1] + (e[2] ? ' !important' : '') + ';';
++				}).join(' ');
++			},
++			set: function (v) { this._list = parseDecls(String(v)); touch(this._rule); },
++			configurable: true
++		},
++		parentRule: { get: function () { return this._rule; }, configurable: true }
++	});
++	define(Decl.prototype, 'item', function (i) { var e = decls(this)[i]; return e ? e[0] : ''; });
++	define(Decl.prototype, 'getPropertyValue', function (n) {
++		n = String(n); if (n.slice(0, 2) !== '--') n = n.toLowerCase();
++		var l = decls(this);
++		for (var i = 0; i < l.length; i++) if (l[i][0] === n) return l[i][1];
++		return '';
++	});
++	define(Decl.prototype, 'getPropertyPriority', function (n) {
++		var l = decls(this);
++		for (var i = 0; i < l.length; i++) if (l[i][0] === n) return l[i][2] ? 'important' : '';
++		return '';
++	});
++	define(Decl.prototype, 'setProperty', function (n, v, p) {
++		n = String(n); if (n.slice(0, 2) !== '--') n = n.toLowerCase();
++		if (v === null || v === undefined || String(v) === '') { this.removeProperty(n); return; }
++		var l = decls(this), e = [n, String(v).trim(), String(p || '').toLowerCase() === 'important'];
++		for (var i = 0; i < l.length; i++) if (l[i][0] === n) { l[i] = e; touch(this._rule); return; }
++		l.push(e);
++		touch(this._rule);
++	});
++	define(Decl.prototype, 'removeProperty', function (n) {
++		var l = decls(this);
++		for (var i = 0; i < l.length; i++) if (l[i][0] === n) {
++			var old = l[i][1];
++			l.splice(i, 1);
++			touch(this._rule);
++			return old;
++		}
++		return '';
++	});
++	function styleOf(r) {
++		if (!r._style) {
++			var o = new Decl(r);
++			/* rule.style.color = ... (camelCase), where Proxy exists */
++			if (typeof Proxy === 'function')
++				o = new Proxy(o, {
++					get: function (t, k) {
++						if (typeof k !== 'string' || k in t) return t[k];
++						if (/^\d+$/.test(k)) return t.item(+k);
++						return t.getPropertyValue(hyphen(k));
++					},
++					set: function (t, k, v) {
++						if (typeof k !== 'string' || k in t) { t[k] = v; return true; }
++						t.setProperty(hyphen(k), v);
++						return true;
++					}
++				});
++			define(r, '_style', o);
++		}
++		return r._style;
++	}
++
++	/* ---- rule surfaces ---- */
++	getter(CSSRule.prototype, 'parentStyleSheet', function () { return this._sheet || null; });
++	getter(CSSRule.prototype, 'parentRule', function () { return this._parent || null; });
++	getter(CSSRule.prototype, 'cssText', function () { return ruleText(this); }, function () { /* ignored, as in browsers */ });
++	function ruleText(r) {
++		if (!r._dirty && r._text) return r._text;
++		switch (r.type) {
++		case 1: return r._sel + ' { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';
++		case 8: return r._key + ' { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';
++		case 5: return '@font-face { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';
++		case 7: return '@keyframes ' + r._name + ' {\n' + r._rules.map(ruleText).join('\n') + '\n}';
++		}
++		if (r._rules) return (r._at + ' ' + r._cond).trim() + ' {\n' + r._rules.map(ruleText).join('\n') + '\n}';
++		return r._text;
++	}
++	getter(StyleRule.prototype, 'selectorText', function () { return this._sel; },
++		function (v) { v = clean(String(v)); if (v) { this._sel = v; touch(this); } });
++	[StyleRule, FontFaceRule, PageRule, KeyframeRule].forEach(function (C) {
++		getter(C.prototype, 'style', function () { return styleOf(this); },
++			function (v) { styleOf(this).cssText = v; });
++	});
++	getter(PageRule.prototype, 'selectorText', function () { return this._sel; });
++	getter(KeyframeRule.prototype, 'keyText', function () { return this._key; },
++		function (v) { this._key = keyOf(clean(String(v))); touch(this); });
++	function mediaList(text) {
++		var m = String(text || '').trim(), parts = m ? m.split(/\s*,\s*/) : [];
++		var o = { mediaText: m, length: parts.length, toString: function () { return m; } };
++		for (var i = 0; i < parts.length; i++) o[i] = parts[i];
++		o.item = function (i) { return parts[i] || null; };
++		return o;
++	}
++	getter(Condition.prototype, 'conditionText', function () { return this._cond; });
++	getter(MediaRule.prototype, 'media', function () { return mediaList(this._cond); });
++	getter(LayerBlock.prototype, 'name', function () { return this._cond; });
++	getter(LayerStatement.prototype, 'nameList', function () { return this._cond.split(/\s*,\s*/); });
++	getter(ImportRule.prototype, 'href', function () { return this._href; });
++	getter(ImportRule.prototype, 'media', function () { return mediaList(this._media); });
++	getter(ImportRule.prototype, 'styleSheet', function () { return null; });
++	getter(NamespaceRule.prototype, 'prefix', function () { return this._prefix; });
++	getter(NamespaceRule.prototype, 'namespaceURI', function () { return this._uri; });
++	getter(KeyframesRule.prototype, 'name', function () { return this._name; },
++		function (v) { this._name = String(v); touch(this); });
++	[Grouping, KeyframesRule].forEach(function (C) {
++		getter(C.prototype, 'cssRules', function () { return this._rules; });
++	});
++	function parseOne(text, sheet, parent, kf) {
++		var t = String(text), l = parseList(t, 0, t.length, sheet, parent, kf);
++		if (l.length !== 1) throw domErr("Failed to parse the rule '" + t + "'.", 'SyntaxError');
++		return l[0];
++	}
++	function insertInto(owner, list, text, index, sheet, kf) {
++		index = index === undefined ? 0 : index >>> 0;
++		if (index > list.length) throw domErr('The index provided (' + index + ') is larger than the maximum index (' + list.length + ').', 'IndexSizeError');
++		var r = parseOne(text, sheet, owner, kf);
++		list.splice(index, 0, r);
++		if (owner) touch(owner); else if (sheet) schedule(sheet);
++		return index;
++	}
++	function deleteFrom(owner, list, index, sheet) {
++		index = index >>> 0;
++		if (index >= list.length) throw domErr('The index provided (' + index + ') is outside the range [0, ' + list.length + ').', 'IndexSizeError');
++		list.splice(index, 1);
++		if (owner) touch(owner); else if (sheet) schedule(sheet);
++	}
++	define(Grouping.prototype, 'insertRule', function (t, i) { return insertInto(this, this._rules, t, i, this._sheet, false); });
++	define(Grouping.prototype, 'deleteRule', function (i) { deleteFrom(this, this._rules, i, this._sheet); });
++	define(KeyframesRule.prototype, 'appendRule', function (t) { insertInto(this, this._rules, t, this._rules.length, this._sheet, true); });
++	define(KeyframesRule.prototype, 'findRule', function (k) {
++		k = keyOf(clean(String(k)));
++		for (var i = this._rules.length - 1; i >= 0; i--) if (this._rules[i]._key === k) return this._rules[i];
++		return null;
++	});
++	define(KeyframesRule.prototype, 'deleteRule', function (k) {
++		var r = this.findRule(k);
++		if (r) deleteFrom(this, this._rules, this._rules.indexOf(r), this._sheet);
++	});
++
++	/* ---- sheets ---- */
++	function initSheet(sh, owner) {
++		define(sh, '_owner', owner);
++		define(sh, '_rules', listOf([]));
++		define(sh, '_src', null);
++		define(sh, '_pending', false);
++		define(sh, '_disabled', false);
++	}
++	function isStyle(n) { return String(n && (n.localName || n.tagName) || '').toLowerCase() === 'style'; }
++	function sync(sh) {
++		var o = sh._owner;
++		if (!o || !isStyle(o) || sh._pending) return sh._rules;
++		var t = String(o.textContent || '');
++		if (t !== sh._src) { sh._src = t; sh._rules = parseList(t, 0, t.length, sh, null, false); }
++		return sh._rules;
++	}
++	var later = typeof g.queueMicrotask === 'function' ? function (f) { g.queueMicrotask(f); }
++		: function (f) { Promise.resolve().then(f); };
++	function schedule(sh) {
++		if (sh._pending || !sh._owner || !isStyle(sh._owner)) return;
++		sh._pending = true;
++		later(function () {
++			sh._pending = false;
++			var t = sh._rules.map(ruleText).join('\n');
++			sh._src = t;
++			try { sh._owner.textContent = t; } catch (e) { /* */ }
++			sh._src = String(sh._owner.textContent || '');
++		});
++	}
++	getter(StyleSheet.prototype, 'type', function () { return 'text/css'; });
++	getter(StyleSheet.prototype, 'ownerNode', function () { return this._owner || null; });
++	getter(StyleSheet.prototype, 'href', function () {
++		var o = this._owner;
++		return o && !isStyle(o) ? (o.href || o.getAttribute('href') || null) : null;
++	});
++	getter(StyleSheet.prototype, 'title', function () {
++		return this._owner && this._owner.getAttribute('title') || null;
++	});
++	getter(StyleSheet.prototype, 'media', function () {
++		return mediaList(this._owner && this._owner.getAttribute('media'));
++	});
++	getter(StyleSheet.prototype, 'disabled', function () { return this._disabled; },
++		function (v) { this._disabled = !!v; });
++	getter(StyleSheet.prototype, 'parentStyleSheet', function () { return null; });
++	getter(CSSStyleSheet.prototype, 'ownerRule', function () { return null; });
++	getter(CSSStyleSheet.prototype, 'cssRules', function () { return sync(this); });
++	getter(CSSStyleSheet.prototype, 'rules', function () { return sync(this); });
++	define(CSSStyleSheet.prototype, 'insertRule', function (t, i) {
++		return insertInto(null, sync(this), t, i, this, false);
++	});
++	define(CSSStyleSheet.prototype, 'deleteRule', function (i) { deleteFrom(null, sync(this), i, this); });
++	define(CSSStyleSheet.prototype, 'addRule', function (sel, style, i) {
++		var l = sync(this);
++		insertInto(null, l, sel + ' { ' + (style || '') + ' }', i === undefined ? l.length : i, this, false);
++		return -1;
++	});
++	define(CSSStyleSheet.prototype, 'removeRule', function (i) { deleteFrom(null, sync(this), i || 0, this); });
++
++	/* one sheet per owner, kept on the element (it points back at it) */
++	function sheetOf(n) {
++		var sh = n.__vbSheet;
++		if (!sh) {
++			sh = Object.create(CSSStyleSheet.prototype);
++			initSheet(sh, n);
++			try { define(n, '__vbSheet', sh); } catch (e) { /* */ }
++		}
++		return sh;
++	}
++	function isSheetOwner(n) {
++		var t = String(n && (n.localName || n.tagName) || '').toLowerCase();
++		if (t === 'style') return true;
++		return t === 'link' && /(^|\s)stylesheet(\s|$)/i.test(n.getAttribute('rel') || '');
++	}
++	Object.defineProperty(d, 'styleSheets', { configurable: true, enumerable: true, get: function () {
++		var out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');
++		for (var i = 0; i < ls.length; i++) out.push(sheetOf(ls[i]));
++		return listOf(out);
++	} });
++	var E = Object.getPrototypeOf(d.createElement('section'));
++	if (E && !('sheet' in E))
++		Object.defineProperty(E, 'sheet', { configurable: true, get: function () {
++			return isSheetOwner(this) && d.documentElement && d.documentElement.contains(this) ? sheetOf(this) : null;
++		} });
++})();
++
+ /* ---- the DOM surface a census found missing (2026-09-26) ---------------
+  * parentElement (!), innerText, localName, the reflected attributes, the
+  * form-control API, text-node odds, document helpers, window
+@@ -1908,9 +2415,79 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			t === 'use' || t === 'symbol' || t === 'defs' || t === 'polygon' || t === 'line')
+ 			? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';
+ 	});
+-	acc(E, 'innerText', function () { return this.textContent; },
++	/* innerText is the RENDERED text, not textContent: <script>,
++	 * <style>, <template>, <noscript> and [hidden] / display:none
++	 * subtrees are left out, a block box starts and ends a line, <br>
++	 * breaks one, a <p> is set off by a blank line, table cells by tabs,
++	 * and white space collapses outside <pre>/<textarea> (the HTML
++	 * "rendered text collection steps", in brief). google.com keeps its
++	 * <style> blocks in <body>: its innerText was 30 KB of CSS. */
++	var IT_SKIP = /^(SCRIPT|STYLE|TEMPLATE|NOSCRIPT|HEAD|TITLE|META|LINK|BASE|IFRAME|VIDEO|AUDIO|CANVAS|MAP|DATALIST)$/;
++	var IT_BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|CENTER|DD|DETAILS|DIALOG|DIR|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HGROUP|HR|LEGEND|LI|MAIN|MENU|NAV|OL|P|PRE|SECTION|SUMMARY|TABLE|CAPTION|TBODY|THEAD|TFOOT|TR|UL|BODY|HTML)$/;
++	var IT_BLOCKDISP = /^(block|list-item|table|flex|grid|flow-root|table-row|table-caption|table-row-group|table-header-group|table-footer-group)$/;
++	/* the element's display from its box; null: it has no box -- it or
++	 * an ancestor is display:none (the bridge's getComputedStyle has no
++	 * cascade for a boxless element, so it cannot say "none" itself) */
++	function itDisplay(el) {
++		try {
++			var nat = g.__gcsNative;
++			if (typeof nat === 'function') {
++				var o = nat(el);
++				return o && o.display ? String(o.display) : null;
++			}
++			var f = g.getComputedStyle, v = f && f(el).display;
++			if (v) return String(v);
++		} catch (e) { /* */ }
++		return '';
++	}
++	function renderedText(root) {
++		var s = '', pend = 0, rd = itDisplay(root), boxed = rd !== null;
++		function put(t, pre) {
++			if (!t) return;
++			if (!pre) {
++				t = t.replace(/[ \t\n\r\f]+/g, ' ');
++				if (t === ' ' && (s === '' || /[ \n]$/.test(s) || pend)) return;
++			}
++			if (pend) {
++				if (s !== '') s = s.replace(/ +$/, '') + (pend > 1 ? '\n\n' : '\n');
++				pend = 0;
++			}
++			if (!pre && (s === '' || /[ \n]$/.test(s))) t = t.replace(/^ /, '');
++			s += t;
++		}
++		function walk(n, pre) {
++			var ch = n.childNodes, i, c, tag, d, block, cell;
++			for (i = 0; ch && i < ch.length; i++) {
++				c = ch[i];
++				if (c.nodeType === 3) { put(String(c.data), pre); continue; }
++				if (c.nodeType !== 1) continue;
++				tag = String(c.tagName || '').toUpperCase();
++				if (IT_SKIP.test(tag) || (c.hasAttribute && c.hasAttribute('hidden'))) continue;
++				if (tag === 'BR') { pend = 0; s = s.replace(/ +$/, '') + '\n'; continue; }
++				/* no box under a laid-out root: not rendered; with
++				 * no layout to ask, go by tag */
++				d = boxed ? itDisplay(c) : '';
++				if (d === null || d === 'none') continue;
++				block = d ? IT_BLOCKDISP.test(d) : IT_BLOCK.test(tag);
++				cell = d ? d === 'table-cell' : (tag === 'TD' || tag === 'TH');
++				if (tag === 'P') pend = Math.max(pend, s === '' ? 0 : 2);
++				else if (block && s !== '') pend = Math.max(pend, 1);
++				walk(c, pre || tag === 'PRE' || tag === 'TEXTAREA');
++				if (tag === 'P') pend = Math.max(pend, 2);
++				else if (block) pend = Math.max(pend, 1);
++				if (cell) {
++					var nx = c.nextElementSibling;
++					if (nx && /^(TD|TH)$/.test(String(nx.tagName).toUpperCase())) put('\t', true);
++				}
++			}
++		}
++		if (rd === 'none') return String(root.textContent || '');
++		walk(root, String(root.tagName || '').toUpperCase() === 'PRE');
++		return s.replace(/ +$/, '');
++	}
++	acc(E, 'innerText', function () { return renderedText(this); },
+ 		function (v) { this.textContent = v; });
+-	acc(E, 'outerText', function () { return this.textContent; });
++	acc(E, 'outerText', function () { return renderedText(this); });
+ 	acc(E, 'clientTop', function () { return 0; });
+ 	acc(E, 'clientLeft', function () { return 0; });
+ 	acc(E, 'shadowRoot', function () { return null; });
+@@ -2074,14 +2651,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	 * and left currentScript null for every script. */
+ 	acc(d, 'currentScript', function () { return d.__vbCurrentScript || null; },
+ 		function (v) { d.__vbCurrentScript = v || null; });
+-	acc(d, 'styleSheets', function () {
+-		var out = [], ls = d.querySelectorAll('link[rel~=stylesheet],style');
+-		for (var i = 0; i < ls.length; i++)
+-			out.push({ ownerNode: ls[i], href: ls[i].href || null, disabled: false,
+-				cssRules: [], rules: [], media: { mediaText: ls[i].media || '' },
+-				insertRule: function () { return 0; }, deleteRule: function () {} });
+-		return out;
+-	});
++	/* document.styleSheets: the CSSOM section above */
+ 	var adopted = [];
+ 	acc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });
+ 	/* document.compareDocumentPosition / contains: elements had them,

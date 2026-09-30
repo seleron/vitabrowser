@@ -2819,3 +2819,36 @@ Same install flow as run 26; the standard autotest
   live (patch 165).
 - Watch as always: `refused` stays 0 in log.txt; new DIFFs in
   receiver.txt; any .dmp from ux0:data/.
+
+
+## Since run 27 — queued for run 28 (not built yet)
+
+Run 27's results (2026-09-30 00:46-00:52, three sessions): the autotest's
+`.plot` dumps all matched reference-dumps (no layout regressions from
+164-167); interaction 30/31 -- the download step (below); google got past
+the `Object.defineProperty` wall on the device too, and the next error it
+reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
+
+- Patch 168 (CSSOM, DOMException, innerText): `document.styleSheets` /
+  `el.sheet` / `cssRules` / `insertRule` work (google's per-module CSS
+  check, CSS-in-JS libraries); `new DOMException(msg, name)` has its name;
+  `innerText` is the rendered text, not the source text.
+  On the device: google.com -- netsurf.log should carry **no**
+  `gen_204?...error=zc` beacon lines now (run 27 had them for every
+  module). Any site built with styled-components/emotion should now be
+  styled.
+- Patch 169 (stylesheet changes after load restyle): the CSS selection
+  context was frozen when the page finished loading, so any stylesheet a
+  script added, changed or emptied later -- a theme switch, a lazily
+  loaded component's CSS, CSSOM edits -- never applied. On the device:
+  watch for pages whose look changes after load as they do in a desktop
+  browser (a dark-theme toggle, a menu that opens by injecting CSS).
+- Patch 170 (downloads): run 27's download FAIL was the sandbox: every
+  VPK is a *safe* eboot (vita-make-fself -s), which cannot create
+  ux0:download/ (errno 2). Downloads now fall back to
+  **ux0:data/VitaBrowser/downloads/** (log: "download: cannot make
+  ux0:download (errno ...)" then "download: saved
+  ux0:data/VitaBrowser/downloads/..."). Expect interaction 31/31; the
+  home page lists the saved file; VitaShell shows it under
+  ux0:data/VitaBrowser/downloads/.
+
