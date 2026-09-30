@@ -240,6 +240,7 @@ NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
 NET-css-account-bar http://127.0.0.1:$HP/CSS-account-bar.html
+NET-css-appearance http://127.0.0.1:$HP/CSS-appearance.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -644,6 +645,13 @@ abp=$(ls "$R"/*NET-css-account-bar*.plot 2>/dev/null)
 abr=$(sed -n 's/.*STR \(ACCTBAR: [0-9]*\/[0-9]* passed\).*/\1/p' $abp 2>/dev/null | head -1)
 echo "  CSS-account-bar: ${abr:-no summary}"
 [ -n "$abp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $abp | sort -u | sed 's/^STR /  /'
+# Appearance (Patch 184): -webkit-appearance is read as appearance and the
+# legacy widget values (button/textfield/...) compute to auto; an unknown
+# value drops. Six getComputedStyle cases (Chromium's answers).
+app=$(ls "$R"/*NET-css-appearance*.plot 2>/dev/null)
+appr=$(sed -n 's/.*STR \(APPEAR: [0-9]*\/[0-9]* passed\).*/\1/p' $app 2>/dev/null | head -1)
+echo "  CSS-appearance: ${appr:-no summary}"
+[ -n "$app" ] && grep -aho 'STR [0-9] [^"]*FAIL' $app | sort -u | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -676,6 +684,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
 [ "$slr" = "SELECTORS: 85/85 passed" ] && \
 [ "$abr" = "ACCTBAR: 5/5 passed" ] && \
+[ "$appr" = "APPEAR: 6/6 passed" ] && \
 [ "$cdr" = "CHARDATA: 5/5 passed" ] && \
 [ "$fhr" = "FLEXHDR: 6/6 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \

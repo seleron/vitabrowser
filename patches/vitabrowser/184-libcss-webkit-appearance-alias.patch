@@ -1,0 +1,150 @@
+# libcss: read -webkit-appearance as appearance; legacy widget values as auto
+# Generated 2026-09-30
+#
+# Scorecard r18-full-183's single most-dropped CSS declaration was
+# `-webkit-appearance: none` (13 of 20 sites -- every webkit-flavoured page
+# styles its form controls with the prefixed name); the legacy widget names
+# (`button`, `textfield`, ...) dropped a further 4 (github, jquery, rte,
+# wpblog). libcss accepted neither: the prefixed name was an unknown
+# property (the declaration dropped whole) and the legacy values were not
+# in the parser's value set.
+#
+# - src/parse/properties/properties.c: css__property_id's alias table (the
+#   mask-properties aliases) gains -webkit-appearance -> APPEARANCE, so the
+#   prefixed name reaches the unprefixed parser; the table is renamed
+#   mask_aliases -> alias_props accordingly.
+# - src/parse/properties/p_appearance.c: the parser's value set gains the
+#   webkit legacy names, all read as auto -- on webkit they mean "use the
+#   platform widget", which is exactly what auto means here (the engine
+#   paints one built-in widget), so accepting them implies no new
+#   rendering. An unrecognised value still drops.
+#
+# Test: CSS-appearance.html, 6 getComputedStyle cases (default auto;
+# -webkit-appearance: none -> none; legacy button/textfield -> auto;
+# unprefixed none unchanged; unknown value drops to auto).
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -394,12 +394,18 @@
+  * colour rather than the element's. mask-image also makes the background
+  * colour transparent, with importance (css__mask_image_hides_colour), and
+  * the mask shorthand resets it through the background one.
++ *
++ * -webkit-appearance is read as appearance (fixes1184, scorecard r18-full-183:
++ * the single most-dropped property, 13 of 20 sites -- every webkit-flavoured
++ * page styles its form controls and buttons with the prefixed name): the
++ * unprefixed parser (p_appearance.c) accepts auto/none, which is all this
++ * engine ever honours, so the alias changes nothing downstream.
+  */
+ static const struct {
+ 	const char *name;
+ 	int prop;
+ 	bool image;
+-} mask_aliases[] = {
++} alias_props[] = {
+ 	{ "mask-image", BACKGROUND_IMAGE, true },
+ 	{ "-webkit-mask-image", BACKGROUND_IMAGE, true },
+ 	{ "mask-size", BACKGROUND_SIZE, false },
+@@ -410,6 +416,7 @@
+ 	{ "-webkit-mask-repeat", BACKGROUND_REPEAT, false },
+ 	{ "mask", BACKGROUND, false },
+ 	{ "-webkit-mask", BACKGROUND, false },
++	{ "-webkit-appearance", APPEARANCE, false },
+ };
+ 
+ int css__property_id(css_language *c, lwc_string *name, bool *mask_image)
+@@ -426,11 +433,11 @@
+ 				&match) == lwc_error_ok && match)
+ 			return i;
+ 	}
+-	for (k = 0; k < sizeof(mask_aliases) / sizeof(mask_aliases[0]); k++) {
+-		const char *a = mask_aliases[k].name;
++	for (k = 0; k < sizeof(alias_props) / sizeof(alias_props[0]); k++) {
++		const char *a = alias_props[k].name;
+ 		if (strlen(a) == n && strncasecmp(d, a, n) == 0) {
+-			*mask_image = mask_aliases[k].image;
+-			return mask_aliases[k].prop;
++			*mask_image = alias_props[k].image;
++			return alias_props[k].prop;
+ 		}
+ 	}
+ 	return -1;
+
+--- a/src/parse/properties/p_appearance.c
++++ b/src/parse/properties/p_appearance.c
+@@ -14,14 +14,16 @@
+  * Does NOT inherit.
+  *
+  * The legacy value set (button / textfield / menulist / checkbox / radio /
+- * ...) is deliberately NOT accepted. Those names only ever meant "use the
+- * platform widget", which is what `auto` already means here, and accepting
+- * them would imply MacSurf can render one widget as another. A declaration
+- * using them is invalid and drops, exactly as it did before this property
+- * existed -- no behaviour regresses.
++ * ...) is accepted and read as `auto` (fixes1184): on webkit they mean "use
++ * the platform widget", which is exactly what `auto` means here -- and 4
++ * scorecard sites (github, jquery, rte, wpblog) style their controls with
++ * the literal names, so before this their declarations dropped with the
++ * prefixed property. Accepting them implies no new rendering: every one
++ * paints the same built-in widget `auto` already paints. A declaration
++ * using an UNRECOGNISED name is invalid and drops.
+  *
+- * `-webkit-appearance` is a separate property name and is not handled here;
+- * it belongs in the cssh_css preprocessor as an alias if a real page needs it.
++ * `-webkit-appearance` is read as `appearance` by the alias table in
++ * properties.c (css__property_id); this parser handles the values only.
+  */
+ 
+ #include <assert.h>
+@@ -32,6 +34,16 @@
+ #include "parse/properties/properties.h"
+ #include "parse/properties/utils.h"
+ 
++/* fixes1184 - the webkit legacy value set, all read as auto (see header). */
++static const char *const appearance_auto_values[] = {
++	"auto", "button", "textfield", "menulist", "menulist-button",
++	"push-button", "radio", "checkbox", "listbox", "progress-bar",
++	"progress-bar-value", "scrollbar-button", "searchfield",
++	"searchfield-decorator", "slider-horizontal", "slider-vertical",
++	"slider-horizontal-thumb", "slider-vertical-thumb", "square-button",
++	"win-button", NULL
++};
++
+ css_error css__parse_appearance(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result)
+@@ -60,16 +72,29 @@
+ 		error = css_stylesheet_style_unset(result,
+ 				CSS_PROP_APPEARANCE);
+ 	} else if (lwc_string_caseless_isequal(token->idata,
+-			c->strings[AUTO], &match) == lwc_error_ok && match) {
+-		error = css__stylesheet_style_appendOPV(result,
+-				CSS_PROP_APPEARANCE, 0, APPEARANCE_AUTO);
+-	} else if (lwc_string_caseless_isequal(token->idata,
+ 			c->strings[NONE], &match) == lwc_error_ok && match) {
+ 		error = css__stylesheet_style_appendOPV(result,
+ 				CSS_PROP_APPEARANCE, 0, APPEARANCE_NONE);
+ 	} else {
+-		*ctx = orig_ctx;
+-		return CSS_INVALID;
++		/* the legacy set (auto and all the widget names): draw the
++		 * built-in widget -- the value stored is APPEARANCE_AUTO. */
++		const char *d = lwc_string_data(token->idata);
++		size_t n = lwc_string_length(token->idata), v;
++		bool is_auto = false;
++		if (d != NULL)
++			for (v = 0; appearance_auto_values[v] != NULL; v++)
++				if (strlen(appearance_auto_values[v]) == n &&
++				    strncasecmp(d, appearance_auto_values[v],
++					       n) == 0) {
++					is_auto = true;
++					break;
++				}
++		if (!is_auto) {
++			*ctx = orig_ctx;
++			return CSS_INVALID;
++		}
++		error = css__stylesheet_style_appendOPV(result,
++				CSS_PROP_APPEARANCE, 0, APPEARANCE_AUTO);
+ 	}
+ 
+ 	if (error != CSS_OK) {

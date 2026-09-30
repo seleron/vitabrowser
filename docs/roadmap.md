@@ -257,6 +257,21 @@ flex-start. With a definite container cross size the item no longer
 grows the line (CSS Flexbox 9.4.5); centering uses the USED size and
 the item overflows −8/+8 as in Chromium (CSS-account-bar.html 5/5,
 FLEXHDR 6/6, full gate clean). The whole account-bar task is done.
+Fixed, patches 184 + 185 (2026-09-30): scorecard r18-full-183's single
+most-dropped CSS declaration was `-webkit-appearance: none` (13 of 20
+sites -- every webkit-flavoured page styles its form controls with the
+prefixed name); libcss accepted neither the prefixed name (unknown
+property, the declaration dropped whole) nor the legacy widget values
+(`button`, `textfield`, ... -- 4 more sites). 184 (libcss) reads
+`-webkit-appearance` as `appearance` via `css__property_id`'s alias
+table and accepts the legacy widget names as `auto` (on webkit they mean
+"use the platform widget", which is exactly what `auto` is here -- the
+engine paints one built-in widget, so accepting them implies no new
+rendering). 185 (netsurf) lets `getComputedStyle(el).appearance` answer
+`auto`/`none` (Chromium parity; the property was unreadable from JS).
+CSS-appearance.html 6/6 (default auto; `-webkit-appearance: none` ->
+none; legacy `button`/`textfield` -> auto; unprefixed `none` unchanged;
+unknown value drops to auto).
 Then the trending list itself (patches 171-172, same night): a temporary
 QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
 Closure's safe-CSS builder reads `.sheet` of a `<style>` in
