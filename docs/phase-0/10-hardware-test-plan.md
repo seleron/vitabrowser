@@ -2912,8 +2912,8 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
 ### Run 28 (2026-09-30, patches up to 183)
 
 Built by Hermes solo (no Claude). The VPKs in this dir are the ones to
-flash (SHA256 prefixes: VitaBrowser.vpk `4367c1466764`,
-VitaBrowser-ext.vpk `78212c91f2ab`).
+flash (SHA256 prefixes: VitaBrowser.vpk `e48d3ec144f7`,
+VitaBrowser-ext.vpk `af9be3009161`).
 
 What to check on the device:
 - **google.com**: the account bar (apps grid + Sign in) now sits INSIDE
