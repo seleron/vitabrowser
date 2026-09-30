@@ -173,6 +173,20 @@ has rows; the XHR returns 200 / 6.9 KB, so the parse or the callback is
 the next thing to trace) -- and the mobile header (ALL / IMAGES).
 Also seen: `#gb-main` gets `style="min-height:undefinedpx"` (a viewport
 height the bridge answers `undefined` for).
+Then the trending list itself (patches 171-172, same night): a temporary
+QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
+Closure's safe-CSS builder reads `.sheet` of a `<style>` in
+`createHTMLDocument('')`, our getter said null outside the main document,
+and a chain of Wiz services failed; (2) a second polyfill run in the same
+realm split the CSSRule classes (`instanceof CSSStyleRule` false); (3) its
+HTML sanitizer needs `createRange().createContextualFragment`, a real
+TreeWalker, iterable `attributes` with every attribute (ours listed ~23
+fixed names) and `XMLSerializer`. All four now work (JS-sanitize.html 7/7,
+Chromium-checked), and google.com in the sim shows **Trending searches**:
+score 52.3 (r6; 40.8 at r4), text 0.421. Still missing: the ALL/IMAGES
+header, the entity subtitle under each trend (on the same line here),
+footer links that run together in innerText (flex items are blockified in
+browsers), `min-height:undefinedpx`.
 
 ### WS-D Memory and robustness (R7, Phase 2 item 11)
 Per-page memory report (patch 142 started it), a JS heap budget that

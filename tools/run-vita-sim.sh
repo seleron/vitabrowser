@@ -231,6 +231,7 @@ NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-innertext http://127.0.0.1:$HP/JS-innertext.html
+NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -570,6 +571,12 @@ itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
 echo "  JS-innertext: ${itr:-no summary}"
 [ -n "$itp" ] && grep -o 'STR [0-9] [^"]*FAIL[^"]*' "$itp" | sed 's/^STR /  /'
+# Sanitizer primitives (Patch 171): attributes, TreeWalker, NodeIterator,
+# Range.createContextualFragment, XMLSerializer, Closure's sanitize loop.
+szp=$(ls "$R"/*NET-js-sanitize.plot 2>/dev/null | head -1)
+szr=$(sed -n 's/.*STR \(SANITIZE: [0-9]*\/[0-9]* passed\).*/\1/p' "$szp" 2>/dev/null | head -1)
+echo "  JS-sanitize: ${szr:-no summary}"
+[ -n "$szp" ] && grep -a 'FAIL (want' "$szp" | sed 's/.*STR /  /' | cut -c1-160
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -595,6 +602,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
 [ "$itr" = "INNERTEXT: 8/8 passed" ] && \
+[ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \

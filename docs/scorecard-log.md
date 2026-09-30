@@ -174,3 +174,21 @@ CSSOM 8/8, INNERTEXT 8/8, DOMSTALL 7/7, REFLOW 3/3, interaction 31/31).
   ALL / IMAGES header. Footer links read "PrivacyTerms": flex items are
   blockified in browsers, our innerText uses the unblockified display.
 
+## r6-google — trending searches render (2026-09-30, patches 171-172)
+
+`--only google --reuse-ref r3`, full gate green first (exit 0).
+
+| tier | site | score | Δ vs r5 | text | visual |
+|---|---|---|---|---|---|
+| search | google | 52.3 | +6.8 | 0.421 | 0.459 |
+
+The "Trending searches" list now renders (it was built in the DOM but
+stayed hidden: the component's render threw inside Closure's HTML
+sanitizer, and its try/catch swallowed it -- patch 171). 0 JS error
+beacons. Most words still "missing" against the r3 reference are the
+trends themselves -- live topics change daily (r3: "ireland citizenship
+rules change", "monty don"; tonight: "wordle hints", "galway gaa") -- plus
+footer words that run together ("PrivacyTerms": our innerText does not
+yet treat flex items as blocks). A fresh Chrome reference would score the
+trend text as matching.
+

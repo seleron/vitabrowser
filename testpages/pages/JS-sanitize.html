@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS sanitizer primitives</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p.r { margin: 3px 0; padding: 2px 6px; font-size: 12px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+</head>
+<body>
+<!-- Patch 171 (vita_polyfill.js + macsurf_qjs.c): what an HTML sanitizer
+     walks. Closure's (google's trending searches) parses markup with
+     createHTMLDocument('').createRange().createContextualFragment(html),
+     walks it with a TreeWalker that REJECTs whole subtrees, copies each
+     element by iterating its attributes and serializes the result with
+     XMLSerializer. Each case's expected string is what Chromium gives.
+     1: attributes / getAttributeNames list every attribute (jsname, data-*,
+        aria-*, custom), in order, iterable, with getNamedItem.
+     2: TreeWalker firstChild / nextSibling / parentNode with a filter that
+        rejects <s> (subtree gone) and skips <i> (children kept).
+     3: TreeWalker nextNode then previousNode over the same tree.
+     4: NodeIterator (reject acts as skip).
+     5: a scratch document's createRange().createContextualFragment(html).
+     6: XMLSerializer of an element (xmlns on the root, void elements).
+     7: Closure's sanitize loop: walk, rebuild, serialize, slice the body. -->
+<p id="sum" class="r wait">SANITIZE: script did not run</p>
+<p id="r1" class="r wait">1 waiting</p><p id="r2" class="r wait">2 waiting</p>
+<p id="r3" class="r wait">3 waiting</p><p id="r4" class="r wait">4 waiting</p>
+<p id="r5" class="r wait">5 waiting</p><p id="r6" class="r wait">6 waiting</p>
+<p id="r7" class="r wait">7 waiting</p>
+<div id="tree" style="display:none"><p id="a1">one<s>gone<b>deep</b></s><i>skip<b>kept</b></i><u>u</u></p><p id="a2">two</p></div>
+<script>
+var want = [null,
+	'id,jsname,data-x,aria-label,foo-bar|id=q|jsname=hJoEPd|n',
+	'P#a1 > "one" I? no > B > U > "u" | up: U,P#a1 | sib: P#a2',
+	'next: P,"one","skip",B,"kept",U,"u",P,"two" | prev: P,"u",U,"kept",B,"skip","one",P,DIV',
+	'DIV,P,"one","gone",B,"deep","skip",B,"kept",U,"u",P,"two"',
+	'3:B,I,#text|<b class="c">x</b><i>y</i>z',
+	'<p xmlns="http://www.w3.org/1999/xhtml" class="k" data-v="1&amp;2">a<br />b&lt;c</p>',
+	'<a href="/x" class="t">ok</a>clean'];
+var N = 7, res = [];
+function label(n) {
+	if (!n) return 'null';
+	if (n.nodeType === 3) return '"' + n.data + '"';
+	return n.tagName + (n.id ? '#' + n.id : '');
+}
+function filt(n) {
+	if (n.nodeType === 3) return 1;
+	if (n.tagName === 'S') return 2;
+	if (n.tagName === 'I') return 3;
+	return 1;
+}
+function run(n, f) { try { res[n] = f(); } catch (e) { res[n] = 'threw ' + e; } }
+run(1, function () {
+	var el = document.createElement('div');
+	el.setAttribute('id', 'q'); el.setAttribute('jsname', 'hJoEPd');
+	el.setAttribute('data-x', '1'); el.setAttribute('aria-label', 'l'); el.setAttribute('foo-bar', 'n');
+	var out = [], a;
+	for (a of el.attributes) out.push(a.name + '=' + a.value);
+	return el.getAttributeNames().join(',') + '|' + out.slice(0, 2).join('|') + '|' +
+		el.attributes.getNamedItem('foo-bar').value;
+});
+run(2, function () {
+	var p = document.getElementById('a1');
+	var w = document.createTreeWalker(p, 5, { acceptNode: filt });
+	var s = label(p);
+	var c = w.firstChild(); s += ' > ' + label(c);
+	var i = w.nextSibling(); s += ' ' + (i && i.tagName === 'I' ? 'I?' : label(i)) + ' no';
+	s = label(p) + ' > ' + label(c) + ' I? no';
+	var b = w.nextSibling(); s += ' > ' + label(b);
+	var u = w.nextSibling(); s += ' > ' + label(u);
+	var ut = w.firstChild(); s += ' > ' + label(ut);
+	var up = [label(w.parentNode()), label(w.parentNode())];
+	var w2 = document.createTreeWalker(document.getElementById('tree'), 1, null);
+	w2.currentNode = document.getElementById('a1');
+	return s + ' | up: ' + up.join(',') + ' | sib: ' + label(w2.nextSibling());
+});
+run(3, function () {
+	var w = document.createTreeWalker(document.getElementById('tree'), 5, filt), n, a = [], b = [];
+	while ((n = w.nextNode())) a.push(label(n).replace(/#.*/, ''));
+	while ((n = w.previousNode())) b.push(label(n).replace(/#.*/, ''));
+	return 'next: ' + a.join(',') + ' | prev: ' + b.join(',');
+});
+run(4, function () {
+	var it = document.createNodeIterator(document.getElementById('tree'), 5, filt), n, a = [];
+	while ((n = it.nextNode())) a.push(label(n).replace(/#.*/, ''));
+	return a.join(',');
+});
+run(5, function () {
+	var doc = document.implementation.createHTMLDocument('');
+	var r = doc.createRange(); r.selectNode(doc.body);
+	var f = r.createContextualFragment('<b class="c">x</b><i>y</i>z');
+	var names = [], c;
+	for (c = f.firstChild; c; c = c.nextSibling) names.push(c.nodeType === 3 ? '#text' : c.tagName);
+	var holder = doc.createElement('div'); holder.appendChild(f);
+	return names.length + ':' + names.join(',') + '|' + holder.innerHTML;
+});
+run(6, function () {
+	var p = document.createElement('p'); p.setAttribute('class', 'k'); p.setAttribute('data-v', '1&2');
+	p.appendChild(document.createTextNode('a')); p.appendChild(document.createElement('br'));
+	p.appendChild(document.createTextNode('b<c'));
+	return new XMLSerializer().serializeToString(p);
+});
+run(7, function () {
+	var allowed = { A: 1, B: 1 }, keep = { href: 1, 'class': 1 };
+	var c = document.implementation.createHTMLDocument('');
+	var r = c.createRange(); r.selectNode(c.body);
+	var src = r.createContextualFragment('<a href="/x" class="t" onclick="bad()">ok</a><script>bad()<\/script>clean');
+	var w = document.createTreeWalker(src, 5, function (n) {
+		return n.nodeType === 3 ? 1 : (allowed[n.tagName] ? 1 : 2);
+	});
+	var d = w.nextNode(), e = c.createDocumentFragment(), f = e, g;
+	while (d !== null) {
+		if (d.nodeType === 3) g = document.createTextNode(d.data);
+		else {
+			g = c.createElement(d.tagName.toLowerCase());
+			for (var at of d.attributes) if (keep[at.name]) g.setAttribute(at.name, at.value);
+		}
+		f.appendChild(g);
+		if ((d = w.firstChild())) f = g;
+		else for (; !(d = w.nextSibling()) && (d = w.parentNode());) f = f.parentNode;
+	}
+	var body = c.body; body.appendChild(e);
+	var s = new XMLSerializer().serializeToString(body);
+	return s.slice(s.indexOf('>') + 1, s.lastIndexOf('</'));
+});
+window.addEventListener('load', function () {
+	var k = 0;
+	for (var n = 1; n <= N; n++) {
+		var ok = res[n] === want[n], p = document.getElementById('r' + n);
+		p.textContent = n + ' ' + res[n] + (ok ? '' : ' FAIL (want ' + want[n] + ')');
+		if (ok) { p.className = 'r pass'; k++; }
+	}
+	document.getElementById('sum').textContent = 'SANITIZE: ' + k + '/' + N + ' passed';
+});
+</script>
+</body></html>

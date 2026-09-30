@@ -2851,4 +2851,16 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
   ux0:data/VitaBrowser/downloads/..."). Expect interaction 31/31; the
   home page lists the saved file; VitaShell shows it under
   ux0:data/VitaBrowser/downloads/.
+- Patch 171 (google's services + trending searches): `.sheet` works for a
+  `<style>` in a scratch document, the CSSOM survives a realm's second
+  polyfill run, and what an HTML sanitizer needs exists: iterable
+  `attributes` listing **every** attribute (it listed ~23 fixed names --
+  jsname, data-*, aria-* were invisible), a real TreeWalker/NodeIterator,
+  `Range.createContextualFragment`, `XMLSerializer`. On the device:
+  **google.com should show "Trending searches"** under the search box
+  (sim: yes). Also watch sites that copy or clone elements by their
+  attributes (templates, sanitizers, Vue/Alpine directives).
+- Patch 172 (simulator only): the host build's performance.now() clock is
+  monotonic (WSL steps the wall clock ~2.2 s every ~34 s, which made
+  JS-dom-stall flaky). No effect on the Vita build.
 

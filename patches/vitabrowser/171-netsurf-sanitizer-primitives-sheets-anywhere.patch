@@ -1,0 +1,847 @@
+# netsurf (MacSurf bridge): google's services and trending searches -- sheets in any document, real attribute lists, what a sanitizer walks
+# Generated 2026-09-30
+#
+# After patches 168-169 google reported no errors, but its "Trending
+# searches" stayed hidden. A temporary QuickJS throw trace (every Error at
+# JS_Throw, with a backtrace built there; not committed) showed what its
+# try/catch blocks had been swallowing:
+#
+# 1. `cannot read property 'insertRule' of null`, failing a chain of Wiz
+#    services (SJpD2c <- HIg7cd <- PMS6Sd <- Sp69O). Closure's safe-CSS
+#    builder (_.Sha) parses CSS through a <style> in
+#    document.implementation.createHTMLDocument(''), and our `sheet`
+#    getter answered null outside the main document. The bridge's
+#    createHTMLDocument is a stand-in whose head/body/documentElement are
+#    three detached elements, so nothing in it looked connected. Now: it
+#    joins them and marks the root; `sheet` exists for an element in any
+#    document.
+# 2. Then `rule instanceof CSSStyleRule` was false: the polyfill runs again
+#    when google's realm is rebuilt, and the second run replaced the CSSRule
+#    classes while the `sheet` getter (installed only if missing) kept
+#    making the first run's rules. The CSSOM section runs once per realm.
+# 3. `not a function` in the trending component's render: Closure's HTML
+#    sanitizer (_.Qc -> uQ) needs
+#      scratchDoc.createRange().createContextualFragment(html)  (missing)
+#      document.createTreeWalker(frag, 5, filter) with firstChild /
+#        nextSibling / parentNode and FILTER_REJECT     (stubs returned null)
+#      element.attributes, iterated to copy each element
+#        (rebuilt from a fixed list of ~23 names: jsname, data-*, aria-*
+#        and every other attribute were invisible)
+#      new XMLSerializer().serializeToString(body)       (missing)
+#
+# macsurf_qjs.c: __attrNamesNative(el) -- the element's attribute names
+# from its real namednodemap (the walk qjs_ih_serialize_attrs does).
+# vita_polyfill.js:
+# - attributes / getAttributeNames() over it: every attribute, in order,
+#   iterable, attributes.getNamedItem / item / named access.
+# - TreeWalker and NodeIterator per the DOM Standard (whatToShow, filter
+#   function or {acceptNode}, ACCEPT/REJECT/SKIP; every traversal method);
+#   NodeFilter constants.
+# - Range.createContextualFragment (parsed through a <template>).
+# - XMLSerializer.serializeToString (XHTML serialization: xmlns on the
+#   root, `<br />`, &amp; &lt; &gt; &quot; escaping).
+# - the scratch document gets createDocumentFragment, createComment,
+#   createElementNS, createRange, createTreeWalker, createNodeIterator,
+#   importNode and createEvent from the main document.
+# Test: JS-sanitize.html 7/7 (the expected strings are Chromium's; the
+# TreeWalker/NodeIterator/XMLSerializer code itself was also run in
+# Chromium against the same cases: 7/7).
+# Sim: google.com shows its Trending searches list (the rows were built in
+# the DOM but hidden: the component shows the list only after render, and
+# render threw inside the sanitizer).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index c3eba87..c23fc52 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -5340,6 +5340,51 @@ static int qjs_ih_serialize_attrs(struct qjs_ih_buf *b, dom_element *el)
+ 	return r;
+ }
+ 
++/* VitaBrowser: every attribute name of an element, from its real
++ * namednodemap (as qjs_ih_serialize_attrs walks it). The JS side built
++ * `attributes` / getAttributeNames() from a fixed list of ~23 common names,
++ * so jsname, jsaction, aria-*, data-* and every other attribute could not
++ * be enumerated: google's HTML sanitizer copies an element by iterating
++ * its attributes, and its trending-search rows lost them. */
++static JSValue qjs_attr_names_native(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	dom_node *n;
++	dom_namednodemap *map = NULL;
++	dom_ulong len = 0, i;
++	uint32_t k = 0;
++	JSValue arr = JS_NewArray(ctx);
++
++	(void)this_val;
++	if (JS_IsException(arr) || argc < 1)
++		return arr;
++	n = qjs_get_node(argv[0]);
++	if (n == NULL)
++		return arr;
++	if (macsurf_dom_node_get_attributes(n, &map) != DOM_NO_ERR ||
++			map == NULL)
++		return arr;
++	if (dom_namednodemap_get_length(map, &len) != DOM_NO_ERR)
++		len = 0;
++	for (i = 0; i < len; i++) {
++		dom_node *an = NULL;
++		dom_string *aname = NULL;
++		if (dom_namednodemap_item(map, i, &an) != DOM_NO_ERR ||
++				an == NULL)
++			continue;
++		if (macsurf_dom_attr_get_name(an, &aname) == DOM_NO_ERR &&
++				aname != NULL) {
++			JS_SetPropertyUint32(ctx, arr, k++,
++				JS_NewStringLen(ctx, dom_string_data(aname),
++					dom_string_byte_length(aname)));
++			macsurf_dom_string_unref(aname);
++		}
++		macsurf_dom_node_unref(an);
++	}
++	dom_namednodemap_unref(map);
++	return arr;
++}
++
+ static int qjs_ih_serialize_element(struct qjs_ih_buf *b, dom_element *el)
+ {
+ 	dom_string *tname = NULL;
+@@ -12212,6 +12257,7 @@ static void register_browser_globals(JSContext *ctx)
+ 	qjs_set_func(ctx, global, "__scrollY",   qjs_js_scroll_y, 0);
+ 	qjs_set_func(ctx, global, "__scrollTo",  qjs_js_scroll_to, 2);
+ 	qjs_set_func(ctx, global, "__gcsNative", qjs_get_computed_style, 1);
++	qjs_set_func(ctx, global, "__attrNamesNative", qjs_attr_names_native, 1);
+ 	qjs_set_func(ctx, global, "__msLife",    qjs_ms_life, 1); /* fixes1015 */
+ 	qjs_set_func(ctx, global, "__msScript",  qjs_ms_current_script, 0); /* fixes1312 */
+ 	qjs_set_func(ctx, global, "__msRafFired", qjs_raf_fired, 0); /* fixes1236 */
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 9e2aefb..5daaea4 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1912,6 +1912,12 @@
+ "(function () {\n"
+ "\tvar d = g.document;\n"
+ "\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\t/* once per realm: a second run (the polyfill is evaluated again when a\n"
++"\t * realm is rebuilt, as on google) replaced the CSSRule classes while\n"
++"\t * the element's `sheet` getter -- installed only if missing -- kept\n"
++"\t * making rules of the first run's, so `rule instanceof CSSStyleRule`\n"
++"\t * was false and google's safe-CSS sanitizer threw */\n"
++"\tif (g.CSSStyleSheet && g.CSSStyleSheet.__vbCssom) return;\n"
+ "\n"
+ "\tfunction klass(name, parent, ctor) {\n"
+ "\t\tvar F = ctor || function () { throw new TypeError('Illegal constructor'); };\n"
+@@ -1953,6 +1959,7 @@
+ "\t\tinitSheet(this, null);\n"
+ "\t});\n"
+ "\tvar DeclBase = typeof g.CSSStyleDeclaration === 'function' ? g.CSSStyleDeclaration : null;\n"
++"\tdefine(CSSStyleSheet, '__vbCssom', true);\n"
+ "\n"
+ "\t/* ---- parsing: a brace/string/comment-aware scan, no tokenizer ---- */\n"
+ "\tvar TOK = /[\"'{}()\\[\\];\\\\]|\\/\\*/g;\n"
+@@ -2360,13 +2367,339 @@
+ "\t\tfor (var i = 0; i < ls.length; i++) out.push(sheetOf(ls[i]));\n"
+ "\t\treturn listOf(out);\n"
+ "\t} });\n"
++"\t/* a sheet exists while its element is in a document -- any document:\n"
++"\t * Closure's safe-CSS sanitizer (google's _.Sha) parses CSS through a\n"
++"\t * <style> in document.implementation.createHTMLDocument('') and read\n"
++"\t * .sheet null there, which failed a whole chain of google's services */\n"
++"\tfunction connected(n) {\n"
++"\t\tvar top = n, i = 0;\n"
++"\t\twhile (top.parentNode && i++ < 4096) top = top.parentNode;\n"
++"\t\treturn top.nodeType === 9 || !!top.__vbDocRoot;\n"
++"\t}\n"
++"\t/* The bridge's createHTMLDocument() is a stand-in: its head, body and\n"
++"\t * documentElement are three detached elements of THIS document, so\n"
++"\t * nothing in it looked connected. Join them as a document's are and\n"
++"\t * mark the root. */\n"
++"\tvar impl = d.implementation;\n"
++"\tif (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vb) {\n"
++"\t\tvar chd = impl.createHTMLDocument, wrapped = function () {\n"
++"\t\t\tvar doc = chd.apply(this, arguments);\n"
++"\t\t\ttry {\n"
++"\t\t\t\tvar root = doc && doc.documentElement;\n"
++"\t\t\t\tif (root && root.nodeType === 1 && doc !== d) {\n"
++"\t\t\t\t\tif (doc.head && !doc.head.parentNode) root.appendChild(doc.head);\n"
++"\t\t\t\t\tif (doc.body && !doc.body.parentNode) root.appendChild(doc.body);\n"
++"\t\t\t\t\tdefine(root, '__vbDocRoot', true);\n"
++"\t\t\t\t}\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t\treturn doc;\n"
++"\t\t};\n"
++"\t\twrapped.__vb = true;\n"
++"\t\ttry { impl.createHTMLDocument = wrapped; } catch (e) { /* */ }\n"
++"\t}\n"
+ "\tvar E = Object.getPrototypeOf(d.createElement('section'));\n"
+ "\tif (E && !('sheet' in E))\n"
+ "\t\tObject.defineProperty(E, 'sheet', { configurable: true, get: function () {\n"
+-"\t\t\treturn isSheetOwner(this) && d.documentElement && d.documentElement.contains(this) ? sheetOf(this) : null;\n"
++"\t\t\treturn isSheetOwner(this) && connected(this) ? sheetOf(this) : null;\n"
+ "\t\t} });\n"
+ "})();\n"
+ "\n"
++"/* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,\n"
++" * XMLSerializer, the scratch document ---------------------------------\n"
++" * Closure's sanitizer (google's trending searches, and wherever Google\n"
++" * builds HTML from data) parses markup with\n"
++" * createHTMLDocument('').createRange().createContextualFragment(html),\n"
++" * walks it with a TreeWalker (FILTER_REJECT drops a subtree), copies each\n"
++" * element by iterating its attributes and serializes the result with\n"
++" * XMLSerializer. The bridge had: a stand-in document with no createRange,\n"
++" * a Range with no createContextualFragment, a TreeWalker whose\n"
++" * firstChild/nextSibling/parentNode returned null, no serializeToString,\n"
++" * and `attributes` rebuilt from a fixed list of ~23 names. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tvar E = Object.getPrototypeOf(d.createElement('section'));\n"
++"\n"
++"\t/* attributes / getAttributeNames: every attribute, from libdom */\n"
++"\tvar names = g.__attrNamesNative;\n"
++"\tif (typeof names === 'function' && E) {\n"
++"\t\tdefine(E, 'getAttributeNames', function () { return names(this); });\n"
++"\t\tvar Attr = typeof g.Attr === 'function' ? g.Attr : null;\n"
++"\t\tObject.defineProperty(E, 'attributes', { configurable: true, get: function () {\n"
++"\t\t\tvar el = this, ns = names(el), list = [], i;\n"
++"\t\t\tfor (i = 0; i < ns.length; i++) {\n"
++"\t\t\t\tvar a = Object.create(Attr && Attr.prototype ? Attr.prototype : Object.prototype);\n"
++"\t\t\t\ta.name = a.nodeName = a.localName = ns[i];\n"
++"\t\t\t\ta.value = a.nodeValue = a.textContent = el.getAttribute(ns[i]);\n"
++"\t\t\t\ta.namespaceURI = null; a.prefix = null; a.specified = true;\n"
++"\t\t\t\ta.nodeType = 2; a.ownerElement = el;\n"
++"\t\t\t\tlist.push(a);\n"
++"\t\t\t\tif (!(ns[i] in list) && !/^\\d/.test(ns[i]))\n"
++"\t\t\t\t\ttry { Object.defineProperty(list, ns[i], { value: a, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t\tdefine(list, 'item', function (k) { return list[k] || null; });\n"
++"\t\t\tdefine(list, 'getNamedItem', function (n) {\n"
++"\t\t\t\tn = String(n).toLowerCase();\n"
++"\t\t\t\tfor (var j = 0; j < list.length; j++) if (list[j].name.toLowerCase() === n) return list[j];\n"
++"\t\t\t\treturn null;\n"
++"\t\t\t});\n"
++"\t\t\tdefine(list, 'getNamedItemNS', function (ns2, n) { return list.getNamedItem(n); });\n"
++"\t\t\treturn list;\n"
++"\t\t} });\n"
++"\t}\n"
++"\n"
++"\t/* TreeWalker / NodeIterator (DOM Standard) */\n"
++"\tvar ACCEPT = 1, REJECT = 2, SKIP = 3;\n"
++"\tfunction accept(w, n) {\n"
++"\t\tif (!((w.whatToShow >>> 0) & (1 << (n.nodeType - 1)))) return SKIP;\n"
++"\t\tvar f = w.filter;\n"
++"\t\tif (!f) return ACCEPT;\n"
++"\t\tvar r = typeof f === 'function' ? f.call(null, n) : (typeof f.acceptNode === 'function' ? f.acceptNode(n) : ACCEPT);\n"
++"\t\treturn +r || 0;\n"
++"\t}\n"
++"\tfunction TreeWalker(root, what, filter) {\n"
++"\t\tthis.root = root;\n"
++"\t\tthis.whatToShow = what === undefined ? 0xFFFFFFFF : what >>> 0;\n"
++"\t\tthis.filter = filter || null;\n"
++"\t\tthis.currentNode = root;\n"
++"\t}\n"
++"\tfunction kids(w, first) {\n"
++"\t\tvar node = first ? w.currentNode.firstChild : w.currentNode.lastChild;\n"
++"\t\twhile (node) {\n"
++"\t\t\tvar r = accept(w, node);\n"
++"\t\t\tif (r === ACCEPT) { w.currentNode = node; return node; }\n"
++"\t\t\tif (r === SKIP) {\n"
++"\t\t\t\tvar c = first ? node.firstChild : node.lastChild;\n"
++"\t\t\t\tif (c) { node = c; continue; }\n"
++"\t\t\t}\n"
++"\t\t\tfor (;;) {\n"
++"\t\t\t\tvar s = first ? node.nextSibling : node.previousSibling;\n"
++"\t\t\t\tif (s) { node = s; break; }\n"
++"\t\t\t\tvar p = node.parentNode;\n"
++"\t\t\t\tif (!p || p === w.root || p === w.currentNode) return null;\n"
++"\t\t\t\tnode = p;\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction sibs(w, next) {\n"
++"\t\tvar node = w.currentNode;\n"
++"\t\tif (node === w.root) return null;\n"
++"\t\tfor (;;) {\n"
++"\t\t\tvar s = next ? node.nextSibling : node.previousSibling;\n"
++"\t\t\twhile (s) {\n"
++"\t\t\t\tnode = s;\n"
++"\t\t\t\tvar r = accept(w, node);\n"
++"\t\t\t\tif (r === ACCEPT) { w.currentNode = node; return node; }\n"
++"\t\t\t\ts = next ? node.firstChild : node.lastChild;\n"
++"\t\t\t\tif (r === REJECT || !s) s = next ? node.nextSibling : node.previousSibling;\n"
++"\t\t\t}\n"
++"\t\t\tnode = node.parentNode;\n"
++"\t\t\tif (!node || node === w.root) return null;\n"
++"\t\t\tif (accept(w, node) === ACCEPT) return null;\n"
++"\t\t}\n"
++"\t}\n"
++"\tTreeWalker.prototype = {\n"
++"\t\tconstructor: TreeWalker,\n"
++"\t\tparentNode: function () {\n"
++"\t\t\tvar node = this.currentNode;\n"
++"\t\t\twhile (node && node !== this.root) {\n"
++"\t\t\t\tnode = node.parentNode;\n"
++"\t\t\t\tif (node && accept(this, node) === ACCEPT) { this.currentNode = node; return node; }\n"
++"\t\t\t}\n"
++"\t\t\treturn null;\n"
++"\t\t},\n"
++"\t\tfirstChild: function () { return kids(this, true); },\n"
++"\t\tlastChild: function () { return kids(this, false); },\n"
++"\t\tnextSibling: function () { return sibs(this, true); },\n"
++"\t\tpreviousSibling: function () { return sibs(this, false); },\n"
++"\t\tpreviousNode: function () {\n"
++"\t\t\tvar node = this.currentNode;\n"
++"\t\t\twhile (node !== this.root) {\n"
++"\t\t\t\tvar s = node.previousSibling;\n"
++"\t\t\t\twhile (s) {\n"
++"\t\t\t\t\tnode = s;\n"
++"\t\t\t\t\tvar r = accept(this, node);\n"
++"\t\t\t\t\twhile (r !== REJECT && node.lastChild) { node = node.lastChild; r = accept(this, node); }\n"
++"\t\t\t\t\tif (r === ACCEPT) { this.currentNode = node; return node; }\n"
++"\t\t\t\t\ts = node.previousSibling;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tif (node === this.root || !node.parentNode) return null;\n"
++"\t\t\t\tnode = node.parentNode;\n"
++"\t\t\t\tif (accept(this, node) === ACCEPT) { this.currentNode = node; return node; }\n"
++"\t\t\t}\n"
++"\t\t\treturn null;\n"
++"\t\t},\n"
++"\t\tnextNode: function () {\n"
++"\t\t\tvar node = this.currentNode, r = ACCEPT;\n"
++"\t\t\tfor (;;) {\n"
++"\t\t\t\twhile (r !== REJECT && node.firstChild) {\n"
++"\t\t\t\t\tnode = node.firstChild;\n"
++"\t\t\t\t\tr = accept(this, node);\n"
++"\t\t\t\t\tif (r === ACCEPT) { this.currentNode = node; return node; }\n"
++"\t\t\t\t}\n"
++"\t\t\t\tvar t = node, s = null;\n"
++"\t\t\t\twhile (t) {\n"
++"\t\t\t\t\tif (t === this.root) return null;\n"
++"\t\t\t\t\ts = t.nextSibling;\n"
++"\t\t\t\t\tif (s) break;\n"
++"\t\t\t\t\tt = t.parentNode;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tif (!t || !s) return null;\n"
++"\t\t\t\tnode = s;\n"
++"\t\t\t\tr = accept(this, node);\n"
++"\t\t\t\tif (r === ACCEPT) { this.currentNode = node; return node; }\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t};\n"
++"\tfunction NodeIterator(root, what, filter) {\n"
++"\t\tthis.root = root;\n"
++"\t\tthis.whatToShow = what === undefined ? 0xFFFFFFFF : what >>> 0;\n"
++"\t\tthis.filter = filter || null;\n"
++"\t\tthis.referenceNode = root;\n"
++"\t\tthis.pointerBeforeReferenceNode = true;\n"
++"\t}\n"
++"\tfunction following(n, root) {\n"
++"\t\tif (n.firstChild) return n.firstChild;\n"
++"\t\twhile (n && n !== root) {\n"
++"\t\t\tif (n.nextSibling) return n.nextSibling;\n"
++"\t\t\tn = n.parentNode;\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction preceding(n, root) {\n"
++"\t\tif (n === root) return null;\n"
++"\t\tvar p = n.previousSibling;\n"
++"\t\tif (p) { while (p.lastChild) p = p.lastChild; return p; }\n"
++"\t\treturn n.parentNode;\n"
++"\t}\n"
++"\tNodeIterator.prototype = {\n"
++"\t\tconstructor: NodeIterator,\n"
++"\t\tnextNode: function () {\n"
++"\t\t\tvar node = this.referenceNode, before = this.pointerBeforeReferenceNode;\n"
++"\t\t\tfor (;;) {\n"
++"\t\t\t\tif (!before) { node = following(node, this.root); if (!node) return null; }\n"
++"\t\t\t\telse before = false;\n"
++"\t\t\t\tif (accept(this, node) === ACCEPT) {\n"
++"\t\t\t\t\tthis.referenceNode = node; this.pointerBeforeReferenceNode = false; return node;\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t},\n"
++"\t\tpreviousNode: function () {\n"
++"\t\t\tvar node = this.referenceNode, before = this.pointerBeforeReferenceNode;\n"
++"\t\t\tfor (;;) {\n"
++"\t\t\t\tif (before) { node = preceding(node, this.root); if (!node) return null; }\n"
++"\t\t\t\telse before = true;\n"
++"\t\t\t\tif (accept(this, node) === ACCEPT) {\n"
++"\t\t\t\t\tthis.referenceNode = node; this.pointerBeforeReferenceNode = true; return node;\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t},\n"
++"\t\tdetach: function () {}\n"
++"\t};\n"
++"\tfunction makeTW(root, what, filter) {\n"
++"\t\tif (!root || typeof root.nodeType !== 'number')\n"
++"\t\t\tthrow new TypeError(\"Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.\");\n"
++"\t\treturn new TreeWalker(root, what, filter);\n"
++"\t}\n"
++"\tfunction makeNI(root, what, filter) {\n"
++"\t\tif (!root || typeof root.nodeType !== 'number')\n"
++"\t\t\tthrow new TypeError(\"Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.\");\n"
++"\t\treturn new NodeIterator(root, what, filter);\n"
++"\t}\n"
++"\tdefine(d, 'createTreeWalker', makeTW);\n"
++"\tdefine(d, 'createNodeIterator', makeNI);\n"
++"\tdefine(g, 'TreeWalker', TreeWalker);\n"
++"\tdefine(g, 'NodeIterator', NodeIterator);\n"
++"\tif (!g.NodeFilter || typeof g.NodeFilter.SHOW_ELEMENT !== 'number') {\n"
++"\t\tdefine(g, 'NodeFilter', { FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,\n"
++"\t\t\tSHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4,\n"
++"\t\t\tSHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128,\n"
++"\t\t\tSHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024 });\n"
++"\t}\n"
++"\n"
++"\t/* Range.createContextualFragment: parse into a fragment (inert: a\n"
++"\t * <template>'s content when the bridge has one, else a detached div) */\n"
++"\tfunction fragmentOf(html) {\n"
++"\t\tvar f = d.createDocumentFragment(), holder = d.createElement('template'), src;\n"
++"\t\tholder.innerHTML = String(html);\n"
++"\t\tsrc = holder.content && holder.content.childNodes ? holder.content : holder;\n"
++"\t\twhile (src.firstChild) f.appendChild(src.firstChild);\n"
++"\t\treturn f;\n"
++"\t}\n"
++"\tif (typeof d.createRange === 'function') {\n"
++"\t\tvar cr = d.createRange;\n"
++"\t\tdefine(d, 'createRange', function () {\n"
++"\t\t\tvar r = cr.apply(d, arguments);\n"
++"\t\t\tif (r && typeof r.createContextualFragment !== 'function')\n"
++"\t\t\t\ttry { define(r, 'createContextualFragment', fragmentOf); } catch (e) { /* */ }\n"
++"\t\t\treturn r;\n"
++"\t\t});\n"
++"\t}\n"
++"\n"
++"\t/* XMLSerializer (the XHTML serialization browsers give for HTML nodes) */\n"
++"\tfunction escText(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\n"
++"\tfunction escAttr(s) { return escText(s).replace(/\"/g, '&quot;'); }\n"
++"\tvar VOID = /^(area|base|br|col|embed|hr|img|input|link|meta|source|track|wbr)$/;\n"
++"\tfunction ser(n, root) {\n"
++"\t\tswitch (n.nodeType) {\n"
++"\t\tcase 1: {\n"
++"\t\t\tvar tag = String(n.localName || n.tagName || '').toLowerCase(), s = '<' + tag, k, an = [];\n"
++"\t\t\tif (root) s += ' xmlns=\"http://www.w3.org/1999/xhtml\"';\n"
++"\t\t\ttry { an = n.getAttributeNames(); } catch (e) { /* */ }\n"
++"\t\t\tfor (k = 0; k < an.length; k++) if (an[k] !== 'xmlns') s += ' ' + an[k] + '=\"' + escAttr(n.getAttribute(an[k])) + '\"';\n"
++"\t\t\tvar c = n.firstChild, inner = '';\n"
++"\t\t\tif (tag === 'template' && n.content) c = n.content.firstChild;\n"
++"\t\t\tfor (; c; c = c.nextSibling) inner += ser(c, false);\n"
++"\t\t\tif (!inner && VOID.test(tag)) return s + ' />';\n"
++"\t\t\treturn s + '>' + inner + '</' + tag + '>';\n"
++"\t\t}\n"
++"\t\tcase 3: return escText(n.data);\n"
++"\t\tcase 4: return '<![CDATA[' + n.data + ']]>';\n"
++"\t\tcase 8: return '<!--' + n.data + '-->';\n"
++"\t\tcase 9: return n.documentElement ? ser(n.documentElement, true) : '';\n"
++"\t\tcase 11: {\n"
++"\t\t\tvar out = '';\n"
++"\t\t\tfor (var f = n.firstChild; f; f = f.nextSibling) out += ser(f, true);\n"
++"\t\t\treturn out;\n"
++"\t\t}\n"
++"\t\t}\n"
++"\t\treturn '';\n"
++"\t}\n"
++"\tfunction XMLSerializer() {\n"
++"\t\tif (!(this instanceof XMLSerializer)) throw new TypeError(\"Constructor XMLSerializer requires 'new'\");\n"
++"\t}\n"
++"\tdefine(XMLSerializer.prototype, 'serializeToString', function (n) {\n"
++"\t\tif (!n || typeof n.nodeType !== 'number')\n"
++"\t\t\tthrow new TypeError(\"Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.\");\n"
++"\t\treturn ser(n, true);\n"
++"\t});\n"
++"\tvar have = g.XMLSerializer;\n"
++"\tif (typeof have !== 'function' || typeof (have.prototype || {}).serializeToString !== 'function')\n"
++"\t\tdefine(g, 'XMLSerializer', XMLSerializer);\n"
++"\n"
++"\t/* the scratch document: the factories a parser or sanitizer calls */\n"
++"\tvar impl = d.implementation;\n"
++"\tif (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vbFactories) {\n"
++"\t\tvar chd = impl.createHTMLDocument, wrap = function () {\n"
++"\t\t\tvar doc = chd.apply(this, arguments);\n"
++"\t\t\tif (doc && doc !== d) {\n"
++"\t\t\t\t['createDocumentFragment', 'createComment', 'createElementNS', 'createRange',\n"
++"\t\t\t\t 'createTreeWalker', 'createNodeIterator', 'importNode', 'createEvent'].forEach(function (m) {\n"
++"\t\t\t\t\tif (typeof doc[m] !== 'function' && typeof d[m] === 'function')\n"
++"\t\t\t\t\t\ttry { define(doc, m, function () { return d[m].apply(d, arguments); }); } catch (e) { /* */ }\n"
++"\t\t\t\t});\n"
++"\t\t\t\tif (!doc.implementation) try { define(doc, 'implementation', impl); } catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t\treturn doc;\n"
++"\t\t};\n"
++"\t\twrap.__vb = chd.__vb;\n"
++"\t\twrap.__vbFactories = true;\n"
++"\t\ttry { impl.createHTMLDocument = wrap; } catch (e) { /* */ }\n"
++"\t}\n"
++"})();\n"
++"\n"
+ "/* ---- the DOM surface a census found missing (2026-09-26) ---------------\n"
+ " * parentElement (!), innerText, localName, the reflected attributes, the\n"
+ " * form-control API, text-node odds, document helpers, window\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 3d3a856..d0caf42 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1911,6 +1911,12 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ (function () {
+ 	var d = g.document;
+ 	if (!d || typeof d.createElement !== 'function') return;
++	/* once per realm: a second run (the polyfill is evaluated again when a
++	 * realm is rebuilt, as on google) replaced the CSSRule classes while
++	 * the element's `sheet` getter -- installed only if missing -- kept
++	 * making rules of the first run's, so `rule instanceof CSSStyleRule`
++	 * was false and google's safe-CSS sanitizer threw */
++	if (g.CSSStyleSheet && g.CSSStyleSheet.__vbCssom) return;
+ 
+ 	function klass(name, parent, ctor) {
+ 		var F = ctor || function () { throw new TypeError('Illegal constructor'); };
+@@ -1952,6 +1958,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		initSheet(this, null);
+ 	});
+ 	var DeclBase = typeof g.CSSStyleDeclaration === 'function' ? g.CSSStyleDeclaration : null;
++	define(CSSStyleSheet, '__vbCssom', true);
+ 
+ 	/* ---- parsing: a brace/string/comment-aware scan, no tokenizer ---- */
+ 	var TOK = /["'{}()\[\];\\]|\/\*/g;
+@@ -2359,13 +2366,339 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		for (var i = 0; i < ls.length; i++) out.push(sheetOf(ls[i]));
+ 		return listOf(out);
+ 	} });
++	/* a sheet exists while its element is in a document -- any document:
++	 * Closure's safe-CSS sanitizer (google's _.Sha) parses CSS through a
++	 * <style> in document.implementation.createHTMLDocument('') and read
++	 * .sheet null there, which failed a whole chain of google's services */
++	function connected(n) {
++		var top = n, i = 0;
++		while (top.parentNode && i++ < 4096) top = top.parentNode;
++		return top.nodeType === 9 || !!top.__vbDocRoot;
++	}
++	/* The bridge's createHTMLDocument() is a stand-in: its head, body and
++	 * documentElement are three detached elements of THIS document, so
++	 * nothing in it looked connected. Join them as a document's are and
++	 * mark the root. */
++	var impl = d.implementation;
++	if (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vb) {
++		var chd = impl.createHTMLDocument, wrapped = function () {
++			var doc = chd.apply(this, arguments);
++			try {
++				var root = doc && doc.documentElement;
++				if (root && root.nodeType === 1 && doc !== d) {
++					if (doc.head && !doc.head.parentNode) root.appendChild(doc.head);
++					if (doc.body && !doc.body.parentNode) root.appendChild(doc.body);
++					define(root, '__vbDocRoot', true);
++				}
++			} catch (e) { /* */ }
++			return doc;
++		};
++		wrapped.__vb = true;
++		try { impl.createHTMLDocument = wrapped; } catch (e) { /* */ }
++	}
+ 	var E = Object.getPrototypeOf(d.createElement('section'));
+ 	if (E && !('sheet' in E))
+ 		Object.defineProperty(E, 'sheet', { configurable: true, get: function () {
+-			return isSheetOwner(this) && d.documentElement && d.documentElement.contains(this) ? sheetOf(this) : null;
++			return isSheetOwner(this) && connected(this) ? sheetOf(this) : null;
+ 		} });
+ })();
+ 
++/* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,
++ * XMLSerializer, the scratch document ---------------------------------
++ * Closure's sanitizer (google's trending searches, and wherever Google
++ * builds HTML from data) parses markup with
++ * createHTMLDocument('').createRange().createContextualFragment(html),
++ * walks it with a TreeWalker (FILTER_REJECT drops a subtree), copies each
++ * element by iterating its attributes and serializes the result with
++ * XMLSerializer. The bridge had: a stand-in document with no createRange,
++ * a Range with no createContextualFragment, a TreeWalker whose
++ * firstChild/nextSibling/parentNode returned null, no serializeToString,
++ * and `attributes` rebuilt from a fixed list of ~23 names. */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	var E = Object.getPrototypeOf(d.createElement('section'));
++
++	/* attributes / getAttributeNames: every attribute, from libdom */
++	var names = g.__attrNamesNative;
++	if (typeof names === 'function' && E) {
++		define(E, 'getAttributeNames', function () { return names(this); });
++		var Attr = typeof g.Attr === 'function' ? g.Attr : null;
++		Object.defineProperty(E, 'attributes', { configurable: true, get: function () {
++			var el = this, ns = names(el), list = [], i;
++			for (i = 0; i < ns.length; i++) {
++				var a = Object.create(Attr && Attr.prototype ? Attr.prototype : Object.prototype);
++				a.name = a.nodeName = a.localName = ns[i];
++				a.value = a.nodeValue = a.textContent = el.getAttribute(ns[i]);
++				a.namespaceURI = null; a.prefix = null; a.specified = true;
++				a.nodeType = 2; a.ownerElement = el;
++				list.push(a);
++				if (!(ns[i] in list) && !/^\d/.test(ns[i]))
++					try { Object.defineProperty(list, ns[i], { value: a, configurable: true }); } catch (e) { /* */ }
++			}
++			define(list, 'item', function (k) { return list[k] || null; });
++			define(list, 'getNamedItem', function (n) {
++				n = String(n).toLowerCase();
++				for (var j = 0; j < list.length; j++) if (list[j].name.toLowerCase() === n) return list[j];
++				return null;
++			});
++			define(list, 'getNamedItemNS', function (ns2, n) { return list.getNamedItem(n); });
++			return list;
++		} });
++	}
++
++	/* TreeWalker / NodeIterator (DOM Standard) */
++	var ACCEPT = 1, REJECT = 2, SKIP = 3;
++	function accept(w, n) {
++		if (!((w.whatToShow >>> 0) & (1 << (n.nodeType - 1)))) return SKIP;
++		var f = w.filter;
++		if (!f) return ACCEPT;
++		var r = typeof f === 'function' ? f.call(null, n) : (typeof f.acceptNode === 'function' ? f.acceptNode(n) : ACCEPT);
++		return +r || 0;
++	}
++	function TreeWalker(root, what, filter) {
++		this.root = root;
++		this.whatToShow = what === undefined ? 0xFFFFFFFF : what >>> 0;
++		this.filter = filter || null;
++		this.currentNode = root;
++	}
++	function kids(w, first) {
++		var node = first ? w.currentNode.firstChild : w.currentNode.lastChild;
++		while (node) {
++			var r = accept(w, node);
++			if (r === ACCEPT) { w.currentNode = node; return node; }
++			if (r === SKIP) {
++				var c = first ? node.firstChild : node.lastChild;
++				if (c) { node = c; continue; }
++			}
++			for (;;) {
++				var s = first ? node.nextSibling : node.previousSibling;
++				if (s) { node = s; break; }
++				var p = node.parentNode;
++				if (!p || p === w.root || p === w.currentNode) return null;
++				node = p;
++			}
++		}
++		return null;
++	}
++	function sibs(w, next) {
++		var node = w.currentNode;
++		if (node === w.root) return null;
++		for (;;) {
++			var s = next ? node.nextSibling : node.previousSibling;
++			while (s) {
++				node = s;
++				var r = accept(w, node);
++				if (r === ACCEPT) { w.currentNode = node; return node; }
++				s = next ? node.firstChild : node.lastChild;
++				if (r === REJECT || !s) s = next ? node.nextSibling : node.previousSibling;
++			}
++			node = node.parentNode;
++			if (!node || node === w.root) return null;
++			if (accept(w, node) === ACCEPT) return null;
++		}
++	}
++	TreeWalker.prototype = {
++		constructor: TreeWalker,
++		parentNode: function () {
++			var node = this.currentNode;
++			while (node && node !== this.root) {
++				node = node.parentNode;
++				if (node && accept(this, node) === ACCEPT) { this.currentNode = node; return node; }
++			}
++			return null;
++		},
++		firstChild: function () { return kids(this, true); },
++		lastChild: function () { return kids(this, false); },
++		nextSibling: function () { return sibs(this, true); },
++		previousSibling: function () { return sibs(this, false); },
++		previousNode: function () {
++			var node = this.currentNode;
++			while (node !== this.root) {
++				var s = node.previousSibling;
++				while (s) {
++					node = s;
++					var r = accept(this, node);
++					while (r !== REJECT && node.lastChild) { node = node.lastChild; r = accept(this, node); }
++					if (r === ACCEPT) { this.currentNode = node; return node; }
++					s = node.previousSibling;
++				}
++				if (node === this.root || !node.parentNode) return null;
++				node = node.parentNode;
++				if (accept(this, node) === ACCEPT) { this.currentNode = node; return node; }
++			}
++			return null;
++		},
++		nextNode: function () {
++			var node = this.currentNode, r = ACCEPT;
++			for (;;) {
++				while (r !== REJECT && node.firstChild) {
++					node = node.firstChild;
++					r = accept(this, node);
++					if (r === ACCEPT) { this.currentNode = node; return node; }
++				}
++				var t = node, s = null;
++				while (t) {
++					if (t === this.root) return null;
++					s = t.nextSibling;
++					if (s) break;
++					t = t.parentNode;
++				}
++				if (!t || !s) return null;
++				node = s;
++				r = accept(this, node);
++				if (r === ACCEPT) { this.currentNode = node; return node; }
++			}
++		}
++	};
++	function NodeIterator(root, what, filter) {
++		this.root = root;
++		this.whatToShow = what === undefined ? 0xFFFFFFFF : what >>> 0;
++		this.filter = filter || null;
++		this.referenceNode = root;
++		this.pointerBeforeReferenceNode = true;
++	}
++	function following(n, root) {
++		if (n.firstChild) return n.firstChild;
++		while (n && n !== root) {
++			if (n.nextSibling) return n.nextSibling;
++			n = n.parentNode;
++		}
++		return null;
++	}
++	function preceding(n, root) {
++		if (n === root) return null;
++		var p = n.previousSibling;
++		if (p) { while (p.lastChild) p = p.lastChild; return p; }
++		return n.parentNode;
++	}
++	NodeIterator.prototype = {
++		constructor: NodeIterator,
++		nextNode: function () {
++			var node = this.referenceNode, before = this.pointerBeforeReferenceNode;
++			for (;;) {
++				if (!before) { node = following(node, this.root); if (!node) return null; }
++				else before = false;
++				if (accept(this, node) === ACCEPT) {
++					this.referenceNode = node; this.pointerBeforeReferenceNode = false; return node;
++				}
++			}
++		},
++		previousNode: function () {
++			var node = this.referenceNode, before = this.pointerBeforeReferenceNode;
++			for (;;) {
++				if (before) { node = preceding(node, this.root); if (!node) return null; }
++				else before = true;
++				if (accept(this, node) === ACCEPT) {
++					this.referenceNode = node; this.pointerBeforeReferenceNode = true; return node;
++				}
++			}
++		},
++		detach: function () {}
++	};
++	function makeTW(root, what, filter) {
++		if (!root || typeof root.nodeType !== 'number')
++			throw new TypeError("Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.");
++		return new TreeWalker(root, what, filter);
++	}
++	function makeNI(root, what, filter) {
++		if (!root || typeof root.nodeType !== 'number')
++			throw new TypeError("Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.");
++		return new NodeIterator(root, what, filter);
++	}
++	define(d, 'createTreeWalker', makeTW);
++	define(d, 'createNodeIterator', makeNI);
++	define(g, 'TreeWalker', TreeWalker);
++	define(g, 'NodeIterator', NodeIterator);
++	if (!g.NodeFilter || typeof g.NodeFilter.SHOW_ELEMENT !== 'number') {
++		define(g, 'NodeFilter', { FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
++			SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4,
++			SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128,
++			SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024 });
++	}
++
++	/* Range.createContextualFragment: parse into a fragment (inert: a
++	 * <template>'s content when the bridge has one, else a detached div) */
++	function fragmentOf(html) {
++		var f = d.createDocumentFragment(), holder = d.createElement('template'), src;
++		holder.innerHTML = String(html);
++		src = holder.content && holder.content.childNodes ? holder.content : holder;
++		while (src.firstChild) f.appendChild(src.firstChild);
++		return f;
++	}
++	if (typeof d.createRange === 'function') {
++		var cr = d.createRange;
++		define(d, 'createRange', function () {
++			var r = cr.apply(d, arguments);
++			if (r && typeof r.createContextualFragment !== 'function')
++				try { define(r, 'createContextualFragment', fragmentOf); } catch (e) { /* */ }
++			return r;
++		});
++	}
++
++	/* XMLSerializer (the XHTML serialization browsers give for HTML nodes) */
++	function escText(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
++	function escAttr(s) { return escText(s).replace(/"/g, '&quot;'); }
++	var VOID = /^(area|base|br|col|embed|hr|img|input|link|meta|source|track|wbr)$/;
++	function ser(n, root) {
++		switch (n.nodeType) {
++		case 1: {
++			var tag = String(n.localName || n.tagName || '').toLowerCase(), s = '<' + tag, k, an = [];
++			if (root) s += ' xmlns="http://www.w3.org/1999/xhtml"';
++			try { an = n.getAttributeNames(); } catch (e) { /* */ }
++			for (k = 0; k < an.length; k++) if (an[k] !== 'xmlns') s += ' ' + an[k] + '="' + escAttr(n.getAttribute(an[k])) + '"';
++			var c = n.firstChild, inner = '';
++			if (tag === 'template' && n.content) c = n.content.firstChild;
++			for (; c; c = c.nextSibling) inner += ser(c, false);
++			if (!inner && VOID.test(tag)) return s + ' />';
++			return s + '>' + inner + '</' + tag + '>';
++		}
++		case 3: return escText(n.data);
++		case 4: return '<![CDATA[' + n.data + ']]>';
++		case 8: return '<!--' + n.data + '-->';
++		case 9: return n.documentElement ? ser(n.documentElement, true) : '';
++		case 11: {
++			var out = '';
++			for (var f = n.firstChild; f; f = f.nextSibling) out += ser(f, true);
++			return out;
++		}
++		}
++		return '';
++	}
++	function XMLSerializer() {
++		if (!(this instanceof XMLSerializer)) throw new TypeError("Constructor XMLSerializer requires 'new'");
++	}
++	define(XMLSerializer.prototype, 'serializeToString', function (n) {
++		if (!n || typeof n.nodeType !== 'number')
++			throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
++		return ser(n, true);
++	});
++	var have = g.XMLSerializer;
++	if (typeof have !== 'function' || typeof (have.prototype || {}).serializeToString !== 'function')
++		define(g, 'XMLSerializer', XMLSerializer);
++
++	/* the scratch document: the factories a parser or sanitizer calls */
++	var impl = d.implementation;
++	if (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vbFactories) {
++		var chd = impl.createHTMLDocument, wrap = function () {
++			var doc = chd.apply(this, arguments);
++			if (doc && doc !== d) {
++				['createDocumentFragment', 'createComment', 'createElementNS', 'createRange',
++				 'createTreeWalker', 'createNodeIterator', 'importNode', 'createEvent'].forEach(function (m) {
++					if (typeof doc[m] !== 'function' && typeof d[m] === 'function')
++						try { define(doc, m, function () { return d[m].apply(d, arguments); }); } catch (e) { /* */ }
++				});
++				if (!doc.implementation) try { define(doc, 'implementation', impl); } catch (e) { /* */ }
++			}
++			return doc;
++		};
++		wrap.__vb = chd.__vb;
++		wrap.__vbFactories = true;
++		try { impl.createHTMLDocument = wrap; } catch (e) { /* */ }
++	}
++})();
++
+ /* ---- the DOM surface a census found missing (2026-09-26) ---------------
+  * parentElement (!), innerText, localName, the reflected attributes, the
+  * form-control API, text-node odds, document helpers, window

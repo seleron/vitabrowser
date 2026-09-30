@@ -1,0 +1,52 @@
+# netsurf (vita frontend, simulator build): a monotonic clock for performance.now()
+# Generated 2026-09-30
+#
+# JS-dom-stall failed now and then in the full gate with one random step
+# showing a ~2 s "stall" (DOMSTALL 6/7), never when the page ran alone.
+# Nothing stalled: WSL steps the wall clock forward ~2.2 s every ~34.5 s
+# (measured: wall +2.31 s against monotonic +0.01 s, at a steady period),
+# and the host build of macos9_micros() -- the clock behind
+# performance.now(), TickCount() and the engine's own timers -- read
+# gettimeofday(). A page timing its event loop saw the step as a stall;
+# temporary main-loop instrumentation (not committed) put the "2 s" in a
+# 16 ms usleep, the tell.
+#
+# - qjs_hooks.c: the host build reads clock_gettime(CLOCK_MONOTONIC), as
+#   the Vita build reads sceKernelGetProcessTimeWide(); every user of the
+#   clock takes differences, so only the base changes.
+# The gap-measuring test pages (JS-dom-stall, JS-reflow-stall,
+# JS-module-static-async, JS-frame-local, JS-fetch-headers,
+# JS-fetch-stream, JS-streaming) now time with performance.now(), not
+# Date.now() -- wall time may step on any machine; JS-window keeps
+# Date.now(), whose timestamp crosses navigations.
+diff --git a/frontends/vita/qjs_hooks.c b/frontends/vita/qjs_hooks.c
+index 476fa3a..d1e549e 100644
+--- a/frontends/vita/qjs_hooks.c
++++ b/frontends/vita/qjs_hooks.c
+@@ -24,6 +24,7 @@
+ 
+ #include <stddef.h>
+ #include <sys/time.h>
++#include <time.h>
+ #ifdef __vita__
+ #include <psp2/kernel/processmgr.h>
+ #endif
+@@ -49,10 +50,15 @@ double macos9_micros(void)
+ #ifdef __vita__
+ 	return (double)sceKernelGetProcessTimeWide();
+ #else
+-	struct timeval tv;
++	/* Monotonic, as the Vita's process time is. The wall clock was used
++	 * here, and WSL steps it forward ~2.2 s every ~34 s: performance.now()
++	 * jumped with it in the simulator, and a page timing its own event
++	 * loop saw a 2 s "stall" that never happened (JS-dom-stall failed
++	 * whenever a step landed in its measuring window). */
++	struct timespec ts;
+ 
+-	gettimeofday(&tv, NULL);
+-	return (double)tv.tv_sec * 1e6 + (double)tv.tv_usec;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+ #endif
+ }
+ 
