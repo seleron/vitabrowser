@@ -202,6 +202,25 @@ has rows; the XHR returns 200 / 6.9 KB, so the parse or the callback is
 the next thing to trace) -- and the mobile header (ALL / IMAGES).
 Also seen: `#gb-main` gets `style="min-height:undefinedpx"` (a viewport
 height the bridge answers `undefined` for).
+Google residuals, 2026-09-30 morning: (1) footer links ran together in
+innerText -- flex items are blockified; fixed (patch 177), google 62.9.
+(2) `min-height:undefinedpx` is BY DESIGN: an inline script writes
+`#gb-main.scrollHeight + "px"` during parsing, before any layout, and the
+bridge answers geometry `undefined` until the tree settles (fixes1014/
+1087: a fabricated 0 written back once erased whole page sections; a NaN
+write is a no-op). Matching Chrome needs a forced synchronous layout
+during parse -- its own risky round. (3) The ALL/IMAGES header IS in the
+page (innerText has it) but drawn off-screen: `<body>` sits at y=-10 and
+the header's items are not centred in its 48px flex row (they start at
+its top), and the Sign-in button stretches into a tall block at the left.
+Google's CSS is plain (`header{display:flex;min-height:48px}`,
+`#gb-main{display:flex;flex-direction:column;min-height:100%}`,
+`body,html{height:100%}`): a flex layout-engine investigation, next.
+Found on the way, also next: the bridge's `element.matches()` answers true
+for `:root`, pseudo-elements, `:hover`, `:first-child`, `:nth-child()` on
+any element and false for `body > div` / `:is()`; querySelectorAll finds
+nothing for `:root`, `:first-child`, `:nth-child()`, `:is()` (Chromium
+comparison on example.com, 9 of 14 selectors wrong).
 Then the trending list itself (patches 171-172, same night): a temporary
 QuickJS throw trace showed what google's try/catch blocks swallowed -- (1)
 Closure's safe-CSS builder reads `.sheet` of a `<style>` in

@@ -638,7 +638,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
-[ "$itr" = "INNERTEXT: 8/8 passed" ] && \
+[ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
 [ "$bcr" = "BLOCKCLASS: 7/7 passed" ] && [ "${bcl:-0}" -ge 6 ] && \
