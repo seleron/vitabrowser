@@ -2873,4 +2873,14 @@ reported (`ysa {{0}}:313:407`, error "zc") is the one patch 168 removes.
   local: rebuilt and laid out ..." per class change; "declined (class
   change on an element with a block-level box)" for the ones that still
   take the full rebuild.
+- Patch 174 (WS-C, block class changes): a script setting the class of a
+  paragraph, div or heading (expand/collapse, highlight, theme on a
+  section) no longer rebuilds the whole page -- only that block (sim:
+  16-27 ms instead of 250-268 ms). Pages whose CSS uses sibling selectors
+  (`.open + .panel`) still take the full rebuild, correctly.
+  netsurf.log: "LIFE rebuild local: block restyled +N px in M us";
+  "declined (page CSS has sibling combinators)" for the others.
+- Patch 175: element positions read by scripts (getBoundingClientRect,
+  offsetTop/Left) were off by the border width for bordered elements --
+  menus/tooltips positioned from them may now line up better.
 

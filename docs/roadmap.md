@@ -146,6 +146,17 @@ holding it through the patch 165 path: 24-27 ms, geometry identical
 a class change on an element whose own box is block-level (its box's
 style must be recomputed) -- the next WS-C item, with lists and nested
 blocks.
+Block class changes (patch 174, 2026-09-30): the element's own block box
+is taken out and the element built again with a fresh cascade, put back
+where it was -- patch 166's removal + insertion: 250-268 ms -> 16-27 ms,
+geometry identical (636-value hash against the unpatched build). Declined
+to the full rebuild when the page's own CSS has a sibling combinator
+(`+`/`~`: the class could restyle following siblings) or the block holds
+objects, controls, floats or a list marker. Found on the way (patch 175):
+getBoundingClientRect / offsetTop / offsetLeft put a bordered box a
+border's width too low and too far right. Still the full rebuild:
+lists (markers, numbering), nested blocks (a new div holding paragraphs),
+floats/tables/flex around the change, pages with sibling combinators.
 Found on the way (patch 164, a correctness fix, not WS-C): without iconv
 (the Vita's libparserutils) the last <=64 characters of a document or
 stylesheet were dropped when the data ended in the pass that filled the

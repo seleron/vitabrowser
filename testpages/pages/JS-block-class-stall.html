@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS block class stall (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+#res { position: fixed; top: 0; left: 0; right: 0; background: #fff; }
+#big p { margin: 2px 0; }
+#big p.blue { color: rgb(0, 0, 255); }
+#big p.blue b { color: rgb(0, 128, 0); }
+#big p.roomy { margin: 20px 0; padding: 12px 6px; border-top: 3px solid rgb(0, 0, 0); }
+#big p.gone { display: none; }
+</style>
+<script>
+(function () {
+	var S = { maxgap: 0, ticks: 0, on: false }, N = 7, k = 0;
+	function now() { return self.performance ? performance.now() : Date.now(); }
+	var last = now();
+	(function tick() {
+		var t = now(), g = t - last;
+		last = t;
+		if (S.on) { S.ticks++; if (g > S.maxgap) S.maxgap = g; }
+		setTimeout(tick, 0);
+	})();
+	function $(id) { return document.getElementById(id); }
+	function median(a) { var s = a.slice().sort(function (x, y) { return x - y; }); return s.length ? s[s.length >> 1] : 0; }
+	var res = [];
+	function t(n, ok, text) { res.push([n, ok, text]); }
+	function show() {
+		var i, r, p;
+		for (i = 0; i < res.length; i++) {
+			r = res[i]; p = $('r' + r[0]);
+			p.textContent = r[0] + ' ' + r[2] + (r[1] ? '' : ' FAIL');
+			if (r[1]) { p.className = 'pass'; k++; }
+		}
+		$('sum').textContent = 'BLOCKCLASS: ' + k + '/' + N + ' passed';
+		document.title = 'JS block class stall (' + k + '/' + N + ')';
+	}
+	document.addEventListener('DOMContentLoaded', function () {
+		var h = [], i;
+		for (i = 0; i < 5000; i++)
+			h.push('<p id="p' + i + '">Paragraph ' + i + ' with <b>some</b> ' +
+				'inline <i>text</i> that <span id="s' + i + '">wraps</span> in the layout, ' +
+				'<a href="#">a link</a> and more words to fill it.</p>');
+		$('big').innerHTML = h.join('');
+	});
+	function colour(el) { return String(getComputedStyle(el).color).replace(/\s+/g, ''); }
+	var BLUE = 'rgb(0,0,255)', GREEN = 'rgb(0,128,0)';
+	function blue(id) {
+		var p = $(id), b = p.getElementsByTagName('b')[0];
+		return colour(p) === BLUE && colour(b) === GREEN;
+	}
+	function plain(id) {
+		var p = $(id), b = p.getElementsByTagName('b')[0];
+		return colour(p) !== BLUE && colour(b) !== GREEN;
+	}
+	/* [name, bounded?, change, check] */
+	var steps = [
+		['paragraph class on', true, function () { $('p2500').className = 'blue'; },
+			function () { return blue('p2500'); }],
+		['paragraph class off', true, function () { $('p2500').className = ''; },
+			function () { return plain('p2500'); }],
+		['paragraph class on again', true, function () { $('p2500').className = 'blue'; },
+			function () { return blue('p2500'); }],
+		['paragraph class off again', true, function () { $('p2500').className = ''; },
+			function () { return plain('p2500'); }],
+		['margins, padding, border', true, function () { $('p2501').className = 'roomy'; },
+			function () {
+				var a = $('p2501').getBoundingClientRect(), b = $('p2502').getBoundingClientRect();
+				return a.height > 40 && b.top >= a.bottom + 19;
+			}],
+		['display: none', true, function () { $('p2503').className = 'gone'; },
+			function () {
+				var a = $('p2502').getBoundingClientRect(), b = $('p2504').getBoundingClientRect();
+				return $('p2503').getBoundingClientRect().height === 0 && b.top >= a.bottom - 1 && b.top < a.bottom + 10;
+			}]
+	];
+	function stack(from, to) {
+		var i, prev = null, r;
+		for (i = from; i <= to; i++) {
+			r = $('p' + i).getBoundingClientRect();
+			if (prev && r.top < prev.bottom - 1) return 'overlap at p' + i;
+			prev = r;
+		}
+		return 'ok';
+	}
+	var gaps = [];
+	function run(i) {
+		if (i >= steps.length) {
+			/* bounded: a full rebuild costs ~250 ms a step here, a local one
+			 * ~25 ms; the host adds a 60-100 ms hiccup to a step now and then
+			 * (the step's own work stays 3-12 ms in the engine log), so: median
+			 * under 60 ms and no step at a full rebuild's 200 ms */
+			var worst = Math.round(Math.max.apply(null, gaps)), med = Math.round(median(gaps)), o = stack(2495, 2502) === 'ok' ? stack(2504, 2510) : stack(2495, 2502);
+			t(7, o === 'ok' && med < 60 && worst < 200, 'bounded block class changes: median gap ' +
+				med + ' ms, longest ' + worst + ' ms; paragraphs stack: ' + o);
+			show();
+			return;
+		}
+		S.maxgap = 0; S.ticks = 0; S.on = true;
+		steps[i][2]();
+		setTimeout(function () {
+			var ok = steps[i][3]();
+			setTimeout(function () {
+				S.on = false;
+				if (steps[i][1]) gaps.push(S.maxgap);
+				t(i + 1, ok, steps[i][0] + ': longest gap ' + Math.round(S.maxgap) + ' ms');
+				setTimeout(function () { run(i + 1); }, 100);
+			}, 50);
+		}, 600);
+	}
+	var started = false, lastH = -1;
+	function settled() {
+		var sh = document.body.scrollHeight;
+		if (sh < 100000 || sh !== lastH) {
+			lastH = sh;
+			setTimeout(settled, 100);
+			return;
+		}
+		/* 1 s after the page stops growing: the load's last full layout
+		 * must not land in step 1's measuring window */
+		setTimeout(function () { run(0); }, 1000);
+	}
+	window.addEventListener('load', function () {
+		if (started) return;
+		started = true;
+		setTimeout(settled, 100);
+	});
+})();
+</script>
+</head>
+<body>
+<!-- Roadmap WS-C, class changes on block-level elements (patch 174). A
+     script sets the class of one paragraph among 5000. That took the full
+     box-tree rebuild (~0.26 s here, seconds on the Vita): the paragraph's
+     own box style has to be recomputed. It is now rebuilt alone and put
+     back in place with the block layout's own margin arithmetic (the
+     patch 166 removal + insertion). The checks read computed colours of
+     the paragraph and of a <b> inside it (descendants re-cascade too).
+     1-4: the class toggled on, off, on, off: each shown.
+     5: a class adding margins, padding and a border: the paragraph grows
+        and what follows moves down by the new margin (read through
+        getBoundingClientRect, which put a bordered box a border's width
+        too low until patch 175).
+     6: a class making the paragraph display: none: the next one moves up.
+     7: steps 1-6 bounded (median main-loop gap < 60 ms, none at a full rebuild's 200 ms) and the
+        paragraphs around them still stack. -->
+<div id="res">
+<p id="sum" class="wait">BLOCKCLASS: script did not run</p>
+<p id="r1" class="wait">1 waiting</p><p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p><p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p><p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+</div>
+<div style="height: 240px"></div>
+<div id="big"></div>
+</body></html>

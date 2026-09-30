@@ -233,6 +233,8 @@ NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-innertext http://127.0.0.1:$HP/JS-innertext.html
 NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
 NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
+NET-js-block-class-stall http://127.0.0.1:$HP/JS-block-class-stall.html
+NET-js-block-class-sibling http://127.0.0.1:$HP/JS-block-class-sibling.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -581,13 +583,28 @@ echo "  JS-sanitize: ${szr:-no summary}"
 # Class changes (Patch 173): a class set on an inline-level element among
 # 5000 paragraphs rebuilds its block only; the page times it, the engine
 # log must show the local rebuilds (and the block-level one declined).
-csp2=$(ls "$R"/*NET-js-class-stall.plot 2>/dev/null | head -1)
-clr=$(sed -n 's/.*STR \(CLASSSTALL: [0-9]*\/[0-9]* passed\).*/\1/p' "$csp2" 2>/dev/null | head -1)
+csp2=$(ls "$R"/*NET-js-class-stall*.plot 2>/dev/null)
+clr=$(sed -n 's/.*STR \(CLASSSTALL: [0-9]*\/[0-9]* passed\).*/\1/p' $csp2 2>/dev/null | head -1)
 cll=$(awk '/page [0-9]*\/[0-9]* NET-js-class-stall: navigate/ {on=1; next}
 	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
 	on' "$R/netsurf.log" 2>/dev/null | grep -c 'LIFE rebuild local: rebuilt and laid out' || true)
 echo "  JS-class-stall: ${clr:-no summary}; ${cll} class changes rebuilt locally"
-[ -n "$csp2" ] && grep -ao 'STR [0-9] [^"]*FAIL' "$csp2" | sed 's/^STR /  /'
+[ -n "$csp2" ] && grep -aho 'STR [0-9] [^"]*FAIL' $csp2 | sort -u | sed 's/^STR /  /'
+# (each page writes its summary once, at the end: it is in whichever of
+# the page's two dumps -- top, -bottom -- was taken after that)
+# Block class changes (Patch 174): a paragraph's own class rebuilds that
+# block alone and places it back (engine log: "block restyled"); with a
+# sibling combinator in the page CSS it must decline to the full rebuild,
+# and the following siblings must still restyle (JS-block-class-sibling).
+bcp=$(ls "$R"/*NET-js-block-class-stall*.plot 2>/dev/null)
+bcr=$(sed -n 's/.*STR \(BLOCKCLASS: [0-9]*\/[0-9]* passed\).*/\1/p' $bcp 2>/dev/null | head -1)
+bcl=$(grep -c 'LIFE rebuild local: block restyled [-+]' "$R/netsurf.log" || true)
+bsp=$(ls "$R"/*NET-js-block-class-sibling*.plot 2>/dev/null)
+bsr=$(sed -n 's/.*STR \(BLOCKSIB: [0-9]*\/[0-9]* passed\).*/\1/p' $bsp 2>/dev/null | head -1)
+bsd=$(grep -c 'declined (page CSS has sibling combinators)' "$R/netsurf.log" || true)
+echo "  JS-block-class-stall: ${bcr:-no summary}; ${bcl} blocks restyled locally"
+echo "  JS-block-class-sibling: ${bsr:-no summary}; ${bsd} declined for sibling combinators"
+[ -n "$bcp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $bcp | sort -u | sed 's/^STR /  /'
 [ -n "$ptp" ] && { grep -o 'STR [0-9]* [0-9] .* FAIL' "$ptp" | sed 's/^STR /  /' || true; }
 # Patch 165: a script's text change rebuilds and lays out only its block
 # (html_reconvert_local): three text edits on a 5000-paragraph page, each
@@ -615,6 +632,8 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$itr" = "INNERTEXT: 8/8 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
+[ "$bcr" = "BLOCKCLASS: 7/7 passed" ] && [ "${bcl:-0}" -ge 6 ] && \
+[ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
 [ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \

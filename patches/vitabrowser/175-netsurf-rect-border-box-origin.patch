@@ -1,0 +1,57 @@
+# netsurf (MacSurf bridge): getBoundingClientRect / offsetTop / offsetLeft start at the border box
+# Generated 2026-09-30
+#
+# Found by JS-block-class-stall.html step 5: a paragraph given a 3px top
+# border and 20px margins measured 23px from the one above and 17px to the
+# one below. box x/y is the PADDING box's corner -- layout places a block
+# at y = ... + margin + border-top (layout.c box->x = left + margin[LEFT] +
+# border[LEFT].width) -- and qjs_el_get_rect used it as the border box's
+# corner while adding both borders to the width and height: every bordered
+# element's rect sat a border's width too low and too far right, reaching
+# into what follows it. offsetTop / offsetLeft had the same slip.
+# - qjs_el_get_rect: x -= border-left, y -= border-top.
+# - offsetTop / offsetLeft: the border box's edge from the parent's
+#   padding edge (both box origins are padding-box corners).
+# Test: JS-block-class-stall.html step 5 (margins 20px above and below the
+# bordered paragraph, as in Chromium).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index c23fc52..61ac2ec 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -7666,6 +7666,13 @@ static JSValue qjs_el_get_rect(JSContext *ctx, JSValueConst this_val,
+ 	b = qjs_box_for(ctx, this_val);
+ 	if (b != NULL) {
+ 		qjs_box_origin(b, &x, &y);
++		/* VitaBrowser: box x/y is the PADDING box's corner (layout puts
++		 * the border outside it: y = ... + border-top), so the border-box
++		 * rect starts a border's width up and to the left. Without this a
++		 * bordered element's rect sat a border lower and further right
++		 * than it is, overlapping the element below it. */
++		x -= b->border[LEFT].width;
++		y -= b->border[TOP].width;
+ 		/* Border-box, matching getBoundingClientRect: content plus padding
+ 		 * plus border on each side. */
+ 		w = qjs_sane(b->width) + b->padding[LEFT] + b->padding[RIGHT] +
+@@ -7827,18 +7834,20 @@ static JSValue qjs_el_metric(JSContext *ctx, JSValueConst this_val,
+ 	/* clientWidth/Height EXCLUDE the border and include padding. */
+ 	case QJS_M_CLIW: v = qjs_sane(b->width) + px; break;
+ 	case QJS_M_CLIH: v = qjs_sane(b->height) + py; break;
++	/* offsetTop/Left: the border box's outer edge from the parent's
++	 * padding edge; box origins are padding-box corners (see get_rect) */
+ 	case QJS_M_OFFT: {
+ 		int x = 0, y = 0, pxo = 0, pyo = 0;
+ 		qjs_box_origin(b, &x, &y);
+ 		if (b->parent != NULL) qjs_box_origin(b->parent, &pxo, &pyo);
+-		v = y - pyo;
++		v = y - b->border[TOP].width - pyo;
+ 		break;
+ 	}
+ 	case QJS_M_OFFL: {
+ 		int x = 0, y = 0, pxo = 0, pyo = 0;
+ 		qjs_box_origin(b, &x, &y);
+ 		if (b->parent != NULL) qjs_box_origin(b->parent, &pxo, &pyo);
+-		v = x - pxo;
++		v = x - b->border[LEFT].width - pxo;
+ 		break;
+ 	}
+ 	/* scrollWidth/Height are the DESCENDANT extent -- how big the content

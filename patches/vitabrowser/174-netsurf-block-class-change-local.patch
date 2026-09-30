@@ -1,0 +1,340 @@
+# netsurf: a class change on a block rebuilds only that block (WS-C)
+# Generated 2026-09-30
+#
+# Roadmap WS-C, after patch 173 (inline-level elements). A class set on an
+# element whose own box is a block -- a paragraph, a div, a heading -- was
+# still the full box-tree rebuild: 250-268 ms of main-loop stall here on
+# 5000 paragraphs, seconds on the Vita. The block's own box style has to
+# be recomputed, which the inline path (rebuild the block's children)
+# cannot do.
+#
+# html.c, html_rl_block_restyle(): the old box is taken out as a removal
+# and the element built again with a fresh cascade (its libcss node data
+# reset) and put back after the same previous sibling as an insertion --
+# patch 166's removal + insertion, each placed with the block layout's own
+# margin arithmetic (layout_relayout_block). Declined (logged, full
+# rebuild) when:
+# - the parent box holds anything but blocks, or the block holds objects,
+#   controls, floats or a list marker, or the element is not a plain block
+#   tag of inline content (html_rl_block_tag / html_rl_inline_subtree);
+# - the page's own CSS has a sibling combinator ('+' or '~' in a selector,
+#   outside brackets and parentheses): the class could restyle the
+#   FOLLOWING siblings, which a one-block rebuild would leave stale. A small
+#   brace/string/comment-aware scan of each author sheet's source, cached
+#   per sheet.
+# If the element is no longer a block (display: inline), the full
+# reconvert takes it from the DOM; display: none is just the removal.
+# Measured on JS-block-class-stall.html (a paragraph's class toggled four
+# times, then margins/padding/border, then display: none): 250-268 ms ->
+# 16-27 ms of longest gap, 6.5-7.2 ms of work per change. Geometry
+# identical to the full path: a hash of 636 values (paragraphs 2490-2620,
+# spans and <b>s around the changes) matched the unpatched build's, twice
+# each. JS-block-class-sibling.html: with `.open + p` / `.open ~ p` in the
+# page CSS each change declines and the siblings restyle (3/3).
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index df1d8de..9f8f6e2 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6567,6 +6567,282 @@ decline:
+ #undef RL_BNO
+ }
+ 
++/* ---- a block whose own class changed (patch 174) ------------------- */
++
++/* index just past the '}' closing the block opened at s[i] == '{' */
++static size_t html_rl_css_skip_block(const uint8_t *s, size_t i, size_t len)
++{
++	int depth = 0;
++
++	while (i < len) {
++		uint8_t ch = s[i];
++		if (ch == '/' && i + 1 < len && s[i + 1] == '*') {
++			for (i += 2; i + 1 < len &&
++			     !(s[i] == '*' && s[i + 1] == '/'); i++)
++				;
++			i += 2;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			for (i++; i < len && s[i] != ch && s[i] != '\n'; i++)
++				if (s[i] == '\\')
++					i++;
++			i++;
++			continue;
++		}
++		if (ch == '{')
++			depth++;
++		else if (ch == '}' && --depth == 0)
++			return i + 1;
++		i++;
++	}
++	return len;
++}
++
++/* Does a selector in this CSS reach a following sibling -- a '+' or '~'
++ * combinator outside brackets and parentheses (nth-child(2n+1) and
++ * [class~=x] do not)? Selector preludes only, inside group at-rules too;
++ * declaration blocks (calc(a + b)) are skipped. */
++static bool html_rl_css_has_sibling(const uint8_t *s, size_t len)
++{
++	size_t i = 0, start = 0;
++	int groups = 0;
++
++	while (i < len) {
++		uint8_t ch = s[i];
++		if (ch == '/' && i + 1 < len && s[i + 1] == '*') {
++			for (i += 2; i + 1 < len &&
++			     !(s[i] == '*' && s[i + 1] == '/'); i++)
++				;
++			i += 2;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			for (i++; i < len && s[i] != ch && s[i] != '\n'; i++)
++				if (s[i] == '\\')
++					i++;
++			i++;
++			continue;
++		}
++		if (ch == ';') {
++			start = ++i;
++			continue;
++		}
++		if (ch == '}') {
++			if (groups > 0)
++				groups--;
++			start = ++i;
++			continue;
++		}
++		if (ch == '{') {
++			size_t a = start, k;
++			int par = 0;
++			while (a < i && (s[a] == ' ' || s[a] == '\t' ||
++					 s[a] == '\n' || s[a] == '\r' ||
++					 s[a] == '\f'))
++				a++;
++			if (a < i && s[a] == '@') {
++				static const char *const group[] = {
++					"@media", "@supports", "@layer",
++					"@container", "@document",
++					"@-moz-document", "@scope",
++					"@starting-style", NULL
++				};
++				int g;
++				for (g = 0; group[g] != NULL; g++)
++					if (i - a >= strlen(group[g]) &&
++					    strncasecmp((const char *)s + a,
++						group[g], strlen(group[g])) == 0)
++						break;
++				if (group[g] != NULL) {
++					groups++;
++					start = ++i;
++				} else {
++					i = html_rl_css_skip_block(s, i, len);
++					start = i;
++				}
++				continue;
++			}
++			for (k = a; k < i; k++) {
++				uint8_t x = s[k];
++				if (x == '(' || x == '[')
++					par++;
++				else if ((x == ')' || x == ']') && par > 0)
++					par--;
++				else if (par == 0 && (x == '+' || x == '~'))
++					return true;
++			}
++			i = html_rl_css_skip_block(s, i, len);
++			start = i;
++			continue;
++		}
++		i++;
++	}
++	return false;
++}
++
++/* any of the page's own stylesheets (per sheet source, cached) */
++static bool html_rl_page_css_has_sibling(html_content *c)
++{
++	static struct { const uint8_t *data; size_t size; bool has; }
++		cache[32];
++	static unsigned int next_slot;
++	unsigned int i, k;
++
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		const uint8_t *data;
++		size_t size = 0;
++		bool has, hit = false;
++		if (c->stylesheets[i].sheet == NULL || c->stylesheets[i].unused)
++			continue;
++		data = content_get_source_data(c->stylesheets[i].sheet, &size);
++		if (data == NULL || size == 0)
++			continue;
++		for (k = 0; k < 32; k++)
++			if (cache[k].data == data && cache[k].size == size) {
++				has = cache[k].has;
++				hit = true;
++				break;
++			}
++		if (!hit) {
++			has = html_rl_css_has_sibling(data, size);
++			cache[next_slot].data = data;
++			cache[next_slot].size = size;
++			cache[next_slot].has = has;
++			next_slot = (next_slot + 1) % 32;
++		}
++		if (has)
++			return true;
++	}
++	return false;
++}
++
++/* The element's own box is a plain block among plain blocks: take the old
++ * box out and build the element again with a fresh cascade, put back where
++ * it was -- patch 166's removal then insertion, laid out with the block
++ * layout's own margin arithmetic. 0 done, -1 declined (nothing changed)
++ * or failed (the full reconvert rebuilds from the DOM). */
++static int html_rl_block_restyle(html_content *c, dom_node *el,
++		struct box *ob, double t0)
++{
++	extern double macos9_micros(void);
++	extern const char *layout_relayout_why;
++	struct content *base_c = &c->base;
++	struct box *pbox = ob->parent, *prev, *nx, *nb, *b, *layout;
++	struct layout_removed_block rb;
++	unsigned int objects_before;
++	int delta = 0, total = 0;
++	bool full = false;
++	const char *why = NULL;
++	static unsigned long restyle_n;
++
++#define RL_RNO(w) do { macsurf_debug_log_writef( \
++		"LIFE rebuild local: declined (%s)", (w)); return -1; } while (0)
++	if (pbox == NULL || pbox->type != BOX_BLOCK)
++		RL_RNO("restyled block's parent is not a block");
++	for (b = pbox->children; b != NULL; b = b->next)
++		if (b->type != BOX_BLOCK || b->node == NULL)
++			RL_RNO("restyled block's parent holds more than blocks");
++	if (ob->object != NULL || ob->gadget != NULL || ob->iframe != NULL ||
++	    ob->list_marker != NULL || ob->float_children != NULL ||
++	    html_rl_subtree_referenced(ob->children))
++		RL_RNO("restyled block holds objects, controls or floats");
++	if (!html_rl_block_tag(el) || !html_rl_inline_subtree(el))
++		RL_RNO("restyled element is not a plain block of text");
++	/* a class on this block could restyle its following siblings */
++	if (html_rl_page_css_has_sibling(c))
++		RL_RNO("page CSS has sibling combinators");
++
++	/* out with the old box, as a removal */
++	prev = ob->prev;
++	nx = ob->next;
++	rb.y = ob->y;
++	rb.border_top = ob->border[TOP].width;
++	rb.bottom = ob->y + ob->padding[TOP] + ob->height +
++		ob->padding[BOTTOM] + ob->border[BOTTOM].width;
++	rb.margin_top = ob->margin[TOP];
++	rb.margin_bottom = ob->margin[BOTTOM];
++	html_rl_unlink(ob);
++	box_free(ob);
++	html_rl_invalidate(pbox);
++	if (layout_relayout_block(c, pbox, prev, NULL, nx, &rb, &delta)) {
++		total += delta;
++	} else {
++		full = true;
++		why = layout_relayout_why;
++	}
++
++	/* in with the new, cascaded afresh, where the old one was */
++	objects_before = c->num_objects;
++	(void) html_reconvert_reset_node_data_walk(el, 0);
++	if (!box_build_element(c, el)) {
++		nb = box_for_node(el);
++		if (nb != NULL) {
++			html_rl_unlink(nb);
++			box_free(nb);
++		}
++		macsurf_debug_log_writef("LIFE rebuild local: restyled block "
++			"failed to build, full reconvert");
++		return -1;
++	}
++	nb = box_for_node(el);
++	if (nb != NULL) {		/* else display: none -- a removal */
++		if (nb->parent != pbox || nb->type != BOX_BLOCK) {
++			/* no longer a block here: the full rebuild */
++			html_rl_unlink(nb);
++			box_free(nb);
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"element is no longer a block, full reconvert");
++			return -1;
++		}
++		html_rl_unlink(nb);
++		html_rl_link_after(pbox, prev, nb);
++		if (!box_normalise_block(nb, c->layout, c)) {
++			full = true;
++			why = why != NULL ? why : "normalise failed";
++		} else if (c->num_objects != objects_before) {
++			full = true;
++			why = why != NULL ? why : "restyled block fetches objects";
++		}
++		html_rl_invalidate(nb);
++		if (!full && layout_relayout_block(c, pbox, nb->prev, nb,
++				nb->next, NULL, &delta)) {
++			total += delta;
++		} else if (!full) {
++			full = true;
++			why = layout_relayout_why;
++		}
++	}
++
++	restyle_n++;
++	if (full) {
++		macsurf_debug_log_writef("LIFE rebuild local: block restyled, "
++			"full layout (%s)", why != NULL ? why : "?");
++		content__reformat(base_c, false, base_c->available_width,
++				base_c->available_height);
++		return 0;
++	}
++	layout = c->layout;
++	base_c->width = layout->x + layout->padding[LEFT] + layout->width +
++		layout->padding[RIGHT] + layout->border[RIGHT].width +
++		layout->margin[RIGHT];
++	base_c->height = layout->y + layout->padding[TOP] + layout->height +
++		layout->padding[BOTTOM] + layout->border[BOTTOM].width +
++		layout->margin[BOTTOM];
++	if (base_c->width < layout->x + layout->descendant_x1)
++		base_c->width = layout->x + layout->descendant_x1;
++	if (base_c->height < layout->y + layout->descendant_y1)
++		base_c->height = layout->y + layout->descendant_y1;
++	selection_reinit(c->sel);
++	macsurf_debug_log_writef("LIFE rebuild local: block restyled %+d px "
++		"in %ld us, page %dx%d (%lu so far)", total,
++		(long)(macos9_micros() - t0), base_c->width, base_c->height,
++		restyle_n);
++	guit->misc->schedule(0, html_relayout_notify, c);
++	return 0;
++#undef RL_RNO
++}
++
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+ 		bool class_change);
+ 
+@@ -6628,11 +6904,18 @@ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+ 		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+ 		    type == DOM_ELEMENT_NODE) {
+ 			b = box_for_node(n);
++			if (class_change && n == vnode && b != NULL &&
++			    b->type == BOX_BLOCK) {
++				/* its own box's style changes: patch 174 */
++				int r = html_rl_block_restyle(c, n, b, t0);
++				dom_node_unref(n);
++				return r;
++			}
+ 			if (class_change && n == vnode && b != NULL &&
+ 			    b->type != BOX_INLINE) {
+ 				dom_node_unref(n);
+ 				RL_NO("class change on an element with a "
+-				      "block-level box");
++				      "non-inline, non-block box");
+ 			}
+ 			if (b != NULL && b->type == BOX_BLOCK) {
+ 				element = n;
