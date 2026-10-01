@@ -241,6 +241,7 @@ NET-css-sibling-class http://127.0.0.1:$HP/CSS-sibling-class.html
 NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET-js-list-structural http://127.0.0.1:$HP/JS-list-structural.html
 NET-js-has193 http://127.0.0.1:$HP/JS-has193.html
+NET-js-flex-stretch-maxheight http://127.0.0.1:$HP/JS-flex-stretch-maxheight.html
 NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
@@ -660,6 +661,13 @@ h9p=$(ls "$R"/*NET-js-has193*.plot 2>/dev/null)
 h9r=$(sed -n 's/.*STR \(HAS193: [0-9]*\/[0-9]* passed\).*/\1/p' $h9p 2>/dev/null | head -1)
 echo "  JS-has193: ${h9r:-no summary}"
 [ -n "$h9p" ] && grep -aho 'STR [0-9] [^"]*FAIL' $h9p | sort -u | sed 's/^STR /  /'
+# Flex stretch vs max-height (Patch 194): stretched nested flex/grid items
+# keep a valid max-height clamp; stretch restoration still applies without
+# max-height and does not over-clamp a larger max-height.
+smp=$(ls "$R"/*NET-js-flex-stretch-maxheight*.plot 2>/dev/null)
+smr=$(sed -n 's/.*STR \(STRMAX194: [0-9]*\/[0-9]* passed\).*/\1/p' $smp 2>/dev/null | head -1)
+echo "  JS-flex-stretch-maxheight: ${smr:-no summary}"
+[ -n "$smp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $smp | sort -u | sed 's/^STR /  /'
 # Selectors (Patch 178): matches / closest / querySelector(All) against
 # Chromium's answers for 85 cases (JS-selectors.html carries them).
 slp=$(ls "$R"/*NET-js-selectors*.plot 2>/dev/null)
@@ -729,6 +737,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
 [ "$lsr" = "LISTSTRUCT: 6/6 passed" ] && [ "${lsd:-0}" -ge 4 ] && [ "${lsm:-0}" -ge 1 ] && \
 [ "$h9r" = "HAS193: 6/6 passed" ] && \
+[ "$smr" = "STRMAX194: 4/4 passed" ] && \
 [ "$slr" = "SELECTORS: 85/85 passed" ] && \
 [ "$abr" = "ACCTBAR: 5/5 passed" ] && \
 [ "$appr" = "APPEAR: 6/6 passed" ] && \

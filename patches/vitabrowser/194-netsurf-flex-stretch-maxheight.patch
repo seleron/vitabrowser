@@ -1,0 +1,71 @@
+# netsurf: flex stretch restoration respects max-height clamp (patch 181 follow-up)
+# Generated 2026-10-01
+#
+# The bug: patch 181's stretch restoration in layout_flex.c
+# layout_flex__place_line_items_cross() unconditionally restores the stretched
+# cross size for nested flex/grid items whose relayout shrank them. But when
+# the item has a max-height smaller than the stretched size, the relayout had
+# already applied a valid max-height clamp (via layout_apply_minmax_height),
+# and the restoration overwrote it — the item rendered at the stretched
+# height, ignoring max-height.
+#
+# Fix: before restoring, clamp the stretched size to the item's max-height
+# (CSS Sizing 4: min/max constraints apply after stretching). box_size_cross
+# is b->height (the content box), so a border-box max-height is adjusted by
+# padding and borders, exactly as layout_apply_minmax_height() does.
+#
+# Decline conditions: percentage max-height does not resolve here (ref -1,
+# no definite containing-block height in this scope); that case keeps the
+# prior behaviour rather than guessing. Non-px lengths that fail to resolve
+# also fall through to the prior behaviour.
+#
+# Measurements: new gate JS-flex-stretch-maxheight.html (STRMAX194 4/4):
+# nested flex max-height 50px in a 200px row clamps to ~50px; nested grid
+# max-height 60px clamps to ~60px; nested flex without max-height still
+# stretches to ~200px (no regression of patch 181's google tab-row fix);
+# nested flex with max-height 500px in a 120px row stretches to ~120px
+# (no over-clamping).
+#
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+--- a/content/handlers/html/layout_flex.c	2026-10-01 14:02:32.300655846 +0000
++++ b/content/handlers/html/layout_flex.c	2026-10-01 14:02:27.810236930 +0000
+@@ -1950,8 +1950,38 @@
+ 				    (b->type == BOX_FLEX ||
+ 				     b->type == BOX_INLINE_FLEX ||
+ 				     b->type == BOX_GRID ||
+-				     b->type == BOX_INLINE_GRID))
++				     b->type == BOX_INLINE_GRID)) {
++					/* Patch 194: max-height clamps the stretched
++					 * size (CSS Sizing 4 -- min/max constraints
++					 * apply after stretching). Without this, the
++					 * relayout's valid max-height clamp is
++					 * overwritten by the restored stretched size.
++					 * box_size_cross is b->height (content box),
++					 * so adjust a border-box limit by padding and
++					 * borders, as layout_apply_minmax_height does.
++					 * Percentage max-height (ref -1) does not
++					 * resolve here; that case keeps the prior
++					 * behaviour. */
++					css_fixed mhv; css_unit mhu; int mhh;
++					if (css_computed_max_height(b->style,
++							&mhv, &mhu) ==
++							CSS_MAX_HEIGHT_SET &&
++					    css_unit_len2device_px_ref(b->style,
++							ctx->unit_len_ctx,
++							mhv, mhu, -1, &mhh)) {
++						int mbp = 0;
++						if (css_computed_box_sizing(b->style) ==
++								CSS_BOX_SIZING_BORDER_BOX)
++							mbp = b->padding[TOP] +
++								b->padding[BOTTOM] +
++								b->border[TOP].width +
++								b->border[BOTTOM].width;
++						mhh = mhh > mbp ? mhh - mbp : 0;
++						if (stretched > mhh)
++							stretched = mhh;
++					}
+ 					*box_size_cross = stretched;
++				}
+ 			}
+ 			fallthrough;
+ 		case CSS_ALIGN_SELF_FLEX_START:
