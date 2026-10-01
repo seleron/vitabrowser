@@ -680,7 +680,9 @@ dsl=$(awk '/page [0-9]*\/[0-9]* NET-js-dom-stall: navigate/ {on=1; next}
 ds_local=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: rebuilt and laid out' || true)
 ds_blocks=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: blocks placed' || true)
 echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_blocks} block changes placed locally"
-[ "$dsr" = "DOMSTALL: 7/7 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
+# Patch 188: step 7 is the span:empty{display:none} + comment-child probe
+# (use-after-free repro): the count went 7 -> 8.
+[ "$dsr" = "DOMSTALL: 8/8 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$csr" = "CSSOM: 8/8 passed" ] && \

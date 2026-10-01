@@ -1,0 +1,103 @@
+# netsurf: clear node->box backlinks when detaching for a local rebuild
+# (use-after-free fix)
+#
+# Roadmap WS-C, script-driven DOM changes. Patch 165's html_reconvert_local
+# takes the block's old inline container out and rebuilds its children with
+# box_rebuild_children, but the old boxes were only detached, not freed, so
+# their node->box backlinks stayed live during the rebuild.
+# box_rebuild_children reuses the full-build idiom
+#   if (box_for_node(n) != NULL) box_construct_element_after(ctx, n, content)
+# in next_node_within -- but during this rebuild the backlinks are NOT
+# authoritative. A node that gets NO new box (box_construct_element's
+# BOX_NONE path returns true without touching the backlink) resolves to its
+# OLD detached box and _after runs on it.
+#
+# Concrete repro (single text mutation, dynamically reachable):
+#   CSS: span:empty { display: none }   DOM: <span><!--c-->a</span>
+#   JS:  span.textContent = ""
+# The comment keeps dom_node_has_child_nodes true, so libcss :empty matches
+# (its node_is_empty ignores comments) while the box builder takes the
+# no-box path. The old span box still has CONVERT_CHILDREN set, so _after's
+# inline branch creates an INLINE_END that BORROWS the old box's style
+# (style_owned=false), appends it to the live tree, and cross-links
+# inline_end->inline_end to the old box. After box_free(old_ic) both the
+# style pointer and the inline_end back-pointer dangle.
+#
+# Fix: html_rl_clear_backlinks(old_ic) clears every node->box backlink
+# in the detached subtree at detach time. The rebuild then sees exactly the
+# full-build state (NULL backlinks for the subtree being built), so _after
+# only ever touches new boxes -- and box_extract_properties' ancestor
+# walk-up resolves parent_style / containing_block exactly as the full
+# build does. This is provably safe: the full build always runs with NULL
+# backlinks, box_rebuild_children has this single caller, and the failure
+# path re-installs the backlinks via the existing html_rl_relink.
+#
+# Measurements: full simulator gate (VM, 2026-10-01). DOMSTALL 8/8 (new
+# step 7, the :empty/comment repro, passes with a 64 ms longest gap -- no
+# crash, the span clears, the paragraph survives; step 8 bounded-timing
+# passes: median 48 ms, longest 64 ms). Engine log for the page: 4 local
+# text rebuilds (the 3 text steps plus the repro), 3 local block
+# placements, 0 full reconverts. SIB186 6/6, BLOCKSIB 3/3 (page title;
+# engine declined 4 class changes for sibling selectors), EVORDER 5/5,
+# SELECTORS 85/85. Gate exit 1 for known environmental causes only: this
+# VM blocks UDP localhost sendto with EPERM (network mirror cannot pass),
+# and the 5000-paragraph class-stall / block-class-stall / reflow-stall
+# pages exceed the page budget on this slower VM (their scripts report
+# "did not run"; html_reconvert_local never ran on reflow-stall).
+#
+# Decline conditions: none new -- the unlink is unconditional at detach;
+# on any rebuild/normalise failure the old boxes and their backlinks are
+# restored exactly as before (html_rl_relink).
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6266,6 +6266,36 @@
+ 	}
+ }
+ 
++/* Clear every node->box backlink in a detached box subtree. Patch 188:
++ * html_reconvert_local takes the block's old children out and rebuilds
++ * them with box_rebuild_children, which reuses the full-build idiom
++ * "if (box_for_node(n) != NULL) box_construct_element_after(...)". With
++ * the old backlinks still live, a node that gets NO new box -- the
++ * BOX_NONE path in box_construct_element returns true without touching
++ * the backlink (e.g. span:empty{display:none} whose only child is a
++ * comment: libcss :empty ignores comments while the box builder takes
++ * the no-box path) -- runs _after on its OLD detached box. The inline
++ * branch then plants an INLINE_END that borrows the old box's style
++ * (style_owned=false) into the live tree and cross-links inline_end to
++ * the old box; both dangle after box_free(old_ic). Cleared, the rebuild
++ * sees exactly the full-build state (NULL backlinks for the subtree
++ * being built), so _after only ever touches new boxes -- and
++ * box_extract_properties' ancestor walk-up resolves parent_style /
++ * containing_block exactly as the full build does. The failure path
++ * below re-installs the backlinks via html_rl_relink. */
++static void html_rl_clear_backlinks(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->node != NULL) {
++			void *old = NULL;
++			(void) dom_node_set_user_data(b->node,
++					corestring_dom___ns_key_box_node_data,
++					NULL, NULL, &old);
++		}
++		html_rl_clear_backlinks(b->children);
++	}
++}
++
+ /* ---- blocks a script inserted or removed ---------------------------- */
+ 
+ /* block elements a script commonly adds as one paragraph of text */
+@@ -7906,6 +7936,12 @@
+ 	}
+ 	block->children = block->last = NULL;
+ 	old_ic->parent = NULL;
++	/* Patch 188: the old subtree's node->box backlinks die with the
++	 * detach (see html_rl_clear_backlinks). Without this,
++	 * box_rebuild_children's
++	 * "if (box_for_node(n) != NULL) box_construct_element_after(...)"
++	 * runs on OLD detached boxes for nodes that get no new box. */
++	html_rl_clear_backlinks(old_ic);
+ 	if (!box_rebuild_children(c, element) ||
+ 	    !box_normalise_block(block, c->layout, c) ||
+ 	    c->num_objects != objects_before) {

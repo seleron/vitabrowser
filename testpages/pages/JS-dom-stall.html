@@ -11,10 +11,15 @@ p { margin: 3px 0; padding: 2px 6px; }
 #sum { font-size: 20px; font-weight: bold; }
 #res { position: fixed; top: 0; left: 0; right: 0; background: #fff; }
 #big p { margin: 2px 0; }
+/* patch 188: the use-after-free probe. A span whose only child is a
+ * comment is :empty to libcss (comments don't count) but not to the DOM;
+ * clearing its text must rebuild locally without running the old
+ * detached box's _after (which planted a style-borrowing INLINE_END). */
+span:empty { display: none; }
 </style>
 <script>
 (function () {
-	var S = { maxgap: 0, ticks: 0, on: false }, N = 7, k = 0, last = (self.performance ? performance.now() : Date.now());
+	var S = { maxgap: 0, ticks: 0, on: false }, N = 8, k = 0, last = (self.performance ? performance.now() : Date.now());
 	(function tick() {
 		var now = (self.performance ? performance.now() : Date.now()), g = now - last;
 		last = now;
@@ -95,6 +100,19 @@ p { margin: 3px 0; padding: 2px 6px; }
 			return !$('p2600') &&
 				$('p2601').getBoundingClientRect().top >=
 				$('p2599').getBoundingClientRect().bottom - 1;
+		}],
+		/* patch 188: span:empty{display:none} + comment child. Before the
+		 * fix, textContent="" ran the OLD detached span box's _after
+		 * (its backlink was still live while the new build made no box),
+		 * planting an INLINE_END borrowing the old style into the live
+		 * tree -- a use-after-free once the old boxes were freed. Now the
+		 * span must simply vanish (no box) and the paragraph survive. */
+		['empty span with comment child', true, function () {
+			$('emptyspan').textContent = '';
+		}, function () {
+			var r = $('emptyspan').getBoundingClientRect();
+			return r.width === 0 && r.height === 0 &&
+				$('emptyprobe').getBoundingClientRect().height > 10;
 		}]
 	];
 	/* the changed stretches still stack: no overlaps */
@@ -131,7 +149,7 @@ p { margin: 3px 0; padding: 2px 6px; }
 			 * (the step's own work stays 3-12 ms in the engine log), so: median
 			 * under 60 ms and no step at a full rebuild's 200 ms */
 			var worst = Math.round(Math.max.apply(null, gaps)), med = Math.round(median(gaps)), o = ordered();
-			t(7, o === 'ok' && med < 60 && worst < 200, 'bounded changes: median gap ' +
+			t(8, o === 'ok' && med < 60 && worst < 200, 'bounded changes: median gap ' +
 				med + ' ms, longest ' + worst + ' ms; paragraphs stack: ' + o);
 			show();
 			return;
@@ -184,7 +202,13 @@ p { margin: 3px 0; padding: 2px 6px; }
      3: innerHTML with inline markup (<b>, <a>): built.
      4: a new paragraph inserted: laid out between its neighbours (still
         the full rebuild; its gap is reported, not bounded).
-     5: the changes stalled the main loop a median < 60 ms and none for
+     5: a paragraph appended at the end: laid out after paragraph 4999.
+     6: a paragraph removed: the neighbours close ranks.
+     7 (patch 188): span:empty{display:none} whose only child is a comment:
+        textContent="" must clear the span (no box) without crashing -- the
+        old detached box's backlink used to run _after and plant a
+        style-borrowing INLINE_END into the live tree (use-after-free).
+     8: the changes stalled the main loop a median < 60 ms and none for
         a full rebuild's 200 ms (sim: ~23 ms; 257-1496 ms with the full
         rebuild; the host adds a 60-100 ms hiccup to a step now and then,
         outside the step's own 3-12 ms of work), and paragraphs
@@ -199,7 +223,11 @@ p { margin: 3px 0; padding: 2px 6px; }
 <p id="r3" class="wait">3 waiting</p><p id="r4" class="wait">4 waiting</p>
 <p id="r5" class="wait">5 waiting</p><p id="r6" class="wait">6 waiting</p>
 <p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
 </div>
 <div id="big"></div>
+<!-- patch 188 probe: static so the textContent="" step below is a single
+     text edit (one element, one kind) offered to html_reconvert_local -->
+<p id="emptyprobe">Probe <span id="emptyspan"><!--c-->a</span> tail.</p>
 </body>
 </html>
