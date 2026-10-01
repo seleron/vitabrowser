@@ -1,0 +1,215 @@
+# netsurf: recascade structural/counter list styles and free removed markers (WS-C)
+# Generated 2026-10-01
+#
+# Roadmap WS-C, follow-up to patch 176. Two gaps in patch 176's local
+# list-item handling:
+#
+# 1. Stale structural/counter styles. Inserting or removing a list item
+#    (or a plain block) shifts every following sibling's :nth-child /
+#    :first-child / :nth-of-type / :only-child index, and CSS counters
+#    (counter-increment/reset + content: counter(...)) for following
+#    generated content. Neither the local path nor the forced full
+#    layout re-runs style selection or rebuilds ::before/::after boxes
+#    (counters resolve at box-construction time), so following siblings
+#    kept stale styles and stale counter text until the next full
+#    reconvert -- a visible regression on idiomatic li:nth-child(odd/even)
+#    zebra striping versus the old full-rebuild path.
+#
+# 2. Marker leak on removal. A removed <li>'s marker box is linked only
+#    via box->list_marker (never in the child chain; marker->parent
+#    points the wrong way) and box_free never traversed it, so each
+#    removed list item leaked one talloc'd struct box until the box
+#    context was destroyed.
+#
+# Fix:
+# - html.c, html_rl_block_change(): after confirming inserted/removed
+#   blocks but before touching any box, scan each used document
+#   stylesheet's source for sibling-position structural pseudo-classes
+#   (:first-child, :last-child, :nth-child(-last), :-of-type variants,
+#   :only-child, :only-of-type) and CSS counter properties
+#   (counter-increment/reset/set). The scan skips comments and strings,
+#   is case-insensitive, and requires identifier boundaries. On a hit
+#   the local path declines and the full reconversion rebuilds styles
+#   from the DOM. This also sharpens patch 166, which had the same
+#   latent issue for plain blocks.
+# - box_manipulate.c, box_free(): free box->list_marker (via box_free,
+#   clearing the pointer first). The marker shares the item's computed
+#   style without owning it (STYLE_OWNED not set, styles NULL), so this
+#   cannot double-free; and no other code frees markers separately, so
+#   there is no double-free from the other side either. Fixing it in
+#   box_free covers nested <li>s inside a removed <ul> as well as
+#   top-level items, and all other box_free callers.
+#
+# Decline conditions: any used document stylesheet (STYLESHEET_START..)
+# whose source contains one of the tokens outside comments/strings.
+# Conservative: a token in a dead rule still declines. Precise enough
+# that no existing gate page hits it (verified: none of the mutating
+# gate pages' stylesheets contain the tokens).
+#
+# Gate: testpages/pages/JS-list-structural.html (LISTSTRUCT 6/6): zebra
+# insert/remove recascades :nth-child backgrounds via getComputedStyle,
+# counter-list insert/remove keep geometry on the decline path, plain
+# list removal frees the marker (engine log) and stacks.
+#
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -360,6 +360,18 @@
+ 		box_free(child);
+ 	}
+ 
++	/* patch 192: a list item's marker box is linked only via list_marker
++	 * (never in the child chain), so it needs freeing here too -- nested
++	 * as well as top-level. The marker is a plain talloc'd box sharing
++	 * the item's computed style (not style-owned), so box_free cannot
++	 * double-free the style. */
++	if (box->list_marker != NULL) {
++		struct box *marker = box->list_marker;
++		box->list_marker = NULL;
++		macsurf_debug_log_writef("box_free: freed list marker");
++		box_free(marker);
++	}
++
+ 	/* last this box */
+ 	box_free_box(box);
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6437,6 +6437,120 @@
+ 
+ #define HTML_RL_MAX_CHANGES 16
+ 
++/* Patch 192: does a stylesheet's source use sibling-position structural
++ * pseudo-classes (:nth-child() etc.) or CSS counters? Inserting or removing
++ * a block/list item shifts every following sibling's child index and
++ * counter values, but the local path never recascades them (and the forced
++ * full layout doesn't re-run style selection either), so their styles and
++ * ::before/::after counter text would go stale. Scan the raw source,
++ * skipping comments and strings; conservative (a match in a dead rule still
++ * declines) but precise enough that ordinary pages never hit it.
++ * Case-insensitive; tokens must sit at identifier boundaries. CSS escapes
++ * inside the token itself (e.g. :\6e th-child) are not recognised -- the
++ * same limitation as the patch-186 scanner. */
++static bool html_rl_css_has_list_style_risk(const uint8_t *s, size_t len)
++{
++	static const char *const toks[] = {
++		":first-child", ":last-child",
++		":nth-child", ":nth-last-child",
++		":first-of-type", ":last-of-type",
++		":nth-of-type", ":nth-last-of-type",
++		":only-child", ":only-of-type",
++		"counter-increment", "counter-reset", "counter-set",
++		NULL
++	};
++	size_t i, k;
++	bool instr = false, incomment = false;
++	uint8_t quote = 0;
++
++	for (i = 0; i < len; i++) {
++		uint8_t ch = s[i];
++		if (incomment) {
++			if (ch == '*' && i + 1 < len && s[i + 1] == '/') {
++				incomment = false;
++				i++;
++			}
++			continue;
++		}
++		if (instr) {
++			if (ch == '\\' && i + 1 < len) {
++				i++;
++				continue;
++			}
++			if (ch == quote)
++				instr = false;
++			continue;
++		}
++		if (ch == '/' && i + 1 < len && s[i + 1] == '*') {
++			incomment = true;
++			i++;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			instr = true;
++			quote = ch;
++			continue;
++		}
++		for (k = 0; toks[k] != NULL; k++) {
++			size_t tl = strlen(toks[k]);
++			size_t j;
++			if (i + tl > len)
++				continue;
++			for (j = 0; j < tl; j++) {
++				uint8_t a = s[i + j], b = (uint8_t)toks[k][j];
++				if (a >= 'A' && a <= 'Z')
++					a += (uint8_t)('a' - 'A');
++				if (a != b)
++					break;
++			}
++			if (j != tl)
++				continue;
++			if (i > 0 && toks[k][0] != ':') {
++				uint8_t p = s[i - 1];
++				if ((p >= 'a' && p <= 'z') ||
++				    (p >= 'A' && p <= 'Z') ||
++				    (p >= '0' && p <= '9') ||
++				    p == '_' || p == '-' || p >= 0x80)
++					continue;
++			}
++			if (i + tl < len) {
++				uint8_t f = s[i + tl];
++				if ((f >= 'a' && f <= 'z') ||
++				    (f >= 'A' && f <= 'Z') ||
++				    (f >= '0' && f <= '9') ||
++				    f == '_' || f == '-' || f >= 0x80)
++					continue;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Patch 192: true if a used document stylesheet uses sibling-position
++ * structural pseudo-classes or CSS counters, whose following-sibling
++ * styles the local block insert/remove path would leave stale. */
++static bool html_rl_block_list_style_risk(html_content *c)
++{
++	unsigned int i;
++
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		const uint8_t *data;
++		size_t size = 0;
++
++		if (c->stylesheets[i].sheet == NULL ||
++		    c->stylesheets[i].unused)
++			continue;
++		data = content_get_source_data(c->stylesheets[i].sheet,
++				&size);
++		if (data == NULL || size == 0)
++			continue;
++		if (html_rl_css_has_list_style_risk(data, size))
++			return true;
++	}
++	return false;
++}
++
+ /* A script inserted and/or removed blocks among parent's block children:
+  * build (or unlink) just those and place them (layout_relayout_block).
+  * 0 done, -1 declined (nothing changed). */
+@@ -6538,6 +6652,15 @@
+ 	if (nadd == 0 && nrem == 0)
+ 		RL_BNO("no inserted or removed block found");
+ 
++	/* Patch 192: structural pseudo-classes (:nth-child() etc.) and CSS
++	 * counters make following siblings' styles and generated-content
++	 * text depend on the item's position. The local path never
++	 * recascades them (and the forced full layout doesn't re-run style
++	 * selection), so decline and let the full reconversion rebuild
++	 * styles from the DOM. */
++	if (html_rl_block_list_style_risk(c))
++		RL_BNO("structural selectors or counters in page CSS");
++
+ 	/* removals first */
+ 	for (i = 0; i < nrem; i++) {
+ 		struct layout_removed_block rb;
