@@ -243,6 +243,7 @@ NET-js-list-structural http://127.0.0.1:$HP/JS-list-structural.html
 NET-js-has193 http://127.0.0.1:$HP/JS-has193.html
 NET-js-flex-stretch-maxheight http://127.0.0.1:$HP/JS-flex-stretch-maxheight.html
 NET-js-flex195 http://127.0.0.1:$HP/JS-flex195.html
+NET-js-appearance196 http://127.0.0.1:$HP/JS-appearance196.html
 NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
@@ -675,6 +676,13 @@ f95p=$(ls "$R"/*NET-js-flex195*.plot 2>/dev/null)
 f95r=$(sed -n 's/.*STR \(FLEX195: [0-9]*\/[0-9]* passed\).*/\1/p' $f95p 2>/dev/null | head -1)
 echo "  JS-flex195: ${f95r:-no summary}"
 [ -n "$f95p" ] && grep -aho 'STR [0-9] [^"]*FAIL' $f95p | sort -u | sed 's/^STR /  /'
+# webkit-appearance (Patch 196): canonical legacy keywords parse (all ->
+# auto); gcs.webkitAppearance and getPropertyValue('-webkit-appearance')
+# answer; el.style.webkitAppearance get/set round-trips.
+a96p=$(ls "$R"/*NET-js-appearance196*.plot 2>/dev/null)
+a96r=$(sed -n 's/.*STR \(APPEAR196: [0-9]*\/[0-9]* passed\).*/\1/p' $a96p 2>/dev/null | head -1)
+echo "  JS-appearance196: ${a96r:-no summary}"
+[ -n "$a96p" ] && grep -aho 'STR [0-9] [^"]*FAIL' $a96p | sort -u | sed 's/^STR /  /'
 # Selectors (Patch 178): matches / closest / querySelector(All) against
 # Chromium's answers for 85 cases (JS-selectors.html carries them).
 slp=$(ls "$R"/*NET-js-selectors*.plot 2>/dev/null)
@@ -746,6 +754,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$h9r" = "HAS193: 6/6 passed" ] && \
 [ "$smr" = "STRMAX194: 4/4 passed" ] && \
 [ "$f95r" = "FLEX195: 4/4 passed" ] && \
+[ "$a96r" = "APPEAR196: 22/22 passed" ] && \
 [ "$slr" = "SELECTORS: 85/85 passed" ] && \
 [ "$abr" = "ACCTBAR: 5/5 passed" ] && \
 [ "$appr" = "APPEAR: 6/6 passed" ] && \
