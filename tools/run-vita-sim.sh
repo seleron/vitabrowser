@@ -230,6 +230,7 @@ NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html
 NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
+NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
 NET-js-innertext http://127.0.0.1:$HP/JS-innertext.html
 NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
 NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
@@ -576,6 +577,12 @@ csp=$(ls "$R"/*NET-js-cssom.plot 2>/dev/null | head -1)
 csr=$(sed -n 's/.*STR \(CSSOM: [0-9]*\/[0-9]* passed\).*/\1/p' "$csp" 2>/dev/null | head -1)
 echo "  JS-cssom: ${csr:-no summary}"
 [ -n "$csp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$csp" | sed 's/^STR /  /'
+# CSSOM Patch 190: lost-update race and read-only cssRules (separate page
+# to avoid interfering with the layout-sensitive checks above).
+c190p=$(ls "$R"/*NET-js-cssom-190.plot 2>/dev/null | head -1)
+c190r=$(sed -n 's/.*STR \(CSSOM190: [0-9]*\/[0-9]* passed\).*/\1/p' "$c190p" 2>/dev/null | head -1)
+echo "  JS-cssom-190: ${c190r:-no summary}"
+[ -n "$c190p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$c190p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -686,6 +693,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
+[ "$c190r" = "CSSOM190: 2/2 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \

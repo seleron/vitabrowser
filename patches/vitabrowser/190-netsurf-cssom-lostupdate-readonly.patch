@@ -1,0 +1,199 @@
+# netsurf: CSSOM lost-update race and mutable cssRules (patch 168 follow-ups)
+#
+# Roadmap WS-C, CSSOM compatibility. Patch 168 built a working CSSOM in
+# vita_polyfill.js, but the read-only review found two correctness issues.
+#
+# Issue 1 (lost-update race, the more important): the CSSOM's schedule()
+# flushes pending rule edits back to the <style> element once per microtask
+# via `sh._owner.textContent = t`, unconditionally. If page JS does
+# `sheet.insertRule(...)` and then, in the same task, sets
+# `el.textContent = "..."` directly, the direct edit is silently clobbered
+# when the microtask runs.
+#
+# Fix: capture the element's text (`sh._src`) at schedule time. At flush
+# time, compare the element's current textContent against the captured
+# value; if it changed underneath, skip the write-back (the direct edit
+# wins) and force a re-parse on next access by clearing _src. This matches
+# browser behavior: a direct textContent set after insertRule discards the
+# CSSOM edit. The reverse order (direct edit, then CSSOM edit) was already
+# safe because sync() re-parses first.
+#
+# Issue 2 (mutable cssRules): `sheet.cssRules` returned the live internal
+# `_rules` array, so page JS could `push(junk)` or `length = 0`, bypassing
+# all validation; the write-back then serialized garbage (`ruleText` of a
+# foreign object yields "undefined").
+#
+# Fix: hand out a read-only Proxy view via the new roRules(holder) helper.
+# The Proxy forwards all reads to the live internal array (so the list
+# stays live, as in browsers) and rejects every write (set/defineProperty/
+# deleteProperty/setPrototypeOf return false, which throws in strict mode).
+# The proxy is cached on the holder and rebuilt when sync() swaps in a
+# fresh array. Applied to CSSStyleSheet.prototype.cssRules, the `rules`
+# alias, and the grouping/keyframes rules' cssRules. Defense in depth:
+# ruleText() now returns '' for non-object inputs instead of serializing
+# "undefined".
+#
+# Measurements: simulator gate (VM, 2026-10-01). CSSOM 8/8 (original
+# checks) + CSSOM190 2/2 (new checks 9 and 10 pass: the lost-update repro
+# keeps the direct textContent edit, and cssRules.push() throws without
+# corrupting the sheet). BLOCKSIB 3/3, SIB186 6/6, EVORDER 5/5, SELECTORS
+# 85/85. DOMSTALL script did not run (5000-paragraph page exceeds the
+# ~10.5s page budget on this VM; patch 188 verified DOMSTALL 8/8 and this
+# patch touches CSSOM only). Gate exit 1 for known environmental causes:
+# this VM blocks UDP localhost sendto with EPERM (network mirror cannot
+# pass), and the 5000-paragraph class-stall / block-class-stall /
+# reflow-stall pages exceed the page budget on this slower VM.
+#
+# Decline conditions: none -- both fixes are unconditional. The schedule()
+# skip only triggers when the element text provably changed underneath
+# (string comparison against the captured schedule-time value); the Proxy
+# only blocks writes, never reads.
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2216,6 +2216,10 @@
+ 	getter(CSSRule.prototype, 'parentRule', function () { return this._parent || null; });
+ 	getter(CSSRule.prototype, 'cssText', function () { return ruleText(this); }, function () { /* ignored, as in browsers */ });
+ 	function ruleText(r) {
++		/* Patch 190: guard against foreign objects (defense in depth;
++		 * cssRules is now a read-only Proxy, but never serialize
++		 * garbage into a stylesheet). */
++		if (!r || typeof r !== 'object') return '';
+ 		if (!r._dirty && r._text) return r._text;
+ 		switch (r.type) {
+ 		case 1: return r._sel + ' { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';
+@@ -2254,7 +2258,7 @@
+ 	getter(KeyframesRule.prototype, 'name', function () { return this._name; },
+ 		function (v) { this._name = String(v); touch(this); });
+ 	[Grouping, KeyframesRule].forEach(function (C) {
+-		getter(C.prototype, 'cssRules', function () { return this._rules; });
++		getter(C.prototype, 'cssRules', function () { return roRules(this); });
+ 	});
+ 	function parseOne(text, sheet, parent, kf) {
+ 		var t = String(text), l = parseList(t, 0, t.length, sheet, parent, kf);
+@@ -2304,13 +2308,39 @@
+ 		if (t !== sh._src) { sh._src = t; sh._rules = parseList(t, 0, t.length, sh, null, false); }
+ 		return sh._rules;
+ 	}
++	/* Patch 190: browsers expose cssRules as a live but read-only list.
++	 * The internal _rules array must stay mutable for insertRule/
++	 * deleteRule, so hand out a Proxy that forwards reads to the live
++	 * array and rejects every write. The proxy is cached on the holder
++	 * and rebuilt when sync() swaps in a fresh array. */
++	function roRules(holder) {
++		var arr = holder._rules;
++		if (holder._roView && holder._roViewArr === arr) return holder._roView;
++		var p = new Proxy(arr, {
++			set: function () { return false; },
++			defineProperty: function () { return false; },
++			deleteProperty: function () { return false; },
++			setPrototypeOf: function () { return false; }
++		});
++		define(holder, '_roView', p);
++		define(holder, '_roViewArr', arr);
++		return p;
++	}
+ 	var later = typeof g.queueMicrotask === 'function' ? function (f) { g.queueMicrotask(f); }
+ 		: function (f) { Promise.resolve().then(f); };
+ 	function schedule(sh) {
+ 		if (sh._pending || !sh._owner || !isStyle(sh._owner)) return;
+ 		sh._pending = true;
++		/* Patch 190: capture the element text at schedule time. If page
++		 * JS rewrites textContent directly after a CSSOM edit, the
++		 * flush must not clobber it: the direct edit wins and the
++		 * pending CSSOM serialization is dropped (a re-parse on next
++		 * access picks up the direct text). */
++		var expect = sh._src;
+ 		later(function () {
+ 			sh._pending = false;
++			var cur = String(sh._owner.textContent || '');
++			if (cur !== expect) { sh._src = null; return; }
+ 			var t = sh._rules.map(ruleText).join('\n');
+ 			sh._src = t;
+ 			try { sh._owner.textContent = t; } catch (e) { /* */ }
+@@ -2333,8 +2363,8 @@
+ 		function (v) { this._disabled = !!v; });
+ 	getter(StyleSheet.prototype, 'parentStyleSheet', function () { return null; });
+ 	getter(CSSStyleSheet.prototype, 'ownerRule', function () { return null; });
+-	getter(CSSStyleSheet.prototype, 'cssRules', function () { return sync(this); });
+-	getter(CSSStyleSheet.prototype, 'rules', function () { return sync(this); });
++	getter(CSSStyleSheet.prototype, 'cssRules', function () { sync(this); return roRules(this); });
++	getter(CSSStyleSheet.prototype, 'rules', function () { sync(this); return roRules(this); });
+ 	define(CSSStyleSheet.prototype, 'insertRule', function (t, i) {
+ 		return insertInto(null, sync(this), t, i, this, false);
+ 	});
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2217,6 +2217,10 @@
+ "\tgetter(CSSRule.prototype, 'parentRule', function () { return this._parent || null; });\n"
+ "\tgetter(CSSRule.prototype, 'cssText', function () { return ruleText(this); }, function () { /* ignored, as in browsers */ });\n"
+ "\tfunction ruleText(r) {\n"
++"\t\t/* Patch 190: guard against foreign objects (defense in depth;\n"
++"\t\t * cssRules is now a read-only Proxy, but never serialize\n"
++"\t\t * garbage into a stylesheet). */\n"
++"\t\tif (!r || typeof r !== 'object') return '';\n"
+ "\t\tif (!r._dirty && r._text) return r._text;\n"
+ "\t\tswitch (r.type) {\n"
+ "\t\tcase 1: return r._sel + ' { ' + (r._style ? r._style.cssText : clean(r._body)) + ' }';\n"
+@@ -2255,7 +2259,7 @@
+ "\tgetter(KeyframesRule.prototype, 'name', function () { return this._name; },\n"
+ "\t\tfunction (v) { this._name = String(v); touch(this); });\n"
+ "\t[Grouping, KeyframesRule].forEach(function (C) {\n"
+-"\t\tgetter(C.prototype, 'cssRules', function () { return this._rules; });\n"
++"\t\tgetter(C.prototype, 'cssRules', function () { return roRules(this); });\n"
+ "\t});\n"
+ "\tfunction parseOne(text, sheet, parent, kf) {\n"
+ "\t\tvar t = String(text), l = parseList(t, 0, t.length, sheet, parent, kf);\n"
+@@ -2305,13 +2309,39 @@
+ "\t\tif (t !== sh._src) { sh._src = t; sh._rules = parseList(t, 0, t.length, sh, null, false); }\n"
+ "\t\treturn sh._rules;\n"
+ "\t}\n"
++"\t/* Patch 190: browsers expose cssRules as a live but read-only list.\n"
++"\t * The internal _rules array must stay mutable for insertRule/\n"
++"\t * deleteRule, so hand out a Proxy that forwards reads to the live\n"
++"\t * array and rejects every write. The proxy is cached on the holder\n"
++"\t * and rebuilt when sync() swaps in a fresh array. */\n"
++"\tfunction roRules(holder) {\n"
++"\t\tvar arr = holder._rules;\n"
++"\t\tif (holder._roView && holder._roViewArr === arr) return holder._roView;\n"
++"\t\tvar p = new Proxy(arr, {\n"
++"\t\t\tset: function () { return false; },\n"
++"\t\t\tdefineProperty: function () { return false; },\n"
++"\t\t\tdeleteProperty: function () { return false; },\n"
++"\t\t\tsetPrototypeOf: function () { return false; }\n"
++"\t\t});\n"
++"\t\tdefine(holder, '_roView', p);\n"
++"\t\tdefine(holder, '_roViewArr', arr);\n"
++"\t\treturn p;\n"
++"\t}\n"
+ "\tvar later = typeof g.queueMicrotask === 'function' ? function (f) { g.queueMicrotask(f); }\n"
+ "\t\t: function (f) { Promise.resolve().then(f); };\n"
+ "\tfunction schedule(sh) {\n"
+ "\t\tif (sh._pending || !sh._owner || !isStyle(sh._owner)) return;\n"
+ "\t\tsh._pending = true;\n"
++"\t\t/* Patch 190: capture the element text at schedule time. If page\n"
++"\t\t * JS rewrites textContent directly after a CSSOM edit, the\n"
++"\t\t * flush must not clobber it: the direct edit wins and the\n"
++"\t\t * pending CSSOM serialization is dropped (a re-parse on next\n"
++"\t\t * access picks up the direct text). */\n"
++"\t\tvar expect = sh._src;\n"
+ "\t\tlater(function () {\n"
+ "\t\t\tsh._pending = false;\n"
++"\t\t\tvar cur = String(sh._owner.textContent || '');\n"
++"\t\t\tif (cur !== expect) { sh._src = null; return; }\n"
+ "\t\t\tvar t = sh._rules.map(ruleText).join('\\n');\n"
+ "\t\t\tsh._src = t;\n"
+ "\t\t\ttry { sh._owner.textContent = t; } catch (e) { /* */ }\n"
+@@ -2334,8 +2364,8 @@
+ "\t\tfunction (v) { this._disabled = !!v; });\n"
+ "\tgetter(StyleSheet.prototype, 'parentStyleSheet', function () { return null; });\n"
+ "\tgetter(CSSStyleSheet.prototype, 'ownerRule', function () { return null; });\n"
+-"\tgetter(CSSStyleSheet.prototype, 'cssRules', function () { return sync(this); });\n"
+-"\tgetter(CSSStyleSheet.prototype, 'rules', function () { return sync(this); });\n"
++"\tgetter(CSSStyleSheet.prototype, 'cssRules', function () { sync(this); return roRules(this); });\n"
++"\tgetter(CSSStyleSheet.prototype, 'rules', function () { sync(this); return roRules(this); });\n"
+ "\tdefine(CSSStyleSheet.prototype, 'insertRule', function (t, i) {\n"
+ "\t\treturn insertInto(null, sync(this), t, i, this, false);\n"
+ "\t});\n"

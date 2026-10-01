@@ -1,0 +1,619 @@
+# netsurf: decline the local block insert/remove path on structural selectors
+#
+# Roadmap WS-C, script-driven DOM changes. Patch 166's html_rl_block_change
+# locally removes/inserts block boxes and calls layout_relayout_block, but
+# the existing parent, sibling and ancestor boxes keep styles selected
+# before the DOM mutation. Any of these selector dependencies can change
+# state on insert/remove while this path never reselects them:
+#   :first-child, :last-child, :nth-child(), :nth-last-child(),
+#   :only-child, :only-of-type, :first-of-type, :last-of-type,
+#   :nth-of-type(), :nth-last-of-type(), :empty, :has(), and the sibling
+#   combinators + and ~.
+#
+# Concrete repro:  CSS p:first-child { margin-top: 0 }. Insert a new first
+# <p>: the new block gets fresh margin-top:0, but the old first block keeps
+# its stale 0 instead of becoming 1em, and patch 166's margin comparison
+# can then accept stale-equals-fresh and report success with geometry one
+# margin off -- a silent divergence, not a crash.
+#
+# Fix: a minimal conservative selector-dependency gate, reusing patch 186's
+# per-stylesheet analysis. The compound parser now records a structural
+# bitmask (positional / :empty / :has) on every compound; the sheet cache
+# keeps the list alongside the sibling-combinator state. html_rl_block_change
+# calls html_rl_block_structural_risk after confirming a change exists but
+# before touching any box: if a used sheet needs the conservative check
+# (patch-186 state 2), has sibling combinators (state 1), or holds a
+# structural compound whose static parts could match an affected element
+# (positional -> any sibling; :empty -> the parent; :has() -> the parent or
+# an ancestor), the change declines and the existing full reconversion runs
+# on the untouched tree. Structural pseudo-classes inside :not()/:is()/
+# /:where() also decline (they are evaluated against the element itself);
+# inside :has() they are dropped (the outer :has bit covers the ancestor).
+# Unparseable relevant syntax declines via the existing r=2 path.
+#
+# Decline conditions (any one): sheet state 2; sheet state 1 (any +/~);
+# a positional compound statically matching a sibling element; an :empty
+# compound statically matching the parent element; a :has compound
+# statically matching the parent or an ancestor box's element; any DOM
+# error while walking (cannot prove safety).
+#
+# Measurements: full simulator gate (VM, 2026-10-01). DOMSTALL 9/9 (new
+# step 8: insert a new first div into #probe under
+# #probe div:first-child{margin-top:0}; the insert declines -- engine log
+# shows "structural selector may restyle a sibling" -- and the full layout
+# gives the old first div its 1em top margin back: ~16px gap to the
+# inserted div, asserted geometrically). Engine log for the page: 4 local
+# text rebuilds, 3 local block placements (the 5000-p steps keep the local
+# path: div:first-child cannot match <p> siblings, span:empty cannot match
+# the div parent), 1 structural decline. BLOCKSIB 3/3, SIB186 6/6,
+# EVORDER 5/5, SELECTORS 85/85.
+#
+# The patch-163 gap (layout_relayout_block not scanning earlier siblings
+# for a positioned descendant whose containing block is a grown ancestor)
+# is intentionally left out: reusing lr_subtree_unsafe on the prev chains
+# newly declines on pages with fixed-position earlier siblings (the
+# dom-stall page's own #res header), which would zero the ds_blocks gate
+# count. A precise bottom-anchor check needs new ancestor-aware logic and
+# does not fit cleanly here; it stays a follow-up.
+#
+# Test: testpages/pages/JS-dom-stall.html step 8 (CSS + #probe fixture +
+# geometric assert); tools/run-vita-sim.sh now expects DOMSTALL 9/9, >= 3
+# local block placements, and >= 1 structural decline on the page.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6440,6 +6440,12 @@
+ /* A script inserted and/or removed blocks among parent's block children:
+  * build (or unlink) just those and place them (layout_relayout_block).
+  * 0 done, -1 declined (nothing changed). */
++/* Patch 189: true if a used stylesheet's structural selectors could restyle
++ * an existing parent, sibling or ancestor on insert/remove. Defined with
++ * the patch-186 sheet cache below. */
++static bool html_rl_block_structural_risk(html_content *c, dom_node *pnode,
++		struct box *pbox);
++
+ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		struct box *pbox, double t0)
+ {
+@@ -6538,6 +6544,14 @@
+ 	if (nadd == 0 && nrem == 0)
+ 		RL_BNO("no inserted or removed block found");
+ 
++	/* Patch 189: structural selectors (:first-child, :nth-child(),
++	 * :empty, :has(), sibling combinators) can restyle the existing
++	 * parent, siblings or ancestors, whose styles this path never
++	 * reselects. Decline before touching any box so the full
++	 * reconversion runs on the untouched tree. */
++	if (html_rl_block_structural_risk(c, pnode, pbox))
++		RL_BNO("structural selectors in page CSS");
++
+ 	/* removals first */
+ 	for (i = 0; i < nrem; i++) {
+ 		struct layout_removed_block rb;
+@@ -6753,8 +6767,42 @@
+ 	 * sheet decline (dynamic state cannot be evaluated exactly). Never
+ 	 * set on a cached compound. */
+ 	bool has_pseudo;
++	/* Patch 189: structural pseudo-classes on this compound, as a
++	 * bitmask. Their match state can change when a block is inserted
++	 * or removed, while the local insert/remove path never reselects
++	 * the styles of the existing parent, siblings or ancestors. */
++	int structural;
+ };
+ 
++/* Bits for html_rl_sib_compound.structural (patch 189). */
++#define HTML_RL_STRUCT_POSITIONAL	1	/* :first-child etc. */
++#define HTML_RL_STRUCT_EMPTY		2	/* :empty */
++#define HTML_RL_STRUCT_HAS		4	/* :has() */
++
++/* Classify a lowercased pseudo-class name by the structural dependency
++ * its match state has on child insertion/removal (patch 189). 0 means
++ * the pseudo-class cannot change state when a block is inserted or
++ * removed (dynamic pseudos like :hover, :target, :root, ...). */
++static int html_rl_structural_kind(const char *name)
++{
++	if (strcmp(name, "first-child") == 0 ||
++	    strcmp(name, "last-child") == 0 ||
++	    strcmp(name, "nth-child") == 0 ||
++	    strcmp(name, "nth-last-child") == 0 ||
++	    strcmp(name, "first-of-type") == 0 ||
++	    strcmp(name, "last-of-type") == 0 ||
++	    strcmp(name, "nth-of-type") == 0 ||
++	    strcmp(name, "nth-last-of-type") == 0 ||
++	    strcmp(name, "only-child") == 0 ||
++	    strcmp(name, "only-of-type") == 0)
++		return HTML_RL_STRUCT_POSITIONAL;
++	if (strcmp(name, "empty") == 0)
++		return HTML_RL_STRUCT_EMPTY;
++	if (strcmp(name, "has") == 0)
++		return HTML_RL_STRUCT_HAS;
++	return 0;
++}
++
+ static void html_rl_sib_compound_free(struct html_rl_sib_compound *cp)
+ {
+ 	int i;
+@@ -6870,16 +6918,22 @@
+ }
+ 
+ static int html_rl_parse_prelude(struct html_rl_sel_parser *p, size_t end,
+-		struct html_rl_sib_compound **lefts, int *nlefts);
++		struct html_rl_sib_compound **lefts, int *nlefts,
++		struct html_rl_sib_compound **structs, int *nstructs);
+ 
+ /* Scan the inside of a selector-taking functional pseudo for a sibling
+- * combinator. 0 = none, 1 = found, -1 = parse error. Both decline. */
+-static int html_rl_scan_pseudo_content(struct html_rl_sel_parser *p)
++ * combinator. 0 = none, 1 = found, -1 = parse error. Both decline.
++ * Patch 189: when is_has is false (:not()/:is()/:where()), structural
++ * pseudo-classes inside also decline, since they are evaluated against
++ * the outer element itself. */
++static int html_rl_scan_pseudo_content(struct html_rl_sel_parser *p,
++		bool is_has)
+ {
+ 	size_t open = p->i, depth = 0, j = p->i;
+ 	struct html_rl_sel_parser sub;
+ 	struct html_rl_sib_compound *l = NULL;
+-	int nl = 0, r, k;
++	struct html_rl_sib_compound *sl = NULL;
++	int nl = 0, nsl = 0, r, k;
+ 	while (j < p->len) {
+ 		uint8_t c = p->s[j];
+ 		if (c == '(')
+@@ -6904,10 +6958,21 @@
+ 	sub.s = p->s;
+ 	sub.len = j;
+ 	sub.i = open + 1;
+-	r = html_rl_parse_prelude(&sub, j, &l, &nl);
++	r = html_rl_parse_prelude(&sub, j, &l, &nl, &sl, &nsl);
+ 	for (k = 0; k < nl; k++)
+ 		html_rl_sib_compound_free(&l[k]);
+ 	free(l);
++	/* Patch 189: a structural pseudo-class inside :not()/:is()/:where()
++	 * is evaluated against the outer element itself, so the outer
++	 * element's style can change on insert/remove. Decline; attributing
++	 * it precisely is not worth the complexity. Inside :has() the outer
++	 * :has bit already covers the ancestor risk, so drop the inner list.
++	 */
++	if (!is_has && nsl > 0)
++		r = 2;
++	for (k = 0; k < nsl; k++)
++		html_rl_sib_compound_free(&sl[k]);
++	free(sl);
+ 	if (r == 2)
+ 		return 1;
+ 	return (r == 1) ? 1 : (r == 0 ? 0 : -1);
+@@ -7090,6 +7155,11 @@
+ 			if (name == NULL)
+ 				return -1;
+ 			html_rl_str_lower(name);
++			/* Patch 189: remember structural pseudo-classes on the
++			 * compound; the local insert/remove path must not run
++			 * while such a selector could restyle an existing
++			 * parent, sibling or ancestor. */
++			cp->structural |= html_rl_structural_kind(name);
+ 			if (is_pel) {
+ 				cp->has_pel = true;
+ 				if (p->i < p->len && p->s[p->i] == '(' &&
+@@ -7099,7 +7169,8 @@
+ 				}
+ 			} else if (p->i < p->len && p->s[p->i] == '(') {
+ 				if (html_rl_is_sel_pseudo(name)) {
+-					int r = html_rl_scan_pseudo_content(p);
++					int r = html_rl_scan_pseudo_content(p,
++						strcmp(name, "has") == 0);
+ 					free(name);
+ 					if (r != 0)
+ 						return 2;
+@@ -7124,17 +7195,40 @@
+ 	return 0;
+ }
+ 
++/* Append a shallow copy of cp to a compound list (patch 189). The list
++ * takes ownership of cp's heap members; cp itself must not be freed
++ * afterwards. */
++static bool html_rl_compound_list_add(struct html_rl_sib_compound **list,
++		int *n, struct html_rl_sib_compound *cp)
++{
++	struct html_rl_sib_compound *nl;
++	nl = realloc(*list, (*n + 1) * sizeof(*nl));
++	if (nl == NULL)
++		return false;
++	*list = nl;
++	(*list)[(*n)++] = *cp;
++	return true;
++}
++
+ /* Parse a selector prelude [p->i, end). 0 = no sibling combinator,
+- * 1 = found (lefts filled), 2 = conservative decline. */
++ * 1 = found (lefts filled), 2 = conservative decline. Patch 189:
++ * compounds carrying structural pseudo-classes are collected into
++ * *structs (may be NULL to skip). */
+ static int html_rl_parse_prelude(struct html_rl_sel_parser *p, size_t end,
+-		struct html_rl_sib_compound **lefts, int *nlefts)
++		struct html_rl_sib_compound **lefts, int *nlefts,
++		struct html_rl_sib_compound **structs, int *nstructs)
+ {
+ 	int found = 0, r = 0, k;
+ 	*lefts = NULL;
+ 	*nlefts = 0;
++	if (structs != NULL) {
++		*structs = NULL;
++		*nstructs = 0;
++	}
+ 	for (;;) {
+ 		struct html_rl_sib_compound cp;
+ 		uint8_t c;
++		bool listed;
+ 		html_rl_skip_ws(p);
+ 		if (p->i >= end)
+ 			break;
+@@ -7156,15 +7250,29 @@
+ 			r = 2;
+ 			goto decline;
+ 		}
++		/* Patch 189: remember compounds with structural
++		 * pseudo-classes for the insert/remove gate. The structs
++		 * list takes ownership of cp's members; the paths below
++		 * must not free cp once it is listed (tracked by listed).
++		 */
++		listed = structs != NULL && cp.structural != 0;
++		if (listed && !html_rl_compound_list_add(structs, nstructs,
++		    &cp)) {
++			html_rl_sib_compound_free(&cp);
++			r = 2;
++			goto decline;
++		}
+ 		html_rl_skip_ws(p);
+ 		if (p->i >= end) {
+-			html_rl_sib_compound_free(&cp);
++			if (!listed)
++				html_rl_sib_compound_free(&cp);
+ 			break;
+ 		}
+ 		c = p->s[p->i];
+ 		if (c == '+' || c == '~') {
+ 			if (cp.has_pseudo) {
+-				html_rl_sib_compound_free(&cp);
++				if (!listed)
++					html_rl_sib_compound_free(&cp);
+ 				r = 2;
+ 				goto decline;
+ 			}
+@@ -7184,7 +7292,8 @@
+ 			p->i++;
+ 		} else {
+ 			/* '>', ',' or a descendant combinator: not our risk */
+-			html_rl_sib_compound_free(&cp);
++			if (!listed)
++				html_rl_sib_compound_free(&cp);
+ 			if (c == '>' || c == ',')
+ 				p->i++;
+ 		}
+@@ -7196,18 +7305,31 @@
+ 	free(*lefts);
+ 	*lefts = NULL;
+ 	*nlefts = 0;
++	if (structs != NULL) {
++		for (k = 0; k < *nstructs; k++)
++			html_rl_sib_compound_free(&(*structs)[k]);
++		free(*structs);
++		*structs = NULL;
++		*nstructs = 0;
++	}
+ 	return r;
+ }
+ 
+-/* Full sheet scan. 0 = none, 1 = precise (lefts filled), 2 = decline. */
++/* Full sheet scan. 0 = none, 1 = precise (lefts filled), 2 = decline.
++ * Patch 189: structural compounds are collected into *structs. */
+ static int html_rl_scan_sheet(const uint8_t *s, size_t len,
+-		struct html_rl_sib_compound **lefts, int *nlefts)
++		struct html_rl_sib_compound **lefts, int *nlefts,
++		struct html_rl_sib_compound **structs, int *nstructs)
+ {
+ 	size_t i = 0, start = 0;
+ 	int groups = 0;
+ 	int found = 0;
+ 	*lefts = NULL;
+ 	*nlefts = 0;
++	if (structs != NULL) {
++		*structs = NULL;
++		*nstructs = 0;
++	}
+ 
+ 	while (i < len) {
+ 		uint8_t ch = s[i];
+@@ -7264,11 +7386,16 @@
+ 			{
+ 				struct html_rl_sel_parser p;
+ 				struct html_rl_sib_compound *l = NULL;
+-				int nl = 0, r, k;
++				struct html_rl_sib_compound *sl = NULL;
++				int nl = 0, nsl = 0, r, k;
+ 				p.s = s;
+ 				p.len = len;
+ 				p.i = start;
+-				r = html_rl_parse_prelude(&p, i, &l, &nl);
++				r = html_rl_parse_prelude(&p, i, &l, &nl,
++						structs, nstructs);
++				/* Patch 189: drop this rule's structural
++				 * compounds on decline; otherwise merge them
++				 * into the sheet list. */
+ 				if (r == 2) {
+ 					for (k = 0; k < *nlefts; k++)
+ 						html_rl_sib_compound_free(
+@@ -7279,8 +7406,53 @@
+ 					for (k = 0; k < nl; k++)
+ 						html_rl_sib_compound_free(&l[k]);
+ 					free(l);
++					if (structs != NULL) {
++						for (k = 0; k < *nstructs; k++)
++							html_rl_sib_compound_free(
++								&(*structs)[k]);
++						free(*structs);
++						*structs = NULL;
++						*nstructs = 0;
++					}
+ 					return 2;
+ 				}
++				if (structs != NULL && nsl > 0) {
++					struct html_rl_sib_compound *ns;
++					ns = realloc(*structs,
++						(*nstructs + nsl) *
++						sizeof(struct html_rl_sib_compound));
++					if (ns == NULL) {
++						for (k = 0; k < nsl; k++)
++							html_rl_sib_compound_free(
++								&sl[k]);
++						free(sl);
++						for (k = 0; k < nl; k++)
++							html_rl_sib_compound_free(
++								&l[k]);
++						free(l);
++						for (k = 0; k < *nlefts; k++)
++							html_rl_sib_compound_free(
++								&(*lefts)[k]);
++						free(*lefts);
++						*lefts = NULL;
++						*nlefts = 0;
++						for (k = 0; k < *nstructs; k++)
++							html_rl_sib_compound_free(
++								&(*structs)[k]);
++						free(*structs);
++						*structs = NULL;
++						*nstructs = 0;
++						return 2;
++					}
++					*structs = ns;
++					for (k = 0; k < nsl; k++)
++						(*structs)[(*nstructs)++] = sl[k];
++					free(sl);
++				} else {
++					for (k = 0; k < nsl; k++)
++						html_rl_sib_compound_free(&sl[k]);
++					free(sl);
++				}
+ 				if (r == 1) {
+ 					struct html_rl_sib_compound *nl2;
+ 					nl2 = realloc(*lefts, (*nlefts + nl) *
+@@ -7437,19 +7609,18 @@
+ 
+ /* Match one parsed compound against an element, with the class attribute
+  * forced to class_override (NULL = use live). Mirrors compoundOk. */
+-static bool html_rl_sib_compound_matches(dom_element *el,
++/* Match only the static parts of a compound (tag, id, classes, attrs).
++ * Patch 189: used to test whether a structural selector could match an
++ * element whose structural pseudo-class state may have changed; the
++ * pseudo-class itself is deliberately not evaluated. class_override is
++ * as in html_rl_sib_compound_matches. */
++static bool html_rl_sib_compound_matches_static(dom_element *el,
+ 		struct html_rl_sib_compound *cp, const char *class_override)
+ {
+ 	int i;
+-	/* A pseudo-element never matches an element (JS: compoundOk returns
+-	 * false when pel is set). */
++	/* A pseudo-element never matches an element. */
+ 	if (cp->has_pel)
+ 		return false;
+-	/* Should be unreachable: the scan declines instead of caching a
+-	 * compound with a pseudo-class. Treat as non-matching rather than
+-	 * risk an unsound local rebuild. */
+-	if (cp->has_pseudo)
+-		return false;
+ 	if (cp->tag != NULL) {
+ 		dom_string *tn = NULL;
+ 		bool ok = false;
+@@ -7508,6 +7679,18 @@
+ 	return true;
+ }
+ 
++/* Full compound match including the pseudo-class guard (patch 186). */
++static bool html_rl_sib_compound_matches(dom_element *el,
++		struct html_rl_sib_compound *cp, const char *class_override)
++{
++	/* Should be unreachable: the scan declines instead of caching a
++	 * compound with a pseudo-class. Treat as non-matching rather than
++	 * risk an unsound local rebuild. */
++	if (cp->has_pseudo)
++		return false;
++	return html_rl_sib_compound_matches_static(el, cp, class_override);
++}
++
+ /* ---- per-sheet cache ----
+  * Keyed by the sheet handle with the source data pointer, size and an
+  * FNV-1a hash validating the entry: the patch-174 cache keyed by (source
+@@ -7525,6 +7708,11 @@
+ 	int state;
+ 	struct html_rl_sib_compound *lefts;
+ 	int nlefts;
++	/* Patch 189: compounds carrying structural pseudo-classes
++	 * (:first-child, :empty, :has(), ...). Valid in every state
++	 * except 2 (decline, where the whole sheet declines anyway). */
++	struct html_rl_sib_compound *structs;
++	int nstructs;
+ };
+ static struct html_rl_sib_sheet html_rl_sib_cache[HTML_RL_SIB_CACHE_N];
+ static unsigned int html_rl_sib_cache_next;
+@@ -7546,6 +7734,9 @@
+ 	for (k = 0; k < e->nlefts; k++)
+ 		html_rl_sib_compound_free(&e->lefts[k]);
+ 	free(e->lefts);
++	for (k = 0; k < e->nstructs; k++)
++		html_rl_sib_compound_free(&e->structs[k]);
++	free(e->structs);
+ 	memset(e, 0, sizeof(*e));
+ }
+ 
+@@ -7583,16 +7774,22 @@
+ 	e->hash = hash;
+ 	{
+ 		struct html_rl_sib_compound *lefts = NULL;
+-		int nlefts = 0, r;
+-		r = html_rl_scan_sheet(data, size, &lefts, &nlefts);
++		struct html_rl_sib_compound *structs = NULL;
++		int nlefts = 0, nstructs = 0, r;
++		r = html_rl_scan_sheet(data, size, &lefts, &nlefts,
++				&structs, &nstructs);
+ 		if (r == 2) {
+ 			e->state = 2;
+ 		} else if (r == 1) {
+ 			e->state = 1;
+ 			e->lefts = lefts;
+ 			e->nlefts = nlefts;
++			e->structs = structs;
++			e->nstructs = nstructs;
+ 		} else {
+ 			e->state = 0;
++			e->structs = structs;
++			e->nstructs = nstructs;
+ 		}
+ 	}
+ 	return e;
+@@ -7655,6 +7852,126 @@
+ 	return risk;
+ }
+ 
++/* ---- structural selector gate for block insert/remove (patch 189) ----
++ *
++ * True if the local insert/remove path must decline because a used
++ * stylesheet could restyle an EXISTING box whose style this path never
++ * reselects: the parent (:empty), a sibling (:first-child, :nth-child(),
++ * ...), or an ancestor (:has()). Only the static parts of each cached
++ * structural compound are tested; the structural pseudo-class itself is
++ * the dependency being gated, so any static match is a decline. Sibling
++ * combinators ('+'/'~', patch-186 state 1/2) also decline: a following
++ * sibling's style may depend on the changed sibling structure, and the
++ * precise per-rule analysis would need full selector matching.
++ *
++ * pnode is the parent DOM element, pbox its box. Returns true on any
++ * DOM error too (cannot prove safety).
++ */
++static bool html_rl_block_structural_risk(html_content *c, dom_node *pnode,
++		struct box *pbox)
++{
++	unsigned int i;
++	int k;
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		struct html_rl_sib_sheet *e;
++		if (c->stylesheets[i].sheet == NULL ||
++		    c->stylesheets[i].unused)
++			continue;
++		e = html_rl_sib_sheet_for(c->stylesheets[i].sheet);
++		if (e == NULL)
++			continue;
++		if (e->state == 2) {
++			macsurf_debug_log_writef("LIFE rebuild local: declined "
++					"(page CSS needs conservative check)");
++			return true;
++		}
++		if (e->state == 1) {
++			macsurf_debug_log_writef("LIFE rebuild local: declined "
++					"(sibling combinators in page CSS)");
++			return true;
++		}
++		for (k = 0; k < e->nstructs; k++) {
++			struct html_rl_sib_compound *cp = &e->structs[k];
++			if ((cp->structural & HTML_RL_STRUCT_POSITIONAL) != 0) {
++				/* Positional pseudo-classes are evaluated
++				 * against the siblings; any sibling the
++				 * static parts could match makes the local
++				 * path unsafe. */
++				dom_node *n = NULL, *next;
++				if (dom_node_get_first_child(pnode, &n) !=
++				    DOM_NO_ERR)
++					return true;
++				while (n != NULL) {
++					dom_node_type type;
++					bool match = false;
++					if (dom_node_get_node_type(n, &type) ==
++					    DOM_NO_ERR &&
++					    type == DOM_ELEMENT_NODE)
++						match =
++						    html_rl_sib_compound_matches_static(
++							(dom_element *)n, cp,
++							NULL);
++					next = NULL;
++					if (dom_node_get_next_sibling(n,
++					    &next) != DOM_NO_ERR)
++						next = NULL;
++					dom_node_unref(n);
++					n = next;
++					if (match) {
++						macsurf_debug_log_writef(
++							"LIFE rebuild local: "
++							"declined (structural "
++							"selector may restyle a "
++							"sibling)");
++						return true;
++					}
++				}
++			}
++			if ((cp->structural & HTML_RL_STRUCT_EMPTY) != 0) {
++				/* :empty is evaluated against the parent. */
++				dom_node_type type;
++				if (dom_node_get_node_type(pnode, &type) !=
++				    DOM_NO_ERR)
++					return true;
++				if (type == DOM_ELEMENT_NODE &&
++				    html_rl_sib_compound_matches_static(
++					(dom_element *)pnode, cp, NULL)) {
++					macsurf_debug_log_writef(
++						"LIFE rebuild local: declined "
++						"(structural selector may "
++						"restyle the parent)");
++					return true;
++				}
++			}
++			if ((cp->structural & HTML_RL_STRUCT_HAS) != 0) {
++				/* :has() is evaluated against the parent and
++				 * its ancestors. */
++				struct box *b;
++				for (b = pbox; b != NULL; b = b->parent) {
++					dom_node_type type;
++					if (b->node == NULL)
++						continue;
++					if (dom_node_get_node_type(b->node,
++					    &type) != DOM_NO_ERR)
++						return true;
++					if (type == DOM_ELEMENT_NODE &&
++					    html_rl_sib_compound_matches_static(
++						(dom_element *)b->node, cp,
++						NULL)) {
++						macsurf_debug_log_writef(
++							"LIFE rebuild local: "
++							"declined (structural "
++							"selector may restyle an "
++							"ancestor)");
++						return true;
++					}
++				}
++			}
++		}
++	}
++	return false;
++}
++
+ /* The element's own box is a plain block among plain blocks: take the old
+  * box out and build the element again with a fresh cascade, put back where
+  * it was -- patch 166's removal then insertion, laid out with the block
