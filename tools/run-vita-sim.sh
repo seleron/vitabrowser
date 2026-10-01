@@ -242,6 +242,7 @@ NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET-js-list-structural http://127.0.0.1:$HP/JS-list-structural.html
 NET-js-has193 http://127.0.0.1:$HP/JS-has193.html
 NET-js-flex-stretch-maxheight http://127.0.0.1:$HP/JS-flex-stretch-maxheight.html
+NET-js-flex195 http://127.0.0.1:$HP/JS-flex195.html
 NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
@@ -668,6 +669,12 @@ smp=$(ls "$R"/*NET-js-flex-stretch-maxheight*.plot 2>/dev/null)
 smr=$(sed -n 's/.*STR \(STRMAX194: [0-9]*\/[0-9]* passed\).*/\1/p' $smp 2>/dev/null | head -1)
 echo "  JS-flex-stretch-maxheight: ${smr:-no summary}"
 [ -n "$smp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $smp | sort -u | sed 's/^STR /  /'
+# Flex centering single-line only (Patch 195): patch 183's oversized-item
+# centering applies to single-line flex; multi-line uses per-line cross size.
+f95p=$(ls "$R"/*NET-js-flex195*.plot 2>/dev/null)
+f95r=$(sed -n 's/.*STR \(FLEX195: [0-9]*\/[0-9]* passed\).*/\1/p' $f95p 2>/dev/null | head -1)
+echo "  JS-flex195: ${f95r:-no summary}"
+[ -n "$f95p" ] && grep -aho 'STR [0-9] [^"]*FAIL' $f95p | sort -u | sed 's/^STR /  /'
 # Selectors (Patch 178): matches / closest / querySelector(All) against
 # Chromium's answers for 85 cases (JS-selectors.html carries them).
 slp=$(ls "$R"/*NET-js-selectors*.plot 2>/dev/null)
@@ -738,6 +745,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$lsr" = "LISTSTRUCT: 6/6 passed" ] && [ "${lsd:-0}" -ge 4 ] && [ "${lsm:-0}" -ge 1 ] && \
 [ "$h9r" = "HAS193: 6/6 passed" ] && \
 [ "$smr" = "STRMAX194: 4/4 passed" ] && \
+[ "$f95r" = "FLEX195: 4/4 passed" ] && \
 [ "$slr" = "SELECTORS: 85/85 passed" ] && \
 [ "$abr" = "ACCTBAR: 5/5 passed" ] && \
 [ "$appr" = "APPEAR: 6/6 passed" ] && \
