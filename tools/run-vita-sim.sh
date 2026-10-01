@@ -231,6 +231,7 @@ NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
+NET-js-abspos191 http://127.0.0.1:$HP/JS-abspos191.html
 NET-js-innertext http://127.0.0.1:$HP/JS-innertext.html
 NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
 NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
@@ -583,6 +584,12 @@ c190p=$(ls "$R"/*NET-js-cssom-190.plot 2>/dev/null | head -1)
 c190r=$(sed -n 's/.*STR \(CSSOM190: [0-9]*\/[0-9]* passed\).*/\1/p' "$c190p" 2>/dev/null | head -1)
 echo "  JS-cssom-190: ${c190r:-no summary}"
 [ -n "$c190p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$c190p" | sed 's/^STR /  /'
+# Patch 191: bottom-anchored abspos in an earlier sibling moves when the
+# containing block grows/shrinks via the local relayout path.
+a191p=$(ls "$R"/*NET-js-abspos191.plot 2>/dev/null | head -1)
+a191r=$(sed -n 's/.*STR \\(ABSPOS191: [0-9]*\\/[0-9]* passed\\).*/\\1/p' "$a191p" 2>/dev/null | head -1)
+echo "  JS-abspos191: ${a191r:-no summary}"
+[ -n "$a191p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$a191p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -694,6 +701,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
 [ "$c190r" = "CSSOM190: 2/2 passed" ] && \
+[ "$a191r" = "ABSPOS191: 2/2 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \

@@ -1,0 +1,182 @@
+# netsurf: reposition bottom-anchored abspos in earlier siblings on local relayout (patch 163 follow-up)
+#
+# Roadmap WS-C, layout correctness. The 163-core local relayout
+# (layout_relayout_core, shared by layout_relayout_object and
+# layout_relayout_line; and layout_relayout_block from patch 166) scans
+# later siblings for positioned/iframe subtrees that would move, but not
+# earlier siblings. When a block grows, an absolutely positioned box in an
+# earlier sibling's subtree, whose containing block is the grown ancestor
+# and which is bottom-anchored (bottom set, top auto), is left at its
+# stale position.
+#
+# Concrete shape:
+#   <div id="container" style="position: relative">  <!-- grows -->
+#     <div id="earlier">  <!-- earlier sibling, static -->
+#       <div id="abs" style="position: absolute; bottom: 0">...</div>
+#     </div>
+#     <div id="grower">...content that grows...</div>
+#   </div>
+# When #grower grows, #container grows by delta. #abs's containing block
+# is #container; with bottom:0 its y must increase by delta. The 163 scan
+# never looked at #earlier, so #abs stayed behind.
+#
+# Fix: new helper lr_reposition_earlier_abspos(). After the delta is
+# applied, it walks each chain level's earlier siblings' subtrees for
+# absolutely positioned boxes that are bottom-anchored. At level 0 the
+# walk starts at the parent's earlier siblings (chain[0]->prev), not the
+# changed block's (the abspos lives in a sibling of the parent, e.g.
+# #earlier vs #grower); at levels i>0 it starts at chain[i]->prev.
+# (lr_bottom_anchored: bottom set, top auto) and whose containing block
+# (lr_containing_block: nearest positioned ancestor) is actually a chain
+# ancestor that grew. Only those boxes are moved (b->y += delta); their
+# descendant bboxes are recalculated and ancestors up to (not including)
+# the CB are refreshed. This is ancestor-aware, not a blanket decline:
+# a naive lr_subtree_unsafe scan over the prev chains over-declines (it
+# fires on fixed-position boxes, which are viewport-relative and never
+# move with ancestor growth, zeroing the ds_blocks gate on pages with a
+# fixed header). Fixed boxes and abspos boxes whose CB is outside the
+# chain are untouched, keeping the local path.
+#
+# Negative deltas (shrink on block removal) move the boxes up by the same
+# mechanism. The helper early-returns on delta == 0.
+#
+# Called from layout_relayout_core (covers 163's layout_relayout_object
+# and 165's layout_relayout_line) and from layout_relayout_block (166,
+# also used by 174). The 189 coordinator's note about the patch-163 gap
+# is addressed here without the over-decline.
+#
+# Measurements: nsvita-sim builds and links clean via
+# tools/run-vita-sim.sh. Targeted gate: ABSPOS191 2/2 passed -- insert a
+# plain block into #grower (local 166 path, +23 px), the bottom-anchored
+# #abs in earlier sibling #earlier moves down exactly 23 px; removing the
+# block moves it up 23 px. (The as-written test initially failed: it set
+# an inline height on the new block, breaking the 166 "plain block"
+# requirement and taking full layout; and it measured before-layout on
+# DOMContentLoaded. Both fixed in the test page.)
+#
+# Decline conditions: none added -- the helper only repositions boxes it
+# can prove need it (abspos + bottom-anchored + CB in the grown chain).
+# If the CB is not in the chain, the box is left alone (its CB did not
+# grow, or the local path already declined on a positioned ancestor).
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -7916,6 +7916,96 @@
+ /* The shared core: an object's box (box), or a rebuilt inline container
+  * (new_ic) that replaced one of new_old_h px with the flags
+  * new_old_flags (html_reconvert_local, a script's text change). */
++/* Patch 191: is b bottom-anchored? (bottom set, top auto: its y moves
++ * with the containing block's height) */
++static bool lr_bottom_anchored(const struct box *b)
++{
++	css_fixed len = 0;
++	css_unit unit = CSS_UNIT_PX;
++	if (b->style == NULL)
++		return false;
++	return css_computed_bottom(b->style, &len, &unit) != CSS_BOTTOM_AUTO &&
++	       css_computed_top(b->style, &len, &unit) == CSS_TOP_AUTO;
++}
++
++/* Patch 191: b's containing block (nearest ancestor with non-static
++ * position), or NULL if none. */
++static struct box *lr_containing_block(struct box *b)
++{
++	struct box *u;
++	for (u = b->parent; u != NULL; u = u->parent)
++		if (u->style != NULL &&
++		    css_computed_position(u->style) != CSS_POSITION_STATIC)
++			return u;
++	return NULL;
++}
++
++/* Patch 191: reposition bottom-anchored abspos boxes in earlier siblings.
++ *
++ * When the chain grows by delta, an absolutely positioned box in an
++ * earlier sibling's subtree, whose containing block is a chain ancestor
++ * and which is bottom-anchored (bottom set, top auto), must move by
++ * delta to stay anchored. (The 163 scan checks later siblings for unsafe
++ * subtrees but not earlier ones. A naive lr_subtree_unsafe over the prev
++ * chains over-declines: fixed-position boxes are viewport-relative and
++ * never move with ancestor growth, and abspos boxes whose CB is outside
++ * the chain are unaffected. This is ancestor-aware: only boxes whose CB
++ * is actually a grown ancestor are touched; everything else keeps the
++ * local path.)
++ *
++ * chain[0..n) are the grown boxes; prev0 is the earlier-sibling chain
++ * at level 0 (ic->prev for the core, prev for layout_relayout_block);
++ * at levels i>0 the earlier siblings start at chain[i]->prev.
++ * Negative deltas (shrink) move the boxes up by the same mechanism.
++ */
++static void lr_reposition_earlier_abspos(const css_unit_ctx *unit_len_ctx,
++		struct box **chain, unsigned int n, struct box *prev0, int delta)
++{
++	unsigned int i, j;
++	struct box *p, *b, *cb, *u;
++
++	if (delta == 0 || n == 0)
++		return;
++
++	for (i = 0; i < n; i++) {
++		struct box *start = (i == 0) ? prev0 : chain[i]->prev;
++		for (p = start; p != NULL; p = p->prev) {
++			b = p;
++			while (b != NULL) {
++				if (b->style != NULL &&
++				    css_computed_position(b->style) ==
++						CSS_POSITION_ABSOLUTE &&
++				    lr_bottom_anchored(b)) {
++					cb = lr_containing_block(b);
++					for (j = 0; j < n; j++)
++						if (cb == chain[j])
++							break;
++					if (j < n) {
++						b->y += delta;
++						layout_calculate_descendant_bboxes(
++							unit_len_ctx, b);
++						for (u = b->parent;
++						     u != NULL && u != cb;
++						     u = u->parent)
++							lr_descendant_bbox_shallow(
++								unit_len_ctx, u);
++					}
++				}
++				/* next in document order, without leaving p */
++				if (b->children != NULL) {
++					b = b->children;
++					continue;
++				}
++				while (b != p && b->next == NULL)
++					b = b->parent;
++				if (b == p)
++					break;
++				b = b->next;
++			}
++		}
++	}
++}
++
+ static bool layout_relayout_core(html_content *content, struct box *box,
+ 		struct box *new_ic, int new_old_h, unsigned int new_old_flags,
+ 		int *delta_out)
+@@ -8045,6 +8135,10 @@
+ 				c->y += delta;
+ 		for (i = 1; i < n; i++)
+ 			chain[i]->height += delta;
++		/* Patch 191: bottom-anchored abspos in earlier siblings
++		 * whose CB grew moves with it. */
++		lr_reposition_earlier_abspos(&content->unit_len_ctx,
++				chain, n, ic->prev, delta);
+ 	}
+ 	for (i = 1; i < n; i++)
+ 		lr_descendant_bbox_shallow(&content->unit_len_ctx, chain[i]);
+@@ -8267,6 +8361,10 @@
+ 			c->y += delta;
+ 	for (i = 0; i < n; i++)
+ 		chain[i]->height += delta;
++	/* Patch 191: bottom-anchored abspos in earlier siblings whose CB
++	 * grew moves with it (negative delta moves it up). */
++	lr_reposition_earlier_abspos(&content->unit_len_ctx, chain, n,
++			parent->prev, delta);
+ 	for (i = 0; i < n; i++)
+ 		lr_descendant_bbox_shallow(&content->unit_len_ctx, chain[i]);
+ 
