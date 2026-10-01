@@ -235,6 +235,7 @@ NET-js-sanitize http://127.0.0.1:$HP/JS-sanitize.html
 NET-js-class-stall http://127.0.0.1:$HP/JS-class-stall.html
 NET-js-block-class-stall http://127.0.0.1:$HP/JS-block-class-stall.html
 NET-js-block-class-sibling http://127.0.0.1:$HP/JS-block-class-sibling.html
+NET-css-sibling-class http://127.0.0.1:$HP/CSS-sibling-class.html
 NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
@@ -610,6 +611,13 @@ bsr=$(sed -n 's/.*STR \(BLOCKSIB: [0-9]*\/[0-9]* passed\).*/\1/p' $bsp 2>/dev/nu
 bsd=$(grep -c 'declined (page CSS has sibling combinators)' "$R/netsurf.log" || true)
 echo "  JS-block-class-stall: ${bcr:-no summary}; ${bcl} blocks restyled locally"
 echo "  JS-block-class-sibling: ${bsr:-no summary}; ${bsd} declined for sibling combinators"
+# Precise sibling risk (Patch 186): unrelated sibling CSS stays local,
+# genuine +/~ risks decline and restyle siblings, :has(+ ...) declines.
+s186p=$(ls "$R"/*NET-css-sibling-class*.plot 2>/dev/null)
+s186r=$(sed -n 's/.*STR \\(SIB186: [0-9]*\\/[0-9]* passed\\).*/\\1/p' $s186p 2>/dev/null | head -1)
+s186d=$(grep -c 'declined (class change moves a sibling selector)' "$R/netsurf.log" || true)
+s186c=$(grep -c 'declined (page CSS needs conservative sibling check)' "$R/netsurf.log" || true)
+echo "  CSS-sibling-class: ${s186r:-no summary}; ${s186d} precise declines, ${s186c} conservative declines"
 [ -n "$bcp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $bcp | sort -u | sed 's/^STR /  /'
 # Lists and nested blocks (Patch 176): a list item or a block of blocks a
 # script adds or removes is built alone and the page laid out once (no

@@ -1,0 +1,1285 @@
+# netsurf: precise sibling-combinator risk for class changes (replaces patch 174 blanket decline)
+# Generated 2026-10-01
+#
+# Patch 174 declined every block-level class change when any author
+# stylesheet contained a '+' or '~' in a selector. That is sound but far
+# too broad: most such rules (e.g. `.menu + .content`) do not involve the
+# element whose class changed, forcing a full rebuild for unrelated CSS.
+#
+# This patch replaces the blanket scan with a precise per-selector check:
+# for every sibling combinator in every author stylesheet, the compound
+# immediately to its left is parsed once and cached per sheet. When a
+# block's class changes from OLD to NEW, each left compound is matched
+# against the element twice -- once with the OLD class set, once with the
+# NEW -- using explicit values from the mutation record, never live DOM.
+# The change is safe for the local path iff no left compound's match state
+# differs (XOR): a compound matching under both, or under neither, means no
+# following sibling's cascade can have changed through that combinator.
+#
+# Measurements: the dedicated CSS-sibling-class.html gate (6 cases) passes.
+# Existing gates preserved: JS-class-stall, JS-block-class-stall,
+# JS-block-class-sibling, and the text/block local-rebuild gates remain
+# green (verified in the simulator gate run).
+#
+# Conservative decline cases (full rebuild, always correct):
+# - '+'/'~' inside :has(), :is(), :not(), :where() (e.g. `.t:has(+ .u)`
+#   restyles a PRECEDING sibling, unreachable by the one-block rebuild).
+# - A pseudo-class on a left compound (e.g. `.a:hover + .b`): dynamic state
+#   cannot be evaluated exactly here.
+# - Any selector prelude that fails to parse, or a combinator where a
+#   compound was expected.
+# - The old class value is unknown (NULL from the mutation record).
+# - Arithmetic '+' in :nth-child(2n+1) is not a combinator and is ignored.
+# - The patch-174 (source pointer, size) cache is replaced with a
+#   stylesheet-handle keyed cache validated by FNV-1a hash, closing the
+#   allocator-reuse aliasing hole.
+#
+# Test: testpages/pages/CSS-sibling-class.html (6 cases: unrelated sibling
+# CSS stays local; genuine + and ~ decline correctly; :has(+ ...) declines;
+# multiple combinators; nth-child arithmetic not mistaken).
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6666,14 +6666,518 @@
+ 	return len;
+ }
+ 
+-/* Does a selector in this CSS reach a following sibling -- a '+' or '~'
+- * combinator outside brackets and parentheses (nth-child(2n+1) and
+- * [class~=x] do not)? Selector preludes only, inside group at-rules too;
+- * declaration blocks (calc(a + b)) are skipped. */
+-static bool html_rl_css_has_sibling(const uint8_t *s, size_t len)
++/* ---- precise sibling-combinator risk for class changes (patch 186) ----
++ *
++ * Patch 174 declined every block-level class change when any author sheet
++ * contained a '+' or '~' in a selector. That is sound but far too broad:
++ * most such rules (e.g. `.menu + .content`) do not involve the element whose
++ * class changed. This replaces the blanket scan with a precise per-selector
++ * check.
++ *
++ * For every sibling combinator ('+' or '~') in every author stylesheet, the
++ * compound immediately to its left is parsed once and cached per sheet. When
++ * a block's class changes from OLD to NEW, each left compound is matched
++ * against the element twice -- once with the OLD class set, once with the
++ * NEW -- using explicit values, never live DOM (the mutation has already
++ * committed, so live DOM holds NEW for both). The change is safe for the
++ * local path iff no left compound's match state differs (XOR): a compound
++ * matching under both, or under neither, means no following sibling's
++ * cascade can have changed through that combinator.
++ *
++ * Conservative declines (the full rebuild, which is always correct):
++ * - '+'/'~' inside a selector-taking functional pseudo (:has, :is, :not,
++ *   :where, :matches, :any): e.g. `.t:has(+ .u)` restyles a PRECEDING
++ *   sibling, which the one-block rebuild cannot reach. Arithmetic '+' in
++ *   :nth-child(2n+1) is not a combinator and is ignored.
++ * - a pseudo-class on a left compound (e.g. `.a:hover + .b`): dynamic state
++ *   cannot be evaluated exactly here.
++ * - any selector prelude that fails to parse, or a combinator where a
++ *   compound was expected.
++ * - the old class value is unknown (NULL).
++ *
++ * The compound matcher mirrors the patch-178 JS selector engine's
++ * compoundOk/attrOk exactly: lowercased tag, case-sensitive #id,
++ * whitespace-separated .classes, attribute operators =, ~=, |=, ^=, $=, *=
++ * with the i flag, and pseudo-elements never matching an element. Anything
++ * the JS engine accepts that this parser rejects (e.g. hex escapes in
++ * idents) fails the parse and declines.
++ */
++
++/* A parsed left compound. has_pseudo is never set on a cached compound:
++ * the scan declines instead. */
++struct html_rl_sib_attr {
++	char *name;	/* lowercased */
++	char op;	/* 0, '=', '~', '|', '^', '$', '*' */
++	char *val;
++	bool ci;
++};
++struct html_rl_sib_compound {
++	char *tag;	/* lowercased, or NULL */
++	char *id;	/* or NULL */
++	char **classes;
++	int nclasses;
++	struct html_rl_sib_attr *attrs;
++	int nattrs;
++	bool has_pel;
++	/* Set while parsing; a left compound with a pseudo-class makes the
++	 * sheet decline (dynamic state cannot be evaluated exactly). Never
++	 * set on a cached compound. */
++	bool has_pseudo;
++};
++
++static void html_rl_sib_compound_free(struct html_rl_sib_compound *cp)
++{
++	int i;
++	free(cp->tag);
++	free(cp->id);
++	for (i = 0; i < cp->nclasses; i++)
++		free(cp->classes[i]);
++	free(cp->classes);
++	for (i = 0; i < cp->nattrs; i++) {
++		free(cp->attrs[i].name);
++		free(cp->attrs[i].val);
++	}
++	free(cp->attrs);
++	memset(cp, 0, sizeof(*cp));
++}
++
++/* ---- selector parser (operates on the sheet source text) ---- */
++struct html_rl_sel_parser {
++	const uint8_t *s;
++	size_t len;
++	size_t i;
++};
++
++static bool html_rl_is_ident_start(uint8_t c)
++{
++	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++	       c == '_' || c == '\\' || c >= 0x80 || c == '-';
++}
++static bool html_rl_is_ident_char(uint8_t c)
++{
++	return html_rl_is_ident_start(c) || (c >= '0' && c <= '9');
++}
++static bool html_rl_is_ws(uint8_t c)
++{
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
++}
++static void html_rl_skip_ws(struct html_rl_sel_parser *p)
++{
++	while (p->i < p->len && html_rl_is_ws(p->s[p->i]))
++		p->i++;
++}
++/* identifier with simple escape handling; hex escapes fail (decline) */
++static char *html_rl_parse_ident(struct html_rl_sel_parser *p)
++{
++	char *out;
++	size_t o = 0;
++	if (p->i >= p->len || !html_rl_is_ident_start(p->s[p->i]))
++		return NULL;
++	out = malloc(p->len - p->i + 1);
++	if (out == NULL)
++		return NULL;
++	while (p->i < p->len && html_rl_is_ident_char(p->s[p->i])) {
++		uint8_t c = p->s[p->i];
++		if (c == '\\' && p->i + 1 < p->len) {
++			p->i++;
++			c = p->s[p->i];
++			if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
++			    (c >= 'A' && c <= 'F')) {
++				free(out);
++				return NULL;
++			}
++			out[o++] = (char)c;
++			p->i++;
++		} else {
++			out[o++] = (char)c;
++			p->i++;
++		}
++	}
++	out[o] = '\0';
++	if (o == 0) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++static void html_rl_str_lower(char *s)
++{
++	for (; *s; s++)
++		*s = (char)tolower((unsigned char)*s);
++}
++/* skip balanced parens from '('; strings and escapes honoured */
++static bool html_rl_skip_parens(struct html_rl_sel_parser *p)
++{
++	int depth = 0;
++	if (p->i >= p->len || p->s[p->i] != '(')
++		return true;
++	while (p->i < p->len) {
++		uint8_t c = p->s[p->i++];
++		if (c == '(')
++			depth++;
++		else if (c == ')' && --depth == 0)
++			return true;
++		else if (c == '"' || c == '\'') {
++			while (p->i < p->len && p->s[p->i] != c &&
++			       p->s[p->i] != '\n') {
++				if (p->s[p->i] == '\\')
++					p->i++;
++				p->i++;
++			}
++			if (p->i < p->len)
++				p->i++;
++		} else if (c == '\\' && p->i < p->len)
++			p->i++;
++	}
++	return false;
++}
++static bool html_rl_is_sel_pseudo(const char *name)
++{
++	return strcmp(name, "has") == 0 || strcmp(name, "is") == 0 ||
++	       strcmp(name, "not") == 0 || strcmp(name, "where") == 0 ||
++	       strcmp(name, "matches") == 0 || strcmp(name, "any") == 0 ||
++	       strcmp(name, "-webkit-any") == 0;
++}
++
++static int html_rl_parse_prelude(struct html_rl_sel_parser *p, size_t end,
++		struct html_rl_sib_compound **lefts, int *nlefts);
++
++/* Scan the inside of a selector-taking functional pseudo for a sibling
++ * combinator. 0 = none, 1 = found, -1 = parse error. Both decline. */
++static int html_rl_scan_pseudo_content(struct html_rl_sel_parser *p)
++{
++	size_t open = p->i, depth = 0, j = p->i;
++	struct html_rl_sel_parser sub;
++	struct html_rl_sib_compound *l = NULL;
++	int nl = 0, r, k;
++	while (j < p->len) {
++		uint8_t c = p->s[j];
++		if (c == '(')
++			depth++;
++		else if (c == ')') {
++			if (--depth == 0)
++				break;
++		} else if (c == '"' || c == '\'') {
++			uint8_t q = c;
++			j++;
++			while (j < p->len && p->s[j] != q && p->s[j] != '\n') {
++				if (p->s[j] == '\\')
++					j++;
++				j++;
++			}
++		} else if (c == '\\')
++			j++;
++		j++;
++	}
++	if (j >= p->len)
++		return -1;
++	sub.s = p->s;
++	sub.len = j;
++	sub.i = open + 1;
++	r = html_rl_parse_prelude(&sub, j, &l, &nl);
++	for (k = 0; k < nl; k++)
++		html_rl_sib_compound_free(&l[k]);
++	free(l);
++	if (r == 2)
++		return 1;
++	return (r == 1) ? 1 : (r == 0 ? 0 : -1);
++}
++
++/* Parse one compound. 0 ok, 2 conservative decline, -1 parse error. */
++static int html_rl_parse_compound(struct html_rl_sel_parser *p,
++		struct html_rl_sib_compound *cp)
++{
++	uint8_t c;
++	size_t start_i;
++	memset(cp, 0, sizeof(*cp));
++	c = p->i < p->len ? p->s[p->i] : 0;
++	if (c == '*') {
++		p->i++;
++	} else if (html_rl_is_ident_start(c)) {
++		cp->tag = html_rl_parse_ident(p);
++		if (cp->tag == NULL)
++			return -1;
++		html_rl_str_lower(cp->tag);
++	}
++	if (p->i < p->len && p->s[p->i] == '|') {
++		p->i++;
++		free(cp->tag);
++		cp->tag = NULL;
++		if (p->i < p->len && p->s[p->i] == '*') {
++			p->i++;
++		} else {
++			cp->tag = html_rl_parse_ident(p);
++			if (cp->tag == NULL)
++				return -1;
++			html_rl_str_lower(cp->tag);
++		}
++	}
++	start_i = p->i;
++	for (;;) {
++		char *name;
++		if (p->i >= p->len)
++			break;
++		c = p->s[p->i];
++		if (c == '#') {
++			p->i++;
++			name = html_rl_parse_ident(p);
++			if (name == NULL)
++				return -1;
++			free(cp->id);
++			cp->id = name;
++			continue;
++		}
++		if (c == '.') {
++			p->i++;
++			name = html_rl_parse_ident(p);
++			if (name == NULL)
++				return -1;
++			cp->classes = realloc(cp->classes,
++				(cp->nclasses + 1) * sizeof(char *));
++			if (cp->classes == NULL) {
++				free(name);
++				return -1;
++			}
++			cp->classes[cp->nclasses++] = name;
++			continue;
++		}
++		if (c == '[') {
++			struct html_rl_sib_attr a;
++			memset(&a, 0, sizeof(a));
++			p->i++;
++			html_rl_skip_ws(p);
++			if (p->i + 1 < p->len && p->s[p->i] == '*' &&
++			    p->s[p->i + 1] == '|')
++				p->i += 2;
++			a.name = html_rl_parse_ident(p);
++			if (a.name == NULL)
++				return -1;
++			html_rl_str_lower(a.name);
++			if (p->i < p->len && p->s[p->i] == '|' &&
++			    !(p->i + 1 < p->len && p->s[p->i + 1] == '=')) {
++				p->i++;
++				free(a.name);
++				a.name = html_rl_parse_ident(p);
++				if (a.name == NULL)
++					return -1;
++				html_rl_str_lower(a.name);
++			}
++			html_rl_skip_ws(p);
++			if (p->i >= p->len) {
++				free(a.name);
++				return -1;
++			}
++			c = p->s[p->i];
++			if (c == ']') {
++				p->i++;
++			} else {
++				if (c == '=')
++					a.op = '=';
++				else if ((c == '~' || c == '|' || c == '^' ||
++					  c == '$' || c == '*') &&
++					 p->i + 1 < p->len &&
++					 p->s[p->i + 1] == '=') {
++					a.op = (char)c;
++					p->i++;
++				} else {
++					free(a.name);
++					return -1;
++				}
++				p->i++;
++				html_rl_skip_ws(p);
++				if (p->i >= p->len) {
++					free(a.name);
++					return -1;
++				}
++				c = p->s[p->i];
++				if (c == '"' || c == '\'') {
++					size_t o = 0;
++					p->i++;
++					a.val = malloc(p->len - p->i + 1);
++					if (a.val == NULL) {
++						free(a.name);
++						return -1;
++					}
++					while (p->i < p->len &&
++					       p->s[p->i] != c &&
++					       p->s[p->i] != '\n') {
++						if (p->s[p->i] == '\\' &&
++						    p->i + 1 < p->len)
++							p->i++;
++						a.val[o++] = (char)p->s[p->i++];
++					}
++					a.val[o] = '\0';
++					if (p->i < p->len)
++						p->i++;
++				} else {
++					a.val = html_rl_parse_ident(p);
++					if (a.val == NULL) {
++						free(a.name);
++						return -1;
++					}
++				}
++				html_rl_skip_ws(p);
++				if (p->i >= p->len) {
++					free(a.name);
++					free(a.val);
++					return -1;
++				}
++				c = p->s[p->i];
++				if (c == 'i' || c == 'I') {
++					a.ci = true;
++					p->i++;
++					html_rl_skip_ws(p);
++				} else if (c == 's' || c == 'S') {
++					p->i++;
++					html_rl_skip_ws(p);
++				}
++				if (p->i >= p->len || p->s[p->i] != ']') {
++					free(a.name);
++					free(a.val);
++					return -1;
++				}
++				p->i++;
++			}
++			cp->attrs = realloc(cp->attrs,
++				(cp->nattrs + 1) *
++				sizeof(struct html_rl_sib_attr));
++			if (cp->attrs == NULL) {
++				free(a.name);
++				free(a.val);
++				return -1;
++			}
++			cp->attrs[cp->nattrs++] = a;
++			continue;
++		}
++		if (c == ':') {
++			bool is_pel = false;
++			p->i++;
++			if (p->i < p->len && p->s[p->i] == ':') {
++				is_pel = true;
++				p->i++;
++			}
++			name = html_rl_parse_ident(p);
++			if (name == NULL)
++				return -1;
++			html_rl_str_lower(name);
++			if (is_pel) {
++				cp->has_pel = true;
++				if (p->i < p->len && p->s[p->i] == '(' &&
++				    !html_rl_skip_parens(p)) {
++					free(name);
++					return -1;
++				}
++			} else if (p->i < p->len && p->s[p->i] == '(') {
++				if (html_rl_is_sel_pseudo(name)) {
++					int r = html_rl_scan_pseudo_content(p);
++					free(name);
++					if (r != 0)
++						return 2;
++				} else {
++					free(name);
++				}
++				if (!html_rl_skip_parens(p))
++					return -1;
++				cp->has_pseudo = true;
++			} else {
++				free(name);
++				cp->has_pseudo = true;
++			}
++			continue;
++		}
++		break;
++	}
++	if (p->i == start_i && cp->tag == NULL && cp->id == NULL &&
++	    cp->nclasses == 0 && cp->nattrs == 0 && !cp->has_pel &&
++	    !cp->has_pseudo)
++		return -1;
++	return 0;
++}
++
++/* Parse a selector prelude [p->i, end). 0 = no sibling combinator,
++ * 1 = found (lefts filled), 2 = conservative decline. */
++static int html_rl_parse_prelude(struct html_rl_sel_parser *p, size_t end,
++		struct html_rl_sib_compound **lefts, int *nlefts)
++{
++	int found = 0, r = 0, k;
++	*lefts = NULL;
++	*nlefts = 0;
++	for (;;) {
++		struct html_rl_sib_compound cp;
++		uint8_t c;
++		html_rl_skip_ws(p);
++		if (p->i >= end)
++			break;
++		c = p->s[p->i];
++		if (c == ',') {
++			p->i++;
++			continue;
++		}
++		if (c == '+' || c == '~' || c == '>') {
++			r = 2;
++			goto decline;
++		}
++		memset(&cp, 0, sizeof(cp));
++		r = html_rl_parse_compound(p, &cp);
++		if (r != 0) {
++			html_rl_sib_compound_free(&cp);
++			if (r == 2)
++				goto decline;
++			r = 2;
++			goto decline;
++		}
++		html_rl_skip_ws(p);
++		if (p->i >= end) {
++			html_rl_sib_compound_free(&cp);
++			break;
++		}
++		c = p->s[p->i];
++		if (c == '+' || c == '~') {
++			if (cp.has_pseudo) {
++				html_rl_sib_compound_free(&cp);
++				r = 2;
++				goto decline;
++			}
++			/* A pseudo-element never matches an element, so it
++			 * cannot make a sibling's style depend on this class
++			 * change; keep it (the matcher returns false). */
++			*lefts = realloc(*lefts,
++				(*nlefts + 1) *
++				sizeof(struct html_rl_sib_compound));
++			if (*lefts == NULL) {
++				html_rl_sib_compound_free(&cp);
++				r = 2;
++				goto decline;
++			}
++			(*lefts)[(*nlefts)++] = cp;
++			found = 1;
++			p->i++;
++		} else {
++			/* '>', ',' or a descendant combinator: not our risk */
++			html_rl_sib_compound_free(&cp);
++			if (c == '>' || c == ',')
++				p->i++;
++		}
++	}
++	return found;
++decline:
++	for (k = 0; k < *nlefts; k++)
++		html_rl_sib_compound_free(&(*lefts)[k]);
++	free(*lefts);
++	*lefts = NULL;
++	*nlefts = 0;
++	return r;
++}
++
++/* Full sheet scan. 0 = none, 1 = precise (lefts filled), 2 = decline. */
++static int html_rl_scan_sheet(const uint8_t *s, size_t len,
++		struct html_rl_sib_compound **lefts, int *nlefts)
+ {
+ 	size_t i = 0, start = 0;
+ 	int groups = 0;
++	int found = 0;
++	*lefts = NULL;
++	*nlefts = 0;
+ 
+ 	while (i < len) {
+ 		uint8_t ch = s[i];
+@@ -6702,11 +7206,8 @@
+ 			continue;
+ 		}
+ 		if (ch == '{') {
+-			size_t a = start, k;
+-			int par = 0;
+-			while (a < i && (s[a] == ' ' || s[a] == '\t' ||
+-					 s[a] == '\n' || s[a] == '\r' ||
+-					 s[a] == '\f'))
++			size_t a = start;
++			while (a < i && html_rl_is_ws(s[a]))
+ 				a++;
+ 			if (a < i && s[a] == '@') {
+ 				static const char *const group[] = {
+@@ -6730,14 +7231,49 @@
+ 				}
+ 				continue;
+ 			}
+-			for (k = a; k < i; k++) {
+-				uint8_t x = s[k];
+-				if (x == '(' || x == '[')
+-					par++;
+-				else if ((x == ')' || x == ']') && par > 0)
+-					par--;
+-				else if (par == 0 && (x == '+' || x == '~'))
+-					return true;
++			{
++				struct html_rl_sel_parser p;
++				struct html_rl_sib_compound *l = NULL;
++				int nl = 0, r, k;
++				p.s = s;
++				p.len = len;
++				p.i = start;
++				r = html_rl_parse_prelude(&p, i, &l, &nl);
++				if (r == 2) {
++					for (k = 0; k < *nlefts; k++)
++						html_rl_sib_compound_free(
++							&(*lefts)[k]);
++					free(*lefts);
++					*lefts = NULL;
++					*nlefts = 0;
++					for (k = 0; k < nl; k++)
++						html_rl_sib_compound_free(&l[k]);
++					free(l);
++					return 2;
++				}
++				if (r == 1) {
++					struct html_rl_sib_compound *nl2;
++					nl2 = realloc(*lefts, (*nlefts + nl) *
++						sizeof(struct html_rl_sib_compound));
++					if (nl2 == NULL) {
++						for (k = 0; k < nl; k++)
++							html_rl_sib_compound_free(
++								&l[k]);
++						free(l);
++						for (k = 0; k < *nlefts; k++)
++							html_rl_sib_compound_free(
++								&(*lefts)[k]);
++						free(*lefts);
++						*lefts = NULL;
++						*nlefts = 0;
++						return 2;
++					}
++					*lefts = nl2;
++					for (k = 0; k < nl; k++)
++						(*lefts)[(*nlefts)++] = l[k];
++					free(l);
++					found = 1;
++				}
+ 			}
+ 			i = html_rl_css_skip_block(s, i, len);
+ 			start = i;
+@@ -6745,43 +7281,348 @@
+ 		}
+ 		i++;
+ 	}
++	return found;
++}
++
++/* ---- compound matcher (mirrors the patch-178 JS engine) ---- */
++
++/* Fetch an attribute value as a C string. If the attribute is `class` and a
++ * class override is given, the override is used (the mutation committed
++ * before the check, so live DOM holds the new value for both branches).
++ * Returns a malloc'd string, or NULL if the attribute is absent. */
++static char *html_rl_sib_attr_value(dom_element *el, const char *name,
++		const char *class_override)
++{
++	dom_string *n, *v = NULL;
++	char *out = NULL;
++	if (strcasecmp(name, "class") == 0 && class_override != NULL)
++		return strdup(class_override);
++	if (dom_string_create((const uint8_t *)name, strlen(name),
++			&n) != DOM_NO_ERR)
++		return NULL;
++	if (dom_element_get_attribute(el, n, &v) == DOM_NO_ERR && v != NULL) {
++		const char *d = dom_string_data(v);
++		size_t l = dom_string_byte_length(v);
++		out = malloc(l + 1);
++		if (out != NULL) {
++			memcpy(out, d, l);
++			out[l] = '\0';
++		}
++		dom_string_unref(v);
++	}
++	dom_string_unref(n);
++	return out;
++}
++
++/* whitespace-separated token membership, like the JS engine's
++ * (' ' + v.replace(/\s+/g, ' ') + ' ').indexOf(' ' + w + ' ') */
++static bool html_rl_class_has(const char *class_val, const char *cls)
++{
++	size_t cl = strlen(cls);
++	const char *p = class_val;
++	if (cl == 0)
++		return false;
++	while (*p) {
++		while (*p && html_rl_is_ws((uint8_t)*p))
++			p++;
++		if (*p == '\0')
++			break;
++		if (strncmp(p, cls, cl) == 0 &&
++		    (p[cl] == '\0' || html_rl_is_ws((uint8_t)p[cl])))
++			return true;
++		while (*p && !html_rl_is_ws((uint8_t)*p))
++			p++;
++	}
+ 	return false;
+ }
+ 
+-/* any of the page's own stylesheets (per sheet source, cached) */
+-static bool html_rl_page_css_has_sibling(html_content *c)
++static void html_rl_str_lower_inplace(char *s)
++{
++	for (; *s; s++)
++		*s = (char)tolower((unsigned char)*s);
++}
++
++/* attribute operator, mirroring attrOk */
++static bool html_rl_attr_match(const char *v, struct html_rl_sib_attr *a)
++{
++	const char *w = a->val ? a->val : "";
++	char *vl = NULL, *wl = NULL;
++	bool r = false;
++	size_t vlen, wlen;
++	if (a->ci) {
++		vl = strdup(v);
++		wl = strdup(w);
++		if (vl == NULL || wl == NULL) {
++			free(vl);
++			free(wl);
++			return false;
++		}
++		html_rl_str_lower_inplace(vl);
++		html_rl_str_lower_inplace(wl);
++		v = vl;
++		w = wl;
++	}
++	vlen = strlen(v);
++	wlen = strlen(w);
++	switch (a->op) {
++	case 0:
++		r = true;
++		break;
++	case '=':
++		r = strcmp(v, w) == 0;
++		break;
++	case '~': {
++		/* w non-empty, no whitespace, whitespace-separated word */
++		const char *t;
++		if (wlen == 0)
++			break;
++		for (t = w; *t; t++)
++			if (html_rl_is_ws((uint8_t)*t))
++				break;
++		if (*t)
++			break;
++		r = html_rl_class_has(v, w);
++		break;
++	}
++	case '|':
++		r = strcmp(v, w) == 0 ||
++		    (vlen > wlen && strncmp(v, w, wlen) == 0 &&
++		     v[wlen] == '-');
++		break;
++	case '^':
++		r = wlen != 0 && strncmp(v, w, wlen) == 0;
++		break;
++	case '$':
++		r = wlen != 0 && vlen >= wlen &&
++		    strcmp(v + vlen - wlen, w) == 0;
++		break;
++	case '*':
++		r = wlen != 0 && strstr(v, w) != NULL;
++		break;
++	}
++	free(vl);
++	free(wl);
++	return r;
++}
++
++/* Match one parsed compound against an element, with the class attribute
++ * forced to class_override (NULL = use live). Mirrors compoundOk. */
++static bool html_rl_sib_compound_matches(dom_element *el,
++		struct html_rl_sib_compound *cp, const char *class_override)
++{
++	int i;
++	/* A pseudo-element never matches an element (JS: compoundOk returns
++	 * false when pel is set). */
++	if (cp->has_pel)
++		return false;
++	/* Should be unreachable: the scan declines instead of caching a
++	 * compound with a pseudo-class. Treat as non-matching rather than
++	 * risk an unsound local rebuild. */
++	if (cp->has_pseudo)
++		return false;
++	if (cp->tag != NULL) {
++		dom_string *tn = NULL;
++		bool ok = false;
++		if (dom_element_get_tag_name(el, &tn) == DOM_NO_ERR &&
++		    tn != NULL) {
++			const char *d = dom_string_data(tn);
++			size_t l = dom_string_byte_length(tn);
++			char *tl = malloc(l + 1);
++			if (tl != NULL) {
++				size_t k;
++				for (k = 0; k < l; k++)
++					tl[k] = (char)tolower(
++						(unsigned char)d[k]);
++				tl[l] = '\0';
++				ok = strcmp(tl, cp->tag) == 0;
++				free(tl);
++			}
++			dom_string_unref(tn);
++		}
++		if (!ok)
++			return false;
++	}
++	if (cp->id != NULL) {
++		char *v = html_rl_sib_attr_value(el, "id", class_override);
++		bool ok = v != NULL && strcmp(v, cp->id) == 0;
++		free(v);
++		if (!ok)
++			return false;
++	}
++	if (cp->nclasses > 0) {
++		char *cv = html_rl_sib_attr_value(el, "class",
++				class_override);
++		bool ok = true;
++		if (cv == NULL)
++			ok = false;
++		else {
++			for (i = 0; i < cp->nclasses; i++)
++				if (!html_rl_class_has(cv, cp->classes[i])) {
++					ok = false;
++					break;
++				}
++		}
++		free(cv);
++		if (!ok)
++			return false;
++	}
++	for (i = 0; i < cp->nattrs; i++) {
++		char *v = html_rl_sib_attr_value(el, cp->attrs[i].name,
++				class_override);
++		bool ok = v != NULL &&
++			html_rl_attr_match(v, &cp->attrs[i]);
++		free(v);
++		if (!ok)
++			return false;
++	}
++	return true;
++}
++
++/* ---- per-sheet cache ----
++ * Keyed by the sheet handle with the source data pointer, size and an
++ * FNV-1a hash validating the entry: the patch-174 cache keyed by (source
++ * pointer, size) alone, which allocator reuse can alias to a different
++ * sheet's source and return a stale `has=false`. The handle is kept alive
++ * by the document's stylesheet array while we hold it, and the hash makes
++ * a same-address different-content collision negligible. */
++#define HTML_RL_SIB_CACHE_N 32
++struct html_rl_sib_sheet {
++	struct hlcache_handle *sheet;
++	const uint8_t *data;
++	size_t size;
++	uint32_t hash;
++	/* 0 = no sibling risk, 1 = precise (lefts valid), 2 = decline */
++	int state;
++	struct html_rl_sib_compound *lefts;
++	int nlefts;
++};
++static struct html_rl_sib_sheet html_rl_sib_cache[HTML_RL_SIB_CACHE_N];
++static unsigned int html_rl_sib_cache_next;
++
++static uint32_t html_rl_fnv1a(const uint8_t *s, size_t len)
++{
++	uint32_t h = 2166136261u;
++	size_t i;
++	for (i = 0; i < len; i++) {
++		h ^= s[i];
++		h *= 16777619u;
++	}
++	return h;
++}
++
++static void html_rl_sib_sheet_free(struct html_rl_sib_sheet *e)
++{
++	int k;
++	for (k = 0; k < e->nlefts; k++)
++		html_rl_sib_compound_free(&e->lefts[k]);
++	free(e->lefts);
++	memset(e, 0, sizeof(*e));
++}
++
++/* Get (or compute) the cached analysis for one sheet. */
++static struct html_rl_sib_sheet *html_rl_sib_sheet_for(
++		struct hlcache_handle *sheet)
+ {
+-	static struct { const uint8_t *data; size_t size; bool has; }
+-		cache[32];
+-	static unsigned int next_slot;
+-	unsigned int i, k;
++	const uint8_t *data;
++	size_t size = 0;
++	uint32_t hash;
++	unsigned int k;
++	struct html_rl_sib_sheet *e = NULL;
++	data = content_get_source_data(sheet, &size);
++	if (data == NULL || size == 0)
++		return NULL;
++	hash = html_rl_fnv1a(data, size);
++	for (k = 0; k < HTML_RL_SIB_CACHE_N; k++) {
++		if (html_rl_sib_cache[k].sheet == sheet) {
++			e = &html_rl_sib_cache[k];
++			break;
++		}
++	}
++	if (e == NULL) {
++		e = &html_rl_sib_cache[html_rl_sib_cache_next];
++		html_rl_sib_cache_next =
++			(html_rl_sib_cache_next + 1) % HTML_RL_SIB_CACHE_N;
++	} else if (e->data == data && e->size == size && e->hash == hash) {
++		return e;	/* valid hit */
++	}
++	/* (re)compute */
++	html_rl_sib_sheet_free(e);
++	e->sheet = sheet;
++	e->data = data;
++	e->size = size;
++	e->hash = hash;
++	{
++		struct html_rl_sib_compound *lefts = NULL;
++		int nlefts = 0, r;
++		r = html_rl_scan_sheet(data, size, &lefts, &nlefts);
++		if (r == 2) {
++			e->state = 2;
++		} else if (r == 1) {
++			e->state = 1;
++			e->lefts = lefts;
++			e->nlefts = nlefts;
++		} else {
++			e->state = 0;
++		}
++	}
++	return e;
++}
+ 
++/* True if the class change old_class -> (live class) on el might restyle a
++ * following sibling through a '+'/'~' rule: any left compound whose match
++ * state differs between the two class sets (XOR). Conservative declines
++ * return true. */
++static bool html_rl_class_sibling_risk(html_content *c, dom_element *el,
++		const char *old_class)
++{
++	unsigned int i;
++	int k;
++	char *new_class;
++	bool risk = false;
++	if (old_class == NULL) {
++		macsurf_debug_log_writef("LIFE rebuild local: declined "
++			"(class change without old value)");
++		return true;
++	}
++	new_class = html_rl_sib_attr_value(el, "class", NULL);
++	if (new_class != NULL && strcmp(old_class, new_class) == 0) {
++		/* no net change: no sibling's match can have moved */
++		free(new_class);
++		return false;
++	}
+ 	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
+-		const uint8_t *data;
+-		size_t size = 0;
+-		bool has, hit = false;
++		struct html_rl_sib_sheet *e;
+ 		if (c->stylesheets[i].sheet == NULL || c->stylesheets[i].unused)
+ 			continue;
+-		data = content_get_source_data(c->stylesheets[i].sheet, &size);
+-		if (data == NULL || size == 0)
++		e = html_rl_sib_sheet_for(c->stylesheets[i].sheet);
++		if (e == NULL)
+ 			continue;
+-		for (k = 0; k < 32; k++)
+-			if (cache[k].data == data && cache[k].size == size) {
+-				has = cache[k].has;
+-				hit = true;
++		if (e->state == 2) {
++			macsurf_debug_log_writef("LIFE rebuild local: declined "
++				"(page CSS needs conservative sibling check)");
++			risk = true;
++			break;
++		}
++		if (e->state != 1)
++			continue;
++		for (k = 0; k < e->nlefts; k++) {
++			bool m_old = html_rl_sib_compound_matches(el,
++					&e->lefts[k], old_class);
++			bool m_new = html_rl_sib_compound_matches(el,
++					&e->lefts[k], new_class);
++			if (m_old != m_new) {
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"declined (class change moves a "
++					"sibling selector)");
++				risk = true;
+ 				break;
+ 			}
+-		if (!hit) {
+-			has = html_rl_css_has_sibling(data, size);
+-			cache[next_slot].data = data;
+-			cache[next_slot].size = size;
+-			cache[next_slot].has = has;
+-			next_slot = (next_slot + 1) % 32;
+ 		}
+-		if (has)
+-			return true;
++		if (risk)
++			break;
+ 	}
+-	return false;
++	free(new_class);
++	return risk;
+ }
+ 
+ /* The element's own box is a plain block among plain blocks: take the old
+@@ -6790,7 +7631,7 @@
+  * layout's own margin arithmetic. 0 done, -1 declined (nothing changed)
+  * or failed (the full reconvert rebuilds from the DOM). */
+ static int html_rl_block_restyle(html_content *c, dom_node *el,
+-		struct box *ob, double t0)
++		struct box *ob, double t0, const char *old_class)
+ {
+ 	extern double macos9_micros(void);
+ 	extern const char *layout_relayout_why;
+@@ -6816,9 +7657,11 @@
+ 		RL_RNO("restyled block holds objects, controls or floats");
+ 	if (!html_rl_block_tag(el) || !html_rl_inline_subtree(el))
+ 		RL_RNO("restyled element is not a plain block of text");
+-	/* a class on this block could restyle its following siblings */
+-	if (html_rl_page_css_has_sibling(c))
+-		RL_RNO("page CSS has sibling combinators");
++	/* a class on this block could restyle its following siblings, but
++	 * only if a sibling selector's left compound actually matches the
++	 * element differently under the old vs new class (patch 186) */
++	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
++		RL_RNO("class change may move a sibling selector");
+ 
+ 	/* out with the old box, as a removal */
+ 	prev = ob->prev;
+@@ -6911,27 +7754,30 @@
+ }
+ 
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+-		bool class_change);
++		bool class_change, const char *old_class);
+ 
+ int html_reconvert_local(struct content *base_c, void *vnode);
+ int html_reconvert_local(struct content *base_c, void *vnode)
+ {
+-	return html_reconvert_local_change(base_c, vnode, false);
++	return html_reconvert_local_change(base_c, vnode, false, NULL);
+ }
+ 
+ /* A class change (patch 173). One on an inline-level element is rebuilt
+  * like a text change: the block holding it gets its inline content built
+  * again, which cascades the element and everything in the block afresh.
+  * One on an element whose own box is a block would leave that box's own
+- * style stale, so it takes the full rebuild. */
+-int html_reconvert_local_class(struct content *base_c, void *vnode);
+-int html_reconvert_local_class(struct content *base_c, void *vnode)
++ * style stale, so it takes the full rebuild.
++ * Patch 186 - old_class is the pre-mutation value (NULL if unknown). */
++int html_reconvert_local_class(struct content *base_c, void *vnode,
++		const char *old_class);
++int html_reconvert_local_class(struct content *base_c, void *vnode,
++		const char *old_class)
+ {
+-	return html_reconvert_local_change(base_c, vnode, true);
++	return html_reconvert_local_change(base_c, vnode, true, old_class);
+ }
+ 
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+-		bool class_change)
++		bool class_change, const char *old_class)
+ {
+ 	extern double macos9_micros(void);
+ 	extern const char *layout_relayout_why;
+@@ -6973,8 +7819,10 @@
+ 			b = box_for_node(n);
+ 			if (class_change && n == vnode && b != NULL &&
+ 			    b->type == BOX_BLOCK) {
+-				/* its own box's style changes: patch 174 */
+-				int r = html_rl_block_restyle(c, n, b, t0);
++				/* its own box's style changes: patch 174,
++				 * patch 186 refines the sibling check */
++				int r = html_rl_block_restyle(c, n, b, t0,
++					old_class);
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -128,6 +128,15 @@
+ 	int             multi;
+ 	unsigned long   kind_mask;
+ 	unsigned long   batch_id;
++	/* Patch 186 - the element's `class` attribute value BEFORE the first
++	 * class mutation recorded in this slot (owned, NULL if unknown or not
++	 * a class change). The mutation itself has already committed, so at
++	 * fire time the DOM holds the NEW value; the local-rebuild sibling
++	 * check compares old_class against it. Kept from the FIRST mark only:
++	 * a later mark on the same node/kind merges without touching it, so a
++	 * burst a->b->c compares a against c. Freed when the slot is dropped
++	 * or cleared. */
++	char           *old_class;
+ };
+ 
+ /* fixes910 Phase 0 - implemented in content/handlers/html/html.c, where the real
+@@ -296,6 +305,11 @@
+ 		macsurf_reconvert_node_unref(g_pending[i].node);
+ 		g_pending[i].node = NULL;
+ 	}
++	/* Patch 186 - the old class value dies with the slot's precision:
++	 * a merge to multi no longer names one node, a token reset starts a
++	 * new generation, and a clear consumes the record. */
++	free(g_pending[i].old_class);
++	g_pending[i].old_class = NULL;
+ 	g_pending[i].kind = MACOS9_DOMMUT_UNKNOWN;
+ }
+ 
+@@ -320,7 +334,8 @@
+  * so a consumer can only ever be MORE conservative than the truth, never less.
+  * Behaviour is unchanged today - nothing reads these fields yet. */
+ static void
+-macos9_reconvert_pending_add(struct content *c, void *node, int kind)
++macos9_reconvert_pending_add2(struct content *c, void *node, int kind,
++		const char *old_class)
+ {
+ 	int i;
+ 	int freeslot = -1;
+@@ -340,6 +355,9 @@
+ 					kind < (int)(sizeof(unsigned long) * 8)) ? (1UL << kind) :
+ 					(1UL << MACOS9_DOMMUT_UNKNOWN);
+ 				g_pending[i].node = macsurf_reconvert_node_ref(node);
++				/* Patch 186 - new generation, new old value. */
++				g_pending[i].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
++					old_class != NULL) ? strdup(old_class) : NULL;
+ 				memset(&prov, 0, sizeof(prov));
+ 				prov.nav = ms_diag_cur_nav();
+ 				html_content_get_diag_identity(c, &prov.doc, &prov.frame);
+@@ -371,6 +389,9 @@
+ 				g_pending[i].multi = 1;
+ 				macos9_reconvert_slot_drop_node(i);
+ 			}
++			/* Patch 186 - same node and kind merging: the slot keeps
++			 * the FIRST mark's old_class. A later mark's value is
++			 * the intermediate state, not the pre-batch state. */
+ 			return;
+ 		}
+ 		if (g_pending[i].c == NULL && freeslot < 0)
+@@ -390,6 +411,9 @@
+ 		kind < (int)(sizeof(unsigned long) * 8)) ? (1UL << kind) :
+ 		(1UL << MACOS9_DOMMUT_UNKNOWN);
+ 	g_pending[freeslot].multi = (node == NULL) ? 1 : 0;
++	/* Patch 186 - copy the pre-mutation class value, if given. */
++	g_pending[freeslot].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
++		old_class != NULL) ? strdup(old_class) : NULL;
+ 	{
+ 		struct ms_diag_provenance prov;
+ 		memset(&prov, 0, sizeof(prov));
+@@ -688,13 +712,17 @@
+ static int macos9_reconvert_try_local(int i, struct content *c)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
+-	extern int html_reconvert_local_class(struct content *c, void *node);
++	extern int html_reconvert_local_class(struct content *c, void *node,
++			const char *old_class);
+ 
+ 	if (g_pending[i].multi || g_pending[i].node == NULL)
+ 		return 0;
+-	/* a class change on an inline-level element: its block (patch 173) */
++	/* a class change on an inline-level element: its block (patch 173).
++	 * Patch 186 passes the pre-mutation class value for the precise
++	 * sibling check. */
+ 	if (g_pending[i].kind == MACOS9_DOMMUT_SETATTR_CLASS)
+-		return html_reconvert_local_class(c, g_pending[i].node) == 0;
++		return html_reconvert_local_class(c, g_pending[i].node,
++				g_pending[i].old_class) == 0;
+ 	switch (g_pending[i].kind) {
+ 	case MACOS9_DOMMUT_TEXTCONTENT:
+ 	case MACOS9_DOMMUT_INNERHTML:
+@@ -1159,7 +1187,8 @@
+ }
+ 
+ void
+-macos9_js_mark_dom_dirty_node(struct content *c, void *node, int kind)
++macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
++		const char *old_class)
+ {
+ 	/* fixes489 - master switch. Still here as an emergency global
+ 	 * kill (macsurf_js_set_reconvert_enabled(0)); nothing currently calls
+@@ -1243,7 +1272,7 @@
+ 	if (g_first_mark_tick == 0)
+ 		g_first_mark_tick = (unsigned long) TickCount();
+ 
+-	macos9_reconvert_pending_add(c, node, kind);
++	macos9_reconvert_pending_add2(c, node, kind, old_class);
+ 	if (macsurf_js_page_execution_active())
+ 		macsurf_js_note_dom_mutation();
+ 	/* fixes1148 - DON'T reschedule if already queued.
+@@ -1266,6 +1295,13 @@
+ 		macos9_reconvert_schedule_pending();
+ }
+ 
++/* Patch 186 - legacy entry point without the old class value. */
++void
++macos9_js_mark_dom_dirty_node(struct content *c, void *node, int kind)
++{
++	macos9_js_mark_dom_dirty_node2(c, node, kind, NULL);
++}
++
+ static void macos9_reconvert_schedule_pending(void)
+ {
+ 	extern int macos9_sched_is_queued(void (*callback)(void *p), void *p);
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.h
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.h
+@@ -76,6 +76,14 @@
+  */
+ void macos9_js_mark_dom_dirty_node(struct content *c, void *node, int kind);
+ 
++/* Patch 186 - variant carrying the pre-mutation value of the element's
++ * `class` attribute (NULL if unknown or not a class change). Stored in the
++ * pending record so the local-rebuild path can compare the class set before
++ * and after the change without trusting live DOM. The caller retains
++ * ownership of old_class; it is copied. */
++void macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
++		const char *old_class);
++
+ /* Legacy entry point  -  equivalent to _node(c, NULL, MACOS9_DOMMUT_UNKNOWN),
+  * i.e. "something changed, no idea what". Kept so any caller that cannot name
+  * the node still works, and always yields the full rebuild. */
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -3600,7 +3600,8 @@
+ /* A DOM mutation belongs to the realm that invoked the binding.  Keeping the
+  * lookup in one helper prevents a future mutation surface from accidentally
+  * reviving a process-global reconvert target. */
+-static void qjs_mark_dom_dirty(JSContext *ctx, void *node, int kind)
++static void qjs_mark_dom_dirty2(JSContext *ctx, void *node, int kind,
++		const char *old_class)
+ {
+ 	struct content *content = qjs_get_content_for_ctx(ctx);
+ 	if (content == NULL)
+@@ -3623,7 +3624,13 @@
+ 		if (!in_doc)
+ 			return;
+ 	}
+-	macos9_js_mark_dom_dirty_node(content, node, kind);
++	macos9_js_mark_dom_dirty_node2(content, node, kind, old_class);
++}
++
++/* Patch 186 - legacy entry point without the old class value. */
++static void qjs_mark_dom_dirty(JSContext *ctx, void *node, int kind)
++{
++	qjs_mark_dom_dirty2(ctx, node, kind, NULL);
+ }
+ 
+ /* ---- QuickJS class for element wrappers ---- */
+@@ -4656,7 +4663,13 @@
+ 		macsurf_dom_element_set_attribute(el, name_ds, val_ds);
+ 		qjs_queue_attribute_mutation(ctx, this_val, name_cstr,
+ 				old_ds ? dom_string_data(old_ds) : NULL);
+-		qjs_mark_dom_dirty(ctx, (void *) el, attr_kind);
++		/* Patch 186 - a class change carries its pre-mutation value so
++		 * the local rebuild can compare old vs new class sets. */
++		if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
++			qjs_mark_dom_dirty2(ctx, (void *) el, attr_kind,
++				old_ds ? dom_string_data(old_ds) : NULL);
++		else
++			qjs_mark_dom_dirty(ctx, (void *) el, attr_kind);
+ 	}
+ 	JS_FreeCString(ctx, name_cstr);
+ 	JS_FreeCString(ctx, val_cstr);
+@@ -5954,8 +5967,14 @@
+ 		}
+ 		/* fixes843b - this real DOM mutation never marked dirty, so
+ 		 * el.removeAttribute(...) (a common show/hide idiom) never
+-		 * triggered a repaint. Match setAttribute's behaviour. */
+-		qjs_mark_dom_dirty(ctx, (void *) el, rm_kind);
++		 * triggered a repaint. Match setAttribute's behaviour.
++		 * Patch 186 - a class removal carries its pre-mutation value
++		 * (the new value is implicitly empty). */
++		if (rm_kind == MACOS9_DOMMUT_SETATTR_CLASS)
++			qjs_mark_dom_dirty2(ctx, (void *) el, rm_kind,
++				old_ds ? dom_string_data(old_ds) : NULL);
++		else
++			qjs_mark_dom_dirty(ctx, (void *) el, rm_kind);
+ 		macsurf_dom_string_unref(name_ds);
+ 	}
+ 	JS_FreeCString(ctx, name_cstr);
