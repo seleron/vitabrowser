@@ -240,6 +240,7 @@ NET-js-block-class-sibling http://127.0.0.1:$HP/JS-block-class-sibling.html
 NET-css-sibling-class http://127.0.0.1:$HP/CSS-sibling-class.html
 NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET-js-list-structural http://127.0.0.1:$HP/JS-list-structural.html
+NET-js-has193 http://127.0.0.1:$HP/JS-has193.html
 NET-js-selectors http://127.0.0.1:$HP/JS-selectors.html
 NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
@@ -652,6 +653,13 @@ lsd=$(grep -c 'LIFE rebuild local: declined (structural selectors or counters in
 lsm=$(grep -c 'box_free: freed list marker' "$R/netsurf.log" || true)
 echo "  JS-list-structural: ${lsr:-no summary}; ${lsd} structural/counter declines, ${lsm} markers freed"
 [ -n "$lsp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lsp | sort -u | sed 's/^STR /  /'
+# :has() gaps (Patch 193): sibling-lead multi-part relative selectors match
+# descendants of following siblings; element.querySelectorAll(':scope')
+# includes the element; nested :has() and :has() with pseudo-classes.
+h9p=$(ls "$R"/*NET-js-has193*.plot 2>/dev/null)
+h9r=$(sed -n 's/.*STR \(HAS193: [0-9]*\/[0-9]* passed\).*/\1/p' $h9p 2>/dev/null | head -1)
+echo "  JS-has193: ${h9r:-no summary}"
+[ -n "$h9p" ] && grep -aho 'STR [0-9] [^"]*FAIL' $h9p | sort -u | sed 's/^STR /  /'
 # Selectors (Patch 178): matches / closest / querySelector(All) against
 # Chromium's answers for 85 cases (JS-selectors.html carries them).
 slp=$(ls "$R"/*NET-js-selectors*.plot 2>/dev/null)
@@ -720,6 +728,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
 [ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
 [ "$lsr" = "LISTSTRUCT: 6/6 passed" ] && [ "${lsd:-0}" -ge 4 ] && [ "${lsm:-0}" -ge 1 ] && \
+[ "$h9r" = "HAS193: 6/6 passed" ] && \
 [ "$slr" = "SELECTORS: 85/85 passed" ] && \
 [ "$abr" = "ACCTBAR: 5/5 passed" ] && \
 [ "$appr" = "APPEAR: 6/6 passed" ] && \

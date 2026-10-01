@@ -1,0 +1,150 @@
+# netsurf: fix :has() selector gaps — sibling-lead multi-part descendants and :scope (WS-C)
+# Generated 2026-10-01
+#
+# Roadmap WS-C, follow-up to patch 178. Two gaps in patch 178's selector
+# engine (content/handlers/javascript/quickjs/vita_polyfill.js):
+#
+# 1. :has() with a sibling-lead multi-part relative selector misses.
+#    hasMatch() enumerated candidates for '+'/'~' leads as the following
+#    siblings *themselves*; for :has(+ .foo .bar) the rightmost compound
+#    (.bar) can match a *descendant* of a following sibling, which was never
+#    tried. Single-part (:has(+ .foo)) was correct; multi-part was not.
+#    Fix: for multi-part relative selectors, also walk each following
+#    sibling's subtree when testing candidates.
+#
+# 2. Element-scoped :scope-only queries returned empty. each() walks
+#    root.firstChild... for element roots, so el.querySelectorAll(':scope')
+#    was [] (Chromium: [el]). Fix: jsQuery() now tests the root element
+#    itself when the selector uses :scope (via a usesScope() helper that
+#    recurses into :has()/:is()/:not()/etc. argument lists). The root
+#    precedes all descendants in document order, so it is tested first.
+#
+# Decline conditions: none — these are pure selector-engine correctness
+# fixes with no fallback paths. The :scope fix only activates when the
+# parsed selector actually contains :scope, so non-:scope queries are
+# unaffected.
+#
+# Gate: testpages/pages/JS-has193.html (HAS193 6/6): :has(+ .foo .bar) and
+# :has(~ .foo .bar) with .bar as a descendant of the sibling;
+# querySelectorAll(':scope') includes the element; single-part :has(+ .foo)
+# still works; nested :has(div:has(span)); :has(span:first-child).
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -3152,6 +3152,13 @@
+ 			if (rel.lead === '+' || rel.lead === '~') {
+ 				for (var s = nextEl(n); s && !found; s = nextEl(s)) {
+ 					found = anchored(s);
++					/* 193: multi-part relative selectors can match a
++					 * descendant of the sibling, not just the sibling
++					 * itself (e.g. :has(+ .foo .bar) where .bar is
++					 * inside the .foo sibling). Walk the subtree. */
++					if (!found && parts.length > 1) {
++						walk(s, function (m) { if (!found && anchored(m)) found = true; return found; });
++					}
+ 					if (rel.lead === '+' && parts.length === 1) break;
+ 				}
+ 			} else {
+@@ -3237,6 +3244,26 @@
+ 		try { Object.defineProperty(a, 'item', { value: function (i) { return this[i] || null; }, configurable: true }); } catch (e) { /* */ }
+ 		return a;
+ 	}
++	/* 193: does any compound in the selector list use :scope (including
++	 * nested inside :has()/:is()/:not()/etc.)? */
++	function usesScope(list) {
++		if (!list) return false;
++		for (var i = 0; i < list.length; i++) {
++			var parts = list[i].parts;
++			if (!parts) continue;
++			for (var j = 0; j < parts.length; j += 2) {
++				var cp = parts[j];
++				if (!cp || !cp.pseudo) continue;
++				for (var k = 0; k < cp.pseudo.length; k++) {
++					var ps = cp.pseudo[k];
++					if (ps.name === 'scope') return true;
++					if (ps.list && usesScope(ps.list)) return true;
++					if (ps.of && usesScope(ps.of)) return true;
++				}
++			}
++		}
++		return false;
++	}
+ 	function inOrder(root, set) {
+ 		/* several seeds: merge in document order */
+ 		var out = [];
+@@ -3246,6 +3273,14 @@
+ 	function jsQuery(root, sel, first, nat) {
+ 		var list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;
+ 		if (!seeds.length) return first ? null : listOf([]);
++		/* 193: :scope matches the scoping element itself, but each()
++		 * never yields the root for element roots. Test it explicitly;
++		 * it precedes all descendants in document order. */
++		if (root.nodeType === 1 && usesScope(list) && matchList(root, list, ctx)) {
++			if (first) return root;
++			all.push(root);
++			seen.add(root);
++		}
+ 		for (i = 0; i < seeds.length; i++) {
+ 			var cand = null;
+ 			try { cand = nat ? nat.call(root, seeds[i]) : null; } catch (e) { cand = null; }
+
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -3153,6 +3153,13 @@
+ "\t\t\tif (rel.lead === '+' || rel.lead === '~') {\n"
+ "\t\t\t\tfor (var s = nextEl(n); s && !found; s = nextEl(s)) {\n"
+ "\t\t\t\t\tfound = anchored(s);\n"
++"\t\t\t\t\t/* 193: multi-part relative selectors can match a\n"
++"\t\t\t\t\t * descendant of the sibling, not just the sibling\n"
++"\t\t\t\t\t * itself (e.g. :has(+ .foo .bar) where .bar is\n"
++"\t\t\t\t\t * inside the .foo sibling). Walk the subtree. */\n"
++"\t\t\t\t\tif (!found && parts.length > 1) {\n"
++"\t\t\t\t\t\twalk(s, function (m) { if (!found && anchored(m)) found = true; return found; });\n"
++"\t\t\t\t\t}\n"
+ "\t\t\t\t\tif (rel.lead === '+' && parts.length === 1) break;\n"
+ "\t\t\t\t}\n"
+ "\t\t\t} else {\n"
+@@ -3238,6 +3245,26 @@
+ "\t\ttry { Object.defineProperty(a, 'item', { value: function (i) { return this[i] || null; }, configurable: true }); } catch (e) { /* */ }\n"
+ "\t\treturn a;\n"
+ "\t}\n"
++"\t/* 193: does any compound in the selector list use :scope (including\n"
++"\t * nested inside :has()/:is()/:not()/etc.)? */\n"
++"\tfunction usesScope(list) {\n"
++"\t\tif (!list) return false;\n"
++"\t\tfor (var i = 0; i < list.length; i++) {\n"
++"\t\t\tvar parts = list[i].parts;\n"
++"\t\t\tif (!parts) continue;\n"
++"\t\t\tfor (var j = 0; j < parts.length; j += 2) {\n"
++"\t\t\t\tvar cp = parts[j];\n"
++"\t\t\t\tif (!cp || !cp.pseudo) continue;\n"
++"\t\t\t\tfor (var k = 0; k < cp.pseudo.length; k++) {\n"
++"\t\t\t\t\tvar ps = cp.pseudo[k];\n"
++"\t\t\t\t\tif (ps.name === 'scope') return true;\n"
++"\t\t\t\t\tif (ps.list && usesScope(ps.list)) return true;\n"
++"\t\t\t\t\tif (ps.of && usesScope(ps.of)) return true;\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t}\n"
+ "\tfunction inOrder(root, set) {\n"
+ "\t\t/* several seeds: merge in document order */\n"
+ "\t\tvar out = [];\n"
+@@ -3247,6 +3274,14 @@
+ "\tfunction jsQuery(root, sel, first, nat) {\n"
+ "\t\tvar list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;\n"
+ "\t\tif (!seeds.length) return first ? null : listOf([]);\n"
++"\t\t/* 193: :scope matches the scoping element itself, but each()\n"
++"\t\t * never yields the root for element roots. Test it explicitly;\n"
++"\t\t * it precedes all descendants in document order. */\n"
++"\t\tif (root.nodeType === 1 && usesScope(list) && matchList(root, list, ctx)) {\n"
++"\t\t\tif (first) return root;\n"
++"\t\t\tall.push(root);\n"
++"\t\t\tseen.add(root);\n"
++"\t\t}\n"
+ "\t\tfor (i = 0; i < seeds.length; i++) {\n"
+ "\t\t\tvar cand = null;\n"
+ "\t\t\ttry { cand = nat ? nat.call(root, seeds[i]) : null; } catch (e) { cand = null; }\n"
