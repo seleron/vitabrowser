@@ -240,6 +240,7 @@ NET-js-block-class-sibling http://127.0.0.1:$HP/JS-block-class-sibling.html
 NET-css-sibling-class http://127.0.0.1:$HP/CSS-sibling-class.html
 NET-js-list-nested-stall http://127.0.0.1:$HP/JS-list-nested-stall.html
 NET-js-list-structural http://127.0.0.1:$HP/JS-list-structural.html
+NET-js-block-sibling-insert http://127.0.0.1:$HP/JS-block-sibling-insert.html
 NET-js-has193 http://127.0.0.1:$HP/JS-has193.html
 NET-js-flex-stretch-maxheight http://127.0.0.1:$HP/JS-flex-stretch-maxheight.html
 NET-js-flex195 http://127.0.0.1:$HP/JS-flex195.html
@@ -665,6 +666,16 @@ lsd=$(grep -c 'LIFE rebuild local: declined (structural selectors or counters in
 lsm=$(grep -c 'box_free: freed list marker' "$R/netsurf.log" || true)
 echo "  JS-list-structural: ${lsr:-no summary}; ${lsd} structural/counter declines, ${lsm} markers freed"
 [ -n "$lsp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lsp | sort -u | sed 's/^STR /  /'
+# Sibling insert/remove (Patch 198): inserting or removing a block that can
+# move a following sibling's match through a + / ~ rule (or flip the
+# parent's :empty / an ancestor's :has) declines the local path; the test
+# page asserts the sibling's computed colour actually changed (on the local
+# path it would stay stale). The engine log must show the declines.
+sbp=$(ls "$R"/*NET-js-block-sibling-insert*.plot 2>/dev/null)
+sbr=$(sed -n 's/.*STR \(SIBINS: [0-9]*\/[0-9]* passed\).*/\1/p' $sbp 2>/dev/null | head -1)
+sbd=$(grep -c 'LIFE rebuild local: declined (sibling combinator may restyle on insert/remove)' "$R/netsurf.log" || true)
+echo "  JS-block-sibling-insert: ${sbr:-no summary}; ${sbd} insert/remove sibling declines"
+[ -n "$sbp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $sbp | sort -u | sed 's/^STR /  /'
 # :has() gaps (Patch 193): sibling-lead multi-part relative selectors match
 # descendants of following siblings; element.querySelectorAll(':scope')
 # includes the element; nested :has() and :has() with pseudo-classes.
@@ -760,6 +771,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
 [ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
 [ "$lsr" = "LISTSTRUCT: 6/6 passed" ] && [ "${lsd:-0}" -ge 4 ] && [ "${lsm:-0}" -ge 1 ] && \
+[ "$sbr" = "SIBINS: 4/4 passed" ] && [ "${sbd:-0}" -ge 2 ] && \
 [ "$h9r" = "HAS193: 6/6 passed" ] && \
 [ "$smr" = "STRMAX194: 4/4 passed" ] && \
 [ "$f95r" = "FLEX195: 4/4 passed" ] && \

@@ -1,0 +1,1121 @@
+# netsurf: precise sibling-combinator decline for block insert/remove (166 follow-up, WS-C)
+# Generated 2026-10-02
+# Base: seleron/vitabrowser ebbacb5637d7eadd8df802d214d4b7143b009a1f (patch stack through 197)
+#
+# What remains of the patch-166 stale-styles issue after 192 and 197:
+# inserting or removing a block among a parent's block children can change
+# a FOLLOWING sibling's style through a sibling combinator (+ / ~), flip
+# the parent's :empty, or change an ancestor's :has() answer, and the
+# local block path never reselects the siblings, the parent or the
+# ancestors -- their styles go stale. Patch 192 covers positional
+# pseudos and counters; 197 covers class changes on the element itself.
+# Shelved 189 declined ANY insert/remove under a sibling-combinator
+# sheet, which over-declined (DOMSTALL 1185-1670 ms against the 200 ms
+# bound), so this patch is precise per element instead.
+#
+# Fix: patch 186's per-sheet selector analysis now records, alongside
+# lefts[] (unchanged), the sibling rules {kind '+'/'~', L, R} -- including
+# chained A + B + C -- and the compounds carrying :empty / :has().
+# html_rl_block_change calls html_rl_block_sibling_risk after 192's
+# structural check, before any box is touched:
+#   '+' : the next sibling S of the inserted/removed element changes iff
+#         R matches S and L's match differs between the old and the new
+#         predecessor. Compared per element.
+#   '~' : any following sibling matching R changes iff the
+#         inserted/removed element matches L.
+#   :empty : the parent's :empty flips iff the mutation changes its
+#         element-childlessness, and an :empty compound statically
+#         matches the parent.
+#   :has : an insert/remove below changes the answer of a :has()
+#         compound statically matching the parent or any ancestor.
+# A sheet in patch 186's conservative state (2) still declines. The
+# DOMSTALL inserts stay local: their sheets carry no matching + / ~
+# compound and the span:empty parent is not :empty-matched, so the
+# 5000-paragraph pages keep their local rebuilds.
+#
+# Companion fix (shared scanner): html_rl_skip_ws now strips CSS
+# comments. Before this, a comment inside a selector prelude (e.g. the
+# note above DOMSTALL's "span:empty { ... }") made the parser fail on
+# the '/' and the whole sheet fell into the conservative decline state
+# even though it carries no sibling risk -- which would have forced
+# every insert on such a page through the full rebuild. Comments may
+# sit between any two tokens in CSS, so the tokeniser now treats them
+# as whitespace everywhere it skips. This also sharpens patch 186's
+# class-path analysis for the same sheets.
+#
+# Logging: "LIFE rebuild local: declined (sibling combinator may
+# restyle on insert/remove)"; the gate counts it (>= 2) and the
+# JS-block-sibling-insert page asserts the following sibling's computed
+# colour actually changed (on the unstaled local path it would not).
+#
+# Decline conditions: as above, plus any DOM error while walking (the
+# check cannot prove safety). Chained selectors (A + B + C) yield both
+# rules; the class-change XOR in 186 is untouched.
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6530,6 +6530,11 @@
+ /* Patch 192: true if a used document stylesheet uses sibling-position
+  * structural pseudo-classes or CSS counters, whose following-sibling
+  * styles the local block insert/remove path would leave stale. */
++/* Patch 198 (below, after the patch-186 sheet machinery it uses). */
++static bool html_rl_block_sibling_risk(html_content *c, dom_node *pnode,
++		dom_node **added, unsigned int nadd,
++		struct box **removed, unsigned int nrem);
++
+ static bool html_rl_block_list_style_risk(html_content *c)
+ {
+ 	unsigned int i;
+@@ -6661,6 +6666,16 @@
+ 	if (html_rl_block_list_style_risk(c))
+ 		RL_BNO("structural selectors or counters in page CSS");
+ 
++	/* Patch 198: sibling combinators (+ / ~), :empty and :has() can
++	 * restyle a following sibling, the parent or an ancestor when a
++	 * block is inserted or removed -- the rest of the patch-166
++	 * stale-styles issue. The check is per element: an insert whose
++	 * element does not move any sibling's match stays on the local
++	 * path. Decline before touching any box. */
++	if (html_rl_block_sibling_risk(c, pnode, added, nadd,
++			removed, nrem))
++		RL_BNO("sibling combinator may restyle on insert/remove");
++
+ 	/* removals first */
+ 	for (i = 0; i < nrem; i++) {
+ 		struct layout_removed_block rb;
+@@ -6876,6 +6891,18 @@
+ 	 * sheet decline (dynamic state cannot be evaluated exactly). Never
+ 	 * set on a cached compound. */
+ 	bool has_pseudo;
++	/* Patch 198: specific pseudo-classes for the insert/remove precise
++	 * decline. has_empty/has_has are set alongside has_pseudo when the
++	 * pseudo is :empty / :has(). */
++	bool has_empty;
++	bool has_has;
++};
++/* Patch 198: a sibling-combinator rule: kind is '+' or '~', l is the left
++ * compound, r is the right compound. */
++struct html_rl_sib_rule {
++	char kind;
++	struct html_rl_sib_compound l;
++	struct html_rl_sib_compound r;
+ };
+ 
+ static void html_rl_sib_compound_free(struct html_rl_sib_compound *cp)
+@@ -6894,6 +6921,106 @@
+ 	memset(cp, 0, sizeof(*cp));
+ }
+ 
++/* Patch 198: deep-copy a compound. On failure, dst is zeroed and false is
++ * returned; src is untouched. */
++static bool html_rl_sib_compound_dup(struct html_rl_sib_compound *dst,
++		const struct html_rl_sib_compound *src)
++{
++	int i;
++	memset(dst, 0, sizeof(*dst));
++	dst->has_pel = src->has_pel;
++	dst->has_pseudo = src->has_pseudo;
++	dst->has_empty = src->has_empty;
++	dst->has_has = src->has_has;
++	if (src->tag != NULL) {
++		dst->tag = strdup(src->tag);
++		if (dst->tag == NULL)
++			return false;
++	}
++	if (src->id != NULL) {
++		dst->id = strdup(src->id);
++		if (dst->id == NULL) {
++			html_rl_sib_compound_free(dst);
++			return false;
++		}
++	}
++	for (i = 0; i < src->nclasses; i++) {
++		char **nc = realloc(dst->classes,
++				(dst->nclasses + 1) * sizeof(char *));
++		if (nc == NULL) {
++			html_rl_sib_compound_free(dst);
++			return false;
++		}
++		dst->classes = nc;
++		dst->classes[dst->nclasses] = strdup(src->classes[i]);
++		if (dst->classes[dst->nclasses] == NULL) {
++			html_rl_sib_compound_free(dst);
++			return false;
++		}
++		dst->nclasses++;
++	}
++	for (i = 0; i < src->nattrs; i++) {
++		struct html_rl_sib_attr *na = realloc(dst->attrs,
++				(dst->nattrs + 1) *
++				sizeof(struct html_rl_sib_attr));
++		if (na == NULL) {
++			html_rl_sib_compound_free(dst);
++			return false;
++		}
++		dst->attrs = na;
++		dst->attrs[dst->nattrs].name = strdup(src->attrs[i].name);
++		dst->attrs[dst->nattrs].val = src->attrs[i].val != NULL ?
++				strdup(src->attrs[i].val) : NULL;
++		dst->attrs[dst->nattrs].op = src->attrs[i].op;
++		dst->attrs[dst->nattrs].ci = src->attrs[i].ci;
++		if (dst->attrs[dst->nattrs].name == NULL ||
++		    (src->attrs[i].val != NULL &&
++		     dst->attrs[dst->nattrs].val == NULL)) {
++			free(dst->attrs[dst->nattrs].name);
++			free(dst->attrs[dst->nattrs].val);
++			html_rl_sib_compound_free(dst);
++			return false;
++		}
++		dst->nattrs++;
++	}
++	return true;
++}
++
++/* Patch 198: append a deep copy of cp to a compound array. */
++static bool html_rl_sib_compound_append(struct html_rl_sib_compound **arr,
++		int *narr, const struct html_rl_sib_compound *cp)
++{
++	struct html_rl_sib_compound *na = realloc(*arr,
++			(*narr + 1) * sizeof(struct html_rl_sib_compound));
++	if (na == NULL)
++		return false;
++	*arr = na;
++	if (!html_rl_sib_compound_dup(&(*arr)[*narr], cp))
++		return false;
++	(*narr)++;
++	return true;
++}
++
++/* Patch 198: append a rule, moving l and r into it (their contents are now
++ * owned by the rule; l and r are NOT freed on success). */
++static bool html_rl_sib_rule_append(struct html_rl_sib_rule **rules,
++		int *nrules, char kind, struct html_rl_sib_compound *l,
++		struct html_rl_sib_compound *r)
++{
++	struct html_rl_sib_rule *nr = realloc(*rules,
++			(*nrules + 1) * sizeof(struct html_rl_sib_rule));
++	if (nr == NULL)
++		return false;
++	*rules = nr;
++	(*rules)[*nrules].kind = kind;
++	(*rules)[*nrules].l = *l;
++	(*rules)[*nrules].r = *r;
++	memset(l, 0, sizeof(*l));
++	memset(r, 0, sizeof(*r));
++	(*nrules)++;
++	return true;
++}
++
+ /* ---- selector parser (operates on the sheet source text) ---- */
+ struct html_rl_sel_parser {
+ 	const uint8_t *s;
+@@ -6916,8 +7043,30 @@
+ }
+ static void html_rl_skip_ws(struct html_rl_sel_parser *p)
+ {
+-	while (p->i < p->len && html_rl_is_ws(p->s[p->i]))
+-		p->i++;
++	/* Patch 198: also strip CSS comments. A comment may sit between
++	 * any two tokens, including inside a selector prelude; without
++	 * this, a comment before a rule (e.g. a note above
++	 * "span:empty { ... }") makes the parser fail on the '/' and the
++	 * whole sheet falls into the conservative decline state even
++	 * though it carries no sibling risk. */
++	for (;;) {
++		while (p->i < p->len && html_rl_is_ws(p->s[p->i]))
++			p->i++;
++		if (p->i + 1 >= p->len || p->s[p->i] != '/' ||
++		    p->s[p->i + 1] != '*')
++			break;
++		{
++			size_t j = p->i + 2;
++			while (j + 1 < p->len &&
++			       !(p->s[j] == '*' && p->s[j + 1] == '/'))
++				j++;
++			if (j + 1 >= p->len) {
++				p->i = p->len;
++				break;
++			}
++			p->i = j + 2;
++		}
++	}
+ }
+ /* identifier with simple escape handling; hex escapes fail (decline) */
+ static char *html_rl_parse_ident(struct html_rl_sel_parser *p)
+@@ -6993,7 +7142,10 @@
+ }
+ 
+ static int html_rl_parse_prelude(struct html_rl_sel_parser *p, size_t end,
+-		struct html_rl_sib_compound **lefts, int *nlefts);
++		struct html_rl_sib_compound **lefts, int *nlefts,
++		struct html_rl_sib_rule **rules, int *nrules,
++		struct html_rl_sib_compound **empty_cp, int *nempty,
++		struct html_rl_sib_compound **has_cp, int *nhas);
+ 
+ /* Scan the inside of a selector-taking functional pseudo for a sibling
+  * combinator. 0 = none, 1 = found, -1 = parse error. Both decline. */
+@@ -7027,7 +7179,8 @@
+ 	sub.s = p->s;
+ 	sub.len = j;
+ 	sub.i = open + 1;
+-	r = html_rl_parse_prelude(&sub, j, &l, &nl);
++	r = html_rl_parse_prelude(&sub, j, &l, &nl, NULL, NULL, NULL, NULL,
++			NULL, NULL);
+ 	for (k = 0; k < nl; k++)
+ 		html_rl_sib_compound_free(&l[k]);
+ 	free(l);
+@@ -7227,12 +7380,20 @@
+ 					if (r != 0)
+ 						return 2;
+ 				} else {
++					/* Patch 198: record :has() for the
++					 * precise insert/remove decline. */
++					if (strcmp(name, "has") == 0)
++						cp->has_has = true;
+ 					free(name);
+ 				}
+ 				if (!html_rl_skip_parens(p))
+ 					return -1;
+ 				cp->has_pseudo = true;
+ 			} else {
++				/* Patch 198: record :empty for the precise
++				 * insert/remove decline. */
++				if (strcmp(name, "empty") == 0)
++					cp->has_empty = true;
+ 				free(name);
+ 				cp->has_pseudo = true;
+ 			}
+@@ -7249,12 +7410,37 @@
+ 
+ /* Parse a selector prelude [p->i, end). 0 = no sibling combinator,
+  * 1 = found (lefts filled), 2 = conservative decline. */
++/* Patch 198: the prelude parse now also records the sibling rules
++ * {kind, L, R} (for the precise insert/remove decline) and the compounds
++ * carrying :empty / :has(). The 186 lefts[] behaviour is unchanged: every
++ * compound left of a +/~ is deep-copied into lefts[]. Chained selectors
++ * (A + B + C) yield both rules. Any parse failure frees everything and
++ * returns 2 (conservative decline). The extra arrays may be NULL (the
++ * pseudo-content scan only wants the decline signal). */
+ static int html_rl_parse_prelude(struct html_rl_sel_parser *p, size_t end,
+-		struct html_rl_sib_compound **lefts, int *nlefts)
++		struct html_rl_sib_compound **lefts, int *nlefts,
++		struct html_rl_sib_rule **rules, int *nrules,
++		struct html_rl_sib_compound **empty_cp, int *nempty,
++		struct html_rl_sib_compound **has_cp, int *nhas)
+ {
+ 	int found = 0, r = 0, k;
++	char pend_kind = 0;
++	struct html_rl_sib_compound pend_l;
+ 	*lefts = NULL;
+ 	*nlefts = 0;
++	if (rules != NULL) {
++		*rules = NULL;
++		*nrules = 0;
++	}
++	if (empty_cp != NULL) {
++		*empty_cp = NULL;
++		*nempty = 0;
++	}
++	if (has_cp != NULL) {
++		*has_cp = NULL;
++		*nhas = 0;
++	}
++	memset(&pend_l, 0, sizeof(pend_l));
+ 	for (;;) {
+ 		struct html_rl_sib_compound cp;
+ 		uint8_t c;
+@@ -7263,10 +7449,15 @@
+ 			break;
+ 		c = p->s[p->i];
+ 		if (c == ',') {
++			if (pend_kind)
++				/* "A +, B": dangling combinator. */
++				goto decline_free_pend;
+ 			p->i++;
+ 			continue;
+ 		}
+ 		if (c == '+' || c == '~' || c == '>') {
++			if (pend_kind)
++				goto decline_free_pend;
+ 			r = 2;
+ 			goto decline;
+ 		}
+@@ -7279,58 +7470,158 @@
+ 			r = 2;
+ 			goto decline;
+ 		}
++		/* Patch 198: keep :empty / :has compounds for the precise
++		 * insert/remove check. */
++		if (empty_cp != NULL && cp.has_empty &&
++		    !html_rl_sib_compound_append(empty_cp, nempty, &cp)) {
++			html_rl_sib_compound_free(&cp);
++			r = 2;
++			goto decline;
++		}
++		if (has_cp != NULL && cp.has_has &&
++		    !html_rl_sib_compound_append(has_cp, nhas, &cp)) {
++			html_rl_sib_compound_free(&cp);
++			r = 2;
++			goto decline;
++		}
+ 		html_rl_skip_ws(p);
+ 		if (p->i >= end) {
+-			html_rl_sib_compound_free(&cp);
++			/* End of prelude: cp closes a pending rule, or is a
++			 * plain compound with no combinator after it. */
++			if (pend_kind) {
++				if (!html_rl_sib_rule_append(rules, nrules,
++						pend_kind, &pend_l, &cp)) {
++					html_rl_sib_compound_free(&cp);
++					goto decline;
++				}
++				pend_kind = 0;
++				/* pend_l and cp moved into the rule. */
++			} else {
++				html_rl_sib_compound_free(&cp);
++			}
+ 			break;
+ 		}
+ 		c = p->s[p->i];
+ 		if (c == '+' || c == '~') {
+ 			if (cp.has_pseudo) {
+ 				html_rl_sib_compound_free(&cp);
++				if (pend_kind)
++					goto decline_free_pend;
+ 				r = 2;
+ 				goto decline;
+ 			}
+ 			/* A pseudo-element never matches an element, so it
+ 			 * cannot make a sibling's style depend on this class
+ 			 * change; keep it (the matcher returns false). */
+-			*lefts = realloc(*lefts,
+-				(*nlefts + 1) *
+-				sizeof(struct html_rl_sib_compound));
+-			if (*lefts == NULL) {
++			if (!html_rl_sib_compound_append(lefts, nlefts, &cp)) {
+ 				html_rl_sib_compound_free(&cp);
++				if (pend_kind)
++					goto decline_free_pend;
+ 				r = 2;
+ 				goto decline;
+ 			}
+-			(*lefts)[(*nlefts)++] = cp;
+ 			found = 1;
++			if (pend_kind) {
++				/* Chained (A + B + ...): cp is the R of the
++				 * pending rule and the L of the next one. */
++				struct html_rl_sib_compound rdup;
++				if (!html_rl_sib_compound_dup(&rdup, &cp)) {
++					html_rl_sib_compound_free(&cp);
++					goto decline;
++				}
++				if (!html_rl_sib_rule_append(rules, nrules,
++						pend_kind, &pend_l, &cp)) {
++					html_rl_sib_compound_free(&rdup);
++					html_rl_sib_compound_free(&cp);
++					goto decline;
++				}
++				/* pend_l and cp moved into the rule; the
++				 * duplicate of cp becomes the next left. */
++				pend_l = rdup;
++			} else {
++				/* Move cp into pend_l. */
++				pend_l = cp;
++			}
++			pend_kind = (char)c;
+ 			p->i++;
++			/* cp was moved; continue to parse the right
++			 * compound. */
+ 		} else {
+-			/* '>', ',' or a descendant combinator: not our risk */
+-			html_rl_sib_compound_free(&cp);
++			/* '>', ',' or a descendant combinator: cp closes a
++			 * pending rule, or is not our risk. */
++			if (pend_kind) {
++				if (!html_rl_sib_rule_append(rules, nrules,
++						pend_kind, &pend_l, &cp)) {
++					html_rl_sib_compound_free(&cp);
++					goto decline;
++				}
++				pend_kind = 0;
++			} else {
++				html_rl_sib_compound_free(&cp);
++			}
+ 			if (c == '>' || c == ',')
+ 				p->i++;
+ 		}
+ 	}
++	if (pend_kind) {
++		/* Trailing "A +" with no right compound. */
++		r = 2;
++		goto decline_free_pend;
++	}
+ 	return found;
++decline_free_pend:
++	html_rl_sib_compound_free(&pend_l);
++	r = 2;
+ decline:
+ 	for (k = 0; k < *nlefts; k++)
+ 		html_rl_sib_compound_free(&(*lefts)[k]);
+ 	free(*lefts);
+ 	*lefts = NULL;
+ 	*nlefts = 0;
++	if (rules != NULL) {
++		for (k = 0; k < *nrules; k++) {
++			html_rl_sib_compound_free(&(*rules)[k].l);
++			html_rl_sib_compound_free(&(*rules)[k].r);
++		}
++		free(*rules);
++		*rules = NULL;
++		*nrules = 0;
++	}
++	if (empty_cp != NULL) {
++		for (k = 0; k < *nempty; k++)
++			html_rl_sib_compound_free(&(*empty_cp)[k]);
++		free(*empty_cp);
++		*empty_cp = NULL;
++		*nempty = 0;
++	}
++	if (has_cp != NULL) {
++		for (k = 0; k < *nhas; k++)
++			html_rl_sib_compound_free(&(*has_cp)[k]);
++		free(*has_cp);
++		*has_cp = NULL;
++		*nhas = 0;
++	}
+ 	return r;
+ }
+ 
+ /* Full sheet scan. 0 = none, 1 = precise (lefts filled), 2 = decline. */
+ static int html_rl_scan_sheet(const uint8_t *s, size_t len,
+-		struct html_rl_sib_compound **lefts, int *nlefts)
++		struct html_rl_sib_compound **lefts, int *nlefts,
++		struct html_rl_sib_rule **rules, int *nrules,
++		struct html_rl_sib_compound **empty_cp, int *nempty,
++		struct html_rl_sib_compound **has_cp, int *nhas)
+ {
+ 	size_t i = 0, start = 0;
+ 	int groups = 0;
+ 	int found = 0;
+ 	*lefts = NULL;
+ 	*nlefts = 0;
++	*rules = NULL;
++	*nrules = 0;
++	*empty_cp = NULL;
++	*nempty = 0;
++	*has_cp = NULL;
++	*nhas = 0;
+ 
+ 	while (i < len) {
+ 		uint8_t ch = s[i];
+@@ -7387,11 +7678,15 @@
+ 			{
+ 				struct html_rl_sel_parser p;
+ 				struct html_rl_sib_compound *l = NULL;
+-				int nl = 0, r, k;
++				struct html_rl_sib_rule *ru = NULL;
++				struct html_rl_sib_compound *em = NULL;
++				struct html_rl_sib_compound *ha = NULL;
++				int nl = 0, nru = 0, nem = 0, nha = 0, r, k;
+ 				p.s = s;
+ 				p.len = len;
+ 				p.i = start;
+-				r = html_rl_parse_prelude(&p, i, &l, &nl);
++				r = html_rl_parse_prelude(&p, i, &l, &nl,
++						&ru, &nru, &em, &nem, &ha, &nha);
+ 				if (r == 2) {
+ 					for (k = 0; k < *nlefts; k++)
+ 						html_rl_sib_compound_free(
+@@ -7402,6 +7697,42 @@
+ 					for (k = 0; k < nl; k++)
+ 						html_rl_sib_compound_free(&l[k]);
+ 					free(l);
++					for (k = 0; k < nru; k++) {
++						html_rl_sib_compound_free(
++							&ru[k].l);
++						html_rl_sib_compound_free(
++							&ru[k].r);
++					}
++					free(ru);
++					for (k = 0; k < nem; k++)
++						html_rl_sib_compound_free(
++							&em[k]);
++					free(em);
++					for (k = 0; k < nha; k++)
++						html_rl_sib_compound_free(
++							&ha[k]);
++					free(ha);
++					for (k = 0; k < *nrules; k++) {
++						html_rl_sib_compound_free(
++							&(*rules)[k].l);
++						html_rl_sib_compound_free(
++							&(*rules)[k].r);
++					}
++					free(*rules);
++					*rules = NULL;
++					*nrules = 0;
++					for (k = 0; k < *nempty; k++)
++						html_rl_sib_compound_free(
++							&(*empty_cp)[k]);
++					free(*empty_cp);
++					*empty_cp = NULL;
++					*nempty = 0;
++					for (k = 0; k < *nhas; k++)
++						html_rl_sib_compound_free(
++							&(*has_cp)[k]);
++					free(*has_cp);
++					*has_cp = NULL;
++					*nhas = 0;
+ 					return 2;
+ 				}
+ 				if (r == 1) {
+@@ -7413,12 +7744,48 @@
+ 							html_rl_sib_compound_free(
+ 								&l[k]);
+ 						free(l);
++						for (k = 0; k < nru; k++) {
++							html_rl_sib_compound_free(
++								&ru[k].l);
++							html_rl_sib_compound_free(
++								&ru[k].r);
++						}
++						free(ru);
++						for (k = 0; k < nem; k++)
++							html_rl_sib_compound_free(
++								&em[k]);
++						free(em);
++						for (k = 0; k < nha; k++)
++							html_rl_sib_compound_free(
++								&ha[k]);
++						free(ha);
+ 						for (k = 0; k < *nlefts; k++)
+ 							html_rl_sib_compound_free(
+ 								&(*lefts)[k]);
+ 						free(*lefts);
+ 						*lefts = NULL;
+ 						*nlefts = 0;
++						for (k = 0; k < *nrules; k++) {
++							html_rl_sib_compound_free(
++								&(*rules)[k].l);
++							html_rl_sib_compound_free(
++								&(*rules)[k].r);
++						}
++						free(*rules);
++						*rules = NULL;
++						*nrules = 0;
++						for (k = 0; k < *nempty; k++)
++							html_rl_sib_compound_free(
++								&(*empty_cp)[k]);
++						free(*empty_cp);
++						*empty_cp = NULL;
++						*nempty = 0;
++						for (k = 0; k < *nhas; k++)
++							html_rl_sib_compound_free(
++								&(*has_cp)[k]);
++						free(*has_cp);
++						*has_cp = NULL;
++						*nhas = 0;
+ 						return 2;
+ 					}
+ 					*lefts = nl2;
+@@ -7427,6 +7794,155 @@
+ 					free(l);
+ 					found = 1;
+ 				}
++				/* Patch 198: merge the sibling rules and the
++				 * :empty / :has compounds from this prelude
++				 * into the sheet-wide lists (regardless of r:
++				 * a prelude with no +/~ may still carry
++				 * :empty / :has). */
++				if (nru > 0) {
++					struct html_rl_sib_rule *nru2;
++					nru2 = realloc(*rules, (*nrules + nru) *
++						sizeof(struct html_rl_sib_rule));
++					if (nru2 == NULL) {
++						for (k = 0; k < nru; k++) {
++							html_rl_sib_compound_free(
++								&ru[k].l);
++							html_rl_sib_compound_free(
++								&ru[k].r);
++						}
++						free(ru);
++						for (k = 0; k < nem; k++)
++							html_rl_sib_compound_free(
++								&em[k]);
++						free(em);
++						for (k = 0; k < nha; k++)
++							html_rl_sib_compound_free(
++								&ha[k]);
++						free(ha);
++						for (k = 0; k < *nlefts; k++)
++							html_rl_sib_compound_free(
++								&(*lefts)[k]);
++						free(*lefts);
++						*lefts = NULL;
++						*nlefts = 0;
++						for (k = 0; k < *nrules; k++) {
++							html_rl_sib_compound_free(
++								&(*rules)[k].l);
++							html_rl_sib_compound_free(
++								&(*rules)[k].r);
++						}
++						free(*rules);
++						*rules = NULL;
++						*nrules = 0;
++						for (k = 0; k < *nempty; k++)
++							html_rl_sib_compound_free(
++								&(*empty_cp)[k]);
++						free(*empty_cp);
++						*empty_cp = NULL;
++						*nempty = 0;
++						for (k = 0; k < *nhas; k++)
++							html_rl_sib_compound_free(
++								&(*has_cp)[k]);
++						free(*has_cp);
++						*has_cp = NULL;
++						*nhas = 0;
++						return 2;
++					}
++					*rules = nru2;
++					for (k = 0; k < nru; k++)
++						(*rules)[(*nrules)++] = ru[k];
++					free(ru);
++				}
++				if (nem > 0) {
++					struct html_rl_sib_compound *nem2;
++					nem2 = realloc(*empty_cp, (*nempty + nem) *
++						sizeof(struct html_rl_sib_compound));
++					if (nem2 == NULL) {
++						for (k = 0; k < nem; k++)
++							html_rl_sib_compound_free(
++								&em[k]);
++						free(em);
++						for (k = 0; k < nha; k++)
++							html_rl_sib_compound_free(
++								&ha[k]);
++						free(ha);
++						for (k = 0; k < *nlefts; k++)
++							html_rl_sib_compound_free(
++								&(*lefts)[k]);
++						free(*lefts);
++						*lefts = NULL;
++						*nlefts = 0;
++						for (k = 0; k < *nrules; k++) {
++							html_rl_sib_compound_free(
++								&(*rules)[k].l);
++							html_rl_sib_compound_free(
++								&(*rules)[k].r);
++						}
++						free(*rules);
++						*rules = NULL;
++						*nrules = 0;
++						for (k = 0; k < *nempty; k++)
++							html_rl_sib_compound_free(
++								&(*empty_cp)[k]);
++						free(*empty_cp);
++						*empty_cp = NULL;
++						*nempty = 0;
++						for (k = 0; k < *nhas; k++)
++							html_rl_sib_compound_free(
++								&(*has_cp)[k]);
++						free(*has_cp);
++						*has_cp = NULL;
++						*nhas = 0;
++						return 2;
++					}
++					*empty_cp = nem2;
++					for (k = 0; k < nem; k++)
++						(*empty_cp)[(*nempty)++] = em[k];
++					free(em);
++				}
++				if (nha > 0) {
++					struct html_rl_sib_compound *nha2;
++					nha2 = realloc(*has_cp, (*nhas + nha) *
++						sizeof(struct html_rl_sib_compound));
++					if (nha2 == NULL) {
++						for (k = 0; k < nha; k++)
++							html_rl_sib_compound_free(
++								&ha[k]);
++						free(ha);
++						for (k = 0; k < *nlefts; k++)
++							html_rl_sib_compound_free(
++								&(*lefts)[k]);
++						free(*lefts);
++						*lefts = NULL;
++						*nlefts = 0;
++						for (k = 0; k < *nrules; k++) {
++							html_rl_sib_compound_free(
++								&(*rules)[k].l);
++							html_rl_sib_compound_free(
++								&(*rules)[k].r);
++						}
++						free(*rules);
++						*rules = NULL;
++						*nrules = 0;
++						for (k = 0; k < *nempty; k++)
++							html_rl_sib_compound_free(
++								&(*empty_cp)[k]);
++						free(*empty_cp);
++						*empty_cp = NULL;
++						*nempty = 0;
++						for (k = 0; k < *nhas; k++)
++							html_rl_sib_compound_free(
++								&(*has_cp)[k]);
++						free(*has_cp);
++						*has_cp = NULL;
++						*nhas = 0;
++						return 2;
++					}
++					*has_cp = nha2;
++					for (k = 0; k < nha; k++)
++						(*has_cp)[(*nhas)++] = ha[k];
++					free(ha);
++				}
+ 			}
+ 			i = html_rl_css_skip_block(s, i, len);
+ 			start = i;
+@@ -7648,6 +8164,14 @@
+ 	int state;
+ 	struct html_rl_sib_compound *lefts;
+ 	int nlefts;
++	/* Patch 198: sibling-combinator rules {kind, L, R} for the precise
++	 * insert/remove decline; compounds carrying :empty / :has(). */
++	struct html_rl_sib_rule *rules;
++	int nrules;
++	struct html_rl_sib_compound *empty_cp;
++	int nempty;
++	struct html_rl_sib_compound *has_cp;
++	int nhas;
+ };
+ static struct html_rl_sib_sheet html_rl_sib_cache[HTML_RL_SIB_CACHE_N];
+ static unsigned int html_rl_sib_cache_next;
+@@ -7669,6 +8193,18 @@
+ 	for (k = 0; k < e->nlefts; k++)
+ 		html_rl_sib_compound_free(&e->lefts[k]);
+ 	free(e->lefts);
++	/* Patch 198. */
++	for (k = 0; k < e->nrules; k++) {
++		html_rl_sib_compound_free(&e->rules[k].l);
++		html_rl_sib_compound_free(&e->rules[k].r);
++	}
++	free(e->rules);
++	for (k = 0; k < e->nempty; k++)
++		html_rl_sib_compound_free(&e->empty_cp[k]);
++	free(e->empty_cp);
++	for (k = 0; k < e->nhas; k++)
++		html_rl_sib_compound_free(&e->has_cp[k]);
++	free(e->has_cp);
+ 	memset(e, 0, sizeof(*e));
+ }
+ 
+@@ -7706,16 +8242,34 @@
+ 	e->hash = hash;
+ 	{
+ 		struct html_rl_sib_compound *lefts = NULL;
+-		int nlefts = 0, r;
+-		r = html_rl_scan_sheet(data, size, &lefts, &nlefts);
++		struct html_rl_sib_rule *rules = NULL;
++		struct html_rl_sib_compound *empty_cp = NULL;
++		struct html_rl_sib_compound *has_cp = NULL;
++		int nlefts = 0, nrules = 0, nempty = 0, nhas = 0, r;
++		r = html_rl_scan_sheet(data, size, &lefts, &nlefts,
++				&rules, &nrules, &empty_cp, &nempty,
++				&has_cp, &nhas);
+ 		if (r == 2) {
+ 			e->state = 2;
+ 		} else if (r == 1) {
+ 			e->state = 1;
+ 			e->lefts = lefts;
+ 			e->nlefts = nlefts;
++			e->rules = rules;
++			e->nrules = nrules;
++			e->empty_cp = empty_cp;
++			e->nempty = nempty;
++			e->has_cp = has_cp;
++			e->nhas = nhas;
+ 		} else {
++			/* No sibling combinator, but :empty / :has compounds
++			 * (if any) still matter for patch 198's
++			 * insert/remove check. */
+ 			e->state = 0;
++			e->empty_cp = empty_cp;
++			e->nempty = nempty;
++			e->has_cp = has_cp;
++			e->nhas = nhas;
+ 		}
+ 	}
+ 	return e;
+@@ -7778,6 +8332,274 @@
+ 	return risk;
+ }
+ 
++/* ---- Patch 198: precise sibling-combinator / :empty / :has decline ---- */
++
++/* Previous element sibling, or NULL. Caller unrefs. */
++static dom_node *html_rl_prev_el_sibling(dom_node *el)
++{
++	dom_node *sib = NULL;
++	if (dom_node_get_previous_sibling(el, &sib) != DOM_NO_ERR)
++		return NULL;
++	while (sib != NULL) {
++		dom_node_type type;
++		dom_node *prev = NULL;
++		if (dom_node_get_node_type(sib, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE)
++			return sib;
++		dom_node_get_previous_sibling(sib, &prev);
++		dom_node_unref(sib);
++		sib = prev;
++	}
++	return NULL;
++}
++
++/* Next element sibling, or NULL. Caller unrefs. */
++static dom_node *html_rl_next_el_sibling(dom_node *el)
++{
++	dom_node *sib = NULL;
++	if (dom_node_get_next_sibling(el, &sib) != DOM_NO_ERR)
++		return NULL;
++	while (sib != NULL) {
++		dom_node_type type;
++		dom_node *next = NULL;
++		if (dom_node_get_node_type(sib, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE)
++			return sib;
++		dom_node_get_next_sibling(sib, &next);
++		dom_node_unref(sib);
++		sib = next;
++	}
++	return NULL;
++}
++
++/* Match a cached compound against a live element (using its own class
++ * set). */
++static bool html_rl_sib_match_live(dom_node *el,
++		struct html_rl_sib_compound *cp)
++{
++	char *cls = html_rl_sib_attr_value((dom_element *)el, "class",
++			NULL);
++	bool m = html_rl_sib_compound_matches((dom_element *)el, cp,
++			cls);
++	free(cls);
++	return m;
++}
++
++/* Match the static parts (tag/id/class/attrs) of a compound, ignoring any
++ * pseudo-class. Used for :empty / :has compounds, which the 186 matcher
++ * refuses outright. Cannot prove safety on allocation failure: returns
++ * true (decline). */
++static bool html_rl_sib_match_static(dom_node *el,
++		struct html_rl_sib_compound *cp)
++{
++	struct html_rl_sib_compound tmp;
++	bool m;
++	if (!html_rl_sib_compound_dup(&tmp, cp))
++		return true;
++	tmp.has_pseudo = false;
++	tmp.has_pel = false;
++	m = html_rl_sib_match_live(el, &tmp);
++	html_rl_sib_compound_free(&tmp);
++	return m;
++}
++
++/* One sheet's sibling rules against one inserted element (between its
++ * element siblings prev and next, either of which may be NULL). */
++static bool html_rl_sib_insert_risky(dom_node *e, dom_node *prev,
++		dom_node *next, struct html_rl_sib_sheet *sh)
++{
++	int k;
++	for (k = 0; k < sh->nrules; k++) {
++		struct html_rl_sib_rule *rule = &sh->rules[k];
++		if (rule->kind == '+') {
++			/* Only the next sibling's predecessor changed. */
++			if (next != NULL &&
++			    html_rl_sib_match_live(next, &rule->r)) {
++				bool m_prev = prev != NULL &&
++					html_rl_sib_match_live(prev,
++							&rule->l);
++				bool m_e = html_rl_sib_match_live(e,
++						&rule->l);
++				if (m_prev != m_e)
++					return true;
++			}
++		} else {
++			/* '~': e is a new preceding sibling for everything
++			 * after it. */
++			if (html_rl_sib_match_live(e, &rule->l)) {
++				dom_node *s = next;
++				/* next is the caller's reference; take our
++				 * own before walking (each step unrefs). */
++				if (s != NULL)
++					dom_node_ref(s);
++				while (s != NULL) {
++					dom_node *nx;
++					if (html_rl_sib_match_live(s,
++							&rule->r)) {
++						dom_node_unref(s);
++						return true;
++					}
++					nx = html_rl_next_el_sibling(s);
++					dom_node_unref(s);
++					s = nx;
++				}
++			}
++		}
++	}
++	return false;
++}
++
++/* One sheet's sibling rules against one removed element: before removal
++ * it sat between element nodes prev and next (from the box chain). */
++static bool html_rl_sib_remove_risky(dom_node *e, dom_node *prev,
++		dom_node *next, struct html_rl_sib_sheet *sh)
++{
++	int k;
++	for (k = 0; k < sh->nrules; k++) {
++		struct html_rl_sib_rule *rule = &sh->rules[k];
++		if (rule->kind == '+') {
++			if (next != NULL &&
++			    html_rl_sib_match_live(next, &rule->r)) {
++				bool m_e = html_rl_sib_match_live(e,
++						&rule->l);
++				bool m_prev = prev != NULL &&
++					html_rl_sib_match_live(prev,
++							&rule->l);
++				if (m_e != m_prev)
++					return true;
++			}
++		} else {
++			if (html_rl_sib_match_live(e, &rule->l)) {
++				dom_node *s = next;
++				/* next is borrowed (box chain); take a
++				 * reference for the walk. */
++				if (s != NULL)
++					dom_node_ref(s);
++				while (s != NULL) {
++					dom_node *nx;
++					if (html_rl_sib_match_live(s,
++							&rule->r)) {
++						dom_node_unref(s);
++						return true;
++					}
++					nx = html_rl_next_el_sibling(s);
++					dom_node_unref(s);
++					s = nx;
++				}
++			}
++		}
++	}
++	return false;
++}
++
++/* True if the block insert/remove could restyle a sibling, the parent or
++ * an ancestor through a sibling combinator, :empty or :has() rule -- the
++ * part of the patch-166 stale-styles issue patches 192 and 197 do not
++ * cover. Unlike shelved patch 189's blanket decline, each candidate is
++ * matched per element: an insert whose element does not move any sibling's
++ * match stays on the local path (so the 5000-paragraph insert pages keep
++ * their local rebuilds). Conservative on any doubt. */
++static bool html_rl_block_sibling_risk(html_content *c, dom_node *pnode,
++		dom_node **added, unsigned int nadd,
++		struct box **removed, unsigned int nrem)
++{
++	unsigned int i, si;
++	int k;
++	bool risk = false;
++
++	for (si = STYLESHEET_START; si < c->stylesheet_count && !risk; si++) {
++		struct html_rl_sib_sheet *sh;
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		sh = html_rl_sib_sheet_for(c->stylesheets[si].sheet);
++		if (sh == NULL)
++			continue;
++		if (sh->state == 2)
++			/* Patch 186 conservative sheet: cannot prove
++			 * safety. */
++			return true;
++		/* Sibling combinators per element. */
++		for (i = 0; i < nadd && !risk; i++) {
++			dom_node *prev = html_rl_prev_el_sibling(added[i]);
++			dom_node *next = html_rl_next_el_sibling(added[i]);
++			risk = html_rl_sib_insert_risky(added[i], prev, next,
++					sh);
++			if (prev != NULL)
++				dom_node_unref(prev);
++			if (next != NULL)
++				dom_node_unref(next);
++		}
++		for (i = 0; i < nrem && !risk; i++) {
++			dom_node *e = removed[i]->node;
++			dom_node *prev = removed[i]->prev != NULL ?
++					removed[i]->prev->node : NULL;
++			dom_node *next = removed[i]->next != NULL ?
++					removed[i]->next->node : NULL;
++			if (e == NULL)
++				return true;
++			risk = html_rl_sib_remove_risky(e, prev, next, sh);
++		}
++		if (risk)
++			break;
++		/* :empty on the parent: did the mutation flip the parent's
++		 * element-childlessness? */
++		if (sh->nempty > 0 && (nadd > 0 || nrem > 0)) {
++			unsigned int nel = 0;
++			dom_node *ch = NULL;
++			bool flipped;
++			if (dom_node_get_first_child(pnode, &ch) ==
++					DOM_NO_ERR) {
++				while (ch != NULL) {
++					dom_node_type type;
++					dom_node *nx = NULL;
++					if (dom_node_get_node_type(ch,
++							&type) == DOM_NO_ERR &&
++					    type == DOM_ELEMENT_NODE)
++						nel++;
++					dom_node_get_next_sibling(ch, &nx);
++					dom_node_unref(ch);
++					ch = nx;
++				}
++			}
++			/* Element children before the mutation:
++			 * nel + nrem - nadd. */
++			flipped = ((nel == 0) !=
++					(nel + nrem - nadd == 0));
++			if (flipped) {
++				for (k = 0; k < sh->nempty; k++) {
++					if (html_rl_sib_match_static(pnode,
++							&sh->empty_cp[k]))
++						return true;
++				}
++			}
++		}
++		/* :has on the parent or an ancestor: an insert/remove
++		 * anywhere below changes the answer. */
++		for (k = 0; k < sh->nhas && !risk; k++) {
++			dom_node *anc = NULL;
++			/* Parent itself. */
++			if (html_rl_sib_match_static(pnode, &sh->has_cp[k]))
++				return true;
++			if (dom_node_get_parent_node(pnode, &anc) !=
++					DOM_NO_ERR)
++				return true;
++			while (anc != NULL && !risk) {
++				dom_node *up = NULL;
++				if (html_rl_sib_match_static(anc,
++						&sh->has_cp[k])) {
++					dom_node_unref(anc);
++					return true;
++				}
++				dom_node_get_parent_node(anc, &up);
++				dom_node_unref(anc);
++				anc = up;
++			}
++		}
++	}
++	return risk;
++}
++
+ /* The element's own box is a plain block among plain blocks: take the old
+  * box out and build the element again with a fresh cascade, put back where
+  * it was -- patch 166's removal then insertion, laid out with the block
