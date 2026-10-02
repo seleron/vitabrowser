@@ -1,0 +1,148 @@
+# netsurf: a module graph load that stops progressing gives up (160/161 follow-up)
+# Generated 2026-10-02
+# Base: seleron/vitabrowser 370efcebdf67dc95b6b7bd4ba96ff434c939a3f4 (patch stack through 198)
+#
+# Patches 160/161 load <script type=module> graphs and import() graphs
+# through qjs_modload pipelines. A pipeline waits, rather than fetch
+# again, for any URL another load is fetching: the whole level is
+# carried and re-looked at on every event-loop pass, and the compile
+# phase waits the same way while another pipeline fetches. Nothing
+# bounds those waits. If the other load never lands -- patch 161's
+# page fetch of a module script never calls back, a level in flight
+# elsewhere never resolves -- the pipeline never finishes: import()
+# promises never settle, and for a prefetched static graph
+# js_module_prefetch_pending() stays true, so html.c holds the page's
+# conversion (and DOMContentLoaded) indefinitely, re-polling every
+# 30 ms (each html content with a held conversion keeps its own poll
+# chain). Every transfer the pipelines start themselves is already
+# bounded (fetch_get_set gives up after BLOCKING_TIMEOUT_S); only the
+# waits are not.
+#
+# Fix: a pipeline keeps a progress snapshot -- fetched + failed +
+# card hits + compiled + levels -- and, when stepped with no transfer
+# of its own running, compares it with the clock. No change for
+# QJS_MODLOAD_STALL_MS and the wait can never end: what the pipeline
+# still owes is registered as failed modules (the loader reports
+# those exactly like a failed fetch: "could not load module '<url>'"),
+# and the pipeline finishes, so its import() jobs are re-queued to
+# reject and a prefetched graph stops holding the conversion. A
+# module another load lands later still registers over its failed
+# entry (qjs_module_register fills a source-less entry), so a slow
+# graph caught by the deadline is not poisoned. A pipeline whose own
+# transfer is running is never cut (fetch_get_set bounds it), and one
+# that keeps fetching or compiling never trips the deadline, so no
+# progressing load, however large, is killed.
+#
+# The bound is the engine's own: BLOCKING_TIMEOUT_S (120 s) in
+# content/fetchers/curl.c is both the CURLOPT_TIMEOUT on every
+# blocking transfer and the wall-clock give-up in fetch_get_set_step;
+# a wedged wait is given one transfer's worth of grace.
+#
+# Test: JS-module-static-async / JS-module-dedupe / JS-module-async
+# unchanged (MODSTATIC 5/5, MODDUP 5/5, MODASYNC 4/4) and no give-up
+# logged on live graphs. 120 s is beyond a gate page's settle budget,
+# so the give-up itself was exercised in a throwaway build with the
+# bound at 400 ms, against a module script whose fetch never answers
+# (accept-and-hold server): the log reads "LIFE module graph (async):
+# gave up on http://127.0.0.1:45700/modleaf.js: no progress for
+# 408 ms", where the unpatched pipeline waits forever. That page's
+# conversion is still held afterwards by the script element's own
+# hlcache fetch, which never completes either; bounding that is core
+# fetch policy (llcache), not module code, and is not this patch.
+# Full gate on the pushed stack: see docs/build-loop-state.md.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -17385,6 +17385,14 @@
+ #define QJS_MODLOAD_JOBS 8
+ #define QJS_MODLOAD_SLICE_MS 12.0
+ #define QJS_MODLOAD_STEP_MS 4.0
++/* A pipeline that makes no progress for this long is wedged: the waits
++ * in qjs_modload_step (a level another load is fetching, the compile
++ * gate) have no bound of their own. The value is the engine's own
++ * transfer bound -- BLOCKING_TIMEOUT_S (120 s) in
++ * content/fetchers/curl.c, the give-up every blocking transfer and
++ * every fetch_get_set set already lives by; a wedged wait is given one
++ * transfer's worth of grace. */
++#define QJS_MODLOAD_STALL_MS 120000.0
+ 
+ struct qjs_modload {
+ 	struct qjs_modload *next;
+@@ -17408,6 +17416,9 @@
+ 	unsigned int nshared;
+ 	size_t bytes;
+ 	double t0, longest_ms;
++	unsigned int progress;		/* fetched+failed+cached+compiled+
++				 * levels, when progress_t was taken */
++	double progress_t;		/* when progress last changed */
+ 	int njobs;
+ 	struct {
+ 		JSJobFunc *job;
+@@ -17492,6 +17503,7 @@
+ 	{
+ 		extern double macos9_micros(void);
+ 		m->t0 = macos9_micros();
++		m->progress_t = m->t0;
+ 	}
+ 	m->next = g_modloads;
+ 	g_modloads = m;
+@@ -17582,6 +17594,59 @@
+ static int qjs_modload_step(struct qjs_modload *m)
+ {
+ 	extern double macos9_micros(void);
++
++	/* The graph-wide deadline: the waits below (a level wholly in
++	 * flight elsewhere, the compile gate) are re-looked at every pass
++	 * and nothing bounds them, so a load that never lands -- a fetch
++	 * that never calls back -- holds its import() promises, and for a
++	 * prefetched static graph the page's conversion and
++	 * DOMContentLoaded, forever. No progress (nothing fetched,
++	 * failed, card-hit, compiled or levelled) for
++	 * QJS_MODLOAD_STALL_MS while no transfer of our own is running
++	 * means the wait can never end: fail what is left as failed
++	 * modules (the loader reports those exactly like a failed fetch)
++	 * and finish. A transfer of our own (m->set) is bounded by
++	 * fetch_get_set itself and is never cut here; a pipeline that
++	 * keeps fetching or compiling never trips this, so no progressing
++	 * load, however large, is killed. A module another load lands
++	 * later still registers over its failed entry
++	 * (qjs_module_register fills a source-less entry), so a graph
++	 * caught by the deadline is not poisoned. */
++	{
++		unsigned int prog = m->fetched + m->failed + m->cached +
++			m->compiled + m->levels;
++		double now = macos9_micros();
++
++		if (prog != m->progress) {
++			m->progress = prog;
++			m->progress_t = now;
++		} else if (m->set == NULL &&
++				(now - m->progress_t) / 1000.0 >=
++					QJS_MODLOAD_STALL_MS) {
++			unsigned int i;
++
++			for (i = 0; i < m->n; i++)
++				if (qjs_module_find(m->reg, m->urls[i]) ==
++						NULL)
++					qjs_module_register(m->reg,
++						m->urls[i], NULL, 0);
++			for (i = 0; i < m->ncarry; i++)
++				if (qjs_module_find(m->reg, m->carry[i]) ==
++						NULL)
++					qjs_module_register(m->reg,
++						m->carry[i], NULL, 0);
++			macsurf_debug_log_writef(
++				"LIFE module graph (async): gave up on %s: "
++				"no progress for %ld ms (%u fetched, %u "
++				"failed, %u levels); registry %u modules",
++				m->root,
++				(long)((now - m->progress_t) / 1000.0),
++				m->fetched, m->failed, m->levels,
++				m->reg->count);
++			return 1;
++		}
++	}
++
+ 	if (m->phase == 0) {
+ 		if (m->set == NULL) {
+ 			if (m->n == 0) {
