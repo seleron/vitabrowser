@@ -1,0 +1,108 @@
+# netsurf: waiting for the page's own module fetch has a deadline (161 follow-up)
+# Generated 2026-10-02
+# Base: seleron/vitabrowser 4c8ea14b981449187133b39f1c70f0f5eb5490ba (patch stack through 199) (patch stack through 199)
+#
+# Patch 161 made non-blocking loads wait for the page's own fetch of a
+# module script's URL (module_entry.page_fetch) instead of fetching it
+# a second time, and made a module script whose URL is already on its
+# way run from the registry when it lands. The wait has no end if the
+# page fetch never calls back: the flag is cleared only from the
+# script fetch's DONE/ERROR callbacks (or when its text registers),
+# so a wedged fetch leaves page_fetch set forever -- every waiter
+# re-looks on each event-loop pass with no exit,
+# js_module_prefetch_pending() keeps the page's conversion held, and
+# whatever waits for fetches to settle downstream (patch 169's
+# late-stylesheet restyle among them) never runs. Patch 199 bounds the
+# pipelines that wait; it can only fail the module, not make it arrive.
+#
+# Fix: the flag carries the time it was set (page_fetch_t0), and the
+# one place loads decide to wait -- qjs_modload_in_flight -- honours
+# it for QJS_PAGE_FETCH_WAIT_MS. Past that, the flag is cleared, the
+# give-up is logged, and the waiter fetches the URL itself: a wedged
+# page fetch degrades to one duplicate fetch (counted by
+# g_module_refetches, as patch 161 already counts those) instead of an
+# indefinite stall. If the page's fetch does land later, its text
+# registers as usual and the module still runs once.
+#
+# The bound is the engine's own: BLOCKING_TIMEOUT_S (120 s) in
+# content/fetchers/curl.c, the per-transfer give-up every blocking
+# fetch and every fetch_get_set set already lives by. The page's fetch
+# is given one full transfer's worth of grace before it is
+# second-guessed.
+#
+# Test: JS-module-dedupe -- whose shared leaves wait out real 1 s page
+# fetches -- unchanged (MODDUP 5/5, with MODSTATIC 5/5, MODASYNC 4/4);
+# a live page fetch well inside the bound is never second-guessed.
+# 120 s is beyond a gate page's settle budget, so the give-up was
+# exercised in a throwaway build with the bound at 400 ms against a
+# module-script fetch served after 1 s (httpd /slow/): the log reads
+# "LIFE module: the page's fetch of .../slow/modleaf.js gave no result
+# in 400 ms; fetching it directly", the graph then completed (1 fetched
+# by the waiter, counted as a refetch; module script ready after
+# 1416 ms) and both script elements ran it through the module map.
+# Full gate on the pushed stack: see docs/build-loop-state.md.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -16628,6 +16628,7 @@
+ 	int     page_fetch; /* the page's own fetch of it (a <script
+ 			     * type=module src>) is on its way: loads wait
+ 			     * for that instead of fetching it again */
++	double  page_fetch_t0; /* when page_fetch was set (macos9_micros) */
+ 	/* VitaBrowser module cache: bytecode read from MACSURF_JSCACHE_DIR
+ 	 * (source may then be NULL: not fetched at all) and the static
+ 	 * import URLs it was saved with (NUL-separated). */
+@@ -16648,6 +16649,13 @@
+ /* Caps on what one page's static graph may fetch. */
+ #define QJS_MODULE_MAX_COUNT 600
+ #define QJS_MODULE_MAX_BYTES (48u * 1024 * 1024)
++/* How long a load waits for the page's own fetch of a module script
++ * before fetching the URL itself. The page fetch is cleared only from
++ * its DONE/ERROR callbacks, so one that never calls back would be
++ * waited on forever; the value is the engine's own transfer bound,
++ * BLOCKING_TIMEOUT_S (120 s) in content/fetchers/curl.c: the page's
++ * fetch gets one full transfer's worth of grace. */
++#define QJS_PAGE_FETCH_WAIT_MS 120000.0
+ 
+ static void qjs_module_registry_free(struct module_registry *reg);
+ 
+@@ -17518,8 +17526,21 @@
+ 	struct module_entry *e = qjs_module_find(m->reg, url);
+ 	unsigned int i;
+ 	if (e != NULL && e->page_fetch && e->source == NULL &&
+-	    e->bc == NULL && !e->compiled)
+-		return 1;	/* the page is fetching it (a module script) */
++	    e->bc == NULL && !e->compiled) {
++		extern double macos9_micros(void);
++
++		if ((macos9_micros() - e->page_fetch_t0) / 1000.0 <
++				QJS_PAGE_FETCH_WAIT_MS)
++			return 1;	/* the page is fetching it (a
++				 * module script) */
++		/* It never called back: stop waiting and fetch the URL
++		 * here. If the page's fetch does land later, its text
++		 * registers as usual and the module still runs once. */
++		e->page_fetch = 0;
++		macsurf_debug_log_writef("LIFE module: the page's fetch "
++			"of %s gave no result in %ld ms; fetching it "
++			"directly", url, (long)QJS_PAGE_FETCH_WAIT_MS);
++	}
+ 	for (o = g_modloads; o != NULL; o = o->next) {
+ 		if (o == m || o->reg != m->reg || o->set == NULL)
+ 			continue;
+@@ -17938,8 +17959,14 @@
+ 	}
+ 	if (e == NULL)
+ 		e = qjs_module_register(reg, url, NULL, 0);
+-	if (e != NULL && e->source == NULL && e->bc == NULL && !e->compiled)
++	if (e != NULL && e->source == NULL && e->bc == NULL && !e->compiled) {
++		if (!e->page_fetch) {
++			extern double macos9_micros(void);
++
++			e->page_fetch_t0 = macos9_micros();
++		}
+ 		e->page_fetch = 1;
++	}
+ }
+ 
+ /* Does this page have the module at url, or is something loading it? A
