@@ -1,0 +1,121 @@
+# netsurf: an absent class attribute is the empty class set, not unknown (186 follow-up, WS-C)
+# Generated 2026-10-02
+# Base: seleron/vitabrowser 9e8e73fc2ce03123640f8c0ccdf60b5734c8d40f (patch stack through 196)
+#
+# The block-class local-rebuild cluster (patches 174/186): every FIRST
+# class assignment on an element that had no class attribute declined
+# the local restyle and fell back to a full box-tree rebuild.
+#
+# Why: patch 186 made the QuickJS setAttribute/removeAttribute bindings
+# carry the pre-mutation class value into the reconvert mark, so
+# html_rl_class_sibling_risk can compare old vs new class sets
+# precisely. libdom's _dom_element_get_attr (libdom/src/core/element.c)
+# answers an absent attribute with DOM_NO_ERR and a NULL dom_string,
+# and the binding passed that NULL straight through as "old value".
+# html_rl_class_sibling_risk treats NULL as "unknown" and declines
+# ("class change without old value"). An absent class attribute is not
+# unknown -- it is the empty class set. The common scripted shape
+# (el.className = "x" on a classless element) hit this on every first
+# touch.
+#
+# Evidence (JS-block-class-stall, pre-fix): steps 1, 5 and 6 set class
+# on classless paragraphs -> 3 conservative declines, 3 full rebuilds
+# (~250 ms each), page median gap 291 ms against the 60 ms bound,
+# BLOCKCLASS 6/7 with only 3 of 6 class changes restyled locally.
+# Steps 2-4 (the element then HAS a class attribute) already took the
+# local path -- the tell that the old value, not the restyle
+# machinery, was at fault. Same root cause as the long-open patch-166
+# stale-structural-styles item: first-touch class changes were the
+# ones forced through the full rebuild.
+#
+# Fix: both bindings keep the get_attribute result. When the read
+# succeeds and returns no value, the old class carried in the
+# SETATTR_CLASS mark is "" (the empty class set) instead of NULL, so
+# the sibling-risk XOR compares class sets precisely. A failed read
+# still passes NULL: genuinely unknown, still declined. The
+# MutationObserver old value in setAttribute keeps the DOM
+# null-for-absent convention, untouched. className and classList both
+# route through setAttribute, so the one fix covers all three.
+#
+# Measurements (simulator, this host): post-fix, BLOCKSIB's classless
+# first-touch changes decline via the precise message ("class change
+# moves a sibling selector") instead of the blanket one; zero
+# "without old value" declines in the focused cluster run; BLOCKSIB
+# 3/3 and SIB186 6/6 unchanged. A local restyle costs ~25 ms a step
+# here where a full rebuild costs ~250 ms. Full-gate numbers are
+# recorded in docs/build-loop-state.md at push time.
+#
+# Companion repo change (not in this patch): the gate counter for
+# sibling-combinator declines in tools/run-vita-sim.sh still matched
+# patch 174's log string ("page CSS has sibling combinators"), which
+# patch 186 removed, so it counted 0 forever. It now counts patch
+# 186's call-site line, "class change may move a sibling selector" --
+# exactly one per sibling-risk decline. The requirement is unchanged
+# (>= 3 declines); only the matched log text tracks the engine's
+# current wording.
+#
+# Decline conditions: unchanged for genuinely unknown old values (a
+# failed attribute read) and for page CSS needing the conservative
+# sibling check. No other behaviour changes: the only marks whose
+# old-class payload changes are SETATTR_CLASS marks on an element
+# whose class attribute was absent and read successfully.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4659,15 +4659,28 @@
+ 	/* fixes1015 - audit WHO sets WHAT to WHAT. */
+ 	qjs_mut_audit("setattr", (dom_node *)el, name_cstr, val_cstr);
+ 	if (name_ds && val_ds) {
+-		(void)macsurf_dom_element_get_attribute(el, name_ds, &old_ds);
++		dom_exception gerr = macsurf_dom_element_get_attribute(el,
++				name_ds, &old_ds);
+ 		macsurf_dom_element_set_attribute(el, name_ds, val_ds);
+ 		qjs_queue_attribute_mutation(ctx, this_val, name_cstr,
+ 				old_ds ? dom_string_data(old_ds) : NULL);
+ 		/* Patch 186 - a class change carries its pre-mutation value so
+-		 * the local rebuild can compare old vs new class sets. */
++		 * the local rebuild can compare old vs new class sets.
++		 * Patch 197 - libdom answers an ABSENT attribute with
++		 * DOM_NO_ERR and a NULL value (_dom_element_get_attr in
++		 * libdom's element.c); that is the empty class set, not an
++		 * unknown one. Passing NULL made
++		 * html_rl_class_sibling_risk decline exactly the
++		 * first-touch case (el.className = "x" on a classless
++		 * element, the common scripted shape) and forced a full
++		 * rebuild for every first class assignment. A failed read
++		 * keeps NULL: truly unknown, still declined. The
++		 * MutationObserver old value above keeps the DOM
++		 * null-for-absent convention, untouched. */
+ 		if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 			qjs_mark_dom_dirty2(ctx, (void *) el, attr_kind,
+-				old_ds ? dom_string_data(old_ds) : NULL);
++				old_ds != NULL ? dom_string_data(old_ds) :
++				(gerr == DOM_NO_ERR ? "" : NULL));
+ 		else
+ 			qjs_mark_dom_dirty(ctx, (void *) el, attr_kind);
+ 	}
+@@ -5959,7 +5972,8 @@
+ 	}
+ 	qjs_mut_audit("rmattr", (dom_node *)el, name_cstr, NULL); /* fixes1015 */
+ 	if (name_ds) {
+-		(void)macsurf_dom_element_get_attribute(el, name_ds, &old_ds);
++		dom_exception gerr = macsurf_dom_element_get_attribute(el,
++				name_ds, &old_ds);
+ 		macsurf_dom_element_remove_attribute(el, name_ds);
+ 		if (old_ds != NULL) {
+ 			qjs_queue_attribute_mutation(ctx, this_val, name_cstr,
+@@ -5969,10 +5983,13 @@
+ 		 * el.removeAttribute(...) (a common show/hide idiom) never
+ 		 * triggered a repaint. Match setAttribute's behaviour.
+ 		 * Patch 186 - a class removal carries its pre-mutation value
+-		 * (the new value is implicitly empty). */
++		 * (the new value is implicitly empty).
++		 * Patch 197 - as in setAttribute, an absent class attribute
++		 * is the empty class set, not an unknown value. */
+ 		if (rm_kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 			qjs_mark_dom_dirty2(ctx, (void *) el, rm_kind,
+-				old_ds ? dom_string_data(old_ds) : NULL);
++				old_ds != NULL ? dom_string_data(old_ds) :
++				(gerr == DOM_NO_ERR ? "" : NULL));
+ 		else
+ 			qjs_mark_dom_dirty(ctx, (void *) el, rm_kind);
+ 		macsurf_dom_string_unref(name_ds);

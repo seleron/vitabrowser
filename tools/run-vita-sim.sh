@@ -627,7 +627,16 @@ bcr=$(sed -n 's/.*STR \(BLOCKCLASS: [0-9]*\/[0-9]* passed\).*/\1/p' $bcp 2>/dev/
 bcl=$(grep -c 'LIFE rebuild local: block restyled [-+]' "$R/netsurf.log" || true)
 bsp=$(ls "$R"/*NET-js-block-class-sibling*.plot 2>/dev/null)
 bsr=$(sed -n 's/.*STR \(BLOCKSIB: [0-9]*\/[0-9]* passed\).*/\1/p' $bsp 2>/dev/null | head -1)
-bsd=$(grep -c 'declined (page CSS has sibling combinators)' "$R/netsurf.log" || true)
+# Patch 197: count the post-186 decline message. Patch 174's string
+# ("page CSS has sibling combinators") was removed by patch 186, which
+# split it into precise/conservative variants logged inside
+# html_rl_class_sibling_risk plus ONE call-site line per decline,
+# "class change may move a sibling selector". The requirement is
+# unchanged (>= 3 sibling-risk declines); only the matched log text
+# tracks the engine's current wording. Without this the counter is
+# permanently 0 and the check can never pass (root cause B of the
+# 2026-10-02 cluster bisect).
+bsd=$(grep -c 'declined (class change may move a sibling selector)' "$R/netsurf.log" || true)
 echo "  JS-block-class-stall: ${bcr:-no summary}; ${bcl} blocks restyled locally"
 echo "  JS-block-class-sibling: ${bsr:-no summary}; ${bsd} declined for sibling combinators"
 # Precise sibling risk (Patch 186): unrelated sibling CSS stays local,
