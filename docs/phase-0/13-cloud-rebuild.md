@@ -106,6 +106,7 @@ interaction passes suggest pages did render there.
 Full recipe on a new machine:
 
     apt-get install gperf flex bison      # plus the usual build tools
+    apt-get install libjpeg-dev libpng-dev  # the simulator build needs both
     tools/bootstrap-work.sh
     SKIP_REGEN=1 tools/build-patched.sh   # nsmonkey link failure is expected
     CA_BUNDLE_LOCAL=/etc/ssl/certs/ca-certificates.crt tools/run-vita-sim.sh

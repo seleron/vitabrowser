@@ -1,0 +1,545 @@
+# netsurf: table captions -- a table-wide block above or below the grid (roadmap WS-A Q3)
+# Generated 2026-10-06
+# Base: seleron/vitabrowser 59d7683099921fcc912d90e8cee1a139bae1ef3c (patch stack through 200)
+#
+# box_construct mapped display: table-caption to BOX_INLINE, so a
+# <caption> reached box_normalise_table as an inline container among the
+# table's children and was wrapped into an implied row group: its text
+# became a cell in an extra first row, squeezed into column 1, with the
+# table's border around it and caption-side ignored. Wikipedia's
+# .wikitable captions, data tables on news and docs sites -- every
+# captioned table rendered that way.
+#
+# Fix (the CSS table wrapper box, without a new box type):
+#  - box_construct: table-caption maps to BOX_BLOCK. default.css gives
+#    caption the UA's text-align: center.
+#  - box_normalise_table: captions stay direct, unwrapped children of the
+#    table, moved (in source order) ahead of the row groups and
+#    normalised as blocks. box_inspect.h gains box_is_table_caption() and
+#    box_table_row_groups() (the first child after the captions); every
+#    walk over a table's row groups (normalise spans, column types,
+#    min/max, layout_table's three passes) starts there, the implied row
+#    for a caption-only table is appended after the captions, and
+#    border-collapse's walk up the previous groups treats a caption like
+#    the table's top edge.
+#  - layout_minmax_table: each caption's minimum width bounds the
+#    table's (CSS Tables 3 3.9.3, what every engine does), and
+#    layout_table, once the column widths are picked, spreads any
+#    shortfall between the grid and the widest caption minimum over the
+#    columns -- the table itself grows, not just its min_width.
+#  - layout_table: once the grid is laid out, layout_table_captions lays
+#    each caption out as a block as wide as the table's border box and
+#    stacks it above the border box (caption-side: top) or below it
+#    (bottom). Captions stay children of the table, painted and hit-tested
+#    like any child; layout_table_caption_extent gives the space they
+#    take, and the callers make room: block flow moves the table down by
+#    the top extent after its margin and clearance, and advances past the
+#    bottom extent before the bottom margin collapses (so margins collapse
+#    outside the captions, as with the wrapper box); a floated table adds
+#    the extents to its margins, which float placement counts.
+# Boundaries: absolutely positioned tables and tables laid out as flex or
+# grid items reserve no caption space (the captions still lay out and
+# paint, outside the table box); a caption's own width/height properties
+# are ignored (it is always as wide as the table). The local relayout
+# paths (163/165/198) decline any chain through a table (not a plain
+# block), so content changes inside a caption take full layout.
+#
+# Test: testpages/pages/CSS-table-caption.html (CAPTION201, 8 checks,
+# Chromium 8/8; measured spans are inline-blocks, since an inline
+# element's rect here is still 0 wide -- a separate, older gap): top caption above the first row, as wide as the table,
+# text centred, flow room above; caption-side: bottom below the grid with
+# the next block after it; an unbreakable caption word widens the table;
+# border-collapse table; caption-only table. Full gate: see
+# docs/build-loop-state.md.
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -256,7 +256,7 @@
+ 	BOX_NONE,            /* CSS_DISPLAY_TABLE_COLUMN_GROUP */
+ 	BOX_NONE,            /* CSS_DISPLAY_TABLE_COLUMN */
+ 	BOX_TABLE_CELL,      /* CSS_DISPLAY_TABLE_CELL */
+-	BOX_INLINE,          /* CSS_DISPLAY_TABLE_CAPTION */
++	BOX_BLOCK,           /* CSS_DISPLAY_TABLE_CAPTION -- patch 201 */
+ 	BOX_NONE,            /* CSS_DISPLAY_NONE */
+ 	BOX_FLEX,            /* CSS_DISPLAY_FLEX */
+ 	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_FLEX */
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -176,6 +176,36 @@
+ 	return (b->parent == NULL || b == b->parent->children);
+ }
+ 
++/**
++ * VitaBrowser (patch 201): is this box a table caption?
++ *
++ * A display: table-caption element is a BOX_BLOCK child of its table.
++ * box_normalise_table moves the captions ahead of the row groups and
++ * leaves them unwrapped; every other block child of a table is wrapped
++ * in an implied row group, so after normalisation a block child of a
++ * table is a caption.
++ */
++static inline bool box_is_table_caption(const struct box *b)
++{
++	return b->type == BOX_BLOCK && b->parent != NULL &&
++			b->parent->type == BOX_TABLE && b->style != NULL &&
++			css_computed_display(b->style, false) ==
++				CSS_DISPLAY_TABLE_CAPTION;
++}
++
++/**
++ * VitaBrowser (patch 201): a table's first row group -- its first child
++ * after the captions, which normalisation keeps at the front.
++ */
++static inline struct box *box_table_row_groups(const struct box *table)
++{
++	struct box *c = table->children;
++
++	while (c != NULL && box_is_table_caption(c))
++		c = c->next;
++	return c;
++}
++
+ static inline unsigned box_count_children(const struct box *b)
+ {
+ 	const struct box *c = b->children;
+diff --git a/content/handlers/html/box_normalise.c b/content/handlers/html/box_normalise.c
+--- a/content/handlers/html/box_normalise.c
++++ b/content/handlers/html/box_normalise.c
+@@ -37,6 +37,7 @@
+ #include "html/box.h"
+ #include "html/box_manipulate.h"
+ #include "html/box_normalise.h"
++#include "html/box_inspect.h"
+ 
+ /* Define to enable box normalise debug */
+ #undef BOX_NORMALISE_DEBUG
+@@ -478,7 +479,7 @@
+ 
+ 	/* Scan table, filling in width and height of table cells with
+ 	 * colspan = 0 and rowspan = 0. Also generate empty cells */
+-	for (table_row_group = table->children;
++	for (table_row_group = box_table_row_groups(table);
+ 	     table_row_group != NULL;
+ 	     table_row_group = table_row_group->next) {
+ 
+@@ -647,8 +648,55 @@
+ 	col_info.spans[1].auto_row = false;
+ 	col_info.num_rows = 0;
+ 
++	/* VitaBrowser (patch 201): captions stay direct children of the
++	 * table, unwrapped, moved (in order) ahead of everything else so
++	 * the row groups start at box_table_row_groups(). Layout places
++	 * them above or below the grid by caption-side. */
++	{
++		struct box *head = NULL, *tail = NULL;
++
++		for (child = table->children; child != NULL;
++				child = next_child) {
++			next_child = child->next;
++			if (!box_is_table_caption(child))
++				continue;
++			/* unlink */
++			if (child->prev != NULL)
++				child->prev->next = child->next;
++			else
++				table->children = child->next;
++			if (child->next != NULL)
++				child->next->prev = child->prev;
++			else
++				table->last = child->prev;
++			/* append to the caption list */
++			child->prev = tail;
++			child->next = NULL;
++			if (tail != NULL)
++				tail->next = child;
++			else
++				head = child;
++			tail = child;
++		}
++		if (head != NULL) {
++			tail->next = table->children;
++			if (table->children != NULL)
++				table->children->prev = tail;
++			else
++				table->last = tail;
++			table->children = head;
++		}
++	}
++
+ 	for (child = table->children; child != NULL; child = next_child) {
+ 		next_child = child->next;
++		if (box_is_table_caption(child)) {
++			if (box_normalise_block(child, root, c) == false) {
++				free(col_info.spans);
++				return false;
++			}
++			continue;
++		}
+ 		switch (child->type) {
+ 		case BOX_TABLE_ROW_GROUP:
+ 			/* ok */
+@@ -749,7 +797,7 @@
+ 	table->columns = col_info.num_columns;
+ 	table->rows = col_info.num_rows;
+ 
+-	if (table->children == NULL) {
++	if (box_table_row_groups(table) == NULL) {
+ 		struct box *row;
+ 
+ #ifdef BOX_NORMALISE_DEBUG
+@@ -801,8 +849,14 @@
+ 		row->parent = row_group;
+ 		row_group->children = row_group->last = row;
+ 
++		/* patch 201: after any captions */
+ 		row_group->parent = table;
+-		table->children = table->last = row_group;
++		row_group->prev = table->last;
++		if (table->last != NULL)
++			table->last->next = row_group;
++		else
++			table->children = row_group;
++		table->last = row_group;
+ 
+ 		table->rows = 1;
+ 	}
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -527,7 +527,7 @@
+ 	}
+ 
+ 	/* 1st pass: consider cells with colspan 1 only */
+-	for (row_group = table->children; row_group; row_group =row_group->next)
++	for (row_group = box_table_row_groups(table); row_group; row_group =row_group->next)
+ 	for (row = row_group->children; row; row = row->next)
+ 	for (cell = row->children; cell; cell = cell->next) {
+ 		assert(cell->type == BOX_TABLE_CELL);
+@@ -557,7 +557,7 @@
+ 	}
+ 
+ 	/* 2nd pass: cells which span multiple columns */
+-	for (row_group = table->children; row_group; row_group =row_group->next)
++	for (row_group = box_table_row_groups(table); row_group; row_group =row_group->next)
+ 	for (row = row_group->children; row; row = row->next)
+ 	for (cell = row->children; cell; cell = cell->next) {
+ 		unsigned int flexible_columns = 0;
+@@ -635,6 +635,18 @@
+ 		table_max += col[i].max;
+ 	}
+ 
++	/* patch 201: a caption is laid out at the table's width, so the
++	 * table is at least as wide as each caption's minimum (CSS Tables
++	 * 3, 3.9.3; what every engine does) */
++	for (cell = table->children; cell != NULL &&
++			box_is_table_caption(cell); cell = cell->next) {
++		layout_minmax_block(cell, font_func, content);
++		if (table_min < cell->min_width)
++			table_min = cell->min_width;
++		if (table_max < cell->min_width)
++			table_max = cell->min_width;
++	}
++
+ 	/* fixed width takes priority, unless it is too narrow */
+ 	if (css_computed_width_px(table->style, &content->unit_len_ctx,
+ 			-1, &width) == CSS_WIDTH_SET) {
+@@ -2954,6 +2966,98 @@
+ 		html_content *content);
+ 
+ /* Documented in layout_internal.h */
++/**
++ * VitaBrowser (patch 201): the vertical space a table's captions take
++ * above (caption-side: top) and below (bottom) its border box. Valid
++ * after layout_table.
++ */
++static void layout_table_caption_extent(const struct box *table,
++		int *above, int *below)
++{
++	const struct box *cap;
++
++	*above = *below = 0;
++	for (cap = table->children; cap != NULL &&
++			box_is_table_caption(cap); cap = cap->next) {
++		int h = cap->margin[TOP] + cap->border[TOP].width +
++				cap->padding[TOP] + cap->height +
++				cap->padding[BOTTOM] +
++				cap->border[BOTTOM].width + cap->margin[BOTTOM];
++
++		if (css_computed_caption_side(cap->style) ==
++				CSS_CAPTION_SIDE_BOTTOM)
++			*below += h;
++		else
++			*above += h;
++	}
++}
++
++/**
++ * VitaBrowser (patch 201): lay out a table's captions once its grid is
++ * laid out. Each caption is a block as wide as the table's border box,
++ * stacked above it (caption-side: top, in source order) or below it
++ * (bottom). They stay children of the table, positioned outside its
++ * border box, the way the CSS table wrapper box holds them; the callers
++ * make room for them with layout_table_caption_extent. Child positions
++ * are relative to the table's padding box, hence the border offsets.
++ */
++static bool layout_table_captions(struct box *table, html_content *content)
++{
++	struct box *cap;
++	int above, below, top_y, bottom_y;
++	int outer = table->border[LEFT].width + table->padding[LEFT] +
++			table->width + table->padding[RIGHT] +
++			table->border[RIGHT].width;
++
++	if (table->children == NULL || !box_is_table_caption(table->children))
++		return true;
++
++	for (cap = table->children; cap != NULL &&
++			box_is_table_caption(cap); cap = cap->next) {
++		int w;
++
++		layout_find_dimensions(&content->unit_len_ctx, outer, -1, cap,
++				cap->style, NULL, NULL, NULL, NULL, NULL, NULL,
++				cap->margin, cap->padding, cap->border);
++		if (cap->margin[LEFT] == AUTO)
++			cap->margin[LEFT] = 0;
++		if (cap->margin[RIGHT] == AUTO)
++			cap->margin[RIGHT] = 0;
++		if (cap->margin[TOP] == AUTO)
++			cap->margin[TOP] = 0;
++		if (cap->margin[BOTTOM] == AUTO)
++			cap->margin[BOTTOM] = 0;
++		w = outer - cap->margin[LEFT] - cap->border[LEFT].width -
++				cap->padding[LEFT] - cap->padding[RIGHT] -
++				cap->border[RIGHT].width - cap->margin[RIGHT];
++		cap->width = w < 0 ? 0 : w;
++		cap->height = AUTO;
++		cap->float_children = 0;
++		cap->cached_place_below_level = 0;
++		if (!layout_block_context(cap, -1, content))
++			return false;
++		cap->x = -table->border[LEFT].width + cap->margin[LEFT] +
++				cap->border[LEFT].width;
++	}
++
++	layout_table_caption_extent(table, &above, &below);
++	top_y = -table->border[TOP].width - above;
++	bottom_y = table->padding[TOP] + table->height +
++			table->padding[BOTTOM] + table->border[BOTTOM].width;
++	for (cap = table->children; cap != NULL &&
++			box_is_table_caption(cap); cap = cap->next) {
++		int *yp = (css_computed_caption_side(cap->style) ==
++				CSS_CAPTION_SIDE_BOTTOM) ? &bottom_y : &top_y;
++
++		cap->y = *yp + cap->margin[TOP] + cap->border[TOP].width;
++		*yp += cap->margin[TOP] + cap->border[TOP].width +
++				cap->padding[TOP] + cap->height +
++				cap->padding[BOTTOM] +
++				cap->border[BOTTOM].width + cap->margin[BOTTOM];
++	}
++	return true;
++}
++
+ bool layout_table(
+ 		struct box *table,
+ 		int available_width,
+@@ -3023,7 +3127,8 @@
+ 
+ 	assert(table->type == BOX_TABLE);
+ 	assert(style);
+-	assert(table->children && table->children->children);
++	assert(box_table_row_groups(table) &&
++			box_table_row_groups(table)->children);
+ 	assert(columns);
+ 
+ 	/* allocate working buffers */
+@@ -3047,7 +3152,7 @@
+ 	layout_find_dimensions(&content->unit_len_ctx, available_width, -1, table,
+ 			style, 0, 0, 0, 0, 0, 0, table->margin, table->padding,
+ 			table->border);
+-	for (row_group = table->children; row_group;
++	for (row_group = box_table_row_groups(table); row_group;
+ 			row_group = row_group->next) {
+ 		for (row = row_group->children; row; row = row->next) {
+ 			for (c = row->children; c; c = c->next) {
+@@ -3436,6 +3541,39 @@
+ 		}
+ 	}
+ 
++	/* patch 201: a caption is as wide as the table's border box, and
++	 * the table is at least as wide as each caption's minimum: spread
++	 * any shortfall over the columns */
++	{
++		struct box *cap;
++		int cap_min = 0, flexible = 0;
++
++		for (cap = table->children; cap != NULL &&
++				box_is_table_caption(cap); cap = cap->next)
++			if (cap_min < cap->min_width)
++				cap_min = cap->min_width;
++		cap_min -= table->border[LEFT].width + table->padding[LEFT] +
++				table->padding[RIGHT] +
++				table->border[RIGHT].width;
++		for (i = 0; i != columns; i++)
++			if (!col[i].positioned)
++				flexible++;
++		if (cap_min > table_width && flexible > 0) {
++			int extra = cap_min - table_width;
++			int share = extra / flexible;
++			int rem = extra - share * flexible;
++
++			for (i = 0; i != columns; i++) {
++				if (col[i].positioned)
++					continue;
++				col[i].width += share + (rem > 0 ? 1 : 0);
++				if (rem > 0)
++					rem--;
++			}
++			table_width = cap_min;
++		}
++	}
++
+ 	xs[0] = x = border_spacing_h;
+ 	for (i = 0; i != columns; i++) {
+ 		if (!col[i].positioned)
+@@ -3448,7 +3586,7 @@
+ 
+ 	/* position cells */
+ 	table_height = border_spacing_v;
+-	for (row_group = table->children; row_group;
++	for (row_group = box_table_row_groups(table); row_group;
+ 			row_group = row_group->next) {
+ 		int row_group_height = 0;
+ 		for (row = row_group->children; row; row = row->next) {
+@@ -3574,7 +3712,7 @@
+ 	/** \todo distribute spare height over the row groups / rows / cells */
+ 
+ 	/* perform vertical alignment */
+-	for (row_group = table->children; row_group;
++	for (row_group = box_table_row_groups(table); row_group;
+ 			row_group = row_group->next) {
+ 		for (row = row_group->children; row; row = row->next) {
+ 			for (c = row->children; c; c = c->next) {
+@@ -3636,7 +3774,7 @@
+ 	table->width = table_width;
+ 	table->height = table_height;
+ 
+-	return true;
++	return layout_table_captions(table, content);
+ }
+ 
+ 
+@@ -4090,6 +4228,15 @@
+ 			b->margin[TOP] = 0;
+ 		if (b->margin[BOTTOM] == AUTO)
+ 			b->margin[BOTTOM] = 0;
++		if (b->type == BOX_TABLE) {
++			/* patch 201: a floated table's captions travel
++			 * with it; float placement counts its margins */
++			int above, below;
++
++			layout_table_caption_extent(b, &above, &below);
++			b->margin[TOP] += above;
++			b->margin[BOTTOM] += below;
++		}
+ 	} else {
+ 		return layout_block_context(b, -1, content);
+ 	}
+@@ -5823,6 +5970,17 @@
+ 			cx = x0;
+ 			box->y += y - cy;
+ 			cy = y;
++
++			/* patch 201: top captions sit between the
++			 * table's margin and its border box */
++			{
++				int above, below;
++
++				layout_table_caption_extent(box, &above,
++						&below);
++				box->y += above;
++				cy += above;
++			}
+ 		}
+ 
+ 		/* Advance to next box. */
+@@ -5856,6 +6014,15 @@
+ 		y = box->y + box->padding[TOP] + box->height +
+ 				box->padding[BOTTOM] +
+ 				box->border[BOTTOM].width;
++		if (box->type == BOX_TABLE) {
++			/* patch 201: bottom captions, before the
++			 * table's bottom margin */
++			int above, below;
++
++			layout_table_caption_extent(box, &above, &below);
++			cy += below;
++			y += below;
++		}
+ 
+ 	advance_to_next_box:
+ 		if (!box->next) {
+diff --git a/content/handlers/html/table.c b/content/handlers/html/table.c
+--- a/content/handlers/html/table.c
++++ b/content/handlers/html/table.c
+@@ -31,6 +31,7 @@
+ #include "css/utils.h"
+ 
+ #include "html/box.h"
++#include "html/box_inspect.h"
+ #include "html/table.h"
+ 
+ /* Define to enable verbose table debug */
+@@ -580,7 +581,10 @@
+ 			a_src = b_src;
+ 		}
+ 
+-		if (group->prev == NULL) {
++		/* patch 201: captions precede the row groups but take
++		 * no part in the border-collapse grid */
++		if (group->prev == NULL ||
++				box_is_table_caption(group->prev)) {
+ 			/* Top border of table */
+ 			table_cell_top_process_table(unit_len_ctx,
+ 						     group->parent, &a, &a_src);
+@@ -589,7 +593,9 @@
+ 			while (table_cell_top_process_group(unit_len_ctx,
+ 							    cell, group->prev,
+ 							    &a, &a_src) == false) {
+-				if (group->prev->prev == NULL) {
++				if (group->prev->prev == NULL ||
++						box_is_table_caption(
++							group->prev->prev)) {
+ 					/* Top border of table */
+ 					table_cell_top_process_table(unit_len_ctx,
+ 								     group->parent,
+@@ -839,7 +845,7 @@
+ 	}
+ 
+ 	/* 1st pass: cells with colspan 1 only */
+-	for (row_group = table->children; row_group; row_group =row_group->next)
++	for (row_group = box_table_row_groups(table); row_group; row_group =row_group->next)
+ 		for (row = row_group->children; row; row = row->next) {
+ 			for (cell = row->children; cell; cell = cell->next) {
+ 				enum css_width_e type;
+@@ -912,7 +918,7 @@
+ 	}
+ 
+ 	/* 2nd pass: cells which span multiple columns */
+-	for (row_group = table->children; row_group; row_group =row_group->next)
++	for (row_group = box_table_row_groups(table); row_group; row_group =row_group->next)
+ 		for (row = row_group->children; row; row = row->next)
+ 			for (cell = row->children; cell; cell = cell->next) {
+ 				unsigned int fixed_columns = 0,
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -72,7 +72,7 @@
+ 
+ table[border], table[border] td, table[border] tr { border-color: grey; }
+ 
+-caption { display: table-caption; }
++caption { display: table-caption; text-align: center; }
+ 
+ thead { display: table-header-group; vertical-align: middle; }
+ tfoot { display: table-footer-group; vertical-align: middle; }

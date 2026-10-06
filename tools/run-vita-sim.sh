@@ -250,6 +250,7 @@ NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
 NET-css-account-bar http://127.0.0.1:$HP/CSS-account-bar.html
 NET-css-appearance http://127.0.0.1:$HP/CSS-appearance.html
+NET-css-table-caption http://127.0.0.1:$HP/CSS-table-caption.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -593,9 +594,14 @@ echo "  JS-cssom-190: ${c190r:-no summary}"
 # Patch 191: bottom-anchored abspos in an earlier sibling moves when the
 # containing block grows/shrinks via the local relayout path.
 a191p=$(ls "$R"/*NET-js-abspos191.plot 2>/dev/null | head -1)
-a191r=$(sed -n 's/.*STR \\(ABSPOS191: [0-9]*\\/[0-9]* passed\\).*/\\1/p' "$a191p" 2>/dev/null | head -1)
+a191r=$(sed -n 's/.*STR \(ABSPOS191: [0-9]*\/[0-9]* passed\).*/\1/p' "$a191p" 2>/dev/null | head -1)
 echo "  JS-abspos191: ${a191r:-no summary}"
 [ -n "$a191p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$a191p" | sed 's/^STR /  /'
+# Patch 201: <caption> is a table-wide block above/below the grid.
+c201p=$(ls "$R"/*NET-css-table-caption.plot 2>/dev/null | head -1)
+c201r=$(sed -n 's/.*STR \(CAPTION201: [0-9]*\/[0-9]* passed\).*/\1/p' "$c201p" 2>/dev/null | head -1)
+echo "  CSS-table-caption: ${c201r:-no summary}"
+[ -n "$c201p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$c201p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -643,7 +649,7 @@ echo "  JS-block-class-sibling: ${bsr:-no summary}; ${bsd} declined for sibling 
 # Precise sibling risk (Patch 186): unrelated sibling CSS stays local,
 # genuine +/~ risks decline and restyle siblings, :has(+ ...) declines.
 s186p=$(ls "$R"/*NET-css-sibling-class*.plot 2>/dev/null)
-s186r=$(sed -n 's/.*STR \\(SIB186: [0-9]*\\/[0-9]* passed\\).*/\\1/p' $s186p 2>/dev/null | head -1)
+s186r=$(sed -n 's/.*STR \(SIB186: [0-9]*\/[0-9]* passed\).*/\1/p' $s186p 2>/dev/null | head -1)
 s186d=$(grep -c 'declined (class change moves a sibling selector)' "$R/netsurf.log" || true)
 s186c=$(grep -c 'declined (page CSS needs conservative sibling check)' "$R/netsurf.log" || true)
 echo "  CSS-sibling-class: ${s186r:-no summary}; ${s186d} precise declines, ${s186c} conservative declines"
@@ -764,6 +770,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
 [ "$c190r" = "CSSOM190: 2/2 passed" ] && \
 [ "$a191r" = "ABSPOS191: 2/2 passed" ] && \
+[ "$c201r" = "CAPTION201: 8/8 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \

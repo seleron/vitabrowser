@@ -67,6 +67,11 @@ once), `light-dark()` / `color-scheme`, SVG `<use>`. The brief's CSS queue
 in MacSurf's order: transform (Q1), two-value `gap` (Q2), `caption-side`
 (Q3), `table-layout: fixed` (Q4), multi-column (Q5).
 *Acceptance:* a test page per feature in the suite; tier scores rise.
+*Status (2026-10-06):* Q3 done in the sim (patch 201): `<caption>` /
+`display: table-caption` is a block as wide as the table, above or below
+its border box by `caption-side`, with room made in the flow; it used to
+be an inline in an implied first cell. CSS-table-caption.html (CAPTION201)
+8/8, 3/8 without the patch. Q4 was already in the stack (fixes184/573).
 
 ### WS-B Web platform (R1, R2, R4)
 1. **Event model conformance.** A listener registered on `document` without
