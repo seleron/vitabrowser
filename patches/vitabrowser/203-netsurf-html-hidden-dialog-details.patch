@@ -1,0 +1,236 @@
+# netsurf: HTML's hiding rules ([hidden], dialog, template, details) + summary toggle
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 76e8c77 (patch stack through 202)
+#
+# The UA stylesheet (resources/default.css) predates HTML5's rendering
+# section: nothing hid an element with the `hidden` attribute, a closed
+# <dialog>, a <template>, <datalist>, or the body of a closed <details>.
+# Every page that keeps markup hidden until a script reveals it -- cookie
+# banners, menus, modals, tab panels, "read more" sections, error
+# messages, Wikipedia's collapsed sections -- showed all of it at once.
+#
+# Fix:
+#  - default.css: [hidden], template, datalist, dialog, source, track,
+#    param, area { display: none } (UA origin, so an author `display`
+#    still wins, as in every browser); dialog[open] shows as an absolutely
+#    positioned, horizontally centred, fit-content box with a border and
+#    1em padding; details and summary are blocks; a closed details hides
+#    every element child but its summaries; the first summary gets a
+#    disclosure triangle (U+25B8 closed, U+25BE open).
+#  - vita_polyfill.js: hiding a details body is only safe if it can be
+#    opened, so a click on a details element's first summary toggles its
+#    `open` attribute as the activation behaviour (a window-level click
+#    listener; preventDefault cancels it; once per event) and queues a
+#    non-bubbling `toggle`. details.open / dialog.open reflect the
+#    attribute; dialog.show() / showModal() open it; close(v) closes it,
+#    sets returnValue and queues `close`.
+# Boundaries: showModal() does not make the rest of the page inert or put
+# the dialog in a top layer (it opens like show()); no ::backdrop; a bare
+# text node directly inside a closed details stays visible (CSS cannot
+# select text nodes); [hidden=until-found] is treated as plain hidden.
+#
+# Test: testpages/pages/HTML-hidden-details.html (HIDDEN203, 9 checks,
+# Chromium 9/9; 0/9 without the patch). Full gate: see
+# docs/build-loop-state.md.
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6121,5 +6121,88 @@
+ "\t\t} catch (e) { /* */ }\n"
+ "\t});\n"
+ "})();\n"
++"/* ---- <details> and <dialog> behaviour (patch 203) -----------------------\n"
++" * default.css now hides closed <details> bodies and closed <dialog>s, as\n"
++" * the HTML rendering rules say; this is what opens them. A click on a\n"
++" * details element's summary toggles its open attribute (the activation\n"
++" * behaviour, so a handler's preventDefault cancels it) and queues a\n"
++" * non-bubbling `toggle` event. details.open and dialog.open reflect the\n"
++" * attribute; dialog.show()/showModal() open it, close(v) closes it, sets\n"
++" * returnValue and fires `close`. A modal dialog is not made inert or\n"
++" * top-layered: it opens like show(). */\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tfunction tagOf(el) { return el && el.tagName ? String(el.tagName).toUpperCase() : ''; }\n"
++"\tfunction later(fn) { if (typeof g.setTimeout === 'function') g.setTimeout(fn, 0); else fn(); }\n"
++"\tfunction fire(el, type) {\n"
++"\t\ttry { el.dispatchEvent(new g.Event(type, { bubbles: false })); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tfunction protoOf(tag) {\n"
++"\t\ttry {\n"
++"\t\t\tvar P = Object.getPrototypeOf(d.createElement(tag));\n"
++"\t\t\treturn P && P !== Object.prototype ? P : null;\n"
++"\t\t} catch (e) { return null; }\n"
++"\t}\n"
++"\tfunction reflectOpen(P) {\n"
++"\t\tif (!P || Object.prototype.hasOwnProperty.call(P, 'open')) return;\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(P, 'open', { configurable: true, enumerable: true,\n"
++"\t\t\t\tget: function () { return this.hasAttribute('open'); },\n"
++"\t\t\t\tset: function (v) {\n"
++"\t\t\t\t\tif (v) this.setAttribute('open', '');\n"
++"\t\t\t\t\telse this.removeAttribute('open');\n"
++"\t\t\t\t} });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t}\n"
++"\tvar DP = protoOf('details'), GP = protoOf('dialog');\n"
++"\treflectOpen(DP);\n"
++"\treflectOpen(GP);\n"
++"\tif (GP) {\n"
++"\t\tvar def = function (name, fn) {\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(GP, name)) return;\n"
++"\t\t\ttry { Object.defineProperty(GP, name, { value: fn, configurable: true, writable: true }); } catch (e) { /* */ }\n"
++"\t\t};\n"
++"\t\tdef('show', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });\n"
++"\t\tdef('showModal', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });\n"
++"\t\tdef('close', function (v) {\n"
++"\t\t\tif (!this.hasAttribute('open')) return;\n"
++"\t\t\tif (v !== undefined) this.returnValue = String(v);\n"
++"\t\t\tthis.removeAttribute('open');\n"
++"\t\t\tvar self = this;\n"
++"\t\t\tlater(function () { fire(self, 'close'); });\n"
++"\t\t});\n"
++"\t\tif (!('returnValue' in GP)) {\n"
++"\t\t\ttry { Object.defineProperty(GP, 'returnValue', { configurable: true, enumerable: true,\n"
++"\t\t\t\tget: function () { return this.__vbReturnValue === undefined ? '' : this.__vbReturnValue; },\n"
++"\t\t\t\tset: function (v) { this.__vbReturnValue = String(v); } }); } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t}\n"
++"\t/* the summary that toggles: the first summary child of a details */\n"
++"\tfunction toggler(t) {\n"
++"\t\tfor (var el = t; el && el.nodeType === 1; el = el.parentNode) {\n"
++"\t\t\tif (tagOf(el) !== 'SUMMARY') continue;\n"
++"\t\t\tvar p = el.parentNode;\n"
++"\t\t\tif (!p || tagOf(p) !== 'DETAILS') return null;\n"
++"\t\t\tfor (var c = p.firstChild; c; c = c.nextSibling)\n"
++"\t\t\t\tif (c.nodeType === 1 && tagOf(c) === 'SUMMARY') return c === el ? p : null;\n"
++"\t\t\treturn null;\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tvar target = typeof g.addEventListener === 'function' ? g : d;\n"
++"\tif (!target.addEventListener) return;\n"
++"\ttarget.addEventListener('click', function (e) {\n"
++"\t\tif (!e || e.defaultPrevented || e.__vbToggled) return;\n"
++"\t\tvar det = toggler(e.target);\n"
++"\t\tif (!det) return;\n"
++"\t\t/* once per click: the listener can see one event twice here\n"
++"\t\t * (window listeners are also reached through the document) */\n"
++"\t\ttry { e.__vbToggled = true; } catch (x) { /* */ }\n"
++"\t\tif (det.hasAttribute('open')) det.removeAttribute('open');\n"
++"\t\telse det.setAttribute('open', '');\n"
++"\t\tlater(function () { fire(det, 'toggle'); });\n"
++"\t}, false);\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6120,4 +6120,87 @@
+ 		} catch (e) { /* */ }
+ 	});
+ })();
++/* ---- <details> and <dialog> behaviour (patch 203) -----------------------
++ * default.css now hides closed <details> bodies and closed <dialog>s, as
++ * the HTML rendering rules say; this is what opens them. A click on a
++ * details element's summary toggles its open attribute (the activation
++ * behaviour, so a handler's preventDefault cancels it) and queues a
++ * non-bubbling `toggle` event. details.open and dialog.open reflect the
++ * attribute; dialog.show()/showModal() open it, close(v) closes it, sets
++ * returnValue and fires `close`. A modal dialog is not made inert or
++ * top-layered: it opens like show(). */
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	function tagOf(el) { return el && el.tagName ? String(el.tagName).toUpperCase() : ''; }
++	function later(fn) { if (typeof g.setTimeout === 'function') g.setTimeout(fn, 0); else fn(); }
++	function fire(el, type) {
++		try { el.dispatchEvent(new g.Event(type, { bubbles: false })); } catch (e) { /* */ }
++	}
++	function protoOf(tag) {
++		try {
++			var P = Object.getPrototypeOf(d.createElement(tag));
++			return P && P !== Object.prototype ? P : null;
++		} catch (e) { return null; }
++	}
++	function reflectOpen(P) {
++		if (!P || Object.prototype.hasOwnProperty.call(P, 'open')) return;
++		try {
++			Object.defineProperty(P, 'open', { configurable: true, enumerable: true,
++				get: function () { return this.hasAttribute('open'); },
++				set: function (v) {
++					if (v) this.setAttribute('open', '');
++					else this.removeAttribute('open');
++				} });
++		} catch (e) { /* */ }
++	}
++	var DP = protoOf('details'), GP = protoOf('dialog');
++	reflectOpen(DP);
++	reflectOpen(GP);
++	if (GP) {
++		var def = function (name, fn) {
++			if (Object.prototype.hasOwnProperty.call(GP, name)) return;
++			try { Object.defineProperty(GP, name, { value: fn, configurable: true, writable: true }); } catch (e) { /* */ }
++		};
++		def('show', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });
++		def('showModal', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });
++		def('close', function (v) {
++			if (!this.hasAttribute('open')) return;
++			if (v !== undefined) this.returnValue = String(v);
++			this.removeAttribute('open');
++			var self = this;
++			later(function () { fire(self, 'close'); });
++		});
++		if (!('returnValue' in GP)) {
++			try { Object.defineProperty(GP, 'returnValue', { configurable: true, enumerable: true,
++				get: function () { return this.__vbReturnValue === undefined ? '' : this.__vbReturnValue; },
++				set: function (v) { this.__vbReturnValue = String(v); } }); } catch (e) { /* */ }
++		}
++	}
++	/* the summary that toggles: the first summary child of a details */
++	function toggler(t) {
++		for (var el = t; el && el.nodeType === 1; el = el.parentNode) {
++			if (tagOf(el) !== 'SUMMARY') continue;
++			var p = el.parentNode;
++			if (!p || tagOf(p) !== 'DETAILS') return null;
++			for (var c = p.firstChild; c; c = c.nextSibling)
++				if (c.nodeType === 1 && tagOf(c) === 'SUMMARY') return c === el ? p : null;
++			return null;
++		}
++		return null;
++	}
++	var target = typeof g.addEventListener === 'function' ? g : d;
++	if (!target.addEventListener) return;
++	target.addEventListener('click', function (e) {
++		if (!e || e.defaultPrevented || e.__vbToggled) return;
++		var det = toggler(e.target);
++		if (!det) return;
++		/* once per click: the listener can see one event twice here
++		 * (window listeners are also reached through the document) */
++		try { e.__vbToggled = true; } catch (x) { /* */ }
++		if (det.hasAttribute('open')) det.removeAttribute('open');
++		else det.setAttribute('open', '');
++		later(function () { fire(det, 'toggle'); });
++	}, false);
++})();
+ })(this);
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -152,3 +152,15 @@
+ 	background: yellow;
+ 	color: black;
+ }
++
++/* VitaBrowser (patch 203): the HTML rendering section's hiding rules.
++ * Without them every [hidden] element, closed <dialog>, <template> and
++ * closed <details> body was shown. */
++[hidden], template, datalist, dialog, source, track, param, area { display: none; }
++dialog[open] { display: block; position: absolute; left: 0; right: 0;
++	width: fit-content; height: fit-content; margin: auto; border: solid;
++	padding: 1em; background-color: white; color: black; }
++details, summary { display: block; }
++details:not([open]) > :not(summary) { display: none; }
++details > summary:first-of-type::before { content: "\25B8  "; }
++details[open] > summary:first-of-type::before { content: "\25BE  "; }

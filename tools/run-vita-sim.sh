@@ -252,6 +252,7 @@ NET-css-account-bar http://127.0.0.1:$HP/CSS-account-bar.html
 NET-css-appearance http://127.0.0.1:$HP/CSS-appearance.html
 NET-css-table-caption http://127.0.0.1:$HP/CSS-table-caption.html
 NET-js-inline-rect http://127.0.0.1:$HP/JS-inline-rect.html
+NET-html-hidden-details http://127.0.0.1:$HP/HTML-hidden-details.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -608,6 +609,12 @@ i202p=$(ls "$R"/*NET-js-inline-rect.plot 2>/dev/null | head -1)
 i202r=$(sed -n 's/.*STR \(INLINERECT: [0-9]*\/[0-9]* passed\).*/\1/p' "$i202p" 2>/dev/null | head -1)
 echo "  JS-inline-rect: ${i202r:-no summary}"
 [ -n "$i202p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$i202p" | sed 's/^STR /  /'
+# Patch 203: [hidden] / closed dialog / template / closed details hidden;
+# summary click toggles; dialog show/close.
+h203p=$(ls "$R"/*NET-html-hidden-details.plot 2>/dev/null | head -1)
+h203r=$(sed -n 's/.*STR \(HIDDEN203: [0-9]*\/[0-9]* passed\).*/\1/p' "$h203p" 2>/dev/null | head -1)
+echo "  HTML-hidden-details: ${h203r:-no summary}"
+[ -n "$h203p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$h203p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -778,6 +785,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$a191r" = "ABSPOS191: 2/2 passed" ] && \
 [ "$c201r" = "CAPTION201: 8/8 passed" ] && \
 [ "$i202r" = "INLINERECT: 6/6 passed" ] && \
+[ "$h203r" = "HIDDEN203: 9/9 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
