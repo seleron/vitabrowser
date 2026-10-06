@@ -1,0 +1,113 @@
+# netsurf: an inline element's rect and offset size are its fragments' union
+# Generated 2026-10-07
+# Base: seleron/vitabrowser c84574f (patch stack through 201)
+#
+# getBoundingClientRect / offsetWidth / offsetHeight on an inline element
+# (<span>, <a>, <b>, ...) answered from the BOX_INLINE's own width, which
+# layout leaves at 0: an inline's content lives in the sibling boxes up to
+# its BOX_INLINE_END, over as many lines as it wraps to. Every span
+# measured 0 wide (a wrapped one 0 x one line) -- tooltips and dropdowns
+# anchored to links, "is this text truncated" checks, underline/marker
+# animations, and the scorecard's own measuring all read nothing.
+#
+# Fix: layout already keeps the union of those fragments as the inline's
+# descendant bbox (layout_calculate_descendant_bboxes fills it at the
+# INLINE_END, relative to the box's x/y, border box included).
+# qjs_inline_extent() reads it for a BOX_INLINE with an inline_end, with
+# the same sanity bounds as qjs_sane; qjs_el_get_rect answers that
+# rectangle (origin + extent, minus scroll) and qjs_el_metric answers its
+# width/height for offsetWidth/offsetHeight. Everything else -- blocks,
+# inline-blocks, replaced inlines, clientWidth, offsetTop/Left -- is
+# unchanged. getClientRects still returns one rect (the union), not one
+# per line.
+#
+# Test: testpages/pages/JS-inline-rect.html (INLINERECT, 6 checks,
+# Chromium 6/6; 2/6 without the patch): a span as wide as an inline-block
+# twin of its text, one line high on its line, a wrapped span spanning its
+# lines, offsetWidth/Height matching the rect, horizontal padding counted,
+# a nested inline containing its child. Full gate: see
+# docs/build-loop-state.md.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -7675,6 +7675,34 @@
+ 	return v;
+ }
+ 
++/* VitaBrowser (patch 202): an inline element (<span>, <a>, <b>...) has
++ * no width of its own -- layout leaves a BOX_INLINE's width at 0 and
++ * puts its content in the sibling boxes up to its BOX_INLINE_END, over
++ * as many lines as it wraps to. Layout does keep the union of those
++ * fragments as the inline's descendant bbox (layout_calculate_
++ * descendant_bboxes, at the INLINE_END), relative to the box's x/y:
++ * that union is what getBoundingClientRect and offsetWidth/Height
++ * answer for an inline in every browser. Returns false when the box is
++ * not such an inline or the extent is not laid out yet. */
++static bool qjs_inline_extent(const struct box *b, int *x0, int *y0,
++		int *x1, int *y1)
++{
++	if (b->type != BOX_INLINE || b->inline_end == NULL)
++		return false;
++	if (b->descendant_x1 < b->descendant_x0 ||
++	    b->descendant_y1 < b->descendant_y0 ||
++	    b->descendant_x0 <= -QJS_LAYOUT_SANE_MAX ||
++	    b->descendant_y0 <= -QJS_LAYOUT_SANE_MAX ||
++	    b->descendant_x1 >= QJS_LAYOUT_SANE_MAX ||
++	    b->descendant_y1 >= QJS_LAYOUT_SANE_MAX)
++		return false;
++	*x0 = b->descendant_x0;
++	*y0 = b->descendant_y0;
++	*x1 = b->descendant_x1;
++	*y1 = b->descendant_y1;
++	return true;
++}
++
+ /* Document coordinates of a box's border edge. */
+ static void qjs_box_origin(struct box *b, int *ox, int *oy)
+ {
+@@ -7699,11 +7727,19 @@
+ 	struct box *b;
+ 	JSValue r;
+ 	int x = 0, y = 0, w = 0, h = 0;
++	int ix0, iy0, ix1, iy1;
+ 	(void)this_val; (void)argc; (void)argv; (void)magic;
+ 
+ 	qjs_geometry_flush(ctx);	/* fixes1073 (#265) */
+ 	b = qjs_box_for(ctx, this_val);
+-	if (b != NULL) {
++	if (b != NULL && qjs_inline_extent(b, &ix0, &iy0, &ix1, &iy1)) {
++		/* patch 202: an inline's rect is its fragments' union */
++		qjs_box_origin(b, &x, &y);
++		x += ix0 - macsurf_qjs_scroll_x();
++		y += iy0 - macsurf_qjs_scroll_y();
++		w = ix1 - ix0;
++		h = iy1 - iy0;
++	} else if (b != NULL) {
+ 		qjs_box_origin(b, &x, &y);
+ 		/* VitaBrowser: box x/y is the PADDING box's corner (layout puts
+ 		 * the border outside it: y = ... + border-top), so the border-box
+@@ -7858,6 +7894,16 @@
+ 	px = b->padding[LEFT] + b->padding[RIGHT];
+ 	py = b->padding[TOP] + b->padding[BOTTOM];
+ 
++	/* patch 202: an inline's offset size is its fragments' union */
++	if (magic == QJS_M_OFFW || magic == QJS_M_OFFH) {
++		int ix0, iy0, ix1, iy1;
++
++		if (qjs_inline_extent(b, &ix0, &iy0, &ix1, &iy1)) {
++			v = (magic == QJS_M_OFFW) ? ix1 - ix0 : iy1 - iy0;
++			goto metric_done;
++		}
++	}
++
+ 	switch (magic) {
+ 	case QJS_M_OFFW: v = qjs_sane(b->width) + px + bx; break;
+ 	case QJS_M_OFFH:
+@@ -7902,6 +7948,7 @@
+ 		break;
+ 	default: v = 0; break;
+ 	}
++metric_done:
+ 	if (v < 0) v = 0;
+ 	{	/* fixes1015 */
+ 		char rb[24];
