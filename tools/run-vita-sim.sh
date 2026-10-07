@@ -273,6 +273,7 @@ NET-html-fieldset-legend http://127.0.0.1:$HP/HTML-fieldset-legend.html
 NET-html-range-color http://127.0.0.1:$HP/HTML-range-color.html
 NET-js-nan-constants http://127.0.0.1:$HP/JS-nan-constants.html
 NET-html-checkbox-size http://127.0.0.1:$HP/HTML-checkbox-size.html
+NET-html-control-margins http://127.0.0.1:$HP/HTML-control-margins.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -735,6 +736,11 @@ c224p=$(ls "$R"/*NET-html-checkbox-size.plot 2>/dev/null | head -1)
 c224r=$(sed -n 's/.*STR \(CHECKBOX224: [0-9]*\/[0-9]* passed\).*/\1/p' "$c224p" 2>/dev/null | head -1)
 echo "  html-checkbox-size: ${c224r:-no summary}"
 [ -n "$c224p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$c224p" | sed 's/^STR /  /'
+# Patch 225: no margin on form controls.
+m225p=$(ls "$R"/*NET-html-control-margins.plot 2>/dev/null | head -1)
+m225r=$(sed -n 's/.*STR \(CTLMARGIN225: [0-9]*\/[0-9]* passed\).*/\1/p' "$m225p" 2>/dev/null | head -1)
+echo "  html-control-margins: ${m225r:-no summary}"
+[ -n "$m225p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$m225p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -964,6 +970,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$r223r" = "RANGECOL223: 4/4 passed" ] && \
 [ "$ncr" = "NANCONST: 4/4 passed" ] && \
 [ "$c224r" = "CHECKBOX224: 4/4 passed" ] && \
+[ "$m225r" = "CTLMARGIN225: 3/3 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
