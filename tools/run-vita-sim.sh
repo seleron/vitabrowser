@@ -254,6 +254,10 @@ NET-css-table-caption http://127.0.0.1:$HP/CSS-table-caption.html
 NET-js-inline-rect http://127.0.0.1:$HP/JS-inline-rect.html
 NET-html-hidden-details http://127.0.0.1:$HP/HTML-hidden-details.html
 NET-css-flow-root http://127.0.0.1:$HP/CSS-flow-root.html
+NET-css-grid-autofill http://127.0.0.1:$HP/CSS-grid-autofill.html
+NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
+NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
+NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -621,6 +625,26 @@ f204p=$(ls "$R"/*NET-css-flow-root.plot 2>/dev/null | head -1)
 f204r=$(sed -n 's/.*STR \(FLOWROOT204: [0-9]*\/[0-9]* passed\).*/\1/p' "$f204p" 2>/dev/null | head -1)
 echo "  CSS-flow-root: ${f204r:-no summary}"
 [ -n "$f204p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$f204p" | sed 's/^STR /  /'
+# Patch 206: grid auto-fill/auto-fit by container width; spaced grid-area.
+g206p=$(ls "$R"/*NET-css-grid-autofill.plot 2>/dev/null | head -1)
+g206r=$(sed -n 's/.*STR \(GRIDFILL206: [0-9]*\/[0-9]* passed\).*/\1/p' "$g206p" 2>/dev/null | head -1)
+echo "  css-grid-autofill: ${g206r:-no summary}"
+[ -n "$g206p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$g206p" | sed 's/^STR /  /'
+# Patch 207: svh/lvh/dvh (etc.) viewport units; lh resolves.
+v207p=$(ls "$R"/*NET-css-viewport-units.plot 2>/dev/null | head -1)
+v207r=$(sed -n 's/.*STR \(VUNITS207: [0-9]*\/[0-9]* passed\).*/\1/p' "$v207p" 2>/dev/null | head -1)
+echo "  css-viewport-units: ${v207r:-no summary}"
+[ -n "$v207p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$v207p" | sed 's/^STR /  /'
+# Patch 208: -webkit-line-clamp clamps the box to N lines.
+l208p=$(ls "$R"/*NET-css-line-clamp.plot 2>/dev/null | head -1)
+l208r=$(sed -n 's/.*STR \(CLAMP208: [0-9]*\/[0-9]* passed\).*/\1/p' "$l208p" 2>/dev/null | head -1)
+echo "  css-line-clamp: ${l208r:-no summary}"
+[ -n "$l208p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$l208p" | sed 's/^STR /  /'
+# Patch 210: 1ch is 0.5em when the "0" glyph is not measured.
+c210p=$(ls "$R"/*NET-css-ch-unit.plot 2>/dev/null | head -1)
+c210r=$(sed -n 's/.*STR \(CHUNIT210: [0-9]*\/[0-9]* passed\).*/\1/p' "$c210p" 2>/dev/null | head -1)
+echo "  css-ch-unit: ${c210r:-no summary}"
+[ -n "$c210p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$c210p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -793,6 +817,10 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$i202r" = "INLINERECT: 6/6 passed" ] && \
 [ "$h203r" = "HIDDEN203: 9/9 passed" ] && \
 [ "$f204r" = "FLOWROOT204: 4/4 passed" ] && \
+[ "$g206r" = "GRIDFILL206: 8/8 passed" ] && \
+[ "$v207r" = "VUNITS207: 4/4 passed" ] && \
+[ "$l208r" = "CLAMP208: 4/4 passed" ] && \
+[ "$c210r" = "CHUNIT210: 2/2 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \

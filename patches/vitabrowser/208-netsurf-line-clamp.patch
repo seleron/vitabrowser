@@ -1,0 +1,186 @@
+# netsurf: -webkit-line-clamp / line-clamp clamp the box to N lines (patch 208, needs 207's lh)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser f352150 (patch stack through 205)
+#
+# Card titles and summaries on news, shop and blog pages clamp to N lines
+# with display: -webkit-box; -webkit-box-orient: vertical;
+# -webkit-line-clamp: N; overflow: hidden. modern_compat dropped the
+# clamp, so every clamped block showed all of its text and the cards grew
+# to fit. macsurf__rewrite_line_clamp (run just before modern_compat, on
+# stylesheets and style="" alike) rewrites an integer -webkit-line-clamp
+# or line-clamp to `max-height: Nlh`: the legacy WebKit clamp sizes the
+# box to N lines and lets the rest overflow, which is what that does; the
+# page's own overflow: hidden cuts the text. No ellipsis is drawn, and
+# the clamp applies whether or not display: -webkit-box is in effect
+# (pages set them together). Non-integer values are still dropped.
+#
+# Test: testpages/pages/CSS-line-clamp.html (CLAMP208, 4 checks,
+# Chromium 4/4; 1/4 without 206-208): clamp 2 at 20px lines is 40px, an
+# inline-style clamp 3 is 60px, a one-line text keeps its line, a
+# line-height: normal clamp lands within Chromium's font-dependent range.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -3564,6 +3564,114 @@
+  *    (10 leading spaces; first cycle still renders via fixes49)
+  *  - `repeating-radial-gradient(` -> `          radial-gradient(`
+  */
++/* VitaBrowser patch 208: `-webkit-line-clamp: N` / `line-clamp: N` ->
++ * `max-height: Nlh`. Card titles and summaries everywhere clamp to N
++ * lines with display: -webkit-box + -webkit-box-orient: vertical +
++ * overflow: hidden; the declaration used to be dropped (modern_compat),
++ * so every clamped block showed its whole text. The legacy WebKit clamp
++ * sizes the box to N lines and leaves the rest to overflow, which is
++ * what max-height: Nlh does (patch 207 resolves lh); the page's own
++ * overflow: hidden then cuts the text. No ellipsis is drawn. Only an
++ * integer value is rewritten; `none` etc. are still dropped. Returns NULL
++ * when nothing matched. */
++static char *
++macsurf__rewrite_line_clamp(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	static const char *const keys[] = { "line-clamp", NULL };
++	static const char *const names[] = { "-webkit-line-clamp", "line-clamp" };
++	char *out;
++	size_t cap, pos = 0, i = 0;
++	int changed = 0;
++
++	if (!macsurf__has_any_ci(data, in_size, keys))
++		return NULL;
++	cap = in_size + 64;
++	out = (char *)malloc(cap);
++	if (out == NULL)
++		return NULL;
++	while (i < in_size) {
++		size_t k;
++		int matched = 0;
++
++		for (k = 0; k < 2 && !matched; k++) {
++			size_t nl = strlen(names[k]), j, v, ve;
++			int n = 0, digits = 0;
++			char tmp[40];
++			int tl;
++
++			if (!macsurf__match_prop_name(data, in_size, i,
++					names[k], nl))
++				continue;
++			j = i + nl;
++			while (j < in_size && (data[j] == ' ' || data[j] == '\t'))
++				j++;
++			if (j >= in_size || data[j] != ':')
++				continue;
++			v = j + 1;
++			while (v < in_size && (data[v] == ' ' || data[v] == '\t'))
++				v++;
++			ve = v;
++			while (ve < in_size && data[ve] >= '0' && data[ve] <= '9' &&
++					digits < 3) {
++				n = n * 10 + (data[ve] - '0');
++				ve++;
++				digits++;
++			}
++			if (digits == 0 || n < 1)
++				continue;
++			/* the value must end here (spaces, !important ok) */
++			{
++				size_t e = ve;
++				while (e < in_size && (data[e] == ' ' ||
++						data[e] == '\t'))
++					e++;
++				if (e < in_size && data[e] != ';' &&
++						data[e] != '}' && data[e] != '!')
++					continue;
++			}
++			tl = snprintf(tmp, sizeof(tmp), "max-height: %dlh", n);
++			if (tl <= 0)
++				continue;
++			if (pos + (size_t)tl + 1 >= cap) {
++				char *neu;
++				cap = (pos + (size_t)tl + 1) * 2;
++				neu = (char *)realloc(out, cap);
++				if (neu == NULL) {
++					free(out);
++					return NULL;
++				}
++				out = neu;
++			}
++			memcpy(out + pos, tmp, (size_t)tl);
++			pos += (size_t)tl;
++			i = ve;
++			matched = 1;
++			changed = 1;
++		}
++		if (matched)
++			continue;
++		if (pos + 2 >= cap) {
++			char *neu;
++			cap = cap * 2;
++			neu = (char *)realloc(out, cap);
++			if (neu == NULL) {
++				free(out);
++				return NULL;
++			}
++			out = neu;
++		}
++		out[pos++] = data[i++];
++	}
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	out[pos] = '\0';
++	*out_size_p = pos;
++	return out;
++}
++
+ static char *
+ macsurf__rewrite_modern_compat(const char *data, size_t in_size,
+ 		size_t *out_size_p)
+@@ -5808,6 +5916,13 @@
+ 	 * Two contracts, matching nscss_process_data:
+ 	 *   - size-changing (out_size_p): swap + take next_size.
+ 	 *   - same-size in-place (no out_size_p, NULL=OOM): swap + keep size. */
++	next = macsurf__rewrite_line_clamp(src, src_size, &next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
+ 	next = macsurf__rewrite_modern_compat(src, src_size, &next_size);
+ 	if (next != NULL) {
+ 		if (cur != NULL) free(cur);
+@@ -6424,6 +6539,8 @@
+ 	char *rewritten_transform = NULL;
+ 	char *rewritten_object_position = NULL;
+ 	char *rewritten_modern_compat = NULL;
++	char *rewritten_line_clamp = NULL;	/* patch 208 */
++	size_t line_clamp_size = 0;
+ 	char *rewritten_inset = NULL;
+ 	char *rewritten_lshort = NULL;   /* #247 phase 2 */
+ 	char *rewritten_at_rules = NULL;   /* fixes273 - @supports/@layer */
+@@ -6728,6 +6845,16 @@
+ 	 * from `repeating-linear/radial-gradient(` so the first cycle still
+ 	 * renders through the existing gradient handler. In-place,
+ 	 * length-preserving; returns NULL when no rewrites apply. */
++	/* patch 208: line-clamp -> max-height: Nlh, before modern_compat
++	 * drops what is left of it */
++	rewritten_line_clamp = macsurf__rewrite_line_clamp(final_data,
++			(size_t)final_size, &line_clamp_size);
++	if (rewritten_line_clamp != NULL &&
++			line_clamp_size <= (size_t)0x7fffffff) {
++		final_data = (const char *)rewritten_line_clamp;
++		final_size = (unsigned int)line_clamp_size;
++	}
++
+ 	rewritten_modern_compat = macsurf__rewrite_modern_compat(final_data,
+ 			(size_t)final_size, &modern_compat_size);
+ 	if (rewritten_modern_compat != NULL &&
+@@ -6814,6 +6941,7 @@
+ 	if (rewritten_inset != NULL) free(rewritten_inset);
+ 	if (rewritten_lshort != NULL) free(rewritten_lshort); /* #247 phase 2 */
+ 	if (rewritten_modern_compat != NULL) free(rewritten_modern_compat);
++	if (rewritten_line_clamp != NULL) free(rewritten_line_clamp);
+ 	if (rewritten_object_position != NULL) free(rewritten_object_position);
+ 	if (rewritten_transform != NULL) free(rewritten_transform);
+ 	if (rewritten_text_shadow != NULL) free(rewritten_text_shadow);

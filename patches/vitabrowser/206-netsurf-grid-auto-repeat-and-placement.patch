@@ -1,0 +1,263 @@
+# netsurf: grid repeat(auto-fill|auto-fit) sized by the container; numeric grid-area/-row/-column with spaces (patch 206, with 206-libcss)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser f352150 (patch stack through 205)
+#
+# Two grid bugs found by a geometry probe against Chromium:
+#
+# 1. grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)) -- the
+#    card-grid idiom -- got its column count at CSS-rewrite time from a
+#    900px viewport guess (fixes362), capped at 8, so a 350px grid had 8
+#    columns of 35px. The rewrite now emits one marker ("afN", "atN",
+#    "apN"; 206-libcss packs them) for repeat(auto-fill|auto-fit,
+#    minmax(Npx, ...)) and repeat(auto-*, Npx) in column lists, and
+#    layout_grid expands it against the grid's own width:
+#    n = floor((W + gap) / (N + gap)), at least 1, at most 16; auto-fit
+#    collapses the empty tracks (never more tracks than in-flow items);
+#    minmax tracks become fixes1214's px-floor + 1fr tracks, plain
+#    lengths px tracks. emit_one_track lets the markers through (it folds
+#    unknown tokens to 1fr). Row lists keep the old expansion (the rows
+#    parser knows no markers). Other auto-repeat forms (several tracks,
+#    non-px minimums) keep the old estimate.
+#
+# 2. macsurf__grid_parse_int_or_minus1 stopped right after the digits, and
+#    every caller then tests for '/', so `grid-area: 2 / 1 / 3 / 3` -- the
+#    form the grid-template-areas pass emits and most authors write --
+#    lost everything after its first number: named areas never spanned
+#    ("c c" was one column) and numeric placements with spaces fell back
+#    to auto-placement. It now skips the whitespace after the number.
+#
+# Test: testpages/pages/CSS-grid-autofill.html (GRIDFILL206, 8 checks,
+# Chromium 8/8; 1/8 without 206-208): 3 columns of 110px in 350px and the
+# 4th item wrapping, 6 columns in 700px, auto-fit stretching 2 items,
+# auto-fill keeping empty tracks, fixed 150px tracks, a "c c" area
+# spanning, grid-area: 1 / 2 / 2 / 4, grid-column: 1 / 3. Full gate: see
+# docs/build-loop-state.md.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -264,6 +264,13 @@
+ 			(tok[1] == 'm' || tok[1] == 'M')) {
+ 		is_minmax_marker = true;
+ 	}
++	/* patch 206: the auto-fill / auto-fit markers ("af100", "at100",
++	 * "ap150") pass through for p_macsurf_grid.c */
++	if (tok_len > 2 && tok[0] == 'a' &&
++			(tok[1] == 'f' || tok[1] == 't' || tok[1] == 'p') &&
++			tok[2] >= '0' && tok[2] <= '9') {
++		is_minmax_marker = true;
++	}
+ 	if (!is_value && !is_auto && !is_minmax_marker) {
+ 		tok_to_emit = fr_fallback;
+ 		emit_len = 3;
+@@ -368,7 +375,7 @@
+  * which case the caller should fall back to the count-only rewrite). */
+ static size_t
+ macsurf__emit_grid_tracks(const char *p, const char *end,
+-		char *out, size_t cap)
++		char *out, size_t cap, bool columns)
+ {
+ 	size_t pos = 0;
+ 	int emitted = 0;
+@@ -393,6 +400,7 @@
+ 			const char *inner_end;
+ 			int depth = 1;
+ 			int r;
++			char auto_kind = 0;
+ 
+ 			p += 7;
+ 			while (p < end && (*p == ' ' || *p == '\t')) p++;
+@@ -404,6 +412,15 @@
+ 				}
+ 				if (n > 0 && n < 1000) mult = n;
+ 			} else {
++				/* patch 206: remember which auto repeat this is;
++				 * the single-track forms below are resolved at
++				 * layout against the real container width. */
++				if ((end - p) >= 8 &&
++						strncasecmp(p, "auto-fit", 8) == 0)
++					auto_kind = 't';
++				else if ((end - p) >= 9 &&
++						strncasecmp(p, "auto-fill", 9) == 0)
++					auto_kind = 'f';
+ 				/* fixes362 - auto-fill / auto-fit: compute the
+ 				 * column count by reading the minmax(N<unit>, ...)
+ 				 * min-track-width and dividing a viewport-estimate
+@@ -467,6 +484,59 @@
+ 			}
+ 			inner_end = p;
+ 			if (p < end && *p == ')') p++;
++			/* patch 206: repeat(auto-fill|auto-fit, minmax(Npx, ...))
++			 * -> one "afN" / "atN" marker, repeat(auto-*, Npx) ->
++			 * "apN": layout_grid expands it to as many tracks as fit
++			 * the container (the 900px viewport guess above made a
++			 * 350px grid of 8 columns). */
++			if (auto_kind != 0 && columns) {
++				const char *q = inner_start, *qe = inner_end;
++				int px = 0, n = -1;
++				char marker[32];
++				bool mm = false;
++
++				while (q < qe && (*q == ' ' || *q == '\t')) q++;
++				while (qe > q && (qe[-1] == ' ' || qe[-1] == '\t'))
++					qe--;
++				if ((qe - q) > 7 && strncasecmp(q, "minmax(", 7) == 0 &&
++						qe[-1] == ')') {
++					const char *c;
++					mm = true;
++					q += 7;
++					qe--;
++					/* only the min part matters; the max must
++					 * be the one track in the repeat */
++					for (c = q; c < qe; c++)
++						if (*c == '(') { mm = false; break; }
++				}
++				while (q < qe && (*q == ' ' || *q == '\t')) q++;
++				while (q < qe && *q >= '0' && *q <= '9' && px < 100000) {
++					px = px * 10 + (*q - '0');
++					q++;
++				}
++				if (px > 0 && (qe - q) >= 2 &&
++						(q[0] == 'p' || q[0] == 'P') &&
++						(q[1] == 'x' || q[1] == 'X')) {
++					q += 2;
++					while (q < qe && (*q == ' ' || *q == '\t')) q++;
++					if (mm && q < qe && *q == ',')
++						n = snprintf(marker, sizeof(marker),
++								"a%c%d", auto_kind, px);
++					else if (!mm && q == qe)
++						n = snprintf(marker, sizeof(marker),
++								"ap%d", px);
++				}
++				if (n > 0) {
++					n = macsurf__emit_one_track(out + pos,
++							cap - pos, marker,
++							(size_t)n);
++					if (n < 0) break;
++					pos += (size_t)n;
++					room--;
++					emitted++;
++					continue;
++				}
++			}
+ 
+ 			for (r = 0; r < mult && room > 0; r++) {
+ 				macsurf__emit_flat_tracks(inner_start,
+@@ -662,7 +732,7 @@
+ 
+ 		tracks_written = macsurf__emit_grid_tracks(
+ 				out + val_start, out + val_end,
+-				buf + prefix_len, tracks_room);
++				buf + prefix_len, tracks_room, true);
+ 
+ 		if (tracks_written == 0 ||
+ 				prefix_len + tracks_written > total_replace) {
+@@ -774,7 +844,7 @@
+ 
+ 		tracks_written = macsurf__emit_grid_tracks(
+ 				out + val_start, out + val_end,
+-				buf + prefix_len, tracks_room);
++				buf + prefix_len, tracks_room, false);
+ 
+ 		if (tracks_written == 0 ||
+ 				prefix_len + tracks_written > total_replace) {
+@@ -877,6 +947,12 @@
+ 		n = n * 10 + (*q - '0');
+ 		q++;
+ 	}
++	/* patch 206: and the space before a following '/'. Callers test
++	 * *p == '/' next, so `grid-area: 2 / 1 / 3 / 3` -- the form the
++	 * template-areas pass emits and most authors write -- lost
++	 * everything after its first number and the item fell back to
++	 * auto-placement. */
++	while (q < end && (*q == ' ' || *q == '\t')) q++;
+ 	*p = q;
+ 	if (n < 1) return 0;
+ 	if (n > 254) n = 254;
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -433,6 +433,10 @@
+ #define MACSURF_GRID_TRACK_UNIT_PERCENT 3
+ #define MACSURF_GRID_TRACK_UNIT_AUTO    4  /* fixes817 (#62): content-sized */
+ #define MACSURF_GRID_TRACK_UNIT_MINMAX_FR 5 /* fixes1214: px floor + 1fr */
++/* patch 206: repeat(auto-fill|auto-fit, ...) markers (p_macsurf_grid.c) */
++#define MACSURF_GRID_TRACK_UNIT_AUTOFILL_FR 6
++#define MACSURF_GRID_TRACK_UNIT_AUTOFIT_FR  7
++#define MACSURF_GRID_TRACK_UNIT_AUTOFILL_PX 8
+ 
+ /* fixes158: per-child placement scratch. The two-pass layout assigns
+  * (col, row, col_span, row_span) in pass 1 (placement + child layout
+@@ -530,6 +534,8 @@
+ 	css_fixed gap_len = 0;
+ 	css_unit gap_unit = CSS_UNIT_PX;
+ 	const int32_t *raw_tracks;
++	int32_t auto_tracks[MACSURF_GRID_TRACK_MAX + 1];	/* patch 206 */
++	int raw_cap = MACSURF_CSS_GRID_TRACK_MAX;		/* patch 206 */
+ 	int track_widths[MACSURF_GRID_TRACK_MAX];
+ 	int track_base[MACSURF_GRID_TRACK_MAX];
+ 	int track_x[MACSURF_GRID_TRACK_MAX];
+@@ -708,7 +714,63 @@
+ 			}
+ 		}
+ 
+-		for (i = 0; i < MACSURF_CSS_GRID_TRACK_MAX; i++) {
++		/* patch 206: repeat(auto-fill|auto-fit, minmax(Npx, ...)) /
++		 * repeat(auto-*, Npx) arrive as one marker track. Expand it
++		 * to as many tracks as fit this container: n = floor((W +
++		 * gap) / (N + gap)), at least 1 (CSS Grid 7.2.3.2); auto-fit
++		 * collapses the empty ones, so it is never more tracks than
++		 * items. minmax tracks become fixes1214's px-floor + 1fr
++		 * tracks, plain lengths px tracks. */
++		if (raw_tracks[1] == 0) {
++			uint8_t au = (uint8_t)(((uint32_t)raw_tracks[0] >> 28) &
++					0xF);
++			int32_t amin = (int32_t)((uint32_t)raw_tracks[0] &
++					0x0FFFFFFFU);
++
++			if (au == MACSURF_GRID_TRACK_UNIT_AUTOFILL_FR ||
++			    au == MACSURF_GRID_TRACK_UNIT_AUTOFIT_FR ||
++			    au == MACSURF_GRID_TRACK_UNIT_AUTOFILL_PX) {
++				int an, k;
++				uint8_t out_unit =
++					(au == MACSURF_GRID_TRACK_UNIT_AUTOFILL_PX)
++					? MACSURF_GRID_TRACK_UNIT_PX
++					: MACSURF_GRID_TRACK_UNIT_MINMAX_FR;
++
++				if (amin < 1)
++					amin = 1;
++				an = (container_width + col_gap) /
++						(amin + col_gap);
++				if (au == MACSURF_GRID_TRACK_UNIT_AUTOFIT_FR) {
++					struct box *ac;
++					int items = 0;
++					for (ac = grid->children; ac != NULL;
++							ac = ac->next)
++						if (ac->style != NULL &&
++						    css_computed_position(
++							ac->style) !=
++						    CSS_POSITION_ABSOLUTE &&
++						    css_computed_position(
++							ac->style) !=
++						    CSS_POSITION_FIXED)
++							items++;
++					if (an > items)
++						an = items;
++				}
++				if (an < 1)
++					an = 1;
++				if (an > MACSURF_GRID_TRACK_MAX)
++					an = MACSURF_GRID_TRACK_MAX;
++				for (k = 0; k < an; k++)
++					auto_tracks[k] = (int32_t)(
++						((uint32_t)out_unit << 28) |
++						((uint32_t)amin & 0x0FFFFFFFU));
++				auto_tracks[an] = 0;
++				raw_tracks = auto_tracks;
++				raw_cap = MACSURF_GRID_TRACK_MAX;
++			}
++		}
++
++		for (i = 0; i < raw_cap; i++) {
+ 			int32_t pk = raw_tracks[i];
+ 			uint8_t unit;
+ 			int32_t value;

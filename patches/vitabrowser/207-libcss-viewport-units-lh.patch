@@ -1,0 +1,102 @@
+# libcss: small/large/dynamic viewport units; the lh unit resolves (patch 207)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser f352150 (patch stack through 205)
+#
+# 1. svh/lvh/dvh, svw/lvw/dvw, svi/.., svb/.., svmin/.., svmax/.. (CSS
+#    Values 4) were unknown units, so `height: 100dvh` -- the modern
+#    full-screen idiom -- dropped the whole declaration.
+#    css__parse_unit_keyword maps each to its plain v* unit: they differ
+#    only where browser UI slides over the viewport, which the Vita's
+#    never does.
+# 2. lh parsed but css_unit__px_per_unit had no case for it and answered
+#    0. 1lh is now the element's computed line-height: a number times the
+#    font size, a percentage of it, a length converted as such, and
+#    normal (or a calc/lh line-height) as 1.2em. 208 relies on it.
+#
+# Test: testpages/pages/CSS-viewport-units.html (VUNITS207, 4 checks,
+# Chromium 4/4; 0/4 without the patch); lh through
+# CSS-line-clamp.html (208).
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -1944,6 +1944,34 @@
+  */
+ css_error css__parse_unit_keyword(const char *ptr, size_t len, uint32_t *unit)
+ {
++	/* VitaBrowser patch 207: the small / large / dynamic viewport units
++	 * (CSS Values 4: svh, lvh, dvh, and the vw/vi/vb/vmin/vmax forms).
++	 * They differ only where browser UI slides in and out of the
++	 * viewport; the Vita's never does, so each is its plain v* unit.
++	 * They were unknown, so `height: 100dvh` -- the modern full-screen
++	 * idiom -- dropped the whole declaration. */
++	if ((len == 3 || len == 5) &&
++			(ptr[0] == 's' || ptr[0] == 'S' ||
++			 ptr[0] == 'l' || ptr[0] == 'L' ||
++			 ptr[0] == 'd' || ptr[0] == 'D') &&
++			(ptr[1] == 'v' || ptr[1] == 'V')) {
++		if (len == 3) {
++			switch (ptr[2]) {
++			case 'h': case 'H': *unit = UNIT_VH; return CSS_OK;
++			case 'w': case 'W': *unit = UNIT_VW; return CSS_OK;
++			case 'i': case 'I': *unit = UNIT_VI; return CSS_OK;
++			case 'b': case 'B': *unit = UNIT_VB; return CSS_OK;
++			default: break;
++			}
++		} else if (strncasecmp(ptr + 1, "vmin", 4) == 0) {
++			*unit = UNIT_VMIN;
++			return CSS_OK;
++		} else if (strncasecmp(ptr + 1, "vmax", 4) == 0) {
++			*unit = UNIT_VMAX;
++			return CSS_OK;
++		}
++	}
++
+ 	if (len == 4) {
+ 		if (strncasecmp(ptr, "grad", 4) == 0)
+ 			*unit = UNIT_GRAD;
+diff --git a/src/select/unit.c b/src/select/unit.c
+--- a/src/select/unit.c
++++ b/src/select/unit.c
+@@ -326,6 +326,42 @@
+ 	case CSS_UNIT_VW:
+ 		return FDIV(viewport_width, F_100);
+ 
++	case CSS_UNIT_LH:
++	{
++		/* VitaBrowser patch 207: 1lh is the element's computed
++		 * line-height (CSS Values 4). It parsed but resolved to 0
++		 * here. normal is taken as 1.2em; a length line-height
++		 * cannot itself be in lh (that would refer to the parent's,
++		 * and it is not worth the recursion). */
++		css_fixed fs = css_unit__font_size_px(ref_style,
++				font_size_default, font_size_minimum,
++				viewport_height, viewport_width, ctx);
++		css_fixed lh = 0;
++		css_unit lhu = CSS_UNIT_PX;
++
++		if (ref_style == NULL)
++			return FMUL(fs, FLTTOFIX(1.2));
++		switch (css_computed_line_height(ref_style, &lh, &lhu)) {
++		case CSS_LINE_HEIGHT_NUMBER:
++			return FMUL(fs, lh);
++		case CSS_LINE_HEIGHT_DIMENSION:
++			if (lhu == CSS_UNIT_PCT)
++				return FDIV(FMUL(fs, lh), F_100);
++			if (lhu == CSS_UNIT_LH || lhu == CSS_UNIT_CALC ||
++					lhu == CSS_UNIT_MIN ||
++					lhu == CSS_UNIT_MAX ||
++					lhu == CSS_UNIT_CLAMP)
++				return FMUL(fs, FLTTOFIX(1.2));
++			return FMUL(lh, css_unit__px_per_unit(measure,
++					ref_style, root_style,
++					font_size_default, font_size_minimum,
++					viewport_height, viewport_width,
++					lhu, lh, ctx, pw));
++		default:
++			return FMUL(fs, FLTTOFIX(1.2));
++		}
++	}
++
+ 	case CSS_UNIT_CALC: /* Fall through */
+ 	case CSS_UNIT_MIN:  /* Fall through */
+ 	case CSS_UNIT_MAX:  /* Fall through */

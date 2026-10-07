@@ -1,0 +1,73 @@
+# libcss: grid auto-fill / auto-fit track markers (patch 206, with 206-netsurf)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser f352150 (patch stack through 205)
+#
+# 206-netsurf's CSS rewrite now hands repeat(auto-fill|auto-fit, ...) to
+# -macsurf-grid as one marker track instead of a guessed count: "af<N>"
+# (auto-fill, minmax(Npx, ...)), "at<N>" (auto-fit, minmax(Npx, ...)),
+# "ap<N>" (auto-fill/fit, Npx). p_macsurf_grid.c packs them as track
+# units 6, 7 and 8 with N as the value (4-bit unit field, 28-bit value,
+# as the existing units); a list starting with one is a track list.
+# layout_grid.c (206-netsurf) expands the marker.
+diff --git a/src/parse/properties/p_macsurf_grid.c b/src/parse/properties/p_macsurf_grid.c
+--- a/src/parse/properties/p_macsurf_grid.c
++++ b/src/parse/properties/p_macsurf_grid.c
+@@ -44,6 +44,30 @@
+ #define MACSURF_GRID_TRACK_UNIT_PERCENT 3
+ #define MACSURF_GRID_TRACK_UNIT_AUTO    4  /* fixes817 (#62): content-sized */
+ #define MACSURF_GRID_TRACK_UNIT_MINMAX_FR 5 /* fixes1214: px floor + 1fr */
++/* VitaBrowser patch 206: repeat(auto-fill|auto-fit, minmax(Npx, ...)) and
++ * repeat(auto-*, Npx), from css_rewrite's "afN" / "atN" / "apN" markers.
++ * The value is N; layout_grid expands the track to as many as fit. */
++#define MACSURF_GRID_TRACK_UNIT_AUTOFILL_FR 6
++#define MACSURF_GRID_TRACK_UNIT_AUTOFIT_FR  7
++#define MACSURF_GRID_TRACK_UNIT_AUTOFILL_PX 8
++
++/* patch 206: the unit of an "af"/"at"/"ap" + digits marker, or 0 */
++static uint8_t macsurf__auto_marker_unit(const char *raw, size_t len)
++{
++	size_t k;
++
++	if (len < 3 || (raw[0] != 'a' && raw[0] != 'A'))
++		return 0;
++	for (k = 2; k < len; k++)
++		if (raw[k] < '0' || raw[k] > '9')
++			return 0;
++	switch (raw[1]) {
++	case 'f': case 'F': return MACSURF_GRID_TRACK_UNIT_AUTOFILL_FR;
++	case 't': case 'T': return MACSURF_GRID_TRACK_UNIT_AUTOFIT_FR;
++	case 'p': case 'P': return MACSURF_GRID_TRACK_UNIT_AUTOFILL_PX;
++	default: return 0;
++	}
++}
+ #define MACSURF_GRID_TRACK_MAX          8
+ 
+ static int32_t macsurf__pack_track(uint8_t unit, int32_t value)
+@@ -142,6 +166,8 @@
+ 				(raw[1] == 'm' || raw[1] == 'M')) {
+ 			track_list_form = true;
+ 		}
++		if (macsurf__auto_marker_unit(raw, raw_len) != 0)
++			track_list_form = true;
+ 	}
+ 
+ 	if (track_list_form) {
+@@ -173,6 +199,18 @@
+ 					parserutils_vector_iterate(vector, ctx);
+ 					continue;
+ 				}
++				if (macsurf__auto_marker_unit(raw, raw_len) != 0) {
++					int32_t px = 0;
++					size_t k;
++					for (k = 2; k < raw_len; k++)
++						if (px < 10000000)
++							px = px * 10 + (raw[k] - '0');
++					tracks[n_tracks++] = macsurf__pack_track(
++						macsurf__auto_marker_unit(raw,
++							raw_len), px);
++					parserutils_vector_iterate(vector, ctx);
++					continue;
++				}
+ 				if (lwc_string_caseless_isequal(token->idata,
+ 						c->strings[AUTO], &amatch) ==
+ 						lwc_error_ok && amatch) {
