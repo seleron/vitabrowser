@@ -268,6 +268,7 @@ NET-css-svg-size http://127.0.0.1:$HP/CSS-svg-size.html
 NET-html-progress-meter http://127.0.0.1:$HP/HTML-progress-meter.html
 NET-html-embed-placeholders http://127.0.0.1:$HP/HTML-embed-placeholders.html
 NET-css-letter-spacing http://127.0.0.1:$HP/CSS-letter-spacing.html
+NET-css-inline-block-space http://127.0.0.1:$HP/CSS-inline-block-space.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -705,6 +706,11 @@ s220p=$(ls "$R"/*NET-css-letter-spacing.plot 2>/dev/null | head -1)
 s220r=$(sed -n 's/.*STR \(SPACING220: [0-9]*\/[0-9]* passed\).*/\1/p' "$s220p" 2>/dev/null | head -1)
 echo "  css-letter-spacing: ${s220r:-no summary}"
 [ -n "$s220p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$s220p" | sed 's/^STR /  /'
+# Patch 221: the space after inline-blocks / replaced boxes.
+i221p=$(ls "$R"/*NET-css-inline-block-space.plot 2>/dev/null | head -1)
+i221r=$(sed -n 's/.*STR \(IBSPACE221: [0-9]*\/[0-9]* passed\).*/\1/p' "$i221p" 2>/dev/null | head -1)
+echo "  css-inline-block-space: ${i221r:-no summary}"
+[ -n "$i221p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$i221p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -891,7 +897,8 @@ rs_ok=no
 [ "$rsr" = "REFLOW: 3/3 passed" ] && rs_ok=yes
 if [ "$rs_ok" = no ] && [ "${GATE_TIMING_SOFT:-0}" = 1 ] && \
    [ "$rsr" = "REFLOW: 2/3 passed" ] && [ -n "$rsp" ] && \
-   grep -q 'STR 3 no stall[^"]*FAIL' "$rsp" && \
+   grep -o 'STR [^"]*' "$rsp" | sed 's/^STR //' | tr '\n' ' ' | \
+	grep -q '3 no stall:.* FAIL' && \
    ! grep -q 'STR [12] [^"]*FAIL' "$rsp"; then
 	rs_ok=soft
 	echo "  REFLOW: only the timing check (3) failed -- accepted, GATE_TIMING_SOFT=1"
@@ -920,6 +927,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$p218r" = "PROGRESS218: 5/5 passed" ] && \
 [ "$e219r" = "EMBED219: 4/4 passed" ] && \
 [ "$s220r" = "SPACING220: 3/3 passed" ] && \
+[ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \

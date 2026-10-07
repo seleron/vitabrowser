@@ -1,0 +1,110 @@
+# netsurf: keep the space between inline-blocks, images and buttons (patch 221)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 209e22b (patch stack through 220)
+#
+# box_construct_text hands a text's leading space -- or a lone " "
+# between two elements -- to the box before it (box->space). The line
+# passes honoured that only after text and inline boxes: after an
+# inline-block (inline-flex / -grid) or a replaced box they reset the
+# space to 0. So "<li inline-block>Home</li> <li>News</li>" menus,
+# "<img> <img>" rows and "<button>OK</button> <button>" pairs ran
+# together, and shrink-to-fit widths came out a space short.
+#
+#  - layout.c: vb_atomic_space() measures such a box's space in its own
+#    font (as text spaces are); layout_minmax_line adds it to the max
+#    width when a box follows, and both layout_line passes put it after
+#    inline-blocks and replaced boxes.
+#
+# Test: testpages/pages/CSS-inline-block-space.html (IBSPACE221, 5
+# checks, Chromium 5/5; before, 1/5): one space between inline-blocks
+# on one line or across a newline, between inline-block menu items,
+# between images and buttons (less their margins), and inside a float's
+# shrink-to-fit width.
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -777,6 +777,32 @@
+ }
+ 
+ /**
++ * patch 221: the width of the collapsed space after an atomic inline (an
++ * inline-block, inline-flex / -grid, or a replaced box such as an image or
++ * button). box_construct_text hands a text's leading space -- or a lone
++ * " " between elements -- to the box before it, but the line passes only
++ * honoured it after text and inline boxes, so "<span ib>a</span>
++ * <span ib>b</span>" (inline-block menus, image rows, buttons) ran
++ * together. Measured in the box's own font, as text spaces are.
++ */
++static int
++vb_atomic_space(struct box *b,
++		const struct gui_layout_table *font_func,
++		const html_content *content)
++{
++	plot_font_style_t fstyle;
++
++	if (b->space == 0 || b->style == NULL)
++		return 0;
++	if (b->space == UNKNOWN_WIDTH) {
++		font_plot_style_from_css(&content->unit_len_ctx, b->style,
++				&fstyle);
++		font_func->width(&fstyle, " ", 1, &b->space);
++	}
++	return b->space;
++}
++
++/**
+  * Calculate minimum and maximum width of a line.
+  *
+  * \param first       a box in an inline container
+@@ -856,6 +882,9 @@
+ 			if (min < b->min_width)
+ 				min = b->min_width;
+ 			max += b->max_width;
++			if (b->next)
++				max += vb_atomic_space(b, font_func,
++						content);
+ 
+ 			if (b->flags & HAS_HEIGHT)
+ 				*line_has_height = true;
+@@ -1132,6 +1161,8 @@
+ 			min = width;
+ 		if (width > 0)
+ 			max += width;
++		if (b->next)
++			max += vb_atomic_space(b, font_func, content);
+ 
+ 		*line_has_height = true;
+ 	}
+@@ -4512,7 +4543,7 @@
+ 					b->padding[RIGHT] +
+ 					b->border[RIGHT].width +
+ 					b->margin[RIGHT];
+-			space_after = 0;
++			space_after = vb_atomic_space(b, font_func, content);
+ 			continue;
+ 		}
+ 
+@@ -4629,7 +4660,7 @@
+ 			continue;
+ 		}
+ 
+-		space_after = 0;
++		space_after = vb_atomic_space(b, font_func, content);
+ 
+ 		/* inline replaced, 10.3.2 and 10.6.2 */
+ 		assert(b->style);
+@@ -4791,8 +4822,12 @@
+ 
+ 			space_before = space_after;
+ 			if (b->object || b->flags & REPLACE_DIM ||
+-					b->flags & IFRAME)
+-				space_after = 0;
++					b->flags & IFRAME ||
++					b->type == BOX_INLINE_BLOCK ||
++					b->type == BOX_INLINE_FLEX ||
++					b->type == BOX_INLINE_GRID)
++				space_after = vb_atomic_space(b, font_func,
++						content);
+ 			else if (b->text || b->type == BOX_INLINE_END ||
+ 					(b->type == BOX_INLINE &&
+ 					 b->space != 0)) {
