@@ -88,7 +88,8 @@ letter-/word-spacing and justified text on the Vita text path (220), the
 space between inline-blocks, images and buttons (221), fieldset/legend
 (222), range and color inputs as widgets (223). Open from the probes:
 @container (dropped), @layer (flattened), Shadow DOM, date inputs as
-plain text fields. Checkbox/radio at browsers' 13 x 13 (224).
+plain text fields. Checkbox/radio at browsers' 13 x 13 (224); no margin
+on text inputs, buttons, selects, textareas (225).
 
 ### WS-B Web platform (R1, R2, R4)
 1. **Event model conformance.** A listener registered on `document` without
