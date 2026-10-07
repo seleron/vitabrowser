@@ -1,0 +1,177 @@
+# netsurf: fieldset and legend drawn as in a browser (patch 222)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 7fc3b8d (patch stack through 221)
+#
+# <legend> had no UA style, so it was an inline beside the fieldset's
+# first control, inside a thin grey frame with 1.12em vertical margins:
+# a form's sections looked nothing like a browser's.
+#
+#  - default.css: browsers' fieldset box (2px groove, padding 0.35em
+#    0.75em 0.625em, 2px side margins, no vertical margin, min-width
+#    min-content); legend a block of width fit-content with 2px side
+#    padding, lifted onto the top border by a negative margin-top (the
+#    border and padding) whose margin-bottom puts the padding back below
+#    it -- the geometry browsers give it.
+#  - box_construct.c, box.h: VB_LEGEND flags <legend> boxes.
+#  - redraw.c: a block whose first in-flow child is a flagged legend
+#    draws its borders d lower (the top border through the legend's
+#    middle) in three clipped passes that leave the top border out
+#    behind the legend.
+#
+# Test: testpages/pages/HTML-fieldset-legend.html (FIELDSET222, 5
+# checks, Chromium 5/5; before, 1/5): the legend on the top border, the
+# content 0.35em below it, the legend shrink-to-fit, the padding and
+# border, and the margins.
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -100,6 +100,8 @@
+ 					 * visible (box_overflow_x/y) */
+ 	VB_PROGRESS = 1 << 18,	/* patch 218: <progress> / <meter>: redraw
+ 				 * paints the bar, not the children */
++	VB_LEGEND = 1 << 19,	/* patch 222: <legend>: a fieldset's top
++				 * border runs through the first one */
+ 	VB_DEFINITE_HEIGHT = 1 << 17,	/* VitaBrowser: an absolutely
+ 					 * positioned box whose height comes
+ 					 * from top + bottom: percentage
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1703,6 +1703,10 @@
+ 					 (tlen == 5 && strncasecmp(tag,
+ 						"meter", 5) == 0)))
+ 				box->flags |= VB_PROGRESS;
++			/* patch 222: <legend> */
++			if (!matched && tag != NULL && tlen == 6 &&
++					strncasecmp(tag, "legend", 6) == 0)
++				box->flags |= VB_LEGEND;
+ 			if (matched) {
+ 				/* fixes202: mark the SVG root as a replaced
+ 				 * element with given dimensions. Without this,
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -3449,6 +3449,88 @@
+ 
+ 
+ /**
++ * patch 222: the <legend> whose fieldset's top border runs through it --
++ * a block child flagged VB_LEGEND that sits at the top of the box (the
++ * first in-flow block; whitespace-only containers before it are skipped).
++ */
++static struct box *vb_fieldset_legend(struct box *box)
++{
++	struct box *c;
++
++	if (box->type != BOX_BLOCK || box->border[TOP].width <= 0)
++		return NULL;
++	for (c = box->children; c != NULL; c = c->next) {
++		if (c->flags & VB_LEGEND)
++			return c->type == BOX_BLOCK ? c : NULL;
++		if (c->type == BOX_INLINE_CONTAINER && c->height == 0)
++			continue;
++		if (c->type == BOX_FLOAT_LEFT || c->type == BOX_FLOAT_RIGHT)
++			continue;
++		return NULL;
++	}
++	return NULL;
++}
++
++/**
++ * patch 222: a fieldset's borders as browsers draw them: the top border
++ * through the middle of the legend (default.css lifts the legend onto
++ * it), left out behind the legend. The border is drawn d lower and d
++ * shorter, in three clipped passes around the gap.
++ */
++static bool vb_redraw_fieldset_borders(struct box *box, struct box *lg,
++		int x_parent, int y_parent, int padding_width,
++		int padding_height, const struct rect *r, float scale,
++		const struct redraw_context *ctx)
++{
++	int bt = box->border[TOP].width;
++	int lh = lg->border[TOP].width + lg->padding[TOP] + lg->height +
++			lg->padding[BOTTOM] + lg->border[BOTTOM].width;
++	/* lg->y is its padding box, relative to box's padding box */
++	int d = lg->y - lg->border[TOP].width + (lh - bt) / 2 + bt;
++	int gx0 = x_parent + box->x + lg->x - lg->border[LEFT].width;
++	int gx1 = x_parent + box->x + lg->x + lg->padding[LEFT] +
++			lg->width + lg->padding[RIGHT] +
++			lg->border[RIGHT].width;
++	int ytop = y_parent + box->y + d;	/* below the moved border */
++	struct rect part[3];
++	int i;
++
++	if (d < 0 || d >= padding_height || gx1 <= gx0) {
++		return html_redraw_borders(box, x_parent, y_parent,
++				padding_width, padding_height, r, scale, ctx);
++	}
++	if (scale != 1.0) {
++		gx0 *= scale;
++		gx1 *= scale;
++		ytop *= scale;
++	}
++	part[0] = *r;
++	if (part[0].x1 > gx0)
++		part[0].x1 = gx0;
++	part[1] = *r;
++	if (part[1].x0 < gx1)
++		part[1].x0 = gx1;
++	part[2] = *r;
++	if (part[2].x0 < gx0)
++		part[2].x0 = gx0;
++	if (part[2].x1 > gx1)
++		part[2].x1 = gx1;
++	if (part[2].y0 < ytop)
++		part[2].y0 = ytop;
++	for (i = 0; i != 3; i++) {
++		if (part[i].x0 >= part[i].x1 || part[i].y0 >= part[i].y1)
++			continue;
++		if (ctx->plot->clip(ctx, &part[i]) != NSERROR_OK)
++			return false;
++		if (!html_redraw_borders(box, x_parent, y_parent + d,
++				padding_width, padding_height - d, &part[i],
++				scale, ctx))
++			return false;
++	}
++	return ctx->plot->clip(ctx, r) == NSERROR_OK;
++}
++
++/**
+  * Redraw the text content of a box, possibly partially highlighted
+  * because the text has been selected, or matches a search operation.
+  *
+@@ -5321,7 +5403,14 @@
+ 			macos9_plot_backdrop = current_background_color;
+ 		}
+ #endif
+-		if (!html_redraw_borders(box, x_parent, y_parent,
++		struct box *lg = vb_fieldset_legend(box);
++
++		if (lg != NULL) {
++			if (!vb_redraw_fieldset_borders(box, lg, x_parent,
++					y_parent, padding_width,
++					padding_height, &r, scale, ctx))
++				return false;
++		} else if (!html_redraw_borders(box, x_parent, y_parent,
+ 				padding_width, padding_height, &r,
+ 				scale, ctx))
+ 			return false;
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -145,7 +145,14 @@
+ 	margin: 1px; border: 1px solid #333; padding: 1px 3px; }
+ textarea[disabled] { background-color: #ddd; color: #333; }
+ 
+-fieldset { display: block; border: thin solid #888; margin: 1.12em 0; }
++/* patch 222: browsers' fieldset box; the legend is a shrink-to-fit
++ * block lifted onto the top border (margin-top undoes the border and
++ * padding; margin-bottom restores the padding below it), and redraw
++ * runs the top border through the legend's middle with a gap for it. */
++fieldset { display: block; margin: 0 2px; border: 2px groove #c0c0c0;
++	padding: 0.35em 0.75em 0.625em; min-width: min-content; }
++legend { display: block; width: fit-content; padding: 0 2px;
++	margin: calc(-0.35em - 2px) 0 0.35em; }
+ 
+ noembed, script, style, title { display: none; }
+ 
