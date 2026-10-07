@@ -1,0 +1,106 @@
+# netsurf: unloaded iframes and <video> keep their size; silent <audio> takes none (patch 219)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 9a6cf0b (patch stack through 218)
+#
+# An iframe this engine does not load -- no src, or a YouTube / Vimeo
+# embed that fixes451 deliberately skips -- stayed an inline box, which
+# ignores width and height: embeds collapsed to nothing and the article
+# text after them moved up into their place. <video> (no media support)
+# was an inline box too, drawing its fallback text, and <audio> without
+# controls showed its fallback text where browsers show nothing.
+#
+#  - box_special.c: box_iframe_placeholder() turns such an iframe into an
+#    inline-block (block-level ones keep their type) with its children
+#    unconverted, so its width / height -- attributes, or default.css --
+#    apply, as in a browser.
+#  - default.css: iframe is 300 x 150 with a 2px inset border (Chromium's
+#    304 x 154 box; was 19em x 10em, borderless); video is an inline-block
+#    with overflow hidden and its fallback text sized away; audio without
+#    controls is display: none.
+#  - hints.c: <video> gets <canvas>'s width/height presentational hints
+#    (the attributes, else 300 x 150).
+#
+# Test: testpages/pages/HTML-embed-placeholders.html (EMBED219, 4 checks,
+# Chromium 4/4; before, the iframe and video were 0 wide): an iframe
+# without src 304 x 154, a skipped YouTube embed 564 x 319 with the next
+# paragraph below it, video 300 x 150 and 320 x 180 from attributes,
+# silent audio 0 high. FRAMELOCAL (script-made frames) unchanged.
+diff --git a/content/handlers/css/hints.c b/content/handlers/css/hints.c
+--- a/content/handlers/css/hints.c
++++ b/content/handlers/css/hints.c
+@@ -1785,7 +1785,10 @@
+ 		css_hint_font_size(pw, node);
+ 	} else if (dom_string_caseless_lwc_isequal(tag, corestring_lwc_body)) {
+ 		css_hint_body_color(pw, node);
+-	} else if (tname != NULL && strcasecmp(tname, "canvas") == 0) {
++	} else if (tname != NULL && (strcasecmp(tname, "canvas") == 0 ||
++			strcasecmp(tname, "video") == 0)) {
++		/* patch 219: <video> sizes like <canvas>: width / height
++		 * attributes, else 300 x 150 */
+ 		css_hint_height_width_canvas(pw, node);
+ 	} else if (tname != NULL && strcasecmp(tname, "ol") == 0) {
+ 		css_hint_list(pw, node);
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1127,6 +1127,23 @@
+ /**
+  * Inline subwindow [16.5].
+  */
++/**
++ * patch 219: an iframe this engine does not load (no src, or a video
++ * embed fixes451 skips) still takes its place in the page, as in a
++ * browser: an inline-level iframe becomes an inline-block, so its
++ * width / height (attributes, or default.css's 300 x 150) apply, and its
++ * fallback children are not shown. It used to be an inline box, which
++ * ignores width and height: YouTube embeds collapsed to nothing and the
++ * text after them moved up.
++ */
++static bool box_iframe_placeholder(struct box *box, bool *convert_children)
++{
++	if (box->type == BOX_INLINE)
++		box->type = BOX_INLINE_BLOCK;
++	*convert_children = false;
++	return true;
++}
++
+ static bool
+ box_iframe(dom_node *n,
+ 	   html_content *content,
+@@ -1154,7 +1171,7 @@
+ 	/* get frame URL */
+ 	err = dom_element_get_attribute(n, corestring_dom_src, &s);
+ 	if (err != DOM_NO_ERR || s == NULL)
+-		return true;
++		return box_iframe_placeholder(box, convert_children);
+ 	if (box_extract_link(content, s, content->base_url, &url) == false) {
+ 		dom_string_unref(s);
+ 		return false;
+@@ -1186,7 +1203,8 @@
+ 			    (hl > 10 && strncmp(hd + hl - 10, ".vimeo.com", 10) == 0)) {
+ 				lwc_string_unref(host);
+ 				nsurl_unref(url);
+-				return true;
++				return box_iframe_placeholder(box,
++						convert_children);
+ 			}
+ 			lwc_string_unref(host);
+ 		}
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -107,7 +107,13 @@
+ 
+ noframes { display: none; }
+ 
+-iframe { width: 19em; height: 10em; }
++/* patch 219: browsers' 300 x 150 and 2px inset border */
++iframe { width: 300px; height: 150px; border: 2px inset #767676; }
++/* patch 219: <video> keeps its box (canvas's width/height hints, else
++ * 300 x 150) with nothing inside drawn; silent <audio> takes no space */
++video { display: inline-block; overflow: hidden; font-size: 0;
++	line-height: 0; }
++audio:not([controls]) { display: none; }
+ 
+ form { display: block; }
+ 

@@ -266,6 +266,7 @@ NET-js-crypto-subtle http://127.0.0.1:$HP/JS-crypto-subtle.html
 NET-css-supports-absent http://127.0.0.1:$HP/CSS-supports-absent.html
 NET-css-svg-size http://127.0.0.1:$HP/CSS-svg-size.html
 NET-html-progress-meter http://127.0.0.1:$HP/HTML-progress-meter.html
+NET-html-embed-placeholders http://127.0.0.1:$HP/HTML-embed-placeholders.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -693,6 +694,11 @@ p218p=$(ls "$R"/*NET-html-progress-meter.plot 2>/dev/null | head -1)
 p218r=$(sed -n 's/.*STR \(PROGRESS218: [0-9]*\/[0-9]* passed\).*/\1/p' "$p218p" 2>/dev/null | head -1)
 echo "  html-progress-meter: ${p218r:-no summary}"
 [ -n "$p218p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$p218p" | sed 's/^STR /  /'
+# Patch 219: unloaded iframes / video keep their size.
+e219p=$(ls "$R"/*NET-html-embed-placeholders.plot 2>/dev/null | head -1)
+e219r=$(sed -n 's/.*STR \(EMBED219: [0-9]*\/[0-9]* passed\).*/\1/p' "$e219p" 2>/dev/null | head -1)
+echo "  html-embed-placeholders: ${e219r:-no summary}"
+[ -n "$e219p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$e219p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -906,6 +912,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$u216r" = "SUPABS216: 3/3 passed" ] && \
 [ "$v217r" = "SVGSIZE217: 5/5 passed" ] && \
 [ "$p218r" = "PROGRESS218: 5/5 passed" ] && \
+[ "$e219r" = "EMBED219: 4/4 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
