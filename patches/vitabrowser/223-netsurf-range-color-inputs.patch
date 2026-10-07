@@ -1,0 +1,319 @@
+# netsurf: <input type=range> and type=color drawn as widgets (patch 223)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 7fc3b8d + patch 222 (patch stack through 222)
+#
+# Unknown input types fall back to text fields, so sliders and colour
+# pickers rendered as 168 x 24 text boxes showing their value, and a
+# slider without a value attribute read "" from script.
+#
+#  - forms.c: range and color make GADGET_HIDDEN controls: their value
+#    is kept, synced with the DOM and submitted like a hidden input's,
+#    and nothing is edited as text.
+#  - box_special.c, box.h: their box is a childless inline-block flagged
+#    VB_INPUT_WIDGET.
+#  - redraw.c: vb_redraw_input_widget() paints a range as browsers do (a
+#    4px grey track, accent-filled up to the value, a 16px round thumb;
+#    min / max / value, default 0 / 100 / midpoint) and a color as a
+#    swatch of its value inside the box.
+#  - default.css: browsers' sizes (range 129 x 16 with 2px margins, no
+#    border; color 50 x 27 with a grey border).
+#  - vita_polyfill.js: a range input's value is sanitised as browsers do
+#    (within min..max, the midpoint when missing or not a number); other
+#    inputs are passed through.
+#
+# Test: testpages/pages/HTML-range-color.html (RANGECOL223, 4 checks,
+# Chromium 4/4; before, 0/4): range sizes, margins, the colour well
+# size, values and types.
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -102,6 +102,8 @@
+ 				 * paints the bar, not the children */
+ 	VB_LEGEND = 1 << 19,	/* patch 222: <legend>: a fieldset's top
+ 				 * border runs through the first one */
++	VB_INPUT_WIDGET = 1 << 20,	/* patch 223: <input type=range /
++					 * color>: redraw paints the widget */
+ 	VB_DEFINITE_HEIGHT = 1 << 17,	/* VitaBrowser: an absolutely
+ 					 * positioned box whose height comes
+ 					 * from top + bottom: percentage
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2276,6 +2276,12 @@
+ 				nsurl_unref(url);
+ 			}
+ 		}
++	} else if (gadget->type == GADGET_HIDDEN) {
++		/* patch 223: range / color (forms.c made them hidden
++		 * controls): a childless inline-block that redraw paints
++		 * as a slider or a colour swatch */
++		box->type = BOX_INLINE_BLOCK;
++		box->flags |= VB_INPUT_WIDGET;
+ 	} else {
+ 		/* unhandled type the default is "text" */
+ 		if (box_input_text(content, box, n) == false)
+diff --git a/content/handlers/html/forms.c b/content/handlers/html/forms.c
+--- a/content/handlers/html/forms.c
++++ b/content/handlers/html/forms.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "utils/config.h"
+ #include "utils/corestrings.h"
+@@ -30,6 +31,17 @@
+ #include "html/form_internal.h"
+ #include "html/private.h"
+ 
++
++/* patch 223: <input type=range> / <input type=color> */
++static bool vb_input_is_widget(dom_string *type)
++{
++	const char *t = dom_string_data(type);
++	size_t l = dom_string_byte_length(type);
++
++	return (l == 5 && (strncasecmp(t, "range", 5) == 0 ||
++			strncasecmp(t, "color", 5) == 0));
++}
++
+ /**
+  * process form element from dom
+  */
+@@ -335,6 +347,10 @@
+ 	} else if (ds_type != NULL && dom_string_caseless_lwc_isequal(ds_type,
+ 			corestring_lwc_image)) {
+ 		control = form_new_control(input, GADGET_IMAGE);
++	} else if (ds_type != NULL && vb_input_is_widget(ds_type)) {
++		/* patch 223: range and color are drawn as widgets, not
++		 * text fields; their value is kept like a hidden input's */
++		control = form_new_control(input, GADGET_HIDDEN);
+ 	} else {
+ 		control = form_new_control(input, GADGET_TEXTBOX);
+ 	}
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -4728,6 +4728,107 @@
+ 	return ctx->plot->rectangle(ctx, &fill, &rect) == NSERROR_OK;
+ }
+ 
++/**
++ * patch 223: <input type=range> as a browser draws it -- a 4px track,
++ * filled in the accent colour up to the value, and a round thumb -- and
++ * <input type=color> as a swatch of its value inside the button box.
++ */
++static bool vb_redraw_input_widget(struct box *box, int x, int y,
++		int width, int height, const struct redraw_context *ctx)
++{
++	plot_style_t st = *plot_style_fill_wbasec;
++	struct rect rect;
++	const char *v = box->gadget != NULL ? box->gadget->value : NULL;
++	colour accent = 0x00ff7500;	/* #0075ff, as BGR */
++
++	if (width <= 0 || height <= 0)
++		return true;
++	st.fill_type = PLOT_OP_TYPE_SOLID;
++	st.stroke_type = PLOT_OP_TYPE_NONE;
++	dom_string *type = NULL;
++	bool colour_well = false;
++
++	if (box->node != NULL && dom_element_get_attribute(
++			(dom_element *)box->node, corestring_dom_type,
++			&type) == DOM_NO_ERR && type != NULL) {
++		colour_well = dom_string_byte_length(type) == 5 &&
++				strncasecmp(dom_string_data(type), "color",
++						5) == 0;
++		dom_string_unref(type);
++	}
++	if (colour_well) {
++		/* color: a swatch inset 4px, framed in grey */
++		unsigned int rgb = 0;
++		if (v != NULL && v[0] == '#' && strlen(v) == 7)
++			rgb = (unsigned int)strtoul(v + 1, NULL, 16);
++		rect.x0 = x + 4;
++		rect.y0 = y + 4;
++		rect.x1 = x + width - 4;
++		rect.y1 = y + height - 4;
++		if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
++			return true;
++		st.fill_colour = 0x00777777;
++		if (ctx->plot->rectangle(ctx, &st, &rect) != NSERROR_OK)
++			return false;
++		rect.x0++;
++		rect.y0++;
++		rect.x1--;
++		rect.y1--;
++		st.fill_colour = ((rgb >> 16) & 0xff) | (rgb & 0xff00) |
++				((rgb & 0xff) << 16);
++		return ctx->plot->rectangle(ctx, &st, &rect) == NSERROR_OK;
++	} else {
++		double mn = vb_attr_num(box, "min", 0);
++		double mx = vb_attr_num(box, "max", 100);
++		double val = (mx > mn) ? mn + (mx - mn) / 2 : mn;
++		double ratio;
++		int r = height < 16 ? height / 2 : 8;
++		int cx, cy = y + height / 2, i;
++		char *end;
++
++		if (v != NULL && v[0] != '\0') {
++			double t = strtod(v, &end);
++			if (end != v)
++				val = t;
++		}
++		ratio = mx > mn ? (val - mn) / (mx - mn) : 0;
++		if (ratio < 0)
++			ratio = 0;
++		if (ratio > 1)
++			ratio = 1;
++		if (html_redraw_accent_colour(box, &accent) == false)
++			accent = 0x00ff7500;
++		cx = x + r + (int)((width - 2 * r) * ratio + 0.5);
++		/* the track: grey, then the filled part */
++		rect.x0 = x + 1;
++		rect.x1 = x + width - 1;
++		rect.y0 = cy - 2;
++		rect.y1 = cy + 2;
++		st.fill_colour = 0x00b2b2b2;
++		if (ctx->plot->rectangle(ctx, &st, &rect) != NSERROR_OK)
++			return false;
++		rect.x1 = cx;
++		st.fill_colour = accent;
++		if (rect.x1 > rect.x0 &&
++				ctx->plot->rectangle(ctx, &st, &rect) != NSERROR_OK)
++			return false;
++		/* the thumb: a disc of horizontal spans */
++		for (i = -r; i < r; i++) {
++			double h = (double)r * r - (i + 0.5) * (i + 0.5);
++			int w = h > 0 ? (int)(sqrt(h) + 0.5) : 0;
++			if (w <= 0)
++				continue;
++			rect.x0 = cx - w;
++			rect.x1 = cx + w;
++			rect.y0 = cy + i;
++			rect.y1 = cy + i + 1;
++			if (ctx->plot->rectangle(ctx, &st, &rect) != NSERROR_OK)
++				return false;
++		}
++		return true;
++	}
++}
++
+ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -5956,6 +6057,12 @@
+ 				current_background_color, ctx))
+ 			return false;
+ 
++	} else if (box->flags & VB_INPUT_WIDGET) {
++		/* patch 223: range slider / colour swatch */
++		if (!vb_redraw_input_widget(box, x + padding_left,
++				y + padding_top, width, height, ctx))
++			return false;
++
+ 	} else if (box->flags & VB_PROGRESS) {
+ 		/* patch 218: the bar's fill; the fallback children are
+ 		 * not painted */
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6628,5 +6628,39 @@
+ "\t * attributes either way. */\n"
+ "\tvoid MP;\n"
+ "})();\n"
++"/* patch 223: <input type=range>'s value is sanitised as in browsers --\n"
++" * a number within min..max (default 0..100), the midpoint when it is\n"
++" * missing or not a number -- so a slider without a value attribute reads\n"
++" * \"50\", not \"\". Other inputs and elements are passed through. */\n"
++"(function () {\n"
++"\tvar IP = g.HTMLInputElement && g.HTMLInputElement.prototype;\n"
++"\tvar p = IP, dsc = null;\n"
++"\tif (!IP) return;\n"
++"\twhile (p && !(dsc = Object.getOwnPropertyDescriptor(p, 'value')))\n"
++"\t\tp = Object.getPrototypeOf(p);\n"
++"\tif (!dsc || !dsc.get || !dsc.configurable) return;\n"
++"\tfunction num(el, name, dflt) {\n"
++"\t\tvar a = el.getAttribute(name);\n"
++"\t\tvar n = (a === null || a === '') ? 0 / 0 : +a;\n"
++"\t\treturn isFinite(n) ? n : dflt;\n"
++"\t}\n"
++"\ttry {\n"
++"\t\tObject.defineProperty(IP, 'value', { configurable: true,\n"
++"\t\t\tenumerable: dsc.enumerable,\n"
++"\t\t\tget: function () {\n"
++"\t\t\t\tvar v = dsc.get.call(this), mn, mx, n;\n"
++"\t\t\t\tif (this.tagName !== 'INPUT' ||\n"
++"\t\t\t\t\t\tString(this.getAttribute('type')).toLowerCase() !== 'range')\n"
++"\t\t\t\t\treturn v;\n"
++"\t\t\t\tmn = num(this, 'min', 0);\n"
++"\t\t\t\tmx = num(this, 'max', 100);\n"
++"\t\t\t\tif (mx < mn) mx = mn;\n"
++"\t\t\t\tn = (v === '' || v === null || v === undefined) ? 0 / 0 : +v;\n"
++"\t\t\t\tif (!isFinite(n)) n = mn + (mx - mn) / 2;\n"
++"\t\t\t\treturn String(Math.max(mn, Math.min(mx, n)));\n"
++"\t\t\t},\n"
++"\t\t\tset: dsc.set ? function (x) { dsc.set.call(this, x); } : undefined });\n"
++"\t} catch (e) { /* */ }\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6627,4 +6627,38 @@
+ 	 * attributes either way. */
+ 	void MP;
+ })();
++/* patch 223: <input type=range>'s value is sanitised as in browsers --
++ * a number within min..max (default 0..100), the midpoint when it is
++ * missing or not a number -- so a slider without a value attribute reads
++ * "50", not "". Other inputs and elements are passed through. */
++(function () {
++	var IP = g.HTMLInputElement && g.HTMLInputElement.prototype;
++	var p = IP, dsc = null;
++	if (!IP) return;
++	while (p && !(dsc = Object.getOwnPropertyDescriptor(p, 'value')))
++		p = Object.getPrototypeOf(p);
++	if (!dsc || !dsc.get || !dsc.configurable) return;
++	function num(el, name, dflt) {
++		var a = el.getAttribute(name);
++		var n = (a === null || a === '') ? 0 / 0 : +a;
++		return isFinite(n) ? n : dflt;
++	}
++	try {
++		Object.defineProperty(IP, 'value', { configurable: true,
++			enumerable: dsc.enumerable,
++			get: function () {
++				var v = dsc.get.call(this), mn, mx, n;
++				if (this.tagName !== 'INPUT' ||
++						String(this.getAttribute('type')).toLowerCase() !== 'range')
++					return v;
++				mn = num(this, 'min', 0);
++				mx = num(this, 'max', 100);
++				if (mx < mn) mx = mn;
++				n = (v === '' || v === null || v === undefined) ? 0 / 0 : +v;
++				if (!isFinite(n)) n = mn + (mx - mn) / 2;
++				return String(Math.max(mn, Math.min(mx, n)));
++			},
++			set: dsc.set ? function (x) { dsc.set.call(this, x); } : undefined });
++	} catch (e) { /* */ }
++})();
+ })(this);
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -131,6 +131,12 @@
+ 	border: none; padding: 0 0.1em; }
+ input[type=file] { background-color: #d9d9d9; color: #000; font-style: italic;
+ 	border: 2px inset #d9d9d9; padding: 1px 2px; }
++/* patch 223: browsers' slider and colour well sizes */
++input[type=range] { width: 129px; height: 16px; margin: 2px;
++	border: none; padding: 0; background-color: transparent; }
++input[type=color] { width: 50px; height: 27px; margin: 0;
++	border: 1px solid #767676; padding: 1px 2px;
++	background-color: #efefef; }
+ input[align=left] { float: left; }
+ input[align=right] { float: right; }
+ 
