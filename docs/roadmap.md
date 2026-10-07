@@ -81,9 +81,14 @@ display: flow-root (204), grid repeat(auto-fill|auto-fit) by container
 width and spaced grid-area placement (206), svh/lvh/dvh units and lh
 (207), -webkit-line-clamp (208), ch = 0.5em (210), CSS nesting (211),
 discrete media features such as prefers-reduced-motion and hover/pointer
-(213), line-height: normal = 1.164 with no forced 1.33 (214). Open from
-the probes: @container (dropped), @supports not(...) for features we lack
-(dropped), @layer (flattened), Shadow DOM.
+(213), line-height: normal = 1.164 with no forced 1.33 (214), the
+@supports of absent properties (216), inline <svg> auto sizing (217),
+<progress>/<meter> bars (218), unloaded iframe / video placeholders (219),
+letter-/word-spacing and justified text on the Vita text path (220), the
+space between inline-blocks, images and buttons (221), fieldset/legend
+(222), range and color inputs as widgets (223). Open from the probes:
+@container (dropped), @layer (flattened), Shadow DOM, checkbox/radio at
+18 x 16 (browsers 13 x 13), date inputs as plain text fields.
 
 ### WS-B Web platform (R1, R2, R4)
 1. **Event model conformance.** A listener registered on `document` without
@@ -99,7 +104,8 @@ the probes: @container (dropped), @supports not(...) for features we lack
    them; `innerText`. *2026-10-07:* 172/176 -- crypto.subtle digest + HMAC
    (patch 215); still missing attachShadow, caches, serviceWorker,
    mediaDevices. Inline elements' getBoundingClientRect (202) and
-   computed colour alpha (212) fixed.
+   computed colour alpha (212) fixed. The engine's NaN / Infinity
+   constants were 0 (a C89 port's flattened union; quickjs patch 05).
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

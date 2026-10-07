@@ -271,6 +271,7 @@ NET-css-letter-spacing http://127.0.0.1:$HP/CSS-letter-spacing.html
 NET-css-inline-block-space http://127.0.0.1:$HP/CSS-inline-block-space.html
 NET-html-fieldset-legend http://127.0.0.1:$HP/HTML-fieldset-legend.html
 NET-html-range-color http://127.0.0.1:$HP/HTML-range-color.html
+NET-js-nan-constants http://127.0.0.1:$HP/JS-nan-constants.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -723,6 +724,11 @@ r223p=$(ls "$R"/*NET-html-range-color.plot 2>/dev/null | head -1)
 r223r=$(sed -n 's/.*STR \(RANGECOL223: [0-9]*\/[0-9]* passed\).*/\1/p' "$r223p" 2>/dev/null | head -1)
 echo "  html-range-color: ${r223r:-no summary}"
 [ -n "$r223p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$r223p" | sed 's/^STR /  /'
+# quickjs patch 05: NaN / Infinity constants.
+ncp=$(ls "$R"/*NET-js-nan-constants.plot 2>/dev/null | head -1)
+ncr=$(sed -n 's/.*STR \(NANCONST: [0-9]*\/[0-9]* passed\).*/\1/p' "$ncp" 2>/dev/null | head -1)
+echo "  js-nan-constants: ${ncr:-no summary}"
+[ -n "$ncp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$ncp" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -950,6 +956,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
 [ "$r223r" = "RANGECOL223: 4/4 passed" ] && \
+[ "$ncr" = "NANCONST: 4/4 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \

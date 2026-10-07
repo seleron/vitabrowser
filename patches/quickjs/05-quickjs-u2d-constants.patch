@@ -1,0 +1,59 @@
+# quickjs: NaN and Infinity are NaN and Infinity, not 0
+#
+# MacSurf's C89 port flattened JSCFunctionListEntry's value union into
+# separate fields (i32, i64, f64, u64). JS_PROP_U2D_DEF -- the IEEE-bits
+# form QuickJS uses for its non-finite constants -- fills u64, but the
+# JS_DEF_PROP_DOUBLE case of both property instantiators read only f64,
+# which those entries leave 0.0. So the globals NaN and Infinity, and
+# Number.NaN, Number.POSITIVE_INFINITY and Number.NEGATIVE_INFINITY, were
+# all 0: isNaN(NaN) was false, isFinite(NaN) true, `x = NaN` a valid
+# number, and every library sentinel or "not a number yet" default built
+# on them silently wrong. Computed NaNs (0 / 0, +"abc") were unaffected.
+#
+# js_def_double() takes the u64 bits when an entry carries them, else
+# f64 (JS_PROP_DOUBLE_DEF entries: Math.PI and friends).
+#
+# Test: testpages/pages/JS-nan-constants.html (NANCONST, 4 checks,
+# Chromium 4/4).
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1474,6 +1474,20 @@
+ static JSValue js_instantiate_prototype(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
+ static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
+                                  void *opaque);
++/* VitaBrowser: the C89 JSCFunctionListEntry has separate f64 and u64
++   fields where upstream has a union, and JS_PROP_U2D_DEF fills u64 (the
++   IEEE bits) while JS_DEF_PROP_DOUBLE read only f64: NaN, Infinity,
++   Number.NaN and Number.{POSITIVE,NEGATIVE}_INFINITY were all 0. */
++static double js_def_double(const JSCFunctionListEntry *e)
++{
++    union { uint64_t u; double d; } c;
++
++    if (e->u64 == 0)
++        return e->f64;
++    c.u = e->u64;
++    return c.d;
++}
++
+ static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
+                                                JSAtom atom, void *opaque);
+ static JSValue JS_NewObjectProtoList(JSContext *ctx, JSValueConst proto,
+@@ -40096,7 +40110,7 @@
+         val = js_int64(e->i64);
+         break;
+     case JS_DEF_PROP_DOUBLE:
+-        val = js_float64(e->f64);
++        val = js_float64(js_def_double(e));
+         break;
+     case JS_DEF_PROP_UNDEFINED:
+         val = JS_UNDEFINED;
+@@ -40172,7 +40186,7 @@
+             val = js_int64(e->i64);
+             break;
+         case JS_DEF_PROP_DOUBLE:
+-            val = js_float64(e->f64);
++            val = js_float64(js_def_double(e));
+             break;
+         case JS_DEF_OBJECT:
+             val = JS_NewObjectProtoList(ctx, ctx->class_proto[JS_CLASS_OBJECT],
