@@ -1,0 +1,539 @@
+# netsurf: <progress> and <meter> render as bars; 203's accessors no longer leak (patch 218)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser d531c3a (patch stack through 217)
+#
+# <progress> and <meter> had no UA styling and no rendering: they took no
+# space (0 x one line) and drew their fallback text, if any, as plain
+# inline content. Upload progress, reading-progress bars, quotas and
+# ratings showed nothing.
+#
+#  - default.css: inline-block, border-box, 1em high, -0.2em
+#    vertical-align, a #e6e6e6 track, overflow hidden; progress 10em wide
+#    and meter 5em (Chromium: 160 x 16 and 80 x 16 at 16px).
+#  - box_construct.c flags their boxes VB_PROGRESS (box.h), and redraw.c
+#    paints the fill instead of the children (the fallback content is
+#    not drawn): progress value / max (no value attribute -- the
+#    indeterminate state -- a third of the track), meter
+#    (value - min) / (max - min); accent-color when set, else blue
+#    #0075ff / green #107c10. Attributes are read at paint time, so a
+#    changed value repaints with the box.
+#  - vita_polyfill.js: progress.value / .max set and read the attributes
+#    and .position answers value / max (-1 when indeterminate). The
+#    bridge's own HTMLMeterElement accessors are left alone: overriding
+#    them did not take effect in the simulator (cause not found).
+#
+# Found while testing: tags the bridge has no constructor for share one
+# generic element prototype, so patch 203's details/dialog accessors
+# (open, show, showModal, close, returnValue) were on every such element.
+# They now answer only for their own tag and behave as plain expando
+# properties (undefined until set) elsewhere; the same holds for the
+# progress accessors here.
+#
+# Test: testpages/pages/HTML-progress-meter.html (PROGRESS218, 5 checks,
+# Chromium 5/5; without the patch the bars measured 0 wide): default
+# sizes, a CSS width honoured and fallback text not growing the bar,
+# value/max/position reflection, an indeterminate bar made determinate,
+# and none of these properties appearing on a <div> or <section>.
+# HIDDEN203 stays 9/9.
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -98,6 +98,8 @@
+ 					 * viewport takes (CSS 2.1 11.1.1):
+ 					 * the box's own used overflow is
+ 					 * visible (box_overflow_x/y) */
++	VB_PROGRESS = 1 << 18,	/* patch 218: <progress> / <meter>: redraw
++				 * paints the bar, not the children */
+ 	VB_DEFINITE_HEIGHT = 1 << 17,	/* VitaBrowser: an absolutely
+ 					 * positioned box whose height comes
+ 					 * from top + bottom: percentage
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <string.h>
++#include <strings.h>
+ #include <dom/dom.h>
+ 
+ #include "utils/errors.h"
+@@ -1695,6 +1696,13 @@
+ 			size_t tlen = dom_string_length(svg_name);
+ 			int matched = dom_string_caseless_lwc_isequal(
+ 					svg_name, corestring_lwc_svg);
++			/* patch 218: <progress> and <meter> paint as bars */
++			if (!matched && tag != NULL &&
++					((tlen == 8 && strncasecmp(tag,
++						"progress", 8) == 0) ||
++					 (tlen == 5 && strncasecmp(tag,
++						"meter", 5) == 0)))
++				box->flags |= VB_PROGRESS;
+ 			if (matched) {
+ 				/* fixes202: mark the SVG root as a replaced
+ 				 * element with given dimensions. Without this,
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -4563,6 +4563,89 @@
+ static plot_style_fixed g_group_parent = (plot_style_fixed)PLOT_STYLE_SCALE;
+ static const css_computed_style *g_group_style = NULL;
+ 
++/* patch 218: a numeric attribute of the box's element, or dflt */
++static double vb_attr_num(const struct box *box, const char *name, double dflt)
++{
++	dom_string *n = NULL, *v = NULL;
++	double r = dflt;
++
++	if (box->node == NULL || dom_string_create((const uint8_t *)name,
++			strlen(name), &n) != DOM_NO_ERR)
++		return dflt;
++	if (dom_element_get_attribute((dom_element *)box->node, n, &v) ==
++			DOM_NO_ERR && v != NULL) {
++		char tmp[40];
++		size_t l = dom_string_byte_length(v);
++		char *end;
++		if (l > sizeof(tmp) - 1)
++			l = sizeof(tmp) - 1;
++		memcpy(tmp, dom_string_data(v), l);
++		tmp[l] = '\0';
++		r = strtod(tmp, &end);
++		if (end == tmp)
++			r = dflt;
++		dom_string_unref(v);
++	}
++	dom_string_unref(n);
++	return r;
++}
++
++/**
++ * patch 218: paint a <progress> / <meter> bar's fill into its content
++ * box (the track is the box's own background, from default.css).
++ * progress: value / max (max default 1); no value attribute is the
++ * indeterminate state, painted as a third of the track. meter: (value -
++ * min) / (max - min), defaults 0..1. Colour: accent-color when set, else
++ * the platform blue (progress) or green (meter).
++ */
++static bool vb_redraw_progress(struct box *box, int x, int y, int width,
++		int height, const struct redraw_context *ctx)
++{
++	plot_style_t fill = *plot_style_fill_wbasec;
++	struct rect rect;
++	colour accent = 0;
++	bool meter = false;
++	double ratio;
++	dom_string *tag = NULL;
++
++	if (width <= 0 || height <= 0)
++		return true;
++	if (box->node != NULL && dom_element_get_tag_name(box->node, &tag) ==
++			DOM_NO_ERR && tag != NULL) {
++		meter = dom_string_byte_length(tag) == 5;
++		dom_string_unref(tag);
++	}
++	if (meter) {
++		double mn = vb_attr_num(box, "min", 0);
++		double mx = vb_attr_num(box, "max", 1);
++		double v = vb_attr_num(box, "value", 0);
++		ratio = mx > mn ? (v - mn) / (mx - mn) : 0;
++	} else {
++		double mx = vb_attr_num(box, "max", 1);
++		double v = vb_attr_num(box, "value", -1);
++		if (mx <= 0)
++			mx = 1;
++		ratio = v < 0 ? 1.0 / 3 : v / mx;
++	}
++	if (ratio < 0)
++		ratio = 0;
++	if (ratio > 1)
++		ratio = 1;
++	if (html_redraw_accent_colour(box, &accent))
++		fill.fill_colour = accent;
++	else
++		fill.fill_colour = meter ? 0x00107c10 : 0x00ff7500;
++	fill.fill_type = PLOT_OP_TYPE_SOLID;
++	fill.stroke_type = PLOT_OP_TYPE_NONE;
++	rect.x0 = x;
++	rect.y0 = y;
++	rect.x1 = x + (int)(width * ratio + 0.5);
++	rect.y1 = y + height;
++	if (rect.x1 <= rect.x0)
++		return true;
++	return ctx->plot->rectangle(ctx, &fill, &rect) == NSERROR_OK;
++}
++
+ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -5784,6 +5867,13 @@
+ 				current_background_color, ctx))
+ 			return false;
+ 
++	} else if (box->flags & VB_PROGRESS) {
++		/* patch 218: the bar's fill; the fallback children are
++		 * not painted */
++		if (!vb_redraw_progress(box, x + padding_left,
++				y + padding_top, width, height, ctx))
++			return false;
++
+ 	} else if (box->flags & SVG_INLINE) {
+ 		/* fixes195 - inline <svg> root. The SVG DOM children are
+ 		 * not in the box tree (skipped at box_construct time);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6144,29 +6144,51 @@
+ "\t\t\treturn P && P !== Object.prototype ? P : null;\n"
+ "\t\t} catch (e) { return null; }\n"
+ "\t}\n"
+-"\tfunction reflectOpen(P) {\n"
+-"\t\tif (!P || Object.prototype.hasOwnProperty.call(P, 'open')) return;\n"
+-"\t\ttry {\n"
+-"\t\t\tObject.defineProperty(P, 'open', { configurable: true, enumerable: true,\n"
+-"\t\t\t\tget: function () { return this.hasAttribute('open'); },\n"
+-"\t\t\t\tset: function (v) {\n"
+-"\t\t\t\t\tif (v) this.setAttribute('open', '');\n"
+-"\t\t\t\t\telse this.removeAttribute('open');\n"
+-"\t\t\t\t} });\n"
+-"\t\t} catch (e) { /* */ }\n"
+-"\t}\n"
++"\t/* Tags the bridge has no constructor for share one generic element\n"
++"\t * prototype (patch 218 found this), so every accessor here checks\n"
++"\t * the tag and behaves as a plain property on other elements. */\n"
++"\tfunction isTag(el, t) { return tagOf(el) === t; }\n"
++"\tfunction expando(el, n) { return el['__vbx_' + n]; }\n"
+ "\tvar DP = protoOf('details'), GP = protoOf('dialog');\n"
+-"\treflectOpen(DP);\n"
+-"\treflectOpen(GP);\n"
++"\t(function () {\n"
++"\t\t/* one 'open' accessor serving both tags, on whichever\n"
++"\t\t * prototypes they have */\n"
++"\t\tvar tagsFor = function (P) {\n"
++"\t\t\tvar t = [];\n"
++"\t\t\tif (P && P === DP) t.push('DETAILS');\n"
++"\t\t\tif (P && P === GP) t.push('DIALOG');\n"
++"\t\t\treturn t;\n"
++"\t\t};\n"
++"\t\t[DP, GP].forEach(function (P) {\n"
++"\t\t\tif (!P || Object.prototype.hasOwnProperty.call(P, 'open')) return;\n"
++"\t\t\tvar tags = tagsFor(P);\n"
++"\t\t\ttry {\n"
++"\t\t\t\tObject.defineProperty(P, 'open', { configurable: true, enumerable: true,\n"
++"\t\t\t\t\tget: function () {\n"
++"\t\t\t\t\t\tif (tags.indexOf(tagOf(this)) < 0) return expando(this, 'open');\n"
++"\t\t\t\t\t\treturn this.hasAttribute('open');\n"
++"\t\t\t\t\t},\n"
++"\t\t\t\t\tset: function (v) {\n"
++"\t\t\t\t\t\tif (tags.indexOf(tagOf(this)) < 0) { this.__vbx_open = v; return; }\n"
++"\t\t\t\t\t\tif (v) this.setAttribute('open', '');\n"
++"\t\t\t\t\t\telse this.removeAttribute('open');\n"
++"\t\t\t\t\t} });\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t})();\n"
+ "\tif (GP) {\n"
+ "\t\tvar def = function (name, fn) {\n"
+ "\t\t\tif (Object.prototype.hasOwnProperty.call(GP, name)) return;\n"
+ "\t\t\ttry { Object.defineProperty(GP, name, { value: fn, configurable: true, writable: true }); } catch (e) { /* */ }\n"
+ "\t\t};\n"
+-"\t\tdef('show', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });\n"
+-"\t\tdef('showModal', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });\n"
++"\t\tdef('show', function () {\n"
++"\t\t\tif (isTag(this, 'DIALOG') && !this.hasAttribute('open')) this.setAttribute('open', '');\n"
++"\t\t});\n"
++"\t\tdef('showModal', function () {\n"
++"\t\t\tif (isTag(this, 'DIALOG') && !this.hasAttribute('open')) this.setAttribute('open', '');\n"
++"\t\t});\n"
+ "\t\tdef('close', function (v) {\n"
+-"\t\t\tif (!this.hasAttribute('open')) return;\n"
++"\t\t\tif (!isTag(this, 'DIALOG') || !this.hasAttribute('open')) return;\n"
+ "\t\t\tif (v !== undefined) this.returnValue = String(v);\n"
+ "\t\t\tthis.removeAttribute('open');\n"
+ "\t\t\tvar self = this;\n"
+@@ -6174,8 +6196,14 @@
+ "\t\t});\n"
+ "\t\tif (!('returnValue' in GP)) {\n"
+ "\t\t\ttry { Object.defineProperty(GP, 'returnValue', { configurable: true, enumerable: true,\n"
+-"\t\t\t\tget: function () { return this.__vbReturnValue === undefined ? '' : this.__vbReturnValue; },\n"
+-"\t\t\t\tset: function (v) { this.__vbReturnValue = String(v); } }); } catch (e) { /* */ }\n"
++"\t\t\t\tget: function () {\n"
++"\t\t\t\t\tif (!isTag(this, 'DIALOG')) return expando(this, 'returnValue');\n"
++"\t\t\t\t\treturn this.__vbReturnValue === undefined ? '' : this.__vbReturnValue;\n"
++"\t\t\t\t},\n"
++"\t\t\t\tset: function (v) {\n"
++"\t\t\t\t\tif (!isTag(this, 'DIALOG')) { this.__vbx_returnValue = v; return; }\n"
++"\t\t\t\t\tthis.__vbReturnValue = String(v);\n"
++"\t\t\t\t} }); } catch (e) { /* */ }\n"
+ "\t\t}\n"
+ "\t}\n"
+ "\t/* the summary that toggles: the first summary child of a details */\n"
+@@ -6523,5 +6551,82 @@
+ "\t\t\tenumerable: true });\n"
+ "\t} catch (e) { /* */ }\n"
+ "})();\n"
++"/* ---- <progress> / <meter> properties (patch 218) -----------------------\n"
++" * default.css sizes the bars and redraw paints the fill from the value /\n"
++" * min / max attributes, so the properties scripts set (bar.value = 40)\n"
++" * must reach the attributes. progress: value (0 without the attribute),\n"
++" * max (default 1), position (value / max, -1 when indeterminate). */\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tfunction num(el, n, dflt) {\n"
++"\t\tvar v = el.getAttribute(n);\n"
++"\t\tvar f = v === null ? NaN : parseFloat(v);\n"
++"\t\treturn isNaN(f) ? dflt : f;\n"
++"\t}\n"
++"\t/* progress and meter may share the bridge's generic element\n"
++"\t * prototype with every other tag the bridge has no constructor for,\n"
++"\t * so each accessor answers only for its tag and hands any other\n"
++"\t * element to the accessor it replaced (or a plain expando). A\n"
++"\t * tag-specific prototype (the bridge's HTMLMeterElement, whose\n"
++"\t * accessors answered 0) is overridden; on the shared generic one a\n"
++"\t * native property is left alone. */\n"
++"\tfunction tagOf(el) { return el && el.tagName ? String(el.tagName).toUpperCase() : ''; }\n"
++"\tvar shared = [protoOf('div'), protoOf('section')];\n"
++"\tfunction reflect(P, n, dflt, TAG) {\n"
++"\t\tif (!P) return;\n"
++"\t\tvar prev = Object.getOwnPropertyDescriptor(P, n);\n"
++"\t\tif (prev && !(prev.get && prev.get.__vb218) && shared.indexOf(P) >= 0)\n"
++"\t\t\treturn;\n"
++"\t\tvar pg = prev && prev.get && prev.get.__vb218 ? prev.get : null;\n"
++"\t\tvar ps = prev && prev.set && prev.get && prev.get.__vb218 ? prev.set : null;\n"
++"\t\tvar get = function () {\n"
++"\t\t\tif (tagOf(this) !== TAG)\n"
++"\t\t\t\treturn pg ? pg.call(this) : this['__vbx_' + n];\n"
++"\t\t\tvar v = this.getAttribute(n), f = (v === null || v === '') ? NaN : Number(v);\n"
++"\t\t\tif (isFinite(f)) return f;\n"
++"\t\t\treturn typeof dflt === 'function' ? dflt(this) : dflt;\n"
++"\t\t};\n"
++"\t\tget.__vb218 = true;\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(P, n, { configurable: true, enumerable: true,\n"
++"\t\t\t\tget: get,\n"
++"\t\t\t\tset: function (v) {\n"
++"\t\t\t\t\tif (tagOf(this) !== TAG) {\n"
++"\t\t\t\t\t\tif (ps) ps.call(this, v); else this['__vbx_' + n] = v;\n"
++"\t\t\t\t\t\treturn;\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\tthis.setAttribute(n, String(+v));\n"
++"\t\t\t\t} });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t}\n"
++"\tfunction protoOf(tag) {\n"
++"\t\ttry {\n"
++"\t\t\tvar P = Object.getPrototypeOf(d.createElement(tag));\n"
++"\t\t\treturn P && P !== Object.prototype ? P : null;\n"
++"\t\t} catch (e) { return null; }\n"
++"\t}\n"
++"\tvar PP = protoOf('progress'), MP = protoOf('meter');\n"
++"\treflect(PP, 'value', 0, 'PROGRESS');\n"
++"\treflect(PP, 'max', 1, 'PROGRESS');\n"
++"\tif (PP && (shared.indexOf(PP) < 0 ||\n"
++"\t\t\t!Object.prototype.hasOwnProperty.call(PP, 'position'))) {\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(PP, 'position', { configurable: true, enumerable: true,\n"
++"\t\t\t\tget: function () {\n"
++"\t\t\t\t\tif (tagOf(this) !== 'PROGRESS') return this.__vbx_position;\n"
++"\t\t\t\t\tif (!this.hasAttribute('value')) return -1;\n"
++"\t\t\t\t\tvar m = num(this, 'max', 1);\n"
++"\t\t\t\t\tif (m <= 0) m = 1;\n"
++"\t\t\t\t\treturn Math.max(0, Math.min(1, num(this, 'value', 0) / m));\n"
++"\t\t\t\t} });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t}\n"
++"\t/* <meter>: the bridge has an HTMLMeterElement of its own; its\n"
++"\t * accessors are left as they are (overriding them did not take in\n"
++"\t * the simulator, cause not found). Its bar is painted from the\n"
++"\t * attributes either way. */\n"
++"\tvoid MP;\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6143,29 +6143,51 @@
+ 			return P && P !== Object.prototype ? P : null;
+ 		} catch (e) { return null; }
+ 	}
+-	function reflectOpen(P) {
+-		if (!P || Object.prototype.hasOwnProperty.call(P, 'open')) return;
+-		try {
+-			Object.defineProperty(P, 'open', { configurable: true, enumerable: true,
+-				get: function () { return this.hasAttribute('open'); },
+-				set: function (v) {
+-					if (v) this.setAttribute('open', '');
+-					else this.removeAttribute('open');
+-				} });
+-		} catch (e) { /* */ }
+-	}
++	/* Tags the bridge has no constructor for share one generic element
++	 * prototype (patch 218 found this), so every accessor here checks
++	 * the tag and behaves as a plain property on other elements. */
++	function isTag(el, t) { return tagOf(el) === t; }
++	function expando(el, n) { return el['__vbx_' + n]; }
+ 	var DP = protoOf('details'), GP = protoOf('dialog');
+-	reflectOpen(DP);
+-	reflectOpen(GP);
++	(function () {
++		/* one 'open' accessor serving both tags, on whichever
++		 * prototypes they have */
++		var tagsFor = function (P) {
++			var t = [];
++			if (P && P === DP) t.push('DETAILS');
++			if (P && P === GP) t.push('DIALOG');
++			return t;
++		};
++		[DP, GP].forEach(function (P) {
++			if (!P || Object.prototype.hasOwnProperty.call(P, 'open')) return;
++			var tags = tagsFor(P);
++			try {
++				Object.defineProperty(P, 'open', { configurable: true, enumerable: true,
++					get: function () {
++						if (tags.indexOf(tagOf(this)) < 0) return expando(this, 'open');
++						return this.hasAttribute('open');
++					},
++					set: function (v) {
++						if (tags.indexOf(tagOf(this)) < 0) { this.__vbx_open = v; return; }
++						if (v) this.setAttribute('open', '');
++						else this.removeAttribute('open');
++					} });
++			} catch (e) { /* */ }
++		});
++	})();
+ 	if (GP) {
+ 		var def = function (name, fn) {
+ 			if (Object.prototype.hasOwnProperty.call(GP, name)) return;
+ 			try { Object.defineProperty(GP, name, { value: fn, configurable: true, writable: true }); } catch (e) { /* */ }
+ 		};
+-		def('show', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });
+-		def('showModal', function () { if (!this.hasAttribute('open')) this.setAttribute('open', ''); });
++		def('show', function () {
++			if (isTag(this, 'DIALOG') && !this.hasAttribute('open')) this.setAttribute('open', '');
++		});
++		def('showModal', function () {
++			if (isTag(this, 'DIALOG') && !this.hasAttribute('open')) this.setAttribute('open', '');
++		});
+ 		def('close', function (v) {
+-			if (!this.hasAttribute('open')) return;
++			if (!isTag(this, 'DIALOG') || !this.hasAttribute('open')) return;
+ 			if (v !== undefined) this.returnValue = String(v);
+ 			this.removeAttribute('open');
+ 			var self = this;
+@@ -6173,8 +6195,14 @@
+ 		});
+ 		if (!('returnValue' in GP)) {
+ 			try { Object.defineProperty(GP, 'returnValue', { configurable: true, enumerable: true,
+-				get: function () { return this.__vbReturnValue === undefined ? '' : this.__vbReturnValue; },
+-				set: function (v) { this.__vbReturnValue = String(v); } }); } catch (e) { /* */ }
++				get: function () {
++					if (!isTag(this, 'DIALOG')) return expando(this, 'returnValue');
++					return this.__vbReturnValue === undefined ? '' : this.__vbReturnValue;
++				},
++				set: function (v) {
++					if (!isTag(this, 'DIALOG')) { this.__vbx_returnValue = v; return; }
++					this.__vbReturnValue = String(v);
++				} }); } catch (e) { /* */ }
+ 		}
+ 	}
+ 	/* the summary that toggles: the first summary child of a details */
+@@ -6522,4 +6550,81 @@
+ 			enumerable: true });
+ 	} catch (e) { /* */ }
+ })();
++/* ---- <progress> / <meter> properties (patch 218) -----------------------
++ * default.css sizes the bars and redraw paints the fill from the value /
++ * min / max attributes, so the properties scripts set (bar.value = 40)
++ * must reach the attributes. progress: value (0 without the attribute),
++ * max (default 1), position (value / max, -1 when indeterminate). */
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	function num(el, n, dflt) {
++		var v = el.getAttribute(n);
++		var f = v === null ? NaN : parseFloat(v);
++		return isNaN(f) ? dflt : f;
++	}
++	/* progress and meter may share the bridge's generic element
++	 * prototype with every other tag the bridge has no constructor for,
++	 * so each accessor answers only for its tag and hands any other
++	 * element to the accessor it replaced (or a plain expando). A
++	 * tag-specific prototype (the bridge's HTMLMeterElement, whose
++	 * accessors answered 0) is overridden; on the shared generic one a
++	 * native property is left alone. */
++	function tagOf(el) { return el && el.tagName ? String(el.tagName).toUpperCase() : ''; }
++	var shared = [protoOf('div'), protoOf('section')];
++	function reflect(P, n, dflt, TAG) {
++		if (!P) return;
++		var prev = Object.getOwnPropertyDescriptor(P, n);
++		if (prev && !(prev.get && prev.get.__vb218) && shared.indexOf(P) >= 0)
++			return;
++		var pg = prev && prev.get && prev.get.__vb218 ? prev.get : null;
++		var ps = prev && prev.set && prev.get && prev.get.__vb218 ? prev.set : null;
++		var get = function () {
++			if (tagOf(this) !== TAG)
++				return pg ? pg.call(this) : this['__vbx_' + n];
++			var v = this.getAttribute(n), f = (v === null || v === '') ? NaN : Number(v);
++			if (isFinite(f)) return f;
++			return typeof dflt === 'function' ? dflt(this) : dflt;
++		};
++		get.__vb218 = true;
++		try {
++			Object.defineProperty(P, n, { configurable: true, enumerable: true,
++				get: get,
++				set: function (v) {
++					if (tagOf(this) !== TAG) {
++						if (ps) ps.call(this, v); else this['__vbx_' + n] = v;
++						return;
++					}
++					this.setAttribute(n, String(+v));
++				} });
++		} catch (e) { /* */ }
++	}
++	function protoOf(tag) {
++		try {
++			var P = Object.getPrototypeOf(d.createElement(tag));
++			return P && P !== Object.prototype ? P : null;
++		} catch (e) { return null; }
++	}
++	var PP = protoOf('progress'), MP = protoOf('meter');
++	reflect(PP, 'value', 0, 'PROGRESS');
++	reflect(PP, 'max', 1, 'PROGRESS');
++	if (PP && (shared.indexOf(PP) < 0 ||
++			!Object.prototype.hasOwnProperty.call(PP, 'position'))) {
++		try {
++			Object.defineProperty(PP, 'position', { configurable: true, enumerable: true,
++				get: function () {
++					if (tagOf(this) !== 'PROGRESS') return this.__vbx_position;
++					if (!this.hasAttribute('value')) return -1;
++					var m = num(this, 'max', 1);
++					if (m <= 0) m = 1;
++					return Math.max(0, Math.min(1, num(this, 'value', 0) / m));
++				} });
++		} catch (e) { /* */ }
++	}
++	/* <meter>: the bridge has an HTMLMeterElement of its own; its
++	 * accessors are left as they are (overriding them did not take in
++	 * the simulator, cause not found). Its bar is painted from the
++	 * attributes either way. */
++	void MP;
++})();
+ })(this);
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -161,6 +161,13 @@
+ 	width: fit-content; height: fit-content; margin: auto; border: solid;
+ 	padding: 1em; background-color: white; color: black; }
+ details, summary { display: block; }
++
++/* patch 218: progress / meter bars (the fill is painted by redraw) */
++progress, meter { display: inline-block; box-sizing: border-box;
++	height: 1em; vertical-align: -0.2em; background-color: #e6e6e6;
++	overflow: hidden; }
++progress { width: 10em; }
++meter { width: 5em; }
+ details:not([open]) > :not(summary) { display: none; }
+ details > summary:first-of-type::before { content: "\25B8  "; }
+ details[open] > summary:first-of-type::before { content: "\25BE  "; }
