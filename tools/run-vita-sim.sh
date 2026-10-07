@@ -260,6 +260,7 @@ NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
 NET-css-nesting http://127.0.0.1:$HP/CSS-nesting.html
 NET-js-computed-alpha http://127.0.0.1:$HP/JS-computed-alpha.html
+NET-css-media-features http://127.0.0.1:$HP/CSS-media-features.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -657,6 +658,11 @@ a212p=$(ls "$R"/*NET-js-computed-alpha.plot 2>/dev/null | head -1)
 a212r=$(sed -n 's/.*STR \(ALPHA212: [0-9]*\/[0-9]* passed\).*/\1/p' "$a212p" 2>/dev/null | head -1)
 echo "  js-computed-alpha: ${a212r:-no summary}"
 [ -n "$a212p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$a212p" | sed 's/^STR /  /'
+# Patch 213: discrete media features answer for the Vita.
+m213p=$(ls "$R"/*NET-css-media-features.plot 2>/dev/null | head -1)
+m213r=$(sed -n 's/.*STR \(MQFEAT213: [0-9]*\/[0-9]* passed\).*/\1/p' "$m213p" 2>/dev/null | head -1)
+echo "  css-media-features: ${m213r:-no summary}"
+[ -n "$m213p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$m213p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -850,6 +856,7 @@ fi
 [ "$c210r" = "CHUNIT210: 2/2 passed" ] && \
 [ "$n211r" = "NEST211: 6/6 passed" ] && \
 [ "$a212r" = "ALPHA212: 4/4 passed" ] && \
+[ "$m213r" = "MQFEAT213: 4/4 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
@@ -1154,6 +1161,12 @@ same=0; bad=0
 for f in "$R"/[01]*.plot; do
 	n=${f##*/}
 	case "$n" in 07-PM-animation*) continue ;; esac
+	# [01]* meant the bundled pages (01-19) until the network list ran
+	# past page 99: 100-* and up are network pages this run never
+	# loads (it has only NET-http-local).
+	case "$n" in
+	*-NET-*) [ -f "$S2/ux0:data/VitaBrowser/$n" ] || continue ;;
+	esac
 	if cmp -s "$f" "$S2/ux0:data/VitaBrowser/$n"; then same=$((same + 1))
 	else bad=$((bad + 1)); echo "  DIFFERS at the Vita's pace: $n"; fi
 done
