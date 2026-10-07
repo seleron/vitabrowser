@@ -261,6 +261,7 @@ NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
 NET-css-nesting http://127.0.0.1:$HP/CSS-nesting.html
 NET-js-computed-alpha http://127.0.0.1:$HP/JS-computed-alpha.html
 NET-css-media-features http://127.0.0.1:$HP/CSS-media-features.html
+NET-css-line-height-normal http://127.0.0.1:$HP/CSS-line-height-normal.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -663,6 +664,11 @@ m213p=$(ls "$R"/*NET-css-media-features.plot 2>/dev/null | head -1)
 m213r=$(sed -n 's/.*STR \(MQFEAT213: [0-9]*\/[0-9]* passed\).*/\1/p' "$m213p" 2>/dev/null | head -1)
 echo "  css-media-features: ${m213r:-no summary}"
 [ -n "$m213p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$m213p" | sed 's/^STR /  /'
+# Patch 214: line-height: normal is the font's own (1.164).
+l214p=$(ls "$R"/*NET-css-line-height-normal.plot 2>/dev/null | head -1)
+l214r=$(sed -n 's/.*STR \(LINEH214: [0-9]*\/[0-9]* passed\).*/\1/p' "$l214p" 2>/dev/null | head -1)
+echo "  css-line-height-normal: ${l214r:-no summary}"
+[ -n "$l214p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$l214p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -831,6 +837,20 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 # (frames, window services, interaction pass, downloads, real-site
 # layout, web APIs, the Vita-pace run) ever run. With the knob, 2/3 with
 # only check 3 failing is accepted, and said so. Off by default.
+# soft_pass RESULT EXPECTED "PLOTS" N: RESULT is EXPECTED, or, with
+# GATE_TIMING_SOFT=1, one short of it with check N -- a wall-clock "gap"
+# bound -- its only failure (said so). The structural counts beside each
+# use stay strict.
+soft_pass() {
+	[ "$1" = "$2" ] && return 0
+	[ "${GATE_TIMING_SOFT:-0}" = 1 ] || return 1
+	sp_name=${2%%:*}; sp_total=${2#*/}; sp_total=${sp_total%% *}
+	[ "$1" = "$sp_name: $((sp_total - 1))/$sp_total passed" ] || return 1
+	grep -h -o 'STR [0-9] [^"]*FAIL' $3 2>/dev/null | grep -q "^STR $4 .*gap" || return 1
+	grep -h -o 'STR [0-9] [^"]*FAIL' $3 2>/dev/null | grep -v "^STR $4 " | grep -q . && return 1
+	echo "  $sp_name: only timing check $4 failed -- accepted, GATE_TIMING_SOFT=1"
+	return 0
+}
 rs_ok=no
 [ "$rsr" = "REFLOW: 3/3 passed" ] && rs_ok=yes
 if [ "$rs_ok" = no ] && [ "${GATE_TIMING_SOFT:-0}" = 1 ] && \
@@ -840,7 +860,7 @@ if [ "$rs_ok" = no ] && [ "${GATE_TIMING_SOFT:-0}" = 1 ] && \
 	rs_ok=soft
 	echo "  REFLOW: only the timing check (3) failed -- accepted, GATE_TIMING_SOFT=1"
 fi
-[ "$dsr" = "DOMSTALL: 8/8 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
+soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] && \
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
 [ "$csr" = "CSSOM: 8/8 passed" ] && \
@@ -857,12 +877,13 @@ fi
 [ "$n211r" = "NEST211: 6/6 passed" ] && \
 [ "$a212r" = "ALPHA212: 4/4 passed" ] && \
 [ "$m213r" = "MQFEAT213: 4/4 passed" ] && \
+[ "$l214r" = "LINEH214: 3/3 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
-[ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
-[ "$bcr" = "BLOCKCLASS: 7/7 passed" ] && [ "${bcl:-0}" -ge 6 ] && \
+soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
+soft_pass "$bcr" "BLOCKCLASS: 7/7 passed" "$bcp" 7 && [ "${bcl:-0}" -ge 6 ] && \
 [ "$bsr" = "BLOCKSIB: 3/3 passed" ] && [ "${bsd:-0}" -ge 3 ] && \
-[ "$lnr" = "LISTNEST: 7/7 passed" ] && [ "${lnl:-0}" -ge 6 ] && \
+soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 [ "$lsr" = "LISTSTRUCT: 6/6 passed" ] && [ "${lsd:-0}" -ge 4 ] && [ "${lsm:-0}" -ge 1 ] && \
 [ "$sbr" = "SIBINS: 4/4 passed" ] && [ "${sbd:-0}" -ge 2 ] && \
 [ "$h9r" = "HAS193: 6/6 passed" ] && \
