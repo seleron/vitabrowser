@@ -1,0 +1,681 @@
+# netsurf: crypto.subtle -- digest (SHA-1/256/384/512) and HMAC (patch 215)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser d431979 (patch stack through 214)
+#
+# crypto.subtle was undefined (one of the API census' 5 missing), so
+# OAuth 2.1 / PKCE sign-in -- which sends base64url(SHA-256(verifier)) --
+# failed or fell back, as did libraries hashing for integrity checks and
+# cache keys. vita_polyfill.js now provides, in pure JS:
+#  - digest() for SHA-1, SHA-256, SHA-384, SHA-512;
+#  - HMAC over those: importKey('raw', ..., {name:'HMAC', hash}),
+#    sign('HMAC'), verify('HMAC') (constant-time compare), exportKey('raw')
+#    for extractable keys; a CryptoKey global;
+#  - every other method (encrypt, decrypt, generateKey, deriveKey,
+#    deriveBits, wrapKey, unwrapKey) rejects with NotSupportedError, which
+#    pages treat as "this browser cannot".
+# As in browsers it exists only in a secure context (https:, file:,
+# localhost / 127.0.0.1 / [::1]); results are Promises of ArrayBuffers.
+# The hashes were checked against Node's crypto for every length 0-399
+# (all four) and HMAC with 5-, 64- and 150-byte keys over lengths 0-300
+# (688 + 1600 cases, 0 mismatches) before going in.
+#
+# Test: testpages/pages/JS-crypto-subtle.html (SUBTLE215, 5 checks,
+# Chromium 5/5; crypto.subtle absent without the patch): presence,
+# SHA-256/SHA-1/SHA-512 of "abc" (FIPS 180 vectors), RFC 4231 case 2
+# HMAC-SHA-256 with verify, the RFC 7636 appendix B PKCE challenge.
+# tools/run-vita-sim.sh's API census floor goes 149 -> 172.
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6204,5 +6204,324 @@
+ "\t\tlater(function () { fire(det, 'toggle'); });\n"
+ "\t}, false);\n"
+ "})();\n"
++"/* ---- crypto.subtle: digest + HMAC (patch 215) ----------------------------\n"
++" * crypto.subtle was absent, so sign-in flows that hash a PKCE verifier\n"
++" * (OAuth 2.1: subtle.digest('SHA-256', verifier)) and libraries that\n"
++" * hash for integrity or cache keys failed or fell back. This provides the\n"
++" * part pages use without key material management: digest() for SHA-1,\n"
++" * SHA-256, SHA-384 and SHA-512, and HMAC over those through\n"
++" * importKey('raw'), sign(), verify() and exportKey('raw'). Everything else rejects\n"
++" * with NotSupportedError, which pages treat as \"this browser cannot\".\n"
++" * As in browsers it exists only in a secure context (https, file, and\n"
++" * localhost / 127.0.0.1). Pure JS: a SHA-256 of a few KB is a few ms. */\n"
++"(function () {\n"
++"\tvar C = g.crypto;\n"
++"\tif (!C || C.subtle) return;\n"
++"\ttry {\n"
++"\t\tvar lp = String(g.location && g.location.protocol || '');\n"
++"\t\tvar lh = String(g.location && g.location.hostname || '');\n"
++"\t\tif (!(lp === 'https:' || lp === 'file:' || lh === 'localhost' ||\n"
++"\t\t\t\tlh === '127.0.0.1' || lh === '[::1]'))\n"
++"\t\t\treturn;\n"
++"\t} catch (e) { return; }\n"
++"\n"
++"\tfunction bytes(data) {\n"
++"\t\tif (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));\n"
++"\t\tif (ArrayBuffer.isView(data))\n"
++"\t\t\treturn new Uint8Array(data.buffer.slice(data.byteOffset,\n"
++"\t\t\t\t\tdata.byteOffset + data.byteLength));\n"
++"\t\tthrow new TypeError('data is not a BufferSource');\n"
++"\t}\n"
++"\tfunction pad(m, lenBytes, block, lenField) {\n"
++"\t\tvar l = m.length, n = l + 1 + lenField;\n"
++"\t\tn = Math.ceil(n / block) * block;\n"
++"\t\tvar p = new Uint8Array(n), bits = l * 8, i;\n"
++"\t\tp.set(m);\n"
++"\t\tp[l] = 0x80;\n"
++"\t\t/* big-endian bit length in the last 8 bytes (lengths < 2^53) */\n"
++"\t\tvar hi = Math.floor(bits / 4294967296), lo = bits >>> 0;\n"
++"\t\tp[n - 8] = hi >>> 24; p[n - 7] = (hi >>> 16) & 255;\n"
++"\t\tp[n - 6] = (hi >>> 8) & 255; p[n - 5] = hi & 255;\n"
++"\t\tp[n - 4] = lo >>> 24; p[n - 3] = (lo >>> 16) & 255;\n"
++"\t\tp[n - 2] = (lo >>> 8) & 255; p[n - 1] = lo & 255;\n"
++"\t\treturn p;\n"
++"\t}\n"
++"\tfunction out32(h) {\n"
++"\t\tvar o = new Uint8Array(h.length * 4), i;\n"
++"\t\tfor (i = 0; i < h.length; i++) {\n"
++"\t\t\to[i * 4] = h[i] >>> 24; o[i * 4 + 1] = (h[i] >>> 16) & 255;\n"
++"\t\t\to[i * 4 + 2] = (h[i] >>> 8) & 255; o[i * 4 + 3] = h[i] & 255;\n"
++"\t\t}\n"
++"\t\treturn o;\n"
++"\t}\n"
++"\tfunction sha1(m) {\n"
++"\t\tvar p = pad(m, 0, 64, 8), h = [0x67452301, 0xefcdab89, 0x98badcfe,\n"
++"\t\t\t0x10325476, 0xc3d2e1f0], w = new Array(80), o, i, t;\n"
++"\t\tfor (o = 0; o < p.length; o += 64) {\n"
++"\t\t\tfor (i = 0; i < 16; i++)\n"
++"\t\t\t\tw[i] = (p[o + i * 4] << 24) | (p[o + i * 4 + 1] << 16) |\n"
++"\t\t\t\t\t(p[o + i * 4 + 2] << 8) | p[o + i * 4 + 3];\n"
++"\t\t\tfor (; i < 80; i++) {\n"
++"\t\t\t\tt = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];\n"
++"\t\t\t\tw[i] = (t << 1) | (t >>> 31);\n"
++"\t\t\t}\n"
++"\t\t\tvar a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f, k;\n"
++"\t\t\tfor (i = 0; i < 80; i++) {\n"
++"\t\t\t\tif (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }\n"
++"\t\t\t\telse if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }\n"
++"\t\t\t\telse if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }\n"
++"\t\t\t\telse { f = b ^ c ^ d; k = 0xca62c1d6; }\n"
++"\t\t\t\tt = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0;\n"
++"\t\t\t\te = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;\n"
++"\t\t\t}\n"
++"\t\t\th[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0;\n"
++"\t\t\th[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0;\n"
++"\t\t}\n"
++"\t\treturn out32(h);\n"
++"\t}\n"
++"\tvar K256 = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,\n"
++"\t\t0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,\n"
++"\t\t0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1,\n"
++"\t\t0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc,\n"
++"\t\t0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3,\n"
++"\t\t0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,\n"
++"\t\t0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1,\n"
++"\t\t0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585,\n"
++"\t\t0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3,\n"
++"\t\t0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814,\n"
++"\t\t0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];\n"
++"\tfunction sha256(m) {\n"
++"\t\tvar p = pad(m, 0, 64, 8), h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372,\n"
++"\t\t\t0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],\n"
++"\t\t\tw = new Array(64), o, i;\n"
++"\t\tfunction r(x, n) { return (x >>> n) | (x << (32 - n)); }\n"
++"\t\tfor (o = 0; o < p.length; o += 64) {\n"
++"\t\t\tfor (i = 0; i < 16; i++)\n"
++"\t\t\t\tw[i] = (p[o + i * 4] << 24) | (p[o + i * 4 + 1] << 16) |\n"
++"\t\t\t\t\t(p[o + i * 4 + 2] << 8) | p[o + i * 4 + 3];\n"
++"\t\t\tfor (; i < 64; i++) {\n"
++"\t\t\t\tvar s0 = r(w[i - 15], 7) ^ r(w[i - 15], 18) ^ (w[i - 15] >>> 3);\n"
++"\t\t\t\tvar s1 = r(w[i - 2], 17) ^ r(w[i - 2], 19) ^ (w[i - 2] >>> 10);\n"
++"\t\t\t\tw[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;\n"
++"\t\t\t}\n"
++"\t\t\tvar a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5],\n"
++"\t\t\t\tgg = h[6], hh = h[7];\n"
++"\t\t\tfor (i = 0; i < 64; i++) {\n"
++"\t\t\t\tvar S1 = r(e, 6) ^ r(e, 11) ^ r(e, 25);\n"
++"\t\t\t\tvar ch = (e & f) ^ (~e & gg);\n"
++"\t\t\t\tvar t1 = (hh + S1 + ch + K256[i] + w[i]) | 0;\n"
++"\t\t\t\tvar S0 = r(a, 2) ^ r(a, 13) ^ r(a, 22);\n"
++"\t\t\t\tvar mj = (a & b) ^ (a & c) ^ (b & c);\n"
++"\t\t\t\tvar t2 = (S0 + mj) | 0;\n"
++"\t\t\t\thh = gg; gg = f; f = e; e = (d + t1) | 0;\n"
++"\t\t\t\td = c; c = b; b = a; a = (t1 + t2) | 0;\n"
++"\t\t\t}\n"
++"\t\t\th[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0;\n"
++"\t\t\th[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0; h[5] = (h[5] + f) | 0;\n"
++"\t\t\th[6] = (h[6] + gg) | 0; h[7] = (h[7] + hh) | 0;\n"
++"\t\t}\n"
++"\t\treturn out32(h);\n"
++"\t}\n"
++"\t/* SHA-512 / SHA-384 on (hi, lo) 32-bit pairs */\n"
++"\tvar K512 = [0x428a2f98, 0xd728ae22, 0x71374491, 0x23ef65cd, 0xb5c0fbcf,\n"
++"\t\t0xec4d3b2f, 0xe9b5dba5, 0x8189dbbc, 0x3956c25b, 0xf348b538, 0x59f111f1,\n"
++"\t\t0xb605d019, 0x923f82a4, 0xaf194f9b, 0xab1c5ed5, 0xda6d8118, 0xd807aa98,\n"
++"\t\t0xa3030242, 0x12835b01, 0x45706fbe, 0x243185be, 0x4ee4b28c, 0x550c7dc3,\n"
++"\t\t0xd5ffb4e2, 0x72be5d74, 0xf27b896f, 0x80deb1fe, 0x3b1696b1, 0x9bdc06a7,\n"
++"\t\t0x25c71235, 0xc19bf174, 0xcf692694, 0xe49b69c1, 0x9ef14ad2, 0xefbe4786,\n"
++"\t\t0x384f25e3, 0x0fc19dc6, 0x8b8cd5b5, 0x240ca1cc, 0x77ac9c65, 0x2de92c6f,\n"
++"\t\t0x592b0275, 0x4a7484aa, 0x6ea6e483, 0x5cb0a9dc, 0xbd41fbd4, 0x76f988da,\n"
++"\t\t0x831153b5, 0x983e5152, 0xee66dfab, 0xa831c66d, 0x2db43210, 0xb00327c8,\n"
++"\t\t0x98fb213f, 0xbf597fc7, 0xbeef0ee4, 0xc6e00bf3, 0x3da88fc2, 0xd5a79147,\n"
++"\t\t0x930aa725, 0x06ca6351, 0xe003826f, 0x14292967, 0x0a0e6e70, 0x27b70a85,\n"
++"\t\t0x46d22ffc, 0x2e1b2138, 0x5c26c926, 0x4d2c6dfc, 0x5ac42aed, 0x53380d13,\n"
++"\t\t0x9d95b3df, 0x650a7354, 0x8baf63de, 0x766a0abb, 0x3c77b2a8, 0x81c2c92e,\n"
++"\t\t0x47edaee6, 0x92722c85, 0x1482353b, 0xa2bfe8a1, 0x4cf10364, 0xa81a664b,\n"
++"\t\t0xbc423001, 0xc24b8b70, 0xd0f89791, 0xc76c51a3, 0x0654be30, 0xd192e819,\n"
++"\t\t0xd6ef5218, 0xd6990624, 0x5565a910, 0xf40e3585, 0x5771202a, 0x106aa070,\n"
++"\t\t0x32bbd1b8, 0x19a4c116, 0xb8d2d0c8, 0x1e376c08, 0x5141ab53, 0x2748774c,\n"
++"\t\t0xdf8eeb99, 0x34b0bcb5, 0xe19b48a8, 0x391c0cb3, 0xc5c95a63, 0x4ed8aa4a,\n"
++"\t\t0xe3418acb, 0x5b9cca4f, 0x7763e373, 0x682e6ff3, 0xd6b2b8a3, 0x748f82ee,\n"
++"\t\t0x5defb2fc, 0x78a5636f, 0x43172f60, 0x84c87814, 0xa1f0ab72, 0x8cc70208,\n"
++"\t\t0x1a6439ec, 0x90befffa, 0x23631e28, 0xa4506ceb, 0xde82bde9, 0xbef9a3f7,\n"
++"\t\t0xb2c67915, 0xc67178f2, 0xe372532b, 0xca273ece, 0xea26619c, 0xd186b8c7,\n"
++"\t\t0x21c0c207, 0xeada7dd6, 0xcde0eb1e, 0xf57d4f7f, 0xee6ed178, 0x06f067aa,\n"
++"\t\t0x72176fba, 0x0a637dc5, 0xa2c898a6, 0x113f9804, 0xbef90dae, 0x1b710b35,\n"
++"\t\t0x131c471b, 0x28db77f5, 0x23047d84, 0x32caab7b, 0x40c72493, 0x3c9ebe0a,\n"
++"\t\t0x15c9bebc, 0x431d67c4, 0x9c100d4c, 0x4cc5d4be, 0xcb3e42b6, 0x597f299c,\n"
++"\t\t0xfc657e2a, 0x5fcb6fab, 0x3ad6faec, 0x6c44198c, 0x4a475817];\n"
++"\tfunction sha512(m, is384) {\n"
++"\t\tvar H = is384 ? [0xcbbb9d5d, 0xc1059ed8, 0x629a292a, 0x367cd507,\n"
++"\t\t\t0x9159015a, 0x3070dd17, 0x152fecd8, 0xf70e5939, 0x67332667,\n"
++"\t\t\t0xffc00b31, 0x8eb44a87, 0x68581511, 0xdb0c2e0d, 0x64f98fa7,\n"
++"\t\t\t0x47b5481d, 0xbefa4fa4] : [0x6a09e667, 0xf3bcc908, 0xbb67ae85,\n"
++"\t\t\t0x84caa73b, 0x3c6ef372, 0xfe94f82b, 0xa54ff53a, 0x5f1d36f1,\n"
++"\t\t\t0x510e527f, 0xade682d1, 0x9b05688c, 0x2b3e6c1f, 0x1f83d9ab,\n"
++"\t\t\t0xfb41bd6b, 0x5be0cd19, 0x137e2179];\n"
++"\t\tvar p = pad(m, 0, 128, 16), W = new Array(160), o, i, j;\n"
++"\t\t/* 64-bit helpers on [hi, lo] in arrays */\n"
++"\t\tfunction add(ah, al, bh, bl) {\n"
++"\t\t\tvar lo = (al >>> 0) + (bl >>> 0);\n"
++"\t\t\treturn [(ah + bh + Math.floor(lo / 4294967296)) | 0, lo | 0];\n"
++"\t\t}\n"
++"\t\tfunction rotr(h, l, n) {\n"
++"\t\t\tif (n < 32) return [(h >>> n) | (l << (32 - n)), (l >>> n) | (h << (32 - n))];\n"
++"\t\t\tn -= 32;\n"
++"\t\t\treturn [(l >>> n) | (h << (32 - n)), (h >>> n) | (l << (32 - n))];\n"
++"\t\t}\n"
++"\t\tfunction shr(h, l, n) {\n"
++"\t\t\treturn n < 32 ? [h >>> n, (l >>> n) | (h << (32 - n))] : [0, h >>> (n - 32)];\n"
++"\t\t}\n"
++"\t\tfunction x3(a, b, c) { return [a[0] ^ b[0] ^ c[0], a[1] ^ b[1] ^ c[1]]; }\n"
++"\t\tfor (o = 0; o < p.length; o += 128) {\n"
++"\t\t\tfor (i = 0; i < 32; i++)\n"
++"\t\t\t\tW[i] = (p[o + i * 4] << 24) | (p[o + i * 4 + 1] << 16) |\n"
++"\t\t\t\t\t(p[o + i * 4 + 2] << 8) | p[o + i * 4 + 3];\n"
++"\t\t\tfor (i = 16; i < 80; i++) {\n"
++"\t\t\t\tvar a15h = W[(i - 15) * 2], a15l = W[(i - 15) * 2 + 1];\n"
++"\t\t\t\tvar a2h = W[(i - 2) * 2], a2l = W[(i - 2) * 2 + 1];\n"
++"\t\t\t\tvar s0 = x3(rotr(a15h, a15l, 1), rotr(a15h, a15l, 8), shr(a15h, a15l, 7));\n"
++"\t\t\t\tvar s1 = x3(rotr(a2h, a2l, 19), rotr(a2h, a2l, 61), shr(a2h, a2l, 6));\n"
++"\t\t\t\tvar t = add(W[(i - 16) * 2], W[(i - 16) * 2 + 1], s0[0], s0[1]);\n"
++"\t\t\t\tt = add(t[0], t[1], W[(i - 7) * 2], W[(i - 7) * 2 + 1]);\n"
++"\t\t\t\tt = add(t[0], t[1], s1[0], s1[1]);\n"
++"\t\t\t\tW[i * 2] = t[0]; W[i * 2 + 1] = t[1];\n"
++"\t\t\t}\n"
++"\t\t\tvar v = H.slice(0);\n"
++"\t\t\tfor (i = 0; i < 80; i++) {\n"
++"\t\t\t\tvar eh = v[8], el = v[9];\n"
++"\t\t\t\tvar S1 = x3(rotr(eh, el, 14), rotr(eh, el, 18), rotr(eh, el, 41));\n"
++"\t\t\t\tvar chh = (eh & v[10]) ^ (~eh & v[12]), chl = (el & v[11]) ^ (~el & v[13]);\n"
++"\t\t\t\tvar t1 = add(v[14], v[15], S1[0], S1[1]);\n"
++"\t\t\t\tt1 = add(t1[0], t1[1], chh, chl);\n"
++"\t\t\t\tt1 = add(t1[0], t1[1], K512[i * 2], K512[i * 2 + 1]);\n"
++"\t\t\t\tt1 = add(t1[0], t1[1], W[i * 2], W[i * 2 + 1]);\n"
++"\t\t\t\tvar ah = v[0], al = v[1];\n"
++"\t\t\t\tvar S0 = x3(rotr(ah, al, 28), rotr(ah, al, 34), rotr(ah, al, 39));\n"
++"\t\t\t\tvar mjh = (ah & v[2]) ^ (ah & v[4]) ^ (v[2] & v[4]);\n"
++"\t\t\t\tvar mjl = (al & v[3]) ^ (al & v[5]) ^ (v[3] & v[5]);\n"
++"\t\t\t\tvar t2 = add(S0[0], S0[1], mjh, mjl);\n"
++"\t\t\t\tfor (j = 15; j >= 2; j--) v[j] = v[j - 2];\n"
++"\t\t\t\tvar ne = add(v[8], v[9], t1[0], t1[1]);\t/* d + t1 (d moved to 8/9) */\n"
++"\t\t\t\tv[8] = ne[0]; v[9] = ne[1];\n"
++"\t\t\t\tvar na = add(t1[0], t1[1], t2[0], t2[1]);\n"
++"\t\t\t\tv[0] = na[0]; v[1] = na[1];\n"
++"\t\t\t}\n"
++"\t\t\tfor (i = 0; i < 16; i += 2) {\n"
++"\t\t\t\tvar s = add(H[i], H[i + 1], v[i], v[i + 1]);\n"
++"\t\t\t\tH[i] = s[0]; H[i + 1] = s[1];\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\treturn out32(H).slice(0, is384 ? 48 : 64);\n"
++"\t}\n"
++"\tvar HASHES = {\n"
++"\t\t'SHA-1': { f: sha1, block: 64 },\n"
++"\t\t'SHA-256': { f: sha256, block: 64 },\n"
++"\t\t'SHA-384': { f: function (m) { return sha512(m, true); }, block: 128 },\n"
++"\t\t'SHA-512': { f: function (m) { return sha512(m, false); }, block: 128 }\n"
++"\t};\n"
++"\tfunction algName(a) {\n"
++"\t\tvar n = typeof a === 'string' ? a : (a && a.name);\n"
++"\t\treturn String(n || '').toUpperCase();\n"
++"\t}\n"
++"\tfunction hashOf(a) {\n"
++"\t\tvar n = algName(a);\n"
++"\t\tif (!HASHES[n]) throw new DOMException('Unrecognized hash: ' + n,\n"
++"\t\t\t\t'NotSupportedError');\n"
++"\t\treturn n;\n"
++"\t}\n"
++"\tfunction hmac(hash, key, data) {\n"
++"\t\tvar H = HASHES[hash], k = key, i;\n"
++"\t\tif (k.length > H.block) k = H.f(k);\n"
++"\t\tvar ik = new Uint8Array(H.block + data.length),\n"
++"\t\t\tok = new Uint8Array(H.block), inner;\n"
++"\t\tfor (i = 0; i < H.block; i++) {\n"
++"\t\t\tvar b = i < k.length ? k[i] : 0;\n"
++"\t\t\tik[i] = b ^ 0x36; ok[i] = b ^ 0x5c;\n"
++"\t\t}\n"
++"\t\tik.set(data, H.block);\n"
++"\t\tinner = H.f(ik);\n"
++"\t\tvar o2 = new Uint8Array(H.block + inner.length);\n"
++"\t\to2.set(ok); o2.set(inner, H.block);\n"
++"\t\treturn H.f(o2);\n"
++"\t}\n"
++"\tfunction CryptoKey() { throw new TypeError('Illegal constructor'); }\n"
++"\tfunction makeKey(hash, raw, extractable, usages) {\n"
++"\t\tvar k = Object.create(CryptoKey.prototype);\n"
++"\t\tObject.defineProperty(k, 'type', { value: 'secret', enumerable: true });\n"
++"\t\tObject.defineProperty(k, 'extractable', { value: !!extractable, enumerable: true });\n"
++"\t\tObject.defineProperty(k, 'algorithm', { value: { name: 'HMAC', hash: { name: hash },\n"
++"\t\t\tlength: raw.length * 8 }, enumerable: true });\n"
++"\t\tObject.defineProperty(k, 'usages', { value: (usages || []).slice(0), enumerable: true });\n"
++"\t\tObject.defineProperty(k, '__vbRaw', { value: raw });\n"
++"\t\treturn k;\n"
++"\t}\n"
++"\tfunction run(fn) {\n"
++"\t\treturn new Promise(function (res, rej) {\n"
++"\t\t\ttry { res(fn()); } catch (e) { rej(e); }\n"
++"\t\t});\n"
++"\t}\n"
++"\tfunction unsupported(what) {\n"
++"\t\treturn function () {\n"
++"\t\t\treturn Promise.reject(new DOMException(what + ' is not supported',\n"
++"\t\t\t\t\t'NotSupportedError'));\n"
++"\t\t};\n"
++"\t}\n"
++"\tvar subtle = {\n"
++"\t\tdigest: function (alg, data) {\n"
++"\t\t\treturn run(function () {\n"
++"\t\t\t\tvar n = hashOf(alg);\n"
++"\t\t\t\treturn HASHES[n].f(bytes(data)).buffer;\n"
++"\t\t\t});\n"
++"\t\t},\n"
++"\t\timportKey: function (format, keyData, alg, extractable, usages) {\n"
++"\t\t\treturn run(function () {\n"
++"\t\t\t\tif (algName(alg) !== 'HMAC' || format !== 'raw')\n"
++"\t\t\t\t\tthrow new DOMException('importKey: only raw HMAC keys are supported',\n"
++"\t\t\t\t\t\t\t'NotSupportedError');\n"
++"\t\t\t\treturn makeKey(hashOf(alg.hash), bytes(keyData), extractable, usages);\n"
++"\t\t\t});\n"
++"\t\t},\n"
++"\t\texportKey: function (format, key) {\n"
++"\t\t\treturn run(function () {\n"
++"\t\t\t\tif (format !== 'raw' || !key || !key.__vbRaw || !key.extractable)\n"
++"\t\t\t\t\tthrow new DOMException('key is not extractable as raw',\n"
++"\t\t\t\t\t\t\t'InvalidAccessError');\n"
++"\t\t\t\treturn new Uint8Array(key.__vbRaw).buffer;\n"
++"\t\t\t});\n"
++"\t\t},\n"
++"\t\tsign: function (alg, key, data) {\n"
++"\t\t\treturn run(function () {\n"
++"\t\t\t\tif (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)\n"
++"\t\t\t\t\tthrow new DOMException('sign: only HMAC is supported',\n"
++"\t\t\t\t\t\t\t'NotSupportedError');\n"
++"\t\t\t\treturn hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)).buffer;\n"
++"\t\t\t});\n"
++"\t\t},\n"
++"\t\tverify: function (alg, key, sig, data) {\n"
++"\t\t\treturn run(function () {\n"
++"\t\t\t\tif (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)\n"
++"\t\t\t\t\tthrow new DOMException('verify: only HMAC is supported',\n"
++"\t\t\t\t\t\t\t'NotSupportedError');\n"
++"\t\t\t\tvar m = hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)),\n"
++"\t\t\t\t\ts = bytes(sig), d = m.length ^ s.length, i;\n"
++"\t\t\t\tfor (i = 0; i < m.length && i < s.length; i++) d |= m[i] ^ s[i];\n"
++"\t\t\t\treturn d === 0;\n"
++"\t\t\t});\n"
++"\t\t},\n"
++"\t\tencrypt: unsupported('encrypt'),\n"
++"\t\tdecrypt: unsupported('decrypt'),\n"
++"\t\tgenerateKey: unsupported('generateKey'),\n"
++"\t\tderiveKey: unsupported('deriveKey'),\n"
++"\t\tderiveBits: unsupported('deriveBits'),\n"
++"\t\twrapKey: unsupported('wrapKey'),\n"
++"\t\tunwrapKey: unsupported('unwrapKey')\n"
++"\t};\n"
++"\ttry { g.CryptoKey = CryptoKey; } catch (e) { /* */ }\n"
++"\ttry {\n"
++"\t\tObject.defineProperty(C, 'subtle', { value: subtle, configurable: true,\n"
++"\t\t\tenumerable: true });\n"
++"\t} catch (e) { /* */ }\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6203,4 +6203,323 @@
+ 		later(function () { fire(det, 'toggle'); });
+ 	}, false);
+ })();
++/* ---- crypto.subtle: digest + HMAC (patch 215) ----------------------------
++ * crypto.subtle was absent, so sign-in flows that hash a PKCE verifier
++ * (OAuth 2.1: subtle.digest('SHA-256', verifier)) and libraries that
++ * hash for integrity or cache keys failed or fell back. This provides the
++ * part pages use without key material management: digest() for SHA-1,
++ * SHA-256, SHA-384 and SHA-512, and HMAC over those through
++ * importKey('raw'), sign(), verify() and exportKey('raw'). Everything else rejects
++ * with NotSupportedError, which pages treat as "this browser cannot".
++ * As in browsers it exists only in a secure context (https, file, and
++ * localhost / 127.0.0.1). Pure JS: a SHA-256 of a few KB is a few ms. */
++(function () {
++	var C = g.crypto;
++	if (!C || C.subtle) return;
++	try {
++		var lp = String(g.location && g.location.protocol || '');
++		var lh = String(g.location && g.location.hostname || '');
++		if (!(lp === 'https:' || lp === 'file:' || lh === 'localhost' ||
++				lh === '127.0.0.1' || lh === '[::1]'))
++			return;
++	} catch (e) { return; }
++
++	function bytes(data) {
++		if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
++		if (ArrayBuffer.isView(data))
++			return new Uint8Array(data.buffer.slice(data.byteOffset,
++					data.byteOffset + data.byteLength));
++		throw new TypeError('data is not a BufferSource');
++	}
++	function pad(m, lenBytes, block, lenField) {
++		var l = m.length, n = l + 1 + lenField;
++		n = Math.ceil(n / block) * block;
++		var p = new Uint8Array(n), bits = l * 8, i;
++		p.set(m);
++		p[l] = 0x80;
++		/* big-endian bit length in the last 8 bytes (lengths < 2^53) */
++		var hi = Math.floor(bits / 4294967296), lo = bits >>> 0;
++		p[n - 8] = hi >>> 24; p[n - 7] = (hi >>> 16) & 255;
++		p[n - 6] = (hi >>> 8) & 255; p[n - 5] = hi & 255;
++		p[n - 4] = lo >>> 24; p[n - 3] = (lo >>> 16) & 255;
++		p[n - 2] = (lo >>> 8) & 255; p[n - 1] = lo & 255;
++		return p;
++	}
++	function out32(h) {
++		var o = new Uint8Array(h.length * 4), i;
++		for (i = 0; i < h.length; i++) {
++			o[i * 4] = h[i] >>> 24; o[i * 4 + 1] = (h[i] >>> 16) & 255;
++			o[i * 4 + 2] = (h[i] >>> 8) & 255; o[i * 4 + 3] = h[i] & 255;
++		}
++		return o;
++	}
++	function sha1(m) {
++		var p = pad(m, 0, 64, 8), h = [0x67452301, 0xefcdab89, 0x98badcfe,
++			0x10325476, 0xc3d2e1f0], w = new Array(80), o, i, t;
++		for (o = 0; o < p.length; o += 64) {
++			for (i = 0; i < 16; i++)
++				w[i] = (p[o + i * 4] << 24) | (p[o + i * 4 + 1] << 16) |
++					(p[o + i * 4 + 2] << 8) | p[o + i * 4 + 3];
++			for (; i < 80; i++) {
++				t = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
++				w[i] = (t << 1) | (t >>> 31);
++			}
++			var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f, k;
++			for (i = 0; i < 80; i++) {
++				if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
++				else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
++				else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
++				else { f = b ^ c ^ d; k = 0xca62c1d6; }
++				t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0;
++				e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
++			}
++			h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0;
++			h[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0;
++		}
++		return out32(h);
++	}
++	var K256 = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,
++		0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
++		0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1,
++		0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc,
++		0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3,
++		0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
++		0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1,
++		0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585,
++		0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3,
++		0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814,
++		0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
++	function sha256(m) {
++		var p = pad(m, 0, 64, 8), h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372,
++			0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
++			w = new Array(64), o, i;
++		function r(x, n) { return (x >>> n) | (x << (32 - n)); }
++		for (o = 0; o < p.length; o += 64) {
++			for (i = 0; i < 16; i++)
++				w[i] = (p[o + i * 4] << 24) | (p[o + i * 4 + 1] << 16) |
++					(p[o + i * 4 + 2] << 8) | p[o + i * 4 + 3];
++			for (; i < 64; i++) {
++				var s0 = r(w[i - 15], 7) ^ r(w[i - 15], 18) ^ (w[i - 15] >>> 3);
++				var s1 = r(w[i - 2], 17) ^ r(w[i - 2], 19) ^ (w[i - 2] >>> 10);
++				w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
++			}
++			var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5],
++				gg = h[6], hh = h[7];
++			for (i = 0; i < 64; i++) {
++				var S1 = r(e, 6) ^ r(e, 11) ^ r(e, 25);
++				var ch = (e & f) ^ (~e & gg);
++				var t1 = (hh + S1 + ch + K256[i] + w[i]) | 0;
++				var S0 = r(a, 2) ^ r(a, 13) ^ r(a, 22);
++				var mj = (a & b) ^ (a & c) ^ (b & c);
++				var t2 = (S0 + mj) | 0;
++				hh = gg; gg = f; f = e; e = (d + t1) | 0;
++				d = c; c = b; b = a; a = (t1 + t2) | 0;
++			}
++			h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0;
++			h[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0; h[5] = (h[5] + f) | 0;
++			h[6] = (h[6] + gg) | 0; h[7] = (h[7] + hh) | 0;
++		}
++		return out32(h);
++	}
++	/* SHA-512 / SHA-384 on (hi, lo) 32-bit pairs */
++	var K512 = [0x428a2f98, 0xd728ae22, 0x71374491, 0x23ef65cd, 0xb5c0fbcf,
++		0xec4d3b2f, 0xe9b5dba5, 0x8189dbbc, 0x3956c25b, 0xf348b538, 0x59f111f1,
++		0xb605d019, 0x923f82a4, 0xaf194f9b, 0xab1c5ed5, 0xda6d8118, 0xd807aa98,
++		0xa3030242, 0x12835b01, 0x45706fbe, 0x243185be, 0x4ee4b28c, 0x550c7dc3,
++		0xd5ffb4e2, 0x72be5d74, 0xf27b896f, 0x80deb1fe, 0x3b1696b1, 0x9bdc06a7,
++		0x25c71235, 0xc19bf174, 0xcf692694, 0xe49b69c1, 0x9ef14ad2, 0xefbe4786,
++		0x384f25e3, 0x0fc19dc6, 0x8b8cd5b5, 0x240ca1cc, 0x77ac9c65, 0x2de92c6f,
++		0x592b0275, 0x4a7484aa, 0x6ea6e483, 0x5cb0a9dc, 0xbd41fbd4, 0x76f988da,
++		0x831153b5, 0x983e5152, 0xee66dfab, 0xa831c66d, 0x2db43210, 0xb00327c8,
++		0x98fb213f, 0xbf597fc7, 0xbeef0ee4, 0xc6e00bf3, 0x3da88fc2, 0xd5a79147,
++		0x930aa725, 0x06ca6351, 0xe003826f, 0x14292967, 0x0a0e6e70, 0x27b70a85,
++		0x46d22ffc, 0x2e1b2138, 0x5c26c926, 0x4d2c6dfc, 0x5ac42aed, 0x53380d13,
++		0x9d95b3df, 0x650a7354, 0x8baf63de, 0x766a0abb, 0x3c77b2a8, 0x81c2c92e,
++		0x47edaee6, 0x92722c85, 0x1482353b, 0xa2bfe8a1, 0x4cf10364, 0xa81a664b,
++		0xbc423001, 0xc24b8b70, 0xd0f89791, 0xc76c51a3, 0x0654be30, 0xd192e819,
++		0xd6ef5218, 0xd6990624, 0x5565a910, 0xf40e3585, 0x5771202a, 0x106aa070,
++		0x32bbd1b8, 0x19a4c116, 0xb8d2d0c8, 0x1e376c08, 0x5141ab53, 0x2748774c,
++		0xdf8eeb99, 0x34b0bcb5, 0xe19b48a8, 0x391c0cb3, 0xc5c95a63, 0x4ed8aa4a,
++		0xe3418acb, 0x5b9cca4f, 0x7763e373, 0x682e6ff3, 0xd6b2b8a3, 0x748f82ee,
++		0x5defb2fc, 0x78a5636f, 0x43172f60, 0x84c87814, 0xa1f0ab72, 0x8cc70208,
++		0x1a6439ec, 0x90befffa, 0x23631e28, 0xa4506ceb, 0xde82bde9, 0xbef9a3f7,
++		0xb2c67915, 0xc67178f2, 0xe372532b, 0xca273ece, 0xea26619c, 0xd186b8c7,
++		0x21c0c207, 0xeada7dd6, 0xcde0eb1e, 0xf57d4f7f, 0xee6ed178, 0x06f067aa,
++		0x72176fba, 0x0a637dc5, 0xa2c898a6, 0x113f9804, 0xbef90dae, 0x1b710b35,
++		0x131c471b, 0x28db77f5, 0x23047d84, 0x32caab7b, 0x40c72493, 0x3c9ebe0a,
++		0x15c9bebc, 0x431d67c4, 0x9c100d4c, 0x4cc5d4be, 0xcb3e42b6, 0x597f299c,
++		0xfc657e2a, 0x5fcb6fab, 0x3ad6faec, 0x6c44198c, 0x4a475817];
++	function sha512(m, is384) {
++		var H = is384 ? [0xcbbb9d5d, 0xc1059ed8, 0x629a292a, 0x367cd507,
++			0x9159015a, 0x3070dd17, 0x152fecd8, 0xf70e5939, 0x67332667,
++			0xffc00b31, 0x8eb44a87, 0x68581511, 0xdb0c2e0d, 0x64f98fa7,
++			0x47b5481d, 0xbefa4fa4] : [0x6a09e667, 0xf3bcc908, 0xbb67ae85,
++			0x84caa73b, 0x3c6ef372, 0xfe94f82b, 0xa54ff53a, 0x5f1d36f1,
++			0x510e527f, 0xade682d1, 0x9b05688c, 0x2b3e6c1f, 0x1f83d9ab,
++			0xfb41bd6b, 0x5be0cd19, 0x137e2179];
++		var p = pad(m, 0, 128, 16), W = new Array(160), o, i, j;
++		/* 64-bit helpers on [hi, lo] in arrays */
++		function add(ah, al, bh, bl) {
++			var lo = (al >>> 0) + (bl >>> 0);
++			return [(ah + bh + Math.floor(lo / 4294967296)) | 0, lo | 0];
++		}
++		function rotr(h, l, n) {
++			if (n < 32) return [(h >>> n) | (l << (32 - n)), (l >>> n) | (h << (32 - n))];
++			n -= 32;
++			return [(l >>> n) | (h << (32 - n)), (h >>> n) | (l << (32 - n))];
++		}
++		function shr(h, l, n) {
++			return n < 32 ? [h >>> n, (l >>> n) | (h << (32 - n))] : [0, h >>> (n - 32)];
++		}
++		function x3(a, b, c) { return [a[0] ^ b[0] ^ c[0], a[1] ^ b[1] ^ c[1]]; }
++		for (o = 0; o < p.length; o += 128) {
++			for (i = 0; i < 32; i++)
++				W[i] = (p[o + i * 4] << 24) | (p[o + i * 4 + 1] << 16) |
++					(p[o + i * 4 + 2] << 8) | p[o + i * 4 + 3];
++			for (i = 16; i < 80; i++) {
++				var a15h = W[(i - 15) * 2], a15l = W[(i - 15) * 2 + 1];
++				var a2h = W[(i - 2) * 2], a2l = W[(i - 2) * 2 + 1];
++				var s0 = x3(rotr(a15h, a15l, 1), rotr(a15h, a15l, 8), shr(a15h, a15l, 7));
++				var s1 = x3(rotr(a2h, a2l, 19), rotr(a2h, a2l, 61), shr(a2h, a2l, 6));
++				var t = add(W[(i - 16) * 2], W[(i - 16) * 2 + 1], s0[0], s0[1]);
++				t = add(t[0], t[1], W[(i - 7) * 2], W[(i - 7) * 2 + 1]);
++				t = add(t[0], t[1], s1[0], s1[1]);
++				W[i * 2] = t[0]; W[i * 2 + 1] = t[1];
++			}
++			var v = H.slice(0);
++			for (i = 0; i < 80; i++) {
++				var eh = v[8], el = v[9];
++				var S1 = x3(rotr(eh, el, 14), rotr(eh, el, 18), rotr(eh, el, 41));
++				var chh = (eh & v[10]) ^ (~eh & v[12]), chl = (el & v[11]) ^ (~el & v[13]);
++				var t1 = add(v[14], v[15], S1[0], S1[1]);
++				t1 = add(t1[0], t1[1], chh, chl);
++				t1 = add(t1[0], t1[1], K512[i * 2], K512[i * 2 + 1]);
++				t1 = add(t1[0], t1[1], W[i * 2], W[i * 2 + 1]);
++				var ah = v[0], al = v[1];
++				var S0 = x3(rotr(ah, al, 28), rotr(ah, al, 34), rotr(ah, al, 39));
++				var mjh = (ah & v[2]) ^ (ah & v[4]) ^ (v[2] & v[4]);
++				var mjl = (al & v[3]) ^ (al & v[5]) ^ (v[3] & v[5]);
++				var t2 = add(S0[0], S0[1], mjh, mjl);
++				for (j = 15; j >= 2; j--) v[j] = v[j - 2];
++				var ne = add(v[8], v[9], t1[0], t1[1]);	/* d + t1 (d moved to 8/9) */
++				v[8] = ne[0]; v[9] = ne[1];
++				var na = add(t1[0], t1[1], t2[0], t2[1]);
++				v[0] = na[0]; v[1] = na[1];
++			}
++			for (i = 0; i < 16; i += 2) {
++				var s = add(H[i], H[i + 1], v[i], v[i + 1]);
++				H[i] = s[0]; H[i + 1] = s[1];
++			}
++		}
++		return out32(H).slice(0, is384 ? 48 : 64);
++	}
++	var HASHES = {
++		'SHA-1': { f: sha1, block: 64 },
++		'SHA-256': { f: sha256, block: 64 },
++		'SHA-384': { f: function (m) { return sha512(m, true); }, block: 128 },
++		'SHA-512': { f: function (m) { return sha512(m, false); }, block: 128 }
++	};
++	function algName(a) {
++		var n = typeof a === 'string' ? a : (a && a.name);
++		return String(n || '').toUpperCase();
++	}
++	function hashOf(a) {
++		var n = algName(a);
++		if (!HASHES[n]) throw new DOMException('Unrecognized hash: ' + n,
++				'NotSupportedError');
++		return n;
++	}
++	function hmac(hash, key, data) {
++		var H = HASHES[hash], k = key, i;
++		if (k.length > H.block) k = H.f(k);
++		var ik = new Uint8Array(H.block + data.length),
++			ok = new Uint8Array(H.block), inner;
++		for (i = 0; i < H.block; i++) {
++			var b = i < k.length ? k[i] : 0;
++			ik[i] = b ^ 0x36; ok[i] = b ^ 0x5c;
++		}
++		ik.set(data, H.block);
++		inner = H.f(ik);
++		var o2 = new Uint8Array(H.block + inner.length);
++		o2.set(ok); o2.set(inner, H.block);
++		return H.f(o2);
++	}
++	function CryptoKey() { throw new TypeError('Illegal constructor'); }
++	function makeKey(hash, raw, extractable, usages) {
++		var k = Object.create(CryptoKey.prototype);
++		Object.defineProperty(k, 'type', { value: 'secret', enumerable: true });
++		Object.defineProperty(k, 'extractable', { value: !!extractable, enumerable: true });
++		Object.defineProperty(k, 'algorithm', { value: { name: 'HMAC', hash: { name: hash },
++			length: raw.length * 8 }, enumerable: true });
++		Object.defineProperty(k, 'usages', { value: (usages || []).slice(0), enumerable: true });
++		Object.defineProperty(k, '__vbRaw', { value: raw });
++		return k;
++	}
++	function run(fn) {
++		return new Promise(function (res, rej) {
++			try { res(fn()); } catch (e) { rej(e); }
++		});
++	}
++	function unsupported(what) {
++		return function () {
++			return Promise.reject(new DOMException(what + ' is not supported',
++					'NotSupportedError'));
++		};
++	}
++	var subtle = {
++		digest: function (alg, data) {
++			return run(function () {
++				var n = hashOf(alg);
++				return HASHES[n].f(bytes(data)).buffer;
++			});
++		},
++		importKey: function (format, keyData, alg, extractable, usages) {
++			return run(function () {
++				if (algName(alg) !== 'HMAC' || format !== 'raw')
++					throw new DOMException('importKey: only raw HMAC keys are supported',
++							'NotSupportedError');
++				return makeKey(hashOf(alg.hash), bytes(keyData), extractable, usages);
++			});
++		},
++		exportKey: function (format, key) {
++			return run(function () {
++				if (format !== 'raw' || !key || !key.__vbRaw || !key.extractable)
++					throw new DOMException('key is not extractable as raw',
++							'InvalidAccessError');
++				return new Uint8Array(key.__vbRaw).buffer;
++			});
++		},
++		sign: function (alg, key, data) {
++			return run(function () {
++				if (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)
++					throw new DOMException('sign: only HMAC is supported',
++							'NotSupportedError');
++				return hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)).buffer;
++			});
++		},
++		verify: function (alg, key, sig, data) {
++			return run(function () {
++				if (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)
++					throw new DOMException('verify: only HMAC is supported',
++							'NotSupportedError');
++				var m = hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)),
++					s = bytes(sig), d = m.length ^ s.length, i;
++				for (i = 0; i < m.length && i < s.length; i++) d |= m[i] ^ s[i];
++				return d === 0;
++			});
++		},
++		encrypt: unsupported('encrypt'),
++		decrypt: unsupported('decrypt'),
++		generateKey: unsupported('generateKey'),
++		deriveKey: unsupported('deriveKey'),
++		deriveBits: unsupported('deriveBits'),
++		wrapKey: unsupported('wrapKey'),
++		unwrapKey: unsupported('unwrapKey')
++	};
++	try { g.CryptoKey = CryptoKey; } catch (e) { /* */ }
++	try {
++		Object.defineProperty(C, 'subtle', { value: subtle, configurable: true,
++			enumerable: true });
++	} catch (e) { /* */ }
++})();
+ })(this);

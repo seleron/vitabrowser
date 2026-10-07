@@ -262,6 +262,7 @@ NET-css-nesting http://127.0.0.1:$HP/CSS-nesting.html
 NET-js-computed-alpha http://127.0.0.1:$HP/JS-computed-alpha.html
 NET-css-media-features http://127.0.0.1:$HP/CSS-media-features.html
 NET-css-line-height-normal http://127.0.0.1:$HP/CSS-line-height-normal.html
+NET-js-crypto-subtle http://127.0.0.1:$HP/JS-crypto-subtle.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -669,6 +670,11 @@ l214p=$(ls "$R"/*NET-css-line-height-normal.plot 2>/dev/null | head -1)
 l214r=$(sed -n 's/.*STR \(LINEH214: [0-9]*\/[0-9]* passed\).*/\1/p' "$l214p" 2>/dev/null | head -1)
 echo "  css-line-height-normal: ${l214r:-no summary}"
 [ -n "$l214p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$l214p" | sed 's/^STR /  /'
+# Patch 215: crypto.subtle digest + HMAC.
+s215p=$(ls "$R"/*NET-js-crypto-subtle.plot 2>/dev/null | head -1)
+s215r=$(sed -n 's/.*STR \(SUBTLE215: [0-9]*\/[0-9]* passed\).*/\1/p' "$s215p" 2>/dev/null | head -1)
+echo "  js-crypto-subtle: ${s215r:-no summary}"
+[ -n "$s215p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$s215p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -878,6 +884,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$a212r" = "ALPHA212: 4/4 passed" ] && \
 [ "$m213r" = "MQFEAT213: 4/4 passed" ] && \
 [ "$l214r" = "LINEH214: 3/3 passed" ] && \
+[ "$s215r" = "SUBTLE215: 5/5 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
@@ -1113,7 +1120,7 @@ apis=$(sed -n 's/.*STR \(APIS: [0-9]*\/[0-9]* present\).*/\1/p' "$ap" 2>/dev/nul
 beh=$(sed -n 's/.*STR \(behaviour: [0-9]*\/[0-9]* right\).*/\1/p' "$ap" 2>/dev/null | head -1)
 echo "  JS-apis: ${apis:-no summary (script did not run?)}, ${beh:-no behaviour line}"
 napi=$(echo "$apis" | sed -n 's/APIS: \([0-9]*\)\/.*/\1/p')
-[ "${napi:-0}" -ge 149 ] && [ "$beh" = "behaviour: 10/10 right" ] || fail "web API census"
+[ "${napi:-0}" -ge 172 ] && [ "$beh" = "behaviour: 10/10 right" ] || fail "web API census"
 # Cross-realm frames (patch 126): an iframe is its own JS runtime; the two
 # talk through postMessage, which crosses as JSON text only.
 xp=$(ls "$R"/*-JS-xrealm.plot 2>/dev/null | head -1)

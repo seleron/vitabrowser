@@ -72,6 +72,18 @@ in MacSurf's order: transform (Q1), two-value `gap` (Q2), `caption-side`
 its border box by `caption-side`, with room made in the flow; it used to
 be an inline in an implied first cell. CSS-table-caption.html (CAPTION201)
 8/8, 3/8 without the patch. Q4 was already in the stack (fixes184/573).
+*Status (2026-10-07, cloud session, live sites unreachable so the
+scorecard could not run):* gaps were found instead with geometry and
+cascade probes against local Chromium (testpages/pages/PROBE-*.html) and
+fixed with a Chromium-verified, disarm-checked gate each: [hidden] /
+dialog / template / closed-details hiding + summary toggle (203),
+display: flow-root (204), grid repeat(auto-fill|auto-fit) by container
+width and spaced grid-area placement (206), svh/lvh/dvh units and lh
+(207), -webkit-line-clamp (208), ch = 0.5em (210), CSS nesting (211),
+discrete media features such as prefers-reduced-motion and hover/pointer
+(213), line-height: normal = 1.164 with no forced 1.33 (214). Open from
+the probes: @container (dropped), @supports not(...) for features we lack
+(dropped), @layer (flattened), Shadow DOM.
 
 ### WS-B Web platform (R1, R2, R4)
 1. **Event model conformance.** A listener registered on `document` without
@@ -84,7 +96,10 @@ be an inline in an implied first cell. CSS-table-caption.html (CAPTION201)
    (hCaptcha, embeds, OAuth widgets) need real loading into their own realm
    with the postMessage bridge (doc 12).
 3. **API census** (JS-apis 161/176): close the missing 15 where sites use
-   them; `innerText`.
+   them; `innerText`. *2026-10-07:* 172/176 -- crypto.subtle digest + HMAC
+   (patch 215); still missing attachShadow, caches, serviceWorker,
+   mediaDevices. Inline elements' getBoundingClientRect (202) and
+   computed colour alpha (212) fixed.
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 
