@@ -1,0 +1,169 @@
+# netsurf: inline <svg> with an auto dimension is sized like browsers do (patch 217)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 92dfbf1 (patch stack through 216)
+#
+# An inline <svg> is a replaced box (fixes202: SVG_INLINE | REPLACE_DIM)
+# with no object, so layout had no intrinsic size or ratio for it: a
+# width or height left auto came out 0 (line layout's "unknown replaced
+# size" branch), and in a flex row the block path made it square. Icons
+# sized by one dimension -- <svg viewBox="0 0 24 24" class="w-6">, or a
+# width attribute alone -- and responsive illustrations with only a
+# viewBox disappeared.
+#
+# vb_inline_svg_resolve_size() (vb_inline_svg.c) reads the root's viewBox
+# from the DOM and resolves CSS 2.1 10.3.2 / 10.6.2 with SVG's intrinsic
+# ratio: one given dimension gives the other through the ratio; neither
+# given, with a viewBox, is the containing block's width (0 for the
+# min/max-width pass); without a viewBox the default object size, 300 x
+# 150. layout_line's inline-replaced sizing uses it (then min/max-width
+# and -height clamp), the min/max-width pass uses it for an auto width,
+# and the block-level REPLACE_DIM path uses it instead of a square.
+#
+# Test: testpages/pages/CSS-svg-size.html (SVGSIZE217, 5 checks,
+# Chromium 5/5; the auto dimension was 0 before, failing 1-4): width
+# given, height given, neither (container width), no viewBox (300 x 150),
+# both attributes unchanged.
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -64,6 +64,7 @@
+ #include "html/private.h"
+ #include "html/box.h"
+ #include "html/box_inspect.h"
++#include "html/vb_inline_svg.h"
+ 
+ /* fixes120: diagnostic instrumentation only. macsurf_debug.h compiles to
+  * stubs on non-Mac builds and to file-backed log on the Mac. */
+@@ -1060,6 +1061,11 @@
+ 						&width, &temp_height,
+ 						INT_MIN, INT_MAX,
+ 						INT_MIN, INT_MAX);
++			} else if ((b->flags & SVG_INLINE) && width == AUTO) {
++				/* patch 217: as layout_line will size it */
++				int temp_height = height;
++				vb_inline_svg_resolve_size(b, -1, AUTO,
++						&width, &temp_height);
+ 			}
+ 
+ 			fixed = frac = 0;
+@@ -4649,6 +4655,19 @@
+ 
+ 			/* We reformat the iframe browser window to new
+ 			 * dimensions in pass 2 */
++		} else if (b->flags & SVG_INLINE) {
++			/* patch 217: inline <svg>, sized from its viewBox
++			 * ratio or the default 300 x 150 */
++			vb_inline_svg_resolve_size(b, *width, AUTO,
++					&b->width, &b->height);
++			if (min_width > 0 && b->width < min_width)
++				b->width = min_width;
++			if (max_width >= 0 && b->width > max_width)
++				b->width = max_width;
++			if (min_height > 0 && b->height < min_height)
++				b->height = min_height;
++			if (max_height >= 0 && b->height > max_height)
++				b->height = max_height;
+ 		} else if (b->gadget != NULL) {
+ 			/* form control with no object */
+ 			if (b->width == AUTO)
+@@ -5602,6 +5621,10 @@
+ 			if (block->obj_w > 0 && block->obj_h > 0)
+ 				block->height = block->width * block->obj_h /
+ 						block->obj_w;
++			else if (block->flags & SVG_INLINE)
++				/* patch 217: the viewBox ratio, else 150 */
++				vb_inline_svg_resolve_size(block, -1, AUTO,
++						&block->width, &block->height);
+ 			else
+ 				block->height = block->width;
+ 		}
+diff --git a/content/handlers/html/vb_inline_svg.c b/content/handlers/html/vb_inline_svg.c
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -397,6 +397,64 @@
+ }
+ 
+ /* exported interface documented in html/vb_inline_svg.h */
++/* patch 217: the root's viewBox width and height, from the DOM */
++static bool vb_svg_viewbox(const struct box *box, float *vw, float *vh)
++{
++	dom_string *name = NULL, *val = NULL;
++	bool ok = false;
++
++	if (box == NULL || box->node == NULL)
++		return false;
++	if (dom_string_create((const uint8_t *)"viewBox", 7, &name) !=
++			DOM_NO_ERR)
++		return false;
++	if (dom_element_get_attribute((dom_element *)box->node, name,
++			&val) == DOM_NO_ERR && val != NULL) {
++		char tmp[80];
++		size_t n = dom_string_byte_length(val), q;
++		float a0, a1, a2, a3;
++
++		if (n > sizeof(tmp) - 1)
++			n = sizeof(tmp) - 1;
++		memcpy(tmp, dom_string_data(val), n);
++		tmp[n] = '\0';
++		for (q = 0; q < n; q++)
++			if (tmp[q] == ',')
++				tmp[q] = ' ';
++		if (sscanf(tmp, "%f %f %f %f", &a0, &a1, &a2, &a3) == 4 &&
++				a2 > 0 && a3 > 0) {
++			*vw = a2;
++			*vh = a3;
++			ok = true;
++		}
++		dom_string_unref(val);
++	}
++	dom_string_unref(name);
++	return ok;
++}
++
++/* exported interface documented in html/vb_inline_svg.h */
++void vb_inline_svg_resolve_size(const struct box *box, int avail,
++		int autov, int *width, int *height)
++{
++	float vw = 0, vh = 0;
++	bool r = vb_svg_viewbox(box, &vw, &vh);
++
++	if (*width == autov && *height == autov) {
++		if (r) {
++			*width = avail >= 0 ? avail : 0;
++			*height = (int)(*width * vh / vw + 0.5f);
++		} else {
++			*width = 300;
++			*height = 150;
++		}
++	} else if (*width == autov) {
++		*width = r ? (int)(*height * vw / vh + 0.5f) : 300;
++	} else if (*height == autov) {
++		*height = r ? (int)(*width * vh / vw + 0.5f) : 150;
++	}
++}
++
+ bool vb_inline_svg_paint(struct box *box, int x, int y, int width,
+ 		int height, const struct redraw_context *ctx,
+ 		const html_content *html)
+diff --git a/content/handlers/html/vb_inline_svg.h b/content/handlers/html/vb_inline_svg.h
+--- a/content/handlers/html/vb_inline_svg.h
++++ b/content/handlers/html/vb_inline_svg.h
+@@ -40,6 +40,18 @@
+ 		int height, const struct redraw_context *ctx,
+ 		const struct html_content *html);
+ 
++/**
++ * VitaBrowser patch 217: the size of an inline <svg> whose width or height
++ * (or both) is auto, as browsers size it (CSS 2.1 10.3.2 / 10.6.2 with
++ * SVG's intrinsic ratio): one given dimension and the root's viewBox ratio
++ * give the other; neither given, with a viewBox, is avail wide (pass a
++ * negative avail for the min/max-width pass: 0 wide then); without a
++ * viewBox the default object size, 300 x 150. AUTO inputs only are
++ * changed; layout's AUTO sentinel is passed in as `autov`.
++ */
++void vb_inline_svg_resolve_size(const struct box *box, int avail,
++		int autov, int *width, int *height);
++
+ /** Drop every cached diagram (memory pressure, content teardown). */
+ void vb_inline_svg_flush(void);
+ 

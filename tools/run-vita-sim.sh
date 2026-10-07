@@ -263,6 +263,8 @@ NET-js-computed-alpha http://127.0.0.1:$HP/JS-computed-alpha.html
 NET-css-media-features http://127.0.0.1:$HP/CSS-media-features.html
 NET-css-line-height-normal http://127.0.0.1:$HP/CSS-line-height-normal.html
 NET-js-crypto-subtle http://127.0.0.1:$HP/JS-crypto-subtle.html
+NET-css-supports-absent http://127.0.0.1:$HP/CSS-supports-absent.html
+NET-css-svg-size http://127.0.0.1:$HP/CSS-svg-size.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -675,6 +677,16 @@ s215p=$(ls "$R"/*NET-js-crypto-subtle.plot 2>/dev/null | head -1)
 s215r=$(sed -n 's/.*STR \(SUBTLE215: [0-9]*\/[0-9]* passed\).*/\1/p' "$s215p" 2>/dev/null | head -1)
 echo "  js-crypto-subtle: ${s215r:-no summary}"
 [ -n "$s215p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$s215p" | sed 's/^STR /  /'
+# Patch 216: @supports knows the properties we lack.
+u216p=$(ls "$R"/*NET-css-supports-absent.plot 2>/dev/null | head -1)
+u216r=$(sed -n 's/.*STR \(SUPABS216: [0-9]*\/[0-9]* passed\).*/\1/p' "$u216p" 2>/dev/null | head -1)
+echo "  css-supports-absent: ${u216r:-no summary}"
+[ -n "$u216p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$u216p" | sed 's/^STR /  /'
+# Patch 217: inline svg auto sizes from the viewBox ratio.
+v217p=$(ls "$R"/*NET-css-svg-size.plot 2>/dev/null | head -1)
+v217r=$(sed -n 's/.*STR \(SVGSIZE217: [0-9]*\/[0-9]* passed\).*/\1/p' "$v217p" 2>/dev/null | head -1)
+echo "  css-svg-size: ${v217r:-no summary}"
+[ -n "$v217p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$v217p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -885,6 +897,8 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$m213r" = "MQFEAT213: 4/4 passed" ] && \
 [ "$l214r" = "LINEH214: 3/3 passed" ] && \
 [ "$s215r" = "SUBTLE215: 5/5 passed" ] && \
+[ "$u216r" = "SUPABS216: 3/3 passed" ] && \
+[ "$v217r" = "SVGSIZE217: 5/5 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
