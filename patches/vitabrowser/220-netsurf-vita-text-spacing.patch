@@ -1,0 +1,127 @@
+# netsurf: letter-spacing and word-spacing reach the Vita text path (patch 220)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 8b53c22 (patch stack through 219)
+#
+# letter-spacing and word-spacing had no effect: the build compiles
+# html/font.c, whose font_plot_style_from_css() never set the
+# plot_font_style_t spacing fields (the fixes42 / fixes139b code is in
+# html_font.c, which this build does not compile). Those fields, and the
+# shadow / transform / hyphens ones after them, held the caller's stack
+# garbage. The Vita text code ignored them anyway, so justified text
+# (redraw.c adds space_expand to word_spacing) drew unspread.
+#
+#  - html/font.c: letter-spacing and word-spacing resolved to device px
+#    (normal => 0); the remaining fields zeroed.
+#  - vita/text.c, text.h: vita_text_style carries both values; advance,
+#    width and the draw loop add letter-spacing after every character
+#    and word-spacing after U+0020 / U+00A0, so layout's measurements
+#    and the drawn text agree. Justified lines now reach both edges.
+#
+# Test: testpages/pages/CSS-letter-spacing.html (SPACING220, 3 checks,
+# Chromium 3/3; before, 0/3, every span measured as unspaced):
+# 4px x 7 letters +28, word-spacing 20px x 2 spaces +40, 0.25em at 20px
+# x 7 letters +35.
+diff --git a/content/handlers/html/font.c b/content/handlers/html/font.c
+--- a/content/handlers/html/font.c
++++ b/content/handlers/html/font.c
+@@ -162,4 +162,27 @@
+ 	css_computed_color(css, &col);
+ 	fstyle->foreground = nscss_color_to_ns(col);
+ 	fstyle->background = 0;
++
++	/* patch 220: letter-spacing and word-spacing in device px (normal
++	 * is 0). These and the fields after them were left unset, so the
++	 * callers' stack garbage reached the font functions. */
++	length = 0;
++	unit = CSS_UNIT_PX;
++	fstyle->letter_spacing = (css_computed_letter_spacing(css,
++			&length, &unit) == CSS_LETTER_SPACING_SET) ?
++		FIXTOINT(css_unit_len2device_px(css, unit_len_ctx,
++				length, unit)) : 0;
++	length = 0;
++	unit = CSS_UNIT_PX;
++	fstyle->word_spacing = (css_computed_word_spacing(css,
++			&length, &unit) == CSS_WORD_SPACING_SET) ?
++		FIXTOINT(css_unit_len2device_px(css, unit_len_ctx,
++				length, unit)) : 0;
++	fstyle->shadow_x = 0;
++	fstyle->shadow_y = 0;
++	fstyle->shadow_blur = 0;
++	fstyle->shadow_color = 0;
++	fstyle->transform = 0;
++	fstyle->transform_b = 0;
++	fstyle->hyphens = 0;
+ }
+diff --git a/frontends/vita/text.c b/frontends/vita/text.c
+--- a/frontends/vita/text.c
++++ b/frontends/vita/text.c
+@@ -248,9 +248,17 @@
+ }
+ 
+ /* exported interface documented in vita/text.h */
++/* patch 220: CSS letter-spacing after every character, word-spacing after
++ * every space (U+0020, U+00A0) */
++static inline int spacing(const struct vita_text_style *style, uint32_t cp)
++{
++	return style->letter_spacing +
++		((cp == 0x20 || cp == 0xa0) ? style->word_spacing : 0);
++}
++
+ int vita_text_advance(const struct vita_text_style *style, uint32_t cp)
+ {
+-	return resolve(style, cp)->adv;
++	return resolve(style, cp)->adv + spacing(style, cp);
+ }
+ 
+ /* exported interface documented in vita/text.h */
+@@ -261,7 +269,8 @@
+ 	int w = 0;
+ 
+ 	while (i < len) {
+-		w += resolve(style, utf8_to_ucs4(utf8 + i, len - i))->adv;
++		uint32_t cp = utf8_to_ucs4(utf8 + i, len - i);
++		w += resolve(style, cp)->adv + spacing(style, cp);
+ 		i = utf8_next(utf8, len, i);
+ 	}
+ 	return w;
+@@ -514,7 +523,7 @@
+ 				}
+ 			}
+ 		}
+-		pen += e->adv;
++		pen += e->adv + spacing(style, e->cp);
+ 	}
+ 	if (n > 0)
+ 		draw_placed(pl, n, rgba);
+@@ -550,6 +559,8 @@
+ 	style->family = VITA_FAMILY_SANS;
+ 	style->bold = false;
+ 	style->italic = false;
++	style->letter_spacing = 0;
++	style->word_spacing = 0;
+ }
+ 
+ /* exported interface documented in vita/text.h */
+@@ -575,6 +586,9 @@
+ 	}
+ 	style->bold = fstyle->weight >= 600;
+ 	style->italic = (fstyle->flags & (FONTF_ITALIC | FONTF_OBLIQUE)) != 0;
++	/* patch 220: px in the core's 96 dpi, as layout measured them */
++	style->letter_spacing = fstyle->letter_spacing;
++	style->word_spacing = fstyle->word_spacing;
+ }
+ 
+ /* exported interface documented in vita/text.h */
+diff --git a/frontends/vita/text.h b/frontends/vita/text.h
+--- a/frontends/vita/text.h
++++ b/frontends/vita/text.h
+@@ -56,6 +56,9 @@
+ 	enum vita_text_family family;
+ 	bool bold;
+ 	bool italic;
++	int letter_spacing;	/**< patch 220: px added after each character */
++	int word_spacing;	/**< and after each space (CSS word-spacing plus
++				 * redraw's justification expansion) */
+ };
+ 
+ /** Counters since start-up, for the diagnostics. */
