@@ -1,0 +1,59 @@
+# netsurf: getComputedStyle keeps a colour's alpha (patch 212, with 212-libcss)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 93f9666 (patch stack through 211)
+#
+# qjs_cs_colour serialized every computed colour as "rgb(r, g, b)",
+# dropping alpha: a transparent background (libcss' initial 0x00000000)
+# read as black "rgb(0, 0, 0)", so scripts checking for
+# "rgba(0, 0, 0, 0)" -- the usual "is this transparent" test, and
+# contrast/theme detection that walks up to the first opaque
+# background -- got the wrong answer. A colour with alpha below 255 is now
+# "rgba(r, g, b, a)" in Blink's form: a with 2 decimals when they round-
+# trip to the same byte, else 3 (128 -> 0.5, 136 -> 0.533, 0 -> 0).
+#
+# Test: testpages/pages/JS-computed-alpha.html (ALPHA212, 4 checks,
+# Chromium 4/4; 1/4 with this half reverted): transparent background, a
+# 50% alpha, #0808 and 0.1, an opaque colour staying rgb().
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -8005,10 +8005,36 @@
+ static void qjs_cs_colour(JSContext *ctx, JSValue o, const char *name,
+ 		css_color c)
+ {
+-	char buf[40];
++	char buf[48];
++	int a = (int)((c >> 24) & 0xff);
+ 	/* libcss packs colour as 0xAARRGGBB. */
+-	sprintf(buf, "rgb(%d, %d, %d)",
+-		(int)((c >> 16) & 0xff), (int)((c >> 8) & 0xff), (int)(c & 0xff));
++	if (a == 255) {
++		sprintf(buf, "rgb(%d, %d, %d)",
++			(int)((c >> 16) & 0xff), (int)((c >> 8) & 0xff),
++			(int)(c & 0xff));
++	} else {
++		/* patch 212: keep the alpha, as browsers do -- transparent
++		 * is "rgba(0, 0, 0, 0)", and it read as black "rgb(0, 0, 0)".
++		 * Blink's form: 2 decimals when they round-trip to the same
++		 * byte, else 3 (128 -> 0.5, 136 -> 0.533). */
++		int hundred = (a * 100 + 127) / 255;
++		char ab[8];
++
++		if ((hundred * 255 + 50) / 100 == a) {
++			if (hundred % 10 == 0)
++				sprintf(ab, "%d.%d", hundred / 100,
++						(hundred / 10) % 10);
++			else
++				sprintf(ab, "0.%02d", hundred);
++		} else {
++			sprintf(ab, "0.%03d", (a * 1000 + 127) / 255);
++		}
++		if (a == 0)
++			strcpy(ab, "0");
++		sprintf(buf, "rgba(%d, %d, %d, %s)",
++			(int)((c >> 16) & 0xff), (int)((c >> 8) & 0xff),
++			(int)(c & 0xff), ab);
++	}
+ 	JS_SetPropertyStr(ctx, o, name, JS_NewString(ctx, buf));
+ }
+ 

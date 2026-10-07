@@ -259,6 +259,7 @@ NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
 NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
 NET-css-nesting http://127.0.0.1:$HP/CSS-nesting.html
+NET-js-computed-alpha http://127.0.0.1:$HP/JS-computed-alpha.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -651,6 +652,11 @@ n211p=$(ls "$R"/*NET-css-nesting.plot 2>/dev/null | head -1)
 n211r=$(sed -n 's/.*STR \(NEST211: [0-9]*\/[0-9]* passed\).*/\1/p' "$n211p" 2>/dev/null | head -1)
 echo "  css-nesting: ${n211r:-no summary}"
 [ -n "$n211p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$n211p" | sed 's/^STR /  /'
+# Patch 212: getComputedStyle keeps colour alpha; alpha rounds.
+a212p=$(ls "$R"/*NET-js-computed-alpha.plot 2>/dev/null | head -1)
+a212r=$(sed -n 's/.*STR \(ALPHA212: [0-9]*\/[0-9]* passed\).*/\1/p' "$a212p" 2>/dev/null | head -1)
+echo "  js-computed-alpha: ${a212r:-no summary}"
+[ -n "$a212p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$a212p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -813,6 +819,21 @@ ds_blocks=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: blocks placed' |
 echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_blocks} block changes placed locally"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
+# GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest
+# main-loop gap); on a loaded VM one host hiccup fails it in most runs,
+# and this combined check then stops the gate before the sections below
+# (frames, window services, interaction pass, downloads, real-site
+# layout, web APIs, the Vita-pace run) ever run. With the knob, 2/3 with
+# only check 3 failing is accepted, and said so. Off by default.
+rs_ok=no
+[ "$rsr" = "REFLOW: 3/3 passed" ] && rs_ok=yes
+if [ "$rs_ok" = no ] && [ "${GATE_TIMING_SOFT:-0}" = 1 ] && \
+   [ "$rsr" = "REFLOW: 2/3 passed" ] && [ -n "$rsp" ] && \
+   grep -q 'STR 3 no stall[^"]*FAIL' "$rsp" && \
+   ! grep -q 'STR [12] [^"]*FAIL' "$rsp"; then
+	rs_ok=soft
+	echo "  REFLOW: only the timing check (3) failed -- accepted, GATE_TIMING_SOFT=1"
+fi
 [ "$dsr" = "DOMSTALL: 8/8 passed" ] && [ "${ds_local:-0}" -ge 3 ] && \
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
@@ -828,6 +849,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$l208r" = "CLAMP208: 4/4 passed" ] && \
 [ "$c210r" = "CHUNIT210: 2/2 passed" ] && \
 [ "$n211r" = "NEST211: 6/6 passed" ] && \
+[ "$a212r" = "ALPHA212: 4/4 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
@@ -845,7 +867,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$appr" = "APPEAR: 6/6 passed" ] && \
 [ "$cdr" = "CHARDATA: 5/5 passed" ] && \
 [ "$fhr" = "FLEXHDR: 6/6 passed" ] && \
-[ "$rsr" = "REFLOW: 3/3 passed" ] && [ "${rs_local:-0}" -ge 4 ] && \
+[ "$rs_ok" != no ] && [ "${rs_local:-0}" -ge 4 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \

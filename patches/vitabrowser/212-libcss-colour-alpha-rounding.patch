@@ -1,0 +1,90 @@
+# libcss: colour alpha rounds like browsers do (patch 212, with 212-netsurf)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 93f9666 (patch stack through 211)
+#
+# The alpha of rgb()/rgba()/hsl()/hsla() was converted to a byte with
+# FIXTOINT, which truncates, from libcss' 22.10 fixed point, which cannot
+# hold 0.1 (it is 0.0996 there): 50% gave 127 and 0.1 gave 25 where
+# browsers give 128 and 26. With 212-netsurf serializing alpha, scripts
+# saw 0.498 and 0.098. vb_alpha_byte() now reads the alpha token's own
+# text (strtod) and rounds half up, at the three alpha sites; percentage
+# colour channels round too (50% -> 128, as in browsers).
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
+ 
+@@ -412,6 +413,24 @@
+ 	}
+ }
+ 
++/* VitaBrowser patch 212: an alpha number or percentage token as a byte,
++ * rounded half up from the token's own text. The 22.10 fixed-point
++ * value is too coarse for it (0.1 is 0.0996 there, so 25 not 26) and
++ * libcss truncated besides (50% gave 127). */
++static int32_t vb_alpha_byte(const css_token *t, bool pct)
++{
++	double v = strtod(lwc_string_data(t->idata), NULL);
++
++	if (pct)
++		v /= 100.0;
++	v = v * 255.0 + 0.5;
++	if (v < 0.0)
++		return 0;
++	if (v > 255.0)
++		return 255;
++	return (int32_t)v;
++}
++
+ /**
+  * Parse a RGB(A) colour specifier
+  *
+@@ -491,14 +510,15 @@
+ 			if (valid == CSS_TOKEN_NUMBER) {
+ 				if (i == 3) {
+ 					/* alpha channel */
+-					intval = FIXTOINT(FMUL(num, F_255));
++					intval = vb_alpha_byte(token, false); /* patch 212 */
+ 				} else {
+ 					/* colour channels */
+ 					intval = FIXTOINT(num);
+ 				}
+ 			} else {
+-				intval = FIXTOINT(
+-					FDIV(FMUL(num, F_255), F_100));
++				intval = (i == 3) ? vb_alpha_byte(token, true) :
++					FIXTOINT(FADD(	/* patch 212: round */
++					FDIV(FMUL(num, F_255), F_100), F_0_5));
+ 			}
+ 
+ 			if (intval > 255) {
+@@ -719,9 +739,9 @@
+ 		}
+ 
+ 		if (token->type == CSS_TOKEN_NUMBER) {
+-			alpha = FIXTOINT(FMUL(alpha, F_255));
++			alpha = vb_alpha_byte(token, false); /* patch 212 */
+ 		} else {
+-			alpha = FIXTOINT(FDIV(FMUL(alpha, F_255), F_100));
++			alpha = vb_alpha_byte(token, true); /* patch 212 */
+ 		}
+ 
+ 		consumeWhitespace(vector, ctx);
+@@ -899,9 +919,9 @@
+ 		}
+ 
+ 		if (token->type == CSS_TOKEN_NUMBER) {
+-			alpha = FIXTOINT(FMUL(alpha, F_255));
++			alpha = vb_alpha_byte(token, false); /* patch 212 */
+ 		} else {
+-			alpha = FIXTOINT(FDIV(FMUL(alpha, F_255), F_100));
++			alpha = vb_alpha_byte(token, true); /* patch 212 */
+ 		}
+ 
+ 		consumeWhitespace(vector, ctx);
