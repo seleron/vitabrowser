@@ -253,6 +253,7 @@ NET-css-appearance http://127.0.0.1:$HP/CSS-appearance.html
 NET-css-table-caption http://127.0.0.1:$HP/CSS-table-caption.html
 NET-js-inline-rect http://127.0.0.1:$HP/JS-inline-rect.html
 NET-html-hidden-details http://127.0.0.1:$HP/HTML-hidden-details.html
+NET-css-flow-root http://127.0.0.1:$HP/CSS-flow-root.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -615,6 +616,11 @@ h203p=$(ls "$R"/*NET-html-hidden-details.plot 2>/dev/null | head -1)
 h203r=$(sed -n 's/.*STR \(HIDDEN203: [0-9]*\/[0-9]* passed\).*/\1/p' "$h203p" 2>/dev/null | head -1)
 echo "  HTML-hidden-details: ${h203r:-no summary}"
 [ -n "$h203p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$h203p" | sed 's/^STR /  /'
+# Patch 204: display: flow-root is a block formatting context root.
+f204p=$(ls "$R"/*NET-css-flow-root.plot 2>/dev/null | head -1)
+f204r=$(sed -n 's/.*STR \(FLOWROOT204: [0-9]*\/[0-9]* passed\).*/\1/p' "$f204p" 2>/dev/null | head -1)
+echo "  CSS-flow-root: ${f204r:-no summary}"
+[ -n "$f204p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$f204p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -786,6 +792,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$c201r" = "CAPTION201: 8/8 passed" ] && \
 [ "$i202r" = "INLINERECT: 6/6 passed" ] && \
 [ "$h203r" = "HIDDEN203: 9/9 passed" ] && \
+[ "$f204r" = "FLOWROOT204: 4/4 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \

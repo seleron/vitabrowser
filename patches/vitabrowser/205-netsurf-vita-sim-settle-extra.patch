@@ -1,0 +1,72 @@
+# netsurf (vita simulator): VITA_SETTLE_EXTRA_MS -- network pages' bottom dump waits for timed gate pages
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 55361f5 (patch stack through 203)
+#
+# The autotest dumps a page once nothing has repainted for VITA_SETTLE_MS
+# (700 ms), then again at the bottom. The timed gate pages idle longer
+# than that by design -- JS-block-class-stall waits 1 s after the page
+# stops growing and ~750 ms between steps; JS-reflow-stall likewise -- so
+# their bottom dump (the one the gates read) raced their own script and
+# read "script did not run" in about half the runs, keeping the gate red
+# on host timing alone. tools/run-vita-sim.sh has passed
+# VITA_SETTLE_EXTRA_MS=7000 to the simulator since patch 162 (2026-09-29)
+# for exactly this, but nothing read it.
+#
+# Fix, VITA_HOST_SIM only: in the network pass (N), the bottom dump also
+# waits until VITA_SETTLE_EXTRA_MS have passed since the page first
+# settled (still bounded by VITA_SETTLE_TIMEOUT_MS from navigation). The
+# device build has no environment and is unchanged; the bundled-page
+# passes A-D are unchanged. Cost: ~5 s per network page in the gate.
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -463,6 +463,33 @@
+ 	return vita_diag_ms() - vita_stats.nav_ms > VITA_SETTLE_TIMEOUT_MS;
+ }
+ 
++#ifdef VITA_HOST_SIM
++/* Patch 205 (simulator only): VITA_SETTLE_EXTRA_MS. A network page's
++ * bottom dump -- the one the gates read -- waits at least this long after
++ * the page first settled. "Settled" is VITA_SETTLE_MS without a repaint,
++ * and the timed gate pages (JS-reflow-stall, JS-block-class-stall, ...)
++ * idle longer than that on purpose (a 1 s wait for the load's last layout,
++ * ~750 ms between steps), so their dump raced their own script and read
++ * "script did not run" in about half the runs. tools/run-vita-sim.sh has
++ * passed 7000 since patch 162; nothing read it until now. The device
++ * build is unchanged (no environment there). */
++static unsigned int vita_settled_ms;
++
++static unsigned int settle_extra_ms(void)
++{
++	static int v = -1;
++
++	if (v < 0) {
++		const char *e = getenv("VITA_SETTLE_EXTRA_MS");
++
++		v = e != NULL ? atoi(e) : 0;
++		if (v < 0)
++			v = 0;
++	}
++	return (unsigned int)v;
++}
++#endif
++
+ /**
+  * The controls for one pass: SELECT combinations are the test functions,
+  * everything else browses (vita/input.c).
+@@ -764,6 +791,15 @@
+ 	case AT_BOTTOM_SETTLE:
+ 		if (!page_settled(gw) && !page_timed_out())
+ 			return FRAME_NONE;
++#ifdef VITA_HOST_SIM
++		if (vita_autotest == AT_BOTTOM_SETTLE &&
++				vita_passes[vita_pass].tag == 'N' &&
++				!page_timed_out() &&
++				vita_diag_ms() - vita_settled_ms < settle_extra_ms())
++			return FRAME_NONE;
++		if (vita_autotest == AT_SETTLE)
++			vita_settled_ms = vita_diag_ms();
++#endif
+ 		if (!page_settled(gw))
+ 			vita_diag_log("autotest: %s did not settle in %u ms",
+ 				      page_name(vita_page),

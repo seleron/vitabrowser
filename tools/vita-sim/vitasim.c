@@ -446,7 +446,11 @@ static void write_png(const char *path, const uint32_t *px)
 /* Polls with no new frame before a page counts as settled (~1 s: the
  * frontend sleeps 16 ms per idle poll). */
 #define SETTLE_POLLS 60
-#define MAX_POLLS 20000
+/* The whole run's poll budget (~16 ms a poll), not a page's: the autotest
+ * never advances `page`. 20000 (~5 min) held the ~260 s autotest until
+ * patch 205 made each network page's bottom dump wait
+ * VITA_SETTLE_EXTRA_MS; run-vita-sim.sh's `timeout 900` still bounds it. */
+#define MAX_POLLS 60000
 
 
 /* ---- VITA_SIM_SCRIPT: a scripted session ------------------------------

@@ -1,0 +1,112 @@
+# netsurf: display: flow-root establishes a block formatting context (patch 204, with 204-libcss)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 55361f5 (patch stack through 203)
+#
+# With 204-libcss the computed display is CSS_DISPLAY_FLOW_ROOT. Here it
+# maps to BOX_BLOCK (box_construct's box_map, kept in sync with libcss'
+# enum), and layout treats it as a block formatting context root exactly
+# where it already treated overflow other than visible as one, without
+# clipping: layout_block_context lays it out in its own context (it
+# contains its floats), its width keeps clear of floats outside it, and
+# layout_next_margin_block neither collapses a margin through it nor
+# descends into it; the local-relayout margin walk (lr_margin_block)
+# declines it too. getComputedStyle answers "flow-root".
+#
+# Test: testpages/pages/CSS-flow-root.html (FLOWROOT204, 4 checks,
+# Chromium 4/4; 0/4 without the patch): contains its float, computed
+# display, keeps clear of an outside float, child margin stays inside.
+# Full gate: see docs/build-loop-state.md.
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -263,6 +263,7 @@
+ 	BOX_GRID,            /* CSS_DISPLAY_GRID -- fixes75 */
+ 	BOX_INLINE_GRID,     /* CSS_DISPLAY_INLINE_GRID -- fixes75 */
+ 	BOX_CONTENTS,        /* CSS_DISPLAY_CONTENTS */
++	BOX_BLOCK,           /* CSS_DISPLAY_FLOW_ROOT -- patch 204 */
+ };
+ 
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1860,6 +1860,20 @@
+ 
+ 
+ /**
++ * VitaBrowser (patch 204): display: flow-root -- a block box that
++ * establishes a new block formatting context (contains its floats,
++ * keeps clear of outside floats, no margin collapsing through it), the
++ * modern clearfix. Laid out like a block with overflow other than
++ * visible, without clipping.
++ */
++static inline bool layout_box_is_flow_root(const struct box *box)
++{
++	return box->style != NULL &&
++			css_computed_display(box->style, false) ==
++				CSS_DISPLAY_FLOW_ROOT;
++}
++
++/**
+  * Find next block that current margin collapses to.
+  *
+  * \param  unit_len_ctx  Length conversion context
+@@ -1921,6 +1935,7 @@
+ 					(box->style &&
+ 					box_overflow_y(box) !=
+ 					CSS_OVERFLOW_VISIBLE) ||
++					layout_box_is_flow_root(box) ||
+ 					(box->type == BOX_INLINE_CONTAINER &&
+ 					!box_is_first_child(box))) {
+ 				/* Collapse to this box; return it */
+@@ -1933,7 +1948,8 @@
+ 		if (box->type == BOX_BLOCK && !box->object && box->children &&
+ 				box->style &&
+ 				box_overflow_y(box) ==
+-				CSS_OVERFLOW_VISIBLE) {
++				CSS_OVERFLOW_VISIBLE &&
++				!layout_box_is_flow_root(box)) {
+ 			/* Down into children. */
+ 			box = box->children;
+ 		} else {
+@@ -5736,7 +5752,8 @@
+ 			if (lh__box_is_object(box) == false &&
+ 					box->style &&
+ 					(overflow_x != CSS_OVERFLOW_VISIBLE ||
+-					 overflow_y != CSS_OVERFLOW_VISIBLE)) {
++					 overflow_y != CSS_OVERFLOW_VISIBLE ||
++					 layout_box_is_flow_root(box))) {
+ 				/* box establishes new block formatting context
+ 				 * so available width may be diminished due to
+ 				 * floats. */
+@@ -5875,7 +5892,8 @@
+ 				(box->flags & MULTICOL_HINT) ||
+ 				(box->type == BOX_BLOCK && box->style &&
+ 				 (overflow_x != CSS_OVERFLOW_VISIBLE ||
+-				  overflow_y != CSS_OVERFLOW_VISIBLE))) {
++				  overflow_y != CSS_OVERFLOW_VISIBLE ||
++				  layout_box_is_flow_root(box)))) {
+ 
+ 			if (box->type == BOX_FLEX) {
+ 				if (!layout_flex(box, box->width, content)) {
+@@ -8378,7 +8396,8 @@
+ 	    css_computed_clear(b->style) != CSS_CLEAR_NONE ||
+ 	    css_computed_float(b->style) != CSS_FLOAT_NONE ||
+ 	    box_overflow_x(b) != CSS_OVERFLOW_VISIBLE ||
+-	    box_overflow_y(b) != CSS_OVERFLOW_VISIBLE)
++	    box_overflow_y(b) != CSS_OVERFLOW_VISIBLE ||
++	    layout_box_is_flow_root(b))
+ 		return false;
+ 	return true;
+ }
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -7395,6 +7395,7 @@
+ 	case CSS_DISPLAY_INLINE_FLEX:  return "inline-flex";
+ 	case CSS_DISPLAY_GRID:         return "grid";
+ 	case CSS_DISPLAY_INLINE_GRID:  return "inline-grid";
++	case CSS_DISPLAY_FLOW_ROOT:    return "flow-root";
+ 	case CSS_DISPLAY_TABLE:        return "table";
+ 	case CSS_DISPLAY_TABLE_CELL:   return "table-cell";
+ 	case CSS_DISPLAY_TABLE_ROW:    return "table-row";
