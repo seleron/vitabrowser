@@ -87,8 +87,8 @@ discrete media features such as prefers-reduced-motion and hover/pointer
 letter-/word-spacing and justified text on the Vita text path (220), the
 space between inline-blocks, images and buttons (221), fieldset/legend
 (222), range and color inputs as widgets (223). Open from the probes:
-@container (dropped), @layer (flattened), Shadow DOM, checkbox/radio at
-18 x 16 (browsers 13 x 13), date inputs as plain text fields.
+@container (dropped), @layer (flattened), Shadow DOM, date inputs as
+plain text fields. Checkbox/radio at browsers' 13 x 13 (224).
 
 ### WS-B Web platform (R1, R2, R4)
 1. **Event model conformance.** A listener registered on `document` without
