@@ -1,0 +1,512 @@
+# netsurf: CSS nesting is flattened before libcss sees the sheet (patch 211)
+# Generated 2026-10-07
+# Base: seleron/vitabrowser 599cc30 (patch stack through 210)
+#
+# Native CSS nesting (CSS Nesting 1, shipped in every engine in 2023)
+# puts style rules and conditional at-rules inside a style rule's block:
+#   .card { color: red; & .t {..} .b {..} &.on {..} @media (q) {..} }
+# libcss read the first nested prelude as a broken declaration and lost
+# the rest of the block, so nested component styles never applied.
+#
+# macsurf__rewrite_nesting, the first pass of macsurf_css_rewrite (before
+# the @supports/@layer pass, so nested ones come out where it unwraps
+# them), flattens it: a nested selector with `&` gets each `&` replaced by
+# the parent; one without gets the parent and a descendant combinator in
+# front (a leading > + ~ is kept); a parent selector list expands as a
+# cartesian product, or as :is(list) past 64 selectors. Conditional group
+# rules (@media @supports @container @layer @document @scope) are
+# recursed into -- at top level as rule lists, inside a style rule as
+# more of its block, hoisted around the parent selector -- and every
+# other at-rule (@keyframes, @font-face, ...) is copied verbatim. A rule's
+# declarations come before its nested rules. Strings, escapes, url() and
+# custom-property values holding {} blocks are respected; comments in a
+# flattened sheet are dropped. A sheet with no nesting is untouched
+# (NULL), after one linear brace-depth scan.
+#
+# Test: testpages/pages/CSS-nesting.html (NEST211, 6 checks, Chromium
+# 6/6; 1/6 without the patch): & and bare nesting with the parent's own
+# declarations kept, &.on, a > child combinator, nested @media, two
+# levels and a parent selector list, a rule after the nested sheet.
+diff --git a/content/handlers/css/css_rewrite.c b/content/handlers/css/css_rewrite.c
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -6527,6 +6527,442 @@
+ 	return b.p;
+ }
+ 
++/* ---- VitaBrowser patch 211: CSS nesting -----------------------------------
++ *
++ * Native CSS nesting (CSS Nesting 1, in every engine since 2023) puts style
++ * rules and conditional at-rules inside a style rule's block:
++ *
++ *   .card { color: red; & .t { x } .b { y } &.on { z } @media (q) { w } }
++ *
++ * libcss parses none of it: a nested rule's prelude reads as a broken
++ * declaration and everything after it in the block is lost. This pass
++ * flattens it before anything else sees the sheet:
++ *
++ *   .card { color: red } .card .t { x } .card .b { y } .card.on { z }
++ *   @media (q) { .card { w } }
++ *
++ * A nested selector with `&` has each `&` replaced by the parent selector;
++ * one without gets the parent and a descendant combinator in front (a
++ * leading > + ~ combinator is kept). A parent selector list is expanded as
++ * a cartesian product, or as `:is(list)` past NEST_PRODUCT_MAX selectors.
++ * Conditional group rules (@media, @supports, @container, @layer,
++ * @document, @scope) are recursed into -- at top level as rule lists, in a
++ * style rule as more of that rule's block -- and every other at-rule
++ * (@keyframes, @font-face, @page, @property, ...) is copied verbatim.
++ * Declarations of a rule are emitted before its nested rules. Strings,
++ * escapes, url() and custom-property values (which may hold {} blocks) are
++ * respected; comments are dropped. Returns NULL (and the sheet is left
++ * untouched) unless something was nested.
++ */
++
++#define NEST_PRODUCT_MAX 64
++#define NEST_DEPTH_MAX 32
++
++struct nest_sb {
++	char *p;
++	size_t n, cap;
++	bool oom;
++};
++
++static void nest_put(struct nest_sb *b, const char *s, size_t n)
++{
++	if (b->oom || n == 0)
++		return;
++	if (b->n + n + 1 > b->cap) {
++		size_t nc = b->cap ? b->cap : 256;
++		char *np;
++		while (b->n + n + 1 > nc)
++			nc *= 2;
++		np = (char *)realloc(b->p, nc);
++		if (np == NULL) {
++			b->oom = true;
++			return;
++		}
++		b->p = np;
++		b->cap = nc;
++	}
++	memcpy(b->p + b->n, s, n);
++	b->n += n;
++	b->p[b->n] = '\0';
++}
++
++static void nest_puts(struct nest_sb *b, const char *s)
++{
++	nest_put(b, s, strlen(s));
++}
++
++/* Skip one string, comment or escape starting at i; returns the index
++ * after it, or i if s[i] starts none of them. */
++static size_t nest_skip_atom(const char *s, size_t i, size_t n)
++{
++	if (i >= n)
++		return i;
++	if (s[i] == '\\')
++		return i + 2 <= n ? i + 2 : n;
++	if (s[i] == '"' || s[i] == '\'') {
++		char q = s[i++];
++		while (i < n && s[i] != q) {
++			if (s[i] == '\\')
++				i++;
++			if (s[i] == '\n')
++				break;
++			i++;
++		}
++		return i < n ? i + 1 : n;
++	}
++	if (s[i] == '/' && i + 1 < n && s[i + 1] == '*') {
++		i += 2;
++		while (i + 1 < n && !(s[i] == '*' && s[i + 1] == '/'))
++			i++;
++		return i + 1 < n ? i + 2 : n;
++	}
++	return i;
++}
++
++/* Index of the first of `stops` at paren/bracket depth 0 from i (strings,
++ * comments and escapes skipped), or n. */
++static size_t nest_scan(const char *s, size_t i, size_t n, const char *stops)
++{
++	int depth = 0;
++
++	while (i < n) {
++		size_t j = nest_skip_atom(s, i, n);
++		if (j != i) {
++			i = j;
++			continue;
++		}
++		if (s[i] == '(' || s[i] == '[')
++			depth++;
++		else if ((s[i] == ')' || s[i] == ']') && depth > 0)
++			depth--;
++		else if (depth == 0 && strchr(stops, s[i]) != NULL)
++			return i;
++		i++;
++	}
++	return n;
++}
++
++/* Index of the '}' matching the '{' at open, or n. */
++static size_t nest_block_end(const char *s, size_t open, size_t n)
++{
++	int depth = 0;
++	size_t i = open;
++
++	while (i < n) {
++		size_t j = nest_skip_atom(s, i, n);
++		if (j != i) {
++			i = j;
++			continue;
++		}
++		if (s[i] == '{')
++			depth++;
++		else if (s[i] == '}' && --depth == 0)
++			return i;
++		i++;
++	}
++	return n;
++}
++
++static bool nest_ws(char c)
++{
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
++}
++
++/* Copy s[a, b) trimmed, comments dropped, into out. */
++static void nest_put_clean(struct nest_sb *out, const char *s, size_t a,
++		size_t b)
++{
++	size_t i = a;
++
++	while (a < b && nest_ws(s[a]))
++		a++;
++	while (b > a && nest_ws(s[b - 1]))
++		b--;
++	i = a;
++	while (i < b) {
++		size_t j = nest_skip_atom(s, i, b);
++		if (j != i) {
++			if (s[i] != '/')
++				nest_put(out, s + i, j - i);
++			else
++				nest_put(out, " ", 1);
++			i = j;
++			continue;
++		}
++		nest_put(out, s + i, 1);
++		i++;
++	}
++}
++
++/* Split s[a, b) at top-level commas into a NUL-separated list of trimmed,
++ * comment-free selectors; returns the count. */
++static int nest_split(const char *s, size_t a, size_t b, struct nest_sb *list)
++{
++	int count = 0;
++
++	while (a < b) {
++		size_t c = nest_scan(s, a, b, ",");
++		struct nest_sb one = { NULL, 0, 0, false };
++		nest_put_clean(&one, s, a, c);
++		if (one.n > 0) {
++			nest_put(list, one.p, one.n);
++			nest_put(list, "\0", 1);
++			count++;
++		}
++		free(one.p);
++		list->oom |= one.oom;
++		a = c < b ? c + 1 : b;
++	}
++	return count;
++}
++
++/* Resolve the nested selector list s[a, b) against parent (a complete
++ * selector list text); the result goes to out. */
++static void nest_resolve(const char *parent, const char *s, size_t a,
++		size_t b, struct nest_sb *out)
++{
++	struct nest_sb pl = { NULL, 0, 0, false }, sl = { NULL, 0, 0, false };
++	int np = nest_split(parent, 0, strlen(parent), &pl);
++	int ns = nest_split(s, a, b, &sl);
++	bool first = true;
++	const char *sp, *pp;
++	int i, j;
++
++	if (np == 0 || pl.oom || sl.oom) {
++		nest_put_clean(out, s, a, b);
++		goto done;
++	}
++	for (i = 0, sp = sl.p; i < ns; i++, sp += strlen(sp) + 1) {
++		bool amp = strchr(sp, '&') != NULL;
++		int reps = (np * ns > NEST_PRODUCT_MAX) ? 1 : np;
++
++		for (j = 0, pp = pl.p; j < reps; j++, pp += strlen(pp) + 1) {
++			const char *c;
++			struct nest_sb is = { NULL, 0, 0, false };
++			const char *par = pp;
++
++			if (reps == 1 && np > 1) {
++				nest_puts(&is, ":is(");
++				nest_put_clean(&is, parent, 0, strlen(parent));
++				nest_puts(&is, ")");
++				par = is.p != NULL ? is.p : pp;
++			}
++			if (!first)
++				nest_puts(out, ", ");
++			first = false;
++			if (amp) {
++				for (c = sp; *c != '\0'; c++) {
++					if (*c == '&')
++						nest_puts(out, par);
++					else
++						nest_put(out, c, 1);
++				}
++			} else {
++				nest_puts(out, par);
++				nest_puts(out, " ");
++				nest_puts(out, sp);
++			}
++			free(is.p);
++		}
++	}
++done:
++	free(pl.p);
++	free(sl.p);
++}
++
++static bool nest_is_group_rule(const char *s, size_t a, size_t b)
++{
++	static const char *const groups[] = { "media", "supports", "container",
++			"layer", "document", "-moz-document", "scope", NULL };
++	size_t k, e = a + 1;
++	int g;
++
++	while (e < b && (isalnum((unsigned char)s[e]) || s[e] == '-'))
++		e++;
++	k = e - (a + 1);
++	for (g = 0; groups[g] != NULL; g++)
++		if (strlen(groups[g]) == k &&
++				strncasecmp(s + a + 1, groups[g], k) == 0)
++			return true;
++	return false;
++}
++
++static void nest_body(const char *s, size_t a, size_t b, const char *sel,
++		struct nest_sb *out, bool *changed, int depth);
++
++/* A list of rules s[a, b) (top level, or inside a group rule there). */
++static void nest_rules(const char *s, size_t a, size_t b,
++		struct nest_sb *out, bool *changed, int depth)
++{
++	size_t i = a;
++
++	while (i < b && !out->oom) {
++		size_t j = nest_skip_atom(s, i, b), stop, end;
++
++		if (j != i && s[i] == '/') {
++			i = j;
++			continue;
++		}
++		if (nest_ws(s[i]) || s[i] == ';' || s[i] == '}') {
++			nest_put(out, s + i, 1);
++			i++;
++			continue;
++		}
++		stop = nest_scan(s, i, b, s[i] == '@' ? ";{" : "{");
++		if (stop >= b || s[stop] == ';') {
++			/* @charset / @import / @layer a, b; or junk */
++			nest_put(out, s + i, (stop < b ? stop + 1 : b) - i);
++			i = stop < b ? stop + 1 : b;
++			continue;
++		}
++		end = nest_block_end(s, stop, b);
++		if (s[i] == '@') {
++			if (nest_is_group_rule(s, i, stop) &&
++					depth < NEST_DEPTH_MAX) {
++				nest_put_clean(out, s, i, stop);
++				nest_puts(out, " {");
++				nest_rules(s, stop + 1, end, out, changed,
++						depth + 1);
++				nest_puts(out, "}");
++			} else {
++				nest_put(out, s + i, (end < b ? end + 1 : b) - i);
++			}
++		} else {
++			struct nest_sb sel = { NULL, 0, 0, false };
++			nest_put_clean(&sel, s, i, stop);
++			if (sel.p != NULL && depth < NEST_DEPTH_MAX)
++				nest_body(s, stop + 1, end, sel.p, out,
++						changed, depth + 1);
++			else
++				nest_put(out, s + i, (end < b ? end + 1 : b) - i);
++			out->oom |= sel.oom;
++			free(sel.p);
++		}
++		i = end < b ? end + 1 : b;
++	}
++}
++
++/* The block s[a, b) of a style rule whose (resolved) selector is sel. */
++static void nest_body(const char *s, size_t a, size_t b, const char *sel,
++		struct nest_sb *out, bool *changed, int depth)
++{
++	struct nest_sb decls = { NULL, 0, 0, false }, tail = { NULL, 0, 0, false };
++	size_t i = a;
++
++	while (i < b && !out->oom) {
++		size_t j = nest_skip_atom(s, i, b), stop, end;
++		bool custom;
++
++		if (j != i && s[i] == '/') {
++			i = j;
++			continue;
++		}
++		if (nest_ws(s[i]) || s[i] == ';') {
++			i++;
++			continue;
++		}
++		custom = (s[i] == '-' && i + 1 < b && s[i + 1] == '-');
++		/* a custom property's value may hold {} blocks: it ends at a
++		 * ';' outside them */
++		if (custom) {
++			size_t k = i;
++			int d = 0;
++			while (k < b) {
++				size_t m = nest_skip_atom(s, k, b);
++				if (m != k) { k = m; continue; }
++				if (s[k] == '{' || s[k] == '(' || s[k] == '[')
++					d++;
++				else if ((s[k] == '}' || s[k] == ')' ||
++						s[k] == ']') && d > 0)
++					d--;
++				else if (s[k] == ';' && d == 0)
++					break;
++				k++;
++			}
++			nest_put_clean(&decls, s, i, k);
++			nest_puts(&decls, "; ");
++			i = k < b ? k + 1 : b;
++			continue;
++		}
++		stop = nest_scan(s, i, b, ";{");
++		if (stop >= b || s[stop] == ';') {
++			nest_put_clean(&decls, s, i, stop);
++			nest_puts(&decls, "; ");
++			i = stop < b ? stop + 1 : b;
++			continue;
++		}
++		/* a nested rule or at-rule */
++		end = nest_block_end(s, stop, b);
++		*changed = true;
++		if (s[i] == '@') {
++			if (nest_is_group_rule(s, i, stop) &&
++					depth < NEST_DEPTH_MAX) {
++				nest_put_clean(&tail, s, i, stop);
++				nest_puts(&tail, " {");
++				nest_body(s, stop + 1, end, sel, &tail, changed,
++						depth + 1);
++				nest_puts(&tail, "}");
++			}
++			/* other at-rules in a style rule are invalid: dropped */
++		} else if (depth < NEST_DEPTH_MAX) {
++			struct nest_sb rs = { NULL, 0, 0, false };
++			nest_resolve(sel, s, i, stop, &rs);
++			if (rs.p != NULL)
++				nest_body(s, stop + 1, end, rs.p, &tail,
++						changed, depth + 1);
++			tail.oom |= rs.oom;
++			free(rs.p);
++		}
++		i = end < b ? end + 1 : b;
++	}
++	if (decls.n > 0) {
++		nest_puts(out, sel);
++		nest_puts(out, " { ");
++		nest_put(out, decls.p, decls.n);
++		nest_puts(out, "}\n");
++	}
++	if (tail.n > 0)
++		nest_put(out, tail.p, tail.n);
++	out->oom |= decls.oom | tail.oom;
++	free(decls.p);
++	free(tail.p);
++}
++
++static char *
++macsurf__rewrite_nesting(const char *data, size_t in_size, size_t *out_size_p)
++{
++	struct nest_sb out = { NULL, 0, 0, false };
++	bool changed = false;
++	size_t i;
++	int depth = 0;
++	bool maybe = false;
++
++	/* cheap test: is there a '{' inside a style rule's block at all?
++	 * (a second level of braces outside @-rules' first level) */
++	for (i = 0; i < in_size; ) {
++		size_t j = nest_skip_atom(data, i, in_size);
++		if (j != i) { i = j; continue; }
++		if (data[i] == '{') {
++			if (++depth >= 2) { maybe = true; break; }
++		} else if (data[i] == '}' && depth > 0) {
++			depth--;
++		}
++		i++;
++	}
++	if (!maybe)
++		return NULL;
++
++	nest_rules(data, 0, in_size, &out, &changed, 0);
++	if (!changed || out.oom || out.p == NULL) {
++		free(out.p);
++		return NULL;
++	}
++	*out_size_p = out.n;
++	return out.p;
++}
++
++
++
+ /* exported interface documented in content/handlers/css/css_rewrite.h */
+ char *macsurf_css_rewrite(const char *data, size_t in_size, size_t *out_size)
+ {
+@@ -6544,6 +6980,7 @@
+ 	char *rewritten_inset = NULL;
+ 	char *rewritten_lshort = NULL;   /* #247 phase 2 */
+ 	char *rewritten_at_rules = NULL;   /* fixes273 - @supports/@layer */
++	char *rewritten_nesting = NULL;    /* patch 211 */
+ 	char *rewritten_grid_align = NULL; /* fixes274 grid alignment */
+ 	char *rewritten_word_break = NULL; /* fixes1055 (#274) */
+ 	char *rewritten_grid_flow = NULL;  /* fixes275 grid-auto-flow */
+@@ -6612,6 +7049,20 @@
+ 		}
+ 	}
+ 
++	/* patch 211: flatten CSS nesting first, so nested @supports /
++	 * @layer blocks come out where the at-rule pass below unwraps
++	 * them. */
++	{
++		size_t nest_size = 0;
++		rewritten_nesting = macsurf__rewrite_nesting(data,
++				(size_t)size, &nest_size);
++		if (rewritten_nesting != NULL &&
++				nest_size <= (size_t)0x7fffffff) {
++			data = (const char *)rewritten_nesting;
++			size = (unsigned int)nest_size;
++		}
++	}
++
+ 	/* fixes273 (Bundle I) - earliest pass: unwrap / drop @supports
+ 	 * and @layer wrappers since libcss in this vintage doesn't parse
+ 	 * them natively. Inner rules then flow through the rest of the
+@@ -6949,6 +7400,7 @@
+ 	if (rewritten_rows != NULL) free(rewritten_rows);
+ 	if (rewritten != NULL) free(rewritten);
+ 	if (rewritten_at_rules != NULL) free(rewritten_at_rules);   /* fixes273 */
++	if (rewritten_nesting != NULL) free(rewritten_nesting);     /* patch 211 */
+ 	if (rewritten_word_break != NULL) free(rewritten_word_break); /* fixes1055 */
+ 	if (rewritten_grid_align != NULL) free(rewritten_grid_align); /* fixes274 */
+ 	if (rewritten_grid_flow != NULL) free(rewritten_grid_flow); /* fixes275 */

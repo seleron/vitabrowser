@@ -258,6 +258,7 @@ NET-css-grid-autofill http://127.0.0.1:$HP/CSS-grid-autofill.html
 NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
 NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
+NET-css-nesting http://127.0.0.1:$HP/CSS-nesting.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -645,6 +646,11 @@ c210p=$(ls "$R"/*NET-css-ch-unit.plot 2>/dev/null | head -1)
 c210r=$(sed -n 's/.*STR \(CHUNIT210: [0-9]*\/[0-9]* passed\).*/\1/p' "$c210p" 2>/dev/null | head -1)
 echo "  css-ch-unit: ${c210r:-no summary}"
 [ -n "$c210p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$c210p" | sed 's/^STR /  /'
+# Patch 211: CSS nesting is flattened by the CSS rewrite.
+n211p=$(ls "$R"/*NET-css-nesting.plot 2>/dev/null | head -1)
+n211r=$(sed -n 's/.*STR \(NEST211: [0-9]*\/[0-9]* passed\).*/\1/p' "$n211p" 2>/dev/null | head -1)
+echo "  css-nesting: ${n211r:-no summary}"
+[ -n "$n211p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$n211p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -821,6 +827,7 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 [ "$v207r" = "VUNITS207: 4/4 passed" ] && \
 [ "$l208r" = "CLAMP208: 4/4 passed" ] && \
 [ "$c210r" = "CHUNIT210: 2/2 passed" ] && \
+[ "$n211r" = "NEST211: 6/6 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 [ "$clr" = "CLASSSTALL: 7/7 passed" ] && [ "${cll:-0}" -ge 5 ] && \
