@@ -1,0 +1,174 @@
+# netsurf: a tap sets an <input type=range> (patch 229)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser 541d08f (patch stack through 228)
+#
+# Fixes a usability regression from patch 223, which drew range inputs as
+# sliders but made them hidden-type controls that ignore taps. Before 223
+# a tap at least opened the value as text; after it a slider could not be
+# changed on the Vita at all.
+#
+#  - html/interaction.c: a tap (click) on a range input sets its value
+#    from where it landed along the track (between the thumb's centres at
+#    either end, as redraw draws it): min + that fraction of (max - min),
+#    snapped to step (default 1; "any" is not snapped), clamped. The value
+#    goes through form_gadget_update_value (control and the DOM's value
+#    attribute, which the bridge's .value reads), the box is repainted, and
+#    input then change are fired (when a page listens), as a browser's
+#    slider does on a click.
+#  - vita/interact.c: the interaction pass taps IN-range.html's slider.
+#
+# A script setting .value already repainted the slider: the input's
+# DOMSubtreeModified handler resyncs the gadget and redraws its box
+# (checked: testpages/pages/PROBE-range-script.html). <input type=color>
+# stays display-only: there is no colour picker on the Vita.
+#
+# Test: interaction pass, "a tap sets a slider; input, change"
+# (testpages/pages/IN-range.html: a tap 80% along a 0..10 slider gives
+# IN-target.html?via=range&v=8&i=1 -- value 8, one input event, then
+# change). Without this patch the step fails (the page stays put):
+# interaction 32/33.
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -26,7 +26,10 @@
+ 
+ #include <assert.h>
+ #include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <math.h>
+ #include <strings.h>
+ 
+ #include <dom/dom.h>
+@@ -1134,6 +1137,100 @@
+ 
+ 
+ /**
++ * patch 229: a tap on an <input type=range> (drawn by patch 223) sets its
++ * value from where it landed along the track -- min + the fraction of the
++ * track times (max - min), snapped to step (default 1; "any" not snapped)
++ * -- repaints it and fires input and change, as a browser's slider does
++ * when it is clicked. The track runs between the thumb's centres at
++ * either end, as redraw draws it. <input type=color> has no picker here.
++ */
++static double vb_attr_double(struct box *box, const char *name, double dflt,
++		bool *any)
++{
++	dom_string *n = NULL, *v = NULL;
++	double r = dflt;
++
++	if (any != NULL)
++		*any = false;
++	if (box->node == NULL || dom_string_create((const uint8_t *)name,
++			strlen(name), &n) != DOM_NO_ERR)
++		return dflt;
++	if (dom_element_get_attribute((dom_element *)box->node, n, &v) ==
++			DOM_NO_ERR && v != NULL) {
++		char tmp[40], *end;
++		size_t l = dom_string_byte_length(v);
++		if (l > sizeof(tmp) - 1)
++			l = sizeof(tmp) - 1;
++		memcpy(tmp, dom_string_data(v), l);
++		tmp[l] = '\0';
++		r = strtod(tmp, &end);
++		if (end == tmp) {
++			r = dflt;
++			if (any != NULL && strcasecmp(tmp, "any") == 0)
++				*any = true;
++		}
++		dom_string_unref(v);
++	}
++	dom_string_unref(n);
++	return r;
++}
++
++static void vb_range_tap(html_content *html, struct form_control *control,
++		struct box *box, int bx)
++{
++	dom_string *type = NULL;
++	bool range = false, any = false;
++	double mn, mx, step, v, ratio;
++	int r, track;
++	char buf[40], *value;
++
++	if (box->node != NULL && dom_element_get_attribute(
++			(dom_element *)box->node, corestring_dom_type,
++			&type) == DOM_NO_ERR && type != NULL) {
++		range = dom_string_byte_length(type) == 5 &&
++				strncasecmp(dom_string_data(type), "range",
++						5) == 0;
++		dom_string_unref(type);
++	}
++	if (!range || box->width <= 0)
++		return;
++	mn = vb_attr_double(box, "min", 0, NULL);
++	mx = vb_attr_double(box, "max", 100, NULL);
++	step = vb_attr_double(box, "step", 1, &any);
++	if (mx < mn)
++		mx = mn;
++	r = box->height < 16 ? box->height / 2 : 8;
++	track = box->width - 2 * r;
++	bx -= box->padding[LEFT];
++	ratio = track > 0 ? (double)(bx - r) / track : 0;
++	if (ratio < 0)
++		ratio = 0;
++	if (ratio > 1)
++		ratio = 1;
++	v = mn + ratio * (mx - mn);
++	if (!any && step > 0)
++		v = mn + floor((v - mn) / step + 0.5) * step;
++	if (v > mx)
++		v = mx;
++	if (v < mn)
++		v = mn;
++	snprintf(buf, sizeof(buf), "%.15g", v);
++	value = strdup(buf);
++	if (value == NULL)
++		return;
++	form_gadget_update_value(control, value);
++	html__redraw_a_box(html, box);
++	if (box->node != NULL) {
++		if (macsurf_qjs_event_type_live("input"))
++			(void) fire_generic_dom_event(corestring_dom_input,
++					box->node, true, false);
++		if (macsurf_qjs_event_type_live("change"))
++			(void) fire_generic_dom_event(corestring_dom_change,
++					box->node, true, false);
++	}
++}
++
++/**
+  * process mouse activity on a form gadget
+  */
+ /**
+@@ -1317,7 +1414,14 @@
+ 		break;
+ 
+ 	case GADGET_HIDDEN:
+-		/* not possible: no box generated */
++		/* no box, except range / color inputs (patch 223), which
++		 * are drawn as widgets: a tap on a range sets its value */
++		if (mas->gadget.box != NULL &&
++				(mas->gadget.box->flags & VB_INPUT_WIDGET) &&
++				(mouse & BROWSER_MOUSE_CLICK_1))
++			vb_range_tap(html, mas->gadget.control,
++					mas->gadget.box,
++					x - mas->gadget.box_x);
+ 		break;
+ 
+ 	case GADGET_RESET:
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -134,6 +134,10 @@
+ 	  C_URL, "IN-events.html", 0, NULL },
+ 	{ "a tap's events, focus, change, readyState", A_TAP, NULL, 200, 285,
+ 	  0, 0, 0, C_URL, "IN-target.html?via=events&r=ok", 0, NULL },
++	{ "open IN-range", A_OPEN, T "IN-range.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-range.html", 0, NULL },
++	{ "a tap sets a slider; input, change", A_TAP, NULL, 335, 108,
++	  0, 0, 0, C_URL, "IN-target.html?via=range&v=8&i=1", 0, NULL },
+ 	{ "open IN-rebuild", A_OPEN, T "IN-rebuild.html", 0, 0, 0, 0, 0,
+ 	  C_URL, "IN-rebuild.html", 0, NULL },
+ 	{ "a submit whose click rebuilds the page", A_TAP, NULL, 250, 140,
