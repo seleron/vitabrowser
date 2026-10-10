@@ -1,0 +1,507 @@
+# netsurf: a settings page (patch 241; roadmap WS-E, Phase 1 exit)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 240)
+#
+# The Phase 1 bar asks for a settings page (user agent, zoom, blocking);
+# the only way to change any of them was to edit files on the card.
+#
+#  - vita/remote.c: the browser's own listener serves /settings, and
+#    /settings?KEY=VALUE applies one setting, saves it, and shows the page
+#    again with "Saved: ...". Only to this device: accept() records the
+#    peer, and anything but 127.0.0.1 (or the device's own address, for a
+#    stack that reports loopback that way) gets 403 -- the LAN may open
+#    pages on the Vita, not change its settings.
+#  - vita/chrome.c: the page (current choice highlighted, the others as
+#    links); vita_chrome_set(): ua = a preset (chrome / safari / firefox /
+#    vita: written to useragent.txt and applied at once), zoom = a zoom
+#    step (applied to the window now, and where new windows start),
+#    blocking = on / off. zoom and blocking are kept in
+#    ux0:data/VitaBrowser/settings.txt, read at start-up. The home page's
+#    controls line links "Settings".
+#  - vita/resolve.c: vita_resolve_blocking turns the block list off.
+#  - vita/interact.c: C_SETTING (in effect, saved, and for the user agent
+#    what sites are sent) and seven steps: open the page, firefox,
+#    blocking off, zoom 125%, then back to chrome / on / 100%. Placed
+#    before IN-download so the history check still sees that page last.
+#
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -53,6 +53,8 @@
+ #include "vita/chrome.h"
+ #include "vita/download.h"
+ #include "vita/find.h"
++#include "vita/input.h"
++#include "vita/resolve.h"
+ 
+ #define VITA_DOWNLOAD_DIR_NAME "ux0:download"
+ 
+@@ -323,6 +325,206 @@ static void write_history(void)
+ 	fclose(fp);
+ }
+ 
++/* ---- settings (patch 241) ----------------------------------------- */
++
++static struct {
++	unsigned int zoom;	/**< zoom step for new windows */
++	bool blocking;		/**< content blocking */
++} settings = { 0, true };
++
++static void settings_save(void)
++{
++	FILE *fp = fopen(VITA_SETTINGS_FILE, "w");
++
++	if (fp == NULL) {
++		vita_diag_log("chrome: cannot write %s", VITA_SETTINGS_FILE);
++		return;
++	}
++	fprintf(fp, "# VitaBrowser settings (the settings page writes this)\n"
++		"zoom=%u\nblocking=%s\n", settings.zoom,
++		settings.blocking ? "on" : "off");
++	fclose(fp);
++}
++
++/* exported interface documented in vita/chrome.h */
++void vita_chrome_load_settings(void)
++{
++	char line[256];
++	FILE *fp = fopen(VITA_SETTINGS_FILE, "r");
++
++	while (fp != NULL && fgets(line, sizeof(line), fp) != NULL) {
++		unsigned int z;
++		if (sscanf(line, "zoom=%u", &z) == 1 && z < VITA_ZOOM_STEPS)
++			settings.zoom = z;
++		else if (strncmp(line, "blocking=off", 12) == 0)
++			settings.blocking = false;
++		else if (strncmp(line, "blocking=on", 11) == 0)
++			settings.blocking = true;
++	}
++	if (fp != NULL)
++		fclose(fp);
++	vita_resolve_blocking = settings.blocking;
++	vita_diag_log("chrome: settings: zoom step %u, blocking %s",
++		      settings.zoom, settings.blocking ? "on" : "off");
++}
++
++/* exported interface documented in vita/chrome.h */
++unsigned int vita_chrome_setting_zoom(void)
++{
++	return settings.zoom;
++}
++
++/** The user agent preset now in VITA_USERAGENT_FILE, or "custom". */
++static const char *ua_current(void)
++{
++	char line[1024];
++	const char *l, *r = "chrome";
++	size_t n, i;
++	FILE *fp = fopen(VITA_USERAGENT_FILE, "r");
++
++	while (fp != NULL && fgets(line, sizeof(line), fp) != NULL) {
++		l = line;
++		n = strlen(line);
++		trim(&l, &n);
++		if (n == 0 || l[0] == '#')
++			continue;
++		r = "custom";
++		for (i = 0; i < sizeof(ua_presets) / sizeof(ua_presets[0]); i++)
++			if (strlen(ua_presets[i].name) == n &&
++			    strncasecmp(l, ua_presets[i].name, n) == 0)
++				r = ua_presets[i].name;
++		break;
++	}
++	if (fp != NULL)
++		fclose(fp);
++	return r;
++}
++
++/* exported interface documented in vita/chrome.h */
++bool vita_chrome_set(struct gui_window *gw, const char *key,
++		     const char *value)
++{
++	size_t i;
++
++	if (strcmp(key, "ua") == 0) {
++		for (i = 0; i < sizeof(ua_presets) / sizeof(ua_presets[0]); i++)
++			if (strcasecmp(value, ua_presets[i].name) == 0) {
++				FILE *fp = fopen(VITA_USERAGENT_FILE, "w");
++				if (fp == NULL)
++					return false;
++				fprintf(fp, "# the settings page wrote this; a "
++					"preset name or a whole user agent\n"
++					"%s\n", ua_presets[i].name);
++				fclose(fp);
++				vita_chrome_load_useragent();
++				return true;
++			}
++		return false;
++	}
++	if (strcmp(key, "zoom") == 0) {
++		char *end;
++		unsigned long z = strtoul(value, &end, 10);
++		if (*value == '\0' || *end != '\0' || z >= VITA_ZOOM_STEPS)
++			return false;
++		settings.zoom = (unsigned int)z;
++		settings_save();
++		if (gw != NULL)
++			vita_input_set_zoom(gw, settings.zoom);
++		return true;
++	}
++	if (strcmp(key, "blocking") == 0) {
++		if (strcmp(value, "on") != 0 && strcmp(value, "off") != 0)
++			return false;
++		settings.blocking = value[1] == 'n';
++		vita_resolve_blocking = settings.blocking;
++		settings_save();
++		return true;
++	}
++	return false;
++}
++
++/* exported interface documented in vita/chrome.h */
++const char *vita_chrome_setting(const char *key)
++{
++	static char buf[16];
++
++	if (strcmp(key, "ua") == 0)
++		return ua_current();
++	if (strcmp(key, "blocking") == 0)
++		return settings.blocking ? "on" : "off";
++	if (strcmp(key, "zoom") == 0) {
++		snprintf(buf, sizeof(buf), "%u", settings.zoom);
++		return buf;
++	}
++	return "";
++}
++
++/** One choice: a link that sets it, or the current value in bold. */
++static size_t settings_choice(char *out, size_t max, const char *key,
++			      const char *value, const char *label, bool on)
++{
++	if (on)
++		return (size_t)snprintf(out, max, "<b class=\"on\">%s</b> ",
++					label);
++	return (size_t)snprintf(out, max, "<a href=\"" VITA_SETTINGS_PATH
++				"?%s=%s\">%s</a> ", key, value, label);
++}
++
++/* exported interface documented in vita/chrome.h */
++void vita_chrome_settings_page(char *out, size_t max, const char *note)
++{
++	const char *ua = ua_current();
++	size_t o = 0, i;
++
++#define PUT(...) do { if (o < max) o += (size_t)snprintf(out + o, max - o, __VA_ARGS__); } while (0)
++	PUT("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
++	    "<title>Settings</title><style>body{font-family:sans-serif;"
++	    "font-size:18px;margin:28px 12px}h1{font-size:26px;margin:0 0 8px}"
++	    "h2{font-size:20px;margin:16px 0 6px}a,b.on{display:inline-block;"
++	    "padding:8px 14px;margin:3px 4px 3px 0;border-radius:6px;"
++	    "text-decoration:none}a{background:#e8eef8;color:#103070}"
++	    "b.on{background:#103070;color:#fff}.hint{color:#444;"
++	    "font-size:15px}.note{background:#dfd;padding:6px 10px}"
++	    "</style></head><body><h1>Settings</h1>");
++	if (note != NULL)
++		PUT("<p class=\"note\" id=\"note\">%s</p>", note);
++	PUT("<h2>User agent</h2><p>");
++	for (i = 0; i < sizeof(ua_presets) / sizeof(ua_presets[0]); i++)
++		if (o < max)
++			o += settings_choice(out + o, max - o, "ua",
++					     ua_presets[i].name,
++					     ua_presets[i].name,
++					     strcmp(ua, ua_presets[i].name) == 0);
++	PUT("</p><p class=\"hint\">What sites see: %s%s. Kept in "
++	    VITA_USERAGENT_FILE " (a whole user agent string works too).</p>",
++	    strcmp(ua, "custom") == 0 ? "a custom string" : ua,
++	    strcmp(ua, "vita") == 0 ? " (the Vita's own)" : "");
++	PUT("<h2>Zoom</h2><p>");
++	for (i = 0; i < VITA_ZOOM_STEPS; i++) {
++		char v[8], label[16];
++		snprintf(v, sizeof(v), "%u", (unsigned int)i);
++		snprintf(label, sizeof(label), "%d%%",
++			 (int)(vita_zoom_steps[i] * 100.0f + 0.5f));
++		if (o < max)
++			o += settings_choice(out + o, max - o, "zoom", v, label,
++					     settings.zoom == i);
++	}
++	PUT("</p><p class=\"hint\">Where pages start; &#x25a1; still steps "
++	    "through these.</p><h2>Content blocking</h2><p>");
++	if (o < max)
++		o += settings_choice(out + o, max - o, "blocking", "on", "on",
++				     settings.blocking);
++	if (o < max)
++		o += settings_choice(out + o, max - o, "blocking", "off", "off",
++				     !settings.blocking);
++	PUT("</p><p class=\"hint\">Ad and tracker hosts in the block list "
++	    "are not fetched (" VITA_BLOCKLIST_USER " adds hosts or "
++	    "@@exceptions). %u blocked so far.</p>", vita_resolve_blocked);
++	PUT("<p class=\"hint\"><a href=\"" VITA_HOME_URL "\">Home</a></p>"
++	    "</body></html>");
++#undef PUT
++}
++
+ /* exported interface documented in vita/chrome.h */
+ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ {
+@@ -372,6 +574,9 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 	      " forward. &#x25a1;: zoom. START: this page. Find in the"
+ 	      " page: &#x25b3;, then /word (SELECT + &#x2193; / &#x2191;:"
+ 	      " next / previous match).", fp);
++	/* patch 241: the settings page, served by this device's listener */
++	fprintf(fp, " <a href=\"http://127.0.0.1:%d" VITA_SETTINGS_PATH
++		"\">Settings</a>.", vita_remote_port());
+ 	if (vita_remote_address() != NULL) {
+ 		fputs(" From a phone or PC on the same Wi-Fi: <b>http://", fp);
+ 		put_escaped(fp, vita_remote_address(), 64);
+diff --git a/frontends/vita/chrome.h b/frontends/vita/chrome.h
+--- a/frontends/vita/chrome.h
++++ b/frontends/vita/chrome.h
+@@ -50,6 +50,10 @@ struct gui_window;
+ #define VITA_HISTORY_FILE "ux0:data/VitaBrowser/history.html"
+ #define VITA_HISTORY_URL "file:///ux0:data/VitaBrowser/history.html"
+ 
++/** The settings page: served by the browser's own listener (vita/remote.c),
++ * to this device only. */
++#define VITA_SETTINGS_PATH "/settings"
++
+ /** The home page, generated from the bookmarks at start-up and again
+  * each time START goes home (its recent pages and downloads change). */
+ #define VITA_HOME_FILE "ux0:data/VitaBrowser/home.html"
+@@ -69,6 +73,35 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n);
+  * see; before netsurf_init(). */
+ void vita_chrome_load_useragent(void);
+ 
++/** The settings (patch 241): "key=value" lines -- zoom (a zoom step
++ * index) and blocking (on / off). The user agent stays in
++ * VITA_USERAGENT_FILE. */
++#define VITA_SETTINGS_FILE "ux0:data/VitaBrowser/settings.txt"
++
++/** Read VITA_SETTINGS_FILE and apply what can be applied before a window
++ * exists (content blocking); the zoom step comes back with
++ * vita_chrome_setting_zoom(). */
++void vita_chrome_load_settings(void);
++
++/** The zoom step the settings ask new windows to start at. */
++unsigned int vita_chrome_setting_zoom(void);
++
++/**
++ * Change one setting, apply it now and save it. key: "ua" (a preset
++ * name), "zoom" (a step index), "blocking" ("on" / "off").
++ * \return true when key and value were valid
++ */
++bool vita_chrome_set(struct gui_window *gw, const char *key,
++		     const char *value);
++
++/** A setting's current value as the page shows it ("firefox", "off",
++ * "1"), for the interaction pass. */
++const char *vita_chrome_setting(const char *key);
++
++/** The settings page (HTML) into out; note is a line to show on top
++ * ("Saved: ..."), or NULL. */
++void vita_chrome_settings_page(char *out, size_t max, const char *note);
++
+ /**
+  * Turn what the user typed into a URL: a URL as it is, a bare host or
+  * path gets https://, anything else (spaces, no dot) becomes a search.
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -34,6 +34,7 @@
+ #include <psp2/ctrl.h>
+ 
+ #include "utils/nsurl.h"
++#include "utils/useragent.h"
+ #include "netsurf/browser_window.h"
+ 
+ #include "vita/chrome.h"
+@@ -76,6 +77,8 @@ enum check {
+ 	C_COOKIE,	/**< the saved jar holds the listener's cookie */
+ 	C_TYPED,	/**< vita_chrome_typed_url() turns text into URLs */
+ 	C_DOWNLOAD,	/**< the download named expect is on the card, intact */
++	C_SETTING,	/**< the setting expect ("key=value") is in effect
++			 * (patch 241) */
+ 	C_HISTORY,	/**< the home page's recent list starts with a link
+ 			 * ending expect, the history page lists at least
+ 			 * value pages */
+@@ -175,6 +178,21 @@ static const struct step {
+ 	{ "cookies are saved to the card", A_REMOTE,
+ 	  "/cookie", 0, 0, 0, 0, 0,
+ 	  C_COOKIE, NULL, 0, NULL },
++	{ "the settings page opens", A_REMOTE, "/settings", 0, 0, 0, 0, 0,
++	  C_URL, "/settings", 0, "IN-settings" },
++	{ "settings: user agent firefox", A_REMOTE, "/settings?ua=firefox",
++	  0, 0, 0, 0, 0, C_SETTING, "ua=firefox", 0, NULL },
++	{ "settings: content blocking off", A_REMOTE,
++	  "/settings?blocking=off", 0, 0, 0, 0, 0, C_SETTING, "blocking=off",
++	  0, NULL },
++	{ "settings: zoom 125%", A_REMOTE, "/settings?zoom=1", 0, 0, 0, 0, 0,
++	  C_ZOOM, NULL, 1, NULL },
++	{ "settings: back to chrome", A_REMOTE, "/settings?ua=chrome",
++	  0, 0, 0, 0, 0, C_SETTING, "ua=chrome", 0, NULL },
++	{ "settings: blocking on again", A_REMOTE, "/settings?blocking=on",
++	  0, 0, 0, 0, 0, C_SETTING, "blocking=on", 0, NULL },
++	{ "settings: zoom 100% again", A_REMOTE, "/settings?zoom=0",
++	  0, 0, 0, 0, 0, C_ZOOM, NULL, 0, NULL },
+ 	{ "a second passes (visit times are whole seconds)", A_WAIT, NULL,
+ 	  0, 0, 0, 0, 0, C_NONE, NULL, 1100, NULL },
+ 	{ "open IN-download", A_OPEN, T "IN-download.html", 0, 0, 0, 0, 0,
+@@ -400,6 +418,24 @@ static void check(struct gui_window *gw, const struct step *s)
+ 	case C_HISTORY:
+ 		ok = history_ok(s->expect, s->value, detail, sizeof detail);
+ 		break;
++	case C_SETTING: {
++		/* in effect, saved, and (the user agent) what sites get */
++		char key[16];
++		const char *eq = strchr(s->expect, '=');
++		snprintf(key, sizeof key, "%.*s",
++			 (int)(eq ? eq - s->expect : 0), s->expect);
++		ok = eq != NULL &&
++			strcmp(vita_chrome_setting(key), eq + 1) == 0;
++		if (ok && strcmp(key, "ua") == 0)
++			ok = strstr(user_agent_string(),
++				    strcmp(eq + 1, "firefox") == 0 ?
++				    "Firefox/" : "Chrome/") != NULL;
++		if (ok && strcmp(key, "blocking") == 0)
++			ok = vita_resolve_blocking == (eq[2] == 'n');
++		snprintf(detail, sizeof detail, "%s = %s; UA %.40s", key,
++			 vita_chrome_setting(key), user_agent_string());
++		break;
++	}
+ 	case C_FIND: {
+ 		unsigned int fi, fn;
+ 		char at[16];
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -1422,6 +1422,9 @@ int main(int argc, char **argv)
+ 	 * core leaves loading and saving both to the frontend). */
+ 	urldb_load(VITA_URLDB_FILE);
+ 	urldb_load_cookies(VITA_COOKIE_FILE);
++	/* patch 241: the settings page's choices (blocking now; the zoom
++	 * when the window exists) */
++	vita_chrome_load_settings();
+ 	seed_consent_cookies();
+ 	/* URLs from a phone or PC (vita/remote.c), then the home page,
+ 	 * which shows the address to send them to. */
+@@ -1444,6 +1447,10 @@ int main(int argc, char **argv)
+ 		fatal("opening the start page", ret);
+ 		goto fail;
+ 	}
++	/* patch 241: the zoom the settings page chose */
++	if (vita_chrome_setting_zoom() != 0)
++		vita_input_set_zoom(vita_window_main(),
++				    vita_chrome_setting_zoom());
+ 
+ 	vita_run(bw);
+ 
+diff --git a/frontends/vita/remote.c b/frontends/vita/remote.c
+--- a/frontends/vita/remote.c
++++ b/frontends/vita/remote.c
+@@ -57,6 +57,7 @@ unsigned int vita_remote_requests, vita_remote_opened;
+ 
+ static int listen_fd = -1;
+ static int client_fd = -1;
++static bool client_local;	/**< the client is this device (patch 241) */
+ static unsigned int client_ms;
+ static char req[4096];
+ static size_t req_len;
+@@ -253,6 +254,39 @@ static void handle(struct gui_window *gw)
+ 		respond("200 OK", NULL, body);
+ 		if (vita_chrome_open(gw, q + 4, "remote") == NSERROR_OK)
+ 			vita_remote_opened++;
++	} else if (strcmp(path, VITA_SETTINGS_PATH) == 0 ||
++		   strncmp(path, VITA_SETTINGS_PATH "?", 10) == 0) {
++		/* patch 241: the settings page -- this device only (the
++		 * listener answers the LAN, which may open pages, not change
++		 * settings) */
++		static char page[8192];
++		char note[160];
++		char *eq;
++		if (!client_local) {
++			respond("403 Forbidden", NULL,
++				"settings are changed on the Vita only");
++			return;
++		}
++		note[0] = '\0';
++		q = strchr(path, '?');
++		if (q != NULL && (eq = strchr(q + 1, '=')) != NULL) {
++			char *amp = strchr(eq + 1, '&');
++			if (amp != NULL)
++				*amp = '\0';
++			*eq = '\0';
++			url_decode(eq + 1);
++			escape(eq + 1, esc, sizeof(esc));
++			if (vita_chrome_set(gw, q + 1, eq + 1))
++				snprintf(note, sizeof(note), "Saved: %.20s = "
++					 "%.60s", q + 1, esc);
++			else
++				snprintf(note, sizeof(note), "Not a setting: "
++					 "%.20s = %.60s", q + 1, esc);
++			vita_diag_log("remote: %s", note);
++		}
++		vita_chrome_settings_page(page, sizeof(page),
++					  note[0] ? note : NULL);
++		respond("200 OK", NULL, page);
+ 	} else if (strcmp(path, "/cookie") == 0) {
+ 		char set[128];
+ 		header("Cookie", cookie, sizeof(cookie));
+@@ -278,9 +312,23 @@ void vita_remote_poll(struct gui_window *gw)
+ 	if (listen_fd < 0)
+ 		return;
+ 	if (client_fd < 0) {
+-		client_fd = accept(listen_fd, NULL, NULL);
++		struct sockaddr_in peer;
++		socklen_t pl = sizeof(peer);
++		memset(&peer, 0, sizeof(peer));
++		client_fd = accept(listen_fd, (struct sockaddr *)&peer, &pl);
+ 		if (client_fd < 0)
+ 			return;
++		client_local = peer.sin_family == AF_INET &&
++			ntohl(peer.sin_addr.s_addr) == INADDR_LOOPBACK;
++		if (!client_local && peer.sin_family == AF_INET &&
++		    vita_net_ip() != NULL) {
++			/* a stack that reports a loopback client by the
++			 * device's own address */
++			struct in_addr me;
++			client_local = inet_pton(AF_INET, vita_net_ip(),
++						 &me) == 1 &&
++				me.s_addr == peer.sin_addr.s_addr;
++		}
+ 		set_nonblocking(client_fd);
+ 		client_ms = vita_diag_ms();
+ 		req_len = 0;
+diff --git a/frontends/vita/resolve.c b/frontends/vita/resolve.c
+--- a/frontends/vita/resolve.c
++++ b/frontends/vita/resolve.c
+@@ -185,6 +185,8 @@ static void block_load(void)
+ 	block_count = o;
+ }
+ 
++bool vita_resolve_blocking = true;
++
+ /* exported interface documented in vita/resolve.h */
+ bool vita_resolve_is_blocked(const char *host)
+ {
+@@ -192,6 +194,8 @@ bool vita_resolve_is_blocked(const char *host)
+ 	const char *p;
+ 	size_t i;
+ 
++	if (!vita_resolve_blocking)
++		return false;	/* turned off on the settings page */
+ 	if (!block_loaded)
+ 		block_load();
+ 	if (block_count == 0 || strlen(host) >= sizeof(h))
+diff --git a/frontends/vita/resolve.h b/frontends/vita/resolve.h
+--- a/frontends/vita/resolve.h
++++ b/frontends/vita/resolve.h
+@@ -35,6 +35,10 @@
+ /** Is host, or a domain it is under, blocked? */
+ bool vita_resolve_is_blocked(const char *host);
+ 
++/** Content blocking on (the default) or off: the settings page
++ * (vita/chrome.c, patch 241). */
++extern bool vita_resolve_blocking;
++
+ /** Fetches refused because their host is blocked. */
+ extern unsigned int vita_resolve_blocked;
+ 

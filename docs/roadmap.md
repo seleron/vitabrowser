@@ -334,8 +334,12 @@ interaction steps on IN-find.html. History (patch 232): the URL database
 is kept across runs; the home page lists the 8 newest visits and links a
 history page (200). Error pages were already there (the core's
 about:query/fetcherror and about:query/ssl, with Back / Try Again);
-a self-signed certificate's reason reads "unknown error". Still to do:
-settings page, download progress UI.
+a self-signed certificate's reason now reads "The certificate is self
+signed." (patch 237: the chain is recorded with curl's mbedTLS backend).
+Settings page (patch 241): http://127.0.0.1:<port>/settings, linked
+from home -- user agent preset, zoom, content blocking, kept in
+settings.txt / useragent.txt, this device only. Still to do: download
+progress UI.
 
 ### WS-F Auth and bot protection (B2)
 Email login (WS-B2 first), cookie persistence across restarts (done),

@@ -3015,3 +3015,23 @@ the first flex/grid row to Chromium's position.
 6. Watch as always: `refused` stays 0 in log.txt; new DIFFs in
    receiver.txt; any .dmp from ux0:data/; `mem[page done]` lines after
    the heaviest page (patch 209 raised the network page limit to 128).
+
+
+## Since run 29 — queued for run 30 (not built yet)
+
+Patches 237-241 + patches/quickjs/06 (2026-10-11), sim-verified, full
+gate green; no VPK built yet (run 29 is with the device).
+
+- 237: certificate errors say why ("The certificate is self signed.",
+  "has expired", "is for a different host") with "View certificate
+  details". On the device: https://self-signed.badssl.com/ and
+  https://expired.badssl.com/.
+- 238-240 + quickjs/06: github.com runs without JS errors (import.meta,
+  import maps, custom element constructors).
+- 241: Settings -- the home page's "Settings" link opens
+  http://127.0.0.1:8080/settings: user agent, zoom, content blocking.
+  On the device: switch to firefox, open a site, check it; set zoom
+  125%, quit and relaunch (pages start at 125%); blocking off then on.
+  If the page says "settings are changed on the Vita only", the Vita
+  reported its loopback client by an address we did not expect -- send
+  log.txt (the remote: lines).
