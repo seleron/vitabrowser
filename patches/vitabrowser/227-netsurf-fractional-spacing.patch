@@ -1,0 +1,248 @@
+# netsurf: fractional letter- and word-spacing (patch 227)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser 114d6b0 (patch stack through 226)
+#
+# Fixes a shortfall in patch 220, which truncated letter-spacing and
+# word-spacing to whole pixels per character: 0.1em at 16px added 1px a
+# letter instead of 1.6 (+10 over ten letters, Chromium +16), 0.5px added
+# nothing, and the error grew with the text.
+#
+#  - plot_style.h: PLOT_SPACING_SCALE (256); the two fields are in
+#    1/PLOT_SPACING_SCALE px.
+#  - html/font.c: resolved at that precision (css_fixed / 4).
+#  - html/redraw.c: justification's per-space expansion (whole px) is
+#    scaled to the same unit before it is added to word_spacing.
+#  - vita/text.c, text.h: vita_text_advance_q() gives an advance in those
+#    units; vita_text_width() sums them and rounds once (vita_text_px), and
+#    the draw loop places each glyph at the rounded running sum, so drawn
+#    and measured widths agree. vita_text_advance() rounds one advance.
+#  - vita/layout.c: position and split accumulate the same units and round
+#    as width does.
+# With no spacing every advance is a whole number of pixels, so text is
+# measured and placed exactly as before.
+#
+# Test: testpages/pages/CSS-fractional-spacing.html (FRACSP227, 4 checks,
+# Chromium 4/4; with 220 alone, 1/4): 0.1em x 10 letters +16, 0.5px x 10
+# +5, word-spacing 2.5px x 4 spaces +10, and a -0.31em letter-spacing
+# grid of four 25% columns on one row (a guard: patch 226 already fixes
+# that one). SPACING220 3/3 and the justified paragraph unchanged.
+diff --git a/content/handlers/html/font.c b/content/handlers/html/font.c
+--- a/content/handlers/html/font.c
++++ b/content/handlers/html/font.c
+@@ -163,21 +163,24 @@
+ 	fstyle->foreground = nscss_color_to_ns(col);
+ 	fstyle->background = 0;
+ 
+-	/* patch 220: letter-spacing and word-spacing in device px (normal
+-	 * is 0). These and the fields after them were left unset, so the
+-	 * callers' stack garbage reached the font functions. */
++	/* patch 220: letter-spacing and word-spacing (normal is 0). These
++	 * and the fields after them were left unset, so the callers' stack
++	 * garbage reached the font functions. patch 227: in
++	 * 1/PLOT_SPACING_SCALE px, not truncated to whole pixels (0.1em at
++	 * 16px was 1px a character instead of 1.6). css_fixed has 10
++	 * fraction bits; PLOT_SPACING_SCALE is 1 << 8. */
+ 	length = 0;
+ 	unit = CSS_UNIT_PX;
+ 	fstyle->letter_spacing = (css_computed_letter_spacing(css,
+ 			&length, &unit) == CSS_LETTER_SPACING_SET) ?
+-		FIXTOINT(css_unit_len2device_px(css, unit_len_ctx,
+-				length, unit)) : 0;
++		css_unit_len2device_px(css, unit_len_ctx,
++				length, unit) / (1024 / PLOT_SPACING_SCALE) : 0;
+ 	length = 0;
+ 	unit = CSS_UNIT_PX;
+ 	fstyle->word_spacing = (css_computed_word_spacing(css,
+ 			&length, &unit) == CSS_WORD_SPACING_SET) ?
+-		FIXTOINT(css_unit_len2device_px(css, unit_len_ctx,
+-				length, unit)) : 0;
++		css_unit_len2device_px(css, unit_len_ctx,
++				length, unit) / (1024 / PLOT_SPACING_SCALE) : 0;
+ 	fstyle->shadow_x = 0;
+ 	fstyle->shadow_y = 0;
+ 	fstyle->shadow_blur = 0;
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -3818,7 +3818,7 @@
+ 	 * adding a per-space delta (computed per justified line in
+ 	 * layout_line) to word_spacing, which the plotter's per-glyph path
+ 	 * already applies after each ASCII space. 0 for non-justified boxes. */
+-	fstyle.word_spacing += box->space_expand;
++	fstyle.word_spacing += box->space_expand * PLOT_SPACING_SCALE;
+ 
+ #ifdef __MACOS9__
+ 	/* Knockout defers text callbacks until its queue is flushed. Keep this
+diff --git a/frontends/vita/layout.c b/frontends/vita/layout.c
+--- a/frontends/vita/layout.c
++++ b/frontends/vita/layout.c
+@@ -39,12 +39,14 @@
+ #include "vita/text.h"
+ #include "vita/layout.h"
+ 
+-/** Advance of the character at string[idx] in `style`. */
++/** Advance of the character at string[idx] in `style`, in
++ * 1/PLOT_SPACING_SCALE px (patch 227: positions are running sums of these,
++ * rounded, as vita_text_width and the drawing round them). */
+ static int char_advance(const struct vita_text_style *style,
+ 			const char *string, size_t length, size_t idx)
+ {
+-	return vita_text_advance(style,
+-				 utf8_to_ucs4(string + idx, length - idx));
++	return vita_text_advance_q(style,
++				   utf8_to_ucs4(string + idx, length - idx));
+ }
+ 
+ static nserror vita_font_width(const plot_font_style_t *fstyle,
+@@ -69,13 +71,13 @@
+ 	/* Stop at the character boundary nearest x. */
+ 	while (idx < length) {
+ 		int adv = char_advance(&style, string, length, idx);
+-		if (2 * x < 2 * pos + adv)
++		if (2 * PLOT_SPACING_SCALE * x < 2 * pos + adv)
+ 			break;
+ 		pos += adv;
+ 		idx = utf8_next(string, length, idx);
+ 	}
+ 	*char_offset = idx;
+-	*actual_x = pos;
++	*actual_x = vita_text_px(pos);
+ 	return NSERROR_OK;
+ }
+ 
+@@ -94,11 +96,11 @@
+ 	 * before the width is exceeded; with no such space, don't break. */
+ 	while (idx < length) {
+ 		if (string[idx] == ' ') {
+-			last_space_x = pos;
++			last_space_x = vita_text_px(pos);
+ 			last_space_idx = idx;
+ 		}
+ 		pos += char_advance(&style, string, length, idx);
+-		if (pos > x && last_space_idx != 0) {
++		if (vita_text_px(pos) > x && last_space_idx != 0) {
+ 			*char_offset = last_space_idx;
+ 			*actual_x = last_space_x;
+ 			return NSERROR_OK;
+@@ -106,7 +108,7 @@
+ 		idx = utf8_next(string, length, idx);
+ 	}
+ 	*char_offset = idx;
+-	*actual_x = pos;
++	*actual_x = vita_text_px(pos);
+ 	return NSERROR_OK;
+ }
+ 
+diff --git a/frontends/vita/text.c b/frontends/vita/text.c
+--- a/frontends/vita/text.c
++++ b/frontends/vita/text.c
+@@ -256,9 +256,23 @@
+ 		((cp == 0x20 || cp == 0xa0) ? style->word_spacing : 0);
+ }
+ 
++/* exported interface documented in vita/text.h */
++int vita_text_px(int q)
++{
++	return q >= 0 ? (q + PLOT_SPACING_SCALE / 2) / PLOT_SPACING_SCALE :
++		-((-q + PLOT_SPACING_SCALE / 2) / PLOT_SPACING_SCALE);
++}
++
++/* exported interface documented in vita/text.h */
++int vita_text_advance_q(const struct vita_text_style *style, uint32_t cp)
++{
++	return resolve(style, cp)->adv * PLOT_SPACING_SCALE +
++		spacing(style, cp);
++}
++
+ int vita_text_advance(const struct vita_text_style *style, uint32_t cp)
+ {
+-	return resolve(style, cp)->adv + spacing(style, cp);
++	return vita_text_px(vita_text_advance_q(style, cp));
+ }
+ 
+ /* exported interface documented in vita/text.h */
+@@ -268,12 +282,13 @@
+ 	size_t i = 0;
+ 	int w = 0;
+ 
++	/* patch 227: summed in 1/PLOT_SPACING_SCALE px, rounded once */
+ 	while (i < len) {
+ 		uint32_t cp = utf8_to_ucs4(utf8 + i, len - i);
+-		w += resolve(style, cp)->adv + spacing(style, cp);
++		w += vita_text_advance_q(style, cp);
+ 		i = utf8_next(utf8, len, i);
+ 	}
+-	return w;
++	return vita_text_px(w);
+ }
+ 
+ /* exported interface documented in vita/text.h */
+@@ -489,7 +504,7 @@
+ {
+ 	struct placed pl[TEXT_BATCH];
+ 	size_t i = 0;
+-	int pen = x, n = 0;
++	int pen = x, n = 0, pen_q = 0;	/* patch 227: pen = x + px(pen_q) */
+ 
+ 	while (i < len) {
+ 		const struct adv_entry *e =
+@@ -523,7 +538,8 @@
+ 				}
+ 			}
+ 		}
+-		pen += e->adv + spacing(style, e->cp);
++		pen_q += e->adv * PLOT_SPACING_SCALE + spacing(style, e->cp);
++		pen = x + vita_text_px(pen_q);
+ 	}
+ 	if (n > 0)
+ 		draw_placed(pl, n, rgba);
+diff --git a/frontends/vita/text.h b/frontends/vita/text.h
+--- a/frontends/vita/text.h
++++ b/frontends/vita/text.h
+@@ -56,7 +56,8 @@
+ 	enum vita_text_family family;
+ 	bool bold;
+ 	bool italic;
+-	int letter_spacing;	/**< patch 220: px added after each character */
++	int letter_spacing;	/**< patch 220: added after each character, in
++				 * 1/PLOT_SPACING_SCALE px (patch 227) */
+ 	int word_spacing;	/**< and after each space (CSS word-spacing plus
+ 				 * redraw's justification expansion) */
+ };
+@@ -95,6 +96,13 @@
+ /** Advance of one code point, in whole pixels, as drawn. */
+ int vita_text_advance(const struct vita_text_style *style, uint32_t cp);
+ 
++/** patch 227: advance of one code point in 1/PLOT_SPACING_SCALE px; a
++ * run's position in pixels is its running sum, rounded (vita_text_px). */
++int vita_text_advance_q(const struct vita_text_style *style, uint32_t cp);
++
++/** patch 227: 1/PLOT_SPACING_SCALE px rounded to the nearest pixel. */
++int vita_text_px(int q);
++
+ /** Width of `len` bytes of UTF-8, as drawn: the sum of the advances. */
+ int vita_text_width(const struct vita_text_style *style, const char *utf8,
+ 		    size_t len);
+diff --git a/include/netsurf/plot_style.h b/include/netsurf/plot_style.h
+--- a/include/netsurf/plot_style.h
++++ b/include/netsurf/plot_style.h
+@@ -150,6 +150,9 @@
+ 	FONTF_SMALLCAPS = 4,
+ } plot_font_flags_t;
+ 
++/** Units of plot_font_style_t letter_spacing / word_spacing per pixel. */
++#define PLOT_SPACING_SCALE 256
++
+ /**
+  * Font style for plotting
+  */
+@@ -169,6 +172,9 @@
+ 	/* fixes42: extra spacing inserted between glyphs in pixels.
+ 	 * 0 (the common case) keeps the fast-path text draw. Non-zero
+ 	 * routes through per-character draw + per-character width. */
++	/* patch 227: letter_spacing and word_spacing are in
++	 * 1/PLOT_SPACING_SCALE px, so fractional values (0.1em) are kept and
++	 * the text code rounds only a whole run's width. */
+ 	int letter_spacing;
+ 	/* fixes139b: extra spacing inserted after each ASCII space (0x20)
+ 	 * in pixels. Same fast-path / per-char split as letter_spacing.
