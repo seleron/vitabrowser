@@ -157,6 +157,23 @@ NSLOG="$OUT/run/ux0:data/VitaBrowser/netsurf.log"
 nfail=$(grep -c 'hlcache content create FAILED' "$NSLOG" || true)
 [ "$nfail" -eq 0 ] || fail "$nfail contents failed to create (parser/charset?)"
 
+# A window's first page joins its session history only when it is ready,
+# and its scripts may read history.length while it parses: that walked the
+# empty history (m.youtube.com, SIGSEGV; patch 231). Started ON the page,
+# so it is the window's first; the page puts the length in its title.
+echo "== history.length while a window's first page parses =="
+HF="$OUT/histfirst"
+rm -rf "$HF"; mkdir -p "$HF/ux0:data/VitaBrowser"
+cp -r "$A" "$HF/"
+echo off > "$HF/ux0:data/VitaBrowser/netlog.cfg"
+hrc=0
+( cd "$HF" && VITA_SIM_OUT="$HF" VITA_SIM_PAGES=1 \
+	timeout 120 "$NS/nsvita-sim" file:///app0:/testpages/JS-history-first.html \
+	> "$HF/stdout.log" 2>&1 ) || hrc=$?
+hft=$(sed -n 's/.*gw title: \(HISTFIRST .*\)/\1/p' "$HF/ux0:data/VitaBrowser/log.txt" 2>/dev/null | tail -1)
+echo "  JS-history-first: exit $hrc, title ${hft:-none} (Chromium: HISTFIRST 1)"
+[ "$hrc" -eq 0 ] && [ "$hft" = "HISTFIRST 1" ] || fail "history.length on a window's first page"
+
 echo "== autotest run (reference dumps) =="
 rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
 # the download gate checks this run's file, not one an earlier run left.

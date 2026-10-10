@@ -1,0 +1,40 @@
+# netsurf: history.length while a window's first page parses (patch 231)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser 90e7047 (patch stack through 230)
+#
+# m.youtube.com crashed the simulator (SIGSEGV 1.8 s in; scorecard r19,
+# state crash, score 0 -- it loaded at 37 in r18 at patch 183). gdb:
+# browser_window_history__enumerate_entry(entry=NULL) from
+# browser_window_history_enumerate <- macsurf_window_history_length
+# (vita/js_platform.c, patch 136) <- the JS history.length getter.
+# A window's first page joins its session history only when the content
+# is ready (browser_window_content_ready -> history add), but its scripts
+# run while it parses, so history->start was still NULL; enumerate
+# checked history but not start. Its siblings (enumerate_back/forward)
+# already check current.
+#
+#  - desktop/browser_history.c: browser_window_history_enumerate returns
+#    when the history has no entry yet (history.length then answers 1,
+#    the caller's floor, which is Chromium's answer for a first page).
+#
+# Gate: tools/run-vita-sim.sh starts a simulator ON
+# testpages/pages/JS-history-first.html (so it is the window's first
+# page), whose head script reads history.length into the title: exit 0
+# and "HISTFIRST 1" (Chromium: 1). Without the fix: SIGSEGV, exit 139.
+# m.youtube.com after the fix: loaded, 76.9 (r20, r19's reference).
+#
+diff --git a/desktop/browser_history.c b/desktop/browser_history.c
+--- a/desktop/browser_history.c
++++ b/desktop/browser_history.c
+@@ -678,7 +678,10 @@ void browser_window_history_enumerate_back(const struct browser_window *bw,
+ void browser_window_history_enumerate(const struct browser_window *bw,
+ 		browser_window_history_enumerate_cb cb, void *user_data)
+ {
+-	if (bw == NULL || bw->history == NULL)
++	/* No entry yet: a window's first page is added when it is ready,
++	 * and its scripts can ask for history.length while it parses
++	 * (m.youtube.com did; VitaBrowser patch 231). */
++	if (bw == NULL || bw->history == NULL || bw->history->start == NULL)
+ 		return;
+ 	browser_window_history__enumerate_entry(bw,
+ 			bw->history->start, cb, user_data);
