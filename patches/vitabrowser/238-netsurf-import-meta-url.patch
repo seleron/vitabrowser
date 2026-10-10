@@ -1,0 +1,66 @@
+# netsurf: import.meta.url (patch 238; needs patches/quickjs/06)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 237)
+#
+# github.com: seven of its modules died with "Automatic publicPath is not
+# supported in this browser". Its rspack runtime finds its own chunks from
+# import.meta.url (`"string" == typeof import.meta.url`), and import.meta
+# was an empty object: QuickJS leaves it to the embedder and the bridge
+# never filled it in.
+#
+#  - qjs_import_meta_init(), registered with JS_SetImportMetaFunc()
+#    (quickjs patch 06): url = the module's name, i.e. the URL the loader
+#    resolved it to; an inline module ("<document>#inline-module-N", from
+#    html/script.c) gets its document's URL, as in browsers. One hook
+#    covers every way a module is loaded (loader callback, top-level
+#    module script, bytecode cache, async pipeline).
+#
+# Gate: testpages/pages/JS-import-meta.html (+ JS-import-meta-mod.js)
+# IMPORTMETA 4/4 (Chromium 4/4): inline and external modules' URLs, the
+# publicPath rspack derives from it, a null-prototype import.meta.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -8208,6 +8208,32 @@ static void qjs_cs_colour(JSContext *ctx, JSValue o, const char *name,
+ 	JS_SetPropertyStr(ctx, o, name, JS_NewString(ctx, buf));
+ }
+ 
++/* VitaBrowser patch 238: fill in a module's import.meta when QuickJS
++ * creates it (quickjs patch 06). url is the module's URL -- the name the
++ * loader resolved it to; an inline module, named "<document>#inline-
++ * module-N" by html/script.c, has its document's URL, as in browsers.
++ * It was an empty object: github.com's rspack runtime threw "Automatic
++ * publicPath is not supported in this browser" (typeof import.meta.url
++ * !== "string") and seven of its modules died. */
++static int qjs_import_meta_init(JSContext *ctx, JSModuleDef *m,
++		JSValueConst meta)
++{
++	JSAtom a = JS_GetModuleName(ctx, m);
++	const char *name = JS_AtomToCString(ctx, a);
++	const char *cut;
++
++	JS_FreeAtom(ctx, a);
++	if (name == NULL)
++		return 0;
++	cut = strstr(name, "#inline-module-");
++	JS_DefinePropertyValueStr(ctx, meta, "url",
++		JS_NewStringLen(ctx, name,
++			cut != NULL ? (size_t)(cut - name) : strlen(name)),
++		JS_PROP_C_W_E);
++	JS_FreeCString(ctx, name);
++	return 0;
++}
++
+ /* VitaBrowser patch 235: the cascade for an element with no box -- it or
+  * an ancestor is display:none, or its box is not built yet. The answer
+  * was nothing (display ""), so jQuery's .show(), which writes an inline
+@@ -18519,6 +18545,8 @@ nserror js_newheap(int timeout, struct jsheap **out_heap)
+ 			(void *)heap->module_reg);
+ 		/* VitaBrowser: import() waits for a non-blocking load */
+ 		JS_SetModuleDeferFunc(heap->rt, qjs_module_defer);
++		/* VitaBrowser patch 238: import.meta.url */
++		JS_SetImportMetaFunc(heap->rt, qjs_import_meta_init);
+ 	}
+ 
+ 	/* Register element class before any context is created */

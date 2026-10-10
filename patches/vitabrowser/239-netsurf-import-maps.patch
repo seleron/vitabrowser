@@ -1,0 +1,382 @@
+# netsurf: import maps (patch 239)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 238)
+#
+# <script type="importmap"> was skipped as an unsupported script type, so
+# bare specifiers never resolved: github.com's chunks import "react",
+# "react-dom" and co. through its map, and failed ("module fetch FAILED
+# status=0 react", then "Loading chunk ... failed after 3 retries").
+#
+#  - html/script.c: an inline script of type importmap goes to
+#    js_set_import_map(thread, json, len, document URL) (js.h; a no-op in
+#    the "none" engine).
+#  - macsurf_qjs.c: the JSON is parsed in the realm (JS_ParseJSON) into
+#    the module registry, which already belongs to one navigation and is
+#    reset with it: "imports" and "scopes", keys normalized (a URL-like
+#    key to its URL), values resolved against the document; a value that
+#    is not URL-like is ignored, and when maps merge the first rule for a
+#    key wins. qjs_module_resolve_mapped() resolves through it -- the
+#    scopes prefixing the importer's URL, most specific first, then
+#    "imports"; exact keys, then the longest "prefix/" key -- and replaces
+#    the plain resolver in the module normalizer, the static-graph
+#    prefetch scanner (160) and the non-blocking import() loader (159).
+#
+# Gate: testpages/pages/JS-importmap.html (+ JS-importmap-lib.js, -lib2,
+# -b, -scoped) IMPORTMAP 4/4 (Chromium 4/4): a bare specifier, a prefix
+# rule, a scope, and dynamic import() through the map. github.com: the
+# map's 9 imports load; JS errors 6 -> 3.
+#
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -1323,6 +1323,14 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 			       (const uint8_t *)dom_string_data(script),
+ 			       dom_string_byte_length(script),
+ 			       "?inline script?");
++	} else if (dom_string_byte_length(mimetype) == 9 &&
++		   strncasecmp(dom_string_data(mimetype), "importmap", 9) == 0) {
++		/* VitaBrowser patch 239: an import map, for the module
++		 * scripts after it (github.com maps "react" & co.) */
++		js_set_import_map(c->js_thread,
++			(const uint8_t *)dom_string_data(script),
++			dom_string_byte_length(script),
++			nsurl_access(c->base_url));
+ 	} else {
+ 		/* Silent skip, same class as the fixes847 async/defer gap:
+ 		 * an inline <script> whose declared type doesn't map to
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -137,6 +137,14 @@ void js_destroythread(jsthread *thread);
+  */
+ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name);
+ 
++/**
++ * VitaBrowser patch 239: a <script type="importmap"> -- its JSON, and the
++ * document URL its URLs resolve against. Later module imports of bare
++ * specifiers ("react") resolve through it.
++ */
++bool js_set_import_map(jsthread *thread, const uint8_t *txt, size_t txtlen,
++		const char *base);
++
+ /**
+  * fire an event at a dom node
+  */
+diff --git a/content/handlers/javascript/none/none.c b/content/handlers/javascript/none/none.c
+--- a/content/handlers/javascript/none/none.c
++++ b/content/handlers/javascript/none/none.c
+@@ -72,6 +72,12 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
+ 	return true;
+ }
+ 
++bool js_set_import_map(jsthread *thread, const uint8_t *txt, size_t txtlen,
++		const char *base)
++{
++	return true;
++}
++
+ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc, struct dom_node *target)
+ {
+ 	return true;
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -16975,11 +16975,28 @@ struct module_entry {
+ };
+ 
+ /* Module registry lives per heap; opaque pointer in the loader. */
++/* VitaBrowser patch 239: an import map's rules -- specifier key (bare, or
++ * a resolved URL) to resolved URL; a key ending in '/' maps a prefix. */
++struct qjs_importmap_entry {
++	char *key;
++	char *value;
++};
++struct qjs_importmap_scope {
++	char *prefix;			/* resolved scope URL */
++	struct qjs_importmap_entry *e;
++	unsigned int n;
++};
++
+ struct module_registry {
+ 	struct module_entry *head;
+ 	int nav_seq;	/* the navigation its entries belong to */
+ 	unsigned int count;
+ 	size_t bytes;
++	/* patch 239: the page's import map(s), merged */
++	struct qjs_importmap_entry *imports;
++	unsigned int n_imports;
++	struct qjs_importmap_scope *scopes;
++	unsigned int n_scopes;
+ };
+ 
+ /* Caps on what one page's static graph may fetch. */
+@@ -17024,6 +17041,86 @@ static char *qjs_module_resolve(const char *base, const char *spec, size_t n)
+ 	return out;
+ }
+ 
++/* patch 239: the rule of e[0..n) for spec: an exact key, else the longest
++ * key ending in '/' that spec starts with (its value must end in '/' too).
++ * Returns the malloc'd URL, or NULL. */
++static char *qjs_importmap_lookup(const struct qjs_importmap_entry *e,
++	unsigned int n, const char *spec)
++{
++	const struct qjs_importmap_entry *best = NULL;
++	size_t bestlen = 0, kl, vl, sl = strlen(spec);
++	unsigned int i;
++	char *out;
++
++	for (i = 0; i < n; i++)
++		if (strcmp(e[i].key, spec) == 0)
++			return strdup(e[i].value);
++	for (i = 0; i < n; i++) {
++		kl = strlen(e[i].key);
++		if (kl > bestlen && kl <= sl && e[i].key[kl - 1] == '/' &&
++		    strncmp(e[i].key, spec, kl) == 0) {
++			best = &e[i];
++			bestlen = kl;
++		}
++	}
++	if (best == NULL)
++		return NULL;
++	vl = strlen(best->value);
++	if (vl == 0 || best->value[vl - 1] != '/')
++		return NULL;	/* a prefix key needs a prefix value */
++	out = (char *)malloc(vl + (sl - bestlen) + 1);
++	if (out == NULL)
++		return NULL;
++	memcpy(out, best->value, vl);
++	memcpy(out + vl, spec + bestlen, sl - bestlen + 1);
++	return out;
++}
++
++/* patch 239: resolve spec (n bytes) against base as qjs_module_resolve
++ * does, then through the page's import map: the scopes whose URL prefixes
++ * base, most specific first, then the top-level "imports". A bare
++ * specifier with no rule stays NULL (the load fails by name, as before). */
++static char *qjs_module_resolve_mapped(struct module_registry *reg,
++	const char *base, const char *spec, size_t n)
++{
++	char *url = qjs_module_resolve(base, spec, n), *key, *mapped = NULL;
++
++	if (reg == NULL || (reg->n_imports == 0 && reg->n_scopes == 0))
++		return url;
++	key = url != NULL ? strdup(url) : strndup(spec, n);
++	if (key == NULL)
++		return url;
++	/* scopes whose URL prefixes base, the longest (most specific) first */
++	if (base != NULL && reg->n_scopes > 0) {
++		const struct qjs_importmap_scope **hit;
++		unsigned int i, j, nh = 0;
++		hit = (const struct qjs_importmap_scope **)malloc(
++			reg->n_scopes * sizeof(*hit));
++		for (i = 0; hit != NULL && i < reg->n_scopes; i++)
++			if (strncmp(reg->scopes[i].prefix, base,
++				    strlen(reg->scopes[i].prefix)) == 0)
++				hit[nh++] = &reg->scopes[i];
++		for (i = 1; i < nh; i++)	/* insertion sort, longest first */
++			for (j = i; j > 0 && strlen(hit[j]->prefix) >
++					strlen(hit[j - 1]->prefix); j--) {
++				const struct qjs_importmap_scope *t = hit[j];
++				hit[j] = hit[j - 1];
++				hit[j - 1] = t;
++			}
++		for (i = 0; i < nh && mapped == NULL; i++)
++			mapped = qjs_importmap_lookup(hit[i]->e, hit[i]->n, key);
++		free(hit);
++	}
++	if (mapped == NULL)
++		mapped = qjs_importmap_lookup(reg->imports, reg->n_imports, key);
++	free(key);
++	if (mapped != NULL) {
++		free(url);
++		return mapped;
++	}
++	return url;
++}
++
+ /* Normalize: resolve an import specifier against the importing module's
+  * URL. QuickJS frees the result with js_free, so it is js_malloc'd. */
+ /* The base an import specifier resolves against: the importing module's
+@@ -17052,8 +17149,8 @@ static char *qjs_module_normalize(JSContext *ctx,
+ 	(void)opaque;
+ 
+ 	if (name == NULL) return NULL;
+-	url = qjs_module_resolve(qjs_module_base(ctx, base_name), name,
+-		strlen(name));
++	url = qjs_module_resolve_mapped((struct module_registry *)opaque,
++		qjs_module_base(ctx, base_name), name, strlen(name));
+ 	if (url == NULL) {
+ 		/* A bare specifier: keep it, so the load fails by name. */
+ 		url = strdup(name);
+@@ -17148,8 +17245,8 @@ static unsigned int qjs_module_scan(struct module_registry *reg,
+ 		if (end >= len || src[end] != q)
+ 			continue;
+ 		{
+-			char *u = qjs_module_resolve(url, src + start,
+-					end - start);
++			char *u = qjs_module_resolve_mapped(reg, url,
++					src + start, end - start);
+ 			if (u == NULL)
+ 				continue;
+ 			for (m = 0; m < n && strcmp(urls[m], u) != 0; m++)
+@@ -17902,8 +17999,8 @@ static int qjs_module_defer(JSContext *ctx, const char *basename,
+ 	if (reg == NULL || argc > 6 || filename == NULL)
+ 		return 0;
+ 	qjs_module_registry_for_nav(reg);
+-	url = qjs_module_resolve(qjs_module_base(ctx, basename), filename,
+-		strlen(filename));
++	url = qjs_module_resolve_mapped(reg, qjs_module_base(ctx, basename),
++		filename, strlen(filename));
+ 	if (url == NULL)
+ 		return 0;		/* bare specifier: fails as before */
+ 	e = qjs_module_find(reg, url);
+@@ -18396,6 +18493,149 @@ static void qjs_module_registry_free(struct module_registry *reg)
+ 	reg->head = NULL;
+ 	reg->count = 0;
+ 	reg->bytes = 0;
++	{	/* patch 239: the import map belongs to the page too */
++		unsigned int i, j;
++		for (i = 0; i < reg->n_imports; i++) {
++			free(reg->imports[i].key);
++			free(reg->imports[i].value);
++		}
++		for (i = 0; i < reg->n_scopes; i++) {
++			for (j = 0; j < reg->scopes[i].n; j++) {
++				free(reg->scopes[i].e[j].key);
++				free(reg->scopes[i].e[j].value);
++			}
++			free(reg->scopes[i].e);
++			free(reg->scopes[i].prefix);
++		}
++		free(reg->imports);
++		free(reg->scopes);
++		reg->imports = NULL;
++		reg->scopes = NULL;
++		reg->n_imports = reg->n_scopes = 0;
++	}
++}
++
++/* patch 239: an import map's "imports"-shaped object into (*e, *n),
++ * appended; keys and values resolved against base. Per the HTML spec a
++ * URL-like key is normalized to its URL, a value that is not URL-like is
++ * ignored, and the first rule for a key wins when maps merge. */
++static void qjs_importmap_add(JSContext *ctx, JSValueConst obj,
++	const char *base, struct qjs_importmap_entry **e, unsigned int *n)
++{
++	JSPropertyEnum *tab = NULL;
++	uint32_t len = 0, i;
++
++	if (!JS_IsObject(obj) ||
++	    JS_GetOwnPropertyNames(ctx, &tab, &len, obj,
++			JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
++		return;
++	for (i = 0; i < len; i++) {
++		JSValue v = JS_GetProperty(ctx, obj, tab[i].atom);
++		const char *k = JS_AtomToCString(ctx, tab[i].atom);
++		const char *vs = JS_IsString(v) ? JS_ToCString(ctx, v) : NULL;
++		char *key = NULL, *val = NULL;
++		unsigned int d;
++
++		if (k != NULL && k[0] != '\0' && vs != NULL) {
++			key = qjs_module_resolve(base, k, strlen(k));
++			if (key == NULL)
++				key = strdup(k);
++			val = qjs_module_resolve(base, vs, strlen(vs));
++		}
++		for (d = 0; key != NULL && d < *n; d++)
++			if (strcmp((*e)[d].key, key) == 0)
++				break;
++		if (key != NULL && val != NULL && d == *n) {
++			struct qjs_importmap_entry *ne = (struct qjs_importmap_entry *)
++				realloc(*e, (*n + 1) * sizeof(**e));
++			if (ne != NULL) {
++				*e = ne;
++				ne[*n].key = key;
++				ne[*n].value = val;
++				(*n)++;
++				key = val = NULL;
++			}
++		}
++		free(key);
++		free(val);
++		if (vs != NULL) JS_FreeCString(ctx, vs);
++		if (k != NULL) JS_FreeCString(ctx, k);
++		JS_FreeValue(ctx, v);
++	}
++	JS_FreePropertyEnum(ctx, tab, len);
++}
++
++/* exported interface documented in js.h (patch 239) */
++bool js_set_import_map(struct jsthread *thread, const uint8_t *txt, size_t txtlen,
++		const char *base)
++{
++	struct module_registry *reg;
++	JSContext *ctx;
++	JSValue map, sub;
++	char *buf;
++
++	if (thread == NULL || thread->ctx == NULL || thread->heap == NULL ||
++	    thread->heap->module_reg == NULL || txt == NULL)
++		return false;
++	ctx = thread->ctx;
++	reg = thread->heap->module_reg;
++	qjs_module_registry_for_nav(reg);
++	buf = (char *)malloc(txtlen + 1);
++	if (buf == NULL)
++		return false;
++	memcpy(buf, txt, txtlen);
++	buf[txtlen] = '\0';
++	map = JS_ParseJSON(ctx, buf, txtlen, "importmap");
++	free(buf);
++	if (JS_IsException(map) || !JS_IsObject(map)) {
++		JSValue ex = JS_GetException(ctx);
++		qjs_log_exc(ctx, ex, "importmap", "parse");
++		JS_FreeValue(ctx, ex);
++		JS_FreeValue(ctx, map);
++		return false;
++	}
++	sub = JS_GetPropertyStr(ctx, map, "imports");
++	qjs_importmap_add(ctx, sub, base, &reg->imports, &reg->n_imports);
++	JS_FreeValue(ctx, sub);
++	sub = JS_GetPropertyStr(ctx, map, "scopes");
++	if (JS_IsObject(sub)) {
++		JSPropertyEnum *tab = NULL;
++		uint32_t len = 0, i;
++		if (JS_GetOwnPropertyNames(ctx, &tab, &len, sub,
++				JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
++			for (i = 0; i < len; i++) {
++				const char *k = JS_AtomToCString(ctx, tab[i].atom);
++				char *pfx = k ? qjs_module_resolve(base, k,
++						strlen(k)) : NULL;
++				JSValue so = JS_GetProperty(ctx, sub, tab[i].atom);
++				struct qjs_importmap_scope *ns = NULL;
++				if (pfx != NULL)
++					ns = (struct qjs_importmap_scope *)realloc(
++						reg->scopes, (reg->n_scopes + 1) *
++						sizeof(*reg->scopes));
++				if (ns != NULL) {
++					struct qjs_importmap_scope *sc;
++					reg->scopes = ns;
++					sc = &ns[reg->n_scopes++];
++					sc->prefix = pfx;
++					sc->e = NULL;
++					sc->n = 0;
++					pfx = NULL;
++					qjs_importmap_add(ctx, so, base, &sc->e, &sc->n);
++				}
++				free(pfx);
++				JS_FreeValue(ctx, so);
++				if (k != NULL) JS_FreeCString(ctx, k);
++			}
++			JS_FreePropertyEnum(ctx, tab, len);
++		}
++	}
++	JS_FreeValue(ctx, sub);
++	JS_FreeValue(ctx, map);
++	macsurf_debug_log_writef("LIFE importmap: %u imports, %u scopes "
++		"(base %.200s)", reg->n_imports, reg->n_scopes,
++		base ? base : "-");
++	return true;
+ }
+ 
+ nserror js_newheap(int timeout, struct jsheap **out_heap)

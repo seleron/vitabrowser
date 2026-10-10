@@ -1,0 +1,456 @@
+# netsurf: custom element constructors, document.firstElementChild,
+# PerformanceObserver entry lists (patch 240)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 239)
+#
+# github.com's last three JS errors, each Chromium-checked:
+#
+#  - Custom elements (vita_polyfill.js): the polyfill only swapped an
+#    upgraded element's prototype, so a class constructor never ran --
+#    Turbo's Object.getPrototypeOf(createElement("turbo-frame").delegate)
+#    threw. HTMLElement is now a constructor that, while an element is
+#    being upgraded, hands super() that element (the usual polyfill
+#    technique), so constructors run for createElement(), `new` and
+#    upgrades of parsed / inserted elements; connectedCallback and
+#    disconnectedCallback run once per insertion / removal;
+#    attributeChangedCallback for observedAttributes (that observer is
+#    only created once a definition asks for it). The bridge reinstalls
+#    document.createElement after the polyfill's first run (it runs twice
+#    per context), so createElement is re-wrapped on every run, once per
+#    native function.
+#  - The document is a ParentNode: firstElementChild, lastElementChild,
+#    childElementCount, children (undefined; "cannot read property
+#    'classList' of undefined" on document.firstElementChild.classList).
+#  - PerformanceObserver (still a no-op) calls back with an entry list
+#    (getEntries / getEntriesByType / getEntriesByName), not a bare array
+#    ("not a function" on e.getEntries()).
+#
+# Gates: testpages/pages/JS-custom-elements.html CUSTOMEL 7/7 (Chromium
+# 7/7; before 2/7), JS-perfobserver.html PERFOBS 2/2 (Chromium 2/2;
+# disarmed 1/2). github.com with 238-240: JS errors 9 -> 0.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -13280,8 +13280,14 @@ static void register_browser_globals(JSContext *ctx)
+ 				"try{__msLife('WANT '+label+'.observe '"
+ 				"+((t&&(t.id||t.tagName))||'?')+' (NO-OP)');}catch(_){}"
+ 				"var self=this;"
++				/* patch 240: the callback's first argument is a
++				 * PerformanceObserverEntryList, not an array
++				 * (github.com: e.getEntries is not a function) */
++				"var L={getEntries:function(){return [];},"
++					"getEntriesByType:function(){return [];},"
++					"getEntriesByName:function(){return [];}};"
+ 				"try{setTimeout(function(){"
+-					"try{self._cb([],self);}catch(e){}"
++					"try{self._cb(L,self);}catch(e){}"
+ 				"},0);}catch(e){}"
+ 			"};"
+ 			"C.prototype.unobserve=function(){};"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -4103,20 +4103,64 @@
+ "\t\t};\n"
+ "\t\tg.DOMMatrix = M; g.WebKitCSSMatrix = M; g.DOMMatrixReadOnly = M;\n"
+ "\t}\n"
+-"\t/* custom elements: a registry, and an upgrade that gives already-\n"
+-"\t * present and later-inserted elements the class's prototype and runs\n"
+-"\t * connectedCallback (constructors cannot run on existing nodes). */\n"
++"\t/* custom elements (patch 240 rewrote this). A defined element's class\n"
++"\t * constructor runs -- for createElement(), for `new`, and when an\n"
++"\t * element already in the document is upgraded -- the way polyfills\n"
++"\t * do it: HTMLElement becomes a constructor that, while an element is\n"
++"\t * being upgraded, hands super() that element, so the constructor\n"
++"\t * body runs on it. (The old polyfill only swapped the prototype, so\n"
++"\t * a constructor's state was missing: github.com's Turbo reads\n"
++"\t * createElement(\"turbo-frame\").delegate.) connectedCallback /\n"
++"\t * disconnectedCallback run on insertion / removal, once each way;\n"
++"\t * attributeChangedCallback for a class's observedAttributes. */\n"
+ "\tif (typeof g.customElements === 'undefined') {\n"
+-"\t\tvar defs = {}, waits = {};\n"
++"\t\tvar defs = {}, waits = {}, building = [], attrMO = null;\n"
++"\t\tvar NativeHE = g.HTMLElement, origCreate = d.createElement;\n"
++"\t\tfunction lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }\n"
++"\t\tfunction nameOf(C) { for (var k in defs) if (defs[k] === C) return k; return null; }\n"
++"\t\tfunction connected(n) {\n"
++"\t\t\tvar de = d.documentElement;\n"
++"\t\t\treturn !!(de && (n === de || (de.contains && de.contains(n))));\n"
++"\t\t}\n"
++"\t\tfunction attrCb(el, C, name, oldV, newV) {\n"
++"\t\t\tvar obs = C.observedAttributes;\n"
++"\t\t\tif (typeof el.attributeChangedCallback !== 'function' || !obs ||\n"
++"\t\t\t    Array.prototype.indexOf.call(obs, name) < 0) return;\n"
++"\t\t\ttry { el.attributeChangedCallback(name, oldV, newV); } catch (e) {\n"
++"\t\t\t\ttry { console.error('customElement ' + lname(el) + ' attributeChangedCallback: ' + e); } catch (x) { /* */ } }\n"
++"\t\t}\n"
++"\t\t/* run C's constructor on el (once) */\n"
++"\t\tfunction construct(el, C) {\n"
++"\t\t\tif (!el || el.__vbConstructed) return;\n"
++"\t\t\tel.__vbConstructed = true;\n"
++"\t\t\tbuilding.push({ el: el, C: C });\n"
++"\t\t\ttry { new C(); } catch (e) {\n"
++"\t\t\t\ttry { Object.setPrototypeOf(el, C.prototype); } catch (x) { /* */ }\n"
++"\t\t\t\ttry { console.error('customElement ' + lname(el) + ' constructor: ' + e); } catch (x) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t\tbuilding.pop();\n"
++"\t\t\tvar obs = C.observedAttributes;\n"
++"\t\t\tif (obs && el.getAttribute) {\n"
++"\t\t\t\tfor (var i = 0; i < obs.length; i++) {\n"
++"\t\t\t\t\tvar v = el.getAttribute(obs[i]);\n"
++"\t\t\t\t\tif (v !== null) attrCb(el, C, String(obs[i]), null, v);\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tfunction connect(el) {\n"
++"\t\t\tif (el.__vbConnected || !connected(el)) return;\n"
++"\t\t\tel.__vbConnected = true;\n"
++"\t\t\tif (typeof el.connectedCallback === 'function') {\n"
++"\t\t\t\ttry { el.connectedCallback(); } catch (e) {\n"
++"\t\t\t\t\ttry { console.error('customElement ' + lname(el) + ' connectedCallback: ' + e); } catch (x) { /* */ } }\n"
++"\t\t\t}\n"
++"\t\t}\n"
+ "\t\tfunction upgrade(node) {\n"
+ "\t\t\tif (!node || node.nodeType !== 1) return;\n"
+-"\t\t\tvar C = defs[String(node.localName || node.tagName || '').toLowerCase()];\n"
+-"\t\t\tif (C && !node.__vbUpgraded) {\n"
+-"\t\t\t\tnode.__vbUpgraded = true;\n"
+-"\t\t\t\ttry { Object.setPrototypeOf(node, C.prototype); } catch (e) { /* */ }\n"
+-"\t\t\t\ttry { if (typeof node.connectedCallback === 'function') node.connectedCallback(); } catch (e) {\n"
+-"\t\t\t\t\ttry { console.error('customElement ' + node.localName + ' connectedCallback: ' + e); } catch (x) { /* */ } }\n"
+-"\t\t\t}\n"
++"\t\t\tvar C = defs[lname(node)];\n"
++"\t\t\tif (!C) return;\n"
++"\t\t\tconstruct(node, C);\n"
++"\t\t\tconnect(node);\n"
+ "\t\t}\n"
+ "\t\tfunction sweep(root) {\n"
+ "\t\t\tvar names = Object.keys(defs);\n"
+@@ -4124,16 +4168,68 @@
+ "\t\t\tvar list = root.querySelectorAll(names.join(','));\n"
+ "\t\t\tfor (var i = 0; i < list.length; i++) upgrade(list[i]);\n"
+ "\t\t}\n"
++"\t\tfunction gone(node) {\n"
++"\t\t\tif (!node || node.nodeType !== 1) return;\n"
++"\t\t\tvar all = [node], i;\n"
++"\t\t\tif (node.querySelectorAll) {\n"
++"\t\t\t\tvar l = node.querySelectorAll('*');\n"
++"\t\t\t\tfor (i = 0; i < l.length; i++) all.push(l[i]);\n"
++"\t\t\t}\n"
++"\t\t\tfor (i = 0; i < all.length; i++) {\n"
++"\t\t\t\tvar el = all[i];\n"
++"\t\t\t\tif (!el.__vbConnected || connected(el)) continue;\n"
++"\t\t\t\tel.__vbConnected = false;\n"
++"\t\t\t\tif (typeof el.disconnectedCallback === 'function') {\n"
++"\t\t\t\t\ttry { el.disconnectedCallback(); } catch (e) { /* */ }\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\t/* HTMLElement as a constructor super() can call */\n"
++"\t\tif (typeof NativeHE === 'function') {\n"
++"\t\t\tvar HE = function HTMLElement() {\n"
++"\t\t\t\tvar nt = new.target, top = building[building.length - 1], el;\n"
++"\t\t\t\tif (!nt) throw new TypeError('Illegal constructor');\n"
++"\t\t\t\tif (top && (top.C === nt || nt.prototype instanceof top.C ||\n"
++"\t\t\t\t\t    top.C.prototype instanceof nt)) {\n"
++"\t\t\t\t\tel = top.el;\n"
++"\t\t\t\t} else {\n"
++"\t\t\t\t\tvar nm = nameOf(nt), cr = d.createElement;\n"
++"\t\t\t\t\tif (!nm) throw new TypeError('Illegal constructor');\n"
++"\t\t\t\t\tel = (cr && cr.__vbNat ? cr.__vbNat : origCreate).call(d, nm);\n"
++"\t\t\t\t\tel.__vbConstructed = true;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tObject.setPrototypeOf(el, nt.prototype);\n"
++"\t\t\t\treturn el;\n"
++"\t\t\t};\n"
++"\t\t\tHE.prototype = NativeHE.prototype;\n"
++"\t\t\ttry { Object.setPrototypeOf(HE, NativeHE); } catch (e) { /* */ }\n"
++"\t\t\ttry { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t\tg.HTMLElement = HE;\n"
++"\t\t}\n"
++"\t\tg.__vbCustomEl = { defs: defs, construct: construct };\n"
+ "\t\tg.customElements = {\n"
+ "\t\t\tdefine: function (name, C) {\n"
+ "\t\t\t\tname = String(name).toLowerCase();\n"
+ "\t\t\t\tif (defs[name]) throw new DOMException('\"' + name + '\" has already been defined', 'NotSupportedError');\n"
++"\t\t\t\tif (typeof C !== 'function') throw new TypeError('not a constructor');\n"
+ "\t\t\t\tdefs[name] = C;\n"
++"\t\t\t\tif (C.observedAttributes && !attrMO && typeof g.MutationObserver === 'function') {\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tattrMO = new MutationObserver(function (ms) {\n"
++"\t\t\t\t\t\t\tms.forEach(function (m) {\n"
++"\t\t\t\t\t\t\t\tvar el = m.target, C2 = el && el.nodeType === 1 && defs[lname(el)];\n"
++"\t\t\t\t\t\t\t\tif (C2 && el.__vbConstructed)\n"
++"\t\t\t\t\t\t\t\t\tattrCb(el, C2, m.attributeName, m.oldValue, el.getAttribute(m.attributeName));\n"
++"\t\t\t\t\t\t\t});\n"
++"\t\t\t\t\t\t});\n"
++"\t\t\t\t\t\tattrMO.observe(d, { attributes: true, attributeOldValue: true, subtree: true });\n"
++"\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t}\n"
+ "\t\t\t\tsweep(d);\n"
+ "\t\t\t\tif (waits[name]) { waits[name].forEach(function (r) { r(C); }); delete waits[name]; }\n"
+ "\t\t\t},\n"
+ "\t\t\tget: function (name) { return defs[String(name).toLowerCase()]; },\n"
+-"\t\t\tgetName: function (C) { for (var k in defs) if (defs[k] === C) return k; return null; },\n"
++"\t\t\tgetName: function (C) { return nameOf(C); },\n"
+ "\t\t\twhenDefined: function (name) {\n"
+ "\t\t\t\tname = String(name).toLowerCase();\n"
+ "\t\t\t\tif (defs[name]) return Promise.resolve(defs[name]);\n"
+@@ -4146,7 +4242,10 @@
+ "\t\t\t\tnew MutationObserver(function (ms) {\n"
+ "\t\t\t\t\tif (!Object.keys(defs).length) return;\n"
+ "\t\t\t\t\tms.forEach(function (m) {\n"
+-"\t\t\t\t\t\tfor (var i = 0; m.addedNodes && i < m.addedNodes.length; i++) {\n"
++"\t\t\t\t\t\tvar i;\n"
++"\t\t\t\t\t\tfor (i = 0; m.removedNodes && i < m.removedNodes.length; i++)\n"
++"\t\t\t\t\t\t\tgone(m.removedNodes[i]);\n"
++"\t\t\t\t\t\tfor (i = 0; m.addedNodes && i < m.addedNodes.length; i++) {\n"
+ "\t\t\t\t\t\t\tupgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);\n"
+ "\t\t\t\t\t\t}\n"
+ "\t\t\t\t\t});\n"
+@@ -4154,6 +4253,41 @@
+ "\t\t\t} catch (e) { /* */ }\n"
+ "\t\t}\n"
+ "\t}\n"
++"\t/* patch 240: createElement runs a defined element's constructor. The\n"
++"\t * bridge installs document.createElement again after this file's\n"
++"\t * first run (qjs_dom_install runs twice per context, and this file\n"
++"\t * with it), so the wrapping is redone on every run, once per native. */\n"
++"\t(function () {\n"
++"\t\tvar CE = g.__vbCustomEl, cr = d.createElement;\n"
++"\t\tif (!CE || typeof cr !== 'function' || cr.__vbNat) return;\n"
++"\t\tvar w = function (name, opts) {\n"
++"\t\t\tvar el = cr.apply(this, arguments);\n"
++"\t\t\tvar C = CE.defs[String(name).toLowerCase()];\n"
++"\t\t\tif (C && el) CE.construct(el, C);\n"
++"\t\t\treturn el;\n"
++"\t\t};\n"
++"\t\tw.__vbNat = cr;\n"
++"\t\td.createElement = w;\n"
++"\t})();\n"
++"\t/* patch 240: the document is a ParentNode too -- firstElementChild\n"
++"\t * and co. were undefined on it (github.com reads\n"
++"\t * document.firstElementChild.classList) */\n"
++"\t(function () {\n"
++"\t\tfunction dkids() {\n"
++"\t\t\tvar out = [], c = d.firstChild;\n"
++"\t\t\tfor (; c; c = c.nextSibling) if (c.nodeType === 1) out.push(c);\n"
++"\t\t\tif (!out.length && d.documentElement) out.push(d.documentElement);\n"
++"\t\t\treturn out;\n"
++"\t\t}\n"
++"\t\tfunction dacc(n, get) {\n"
++"\t\t\ttry { if (d[n] !== undefined && d[n] !== null) return; } catch (e) { /* replace it */ }\n"
++"\t\t\ttry { Object.defineProperty(d, n, { get: get, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\tdacc('children', dkids);\n"
++"\t\tdacc('firstElementChild', function () { var k = dkids(); return k.length ? k[0] : null; });\n"
++"\t\tdacc('lastElementChild', function () { var k = dkids(); return k.length ? k[k.length - 1] : null; });\n"
++"\t\tdacc('childElementCount', function () { return dkids().length; });\n"
++"\t})();\n"
+ "})();\n"
+ "\n"
+ "/* ---- addEventListener: listener objects, once, signal ------------------\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -4102,20 +4102,64 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		};
+ 		g.DOMMatrix = M; g.WebKitCSSMatrix = M; g.DOMMatrixReadOnly = M;
+ 	}
+-	/* custom elements: a registry, and an upgrade that gives already-
+-	 * present and later-inserted elements the class's prototype and runs
+-	 * connectedCallback (constructors cannot run on existing nodes). */
++	/* custom elements (patch 240 rewrote this). A defined element's class
++	 * constructor runs -- for createElement(), for `new`, and when an
++	 * element already in the document is upgraded -- the way polyfills
++	 * do it: HTMLElement becomes a constructor that, while an element is
++	 * being upgraded, hands super() that element, so the constructor
++	 * body runs on it. (The old polyfill only swapped the prototype, so
++	 * a constructor's state was missing: github.com's Turbo reads
++	 * createElement("turbo-frame").delegate.) connectedCallback /
++	 * disconnectedCallback run on insertion / removal, once each way;
++	 * attributeChangedCallback for a class's observedAttributes. */
+ 	if (typeof g.customElements === 'undefined') {
+-		var defs = {}, waits = {};
++		var defs = {}, waits = {}, building = [], attrMO = null;
++		var NativeHE = g.HTMLElement, origCreate = d.createElement;
++		function lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }
++		function nameOf(C) { for (var k in defs) if (defs[k] === C) return k; return null; }
++		function connected(n) {
++			var de = d.documentElement;
++			return !!(de && (n === de || (de.contains && de.contains(n))));
++		}
++		function attrCb(el, C, name, oldV, newV) {
++			var obs = C.observedAttributes;
++			if (typeof el.attributeChangedCallback !== 'function' || !obs ||
++			    Array.prototype.indexOf.call(obs, name) < 0) return;
++			try { el.attributeChangedCallback(name, oldV, newV); } catch (e) {
++				try { console.error('customElement ' + lname(el) + ' attributeChangedCallback: ' + e); } catch (x) { /* */ } }
++		}
++		/* run C's constructor on el (once) */
++		function construct(el, C) {
++			if (!el || el.__vbConstructed) return;
++			el.__vbConstructed = true;
++			building.push({ el: el, C: C });
++			try { new C(); } catch (e) {
++				try { Object.setPrototypeOf(el, C.prototype); } catch (x) { /* */ }
++				try { console.error('customElement ' + lname(el) + ' constructor: ' + e); } catch (x) { /* */ }
++			}
++			building.pop();
++			var obs = C.observedAttributes;
++			if (obs && el.getAttribute) {
++				for (var i = 0; i < obs.length; i++) {
++					var v = el.getAttribute(obs[i]);
++					if (v !== null) attrCb(el, C, String(obs[i]), null, v);
++				}
++			}
++		}
++		function connect(el) {
++			if (el.__vbConnected || !connected(el)) return;
++			el.__vbConnected = true;
++			if (typeof el.connectedCallback === 'function') {
++				try { el.connectedCallback(); } catch (e) {
++					try { console.error('customElement ' + lname(el) + ' connectedCallback: ' + e); } catch (x) { /* */ } }
++			}
++		}
+ 		function upgrade(node) {
+ 			if (!node || node.nodeType !== 1) return;
+-			var C = defs[String(node.localName || node.tagName || '').toLowerCase()];
+-			if (C && !node.__vbUpgraded) {
+-				node.__vbUpgraded = true;
+-				try { Object.setPrototypeOf(node, C.prototype); } catch (e) { /* */ }
+-				try { if (typeof node.connectedCallback === 'function') node.connectedCallback(); } catch (e) {
+-					try { console.error('customElement ' + node.localName + ' connectedCallback: ' + e); } catch (x) { /* */ } }
+-			}
++			var C = defs[lname(node)];
++			if (!C) return;
++			construct(node, C);
++			connect(node);
+ 		}
+ 		function sweep(root) {
+ 			var names = Object.keys(defs);
+@@ -4123,16 +4167,68 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			var list = root.querySelectorAll(names.join(','));
+ 			for (var i = 0; i < list.length; i++) upgrade(list[i]);
+ 		}
++		function gone(node) {
++			if (!node || node.nodeType !== 1) return;
++			var all = [node], i;
++			if (node.querySelectorAll) {
++				var l = node.querySelectorAll('*');
++				for (i = 0; i < l.length; i++) all.push(l[i]);
++			}
++			for (i = 0; i < all.length; i++) {
++				var el = all[i];
++				if (!el.__vbConnected || connected(el)) continue;
++				el.__vbConnected = false;
++				if (typeof el.disconnectedCallback === 'function') {
++					try { el.disconnectedCallback(); } catch (e) { /* */ }
++				}
++			}
++		}
++		/* HTMLElement as a constructor super() can call */
++		if (typeof NativeHE === 'function') {
++			var HE = function HTMLElement() {
++				var nt = new.target, top = building[building.length - 1], el;
++				if (!nt) throw new TypeError('Illegal constructor');
++				if (top && (top.C === nt || nt.prototype instanceof top.C ||
++					    top.C.prototype instanceof nt)) {
++					el = top.el;
++				} else {
++					var nm = nameOf(nt), cr = d.createElement;
++					if (!nm) throw new TypeError('Illegal constructor');
++					el = (cr && cr.__vbNat ? cr.__vbNat : origCreate).call(d, nm);
++					el.__vbConstructed = true;
++				}
++				Object.setPrototypeOf(el, nt.prototype);
++				return el;
++			};
++			HE.prototype = NativeHE.prototype;
++			try { Object.setPrototypeOf(HE, NativeHE); } catch (e) { /* */ }
++			try { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }
++			g.HTMLElement = HE;
++		}
++		g.__vbCustomEl = { defs: defs, construct: construct };
+ 		g.customElements = {
+ 			define: function (name, C) {
+ 				name = String(name).toLowerCase();
+ 				if (defs[name]) throw new DOMException('"' + name + '" has already been defined', 'NotSupportedError');
++				if (typeof C !== 'function') throw new TypeError('not a constructor');
+ 				defs[name] = C;
++				if (C.observedAttributes && !attrMO && typeof g.MutationObserver === 'function') {
++					try {
++						attrMO = new MutationObserver(function (ms) {
++							ms.forEach(function (m) {
++								var el = m.target, C2 = el && el.nodeType === 1 && defs[lname(el)];
++								if (C2 && el.__vbConstructed)
++									attrCb(el, C2, m.attributeName, m.oldValue, el.getAttribute(m.attributeName));
++							});
++						});
++						attrMO.observe(d, { attributes: true, attributeOldValue: true, subtree: true });
++					} catch (e) { /* */ }
++				}
+ 				sweep(d);
+ 				if (waits[name]) { waits[name].forEach(function (r) { r(C); }); delete waits[name]; }
+ 			},
+ 			get: function (name) { return defs[String(name).toLowerCase()]; },
+-			getName: function (C) { for (var k in defs) if (defs[k] === C) return k; return null; },
++			getName: function (C) { return nameOf(C); },
+ 			whenDefined: function (name) {
+ 				name = String(name).toLowerCase();
+ 				if (defs[name]) return Promise.resolve(defs[name]);
+@@ -4145,7 +4241,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				new MutationObserver(function (ms) {
+ 					if (!Object.keys(defs).length) return;
+ 					ms.forEach(function (m) {
+-						for (var i = 0; m.addedNodes && i < m.addedNodes.length; i++) {
++						var i;
++						for (i = 0; m.removedNodes && i < m.removedNodes.length; i++)
++							gone(m.removedNodes[i]);
++						for (i = 0; m.addedNodes && i < m.addedNodes.length; i++) {
+ 							upgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);
+ 						}
+ 					});
+@@ -4153,6 +4252,41 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			} catch (e) { /* */ }
+ 		}
+ 	}
++	/* patch 240: createElement runs a defined element's constructor. The
++	 * bridge installs document.createElement again after this file's
++	 * first run (qjs_dom_install runs twice per context, and this file
++	 * with it), so the wrapping is redone on every run, once per native. */
++	(function () {
++		var CE = g.__vbCustomEl, cr = d.createElement;
++		if (!CE || typeof cr !== 'function' || cr.__vbNat) return;
++		var w = function (name, opts) {
++			var el = cr.apply(this, arguments);
++			var C = CE.defs[String(name).toLowerCase()];
++			if (C && el) CE.construct(el, C);
++			return el;
++		};
++		w.__vbNat = cr;
++		d.createElement = w;
++	})();
++	/* patch 240: the document is a ParentNode too -- firstElementChild
++	 * and co. were undefined on it (github.com reads
++	 * document.firstElementChild.classList) */
++	(function () {
++		function dkids() {
++			var out = [], c = d.firstChild;
++			for (; c; c = c.nextSibling) if (c.nodeType === 1) out.push(c);
++			if (!out.length && d.documentElement) out.push(d.documentElement);
++			return out;
++		}
++		function dacc(n, get) {
++			try { if (d[n] !== undefined && d[n] !== null) return; } catch (e) { /* replace it */ }
++			try { Object.defineProperty(d, n, { get: get, configurable: true }); } catch (e) { /* */ }
++		}
++		dacc('children', dkids);
++		dacc('firstElementChild', function () { var k = dkids(); return k.length ? k[0] : null; });
++		dacc('lastElementChild', function () { var k = dkids(); return k.length ? k[k.length - 1] : null; });
++		dacc('childElementCount', function () { return dkids().length; });
++	})();
+ })();
+ 
+ /* ---- addEventListener: listener objects, once, signal ------------------

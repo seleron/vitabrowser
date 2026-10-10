@@ -298,6 +298,10 @@ NET-js-innerhtml-raw http://127.0.0.1:$HP/JS-innerhtml-raw.html
 NET-js-offsetparent http://127.0.0.1:$HP/JS-offsetparent.html
 NET-js-computed-unboxed http://127.0.0.1:$HP/JS-computed-unboxed.html
 NET-css-inline-outranks http://127.0.0.1:$HP/CSS-inline-outranks.html
+NET-js-import-meta http://127.0.0.1:$HP/JS-import-meta.html
+NET-js-importmap http://127.0.0.1:$HP/JS-importmap.html
+NET-js-custom-elements http://127.0.0.1:$HP/JS-custom-elements.html
+NET-js-perfobserver http://127.0.0.1:$HP/JS-perfobserver.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -785,13 +789,18 @@ l228p=$(ls "$R"/*NET-html-legend-reset.plot 2>/dev/null | head -1)
 l228r=$(sed -n 's/.*STR \(LEGEND228: [0-9]*\/[0-9]* passed\).*/\1/p' "$l228p" 2>/dev/null | head -1)
 echo "  html-legend-reset: ${l228r:-no summary}"
 [ -n "$l228p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$l228p" | sed 's/^STR /  /'
+# Patches 238-240 (github.com) share this loop: import.meta.url, import
+# maps, custom element constructors + document.firstElementChild +
+# PerformanceObserver entry lists.
 # Patches 233-236 (make.wordpress.org's o2 app): a raw-text element's own
 # innerHTML unescaped (233), offsetParent / offsetTop per CSSOM View (234),
 # getComputedStyle for an element with no box (235), inline style outranks
 # author rules whatever matched last (236, libcss).
 o2_bad=
 for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
-	 "js-computed-unboxed UNBOXED 7" "css-inline-outranks INLINE236 4"; do
+	 "js-computed-unboxed UNBOXED 7" "css-inline-outranks INLINE236 4" \
+	 "js-import-meta IMPORTMETA 4" "js-importmap IMPORTMAP 4" \
+	 "js-custom-elements CUSTOMEL 7" "js-perfobserver PERFOBS 2"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)

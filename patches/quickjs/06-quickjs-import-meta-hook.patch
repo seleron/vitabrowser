@@ -1,0 +1,61 @@
+# quickjs: a host hook to fill in import.meta
+#
+# import.meta was an empty object: QuickJS creates it lazily and leaves its
+# contents to the embedder, which VitaBrowser never set. Bundlers read
+# import.meta.url to find their own chunks -- github.com's rspack runtime
+# throws "Automatic publicPath is not supported in this browser" when it
+# is not a string, which killed seven of its modules. JS_SetImportMetaFunc()
+# registers a host function called once per module when its import.meta
+# object is created, whichever way the module was loaded (loader callback,
+# top-level module script, bytecode cache, async pipeline).
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1230,6 +1230,13 @@
+                               JSValueConst *argv, JSJobFunc *job,
+                               void *opaque);
+ JS_EXTERN void JS_SetModuleDeferFunc(JSRuntime *rt, JSModuleDeferFunc *func);
++/* VitaBrowser: called once per module, when its import.meta object is
++   created (the first time the module reads import.meta, or the host asks
++   with JS_GetImportMeta), to fill it in -- a browser sets "url". A
++   negative return is an exception. */
++typedef int JSImportMetaFunc(JSContext *ctx, JSModuleDef *m,
++                             JSValueConst meta);
++JS_EXTERN void JS_SetImportMetaFunc(JSRuntime *rt, JSImportMetaFunc *func);
+ /* VitaBrowser: make global var / function declarations configurable while
+    on (host bootstrap scripts; page scripts keep the standard behaviour). */
+ JS_EXTERN void JS_SetGlobalDeclsConfigurable(JSContext *ctx, bool on);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -356,6 +356,7 @@
+     JSModuleCheckSupportedImportAttributes *module_check_attrs;
+     void *module_loader_opaque;
+     JSModuleDeferFunc *module_defer_func; /* VitaBrowser */
++    JSImportMetaFunc *import_meta_func; /* VitaBrowser */
+     /* timestamp for internal use in module evaluation */
+     int64_t module_async_evaluation_next_timestamp;
+ 
+@@ -30039,6 +30040,11 @@
+     ctx->global_decls_configurable = on;
+ }
+ 
++void JS_SetImportMetaFunc(JSRuntime *rt, JSImportMetaFunc *func)
++{
++    rt->import_meta_func = func;
++}
++
+ void JS_SetModuleDeferFunc(JSRuntime *rt, JSModuleDeferFunc *func)
+ {
+     rt->module_defer_func = func;
+@@ -31095,6 +31101,10 @@
+         if (JS_IsException(obj))
+             return JS_EXCEPTION;
+         m->meta_obj = obj;
++        /* VitaBrowser: the host fills it in (import.meta.url) */
++        if (ctx->rt->import_meta_func &&
++            ctx->rt->import_meta_func(ctx, m, obj) < 0)
++            return JS_EXCEPTION;
+     }
+     return js_dup(obj);
+ }
