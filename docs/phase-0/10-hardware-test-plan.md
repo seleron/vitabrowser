@@ -2937,12 +2937,35 @@ What to check on the device:
 
 ## Run 29 — hand-off (2026-10-10; replaces untested run 28)
 
-Run 28 (Hermes, patches up to 183) was never run on the device
-(`results\` held only run 27's sessions; now renamed `results-run27\`).
-Run 29 carries everything since run 27: **patches 168-230 +
-patches/quickjs/05**, all unverified on hardware.
+**Rebuilt 23:02 with patches 231-236 -- flash THIS build:**
+VitaBrowser.vpk `b7ebf9c27396`, VitaBrowser-ext.vpk `b90dd650c21b`,
+nsvita.elf `c65502a1281f` (built at bdf7ce7; the stack re-verified
+against a scratch apply of the committed patches). The first run-29
+build (`378077ea456a`, below) crashed on m.youtube.com in the simulator
+(patch 231) and was never flashed; it is archived as
+`hwtest-2026-10-10-run29-first-378077ea/`. Reference autotest of the
+rebuild: interact **44/44**, js 18/18, 32 dumps -- the 30 earlier ones
+identical, plus IN-home-recent and IN-history (patch 232; their ages
+such as "just now" can differ on the device). What 231-236 add:
 
-Built at 90e7047 on the desktop: clean restage (315 applied + the two
+- **231**: m.youtube.com no longer crashes (history.length read while
+  the first page parsed). Sim score 0 -> 76.9.
+- **232 History**: the home page now has "Recently visited" (8 newest,
+  with "5 min ago" ages) and an "All history" page; visits are kept in
+  ux0:data/VitaBrowser/urldb across restarts. START rewrites the home
+  page each time.
+- **233-236**: make.wordpress.org/core shows its posts (sim 49.5 ->
+  81.0): script templates read back raw, offsetParent/offsetTop as in
+  browsers (an infinite loop before), getComputedStyle for hidden
+  elements, and the style attribute always outranking normal CSS rules
+  (libcss) -- the last one changes every page with inline styles.
+
+Run 29 carries everything since run 27: **patches 168-236 +
+patches/quickjs/05**, all unverified on hardware. Run 28 (Hermes, patches
+up to 183) was never run on the device (`results\` held only run 27's
+sessions; now renamed `results-run27\`).
+
+First build, at 90e7047 on the desktop: clean restage (315 applied + the two
 known collisions), streams 4/4 (fixtures refreshed for patch 214, commit
 8a47fb8), renderer 102/102 + 30/30, full sim gate exit 0 (interaction
 41/41, also at the Vita's pace), cross-build green. First Vita build of
@@ -2961,9 +2984,16 @@ the first flex/grid row to Chromium's position.
 **On the device:**
 
 1. Autotest as usual (SELECT + □): every `.plot` SAME against the new
-   reference-dumps (PM-animation may differ: it is timing-dependent),
-   interact **41/41**, js 18/18. The interaction pass now includes
-   eight find-in-page steps on IN-find.html.
+   reference-dumps (PM-animation may differ: it is timing-dependent;
+   IN-home-recent / IN-history may differ in their ages), interact
+   **44/44**, js 18/18. The interaction pass includes eight
+   find-in-page steps on IN-find.html and the history checks.
+2a. **History (patch 232)**: browse two or three sites, press START: the
+   home page lists them under "Recently visited", newest first. Quit
+   (SELECT + START), relaunch: still there. "All history" opens the
+   full list.
+2b. **m.youtube.com** loads (it crashed the simulator before 231) and
+   **make.wordpress.org/core** shows its posts below the welcome box.
 2. **Find in page (patch 230, new).** On any long article (e.g.
    en.m.wikipedia.org/wiki/PlayStation_Vita): △, type `/vita`, OK. The
    message line says `find "vita": 1 of N` and the first match is
