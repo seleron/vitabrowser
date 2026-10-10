@@ -1,0 +1,585 @@
+# netsurf: find in page on the Vita (patch 230; roadmap WS-E, Phase 1 exit)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser c1a0f0e (patch stack through 229)
+#
+# Find in page is on the Phase 1 exit list and the frontend had none. The
+# core's text search already does the work (content/textsearch.c: the
+# matches, the highlight, a CONTENT_MSG_SCROLL to the current one); the
+# Vita had no way in and nowhere to show the result.
+#
+#  - vita/find.c (new): the URL keyboard is the find bar. Text typed into
+#    it that starts with '/' is a term to find (no typed URL starts with
+#    one); a new term starts at the first match, the same term again
+#    moves to the next, "/" alone ends the find. Case-insensitive. The
+#    message line says 'find "term": 2 of 5' or 'not found'.
+#  - vita/main.c: SELECT + DOWN / UP step to the next / previous match
+#    (before the autotest's early return, so the interaction pass can
+#    press them; only while a find is active).
+#  - content/textsearch.c: the next match after the last is the first and
+#    the previous before the first is the last, as browsers' find does
+#    (the core stopped at either end). content_textsearch_position() and
+#    browser_window_search_position() give the current match's position
+#    and the match count.
+#  - vita/window.c: set_scroll with an AREA (only the text search sends
+#    one; fragments, history and drags send a point and are unchanged)
+#    converts the content rect to zoomed offsets, leaves the view alone
+#    when the match is already on screen, else centres it, then clamps.
+#    The old code put the match's top-left at the screen's corner, ignoring
+#    zoom. A new page drops the find (its matches went with the old page).
+#  - vita/chrome.c: the home page's controls line mentions find.
+#  - vita/interact.c: C_FIND and eight steps on IN-find.html (three
+#    matches, one in capitals, two far below the first screen): first on
+#    screen, SELECT+DOWN scrolls to the second, retyping steps to the
+#    third, wrap forwards and backwards, a missing term, "/" ends it. Each
+#    checks the position, that the match is on screen, and a minimum
+#    scroll offset.
+#
+diff --git a/content/textsearch.c b/content/textsearch.c
+--- a/content/textsearch.c
++++ b/content/textsearch.c
+@@ -282,13 +282,19 @@ search_text(struct textsearch_context *context,
+ 		context->newsearch = false;
+ 
+ 	} else if (context->current != NULL) {
+-		/* continued search in the direction specified */
++		/* continued search in the direction specified; past the
++		 * last match it wraps to the first and back, as browsers'
++		 * find does (VitaBrowser patch 230) */
+ 		if (forwards) {
+ 			if (context->current->next)
+ 				context->current = context->current->next;
++			else
++				context->current = context->found->next;
+ 		} else {
+ 			if (context->current->prev)
+ 				context->current = context->current->prev;
++			else
++				context->current = context->found->prev;
+ 		}
+ 	}
+ 
+@@ -756,6 +762,30 @@ content_textsearch(struct hlcache_handle *h,
+ }
+ 
+ 
++/* exported interface, documented in content/textsearch.h */
++void content_textsearch_position(struct hlcache_handle *h,
++				 unsigned int *index, unsigned int *count)
++{
++	struct content *c = hlcache_handle_get_content(h);
++	struct textsearch_context *ctx;
++	struct list_entry *a;
++	unsigned int n = 0;
++
++	*index = *count = 0;
++	if (c == NULL || c->textsearch.context == NULL)
++		return;
++	ctx = c->textsearch.context;
++	if (ctx->found == NULL)
++		return;
++	for (a = ctx->found->next; a != NULL; a = a->next) {
++		n++;
++		if (a == ctx->current)
++			*index = n;
++	}
++	*count = n;
++}
++
++
+ /* exported interface, documented in content/content.h */
+ nserror content_textsearch_clear(struct hlcache_handle *h)
+ {
+diff --git a/content/textsearch.h b/content/textsearch.h
+--- a/content/textsearch.h
++++ b/content/textsearch.h
+@@ -49,6 +49,14 @@ nserror content_textsearch(struct hlcache_handle *h, void *context, search_flags
+  */
+ nserror content_textsearch_clear(struct hlcache_handle *h);
+ 
++/**
++ * The position of a content's search: the current match `*index`
++ * (1-based, 0 = none) of `*count`.
++ * \param[in] h Handle to the content searched.
++ */
++void content_textsearch_position(struct hlcache_handle *h,
++				 unsigned int *index, unsigned int *count);
++
+ /**
+  * Ends the search process, invalidating all state freeing the list of
+  * found boxes.
+diff --git a/desktop/search.c b/desktop/search.c
+--- a/desktop/search.c
++++ b/desktop/search.c
+@@ -43,6 +43,17 @@ void browser_window_search(struct browser_window *bw, void *context,
+ 	}
+ }
+ 
++/* exported function documented in desktop/search.h */
++void browser_window_search_position(struct browser_window *bw,
++		unsigned int *index, unsigned int *count)
++{
++	*index = *count = 0;
++	if ((bw != NULL) &&
++	    (bw->current_content != NULL)) {
++		content_textsearch_position(bw->current_content, index, count);
++	}
++}
++
+ /* exported function documented in desktop/search.h */
+ void browser_window_search_clear(struct browser_window *bw)
+ {
+diff --git a/desktop/search.h b/desktop/search.h
+--- a/desktop/search.h
++++ b/desktop/search.h
+@@ -54,4 +54,15 @@ void browser_window_search(struct browser_window *bw, void *context, search_flag
+ 
+ void browser_window_search_clear(struct browser_window *bw);
+ 
++/**
++ * Where the window's text search is: the current match `*index` (1-based,
++ * 0 = none) of `*count` matches.
++ *
++ * \param bw The browser window.
++ * \param index Receives the current match's position.
++ * \param count Receives the number of matches.
++ */
++void browser_window_search_position(struct browser_window *bw,
++		unsigned int *index, unsigned int *count);
++
+ #endif
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -81,7 +81,7 @@ MESSAGES_TARGET=$(VITA_RESOURCES_DIR)
+ S_FRONTEND := main.c window.c schedule.c fetch.c file.c layout.c bitmap.c \
+ 	plot.c plot_geom.c replay.c diag.c text.c netlog.c net.c jsprobe.c \
+ 	qjs_hooks.c js_platform.c netprobe.c resolve.c input.c chrome.c \
+-	remote.c interact.c texpool.c pathfill.c download.c
++	remote.c interact.c texpool.c pathfill.c download.c find.c
+ 
+ # This is the final source build list
+ # Note this is deliberately *not* expanded here as common and image
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -50,6 +50,7 @@
+ #include "vita/window.h"
+ #include "vita/chrome.h"
+ #include "vita/download.h"
++#include "vita/find.h"
+ 
+ #define VITA_DOWNLOAD_DIR_NAME "ux0:download"
+ 
+@@ -205,7 +206,9 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 	      "</style></head><body>\n<h1>VitaBrowser</h1>\n"
+ 	      "<p class=\"hint\">Tap a link, or move the pointer (left stick)"
+ 	      " and press &#x2715;. &#x25b3; types a URL. L / R: back /"
+-	      " forward. &#x25a1;: zoom. START: this page.", fp);
++	      " forward. &#x25a1;: zoom. START: this page. Find in the"
++	      " page: &#x25b3;, then /word (SELECT + &#x2193; / &#x2191;:"
++	      " next / previous match).", fp);
+ 	if (vita_remote_address() != NULL) {
+ 		fputs(" From a phone or PC on the same Wi-Fi: <b>http://", fp);
+ 		put_escaped(fp, vita_remote_address(), 64);
+@@ -383,6 +386,12 @@ void vita_chrome_enter_text(struct gui_window *gw, const char *utf8)
+ 	if (bw == NULL)
+ 		return;
+ 	if (!vita_chrome_editing(gw)) {
++		/* "/term" finds in the page (vita/find.c): no URL typed
++		 * into the address keyboard starts with '/'. */
++		if (utf8[0] == '/') {
++			vita_find(gw, utf8 + 1);
++			return;
++		}
+ 		vita_chrome_open(gw, utf8, "typed");
+ 		return;
+ 	}
+diff --git b/frontends/vita/find.c b/frontends/vita/find.c
+new file mode 100644
+--- /dev/null
++++ b/frontends/vita/find.c
+@@ -0,0 +1,130 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Find in page (roadmap WS-E, Phase 1 exit).
++ *
++ * The core's text search does the work (content/textsearch.c: the matches,
++ * the highlight, a CONTENT_MSG_SCROLL to the current one, which
++ * vita/window.c centres on screen). The Vita has no find bar, so the
++ * entry is the URL keyboard: text typed there that starts with '/' is a
++ * term to find (no URL starts with one). SELECT + DOWN / UP step to the
++ * next / previous match, and typing the same term again steps forwards
++ * too. The message line shows where the find is ("2 of 5").
++ */
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "utils/errors.h"
++#include "desktop/search.h"
++
++#include "vita/diag.h"
++#include "vita/download.h"
++#include "vita/window.h"
++#include "vita/find.h"
++
++/** How long the position stays on the message line, ms. */
++#define FIND_MESSAGE_MS 4000
++
++static struct {
++	char term[128];
++	unsigned int index, count;
++} find;
++
++/** Read the position back from the core and put it on screen. */
++static void report(struct gui_window *gw)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++
++	find.index = find.count = 0;
++	if (bw != NULL)
++		browser_window_search_position(bw, &find.index, &find.count);
++	if (find.count == 0)
++		vita_show_message(FIND_MESSAGE_MS, "find \"%s\": not found",
++				  find.term);
++	else
++		vita_show_message(FIND_MESSAGE_MS, "find \"%s\": %u of %u",
++				  find.term, find.index, find.count);
++	vita_diag_log("find: \"%s\" %u/%u", find.term, find.index,
++		      find.count);
++	vita_window_force_redraw(gw);
++}
++
++/* exported interface documented in vita/find.h */
++void vita_find(struct gui_window *gw, const char *term)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++
++	if (bw == NULL)
++		return;
++	if (term[0] == '\0') {
++		if (find.term[0] != '\0') {
++			browser_window_search(bw, gw, SEARCH_FLAG_FORWARDS,
++					      NULL);
++			vita_show_message(1500, "find ended");
++			vita_diag_log("find: ended");
++		}
++		find.term[0] = '\0';
++		find.index = find.count = 0;
++		vita_window_force_redraw(gw);
++		return;
++	}
++	/* The same term continues (core: same string = next match); a new
++	 * one starts over at the top of the page. */
++	snprintf(find.term, sizeof(find.term), "%s", term);
++	browser_window_search(bw, gw, SEARCH_FLAG_FORWARDS, find.term);
++	report(gw);
++}
++
++/* exported interface documented in vita/find.h */
++void vita_find_step(struct gui_window *gw, bool forwards)
++{
++	struct browser_window *bw = vita_window_browser(gw);
++
++	if (bw == NULL || find.term[0] == '\0')
++		return;
++	browser_window_search(bw, gw,
++			      forwards ? SEARCH_FLAG_FORWARDS : 0, find.term);
++	report(gw);
++}
++
++/* exported interface documented in vita/find.h */
++bool vita_find_active(void)
++{
++	return find.term[0] != '\0';
++}
++
++/* exported interface documented in vita/find.h */
++void vita_find_position(unsigned int *index, unsigned int *count)
++{
++	*index = find.index;
++	*count = find.count;
++}
++
++/* exported interface documented in vita/find.h */
++void vita_find_reset(struct gui_window *gw)
++{
++	(void)gw;
++	if (find.term[0] != '\0')
++		vita_diag_log("find: \"%s\" dropped (new page)", find.term);
++	find.term[0] = '\0';
++	find.index = find.count = 0;
++}
+diff --git b/frontends/vita/find.h b/frontends/vita/find.h
+new file mode 100644
+--- /dev/null
++++ b/frontends/vita/find.h
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2026 VitaBrowser contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/** \file Find in page (vita/find.c). */
++
++#ifndef NETSURF_VITA_FIND_H
++#define NETSURF_VITA_FIND_H
++
++#include <stdbool.h>
++
++struct gui_window;
++
++/**
++ * Find `term` in the window's page, case-insensitively: a new term starts
++ * at the first match, the term already being found moves to the next one
++ * (so typing it again steps through the page), and "" ends the find.
++ * The match is highlighted and scrolled to; the message line says
++ * "n of N".
++ */
++void vita_find(struct gui_window *gw, const char *term);
++
++/** The next (forwards) or previous match of the active find; wraps. */
++void vita_find_step(struct gui_window *gw, bool forwards);
++
++/** True while a find has a term (matches or not). */
++bool vita_find_active(void);
++
++/** The active find's position: match `*index` (1-based, 0 = none) of
++ * `*count`. */
++void vita_find_position(unsigned int *index, unsigned int *count);
++
++/** Forget the find: the window got a new page (its matches went with the
++ * old one). */
++void vita_find_reset(struct gui_window *gw);
++
++#endif
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -39,6 +39,7 @@
+ #include "vita/chrome.h"
+ #include "vita/diag.h"
+ #include "vita/download.h"
++#include "vita/find.h"
+ #include "vita/input.h"
+ #include "vita/remote.h"
+ #include "vita/resolve.h"
+@@ -74,6 +75,9 @@ enum check {
+ 	C_COOKIE,	/**< the saved jar holds the listener's cookie */
+ 	C_TYPED,	/**< vita_chrome_typed_url() turns text into URLs */
+ 	C_DOWNLOAD,	/**< the download named expect is on the card, intact */
++	C_FIND,		/**< the find is at expect ("n/N"; "-" = no find), its
++			 * match on screen, and the scroll offset at least
++			 * value */
+ 	C_NONE,		/**< nothing to check */
+ };
+ 
+@@ -142,6 +146,22 @@ static const struct step {
+ 	  C_URL, "IN-rebuild.html", 0, NULL },
+ 	{ "a submit whose click rebuilds the page", A_TAP, NULL, 250, 140,
+ 	  0, 0, 0, C_URL, "IN-target.html?via=rebuild&r=ok", 0, NULL },
++	{ "open IN-find", A_OPEN, T "IN-find.html", 0, 0, 0, 0, 0,
++	  C_URL, "IN-find.html", 0, NULL },
++	{ "find: /needle, first of 3 (on screen)", A_TYPE, "/needle",
++	  0, 0, 0, 0, 0, C_FIND, "1/3", 0, NULL },
++	{ "find: SELECT+DOWN, second, scrolled to", A_BUTTON, NULL, 0, 0, 0,
++	  0, SCE_CTRL_SELECT | SCE_CTRL_DOWN, C_FIND, "2/3", 600, "IN-find-2" },
++	{ "find: the same term again, third", A_TYPE, "/needle",
++	  0, 0, 0, 0, 0, C_FIND, "3/3", 1800, NULL },
++	{ "find: SELECT+DOWN wraps to the first", A_BUTTON, NULL, 0, 0, 0, 0,
++	  SCE_CTRL_SELECT | SCE_CTRL_DOWN, C_FIND, "1/3", 0, NULL },
++	{ "find: SELECT+UP wraps to the last", A_BUTTON, NULL, 0, 0, 0, 0,
++	  SCE_CTRL_SELECT | SCE_CTRL_UP, C_FIND, "3/3", 1800, NULL },
++	{ "find: a missing term", A_TYPE, "/nowhere-to-be-seen",
++	  0, 0, 0, 0, 0, C_FIND, "0/0", 0, NULL },
++	{ "find: / alone ends it", A_TYPE, "/", 0, 0, 0, 0, 0,
++	  C_FIND, "-", 0, NULL },
+ 	{ "a typed URL opens", A_TYPE, T "IN-target.html?via=typed",
+ 	  0, 0, 0, 0, 0, C_URL, "IN-target.html?via=typed", 0, NULL },
+ 	{ "a URL pushed to the LAN listener opens", A_REMOTE,
+@@ -326,6 +346,24 @@ static void check(struct gui_window *gw, const struct step *s)
+ 	case C_DOWNLOAD:
+ 		ok = download_ok(s->expect, detail, sizeof detail);
+ 		break;
++	case C_FIND: {
++		unsigned int fi, fn;
++		char at[16];
++
++		vita_find_position(&fi, &fn);
++		if (vita_find_active())
++			snprintf(at, sizeof at, "%u/%u", fi, fn);
++		else
++			snprintf(at, sizeof at, "-");
++		vita_window_scroll_pos(gw, &x, &y);
++		ok = strcmp(at, s->expect) == 0 && y >= s->value &&
++			(fi == 0 || vita_window_revealed_visible(gw));
++		snprintf(detail, sizeof detail, "find %s, scroll %d, match %s",
++			 at, y, fi == 0 ? "none" :
++			 vita_window_revealed_visible(gw) ? "on screen" :
++			 "OFF SCREEN");
++		break;
++	}
+ 	case C_NONE:
+ 		ok = true;
+ 		break;
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -74,6 +74,7 @@
+ #include "vita/chrome.h"
+ #include "vita/remote.h"
+ #include "vita/interact.h"
++#include "vita/find.h"
+ #include "content/urldb.h"
+ #include "vita/netprobe.h"
+ /* The QuickJS bridge's event-loop pump (quickjs/macsurf_qjs.c) and its
+@@ -509,6 +510,16 @@ static int vita_controls(struct gui_window *gw, struct browser_window *bw,
+ 	if (in->buttons & SCE_CTRL_SELECT) {
+ 		if (pressed & SCE_CTRL_START)
+ 			vita_quit = true;
++		/* Find in page (vita/find.c): next / previous match. Before
++		 * the autotest's early return: its interaction pass steps
++		 * a find with these too. */
++		if (vita_find_active() &&
++		    (vita_autotest == AT_OFF || vita_autotest == AT_INTERACT)) {
++			if (pressed & SCE_CTRL_DOWN)
++				vita_find_step(gw, true);
++			if (pressed & SCE_CTRL_UP)
++				vita_find_step(gw, false);
++		}
+ 		if (vita_autotest != AT_OFF)
+ 			return 0;	/* the autotest drives navigation */
+ 		if (pressed & SCE_CTRL_SQUARE) {
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -55,6 +55,7 @@ extern void macsurf_lazyimg_viewport_changed(int scroll_y, int viewport_h);
+ #include "vita/diag.h"
+ #include "vita/plot.h"
+ #include "vita/window.h"
++#include "vita/find.h"
+ 
+ struct gui_window {
+ 	struct browser_window *bw;
+@@ -66,6 +67,8 @@ struct gui_window {
+ 	char title[160];		/**< the page's title, for the HUD */
+ 	int popup_id;			/**< window.open id; 0: not a popup */
+ 	struct gui_window *below;	/**< the window this one covers */
++	struct rect revealed;		/**< last area set_scroll showed */
++	bool has_revealed;		/**< revealed is set */
+ };
+ 
+ /* The windows form a stack: a new one (window.open, a link opened "in a
+@@ -172,6 +175,32 @@ static bool vita_window_get_scroll(struct gui_window *gw, int *sx, int *sy)
+ static nserror vita_window_set_scroll(struct gui_window *gw,
+ 				      const struct rect *rect)
+ {
++	if (rect->x1 != rect->x0 || rect->y1 != rect->y0) {
++		/* An area to bring into view (a find's match): content
++		 * pixels, where the offsets are zoomed ones. Already on
++		 * screen, it stays put; else it is centred (the jump to a
++		 * corner put a match under the message line), then
++		 * clamped. */
++		float scale = browser_window_get_scale(gw->bw);
++		int x0, y0, x1, y1, sx = gw->scrollx, sy = gw->scrolly;
++
++		if (scale <= 0.0f)
++			scale = 1.0f;
++		x0 = (int)(rect->x0 * scale);
++		y0 = (int)(rect->y0 * scale);
++		x1 = (int)(rect->x1 * scale);
++		y1 = (int)(rect->y1 * scale);
++		gw->revealed = *rect;
++		gw->has_revealed = true;
++		if (y0 < sy || y1 > sy + VITA_SCREEN_HEIGHT)
++			sy = (y0 + y1 - VITA_SCREEN_HEIGHT) / 2;
++		if (x0 < sx || x1 > sx + VITA_SCREEN_WIDTH)
++			sx = (x1 - x0 > VITA_SCREEN_WIDTH) ? x0 :
++				(x0 + x1 - VITA_SCREEN_WIDTH) / 2;
++		vita_window_scroll_to(gw, sx, sy);
++		gw->dirty = true;
++		return NSERROR_OK;
++	}
+ 	gw->scrollx = rect->x0;
+ 	gw->scrolly = rect->y0;
+ 	gw->dirty = true;
+@@ -194,6 +223,8 @@ static nserror vita_window_event(struct gui_window *gw,
+ 	switch (event) {
+ 	case GW_EVENT_NEW_CONTENT:
+ 		gw->new_content++;
++		gw->has_revealed = false;
++		vita_find_reset(gw);
+ 		gw->scrollx = 0;
+ 		gw->scrolly = 0;
+ 		gw->dirty = true;
+@@ -348,6 +379,24 @@ void vita_window_scroll_to(struct gui_window *gw, int x, int y)
+ 		vita_window_scroll_by(gw, x - gw->scrollx, y - gw->scrolly);
+ }
+ 
++/* exported interface documented in vita/window.h */
++bool vita_window_revealed_visible(struct gui_window *gw)
++{
++	float scale;
++
++	if (gw == NULL || !gw->has_revealed)
++		return false;
++	scale = browser_window_get_scale(gw->bw);
++	if (scale <= 0.0f)
++		scale = 1.0f;
++	return (int)(gw->revealed.y0 * scale) >= gw->scrolly &&
++		(int)(gw->revealed.y1 * scale) <=
++			gw->scrolly + VITA_SCREEN_HEIGHT &&
++		(int)(gw->revealed.x0 * scale) >= gw->scrollx &&
++		(int)(gw->revealed.x0 * scale) <
++			gw->scrollx + VITA_SCREEN_WIDTH;
++}
++
+ /* exported interface documented in vita/window.h */
+ void vita_window_scroll_pos(struct gui_window *gw, int *x, int *y)
+ {
+diff --git a/frontends/vita/window.h b/frontends/vita/window.h
+--- a/frontends/vita/window.h
++++ b/frontends/vita/window.h
+@@ -47,6 +47,10 @@ void vita_window_scroll_to(struct gui_window *gw, int x, int y);
+ /** The scroll offset in pixels (0, 0 without a window). */
+ void vita_window_scroll_pos(struct gui_window *gw, int *x, int *y);
+ 
++/** True when the last area the core scrolled to (a find's match) is on
++ * screen now: its top-left corner in view and its height too. */
++bool vita_window_revealed_visible(struct gui_window *gw);
++
+ /** Is a fetch in progress (between the throbber events)? */
+ bool vita_window_loading(struct gui_window *gw);
+ 

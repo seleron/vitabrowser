@@ -327,6 +327,12 @@ the safe eboot may not write there (patch 170; every VPK is safe), with
 Content-Disposition names, progress, downloads page, history page, find in page, error pages, settings page,
 desktop/mobile UA toggle.
 *Acceptance:* interaction-pass steps for each; device checklist.
+*Status (2026-10-10):* find in page done in the sim (patch 230): "/word"
+on the URL keyboard, SELECT + DOWN / UP for next / previous, wraps, the
+match centred and highlighted, "n of N" on the message line; 8
+interaction steps on IN-find.html. Still to do: history page, error
+pages that say what failed, settings page, Content-Disposition progress
+UI.
 
 ### WS-F Auth and bot protection (B2)
 Email login (WS-B2 first), cookie persistence across restarts (done),
