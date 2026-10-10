@@ -1,0 +1,151 @@
+# netsurf: lift a fieldset's legend from its own border and padding (patch 228)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser e71759b (patch stack through 227)
+#
+# Fixes a regression from patch 222, which lifted the legend onto the
+# fieldset's top border with a fixed margin-top in default.css (the
+# default 2px border plus 0.35em padding) on every <legend>. A fieldset
+# reset to no border or padding -- Bootstrap's is -- then had its legend
+# pulled 8-9px up over the content above, a legend outside a fieldset was
+# lifted too, and a fieldset with another border or padding put its legend
+# off the border.
+#
+#  - box_construct.c, box.h: VB_FIELDSET flags <fieldset> boxes.
+#  - layout.c: vb_legend_margins() gives the rendered legend -- the
+#    fieldset's first <legend> child, in flow (not floated or absolutely
+#    positioned; a floated legend, as Bootstrap's, is an ordinary float, as
+#    in browsers) -- a margin-top less the fieldset's top border + padding
+#    and a margin-bottom plus its top padding, so its margin box starts at
+#    the fieldset's border-box top and the content after it starts the
+#    padding below it. Applied where block margins are resolved
+#    (layout_block_find_dimensions) and where top margins are collapsed
+#    (layout_next_margin_block), which re-reads them.
+#  - default.css: the fixed legend margins go; only a fieldset's legend
+#    is fit-content (a loose legend is a full-width block, as in browsers).
+#
+# Test: testpages/pages/HTML-legend-reset.html (LEGEND228, 4 checks,
+# Chromium 4/4; with 222 alone, 0/4): Bootstrap's reset fieldset, a
+# fieldset without border or padding, a legend outside a fieldset, and a
+# 4px border / 10px padding fieldset. FIELDSET222 5/5 (its legend now at
+# 0 rather than -1).
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -104,6 +104,8 @@
+ 				 * border runs through the first one */
+ 	VB_INPUT_WIDGET = 1 << 20,	/* patch 223: <input type=range /
+ 					 * color>: redraw paints the widget */
++	VB_FIELDSET = 1 << 21,	/* patch 228: <fieldset>: its first legend
++				 * is lifted onto the top border */
+ 	VB_DEFINITE_HEIGHT = 1 << 17,	/* VitaBrowser: an absolutely
+ 					 * positioned box whose height comes
+ 					 * from top + bottom: percentage
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1707,6 +1707,10 @@
+ 			if (!matched && tag != NULL && tlen == 6 &&
+ 					strncasecmp(tag, "legend", 6) == 0)
+ 				box->flags |= VB_LEGEND;
++			/* patch 228: <fieldset> */
++			if (!matched && tag != NULL && tlen == 8 &&
++					strncasecmp(tag, "fieldset", 8) == 0)
++				box->flags |= VB_FIELDSET;
+ 			if (matched) {
+ 				/* fixes202: mark the SVG root as a replaced
+ 				 * element with given dimensions. Without this,
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1963,6 +1963,8 @@
+  * \param  max_neg_margin  updated to to maximum negative margin encountered
+  * \return  next box that current margin collapses to, or NULL if none.
+  */
++static void vb_legend_margins(struct box *box);
++
+ static struct box*
+ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 			 struct box *box,
+@@ -1991,6 +1993,7 @@
+ 						NULL, NULL, NULL, NULL,
+ 						NULL, NULL, box->margin,
+ 						box->padding, box->border);
++				vb_legend_margins(box);	/* patch 228 */
+ 
+ 				/* Apply top margin */
+ 				if (*max_pos_margin < box->margin[TOP])
+@@ -2302,6 +2305,41 @@
+ 
+ 
+ /**
++ * patch 228: a fieldset's rendered legend -- its first <legend> child, in
++ * flow (not floated or absolutely positioned) -- sits on the fieldset's
++ * top border, as in browsers: its margin box starts at the fieldset's
++ * border-box top, and the content after it starts the fieldset's top
++ * padding below it. Done here from the fieldset's own border and padding
++ * (patch 222 did it in default.css with the default ones, so a fieldset
++ * reset to no border and padding, as Bootstrap's is, pulled its legend up
++ * over the content above, and so did any legend outside a fieldset).
++ */
++static void vb_legend_margins(struct box *box)
++{
++	struct box *fs = box->parent, *c;
++	int lift;
++
++	if (!(box->flags & VB_LEGEND) || box->type != BOX_BLOCK ||
++			fs == NULL || !(fs->flags & VB_FIELDSET) ||
++			box->style == NULL ||
++			css_computed_position(box->style) ==
++				CSS_POSITION_ABSOLUTE ||
++			css_computed_position(box->style) ==
++				CSS_POSITION_FIXED)
++		return;
++	for (c = fs->children; c != NULL && !(c->flags & VB_LEGEND);
++			c = c->next)
++		;
++	if (c != box)
++		return;
++	lift = fs->border[TOP].width + fs->padding[TOP];
++	if (lift <= 0)
++		return;
++	box->margin[TOP] -= lift;
++	box->margin[BOTTOM] += fs->padding[TOP];
++}
++
++/**
+  * Compute dimensions of box, margins, paddings, and borders for a block-level
+  * element.
+  *
+@@ -2394,6 +2432,8 @@
+ 		margin[TOP] = 0;
+ 	if (margin[BOTTOM] == AUTO)
+ 		margin[BOTTOM] = 0;
++
++	vb_legend_margins(box);
+ }
+ 
+ 
+diff --git a/resources/default.css b/resources/default.css
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -155,14 +155,14 @@
+ 	margin: 0; border: 1px solid #333; padding: 1px 3px; }
+ textarea[disabled] { background-color: #ddd; color: #333; }
+ 
+-/* patch 222: browsers' fieldset box; the legend is a shrink-to-fit
+- * block lifted onto the top border (margin-top undoes the border and
+- * padding; margin-bottom restores the padding below it), and redraw
+- * runs the top border through the legend's middle with a gap for it. */
++/* patch 222: browsers' fieldset box; the rendered legend is a
++ * shrink-to-fit block lifted onto the top border (layout.c,
++ * vb_legend_margins, patch 228), and redraw runs the top border through
++ * the legend's middle with a gap for it. */
+ fieldset { display: block; margin: 0 2px; border: 2px groove #c0c0c0;
+ 	padding: 0.35em 0.75em 0.625em; min-width: min-content; }
+-legend { display: block; width: fit-content; padding: 0 2px;
+-	margin: calc(-0.35em - 2px) 0 0.35em; }
++legend { display: block; padding: 0 2px; }
++fieldset > legend { width: fit-content; }
+ 
+ noembed, script, style, title { display: none; }
+ 

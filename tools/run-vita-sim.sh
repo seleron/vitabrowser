@@ -276,6 +276,7 @@ NET-html-checkbox-size http://127.0.0.1:$HP/HTML-checkbox-size.html
 NET-html-control-margins http://127.0.0.1:$HP/HTML-control-margins.html
 NET-css-inline-block-space-font http://127.0.0.1:$HP/CSS-inline-block-space-font.html
 NET-css-fractional-spacing http://127.0.0.1:$HP/CSS-fractional-spacing.html
+NET-html-legend-reset http://127.0.0.1:$HP/HTML-legend-reset.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -753,6 +754,11 @@ f227p=$(ls "$R"/*NET-css-fractional-spacing.plot 2>/dev/null | head -1)
 f227r=$(sed -n 's/.*STR \(FRACSP227: [0-9]*\/[0-9]* passed\).*/\1/p' "$f227p" 2>/dev/null | head -1)
 echo "  css-fractional-spacing: ${f227r:-no summary}"
 [ -n "$f227p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$f227p" | sed 's/^STR /  /'
+# Patch 228: the legend lifted from its fieldset's own border / padding.
+l228p=$(ls "$R"/*NET-html-legend-reset.plot 2>/dev/null | head -1)
+l228r=$(sed -n 's/.*STR \(LEGEND228: [0-9]*\/[0-9]* passed\).*/\1/p' "$l228p" 2>/dev/null | head -1)
+echo "  html-legend-reset: ${l228r:-no summary}"
+[ -n "$l228p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$l228p" | sed 's/^STR /  /'
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -985,6 +991,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$m225r" = "CTLMARGIN225: 3/3 passed" ] && \
 [ "$i226r" = "IBFONT226: 4/4 passed" ] && \
 [ "$f227r" = "FRACSP227: 4/4 passed" ] && \
+[ "$l228r" = "LEGEND228: 4/4 passed" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
