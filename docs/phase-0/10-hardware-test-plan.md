@@ -2933,3 +2933,55 @@ What to check on the device:
 - No crashes/dumps expected; the libdom fragment change (182) is the only
   one that touches parsing of arbitrary page content, so watch for any
   site that suddenly renders its header differently.
+
+
+## Run 29 — hand-off (2026-10-10; replaces untested run 28)
+
+Run 28 (Hermes, patches up to 183) was never run on the device
+(`results\` held only run 27's sessions; now renamed `results-run27\`).
+Run 29 carries everything since run 27: **patches 168-230 +
+patches/quickjs/05**, all unverified on hardware.
+
+Built at 90e7047 on the desktop: clean restage (315 applied + the two
+known collisions), streams 4/4 (fixtures refreshed for patch 214, commit
+8a47fb8), renderer 102/102 + 30/30, full sim gate exit 0 (interaction
+41/41, also at the Vita's pace), cross-build green. First Vita build of
+quickjs 05 (NaN / Infinity were 0 on the Vita as well). Reference
+autotest (device conditions: bundled pages, default network tests,
+ux0:download blocked as on a safe eboot): interact 41/41, js 18/18.
+SHA256 first 12: VitaBrowser.vpk `378077ea456a`, VitaBrowser-ext.vpk
+`fa00544c38f2`, nsvita.elf `22675e1f1312`. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-10-run29/`. New `reference-dumps\`
+(30; the old set is `reference-dumps-run26\`): nearly every dump changed
+against run 27's, by design -- line-height: normal is now the font's
+1.164 (patch 214), so text sits 1-4 px higher and pages are shorter (L3
+and L4 no longer scroll, so they have no `-bottom` dump), and 180-183 moved
+the first flex/grid row to Chromium's position.
+
+**On the device:**
+
+1. Autotest as usual (SELECT + □): every `.plot` SAME against the new
+   reference-dumps (PM-animation may differ: it is timing-dependent),
+   interact **41/41**, js 18/18. The interaction pass now includes
+   eight find-in-page steps on IN-find.html.
+2. **Find in page (patch 230, new).** On any long article (e.g.
+   en.m.wikipedia.org/wiki/PlayStation_Vita): △, type `/vita`, OK. The
+   message line says `find "vita": 1 of N` and the first match is
+   highlighted. SELECT + ↓ goes to the next match (the page scrolls so
+   it is in the middle of the screen), SELECT + ↑ to the previous; past
+   the last it wraps to the first. △ then `/` alone ends the find.
+   Report: does the highlight show, is the match readable (not under the
+   message line), and is SELECT + ↓ instant on a long page?
+3. **Text** (patches 214, 220, 226, 227 change the Vita text path: letter-
+   and word-spacing in 1/256 px, justified text, the space after
+   inline-blocks). Look at a page with justified text and a nav bar of
+   inline-block links (wikipedia's footer, any news site's menu): words
+   must not overlap or run together. Note whether text-heavy pages feel
+   slower to scroll than run 27.
+4. **google.com**: the run 28 list -- the account bar (apps + Sign in)
+   inside the header row at its right edge.
+5. **Forms**: a page with a range slider (patch 229: a tap sets it),
+   checkboxes (now 13 x 13), a fieldset with a legend.
+6. Watch as always: `refused` stays 0 in log.txt; new DIFFs in
+   receiver.txt; any .dmp from ux0:data/; `mem[page done]` lines after
+   the heaviest page (patch 209 raised the network page limit to 128).
