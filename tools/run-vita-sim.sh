@@ -302,6 +302,7 @@ NET-js-import-meta http://127.0.0.1:$HP/JS-import-meta.html
 NET-js-importmap http://127.0.0.1:$HP/JS-importmap.html
 NET-js-custom-elements http://127.0.0.1:$HP/JS-custom-elements.html
 NET-js-perfobserver http://127.0.0.1:$HP/JS-perfobserver.html
+NET-js-template-text http://127.0.0.1:$HP/JS-template-text.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -800,7 +801,8 @@ o2_bad=
 for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-computed-unboxed UNBOXED 7" "css-inline-outranks INLINE236 4" \
 	 "js-import-meta IMPORTMETA 4" "js-importmap IMPORTMAP 4" \
-	 "js-custom-elements CUSTOMEL 7" "js-perfobserver PERFOBS 2"; do
+	 "js-custom-elements CUSTOMEL 7" "js-perfobserver PERFOBS 2" \
+	 "js-template-text TPLTEXT 4"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
