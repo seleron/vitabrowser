@@ -4,6 +4,40 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-10 22:20 — full 21-site scorecard, patches up to 230 (desktop)
+
+Run `<WORK>/vitabrowser-work/score/r19-full-230` (all 21 sites, fresh Chrome
+refs), against r18 (patch 183, also fresh refs; live sites moved in
+between, so single-site deltas of a few points are noise). The first full
+run since patch 183: the cloud sessions that wrote 184-229 could not reach
+live sites.
+
+| tier | r18 (183) | r19 (230) |
+|---|---|---|
+| static | 82.0 | 86.6 |
+| wiki | 87.2 | 88.2 |
+| news | 79.5 | 80.4 |
+| forum | 54.1* | 54.4* |
+| wordpress | 61.1 | 61.5 |
+| jquery | 87.0 | 88.6 |
+| docs | 81.8 | 82.2 |
+| search | 81.3 | 80.0 |
+| spa | 59.9 | 46.7 |
+| **all** | **73.6** | **72.4** |
+
+*forum = the two anti-bot walls (stackoverflow, old.reddit), as before.
+
+Every tier but spa is level or up (search -1.3 is google moving 81.3 ->
+80.0, within live-page noise; example.com 76.7 -> 89.9, rte +3.2,
+hackernews +3.3). **spa's drop is one crash: m.youtube.com SIGSEGV 1.8 s
+in** (37.0 at r18). Its scripts read history.length while the window's
+first page was still parsing, before the page joins the session history,
+and the length walk dereferenced the empty history (patch 136's getter;
+fixed by patch 231). Re-scored on r19's reference (`r20-youtube-231`):
+**youtube 76.9** (text 1.0, visual 0.423). With that, spa = 72.3 and
+the all-site mean (sites with a usable Chrome reference, as the
+tool counts it) = 76.5.
+
 ## 2026-09-30 10:35 — Patch 182: innerHTML no longer flips the document to quirks
 
 Run `<WORK>/vitabrowser-work/score/r16-google-182` (google, fresh Chrome ref).

@@ -330,9 +330,12 @@ desktop/mobile UA toggle.
 *Status (2026-10-10):* find in page done in the sim (patch 230): "/word"
 on the URL keyboard, SELECT + DOWN / UP for next / previous, wraps, the
 match centred and highlighted, "n of N" on the message line; 8
-interaction steps on IN-find.html. Still to do: history page, error
-pages that say what failed, settings page, Content-Disposition progress
-UI.
+interaction steps on IN-find.html. History (patch 232): the URL database
+is kept across runs; the home page lists the 8 newest visits and links a
+history page (200). Error pages were already there (the core's
+about:query/fetcherror and about:query/ssl, with Back / Try Again);
+a self-signed certificate's reason reads "unknown error". Still to do:
+settings page, download progress UI.
 
 ### WS-F Auth and bot protection (B2)
 Email login (WS-B2 first), cookie persistence across restarts (done),

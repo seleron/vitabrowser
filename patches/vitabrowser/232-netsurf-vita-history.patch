@@ -1,0 +1,443 @@
+# netsurf: history -- kept across runs, on the home page and its own page
+# (patch 232; roadmap WS-E, Phase 1 exit)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser (patch stack through 231)
+#
+# The core records every page a window shows in its URL database (title,
+# visit count, last visit), but leaves loading and saving it to the
+# frontend, and the Vita did neither: no history, not even within a run,
+# and nothing kept between runs. The home page was also written once at
+# start-up, so its downloads list went stale as soon as one finished.
+#
+#  - vita/main.c: urldb_load(ux0:data/VitaBrowser/urldb) at start (before
+#    the cookie jar), urldb_save() whenever the cookie jar is saved (after
+#    a page loads, at most every VITA_COOKIE_SAVE_MS -- the PS button
+#    skips exit code) and at quit. The core drops pages not visited for
+#    expire_url days (28) when it saves. START now rewrites the home page
+#    before going there.
+#  - vita/chrome.c: the home page gets "Recently visited" (the 8 newest
+#    visits: title, host, "5 min ago") and an "All history" link; the
+#    history page (ux0:data/VitaBrowser/history.html, written with the
+#    home page) lists up to 200, newest first. Our own pages (home,
+#    history, downloads under ux0:data/VitaBrowser/) and about: pages are
+#    left out. Ages, not clock times: the Vita's clock zone is unknown,
+#    a difference reads right in every zone.
+#  - vita/interact.c: A_WAIT (visit times are whole seconds, so the step
+#    before IN-download waits 1.1 s to keep the newest visit unambiguous)
+#    and C_HISTORY: after START, the home page's recent list must start
+#    with IN-download.html (the last page visited) and the history page
+#    must hold at least 8 pages; then the history page is opened.
+#
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -29,6 +29,7 @@
+ #include <string.h>
+ #include <strings.h>
+ #include <dirent.h>
++#include <time.h>
+ 
+ #ifdef __vita__
+ #include <psp2/common_dialog.h>
+@@ -44,6 +45,7 @@
+ #include "utils/useragent.h"
+ #include "netsurf/browser_window.h"
+ #include "netsurf/keypress.h"
++#include "netsurf/url_db.h"
+ 
+ #include "vita/diag.h"
+ #include "vita/remote.h"
+@@ -167,6 +169,160 @@ void vita_chrome_load_useragent(void)
+ 	vita_diag_log("chrome: user agent: %s", user_agent_string());
+ }
+ 
++/** The history page's length; the home page shows the first few. */
++#define HISTORY_MAX 200
++#define HISTORY_HOME 8
++
++/** A visited page, from the URL database. */
++struct visit {
++	char *url;
++	char *title;
++	time_t when;
++	unsigned int visits;
++};
++
++static struct {
++	struct visit *v;
++	unsigned int n, cap;
++} visits;
++
++static void visits_free(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < visits.n; i++) {
++		free(visits.v[i].url);
++		free(visits.v[i].title);
++	}
++	free(visits.v);
++	memset(&visits, 0, sizeof(visits));
++}
++
++static bool visit_entry(nsurl *url, const struct url_data *d)
++{
++	const char *s = nsurl_access(url);
++	struct visit *v;
++
++	if (d->visits == 0 || d->last_visit == 0)
++		return true;
++	/* Not our own pages (home, history, downloads), nor about:. */
++	if (strncmp(s, "file:///" VITA_DIAG_DIR,
++		    sizeof("file:///" VITA_DIAG_DIR) - 1) == 0 ||
++	    strncmp(s, "about:", 6) == 0)
++		return true;
++	if (visits.n == visits.cap) {
++		unsigned int cap = visits.cap ? visits.cap * 2 : 64;
++		struct visit *nv = realloc(visits.v, cap * sizeof(*nv));
++		if (nv == NULL)
++			return false;
++		visits.v = nv;
++		visits.cap = cap;
++	}
++	v = &visits.v[visits.n];
++	v->url = strdup(s);
++	v->title = (d->title != NULL && d->title[0] != '\0') ?
++		strdup(d->title) : NULL;
++	v->when = d->last_visit;
++	v->visits = d->visits;
++	if (v->url == NULL) {
++		free(v->title);
++		return false;
++	}
++	visits.n++;
++	return true;
++}
++
++static int visit_newest_first(const void *a, const void *b)
++{
++	const struct visit *x = a, *y = b;
++
++	if (x->when != y->when)
++		return x->when < y->when ? 1 : -1;
++	return strcmp(x->url, y->url);
++}
++
++/** The URL database's visited pages, newest first, into visits. */
++static void visits_collect(void)
++{
++	visits_free();
++	urldb_iterate_entries(visit_entry);
++	if (visits.n > 1)
++		qsort(visits.v, visits.n, sizeof(visits.v[0]),
++		      visit_newest_first);
++}
++
++/** "5 min ago": the Vita's clock may be set to any zone, a difference
++ * reads right in all of them. */
++static void put_age(FILE *fp, time_t when, time_t now)
++{
++	long d = (long)(now - when);
++
++	if (d < 60)
++		fputs("just now", fp);
++	else if (d < 3600)
++		fprintf(fp, "%ld min ago", d / 60);
++	else if (d < 86400)
++		fprintf(fp, "%ld h ago", d / 3600);
++	else
++		fprintf(fp, "%ld days ago", d / 86400);
++}
++
++/** The first `max` visits as links, each with its host and age. */
++static void put_visits(FILE *fp, unsigned int max)
++{
++	time_t now = time(NULL);
++	unsigned int i;
++
++	for (i = 0; i < visits.n && i < max; i++) {
++		const struct visit *v = &visits.v[i];
++		const char *t = v->title != NULL ? v->title : v->url;
++		const char *h = strstr(v->url, "://");
++
++		h = h != NULL ? h + 3 : v->url;
++		fputs("<a href=\"", fp);
++		put_escaped(fp, v->url, strlen(v->url));
++		fputs("\">", fp);
++		put_escaped(fp, t, strlen(t) > 120 ? 120 : strlen(t));
++		fputs("<span class=\"meta\">", fp);
++		if (strcspn(h, "/?#") > 0)
++			put_escaped(fp, h, strcspn(h, "/?#"));
++		else	/* file:///...: no host */
++			fputs("file", fp);
++		fputs(" &middot; ", fp);
++		put_age(fp, v->when, now);
++		fputs("</span></a>\n", fp);
++	}
++}
++
++/** The history page: every visit the database keeps, up to HISTORY_MAX. */
++static void write_history(void)
++{
++	FILE *fp = fopen(VITA_HISTORY_FILE, "w");
++
++	if (fp == NULL)
++		return;
++	fputs("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
++	      "<title>History</title><style>\n"
++	      "body { font-family: sans-serif; font-size: 18px;"
++	      " margin: 28px 12px 30px 12px; }\n"
++	      "h1 { font-size: 26px; margin: 0 0 6px 0; }\n"
++	      ".hint { color: #444; font-size: 15px; }\n"
++	      ".recent a { display: block; padding: 6px 12px; margin: 3px 0;"
++	      " background: #f0f0f0; border-radius: 6px; color: #103070;"
++	      " text-decoration: none; }\n"
++	      ".meta { display: block; color: #666; font-size: 14px; }\n"
++	      "</style></head><body>\n<h1>History</h1>\n"
++	      "<div class=\"recent\">\n", fp);
++	put_visits(fp, HISTORY_MAX);
++	fputs("</div>\n", fp);
++	if (visits.n == 0)
++		fputs("<p class=\"hint\">No pages visited yet.</p>\n", fp);
++	fprintf(fp, "<p class=\"hint\">%u pages, newest first. Kept in "
++		VITA_URLDB_FILE " (pages not visited for a month drop "
++		"out).</p>\n</body></html>\n", visits.n);
++	fclose(fp);
++}
++
+ /* exported interface documented in vita/chrome.h */
+ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ {
+@@ -185,10 +341,13 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 		}
+ 		bm = fopen(VITA_BOOKMARKS_FILE, "r");
+ 	}
++	visits_collect();
++	write_history();
+ 	fp = fopen(VITA_HOME_FILE, "w");
+ 	if (fp == NULL) {
+ 		if (bm != NULL)
+ 			fclose(bm);
++		visits_free();
+ 		return NSERROR_SAVE_FAILED;
+ 	}
+ 	fputs("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
+@@ -203,6 +362,10 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 	      ".hint { color: #444; font-size: 15px; }\n"
+ 	      ".tests a { display: inline-block; margin: 2px 8px 2px 0;"
+ 	      " font-size: 15px; }\n"
++	      ".recent a { display: block; padding: 6px 12px; margin: 3px 0;"
++	      " background: #f0f0f0; border-radius: 6px; color: #103070;"
++	      " text-decoration: none; }\n"
++	      ".meta { display: block; color: #666; font-size: 14px; }\n"
+ 	      "</style></head><body>\n<h1>VitaBrowser</h1>\n"
+ 	      "<p class=\"hint\">Tap a link, or move the pointer (left stick)"
+ 	      " and press &#x2715;. &#x25b3; types a URL. L / R: back /"
+@@ -240,6 +403,14 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 		fclose(bm);
+ 	fputs("</div>\n<p class=\"hint\">Bookmarks: "
+ 	      VITA_BOOKMARKS_FILE "</p>\n", fp);
++	/* Recently visited (the URL database, kept across runs). */
++	if (visits.n > 0) {
++		fputs("<h2>Recently visited</h2>\n<div class=\"recent\">\n",
++		      fp);
++		put_visits(fp, HISTORY_HOME);
++		fputs("</div>\n<p class=\"hint\"><a href=\"" VITA_HISTORY_URL
++		      "\">All history</a></p>\n", fp);
++	}
+ 	/* Downloads (vita/download.c): what is in its folders */
+ 	{
+ 		unsigned int nd = 0, k;
+@@ -285,7 +456,9 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 		vita_remote_port());
+ 	fputs("</div>\n</body></html>\n", fp);
+ 	fclose(fp);
+-	vita_diag_log("chrome: home page with %u bookmarks", count);
++	vita_diag_log("chrome: home page with %u bookmarks, %u visited",
++		      count, visits.n);
++	visits_free();
+ 	return NSERROR_OK;
+ }
+ 
+diff --git a/frontends/vita/chrome.h b/frontends/vita/chrome.h
+--- a/frontends/vita/chrome.h
++++ b/frontends/vita/chrome.h
+@@ -41,12 +41,24 @@ struct gui_window;
+  * Created with the default (Chrome on Android) if missing. */
+ #define VITA_USERAGENT_FILE "ux0:data/VitaBrowser/useragent.txt"
+ 
+-/** The home page, generated from the bookmarks at start-up. */
++/** The URL database (visited pages: title, visits, last visit), kept
++ * across runs; the history page and the home page's recent list come
++ * from it. */
++#define VITA_URLDB_FILE "ux0:data/VitaBrowser/urldb"
++
++/** The history page, written with the home page. */
++#define VITA_HISTORY_FILE "ux0:data/VitaBrowser/history.html"
++#define VITA_HISTORY_URL "file:///ux0:data/VitaBrowser/history.html"
++
++/** The home page, generated from the bookmarks at start-up and again
++ * each time START goes home (its recent pages and downloads change). */
+ #define VITA_HOME_FILE "ux0:data/VitaBrowser/home.html"
+ #define VITA_HOME_URL "file:///ux0:data/VitaBrowser/home.html"
+ 
+ /**
+- * Write the home page from the bookmarks and the bundled test pages.
++ * Write the home page from the bookmarks, the most recently visited
++ * pages, the downloads and the bundled test pages, and the history page
++ * (every visited page the URL database keeps, newest first).
+  *
+  * \param test_pages  names of the bundled test pages (app0:/testpages/)
+  * \param n           how many
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -63,6 +63,7 @@ enum act {
+ 	A_DRAG,		/**< touch at x,y, move to x2,y2, let go */
+ 	A_TYPE,		/**< deliver arg as entered text */
+ 	A_REMOTE,	/**< navigate to the LAN listener's path arg */
++	A_WAIT,		/**< let value ms pass (since the step began) */
+ };
+ 
+ enum check {
+@@ -75,6 +76,9 @@ enum check {
+ 	C_COOKIE,	/**< the saved jar holds the listener's cookie */
+ 	C_TYPED,	/**< vita_chrome_typed_url() turns text into URLs */
+ 	C_DOWNLOAD,	/**< the download named expect is on the card, intact */
++	C_HISTORY,	/**< the home page's recent list starts with a link
++			 * ending expect, the history page lists at least
++			 * value pages */
+ 	C_FIND,		/**< the find is at expect ("n/N"; "-" = no find), its
+ 			 * match on screen, and the scroll offset at least
+ 			 * value */
+@@ -171,12 +175,18 @@ static const struct step {
+ 	{ "cookies are saved to the card", A_REMOTE,
+ 	  "/cookie", 0, 0, 0, 0, 0,
+ 	  C_COOKIE, NULL, 0, NULL },
++	{ "a second passes (visit times are whole seconds)", A_WAIT, NULL,
++	  0, 0, 0, 0, 0, C_NONE, NULL, 1100, NULL },
+ 	{ "open IN-download", A_OPEN, T "IN-download.html", 0, 0, 0, 0, 0,
+ 	  C_URL, "IN-download.html", 0, NULL },
+ 	{ "a download link tap saves, no navigate", A_TAP, NULL, 250, 140,
+ 	  0, 0, 0, C_DOWNLOAD, "vita-test.bin", 0, NULL },
+ 	{ "START goes home", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_START,
+ 	  C_URL, "VitaBrowser/home.html", 0, NULL },
++	{ "home lists the last page visited first", A_NONE, NULL, 0, 0, 0,
++	  0, 0, C_HISTORY, "IN-download.html", 8, "IN-home-recent" },
++	{ "the history page opens", A_OPEN, VITA_HISTORY_URL, 0, 0, 0, 0, 0,
++	  C_URL, "VitaBrowser/history.html", 0, "IN-history" },
+ };
+ #define STEP_COUNT (sizeof(steps) / sizeof(steps[0]))
+ 
+@@ -264,6 +274,47 @@ static bool cookie_ok(char *detail, size_t max)
+ 	return strstr(buf, "vbtest") != NULL;
+ }
+ 
++/** The first href of the home page's recent list ends with `expect`,
++ * and the history page has at least `min` entries. */
++static bool history_ok(const char *expect, int min, char *detail,
++		       size_t max)
++{
++	static char buf[65536];
++	const char *r, *h, *q;
++	size_t n = 0, k = strlen(expect);
++	int entries = 0;
++	FILE *fp = fopen(VITA_HOME_FILE, "rb");
++	bool first = false;
++	char href[96] = "-";
++
++	if (fp != NULL) {
++		n = fread(buf, 1, sizeof(buf) - 1, fp);
++		fclose(fp);
++	}
++	buf[n] = '\0';
++	r = strstr(buf, "<div class=\"recent\">");
++	h = r ? strstr(r, "href=\"") : NULL;
++	q = h ? strchr(h + 6, '"') : NULL;
++	if (q != NULL) {
++		/* copied now: buf is reused for the history page below */
++		snprintf(href, sizeof href, "%.*s", (int)(q - (h + 6)), h + 6);
++		if ((size_t)(q - (h + 6)) >= k)
++			first = strncmp(q - k, expect, k) == 0;
++	}
++	n = 0;
++	fp = fopen(VITA_HISTORY_FILE, "rb");
++	if (fp != NULL) {
++		n = fread(buf, 1, sizeof(buf) - 1, fp);
++		fclose(fp);
++	}
++	buf[n] = '\0';
++	for (r = buf; (r = strstr(r, "<span class=\"meta\">")) != NULL; r++)
++		entries++;
++	snprintf(detail, max, "recent list %s, first %s; history %d pages",
++		 h ? "found" : "MISSING", href, entries);
++	return first && entries >= min;
++}
++
+ static bool download_ok(const char *name, char *detail, size_t max)
+ {
+ 	/* vita/download.c saves to ux0:download/ or, where a safe eboot may
+@@ -346,6 +397,9 @@ static void check(struct gui_window *gw, const struct step *s)
+ 	case C_DOWNLOAD:
+ 		ok = download_ok(s->expect, detail, sizeof detail);
+ 		break;
++	case C_HISTORY:
++		ok = history_ok(s->expect, s->value, detail, sizeof detail);
++		break;
+ 	case C_FIND: {
+ 		unsigned int fi, fn;
+ 		char at[16];
+@@ -399,6 +453,11 @@ static bool act(struct gui_window *gw, const struct step *s,
+ 	case A_TYPE:
+ 		vita_chrome_enter_text(gw, s->arg);
+ 		return true;
++	case A_WAIT:
++		/* So that the next page's visit is a later second than the
++		 * last one's: the history sorts by them (C_HISTORY). */
++		return vita_diag_ms() - run.started_ms >=
++			(unsigned int)s->value;
+ 	case A_BUTTON:
+ 		if (p == 0) {
+ 			in->buttons = s->button;
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -572,6 +572,9 @@ static int vita_controls(struct gui_window *gw, struct browser_window *bw,
+ 			vita_diag_log("input: home closes popup %d", ids[i]);
+ 			vita_popup_close_later(ids[i]);
+ 		}
++		/* Home again: its recent pages and downloads are as of
++		 * now (vita/chrome.c). */
++		vita_chrome_write_home(vita_local_pages, VITA_LOCAL_PAGES);
+ 		vita_chrome_open(m != NULL ? m : gw, VITA_HOME_URL, "home");
+ 		break;
+ 	}
+@@ -1239,6 +1242,8 @@ static void vita_run(struct browser_window *bw0)
+ 		if (cookies_due &&
+ 		    vita_diag_ms() - cookies_saved >= VITA_COOKIE_SAVE_MS) {
+ 			urldb_save_cookies(VITA_COOKIE_FILE);
++			/* and the visit just made (the history) */
++			urldb_save(VITA_URLDB_FILE);
+ 			cookies_saved = vita_diag_ms();
+ 			cookies_due = false;
+ 		}
+@@ -1302,6 +1307,7 @@ static void vita_run(struct browser_window *bw0)
+ 	}
+ 	vita_diag_log("quit requested");
+ 	urldb_save_cookies(VITA_COOKIE_FILE);
++	urldb_save(VITA_URLDB_FILE);
+ 	vita_diag_engine_flush();
+ }
+ 
+@@ -1412,8 +1418,9 @@ int main(int argc, char **argv)
+ 	vita_diag_memory("after init");
+ 	apply_run_profile();
+ 
+-	/* The cookie jar from the last run (the core leaves loading and
+-	 * saving it to the frontend). */
++	/* The visited pages and the cookie jar from the last run (the
++	 * core leaves loading and saving both to the frontend). */
++	urldb_load(VITA_URLDB_FILE);
+ 	urldb_load_cookies(VITA_COOKIE_FILE);
+ 	seed_consent_cookies();
+ 	/* URLs from a phone or PC (vita/remote.c), then the home page,
