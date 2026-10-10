@@ -1,0 +1,99 @@
+# netsurf: the space after an inline-block is set in the surrounding font (patch 226)
+# Generated 2026-10-09
+# Base: seleron/vitabrowser e35fbcd (patch stack through 225)
+#
+# Fixes a regression from patch 221. It measured the collapsed space
+# after an inline-block or replaced box in that box's own font. The space
+# is part of the text around the box, so the usual ways of butting
+# inline-block columns together -- font-size: 0 on the parent (or a
+# negative letter-spacing) reset on the children -- left a full space
+# between columns, and four 25% columns wrapped the last one to a second
+# row (they fit before 221 only because every such space was dropped).
+#
+#  - layout.c: vb_space_style() finds the text's style -- the innermost
+#    enclosing inline element (the nearest unclosed inline start before
+#    the box), else the block of its inline container -- and
+#    vb_atomic_space() measures in it, with letter- and word-spacing. A
+#    zero font size gives a zero space (font_plot_style_from_css would
+#    clamp it up to the minimum font size).
+#
+# Test: testpages/pages/CSS-inline-block-space-font.html (IBFONT226, 4
+# checks, Chromium 4/4; with 221 alone, 1/4): font-size: 0 columns on one
+# row, a 32px parent's space between 16px inline-blocks, no gap inside a
+# font-size: 0 span, a 16px space in a 16px parent. IBSPACE221 5/5
+# unchanged.
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -783,26 +783,68 @@
+  * " " between elements -- to the box before it, but the line passes only
+  * honoured it after text and inline boxes, so "<span ib>a</span>
+  * <span ib>b</span>" (inline-block menus, image rows, buttons) ran
+- * together. Measured in the box's own font, as text spaces are.
++ * together. Measured in the font of the text around the box (patch 226).
+  */
++static const css_computed_style *vb_space_style(struct box *b);
++
+ static int
+ vb_atomic_space(struct box *b,
+ 		const struct gui_layout_table *font_func,
+ 		const html_content *content)
+ {
+ 	plot_font_style_t fstyle;
++	const css_computed_style *st;
+ 
+ 	if (b->space == 0 || b->style == NULL)
+ 		return 0;
+ 	if (b->space == UNKNOWN_WIDTH) {
+-		font_plot_style_from_css(&content->unit_len_ctx, b->style,
+-				&fstyle);
++		css_fixed fs = 0;
++		css_unit fu = CSS_UNIT_PX;
++
++		st = vb_space_style(b);
++		css_computed_font_size(st, &fs, &fu);
++		if (fs == 0) {
++			/* font-size: 0 -- font_plot_style_from_css would
++			 * clamp it up to the minimum font size */
++			b->space = 0;
++			return 0;
++		}
++		font_plot_style_from_css(&content->unit_len_ctx, st, &fstyle);
+ 		font_func->width(&fstyle, " ", 1, &b->space);
+ 	}
+ 	return b->space;
+ }
+ 
+ /**
++ * patch 226: the style the space after an atomic inline is set in -- the
++ * text around the box, not the box itself: its innermost enclosing inline
++ * element (the nearest unclosed inline start before it on the inline
++ * container), else the block the inline container belongs to. Patch 221
++ * measured it in the inline-block's own font, so the usual gap-removal
++ * tricks (font-size: 0 or a negative letter-spacing on the parent, reset on
++ * the children) left a full space between columns and wrapped the last one.
++ */
++static const css_computed_style *vb_space_style(struct box *b)
++{
++	struct box *p;
++	int depth = 0;
++
++	for (p = b->prev; p != NULL; p = p->prev) {
++		if (p->type == BOX_INLINE_END) {
++			depth++;
++		} else if (p->type == BOX_INLINE && p->inline_end != NULL) {
++			if (depth == 0)
++				return p->style != NULL ? p->style : b->style;
++			depth--;
++		}
++	}
++	if (b->parent != NULL && b->parent->parent != NULL &&
++			b->parent->parent->style != NULL)
++		return b->parent->parent->style;
++	return b->style;
++}
++
++/**
+  * Calculate minimum and maximum width of a line.
+  *
+  * \param first       a box in an inline container
