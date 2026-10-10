@@ -941,13 +941,40 @@ soft_pass() {
 	echo "  $sp_name: only timing check $4 failed -- accepted, GATE_TIMING_SOFT=1"
 	return 0
 }
-# The longest local relayout is host wall-clock too: under
-# GATE_TIMING_SOFT=1 up to twice the 16 ms bound is accepted, and said so.
-rs_bound=16000
+# The longest local relayout is host wall-clock too. Under
+# GATE_TIMING_SOFT=1 a run over the 16 ms bound is measured once more --
+# the reflow page alone, in a fresh simulator -- and the bound applies to
+# that second measurement (said so). The bound itself never moves: a real
+# slowdown fails both runs. (Was: up to 2x accepted outright.)
 if [ "${GATE_TIMING_SOFT:-0}" = 1 ] && [ "${rs_max:-99999}" -ge 16000 ] && \
-   [ "${rs_max:-99999}" -lt 32000 ]; then
-	rs_bound=32000
-	echo "  REFLOW: longest local relayout ${rs_max} us over 16000 -- accepted, GATE_TIMING_SOFT=1"
+   [ "${rs_local:-0}" -ge 4 ] && [ "${rs_full:-1}" -eq 0 ]; then
+	echo "  REFLOW: longest local relayout ${rs_max} us over 16000 -- measuring once more"
+	S3="$OUT/reflow-retry"
+	rm -rf "$S3"; mkdir -p "$S3/ux0:data/VitaBrowser"
+	cp -r "$OUT/run/app0:" "$S3/"
+	echo off > "$S3/ux0:data/VitaBrowser/netlog.cfg"
+	echo "NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html" \
+		> "$S3/ux0:data/VitaBrowser/nettest.txt"
+	python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+		--http "$HP" > "$OUT/httpd-retry.log" 2>&1 &
+	HTTPD=$!
+	sleep 1
+	( cd "$S3" && VITA_SIM_AUTOTEST=1 \
+		VITA_SETTLE_EXTRA_MS="${VITA_SETTLE_EXTRA_MS:-7000}" \
+		timeout 900 "$NS/nsvita-sim" > "$S3/stdout.log" 2>&1 ) || true
+	kill $HTTPD 2>/dev/null || true
+	rsl2=$(awk '/page [0-9]*\/[0-9]* NET-js-reflow-stall: navigate/ {on=1; next}
+		on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+		on' "$S3/ux0:data/VitaBrowser/netsurf.log" 2>/dev/null)
+	rs_local2=$(printf '%s\n' "$rsl2" | grep -c 'LIFE relayout local: [+-][0-9]* px in' || true)
+	rs_full2=$(printf '%s\n' "$rsl2" | grep -c 'LIFE relayout local: full reflow instead' || true)
+	rs_max2=$(printf '%s\n' "$rsl2" | sed -n 's/.*LIFE relayout local: [+-][0-9]* px in \([0-9]*\) us.*/\1/p' | sort -n | tail -1)
+	echo "  REFLOW retry: ${rs_local2} local relayouts (longest ${rs_max2:-?} us), ${rs_full2} fell back to full"
+	if [ "${rs_local2:-0}" -ge 4 ] && [ "${rs_full2:-1}" -eq 0 ] && \
+	   [ "${rs_max2:-99999}" -lt 16000 ]; then
+		rs_max=$rs_max2
+		echo "  REFLOW: second measurement under 16000 -- accepted, GATE_TIMING_SOFT=1"
+	fi
 fi
 rs_ok=no
 [ "$rsr" = "REFLOW: 3/3 passed" ] && rs_ok=yes
@@ -1010,7 +1037,7 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 [ "$cdr" = "CHARDATA: 5/5 passed" ] && \
 [ "$fhr" = "FLEXHDR: 6/6 passed" ] && \
 [ "$rs_ok" != no ] && [ "${rs_local:-0}" -ge 4 ] && \
-[ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt "$rs_bound" ] && \
+[ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
