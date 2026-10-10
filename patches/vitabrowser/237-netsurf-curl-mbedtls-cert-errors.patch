@@ -1,0 +1,295 @@
+# netsurf: certificate errors say why with curl's mbedTLS backend
+# (patch 237)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser (patch stack through 236)
+#
+# Every certificate failure -- self-signed, expired, wrong host -- reached
+# about:query/ssl as "An unknown error occurred while processing the
+# certificate. Certificate information is not available for viewing".
+# content/fetchers/curl.c builds the certificate chain the error page
+# reads only from OpenSSL's verify callbacks; the Vita's curl (vitaSDK
+# curl-mbedtls) and the simulator's (tools/build-host-curl.sh) use
+# mbedTLS, and that backend leaves CURLINFO_SSL_VERIFYRESULT unset, so
+# nothing recorded why.
+#
+#  - curl.c (WITH_MBEDTLS): a CURLOPT_SSL_CTX_FUNCTION receives curl's
+#    mbedtls_ssl_config and wraps its verify callback (curl installs it
+#    before calling the hook; f_vrfy/p_vrfy read with
+#    MBEDTLS_ALLOW_PRIVATE_ACCESS). The wrapper runs curl's callback
+#    first (it masks a disabled check's flags), then keeps each
+#    certificate's DER and its flags mapped to a NetSurf reason:
+#    NOT_TRUSTED -> self signed (issuer == subject; at depth > 0 "chain
+#    self signed") or unknown issuer; CN_MISMATCH -> different host;
+#    EXPIRED / FUTURE / REVOKED; BAD_MD/PK/KEY -> bad signature. When any
+#    certificate failed, the chain goes to the cache the error page reads
+#    (with DER: "View certificate details" works). Only failed chains are
+#    cached -- the OpenSSL path caches every https URL's chain, which
+#    would grow without bound on the Vita. A fetch whose certificate the
+#    user accepted clears the hook, as the OpenSSL path does.
+#  - frontends/vita/Makefile: -DWITH_MBEDTLS. Detected at run time too
+#    (curl_version_info ssl_version "mbedTLS..."), logged at start-up.
+#
+# badssl.com in the simulator: self-signed "The certificate is self
+# signed.", expired "The certificate has expired.", wrong.host "The
+# certificate is for a different host than the server.", untrusted-root
+# "The certificate chain is self signed."; sha256 (valid) loads. Gate:
+# 21-NET-https-rogue (the suite's self-signed server) must now say "The
+# certificate is self signed." on its refusal page.
+#
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -111,6 +111,7 @@
+ 
+ #else /* WITH_OPENSSL */
+ 
++/* Without OpenSSL a "certificate" is its DER bytes (malloc'd). */
+ typedef char X509;
+ 
+ static void X509_free(X509 *cert)
+@@ -120,6 +121,15 @@ static void X509_free(X509 *cert)
+ 
+ #endif /* WITH_OPENSSL */
+ 
++#ifdef WITH_MBEDTLS
++/* VitaBrowser patch 237: the per-certificate verify callback of curl's
++ * mbedTLS backend is wrapped to record the chain (f_vrfy / p_vrfy are
++ * private fields of the config in mbedTLS 3). */
++#define MBEDTLS_ALLOW_PRIVATE_ACCESS
++#include <mbedtls/ssl.h>
++#include <mbedtls/x509_crt.h>
++#endif
++
+ /* SSL certificate chain cache */
+ 
+ /* We're only interested in the hostname and port */
+@@ -211,7 +221,8 @@ static hashmap_t *curl_fetch_ssl_hashmap = NULL;
+ /** SSL certificate info */
+ struct cert_info {
+ 	X509 *cert;		/**< Pointer to certificate */
+-	long err;		/**< OpenSSL error code */
++	long err;		/**< OpenSSL error code (mbedTLS: ssl_cert_err) */
++	size_t der_len;		/**< mbedTLS: length of the DER in cert */
+ };
+ 
+ #if LIBCURL_VERSION_NUM >= 0x072000 /* 7.32.0 depricated CURLOPT_PROGRESSFUNCTION*/
+@@ -259,6 +270,12 @@ struct curl_fetch_info {
+ 	uint64_t last_progress_update;	/**< Time of last progress update */
+ 	int cert_depth; /**< deepest certificate in use */
+ 	struct cert_info cert_data[MAX_CERT_DEPTH]; /**< HTTPS certificate data */
++#ifdef WITH_MBEDTLS
++	/** curl's own verify callback, which ours wraps (patch 237) */
++	int (*mbed_vrfy)(void *, mbedtls_x509_crt *, int, uint32_t *);
++	void *mbed_vrfy_p;	/**< its context */
++	bool cert_failed;	/**< some certificate in the chain failed */
++#endif
+ #ifdef WITH_CURL_ASYNC_RESOLVE
+ 	struct curl_slist *resolve; /**< CURLOPT_RESOLVE: host:port:address */
+ 	bool dns_failed; /**< the lookup failed: end without curl */
+@@ -305,6 +322,9 @@ static int curl_fetchers_registered = 0;
+ 
+ /** Flag for runtime detection of openssl usage */
+ static bool curl_with_openssl;
++#ifdef WITH_MBEDTLS
++static bool curl_with_mbedtls;	/**< curl's TLS is mbedTLS (patch 237) */
++#endif
+ 
+ /** Error buffer for cURL. */
+ static char fetch_error_buffer[CURL_ERROR_SIZE];
+@@ -483,6 +503,11 @@ static struct curl_fetch_info *fetch_alloc(void)
+ 	/* Clear certificate chain data */
+ 	memset(fetch->cert_data, 0, sizeof(fetch->cert_data));
+ 	fetch->cert_depth = -1;
++#ifdef WITH_MBEDTLS
++	fetch->mbed_vrfy = NULL;
++	fetch->mbed_vrfy_p = NULL;
++	fetch->cert_failed = false;
++#endif
+ #ifdef WITH_CURL_ASYNC_RESOLVE
+ 	fetch->resolve = NULL;
+ 	fetch->dns_failed = false;
+@@ -903,6 +928,127 @@ fetch_curl_sslctxfun(CURL *curl_handle, void *_sslctx, void *parm)
+ #endif /* WITH_OPENSSL */
+ 
+ 
++#ifdef WITH_MBEDTLS
++/*
++ * VitaBrowser patch 237: certificate errors with curl's mbedTLS backend.
++ *
++ * The chain above is built from OpenSSL's verify callbacks; with mbedTLS
++ * (the Vita's TLS, and the simulator's) nothing recorded it, so every
++ * failure reached the error page as "An unknown error occurred while
++ * processing the certificate" with nothing to view. Here curl's verify
++ * callback is wrapped: each certificate's DER and mbedTLS's flags for it
++ * are kept in the fetch, as the OpenSSL path does, and when any of them
++ * failed the chain goes to the cache the error page reads. Unlike the
++ * OpenSSL path only failed chains are cached: every https fetch caching
++ * its chain would grow without bound on the Vita.
++ */
++
++/** mbedTLS's verify flags for one certificate as a NetSurf reason. */
++static ssl_cert_err
++fetch_curl_mbedtls_err(uint32_t flags, const mbedtls_x509_crt *crt, int depth)
++{
++	if (flags == 0)
++		return SSL_CERT_ERR_OK;
++	if (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED) {
++		/* untrusted and its own issuer: a self-signed certificate */
++		if (crt->issuer_raw.len == crt->subject_raw.len &&
++		    memcmp(crt->issuer_raw.p, crt->subject_raw.p,
++			   crt->issuer_raw.len) == 0)
++			return depth == 0 ? SSL_CERT_ERR_SELF_SIGNED :
++				SSL_CERT_ERR_CHAIN_SELF_SIGNED;
++		return SSL_CERT_ERR_BAD_ISSUER;
++	}
++	if (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)
++		return SSL_CERT_ERR_HOSTNAME_MISMATCH;
++	if (flags & MBEDTLS_X509_BADCERT_EXPIRED)
++		return SSL_CERT_ERR_TOO_OLD;
++	if (flags & MBEDTLS_X509_BADCERT_FUTURE)
++		return SSL_CERT_ERR_TOO_YOUNG;
++	if (flags & MBEDTLS_X509_BADCERT_REVOKED)
++		return SSL_CERT_ERR_REVOKED;
++	if (flags & (MBEDTLS_X509_BADCERT_BAD_MD | MBEDTLS_X509_BADCERT_BAD_PK |
++		     MBEDTLS_X509_BADCERT_BAD_KEY))
++		return SSL_CERT_ERR_BAD_SIG;
++	return SSL_CERT_ERR_UNKNOWN;
++}
++
++/** The recorded chain into the cache the error page reads. */
++static void fetch_curl_mbedtls_store_certs(struct curl_fetch_info *f)
++{
++	struct cert_chain chain, *cached_chain;
++	size_t depth;
++
++	memset(&chain, 0, sizeof(chain));
++	chain.depth = f->cert_depth + 1;
++	for (depth = 0; depth < chain.depth; depth++) {
++		if (f->cert_data[depth].cert == NULL) {
++			chain.certs[depth].err = SSL_CERT_ERR_CERT_MISSING;
++			continue;
++		}
++		chain.certs[depth].err = (ssl_cert_err) f->cert_data[depth].err;
++		chain.certs[depth].der = (uint8_t *) f->cert_data[depth].cert;
++		chain.certs[depth].der_length = f->cert_data[depth].der_len;
++	}
++	cached_chain = hashmap_lookup(curl_fetch_ssl_hashmap, f->url);
++	if (cached_chain == NULL)
++		cached_chain = hashmap_insert(curl_fetch_ssl_hashmap, f->url);
++	if (cached_chain == NULL ||
++	    cert_chain_dup_into(&chain, cached_chain) != NSERROR_OK)
++		hashmap_remove(curl_fetch_ssl_hashmap, f->url);
++}
++
++/**
++ * mbedTLS verify callback: curl's own first (it masks the flags of a
++ * check that is turned off), then record the certificate. mbedTLS calls
++ * it from the deepest certificate to the peer's at depth 0.
++ */
++static int fetch_curl_mbedtls_verify(void *p, mbedtls_x509_crt *crt,
++				     int depth, uint32_t *flags)
++{
++	struct curl_fetch_info *f = p;
++	int ret = 0;
++
++	if (f->mbed_vrfy != NULL)
++		ret = f->mbed_vrfy(f->mbed_vrfy_p, crt, depth, flags);
++	if (depth >= 0 && depth < MAX_CERT_DEPTH &&
++	    f->cert_data[depth].cert == NULL) {
++		char *der = malloc(crt->raw.len > 0 ? crt->raw.len : 1);
++		if (der != NULL) {
++			memcpy(der, crt->raw.p, crt->raw.len);
++			f->cert_data[depth].cert = der;
++			f->cert_data[depth].der_len = crt->raw.len;
++		}
++		f->cert_data[depth].err =
++			fetch_curl_mbedtls_err(*flags, crt, depth);
++		if (depth > f->cert_depth)
++			f->cert_depth = depth;
++		if (*flags != 0)
++			f->cert_failed = true;
++	}
++	if (depth == 0 && f->cert_failed)
++		fetch_curl_mbedtls_store_certs(f);
++	return ret;
++}
++
++/** cURL SSL setup callback (mbedTLS): wrap curl's verify callback. */
++static CURLcode
++fetch_curl_mbedtls_sslctxfun(CURL *curl_handle, void *conf, void *parm)
++{
++	struct curl_fetch_info *f = parm;
++	mbedtls_ssl_config *c = conf;
++
++	(void) curl_handle;
++	/* a reused handle's config may already hold our wrapper */
++	if (c->f_vrfy != fetch_curl_mbedtls_verify) {
++		f->mbed_vrfy = c->f_vrfy;
++		f->mbed_vrfy_p = c->p_vrfy;
++	}
++	mbedtls_ssl_conf_verify(c, fetch_curl_mbedtls_verify, f);
++	return CURLE_OK;
++}
++#endif /* WITH_MBEDTLS */
++
++
+ /**
+  * Report the certificate information in the fetch to the users
+  */
+@@ -1315,6 +1461,12 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 			SETOPT(CURLOPT_SSL_CTX_FUNCTION, NULL);
+ 			SETOPT(CURLOPT_SSL_CTX_DATA, NULL);
+ 		}
++#ifdef WITH_MBEDTLS
++		if (curl_with_mbedtls) {
++			SETOPT(CURLOPT_SSL_CTX_FUNCTION, NULL);
++			SETOPT(CURLOPT_SSL_CTX_DATA, NULL);
++		}
++#endif
+ 	} else {
+ 		/* do verification */
+ 		SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
+@@ -1324,6 +1476,13 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 			SETOPT(CURLOPT_SSL_CTX_FUNCTION, fetch_curl_sslctxfun);
+ 			SETOPT(CURLOPT_SSL_CTX_DATA, f);
+ 		}
++#endif
++#ifdef WITH_MBEDTLS
++		if (curl_with_mbedtls) {
++			SETOPT(CURLOPT_SSL_CTX_FUNCTION,
++			       fetch_curl_mbedtls_sslctxfun);
++			SETOPT(CURLOPT_SSL_CTX_DATA, f);
++		}
+ #endif
+ 	}
+ 
+@@ -2278,6 +2437,16 @@ nserror fetch_curl_register(void)
+ 
+ 	NSLOG(netsurf, INFO, "cURL %slinked against openssl",
+ 	      curl_with_openssl ? "" : "not ");
++#ifdef WITH_MBEDTLS
++	{
++		curl_version_info_data *vi = curl_version_info(CURLVERSION_NOW);
++		curl_with_mbedtls = vi != NULL && vi->ssl_version != NULL &&
++			strncmp(vi->ssl_version, "mbedTLS", 7) == 0;
++		NSLOG(netsurf, INFO, "cURL TLS %s: certificate chain %s",
++		      (vi && vi->ssl_version) ? vi->ssl_version : "?",
++		      curl_with_mbedtls ? "recorded (mbedTLS)" : "not recorded");
++	}
++#endif
+ 
+ 	/* cURL initialised okay, register the fetchers */
+ 
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -20,6 +20,9 @@ CFLAGS += -std=c99 -g -Ifrontends/vita/compat \
+ # vitaSDK's libcurl (no asynchronous resolver) block in getaddrinfo()
+ # (content/fetchers/curl_resolve.h).
+ CFLAGS += -DWITH_CURL_ASYNC_RESOLVE
++# curl's TLS is mbedTLS (vitaSDK curl-mbedtls; tools/build-host-curl.sh for
++# the simulator): content/fetchers/curl.c records certificate chains (237)
++CFLAGS += -DWITH_MBEDTLS
+ 
+ # Text is drawn and measured with FreeType (vita/text.c).
+ CFLAGS += $(shell $(PKG_CONFIG) --cflags freetype2)

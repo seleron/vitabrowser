@@ -391,7 +391,12 @@ done
 # NetSurf's refusal is its certificate query page, titled "Privacy error".
 rogue_title=$(sed -n '/page 21\/[0-9]* NET-https-rogue: navigate/,/NET-https-rogue settled/p' \
 	"$R/log.txt" | sed -n 's/.*gw title: //p' | tail -1)
+# ...and it says why (patch 237: with mbedTLS it always said "An unknown
+# error occurred while processing the certificate").
+rogue_why=$(grep -o 'STR The certificate is self signed\.' "$R/21-NET-https-rogue.plot" 2>/dev/null | head -1)
+echo "  21-NET-https-rogue reason: ${rogue_why:-MISSING (not \"The certificate is self signed.\")}"
 if [ -f "$R/21-NET-https-rogue.plot" ] && [ "$rogue_title" = "Privacy error" ] && \
+   [ -n "$rogue_why" ] && \
    ! body "$R/21-NET-https-rogue.plot" | cmp -s - "$OUT/l1.body"; then
 	echo "  21-NET-https-rogue: refused (\"$rogue_title\" page)"
 else
