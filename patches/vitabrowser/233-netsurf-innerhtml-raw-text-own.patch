@@ -1,0 +1,114 @@
+# netsurf: a raw-text element's own innerHTML is its text, unescaped
+# (patch 233)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser (patch stack through 232)
+#
+# make.wordpress.org/core (scorecard 49.5, text recall 0.30) showed
+# template source on the page: "<# if ( o2.options.showAvatars ... ) #>".
+# wp.template / _.template / Handlebars read a template kept in
+# <script type="text/template"> as $('#tmpl-x').html(), the script's own
+# innerHTML. The serializer emitted raw-text children unescaped only when
+# serializing their PARENT; the element's own innerHTML went through the
+# escaping path, so the template saw "&lt;# ... #&gt;", its evaluate
+# blocks never matched, and the text was inserted literally.
+#
+#  - qjs_ih_is_raw_text(): HTML serialization's raw-text parents (script,
+#    style, xmp, iframe, noembed, noframes, plaintext; noscript stays out
+#    because our parser builds its children as elements). Used for a
+#    parent's children (was script/style only) and now for the element's
+#    own innerHTML getter.
+#  - qjs_ih_serialize_raw_children(): an element or comment a script put
+#    inside a raw-text element is serialized normally (was dropped).
+#
+# Gate: testpages/pages/JS-innerhtml-raw.html IHRAW 6/6 (Chromium 6/6;
+# before 2/6: the template, style and xmp checks failed; textarea stays
+# escaped and a parent serializing its script raw already passed).
+# o2's live widget renders its items instead of template source.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -5313,6 +5313,11 @@ static int qjs_ih_serialize_raw_children(struct qjs_ih_buf *b,
+ 							(size_t) dom_string_length(ds));
+ 					macsurf_dom_string_unref(ds);
+ 				}
++			} else {
++				/* an element or comment a script put there:
++				 * serialized as anywhere else (VitaBrowser
++				 * patch 233; was dropped) */
++				r = qjs_ih_serialize_node(b, child);
+ 			}
+ 		}
+ 		macsurf_dom_node_unref(child);
+@@ -5321,6 +5326,45 @@ static int qjs_ih_serialize_raw_children(struct qjs_ih_buf *b,
+ 	return r;
+ }
+ 
++/* The HTML serializer's raw-text parents: their text children are
++ * appended literally (VitaBrowser patch 233; was script and style only).
++ * With scripting enabled the list includes noscript, but our parser builds
++ * noscript's children as elements, so it stays out. */
++static int qjs_ih_is_raw_text(const char *tag_lc)
++{
++	static const char *const raw[] = { "script", "style", "xmp",
++		"iframe", "noembed", "noframes", "plaintext", NULL };
++	int i;
++
++	for (i = 0; raw[i] != NULL; i++)
++		if (strcmp(tag_lc, raw[i]) == 0)
++			return 1;
++	return 0;
++}
++
++/* qjs_ih_is_raw_text for an element (its tag name, lowercased). */
++static int qjs_ih_element_is_raw_text(dom_element *el)
++{
++	dom_string *tname = NULL;
++	const char *tag;
++	char tag_lc[16];
++	int i, raw = 0;
++
++	if (macsurf_dom_element_get_tag_name(el, &tname) != DOM_NO_ERR
++			|| tname == NULL)
++		return 0;
++	tag = dom_string_data(tname);
++	for (i = 0; i < 15 && tag[i]; i++) {
++		char c = tag[i];
++		tag_lc[i] = (c >= 'A' && c <= 'Z') ? (char) (c + 32) : c;
++	}
++	tag_lc[i] = '\0';
++	if (tag[i] == '\0')
++		raw = qjs_ih_is_raw_text(tag_lc);
++	macsurf_dom_string_unref(tname);
++	return raw;
++}
++
+ /* Attributes: enumerate the element's real namednodemap. The map and each
+  * item node / name / value come back ref'd; everything is unref'd here. */
+ static int qjs_ih_serialize_attrs(struct qjs_ih_buf *b, dom_element *el)
+@@ -5430,7 +5474,7 @@ static int qjs_ih_serialize_element(struct qjs_ih_buf *b, dom_element *el)
+ 	}
+ 	tag_lc[i] = '\0';
+ 
+-	raw = (strcmp(tag_lc, "script") == 0 || strcmp(tag_lc, "style") == 0);
++	raw = qjs_ih_is_raw_text(tag_lc);
+ 
+ 	r = qjs_ih_append(b, "<", 1);
+ 	if (!r) r = qjs_ih_append_cstr(b, tag_lc);
+@@ -5472,7 +5516,15 @@ static JSValue qjs_el_get_inner_html_data(JSContext *ctx,
+ 	 * element's own tag and attributes belong to outerHTML. Serialize the
+ 	 * children, not the element itself (a harness round-trip test caught
+ 	 * the element-once version wrapping the re-parse in a stray child). */
+-	r = qjs_ih_serialize_children(&b, (dom_node *) el);
++	/* A raw-text element's own innerHTML is its text, unescaped, as
++	 * when its parent is serialized: templates kept in <script
++	 * type="text/template"> (wp.template, _.template, Handlebars) are
++	 * read this way, and "&lt;#" never matched their "<#" blocks
++	 * (VitaBrowser patch 233). */
++	if (qjs_ih_element_is_raw_text(el))
++		r = qjs_ih_serialize_raw_children(&b, (dom_node *) el);
++	else
++		r = qjs_ih_serialize_children(&b, (dom_node *) el);
+ 	if (r != 0 || b.data == NULL) {
+ 		if (b.data) free(b.data);
+ 		return JS_NewString(ctx, "");

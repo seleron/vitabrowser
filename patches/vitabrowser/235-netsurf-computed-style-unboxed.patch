@@ -1,0 +1,129 @@
+# netsurf: getComputedStyle for an element with no box answers from the
+# cascade (patch 235)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser (patch stack through 234)
+#
+# An element that is display:none (or under one) has no box, and
+# __gcsNative answered nothing for it: display "" and every other
+# property from the inline style only. jQuery's .show() writes an inline
+# display only when the computed one is "none", so a container hidden by
+# a stylesheet was never shown: make.wordpress.org's o2 app does
+# o2.$appContainer.html('').show() on "#content { display: none }", and
+# its ten rendered posts never got a box.
+#
+#  - qjs_style_unboxed(): the cascade for a boxless element through
+#    html_svg_get_style() (box_construct's own selection), the parent's
+#    style taken from its box when the tree is settled, else computed the
+#    same way one level up (depth-capped); custom properties are not
+#    inherited on this path.
+#  - qjs_get_computed_style(): uses it when there is no box; the
+#    box-derived values (used width/height, margins, padding) are left to
+#    the inline fallback as before.
+#
+# Gate: testpages/pages/JS-computed-unboxed.html UNBOXED 7/7 (Chromium
+# 7/7; before 0/6 on the first six checks), including o2's
+# empty-show-refill order.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -8208,11 +8208,53 @@ static void qjs_cs_colour(JSContext *ctx, JSValue o, const char *name,
+ 	JS_SetPropertyStr(ctx, o, name, JS_NewString(ctx, buf));
+ }
+ 
++/* VitaBrowser patch 235: the cascade for an element with no box -- it or
++ * an ancestor is display:none, or its box is not built yet. The answer
++ * was nothing (display ""), so jQuery's .show(), which writes an inline
++ * display only when the computed one is "none", left stylesheet-hidden
++ * containers hidden (make.wordpress.org's o2 app: #content and its posts
++ * never got a box). The parent's style comes from its box when the tree
++ * is settled, else from this same selection one level up; custom
++ * properties are not inherited here. Caller destroys the results; NULL
++ * when it cannot be computed. */
++static css_select_results *qjs_style_unboxed(struct html_content *html,
++		dom_node *n, int use_boxes, int depth)
++{
++	dom_node *p = NULL;
++	dom_node_type t = 0;
++	css_select_results *pr = NULL, *r;
++	const css_computed_style *ps = NULL;
++
++	if (html == NULL || html->select_ctx == NULL || depth > 64)
++		return NULL;
++	macsurf_dom_node_get_parent_node(n, &p);
++	if (p != NULL && macsurf_dom_node_get_node_type(p, &t) == DOM_NO_ERR &&
++	    t == 1) {
++		struct box *pb = use_boxes ? box_for_node(p) : NULL;
++		if (pb != NULL && macsurf_ptr_is_heap((const void *)pb) &&
++		    pb->style != NULL) {
++			ps = pb->style;
++		} else {
++			pr = qjs_style_unboxed(html, p, use_boxes, depth + 1);
++			if (pr != NULL)
++				ps = pr->styles[CSS_PSEUDO_ELEMENT_NONE];
++		}
++	}
++	if (p != NULL)
++		macsurf_dom_node_unref(p);
++	r = html_svg_get_style(html, n, ps, NULL, NULL);
++	if (pr != NULL)
++		css_select_results_destroy(pr);
++	return r;
++}
++
+ static JSValue qjs_get_computed_style(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+ 	JSValue out, inline_style;
+ 	struct box *b = NULL;
++	css_select_results *unboxed = NULL;	/* patch 235 */
++	css_computed_style *s0 = NULL;
+ 	(void)this_val;
+ 
+ 	qjs_geometry_flush(ctx);	/* fixes1073 (#265) */
+@@ -8236,7 +8278,22 @@ static JSValue qjs_get_computed_style(JSContext *ctx, JSValueConst this_val,
+ 	}
+ 
+ 	if (b != NULL && b->style != NULL) {
+-		css_computed_style *s = b->style;
++		s0 = b->style;
++	} else if (argc >= 1 && JS_IsObject(argv[0])) {
++		/* patch 235: no box -- answer from the cascade */
++		dom_node *n = qjs_get_node(argv[0]);
++		dom_node_type nt = 0;
++		struct content *c = qjs_get_content_for_ctx(ctx);
++		if (n != NULL && c != NULL &&
++		    macsurf_dom_node_get_node_type(n, &nt) == DOM_NO_ERR &&
++		    nt == 1)
++			unboxed = qjs_style_unboxed((struct html_content *)c, n,
++					qjs_geometry_settled(ctx), 0);
++		if (unboxed != NULL)
++			s0 = unboxed->styles[CSS_PSEUDO_ELEMENT_NONE];
++	}
++	if (s0 != NULL) {
++		css_computed_style *s = s0;
+ 		css_fixed len = 0;
+ 		css_unit unit = CSS_UNIT_PX;
+ 		css_color col = 0;
+@@ -8330,7 +8387,9 @@ static JSValue qjs_get_computed_style(JSContext *ctx, JSValueConst this_val,
+ 					"none" : "auto"));
+ 		/* Used width/height come from the BOX, not the cascade -- the
+ 		 * cascade may say `auto` while the box knows the resolved pixels,
+-		 * and "used value" is what getComputedStyle is specified to give. */
++		 * and "used value" is what getComputedStyle is specified to give.
++		 * (No box, patch 235: left to the inline fallback.) */
++		if (b != NULL && b->style != NULL) {
+ 		qjs_cs_px(ctx, out, "width", qjs_sane(b->width));
+ 		qjs_cs_px(ctx, out, "height", qjs_sane(b->height));
+ 		qjs_cs_px(ctx, out, "marginTop", b->margin[TOP]);
+@@ -8341,7 +8400,10 @@ static JSValue qjs_get_computed_style(JSContext *ctx, JSValueConst this_val,
+ 		qjs_cs_px(ctx, out, "paddingRight", b->padding[RIGHT]);
+ 		qjs_cs_px(ctx, out, "paddingBottom", b->padding[BOTTOM]);
+ 		qjs_cs_px(ctx, out, "paddingLeft", b->padding[LEFT]);
++		}
+ 	}
++	if (unboxed != NULL)
++		css_select_results_destroy(unboxed);
+ 
+ 	/* Inline style wins where the cascade gave us nothing, preserving the
+ 	 * old behaviour for every property not covered above. */

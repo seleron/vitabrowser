@@ -4,6 +4,31 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-11 00:40 — patches 231-236: YouTube and make.wordpress.org/core
+
+Run `<WORK>/vitabrowser-work/score/r25-full-236` (all 21 sites, r19's Chrome
+references), then `r26-fresh-hn-google` (fresh references for the two
+sites whose content moves by the hour).
+
+| site | r19 (230) | r25 (236) | |
+|---|---|---|---|
+| youtube | 0.0 (crash) | 76.9 | patch 231 |
+| wpblog (make.wordpress.org/core) | 49.5 | **81.0** | text 0.30 -> 0.998; 233-236 |
+| hackernews | 91.0 | 83.5 / **92.7** fresh | stale reference (front page moved) |
+| google | 80.0 | 70.1 / **81.2** fresh | stale reference (trends moved) |
+| every other site | | within +-0.7 | |
+
+With the fresh hackernews/google scores the all-site mean (sites with a
+usable reference) is **78.3** (r19: 72.4; r18 at patch 183: 73.6).
+make.wordpress.org/core's posts are rendered by the o2 app in JS, and it
+took four engine bugs to get there, each with a Chromium-verified gate:
+the template in <script type="text/template"> read back escaped (233);
+jquery.sonar's offsetParent loop never ending because body.offsetParent
+was body (234); getComputedStyle answering nothing for a display:none
+element, so jQuery's .show() did nothing (235); and libcss ranking the
+style attribute with the leftover specificity of the last matched rule,
+so "#content { display: none }" beat style="display:block" (236).
+
 ## 2026-10-10 22:20 — full 21-site scorecard, patches up to 230 (desktop)
 
 Run `<WORK>/vitabrowser-work/score/r19-full-230` (all 21 sites, fresh Chrome
@@ -33,7 +58,9 @@ hackernews +3.3). **spa's drop is one crash: m.youtube.com SIGSEGV 1.8 s
 in** (37.0 at r18). Its scripts read history.length while the window's
 first page was still parsing, before the page joins the session history,
 and the length walk dereferenced the empty history (patch 136's getter;
-fixed by patch 231). Re-scored on r19's reference (`r20-youtube-231`):
+fixed by patch 231). Re-scored (`r20-youtube-231`; a fresh Chrome reference taken
+the same hour, its text identical to r19's -- the run was given r19's
+run directory instead of its ref/ directory):
 **youtube 76.9** (text 1.0, visual 0.423). With that, spa = 72.3 and
 the all-site mean (sites with a usable Chrome reference, as the
 tool counts it) = 76.5.

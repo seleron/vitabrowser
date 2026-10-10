@@ -1,0 +1,239 @@
+# netsurf: offsetParent, offsetTop/Left and clientTop/Left per CSSOM View
+# (patch 234)
+# Generated 2026-10-10
+# Base: seleron/vitabrowser (patch stack through 233)
+#
+# make.wordpress.org/core: a setTimeout callback burned the whole 8 s
+# script budget ("InternalError: interrupted"; stack: jquery.sonar
+# detect() -> the <el-layout> offsetParent getter). The getter was always
+# document.body -- body's own included -- so the classic
+#   do { top += el.offsetTop; } while (el = el.offsetParent);
+# never ended. Where such a loop did end, offsetTop counted from the
+# parent BOX, so the sum was not the element's position either.
+#
+#  - qjs_offset_parent(): CSSOM View's offsetParent -- none for body,
+#    html and position:fixed; else the nearest positioned ancestor, or
+#    (for a static element) a td/th/table, or body; none when no such
+#    ancestor is found (detached, in head). A native getter replaces the
+#    JS one in lay_src; boxless once the tree is settled = null.
+#  - offsetTop/Left: the border edge from the offsetParent's padding
+#    edge, or from the page when that is body; body/html answer 0.
+#  - clientTop/Left: the top/left border widths (the polyfill's were
+#    constant 0 stubs; its acc() leaves a native getter alone).
+#
+# Gate: testpages/pages/JS-offsetparent.html OFFPARENT 8/8 (Chromium
+# 8/8; before 0/8, the loop capped at 50 steps). Checks compare offsets
+# with the engine's own getBoundingClientRect, so they hold under any
+# layout.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -7770,6 +7770,108 @@ static void qjs_box_origin(struct box *b, int *ox, int *oy)
+ 	*oy = y;
+ }
+ 
++/* VitaBrowser patch 234: is n an element named tag? */
++static int qjs_node_is_tag(dom_node *n, const char *tag)
++{
++	dom_node_type t = 0;
++	dom_string *name = NULL;
++	int r;
++
++	if (n == NULL || macsurf_dom_node_get_node_type(n, &t) != DOM_NO_ERR
++			|| t != 1)
++		return 0;
++	if (macsurf_dom_element_get_tag_name((dom_element *) n, &name)
++			!= DOM_NO_ERR || name == NULL)
++		return 0;
++	r = strcasecmp(dom_string_data(name), tag) == 0;
++	macsurf_dom_string_unref(name);
++	return r;
++}
++
++/* VitaBrowser patch 234: CSSOM View's offsetParent of element n (box b).
++ *
++ * The JS getter was always document.body -- body's own included -- so
++ *   do { top += el.offsetTop; } while (el = el.offsetParent);
++ * never ended (make.wordpress.org: jquery.sonar spun out the 8 s budget
++ * and o2 never rendered its posts). Now: none for body, html and
++ * position:fixed; else the nearest ancestor that is positioned, or -- for
++ * a static element -- a td, th or table, or body; none when no such
++ * ancestor is found (detached, in head). b NULL means the element has no
++ * box: the caller answers null once the tree is settled, and while it is
++ * not, this goes by the DOM alone (body for anything under it).
++ *
++ * Returns a REF'd node or NULL. *opbox gets the offsetParent's box, or
++ * NULL for body: offsets then count from the page. */
++static dom_node *qjs_offset_parent(dom_node *n, struct box *b,
++		struct box **opbox)
++{
++	dom_node *p = NULL, *next;
++	int static_el = 1;
++
++	*opbox = NULL;
++	if (qjs_node_is_tag(n, "body") || qjs_node_is_tag(n, "html"))
++		return NULL;
++	if (b != NULL && b->style != NULL) {
++		uint8_t pos = css_computed_position(b->style);
++		if (pos == CSS_POSITION_FIXED)
++			return NULL;
++		static_el = (pos == CSS_POSITION_STATIC);
++	}
++	macsurf_dom_node_get_parent_node(n, &p);
++	while (p != NULL) {
++		dom_node_type t = 0;
++
++		macsurf_dom_node_get_node_type(p, &t);
++		if (t != 1)
++			break;	/* the document or a fragment: not under body */
++		if (qjs_node_is_tag(p, "body"))
++			return p;
++		if (b != NULL) {
++			struct box *pb = box_for_node(p);
++			if (pb != NULL && macsurf_ptr_is_heap((const void *)pb) &&
++			    pb->style != NULL &&
++			    (css_computed_position(pb->style) !=
++					CSS_POSITION_STATIC ||
++			     (static_el && (qjs_node_is_tag(p, "td") ||
++					    qjs_node_is_tag(p, "th") ||
++					    qjs_node_is_tag(p, "table"))))) {
++				*opbox = pb;
++				return p;
++			}
++		}
++		next = NULL;
++		macsurf_dom_node_get_parent_node(p, &next);
++		macsurf_dom_node_unref(p);
++		p = next;
++	}
++	if (p != NULL)
++		macsurf_dom_node_unref(p);
++	return NULL;
++}
++
++/* VitaBrowser patch 234: the offsetParent getter (it was JS: always
++ * body). Settled and boxless = not rendered = null. */
++static JSValue qjs_el_offset_parent(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv, int magic, JSValueConst *func_data)
++{
++	dom_node *n, *op;
++	struct box *b = NULL, *opb = NULL;
++	(void)argc; (void)argv; (void)magic; (void)func_data;
++
++	n = qjs_get_node(this_val);
++	if (n == NULL)
++		return JS_NULL;
++	qjs_geometry_flush(ctx);
++	if (qjs_geometry_settled(ctx)) {
++		struct content *c = qjs_get_content_for_ctx(ctx);
++		b = qjs_box_for(ctx, this_val);
++		if (b == NULL && c != NULL && c->status == CONTENT_STATUS_DONE)
++			return JS_NULL;
++	}
++	op = qjs_offset_parent(n, b, &opb);
++	return op != NULL ? qjs_wrap_any_node(ctx, op) : JS_NULL;
++}
++
+ /* fixes1015 - defined just below, used by get_rect above its definition. */
+ static void qjs_geom_audit(const char *what, JSValueConst wrapper,
+ 		const char *result);
+@@ -7868,6 +7970,8 @@ static void qjs_geom_audit(const char *what, JSValueConst wrapper,
+ #define QJS_M_OFFL   5
+ #define QJS_M_SCRW   6
+ #define QJS_M_SCRH   7
++#define QJS_M_CLIT   8	/* patch 234: clientTop/Left (were 0 stubs) */
++#define QJS_M_CLIL   9
+ 
+ static JSValue qjs_el_metric(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv, int magic, JSValueConst *func_data)
+@@ -7972,20 +8076,32 @@ static JSValue qjs_el_metric(JSContext *ctx, JSValueConst this_val,
+ 	/* clientWidth/Height EXCLUDE the border and include padding. */
+ 	case QJS_M_CLIW: v = qjs_sane(b->width) + px; break;
+ 	case QJS_M_CLIH: v = qjs_sane(b->height) + py; break;
+-	/* offsetTop/Left: the border box's outer edge from the parent's
+-	 * padding edge; box origins are padding-box corners (see get_rect) */
+-	case QJS_M_OFFT: {
+-		int x = 0, y = 0, pxo = 0, pyo = 0;
+-		qjs_box_origin(b, &x, &y);
+-		if (b->parent != NULL) qjs_box_origin(b->parent, &pxo, &pyo);
+-		v = y - b->border[TOP].width - pyo;
+-		break;
+-	}
++	/* clientTop/Left: the top / left border widths (patch 234) */
++	case QJS_M_CLIT: v = b->border[TOP].width; break;
++	case QJS_M_CLIL: v = b->border[LEFT].width; break;
++	/* offsetTop/Left: the border box's outer edge from the OFFSETPARENT's
++	 * padding edge, or from the page when that is body (or there is
++	 * none); body's own are 0 (CSSOM View). Box origins are padding-box
++	 * corners (see get_rect). Patch 234: this counted from the parent
++	 * box, so summing up the offsetParent chain gave the wrong place. */
++	case QJS_M_OFFT:
+ 	case QJS_M_OFFL: {
+ 		int x = 0, y = 0, pxo = 0, pyo = 0;
++		dom_node *n = qjs_get_node(this_val), *op;
++		struct box *opb = NULL;
++
++		if (qjs_node_is_tag(n, "body") || qjs_node_is_tag(n, "html")) {
++			v = 0;
++			break;
++		}
+ 		qjs_box_origin(b, &x, &y);
+-		if (b->parent != NULL) qjs_box_origin(b->parent, &pxo, &pyo);
+-		v = x - b->border[LEFT].width - pxo;
++		op = qjs_offset_parent(n, b, &opb);
++		if (opb != NULL)
++			qjs_box_origin(opb, &pxo, &pyo);
++		if (op != NULL)
++			macsurf_dom_node_unref(op);
++		v = magic == QJS_M_OFFT ? y - b->border[TOP].width - pyo :
++			x - b->border[LEFT].width - pxo;
+ 		break;
+ 	}
+ 	/* scrollWidth/Height are the DESCENDANT extent -- how big the content
+@@ -8022,6 +8138,8 @@ static const char *qjs_metric_name(int magic)
+ 	case QJS_M_OFFL: return "offsetLeft";
+ 	case QJS_M_SCRW: return "scrollWidth";
+ 	case QJS_M_SCRH: return "scrollHeight";
++	case QJS_M_CLIT: return "clientTop";
++	case QJS_M_CLIL: return "clientLeft";
+ 	default:         return "metric?";
+ 	}
+ }
+@@ -11317,7 +11435,9 @@ static void qjs_el_install_proto_surface(JSContext *ctx, JSValue proto)
+ 			{ "offsetTop",    QJS_M_OFFT },
+ 			{ "offsetLeft",   QJS_M_OFFL },
+ 			{ "scrollWidth",  QJS_M_SCRW },
+-			{ "scrollHeight", QJS_M_SCRH }
++			{ "scrollHeight", QJS_M_SCRH },
++			{ "clientTop",    QJS_M_CLIT },
++			{ "clientLeft",   QJS_M_CLIL }
+ 		};
+ 		JSAtom a;
+ 		JSValue fn;
+@@ -11329,6 +11449,13 @@ static void qjs_el_install_proto_surface(JSContext *ctx, JSValue proto)
+ 					JS_PROP_CONFIGURABLE);
+ 			JS_FreeAtom(ctx, a);
+ 		}
++		/* patch 234: offsetParent, native (was lay_src's JS) */
++		a = JS_NewAtom(ctx, "offsetParent");
++		fn = JS_NewCFunctionData(ctx, qjs_el_offset_parent, 0, 0, 0,
++				NULL);
++		JS_DefinePropertyGetSet(ctx, proto, a, fn, JS_UNDEFINED,
++				JS_PROP_CONFIGURABLE);
++		JS_FreeAtom(ctx, a);
+ 	}
+ 	{
+ 		/* getClientRects wraps the single rect; scrollTop/Left are the
+@@ -11349,11 +11476,6 @@ static void qjs_el_install_proto_surface(JSContext *ctx, JSValue proto)
+ 					"(window.scrollX||0):0;},"
+ 				"set:function(v){if(typeof window!=='undefined'&&"
+ 					"window.scrollTo)window.scrollTo(v|0,window.scrollY||0);}});"
+-			"Object.defineProperty(P,'offsetParent',{configurable:true,"
+-				"get:function(){var p=this.parentNode;"
+-				"while(p&&p.nodeType===1){"
+-					"if(p===document.body)return p;p=p.parentNode;}"
+-				"return (typeof document!=='undefined')?document.body:null;}});"
+ 			"P.scrollIntoView=function(){"
+ 				"var r=this.getBoundingClientRect();"
+ 				"if(typeof window!=='undefined'&&window.scrollTo)"

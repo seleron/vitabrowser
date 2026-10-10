@@ -294,6 +294,10 @@ NET-html-control-margins http://127.0.0.1:$HP/HTML-control-margins.html
 NET-css-inline-block-space-font http://127.0.0.1:$HP/CSS-inline-block-space-font.html
 NET-css-fractional-spacing http://127.0.0.1:$HP/CSS-fractional-spacing.html
 NET-html-legend-reset http://127.0.0.1:$HP/HTML-legend-reset.html
+NET-js-innerhtml-raw http://127.0.0.1:$HP/JS-innerhtml-raw.html
+NET-js-offsetparent http://127.0.0.1:$HP/JS-offsetparent.html
+NET-js-computed-unboxed http://127.0.0.1:$HP/JS-computed-unboxed.html
+NET-css-inline-outranks http://127.0.0.1:$HP/CSS-inline-outranks.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -776,6 +780,20 @@ l228p=$(ls "$R"/*NET-html-legend-reset.plot 2>/dev/null | head -1)
 l228r=$(sed -n 's/.*STR \(LEGEND228: [0-9]*\/[0-9]* passed\).*/\1/p' "$l228p" 2>/dev/null | head -1)
 echo "  html-legend-reset: ${l228r:-no summary}"
 [ -n "$l228p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$l228p" | sed 's/^STR /  /'
+# Patches 233-236 (make.wordpress.org's o2 app): a raw-text element's own
+# innerHTML unescaped (233), offsetParent / offsetTop per CSSOM View (234),
+# getComputedStyle for an element with no box (235), inline style outranks
+# author rules whatever matched last (236, libcss).
+o2_bad=
+for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
+	 "js-computed-unboxed UNBOXED 7" "css-inline-outranks INLINE236 4"; do
+	set -- $g
+	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
+	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
+	echo "  $1: ${gr:-no summary}"
+	[ -n "$gp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$gp" | sed 's/^STR /  /'
+	[ "$gr" = "$2: $3/$3 passed" ] || o2_bad="$o2_bad $1"
+done
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
@@ -1035,7 +1053,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$m225r" = "CTLMARGIN225: 3/3 passed" ] && \
 [ "$i226r" = "IBFONT226: 4/4 passed" ] && \
 [ "$f227r" = "FRACSP227: 4/4 passed" ] && \
-[ "$l228r" = "LEGEND228: 4/4 passed" ] && \
+[ "$l228r" = "LEGEND228: 4/4 passed" ] && [ -z "$o2_bad" ] && \
 [ "$itr" = "INNERTEXT: 9/9 passed" ] && \
 [ "$szr" = "SANITIZE: 7/7 passed" ] && \
 soft_pass "$clr" "CLASSSTALL: 7/7 passed" "$csp2" 7 && [ "${cll:-0}" -ge 5 ] && \
