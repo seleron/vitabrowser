@@ -174,13 +174,42 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
 
+class TLSThreadingServer(http.server.ThreadingHTTPServer):
+    """TLS handshakes in each connection's own thread.
+
+    Wrapping the listening socket made accept() do the handshake in the one
+    serving thread: a client that connected and stalled mid-handshake (the
+    gate aborts some on purpose: the rogue-certificate pages) held up every
+    later https connection, and a page's streams got no byte before the
+    next navigation (JS-streaming-https "script did not run", 2026-10-11).
+    """
+    ssl_ctx = None
+
+    def finish_request(self, request, client_address):
+        request.settimeout(10)
+        try:
+            request = self.ssl_ctx.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        request.settimeout(None)
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            try:
+                request.close()
+            except OSError:
+                pass
+
+
 def serve(port, directory, cert=None, key=None):
     handler = functools.partial(Quiet, directory=directory)
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     if cert:
+        srv = TLSThreadingServer(("127.0.0.1", port), handler)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        srv.ssl_ctx = ctx
+    else:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     return srv
