@@ -3017,21 +3017,72 @@ the first flex/grid row to Chromium's position.
    the heaviest page (patch 209 raised the network page limit to 128).
 
 
-## Since run 29 — queued for run 30 (not built yet)
+## Run 30 — hand-off (2026-10-11 06:32; replaces untested run 29)
 
-Patches 237-241 + patches/quickjs/06 (2026-10-11), sim-verified, full
-gate green; no VPK built yet (run 29 is with the device).
+**Flash this build:** VitaBrowser.vpk `6f283bae3a7c`, VitaBrowser-ext.vpk
+`1d33f66690a5`, nsvita.elf `9242f4a978d1` (patches through 248, built at
+c56193c + 248). Run 29 (`b7ebf9c27396`) never came back from the device (no
+`results\`), so run 30 carries everything since run 27: **patches
+168-248 + patches/quickjs/05-06**, all unverified on hardware. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-11-run30/`; run 29's reference dumps
+are now `reference-dumps-run29\`.
 
-- 237: certificate errors say why ("The certificate is self signed.",
-  "has expired", "is for a different host") with "View certificate
-  details". On the device: https://self-signed.badssl.com/ and
-  https://expired.badssl.com/.
-- 238-240 + quickjs/06: github.com runs without JS errors (import.meta,
-  import maps, custom element constructors).
-- 241: Settings -- the home page's "Settings" link opens
-  http://127.0.0.1:8080/settings: user agent, zoom, content blocking.
-  On the device: switch to firefox, open a site, check it; set zoom
-  125%, quit and relaunch (pages start at 125%); blocking off then on.
-  If the page says "settings are changed on the Vita only", the Vita
-  reported its loopback client by an address we did not expect -- send
-  log.txt (the remote: lines).
+Build: clean restage (334 applied + the two known collisions) whose
+sources are identical to the tree the full gate passed on (patch 248, a
+Duktape-only link fix for nsmonkey, is the one difference and is not in
+the Vita or simulator build); streams 4/4, renderer 102/102 + 30/30, full
+sim gate exit 0 with no soft accepts (interaction 52/52, also at the
+Vita's pace), cross-build green. Reference autotest under device
+conditions: interact **52/52**, js 18/18, 34 dumps -- 30 identical to run
+29's, IN-home-recent (now links Settings and Downloads) and IN-history
+(ages) differ, IN-settings and IN-downloads are new.
+
+What 237-248 add:
+
+- **237** certificate errors say why ("The certificate is self signed.",
+  "has expired", "is for a different host"), with "View certificate
+  details".
+- **238-240 + quickjs/06** github.com runs without JS errors; **242-243**
+  its React file list renders (sim 64.7 -> 81.8).
+- **241 Settings** (home page link -> http://127.0.0.1:8080/settings):
+  user agent, zoom, content blocking.
+- **244** iframes a script creates from another site load (consent
+  dialogs, captchas, embeds); **246** DOMPurify-style sanitizers work,
+  and a late-shown frame takes its real size -- the Guardian now shows
+  its consent dialog as Chrome does; **247** hCaptcha's messages reach
+  its frames (claude.ai's email sign-in still stops at hCaptcha's proof
+  of work, which needs WebAssembly).
+- **245 Downloads**: a progress strip above the HUD (bar, percent, size,
+  speed, time left) and a Downloads page (home page link) with Cancel.
+
+**On the device:**
+
+1. Autotest (SELECT + □): every `.plot` SAME against the new
+   reference-dumps (PM-animation is timing-dependent; IN-home-recent /
+   IN-history ages may differ), interact **52/52**, js 18/18.
+2. **Certificates (237)**: https://self-signed.badssl.com/ and
+   https://expired.badssl.com/ say why, and "View certificate details"
+   opens.
+3. **Settings (241)**: switch the user agent to firefox, open a site;
+   set zoom 125%, quit and relaunch (pages start at 125%); blocking off
+   then on. If the page says "settings are changed on the Vita only",
+   send log.txt (the remote: lines).
+4. **Downloads (245)**: start a large download (e.g. a 10 MB test file
+   from a speed-test site): the strip shows bar, percent, KB/s and time
+   left above the HUD; open Downloads from the home page -- the bar moves
+   every second; Cancel stops it and the partial file is removed
+   (ux0:data/VitaBrowser/downloads/). Report: does the strip cover
+   anything important, does the refreshing page cost scrolling speed?
+5. **github.com** (a repository page): the file list and the latest
+   commit box render. **theguardian.com**: the consent dialog appears over
+   the page; "Reject all" / "Accept all" can be pressed (a tap inside a
+   cross-site frame -- report whether it works and the page then shows).
+6. **claude.ai/login** with email: expect it to stop at the captcha
+   (WebAssembly); note how long the page takes and whether it crashes.
+7. Watch as always: `refused` stays 0 in log.txt; new DIFFs in
+   receiver.txt; any .dmp from ux0:data/; `mem[page done]` after the
+   Guardian (its consent frame is a second page and realm) and github.
+
+## Since run 30 — queued for run 31 (not built yet)
+
+Nothing yet.
