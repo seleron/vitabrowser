@@ -1,0 +1,1118 @@
+# netsurf: iframes a script creates load -- cross-origin ones in a window
+# and realm of their own, hidden ones included (patch 244; roadmap WS-B2)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 243)
+#
+# The engine loaded only the iframes it parsed: iframe windows were made
+# once, when the page became ready (browser_window_create_iframes, a fixed
+# array of windows), so an iframe a script inserted got a box at most and
+# never fetched -- hCaptcha's frames (claude.ai's email sign-in), OAuth
+# widgets, embeds. Hidden iframes got no iframe record at all.
+#
+#  - desktop/browser_private.h, browser_window.c, frames.c: iframe windows
+#    are allocated one by one (bw->iframes is an array of pointers), so it
+#    can grow without moving a live window, and each remembers its
+#    <iframe> element (iframe_node). Windows are re-linked to the rebuilt
+#    box tree by that element, not by position (an iframe inserted before
+#    the others shifted every window onto the wrong box); a window whose
+#    element has no box now gets NULL (the scroll callback copes).
+#    browser_window_recalculate_iframes notices an iframe record with no
+#    window -- or a script having inserted an iframe -- and schedules
+#    browser_window_sync_iframes, which makes windows for new CROSS-ORIGIN
+#    frames (same-origin / blank script-made frames keep patch 143's
+#    window in the page's realm: google's sign-in evaluates into it, and a
+#    second load would run them twice), links their realm under the
+#    frame's name or a page-unique "vbframe-N", and navigates them. A
+#    frame with no box (display:none: hCaptcha's invisible checkbox frame)
+#    is found in the DOM and gets a box-less 300x150 window. At most 8
+#    script-made frame windows per page (each is a page and a realm).
+#  - html/box_special.c: once the page is ready, a visibility:hidden
+#    iframe is recorded too (hCaptcha's challenge frames); parsed hidden
+#    frames stay skipped, as before. A late iframe record asks for the
+#    window's notification (html_iframe_added_late); html/dom_event.c asks
+#    when a script inserts an iframe (html_iframe_sync_wanted).
+#  - html/html.c, browser_window.c: when an iframe window's page is DONE,
+#    `load` fires at its element in the parent page (html_iframe_loaded) --
+#    parsed iframes get it now too, as in browsers.
+#  - vita/js_platform.c: a frame's document finds its own window while it
+#    loads (window_with walks the iframe windows), so location.hash is the
+#    frame's fragment (hCaptcha configures each frame from it).
+#  - quickjs/macsurf_qjs.c + vita_polyfill.js: __vitaIframeKey(element)
+#    answers the key its window was linked with (found by element, so a
+#    box-less frame has one too), and iframe.contentWindow resolves it at
+#    each send: a script reads contentWindow before the frame's window
+#    exists. Also fixed: three content_get_type() calls on a struct
+#    content * (the function takes an hlcache handle; an implicit
+#    declaration hid it) -- the box-walk fallback of postMessage to a
+#    child never matched.
+#
+# Gate: testpages/pages/JS-xorigin-frame.html (+ -child) XFRAME 8/8
+# (Chromium with the test CA: 8/8): a script-made frame from the gate's
+# https port runs in its own realm and posts to its parent with its own
+# origin, contentWindow.postMessage round trip, the iframe's load event,
+# display:none and visibility:hidden frames load, and each reads its own
+# fragment. Before this patch: 0/8 (nothing fetched).
+#
+# claude.ai/login: hCaptcha's four frames (two display:none checkbox,
+# two visibility:hidden challenge) load and reach DONE, the challenge
+# frames send challenge-loaded / get-url / site-setup to the page, which
+# receives them with the right origin. hcaptcha.execute() still does not
+# settle: the checkbox frames post nothing and the page sends nothing to
+# any frame -- the next step is hCaptcha's own protocol (see the loop log).
+#
+# WIP (2026-10-11): NOT in the applied stack -- the Guardian regressed 74.1 -> 70.1 (visual 0.353 -> 0.267, top of page blank) once Sourcepoint's consent frame loads; making iframe canvases transparent (included here: redraw.c, browser_window.c) did not fix it. Gate with it: exit 0, XFRAME 8/8.
+#
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1161,10 +1161,16 @@ box_iframe(dom_node *n,
+ 		return true;
+ 
+ 	if (box->style &&
+-	    css_computed_visibility(box->style) == CSS_VISIBILITY_HIDDEN) {
++	    css_computed_visibility(box->style) == CSS_VISIBILITY_HIDDEN &&
++	    content->base.status != CONTENT_STATUS_READY &&
++	    content->base.status != CONTENT_STATUS_DONE) {
+ 		/* Don't create iframe discriptors for invisible iframes
+ 		 * TODO: handle hidden iframes at browser_window generation
+-		 * time instead? */
++		 * time instead?
++		 * VitaBrowser patch 244: once the page is ready an iframe is
++		 * one a script made, and browsers load hidden frames --
++		 * hCaptcha's challenge frames are visibility:hidden. (Parsed
++		 * hidden frames stay skipped, as before: memory.) */
+ 		return true;
+ 	}
+ 
+@@ -1230,6 +1236,11 @@ box_iframe(dom_node *n,
+ 	/* Add this iframe to the linked list of iframes */
+ 	iframe->next = content->iframe;
+ 	content->iframe = iframe;
++	/* VitaBrowser patch 244: after the page is ready this is an iframe a
++	 * script inserted -- the window loads it if it is cross-origin */
++	if (content->base.status == CONTENT_STATUS_READY ||
++	    content->base.status == CONTENT_STATUS_DONE)
++		html_iframe_added_late(content);
+ 
+ 	/* fill in specified values */
+ 	err = dom_element_get_attribute(n, corestring_dom_name, &s);
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -705,6 +705,12 @@ dom_default_action_DOMNodeInserted_cb(struct dom_event *evt, void *pw)
+ 				js_frame_inserted(htmlc->js_thread,
+ 						(struct dom_node *)node);
+ 			}
++			/* patch 244: the window loads it if it is cross-origin
++			 * -- also when it has no box (display:none: hCaptcha's
++			 * invisible checkbox frame) */
++			if (htmlc->base.status == CONTENT_STATUS_READY ||
++			    htmlc->base.status == CONTENT_STATUS_DONE)
++				html_iframe_added_late(htmlc);
+ 			break;
+ #endif
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6087,6 +6087,50 @@ static void html_relayout_notify(void *p)
+ 	content_broadcast(&htmlc->base, CONTENT_MSG_REFORMAT, &data);
+ }
+ 
++/* exported interface documented in html/html.h (patch 244) */
++void html_iframe_loaded(struct hlcache_handle *parent, struct dom_node *node)
++{
++	struct content *c = hlcache_handle_get_content(parent);
++	html_content *htmlc;
++
++	if (c == NULL || node == NULL ||
++	    content_get_type(parent) != CONTENT_HTML)
++		return;
++	htmlc = (html_content *) c;
++#ifdef WITH_QUICKJS
++	if (htmlc->js_thread != NULL && !htmlc->aborted)
++		js_fire_script_load(htmlc->js_thread, node, 1);
++#else
++	(void) htmlc;
++#endif
++}
++
++/* VitaBrowser patch 244: box construction recorded an iframe after the
++ * page was ready -- one a script inserted. The window re-links its iframe
++ * windows, and makes and loads one for a new cross-origin frame, on
++ * CONTENT_MSG_REFORMAT (browser_window_recalculate_iframes); a local
++ * rebuild broadcasts none, so ask for the notification. */
++void html_iframe_added_late(html_content *htmlc)
++{
++	htmlc->iframe_sync_wanted = true;
++	guit->misc->schedule(0, html_relayout_notify, htmlc);
++}
++
++/* exported interface documented in html/html.h (patch 244) */
++bool html_iframe_sync_wanted(struct hlcache_handle *h)
++{
++	struct content *c = hlcache_handle_get_content(h);
++	html_content *htmlc;
++	bool wanted;
++
++	if (c == NULL || content_get_type(h) != CONTENT_HTML)
++		return false;
++	htmlc = (html_content *) c;
++	wanted = htmlc->iframe_sync_wanted;
++	htmlc->iframe_sync_wanted = false;
++	return wanted;
++}
++
+ /* VitaBrowser (roadmap WS-C item 2 part B): an object that arrived after
+  * the page was laid out (a lazy image, a slow server) changes only its own
+  * lines and moves what follows: lay out just that (layout_relayout_object)
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -239,6 +239,23 @@ struct content_html_frames *html_get_frameset(struct hlcache_handle *h);
+  */
+ struct content_html_iframe *html_get_iframe(struct hlcache_handle *h);
+ 
++struct dom_node;
++/**
++ * VitaBrowser patch 244: an iframe's own page has loaded -- fire `load`
++ * at its <iframe> element in the parent page's realm.
++ *
++ * \param parent the page holding the iframe
++ * \param node the <iframe> element
++ */
++void html_iframe_loaded(struct hlcache_handle *parent, struct dom_node *node);
++
++/**
++ * VitaBrowser patch 244: has a script inserted an iframe since the last
++ * call? (Clears it.) The window then looks for frames to load, also ones
++ * with no box.
++ */
++bool html_iframe_sync_wanted(struct hlcache_handle *h);
++
+ /**
+  * obtain html base target from handle
+  *
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -121,6 +121,9 @@ typedef struct html_content {
+ 
+ 	/** Base URL (may be a copy of content->url). */
+ 	struct nsurl *base_url;
++	/** VitaBrowser patch 244: a script inserted an iframe; the window
++	 * should look for frames to load (html_iframe_sync_wanted) */
++	bool iframe_sync_wanted;
+ 	/** Base target */
+ 	char *base_target;
+ 
+@@ -355,6 +358,10 @@ bool html_saw_insecure_scripts(html_content *htmlc);
+  */
+ nserror html_proceed_to_done(html_content *html);
+ 
++/** VitaBrowser patch 244: an iframe was recorded after the page was
++ * ready (a script inserted it): notify the window (html.c). */
++void html_iframe_added_late(html_content *htmlc);
++
+ 
+ /* in html/redraw.c */
+ bool html_redraw(struct content *c, struct content_redraw_data *data,
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -6237,10 +6237,18 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 		if (html->background_colour != NS_TRANSPARENT)
+ 			pstyle_fill_bg.fill_colour = html->background_colour;
+ 
+-		result &= (ctx->plot->rectangle(ctx, &pstyle_fill_bg, clip) == NSERROR_OK);
++		/* VitaBrowser patch 244: an iframe's page with no background
++		 * of its own is transparent, as in browsers (the window asks
++		 * with NS_TRANSPARENT): a consent dialog's frame still loading
++		 * covered the page in white once script-made frames loaded */
++		if (pstyle_fill_bg.fill_colour != NS_TRANSPARENT)
++			result &= (ctx->plot->rectangle(ctx, &pstyle_fill_bg,
++					clip) == NSERROR_OK);
+ 
+ 		result &= html_redraw_box(html, box, data->x, data->y, clip,
+-				data->scale, pstyle_fill_bg.fill_colour, ctx);
++				data->scale,
++				pstyle_fill_bg.fill_colour != NS_TRANSPARENT ?
++				pstyle_fill_bg.fill_colour : 0xFFFFFF, ctx);
+ 	}
+ 
+ 	if (select) {
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -3120,6 +3120,39 @@ qjs_xrealm_post_to_parent(JSContext *ctx, JSValueConst this_val,
+ 	return ret;
+ }
+ 
++/* VitaBrowser patch 244: __vitaIframeKey(iframeElement) -- the frame key
++ * the iframe's own window was linked to this realm with (its name, or the
++ * "vbframe-N" a script-made frame gets), so contentWindow.postMessage
++ * reaches that realm whatever the frame's position among the others; null
++ * while the frame has no window yet. */
++static JSValue
++qjs_xrealm_iframe_key(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct content *c;
++	struct browser_window *bw;
++	dom_node *n;
++	int i;
++	(void)this_val;
++	if (argc < 1 || !JS_IsObject(argv[0]))
++		return JS_NULL;
++	n = qjs_get_node(argv[0]);
++	c = qjs_get_content_for_ctx(ctx);
++	if (n == NULL || c == NULL || (c->handler == NULL || c->handler->type() != CONTENT_HTML))
++		return JS_NULL;
++	/* by the element each iframe window shows: a display:none frame
++	 * has no box to go through (hCaptcha's checkbox frame) */
++	bw = ((struct html_content *)c)->bw;
++	for (i = 0; bw != NULL && i < bw->iframe_count; i++) {
++		struct browser_window *w = bw->iframes[i];
++		if (w->iframe_node == n && w->jsheap != NULL &&
++		    w->jsheap->frame_key != NULL &&
++		    *w->jsheap->frame_key != '\0')
++			return JS_NewString(ctx, w->jsheap->frame_key);
++	}
++	return JS_NULL;
++}
++
+ /* __vitaPostMessageToIframe(frameLabel, jsonPayload) -- the parent realm
+  * delivering into a named child frame (frameLabel === "" targets the first
+  * iframe, matching the Phase-0 single-frame surface).  frameLabel is the
+@@ -3183,7 +3216,7 @@ qjs_xrealm_post_to_iframe(JSContext *ctx, JSValueConst this_val,
+ 		}
+ 	}
+ 	if (!sent && heap != NULL && c != NULL &&
+-			content_get_type(c) == CONTENT_HTML) {
++			(c->handler != NULL && c->handler->type() == CONTENT_HTML)) {
+ 		struct html_content *htmlc = (struct html_content *)c;
+ 		struct qjs_xrealm_iframes ifr;
+ 		int i;
+@@ -3228,7 +3261,7 @@ qjs_xrealm_iframe_doc_key(JSContext *ctx, JSValueConst this_val,
+ 	owner = qjs_owner_for_ctx(ctx);
+ 	c = owner != NULL ? owner->content : NULL;
+ 	if (owner == NULL || c == NULL ||
+-			content_get_type(c) != CONTENT_HTML)
++			(c->handler == NULL || c->handler->type() != CONTENT_HTML))
+ 		return ret;
+ 	memset(&ifr, 0, sizeof(ifr));
+ 	qjs_xrealm_layout_walk(((struct html_content *)c)->layout, 0, &ifr);
+@@ -3423,6 +3456,8 @@ void macsurf_qjs_xrealm_register(JSContext *ctx)
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_post_to_iframe,
+ 			"__vitaPostMessageToIframe", 2);
+ 	JS_SetPropertyStr(ctx, global, "__vitaPostMessageToIframe", f);
++	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_key, "__vitaIframeKey", 1);
++	JS_SetPropertyStr(ctx, global, "__vitaIframeKey", f);	/* 244 */
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_doc_key,
+ 			"__vitaIframeContentDocKey", 1);
+ 	JS_SetPropertyStr(ctx, global, "__vitaIframeContentDocKey", f);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -5006,6 +5006,11 @@
+ "\n"
+ "\t/* A shim window for the realm named `label`, living in THIS realm. */\n"
+ "\tfunction makeShim(label) {\n"
++"\t\t/* patch 244: label may be a function, asked at each send -- a\n"
++"\t\t * script-made frame's window (and key) appear after the page\n"
++"\t\t * first reads iframe.contentWindow */\n"
++"\t\tvar labelNow = typeof label === 'function' ? label : function () { return label; };\n"
++"\t\tif (typeof label === 'function') label = '';\n"
+ "\t\tvar w = {\n"
+ "\t\t\tclosed: false, name: label,\n"
+ "\t\t\touterWidth: 800, outerHeight: 600, innerWidth: 800, innerHeight: 600,\n"
+@@ -5027,7 +5032,7 @@
+ "\t\t\t\t * realm, so strings and objects both arrive as sent. */\n"
+ "\t\t\t\tvar data = JSON.stringify(msg === undefined ? null : msg);\n"
+ "\t\t\t\tif (frameKey === null && typeof __vitaPostMessageToIframe === 'function')\n"
+-"\t\t\t\t\treturn __vitaPostMessageToIframe(String(label), String(data));\n"
++"\t\t\t\t\treturn __vitaPostMessageToIframe(String(labelNow()), String(data));\n"
+ "\t\t\t\tif (frameKey !== null && typeof __vitaPostMessageToParent === 'function')\n"
+ "\t\t\t\t\treturn __vitaPostMessageToParent(String(data));\n"
+ "\t\t\t} catch (e) { /* drop, never throw */ }\n"
+@@ -5233,6 +5238,13 @@
+ "\t\t\tif (I && I !== Object.prototype) {\n"
+ "\t\t\t\tvar winCache = new WeakMap();\n"
+ "\t\t\t\tfunction labelOf(el) {\n"
++"\t\t\t\t\t/* patch 244: the key its own window was linked\n"
++"\t\t\t\t\t * with, when it has one */\n"
++"\t\t\t\t\tif (typeof __vitaIframeKey === 'function') {\n"
++"\t\t\t\t\t\tvar key = null;\n"
++"\t\t\t\t\t\ttry { key = __vitaIframeKey(el); } catch (e) { /* */ }\n"
++"\t\t\t\t\t\tif (key) return String(key);\n"
++"\t\t\t\t\t}\n"
+ "\t\t\t\t\tif (el && el.name) return String(el.name);\n"
+ "\t\t\t\t\ttry {\n"
+ "\t\t\t\t\t\tvar ifr = d0.querySelectorAll ? d0.querySelectorAll('iframe') : null;\n"
+@@ -5319,7 +5331,11 @@
+ "\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
+ "\t\t\t\t\t\t\t\tif (localFrame(this)) return localWindow(this);\n"
+ "\t\t\t\t\t\t\t\tvar w = winCache.get(this);\n"
+-"\t\t\t\t\t\t\t\tif (!w) { w = makeShim(labelOf(this)); winCache.set(this, w); }\n"
++"\t\t\t\t\t\t\t\tif (!w) {\n"
++"\t\t\t\t\t\t\t\t\tvar self = this;\n"
++"\t\t\t\t\t\t\t\t\tw = makeShim(function () { return labelOf(self); });\n"
++"\t\t\t\t\t\t\t\t\twinCache.set(this, w);\n"
++"\t\t\t\t\t\t\t\t}\n"
+ "\t\t\t\t\t\t\t\treturn w;\n"
+ "\t\t\t\t\t\t\t} catch (e) { return null; }\n"
+ "\t\t\t\t\t\t}\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -5005,6 +5005,11 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 
+ 	/* A shim window for the realm named `label`, living in THIS realm. */
+ 	function makeShim(label) {
++		/* patch 244: label may be a function, asked at each send -- a
++		 * script-made frame's window (and key) appear after the page
++		 * first reads iframe.contentWindow */
++		var labelNow = typeof label === 'function' ? label : function () { return label; };
++		if (typeof label === 'function') label = '';
+ 		var w = {
+ 			closed: false, name: label,
+ 			outerWidth: 800, outerHeight: 600, innerWidth: 800, innerHeight: 600,
+@@ -5026,7 +5031,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				 * realm, so strings and objects both arrive as sent. */
+ 				var data = JSON.stringify(msg === undefined ? null : msg);
+ 				if (frameKey === null && typeof __vitaPostMessageToIframe === 'function')
+-					return __vitaPostMessageToIframe(String(label), String(data));
++					return __vitaPostMessageToIframe(String(labelNow()), String(data));
+ 				if (frameKey !== null && typeof __vitaPostMessageToParent === 'function')
+ 					return __vitaPostMessageToParent(String(data));
+ 			} catch (e) { /* drop, never throw */ }
+@@ -5232,6 +5237,13 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			if (I && I !== Object.prototype) {
+ 				var winCache = new WeakMap();
+ 				function labelOf(el) {
++					/* patch 244: the key its own window was linked
++					 * with, when it has one */
++					if (typeof __vitaIframeKey === 'function') {
++						var key = null;
++						try { key = __vitaIframeKey(el); } catch (e) { /* */ }
++						if (key) return String(key);
++					}
+ 					if (el && el.name) return String(el.name);
+ 					try {
+ 						var ifr = d0.querySelectorAll ? d0.querySelectorAll('iframe') : null;
+@@ -5318,7 +5330,11 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
+ 								if (localFrame(this)) return localWindow(this);
+ 								var w = winCache.get(this);
+-								if (!w) { w = makeShim(labelOf(this)); winCache.set(this, w); }
++								if (!w) {
++									var self = this;
++									w = makeShim(function () { return labelOf(self); });
++									winCache.set(this, w);
++								}
+ 								return w;
+ 							} catch (e) { return null; }
+ 						}
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -93,6 +93,8 @@ struct browser_fetch_parameters {
+ /**
+  * Browser window data.
+  */
++struct dom_node;
++
+ struct browser_window {
+ 	/**
+ 	 * Content handle of page currently displayed which must have
+@@ -245,9 +247,16 @@ struct browser_window {
+ 	struct browser_window *children;
+ 	struct browser_window *parent;
+ 
+-	/** [iframe_count] iframes */
++	/** [iframe_count] iframes, each allocated on its own: the array
++	 * grows when a script adds a cross-origin iframe (VitaBrowser
++	 * patch 244) without moving a live window */
+ 	int iframe_count;
+-	struct browser_window *iframes;
++	struct browser_window **iframes;
++	/** the <iframe> element an iframe window shows (a reference): windows
++	 * are re-linked to the rebuilt box tree by it (patch 244) */
++	struct dom_node *iframe_node;
++	/** a window for a frame a script made (patch 244: capped per page) */
++	bool script_made;
+ 
+ 	/** browser window child of root browser window which has input focus */
+ 	struct browser_window *focus;
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -385,7 +385,7 @@ static bool browser_window_check_throbber(struct browser_window *bw)
+ 
+ 	if (bw->iframes) {
+ 		for (index = 0; index < bw->iframe_count; index++) {
+-			if (browser_window_check_throbber(&bw->iframes[index]))
++			if (browser_window_check_throbber(bw->iframes[index]))
+ 				return true;
+ 		}
+ 	}
+@@ -1680,6 +1680,14 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			}
+ 		}
+ 		res = browser_window_content_done(bw);
++		/* VitaBrowser patch 244: an iframe's page is done -- its
++		 * element's `load` in the parent page (script-made frames are
++		 * waited on that way, as are parsed ones) */
++		if (bw->browser_window_type == BROWSER_WINDOW_IFRAME &&
++		    bw->iframe_node != NULL && bw->parent != NULL &&
++		    bw->parent->current_content != NULL)
++			html_iframe_loaded(bw->parent->current_content,
++					   bw->iframe_node);
+ 		break;
+ 
+ 	case CONTENT_MSG_ERROR:
+@@ -2150,7 +2158,7 @@ browser_window_set_scale_internal(struct browser_window *bw, float scale)
+ 
+ 	/* scale iframes */
+ 	for (i = 0; i < bw->iframe_count; i++) {
+-		res = browser_window_set_scale_internal(&bw->iframes[i], scale);
++		res = browser_window_set_scale_internal(bw->iframes[i], scale);
+ 	}
+ 
+ 	return res;
+@@ -2210,7 +2218,7 @@ browser_window_find_target_internal(struct browser_window *bw,
+ 
+ 	if (bw->iframes != NULL) {
+ 		for (i = 0; i < bw->iframe_count; i++) {
+-			browser_window_find_target_internal(&bw->iframes[i],
++			browser_window_find_target_internal(bw->iframes[i],
+ 							    target,
+ 							    depth,
+ 							    page,
+@@ -2936,7 +2944,11 @@ browser_window_redraw(struct browser_window *bw,
+ 	data.width = width;
+ 	data.height = height;
+ 
+-	data.background_colour = 0xFFFFFF;
++	/* VitaBrowser patch 244: an iframe is transparent where its page sets
++	 * no background (html_redraw then fills nothing) */
++	data.background_colour =
++		bw->browser_window_type == BROWSER_WINDOW_IFRAME ?
++		NS_TRANSPARENT : 0xFFFFFF;
+ 	data.scale = bw->scale;
+ 	data.repeat_x = false;
+ 	data.repeat_y = false;
+@@ -4410,7 +4422,7 @@ void browser_window_stop(struct browser_window *bw)
+ 	if (bw->iframes) {
+ 		children = bw->iframe_count;
+ 		for (index = 0; index < children; index++)
+-			browser_window_stop(&bw->iframes[index]);
++			browser_window_stop(bw->iframes[index]);
+ 	}
+ 
+ 	if (bw->current_content != NULL) {
+diff --git a/desktop/frames.c b/desktop/frames.c
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -25,17 +25,23 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdlib.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <time.h>
+ #include <math.h>
+ 
+ #include "utils/log.h"
+ #include "utils/utils.h"
++#include "utils/nsurl.h"
++#include "netsurf/misc.h"
++#include "desktop/gui_internal.h"
++#include <dom/dom.h>
+ #include "netsurf/content.h"
+ #include "content/hlcache.h"
+ #include "html/html.h"
+ #include "html/box.h"
+ #include "html/box_inspect.h"
++#include "html/html_save.h"
+ 
+ #include "desktop/browser_private.h"
+ #include "desktop/frames.h"
+@@ -62,7 +68,10 @@ void browser_window_scroll_callback(void *client_data,
+ 	switch(scrollbar_data->msg) {
+ 	case SCROLLBAR_MSG_MOVED:
+ 		if (bw->browser_window_type == BROWSER_WINDOW_IFRAME) {
+-			html_redraw_a_box(bw->parent->current_content, bw->box);
++			/* patch 244: an iframe window can be without a box */
++			if (bw->box != NULL)
++				html_redraw_a_box(bw->parent->current_content,
++						  bw->box);
+ 		} else {
+ 			struct rect rect;
+ 
+@@ -199,13 +208,86 @@ nserror browser_window_invalidate_iframe(struct browser_window *bw)
+ 	return NSERROR_OK;
+ }
+ 
++/**
++ * Set up one iframe window for iframe record cur of bw's content
++ * (VitaBrowser patch 244: shared by the windows made when the page is ready
++ * and those made for iframes a script adds later). key names the frame's
++ * realm for the cross-realm bridge: the iframe's name, else a page-unique
++ * key.
++ */
++static nserror
++browser_window_iframe_setup(struct browser_window *bw,
++			    struct browser_window *window,
++			    struct content_html_iframe *cur,
++			    const char *key)
++{
++	struct rect rect;
++
++	/* Initialise common parts */
++	browser_window_initialise_common(BW_CREATE_NONE, window, NULL);
++
++	/* window characteristics */
++	window->browser_window_type = BROWSER_WINDOW_IFRAME;
++	window->scrolling = cur->scrolling;
++	window->border = cur->border;
++	window->border_colour = cur->border_colour;
++	window->no_resize = true;
++	window->margin_width = cur->margin_width;
++	window->margin_height = cur->margin_height;
++	window->scale = bw->scale;
++	if (cur->name != NULL) {
++		window->name = strdup(cur->name);
++		if (window->name == NULL)
++			return NSERROR_NOMEM;
++	}
++
++	/* linking: the box, and the element it is for (patch 244) */
++	window->box = cur->box;
++	window->parent = bw;
++	window->box->iframe = window;
++	window->iframe_node = NULL;
++	if (cur->box->node != NULL)
++		window->iframe_node = dom_node_ref(cur->box->node);
++
++	/* Cross-realm frame bridge: link this iframe realm to its
++	 * parent's realm (window.parent / postMessage).  Degrades
++	 * gracefully if the parent has no JS heap. */
++#ifdef WITH_QUICKJS
++	js_link_frame_heaps(window->jsheap, bw->jsheap, key);
++#else
++	(void) key;
++#endif
++
++	/* iframe dimensions */
++	box_bounds(window->box, &rect);
++
++	browser_window_set_position(window, rect.x0, rect.y0);
++	browser_window_set_dimensions(window, rect.x1 - rect.x0,
++			rect.y1 - rect.y0);
++	return NSERROR_OK;
++}
++
++/** One iframe window, freed (patch 244: each is allocated on its own). */
++static void browser_window_iframe_free(struct browser_window *window)
++{
++	if (window->box != NULL) {
++		window->box->iframe = NULL;
++		window->box = NULL;
++	}
++	browser_window_destroy_internal(window);
++	if (window->iframe_node != NULL) {
++		dom_node_unref(window->iframe_node);
++		window->iframe_node = NULL;
++	}
++	free(window);
++}
++
+ /* exported function documented in desktop/frames.h */
+ nserror browser_window_create_iframes(struct browser_window *bw)
+ {
+ 	nserror ret = NSERROR_OK;
+ 	struct browser_window *window;
+ 	struct content_html_iframe *cur;
+-	struct rect rect;
+ 	int iframes = 0;
+ 	int index;
+ 	struct content_html_iframe *iframe;
+@@ -229,58 +311,25 @@ nserror browser_window_create_iframes(struct browser_window *bw)
+ 	for (cur = iframe; cur; cur = cur->next) {
+ 		iframes++;
+ 	}
+-	bw->iframes = calloc(iframes, sizeof(*bw));
++	bw->iframes = calloc(iframes, sizeof(*bw->iframes));
+ 	if (!bw->iframes) {
+ 		return NSERROR_NOMEM;
+ 	}
+-	bw->iframe_count = iframes;
+ 
+ 	index = 0;
+ 	for (cur = iframe; cur; cur = cur->next) {
+-		window = &(bw->iframes[index++]);
+-
+-		/* Initialise common parts */
+-		browser_window_initialise_common(BW_CREATE_NONE,
+-				window, NULL);
+-
+-		/* window characteristics */
+-		window->browser_window_type = BROWSER_WINDOW_IFRAME;
+-		window->scrolling = cur->scrolling;
+-		window->border = cur->border;
+-		window->border_colour = cur->border_colour;
+-		window->no_resize = true;
+-		window->margin_width = cur->margin_width;
+-		window->margin_height = cur->margin_height;
+-		window->scale = bw->scale;
+-		if (cur->name != NULL) {
+-			window->name = strdup(cur->name);
+-			if (window->name == NULL) {
+-				free(bw->iframes) ;
+-				bw->iframes = 0;
+-				bw->iframe_count = 0;
+-				return NSERROR_NOMEM;
+-			}
++		window = calloc(1, sizeof(*window));
++		if (window == NULL ||
++		    browser_window_iframe_setup(bw, window, cur,
++				cur->name != NULL ? cur->name : "") !=
++				NSERROR_OK) {
++			if (window != NULL)
++				browser_window_iframe_free(window);
++			browser_window_destroy_iframes(bw);
++			return NSERROR_NOMEM;
+ 		}
+-
+-		/* linking */
+-		window->box = cur->box;
+-		window->parent = bw;
+-		window->box->iframe = window;
+-
+-		/* Cross-realm frame bridge: link this iframe realm to its
+-		 * parent's realm (window.parent / postMessage).  Degrades
+-		 * gracefully if the parent has no JS heap. */
+-#ifdef WITH_QUICKJS
+-		js_link_frame_heaps(window->jsheap, bw->jsheap,
+-				window->name != NULL ? window->name : "");
+-#endif
+-
+-		/* iframe dimensions */
+-		box_bounds(window->box, &rect);
+-
+-		browser_window_set_position(window, rect.x0, rect.y0);
+-		browser_window_set_dimensions(window, rect.x1 - rect.x0,
+-				rect.y1 - rect.y0);
++		bw->iframes[index++] = window;
++		bw->iframe_count = index;
+ 	}
+ 
+ 	/* calculate dimensions */
+@@ -289,7 +338,7 @@ nserror browser_window_create_iframes(struct browser_window *bw)
+ 
+ 	index = 0;
+ 	for (cur = iframe; cur; cur = cur->next) {
+-		window = &(bw->iframes[index++]);
++		window = bw->iframes[index++];
+ 		if (cur->url) {
+ 			/* fetch iframe's content */
+ 			ret = browser_window_navigate(window,
+@@ -306,49 +355,289 @@ nserror browser_window_create_iframes(struct browser_window *bw)
+ }
+ 
+ 
++/** VitaBrowser patch 244: at most this many windows for script-made
++ * frames per page (each is a page and a realm: the Vita's memory). */
++#define SCRIPT_FRAMES_MAX 8
++
++/** Is node shown by one of bw's iframe windows already? */
++static bool browser_window_has_iframe_node(struct browser_window *bw,
++					   struct dom_node *node)
++{
++	int i;
++
++	for (i = 0; i < bw->iframe_count; i++)
++		if (bw->iframes[i]->iframe_node == node)
++			return true;
++	return false;
++}
++
++/**
++ * VitaBrowser patch 244: a window for an iframe element with no box -- a
++ * display:none frame, which browsers load all the same (hCaptcha's
++ * invisible checkbox frame). It gets a browser's default iframe size.
++ */
++static nserror
++browser_window_iframe_setup_boxless(struct browser_window *bw,
++				    struct browser_window *window,
++				    struct dom_node *node, const char *key)
++{
++	browser_window_initialise_common(BW_CREATE_NONE, window, NULL);
++	window->browser_window_type = BROWSER_WINDOW_IFRAME;
++	window->scrolling = BW_SCROLLING_AUTO;
++	window->border = false;
++	window->no_resize = true;
++	window->scale = bw->scale;
++	window->box = NULL;
++	window->parent = bw;
++	window->iframe_node = dom_node_ref(node);
++#ifdef WITH_QUICKJS
++	js_link_frame_heaps(window->jsheap, bw->jsheap, key);
++#else
++	(void) key;
++#endif
++	browser_window_set_position(window, 0, 0);
++	browser_window_set_dimensions(window, 300, 150);
++	return NSERROR_OK;
++}
++
++/** Add window to bw's iframe windows; false (window freed) on failure. */
++static bool browser_window_iframe_add(struct browser_window *bw,
++				      struct browser_window *window)
++{
++	struct browser_window **grown = realloc(bw->iframes,
++			(bw->iframe_count + 1) * sizeof(*grown));
++
++	if (grown == NULL) {
++		browser_window_iframe_free(window);
++		return false;
++	}
++	bw->iframes = grown;
++	bw->iframes[bw->iframe_count++] = window;
++	return true;
++}
++
++/**
++ * VitaBrowser patch 244: does iframe record cur have no window yet, and is
++ * it one to load? The windows made when the page was ready cover every
++ * iframe the parser found; a record without one is an iframe a script
++ * inserted (the box tree was rebuilt with it). Only cross-origin ones are
++ * loaded here: a same-origin or blank script-made frame keeps patch 143's
++ * window in the page's own realm (google's sign-in evaluates into it), and
++ * loading it again in a realm of its own would run it twice.
++ */
++static bool
++browser_window_iframe_is_new(struct browser_window *bw,
++			     struct content_html_iframe *cur)
++{
++	int i;
++
++	if (cur->box == NULL || cur->box->node == NULL || cur->url == NULL)
++		return false;
++	for (i = 0; i < bw->iframe_count; i++)
++		if (bw->iframes[i]->iframe_node == cur->box->node)
++			return false;
++	return !nsurl_compare(cur->url,
++			hlcache_handle_get_url(bw->current_content),
++			NSURL_SCHEME | NSURL_HOST | NSURL_PORT);
++}
++
++/**
++ * VitaBrowser patch 244: make and load windows for iframes a script added
++ * (scheduled from browser_window_recalculate_iframes: not navigating from
++ * inside the reformat that found them).
++ */
++static void browser_window_sync_iframes(void *p)
++{
++	struct browser_window *bw = p;
++	struct content_html_iframe *cur;
++	static unsigned int seq;
++	unsigned int made = 0;
++	int i;
++
++	if (bw->current_content == NULL ||
++	    content_get_type(bw->current_content) != CONTENT_HTML)
++		return;
++	for (i = 0; i < bw->iframe_count; i++)
++		if (bw->iframes[i]->script_made)
++			made++;
++	/* iframe records (frames with a box) */
++	for (cur = html_get_iframe(bw->current_content); cur != NULL;
++	     cur = cur->next) {
++		struct browser_window *window;
++		char key[32];
++
++		if (!browser_window_iframe_is_new(bw, cur))
++			continue;
++		if (made >= SCRIPT_FRAMES_MAX)
++			break;
++		window = calloc(1, sizeof(*window));
++		if (window == NULL)
++			return;
++		snprintf(key, sizeof(key), "vbframe-%u", ++seq);
++		if (browser_window_iframe_setup(bw, window, cur,
++				cur->name != NULL && *cur->name != '\0' ?
++				cur->name : key) != NSERROR_OK) {
++			browser_window_iframe_free(window);
++			return;
++		}
++		window->script_made = true;
++		if (!browser_window_iframe_add(bw, window))
++			return;
++		made++;
++		NSLOG(netsurf, INFO, "script-made iframe %s as %s",
++		      nsurl_access(cur->url), key);
++		browser_window_navigate(window, cur->url,
++				hlcache_handle_get_url(bw->current_content),
++				BW_NAVIGATE_UNVERIFIABLE, NULL, NULL,
++				bw->current_content);
++	}
++	/* iframe elements with no record: display:none frames */
++	{
++		dom_document *doc = html_get_document(bw->current_content);
++		nsurl *base = html_get_base_url(bw->current_content);
++		dom_string *tag = NULL, *srcname = NULL, *namename = NULL;
++		dom_nodelist *list = NULL;
++		uint32_t n = 0, k;
++
++		if (doc == NULL || base == NULL ||
++		    dom_string_create((const uint8_t *)"iframe", 6, &tag) !=
++				DOM_NO_ERR ||
++		    dom_string_create((const uint8_t *)"src", 3, &srcname) !=
++				DOM_NO_ERR ||
++		    dom_string_create((const uint8_t *)"name", 4, &namename) !=
++				DOM_NO_ERR ||
++		    dom_document_get_elements_by_tag_name(doc, tag, &list) !=
++				DOM_NO_ERR || list == NULL ||
++		    dom_nodelist_get_length(list, &n) != DOM_NO_ERR)
++			n = 0;
++		for (k = 0; k < n && made < SCRIPT_FRAMES_MAX; k++) {
++			dom_node *node = NULL;
++			dom_string *src = NULL, *name = NULL;
++			nsurl *url = NULL;
++			struct browser_window *window;
++			char key[32];
++
++			if (dom_nodelist_item(list, k, &node) != DOM_NO_ERR ||
++			    node == NULL)
++				continue;
++			if (browser_window_has_iframe_node(bw, node))
++				goto next;
++			for (cur = html_get_iframe(bw->current_content);
++			     cur != NULL; cur = cur->next)
++				if (cur->box != NULL && cur->box->node == node)
++					break;
++			if (cur != NULL)
++				goto next;	/* has a record: handled above */
++			if (dom_element_get_attribute((dom_element *)node,
++					srcname, &src) != DOM_NO_ERR ||
++			    src == NULL || dom_string_length(src) == 0 ||
++			    nsurl_join(base, dom_string_data(src), &url) !=
++					NSERROR_OK)
++				goto next;
++			if (nsurl_compare(url,
++					hlcache_handle_get_url(bw->current_content),
++					NSURL_SCHEME | NSURL_HOST | NSURL_PORT))
++				goto next;	/* same origin: patch 143's */
++			{
++				lwc_string *scheme = nsurl_get_component(url,
++						NSURL_SCHEME);
++				bool http = scheme != NULL &&
++					(lwc_string_length(scheme) == 4 ||
++					 lwc_string_length(scheme) == 5) &&
++					strncmp(lwc_string_data(scheme), "http",
++						4) == 0;
++				if (scheme != NULL)
++					lwc_string_unref(scheme);
++				if (!http)
++					goto next;
++			}
++			window = calloc(1, sizeof(*window));
++			if (window == NULL)
++				goto next;
++			snprintf(key, sizeof(key), "vbframe-%u", ++seq);
++			dom_element_get_attribute((dom_element *)node,
++					namename, &name);
++			if (name != NULL && dom_string_length(name) > 0) {
++				window->name = strdup(dom_string_data(name));
++			}
++			browser_window_iframe_setup_boxless(bw, window, node,
++				window->name != NULL ? window->name : key);
++			window->script_made = true;
++			if (browser_window_iframe_add(bw, window)) {
++				made++;
++				NSLOG(netsurf, INFO, "script-made iframe "
++				      "(no box) %s as %s", nsurl_access(url),
++				      key);
++				browser_window_navigate(window, url,
++					hlcache_handle_get_url(bw->current_content),
++					BW_NAVIGATE_UNVERIFIABLE, NULL, NULL,
++					bw->current_content);
++			}
++		next:
++			if (url != NULL)
++				nsurl_unref(url);
++			if (src != NULL)
++				dom_string_unref(src);
++			if (name != NULL)
++				dom_string_unref(name);
++			dom_node_unref(node);
++		}
++		if (list != NULL)
++			dom_nodelist_unref(list);
++		if (tag != NULL)
++			dom_string_unref(tag);
++		if (srcname != NULL)
++			dom_string_unref(srcname);
++		if (namename != NULL)
++			dom_string_unref(namename);
++	}
++	browser_window_update_extent(bw);
++}
++
++
+ /* exported function documented in desktop/frames.h */
+ void browser_window_recalculate_iframes(struct browser_window *bw)
+ {
+ 	struct browser_window *window;
+ 	int index;
++	bool fresh = false;
+ 
+ 	/* fixes905 (MacSurf) - RE-LINK each iframe window to its box in the
+-	 * parent's CURRENT box tree before anything touches window->box.
+-	 *
+-	 * window->box is set ONCE, at browser_window_create_iframes, and NULLed
+-	 * only at destroy. But a reconvert rebuilds the parent's box tree from the
+-	 * (JS-mutated) DOM -- freeing the OLD iframe boxes and creating new ones --
+-	 * without re-running create_iframes. window->box then dangles at a freed
+-	 * box, and browser_window_invalidate_iframe -> html_redraw_a_box ->
+-	 * box_coords walks that freed box's parent chain (observed wild ptr
+-	 * 0x40408200, well below the app heap) -> crash. The reconvert rebuilt the
+-	 * content's iframe list (html_get_iframe) with the NEW boxes, in the same
+-	 * DOM order create_iframes consumed, so re-point each window at its new box
+-	 * and fix the box->iframe backlink. This runs on every CONTENT_MSG_REFORMAT,
+-	 * so a reconvert's reformat re-links before any later iframe redraw. */
+-	if (bw->iframes != NULL && bw->iframe_count > 0 &&
+-			bw->current_content != NULL &&
+-			content_get_type(bw->current_content) == CONTENT_HTML) {
+-		struct content_html_iframe *cur =
+-				html_get_iframe(bw->current_content);
+-		index = 0;
+-		while (cur != NULL && index < bw->iframe_count) {
+-			window = &(bw->iframes[index]);
+-			if (window->box != cur->box) {
++	 * parent's CURRENT box tree before anything touches window->box: a
++	 * reconvert rebuilds the box tree from the (JS-mutated) DOM, freeing
++	 * the old iframe boxes, without re-running create_iframes, and a stale
++	 * window->box crashed in box_coords. VitaBrowser patch 244: matched by
++	 * the window's <iframe> element, not by position -- an iframe a script
++	 * inserts before the others shifted every window onto the wrong box --
++	 * and a window whose element has no box now gets NULL. */
++	if (bw->current_content != NULL &&
++	    content_get_type(bw->current_content) == CONTENT_HTML) {
++		struct content_html_iframe *list =
++				html_get_iframe(bw->current_content), *cur;
++		for (index = 0; index < bw->iframe_count; index++) {
++			window = bw->iframes[index];
++			for (cur = list; cur != NULL; cur = cur->next)
++				if (cur->box != NULL &&
++				    cur->box->node == window->iframe_node)
++					break;
++			if (cur == NULL) {
++				window->box = NULL;
++			} else if (window->box != cur->box) {
+ 				window->box = cur->box;
+-				if (cur->box != NULL) {
+-					cur->box->iframe = window;
+-				}
++				cur->box->iframe = window;
+ 			}
+-			cur = cur->next;
+-			index++;
+ 		}
++		for (cur = list; cur != NULL && !fresh; cur = cur->next)
++			fresh = browser_window_iframe_is_new(bw, cur);
++		if (html_iframe_sync_wanted(bw->current_content))
++			fresh = true;
++		if (fresh)
++			guit->misc->schedule(0, browser_window_sync_iframes, bw);
+ 	}
+ 
+ 	for (index = 0; index < bw->iframe_count; index++) {
+-		window = &(bw->iframes[index]);
+-
+-		if (window != NULL) {
++		window = bw->iframes[index];
++		if (window != NULL && window->box != NULL) {
+ 			browser_window_handle_scrollbars(window);
+ 		}
+ 	}
+@@ -360,14 +649,11 @@ nserror browser_window_destroy_iframes(struct browser_window *bw)
+ {
+ 	int i;
+ 
++	/* patch 244: a sync scheduled for this window must not run after */
++	guit->misc->schedule(-1, browser_window_sync_iframes, bw);
+ 	if (bw->iframes != NULL) {
+-		for (i = 0; i < bw->iframe_count; i++) {
+-			if (bw->iframes[i].box != NULL) {
+-				bw->iframes[i].box->iframe = NULL;
+-				bw->iframes[i].box = NULL;
+-			}
+-			browser_window_destroy_internal(&bw->iframes[i]);
+-		}
++		for (i = 0; i < bw->iframe_count; i++)
++			browser_window_iframe_free(bw->iframes[i]);
+ 		free(bw->iframes);
+ 		bw->iframes = NULL;
+ 		bw->iframe_count = 0;
+@@ -1088,7 +1374,7 @@ static bool browser_window_resize_frames(struct browser_window *bw,
+ 	}
+ 	if (bw->iframes) {
+ 		for (i = 0; i < bw->iframe_count; i++)
+-			if (browser_window_resize_frames(&bw->iframes[i],
++			if (browser_window_resize_frames(bw->iframes[i],
+ 					mouse, x, y, pointer))
+ 				return true;
+ 	}
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -164,6 +164,28 @@ bool vita_js_dialog_auto;
+  * document already replaced, an iframe still loading) gets no window, so a
+  * stale realm can never steer the page that replaced it.
+  */
++/** VitaBrowser patch 244: the window under root (root itself, or one of
++ * its iframe windows, at any depth) loading or showing c. */
++static struct browser_window *window_with(struct browser_window *root,
++					  struct content *c)
++{
++	int i;
++
++	if (root == NULL)
++		return NULL;
++	if ((root->loading_content != NULL &&
++	     hlcache_handle_get_content(root->loading_content) == c) ||
++	    (root->current_content != NULL &&
++	     hlcache_handle_get_content(root->current_content) == c))
++		return root;
++	for (i = 0; i < root->iframe_count; i++) {
++		struct browser_window *w = window_with(root->iframes[i], c);
++		if (w != NULL)
++			return w;
++	}
++	return NULL;
++}
++
+ static struct browser_window *window_for(struct content *c)
+ {
+ 	struct browser_window *bw =
+@@ -176,13 +198,10 @@ static struct browser_window *window_for(struct content *c)
+ 		return NULL;
+ 	if (htmlc->bw != NULL)
+ 		return htmlc->bw;
+-	if (bw != NULL && bw->loading_content != NULL &&
+-	    hlcache_handle_get_content(bw->loading_content) == c)
+-		return bw;
+-	if (bw != NULL && bw->current_content != NULL &&
+-	    hlcache_handle_get_content(bw->current_content) == c)
+-		return bw;
+-	return NULL;
++	/* patch 244: a frame's document while it loads -- it has no bw of its
++	 * own yet, and its fragment (hCaptcha's #frame=...&id=...) lives on
++	 * its iframe window */
++	return window_with(bw, c);
+ }
+ 
+ /*

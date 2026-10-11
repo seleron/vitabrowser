@@ -1,0 +1,484 @@
+# netsurf: download progress strip, rate/ETA, a Downloads page with cancel (patch 245, WIP, unbuilt-verified only: compiles; not gated). Base: 243 + wip/244.
+#
+diff --git a/frontends/vita/chrome.c b/frontends/vita/chrome.c
+--- a/frontends/vita/chrome.c
++++ b/frontends/vita/chrome.c
+@@ -207,11 +207,24 @@ static bool visit_entry(nsurl *url, const struct url_data *d)
+ 
+ 	if (d->visits == 0 || d->last_visit == 0)
+ 		return true;
+-	/* Not our own pages (home, history, downloads), nor about:. */
++	/* Not our own pages (home, history, downloads), nor about:, nor the
++	 * listener's settings / downloads pages (patch 245: browser chrome,
++	 * as Chrome keeps chrome:// pages out of history). */
+ 	if (strncmp(s, "file:///" VITA_DIAG_DIR,
+ 		    sizeof("file:///" VITA_DIAG_DIR) - 1) == 0 ||
+ 	    strncmp(s, "about:", 6) == 0)
+ 		return true;
++	{
++		char own[48];
++		size_t ol = (size_t)snprintf(own, sizeof(own),
++				"http://127.0.0.1:%d/", vita_remote_port());
++		if (strncmp(s, own, ol) == 0 &&
++		    (strncmp(s + ol, VITA_SETTINGS_PATH + 1,
++			     sizeof(VITA_SETTINGS_PATH) - 2) == 0 ||
++		     strncmp(s + ol, VITA_DOWNLOADS_PATH + 1,
++			     sizeof(VITA_DOWNLOADS_PATH) - 2) == 0))
++			return true;
++	}
+ 	if (visits.n == visits.cap) {
+ 		unsigned int cap = visits.cap ? visits.cap * 2 : 64;
+ 		struct visit *nv = realloc(visits.v, cap * sizeof(*nv));
+@@ -577,6 +590,9 @@ nserror vita_chrome_write_home(const char *const *test_pages, unsigned int n)
+ 	/* patch 241: the settings page, served by this device's listener */
+ 	fprintf(fp, " <a href=\"http://127.0.0.1:%d" VITA_SETTINGS_PATH
+ 		"\">Settings</a>.", vita_remote_port());
++	/* patch 245: downloads, with progress and cancel */
++	fprintf(fp, " <a href=\"http://127.0.0.1:%d" VITA_DOWNLOADS_PATH
++		"\">Downloads</a>.", vita_remote_port());
+ 	if (vita_remote_address() != NULL) {
+ 		fputs(" From a phone or PC on the same Wi-Fi: <b>http://", fp);
+ 		put_escaped(fp, vita_remote_address(), 64);
+diff --git a/frontends/vita/download.c b/frontends/vita/download.c
+--- a/frontends/vita/download.c
++++ b/frontends/vita/download.c
+@@ -56,8 +56,74 @@ struct gui_download_window {
+ 	char path[256];
+ 	unsigned long long got, total;
+ 	unsigned int last_ms;
++	/* patch 245: the downloads page and the progress bar */
++	unsigned int id;		/**< page-unique, for "cancel" */
++	unsigned int start_ms;
++	unsigned long long rate;	/**< bytes per second, smoothed */
++	unsigned long long rate_got;	/**< got at the last rate sample */
++	unsigned int rate_ms;
++	struct gui_download_window *next;	/**< the active list */
+ };
+ 
++/* patch 245: the downloads in progress, and the last ones that ended */
++static struct gui_download_window *active;
++static unsigned int next_id;
++#define RECENT_MAX 8
++static struct {
++	char name[128];
++	char path[256];
++	unsigned long long size;
++	char result[64];		/**< "saved", "failed: ...", "cancelled" */
++} recent[RECENT_MAX];
++static unsigned int recent_n;
++
++static void list_remove(struct gui_download_window *dw)
++{
++	struct gui_download_window **pp;
++
++	for (pp = &active; *pp != NULL; pp = &(*pp)->next)
++		if (*pp == dw) {
++			*pp = dw->next;
++			return;
++		}
++}
++
++static void remember(struct gui_download_window *dw, const char *result)
++{
++	unsigned int i;
++
++	for (i = (recent_n < RECENT_MAX ? recent_n : RECENT_MAX - 1); i > 0; i--)
++		recent[i] = recent[i - 1];
++	snprintf(recent[0].name, sizeof(recent[0].name), "%s", dw->name);
++	snprintf(recent[0].path, sizeof(recent[0].path), "%s", dw->path);
++	recent[0].size = dw->got;
++	snprintf(recent[0].result, sizeof(recent[0].result), "%s", result);
++	if (recent_n < RECENT_MAX)
++		recent_n++;
++}
++
++/* "1.2 MB/s", "340 KB/s" */
++static void fmt_rate(char *out, size_t max, unsigned long long r)
++{
++	if (r >= 1024 * 1024)
++		snprintf(out, max, "%llu.%llu MB/s", r / (1024 * 1024),
++			 (r % (1024 * 1024)) * 10 / (1024 * 1024));
++	else
++		snprintf(out, max, "%llu KB/s", r / 1024);
++}
++
++/* the time left, "0:42", or "" when it cannot be told */
++static void fmt_eta(char *out, size_t max, const struct gui_download_window *dw)
++{
++	unsigned long long s;
++
++	out[0] = '\0';
++	if (dw->total == 0 || dw->rate == 0 || dw->got >= dw->total)
++		return;
++	s = (dw->total - dw->got) / dw->rate;
++	snprintf(out, max, "%llu:%02llu", s / 60, s % 60);
++}
++
+ /* Where a download may go, in order. Every VitaBrowser VPK is a safe
+  * eboot (vita-make-fself -s), and a safe app is kept out of most of ux0::
+  * sceIoMkdir("ux0:download") fails and the fopen gets ENOENT (hardware
+@@ -176,8 +242,12 @@ vita_download_create(download_context *ctx, struct gui_window *parent)
+ 	vita_diag_log("download: %s -> %s (%llu bytes, %s)",
+ 		      url != NULL ? nsurl_access(url) : "?", dw->path,
+ 		      dw->total, download_context_get_mime_type(ctx));
+-	vita_show_message(0, "downloading %s...", dw->name);
++	vita_show_message(2000, "downloading %s...", dw->name);
+ 	dw->last_ms = vita_diag_ms();
++	dw->start_ms = dw->rate_ms = dw->last_ms;
++	dw->id = ++next_id;
++	dw->next = active;
++	active = dw;
+ 	return dw;
+ }
+ 
+@@ -195,15 +265,22 @@ static nserror vita_download_data(struct gui_download_window *dw,
+ 	}
+ 	dw->got += size;
+ 	now = vita_diag_ms();
++	if (now - dw->rate_ms >= 1000) {
++		/* patch 245: the rate, smoothed over about four seconds */
++		unsigned long long r = (dw->got - dw->rate_got) * 1000 /
++			(now - dw->rate_ms);
++		dw->rate = dw->rate == 0 ? r : (dw->rate * 3 + r) / 4;
++		dw->rate_got = dw->got;
++		dw->rate_ms = now;
++	}
+ 	if (now - dw->last_ms >= 500) {
++		/* patch 245: the progress strip (vita/main.c) shows it --
++		 * the message box in mid-screen stayed over the page for the
++		 * whole download */
+ 		dw->last_ms = now;
+-		if (dw->total > 0)
+-			vita_show_message(0, "downloading %s: %llu%% (%llu KiB)",
+-				     dw->name, dw->got * 100 / dw->total,
+-				     dw->got / 1024);
+-		else
+-			vita_show_message(0, "downloading %s: %llu KiB", dw->name,
+-				     dw->got / 1024);
++		vita_download_overlay_changed();
++		vita_diag_log("download: %s %llu/%llu bytes, %llu B/s",
++			      dw->name, dw->got, dw->total, dw->rate);
+ 	}
+ 	return NSERROR_OK;
+ }
+@@ -221,6 +298,13 @@ static void vita_download_error(struct gui_download_window *dw,
+ 	vita_diag_log("download: %s failed: %s", dw->path,
+ 		      msg != NULL ? msg : "?");
+ 	vita_show_message(5000, "download failed: %s", msg != NULL ? msg : "?");
++	list_remove(dw);
++	vita_download_overlay_changed();
++	{
++		char r[64];
++		snprintf(r, sizeof(r), "failed: %.50s", msg != NULL ? msg : "?");
++		remember(dw, r);
++	}
+ 	free(dw);
+ }
+ 
+@@ -235,9 +319,133 @@ static void vita_download_done(struct gui_download_window *dw)
+ 		 dw->path);
+ 	vita_diag_log("download: saved %s (%llu bytes)", dw->path, dw->got);
+ 	vita_show_message(5000, "saved %s", dw->path);
++	list_remove(dw);
++	vita_download_overlay_changed();
++	remember(dw, "saved");
+ 	free(dw);
+ }
+ 
++/* exported interface documented in vita/download.h */
++bool vita_download_progress(char *name, size_t max, unsigned int *permille,
++			    char *detail, size_t dmax)
++{
++	struct gui_download_window *dw = active;
++	char rate[24], eta[32];
++	unsigned int n = 0;
++
++	if (dw == NULL)
++		return false;
++	for (; dw != NULL; dw = dw->next)
++		n++;
++	dw = active;
++	snprintf(name, max, "%s%s", dw->name, n > 1 ? " (+more)" : "");
++	*permille = dw->total > 0 ?
++		(unsigned int)(dw->got * 1000 / dw->total) : 0;
++	fmt_rate(rate, sizeof(rate), dw->rate);
++	fmt_eta(eta, sizeof(eta), dw);
++	if (dw->total > 0)
++		snprintf(detail, dmax, "%llu / %llu KiB  %s%s%s",
++			 dw->got / 1024, dw->total / 1024, rate,
++			 eta[0] ? "  " : "", eta);
++	else
++		snprintf(detail, dmax, "%llu KiB  %s", dw->got / 1024, rate);
++	return true;
++}
++
++/* exported interface documented in vita/download.h */
++bool vita_download_recent(unsigned int i, const char **name,
++			  const char **result)
++{
++	if (i >= recent_n)
++		return false;
++	*name = recent[i].name;
++	*result = recent[i].result;
++	return true;
++}
++
++/* exported interface documented in vita/download.h */
++bool vita_download_cancel(unsigned int id)
++{
++	struct gui_download_window *dw;
++
++	for (dw = active; dw != NULL; dw = dw->next)
++		if (dw->id == id)
++			break;
++	if (dw == NULL)
++		return false;
++	/* as the GTK frontend does: stop the fetch and let the context go;
++	 * the core calls this window no more */
++	download_context_abort(dw->ctx);
++	download_context_destroy(dw->ctx);
++	if (dw->fp != NULL) {
++		fclose(dw->fp);
++		dw->fp = NULL;
++		remove(dw->path);
++	}
++	vita_diag_log("download: %s cancelled at %llu bytes", dw->name,
++		      dw->got);
++	vita_show_message(3000, "download cancelled: %s", dw->name);
++	list_remove(dw);
++	vita_download_overlay_changed();
++	remember(dw, "cancelled");
++	free(dw);
++	return true;
++}
++
++/* exported interface documented in vita/download.h */
++void vita_download_page(char *out, size_t max, const char *note)
++{
++	struct gui_download_window *dw;
++	size_t o = 0;
++	unsigned int i;
++
++#define PUT(...) do { if (o < max) o += (size_t)snprintf(out + o, max - o, __VA_ARGS__); } while (0)
++	PUT("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
++	if (active != NULL)	/* live while something downloads */
++		PUT("<meta http-equiv=\"refresh\" content=\"1\">");
++	PUT("<title>Downloads</title><style>body{font-family:sans-serif;"
++	    "font-size:18px;margin:28px 12px}h1{font-size:26px;margin:0 0 8px}"
++	    "h2{font-size:20px;margin:16px 0 6px}.d{padding:8px 0;"
++	    "border-bottom:1px solid #ddd}progress{width:100%%;height:16px}"
++	    ".hint{color:#444;font-size:15px}a.c{display:inline-block;"
++	    "padding:6px 14px;background:#fde;color:#702;border-radius:6px;"
++	    "text-decoration:none}.note{background:#dfd;padding:6px 10px}"
++	    "</style></head><body><h1>Downloads</h1>");
++	if (note != NULL)
++		PUT("<p class=\"note\" id=\"note\">%s</p>", note);
++	PUT("<h2>In progress</h2>");
++	if (active == NULL)
++		PUT("<p class=\"hint\" id=\"idle\">Nothing downloading.</p>");
++	for (dw = active; dw != NULL; dw = dw->next) {
++		char rate[24], eta[32];
++		fmt_rate(rate, sizeof(rate), dw->rate);
++		fmt_eta(eta, sizeof(eta), dw);
++		PUT("<div class=\"d\"><b>%s</b><br>", dw->name);
++		if (dw->total > 0)
++			PUT("<progress max=\"%llu\" value=\"%llu\"></progress>"
++			    "<br>%llu%% &middot; %llu of %llu KiB &middot; %s%s%s",
++			    dw->total, dw->got, dw->got * 100 / dw->total,
++			    dw->got / 1024, dw->total / 1024, rate,
++			    eta[0] ? " &middot; " : "", eta);
++		else
++			PUT("%llu KiB &middot; %s", dw->got / 1024, rate);
++		PUT(" <a class=\"c\" href=\"" VITA_DOWNLOADS_PATH
++		    "?cancel=%u\">Cancel</a></div>", dw->id);
++	}
++	PUT("<h2>Recent</h2>");
++	if (recent_n == 0)
++		PUT("<p class=\"hint\">None this session.</p>");
++	for (i = 0; i < recent_n; i++)
++		PUT("<div class=\"d\"><b>%s</b> &middot; %s &middot; %llu KiB"
++		    "<br><span class=\"hint\">%s</span></div>",
++		    recent[i].name, recent[i].result, recent[i].size / 1024,
++		    recent[i].path);
++	PUT("<p class=\"hint\">Saved in %s or %sdownloads/. <a href=\""
++	    "file:///ux0:data/VitaBrowser/home.html\">Home</a></p>"
++	    "</body></html>", vita_download_dirs[0], VITA_DIAG_DIR);
++#undef PUT
++}
++
+ static struct gui_download_table download_table = {
+ 	.create = vita_download_create,
+ 	.data = vita_download_data,
+diff --git a/frontends/vita/download.h b/frontends/vita/download.h
+--- a/frontends/vita/download.h
++++ b/frontends/vita/download.h
+@@ -21,6 +21,9 @@
+ #ifndef NETSURF_VITA_DOWNLOAD_H
+ #define NETSURF_VITA_DOWNLOAD_H
+ 
++#include <stdbool.h>
++#include <stddef.h>
++
+ extern struct gui_download_table *vita_download_table;
+ 
+ /** Where downloads go, in order: ux0:download/, then (a safe eboot may
+@@ -32,6 +35,32 @@ extern const char *const vita_download_dirs[VITA_DOWNLOAD_DIRS];
+ extern unsigned int vita_downloads_done;
+ extern char vita_download_last[256];
+ 
++/** The downloads page (patch 245): served by the browser's own listener
++ * (vita/remote.c) to this device; ?cancel=ID stops one. */
++#define VITA_DOWNLOADS_PATH "/downloads"
++
++/**
++ * The download shown in the progress bar (the newest active one): its
++ * name, progress in 1/1000 (0 when the size is unknown), and a detail
++ * line ("120 / 800 KiB  340 KB/s  0:02"). False when nothing downloads.
++ */
++bool vita_download_progress(char *name, size_t max, unsigned int *permille,
++			    char *detail, size_t dmax);
++
++/** The i-th most recent ended download's name and result ("saved",
++ * "failed: ...", "cancelled"); false past the end. */
++bool vita_download_recent(unsigned int i, const char **name,
++			  const char **result);
++
++/** Stop download id (the downloads page's Cancel); false when unknown. */
++bool vita_download_cancel(unsigned int id);
++
++/** The downloads page (HTML) into out; note shows on top, or NULL. */
++void vita_download_page(char *out, size_t max, const char *note);
++
++/** The progress strip needs repainting (vita/main.c, patch 245). */
++void vita_download_overlay_changed(void);
++
+ /** The on-screen message line (vita/main.c): ms 0 = until replaced. */
+ void vita_show_message(unsigned int ms, const char *fmt, ...)
+ 	__attribute__((format(printf, 2, 3)));
+diff --git a/frontends/vita/interact.c b/frontends/vita/interact.c
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -77,6 +77,8 @@ enum check {
+ 	C_COOKIE,	/**< the saved jar holds the listener's cookie */
+ 	C_TYPED,	/**< vita_chrome_typed_url() turns text into URLs */
+ 	C_DOWNLOAD,	/**< the download named expect is on the card, intact */
++	C_DLRECENT,	/**< the newest ended download is expect, saved
++			 * (patch 245) */
+ 	C_SETTING,	/**< the setting expect ("key=value") is in effect
+ 			 * (patch 241) */
+ 	C_HISTORY,	/**< the home page's recent list starts with a link
+@@ -199,6 +201,8 @@ static const struct step {
+ 	  C_URL, "IN-download.html", 0, NULL },
+ 	{ "a download link tap saves, no navigate", A_TAP, NULL, 250, 140,
+ 	  0, 0, 0, C_DOWNLOAD, "vita-test.bin", 0, NULL },
++	{ "the downloads page lists it", A_REMOTE, "/downloads", 0, 0, 0, 0,
++	  0, C_DLRECENT, "vita-test.bin", 0, "IN-downloads" },
+ 	{ "START goes home", A_BUTTON, NULL, 0, 0, 0, 0, SCE_CTRL_START,
+ 	  C_URL, "VitaBrowser/home.html", 0, NULL },
+ 	{ "home lists the last page visited first", A_NONE, NULL, 0, 0, 0,
+@@ -418,6 +422,15 @@ static void check(struct gui_window *gw, const struct step *s)
+ 	case C_HISTORY:
+ 		ok = history_ok(s->expect, s->value, detail, sizeof detail);
+ 		break;
++	case C_DLRECENT: {
++		const char *n = NULL, *r = NULL;
++		ok = vita_download_recent(0, &n, &r) && strcmp(n, s->expect) == 0 &&
++			strcmp(r, "saved") == 0 &&
++			url_ends(gw, "/downloads", detail, sizeof detail);
++		snprintf(detail, sizeof detail, "newest: %s, %s", n ? n : "-",
++			 r ? r : "-");
++		break;
++	}
+ 	case C_SETTING: {
+ 		/* in effect, saved, and (the user agent) what sites get */
+ 		char key[16];
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -352,6 +352,12 @@ static void set_message(unsigned int ms, const char *fmt, ...)
+ 	vita_overlay_dirty = true;
+ }
+ 
++/* exported interface documented in vita/download.h */
++void vita_download_overlay_changed(void)
++{
++	vita_overlay_dirty = true;
++}
++
+ /* exported interface documented in vita/download.h */
+ void vita_show_message(unsigned int ms, const char *fmt, ...)
+ {
+@@ -944,6 +950,34 @@ static void draw_overlay(void)
+ 					    0xffffff, 3);
+ 		}
+ 	}
++	{
++		/* patch 245: a download's progress, in a strip above the
++		 * HUD (at the bottom when the HUD is off): the bar, then the
++		 * name, percent, size, rate and time left */
++		char name[96], detail[96], line[320];
++		unsigned int pm;
++		if (vita_download_progress(name, sizeof(name), &pm, detail,
++					   sizeof(detail))) {
++			int y1 = VITA_SCREEN_HEIGHT - (vita_hud ? 22 : 0);
++			int y0 = y1 - 26;
++			int w = (int)((VITA_SCREEN_WIDTH - 12) * pm / 1000);
++			vita_plot_fill_rect(0, y0, VITA_SCREEN_WIDTH, y1,
++					    0x101830, 3);
++			vita_plot_fill_rect(6, y1 - 6, VITA_SCREEN_WIDTH - 6,
++					    y1 - 3, 0x404860, 3);
++			if (w > 0)
++				vita_plot_fill_rect(6, y1 - 6, 6 + w, y1 - 3,
++						    0x40c0ff, 3);
++			if (pm > 0)
++				snprintf(line, sizeof(line), "%s  %u%%  %s",
++					 name, pm / 10, detail);
++			else
++				snprintf(line, sizeof(line), "%s  %s", name,
++					 detail);
++			vita_plot_text(6, y0 + 15, line, strlen(line),
++				       0xffffff, 13);
++		}
++	}
+ 	if (vita_message[0] != '\0') {
+ 		if (vita_message_until != 0 &&
+ 		    vita_diag_ms() > vita_message_until) {
+diff --git a/frontends/vita/remote.c b/frontends/vita/remote.c
+--- a/frontends/vita/remote.c
++++ b/frontends/vita/remote.c
+@@ -49,6 +49,7 @@
+ #include "vita/diag.h"
+ #include "vita/net.h"
+ #include "vita/remote.h"
++#include "vita/download.h"
+ 
+ /** A client gets this long to send its request, ms. */
+ #define REQUEST_MS 3000
+@@ -287,6 +288,27 @@ static void handle(struct gui_window *gw)
+ 		vita_chrome_settings_page(page, sizeof(page),
+ 					  note[0] ? note : NULL);
+ 		respond("200 OK", NULL, page);
++	} else if (strcmp(path, VITA_DOWNLOADS_PATH) == 0 ||
++		   strncmp(path, VITA_DOWNLOADS_PATH "?", 11) == 0) {
++		/* patch 245: the downloads page -- this device only, like
++		 * the settings */
++		static char page[12288];
++		char note[160];
++		if (!client_local) {
++			respond("403 Forbidden", NULL,
++				"downloads are managed on the Vita only");
++			return;
++		}
++		note[0] = '\0';
++		q = strstr(path, "cancel=");
++		if (q != NULL) {
++			unsigned int id = (unsigned int)strtoul(q + 7, NULL, 10);
++			snprintf(note, sizeof(note), "%s",
++				 vita_download_cancel(id) ? "Cancelled." :
++				 "That download is no longer running.");
++		}
++		vita_download_page(page, sizeof(page), note[0] ? note : NULL);
++		respond("200 OK", NULL, page);
+ 	} else if (strcmp(path, "/cookie") == 0) {
+ 		char set[128];
+ 		header("Cookie", cookie, sizeof(cookie));
