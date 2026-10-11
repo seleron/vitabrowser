@@ -1,0 +1,120 @@
+# netsurf: <iframe> and <img> are instanceof HTMLIFrameElement /
+# HTMLImageElement -- hCaptcha's messages reach its frames (patch 247;
+# roadmap WS-B2)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 246)
+#
+# The polyfill's element constructors (vita_polyfill.js, the tag map)
+# skip a name the bridge already defines; the bridge defines empty stubs
+# for HTMLIFrameElement and HTMLImageElement, and the wrappers of those two
+# tags are built on HTMLElement.prototype, not the stub's prototype -- so
+# `iframe instanceof HTMLIFrameElement` was false (every other tag in the
+# map was true). hCaptcha sends to a frame with
+#     e instanceof HTMLIFrameElement ? e.contentWindow.postMessage(m, o)
+#                                    : e.postMessage(m, o)
+# so claude.ai's page called postMessage on the element, swallowed the
+# TypeError, and its sign-in captcha never answered the challenge frame's
+# requests (get-url, site-setup, create-challenge): what the 244 log called
+# "the page sends nothing to any frame".
+#
+#  - vita_polyfill.js: a constructor in the map that already exists gets a
+#    Symbol.hasInstance that keeps the prototype test and adds the
+#    polyfill's own constructors' tag test -- for an element (an
+#    HTMLElement by prototype, not a look-alike object), and not for a
+#    subclass (it keeps the plain prototype test).
+#
+# Gate: testpages/pages/JS-element-instanceof.html INSTOF 6/6 (Chromium
+# 6/6; before: iframe and img checks false and hCaptcha's send threw).
+#
+# claude.ai/login after this patch: the page sends create-challenge to the
+# challenge frame, answers its getcaptcha-manifest request, and the frame
+# posts two getcaptcha requests to api.hcaptcha.com (200 each); it then
+# closes with "network-error": the challenge needs hsw.js, hCaptcha's
+# proof of work, which runs WebAssembly (WebAssembly.instantiate) --
+# QuickJS has none (the frame logs WANT WebAssembly). Next step recorded
+# in the loop log. new Image() is still a stand-in object, not an element.
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -4758,9 +4758,37 @@
+ "\t\tvar bp = probe && Object.getPrototypeOf(probe);\n"
+ "\t\tif (bp && 'textContent' in bp) base = bp;\n"
+ "\t} catch (e) { /* */ }\n"
++"\tvar dflt = Function.prototype[Symbol.hasInstance];\n"
+ "\tObject.keys(map).forEach(function (name) {\n"
+-"\t\tif (typeof g[name] === 'function') return;\n"
+ "\t\tvar tags = map[name] ? map[name].split(' ') : [];\n"
++"\t\t/* VitaBrowser patch 247: a constructor that already exists (the\n"
++"\t\t * bridge's stubs) answers instanceof by tag too when its prototype\n"
++"\t\t * is not in the element's chain: <iframe> and <img> wrappers are\n"
++"\t\t * built on HTMLElement.prototype, so `iframe instanceof\n"
++"\t\t * HTMLIFrameElement` was false -- hCaptcha then posted to the\n"
++"\t\t * element instead of its contentWindow (a TypeError it swallows),\n"
++"\t\t * and claude.ai's sign-in captcha never got an answer. A subclass\n"
++"\t\t * keeps the plain prototype test. */\n"
++"\t\tvar E = g[name];\n"
++"\t\tif (typeof E === 'function') {\n"
++"\t\t\tif (tags.length && !E.__vbInst) {\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\tObject.defineProperty(E, Symbol.hasInstance, { configurable: true,\n"
++"\t\t\t\t\t\tvalue: function (x) {\n"
++"\t\t\t\t\t\t\tif (dflt.call(this, x)) return true;\n"
++"\t\t\t\t\t\t\tif (this !== E || !x || typeof x !== 'object' || x.nodeType !== 1)\n"
++"\t\t\t\t\t\t\t\treturn false;\n"
++"\t\t\t\t\t\t\t/* an element, not a look-alike object */\n"
++"\t\t\t\t\t\t\tif (typeof g.HTMLElement === 'function' &&\n"
++"\t\t\t\t\t\t\t    !dflt.call(g.HTMLElement, x))\n"
++"\t\t\t\t\t\t\t\treturn false;\n"
++"\t\t\t\t\t\t\treturn tags.indexOf(String(x.localName || x.tagName || '').toLowerCase()) >= 0;\n"
++"\t\t\t\t\t\t} });\n"
++"\t\t\t\t\tObject.defineProperty(E, '__vbInst', { value: true });\n"
++"\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t\treturn;\n"
++"\t\t}\n"
+ "\t\tvar C = function () { throw new TypeError('Illegal constructor'); };\n"
+ "\t\ttry { Object.defineProperty(C, 'name', { value: name }); } catch (e) { /* */ }\n"
+ "\t\tC.prototype = Object.create(base);\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -4757,9 +4757,37 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		var bp = probe && Object.getPrototypeOf(probe);
+ 		if (bp && 'textContent' in bp) base = bp;
+ 	} catch (e) { /* */ }
++	var dflt = Function.prototype[Symbol.hasInstance];
+ 	Object.keys(map).forEach(function (name) {
+-		if (typeof g[name] === 'function') return;
+ 		var tags = map[name] ? map[name].split(' ') : [];
++		/* VitaBrowser patch 247: a constructor that already exists (the
++		 * bridge's stubs) answers instanceof by tag too when its prototype
++		 * is not in the element's chain: <iframe> and <img> wrappers are
++		 * built on HTMLElement.prototype, so `iframe instanceof
++		 * HTMLIFrameElement` was false -- hCaptcha then posted to the
++		 * element instead of its contentWindow (a TypeError it swallows),
++		 * and claude.ai's sign-in captcha never got an answer. A subclass
++		 * keeps the plain prototype test. */
++		var E = g[name];
++		if (typeof E === 'function') {
++			if (tags.length && !E.__vbInst) {
++				try {
++					Object.defineProperty(E, Symbol.hasInstance, { configurable: true,
++						value: function (x) {
++							if (dflt.call(this, x)) return true;
++							if (this !== E || !x || typeof x !== 'object' || x.nodeType !== 1)
++								return false;
++							/* an element, not a look-alike object */
++							if (typeof g.HTMLElement === 'function' &&
++							    !dflt.call(g.HTMLElement, x))
++								return false;
++							return tags.indexOf(String(x.localName || x.tagName || '').toLowerCase()) >= 0;
++						} });
++					Object.defineProperty(E, '__vbInst', { value: true });
++				} catch (e) { /* */ }
++			}
++			return;
++		}
+ 		var C = function () { throw new TypeError('Illegal constructor'); };
+ 		try { Object.defineProperty(C, 'name', { value: name }); } catch (e) { /* */ }
+ 		C.prototype = Object.create(base);
