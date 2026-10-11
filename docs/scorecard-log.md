@@ -4,6 +4,20 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-11 06:02 — patches 244-246: the Guardian 74.1 -> 80.1
+
+`--only guardian --reuse-ref r19-full-230/ref`, two runs: 80.1 / 80.1
+(text 0.97, visual 0.353 -> 0.536). With 244 alone it was 70.1: the
+consent frame that 244 loads ran its heap out and blanked the top of the
+page. 246 fixes the cause (DOMPurify's captured getElementsByTagName
+answered for the wrong document, doubling the frame's markup on each
+sanitize) and sizes the late-linked frame, so the consent dialog is drawn
+over the dimmed page as in Chromium's reference. Check runs r37 (r19
+references) / r38 (fresh): github 81.8, youtube 76.9, claude 75.4, mdn
+81.0, wikipedia 87.9 unchanged; hackernews 93.0, bbc 89.7, rte 83.2,
+cnnlite 85.4 on fresh references (their r19-reference dips are the front
+pages having moved since yesterday).
+
 ## 2026-10-11 01:18 — patches 242-243: github.com 64.7 -> 81.8
 
 `--only github --reuse-ref r19-full-230/ref`, five runs: 81.8 / 81.8 /
