@@ -309,6 +309,8 @@ NET-css-late-link http://127.0.0.1:$HP/CSS-late-link.html
 NET-js-xorigin-frame http://127.0.0.1:$HP/JS-xorigin-frame.html
 NET-js-scratch-doc http://127.0.0.1:$HP/JS-scratch-doc.html
 NET-js-element-instanceof http://127.0.0.1:$HP/JS-element-instanceof.html
+NET-js-node-names http://127.0.0.1:$HP/JS-node-names.html
+NET-js-image-load http://127.0.0.1:$HP/JS-image-load.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -811,7 +813,8 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-template-text TPLTEXT 4" "js-selector-list-long LONGLIST 4" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
-	 "js-element-instanceof INSTOF 6"; do
+	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
+	 "js-image-load IMGLOAD 11"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)

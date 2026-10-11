@@ -1,0 +1,953 @@
+# netsurf: <img> load / error events, complete / naturalWidth, inline
+# onload / onerror, <body onload>, new Image() as a real element (patch 250)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 249)
+#
+# No <img> ever fired load or error; complete, naturalWidth and
+# naturalHeight did not exist (undefined); width was the attribute string;
+# inline onload= / onerror= attributes were never compiled (only 14 UI
+# events were), so <body onload> did nothing either; and new Image() was a
+# stand-in object whose src was a plain property -- it never fetched or
+# fired. Scripts that wait for an image (lightboxes, masonry grids,
+# carousels, imagesLoaded, `img.onload = ...; img.src = url` preloaders)
+# waited forever. Chromium fires all of these.
+#
+#  - html/object.c: a per-page table of each <img>'s last image (URL,
+#    state, natural size). An object fetch that settles for an <img>
+#    records it and queues load / error; so does the adoption of an
+#    already-decoded speculative fetch by its box (the preload scanner
+#    fetched it before the box existed), and an object that settles inside
+#    box construction (a cached image, before the box has its element) is
+#    resolved once the box has one -- polled only while the boxes are
+#    still being built (a generated-content box never gets an element). Events fire from a scheduled callback,
+#    never inside the cache callback, once per element and URL (a box-tree
+#    rebuild re-adopts objects and reports DONE again). An <img> outside
+#    the document gets a fetch of its own (html_image_fetch_detached; 32 in
+#    flight per page at most), released when it settles -- the cache keeps
+#    the data for the <img> that usually follows a preload. A superseded
+#    or finished fetch's handle is released (never aborted: aborting a
+#    handle whose content another user shares clones the content, and
+#    during that content's DONE broadcast the clone asserted in
+#    content_set_ready -- 1 github.com run in 6 before this was found)
+#    from the scheduled callback, not inside a cache callback. Freed with
+#    the content.
+#  - html/html.c: the queued image events fire before window load, as in
+#    browsers; the table is freed in html_destroy.
+#  - quickjs/macsurf_qjs.c: __vitaImgState(el) / __vitaImgFetch(el, src);
+#    onload / onerror join the inline handler attributes; on <body> /
+#    <frameset> they set window.onload / onerror (unless a script did).
+#    A "load" event no longer reaches window listeners through the
+#    document fan-out (DOM "get the parent": a Document's parent is its
+#    Window unless the event is load). With element load events now
+#    common, web-vitals' TTFB helper -- a capturing window load listener
+#    that re-adds itself while readyState is not "complete" -- doubled with
+#    every image event until bbc.com ran out of heap (4 runs in 6; 5111
+#    window listeners); with the rule, 0 in 6, 25-31 listeners.
+#  - vita_polyfill.js: complete, naturalWidth, naturalHeight, decode(), and
+#    width / height (rendered, else the attribute, else natural) for <img>;
+#    src answers the absolute URL; setting src (or setAttribute('src')) on
+#    an <img> outside the document fetches it; new Image(w, h) is an <img>
+#    element (instanceof Image and HTMLImageElement).
+#
+# Gate: testpages/pages/JS-image-load.html IMGLOAD 11/11 (Chromium 11/11;
+# check 11, element loads kept off a capturing window listener, fails
+# with the fan-out rule disarmed).
+# Before this patch a probe of the same cases saw no load / error at all,
+# complete / naturalWidth undefined, and new Image() never fetching.
+# Known difference: a listener added by script runs before a parse-time
+# onload= attribute (dispatchEvent calls listeners before the on* slot;
+# browsers order by registration).
+#
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1405,6 +1405,9 @@ html_proceed_to_done(html_content *html)
+ #if MACSURF_JS_FIRE_LOAD && defined(WITH_QUICKJS)
+ 			/* (QuickJS only: the other backends have no such hook, and
+ 			 * nsmonkey builds with Duktape.) */
++			/* patch 250: the images' load / error first --
++			 * window load waits for them in browsers */
++			html_image_flush_events(html);
+ 			if (html->js_thread != NULL) {
+ 				js_fire_window_load(html->js_thread,
+ 						html->document);
+@@ -9162,6 +9165,7 @@ static void html_destroy(struct content *c)
+ 	html_script_free(html);
+ 
+ 	/* Free objects */
++	html_image_states_free(html);	/* patch 250 */
+ 	html_object_free_objects(html);
+ 
+ 	/* free layout */
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -122,6 +122,28 @@ struct html_script {
+ /**
+  * An object (img, object, etc. tag) in a CONTENT_HTML document.
+  */
++/* VitaBrowser patch 250: <img> load / error events and state */
++struct dom_node;
++struct content_html_object;
++struct html_content;
++/** An <img>'s object fetch has finished (ok) or failed: queue its load or
++ * error event, unless that URL's event was already fired for the element. */
++void html_image_object_settled(struct html_content *c,
++		struct content_html_object *o, bool ok);
++/** Fetch the image of an <img> that is not in the document (new Image(),
++ * a detached element given a src): load / error fire when it settles. */
++bool html_image_fetch_detached(struct content *c, struct dom_node *node,
++		const char *src);
++/** What the element's image is: state 0 loading / unknown, 1 loaded,
++ * 2 broken, with its natural size; false when nothing is known. When src
++ * is given and differs from what was loaded, the state is 0. */
++bool html_image_state(struct content *c, struct dom_node *node,
++		const char *src, int *state, int *width, int *height);
++/** Fire the queued image events now (before window load). */
++void html_image_flush_events(struct html_content *c);
++/** Free the table (at content destruction). */
++void html_image_states_free(struct html_content *c);
++
+ struct content_html_object {
+ 	struct content *parent;		/**< Parent document */
+ 	struct content_html_object *next; /**< Next in chain */
+@@ -148,6 +170,10 @@ struct content_html_object {
+ 	 * its callback handle; without an explicit ledger that lost callback can
+ 	 * never repay the count and the document remains READY forever. */
+ 	bool active_counted;
++	/** VitaBrowser patch 250: settled (1 loaded, 2 broken) while its box
++	 * had no element yet -- a cached image finishes inside box
++	 * construction; its event is resolved when the box has one */
++	int img_settle;
+ };
+ 
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -47,6 +47,7 @@
+ #include "html/box.h"
+ #include "html/box_inspect.h"
+ #include "html/object.h"
++#include "javascript/js.h"	/* patch 250: js_fire_script_load */
+ #include "macos9_deathrow.h"
+ 
+ extern int macsurf_ptr_is_heap(const void *);
+@@ -519,6 +520,7 @@ html_object_callback(hlcache_handle *object,
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 
+ 		html_object_done(box, object, o->background);
++		html_image_object_settled(c, o, true);	/* patch 250 */
+ 
+ 		if (c->base.status != CONTENT_STATUS_LOADING &&
+ 				box->flags & REPLACE_DIM) {
+@@ -561,6 +563,7 @@ html_object_callback(hlcache_handle *object,
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 
+ 		html_object_failed(box, c, o->background);
++		html_image_object_settled(c, o, false);	/* patch 250 */
+ 
+ 		break;
+ 
+@@ -1358,6 +1361,9 @@ html_fetch_object(html_content *c,
+ 				 * callback's decrement will never run for this
+ 				 * entry. */
+ 				html_object_done(box, dup->content, background);
++				/* patch 250: its load event, which the box-less
++				 * (speculative) fetch could not fire */
++				html_image_object_settled(c, dup, true);
+ 			} else if (was_counted == 0) {
+ 				/* In flight and not yet counted: the (now
+ 				 * adopted) callback path ends in
+@@ -1459,3 +1465,348 @@ html_object_sched_pins(void (*cb)(void *), void *p, struct content *target)
+ 	}
+ 	return false;
+ }
++
++
++/* ---- VitaBrowser patch 250: <img> load / error events and state ----
++ *
++ * No <img> ever fired load or error, and complete / naturalWidth /
++ * naturalHeight did not exist: scripts that wait for an image (lightboxes,
++ * masonry grids, carousels, imagesLoaded, `img.onload = ...; img.src =`)
++ * waited forever, and new Image() was a stand-in object that never loaded.
++ * Each element's last image is recorded here -- from its object fetch when
++ * it is in the document, or from a fetch of its own when it is not -- and
++ * its event fires once per URL from a scheduled callback (never inside the
++ * cache callback, where a script could rebuild the box tree under it).
++ * The table outlives box-tree rebuilds, which re-adopt the objects and
++ * report DONE again; it is freed with the content.
++ */
++
++#define IMG_DETACHED_MAX 32	/**< detached fetches in flight per page */
++
++struct html_img_state {
++	struct html_img_state *next;
++	html_content *c;
++	dom_node *node;		/**< ref'd */
++	nsurl *url;		/**< ref'd: the URL state describes */
++	hlcache_handle *h;	/**< a detached fetch in flight, or NULL */
++	int state;		/**< 0 loading, 1 loaded, 2 broken */
++	int w, ht;		/**< natural size when loaded */
++	bool queued;		/**< its event waits to be fired */
++	bool fired;		/**< the event for url has been queued */
++};
++
++static void img_fire_cb(void *p);
++
++/* A superseded fetch's handle: released from img_fire_cb, never aborted
++ * and never inside a cache callback -- aborting a handle whose content
++ * another user shares clones the content, and doing it during that
++ * content's DONE broadcast made the clone report READY while unlocked
++ * (content_set_ready's assertion, github.com). */
++struct html_img_stale {
++	struct html_img_stale *next;
++	hlcache_handle *h;
++};
++
++static void img_retire(html_content *c, hlcache_handle **h)
++{
++	struct html_img_stale *z;
++	if (*h == NULL)
++		return;
++	z = malloc(sizeof(*z));
++	if (z == NULL)
++		return;		/* leaked until the content goes */
++	z->h = *h;
++	z->next = c->img_stale;
++	c->img_stale = z;
++	*h = NULL;
++	if (!c->img_fire_scheduled) {
++		c->img_fire_scheduled = true;
++		guit->misc->schedule(0, img_fire_cb, c);
++	}
++}
++
++static void img_release_stale(html_content *c)
++{
++	while (c->img_stale != NULL) {
++		struct html_img_stale *z = c->img_stale;
++		c->img_stale = z->next;
++		safe_hlcache_handle_release(&z->h);
++		free(z);
++	}
++}
++
++static struct html_img_state *img_find(html_content *c, dom_node *node)
++{
++	struct html_img_state *s;
++	for (s = c->img_states; s != NULL; s = s->next)
++		if (s->node == node)
++			return s;
++	return NULL;
++}
++
++static struct html_img_state *img_get(html_content *c, dom_node *node)
++{
++	struct html_img_state *s = img_find(c, node);
++	if (s != NULL)
++		return s;
++	s = calloc(1, sizeof(*s));
++	if (s == NULL)
++		return NULL;
++	s->c = c;
++	s->node = dom_node_ref(node);
++	s->next = c->img_states;
++	c->img_states = s;
++	return s;
++}
++
++static void img_set_url(struct html_img_state *s, nsurl *url)
++{
++	if (s->url != NULL)
++		nsurl_unref(s->url);
++	s->url = url != NULL ? nsurl_ref(url) : NULL;
++}
++
++static bool img_is_img(dom_node *node)
++{
++	dom_string *name = NULL;
++	bool is = false;
++	if (node != NULL && dom_node_get_node_name(node, &name) == DOM_NO_ERR &&
++	    name != NULL) {
++		is = dom_string_caseless_lwc_isequal(name, corestring_lwc_img);
++		dom_string_unref(name);
++	}
++	return is;
++}
++
++static void img_resolve_pending(html_content *c, bool *waiting)
++{
++	struct content_html_object *o;
++	*waiting = false;
++	for (o = c->object_list; o != NULL; o = o->next) {
++		if (o->img_settle == 0)
++			continue;
++		if (o->box == NULL) {
++			o->img_settle = 0;
++		} else if (o->box->node != NULL) {
++			int st = o->img_settle;
++			o->img_settle = 0;
++			html_image_object_settled(c, o, st == 1);
++		} else if (c->base.status == CONTENT_STATUS_LOADING) {
++			*waiting = true;	/* boxes still being built */
++		} else {
++			/* built, and still no element: generated content
++			 * (content: url(...)), not an <img> -- polling for
++			 * it would run every 20 ms for the page's life */
++			o->img_settle = 0;
++		}
++	}
++}
++
++static void img_fire_cb(void *p)
++{
++	html_content *c = p;
++	struct html_img_state *s;
++	bool waiting;
++
++	c->img_fire_scheduled = false;
++	img_release_stale(c);
++	img_resolve_pending(c, &waiting);
++	if (waiting && !c->img_fire_scheduled) {
++		/* box construction still running: look again shortly */
++		c->img_fire_scheduled = true;
++		guit->misc->schedule(20, img_fire_cb, c);
++	}
++	/* one at a time, rescanning: a handler may set another src, which
++	 * adds to or changes the table */
++	for (;;) {
++		for (s = c->img_states; s != NULL && !s->queued; s = s->next)
++			;
++		if (s == NULL)
++			break;
++		s->queued = false;
++		if (c->js_thread != NULL && s->state != 0)
++			js_fire_script_load(c->js_thread, s->node,
++					s->state == 1 ? 1 : 0);
++	}
++}
++
++static void img_queue(struct html_img_state *s)
++{
++	s->queued = true;
++	s->fired = true;
++	if (!s->c->img_fire_scheduled) {
++		s->c->img_fire_scheduled = true;
++		guit->misc->schedule(0, img_fire_cb, s->c);
++	}
++}
++
++/* exported interface documented in html/html.h */
++void html_image_object_settled(html_content *c, struct content_html_object *o,
++		bool ok)
++{
++	struct html_img_state *s;
++	dom_node *node;
++	int st = ok ? 1 : 2;
++
++	if (o->background || o->box == NULL || o->url == NULL)
++		return;
++	node = o->box->node;
++	if (node == NULL) {
++		/* inside box construction: the box gets its element after
++		 * this; resolved by img_fire_cb */
++		o->img_settle = st;
++		if (!c->img_fire_scheduled) {
++			c->img_fire_scheduled = true;
++			guit->misc->schedule(0, img_fire_cb, c);
++		}
++		return;
++	}
++	o->img_settle = 0;
++	if (!img_is_img(node))
++		return;
++	s = img_find(c, node);
++	if (s != NULL && s->fired && s->state == st && s->url != NULL &&
++	    nsurl_compare(s->url, o->url, NSURL_COMPLETE))
++		return;		/* re-adopted after a rebuild, or loaded detached */
++	if (s == NULL && (s = img_get(c, node)) == NULL)
++		return;
++	img_retire(c, &s->h);	/* a detached fetch this one overtakes */
++	img_set_url(s, o->url);
++	s->state = st;
++	s->w = s->ht = 0;
++	if (ok && o->content != NULL) {
++		s->w = content_get_width(o->content);
++		s->ht = content_get_height(o->content);
++	}
++	img_queue(s);
++}
++
++static nserror img_detached_cb(hlcache_handle *handle,
++		const hlcache_event *event, void *pw)
++{
++	struct html_img_state *s = pw;
++
++	if (handle != s->h)
++		return NSERROR_OK;	/* superseded; released later */
++	switch (event->type) {
++	case CONTENT_MSG_DONE:
++		s->state = 1;
++		s->w = content_get_width(handle);
++		s->ht = content_get_height(handle);
++		break;
++	case CONTENT_MSG_ERROR:
++		s->state = 2;
++		break;
++	default:
++		return NSERROR_OK;
++	}
++	/* the bitmap is not kept: the cache holds the data for the <img>
++	 * that usually follows a preload (released from img_fire_cb, not
++	 * inside this callback) */
++	img_retire(s->c, &s->h);
++	img_queue(s);
++	return NSERROR_OK;
++}
++
++/* exported interface documented in html/html.h */
++bool html_image_fetch_detached(struct content *cc, dom_node *node,
++		const char *src)
++{
++	html_content *c = (html_content *) cc;
++	struct html_img_state *s, *t;
++	nsurl *url = NULL;
++	int inflight = 0;
++
++	if (c == NULL || node == NULL || src == NULL || *src == '\0' ||
++	    c->base_url == NULL)
++		return false;
++	if (nsurl_join(c->base_url, src, &url) != NSERROR_OK)
++		return false;
++	s = img_find(c, node);
++	if (s != NULL && s->url != NULL &&
++	    nsurl_compare(s->url, url, NSURL_COMPLETE)) {
++		/* the same image again: browsers fire its event again */
++		if (s->h == NULL && s->state != 0)
++			img_queue(s);
++		nsurl_unref(url);
++		return true;
++	}
++	for (t = c->img_states; t != NULL; t = t->next)
++		if (t->h != NULL)
++			inflight++;
++	if (inflight >= IMG_DETACHED_MAX) {
++		nsurl_unref(url);
++		return false;
++	}
++	if (s == NULL && (s = img_get(c, node)) == NULL) {
++		nsurl_unref(url);
++		return false;
++	}
++	img_retire(c, &s->h);
++	img_set_url(s, url);
++	s->state = 0;
++	s->w = s->ht = 0;
++	s->fired = false;
++	if (hlcache_handle_retrieve(url, HLCACHE_RETRIEVE_SNIFF_TYPE,
++			content_get_url(&c->base), NULL, img_detached_cb, s,
++			NULL, CONTENT_IMAGE, &s->h) != NSERROR_OK) {
++		s->h = NULL;
++		s->state = 2;
++		img_queue(s);
++	}
++	nsurl_unref(url);
++	return true;
++}
++
++/* exported interface documented in html/html.h */
++bool html_image_state(struct content *cc, dom_node *node, const char *src,
++		int *state, int *width, int *height)
++{
++	html_content *c = (html_content *) cc;
++	struct html_img_state *s;
++
++	if (c == NULL || node == NULL || (s = img_find(c, node)) == NULL)
++		return false;
++	*state = s->state;
++	*width = s->w;
++	*height = s->ht;
++	if (src != NULL && *src != '\0' && s->url != NULL &&
++	    c->base_url != NULL) {
++		nsurl *u = NULL;
++		if (nsurl_join(c->base_url, src, &u) == NSERROR_OK) {
++			if (!nsurl_compare(u, s->url, NSURL_COMPLETE)) {
++				*state = 0;	/* a newer src is loading */
++				*width = *height = 0;
++			}
++			nsurl_unref(u);
++		}
++	}
++	return true;
++}
++
++/* exported interface documented in html/html.h */
++void html_image_flush_events(html_content *c)
++{
++	if (c->img_fire_scheduled) {
++		guit->misc->schedule(-1, img_fire_cb, c);
++		c->img_fire_scheduled = false;
++		img_fire_cb(c);
++	}
++}
++
++/* exported interface documented in html/html.h */
++void html_image_states_free(html_content *c)
++{
++	guit->misc->schedule(-1, img_fire_cb, c);
++	c->img_fire_scheduled = false;
++	img_release_stale(c);
++	while (c->img_states != NULL) {
++		struct html_img_state *s = c->img_states;
++		c->img_states = s->next;
++		safe_hlcache_handle_release(&s->h);
++		if (s->url != NULL)
++			nsurl_unref(s->url);
++		dom_node_unref(s->node);
++		free(s);
++	}
++}
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -124,6 +124,11 @@ typedef struct html_content {
+ 	/** VitaBrowser patch 244: a script inserted an iframe; the window
+ 	 * should look for frames to load (html_iframe_sync_wanted) */
+ 	bool iframe_sync_wanted;
++	/** VitaBrowser patch 250: what each <img> loaded (load/error events,
++	 * complete, naturalWidth), and detached images' fetches */
++	struct html_img_state *img_states;
++	struct html_img_stale *img_stale;	/**< handles to release */
++	bool img_fire_scheduled;	/**< img_fire_cb is scheduled */
+ 	/** Base target */
+ 	char *base_target;
+ 
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -39,6 +39,7 @@
+ #include "netsurf/plot_style.h"
+ #include "netsurf/layout.h"
+ #include "content/handlers/html/private.h"
++#include "content/handlers/html/html.h"	/* patch 250: html_image_* */
+ /* fixes1011 (Phase 3) - the box tree, for the layout metrics. box.h defines
+  * struct box and the LEFT/RIGHT/TOP/BOTTOM edge indices; box_inspect.h has
+  * box_coords(); box_construct.h has box_for_node(). */
+@@ -3182,6 +3183,70 @@ static bool qjs_frame_size(JSContext *ctx, int *w, int *h)
+ 	return true;
+ }
+ 
++static dom_string *qjs_make_domstr(const char *s);
++
++/* VitaBrowser patch 250: __vitaImgState(img) -> [state, naturalWidth,
++ * naturalHeight] (state 0 loading / unknown, 1 loaded, 2 broken) for the
++ * element's current src, or null when nothing is known of it; it backs
++ * complete / naturalWidth / naturalHeight / decode(). */
++static JSValue qjs_img_state(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct content *c;
++	dom_node *n;
++	dom_string *nm, *v = NULL;
++	int st = 0, w = 0, h = 0;
++	bool known;
++	JSValue a;
++	(void)this_val;
++	if (argc < 1 || (n = qjs_get_node(argv[0])) == NULL)
++		return JS_NULL;
++	c = qjs_get_content_for_ctx(ctx);
++	if (c == NULL || c->handler == NULL ||
++	    c->handler->type() != CONTENT_HTML)
++		return JS_NULL;
++	nm = qjs_make_domstr("src");
++	if (nm != NULL) {
++		macsurf_dom_element_get_attribute((dom_element *)n, nm, &v);
++		macsurf_dom_string_unref(nm);
++	}
++	known = html_image_state(c, n, v != NULL ? dom_string_data(v) : NULL,
++			&st, &w, &h);
++	if (v != NULL) macsurf_dom_string_unref(v);
++	if (!known)
++		return JS_NULL;
++	a = JS_NewArray(ctx);
++	JS_SetPropertyUint32(ctx, a, 0, JS_NewInt32(ctx, st));
++	JS_SetPropertyUint32(ctx, a, 1, JS_NewInt32(ctx, w));
++	JS_SetPropertyUint32(ctx, a, 2, JS_NewInt32(ctx, h));
++	return a;
++}
++
++/* VitaBrowser patch 250: __vitaImgFetch(img, src) -- an <img> outside the
++ * document (new Image(), a detached element) given a src: fetch it; its
++ * load / error fire when it settles. */
++static JSValue qjs_img_fetch(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct content *c;
++	dom_node *n;
++	const char *src;
++	bool ok;
++	(void)this_val;
++	if (argc < 2 || (n = qjs_get_node(argv[0])) == NULL)
++		return JS_FALSE;
++	c = qjs_get_content_for_ctx(ctx);
++	if (c == NULL || c->handler == NULL ||
++	    c->handler->type() != CONTENT_HTML)
++		return JS_FALSE;
++	src = JS_ToCString(ctx, argv[1]);
++	if (src == NULL)
++		return JS_FALSE;
++	ok = html_image_fetch_detached(c, n, src);
++	JS_FreeCString(ctx, src);
++	return JS_NewBool(ctx, ok);
++}
++
+ /* __vitaPostMessageToIframe(frameLabel, jsonPayload) -- the parent realm
+  * delivering into a named child frame (frameLabel === "" targets the first
+  * iframe, matching the Phase-0 single-frame surface).  frameLabel is the
+@@ -3487,6 +3552,10 @@ void macsurf_qjs_xrealm_register(JSContext *ctx)
+ 	JS_SetPropertyStr(ctx, global, "__vitaPostMessageToIframe", f);
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_key, "__vitaIframeKey", 1);
+ 	JS_SetPropertyStr(ctx, global, "__vitaIframeKey", f);	/* 244 */
++	f = JS_NewCFunction(ctx, qjs_img_state, "__vitaImgState", 1);
++	JS_SetPropertyStr(ctx, global, "__vitaImgState", f);	/* 250 */
++	f = JS_NewCFunction(ctx, qjs_img_fetch, "__vitaImgFetch", 2);
++	JS_SetPropertyStr(ctx, global, "__vitaImgFetch", f);	/* 250 */
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_doc_key,
+ 			"__vitaIframeContentDocKey", 1);
+ 	JS_SetPropertyStr(ctx, global, "__vitaIframeContentDocKey", f);
+@@ -8981,6 +9050,7 @@ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ 		int is_doc = (document != NULL &&
+ 				node == (dom_node *)document);
+ 		int capturing = 0;
++		int to_window;
+ 		JSValue global = JS_UNDEFINED;
+ 		if (is_doc) {
+ 			dom_event_flow_phase ph = 0;
+@@ -8991,14 +9061,25 @@ static void qjs_dom_listener_cb(dom_event *evt, void *pw)
+ 			global = JS_GetGlobalObject(ctx);
+ 		}
+ 
+-		if (is_doc && capturing) {
++		/* VitaBrowser patch 250: a "load" event never reaches window
++		 * (DOM "get the parent": a Document's parent is its Window
++		 * unless the event is load). Element load events are common
++		 * now that images fire them, and web-vitals' TTFB helper, a
++		 * capturing window load listener that re-adds itself while
++		 * readyState is not "complete", doubled with every image event
++		 * until bbc.com's heap ran out. window's own load is
++		 * dispatched to it directly (js_fire_window_load). */
++		to_window = is_doc &&
++			!dom_string_isequal(type_ds, corestring_dom_load);
++
++		if (to_window && capturing) {
+ 			qjs_fire_dispatch(ctx, global, evobj, "window");
+ 		}
+ 
+ 		qjs_fire_dispatch(ctx, hit->val, evobj,
+ 				is_doc ? "document" : "element");
+ 
+-		if (is_doc && !capturing) {
++		if (to_window && !capturing) {
+ 			qjs_fire_dispatch(ctx, global, evobj, "window");
+ 		}
+ 		if (is_doc) JS_FreeValue(ctx, global);
+@@ -9618,8 +9699,13 @@ void macsurf_qjs_bind_inline_handlers(struct dom_node *node)
+ 	static const char *const names[] = {
+ 		"onclick", "onchange", "onsubmit", "oninput", "onfocus",
+ 		"onblur", "onmouseover", "onmouseout", "onmousedown",
+-		"onmouseup", "onkeydown", "onkeyup", "onkeypress", "ondblclick"
++		"onmouseup", "onkeydown", "onkeyup", "onkeypress", "ondblclick",
++		/* VitaBrowser patch 250: <img onload / onerror> (and
++		 * <script>, <iframe>, <link>): their events fire now. On
++		 * <body> / <frameset> they are the WINDOW's handlers. */
++		"onload", "onerror"
+ 	};
++	bool body_like = false;
+ 	const int n_names = (int)(sizeof(names) / sizeof(names[0]));
+ 	JSContext *ctx;
+ 	JSValue wrapper, H, fnv, src;
+@@ -9630,6 +9716,14 @@ void macsurf_qjs_bind_inline_handlers(struct dom_node *node)
+ 
+ 	ctx = qjs_ctx_for_dom_node(node);
+ 	if (ctx == NULL) return;
++	{
++		dom_string *tn = NULL;
++		if (dom_node_get_node_name(node, &tn) == DOM_NO_ERR && tn) {
++			body_like = strcasecmp(dom_string_data(tn), "body") == 0 ||
++				strcasecmp(dom_string_data(tn), "frameset") == 0;
++			macsurf_dom_string_unref(tn);
++		}
++	}
+ 
+ 	for (i = 0; i < n_names; i++) {
+ 		const char *type;
+@@ -9682,6 +9776,22 @@ void macsurf_qjs_bind_inline_handlers(struct dom_node *node)
+ 		}
+ 		fnv = src;
+ 
++		/* patch 250: <body onload> is window.onload (unless a script
++		 * set one first) */
++		if (body_like && (strcmp(names[i], "onload") == 0 ||
++				  strcmp(names[i], "onerror") == 0)) {
++			JSValue gl = JS_GetGlobalObject(ctx);
++			JSValue cur = JS_GetPropertyStr(ctx, gl, names[i]);
++			if (!JS_IsFunction(ctx, cur))
++				JS_SetPropertyStr(ctx, gl, names[i],
++						JS_DupValue(ctx, fnv));
++			JS_FreeValue(ctx, cur);
++			JS_FreeValue(ctx, gl);
++			JS_FreeValue(ctx, fnv);
++			bound++;
++			continue;
++		}
++
+ 		/* Wrapper on demand: only elements that actually carry an on*
+ 		 * attribute get one, so this does not wrap the whole document. */
+ 		macsurf_dom_node_ref(node);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2515,6 +2515,119 @@
+ "\t});\n"
+ "})();\n"
+ "\n"
++"/* ---- images: load / error, complete, naturalWidth, new Image() --------\n"
++" * VitaBrowser patch 250. No <img> fired load or error and complete /\n"
++" * naturalWidth did not exist, so scripts waiting for an image waited\n"
++" * forever; new Image() was a stand-in object that never loaded. The\n"
++" * engine now records each <img>'s image (html/object.c) and fires its\n"
++" * events; these accessors read that record, and an <img> outside the\n"
++" * document fetches when given a src, as in browsers. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document, st = g.__vitaImgState, fetchImg = g.__vitaImgFetch;\n"
++"\tif (!d || typeof d.createElement !== 'function' || typeof st !== 'function') return;\n"
++"\tvar P = Object.getPrototypeOf(d.createElement('img'));\n"
++"\tif (!P) return;\n"
++"\tfunction isImg(el) {\n"
++"\t\treturn !!el && el.nodeType === 1 && String(el.tagName).toUpperCase() === 'IMG';\n"
++"\t}\n"
++"\tfunction connected(el) {\n"
++"\t\tvar n = el, i = 0;\n"
++"\t\twhile (n.parentNode && i++ < 10000) n = n.parentNode;\n"
++"\t\treturn n.nodeType === 9;\n"
++"\t}\n"
++"\tfunction srcOf(el) { var v = el.getAttribute('src'); return v == null ? '' : String(v); }\n"
++"\tfunction state(el) { try { return st(el); } catch (e) { return null; } }\n"
++"\tfunction startFetch(el) {\n"
++"\t\tvar v = srcOf(el);\n"
++"\t\tif (v && typeof fetchImg === 'function' && !connected(el))\n"
++"\t\t\ttry { fetchImg(el, v); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tfunction own(name) {\n"
++"\t\tvar o = P, dsc;\n"
++"\t\twhile (o && !(dsc = Object.getOwnPropertyDescriptor(o, name))) o = Object.getPrototypeOf(o);\n"
++"\t\treturn dsc || null;\n"
++"\t}\n"
++"\tfunction acc(name, get, set) {\n"
++"\t\tvar cur = own(name);\n"
++"\t\tif (cur && cur.get && cur.get.__vbImg) return;\n"
++"\t\tvar oget = cur && cur.get, oset = cur && cur.set;\n"
++"\t\tvar gf = function () { return isImg(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };\n"
++"\t\tgf.__vbImg = true;\n"
++"\t\tvar sf = function (v) {\n"
++"\t\t\tif (isImg(this) && set) set.call(this, v, oset);\n"
++"\t\t\telse if (oset) oset.call(this, v);\n"
++"\t\t};\n"
++"\t\tObject.defineProperty(P, name, { configurable: true, get: gf, set: sf });\n"
++"\t}\n"
++"\tacc('complete', function () {\n"
++"\t\tif (!srcOf(this)) return true;\n"
++"\t\tvar s = state(this);\n"
++"\t\treturn !!s && s[0] !== 0;\n"
++"\t});\n"
++"\tacc('naturalWidth', function () { var s = state(this); return s && s[0] === 1 ? s[1] : 0; });\n"
++"\tacc('naturalHeight', function () { var s = state(this); return s && s[0] === 1 ? s[2] : 0; });\n"
++"\tfunction dim(attr, natural, offset) {\n"
++"\t\treturn function () {\n"
++"\t\t\tvar r = this[offset];\n"
++"\t\t\tif (typeof r === 'number' && r > 0 && connected(this)) return r;\n"
++"\t\t\tvar a = parseInt(this.getAttribute(attr), 10);\n"
++"\t\t\tif (a >= 0) return a;\n"
++"\t\t\treturn this[natural] || 0;\n"
++"\t\t};\n"
++"\t}\n"
++"\tfunction setDim(attr) { return function (v) { this.setAttribute(attr, String(v)); }; }\n"
++"\tacc('width', dim('width', 'naturalWidth', 'offsetWidth'), setDim('width'));\n"
++"\tacc('height', dim('height', 'naturalHeight', 'offsetHeight'), setDim('height'));\n"
++"\tacc('src', function () {\n"
++"\t\t/* absolute, as browsers answer */\n"
++"\t\tvar v = srcOf(this);\n"
++"\t\tif (!v) return '';\n"
++"\t\ttry { return new URL(v, d.baseURI || g.location.href).href; } catch (e) { return v; }\n"
++"\t}, function (v, oset) {\n"
++"\t\tif (oset) oset.call(this, v); else this.setAttribute('src', String(v));\n"
++"\t\tstartFetch(this);\n"
++"\t});\n"
++"\tvar sa = P.setAttribute;\n"
++"\tif (typeof sa === 'function' && !sa.__vbImg) {\n"
++"\t\tvar w = function (name, v) {\n"
++"\t\t\tvar r = sa.apply(this, arguments);\n"
++"\t\t\tif (isImg(this) && String(name).toLowerCase() === 'src') startFetch(this);\n"
++"\t\t\treturn r;\n"
++"\t\t};\n"
++"\t\tw.__vbImg = true;\n"
++"\t\tP.setAttribute = w;\n"
++"\t}\n"
++"\tif (!P.decode || !P.decode.__vbImg) {\n"
++"\t\tvar dec = function () {\n"
++"\t\t\tvar el = this;\n"
++"\t\t\treturn new Promise(function (res, rej) {\n"
++"\t\t\t\tfunction settle() {\n"
++"\t\t\t\t\tvar s = state(el);\n"
++"\t\t\t\t\tif (s && s[0] === 1) { res(); return true; }\n"
++"\t\t\t\t\tif (s && s[0] === 2) { rej(new Error('EncodingError: the image cannot be decoded')); return true; }\n"
++"\t\t\t\t\treturn false;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tif (settle()) return;\n"
++"\t\t\t\tel.addEventListener('load', function () { res(); });\n"
++"\t\t\t\tel.addEventListener('error', function () { rej(new Error('EncodingError: the image cannot be decoded')); });\n"
++"\t\t\t});\n"
++"\t\t};\n"
++"\t\tdec.__vbImg = true;\n"
++"\t\tP.decode = dec;\n"
++"\t}\n"
++"\t/* new Image(w, h) is an <img> */\n"
++"\tvar Img = function Image(w, h) {\n"
++"\t\tvar e = g.document.createElement('img');\n"
++"\t\tif (w !== undefined) e.setAttribute('width', String(w));\n"
++"\t\tif (h !== undefined) e.setAttribute('height', String(h));\n"
++"\t\treturn e;\n"
++"\t};\n"
++"\tImg.prototype = (g.HTMLImageElement && g.HTMLImageElement.prototype) || P;\n"
++"\tObject.defineProperty(Img, Symbol.hasInstance, { value: function (x) { return isImg(x); } });\n"
++"\tg.Image = Img;\n"
++"})();\n"
++"\n"
+ "/* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,\n"
+ " * XMLSerializer, the scratch document ---------------------------------\n"
+ " * Closure's sanitizer (google's trending searches, and wherever Google\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2514,6 +2514,119 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	});
+ })();
+ 
++/* ---- images: load / error, complete, naturalWidth, new Image() --------
++ * VitaBrowser patch 250. No <img> fired load or error and complete /
++ * naturalWidth did not exist, so scripts waiting for an image waited
++ * forever; new Image() was a stand-in object that never loaded. The
++ * engine now records each <img>'s image (html/object.c) and fires its
++ * events; these accessors read that record, and an <img> outside the
++ * document fetches when given a src, as in browsers. */
++
++(function () {
++	var d = g.document, st = g.__vitaImgState, fetchImg = g.__vitaImgFetch;
++	if (!d || typeof d.createElement !== 'function' || typeof st !== 'function') return;
++	var P = Object.getPrototypeOf(d.createElement('img'));
++	if (!P) return;
++	function isImg(el) {
++		return !!el && el.nodeType === 1 && String(el.tagName).toUpperCase() === 'IMG';
++	}
++	function connected(el) {
++		var n = el, i = 0;
++		while (n.parentNode && i++ < 10000) n = n.parentNode;
++		return n.nodeType === 9;
++	}
++	function srcOf(el) { var v = el.getAttribute('src'); return v == null ? '' : String(v); }
++	function state(el) { try { return st(el); } catch (e) { return null; } }
++	function startFetch(el) {
++		var v = srcOf(el);
++		if (v && typeof fetchImg === 'function' && !connected(el))
++			try { fetchImg(el, v); } catch (e) { /* */ }
++	}
++	function own(name) {
++		var o = P, dsc;
++		while (o && !(dsc = Object.getOwnPropertyDescriptor(o, name))) o = Object.getPrototypeOf(o);
++		return dsc || null;
++	}
++	function acc(name, get, set) {
++		var cur = own(name);
++		if (cur && cur.get && cur.get.__vbImg) return;
++		var oget = cur && cur.get, oset = cur && cur.set;
++		var gf = function () { return isImg(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };
++		gf.__vbImg = true;
++		var sf = function (v) {
++			if (isImg(this) && set) set.call(this, v, oset);
++			else if (oset) oset.call(this, v);
++		};
++		Object.defineProperty(P, name, { configurable: true, get: gf, set: sf });
++	}
++	acc('complete', function () {
++		if (!srcOf(this)) return true;
++		var s = state(this);
++		return !!s && s[0] !== 0;
++	});
++	acc('naturalWidth', function () { var s = state(this); return s && s[0] === 1 ? s[1] : 0; });
++	acc('naturalHeight', function () { var s = state(this); return s && s[0] === 1 ? s[2] : 0; });
++	function dim(attr, natural, offset) {
++		return function () {
++			var r = this[offset];
++			if (typeof r === 'number' && r > 0 && connected(this)) return r;
++			var a = parseInt(this.getAttribute(attr), 10);
++			if (a >= 0) return a;
++			return this[natural] || 0;
++		};
++	}
++	function setDim(attr) { return function (v) { this.setAttribute(attr, String(v)); }; }
++	acc('width', dim('width', 'naturalWidth', 'offsetWidth'), setDim('width'));
++	acc('height', dim('height', 'naturalHeight', 'offsetHeight'), setDim('height'));
++	acc('src', function () {
++		/* absolute, as browsers answer */
++		var v = srcOf(this);
++		if (!v) return '';
++		try { return new URL(v, d.baseURI || g.location.href).href; } catch (e) { return v; }
++	}, function (v, oset) {
++		if (oset) oset.call(this, v); else this.setAttribute('src', String(v));
++		startFetch(this);
++	});
++	var sa = P.setAttribute;
++	if (typeof sa === 'function' && !sa.__vbImg) {
++		var w = function (name, v) {
++			var r = sa.apply(this, arguments);
++			if (isImg(this) && String(name).toLowerCase() === 'src') startFetch(this);
++			return r;
++		};
++		w.__vbImg = true;
++		P.setAttribute = w;
++	}
++	if (!P.decode || !P.decode.__vbImg) {
++		var dec = function () {
++			var el = this;
++			return new Promise(function (res, rej) {
++				function settle() {
++					var s = state(el);
++					if (s && s[0] === 1) { res(); return true; }
++					if (s && s[0] === 2) { rej(new Error('EncodingError: the image cannot be decoded')); return true; }
++					return false;
++				}
++				if (settle()) return;
++				el.addEventListener('load', function () { res(); });
++				el.addEventListener('error', function () { rej(new Error('EncodingError: the image cannot be decoded')); });
++			});
++		};
++		dec.__vbImg = true;
++		P.decode = dec;
++	}
++	/* new Image(w, h) is an <img> */
++	var Img = function Image(w, h) {
++		var e = g.document.createElement('img');
++		if (w !== undefined) e.setAttribute('width', String(w));
++		if (h !== undefined) e.setAttribute('height', String(h));
++		return e;
++	};
++	Img.prototype = (g.HTMLImageElement && g.HTMLImageElement.prototype) || P;
++	Object.defineProperty(Img, Symbol.hasInstance, { value: function (x) { return isImg(x); } });
++	g.Image = Img;
++})();
++
+ /* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,
+  * XMLSerializer, the scratch document ---------------------------------
+  * Closure's sanitizer (google's trending searches, and wherever Google

@@ -1,0 +1,171 @@
+# netsurf: nodeName is the tagName; SVG / MathML names keep their case and
+# namespace; long names whole (patch 249)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 248)
+#
+# An element's nodeName was its lower-case name ("a"), while tagName was
+# upper case: the spec makes them the same string, so the common
+# `el.nodeName === 'A'` / `switch (node.nodeName)` tests never matched
+# (fixes1168 had left nodeName alone "to limit the blast radius"; none of
+# our own code compares it to a lower-case literal). libdom upper-cases
+# every name in an HTML document, so an <svg> answered "SVG" and
+# foreignObject "FOREIGNOBJECT"; namespaceURI was guessed from ten SVG tag
+# names; names were cut at 31 characters.
+#
+#  - quickjs/macsurf_qjs.c (the element wrapper): nodeName = tagName. An
+#    element whose libdom namespace is SVG or MathML gets its name in the
+#    parser's spelling -- lower case, plus the HTML parser's SVG camel-case
+#    table (clipPath, foreignObject, linearGradient, the fe* filters ...),
+#    which is exactly what the parser had applied -- and a hidden __vbNS.
+#    createElement('svg') stays an HTML element ("SVG"), as in browsers.
+#    Names up to 127 characters.
+#  - vita_polyfill.js: localName and namespaceURI from that namespace.
+#
+# Gate: testpages/pages/JS-node-names.html NODENAME 8/8 (Chromium 8/8).
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4422,8 +4422,9 @@ static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
+ 	JSValue obj;
+ 	dom_string *tag_ds = NULL;
+ 	const char *tag_str = "";
+-	char tag_lc[32];
+-	char tag_uc[32];
++	char tag_lc[128];
++	char tag_uc[128];
++	const char *foreign_ns = NULL;	/* patch 249: SVG / MathML */
+ 	int i;
+ 
+ 	if (el == NULL) return JS_NULL;
+@@ -4465,13 +4466,59 @@ static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
+ 	    && tag_ds != NULL) {
+ 		tag_str = dom_string_data(tag_ds);
+ 	}
+-	for (i = 0; i < 31 && tag_str[i]; i++) {
++	for (i = 0; i < 127 && tag_str[i]; i++) {
+ 		char c = tag_str[i];
+ 		tag_lc[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+ 		tag_uc[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+ 	}
+ 	tag_lc[i] = '\0';
+ 	tag_uc[i] = '\0';
++	/* VitaBrowser patch 249: an element outside the HTML namespace (an
++	 * <svg> subtree's, a <math>'s) keeps its name's case -- "svg",
++	 * "foreignObject" -- as tagName / nodeName / localName do in browsers;
++	 * an HTML element's names are upper case. The name was also cut at
++	 * 31 characters (custom element names are longer). */
++	{
++		dom_string *ns_ds = NULL;
++		if (dom_node_get_namespace((dom_node *) el, &ns_ds) == DOM_NO_ERR
++		    && ns_ds != NULL) {
++			const char *ns = dom_string_data(ns_ds);
++			if (strcmp(ns, "http://www.w3.org/2000/svg") == 0)
++				foreign_ns = "http://www.w3.org/2000/svg";
++			else if (strcmp(ns, "http://www.w3.org/1998/Math/MathML") == 0)
++				foreign_ns = "http://www.w3.org/1998/Math/MathML";
++			macsurf_dom_string_unref(ns_ds);
++		}
++		if (foreign_ns != NULL) {
++			/* libdom upper-cases every name in an HTML document;
++			 * the parser lower-cases foreign names and then gives
++			 * SVG's these camel-case spellings (HTML "adjust SVG
++			 * tag names"), so this rebuilds them exactly */
++			static const char *const svg_case[] = {
++				"altGlyph", "altGlyphDef", "altGlyphItem",
++				"animateColor", "animateMotion",
++				"animateTransform", "clipPath", "feBlend",
++				"feColorMatrix", "feComponentTransfer",
++				"feComposite", "feConvolveMatrix",
++				"feDiffuseLighting", "feDisplacementMap",
++				"feDistantLight", "feDropShadow", "feFlood",
++				"feFuncA", "feFuncB", "feFuncG", "feFuncR",
++				"feGaussianBlur", "feImage", "feMerge",
++				"feMergeNode", "feMorphology", "feOffset",
++				"fePointLight", "feSpecularLighting",
++				"feSpotLight", "feTile", "feTurbulence",
++				"foreignObject", "glyphRef", "linearGradient",
++				"radialGradient", "textPath", NULL };
++			int k;
++			strcpy(tag_uc, tag_lc);
++			for (k = 0; strcmp(foreign_ns, "http://www.w3.org/2000/svg") == 0 &&
++				    svg_case[k] != NULL; k++)
++				if (strcasecmp(svg_case[k], tag_lc) == 0) {
++					strcpy(tag_uc, svg_case[k]);
++					break;
++				}
++		}
++	}
+ 	if (tag_ds) macsurf_dom_string_unref(tag_ds);
+ 
+ 	/* fixes1127 -- route the wrapper through its tag's constructor
+@@ -4487,12 +4534,16 @@ static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
+ 		JS_FreeValue(ctx, tp);
+ 	}
+ 	/* fixes1168 (#299) - tagName is UPPERCASE for HTML elements, matching
+-	 * every real browser (nodeName is the qualified name - also uppercase
+-	 * per spec - but is left as-is here to limit the blast radius to what
+-	 * #299 asked for). The lowercase form still feeds the constructor
+-	 * prototype lookup above. */
++	 * every real browser. VitaBrowser patch 249: nodeName is the same
++	 * string, as the spec says (it was the lowercase name, so `el.nodeName
++	 * === 'A'` was never true), and a foreign element keeps its case (both
++	 * above). The lowercase form still feeds the constructor prototype
++	 * lookup above. */
+ 	JS_SetPropertyStr(ctx, obj, "tagName",  JS_NewString(ctx, tag_uc));
+-	JS_SetPropertyStr(ctx, obj, "nodeName", JS_NewString(ctx, tag_lc));
++	JS_SetPropertyStr(ctx, obj, "nodeName", JS_NewString(ctx, tag_uc));
++	if (foreign_ns != NULL)
++		JS_DefinePropertyValueStr(ctx, obj, "__vbNS",
++				JS_NewString(ctx, foreign_ns), JS_PROP_CONFIGURABLE);
+ 	JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, 1));
+ 	JS_SetPropertyStr(ctx, obj, "__ptr",
+ 		JS_NewInt64(ctx, (long long)(size_t)el));
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -3497,12 +3497,15 @@
+ "\treflect('hidden', 'hidden', 'bool'); reflect('lang', 'lang'); reflect('dir', 'dir');\n"
+ "\treflect('tabIndex', 'tabindex', 'int'); reflect('draggable', 'draggable', 'bool');\n"
+ "\treflect('slot', 'slot'); reflect('autocomplete', 'autocomplete');\n"
+-"\tacc(E, 'localName', function () { return String(this.tagName || '').toLowerCase(); });\n"
++"\t/* patch 249: from the element's real namespace (the bridge marks an\n"
++"\t * SVG / MathML element with __vbNS and keeps its name's case); it was\n"
++"\t * guessed from a list of ten SVG tag names */\n"
++"\tacc(E, 'localName', function () {\n"
++"\t\tvar t = String(this.tagName || '');\n"
++"\t\treturn this.__vbNS ? t : t.toLowerCase();\n"
++"\t});\n"
+ "\tacc(E, 'namespaceURI', function () {\n"
+-"\t\tvar t = String(this.tagName || '').toLowerCase();\n"
+-"\t\treturn (t === 'svg' || t === 'path' || t === 'g' || t === 'circle' || t === 'rect' ||\n"
+-"\t\t\tt === 'use' || t === 'symbol' || t === 'defs' || t === 'polygon' || t === 'line')\n"
+-"\t\t\t? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';\n"
++"\t\treturn this.__vbNS || 'http://www.w3.org/1999/xhtml';\n"
+ "\t});\n"
+ "\t/* innerText is the RENDERED text, not textContent: <script>,\n"
+ "\t * <style>, <template>, <noscript> and [hidden] / display:none\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -3496,12 +3496,15 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	reflect('hidden', 'hidden', 'bool'); reflect('lang', 'lang'); reflect('dir', 'dir');
+ 	reflect('tabIndex', 'tabindex', 'int'); reflect('draggable', 'draggable', 'bool');
+ 	reflect('slot', 'slot'); reflect('autocomplete', 'autocomplete');
+-	acc(E, 'localName', function () { return String(this.tagName || '').toLowerCase(); });
++	/* patch 249: from the element's real namespace (the bridge marks an
++	 * SVG / MathML element with __vbNS and keeps its name's case); it was
++	 * guessed from a list of ten SVG tag names */
++	acc(E, 'localName', function () {
++		var t = String(this.tagName || '');
++		return this.__vbNS ? t : t.toLowerCase();
++	});
+ 	acc(E, 'namespaceURI', function () {
+-		var t = String(this.tagName || '').toLowerCase();
+-		return (t === 'svg' || t === 'path' || t === 'g' || t === 'circle' || t === 'rect' ||
+-			t === 'use' || t === 'symbol' || t === 'defs' || t === 'polygon' || t === 'line')
+-			? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';
++		return this.__vbNS || 'http://www.w3.org/1999/xhtml';
+ 	});
+ 	/* innerText is the RENDERED text, not textContent: <script>,
+ 	 * <style>, <template>, <noscript> and [hidden] / display:none
