@@ -1,0 +1,323 @@
+# netsurf: document methods captured and called on a scratch document
+# answer for it; a frame shown late takes its box's size; innerWidth /
+# innerHeight inside a frame are the frame's (patch 246; roadmap WS-B2)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 245, 244 applied)
+#
+# With 244 loading script-made frames, the Guardian's consent frame
+# (sourcepoint) loaded and the page went blank at the top, 74.1 -> 70.1:
+# the frame's QuickJS heap ran out ("InternalError: out of memory" in the
+# innerHTML getter). Measured: each innerHTML read in the frame was about
+# twice the previous one, 265 KB to 48 MB in ten calls. The cause was not
+# the serializer (a size cap had been proposed): DOMPurify captures
+# document.getElementsByTagName once and calls it on its scratch document,
+#     getElementsByTagName.call(parsed, 'body')[0]
+# and our document methods answered for the page's document whatever
+# `this` was. So sanitize() returned the frame's own body, React put it
+# back in, and the next sanitize doubled it. The page was wrong long
+# before it ran out of memory.
+#
+#  - vita_polyfill.js: document.getElementsByTagName / ByClassName /
+#    getElementById / querySelector / querySelectorAll called with another
+#    document as `this` run on that document. The stand-in documents
+#    (DOMParser.parseFromString, implementation.createHTMLDocument: our
+#    elements wearing a document's hat) find their own html / head / body
+#    by tag (they found none) and answer getElementsByTagName for their
+#    tree.
+#  - desktop/frames.c: when recalculate_iframes links a window to a new
+#    box (a frame made box-less inside a display:none container, shown
+#    later), the window takes that box's position and size and is
+#    reformatted, as layout does for windows it already knows; it kept
+#    300x150 until the next layout -- sourcepoint's full-screen consent
+#    dialog sat in the corner.
+#  - quickjs/macsurf_qjs.c: innerWidth / innerHeight (and outer*) in an
+#    iframe's realm are the frame window's size; they read the whole
+#    screen (a 400x120 frame was told 960x544).
+#
+# Gate: testpages/pages/JS-scratch-doc.html SCRATCHDOC 6/6 (Chromium
+# 6/6): a captured getElementsByTagName / querySelector on DOMParser and
+# createHTMLDocument documents, a DOMPurify-shaped sanitize repeated five
+# times stays the same length, the page's own document still answers.
+# JS-xorigin-frame.html check 9: a cross-origin frame in a display:none
+# container, shown after it loads, reports 400x120 (Chromium 9/9; before:
+# 960x544, and 300x150 drawn).
+#
+# Scorecard (r19 reference): guardian 70.1 (244 alone) -> 80.1 twice
+# (74.1 before 244; the consent dialog now drawn as Chromium draws it,
+# visual 0.267 -> 0.536); bbc 63.5 (244 alone) -> 75.6 / 76.0.
+#
+# Not changed: element nodeName is still lowercase (tagName is uppercase;
+# the spec makes them equal) -- a deliberate earlier choice, logged as a
+# follow-up; DOMPurify lowercases names itself.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1232,19 +1232,27 @@ static int macsurf_qjs_scroll_x(void);
+ static int macsurf_qjs_scroll_y(void);
+ static int macsurf_qjs_viewport_w(void);
+ static int macsurf_qjs_viewport_h(void);
++static bool qjs_frame_size(JSContext *ctx, int *w, int *h);
+ 
+-/* fixes1011 - thin JS wrappers over the viewport/scroll accessors. */
++/* fixes1011 - thin JS wrappers over the viewport/scroll accessors.
++ * VitaBrowser patch 246: in an iframe's realm, the frame's own size. */
+ static JSValue qjs_js_viewport_w(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
++	int w, h;
+ 	(void)this_val; (void)argc; (void)argv;
++	if (qjs_frame_size(ctx, &w, &h))
++		return JS_NewInt32(ctx, w);
+ 	return JS_NewInt32(ctx, macsurf_qjs_viewport_w());
+ }
+ 
+ static JSValue qjs_js_viewport_h(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
++	int w, h;
+ 	(void)this_val; (void)argc; (void)argv;
++	if (qjs_frame_size(ctx, &w, &h))
++		return JS_NewInt32(ctx, h);
+ 	return JS_NewInt32(ctx, macsurf_qjs_viewport_h());
+ }
+ 
+@@ -3153,6 +3161,27 @@ qjs_xrealm_iframe_key(JSContext *ctx, JSValueConst this_val,
+ 	return JS_NULL;
+ }
+ 
++/* VitaBrowser patch 246: the size of the iframe window this realm's page is
++ * shown in -- innerWidth/innerHeight inside a frame read the whole screen,
++ * so a frame measuring itself (a consent dialog, a captcha) was told
++ * 960x544 in a 400x120 box. False outside a frame. */
++static bool qjs_frame_size(JSContext *ctx, int *w, int *h)
++{
++	struct content *c = qjs_get_content_for_ctx(ctx);
++	struct browser_window *bw;
++
++	if (c == NULL || c->handler == NULL ||
++	    c->handler->type() != CONTENT_HTML)
++		return false;
++	bw = ((struct html_content *)c)->bw;
++	if (bw == NULL || bw->browser_window_type != BROWSER_WINDOW_IFRAME ||
++	    bw->width <= 0 || bw->height <= 0)
++		return false;
++	*w = bw->width;
++	*h = bw->height;
++	return true;
++}
++
+ /* __vitaPostMessageToIframe(frameLabel, jsonPayload) -- the parent realm
+  * delivering into a named child frame (frameLabel === "" targets the first
+  * iframe, matching the Phase-0 single-frame surface).  frameLabel is the
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2434,6 +2434,87 @@
+ "\t\t} });\n"
+ "})();\n"
+ "\n"
++"/* ---- the scratch documents answer for themselves (VitaBrowser patch 246)\n"
++" * DOMPurify (sourcepoint's consent notices, and wherever HTML from data is\n"
++" * sanitized) captures document.getElementsByTagName once and later calls it\n"
++" * on its scratch document: getElementsByTagName.call(parsed, 'body')[0].\n"
++" * Our document methods answered for THIS document whatever `this` was, so\n"
++" * the sanitizer returned the frame's own body; React put it back into the\n"
++" * page, the next sanitize doubled it, and at 48 MB the frame's heap ran\n"
++" * out (the Guardian's consent frame, blanking the page under it). The\n"
++" * stand-in documents (DOMParser, createHTMLDocument) also found no body or\n"
++" * html by tag name -- they are elements of this document wearing a\n"
++" * document's hat. Now a document method called on another document runs on\n"
++" * that one, and a stand-in finds its own html / head / body. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d || typeof d.createElement !== 'function') return;\n"
++"\tfunction byTag(doc, tag) {\n"
++"\t\tvar t = String(tag).toLowerCase(), root = doc.documentElement, r;\n"
++"\t\tif (t === 'html') return root ? [root] : [];\n"
++"\t\tif (t === 'body') return doc.body ? [doc.body] : [];\n"
++"\t\tif (t === 'head') return doc.head ? [doc.head] : [];\n"
++"\t\tif (!root || typeof root.querySelectorAll !== 'function') return [];\n"
++"\t\ttry { r = root.querySelectorAll(t === '*' ? '*' : t); } catch (e) { return []; }\n"
++"\t\treturn Array.prototype.slice.call(r);\n"
++"\t}\n"
++"\tfunction hat(doc) {\n"
++"\t\tif (!doc || doc === d || typeof doc !== 'object' || doc.__vbHat) return doc;\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(doc, '__vbHat', { value: true });\n"
++"\t\t\tdoc.getElementsByTagName = function (t) { return byTag(this, t); };\n"
++"\t\t\tif (typeof doc.getElementsByClassName !== 'function' ||\n"
++"\t\t\t    !doc.documentElement)\n"
++"\t\t\t\tdoc.getElementsByClassName = function (c) {\n"
++"\t\t\t\t\tvar root = this.documentElement;\n"
++"\t\t\t\t\tif (!root || typeof root.getElementsByClassName !== 'function') return [];\n"
++"\t\t\t\t\treturn root.getElementsByClassName(c);\n"
++"\t\t\t\t};\n"
++"\t\t\tif (!doc.ownerDocument) doc.ownerDocument = null;\n"
++"\t\t\tif (typeof doc.createElement !== 'function')\n"
++"\t\t\t\tdoc.createElement = function (n) { return d.createElement(n); };\n"
++"\t\t\tif (typeof doc.createTextNode !== 'function')\n"
++"\t\t\t\tdoc.createTextNode = function (x) { return d.createTextNode(x); };\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t\treturn doc;\n"
++"\t}\n"
++"\tvar DP = g.DOMParser && g.DOMParser.prototype;\n"
++"\tif (DP && typeof DP.parseFromString === 'function' && !DP.parseFromString.__vbHat) {\n"
++"\t\tvar pfs = DP.parseFromString, w1 = function () {\n"
++"\t\t\treturn hat(pfs.apply(this, arguments));\n"
++"\t\t};\n"
++"\t\tw1.__vbHat = true;\n"
++"\t\tDP.parseFromString = w1;\n"
++"\t}\n"
++"\tvar impl = d.implementation;\n"
++"\tif (impl && typeof impl.createHTMLDocument === 'function' &&\n"
++"\t    !impl.createHTMLDocument.__vbHat) {\n"
++"\t\tvar chd = impl.createHTMLDocument, w2 = function () {\n"
++"\t\t\treturn hat(chd.apply(this, arguments));\n"
++"\t\t};\n"
++"\t\tw2.__vbHat = true;\n"
++"\t\tw2.__vb = chd.__vb;\n"
++"\t\ttry { impl.createHTMLDocument = w2; } catch (e) { /* */ }\n"
++"\t}\n"
++"\t/* document methods follow `this` to another document */\n"
++"\t['getElementsByTagName', 'getElementsByClassName', 'getElementById',\n"
++"\t 'querySelector', 'querySelectorAll'].forEach(function (name) {\n"
++"\t\tvar f = d[name];\n"
++"\t\tif (typeof f !== 'function' || f.__vbThis) return;\n"
++"\t\tvar w = function () {\n"
++"\t\t\tvar o = this;\n"
++"\t\t\tif (o && o !== d && o !== g && typeof o === 'object' &&\n"
++"\t\t\t    o.nodeType === 9 && typeof o[name] === 'function' &&\n"
++"\t\t\t    o[name] !== w)\n"
++"\t\t\t\treturn o[name].apply(o, arguments);\n"
++"\t\t\treturn f.apply(d, arguments);\n"
++"\t\t};\n"
++"\t\tw.__vbThis = true;\n"
++"\t\ttry { d[name] = w; } catch (e) { /* */ }\n"
++"\t});\n"
++"})();\n"
++"\n"
+ "/* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,\n"
+ " * XMLSerializer, the scratch document ---------------------------------\n"
+ " * Closure's sanitizer (google's trending searches, and wherever Google\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2433,6 +2433,87 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		} });
+ })();
+ 
++/* ---- the scratch documents answer for themselves (VitaBrowser patch 246)
++ * DOMPurify (sourcepoint's consent notices, and wherever HTML from data is
++ * sanitized) captures document.getElementsByTagName once and later calls it
++ * on its scratch document: getElementsByTagName.call(parsed, 'body')[0].
++ * Our document methods answered for THIS document whatever `this` was, so
++ * the sanitizer returned the frame's own body; React put it back into the
++ * page, the next sanitize doubled it, and at 48 MB the frame's heap ran
++ * out (the Guardian's consent frame, blanking the page under it). The
++ * stand-in documents (DOMParser, createHTMLDocument) also found no body or
++ * html by tag name -- they are elements of this document wearing a
++ * document's hat. Now a document method called on another document runs on
++ * that one, and a stand-in finds its own html / head / body. */
++
++(function () {
++	var d = g.document;
++	if (!d || typeof d.createElement !== 'function') return;
++	function byTag(doc, tag) {
++		var t = String(tag).toLowerCase(), root = doc.documentElement, r;
++		if (t === 'html') return root ? [root] : [];
++		if (t === 'body') return doc.body ? [doc.body] : [];
++		if (t === 'head') return doc.head ? [doc.head] : [];
++		if (!root || typeof root.querySelectorAll !== 'function') return [];
++		try { r = root.querySelectorAll(t === '*' ? '*' : t); } catch (e) { return []; }
++		return Array.prototype.slice.call(r);
++	}
++	function hat(doc) {
++		if (!doc || doc === d || typeof doc !== 'object' || doc.__vbHat) return doc;
++		try {
++			Object.defineProperty(doc, '__vbHat', { value: true });
++			doc.getElementsByTagName = function (t) { return byTag(this, t); };
++			if (typeof doc.getElementsByClassName !== 'function' ||
++			    !doc.documentElement)
++				doc.getElementsByClassName = function (c) {
++					var root = this.documentElement;
++					if (!root || typeof root.getElementsByClassName !== 'function') return [];
++					return root.getElementsByClassName(c);
++				};
++			if (!doc.ownerDocument) doc.ownerDocument = null;
++			if (typeof doc.createElement !== 'function')
++				doc.createElement = function (n) { return d.createElement(n); };
++			if (typeof doc.createTextNode !== 'function')
++				doc.createTextNode = function (x) { return d.createTextNode(x); };
++		} catch (e) { /* */ }
++		return doc;
++	}
++	var DP = g.DOMParser && g.DOMParser.prototype;
++	if (DP && typeof DP.parseFromString === 'function' && !DP.parseFromString.__vbHat) {
++		var pfs = DP.parseFromString, w1 = function () {
++			return hat(pfs.apply(this, arguments));
++		};
++		w1.__vbHat = true;
++		DP.parseFromString = w1;
++	}
++	var impl = d.implementation;
++	if (impl && typeof impl.createHTMLDocument === 'function' &&
++	    !impl.createHTMLDocument.__vbHat) {
++		var chd = impl.createHTMLDocument, w2 = function () {
++			return hat(chd.apply(this, arguments));
++		};
++		w2.__vbHat = true;
++		w2.__vb = chd.__vb;
++		try { impl.createHTMLDocument = w2; } catch (e) { /* */ }
++	}
++	/* document methods follow `this` to another document */
++	['getElementsByTagName', 'getElementsByClassName', 'getElementById',
++	 'querySelector', 'querySelectorAll'].forEach(function (name) {
++		var f = d[name];
++		if (typeof f !== 'function' || f.__vbThis) return;
++		var w = function () {
++			var o = this;
++			if (o && o !== d && o !== g && typeof o === 'object' &&
++			    o.nodeType === 9 && typeof o[name] === 'function' &&
++			    o[name] !== w)
++				return o[name].apply(o, arguments);
++			return f.apply(d, arguments);
++		};
++		w.__vbThis = true;
++		try { d[name] = w; } catch (e) { /* */ }
++	});
++})();
++
+ /* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,
+  * XMLSerializer, the scratch document ---------------------------------
+  * Closure's sanitizer (google's trending searches, and wherever Google
+diff --git a/desktop/frames.c b/desktop/frames.c
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -625,6 +625,25 @@ void browser_window_recalculate_iframes(struct browser_window *bw)
+ 			} else if (window->box != cur->box) {
+ 				window->box = cur->box;
+ 				cur->box->iframe = window;
++				/* patch 246: placed and sized from its new box,
++				 * as layout does for linked windows -- one made
++				 * box-less (300x150) or for an older box kept
++				 * that size until the next layout: sourcepoint's
++				 * full-screen consent frame sat in a corner */
++				if (cur->box->width > 0 &&
++				    cur->box->width < 0x100000 &&
++				    cur->box->height >= 0 &&
++				    cur->box->height < 0x100000) {
++					int x, y;
++					box_coords(cur->box, &x, &y);
++					browser_window_set_position(window, x, y);
++					browser_window_set_dimensions(window,
++						cur->box->width,
++						cur->box->height);
++					browser_window_reformat(window, true,
++						cur->box->width,
++						cur->box->height);
++				}
+ 			}
+ 		}
+ 		for (cur = list; cur != NULL && !fresh; cur = cur->next)
