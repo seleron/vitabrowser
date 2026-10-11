@@ -4,6 +4,18 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-11 09:31 — patches 249-250: images fire load; mean 79.8 -> 80.0
+
+A/B on the same fresh Chrome references, run back to back: r43 (patches
+to 250) against r44 (the 247 build, `sc.SIM` pointed at the copy of the
+tested 247 tree). All 21 sites: 79.8 -> 80.0. wikipedia 85.1 -> 87.9
+(visual 0.627 -> 0.698: its images now load the way its scripts wait
+for), guardian 80.5 -> 81.1, hackernews 92.1 -> 92.7, youtube 76.9 ->
+77.3, bbc 89.9 -> 89.7; the other 15 identical. Two regressions found on
+the way and fixed before landing: github crashing 1 run in 6 (a cache
+handle aborted mid-broadcast) and bbc out of heap 4 runs in 6 (element
+load events reaching a self-re-adding window listener).
+
 ## 2026-10-11 06:02 — patches 244-246: the Guardian 74.1 -> 80.1
 
 `--only guardian --reuse-ref r19-full-230/ref`, two runs: 80.1 / 80.1
