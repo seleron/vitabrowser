@@ -1,0 +1,474 @@
+# netsurf: github.com's React file list renders -- selector lists past 8
+# alternatives, HTMLElement on every polyfill run, a minimal Shadow DOM
+# (patch 242)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 241)
+#
+# github.com/<repo> scored 64.7 (text 0.645) with 0 JS errors: its file
+# list's commit messages and the latest-commit box are filled in by the
+# <react-app app-name="code-view"> element, and that element was never
+# upgraded, so React never booted. Found by probing the live page in the
+# simulator (scorecard run_sim + a custom SIM_EVAL_JS):
+#
+#  - The upgrade sweep queries every defined name in one list (75 on
+#    github.com). The native matcher keeps at most 8 alternatives of a
+#    list (QJS_SEL_MAX_LIST: a stack array of ~7 KB structs, not safely
+#    growable on the Vita) and dropped the rest without a word; react-app
+#    was past the 8th. The querySelector(All) wrappers (patch 178) now send
+#    a longer plain list to the native matcher in chunks of 8 and merge the
+#    results in document order.
+#  - The bridge installs its own HTMLElement again after the polyfill's
+#    first run, so classes defined by the page extended the bridge's and
+#    not 240's upgrade-aware constructor. That constructor is now installed
+#    on every run (state on the hidden registry object, like 240's
+#    createElement wrapper). A constructor that throws during an upgrade
+#    is logged with its stack.
+#  - React's components then reached Element.attachShadow, which the
+#    engine lacks: github.com's invoker-commands polyfill wraps
+#    HTMLElement.prototype.attachShadow unconditionally and called the
+#    missing original (<relative-time>, <tool-tip>: "cannot read property
+#    'call' of undefined"). A minimal Shadow DOM API: attachShadow
+#    (open / closed, a second call throws NotSupportedError),
+#    element.shadowRoot, a ShadowRoot (a document fragment with host,
+#    mode, innerHTML, getElementById, adoptedStyleSheets) replacing the
+#    interface census's empty ShadowRoot stub, and replaceChildren on
+#    fragments. The shadow tree is NOT drawn -- the host's light DOM stays
+#    what is rendered (the safe side for text).
+#
+# Gates: JS-selector-list-long.html LONGLIST 4/4 (Chromium 4/4; chunking
+# disarmed 0/4), JS-attach-shadow.html SHADOW 7/7 (Chromium 7/7).
+# github.com (r19's Chrome reference, with patch 243): 64.7 -> 81.8, text
+# 0.645 -> 1.0, 0 JS errors.
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -3271,6 +3271,21 @@
+ "\t\teach(root, function (m) { if (set.has(m)) out.push(m); return false; });\n"
+ "\t\treturn out;\n"
+ "\t}\n"
++"\t/* patch 242: the native matcher keeps at most 8 alternatives of a\n"
++"\t * selector list (QJS_SEL_MAX_LIST, a stack array) and silently drops\n"
++"\t * the rest; github.com's custom-element sweep asks for 75 names at\n"
++"\t * once. A longer plain list goes to it in chunks, merged in document\n"
++"\t * order. */\n"
++"\tvar NAT_MAX_ALT = 8;\n"
++"\tfunction manyAlts(sel) { return sel.split(',').length > NAT_MAX_ALT; }\n"
++"\tfunction natChunks(root, sel, natAll) {\n"
++"\t\tvar alts = sel.split(','), set = new Set(), i, j, r;\n"
++"\t\tfor (i = 0; i < alts.length; i += NAT_MAX_ALT) {\n"
++"\t\t\tr = natAll.call(root, alts.slice(i, i + NAT_MAX_ALT).join(','));\n"
++"\t\t\tfor (j = 0; r && j < r.length; j++) set.add(r[j]);\n"
++"\t\t}\n"
++"\t\treturn inOrder(root, set);\n"
++"\t}\n"
+ "\tfunction jsQuery(root, sel, first, nat) {\n"
+ "\t\tvar list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;\n"
+ "\t\tif (!seeds.length) return first ? null : listOf([]);\n"
+@@ -3324,7 +3339,9 @@
+ "\t\t\tvar natAll = qa, wa = function (sel) {\n"
+ "\t\t\t\tsel = String(sel);\n"
+ "\t\t\t\tparse(sel);\t/* an invalid selector throws SyntaxError */\n"
+-"\t\t\t\tif (plain(sel)) return natAll.call(this, sel);\n"
++"\t\t\t\tif (plain(sel))\n"
++"\t\t\t\t\treturn manyAlts(sel) ? listOf(natChunks(this, sel, natAll)) :\n"
++"\t\t\t\t\t\tnatAll.call(this, sel);\n"
+ "\t\t\t\treturn jsQuery(this, sel, false, natAll);\n"
+ "\t\t\t};\n"
+ "\t\t\twa.__vbNat = natAll;\n"
+@@ -3334,7 +3351,10 @@
+ "\t\t\tvar nat1 = q1, all = nativeOf(o.querySelectorAll), w1 = function (sel) {\n"
+ "\t\t\t\tsel = String(sel);\n"
+ "\t\t\t\tparse(sel);\n"
+-"\t\t\t\tif (plain(sel)) return nat1.call(this, sel);\n"
++"\t\t\t\tif (plain(sel)) {\n"
++"\t\t\t\t\tif (manyAlts(sel)) return natChunks(this, sel, all)[0] || null;\n"
++"\t\t\t\t\treturn nat1.call(this, sel);\n"
++"\t\t\t\t}\n"
+ "\t\t\t\treturn jsQuery(this, sel, true, all);\n"
+ "\t\t\t};\n"
+ "\t\t\tw1.__vbNat = nat1;\n"
+@@ -4115,7 +4135,7 @@
+ "\t * attributeChangedCallback for a class's observedAttributes. */\n"
+ "\tif (typeof g.customElements === 'undefined') {\n"
+ "\t\tvar defs = {}, waits = {}, building = [], attrMO = null;\n"
+-"\t\tvar NativeHE = g.HTMLElement, origCreate = d.createElement;\n"
++"\t\t/* (HTMLElement is installed per run, below) */\n"
+ "\t\tfunction lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }\n"
+ "\t\tfunction nameOf(C) { for (var k in defs) if (defs[k] === C) return k; return null; }\n"
+ "\t\tfunction connected(n) {\n"
+@@ -4136,7 +4156,8 @@
+ "\t\t\tbuilding.push({ el: el, C: C });\n"
+ "\t\t\ttry { new C(); } catch (e) {\n"
+ "\t\t\t\ttry { Object.setPrototypeOf(el, C.prototype); } catch (x) { /* */ }\n"
+-"\t\t\t\ttry { console.error('customElement ' + lname(el) + ' constructor: ' + e); } catch (x) { /* */ }\n"
++"\t\t\t\ttry { console.error('customElement ' + lname(el) + ' constructor: ' + e +\n"
++"\t\t\t\t\t(e && e.stack ? ' STACK ' + String(e.stack).slice(0, 600) : '')); } catch (x) { /* */ }\n"
+ "\t\t\t}\n"
+ "\t\t\tbuilding.pop();\n"
+ "\t\t\tvar obs = C.observedAttributes;\n"
+@@ -4184,29 +4205,8 @@
+ "\t\t\t\t}\n"
+ "\t\t\t}\n"
+ "\t\t}\n"
+-"\t\t/* HTMLElement as a constructor super() can call */\n"
+-"\t\tif (typeof NativeHE === 'function') {\n"
+-"\t\t\tvar HE = function HTMLElement() {\n"
+-"\t\t\t\tvar nt = new.target, top = building[building.length - 1], el;\n"
+-"\t\t\t\tif (!nt) throw new TypeError('Illegal constructor');\n"
+-"\t\t\t\tif (top && (top.C === nt || nt.prototype instanceof top.C ||\n"
+-"\t\t\t\t\t    top.C.prototype instanceof nt)) {\n"
+-"\t\t\t\t\tel = top.el;\n"
+-"\t\t\t\t} else {\n"
+-"\t\t\t\t\tvar nm = nameOf(nt), cr = d.createElement;\n"
+-"\t\t\t\t\tif (!nm) throw new TypeError('Illegal constructor');\n"
+-"\t\t\t\t\tel = (cr && cr.__vbNat ? cr.__vbNat : origCreate).call(d, nm);\n"
+-"\t\t\t\t\tel.__vbConstructed = true;\n"
+-"\t\t\t\t}\n"
+-"\t\t\t\tObject.setPrototypeOf(el, nt.prototype);\n"
+-"\t\t\t\treturn el;\n"
+-"\t\t\t};\n"
+-"\t\t\tHE.prototype = NativeHE.prototype;\n"
+-"\t\t\ttry { Object.setPrototypeOf(HE, NativeHE); } catch (e) { /* */ }\n"
+-"\t\t\ttry { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }\n"
+-"\t\t\tg.HTMLElement = HE;\n"
+-"\t\t}\n"
+-"\t\tg.__vbCustomEl = { defs: defs, construct: construct };\n"
++"\t\tg.__vbCustomEl = { defs: defs, construct: construct,\n"
++"\t\t\t\t    building: building, nameOf: nameOf };\n"
+ "\t\tg.customElements = {\n"
+ "\t\t\tdefine: function (name, C) {\n"
+ "\t\t\t\tname = String(name).toLowerCase();\n"
+@@ -4253,6 +4253,36 @@
+ "\t\t\t} catch (e) { /* */ }\n"
+ "\t\t}\n"
+ "\t}\n"
++"\t/* patch 240/242: HTMLElement as a constructor super() can call -- while\n"
++"\t * an element is being upgraded it hands that element to super(), so\n"
++"\t * the constructor body runs on it. Installed on every run of this\n"
++"\t * file: the bridge installs its own HTMLElement again after the first\n"
++"\t * (242: github.com's classes extended the bridge's, and never\n"
++"\t * upgraded). */\n"
++"\t(function () {\n"
++"\t\tvar CE = g.__vbCustomEl, NHE = g.HTMLElement;\n"
++"\t\tif (!CE || typeof NHE !== 'function' || NHE.__vbHE) return;\n"
++"\t\tvar HE = function HTMLElement() {\n"
++"\t\t\tvar nt = new.target, b = CE.building, top = b[b.length - 1], el;\n"
++"\t\t\tif (!nt) throw new TypeError('Illegal constructor');\n"
++"\t\t\tif (top && (top.C === nt || nt.prototype instanceof top.C ||\n"
++"\t\t\t\t    top.C.prototype instanceof nt)) {\n"
++"\t\t\t\tel = top.el;\n"
++"\t\t\t} else {\n"
++"\t\t\t\tvar nm = CE.nameOf(nt), cr = d.createElement;\n"
++"\t\t\t\tif (!nm) throw new TypeError('Illegal constructor');\n"
++"\t\t\t\tel = (cr && cr.__vbNat ? cr.__vbNat : cr).call(d, nm);\n"
++"\t\t\t\tel.__vbConstructed = true;\n"
++"\t\t\t}\n"
++"\t\t\tObject.setPrototypeOf(el, nt.prototype);\n"
++"\t\t\treturn el;\n"
++"\t\t};\n"
++"\t\tHE.__vbHE = true;\n"
++"\t\tHE.prototype = NHE.prototype;\n"
++"\t\ttry { Object.setPrototypeOf(HE, NHE); } catch (e) { /* */ }\n"
++"\t\ttry { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tg.HTMLElement = HE;\n"
++"\t})();\n"
+ "\t/* patch 240: createElement runs a defined element's constructor. The\n"
+ "\t * bridge installs document.createElement again after this file's\n"
+ "\t * first run (qjs_dom_install runs twice per context, and this file\n"
+@@ -4269,6 +4299,63 @@
+ "\t\tw.__vbNat = cr;\n"
+ "\t\td.createElement = w;\n"
+ "\t})();\n"
++"\t/* patch 242: a minimal Shadow DOM API -- Element.attachShadow, a\n"
++"\t * ShadowRoot (a document fragment with host, mode, innerHTML and\n"
++"\t * getElementById), element.shadowRoot for an open root. The shadow\n"
++"\t * tree is NOT drawn: the host's light DOM stays what is rendered.\n"
++"\t * The engine had none, and github.com's invoker-commands polyfill\n"
++"\t * wraps HTMLElement.prototype.attachShadow unconditionally (it calls\n"
++"\t * the saved original), so every component that attaches a shadow\n"
++"\t * root in its constructor threw: <relative-time>, <tool-tip>. */\n"
++"\t(function () {\n"
++"\t\tvar EP = (g.Element && g.Element.prototype) ||\n"
++"\t\t\tObject.getPrototypeOf(Object.getPrototypeOf(d.createElement('div')));\n"
++"\t\tif (!EP || typeof EP.attachShadow === 'function') return;\n"
++"\t\tvar FP = Object.getPrototypeOf(d.createDocumentFragment());\n"
++"\t\tvar SR = function ShadowRoot() { throw new TypeError('Illegal constructor'); };\n"
++"\t\tSR.prototype = Object.create(FP);\n"
++"\t\ttry { Object.defineProperty(SR.prototype, 'constructor', { value: SR, writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(SR.prototype, 'innerHTML', { configurable: true,\n"
++"\t\t\t\tget: function () {\n"
++"\t\t\t\t\tvar h = d.createElement('div'), c;\n"
++"\t\t\t\t\tfor (c = this.firstChild; c; c = c.nextSibling) h.appendChild(c.cloneNode(true));\n"
++"\t\t\t\t\treturn h.innerHTML;\n"
++"\t\t\t\t},\n"
++"\t\t\t\tset: function (v) {\n"
++"\t\t\t\t\tvar h = d.createElement('div');\n"
++"\t\t\t\t\twhile (this.firstChild) this.removeChild(this.firstChild);\n"
++"\t\t\t\t\th.innerHTML = String(v);\n"
++"\t\t\t\t\twhile (h.firstChild) this.appendChild(h.firstChild);\n"
++"\t\t\t\t} });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t\tSR.prototype.getElementById = function (id) {\n"
++"\t\t\tvar l = this.querySelectorAll('[id]'), i;\n"
++"\t\t\tfor (i = 0; i < l.length; i++) if (l[i].id === String(id)) return l[i];\n"
++"\t\t\treturn null;\n"
++"\t\t};\n"
++"\t\t/* (a ShadowRoot already there is the interface census's empty\n"
++"\t\t * stub: there was no attachShadow to make one) */\n"
++"\t\tg.ShadowRoot = SR;\n"
++"\t\tEP.attachShadow = function attachShadow(init) {\n"
++"\t\t\tif (this.__vbShadow)\n"
++"\t\t\t\tthrow new DOMException('Shadow root cannot be created on a host which already hosts a shadow tree.', 'NotSupportedError');\n"
++"\t\t\tvar r = d.createDocumentFragment(), host = this;\n"
++"\t\t\tvar mode = init && init.mode === 'closed' ? 'closed' : 'open';\n"
++"\t\t\ttry { Object.setPrototypeOf(r, SR.prototype); } catch (e) { /* */ }\n"
++"\t\t\ttry {\n"
++"\t\t\t\tObject.defineProperty(r, 'host', { value: host, configurable: true });\n"
++"\t\t\t\tObject.defineProperty(r, 'mode', { value: mode, configurable: true });\n"
++"\t\t\t\tObject.defineProperty(r, 'delegatesFocus', { value: !!(init && init.delegatesFocus), configurable: true });\n"
++"\t\t\t\tObject.defineProperty(r, 'adoptedStyleSheets', { value: [], writable: true, configurable: true });\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t\tthis.__vbShadow = r;\n"
++"\t\t\tif (mode === 'open') {\n"
++"\t\t\t\ttry { Object.defineProperty(this, 'shadowRoot', { get: function () { return r; }, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t\treturn r;\n"
++"\t\t};\n"
++"\t})();\n"
+ "\t/* patch 240: the document is a ParentNode too -- firstElementChild\n"
+ "\t * and co. were undefined on it (github.com reads\n"
+ "\t * document.firstElementChild.classList) */\n"
+@@ -4423,6 +4510,15 @@
+ "\t\t\tthis.appendChild(typeof n === 'string' ? d.createTextNode(n) : n);\n"
+ "\t\t}\n"
+ "\t});\n"
++"\t/* patch 242: replaceChildren on fragments (and so shadow roots):\n"
++"\t * github.com's <relative-time> renders into its root with it */\n"
++"\tdef('replaceChildren', function () {\n"
++"\t\twhile (this.firstChild) this.removeChild(this.firstChild);\n"
++"\t\tfor (var i = 0; i < arguments.length; i++) {\n"
++"\t\t\tvar n = arguments[i];\n"
++"\t\t\tthis.appendChild(typeof n === 'string' ? d.createTextNode(n) : n);\n"
++"\t\t}\n"
++"\t});\n"
+ "\tdef('prepend', function () {\n"
+ "\t\tvar first = this.firstChild;\n"
+ "\t\tfor (var i = 0; i < arguments.length; i++) {\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -3270,6 +3270,21 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		each(root, function (m) { if (set.has(m)) out.push(m); return false; });
+ 		return out;
+ 	}
++	/* patch 242: the native matcher keeps at most 8 alternatives of a
++	 * selector list (QJS_SEL_MAX_LIST, a stack array) and silently drops
++	 * the rest; github.com's custom-element sweep asks for 75 names at
++	 * once. A longer plain list goes to it in chunks, merged in document
++	 * order. */
++	var NAT_MAX_ALT = 8;
++	function manyAlts(sel) { return sel.split(',').length > NAT_MAX_ALT; }
++	function natChunks(root, sel, natAll) {
++		var alts = sel.split(','), set = new Set(), i, j, r;
++		for (i = 0; i < alts.length; i += NAT_MAX_ALT) {
++			r = natAll.call(root, alts.slice(i, i + NAT_MAX_ALT).join(','));
++			for (j = 0; r && j < r.length; j++) set.add(r[j]);
++		}
++		return inOrder(root, set);
++	}
+ 	function jsQuery(root, sel, first, nat) {
+ 		var list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;
+ 		if (!seeds.length) return first ? null : listOf([]);
+@@ -3323,7 +3338,9 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			var natAll = qa, wa = function (sel) {
+ 				sel = String(sel);
+ 				parse(sel);	/* an invalid selector throws SyntaxError */
+-				if (plain(sel)) return natAll.call(this, sel);
++				if (plain(sel))
++					return manyAlts(sel) ? listOf(natChunks(this, sel, natAll)) :
++						natAll.call(this, sel);
+ 				return jsQuery(this, sel, false, natAll);
+ 			};
+ 			wa.__vbNat = natAll;
+@@ -3333,7 +3350,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			var nat1 = q1, all = nativeOf(o.querySelectorAll), w1 = function (sel) {
+ 				sel = String(sel);
+ 				parse(sel);
+-				if (plain(sel)) return nat1.call(this, sel);
++				if (plain(sel)) {
++					if (manyAlts(sel)) return natChunks(this, sel, all)[0] || null;
++					return nat1.call(this, sel);
++				}
+ 				return jsQuery(this, sel, true, all);
+ 			};
+ 			w1.__vbNat = nat1;
+@@ -4114,7 +4134,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	 * attributeChangedCallback for a class's observedAttributes. */
+ 	if (typeof g.customElements === 'undefined') {
+ 		var defs = {}, waits = {}, building = [], attrMO = null;
+-		var NativeHE = g.HTMLElement, origCreate = d.createElement;
++		/* (HTMLElement is installed per run, below) */
+ 		function lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }
+ 		function nameOf(C) { for (var k in defs) if (defs[k] === C) return k; return null; }
+ 		function connected(n) {
+@@ -4135,7 +4155,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			building.push({ el: el, C: C });
+ 			try { new C(); } catch (e) {
+ 				try { Object.setPrototypeOf(el, C.prototype); } catch (x) { /* */ }
+-				try { console.error('customElement ' + lname(el) + ' constructor: ' + e); } catch (x) { /* */ }
++				try { console.error('customElement ' + lname(el) + ' constructor: ' + e +
++					(e && e.stack ? ' STACK ' + String(e.stack).slice(0, 600) : '')); } catch (x) { /* */ }
+ 			}
+ 			building.pop();
+ 			var obs = C.observedAttributes;
+@@ -4183,29 +4204,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				}
+ 			}
+ 		}
+-		/* HTMLElement as a constructor super() can call */
+-		if (typeof NativeHE === 'function') {
+-			var HE = function HTMLElement() {
+-				var nt = new.target, top = building[building.length - 1], el;
+-				if (!nt) throw new TypeError('Illegal constructor');
+-				if (top && (top.C === nt || nt.prototype instanceof top.C ||
+-					    top.C.prototype instanceof nt)) {
+-					el = top.el;
+-				} else {
+-					var nm = nameOf(nt), cr = d.createElement;
+-					if (!nm) throw new TypeError('Illegal constructor');
+-					el = (cr && cr.__vbNat ? cr.__vbNat : origCreate).call(d, nm);
+-					el.__vbConstructed = true;
+-				}
+-				Object.setPrototypeOf(el, nt.prototype);
+-				return el;
+-			};
+-			HE.prototype = NativeHE.prototype;
+-			try { Object.setPrototypeOf(HE, NativeHE); } catch (e) { /* */ }
+-			try { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }
+-			g.HTMLElement = HE;
+-		}
+-		g.__vbCustomEl = { defs: defs, construct: construct };
++		g.__vbCustomEl = { defs: defs, construct: construct,
++				    building: building, nameOf: nameOf };
+ 		g.customElements = {
+ 			define: function (name, C) {
+ 				name = String(name).toLowerCase();
+@@ -4252,6 +4252,36 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			} catch (e) { /* */ }
+ 		}
+ 	}
++	/* patch 240/242: HTMLElement as a constructor super() can call -- while
++	 * an element is being upgraded it hands that element to super(), so
++	 * the constructor body runs on it. Installed on every run of this
++	 * file: the bridge installs its own HTMLElement again after the first
++	 * (242: github.com's classes extended the bridge's, and never
++	 * upgraded). */
++	(function () {
++		var CE = g.__vbCustomEl, NHE = g.HTMLElement;
++		if (!CE || typeof NHE !== 'function' || NHE.__vbHE) return;
++		var HE = function HTMLElement() {
++			var nt = new.target, b = CE.building, top = b[b.length - 1], el;
++			if (!nt) throw new TypeError('Illegal constructor');
++			if (top && (top.C === nt || nt.prototype instanceof top.C ||
++				    top.C.prototype instanceof nt)) {
++				el = top.el;
++			} else {
++				var nm = CE.nameOf(nt), cr = d.createElement;
++				if (!nm) throw new TypeError('Illegal constructor');
++				el = (cr && cr.__vbNat ? cr.__vbNat : cr).call(d, nm);
++				el.__vbConstructed = true;
++			}
++			Object.setPrototypeOf(el, nt.prototype);
++			return el;
++		};
++		HE.__vbHE = true;
++		HE.prototype = NHE.prototype;
++		try { Object.setPrototypeOf(HE, NHE); } catch (e) { /* */ }
++		try { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }
++		g.HTMLElement = HE;
++	})();
+ 	/* patch 240: createElement runs a defined element's constructor. The
+ 	 * bridge installs document.createElement again after this file's
+ 	 * first run (qjs_dom_install runs twice per context, and this file
+@@ -4268,6 +4298,63 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		w.__vbNat = cr;
+ 		d.createElement = w;
+ 	})();
++	/* patch 242: a minimal Shadow DOM API -- Element.attachShadow, a
++	 * ShadowRoot (a document fragment with host, mode, innerHTML and
++	 * getElementById), element.shadowRoot for an open root. The shadow
++	 * tree is NOT drawn: the host's light DOM stays what is rendered.
++	 * The engine had none, and github.com's invoker-commands polyfill
++	 * wraps HTMLElement.prototype.attachShadow unconditionally (it calls
++	 * the saved original), so every component that attaches a shadow
++	 * root in its constructor threw: <relative-time>, <tool-tip>. */
++	(function () {
++		var EP = (g.Element && g.Element.prototype) ||
++			Object.getPrototypeOf(Object.getPrototypeOf(d.createElement('div')));
++		if (!EP || typeof EP.attachShadow === 'function') return;
++		var FP = Object.getPrototypeOf(d.createDocumentFragment());
++		var SR = function ShadowRoot() { throw new TypeError('Illegal constructor'); };
++		SR.prototype = Object.create(FP);
++		try { Object.defineProperty(SR.prototype, 'constructor', { value: SR, writable: true, configurable: true }); } catch (e) { /* */ }
++		try {
++			Object.defineProperty(SR.prototype, 'innerHTML', { configurable: true,
++				get: function () {
++					var h = d.createElement('div'), c;
++					for (c = this.firstChild; c; c = c.nextSibling) h.appendChild(c.cloneNode(true));
++					return h.innerHTML;
++				},
++				set: function (v) {
++					var h = d.createElement('div');
++					while (this.firstChild) this.removeChild(this.firstChild);
++					h.innerHTML = String(v);
++					while (h.firstChild) this.appendChild(h.firstChild);
++				} });
++		} catch (e) { /* */ }
++		SR.prototype.getElementById = function (id) {
++			var l = this.querySelectorAll('[id]'), i;
++			for (i = 0; i < l.length; i++) if (l[i].id === String(id)) return l[i];
++			return null;
++		};
++		/* (a ShadowRoot already there is the interface census's empty
++		 * stub: there was no attachShadow to make one) */
++		g.ShadowRoot = SR;
++		EP.attachShadow = function attachShadow(init) {
++			if (this.__vbShadow)
++				throw new DOMException('Shadow root cannot be created on a host which already hosts a shadow tree.', 'NotSupportedError');
++			var r = d.createDocumentFragment(), host = this;
++			var mode = init && init.mode === 'closed' ? 'closed' : 'open';
++			try { Object.setPrototypeOf(r, SR.prototype); } catch (e) { /* */ }
++			try {
++				Object.defineProperty(r, 'host', { value: host, configurable: true });
++				Object.defineProperty(r, 'mode', { value: mode, configurable: true });
++				Object.defineProperty(r, 'delegatesFocus', { value: !!(init && init.delegatesFocus), configurable: true });
++				Object.defineProperty(r, 'adoptedStyleSheets', { value: [], writable: true, configurable: true });
++			} catch (e) { /* */ }
++			this.__vbShadow = r;
++			if (mode === 'open') {
++				try { Object.defineProperty(this, 'shadowRoot', { get: function () { return r; }, configurable: true }); } catch (e) { /* */ }
++			}
++			return r;
++		};
++	})();
+ 	/* patch 240: the document is a ParentNode too -- firstElementChild
+ 	 * and co. were undefined on it (github.com reads
+ 	 * document.firstElementChild.classList) */
+@@ -4422,6 +4509,15 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			this.appendChild(typeof n === 'string' ? d.createTextNode(n) : n);
+ 		}
+ 	});
++	/* patch 242: replaceChildren on fragments (and so shadow roots):
++	 * github.com's <relative-time> renders into its root with it */
++	def('replaceChildren', function () {
++		while (this.firstChild) this.removeChild(this.firstChild);
++		for (var i = 0; i < arguments.length; i++) {
++			var n = arguments[i];
++			this.appendChild(typeof n === 'string' ? d.createTextNode(n) : n);
++		}
++	});
+ 	def('prepend', function () {
+ 		var first = this.firstChild;
+ 		for (var i = 0; i < arguments.length; i++) {

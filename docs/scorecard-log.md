@@ -4,7 +4,18 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
-## 2026-10-10 22:40 — patches 231-236: YouTube and make.wordpress.org/core
+## 2026-10-11 01:18 — patches 242-243: github.com 64.7 -> 81.8
+
+`--only github --reuse-ref r19-full-230/ref`, five runs: 81.8 / 81.8 /
+81.8 / 81.8 / 65.8 (the last dumped its text before React filled the
+commit messages), text 1.0, 0 JS errors (was 64.7, text 0.645, after 240
+already 0 errors). The commit messages and the latest-commit box are
+rendered by React once <react-app> is upgraded (242) and the page reaches
+DONE (243). Check run r34/r35: no regression (bbc/wikipedia dips on r19's
+stale reference vanish on fresh ones: 76.4 / 87.9; mdn 79.4 fresh, the
+same with the Shadow DOM API disabled).
+
+## 2026-10-10 22:55 — patches 231-236: YouTube and make.wordpress.org/core
 
 Run `<WORK>/vitabrowser-work/score/r25-full-236` (all 21 sites, r19's Chrome
 references), then `r26-fresh-hn-google` (fresh references for the two

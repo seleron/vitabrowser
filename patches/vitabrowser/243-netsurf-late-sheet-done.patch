@@ -1,0 +1,161 @@
+# netsurf: a page whose last fetch is a late stylesheet or a failed async
+# script reaches DONE (patch 243)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 242)
+#
+# Once React ran on github.com (242), the page stayed READY in 5 of 6
+# simulator runs: no "Done", no load event, the throbber spinning -- and
+# the scorecard's text dump (browser_window_exec, which runs only on a
+# DONE page) was refused, so the page scored text 0.0. All curl fetches
+# had finished; the html content's own count of active fetches reached 0
+# in the stylesheet callback (React inserts its stylesheets late), and
+# that callback, unlike the image callback, never takes the page
+# READY -> DONE. When a restyle pass follows the sheet, its end does (the
+# fixes1288 check), which is why a simple late <link> does not show it;
+# on github.com nothing followed.
+#
+#  - html/css.c: when a stylesheet finishes (or fails) and the page is
+#    READY with nothing active, html_proceed_to_done.
+#  - html/script.c: html_script_exec offers the same transition whether or
+#    not a script ran this time (an async script that failed as the last
+#    fetch left the page READY too). html_proceed_to_done acts only at
+#    READY with nothing active.
+#  - html/html.c: html_exec logs why it refused (no document, no body --
+#    it appended to NULL before -- or a DOM error) instead of DEEPDEBUG.
+#  - vita/main.c: a refused simulator eval logs the content's status.
+#
+# github.com after the fix: DONE in 5 of 5 runs (was 1 of 6), the text
+# dump runs every time, 81.8 in 4 of 5 (one run dumped before React filled
+# the commit messages). testpages/pages/CSS-late-link.html (LATELINK 3/3,
+# Chromium 3/3) guards a late <link> holding back `load`; it passes
+# without this patch too (a restyle catches that shape), so github.com is
+# the evidence for the patch itself.
+#
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -204,6 +204,17 @@ html_convert_css_callback(hlcache_handle *css,
+ 		html_begin_conversion(parent);
+ 	}
+ 
++	/* VitaBrowser patch 243: a sheet that lands after the page is laid
++	 * out, as the last thing it waited for (a <link> a script inserted),
++	 * takes the page READY -> DONE -- only the image callback did, so the
++	 * page stayed READY for good: no "Done", no load event, the throbber
++	 * spinning (github.com, once React inserts its stylesheets). */
++	if ((event->type == CONTENT_MSG_DONE ||
++	     event->type == CONTENT_MSG_ERROR) &&
++	    content__get_status(&parent->base) == CONTENT_STATUS_READY &&
++	    parent->base.active == 0)
++		html_proceed_to_done(parent);
++
+ 	return NSERROR_OK;
+ }
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9997,44 +9997,50 @@ bool html_exec(struct content *c, const char *src, size_t srclen)
+ 	dom_html_script_element *script_node;
+ 
+ 	if (htmlc->document == NULL) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to exec, no document");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to exec, no document");
+ 		goto out_no_string;
+ 	}
+ 
+ 	err = dom_string_create((const uint8_t *)src, srclen, &dom_src);
+ 	if (err != DOM_NO_ERR) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to exec, could not create string");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to exec, could not create string" " (err %d)", (int)err);
+ 		goto out_no_string;
+ 	}
+ 
+ 	err = dom_html_document_get_body(htmlc->document, &body_node);
++	if (err == DOM_NO_ERR && body_node == NULL) {
++		/* VitaBrowser patch 243: no <body> (yet): nothing to append
++		 * to -- appending to NULL failed, unreported */
++		macsurf_debug_log_writef("LIFE html_exec: the document has no body");
++		goto out_no_body;
++	}
+ 	if (err != DOM_NO_ERR) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to retrieve body element");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to retrieve body element" " (err %d)", (int)err);
+ 		goto out_no_body;
+ 	}
+ 
+ 	err = dom_document_create_text_node(htmlc->document, dom_src, &text_node);
+ 	if (err != DOM_NO_ERR) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to exec, could not create text node");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to exec, could not create text node" " (err %d)", (int)err);
+ 		goto out_no_text_node;
+ 	}
+ 
+ 	err = dom_document_create_element(htmlc->document, corestring_dom_SCRIPT, &script_node);
+ 	if (err != DOM_NO_ERR) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to exec, could not create script node");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to exec, could not create script node" " (err %d)", (int)err);
+ 		goto out_no_script_node;
+ 	}
+ 
+ 	err = dom_node_append_child(script_node, text_node, &spare_node);
+ 	if (err != DOM_NO_ERR) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to exec, could not insert code node into script node");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to exec, could not insert code node into script node" " (err %d)", (int)err);
+ 		goto out_unparented;
+ 	}
+ 	dom_node_unref(spare_node); /* We do not need the spare ref at all */
+ 
+ 	err = dom_node_append_child(body_node, script_node, &spare_node);
+ 	if (err != DOM_NO_ERR) {
+-		NSLOG(netsurf, DEEPDEBUG, "Unable to exec, could not insert script node into document body");
++		macsurf_debug_log_writef("LIFE html_exec: " "Unable to exec, could not insert script node into document body" " (err %d)", (int)err);
+ 		goto out_unparented;
+ 	}
+ 	dom_node_unref(spare_node); /* Again no need for the spare ref */
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -352,11 +352,12 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 		have_run_something = true;
+ 	}
+ 
+-	if (have_run_something) {
+-		return html_proceed_to_done(c);
+-	}
+-
+-	return NSERROR_OK;
++	/* VitaBrowser patch 243: READY -> DONE whether or not a script ran
++	 * now -- an async script that failed (or a module whose fetch ended)
++	 * as the last fetch the page waited for left it READY for good.
++	 * html_proceed_to_done acts only at READY with nothing active. */
++	(void) have_run_something;
++	return html_proceed_to_done(c);
+ }
+ 
+ /** Keep an inline module for the end of the parse (in document order). */
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -59,6 +59,7 @@
+ #include "utils/nsurl.h"
+ #include "netsurf/browser.h"
+ #include "netsurf/browser_window.h"
++#include "content/content.h"
+ #include "content/hlcache.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/netsurf.h"
+@@ -1042,6 +1043,13 @@ static void vitasim_command(struct browser_window *bw)
+ 			ok = browser_window_exec(bw, src, (size_t)n);
+ 			vita_diag_log("sim eval: %s -> %s", cmd + 5,
+ 				      ok ? "ran" : "FAILED");
++			if (!ok) {
++				struct hlcache_handle *h =
++					browser_window_get_content(bw);
++				vita_diag_log("sim eval: content %s, status %d",
++					      h ? "present" : "missing",
++					      h ? (int)content_get_status(h) : -1);
++			}
+ 		}
+ 		free(src);
+ 		fclose(fp);
