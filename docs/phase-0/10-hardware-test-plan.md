@@ -3085,4 +3085,13 @@ What 237-248 add:
 
 ## Since run 30 — queued for run 31 (not built yet)
 
-Nothing yet.
+Patches 249-250 (2026-10-11), sim-verified, full gate green, Vita
+cross-build green; no VPK handed off (run 30 is with the device).
+
+- 249: element nodeName is upper case (as tagName); SVG keeps its case.
+  Nothing to see directly -- watch sites that misbehaved for no reason.
+- 250: images fire load / error, complete / naturalWidth work, new
+  Image() loads, <body onload> runs. On the device: a gallery or
+  lightbox site (images that appear "on load"), wikipedia (sim score
+  +2.8), and watch memory (mem[page done]) and scroll speed on
+  image-heavy pages (every image now fires an event).
