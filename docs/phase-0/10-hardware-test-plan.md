@@ -3285,12 +3285,33 @@ Handed off as run 32 (above).
   image lands; the late image relayout was "several hundred ms on the
   Vita" for a 5000-paragraph page.
 
-## Since run 32 — queued for run 33 (not built yet)
+## Run 33 — hand-off (2026-10-12 12:05; replaces untested run 32)
+
+**Flash this build:** VitaBrowser.vpk `eee9f66890bc`, VitaBrowser-ext.vpk
+`57a7910ea798`, nsvita.elf `ae13be82ee60` (patches through 254, built at
+a400158). Run 32 (`1c19ece9c91b`) has no `results\` yet, so run 33
+carries everything since run 27: **patches 168-254 +
+patches/quickjs/05-06 + patches/wasm3/01**, all unverified on hardware.
+Archive `<WORK>/vitabrowser-work/hwtest-2026-10-12-run33/`; run 32's
+reference dumps are now `reference-dumps-run32\`.
+
+Build: clean restage (340 applied + the two known collisions), checked
+first against a scratch application of the same stack; streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(WASM254 15/15 with both long calls sliced, 25 frames each; REFLOW 3/3;
+CANVAS251 22/22; interaction 52/52, also at the Vita's pace),
+cross-build green. Reference autotest under device conditions: interact
+**52/52**, js 18/18, 34 dumps identical to run 32's.
+
+**On the device:** run 32's list (with 31's and 30's) still applies;
+what is new is 254, below -- above all claude.ai's email sign-in, where
+hCaptcha's proof of work should now run.
+
+### What run 33 adds over run 32
 
 Patch 254 (2026-10-12), sim-verified: full sim gate exit 0, no soft
 accepts (WASM254 15/15, both long calls sliced, 25 frames each), Vita
-cross-build green (wasm3 links: nsvita.elf +1 MB). Run 32 is with the
-device.
+cross-build green (wasm3 links: nsvita.elf +1 MB).
 
 - **254: WebAssembly.** There was none. wasm3 0.5.0 (MIT, an interpreter
   in portable C; tools/fetch-wasm3.sh, built beside QuickJS) behind
