@@ -3287,6 +3287,9 @@ Handed off as run 32 (above).
 
 ## Run 33 — hand-off (2026-10-12 12:05; replaces untested run 32)
 
+**Superseded by run 34 (below) before it was tested: do not flash
+`eee9f66890bc`** -- it crashes at the hCaptcha check.
+
 **Flash this build:** VitaBrowser.vpk `eee9f66890bc`, VitaBrowser-ext.vpk
 `57a7910ea798`, nsvita.elf `ae13be82ee60` (patches through 254, built at
 a400158). Run 32 (`1c19ece9c91b`) has no `results\` yet, so run 33
@@ -3311,8 +3314,8 @@ hCaptcha's proof of work should now run.
 claude.ai/login (3 of 4 simulator loads, about 11 s in, while hCaptcha's
 frames set up -- fixed by patch 255), and its hCaptcha step ends in
 `network-error` whatever hsw does (the binary getcaptcha body went out as
-text -- patch 256). Both are queued for run 34, below. If the device
-crashes there, that is this bug: note it and move on.
+text -- patch 256). Both are fixed in run 34, below, which replaces this
+build in `Desktop\VitaBrowser-hwtest\`.
 
 ### What run 33 adds over run 32
 
@@ -3353,9 +3356,60 @@ cross-build green (wasm3 links: nsvita.elf +1 MB).
   2. Any page that uses WebAssembly otherwise (a wasm demo, a game):
      note load time and whether it runs.
 
-## Since run 33 — queued for run 34 (not built yet)
+## Run 34 — hand-off (2026-10-12 14:30; replaces untested run 33)
 
-### Patches 255-256 (2026-10-12): hCaptcha's hsw, run live in the simulator
+**Flash this build:** VitaBrowser.vpk `ef648ce7b51a`, VitaBrowser-ext.vpk
+`98210dbfda97`, nsvita.elf `93cedb2a1642` (patches through 256, built at
+9c80e1e). Run 33 (`eee9f66890bc`) was never tested and is withdrawn (it
+crashes on claude.ai/login, patch 255); no runs since 27 have results, so
+run 34 carries **patches 168-256 + patches/quickjs/05-06 +
+patches/wasm3/01**, all unverified on hardware. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-12-run34/` (SHA256SUMS,
+reference dumps, the reference run in `sim/`); run 33's reference dumps
+are now `reference-dumps-run33\`. Only run 34's VPKs are in
+`Desktop\VitaBrowser-hwtest\`.
+
+Build: clean restage (342 applied + the two known collisions), checked
+first against a scratch application of the same stack -- identical to
+the tree the gates ran on (backup
+`applytest-backup-pre-run34-20261012-1411.tar.gz`); streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(JS-fetch-body 12/12 over http and https, WASM254 15/15 with both long
+calls sliced at 25 frames, REFLOW 3/3, CANVAS251 22/22, interaction 52/52
+also at the Vita's pace), cross-build green. Reference autotest under
+device conditions: interact **52/52**, js 18/18, 34 dumps -- 33
+identical to run 33's; IN-history lists "IN target" and "IN range" in
+the other order (the history page sorts by visit time in whole seconds,
+and those two pages are visited within the same second or two -- a
+timing tie, not a change).
+
+**On the device:** start `receive-results.bat` first. Run 32's list (with
+31's and 30's) still applies; run 33's is replaced by items 2-4 here:
+
+1. Autotest (SELECT + SQUARE): every `.plot` SAME against the new
+   reference-dumps (PM-animation is timing-dependent; IN-home-recent /
+   IN-history may differ -- above), interact **52/52**, js 18/18.
+2. **claude.ai email sign-in (254-256):** claude.ai/login, enter an
+   email, Continue. Expect: **no crash** (run 33 would crash here); the
+   status line shows "WebAssembly running: N s (O stops)" -- about 20 s
+   per frame is the estimate, twice (two hCaptcha frames), with the page
+   still redrawing while it runs; then hCaptcha reports an error and no
+   sign-in email arrives (expected: hCaptcha refuses this browser's
+   fingerprint, below). Report: the seconds shown for each run, whether
+   the screen kept updating, `mem[page done]` in log.txt afterwards, and
+   what the page shows at the end.
+3. **CIRCLE stops WebAssembly (254):** load claude.ai/login again, start
+   the sign-in, and press CIRCLE while "WebAssembly running" is shown:
+   the message should go and the browser stay usable (hCaptcha then
+   fails, as in 2).
+4. **Any other WebAssembly page** you know of (a wasm demo or game): note
+   load time and whether it runs.
+
+(256's binary request bodies have no device check of their own: the gate
+covers them, and file uploads through FormData still send a file's
+contents empty -- a known gap, not this patch.)
+
+### What run 34 adds over run 33: patches 255-256, hCaptcha's hsw run live in the simulator
 
 claude.ai/login in the simulator, with `hcaptcha.execute()` called from a
 script after 20 s (as the email sign-in does). hsw now runs under
@@ -3408,7 +3462,5 @@ past the 8 s runaway budget on the host and was stopped
 back on later loads, so whether it would clear with more time is
 unmeasured.
 
-**On the device (run 34):** claude.ai/login, email, Continue: no crash;
-"WebAssembly running" for roughly 20 s per frame, twice; then hCaptcha
-reports an error (expected, above) -- note the time and `mem[page done]`.
+(Device checks for these: run 34's list, above, items 2-3.)
 
