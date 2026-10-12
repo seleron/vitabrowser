@@ -26,7 +26,9 @@ p { margin: 0; padding: 1px 6px; font-size: 11px; line-height: 1.3; }
  * "blob" and "json".
  * Patch 257: FormData with files -- a Blob is stored as a File and its bytes
  * go in the multipart body (they went as nothing); names escaped, text
- * values UTF-8 with CRLF line breaks. */
+ * values UTF-8 with CRLF line breaks.
+ * Patch 258: Response.formData() reads multipart/form-data bodies (it
+ * read url-encoded ones only), as Chromium does -- checks 18-22. */
 var passed = 0, total = 0, failedNames = [];
 function t(name, cond) {
   total++;
@@ -226,11 +228,74 @@ function formFiles() {
       t('17 text is UTF-8 with CRLF, names escaped',
         p !== null && p.data === 'caf\u00c3\u00a9\r\nline2' &&
         b.indexOf('name="q%22x"') >= 0);
+      return readForms();
+    }).then(function () {
       sum();
     }).catch(function (e) {
       t('form files failed: ' + (e && e.message), false);
       sum();
     });
+  });
+}
+
+function fdOf(body, ct) {
+  return new Response(body, { headers: { 'content-type': ct } }).formData();
+}
+function rejects(p) {
+  return p.then(function () { return false; },
+    function (e) { return e instanceof TypeError; });
+}
+function readForms() {
+  /* 18: a FormData through a Response and back */
+  var fd = new FormData();
+  fd.append('t', 'hi\nthere');
+  fd.append('f', new Blob([all], { type: 'application/x-test' }), 'k.bin');
+  return new Response(fd).formData().then(function (got) {
+    var f = got.get('f');
+    return (f instanceof Blob ? f.arrayBuffer() : Promise.resolve(null)).then(function (ab) {
+      t('18 formData() reads a multipart body back',
+        got.get('t') === 'hi\r\nthere' && f !== null && f.name === 'k.bin' &&
+        f.type === 'application/x-test' && same(ab, all));
+    });
+  }).then(function () {
+    /* 19: a quoted boundary, preamble and epilogue, lower-case headers, a
+     * file part with no type, an empty filename, a text part's type */
+    var B = 'XyZ', P = function (h, d) { return '--' + B + '\r\n' + h + '\r\n\r\n' + d + '\r\n'; };
+    var body = 'preamble\r\n' +
+      P('content-disposition: form-data; name="a"\r\ncontent-type: text/html', 'one') +
+      P('Content-Disposition: form-data; name="f"; filename="x.txt"', 'filedata') +
+      P('Content-Disposition: form-data; name="e"; filename=""', '') +
+      P('Content-Disposition: form-data; name="q%22x"', 'z') +
+      '--' + B + '--\r\nepilogue';
+    return fdOf(body, 'multipart/form-data; boundary="' + B + '"');
+  }).then(function (got) {
+    var f = got.get('f'), e = got.get('e');
+    t('19 multipart parts as Chromium reads them',
+      got.get('a') === 'one' && f instanceof Blob && f.name === 'x.txt' &&
+      f.type === 'text/plain' && f.size === 8 && e instanceof Blob &&
+      e.name === '' && e.size === 0 && got.get('q%22x') === 'z');
+    /* 20: UTF-8 names and values */
+    var B = 'b0', txt = '--' + B + '\r\nContent-Disposition: form-data; name="caf\u00e9"\r\n\r\n' +
+      '\u00e9t\u00e9\r\n--' + B + '--';
+    return fdOf(new TextEncoder().encode(txt), 'multipart/form-data; boundary=' + B);
+  }).then(function (got) {
+    t('20 UTF-8 names and values', got.get('caf\u00e9') === '\u00e9t\u00e9');
+    /* 21: malformed bodies and a missing boundary reject with TypeError */
+    var B = 'XyZ', part = '--' + B + '\r\nContent-Disposition: form-data; name="a"\r\n\r\nx\r\n';
+    return Promise.all([
+      rejects(fdOf(part, 'multipart/form-data; boundary=' + B)),
+      rejects(fdOf('garbage', 'multipart/form-data; boundary=' + B)),
+      rejects(fdOf(part + '--' + B + '--', 'multipart/form-data')),
+      rejects(fdOf('--' + B + '\r\nContent-Disposition: attachment; name="a"\r\n\r\nx\r\n--' + B + '--',
+        'multipart/form-data; boundary=' + B)),
+      rejects(fdOf('a=1', 'text/plain'))
+    ]);
+  }).then(function (r) {
+    t('21 malformed multipart rejects', r.join() === 'true,true,true,true,true');
+    /* 22: url-encoded still */
+    return fdOf('a=1&b=two+words', 'application/x-www-form-urlencoded');
+  }).then(function (got) {
+    t('22 url-encoded formData()', got.get('a') === '1' && got.get('b') === 'two words');
   });
 }
 </script>

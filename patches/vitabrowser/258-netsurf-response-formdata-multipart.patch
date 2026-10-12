@@ -1,0 +1,197 @@
+# netsurf: Response.formData() reads multipart/form-data bodies (patch 258)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 257)
+#
+# Response.formData() rejected anything but an url-encoded body
+# ("formData() supports url-encoded bodies only"), so a multipart body --
+# from a server, or a FormData put through a Response -- could not be
+# read. It is parsed now, the way
+# Chromium reads one (checked case by case):
+#
+#  - the boundary from the Content-Type, quoted or not (none: TypeError
+#    "Invalid MIME type"); preamble and epilogue skipped; header names in
+#    any case;
+#  - a part with a filename becomes a File (type text/plain unless the
+#    part has one; an empty filename is still a File), any other part a
+#    string decoded as UTF-8 (its Content-Type ignored); names and
+#    filenames are UTF-8 and not unescaped (%22 stays);
+#  - a malformed body rejects with TypeError: no closing delimiter, a part
+#    whose disposition is not form-data or has no name. Other types reject
+#    too ("Failed to fetch", as Chromium says).
+#
+# Request still has no body methods (text / json / formData ...).
+#
+# Gate: testpages/pages/JS-fetch-body.html checks 18-22 (a FormData with a
+# binary file through a Response and back, Chromium's edge cases, UTF-8,
+# five malformed bodies, url-encoded still), 22/22 over http and https
+# (Chromium 22/22; the build before stops at check 18).
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1156,10 +1156,78 @@
+ 	if (!isFn(g.Blob)) return Promise.reject(new TypeError('Blob is not supported'));
+ 	return this.bytes().then(function (u) { return new g.Blob([u], { type: type }); });
+ };
++/* VitaBrowser patch 258: a multipart/form-data body into a FormData, as
++ * Chromium reads it: preamble and epilogue skipped, header names in any
++ * case, a part with a filename becomes a File (type text/plain unless the
++ * part says otherwise; a filename may be empty), any other part a UTF-8
++ * string; names and filenames are UTF-8 and not unescaped. null when the
++ * body is malformed: no closing delimiter, a part that is not
++ * "form-data" or has no name. u is the body's bytes. */
++function multipartParam(v, key) {
++	var m = new RegExp('(?:^|;)\\s*' + key + '\\s*=\\s*(?:"([^"]*)"|([^;\\s]*))', 'i').exec(v);
++	return m ? (m[1] !== undefined ? m[1] : m[2]) : null;
++}
++function latin1Utf8(t) {
++	var b = new Uint8Array(t.length);
++	for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i);
++	return new g.TextDecoder().decode(b);
++}
++function multipartParse(u, boundary) {
++	/* one char per byte, to search in */
++	var s = '', i;
++	for (i = 0; i < u.length; i += 8192)
++		s += String.fromCharCode.apply(null, u.subarray(i, i + 8192));
++	var dl = '--' + boundary, fd = new g.FormData(), pos = s.indexOf(dl);
++	if (pos < 0) return null;
++	pos += dl.length;
++	for (;;) {
++		if (s.substr(pos, 2) === '--') return fd;
++		if (s.substr(pos, 2) !== '\r\n') return null;
++		pos += 2;
++		var he = s.indexOf('\r\n\r\n', pos);
++		if (he < 0) return null;
++		var lines = s.slice(pos, he).split('\r\n'), name = null, fname = null, type = '';
++		for (i = 0; i < lines.length; i++) {
++			var c = lines[i].indexOf(':');
++			if (c < 0) continue;
++			var k = lines[i].slice(0, c).replace(/^\s+|\s+$/g, '').toLowerCase();
++			var v = lines[i].slice(c + 1).replace(/^\s+|\s+$/g, '');
++			if (k === 'content-disposition') {
++				if (!/^form-data\s*(;|$)/i.test(v)) return null;
++				name = multipartParam(v, 'name');
++				fname = multipartParam(v, 'filename');
++			} else if (k === 'content-type') {
++				type = v;
++			}
++		}
++		if (name === null) return null;
++		var de = s.indexOf('\r\n' + dl, he + 4);
++		if (de < 0) return null;
++		var data = u.subarray(he + 4, de);
++		if (fname !== null)
++			fd.append(latin1Utf8(name), new g.File([data], latin1Utf8(fname),
++				{ type: type || 'text/plain' }));
++		else
++			fd.append(latin1Utf8(name), new g.TextDecoder().decode(data));
++		pos = de + 2 + dl.length;
++	}
++}
+ Resp.prototype.formData = function () {
+-	var type = (this._headers.get('content-type') || '').toLowerCase();
+-	if (!isFn(g.FormData) || type.indexOf('application/x-www-form-urlencoded') !== 0)
+-		return Promise.reject(new TypeError('formData() supports url-encoded bodies only'));
++	var ct = this._headers.get('content-type') || '', type = ct.toLowerCase();
++	if (!isFn(g.FormData))
++		return Promise.reject(new TypeError('FormData is not supported'));
++	if (type.indexOf('multipart/form-data') === 0) {
++		var boundary = multipartParam(ct, 'boundary');
++		if (!boundary)
++			return Promise.reject(new TypeError('Invalid MIME type'));
++		return this.bytes().then(function (u) {
++			var fd = multipartParse(u, boundary);
++			if (!fd) throw new TypeError('Failed to fetch');
++			return fd;
++		});
++	}
++	if (type.indexOf('application/x-www-form-urlencoded') !== 0)
++		return Promise.reject(new TypeError('Failed to fetch'));
+ 	return this.text().then(function (t) {
+ 		var fd = new g.FormData(), q = new g.URLSearchParams(t);
+ 		q.forEach(function (v, k) { fd.append(k, v); });
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1157,10 +1157,78 @@
+ "\tif (!isFn(g.Blob)) return Promise.reject(new TypeError('Blob is not supported'));\n"
+ "\treturn this.bytes().then(function (u) { return new g.Blob([u], { type: type }); });\n"
+ "};\n"
++"/* VitaBrowser patch 258: a multipart/form-data body into a FormData, as\n"
++" * Chromium reads it: preamble and epilogue skipped, header names in any\n"
++" * case, a part with a filename becomes a File (type text/plain unless the\n"
++" * part says otherwise; a filename may be empty), any other part a UTF-8\n"
++" * string; names and filenames are UTF-8 and not unescaped. null when the\n"
++" * body is malformed: no closing delimiter, a part that is not\n"
++" * \"form-data\" or has no name. u is the body's bytes. */\n"
++"function multipartParam(v, key) {\n"
++"\tvar m = new RegExp('(?:^|;)\\\\s*' + key + '\\\\s*=\\\\s*(?:\"([^\"]*)\"|([^;\\\\s]*))', 'i').exec(v);\n"
++"\treturn m ? (m[1] !== undefined ? m[1] : m[2]) : null;\n"
++"}\n"
++"function latin1Utf8(t) {\n"
++"\tvar b = new Uint8Array(t.length);\n"
++"\tfor (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i);\n"
++"\treturn new g.TextDecoder().decode(b);\n"
++"}\n"
++"function multipartParse(u, boundary) {\n"
++"\t/* one char per byte, to search in */\n"
++"\tvar s = '', i;\n"
++"\tfor (i = 0; i < u.length; i += 8192)\n"
++"\t\ts += String.fromCharCode.apply(null, u.subarray(i, i + 8192));\n"
++"\tvar dl = '--' + boundary, fd = new g.FormData(), pos = s.indexOf(dl);\n"
++"\tif (pos < 0) return null;\n"
++"\tpos += dl.length;\n"
++"\tfor (;;) {\n"
++"\t\tif (s.substr(pos, 2) === '--') return fd;\n"
++"\t\tif (s.substr(pos, 2) !== '\\r\\n') return null;\n"
++"\t\tpos += 2;\n"
++"\t\tvar he = s.indexOf('\\r\\n\\r\\n', pos);\n"
++"\t\tif (he < 0) return null;\n"
++"\t\tvar lines = s.slice(pos, he).split('\\r\\n'), name = null, fname = null, type = '';\n"
++"\t\tfor (i = 0; i < lines.length; i++) {\n"
++"\t\t\tvar c = lines[i].indexOf(':');\n"
++"\t\t\tif (c < 0) continue;\n"
++"\t\t\tvar k = lines[i].slice(0, c).replace(/^\\s+|\\s+$/g, '').toLowerCase();\n"
++"\t\t\tvar v = lines[i].slice(c + 1).replace(/^\\s+|\\s+$/g, '');\n"
++"\t\t\tif (k === 'content-disposition') {\n"
++"\t\t\t\tif (!/^form-data\\s*(;|$)/i.test(v)) return null;\n"
++"\t\t\t\tname = multipartParam(v, 'name');\n"
++"\t\t\t\tfname = multipartParam(v, 'filename');\n"
++"\t\t\t} else if (k === 'content-type') {\n"
++"\t\t\t\ttype = v;\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tif (name === null) return null;\n"
++"\t\tvar de = s.indexOf('\\r\\n' + dl, he + 4);\n"
++"\t\tif (de < 0) return null;\n"
++"\t\tvar data = u.subarray(he + 4, de);\n"
++"\t\tif (fname !== null)\n"
++"\t\t\tfd.append(latin1Utf8(name), new g.File([data], latin1Utf8(fname),\n"
++"\t\t\t\t{ type: type || 'text/plain' }));\n"
++"\t\telse\n"
++"\t\t\tfd.append(latin1Utf8(name), new g.TextDecoder().decode(data));\n"
++"\t\tpos = de + 2 + dl.length;\n"
++"\t}\n"
++"}\n"
+ "Resp.prototype.formData = function () {\n"
+-"\tvar type = (this._headers.get('content-type') || '').toLowerCase();\n"
+-"\tif (!isFn(g.FormData) || type.indexOf('application/x-www-form-urlencoded') !== 0)\n"
+-"\t\treturn Promise.reject(new TypeError('formData() supports url-encoded bodies only'));\n"
++"\tvar ct = this._headers.get('content-type') || '', type = ct.toLowerCase();\n"
++"\tif (!isFn(g.FormData))\n"
++"\t\treturn Promise.reject(new TypeError('FormData is not supported'));\n"
++"\tif (type.indexOf('multipart/form-data') === 0) {\n"
++"\t\tvar boundary = multipartParam(ct, 'boundary');\n"
++"\t\tif (!boundary)\n"
++"\t\t\treturn Promise.reject(new TypeError('Invalid MIME type'));\n"
++"\t\treturn this.bytes().then(function (u) {\n"
++"\t\t\tvar fd = multipartParse(u, boundary);\n"
++"\t\t\tif (!fd) throw new TypeError('Failed to fetch');\n"
++"\t\t\treturn fd;\n"
++"\t\t});\n"
++"\t}\n"
++"\tif (type.indexOf('application/x-www-form-urlencoded') !== 0)\n"
++"\t\treturn Promise.reject(new TypeError('Failed to fetch'));\n"
+ "\treturn this.text().then(function (t) {\n"
+ "\t\tvar fd = new g.FormData(), q = new g.URLSearchParams(t);\n"
+ "\t\tq.forEach(function (v, k) { fd.append(k, v); });\n"

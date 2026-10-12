@@ -3489,3 +3489,20 @@ exit 0 with no soft accepts; Vita cross-build green. No device check of
 its own (no site on the device's list uploads a file from script); run
 34 is with the device.
 
+### Patch 258 (2026-10-12): Response.formData() reads multipart bodies
+
+Response.formData() rejected anything but an url-encoded body, so a
+multipart one -- from a server, or a FormData put through a Response --
+could not be read. It is parsed now the way Chromium reads one (checked
+case by case): boundary quoted or not, preamble and epilogue skipped, a
+part with a filename becomes a File (text/plain unless typed; an empty
+filename still counts), other parts UTF-8 strings, names not unescaped;
+a malformed body (no closing delimiter, a part without a form-data
+disposition or a name) rejects with TypeError. Request still has no body
+methods.
+
+Sim-verified: JS-fetch-body checks 18-22, 22/22 over http and https
+(Chromium 22/22; the build before stops at check 18); full sim gate
+exit 0 with no soft accepts; Vita cross-build green. No device check of
+its own.
+

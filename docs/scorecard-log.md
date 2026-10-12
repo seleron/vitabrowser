@@ -4,6 +4,14 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patch 258: Response.formData() reads multipart (not re-scored)
+
+Follow-on to 257: formData() on a multipart/form-data body (it took
+url-encoded only), matching Chromium's parser case by case (files as
+File, default text/plain, UTF-8 names, malformed bodies reject). Gate
+JS-fetch-body 22/22 (Chromium 22/22). Not re-scored: no scored site reads
+a multipart response on load.
+
 ## 2026-10-12 — patch 257: FormData sends files (not re-scored)
 
 The gap run 34's hand-off noted: FormData file parts went empty (the
