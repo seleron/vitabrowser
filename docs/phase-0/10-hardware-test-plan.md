@@ -3208,6 +3208,14 @@ accepts (JS-reflow-stall longest gap 16.3 ms, longest local relayout 7
 us -- every earlier gate logged 4.5-8.75 ms), Vita cross-build green.
 Run 31 is with the device.
 
+**Run 32 VPK built (2026-10-12 10:16, patches through 253, at 3100b5b),
+not handed off:** VitaBrowser.vpk `70a2cb2f6807`, VitaBrowser-ext.vpk
+`ed4ba83d25a2`, nsvita.elf `af19c161695d`; archived in
+`<WORK>/vitabrowser-work/hwtest-2026-10-12-run32/` (SHA256SUMS). Built
+straight from the gated tree with tools/build-vita.sh -- no restage or
+reference autotest yet; do both before copying it to
+`Desktop\VitaBrowser-hwtest\`.
+
 - **253: a late image's relayout no longer walks the whole page.** The
   WS-C item left open above. Profiled rather than guessed:
   1. *Where the gap is.* Temporary timers around each main-loop pass
