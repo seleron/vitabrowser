@@ -3470,6 +3470,9 @@ unmeasured.
 
 ## Run 35 — hand-off (2026-10-12 21:45; replaces untested run 34)
 
+**Superseded by run 36 (below) before it was tested.** Its checklist
+carries over to run 36 unchanged.
+
 **Flash this build:** VitaBrowser.vpk `b98697013725`, VitaBrowser-ext.vpk
 `2528eef61fe2`, nsvita.elf `3d01bacf8456` (patches through 258, built at
 3651e45 = origin/master). Run 34 (`ef648ce7b51a`) has no `results\` yet,
@@ -3559,9 +3562,43 @@ Sim-verified: JS-fetch-body checks 18-22, 22/22 over http and https
 exit 0 with no soft accepts; Vita cross-build green. No device check of
 its own.
 
-## Since run 35 — queued for run 36 (not built yet)
+## Run 36 — hand-off (2026-10-12 22:50; replaces untested run 35)
 
-### Patch 259 (2026-10-12): Request bodies can be read
+**Flash this build:** VitaBrowser.vpk `3e2d6fedffba`, VitaBrowser-ext.vpk
+`9e2d0fea1731`, nsvita.elf `1afa56c1c4a5` (patches through 259, built at
+d8e8db0 = origin/master). Run 35 (`b98697013725`) has no `results\` yet,
+so run 36 carries everything since run 27: **patches 168-259 +
+patches/quickjs/05-06 + patches/wasm3/01**, all unverified on hardware.
+Archive `<WORK>/vitabrowser-work/hwtest-2026-10-12-run36/` (SHA256SUMS,
+reference dumps, the reference run in `sim/`); run 35's reference dumps
+are now `reference-dumps-run35\`. Only run 36's VPKs are in
+`Desktop\VitaBrowser-hwtest\`.
+
+Build: clean restage from origin/master (345 applied + the two known
+collisions), checked first against a scratch application of the same
+stack -- identical to the tree the gates ran on (backup
+`applytest-backup-pre-run36-20261012-2228.tar.gz`); streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(JS-fetch-body 30/30 over http and https, WASM254 15/15 with both long
+calls sliced, REFLOW 3/3, CANVAS251 22/22, interaction 52/52 also at the
+Vita's pace), cross-build green. Reference autotest under device
+conditions: interact **52/52**, js 18/18, 34 dumps -- 32 identical to
+run 35's; IN-history lists the same entries in another order and
+IN-home-recent (the few most recent) shows one same-second visit in place
+of another -- exactly the reverse of run 35's difference; every drawing
+command identical (the whole-second visit-time tie, see run 34).
+
+**On the device:** start `receive-results.bat` first, then run 35's
+list, above, unchanged: the autotest (every `.plot` SAME, IN-history /
+IN-home-recent may differ in order; interact **52/52**, js 18/18), the
+claude.ai email sign-in (no crash, "WebAssembly running" about 20 s per
+frame twice, then an expected hCaptcha error), CIRCLE stopping
+WebAssembly, and any other WebAssembly page. 259 has no device check of
+its own; the gate covers it (JS-fetch-body checks 23-30).
+
+### What run 36 adds over run 35
+
+#### Patch 259 (2026-10-12): Request bodies can be read
 
 The bridge's Request kept init.body as given and had no readers --
 `req.text()`, `req.json()`, `req.formData()` were not functions, `body`
@@ -3575,7 +3612,7 @@ once.
 
 Sim-verified: JS-fetch-body checks 23-30, 30/30 over http and https
 (Chromium 30/30; run 35's build stops at check 25); full sim gate exit
-0 with no soft accepts; Vita cross-build green. No device check of its own (scripts on the device's sites do
-not build Requests with bodies that we know of); run 35 is with the
-device.
+0 with no soft accepts; Vita cross-build green. No device check of its
+own (scripts on the device's sites do not build Requests with bodies
+that we know of).
 
