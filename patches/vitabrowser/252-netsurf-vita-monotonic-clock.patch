@@ -1,0 +1,251 @@
+# netsurf (frontends/vita): one monotonic clock for timers, the autotest,
+# the script deadline and the logs (patch 252)
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 251)
+#
+# The JS-fetch-stream "freeze" in the simulator (gate 250c: the http page
+# dumped with every row "waiting"; 250d: 2/8): the page did not freeze.
+# The frontend read the wall clock (gettimeofday) for its scheduler, the
+# autotest's settle test, the JavaScript interrupt deadline and the log
+# stamps, and WSL steps the wall clock forward about +1.9 s every ~32 s
+# (measured: +1.871 s and +1.890 s, 32 s apart, against CLOCK_MONOTONIC).
+# A step is a gap with no events in netsurf.log (198.26 -> 199.51 in
+# gate 250c's log, nothing in between), and to the frontend 1.9 s of
+# quiet: "settled" is 700 ms without a repaint, so a page still streaming
+# (its 250 ms ticker had not yet had a chance to run) was dumped at once.
+# The same step fired every timer due in the next ~2 s together (a test
+# waiting 600 ms for a reconversion read the old styles) and could stop a
+# script as past its deadline. performance.now() was moved to the
+# monotonic clock earlier (qjs_hooks.c); the rest kept the wall clock.
+#
+#  - diag.c: vita_mono_us(), the frontend's clock -- the Vita's process
+#    time (sceKernelGetProcessTimeWide, monotonic), CLOCK_MONOTONIC in the
+#    simulator. vita_diag_ms() (settling, timeouts, log stamps) reads it.
+#  - schedule.c: callbacks are timed on it.
+#  - jsprobe.c: the interrupt deadline; netlog.c: its timing.
+#
+# On the Vita the wall clock moves when the time is set (or synced); the
+# same code now ignores that too. NetSurf's own NSLOG stamps (utils/log.c)
+# still read the wall clock: cosmetic.
+#
+# Reproduction: an LD_PRELOAD shim steps gettimeofday / CLOCK_REALTIME
+# +1.9 s every 2.5 s; autotest pass N with JS-fetch-stream six times --
+# see docs/phase-0/10-hardware-test-plan.md, "Since run 30".
+diff --git a/frontends/vita/diag.c b/frontends/vita/diag.c
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -36,12 +36,14 @@
+ #endif
+ #include <sys/stat.h>
+ #include <sys/time.h>
++#include <time.h>
+ #include <sys/types.h>
+ 
+ #include <vita2d.h>
+ #include <zlib.h>
+ #ifdef __vita__
+ #include <psp2/appmgr.h>
++#include <psp2/kernel/processmgr.h>
+ #include <psp2/kernel/sysmem.h>
+ #include <psp2/power.h>
+ #endif
+@@ -69,7 +71,7 @@
+  * suffer, and the start of a failure is what matters. */
+ #define ENGINE_LOG_CAP (16 * 1024 * 1024)
+ 
+-static struct timeval diag_t0;
++static uint64_t diag_t0_us;	/* patch 252: on the monotonic clock */
+ static bool diag_ready;
+ 
+ /** Clocks as found at boot, restored by a 0 in vita_diag_set_clocks(). */
+@@ -110,13 +112,22 @@
+ static int diag_open_errno, diag_write_errno;
+ 
+ /* exported interface documented in vita/diag.h */
+-unsigned int vita_diag_ms(void)
++uint64_t vita_mono_us(void)
+ {
+-	struct timeval tv;
++#ifdef __vita__
++	return (uint64_t)sceKernelGetProcessTimeWide();
++#else
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
++#endif
++}
+ 
+-	gettimeofday(&tv, NULL);
+-	return (unsigned int)((tv.tv_sec - diag_t0.tv_sec) * 1000 +
+-			      (tv.tv_usec - diag_t0.tv_usec) / 1000);
++/* exported interface documented in vita/diag.h */
++unsigned int vita_diag_ms(void)
++{
++	return (unsigned int)((vita_mono_us() - diag_t0_us) / 1000u);
+ }
+ 
+ /* exported interface documented in vita/diag.h */
+@@ -179,7 +190,7 @@
+ /* exported interface documented in vita/diag.h */
+ void vita_diag_init(void)
+ {
+-	gettimeofday(&diag_t0, NULL);
++	diag_t0_us = vita_mono_us();
+ 	/* ux0:data exists on every Vita; our directory may not. */
+ 	mkdir("ux0:data", 0777);
+ 	mkdir(VITA_DIAG_DIR, 0777);
+diff --git a/frontends/vita/diag.h b/frontends/vita/diag.h
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -31,6 +31,7 @@
+ #define NETSURF_VITA_DIAG_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <stdio.h>
+ 
+ /** Where diagnostics are written (created on start-up). */
+@@ -47,6 +48,17 @@
+ unsigned int vita_diag_ms(void);
+ 
+ /**
++ * VitaBrowser patch 252: the frontend's clock -- monotonic microseconds
++ * from an arbitrary start (the Vita's process time; CLOCK_MONOTONIC in the
++ * simulator). Timers, the autotest's settling, the script deadline and
++ * the log stamps all read it. The wall clock steps: WSL moves it ~+1.9 s
++ * every ~32 s (and a Vita's when its time is set), which fired timers
++ * early, cut scripts off and made a page still running its script look
++ * settled.
++ */
++uint64_t vita_mono_us(void);
++
++/**
+  * Set the ARM / bus / GPU / GPU-crossbar clocks in MHz; 0 means "as at
+  * boot". Logs each call's result and the clocks read back afterwards.
+  * No-op (logged) in the host simulator.
+diff --git a/frontends/vita/schedule.c b/frontends/vita/schedule.c
+--- a/frontends/vita/schedule.c
++++ b/frontends/vita/schedule.c
+@@ -23,6 +23,18 @@
+ #include "utils/log.h"
+ 
+ #include "vita/schedule.h"
++#include "vita/diag.h"
++
++/* patch 252: callbacks are timed on the monotonic clock, as a timeval so
++ * the list keeps its arithmetic. A step of the wall clock fired every
++ * callback due in the next ~2 s at once (WSL steps it every ~32 s). */
++static void mono_tv(struct timeval *tv)
++{
++	uint64_t us = vita_mono_us();
++
++	tv->tv_sec = (long)(us / 1000000u);
++	tv->tv_usec = (long)(us % 1000000u);
++}
+ 
+ /* linked list of scheduled callbacks */
+ static struct nscallback *schedule_list = NULL;
+@@ -121,7 +133,7 @@
+ 
+ 	nscb = calloc(1, sizeof(struct nscallback));
+ 
+-	gettimeofday(&nscb->tv, NULL);
++	mono_tv(&nscb->tv);
+ 	timeradd(&nscb->tv, &tv, &nscb->tv);
+ 
+ 	nscb->callback = callback;
+@@ -164,7 +176,7 @@
+ 	prev_nscb = NULL;
+ 	nexttime = cur_nscb->tv;
+ 
+-	gettimeofday(&tv, NULL);
++	mono_tv(&tv);
+ 
+ 	while (cur_nscb != NULL) {
+ 		if (timercmp(&tv, &cur_nscb->tv, >)) {
+@@ -220,7 +232,7 @@
+ 	struct timeval tv;
+ 	struct nscallback *cur_nscb;
+ 
+-	gettimeofday(&tv, NULL);
++	mono_tv(&tv);
+ 
+ 	NSLOG(netsurf, INFO, "schedule list at %lld:%ld",
+ 	      (long long)tv.tv_sec, tv.tv_usec);
+diff --git a/frontends/vita/jsprobe.c b/frontends/vita/jsprobe.c
+--- a/frontends/vita/jsprobe.c
++++ b/frontends/vita/jsprobe.c
+@@ -30,13 +30,13 @@
+ 
+ #include "vita/jsprobe.h"
+ #include "vita/qjs_hooks.h"
++#include "vita/diag.h"
+ 
++/* patch 252: monotonic -- a wall clock step past the deadline stopped a
++ * script that had run for milliseconds */
+ static unsigned int now_ms(void)
+ {
+-	struct timeval tv;
+-
+-	gettimeofday(&tv, NULL);
+-	return (unsigned int)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
++	return (unsigned int)(vita_mono_us() / 1000u);
+ }
+ 
+ /** The interrupt handler's deadline; 0 = no deadline. */
+diff --git a/frontends/vita/netlog.c b/frontends/vita/netlog.c
+--- a/frontends/vita/netlog.c
++++ b/frontends/vita/netlog.c
+@@ -43,6 +43,7 @@
+ 
+ #include "vita/net.h"
+ #include "vita/netlog.h"
++#include "vita/diag.h"
+ 
+ struct vita_netlog_stats vita_netlog_stats;
+ 
+@@ -73,16 +74,12 @@
+ static char hello_text[256];
+ static char receiver[32];
+ static char status[160];
+-static struct timeval t0;
++static uint64_t t0_us;		/* patch 252: monotonic */
+ 
+ 
+ static unsigned int now_ms(void)
+ {
+-	struct timeval t;
+-
+-	gettimeofday(&t, NULL);
+-	return (unsigned int)((t.tv_sec - t0.tv_sec) * 1000 +
+-			      (t.tv_usec - t0.tv_usec) / 1000);
++	return (unsigned int)((vita_mono_us() - t0_us) / 1000u);
+ }
+ 
+ static void sleep_ms(unsigned int ms)
+@@ -205,14 +202,21 @@
+ 	bool off;
+ 	int on = 1;
+ 
+-	gettimeofday(&t0, NULL);
++	t0_us = vita_mono_us();
+ 	memset(&vita_netlog_stats, 0, sizeof(vita_netlog_stats));
+ 	memset(&dest, 0, sizeof(dest));
+ 	dest.sin_family = AF_INET;
+ 	dest.sin_port = htons(VITA_NETLOG_PORT);
+ 	dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+-	/* Distinct per launch (the Vita's clock is set; so is the host's). */
+-	boot_id = (uint32_t)t0.tv_sec * 2654435761u ^ (uint32_t)t0.tv_usec;
++	/* Distinct per launch (the Vita's clock is set; so is the host's):
++	 * the one use of the wall clock here */
++	{
++		struct timeval wall;
++
++		gettimeofday(&wall, NULL);
++		boot_id = (uint32_t)wall.tv_sec * 2654435761u ^
++			(uint32_t)wall.tv_usec;
++	}
+ 	snprintf(hello_text, sizeof(hello_text), "%s", hello);
+ 
+ 	if (!read_config(config, &off)) {

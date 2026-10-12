@@ -250,3 +250,9 @@ interaction 27/27 (also at the Vita's pace), APIs 161/176 with behaviour
    byte. This only matters for a server that sends headers and then waits.
 4. `tools/check-goldens.sh` (the *pristine* engine's goldens) needs an
    unpatched nsmonkey build and was not run here.
+
+*2026-10-11:* the occasional JS-fetch-stream failure in the simulator
+gate (rows "waiting", or no summary) was never the streaming code: the
+frontend timed its autotest settle and its timers with the wall clock,
+which WSL steps forward ~1.9 s every ~32 s. Patch 252 moved them to a
+monotonic clock (doc 10, "Since run 30").
