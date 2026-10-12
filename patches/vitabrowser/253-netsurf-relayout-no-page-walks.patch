@@ -1,0 +1,160 @@
+# netsurf: a late image's relayout no longer walks the whole page twice
+# (patch 253)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 252)
+#
+# JS-reflow-stall's check 3 (no main-loop gap over 60 ms while four late
+# images land under 5000 paragraphs) sat on its bound: 40-94 ms on the
+# host. Timed per main-loop pass (temporary instrumentation in vita_run
+# and vita_schedule_run): the gap was one scheduler callback,
+# llcache_catch_up_all_users, delivering the four images -- 24-41 ms of
+# CPU. A sampling profiler (SIGPROF + backtrace, LD_PRELOAD; 4 ms ticks
+# here) put it in two whole-tree walks per relayout, eight relayouts per
+# burst (each image's READY at +0 px and DONE at +80 px):
+#
+#  - layout.c, lr_reposition_earlier_abspos (patch 191) walked every box
+#    before the grown one -- the whole page above a late image -- looking
+#    for bottom-anchored absolute boxes whose containing block grew. A
+#    containing block is a positioned box: with none in the grown chain
+#    nothing can match, so the walk is skipped; and it no longer descends
+#    into a positioned box, whose descendants' containing block is that box
+#    or one inside it, never a chain box. Exact, not a heuristic. The
+#    +80 px relayouts went from 5-9 ms to 5-6 us.
+#  - html.c, html_relayout_object_local relabelled every box for the text
+#    selection (selection_reinit -> selection_label_subtree, ~1.5 ms per
+#    call here). An object that finished loading changes no text, so
+#    html_textselection_relabel() (textselection.c) relabels the image's
+#    inline container only and checks that its end meets the next box's
+#    label; anything else falls back to the full walk. Checked with a
+#    temporary verifier (full relabel after each local one, offsets
+#    compared): 95 052 boxes, 0 different, no fallback.
+#
+# Result: the page's longest gap is 16 ms (one idle pass) in 5/5
+# single-page runs and 2/2 autotest runs, from 40-94 ms. Completing the
+# objects across passes, or opening the page's window after the
+# autotest's settle, were not needed.
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -8295,6 +8295,17 @@
+ 
+ 	if (delta == 0 || n == 0)
+ 		return;
++	/* VitaBrowser patch 253: a containing block is a positioned box, so
++	 * with no positioned box in the chain nothing can match -- and the
++	 * walk below covers everything before the grown box (the whole page
++	 * above a late image: 2-3 ms per image for 5000 paragraphs). */
++	for (j = 0; j < n; j++)
++		if (chain[j]->style != NULL &&
++		    css_computed_position(chain[j]->style) !=
++				CSS_POSITION_STATIC)
++			break;
++	if (j == n)
++		return;
+ 
+ 	for (i = 0; i < n; i++) {
+ 		struct box *start = (i == 0) ? prev0 : chain[i]->prev;
+@@ -8320,8 +8331,14 @@
+ 								unit_len_ctx, u);
+ 					}
+ 				}
+-				/* next in document order, without leaving p */
+-				if (b->children != NULL) {
++				/* next in document order, without leaving p;
++				 * patch 253: not into a positioned box, whose
++				 * descendants' containing block is that box or
++				 * one inside it -- never a chain box */
++				if (b->children != NULL &&
++				    (b->style == NULL ||
++				     css_computed_position(b->style) ==
++						CSS_POSITION_STATIC)) {
+ 					b = b->children;
+ 					continue;
+ 				}
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6182,7 +6182,10 @@
+ 		c->width = layout->x + layout->descendant_x1;
+ 	if (c->height < layout->y + layout->descendant_y1)
+ 		c->height = layout->y + layout->descendant_y1;
+-	selection_reinit(htmlc->sel);
++	/* patch 253: the text is unchanged -- relabel the image's lines only
++	 * (the full labelling walked all 5000 paragraphs, twice per image) */
++	if (!html_textselection_relabel(c, box))
++		selection_reinit(htmlc->sel);
+ 
+ 	macsurf_debug_log_writef("LIFE relayout local: %+d px in %ld us, "
+ 		"page %dx%d (%lu local, %lu full so far)", delta,
+diff --git a/content/handlers/html/textselection.c b/content/handlers/html/textselection.c
+--- a/content/handlers/html/textselection.c
++++ b/content/handlers/html/textselection.c
+@@ -529,6 +529,37 @@
+ 
+ 
+ /* exported interface documented in html/textselection.h */
++bool html_textselection_relabel(struct content *c, struct box *box)
++{
++	html_content *html = (html_content *)c;
++	struct box *start, *n;
++	unsigned end, want;
++
++	if (html->layout == NULL || box == NULL)
++		return false;
++	/* the lines around box: its inline container (a line re-laid out may
++	 * split its text boxes anew), else its parent */
++	for (start = box; start != NULL &&
++		     start->type != BOX_INLINE_CONTAINER; start = start->parent)
++		;
++	if (start == NULL)
++		start = box->parent;
++	if (start == NULL || start->list_marker != NULL)
++		return false;
++	end = selection_label_subtree(start, start->byte_offset);
++	/* the text after it is where it was if this subtree ends where the
++	 * next box in document order starts */
++	for (n = start; n != NULL && n->next == NULL; n = n->parent)
++		;
++	if (n == NULL)
++		return false;
++	n = n->next;
++	want = n->list_marker != NULL ? n->list_marker->byte_offset :
++		n->byte_offset;
++	return end == want;
++}
++
++/* exported interface documented in html/textselection.h */
+ nserror
+ html_textselection_get_end(struct content *c, unsigned *end_idx)
+ {
+diff --git a/content/handlers/html/textselection.h b/content/handlers/html/textselection.h
+--- a/content/handlers/html/textselection.h
++++ b/content/handlers/html/textselection.h
+@@ -24,8 +24,11 @@
+ #ifndef NETSURF_HTML_TEXTSELECTION_H
+ #define NETSURF_HTML_TEXTSELECTION_H
+ 
++#include <stdbool.h>
++
+ struct content;
+ struct selection;
++struct box;
+ 
+ nserror html_textselection_redraw(struct content *c, unsigned start_idx, unsigned end_idx);
+ 
+@@ -40,4 +43,15 @@
+  */
+ nserror html_textselection_get_end(struct content *c, unsigned *end_idx);
+ 
++/**
++ * VitaBrowser patch 253: relabel only the lines around box after a local
++ * relayout that changed no text (an object that finished loading). The
++ * whole-tree labelling (selection_reinit) walked every box of the page
++ * for each late image.
++ *
++ * \return true if the labels after the subtree are still right; false
++ *         if the caller must relabel everything (selection_reinit)
++ */
++bool html_textselection_relabel(struct content *c, struct box *box);
++
+ #endif

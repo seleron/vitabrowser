@@ -3175,8 +3175,9 @@ run 31 (above).
   ticker was tried first and reverted: a text change pending when the
   block is inserted takes the rebuild past the sibling-rule decline the
   gate counts -- 0 declines instead of 4, styles still right.)
-- **Not fixed -- JS-reflow-stall check 3 ("no stall", < 60 ms) sits on
-  its bound on this machine tonight.** Four strict gates with 252 failed
+- **Not fixed (fixed since by patch 253, "Since run 31" below) --
+  JS-reflow-stall check 3 ("no stall", < 60 ms) sat on its bound on this
+  machine that night.** Four strict gates with 252 failed
   it (71.6, 94.5, 90.9 ms where recorded); the morning's five 250 gates,
   tonight's base and 251 had passed. It is not patch 252: the same gate
   with the 251-only binary swapped in failed it too (75.2 ms -- and that
@@ -3199,3 +3200,48 @@ run 31 (above).
   completing objects across passes; and open the window after the
   autotest's settle. Tried and reverted: a repaint ticker on the page (a
   text change inside its position:fixed results is a full 55 ms layout).
+
+## Since run 31 — queued for run 32 (not built yet)
+
+Patch 253 (2026-10-12), sim-verified: full sim gate exit 0, no soft
+accepts (JS-reflow-stall longest gap 16.3 ms, longest local relayout 7
+us -- every earlier gate logged 4.5-8.75 ms), Vita cross-build green.
+Run 31 is with the device.
+
+- **253: a late image's relayout no longer walks the whole page.** The
+  WS-C item left open above. Profiled rather than guessed:
+  1. *Where the gap is.* Temporary timers around each main-loop pass
+     (scheduler / JavaScript / draw or sleep) and around each scheduler
+     callback: an idle pass on the page is 10 ms of JavaScript (the
+     pump's slice, which its setTimeout(0) loop fills) plus a 16 ms
+     sleep; the stall was one callback, llcache_catch_up_all_users,
+     taking 24-41 ms while it delivered all four images (they arrive
+     together and are handed over in one call).
+  2. *What it spends.* An LD_PRELOAD sampling profiler (SIGPROF every
+     tick -- 4 ms on this kernel, not the 0.5 ms asked -- with
+     backtrace(), symbolised with addr2line against the maps:
+     tools/vita-sim/sprof.c + sprof-sym.py), samples in that callback: half in
+     selection_reinit -> selection_label_subtree, the text-selection
+     labelling of every box, run after each of the burst's eight
+     relayouts (READY +0 px and DONE +80 px per image); most of the
+     rest in lr_reposition_earlier_abspos (patch 191), which visited
+     every box before the grown one -- the whole page above a late
+     image -- per relayout. That is the "~10 ms per image outside the
+     relayout" of the note above, and the relayout's own 5-9 ms.
+  3. *The fixes, both exact.* The abspos scan returns at once when no
+     box of the grown chain is positioned (a containing block always
+     is), and never descends into a positioned box (its descendants'
+     containing block is that box or one inside it): +80 px relayouts
+     5-9 ms -> 5-6 us. The selection is relabelled for the image's
+     inline container only, accepted only if its end meets the next
+     box's existing label (else the full walk); a temporary verifier
+     that relabelled everything after each local relabel found 95 052
+     boxes, 0 different, no fallback.
+  4. *Result.* Longest gap 16 ms -- one idle pass -- in 5/5 single-page
+     runs and 2/2 runs through the autotest (was 40-94 ms). Completing
+     objects across passes and moving the page's window after the
+     autotest's settle were not needed and not done.
+  On the device: a long page whose images arrive late (a news article
+  with lazy images, wikipedia) should scroll without a hitch as each
+  image lands; the late image relayout was "several hundred ms on the
+  Vita" for a 5000-paragraph page.

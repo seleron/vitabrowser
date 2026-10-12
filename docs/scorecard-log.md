@@ -4,6 +4,17 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patch 253: late images stop stalling the page (not re-scored)
+
+WS-C, the JS-reflow-stall item doc 10 left open: profiled (per-pass
+timers, then tools/vita-sim/sprof.c), the stall was two whole-tree walks
+per late-image relayout -- the earlier-abspos scan of patch 191 and the
+text-selection labelling -- eight relayouts per four-image burst. Both
+now exact and local: the page's longest gap 40-94 ms -> 16 ms (one idle
+pass), relayout 5-9 ms -> 7 us. Gate exit 0 strict. No scorecard run:
+the sites' Done-s measures the initial load, which this does not touch;
+the device run (scrolling while images land) is where it shows.
+
 ## 2026-10-12 — patches 251-252: canvas draws; the simulator keeps time (not re-scored)
 
 Tasks from doc 10's queue and the WebAssembly note's prerequisites:
