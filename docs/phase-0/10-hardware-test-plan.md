@@ -3201,20 +3201,51 @@ run 31 (above).
   autotest's settle. Tried and reverted: a repaint ticker on the page (a
   text change inside its position:fixed results is a full 55 ms layout).
 
-## Since run 31 — queued for run 32 (not built yet)
+## Run 32 — hand-off (2026-10-12 11:05; replaces untested run 31)
+
+**Flash this build:** VitaBrowser.vpk `1c19ece9c91b`, VitaBrowser-ext.vpk
+`22f3d4641e03`, nsvita.elf `54e4ae63a378` (patches through 253, built at
+a66fe4f). Run 31 (`ca45146fbf61`) has no `results\` yet, so run 32
+carries everything since run 27: **patches 168-253 +
+patches/quickjs/05-06**, all unverified on hardware. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-12-run32/`; run 31's reference
+dumps are now `reference-dumps-run31\`. (An earlier build of the same
+sources, `70a2cb2f6807`, made before the restage, was never handed off.)
+
+Build: clean restage (339 applied + the two known collisions), checked
+first against a scratch application of the same stack; streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(REFLOW 3/3, longest local relayout 10 us, CANVAS251 22/22, interaction
+52/52, also at the Vita's pace), cross-build green. Reference autotest
+under device conditions: interact **52/52**, js 18/18, 34 dumps
+identical to run 31's. The first reference run scored js **17/18**: the
+out-of-memory probe caught `null` instead of "InternalError: out of
+memory" -- QuickJS throws null when even the error object cannot be
+allocated, i.e. the failing allocation left no headroom under the 32 MiB
+cap; it depends on the heap at that moment, not on these patches (the
+gate's probe and two more runs: 18/18; the runtime stayed usable). Kept
+as `sim-first-js17of18/`. If the device reports 17/18 with that line,
+it is the same thing.
+
+**On the device:** run 31's list (it includes run 30's) still applies,
+plus:
+
+1. Autotest (SELECT + SQUARE): every `.plot` SAME against the new
+   reference-dumps (PM-animation is timing-dependent; IN-home-recent /
+   IN-history may differ), interact **52/52**, js 18/18.
+2. **Late images (253):** a long page whose images arrive as you scroll
+   (a news article with lazy images, a long wikipedia article): scroll
+   while they land -- it should not hitch at each image (it re-laid out
+   in "several hundred ms on the Vita" per image on a long page).
+
+### What run 32 adds over run 31
 
 Patch 253 (2026-10-12), sim-verified: full sim gate exit 0, no soft
 accepts (JS-reflow-stall longest gap 16.3 ms, longest local relayout 7
 us -- every earlier gate logged 4.5-8.75 ms), Vita cross-build green.
-Run 31 is with the device.
+Run 31 was with the device.
 
-**Run 32 VPK built (2026-10-12 10:16, patches through 253, at 3100b5b),
-not handed off:** VitaBrowser.vpk `70a2cb2f6807`, VitaBrowser-ext.vpk
-`ed4ba83d25a2`, nsvita.elf `af19c161695d`; archived in
-`<WORK>/vitabrowser-work/hwtest-2026-10-12-run32/` (SHA256SUMS). Built
-straight from the gated tree with tools/build-vita.sh -- no restage or
-reference autotest yet; do both before copying it to
-`Desktop\VitaBrowser-hwtest\`.
+Handed off as run 32 (above).
 
 - **253: a late image's relayout no longer walks the whole page.** The
   WS-C item left open above. Profiled rather than guessed:
