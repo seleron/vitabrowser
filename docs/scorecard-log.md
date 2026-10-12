@@ -4,6 +4,28 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patches 251-252: canvas draws; the simulator keeps time (not re-scored)
+
+Tasks from doc 10's queue and the WebAssembly note's prerequisites:
+(1) canvas 2D drawing, (2) the JS-fetch-stream "freeze" in the
+simulator, (3) settle-deterministic flaky tests. No scorecard run: the
+work was a platform feature and gate reliability, and none of the 21
+sites was chosen for it (the canvas-drawing ones -- charts, captchas --
+are not in the set). Details: doc 10, "Since run 30".
+
+- 251: getContext('2d') draws (it was a no-op); a display:none <img>
+  loads and holds window load. Gate JS-canvas-2d 22/22 (Chromium 22/22)
+  + on-screen pixels; the raster is ASan + UBSan clean under
+  tools/test-canvas-raster.sh.
+- 252: the frontend's clocks are monotonic. WSL steps the wall clock
+  +1.9 s every ~32 s; the autotest took that for 1.9 s of quiet and
+  dumped pages mid-script (JS-fetch-stream in gate 250c/d, JS-class-stall
+  in gate 251). Reproduced with a clock-stepping LD_PRELOAD shim: 2/6
+  bad before, 6/6 good after.
+- SIBINS steps 500 ms apart (they were exactly the 700 ms settle).
+- Open: JS-reflow-stall check 3 sits at its 60 ms bound on this machine
+  with or without 252 (four late images handled in one main-loop pass).
+
 ## 2026-10-11 09:31 — patches 249-250: images fire load; mean 79.8 -> 80.0
 
 A/B on the same fresh Chrome references, run back to back: r43 (patches

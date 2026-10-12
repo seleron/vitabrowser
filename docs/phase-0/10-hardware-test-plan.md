@@ -3095,3 +3095,73 @@ cross-build green; no VPK handed off (run 30 is with the device).
   lightbox site (images that appear "on load"), wikipedia (sim score
   +2.8), and watch memory (mem[page done]) and scroll speed on
   image-heavy pages (every image now fires an event).
+
+Patches 251-252 (2026-10-11 night), sim-verified. Full gate (gate 252e,
+both patches): exit 0, no soft accepts -- it ran with GATE_TIMING_SOFT=1
+after four strict runs had failed only JS-reflow-stall check 3 (below),
+and REFLOW passed 3/3 outright. Vita cross-build green (tools/build-vita.sh
+exit 0, 2026-10-12 01:05; no warnings from the new code). No VPK handed
+off: run 30 is with the device.
+
+- **251 canvas 2D draws.** Every drawing call used to be a no-op. Now:
+  shapes, strokes (joins, caps, dashes), transforms, clipping, gradients,
+  drawImage of images and other canvases, patterns, text in the page's
+  own fonts, getImageData / putImageData, toDataURL / toBlob, Path2D
+  (SVG path data too). Gate JS-canvas-2d 22/22 (Chromium 22/22) plus the
+  on-screen pixels. A display:none `<img>` now loads (it never did), and
+  window load waits for it, as in Chromium. Not done: shadows, filters,
+  rotated text.
+  On the device: a chart site (any page with a canvas chart -- e.g. a
+  stock or weather chart), a canvas game, and watch `mem[page done]`
+  (each canvas holds its pixels twice: one copy to draw in, one as the
+  texture). Report how long a heavy chart takes to appear; the
+  rasteriser is C, the context's bookkeeping is JavaScript (host: about
+  8 us per fillRect, 25 us per 96x96 drawImage; expect 10-30x on the
+  ARM).
+- **252 one monotonic clock.** The simulator's JS-fetch-stream "freeze"
+  (gate 250c: every row waiting; 250d: 2/8) was the wall clock: WSL steps
+  it about +1.9 s every ~32 s (measured: +1.871 s and +1.890 s, 32 s
+  apart), and the frontend timed its scheduler, its autotest settle
+  ("700 ms without a repaint"), the script deadline and its log stamps
+  with gettimeofday. A step looked like 1.9 s of quiet, so a page still
+  streaming was dumped at once (gate 250c's netsurf.log: nothing at all
+  between 198.26 and 199.51); it also fired every timer due within the
+  next ~2 s together. gate 251 failed the same way on JS-class-stall
+  (stepping every 0.78 s, then 2.36 s of nothing and a dump). Reproduced
+  on demand with an LD_PRELOAD shim that steps gettimeofday /
+  CLOCK_REALTIME +1.9 s every 2.5 s, autotest pass N with JS-fetch-stream
+  six times: before 252, 2 of 6 dumped early (2/8, no summary); with
+  252, 6/6 at 8/8. All of it now reads vita_mono_us() -- the Vita's
+  process time, CLOCK_MONOTONIC in the simulator. On the device nothing
+  should change (the Vita's wall clock rarely moves); if the time is set
+  while browsing, timers no longer jump.
+- **Test pages:** JS-block-sibling-insert (SIBINS) steps 500 ms apart
+  (400 + 100, was 600 + 100): its steps were 700 ms apart, exactly the
+  settle threshold, so it could be dumped between two of them. (A repaint
+  ticker was tried first and reverted: a text change pending when the
+  block is inserted takes the rebuild past the sibling-rule decline the
+  gate counts -- 0 declines instead of 4, styles still right.)
+- **Not fixed -- JS-reflow-stall check 3 ("no stall", < 60 ms) sits on
+  its bound on this machine tonight.** Four strict gates with 252 failed
+  it (71.6, 94.5, 90.9 ms where recorded); the morning's five 250 gates,
+  tonight's base and 251 had passed. It is not patch 252: the same gate
+  with the 251-only binary swapped in failed it too (75.2 ms -- and that
+  run broke on JS-streaming http 3/7, the wall-clock flake 252 fixes),
+  and ten single-page runs alternating the builds spread alike (251:
+  59 / 94 / 59 / 55 / 62 ms; 251+252: 81 / 60 / 53 / 43 / 85 ms). Two
+  things fill the page's measuring window, and the longer one is the
+  gap:
+  1. the autotest's own work: it judges the page settled about 0.5 s
+     before the images land (the page draws nothing while it waits) and
+     renders five "measure N" frames back to back plus a dump -- 6/9/17
+     ms CPU each in the morning's logs, 11-14/24 tonight;
+  2. the images' batch: the four arrive in one main-loop pass, and four
+     READY -> DONE cycles with eight local relayouts (5-9 ms each) and
+     the redraw take 45-95 ms on the host (38-39 ms when the page was
+     written). Served 3 s late (window and settle apart) it failed every
+     time at ~77 ms: the batch alone.
+  Next (WS-C): what the ~10 ms per image outside the relayout is
+  (between msg:3 and msg:4, and after each relayout, in netsurf.log), or
+  completing objects across passes; and open the window after the
+  autotest's settle. Tried and reverted: a repaint ticker on the page (a
+  text change inside its position:fixed results is a full 55 ms layout).
