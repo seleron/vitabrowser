@@ -3559,3 +3559,23 @@ Sim-verified: JS-fetch-body checks 18-22, 22/22 over http and https
 exit 0 with no soft accepts; Vita cross-build green. No device check of
 its own.
 
+## Since run 35 — queued for run 36 (not built yet)
+
+### Patch 259 (2026-10-12): Request bodies can be read
+
+The bridge's Request kept init.body as given and had no readers --
+`req.text()`, `req.json()`, `req.formData()` were not functions, `body`
+was the raw value, `bodyUsed` never changed, the URL was not resolved. It
+is now a Request built on Response's body code, following Chromium
+(checked case by case): URL resolved against the document; the six
+standard methods upper-cased; no body for GET / HEAD; `body` a stream or
+null, with the Content-Type the body implies; `new Request(req)` takes
+req's body (req is then used); clone(); `fetch(req)` sends req's own body
+once.
+
+Sim-verified: JS-fetch-body checks 23-30, 30/30 over http and https
+(Chromium 30/30; run 35's build stops at check 25); full sim gate exit
+0 with no soft accepts; Vita cross-build green. No device check of its own (scripts on the device's sites do
+not build Requests with bodies that we know of); run 35 is with the
+device.
+

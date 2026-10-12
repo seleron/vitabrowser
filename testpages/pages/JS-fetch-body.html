@@ -28,7 +28,9 @@ p { margin: 0; padding: 1px 6px; font-size: 11px; line-height: 1.3; }
  * go in the multipart body (they went as nothing); names escaped, text
  * values UTF-8 with CRLF line breaks.
  * Patch 258: Response.formData() reads multipart/form-data bodies (it
- * read url-encoded ones only), as Chromium does -- checks 18-22. */
+ * read url-encoded ones only), as Chromium does -- checks 18-22.
+ * Patch 259: Request has a body to read (text, json, formData, ...), and
+ * Chromium's constructor rules -- checks 23-30. */
 var passed = 0, total = 0, failedNames = [];
 function t(name, cond) {
   total++;
@@ -296,6 +298,95 @@ function readForms() {
     return fdOf('a=1&b=two+words', 'application/x-www-form-urlencoded');
   }).then(function (got) {
     t('22 url-encoded formData()', got.get('a') === '1' && got.get('b') === 'two words');
+    return requests();
+  });
+}
+function throwsType(f) {
+  try { f(); return false; } catch (e) { return e instanceof TypeError; }
+}
+function requests() {
+  var P = function (body, h) { return new Request(base + 'x', { method: 'POST', body: body, headers: h }); };
+  /* 23: URL, method, no body for GET / HEAD */
+  var u = new Request('x?y#z').url;
+  t('23 Request URL and method',
+    u === base + 'x?y#z' &&
+    new Request('/', { method: 'post' }).method === 'POST' &&
+    new Request('/', { method: 'patch' }).method === 'patch' &&
+    new Request('/', { method: 'Custom' }).method === 'Custom' &&
+    throwsType(function () { new Request('/', { body: 'x' }); }) &&
+    throwsType(function () { new Request('/', { method: 'HEAD', body: 'x' }); }));
+  /* 24: body and the type it implies */
+  var fd = new FormData(); fd.append('a', '1');
+  var none = new Request('/');
+  t('24 Request body and Content-Type',
+    none.body === null && none.bodyUsed === false &&
+    P('x').body instanceof ReadableStream &&
+    P('x').headers.get('content-type') === 'text/plain;charset=UTF-8' &&
+    P(fd).headers.get('content-type').indexOf('multipart/form-data; boundary=') === 0 &&
+    P(new URLSearchParams('a=1')).headers.get('content-type') ===
+      'application/x-www-form-urlencoded;charset=UTF-8' &&
+    P(new Uint8Array(2)).headers.get('content-type') === null);
+  /* 25: the readers */
+  return Promise.all([
+    P('{"a":[1]}').json(),
+    P(new Uint8Array([1, 2, 3])).arrayBuffer(),
+    P('hey', { 'content-type': 'x/y' }).blob(),
+    new Request('/').text()
+  ]).then(function (r) {
+    t('25 Request json / arrayBuffer / blob / text',
+      r[0].a[0] === 1 && r[1].byteLength === 3 && r[2].type === 'x/y' &&
+      r[2].size === 3 && r[3] === '');
+    /* 26: formData, multipart and url-encoded */
+    var f = new FormData();
+    f.append('k', 'v');
+    f.append('b', new Blob(['xyz'], { type: 'a/b' }), 'n.bin');
+    return Promise.all([P(f).formData(), P(new URLSearchParams('a=1&b=2')).formData()]);
+  }).then(function (r) {
+    var b = r[0].get('b');
+    t('26 Request formData()', r[0].get('k') === 'v' && b instanceof Blob &&
+      b.name === 'n.bin' && b.type === 'a/b' && b.size === 3 && r[1].get('b') === '2');
+    /* 27: new Request(req) takes req's body */
+    var r1 = P('{"a":1}'), r2 = new Request(r1);
+    var a = P('1'), over = new Request(a, { body: '2' });
+    var ok = r1.bodyUsed === true && r2.method === 'POST' && a.bodyUsed === true &&
+      throwsType(function () { new Request(r1); });
+    return Promise.all([r2.text(), over.text()]).then(function (x) {
+      t('27 new Request(req) takes the body', ok && x[0] === '{"a":1}' && x[1] === '2');
+    });
+  }).then(function () {
+    /* 28: clone, and a body read once */
+    var r = P('abc'), c = r.clone();
+    return Promise.all([r.text(), c.text()]).then(function (x) {
+      var used = throwsType(function () { r.clone(); });
+      return r.text().then(function () { return false; }, function (e) {
+        return e instanceof TypeError;
+      }).then(function (again) {
+        t('28 Request clone, body read once', x[0] === 'abc' && x[1] === 'abc' && used && again);
+      });
+    });
+  }).then(function () {
+    /* 29: fetch(request) sends the request's body */
+    var r = new Request(echoUrl, { method: 'POST', body: all,
+      headers: { 'Content-Type': 'application/octet-stream' } });
+    return fetch(r).then(function (res) {
+      var ct = res.headers.get('X-Echo-Content-Type');
+      return res.arrayBuffer().then(function (ab) {
+        var used = r.bodyUsed;
+        return fetch(r).then(function () { return false; }, function (e) {
+          return e instanceof TypeError;
+        }).then(function (rej) {
+          t('29 fetch(request) sends its body, once',
+            same(ab, all) && ct === 'application/octet-stream' && used && rej);
+        });
+      });
+    });
+  }).then(function () {
+    /* 30: the rest, as Chromium has them */
+    var r = new Request('/');
+    t('30 Request defaults',
+      [r.credentials, r.mode, r.cache, r.redirect, r.referrer, r.destination,
+       r.keepalive, r.integrity].join(',') === 'same-origin,cors,default,follow,about:client,,false,' &&
+      r.signal instanceof AbortSignal && Object.keys(r).length === 0);
   });
 }
 </script>

@@ -1,0 +1,295 @@
+# netsurf: Request gets a body to read -- text, json, formData,
+# arrayBuffer, blob, bytes, body, bodyUsed, clone (patch 259)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 258)
+#
+# The bridge's Request (macsurf_qjs.c) stored init.body as it was given
+# and had no readers: req.text(), req.json(), req.formData() ... were not
+# functions, `body` was the raw value rather than a stream, bodyUsed never
+# changed, and the URL was not resolved. vita_polyfill.js now replaces it
+# with a Request that shares Response's body machinery (extractBody, _take
+# and the readers, patches 132 / 256-258), following Chromium (checked
+# case by case):
+#
+#  - the URL resolved against the document; DELETE GET HEAD OPTIONS POST
+#    PUT upper-cased, other methods kept; a GET / HEAD with a body throws;
+#  - `body` a ReadableStream or null; the body's Content-Type unless one is
+#    set (text/plain;charset=UTF-8, multipart with its boundary,
+#    url-encoded; bytes get none);
+#  - new Request(req) takes req's body and marks req used -- even when
+#    init gives another body -- and a used Request cannot be wrapped,
+#    cloned, read again or fetched; clone() tees a streamed body;
+#  - fetch(req) sends req's own body (not re-extracted from the stream)
+#    and uses it up;
+#  - every field a prototype getter (no own properties), signal an
+#    AbortSignal, destination "", keepalive false.
+#
+# Gate: testpages/pages/JS-fetch-body.html checks 23-30, 30/30 over http
+# and https (Chromium 30/30; run 35's build stops at check 25, "not a
+# function").
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1269,6 +1269,96 @@
+ };
+ define(g, 'Response', Resp);
+ 
++/* ---- Request (VitaBrowser patch 259) ------------------------------------
++ * The bridge's Request (macsurf_qjs.c) kept init.body as it was given and
++ * had no way to read it: no text / json / formData / arrayBuffer / blob,
++ * `body` the raw value rather than a stream. This one shares Response's
++ * body machinery (extractBody, _take and the readers above) and follows
++ * Chromium (checked case by case): the URL resolved against the document,
++ * the six standard methods upper-cased (others kept), no body for GET /
++ * HEAD, the body's Content-Type unless one is set, `new Request(req)`
++ * taking req's body (req is then used, even when init gives another
++ * body; a used one cannot be wrapped, cloned or fetched), every field a
++ * prototype getter. */
++var REQ_METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];
++var Req = function Request(input, init) {
++	if (!(this instanceof Req))
++		throw new TypeError("Failed to construct 'Request': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
++	init = init || {};
++	var src = input instanceof Req ? input : null, url, b = null, stream = null;
++	if (src) {
++		if (src._b && src.bodyUsed)
++			throw new TypeError("Failed to construct 'Request': Cannot construct a Request with a Request object that has already been used.");
++		url = src._url;
++	} else {
++		url = String(input);
++		try {
++			if (isFn(g.URL)) url = new g.URL(url, g.location ? String(g.location.href) : undefined).href;
++		} catch (e) { /* kept as given */ }
++	}
++	var method = init.method !== undefined ? String(init.method) : src ? src._method : 'GET';
++	if (REQ_METHODS.indexOf(method.toUpperCase()) >= 0) method = method.toUpperCase();
++	var headers = new g.Headers(init.headers !== undefined ? init.headers : src ? src._headers : undefined);
++	if (init.body !== undefined && init.body !== null) {
++		b = extractBody(init.body);
++		stream = b && b.stream ? b.stream : null;
++	} else if (src && src._b) {
++		b = src._b;
++		stream = src._stream;
++	}
++	if (b && (method === 'GET' || method === 'HEAD'))
++		throw new TypeError("Failed to construct 'Request': Request with GET/HEAD method cannot have body.");
++	if (b && b.type && !headers.has('content-type')) headers.set('content-type', b.type);
++	if (src && src._b) src._used = true;
++	function pick(k, d) { return init[k] !== undefined ? init[k] : src ? src['_' + k] : d; }
++	define(this, '_url', url);
++	define(this, '_method', method);
++	define(this, '_headers', headers);
++	define(this, '_b', b);
++	define(this, '_stream', stream);
++	define(this, '_used', false);
++	define(this, '_credentials', String(pick('credentials', 'same-origin')));
++	define(this, '_mode', String(pick('mode', 'cors')));
++	define(this, '_cache', String(pick('cache', 'default')));
++	define(this, '_redirect', String(pick('redirect', 'follow')));
++	define(this, '_referrer', String(pick('referrer', 'about:client')));
++	define(this, '_referrerPolicy', String(pick('referrerPolicy', '')));
++	define(this, '_integrity', String(pick('integrity', '')));
++	define(this, '_keepalive', !!pick('keepalive', false));
++	define(this, '_signal', pick('signal', null) ||
++		(isFn(g.AbortController) ? new g.AbortController().signal : null));
++};
++['url', 'method', 'headers', 'credentials', 'mode', 'cache', 'redirect', 'referrer',
++ 'referrerPolicy', 'integrity', 'keepalive', 'signal'].forEach(function (k) {
++	Object.defineProperty(Req.prototype, k, { configurable: true, enumerable: true,
++		get: function () { return this['_' + k]; } });
++});
++Object.defineProperty(Req.prototype, 'destination', { configurable: true, enumerable: true,
++	get: function () { return ''; } });
++['body', 'bodyUsed'].forEach(function (k) {
++	Object.defineProperty(Req.prototype, k, Object.getOwnPropertyDescriptor(Resp.prototype, k));
++});
++['_take', 'text', 'json', 'bytes', 'arrayBuffer', 'blob', 'formData'].forEach(function (k) {
++	define(Req.prototype, k, Resp.prototype[k]);
++});
++define(Req.prototype, 'clone', function clone() {
++	if (this.bodyUsed)
++		throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
++	var r = Object.create(Req.prototype), self = this;
++	Object.getOwnPropertyNames(this).forEach(function (k) {
++		if (k.charAt(0) === '_') define(r, k, self[k]);
++	});
++	define(r, '_headers', new g.Headers(this._headers));
++	define(r, '_used', false);
++	if (this._b && (this._stream || this._b.stream)) {
++		var pair = this.body.tee();
++		this._stream = pair[0];
++		define(r, '_stream', pair[1]);
++	}
++	return r;
++});
++define(g, 'Request', Req);
++
+ /* Headers from the native slot's raw block ("Name: value" lines after the
+  * status line), and the status text from that status line. */
+ function rawHeaders(raw) {
+@@ -1291,12 +1381,21 @@
+ if (isFn(g.__xhrNativeSend) && isFn(g.__xhrNativeTakeBytes)) {
+ 	g.fetch = function fetch(input, init) {
+ 		init = init || {};
+-		var url, method, headers, body, signal;
++		var url, method, headers, body, signal, rb;
++		/* patch 259: a Request's body is its own, read once */
++		if (input instanceof Req) {
++			if (input._b && input.bodyUsed)
++				return Promise.reject(new TypeError("Failed to execute 'fetch' on 'Window': Cannot construct a Request with a Request object that has already been used."));
++			if (init.body === undefined && input._b)
++				rb = input._stream ? { stream: input._stream, type: input._b.type } : input._b;
++			if (input._b) input._used = true;
++		}
+ 		if (input && typeof input === 'object' && input.url !== undefined) {
+ 			url = String(input.url);
+ 			method = init.method !== undefined ? init.method : input.method;
+ 			headers = init.headers !== undefined ? init.headers : input.headers;
+-			body = init.body !== undefined ? init.body : input.body;
++			body = init.body !== undefined ? init.body :
++				input instanceof Req ? undefined : input.body;
+ 			signal = init.signal !== undefined ? init.signal : input.signal;
+ 		} else {
+ 			url = String(input);
+@@ -1304,7 +1403,7 @@
+ 		}
+ 		method = String(method || 'GET').toUpperCase();
+ 		if (signal && signal.aborted) return Promise.reject(abortReason(signal));
+-		var h = new g.Headers(headers), list = [], b = extractBody(body);
++		var h = new g.Headers(headers), list = [], b = rb || extractBody(body);
+ 		if ((method === 'GET' || method === 'HEAD') && b)
+ 			return Promise.reject(new TypeError("Failed to execute 'fetch': Request with GET/HEAD method cannot have body."));
+ 		if (b && b.type && !h.has('content-type')) h.set('content-type', b.type);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1270,6 +1270,96 @@
+ "};\n"
+ "define(g, 'Response', Resp);\n"
+ "\n"
++"/* ---- Request (VitaBrowser patch 259) ------------------------------------\n"
++" * The bridge's Request (macsurf_qjs.c) kept init.body as it was given and\n"
++" * had no way to read it: no text / json / formData / arrayBuffer / blob,\n"
++" * `body` the raw value rather than a stream. This one shares Response's\n"
++" * body machinery (extractBody, _take and the readers above) and follows\n"
++" * Chromium (checked case by case): the URL resolved against the document,\n"
++" * the six standard methods upper-cased (others kept), no body for GET /\n"
++" * HEAD, the body's Content-Type unless one is set, `new Request(req)`\n"
++" * taking req's body (req is then used, even when init gives another\n"
++" * body; a used one cannot be wrapped, cloned or fetched), every field a\n"
++" * prototype getter. */\n"
++"var REQ_METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];\n"
++"var Req = function Request(input, init) {\n"
++"\tif (!(this instanceof Req))\n"
++"\t\tthrow new TypeError(\"Failed to construct 'Request': Please use the 'new' operator, this DOM object constructor cannot be called as a function.\");\n"
++"\tinit = init || {};\n"
++"\tvar src = input instanceof Req ? input : null, url, b = null, stream = null;\n"
++"\tif (src) {\n"
++"\t\tif (src._b && src.bodyUsed)\n"
++"\t\t\tthrow new TypeError(\"Failed to construct 'Request': Cannot construct a Request with a Request object that has already been used.\");\n"
++"\t\turl = src._url;\n"
++"\t} else {\n"
++"\t\turl = String(input);\n"
++"\t\ttry {\n"
++"\t\t\tif (isFn(g.URL)) url = new g.URL(url, g.location ? String(g.location.href) : undefined).href;\n"
++"\t\t} catch (e) { /* kept as given */ }\n"
++"\t}\n"
++"\tvar method = init.method !== undefined ? String(init.method) : src ? src._method : 'GET';\n"
++"\tif (REQ_METHODS.indexOf(method.toUpperCase()) >= 0) method = method.toUpperCase();\n"
++"\tvar headers = new g.Headers(init.headers !== undefined ? init.headers : src ? src._headers : undefined);\n"
++"\tif (init.body !== undefined && init.body !== null) {\n"
++"\t\tb = extractBody(init.body);\n"
++"\t\tstream = b && b.stream ? b.stream : null;\n"
++"\t} else if (src && src._b) {\n"
++"\t\tb = src._b;\n"
++"\t\tstream = src._stream;\n"
++"\t}\n"
++"\tif (b && (method === 'GET' || method === 'HEAD'))\n"
++"\t\tthrow new TypeError(\"Failed to construct 'Request': Request with GET/HEAD method cannot have body.\");\n"
++"\tif (b && b.type && !headers.has('content-type')) headers.set('content-type', b.type);\n"
++"\tif (src && src._b) src._used = true;\n"
++"\tfunction pick(k, d) { return init[k] !== undefined ? init[k] : src ? src['_' + k] : d; }\n"
++"\tdefine(this, '_url', url);\n"
++"\tdefine(this, '_method', method);\n"
++"\tdefine(this, '_headers', headers);\n"
++"\tdefine(this, '_b', b);\n"
++"\tdefine(this, '_stream', stream);\n"
++"\tdefine(this, '_used', false);\n"
++"\tdefine(this, '_credentials', String(pick('credentials', 'same-origin')));\n"
++"\tdefine(this, '_mode', String(pick('mode', 'cors')));\n"
++"\tdefine(this, '_cache', String(pick('cache', 'default')));\n"
++"\tdefine(this, '_redirect', String(pick('redirect', 'follow')));\n"
++"\tdefine(this, '_referrer', String(pick('referrer', 'about:client')));\n"
++"\tdefine(this, '_referrerPolicy', String(pick('referrerPolicy', '')));\n"
++"\tdefine(this, '_integrity', String(pick('integrity', '')));\n"
++"\tdefine(this, '_keepalive', !!pick('keepalive', false));\n"
++"\tdefine(this, '_signal', pick('signal', null) ||\n"
++"\t\t(isFn(g.AbortController) ? new g.AbortController().signal : null));\n"
++"};\n"
++"['url', 'method', 'headers', 'credentials', 'mode', 'cache', 'redirect', 'referrer',\n"
++" 'referrerPolicy', 'integrity', 'keepalive', 'signal'].forEach(function (k) {\n"
++"\tObject.defineProperty(Req.prototype, k, { configurable: true, enumerable: true,\n"
++"\t\tget: function () { return this['_' + k]; } });\n"
++"});\n"
++"Object.defineProperty(Req.prototype, 'destination', { configurable: true, enumerable: true,\n"
++"\tget: function () { return ''; } });\n"
++"['body', 'bodyUsed'].forEach(function (k) {\n"
++"\tObject.defineProperty(Req.prototype, k, Object.getOwnPropertyDescriptor(Resp.prototype, k));\n"
++"});\n"
++"['_take', 'text', 'json', 'bytes', 'arrayBuffer', 'blob', 'formData'].forEach(function (k) {\n"
++"\tdefine(Req.prototype, k, Resp.prototype[k]);\n"
++"});\n"
++"define(Req.prototype, 'clone', function clone() {\n"
++"\tif (this.bodyUsed)\n"
++"\t\tthrow new TypeError(\"Failed to execute 'clone' on 'Request': Request body is already used\");\n"
++"\tvar r = Object.create(Req.prototype), self = this;\n"
++"\tObject.getOwnPropertyNames(this).forEach(function (k) {\n"
++"\t\tif (k.charAt(0) === '_') define(r, k, self[k]);\n"
++"\t});\n"
++"\tdefine(r, '_headers', new g.Headers(this._headers));\n"
++"\tdefine(r, '_used', false);\n"
++"\tif (this._b && (this._stream || this._b.stream)) {\n"
++"\t\tvar pair = this.body.tee();\n"
++"\t\tthis._stream = pair[0];\n"
++"\t\tdefine(r, '_stream', pair[1]);\n"
++"\t}\n"
++"\treturn r;\n"
++"});\n"
++"define(g, 'Request', Req);\n"
++"\n"
+ "/* Headers from the native slot's raw block (\"Name: value\" lines after the\n"
+ " * status line), and the status text from that status line. */\n"
+ "function rawHeaders(raw) {\n"
+@@ -1292,12 +1382,21 @@
+ "if (isFn(g.__xhrNativeSend) && isFn(g.__xhrNativeTakeBytes)) {\n"
+ "\tg.fetch = function fetch(input, init) {\n"
+ "\t\tinit = init || {};\n"
+-"\t\tvar url, method, headers, body, signal;\n"
++"\t\tvar url, method, headers, body, signal, rb;\n"
++"\t\t/* patch 259: a Request's body is its own, read once */\n"
++"\t\tif (input instanceof Req) {\n"
++"\t\t\tif (input._b && input.bodyUsed)\n"
++"\t\t\t\treturn Promise.reject(new TypeError(\"Failed to execute 'fetch' on 'Window': Cannot construct a Request with a Request object that has already been used.\"));\n"
++"\t\t\tif (init.body === undefined && input._b)\n"
++"\t\t\t\trb = input._stream ? { stream: input._stream, type: input._b.type } : input._b;\n"
++"\t\t\tif (input._b) input._used = true;\n"
++"\t\t}\n"
+ "\t\tif (input && typeof input === 'object' && input.url !== undefined) {\n"
+ "\t\t\turl = String(input.url);\n"
+ "\t\t\tmethod = init.method !== undefined ? init.method : input.method;\n"
+ "\t\t\theaders = init.headers !== undefined ? init.headers : input.headers;\n"
+-"\t\t\tbody = init.body !== undefined ? init.body : input.body;\n"
++"\t\t\tbody = init.body !== undefined ? init.body :\n"
++"\t\t\t\tinput instanceof Req ? undefined : input.body;\n"
+ "\t\t\tsignal = init.signal !== undefined ? init.signal : input.signal;\n"
+ "\t\t} else {\n"
+ "\t\t\turl = String(input);\n"
+@@ -1305,7 +1404,7 @@
+ "\t\t}\n"
+ "\t\tmethod = String(method || 'GET').toUpperCase();\n"
+ "\t\tif (signal && signal.aborted) return Promise.reject(abortReason(signal));\n"
+-"\t\tvar h = new g.Headers(headers), list = [], b = extractBody(body);\n"
++"\t\tvar h = new g.Headers(headers), list = [], b = rb || extractBody(body);\n"
+ "\t\tif ((method === 'GET' || method === 'HEAD') && b)\n"
+ "\t\t\treturn Promise.reject(new TypeError(\"Failed to execute 'fetch': Request with GET/HEAD method cannot have body.\"));\n"
+ "\t\tif (b && b.type && !h.has('content-type')) h.set('content-type', b.type);\n"

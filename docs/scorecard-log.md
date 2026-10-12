@@ -4,6 +4,15 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patch 259: Request bodies (not re-scored)
+
+Request had no body readers (text / json / formData / arrayBuffer / blob
+were not functions) and kept the raw body; now built on Response's body
+code with Chromium's constructor rules (URL resolution, method
+normalisation, body hand-off and use-once, clone). Gate JS-fetch-body
+30/30 (Chromium 30/30). Not re-scored: no scored site reads a Request's
+body on load.
+
 ## 2026-10-12 — patch 258: Response.formData() reads multipart (not re-scored)
 
 Follow-on to 257: formData() on a multipart/form-data body (it took
