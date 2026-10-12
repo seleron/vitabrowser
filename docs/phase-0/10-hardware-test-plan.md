@@ -3284,3 +3284,43 @@ Handed off as run 32 (above).
   with lazy images, wikipedia) should scroll without a hitch as each
   image lands; the late image relayout was "several hundred ms on the
   Vita" for a 5000-paragraph page.
+
+## Since run 32 — queued for run 33 (not built yet)
+
+Patch 254 (2026-10-12), sim-verified: full sim gate exit 0, no soft
+accepts (WASM254 15/15, both long calls sliced, 25 frames each), Vita
+cross-build green (wasm3 links: nsvita.elf +1 MB). Run 32 is with the
+device.
+
+- **254: WebAssembly.** There was none. wasm3 0.5.0 (MIT, an interpreter
+  in portable C; tools/fetch-wasm3.sh, built beside QuickJS) behind
+  `WebAssembly` -- Module, Instance, Memory, Table, Global, the three
+  errors, validate / compile / instantiate and the streaming forms
+  (details in the patch header; not done: imported globals and tables,
+  growing an instance's table, shared memory, compile-time body
+  validation, a worker thread). A long call cannot yield to scripts, so
+  it is *sliced* instead: every 200 ms of it the page is drawn as it
+  stands with "WebAssembly running: N s (O stops)"; CIRCLE stops the call
+  (a RuntimeError, as a 300 s cap does). Time inside WebAssembly no
+  longer counts against the 8 s runaway-script budget, so a minute of
+  proof of work does not kill the script that asked for it.
+  Checks: the gate page JS-wasm (Chromium 15/15) -- numbers, traps,
+  memory growth detaching old views, globals, tables, an import calling
+  back into an export (wasm-bindgen does this for every string),
+  exceptions through wasm, imported memory keeping earlier views
+  (emscripten), streaming, and two 5 s calls in one script;
+  tools/test-wasm.sh -- the glue and wasm3 under ASan + UBSan with 3000
+  mutated modules. Two bugs found that way and fixed before landing: a
+  double release of an instance (QuickJS calls a detached ArrayBuffer's
+  free callback twice), and wasm3's signed-overflow arithmetic (now
+  -fwrapv, which an optimising ARM compiler would otherwise be free to
+  break).
+  **On the device:**
+  1. claude.ai/login with email: hCaptcha's proof of work should now
+     run. Watch for "WebAssembly running: N s" at the bottom: report
+     how long it runs (the estimate is about a minute per frame, two
+     frames), whether the screen keeps updating, whether CIRCLE stops
+     it, `mem[page done]` after, and what hCaptcha shows next (headless
+     Chromium gets an image challenge).
+  2. Any page that uses WebAssembly otherwise (a wasm demo, a game):
+     note load time and whether it runs.

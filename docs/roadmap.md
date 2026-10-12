@@ -112,6 +112,10 @@ on text inputs, buttons, selects, textareas (225).
    pixel read-back, toDataURL; it was a no-op stub. First of the two
    prerequisites for an hCaptcha attempt (docs/wasm-hcaptcha-measurement.md);
    WebAssembly with time slicing is the second.
+5. **WebAssembly** (*2026-10-12, patch 254*): wasm3 behind the
+   WebAssembly API; long calls draw the page every 200 ms and can be
+   stopped; wasm time is outside the script budget. Next: run hCaptcha's
+   hsw on the device (doc 10, "Since run 32").
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

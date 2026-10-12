@@ -86,7 +86,12 @@ WebAssembly: `WANT WebAssembly` appears on 1 of 21 sites (claude.ai).
    "Since run 30"): hsw's toDataURL / getImageData now read real pixels,
    and the challenge grid has something to draw into. Left for a captcha:
    shadows and filters (not used by the grid), rotated text.
-2. **WebAssembly with time slicing**: wasm3 behind a JS
+2. **WebAssembly with time slicing** -- **done 2026-10-12, patch 254**
+   (doc 10, "Since run 32"), with one change from the plan below: no
+   worker thread. A call still blocks scripts, but the frontend draws the
+   page every 200 ms of it and CIRCLE stops it; the script budget does
+   not count the time. hsw itself has not been run yet (it needs the
+   live site): that is step 3. Planned as: wasm3 behind a JS
    WebAssembly.instantiate / Module / Instance / Memory API.
    - Imports: one trampoline per signature.
    - Memory: exported as an ArrayBuffer over wasm3's memory, detached and

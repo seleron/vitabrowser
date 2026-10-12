@@ -4,6 +4,16 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patch 254: WebAssembly (not re-scored)
+
+WS-B / WS-F: the second prerequisite in docs/wasm-hcaptcha-measurement.md.
+wasm3 behind the WebAssembly API, long calls sliced (a frame every 200 ms,
+CIRCLE stops), wasm time outside the script budget. Gate JS-wasm 15/15
+(Chromium 15/15), gate exit 0 strict; tools/test-wasm.sh clean under ASan +
+UBSan. Not re-scored: only claude.ai of the 21 sites probes for
+WebAssembly, and its use (hCaptcha) is behind sign-in; the device run will
+say how long hsw takes.
+
 ## 2026-10-12 — patch 253: late images stop stalling the page (not re-scored)
 
 WS-C, the JS-reflow-stall item doc 10 left open: profiled (per-pass
