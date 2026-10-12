@@ -3358,6 +3358,9 @@ cross-build green (wasm3 links: nsvita.elf +1 MB).
 
 ## Run 34 — hand-off (2026-10-12 14:30; replaces untested run 33)
 
+**Superseded by run 35 (below) before it was tested.** Its checklist
+items 2-4 carry over to run 35.
+
 **Flash this build:** VitaBrowser.vpk `ef648ce7b51a`, VitaBrowser-ext.vpk
 `98210dbfda97`, nsvita.elf `93cedb2a1642` (patches through 256, built at
 9c80e1e). Run 33 (`eee9f66890bc`) was never tested and is withdrawn (it
@@ -3465,9 +3468,59 @@ unmeasured.
 
 (Device checks for these: run 34's list, above, items 2-3.)
 
-## Since run 34 — queued for run 35 (not built yet)
+## Run 35 — hand-off (2026-10-12 21:45; replaces untested run 34)
 
-### Patch 257 (2026-10-12): FormData sends files
+**Flash this build:** VitaBrowser.vpk `b98697013725`, VitaBrowser-ext.vpk
+`2528eef61fe2`, nsvita.elf `3d01bacf8456` (patches through 258, built at
+3651e45 = origin/master). Run 34 (`ef648ce7b51a`) has no `results\` yet,
+so run 35 carries everything since run 27: **patches 168-258 +
+patches/quickjs/05-06 + patches/wasm3/01**, all unverified on hardware.
+Archive `<WORK>/vitabrowser-work/hwtest-2026-10-12-run35/` (SHA256SUMS,
+reference dumps, the reference run in `sim/`); run 34's reference dumps
+are now `reference-dumps-run34\`. Only run 35's VPKs are in
+`Desktop\VitaBrowser-hwtest\`.
+
+Build: clean restage from origin/master (344 applied + the two known
+collisions), checked first against a scratch application of the same
+stack -- identical to the tree the gates ran on (backup
+`applytest-backup-pre-run35-20261012-2124.tar.gz`); streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(JS-fetch-body 22/22 over http and https, WASM254 15/15 with both long
+calls sliced, REFLOW 3/3, CANVAS251 22/22, interaction 52/52 also at the
+Vita's pace), cross-build green. Reference autotest under device
+conditions: interact **52/52**, js 18/18, 34 dumps -- 32 identical to
+run 34's; IN-history and IN-home-recent list some same-second visits in
+another order (text only; every drawing command identical -- the
+whole-second visit-time tie described under run 34).
+
+**On the device:** start `receive-results.bat` first. Run 32's list (with
+31's and 30's) still applies, plus:
+
+1. Autotest (SELECT + SQUARE): every `.plot` SAME against the new
+   reference-dumps (PM-animation is timing-dependent; IN-home-recent /
+   IN-history may differ in order), interact **52/52**, js 18/18.
+2. **claude.ai email sign-in (254-256):** claude.ai/login, enter an
+   email, Continue. Expect: **no crash**; "WebAssembly running: N s (O
+   stops)" -- about 20 s per frame estimated, twice (two hCaptcha
+   frames), with the page still redrawing; then hCaptcha reports an error
+   and no sign-in email arrives (expected: hCaptcha refuses this
+   browser's fingerprint, see run 34). Report the seconds shown for each
+   run, whether the screen kept updating, `mem[page done]` in log.txt
+   afterwards, and what the page shows at the end.
+3. **CIRCLE stops WebAssembly (254):** start the sign-in again and press
+   CIRCLE while "WebAssembly running" is shown: the message should go and
+   the browser stay usable (hCaptcha then fails, as in 2).
+4. **Any other WebAssembly page** you know of (a wasm demo or game): note
+   load time and whether it runs.
+
+257 and 258 have no device check of their own: the Vita frontend has no
+file chooser, so no file can be picked to upload, and no site on the
+list reads a multipart response; the gate covers both (JS-fetch-body
+checks 13-22).
+
+### What run 35 adds over run 34
+
+#### Patch 257 (2026-10-12): FormData sends files
 
 A script's file upload -- a FormData holding a Blob or File, sent with
 XMLHttpRequest or fetch() -- went out with every file part empty: the
@@ -3480,16 +3533,16 @@ else its own name, else "blob", and any other value as its string; names
 and filenames escape `"` CR LF; text values' line breaks become CRLF.
 Not touched: a `<form enctype="multipart/form-data">` submitted without
 script (the engine's own form path; the Vita frontend has no file
-chooser), and Response.formData() still reads url-encoded bodies only.
+chooser), and Response.formData() read url-encoded bodies only (258,
+below).
 
 Sim-verified: JS-fetch-body checks 13-17 (file bytes by XHR and by fetch,
 the stored File, string values, UTF-8 / CRLF / escaped names), 17/17 over
 http and https (Chromium 17/17; run 34's build 12/17); full sim gate
 exit 0 with no soft accepts; Vita cross-build green. No device check of
-its own (no site on the device's list uploads a file from script); run
-34 is with the device.
+its own (no site on the device's list uploads a file from script).
 
-### Patch 258 (2026-10-12): Response.formData() reads multipart bodies
+#### Patch 258 (2026-10-12): Response.formData() reads multipart bodies
 
 Response.formData() rejected anything but an url-encoded body, so a
 multipart one -- from a server, or a FormData put through a Response --
