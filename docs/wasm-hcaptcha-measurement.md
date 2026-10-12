@@ -82,7 +82,10 @@ WebAssembly: `WANT WebAssembly` appears on 1 of 21 sites (claude.ai).
 1. **A real canvas 2D raster**: fill/stroke paths, drawImage, text,
    get/putImageData, toDataURL, composited as the canvas element's image.
    Wider value than hCaptcha (charts, games, sites that draw text). This
-   is a project of its own.
+   is a project of its own. **Done 2026-10-11, patch 251** (see doc 10,
+   "Since run 30"): hsw's toDataURL / getImageData now read real pixels,
+   and the challenge grid has something to draw into. Left for a captcha:
+   shadows and filters (not used by the grid), rotated text.
 2. **WebAssembly with time slicing**: wasm3 behind a JS
    WebAssembly.instantiate / Module / Instance / Memory API.
    - Imports: one trampoline per signature.

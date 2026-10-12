@@ -311,6 +311,7 @@ NET-js-scratch-doc http://127.0.0.1:$HP/JS-scratch-doc.html
 NET-js-element-instanceof http://127.0.0.1:$HP/JS-element-instanceof.html
 NET-js-node-names http://127.0.0.1:$HP/JS-node-names.html
 NET-js-image-load http://127.0.0.1:$HP/JS-image-load.html
+NET-js-canvas-2d http://127.0.0.1:$HP/JS-canvas-2d.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -814,7 +815,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
-	 "js-image-load IMGLOAD 11"; do
+	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
@@ -822,6 +823,22 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	[ -n "$gp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$gp" | sed 's/^STR /  /'
 	[ "$gr" = "$2: $3/$3 passed" ] || o2_bad="$o2_bad $1"
 done
+# Patch 251: the page's own canvas reaches the screen -- its bitmap is
+# plotted at the canvas's size, and the autotest's snapshot shows the
+# drawing there (the disc's blue at its centre, the yellow ground near a
+# corner). Before 251 nothing was plotted at all.
+cvp=$(ls "$R"/*NET-js-canvas-2d.plot 2>/dev/null | head -1)
+cvb=$(grep -a -m1 -o 'PLOT BITMAP X [0-9]* Y [0-9]* WIDTH 240 HEIGHT 80' "$cvp" 2>/dev/null || true)
+cvs=$(ls "$OUT"/snaps/N-*-NET-js-canvas-2d.png 2>/dev/null | head -1)
+cvpx=
+if [ -n "$cvb" ] && [ -n "$cvs" ]; then
+	set -- $cvb
+	cvpx=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$cvs" \
+		$(($4 + 40)),$(($6 + 40)) $(($4 + 230)),$(($6 + 5)) | \
+		awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  js-canvas-2d on screen: ${cvb:-no canvas bitmap plotted}; pixels ${cvpx:-none}"
+[ "$cvpx" = "0,85,170 255,204,0 " ] || o2_bad="$o2_bad js-canvas-2d-screen"
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)

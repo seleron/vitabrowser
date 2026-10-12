@@ -107,6 +107,11 @@ on text inputs, buttons, selects, textareas (225).
    mediaDevices. Inline elements' getBoundingClientRect (202) and
    computed colour alpha (212) fixed. The engine's NaN / Infinity
    constants were 0 (a C89 port's flattened union; quickjs patch 05).
+4. **Canvas 2D** (*2026-10-11, patch 251*): a real raster behind
+   getContext('2d') -- paths, strokes, gradients, images, text, clipping,
+   pixel read-back, toDataURL; it was a no-op stub. First of the two
+   prerequisites for an hCaptcha attempt (docs/wasm-hcaptcha-measurement.md);
+   WebAssembly with time slicing is the second.
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

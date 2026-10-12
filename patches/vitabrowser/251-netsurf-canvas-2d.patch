@@ -1,0 +1,4852 @@
+# netsurf: a real canvas 2D context -- shapes, strokes, text, images,
+# gradients, clipping, getImageData / putImageData, toDataURL (patch 251);
+# a display:none <img> loads, and window load waits for it
+# Generated 2026-10-11
+# Base: seleron/vitabrowser (patch stack through 250)
+#
+# getContext('2d') returned a context whose every drawing method did
+# nothing (fixes1245): charts, games, maps, QR codes, avatars and the
+# image grid of a captcha were blank, and a script reading back its own
+# drawing (getImageData, toDataURL -- fingerprinting, hCaptcha) got zeros
+# or a fixed 1x1 PNG. Chromium draws all of it.
+#
+#  - quickjs/macsurf_canvas.c (new): the pixels. Each context keeps
+#    premultiplied RGBA in ordinary memory; the changed rectangle is copied
+#    unpremultiplied into the element's bitmap (the canvas node's
+#    __ns_key_canvas_node_data user data, which redraw.c already plots for
+#    a canvas box) from a scheduled callback, once per batch of drawing,
+#    and the box is redrawn. Shapes arrive flattened to polygons in device
+#    pixels; a scanline rasteriser samples 4 sub-scanlines per row with
+#    exact horizontal coverage, nonzero or even-odd. A stroke is the union
+#    of convex pieces (a quad per segment; miter / bevel / round joins;
+#    butt / square / round caps), all wound the same way so the nonzero
+#    rule merges them. Paints: colour, linear / radial / conic gradients
+#    (256-entry table), images (drawImage and patterns) sampled through
+#    the inverse transform, nearest or bilinear. Porter-Duff operators,
+#    lighter, multiply, screen, darken, lighten; the clip is a coverage
+#    mask saved and restored with the state. PNG export uses stored
+#    deflate blocks. Coordinates are clamped before every float/int
+#    conversion (ASan + UBSan clean over 60 000 fuzzed native calls).
+#  - vita_polyfill.js: CanvasRenderingContext2D -- styles, transforms,
+#    the path (points transformed as they are added, curves and arcs
+#    flattened in device pixels), Path2D with SVG path data, line dashes,
+#    CSS colours (named, hex, rgb/rgba, hsl/hsla) and fonts, gradients,
+#    patterns, ImageData, measureText, isPointInPath / isPointInStroke,
+#    canvas width / height (setting either clears the canvas and resets
+#    the context), toDataURL / toBlob, createImageBitmap. Colours are
+#    parsed once per string; fillRect avoids the path builder.
+#  - text: the frontend renders glyphs with FreeType straight into the
+#    canvas (vita_text_glyphs, not through the screen's glyph atlas), in
+#    the page's own faces, so measureText and fillText agree.
+#  - drawImage(<img>): html_image_bitmap() -- the box's object, or the
+#    image a detached <img> (new Image()) loaded, which is now kept
+#    decoded (24 per page at most, oldest returned to the cache first).
+#  - A display:none <img> never loaded (no box, no object fetch): no load
+#    event, naturalWidth 0, nothing for drawImage of a hidden sprite
+#    sheet. Box construction now fetches it as a detached image does
+#    (html_image_fetch_hidden, once per URL; not loading=lazy), counted in
+#    the page's active fetches so window load waits for it as in browsers.
+#
+# Not done: shadows, filters, text rotated or skewed by the transform
+# (glyphs stay upright at the transformed origin and size), strokeText
+# draws filled glyphs.
+#
+# Gate: testpages/pages/JS-canvas-2d.html, CANVAS251 22/22 (Chromium
+# 22/22): every check reads pixels back; plus the page's own canvas on
+# screen (run-vita-sim.sh reads the snapshot under its plotted bitmap).
+diff --git a/content/handlers/javascript/quickjs/Makefile b/content/handlers/javascript/quickjs/Makefile
+--- a/content/handlers/javascript/quickjs/Makefile
++++ b/content/handlers/javascript/quickjs/Makefile
+@@ -11,7 +11,7 @@
+ S_JAVASCRIPT += quickjs/macsurf_qjs.c quickjs/macsurf_qjs_audit.c \
+ 	quickjs/macos9_reconvert.c quickjs/macos9_js_fetch.c \
+ 	quickjs/macos9_content_registry.c quickjs/macsurf_dom_dispatch.c \
+-	quickjs/macsurf_diag_none.c
++	quickjs/macsurf_diag_none.c quickjs/macsurf_canvas.c
+ 
+ # The bridge as imported, under NetSurf's -Werror warning set. All three are
+ # inert for non-Mac builds, and fixing them would mean editing MacSurf's
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -31,6 +31,7 @@
+ #include "macsurf_qjs_audit.h"
+ #include "macsurf_timebase.h"
+ #include "macos9_js_fetch.h"
++#include "macsurf_canvas.h"	/* patch 251 */
+ #include "macsurf_diag.h"
+ /* fixes1245 (#167) - plot_font_style_t/gui_layout_table for canvas
+  * measureText's real (not fabricated) width query. Neither was pulled in
+@@ -3247,6 +3248,21 @@
+ 	return JS_NewBool(ctx, ok);
+ }
+ 
++/* VitaBrowser patch 251: what the canvas raster needs from the bridge --
++ * an element's node, and the decoded image an <img> shows (drawImage). */
++static struct bitmap *qjs_canvas_img_bitmap(JSContext *ctx, dom_node *n)
++{
++	struct content *c = qjs_get_content_for_ctx(ctx);
++	if (c == NULL || c->handler == NULL ||
++	    c->handler->type() != CONTENT_HTML)
++		return NULL;
++	return html_image_bitmap(c, n);
++}
++
++static const struct macsurf_canvas_ops qjs_canvas_ops = {
++	qjs_get_node, qjs_canvas_img_bitmap
++};
++
+ /* __vitaPostMessageToIframe(frameLabel, jsonPayload) -- the parent realm
+  * delivering into a named child frame (frameLabel === "" targets the first
+  * iframe, matching the Phase-0 single-frame surface).  frameLabel is the
+@@ -3556,6 +3572,7 @@
+ 	JS_SetPropertyStr(ctx, global, "__vitaImgState", f);	/* 250 */
+ 	f = JS_NewCFunction(ctx, qjs_img_fetch, "__vitaImgFetch", 2);
+ 	JS_SetPropertyStr(ctx, global, "__vitaImgFetch", f);	/* 250 */
++	macsurf_canvas_install(ctx, global, &qjs_canvas_ops);	/* 251 */
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_doc_key,
+ 			"__vitaIframeContentDocKey", 1);
+ 	JS_SetPropertyStr(ctx, global, "__vitaIframeContentDocKey", f);
+@@ -11136,6 +11153,7 @@
+ 	s_blob_class_id = 0;
+ 	JS_NewClassID(rt, &s_blob_class_id);
+ 	JS_NewClass(rt, s_blob_class_id, &s_blob_class);
++	macsurf_canvas_init_class(rt);	/* patch 251 */
+ }
+ 
+ /* ====================================================================== */
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2627,6 +2627,1136 @@
+ 	g.Image = Img;
+ })();
+ 
++/* ---- canvas 2D: a real drawing context --------------------------------
++ * VitaBrowser patch 251. getContext('2d') returned a context whose every
++ * drawing method did nothing (fixes1245): charts, games, maps, QR codes
++ * and captcha images were blank, and a script reading back its own
++ * drawing (getImageData, toDataURL) got zeros. The pixels are now real
++ * (macsurf_canvas.c, behind the hidden global __cv); this is the
++ * context's state: styles, transforms, the path (flattened to device
++ * pixels as it is built, as the spec transforms points when they are
++ * added), Path2D (SVG path data too), dashes, colours, fonts, gradients,
++ * patterns and ImageData. Not done: shadows, filters, rotated text. */
++
++(function () {
++	var d = g.document, cv = g.__cv;
++	if (!d || !cv || typeof d.createElement !== 'function') return;
++	var P = Object.getPrototypeOf(d.createElement('canvas'));
++	if (!P) return;
++	var PI2 = Math.PI * 2;
++	function isCanvas(el) {
++		return !!el && el.nodeType === 1 && String(el.tagName).toUpperCase() === 'CANVAS';
++	}
++	function isImgEl(el) {
++		return !!el && el.nodeType === 1 && String(el.tagName).toUpperCase() === 'IMG';
++	}
++	function domErr(msg, name) {
++		try { return new g.DOMException(msg, name); } catch (e) { var x = new Error(msg); x.name = name; return x; }
++	}
++	function fin() {
++		for (var i = 0; i < arguments.length; i++)
++			if (typeof arguments[i] !== 'number' || !isFinite(arguments[i])) return false;
++		return true;
++	}
++
++	/* ---- colours ---- */
++	var NAMED = {};
++	('aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 azure f0ffff beige f5f5dc ' +
++	 'bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff blueviolet 8a2be2 brown a52a2a ' +
++	 'burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 chocolate d2691e coral ff7f50 ' +
++	 'cornflowerblue 6495ed cornsilk fff8dc crimson dc143c cyan 00ffff darkblue 00008b darkcyan 008b8b ' +
++	 'darkgoldenrod b8860b darkgray a9a9a9 darkgreen 006400 darkgrey a9a9a9 darkkhaki bdb76b ' +
++	 'darkmagenta 8b008b darkolivegreen 556b2f darkorange ff8c00 darkorchid 9932cc darkred 8b0000 ' +
++	 'darksalmon e9967a darkseagreen 8fbc8f darkslateblue 483d8b darkslategray 2f4f4f ' +
++	 'darkslategrey 2f4f4f darkturquoise 00ced1 darkviolet 9400d3 deeppink ff1493 deepskyblue 00bfff ' +
++	 'dimgray 696969 dimgrey 696969 dodgerblue 1e90ff firebrick b22222 floralwhite fffaf0 ' +
++	 'forestgreen 228b22 fuchsia ff00ff gainsboro dcdcdc ghostwhite f8f8ff gold ffd700 ' +
++	 'goldenrod daa520 gray 808080 green 008000 greenyellow adff2f grey 808080 honeydew f0fff0 ' +
++	 'hotpink ff69b4 indianred cd5c5c indigo 4b0082 ivory fffff0 khaki f0e68c lavender e6e6fa ' +
++	 'lavenderblush fff0f5 lawngreen 7cfc00 lemonchiffon fffacd lightblue add8e6 lightcoral f08080 ' +
++	 'lightcyan e0ffff lightgoldenrodyellow fafad2 lightgray d3d3d3 lightgreen 90ee90 lightgrey d3d3d3 ' +
++	 'lightpink ffb6c1 lightsalmon ffa07a lightseagreen 20b2aa lightskyblue 87cefa ' +
++	 'lightslategray 778899 lightslategrey 778899 lightsteelblue b0c4de lightyellow ffffe0 lime 00ff00 ' +
++	 'limegreen 32cd32 linen faf0e6 magenta ff00ff maroon 800000 mediumaquamarine 66cdaa ' +
++	 'mediumblue 0000cd mediumorchid ba55d3 mediumpurple 9370db mediumseagreen 3cb371 ' +
++	 'mediumslateblue 7b68ee mediumspringgreen 00fa9a mediumturquoise 48d1cc mediumvioletred c71585 ' +
++	 'midnightblue 191970 mintcream f5fffa mistyrose ffe4e1 moccasin ffe4b5 navajowhite ffdead ' +
++	 'navy 000080 oldlace fdf5e6 olive 808000 olivedrab 6b8e23 orange ffa500 orangered ff4500 ' +
++	 'orchid da70d6 palegoldenrod eee8aa palegreen 98fb98 paleturquoise afeeee palevioletred db7093 ' +
++	 'papayawhip ffefd5 peachpuff ffdab9 peru cd853f pink ffc0cb plum dda0dd powderblue b0e0e6 ' +
++	 'purple 800080 rebeccapurple 663399 red ff0000 rosybrown bc8f8f royalblue 4169e1 ' +
++	 'saddlebrown 8b4513 salmon fa8072 sandybrown f4a460 seagreen 2e8b57 seashell fff5ee ' +
++	 'sienna a0522d silver c0c0c0 skyblue 87ceeb slateblue 6a5acd slategray 708090 slategrey 708090 ' +
++	 'snow fffafa springgreen 00ff7f steelblue 4682b4 tan d2b48c teal 008080 thistle d8bfd8 ' +
++	 'tomato ff6347 turquoise 40e0d0 violet ee82ee wheat f5deb3 white ffffff whitesmoke f5f5f5 ' +
++	 'yellow ffff00 yellowgreen 9acd32').split(' ').forEach(function (v, i, a) {
++		if (i & 1) NAMED[a[i - 1]] = v;
++	});
++	function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
++	function hsl2rgb(h, s, l) {
++		h = ((h % 360) + 360) % 360 / 360;
++		function f(n) {
++			var k = (n + h * 12) % 12, a = s * Math.min(l, 1 - l);
++			return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
++		}
++		return [f(0) * 255, f(8) * 255, f(4) * 255];
++	}
++	/* -> [r, g, b, a] (0..255, alpha 0..1) or null */
++	function parseColor(v) {
++		if (typeof v !== 'string') return null;
++		var s = v.trim().toLowerCase(), m;
++		if (s === 'transparent') return [0, 0, 0, 0];
++		if (s === 'currentcolor') return [0, 0, 0, 1];
++		if (NAMED[s]) s = '#' + NAMED[s];
++		if (s.charAt(0) === '#') {
++			var h = s.slice(1);
++			if (!/^[0-9a-f]+$/.test(h)) return null;
++			if (h.length === 3 || h.length === 4)
++				h = h.replace(/./g, function (c) { return c + c; });
++			if (h.length !== 6 && h.length !== 8) return null;
++			return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16),
++				h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1];
++		}
++		if ((m = /^(rgba?|hsla?)\(\s*(.*?)\s*\)$/.exec(s))) {
++			var parts = m[2].split(/\s*,\s*|\s*\/\s*|\s+/), n = [], i;
++			if (parts.length < 3 || parts.length > 4) return null;
++			for (i = 0; i < parts.length; i++) {
++				var t = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(%|deg|rad|turn)?$/.exec(parts[i]);
++				if (!t) {
++					if (parts[i] === 'none') { n.push([0, '']); continue; }
++					return null;
++				}
++				n.push([parseFloat(t[1]), t[2] || '']);
++			}
++			var a = 1;
++			if (n.length === 4) a = n[3][1] === '%' ? n[3][0] / 100 : n[3][0];
++			a = clamp(a, 0, 1);
++			if (m[1].charAt(0) === 'r') {
++				var c = [];
++				for (i = 0; i < 3; i++)
++					c.push(clamp(n[i][1] === '%' ? n[i][0] * 2.55 : n[i][0], 0, 255));
++				return [Math.round(c[0]), Math.round(c[1]), Math.round(c[2]), a];
++			}
++			var hue = n[0][0];
++			if (n[0][1] === 'rad') hue = hue * 180 / Math.PI;
++			else if (n[0][1] === 'turn') hue *= 360;
++			var rgb = hsl2rgb(hue, clamp(n[1][0] / 100, 0, 1), clamp(n[2][0] / 100, 0, 1));
++			return [Math.round(rgb[0]), Math.round(rgb[1]), Math.round(rgb[2]), a];
++		}
++		return null;
++	}
++	/* pages set the same few colours again and again: parsed once each */
++	var colorCache = Object.create(null), colorCount = 0;
++	function colorOf(v) {
++		var k = String(v), c = colorCache[k];
++		if (c !== undefined) return c;
++		c = parseColor(k);
++		if (colorCount++ > 512) { colorCache = Object.create(null); colorCount = 0; }
++		colorCache[k] = c;
++		return c;
++	}
++	function hex2(n) { return (n < 16 ? '0' : '') + n.toString(16); }
++	function serialColor(c) {
++		if (c[3] >= 1) return '#' + hex2(c[0]) + hex2(c[1]) + hex2(c[2]);
++		var byte = Math.round(c[3] * 255), a = byte / 255;
++		for (var p = 1; p <= 3; p++) {
++			var t = Math.round(c[3] * Math.pow(10, p)) / Math.pow(10, p);
++			if (Math.round(t * 255) === byte) { a = t; break; }
++		}
++		return 'rgba(' + c[0] + ', ' + c[1] + ', ' + c[2] + ', ' + a + ')';
++	}
++
++	/* ---- fonts ---- */
++	var FONT_RE = /^((?:(?:normal|italic|oblique|small-caps|bold|bolder|lighter|[1-9]00|(?:ultra-|extra-|semi-)?(?:condensed|expanded))\s+)*)([+]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(px|pt|pc|in|cm|mm|q|em|rem|ex|ch|%|vw|vh)(?:\s*\/\s*[^\s]+)?\s+(\S.*)$/i;
++	var UNIT = { px: 1, pt: 4 / 3, pc: 16, 'in': 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6,
++		em: 16, rem: 16, ex: 8, ch: 8, '%': 0.16, vw: 9.6, vh: 5.44 };
++	function parseFont(v) {
++		var m = FONT_RE.exec(String(v).trim());
++		if (!m) return null;
++		var pre = m[1].toLowerCase(), fam = m[4].trim();
++		var px = parseFloat(m[2]) * UNIT[m[3].toLowerCase()];
++		if (!(px >= 0) || !isFinite(px)) return null;
++		var lf = fam.toLowerCase();
++		var family = /monospace|courier|consolas|menlo|monaco|mono\b/.test(lf) ? 2 :
++			(/(^|,)\s*["']?(serif|times|georgia|garamond|palatino|cambria|book antiqua)/.test(lf) &&
++			 !/^\s*["']?[^,]*sans/.test(lf) ? 1 : 0);
++		var words = pre.split(/\s+/).filter(function (w) { return w && w !== 'normal'; });
++		var str = (words.length ? words.join(' ') + ' ' : '') +
++			(Math.round(px * 1000) / 1000) + 'px ' + fam;
++		return { px: px, fam: family, b: /bold|bolder|[6-9]00/.test(pre) ? 1 : 0,
++			i: /italic|oblique/.test(pre) ? 1 : 0, str: str };
++	}
++
++	/* ---- matrices: [a, b, c, d, e, f] ---- */
++	function mul(m, n) {
++		return [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
++			m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
++			m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
++	}
++	function inv(m) {
++		var det = m[0] * m[3] - m[1] * m[2];
++		if (!det || !isFinite(det)) return null;
++		return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det,
++			(m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
++	}
++	function scaleOf(m) { return Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])); }
++	function matrixInit(o) {
++		if (!o || typeof o !== 'object') return [1, 0, 0, 1, 0, 0];
++		function pick(a, b, dflt) {
++			var v = o[a] !== undefined ? o[a] : o[b];
++			return v === undefined ? dflt : +v;
++		}
++		return [pick('a', 'm11', 1), pick('b', 'm12', 0), pick('c', 'm21', 0),
++			pick('d', 'm22', 1), pick('e', 'm41', 0), pick('f', 'm42', 0)];
++	}
++
++	/* ---- the path, in device pixels ---- */
++	function Builder() { this.clear(); }
++	Builder.prototype.clear = function () {
++		this.p = []; this.c = []; this.cl = []; this.n = 0;
++		this.sx = 0; this.sy = 0; this.lx = 0; this.ly = 0; this.cache = null;
++	};
++	Builder.prototype.end = function (closed) {
++		if (this.n > 0) { this.c.push(this.n); this.cl.push(closed ? 1 : 0); }
++		this.n = 0;
++	};
++	Builder.prototype.move = function (x, y) {
++		this.end(false);
++		this.p.push(x, y); this.n = 1;
++		this.sx = this.lx = x; this.sy = this.ly = y; this.cache = null;
++	};
++	Builder.prototype.line = function (x, y) {
++		if (this.n === 0) { this.move(x, y); return; }
++		this.p.push(x, y); this.n++;
++		this.lx = x; this.ly = y; this.cache = null;
++	};
++	Builder.prototype.close = function () {
++		if (this.n === 0) return;
++		this.end(true);
++		this.move(this.sx, this.sy);
++	};
++	/* -> [Float64Array points, Int32Array counts, Uint8Array closed] */
++	Builder.prototype.arrays = function () {
++		if (this.cache) return this.cache;
++		var c = this.c.slice(), cl = this.cl.slice();
++		if (this.n > 0) { c.push(this.n); cl.push(0); }
++		return (this.cache = [new Float64Array(this.p), new Int32Array(c), new Uint8Array(cl)]);
++	};
++	function tx(m, x, y) { return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]; }
++	function curveSteps(len) { return clamp(Math.ceil(Math.sqrt(len) * 1.5), 1, 200); }
++	function arcStepAngle(rd) {
++		if (!(rd > 0.2)) return Math.PI / 2;
++		return Math.max(2 * Math.acos(1 - 0.2 / rd), 0.01);
++	}
++	/* an elliptical arc, user space: centre, radii, rotation, start, sweep */
++	function arcPoints(b, m, x, y, rx, ry, rot, a0, sweep, joinFirst) {
++		var rd = Math.max(rx, ry) * Math.sqrt(Math.max(Math.abs(m[0] * m[0] + m[1] * m[1]),
++			Math.abs(m[2] * m[2] + m[3] * m[3])));
++		var n = clamp(Math.ceil(Math.abs(sweep) / arcStepAngle(rd)), 1, 1000);
++		var cr = Math.cos(rot), sr = Math.sin(rot);
++		for (var i = 0; i <= n; i++) {
++			var t = a0 + sweep * i / n, ct = Math.cos(t), st = Math.sin(t);
++			var p = tx(m, x + rx * ct * cr - ry * st * sr, y + rx * ct * sr + ry * st * cr);
++			if (i === 0 && !joinFirst) b.move(p[0], p[1]);
++			else b.line(p[0], p[1]);
++		}
++	}
++	function sweepOf(a0, a1, ccw) {
++		var s = a1 - a0;
++		if (!ccw) {
++			if (s >= PI2) return PI2;
++			s %= PI2; if (s < 0) s += PI2;
++		} else {
++			if (s <= -PI2) return -PI2;
++			s %= PI2; if (s > 0) s -= PI2;
++		}
++		return s;
++	}
++	/* path operations, shared by the context and Path2D: (builder, matrix,
++	 * arguments in user space) */
++	var OPS = {
++		moveTo: function (b, m, x, y) {
++			if (!fin(x, y)) return;
++			var p = tx(m, x, y); b.move(p[0], p[1]);
++		},
++		lineTo: function (b, m, x, y) {
++			if (!fin(x, y)) return;
++			var p = tx(m, x, y); b.line(p[0], p[1]);
++		},
++		closePath: function (b) { b.close(); },
++		quadraticCurveTo: function (b, m, cx, cy, x, y) {
++			if (!fin(cx, cy, x, y)) return;
++			if (b.n === 0) OPS.moveTo(b, m, cx, cy);
++			var p0x = b.lx, p0y = b.ly, c = tx(m, cx, cy), e = tx(m, x, y);
++			var n = curveSteps(Math.hypot(c[0] - p0x, c[1] - p0y) + Math.hypot(e[0] - c[0], e[1] - c[1]));
++			for (var i = 1; i <= n; i++) {
++				var t = i / n, u = 1 - t;
++				b.line(u * u * p0x + 2 * u * t * c[0] + t * t * e[0], u * u * p0y + 2 * u * t * c[1] + t * t * e[1]);
++			}
++		},
++		bezierCurveTo: function (b, m, c1x, c1y, c2x, c2y, x, y) {
++			if (!fin(c1x, c1y, c2x, c2y, x, y)) return;
++			if (b.n === 0) OPS.moveTo(b, m, c1x, c1y);
++			var p0x = b.lx, p0y = b.ly, a = tx(m, c1x, c1y), c = tx(m, c2x, c2y), e = tx(m, x, y);
++			var n = curveSteps(Math.hypot(a[0] - p0x, a[1] - p0y) + Math.hypot(c[0] - a[0], c[1] - a[1]) +
++				Math.hypot(e[0] - c[0], e[1] - c[1]));
++			for (var i = 1; i <= n; i++) {
++				var t = i / n, u = 1 - t, k0 = u * u * u, k1 = 3 * u * u * t, k2 = 3 * u * t * t, k3 = t * t * t;
++				b.line(k0 * p0x + k1 * a[0] + k2 * c[0] + k3 * e[0], k0 * p0y + k1 * a[1] + k2 * c[1] + k3 * e[1]);
++			}
++		},
++		arc: function (b, m, x, y, r, a0, a1, ccw) {
++			if (!fin(x, y, r, a0, a1)) return;
++			if (r < 0) throw domErr('The radius provided (' + r + ') is negative.', 'IndexSizeError');
++			arcPoints(b, m, x, y, r, r, 0, a0, sweepOf(a0, a1, !!ccw), b.n > 0);
++		},
++		ellipse: function (b, m, x, y, rx, ry, rot, a0, a1, ccw) {
++			if (!fin(x, y, rx, ry, rot, a0, a1)) return;
++			if (rx < 0 || ry < 0) throw domErr('The radius provided is negative.', 'IndexSizeError');
++			arcPoints(b, m, x, y, rx, ry, rot, a0, sweepOf(a0, a1, !!ccw), b.n > 0);
++		},
++		arcTo: function (b, m, x1, y1, x2, y2, r) {
++			if (!fin(x1, y1, x2, y2, r)) return;
++			if (r < 0) throw domErr('The radius provided (' + r + ') is negative.', 'IndexSizeError');
++			if (b.n === 0) { OPS.moveTo(b, m, x1, y1); return; }
++			var im = inv(m);
++			if (!im) return;
++			var p0 = tx(im, b.lx, b.ly);
++			var v1x = p0[0] - x1, v1y = p0[1] - y1, v2x = x2 - x1, v2y = y2 - y1;
++			var l1 = Math.hypot(v1x, v1y), l2 = Math.hypot(v2x, v2y);
++			var cross = v1x * v2y - v1y * v2x;
++			if (l1 === 0 || l2 === 0 || r === 0 || Math.abs(cross) < 1e-12 * l1 * l2) {
++				OPS.lineTo(b, m, x1, y1);
++				return;
++			}
++			v1x /= l1; v1y /= l1; v2x /= l2; v2y /= l2;
++			var cosA = clamp(v1x * v2x + v1y * v2y, -1, 1), half = Math.acos(cosA) / 2;
++			var dist = r / Math.tan(half);
++			var t1x = x1 + v1x * dist, t1y = y1 + v1y * dist, t2x = x1 + v2x * dist, t2y = y1 + v2y * dist;
++			var bx = v1x + v2x, by = v1y + v2y, bl = Math.hypot(bx, by), cd = r / Math.sin(half);
++			var cx = x1 + bx / bl * cd, cy = y1 + by / bl * cd;
++			var as = Math.atan2(t1y - cy, t1x - cx), ae = Math.atan2(t2y - cy, t2x - cx), sw = ae - as;
++			while (sw > Math.PI) sw -= PI2;
++			while (sw <= -Math.PI) sw += PI2;
++			OPS.lineTo(b, m, t1x, t1y);
++			arcPoints(b, m, cx, cy, r, r, 0, as, sw, true);
++		},
++		rect: function (b, m, x, y, w, h) {
++			if (!fin(x, y, w, h)) return;
++			OPS.moveTo(b, m, x, y); OPS.lineTo(b, m, x + w, y);
++			OPS.lineTo(b, m, x + w, y + h); OPS.lineTo(b, m, x, y + h); b.close();
++		},
++		roundRect: function (b, m, x, y, w, h, radii) {
++			if (!fin(x, y, w, h)) return;
++			var r = radii === undefined ? [0] : (Array.isArray(radii) || (radii && typeof radii.length === 'number' && typeof radii !== 'string') ? Array.prototype.slice.call(radii) : [radii]);
++			if (r.length < 1 || r.length > 4) throw new RangeError('roundRect: 1 to 4 radii');
++			r = r.map(function (v) {
++				var n = typeof v === 'object' && v ? +(v.x !== undefined ? v.x : 0) : +v;
++				if (!isFinite(n)) n = 0;
++				if (n < 0) throw new RangeError('roundRect: a radius is negative');
++				return n;
++			});
++			var tl, tr, br, bl;
++			if (r.length === 1) tl = tr = br = bl = r[0];
++			else if (r.length === 2) { tl = br = r[0]; tr = bl = r[1]; }
++			else if (r.length === 3) { tl = r[0]; tr = bl = r[1]; br = r[2]; }
++			else { tl = r[0]; tr = r[1]; br = r[2]; bl = r[3]; }
++			var aw = Math.abs(w), ah = Math.abs(h);
++			var f = Math.min(1, aw / ((tl + tr) || 1), aw / ((bl + br) || 1), ah / ((tl + bl) || 1), ah / ((tr + br) || 1));
++			tl *= f; tr *= f; br *= f; bl *= f;
++			if (w < 0) { x += w; w = -w; }
++			if (h < 0) { y += h; h = -h; }
++			OPS.moveTo(b, m, x + tl, y);
++			OPS.lineTo(b, m, x + w - tr, y);
++			if (tr) arcPoints(b, m, x + w - tr, y + tr, tr, tr, 0, -Math.PI / 2, Math.PI / 2, true);
++			OPS.lineTo(b, m, x + w, y + h - br);
++			if (br) arcPoints(b, m, x + w - br, y + h - br, br, br, 0, 0, Math.PI / 2, true);
++			OPS.lineTo(b, m, x + bl, y + h);
++			if (bl) arcPoints(b, m, x + bl, y + h - bl, bl, bl, 0, Math.PI / 2, Math.PI / 2, true);
++			OPS.lineTo(b, m, x, y + tl);
++			if (tl) arcPoints(b, m, x + tl, y + tl, tl, tl, 0, Math.PI, Math.PI / 2, true);
++			b.close();
++			OPS.moveTo(b, m, x, y);
++		}
++	};
++
++	/* ---- Path2D ---- */
++	function svgArc(path, x1, y1, rx, ry, phi, fa, fs, x2, y2) {
++		if (x1 === x2 && y1 === y2) return;
++		rx = Math.abs(rx); ry = Math.abs(ry);
++		if (!rx || !ry) { path.lineTo(x2, y2); return; }
++		var cp = Math.cos(phi), sp = Math.sin(phi);
++		var dx = (x1 - x2) / 2, dy = (y1 - y2) / 2;
++		var x1p = cp * dx + sp * dy, y1p = -sp * dx + cp * dy;
++		var lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
++		if (lam > 1) { lam = Math.sqrt(lam); rx *= lam; ry *= lam; }
++		var num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
++		var den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
++		var co = Math.sqrt(Math.max(0, num / den)) * (fa === fs ? -1 : 1);
++		var cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;
++		var cx = cp * cxp - sp * cyp + (x1 + x2) / 2, cy = sp * cxp + cp * cyp + (y1 + y2) / 2;
++		function ang(ux, uy, vx, vy) {
++			var a = Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
++			return a;
++		}
++		var t1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
++		var dt = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
++		if (!fs && dt > 0) dt -= PI2;
++		else if (fs && dt < 0) dt += PI2;
++		path.ellipse(cx, cy, rx, ry, phi, t1, t1 + dt, dt < 0);
++	}
++	function parseSvgPath(path, s) {
++		var toks = String(s).match(/[MmLlHhVvCcSsQqTtAaZz]|[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g) || [];
++		var i = 0, cmd = '', x = 0, y = 0, sx = 0, sy = 0, cx = 0, cy = 0, last = '';
++		function num() {
++			if (i >= toks.length || /[a-z]/i.test(toks[i])) throw 0;
++			return parseFloat(toks[i++]);
++		}
++		function flag() {
++			/* arc flags may be written together ("a1 1 0 01 2 2") */
++			var t = toks[i];
++			if (t === undefined) throw 0;
++			if (t.length > 1 && (t.charAt(0) === '0' || t.charAt(0) === '1') && !/[.eE]/.test(t.charAt(1))) {
++				toks[i] = t.slice(1);
++				return t.charAt(0) === '1';
++			}
++			i++;
++			return +t !== 0;
++		}
++		try {
++			while (i < toks.length) {
++				if (/[a-z]/i.test(toks[i])) cmd = toks[i++];
++				else if (!cmd) break;
++				var rel = cmd === cmd.toLowerCase() && cmd !== 'z' ? 1 : 0, C = cmd.toUpperCase();
++				var ox = rel ? x : 0, oy = rel ? y : 0, a, b2, c2, d2, e2, f2;
++				switch (C) {
++				case 'M':
++					x = num() + ox; y = num() + oy; path.moveTo(x, y); sx = x; sy = y;
++					cmd = rel ? 'l' : 'L'; break;
++				case 'L': x = num() + ox; y = num() + oy; path.lineTo(x, y); break;
++				case 'H': x = num() + ox; path.lineTo(x, y); break;
++				case 'V': y = num() + oy; path.lineTo(x, y); break;
++				case 'C':
++					a = num() + ox; b2 = num() + oy; c2 = num() + ox; d2 = num() + oy; e2 = num() + ox; f2 = num() + oy;
++					path.bezierCurveTo(a, b2, c2, d2, e2, f2); cx = c2; cy = d2; x = e2; y = f2; break;
++				case 'S':
++					a = (last === 'C' || last === 'S') ? 2 * x - cx : x;
++					b2 = (last === 'C' || last === 'S') ? 2 * y - cy : y;
++					c2 = num() + ox; d2 = num() + oy; e2 = num() + ox; f2 = num() + oy;
++					path.bezierCurveTo(a, b2, c2, d2, e2, f2); cx = c2; cy = d2; x = e2; y = f2; break;
++				case 'Q':
++					a = num() + ox; b2 = num() + oy; e2 = num() + ox; f2 = num() + oy;
++					path.quadraticCurveTo(a, b2, e2, f2); cx = a; cy = b2; x = e2; y = f2; break;
++				case 'T':
++					a = (last === 'Q' || last === 'T') ? 2 * x - cx : x;
++					b2 = (last === 'Q' || last === 'T') ? 2 * y - cy : y;
++					e2 = num() + ox; f2 = num() + oy;
++					path.quadraticCurveTo(a, b2, e2, f2); cx = a; cy = b2; x = e2; y = f2; break;
++				case 'A': {
++					var rx = num(), ry = num(), rot = num() * Math.PI / 180, fa = flag(), fs = flag();
++					e2 = num() + ox; f2 = num() + oy;
++					svgArc(path, x, y, rx, ry, rot, fa, fs, e2, f2); x = e2; y = f2; break;
++				}
++				case 'Z': path.closePath(); x = sx; y = sy; break;
++				default: throw 0;
++				}
++				last = C;
++			}
++		} catch (e) { if (e !== 0) throw e; }
++	}
++	function Path2D(arg) {
++		if (!(this instanceof Path2D)) throw new TypeError("Constructor Path2D requires 'new'");
++		define(this, '_ops', []);
++		if (arg instanceof Path2D) this._ops = arg._ops.slice();
++		else if (arg !== undefined && arg !== null) parseSvgPath(this, arg);
++	}
++	Object.keys(OPS).forEach(function (name) {
++		define(Path2D.prototype, name, function () {
++			var a = Array.prototype.slice.call(arguments);
++			/* validate now, as the context would */
++			if ((name === 'arc' && a[2] < 0) || (name === 'arcTo' && a[4] < 0) ||
++			    (name === 'ellipse' && (a[2] < 0 || a[3] < 0)))
++				throw domErr('The radius provided is negative.', 'IndexSizeError');
++			this._ops.push([name, a]);
++		});
++	});
++	define(Path2D.prototype, 'addPath', function (p, m) {
++		if (!(p instanceof Path2D)) throw new TypeError('addPath: not a Path2D');
++		this._ops.push(['__add', [p._ops.slice(), matrixInit(m)]]);
++	});
++	function replay(ops, b, m) {
++		for (var i = 0; i < ops.length; i++) {
++			var o = ops[i];
++			if (o[0] === '__add') replay(o[1][0], b, mul(m, o[1][1]));
++			else OPS[o[0]].apply(null, [b, m].concat(o[1]));
++		}
++	}
++
++	/* ---- gradients, patterns, ImageData, TextMetrics ---- */
++	function CanvasGradient() { throw new TypeError('Illegal constructor'); }
++	function makeGrad(type, geo) {
++		var o = Object.create(CanvasGradient.prototype);
++		define(o, '_t', type); define(o, '_g', geo); define(o, '_st', []);
++		return o;
++	}
++	define(CanvasGradient.prototype, 'addColorStop', function (off, color) {
++		off = +off;
++		if (!(off >= 0 && off <= 1)) throw domErr('The provided value (' + off + ') is outside the range (0.0, 1.0).', 'IndexSizeError');
++		var c = parseColor(String(color));
++		if (!c) throw domErr("The value provided ('" + color + "') could not be parsed as a color.", 'SyntaxError');
++		var st = this._st, i = st.length;
++		while (i > 0 && st[i - 1][0] > off) i--;
++		st.splice(i, 0, [off, c]);
++	});
++	function CanvasPattern() { throw new TypeError('Illegal constructor'); }
++	define(CanvasPattern.prototype, 'setTransform', function (m) { this._m = matrixInit(m); });
++	function ImageData(a, b, c) {
++		if (!(this instanceof ImageData)) throw new TypeError("Constructor ImageData requires 'new'");
++		var w, h, data;
++		if (a && typeof a === 'object' && typeof a.length === 'number') {
++			if (!(a instanceof Uint8ClampedArray)) throw new TypeError('ImageData: data is not a Uint8ClampedArray');
++			w = b >>> 0;
++			if (!w || a.length % 4 || (a.length / 4) % w) throw domErr('ImageData: bad width', 'IndexSizeError');
++			h = c === undefined ? a.length / 4 / w : c >>> 0;
++			if (h * w * 4 !== a.length) throw domErr('ImageData: bad height', 'IndexSizeError');
++			data = a;
++		} else {
++			w = a >>> 0; h = b >>> 0;
++			if (!w || !h) throw domErr('The source width is 0.', 'IndexSizeError');
++			data = new Uint8ClampedArray(w * h * 4);
++		}
++		define(this, '_w', w); define(this, '_h', h); define(this, '_d', data);
++	}
++	Object.defineProperty(ImageData.prototype, 'width', { configurable: true, get: function () { return this._w; } });
++	Object.defineProperty(ImageData.prototype, 'height', { configurable: true, get: function () { return this._h; } });
++	Object.defineProperty(ImageData.prototype, 'data', { configurable: true, get: function () { return this._d; } });
++	Object.defineProperty(ImageData.prototype, 'colorSpace', { configurable: true, get: function () { return 'srgb'; } });
++	function TextMetrics() { throw new TypeError('Illegal constructor'); }
++
++	/* ---- the context ---- */
++	var OPNAMES = ['source-over', 'source-in', 'source-out', 'source-atop', 'destination-over',
++		'destination-in', 'destination-out', 'destination-atop', 'lighter', 'copy', 'xor',
++		'multiply', 'screen', 'darken', 'lighten'];
++	/* blend modes drawn as source-over */
++	var OPOTHER = ['overlay', 'color-dodge', 'color-burn', 'hard-light', 'soft-light',
++		'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'];
++	var BLACK = [0, 0, 0, 0, 1];
++	function fresh() {
++		return { fs: '#000000', fc: BLACK, ss: '#000000', sc: BLACK, lw: 1,
++			cap: 'butt', join: 'miter', ml: 10, dash: [], doff: 0,
++			font: '10px sans-serif', f: { px: 10, fam: 0, b: 0, i: 0 }, ta: 'start',
++			tb: 'alphabetic', dir: 'inherit', ga: 1, gco: 'source-over', op: 0,
++			m: [1, 0, 0, 1, 0, 0], ise: true, isq: 'low', shb: 0, shc: 'rgba(0, 0, 0, 0)',
++			shx: 0, shy: 0, filter: 'none', ls: '0px', ws: '0px', fk: 'auto', fst: 'normal',
++			fvc: 'normal', tr: 'auto' };
++	}
++	function copyState(s) {
++		var o = {}, k;
++		for (k in s) o[k] = s[k];
++		o.m = s.m.slice(); o.dash = s.dash.slice();
++		return o;
++	}
++	function attrDim(el, name, dflt) {
++		var v = el.getAttribute(name);
++		if (v == null) return dflt;
++		var m = /^[\t\n\f\r ]*\+?(\d+)/.exec(String(v));
++		if (!m) return dflt;
++		var n = parseInt(m[1], 10);
++		return n >= 0 && n <= 0x7fffffff ? n : dflt;
++	}
++	function CanvasRenderingContext2D() { throw new TypeError('Illegal constructor'); }
++	var C = CanvasRenderingContext2D.prototype;
++	function makeCtx(el) {
++		var c = Object.create(C);
++		define(c, '_el', el);
++		define(c, '_h', cv.create(el, attrDim(el, 'width', 300), attrDim(el, 'height', 150)));
++		define(c, '_s', fresh());
++		define(c, '_stack', []);
++		define(c, '_b', new Builder());
++		return c;
++	}
++	function ctxOf(el) {
++		var c = el.__vbCtx2d;
++		return c && c._el === el ? c : null;
++	}
++	/* a canvas's size changed (or was set again): it is cleared and its
++	 * context starts over */
++	function resetCanvas(el) {
++		var c = ctxOf(el);
++		if (!c) return;
++		cv.resize(c._h, attrDim(el, 'width', 300), attrDim(el, 'height', 150));
++		c._s = fresh(); c._stack = []; c._b.clear();
++	}
++	Object.defineProperty(C, 'canvas', { configurable: true, enumerable: true,
++		get: function () { return this._el; } });
++	function prop(name, get, set) {
++		Object.defineProperty(C, name, { configurable: true, enumerable: true,
++			get: get, set: set });
++	}
++	/* the colour is kept as its paint, [0, r, g, b, a] (shared, never
++	 * changed), with its serialization */
++	var serialCache = new WeakMap();
++	function styleProp(name, sk, ck) {
++		prop(name, function () { return this._s[sk]; }, function (v) {
++			if (v && typeof v === 'object' && (v instanceof CanvasGradient || v instanceof CanvasPattern)) {
++				this._s[sk] = v; this._s[ck] = null;
++				return;
++			}
++			var c = colorOf(v);
++			if (!c) return;
++			var ser = serialCache.get(c);
++			if (ser === undefined) {
++				ser = [serialColor(c), [0, c[0], c[1], c[2], c[3]]];
++				serialCache.set(c, ser);
++			}
++			this._s[sk] = ser[0]; this._s[ck] = ser[1];
++		});
++	}
++	styleProp('fillStyle', 'fs', 'fc');
++	styleProp('strokeStyle', 'ss', 'sc');
++	function numProp(name, k, ok) {
++		prop(name, function () { return this._s[k]; }, function (v) {
++			v = +v;
++			if (isFinite(v) && (!ok || ok(v))) this._s[k] = v;
++		});
++	}
++	numProp('lineWidth', 'lw', function (v) { return v > 0; });
++	numProp('miterLimit', 'ml', function (v) { return v > 0; });
++	numProp('lineDashOffset', 'doff');
++	numProp('globalAlpha', 'ga', function (v) { return v >= 0 && v <= 1; });
++	numProp('shadowBlur', 'shb', function (v) { return v >= 0; });
++	numProp('shadowOffsetX', 'shx');
++	numProp('shadowOffsetY', 'shy');
++	function enumProp(name, k, values) {
++		prop(name, function () { return this._s[k]; }, function (v) {
++			v = String(v);
++			if (values.indexOf(v) >= 0) this._s[k] = v;
++		});
++	}
++	enumProp('lineCap', 'cap', ['butt', 'round', 'square']);
++	enumProp('lineJoin', 'join', ['miter', 'round', 'bevel']);
++	enumProp('textAlign', 'ta', ['start', 'end', 'left', 'right', 'center']);
++	enumProp('textBaseline', 'tb', ['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom']);
++	enumProp('direction', 'dir', ['ltr', 'rtl', 'inherit']);
++	enumProp('imageSmoothingQuality', 'isq', ['low', 'medium', 'high']);
++	enumProp('fontKerning', 'fk', ['auto', 'normal', 'none']);
++	enumProp('fontStretch', 'fst', ['ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed', 'normal',
++		'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded']);
++	enumProp('fontVariantCaps', 'fvc', ['normal', 'small-caps', 'all-small-caps', 'petite-caps',
++		'all-petite-caps', 'unicase', 'titling-caps']);
++	enumProp('textRendering', 'tr', ['auto', 'optimizeSpeed', 'optimizeLegibility', 'geometricPrecision']);
++	prop('globalCompositeOperation', function () { return this._s.gco; }, function (v) {
++		v = String(v);
++		var i = OPNAMES.indexOf(v);
++		if (i < 0 && OPOTHER.indexOf(v) < 0) return;
++		this._s.gco = v; this._s.op = i < 0 ? 0 : i;
++	});
++	prop('imageSmoothingEnabled', function () { return this._s.ise; }, function (v) { this._s.ise = !!v; });
++	prop('shadowColor', function () { return this._s.shc; }, function (v) {
++		var c = parseColor(String(v));
++		if (c) this._s.shc = serialColor(c);
++	});
++	prop('filter', function () { return this._s.filter; }, function (v) { this._s.filter = String(v); });
++	prop('letterSpacing', function () { return this._s.ls; }, function (v) { this._s.ls = String(v); });
++	prop('wordSpacing', function () { return this._s.ws; }, function (v) { this._s.ws = String(v); });
++	prop('font', function () { return this._s.font; }, function (v) {
++		var f = parseFont(v);
++		if (!f) return;
++		this._s.font = f.str; this._s.f = f;
++	});
++
++	function meth(name, fn) { define(C, name, fn); }
++	meth('save', function () { this._stack.push(copyState(this._s)); cv.save(this._h); });
++	meth('restore', function () {
++		if (!this._stack.length) return;
++		this._s = this._stack.pop(); cv.restore(this._h);
++	});
++	meth('reset', function () {
++		cv.resize(this._h, attrDim(this._el, 'width', 300), attrDim(this._el, 'height', 150));
++		this._s = fresh(); this._stack = []; this._b.clear();
++	});
++	meth('isContextLost', function () { return false; });
++	meth('getContextAttributes', function () {
++		return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false };
++	});
++	/* transforms */
++	meth('setTransform', function (a, b, c, dd, e, f) {
++		var m = arguments.length >= 6 ? [+a, +b, +c, +dd, +e, +f] : matrixInit(a);
++		if (fin.apply(null, m)) this._s.m = m;
++	});
++	meth('resetTransform', function () { this._s.m = [1, 0, 0, 1, 0, 0]; });
++	meth('transform', function (a, b, c, dd, e, f) {
++		if (fin(a, b, c, dd, e, f)) this._s.m = mul(this._s.m, [a, b, c, dd, e, f]);
++	});
++	meth('translate', function (x, y) {
++		if (fin(x, y)) this._s.m = mul(this._s.m, [1, 0, 0, 1, x, y]);
++	});
++	meth('scale', function (x, y) {
++		if (fin(x, y)) this._s.m = mul(this._s.m, [x, 0, 0, y, 0, 0]);
++	});
++	meth('rotate', function (a) {
++		if (fin(a)) this._s.m = mul(this._s.m, [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a), 0, 0]);
++	});
++	meth('getTransform', function () {
++		var m = this._s.m;
++		if (typeof g.DOMMatrix === 'function') {
++			try { return new g.DOMMatrix(m); } catch (e) { /* */ }
++		}
++		return { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5],
++			m11: m[0], m12: m[1], m21: m[2], m22: m[3], m41: m[4], m42: m[5],
++			is2D: true, isIdentity: m[0] === 1 && !m[1] && !m[2] && m[3] === 1 && !m[4] && !m[5] };
++	});
++	/* the path */
++	meth('beginPath', function () { this._b.clear(); });
++	Object.keys(OPS).forEach(function (name) {
++		meth(name, function () {
++			OPS[name].apply(null, [this._b, this._s.m].concat(Array.prototype.slice.call(arguments)));
++		});
++	});
++	/* the shape to draw: the current path, or a Path2D under the current
++	 * transform; and the fill rule */
++	function shape(ctx, a, b) {
++		if (a instanceof Path2D) {
++			var pb = new Builder();
++			replay(a._ops, pb, ctx._s.m);
++			return [pb.arrays(), b === 'evenodd'];
++		}
++		return [ctx._b.arrays(), a === 'evenodd'];
++	}
++	function stops(gr) {
++		var a = new Float64Array(gr._st.length * 5);
++		gr._st.forEach(function (s, i) {
++			a[5 * i] = s[0]; a[5 * i + 1] = s[1][0]; a[5 * i + 2] = s[1][1];
++			a[5 * i + 3] = s[1][2]; a[5 * i + 4] = s[1][3];
++		});
++		return a;
++	}
++	/* an image source: [handle-or-element, width, height], or null when it
++	 * has nothing to draw yet */
++	function source(img) {
++		if (img && img.__vbBitmap) img = img.__vbBitmap;
++		if (isCanvas(img)) {
++			var c = ctxOf(img);
++			var w = attrDim(img, 'width', 300), h = attrDim(img, 'height', 150);
++			if (!w || !h) throw domErr('The image argument is a canvas element with a width or height of 0.', 'InvalidStateError');
++			return c ? [c._h, w, h] : null;
++		}
++		if (isImgEl(img)) {
++			var sz = cv.imgsize(img);
++			return sz && sz[0] > 0 && sz[1] > 0 ? [img, sz[0], sz[1]] : null;
++		}
++		if (img && img.nodeType === 1) return null;	/* <video>, <svg image>: nothing yet */
++		throw new TypeError("Failed to execute 'drawImage': The provided value is not of type '(HTMLImageElement or HTMLCanvasElement or ImageBitmap)'.");
++	}
++	function paintOf(ctx, style, col) {
++		var s = ctx._s, im;
++		if (col) return col;
++		if (style instanceof CanvasGradient) {
++			im = inv(s.m);
++			if (!im) return null;
++			var geo = style._g;
++			return [style._t].concat(im, geo, [stops(style)]);
++		}
++		if (style instanceof CanvasPattern) {
++			var src = source(style._src);
++			if (!src) return null;
++			im = inv(mul(s.m, style._m || [1, 0, 0, 1, 0, 0]));
++			if (!im) return null;
++			var r = style._rep;
++			return [4].concat(im, [src[0], 0, 0, src[1], src[2],
++				r === 'repeat' || r === 'repeat-x' ? 1 : 0,
++				r === 'repeat' || r === 'repeat-y' ? 1 : 0, s.ise ? 1 : 0]);
++		}
++		return null;
++	}
++	function fillWith(ctx, arrs, evenodd, paint) {
++		if (paint) cv.fill(ctx._h, arrs[0], arrs[1], evenodd, paint, ctx._s.ga, ctx._s.op);
++	}
++	function dashed(arrs, dash, off, sc) {
++		var pts = arrs[0], cnt = arrs[1], cls = arrs[2];
++		var total = 0, i, k;
++		var pat = dash.map(function (v) { return v * sc; });
++		for (i = 0; i < pat.length; i++) total += pat[i];
++		if (!(total > 0)) return arrs;
++		var op = [], oc = [], base = 0;
++		for (k = 0; k < cnt.length; k++) {
++			var n = cnt[k], seg = [];
++			for (i = 0; i < n; i++) seg.push(pts[2 * (base + i)], pts[2 * (base + i) + 1]);
++			if (cls[k] && n > 1) seg.push(pts[2 * base], pts[2 * base + 1]);
++			base += n;
++			/* where in the pattern this subpath starts */
++			var pos = ((off * sc) % total + total) % total, di = 0;
++			while (pos >= pat[di]) { pos -= pat[di]; di = (di + 1) % pat.length; }
++			var left = pat[di] - pos, on = !(di & 1), cur = [];
++			if (on) cur.push(seg[0], seg[1]);
++			for (i = 2; i < seg.length; i += 2) {
++				var x0 = seg[i - 2], y0 = seg[i - 1], x1 = seg[i], y1 = seg[i + 1];
++				var len = Math.hypot(x1 - x0, y1 - y0), t = 0;
++				while (len - t > left) {
++					t += left;
++					var px = x0 + (x1 - x0) * t / len, py = y0 + (y1 - y0) * t / len;
++					if (on) { cur.push(px, py); op.push(cur); cur = []; }
++					else cur = [px, py];
++					on = !on; di = (di + 1) % pat.length; left = pat[di];
++					if (op.length > 200000) return arrs;
++				}
++				left -= len - t;
++				if (on) cur.push(x1, y1);
++			}
++			if (on && cur.length >= 4) op.push(cur);
++		}
++		var flat = [];
++		op.forEach(function (c) { flat.push.apply(flat, c); oc.push(c.length / 2); });
++		return [new Float64Array(flat), new Int32Array(oc), new Uint8Array(oc.length)];
++	}
++	var CAPS = { butt: 0, round: 1, square: 2 }, JOINS = { miter: 0, round: 1, bevel: 2 };
++	function strokeWith(ctx, arrs) {
++		var s = ctx._s, sc = scaleOf(s.m), paint = paintOf(ctx, s.ss, s.sc);
++		if (!paint || !(sc > 0)) return;
++		if (s.dash.length) arrs = dashed(arrs, s.dash, s.doff, sc);
++		cv.stroke(ctx._h, arrs[0], arrs[1], arrs[2], s.lw * sc, CAPS[s.cap], JOINS[s.join], s.ml,
++			paint, s.ga, s.op);
++	}
++	meth('fill', function (a, b) {
++		var sh = shape(this, a, b);
++		fillWith(this, sh[0], sh[1], paintOf(this, this._s.fs, this._s.fc));
++	});
++	meth('stroke', function (a) {
++		strokeWith(this, shape(this, a)[0]);
++	});
++	meth('clip', function (a, b) {
++		var sh = shape(this, a, b);
++		cv.clip(this._h, sh[0][0], sh[0][1], sh[1]);
++	});
++	function rectArrs(m, x, y, w, h) {
++		var b = new Builder();
++		OPS.rect(b, m, x, y, w, h);
++		return b.arrays();
++	}
++	/* fillRect / clearRect / drawImage: the rectangle's corners, in arrays
++	 * reused call after call (the natives copy what they need) */
++	var RP = new Float64Array(8), RC = new Int32Array([4]);
++	function rectPts(m, x, y, w, h) {
++		var x1 = x + w, y1 = y + h;
++		RP[0] = m[0] * x + m[2] * y + m[4]; RP[1] = m[1] * x + m[3] * y + m[5];
++		RP[2] = m[0] * x1 + m[2] * y + m[4]; RP[3] = m[1] * x1 + m[3] * y + m[5];
++		RP[4] = m[0] * x1 + m[2] * y1 + m[4]; RP[5] = m[1] * x1 + m[3] * y1 + m[5];
++		RP[6] = m[0] * x + m[2] * y1 + m[4]; RP[7] = m[1] * x + m[3] * y1 + m[5];
++		return RP;
++	}
++	meth('fillRect', function (x, y, w, h) {
++		if (!fin(x, y, w, h) || !w || !h) return;
++		var s = this._s, paint = s.fc || paintOf(this, s.fs, null);
++		if (paint) cv.fill(this._h, rectPts(s.m, x, y, w, h), RC, false, paint, s.ga, s.op);
++	});
++	meth('strokeRect', function (x, y, w, h) {
++		if (!fin(x, y, w, h)) return;
++		strokeWith(this, rectArrs(this._s.m, x, y, w, h));
++	});
++	meth('clearRect', function (x, y, w, h) {
++		if (!fin(x, y, w, h) || !w || !h) return;
++		/* destination-out with opaque paint: clears, inside the clip */
++		cv.fill(this._h, rectPts(this._s.m, x, y, w, h), RC, false, BLACK, 1, 6);
++	});
++	function windAt(arrs, x, y, evenodd) {
++		var pts = arrs[0], cnt = arrs[1], base = 0, w = 0, k, i;
++		for (k = 0; k < cnt.length; k++) {
++			var n = cnt[k];
++			for (i = 0; i < n; i++) {
++				var j = (i + 1) % n;
++				var x0 = pts[2 * (base + i)], y0 = pts[2 * (base + i) + 1];
++				var x1 = pts[2 * (base + j)], y1 = pts[2 * (base + j) + 1];
++				if ((y0 <= y) !== (y1 <= y)) {
++					var xc = x0 + (y - y0) * (x1 - x0) / (y1 - y0);
++					if (xc > x) w += y1 > y0 ? 1 : -1;
++				}
++			}
++			base += n;
++		}
++		return evenodd ? (w & 1) !== 0 : w !== 0;
++	}
++	meth('isPointInPath', function (a, b, c, dd) {
++		if (a instanceof Path2D) {
++			if (!fin(+b, +c)) return false;
++			return windAt(shape(this, a)[0], +b, +c, dd === 'evenodd');
++		}
++		if (!fin(+a, +b)) return false;
++		return windAt(this._b.arrays(), +a, +b, c === 'evenodd');
++	});
++	meth('isPointInStroke', function (a, b, c) {
++		var arrs, x, y;
++		if (a instanceof Path2D) { arrs = shape(this, a)[0]; x = +b; y = +c; }
++		else { arrs = this._b.arrays(); x = +a; y = +b; }
++		if (!fin(x, y)) return false;
++		var hw = this._s.lw * scaleOf(this._s.m) / 2, pts = arrs[0], cnt = arrs[1], cls = arrs[2], base = 0;
++		for (var k = 0; k < cnt.length; k++) {
++			var n = cnt[k], segs = cls[k] ? n : n - 1;
++			for (var i = 0; i < segs; i++) {
++				var j = (i + 1) % n;
++				var x0 = pts[2 * (base + i)], y0 = pts[2 * (base + i) + 1];
++				var x1 = pts[2 * (base + j)], y1 = pts[2 * (base + j) + 1];
++				var dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;
++				var t = l2 ? clamp(((x - x0) * dx + (y - y0) * dy) / l2, 0, 1) : 0;
++				if (Math.hypot(x - x0 - t * dx, y - y0 - t * dy) <= hw) return true;
++			}
++			base += n;
++		}
++		return false;
++	});
++	meth('drawFocusIfNeeded', function () { });
++	meth('scrollPathIntoView', function () { });
++	/* lines */
++	meth('setLineDash', function (seg) {
++		if (!seg || typeof seg.length !== 'number') throw new TypeError('setLineDash: not a sequence');
++		var a = Array.prototype.slice.call(seg).map(Number);
++		for (var i = 0; i < a.length; i++) if (!isFinite(a[i]) || a[i] < 0) return;
++		if (a.length & 1) a = a.concat(a);
++		this._s.dash = a;
++	});
++	meth('getLineDash', function () { return this._s.dash.slice(); });
++	/* gradients and patterns */
++	meth('createLinearGradient', function (x0, y0, x1, y1) {
++		if (!fin(x0, y0, x1, y1)) throw new TypeError("createLinearGradient: a value is non-finite");
++		return makeGrad(1, [x0, y0, x1, y1]);
++	});
++	meth('createRadialGradient', function (x0, y0, r0, x1, y1, r1) {
++		if (!fin(x0, y0, r0, x1, y1, r1)) throw new TypeError("createRadialGradient: a value is non-finite");
++		if (r0 < 0 || r1 < 0) throw domErr('The radius provided is negative.', 'IndexSizeError');
++		return makeGrad(2, [x0, y0, r0, x1, y1, r1]);
++	});
++	meth('createConicGradient', function (a, x, y) {
++		if (!fin(a, x, y)) throw new TypeError("createConicGradient: a value is non-finite");
++		return makeGrad(3, [a, x, y]);
++	});
++	meth('createPattern', function (img, rep) {
++		rep = rep === null || rep === undefined || rep === '' ? 'repeat' : String(rep);
++		if (['repeat', 'repeat-x', 'repeat-y', 'no-repeat'].indexOf(rep) < 0)
++			throw domErr("The provided type ('" + rep + "') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'.", 'SyntaxError');
++		if (!source(img) && !isCanvas(img)) return null;
++		var p = Object.create(CanvasPattern.prototype);
++		define(p, '_src', img); define(p, '_rep', rep); define(p, '_m', [1, 0, 0, 1, 0, 0]);
++		return p;
++	});
++	/* images */
++	meth('drawImage', function (img, a1, a2, a3, a4, a5, a6, a7, a8) {
++		var n = arguments.length, src = source(img), sx, sy, sw, sh, dx, dy, dw, dh;
++		if (n !== 3 && n !== 5 && n !== 9) throw new TypeError('drawImage: 3, 5 or 9 arguments');
++		if (!src) return;
++		if (n === 3) { sx = 0; sy = 0; sw = src[1]; sh = src[2]; dx = a1; dy = a2; dw = sw; dh = sh; }
++		else if (n === 5) { sx = 0; sy = 0; sw = src[1]; sh = src[2]; dx = a1; dy = a2; dw = a3; dh = a4; }
++		else { sx = a1; sy = a2; sw = a3; sh = a4; dx = a5; dy = a6; dw = a7; dh = a8; }
++		if (!fin(sx, sy, sw, sh, dx, dy, dw, dh) || !sw || !sh || !dw || !dh) return;
++		/* the source rectangle, inside the image (the destination shrinks
++		 * with it) */
++		if (sw < 0) { sx += sw; sw = -sw; }
++		if (sh < 0) { sy += sh; sh = -sh; }
++		if (dw < 0) { dx += dw; dw = -dw; }
++		if (dh < 0) { dy += dh; dh = -dh; }
++		var kx = dw / sw, ky = dh / sh;
++		if (sx < 0) { dx -= sx * kx; dw += sx * kx; sw += sx; sx = 0; }
++		if (sy < 0) { dy -= sy * ky; dh += sy * ky; sh += sy; sy = 0; }
++		if (sx + sw > src[1]) { dw -= (sx + sw - src[1]) * kx; sw = src[1] - sx; }
++		if (sy + sh > src[2]) { dh -= (sy + sh - src[2]) * ky; sh = src[2] - sy; }
++		if (!(sw > 0 && sh > 0 && dw > 0 && dh > 0)) return;
++		var s = this._s, im = inv(s.m);
++		if (!im) return;
++		/* device -> user -> source pixels */
++		var toSrc = mul([sw / dw, 0, 0, sh / dh, sx - dx * sw / dw, sy - dy * sh / dh], im);
++		var paint = [4].concat(toSrc, [src[0], sx, sy, sw, sh, 0, 0, s.ise ? 1 : 0]);
++		cv.fill(this._h, rectPts(s.m, dx, dy, dw, dh), RC, false, paint, s.ga, s.op);
++	});
++	meth('createImageData', function (a, b) {
++		if (a instanceof ImageData) return new ImageData(a.width, a.height);
++		var w = Math.abs(a | 0), h = Math.abs(b | 0);
++		if (!w || !h) throw domErr('The source width is 0.', 'IndexSizeError');
++		return new ImageData(w, h);
++	});
++	meth('getImageData', function (x, y, w, h) {
++		if (!fin(+x, +y, +w, +h)) throw new TypeError('getImageData: non-finite value');
++		x |= 0; y |= 0; w |= 0; h |= 0;
++		if (!w || !h) throw domErr('The source ' + (w ? 'height' : 'width') + ' is 0.', 'IndexSizeError');
++		if (w < 0) { x += w; w = -w; }
++		if (h < 0) { y += h; h = -h; }
++		return new ImageData(new Uint8ClampedArray(cv.get(this._h, x, y, w, h)), w, h);
++	});
++	meth('putImageData', function (id, dx, dy, x0, y0, w, h) {
++		if (!(id instanceof ImageData)) throw new TypeError('putImageData: not an ImageData');
++		if (!fin(+dx, +dy)) return;
++		var iw = id.width, ih = id.height;
++		if (arguments.length < 7) { x0 = 0; y0 = 0; w = iw; h = ih; }
++		x0 = +x0 | 0; y0 = +y0 | 0; w = +w | 0; h = +h | 0;
++		if (w < 0) { x0 += w; w = -w; }
++		if (h < 0) { y0 += h; h = -h; }
++		var x1 = Math.min(iw, x0 + w), y1 = Math.min(ih, y0 + h);
++		x0 = Math.max(0, x0); y0 = Math.max(0, y0);
++		if (x1 <= x0 || y1 <= y0) return;
++		cv.put(this._h, id.data, iw, ih, dx | 0, dy | 0, x0, y0, x1, y1);
++	});
++	/* text */
++	function textOf(t) { return String(t).replace(/[\t\n\f\r]/g, ' '); }
++	function metrics(ctx, text) {
++		var f = ctx._s.f;
++		var r = cv.measure(text, f.px, f.fam, f.b, f.i);
++		return { w: r[0], asc: r[1], desc: r[2] };
++	}
++	function drawText(ctx, text, x, y, maxW, style, col) {
++		var s = ctx._s, f = s.f, sc = scaleOf(s.m);
++		if (!fin(x, y) || !(sc > 0)) return;
++		text = textOf(text);
++		var mt = metrics(ctx, text), w = mt.w, px = f.px;
++		if (maxW !== undefined) {
++			maxW = +maxW;
++			if (!(maxW > 0)) return;
++			if (w > maxW) { px = px * maxW / w; w = maxW; }
++		}
++		var rtl = s.dir === 'rtl', ta = s.ta;
++		if (ta === 'start') ta = rtl ? 'right' : 'left';
++		else if (ta === 'end') ta = rtl ? 'left' : 'right';
++		var ox = ta === 'right' ? -w : (ta === 'center' ? -w / 2 : 0);
++		var asc = mt.asc * px / f.px, desc = mt.desc * px / f.px, tb = s.tb;
++		var oy = tb === 'top' ? asc : tb === 'hanging' ? asc * 0.8 : tb === 'middle' ? (asc - desc) / 2 :
++			(tb === 'bottom' || tb === 'ideographic') ? -desc : 0;
++		var paint = paintOf(ctx, style, col);
++		if (!paint) return;
++		var p = tx(s.m, x + ox, y + oy);
++		cv.text(ctx._h, text, px * sc, f.fam, f.b, f.i, p[0], p[1], paint, s.ga, s.op);
++	}
++	meth('fillText', function (t, x, y, maxW) { drawText(this, t, +x, +y, maxW, this._s.fs, this._s.fc); });
++	/* outlines are drawn filled (no glyph outlines here) */
++	meth('strokeText', function (t, x, y, maxW) { drawText(this, t, +x, +y, maxW, this._s.ss, this._s.sc); });
++	meth('measureText', function (t) {
++		var mt = metrics(this, textOf(t)), s = this._s, ta = s.ta, rtl = s.dir === 'rtl';
++		if (ta === 'start') ta = rtl ? 'right' : 'left';
++		else if (ta === 'end') ta = rtl ? 'left' : 'right';
++		var left = ta === 'right' ? mt.w : (ta === 'center' ? mt.w / 2 : 0);
++		var o = Object.create(TextMetrics.prototype), tb = s.tb;
++		var base = tb === 'top' ? mt.asc : tb === 'hanging' ? mt.asc * 0.8 : tb === 'middle' ? (mt.asc - mt.desc) / 2 :
++			(tb === 'bottom' || tb === 'ideographic') ? -mt.desc : 0;
++		var v = { width: mt.w, actualBoundingBoxLeft: left, actualBoundingBoxRight: mt.w - left,
++			actualBoundingBoxAscent: mt.asc - base, actualBoundingBoxDescent: mt.desc + base,
++			fontBoundingBoxAscent: mt.asc - base, fontBoundingBoxDescent: mt.desc + base,
++			emHeightAscent: mt.asc - base, emHeightDescent: mt.desc + base,
++			hangingBaseline: mt.asc * 0.8 - base, alphabeticBaseline: -base,
++			ideographicBaseline: -mt.desc - base };
++		Object.keys(v).forEach(function (k) {
++			Object.defineProperty(o, k, { value: v[k], enumerable: true, configurable: true });
++		});
++		return o;
++	});
++
++	/* ---- the element ---- */
++	function own(name) {
++		var o = P, dsc;
++		while (o && !(dsc = Object.getOwnPropertyDescriptor(o, name))) o = Object.getPrototypeOf(o);
++		return dsc || null;
++	}
++	function acc(name, get, set) {
++		var cur = own(name);
++		if (cur && cur.get && cur.get.__vbCv) return;
++		var oget = cur && cur.get, oset = cur && cur.set;
++		var gf = function () { return isCanvas(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };
++		gf.__vbCv = true;
++		var sf = function (v) {
++			if (isCanvas(this)) set.call(this, v);
++			else if (oset) oset.call(this, v);
++		};
++		Object.defineProperty(P, name, { configurable: true, get: gf, set: sf });
++	}
++	acc('width', function () { return attrDim(this, 'width', 300); }, function (v) {
++		this.setAttribute('width', String(v >>> 0));
++	});
++	acc('height', function () { return attrDim(this, 'height', 150); }, function (v) {
++		this.setAttribute('height', String(v >>> 0));
++	});
++	var sa = P.setAttribute;
++	if (typeof sa === 'function' && !sa.__vbCv) {
++		var w = function (name) {
++			var r = sa.apply(this, arguments), n = String(name).toLowerCase();
++			if ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);
++			return r;
++		};
++		w.__vbCv = true;
++		P.setAttribute = w;
++	}
++	var ra = P.removeAttribute;
++	if (typeof ra === 'function' && !ra.__vbCv) {
++		var wr = function (name) {
++			var r = ra.apply(this, arguments), n = String(name).toLowerCase();
++			if ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);
++			return r;
++		};
++		wr.__vbCv = true;
++		P.removeAttribute = wr;
++	}
++	var oldGet = P.getContext, oldURL = P.toDataURL, oldBlob = P.toBlob;
++	function getContext(type) {
++		if (!isCanvas(this)) return oldGet ? oldGet.apply(this, arguments) : null;
++		if (String(type) !== '2d') return null;
++		var c = ctxOf(this);
++		if (!c) {
++			c = makeCtx(this);
++			define(this, '__vbCtx2d', c);
++		}
++		return c;
++	}
++	function toDataURL() {
++		if (!isCanvas(this)) return oldURL ? oldURL.apply(this, arguments) : 'data:,';
++		if (!attrDim(this, 'width', 300) || !attrDim(this, 'height', 150)) return 'data:,';
++		return cv.png(getContext.call(this, '2d')._h, true);
++	}
++	function toBlob(cb) {
++		if (!isCanvas(this)) return oldBlob ? oldBlob.apply(this, arguments) : undefined;
++		if (typeof cb !== 'function') throw new TypeError('toBlob: callback is not a function');
++		var el = this, blob = null;
++		if (attrDim(el, 'width', 300) && attrDim(el, 'height', 150) && typeof g.Blob === 'function') {
++			try { blob = new g.Blob([cv.png(getContext.call(el, '2d')._h, false)], { type: 'image/png' }); }
++			catch (e) { blob = null; }
++		}
++		setTimeout(function () { cb(blob); }, 0);
++	}
++	var targets = [P];
++	if (g.HTMLCanvasElement && g.HTMLCanvasElement.prototype && g.HTMLCanvasElement.prototype !== P)
++		targets.push(g.HTMLCanvasElement.prototype);
++	targets.forEach(function (T) {
++		define(T, 'getContext', getContext);
++		define(T, 'toDataURL', toDataURL);
++		define(T, 'toBlob', toBlob);
++	});
++	define(C, 'constructor', CanvasRenderingContext2D);
++	g.CanvasRenderingContext2D = CanvasRenderingContext2D;
++	g.CanvasGradient = CanvasGradient;
++	g.CanvasPattern = CanvasPattern;
++	g.Path2D = Path2D;
++	g.ImageData = ImageData;
++	g.TextMetrics = TextMetrics;
++	/* createImageBitmap: images and canvases, copied into a canvas */
++	g.createImageBitmap = function (img, sx, sy, sw, sh) {
++		var nargs = arguments.length;
++		return new Promise(function (res, rej) {
++			try {
++				var c = d.createElement('canvas'), x;
++				if (img instanceof ImageData) {
++					c.width = img.width; c.height = img.height;
++					c.getContext('2d').putImageData(img, 0, 0);
++				} else {
++					var src = source(img);
++					if (!src) { rej(domErr('The source image could not be decoded.', 'InvalidStateError')); return; }
++					if (nargs >= 5) {
++						c.width = Math.abs(sw); c.height = Math.abs(sh);
++						c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, Math.abs(sw), Math.abs(sh));
++					} else {
++						c.width = src[1]; c.height = src[2];
++						c.getContext('2d').drawImage(img, 0, 0);
++					}
++				}
++				x = { width: c.width, height: c.height, close: function () { } };
++				define(x, '__vbBitmap', c);
++				res(x);
++			} catch (e) { rej(e); }
++		});
++	};
++})();
++
+ /* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,
+  * XMLSerializer, the scratch document ---------------------------------
+  * Closure's sanitizer (google's trending searches, and wherever Google
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2628,6 +2628,1136 @@
+ "\tg.Image = Img;\n"
+ "})();\n"
+ "\n"
++"/* ---- canvas 2D: a real drawing context --------------------------------\n"
++" * VitaBrowser patch 251. getContext('2d') returned a context whose every\n"
++" * drawing method did nothing (fixes1245): charts, games, maps, QR codes\n"
++" * and captcha images were blank, and a script reading back its own\n"
++" * drawing (getImageData, toDataURL) got zeros. The pixels are now real\n"
++" * (macsurf_canvas.c, behind the hidden global __cv); this is the\n"
++" * context's state: styles, transforms, the path (flattened to device\n"
++" * pixels as it is built, as the spec transforms points when they are\n"
++" * added), Path2D (SVG path data too), dashes, colours, fonts, gradients,\n"
++" * patterns and ImageData. Not done: shadows, filters, rotated text. */\n"
++"\n"
++"(function () {\n"
++"\tvar d = g.document, cv = g.__cv;\n"
++"\tif (!d || !cv || typeof d.createElement !== 'function') return;\n"
++"\tvar P = Object.getPrototypeOf(d.createElement('canvas'));\n"
++"\tif (!P) return;\n"
++"\tvar PI2 = Math.PI * 2;\n"
++"\tfunction isCanvas(el) {\n"
++"\t\treturn !!el && el.nodeType === 1 && String(el.tagName).toUpperCase() === 'CANVAS';\n"
++"\t}\n"
++"\tfunction isImgEl(el) {\n"
++"\t\treturn !!el && el.nodeType === 1 && String(el.tagName).toUpperCase() === 'IMG';\n"
++"\t}\n"
++"\tfunction domErr(msg, name) {\n"
++"\t\ttry { return new g.DOMException(msg, name); } catch (e) { var x = new Error(msg); x.name = name; return x; }\n"
++"\t}\n"
++"\tfunction fin() {\n"
++"\t\tfor (var i = 0; i < arguments.length; i++)\n"
++"\t\t\tif (typeof arguments[i] !== 'number' || !isFinite(arguments[i])) return false;\n"
++"\t\treturn true;\n"
++"\t}\n"
++"\n"
++"\t/* ---- colours ---- */\n"
++"\tvar NAMED = {};\n"
++"\t('aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 azure f0ffff beige f5f5dc ' +\n"
++"\t 'bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff blueviolet 8a2be2 brown a52a2a ' +\n"
++"\t 'burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 chocolate d2691e coral ff7f50 ' +\n"
++"\t 'cornflowerblue 6495ed cornsilk fff8dc crimson dc143c cyan 00ffff darkblue 00008b darkcyan 008b8b ' +\n"
++"\t 'darkgoldenrod b8860b darkgray a9a9a9 darkgreen 006400 darkgrey a9a9a9 darkkhaki bdb76b ' +\n"
++"\t 'darkmagenta 8b008b darkolivegreen 556b2f darkorange ff8c00 darkorchid 9932cc darkred 8b0000 ' +\n"
++"\t 'darksalmon e9967a darkseagreen 8fbc8f darkslateblue 483d8b darkslategray 2f4f4f ' +\n"
++"\t 'darkslategrey 2f4f4f darkturquoise 00ced1 darkviolet 9400d3 deeppink ff1493 deepskyblue 00bfff ' +\n"
++"\t 'dimgray 696969 dimgrey 696969 dodgerblue 1e90ff firebrick b22222 floralwhite fffaf0 ' +\n"
++"\t 'forestgreen 228b22 fuchsia ff00ff gainsboro dcdcdc ghostwhite f8f8ff gold ffd700 ' +\n"
++"\t 'goldenrod daa520 gray 808080 green 008000 greenyellow adff2f grey 808080 honeydew f0fff0 ' +\n"
++"\t 'hotpink ff69b4 indianred cd5c5c indigo 4b0082 ivory fffff0 khaki f0e68c lavender e6e6fa ' +\n"
++"\t 'lavenderblush fff0f5 lawngreen 7cfc00 lemonchiffon fffacd lightblue add8e6 lightcoral f08080 ' +\n"
++"\t 'lightcyan e0ffff lightgoldenrodyellow fafad2 lightgray d3d3d3 lightgreen 90ee90 lightgrey d3d3d3 ' +\n"
++"\t 'lightpink ffb6c1 lightsalmon ffa07a lightseagreen 20b2aa lightskyblue 87cefa ' +\n"
++"\t 'lightslategray 778899 lightslategrey 778899 lightsteelblue b0c4de lightyellow ffffe0 lime 00ff00 ' +\n"
++"\t 'limegreen 32cd32 linen faf0e6 magenta ff00ff maroon 800000 mediumaquamarine 66cdaa ' +\n"
++"\t 'mediumblue 0000cd mediumorchid ba55d3 mediumpurple 9370db mediumseagreen 3cb371 ' +\n"
++"\t 'mediumslateblue 7b68ee mediumspringgreen 00fa9a mediumturquoise 48d1cc mediumvioletred c71585 ' +\n"
++"\t 'midnightblue 191970 mintcream f5fffa mistyrose ffe4e1 moccasin ffe4b5 navajowhite ffdead ' +\n"
++"\t 'navy 000080 oldlace fdf5e6 olive 808000 olivedrab 6b8e23 orange ffa500 orangered ff4500 ' +\n"
++"\t 'orchid da70d6 palegoldenrod eee8aa palegreen 98fb98 paleturquoise afeeee palevioletred db7093 ' +\n"
++"\t 'papayawhip ffefd5 peachpuff ffdab9 peru cd853f pink ffc0cb plum dda0dd powderblue b0e0e6 ' +\n"
++"\t 'purple 800080 rebeccapurple 663399 red ff0000 rosybrown bc8f8f royalblue 4169e1 ' +\n"
++"\t 'saddlebrown 8b4513 salmon fa8072 sandybrown f4a460 seagreen 2e8b57 seashell fff5ee ' +\n"
++"\t 'sienna a0522d silver c0c0c0 skyblue 87ceeb slateblue 6a5acd slategray 708090 slategrey 708090 ' +\n"
++"\t 'snow fffafa springgreen 00ff7f steelblue 4682b4 tan d2b48c teal 008080 thistle d8bfd8 ' +\n"
++"\t 'tomato ff6347 turquoise 40e0d0 violet ee82ee wheat f5deb3 white ffffff whitesmoke f5f5f5 ' +\n"
++"\t 'yellow ffff00 yellowgreen 9acd32').split(' ').forEach(function (v, i, a) {\n"
++"\t\tif (i & 1) NAMED[a[i - 1]] = v;\n"
++"\t});\n"
++"\tfunction clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }\n"
++"\tfunction hsl2rgb(h, s, l) {\n"
++"\t\th = ((h % 360) + 360) % 360 / 360;\n"
++"\t\tfunction f(n) {\n"
++"\t\t\tvar k = (n + h * 12) % 12, a = s * Math.min(l, 1 - l);\n"
++"\t\t\treturn l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));\n"
++"\t\t}\n"
++"\t\treturn [f(0) * 255, f(8) * 255, f(4) * 255];\n"
++"\t}\n"
++"\t/* -> [r, g, b, a] (0..255, alpha 0..1) or null */\n"
++"\tfunction parseColor(v) {\n"
++"\t\tif (typeof v !== 'string') return null;\n"
++"\t\tvar s = v.trim().toLowerCase(), m;\n"
++"\t\tif (s === 'transparent') return [0, 0, 0, 0];\n"
++"\t\tif (s === 'currentcolor') return [0, 0, 0, 1];\n"
++"\t\tif (NAMED[s]) s = '#' + NAMED[s];\n"
++"\t\tif (s.charAt(0) === '#') {\n"
++"\t\t\tvar h = s.slice(1);\n"
++"\t\t\tif (!/^[0-9a-f]+$/.test(h)) return null;\n"
++"\t\t\tif (h.length === 3 || h.length === 4)\n"
++"\t\t\t\th = h.replace(/./g, function (c) { return c + c; });\n"
++"\t\t\tif (h.length !== 6 && h.length !== 8) return null;\n"
++"\t\t\treturn [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16),\n"
++"\t\t\t\th.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1];\n"
++"\t\t}\n"
++"\t\tif ((m = /^(rgba?|hsla?)\\(\\s*(.*?)\\s*\\)$/.exec(s))) {\n"
++"\t\t\tvar parts = m[2].split(/\\s*,\\s*|\\s*\\/\\s*|\\s+/), n = [], i;\n"
++"\t\t\tif (parts.length < 3 || parts.length > 4) return null;\n"
++"\t\t\tfor (i = 0; i < parts.length; i++) {\n"
++"\t\t\t\tvar t = /^([+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:e[+-]?\\d+)?)(%|deg|rad|turn)?$/.exec(parts[i]);\n"
++"\t\t\t\tif (!t) {\n"
++"\t\t\t\t\tif (parts[i] === 'none') { n.push([0, '']); continue; }\n"
++"\t\t\t\t\treturn null;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tn.push([parseFloat(t[1]), t[2] || '']);\n"
++"\t\t\t}\n"
++"\t\t\tvar a = 1;\n"
++"\t\t\tif (n.length === 4) a = n[3][1] === '%' ? n[3][0] / 100 : n[3][0];\n"
++"\t\t\ta = clamp(a, 0, 1);\n"
++"\t\t\tif (m[1].charAt(0) === 'r') {\n"
++"\t\t\t\tvar c = [];\n"
++"\t\t\t\tfor (i = 0; i < 3; i++)\n"
++"\t\t\t\t\tc.push(clamp(n[i][1] === '%' ? n[i][0] * 2.55 : n[i][0], 0, 255));\n"
++"\t\t\t\treturn [Math.round(c[0]), Math.round(c[1]), Math.round(c[2]), a];\n"
++"\t\t\t}\n"
++"\t\t\tvar hue = n[0][0];\n"
++"\t\t\tif (n[0][1] === 'rad') hue = hue * 180 / Math.PI;\n"
++"\t\t\telse if (n[0][1] === 'turn') hue *= 360;\n"
++"\t\t\tvar rgb = hsl2rgb(hue, clamp(n[1][0] / 100, 0, 1), clamp(n[2][0] / 100, 0, 1));\n"
++"\t\t\treturn [Math.round(rgb[0]), Math.round(rgb[1]), Math.round(rgb[2]), a];\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\t/* pages set the same few colours again and again: parsed once each */\n"
++"\tvar colorCache = Object.create(null), colorCount = 0;\n"
++"\tfunction colorOf(v) {\n"
++"\t\tvar k = String(v), c = colorCache[k];\n"
++"\t\tif (c !== undefined) return c;\n"
++"\t\tc = parseColor(k);\n"
++"\t\tif (colorCount++ > 512) { colorCache = Object.create(null); colorCount = 0; }\n"
++"\t\tcolorCache[k] = c;\n"
++"\t\treturn c;\n"
++"\t}\n"
++"\tfunction hex2(n) { return (n < 16 ? '0' : '') + n.toString(16); }\n"
++"\tfunction serialColor(c) {\n"
++"\t\tif (c[3] >= 1) return '#' + hex2(c[0]) + hex2(c[1]) + hex2(c[2]);\n"
++"\t\tvar byte = Math.round(c[3] * 255), a = byte / 255;\n"
++"\t\tfor (var p = 1; p <= 3; p++) {\n"
++"\t\t\tvar t = Math.round(c[3] * Math.pow(10, p)) / Math.pow(10, p);\n"
++"\t\t\tif (Math.round(t * 255) === byte) { a = t; break; }\n"
++"\t\t}\n"
++"\t\treturn 'rgba(' + c[0] + ', ' + c[1] + ', ' + c[2] + ', ' + a + ')';\n"
++"\t}\n"
++"\n"
++"\t/* ---- fonts ---- */\n"
++"\tvar FONT_RE = /^((?:(?:normal|italic|oblique|small-caps|bold|bolder|lighter|[1-9]00|(?:ultra-|extra-|semi-)?(?:condensed|expanded))\\s+)*)([+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:e[+-]?\\d+)?)(px|pt|pc|in|cm|mm|q|em|rem|ex|ch|%|vw|vh)(?:\\s*\\/\\s*[^\\s]+)?\\s+(\\S.*)$/i;\n"
++"\tvar UNIT = { px: 1, pt: 4 / 3, pc: 16, 'in': 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6,\n"
++"\t\tem: 16, rem: 16, ex: 8, ch: 8, '%': 0.16, vw: 9.6, vh: 5.44 };\n"
++"\tfunction parseFont(v) {\n"
++"\t\tvar m = FONT_RE.exec(String(v).trim());\n"
++"\t\tif (!m) return null;\n"
++"\t\tvar pre = m[1].toLowerCase(), fam = m[4].trim();\n"
++"\t\tvar px = parseFloat(m[2]) * UNIT[m[3].toLowerCase()];\n"
++"\t\tif (!(px >= 0) || !isFinite(px)) return null;\n"
++"\t\tvar lf = fam.toLowerCase();\n"
++"\t\tvar family = /monospace|courier|consolas|menlo|monaco|mono\\b/.test(lf) ? 2 :\n"
++"\t\t\t(/(^|,)\\s*[\"']?(serif|times|georgia|garamond|palatino|cambria|book antiqua)/.test(lf) &&\n"
++"\t\t\t !/^\\s*[\"']?[^,]*sans/.test(lf) ? 1 : 0);\n"
++"\t\tvar words = pre.split(/\\s+/).filter(function (w) { return w && w !== 'normal'; });\n"
++"\t\tvar str = (words.length ? words.join(' ') + ' ' : '') +\n"
++"\t\t\t(Math.round(px * 1000) / 1000) + 'px ' + fam;\n"
++"\t\treturn { px: px, fam: family, b: /bold|bolder|[6-9]00/.test(pre) ? 1 : 0,\n"
++"\t\t\ti: /italic|oblique/.test(pre) ? 1 : 0, str: str };\n"
++"\t}\n"
++"\n"
++"\t/* ---- matrices: [a, b, c, d, e, f] ---- */\n"
++"\tfunction mul(m, n) {\n"
++"\t\treturn [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],\n"
++"\t\t\tm[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],\n"
++"\t\t\tm[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];\n"
++"\t}\n"
++"\tfunction inv(m) {\n"
++"\t\tvar det = m[0] * m[3] - m[1] * m[2];\n"
++"\t\tif (!det || !isFinite(det)) return null;\n"
++"\t\treturn [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det,\n"
++"\t\t\t(m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];\n"
++"\t}\n"
++"\tfunction scaleOf(m) { return Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])); }\n"
++"\tfunction matrixInit(o) {\n"
++"\t\tif (!o || typeof o !== 'object') return [1, 0, 0, 1, 0, 0];\n"
++"\t\tfunction pick(a, b, dflt) {\n"
++"\t\t\tvar v = o[a] !== undefined ? o[a] : o[b];\n"
++"\t\t\treturn v === undefined ? dflt : +v;\n"
++"\t\t}\n"
++"\t\treturn [pick('a', 'm11', 1), pick('b', 'm12', 0), pick('c', 'm21', 0),\n"
++"\t\t\tpick('d', 'm22', 1), pick('e', 'm41', 0), pick('f', 'm42', 0)];\n"
++"\t}\n"
++"\n"
++"\t/* ---- the path, in device pixels ---- */\n"
++"\tfunction Builder() { this.clear(); }\n"
++"\tBuilder.prototype.clear = function () {\n"
++"\t\tthis.p = []; this.c = []; this.cl = []; this.n = 0;\n"
++"\t\tthis.sx = 0; this.sy = 0; this.lx = 0; this.ly = 0; this.cache = null;\n"
++"\t};\n"
++"\tBuilder.prototype.end = function (closed) {\n"
++"\t\tif (this.n > 0) { this.c.push(this.n); this.cl.push(closed ? 1 : 0); }\n"
++"\t\tthis.n = 0;\n"
++"\t};\n"
++"\tBuilder.prototype.move = function (x, y) {\n"
++"\t\tthis.end(false);\n"
++"\t\tthis.p.push(x, y); this.n = 1;\n"
++"\t\tthis.sx = this.lx = x; this.sy = this.ly = y; this.cache = null;\n"
++"\t};\n"
++"\tBuilder.prototype.line = function (x, y) {\n"
++"\t\tif (this.n === 0) { this.move(x, y); return; }\n"
++"\t\tthis.p.push(x, y); this.n++;\n"
++"\t\tthis.lx = x; this.ly = y; this.cache = null;\n"
++"\t};\n"
++"\tBuilder.prototype.close = function () {\n"
++"\t\tif (this.n === 0) return;\n"
++"\t\tthis.end(true);\n"
++"\t\tthis.move(this.sx, this.sy);\n"
++"\t};\n"
++"\t/* -> [Float64Array points, Int32Array counts, Uint8Array closed] */\n"
++"\tBuilder.prototype.arrays = function () {\n"
++"\t\tif (this.cache) return this.cache;\n"
++"\t\tvar c = this.c.slice(), cl = this.cl.slice();\n"
++"\t\tif (this.n > 0) { c.push(this.n); cl.push(0); }\n"
++"\t\treturn (this.cache = [new Float64Array(this.p), new Int32Array(c), new Uint8Array(cl)]);\n"
++"\t};\n"
++"\tfunction tx(m, x, y) { return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]; }\n"
++"\tfunction curveSteps(len) { return clamp(Math.ceil(Math.sqrt(len) * 1.5), 1, 200); }\n"
++"\tfunction arcStepAngle(rd) {\n"
++"\t\tif (!(rd > 0.2)) return Math.PI / 2;\n"
++"\t\treturn Math.max(2 * Math.acos(1 - 0.2 / rd), 0.01);\n"
++"\t}\n"
++"\t/* an elliptical arc, user space: centre, radii, rotation, start, sweep */\n"
++"\tfunction arcPoints(b, m, x, y, rx, ry, rot, a0, sweep, joinFirst) {\n"
++"\t\tvar rd = Math.max(rx, ry) * Math.sqrt(Math.max(Math.abs(m[0] * m[0] + m[1] * m[1]),\n"
++"\t\t\tMath.abs(m[2] * m[2] + m[3] * m[3])));\n"
++"\t\tvar n = clamp(Math.ceil(Math.abs(sweep) / arcStepAngle(rd)), 1, 1000);\n"
++"\t\tvar cr = Math.cos(rot), sr = Math.sin(rot);\n"
++"\t\tfor (var i = 0; i <= n; i++) {\n"
++"\t\t\tvar t = a0 + sweep * i / n, ct = Math.cos(t), st = Math.sin(t);\n"
++"\t\t\tvar p = tx(m, x + rx * ct * cr - ry * st * sr, y + rx * ct * sr + ry * st * cr);\n"
++"\t\t\tif (i === 0 && !joinFirst) b.move(p[0], p[1]);\n"
++"\t\t\telse b.line(p[0], p[1]);\n"
++"\t\t}\n"
++"\t}\n"
++"\tfunction sweepOf(a0, a1, ccw) {\n"
++"\t\tvar s = a1 - a0;\n"
++"\t\tif (!ccw) {\n"
++"\t\t\tif (s >= PI2) return PI2;\n"
++"\t\t\ts %= PI2; if (s < 0) s += PI2;\n"
++"\t\t} else {\n"
++"\t\t\tif (s <= -PI2) return -PI2;\n"
++"\t\t\ts %= PI2; if (s > 0) s -= PI2;\n"
++"\t\t}\n"
++"\t\treturn s;\n"
++"\t}\n"
++"\t/* path operations, shared by the context and Path2D: (builder, matrix,\n"
++"\t * arguments in user space) */\n"
++"\tvar OPS = {\n"
++"\t\tmoveTo: function (b, m, x, y) {\n"
++"\t\t\tif (!fin(x, y)) return;\n"
++"\t\t\tvar p = tx(m, x, y); b.move(p[0], p[1]);\n"
++"\t\t},\n"
++"\t\tlineTo: function (b, m, x, y) {\n"
++"\t\t\tif (!fin(x, y)) return;\n"
++"\t\t\tvar p = tx(m, x, y); b.line(p[0], p[1]);\n"
++"\t\t},\n"
++"\t\tclosePath: function (b) { b.close(); },\n"
++"\t\tquadraticCurveTo: function (b, m, cx, cy, x, y) {\n"
++"\t\t\tif (!fin(cx, cy, x, y)) return;\n"
++"\t\t\tif (b.n === 0) OPS.moveTo(b, m, cx, cy);\n"
++"\t\t\tvar p0x = b.lx, p0y = b.ly, c = tx(m, cx, cy), e = tx(m, x, y);\n"
++"\t\t\tvar n = curveSteps(Math.hypot(c[0] - p0x, c[1] - p0y) + Math.hypot(e[0] - c[0], e[1] - c[1]));\n"
++"\t\t\tfor (var i = 1; i <= n; i++) {\n"
++"\t\t\t\tvar t = i / n, u = 1 - t;\n"
++"\t\t\t\tb.line(u * u * p0x + 2 * u * t * c[0] + t * t * e[0], u * u * p0y + 2 * u * t * c[1] + t * t * e[1]);\n"
++"\t\t\t}\n"
++"\t\t},\n"
++"\t\tbezierCurveTo: function (b, m, c1x, c1y, c2x, c2y, x, y) {\n"
++"\t\t\tif (!fin(c1x, c1y, c2x, c2y, x, y)) return;\n"
++"\t\t\tif (b.n === 0) OPS.moveTo(b, m, c1x, c1y);\n"
++"\t\t\tvar p0x = b.lx, p0y = b.ly, a = tx(m, c1x, c1y), c = tx(m, c2x, c2y), e = tx(m, x, y);\n"
++"\t\t\tvar n = curveSteps(Math.hypot(a[0] - p0x, a[1] - p0y) + Math.hypot(c[0] - a[0], c[1] - a[1]) +\n"
++"\t\t\t\tMath.hypot(e[0] - c[0], e[1] - c[1]));\n"
++"\t\t\tfor (var i = 1; i <= n; i++) {\n"
++"\t\t\t\tvar t = i / n, u = 1 - t, k0 = u * u * u, k1 = 3 * u * u * t, k2 = 3 * u * t * t, k3 = t * t * t;\n"
++"\t\t\t\tb.line(k0 * p0x + k1 * a[0] + k2 * c[0] + k3 * e[0], k0 * p0y + k1 * a[1] + k2 * c[1] + k3 * e[1]);\n"
++"\t\t\t}\n"
++"\t\t},\n"
++"\t\tarc: function (b, m, x, y, r, a0, a1, ccw) {\n"
++"\t\t\tif (!fin(x, y, r, a0, a1)) return;\n"
++"\t\t\tif (r < 0) throw domErr('The radius provided (' + r + ') is negative.', 'IndexSizeError');\n"
++"\t\t\tarcPoints(b, m, x, y, r, r, 0, a0, sweepOf(a0, a1, !!ccw), b.n > 0);\n"
++"\t\t},\n"
++"\t\tellipse: function (b, m, x, y, rx, ry, rot, a0, a1, ccw) {\n"
++"\t\t\tif (!fin(x, y, rx, ry, rot, a0, a1)) return;\n"
++"\t\t\tif (rx < 0 || ry < 0) throw domErr('The radius provided is negative.', 'IndexSizeError');\n"
++"\t\t\tarcPoints(b, m, x, y, rx, ry, rot, a0, sweepOf(a0, a1, !!ccw), b.n > 0);\n"
++"\t\t},\n"
++"\t\tarcTo: function (b, m, x1, y1, x2, y2, r) {\n"
++"\t\t\tif (!fin(x1, y1, x2, y2, r)) return;\n"
++"\t\t\tif (r < 0) throw domErr('The radius provided (' + r + ') is negative.', 'IndexSizeError');\n"
++"\t\t\tif (b.n === 0) { OPS.moveTo(b, m, x1, y1); return; }\n"
++"\t\t\tvar im = inv(m);\n"
++"\t\t\tif (!im) return;\n"
++"\t\t\tvar p0 = tx(im, b.lx, b.ly);\n"
++"\t\t\tvar v1x = p0[0] - x1, v1y = p0[1] - y1, v2x = x2 - x1, v2y = y2 - y1;\n"
++"\t\t\tvar l1 = Math.hypot(v1x, v1y), l2 = Math.hypot(v2x, v2y);\n"
++"\t\t\tvar cross = v1x * v2y - v1y * v2x;\n"
++"\t\t\tif (l1 === 0 || l2 === 0 || r === 0 || Math.abs(cross) < 1e-12 * l1 * l2) {\n"
++"\t\t\t\tOPS.lineTo(b, m, x1, y1);\n"
++"\t\t\t\treturn;\n"
++"\t\t\t}\n"
++"\t\t\tv1x /= l1; v1y /= l1; v2x /= l2; v2y /= l2;\n"
++"\t\t\tvar cosA = clamp(v1x * v2x + v1y * v2y, -1, 1), half = Math.acos(cosA) / 2;\n"
++"\t\t\tvar dist = r / Math.tan(half);\n"
++"\t\t\tvar t1x = x1 + v1x * dist, t1y = y1 + v1y * dist, t2x = x1 + v2x * dist, t2y = y1 + v2y * dist;\n"
++"\t\t\tvar bx = v1x + v2x, by = v1y + v2y, bl = Math.hypot(bx, by), cd = r / Math.sin(half);\n"
++"\t\t\tvar cx = x1 + bx / bl * cd, cy = y1 + by / bl * cd;\n"
++"\t\t\tvar as = Math.atan2(t1y - cy, t1x - cx), ae = Math.atan2(t2y - cy, t2x - cx), sw = ae - as;\n"
++"\t\t\twhile (sw > Math.PI) sw -= PI2;\n"
++"\t\t\twhile (sw <= -Math.PI) sw += PI2;\n"
++"\t\t\tOPS.lineTo(b, m, t1x, t1y);\n"
++"\t\t\tarcPoints(b, m, cx, cy, r, r, 0, as, sw, true);\n"
++"\t\t},\n"
++"\t\trect: function (b, m, x, y, w, h) {\n"
++"\t\t\tif (!fin(x, y, w, h)) return;\n"
++"\t\t\tOPS.moveTo(b, m, x, y); OPS.lineTo(b, m, x + w, y);\n"
++"\t\t\tOPS.lineTo(b, m, x + w, y + h); OPS.lineTo(b, m, x, y + h); b.close();\n"
++"\t\t},\n"
++"\t\troundRect: function (b, m, x, y, w, h, radii) {\n"
++"\t\t\tif (!fin(x, y, w, h)) return;\n"
++"\t\t\tvar r = radii === undefined ? [0] : (Array.isArray(radii) || (radii && typeof radii.length === 'number' && typeof radii !== 'string') ? Array.prototype.slice.call(radii) : [radii]);\n"
++"\t\t\tif (r.length < 1 || r.length > 4) throw new RangeError('roundRect: 1 to 4 radii');\n"
++"\t\t\tr = r.map(function (v) {\n"
++"\t\t\t\tvar n = typeof v === 'object' && v ? +(v.x !== undefined ? v.x : 0) : +v;\n"
++"\t\t\t\tif (!isFinite(n)) n = 0;\n"
++"\t\t\t\tif (n < 0) throw new RangeError('roundRect: a radius is negative');\n"
++"\t\t\t\treturn n;\n"
++"\t\t\t});\n"
++"\t\t\tvar tl, tr, br, bl;\n"
++"\t\t\tif (r.length === 1) tl = tr = br = bl = r[0];\n"
++"\t\t\telse if (r.length === 2) { tl = br = r[0]; tr = bl = r[1]; }\n"
++"\t\t\telse if (r.length === 3) { tl = r[0]; tr = bl = r[1]; br = r[2]; }\n"
++"\t\t\telse { tl = r[0]; tr = r[1]; br = r[2]; bl = r[3]; }\n"
++"\t\t\tvar aw = Math.abs(w), ah = Math.abs(h);\n"
++"\t\t\tvar f = Math.min(1, aw / ((tl + tr) || 1), aw / ((bl + br) || 1), ah / ((tl + bl) || 1), ah / ((tr + br) || 1));\n"
++"\t\t\ttl *= f; tr *= f; br *= f; bl *= f;\n"
++"\t\t\tif (w < 0) { x += w; w = -w; }\n"
++"\t\t\tif (h < 0) { y += h; h = -h; }\n"
++"\t\t\tOPS.moveTo(b, m, x + tl, y);\n"
++"\t\t\tOPS.lineTo(b, m, x + w - tr, y);\n"
++"\t\t\tif (tr) arcPoints(b, m, x + w - tr, y + tr, tr, tr, 0, -Math.PI / 2, Math.PI / 2, true);\n"
++"\t\t\tOPS.lineTo(b, m, x + w, y + h - br);\n"
++"\t\t\tif (br) arcPoints(b, m, x + w - br, y + h - br, br, br, 0, 0, Math.PI / 2, true);\n"
++"\t\t\tOPS.lineTo(b, m, x + bl, y + h);\n"
++"\t\t\tif (bl) arcPoints(b, m, x + bl, y + h - bl, bl, bl, 0, Math.PI / 2, Math.PI / 2, true);\n"
++"\t\t\tOPS.lineTo(b, m, x, y + tl);\n"
++"\t\t\tif (tl) arcPoints(b, m, x + tl, y + tl, tl, tl, 0, Math.PI, Math.PI / 2, true);\n"
++"\t\t\tb.close();\n"
++"\t\t\tOPS.moveTo(b, m, x, y);\n"
++"\t\t}\n"
++"\t};\n"
++"\n"
++"\t/* ---- Path2D ---- */\n"
++"\tfunction svgArc(path, x1, y1, rx, ry, phi, fa, fs, x2, y2) {\n"
++"\t\tif (x1 === x2 && y1 === y2) return;\n"
++"\t\trx = Math.abs(rx); ry = Math.abs(ry);\n"
++"\t\tif (!rx || !ry) { path.lineTo(x2, y2); return; }\n"
++"\t\tvar cp = Math.cos(phi), sp = Math.sin(phi);\n"
++"\t\tvar dx = (x1 - x2) / 2, dy = (y1 - y2) / 2;\n"
++"\t\tvar x1p = cp * dx + sp * dy, y1p = -sp * dx + cp * dy;\n"
++"\t\tvar lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);\n"
++"\t\tif (lam > 1) { lam = Math.sqrt(lam); rx *= lam; ry *= lam; }\n"
++"\t\tvar num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;\n"
++"\t\tvar den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;\n"
++"\t\tvar co = Math.sqrt(Math.max(0, num / den)) * (fa === fs ? -1 : 1);\n"
++"\t\tvar cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;\n"
++"\t\tvar cx = cp * cxp - sp * cyp + (x1 + x2) / 2, cy = sp * cxp + cp * cyp + (y1 + y2) / 2;\n"
++"\t\tfunction ang(ux, uy, vx, vy) {\n"
++"\t\t\tvar a = Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);\n"
++"\t\t\treturn a;\n"
++"\t\t}\n"
++"\t\tvar t1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);\n"
++"\t\tvar dt = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);\n"
++"\t\tif (!fs && dt > 0) dt -= PI2;\n"
++"\t\telse if (fs && dt < 0) dt += PI2;\n"
++"\t\tpath.ellipse(cx, cy, rx, ry, phi, t1, t1 + dt, dt < 0);\n"
++"\t}\n"
++"\tfunction parseSvgPath(path, s) {\n"
++"\t\tvar toks = String(s).match(/[MmLlHhVvCcSsQqTtAaZz]|[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?/g) || [];\n"
++"\t\tvar i = 0, cmd = '', x = 0, y = 0, sx = 0, sy = 0, cx = 0, cy = 0, last = '';\n"
++"\t\tfunction num() {\n"
++"\t\t\tif (i >= toks.length || /[a-z]/i.test(toks[i])) throw 0;\n"
++"\t\t\treturn parseFloat(toks[i++]);\n"
++"\t\t}\n"
++"\t\tfunction flag() {\n"
++"\t\t\t/* arc flags may be written together (\"a1 1 0 01 2 2\") */\n"
++"\t\t\tvar t = toks[i];\n"
++"\t\t\tif (t === undefined) throw 0;\n"
++"\t\t\tif (t.length > 1 && (t.charAt(0) === '0' || t.charAt(0) === '1') && !/[.eE]/.test(t.charAt(1))) {\n"
++"\t\t\t\ttoks[i] = t.slice(1);\n"
++"\t\t\t\treturn t.charAt(0) === '1';\n"
++"\t\t\t}\n"
++"\t\t\ti++;\n"
++"\t\t\treturn +t !== 0;\n"
++"\t\t}\n"
++"\t\ttry {\n"
++"\t\t\twhile (i < toks.length) {\n"
++"\t\t\t\tif (/[a-z]/i.test(toks[i])) cmd = toks[i++];\n"
++"\t\t\t\telse if (!cmd) break;\n"
++"\t\t\t\tvar rel = cmd === cmd.toLowerCase() && cmd !== 'z' ? 1 : 0, C = cmd.toUpperCase();\n"
++"\t\t\t\tvar ox = rel ? x : 0, oy = rel ? y : 0, a, b2, c2, d2, e2, f2;\n"
++"\t\t\t\tswitch (C) {\n"
++"\t\t\t\tcase 'M':\n"
++"\t\t\t\t\tx = num() + ox; y = num() + oy; path.moveTo(x, y); sx = x; sy = y;\n"
++"\t\t\t\t\tcmd = rel ? 'l' : 'L'; break;\n"
++"\t\t\t\tcase 'L': x = num() + ox; y = num() + oy; path.lineTo(x, y); break;\n"
++"\t\t\t\tcase 'H': x = num() + ox; path.lineTo(x, y); break;\n"
++"\t\t\t\tcase 'V': y = num() + oy; path.lineTo(x, y); break;\n"
++"\t\t\t\tcase 'C':\n"
++"\t\t\t\t\ta = num() + ox; b2 = num() + oy; c2 = num() + ox; d2 = num() + oy; e2 = num() + ox; f2 = num() + oy;\n"
++"\t\t\t\t\tpath.bezierCurveTo(a, b2, c2, d2, e2, f2); cx = c2; cy = d2; x = e2; y = f2; break;\n"
++"\t\t\t\tcase 'S':\n"
++"\t\t\t\t\ta = (last === 'C' || last === 'S') ? 2 * x - cx : x;\n"
++"\t\t\t\t\tb2 = (last === 'C' || last === 'S') ? 2 * y - cy : y;\n"
++"\t\t\t\t\tc2 = num() + ox; d2 = num() + oy; e2 = num() + ox; f2 = num() + oy;\n"
++"\t\t\t\t\tpath.bezierCurveTo(a, b2, c2, d2, e2, f2); cx = c2; cy = d2; x = e2; y = f2; break;\n"
++"\t\t\t\tcase 'Q':\n"
++"\t\t\t\t\ta = num() + ox; b2 = num() + oy; e2 = num() + ox; f2 = num() + oy;\n"
++"\t\t\t\t\tpath.quadraticCurveTo(a, b2, e2, f2); cx = a; cy = b2; x = e2; y = f2; break;\n"
++"\t\t\t\tcase 'T':\n"
++"\t\t\t\t\ta = (last === 'Q' || last === 'T') ? 2 * x - cx : x;\n"
++"\t\t\t\t\tb2 = (last === 'Q' || last === 'T') ? 2 * y - cy : y;\n"
++"\t\t\t\t\te2 = num() + ox; f2 = num() + oy;\n"
++"\t\t\t\t\tpath.quadraticCurveTo(a, b2, e2, f2); cx = a; cy = b2; x = e2; y = f2; break;\n"
++"\t\t\t\tcase 'A': {\n"
++"\t\t\t\t\tvar rx = num(), ry = num(), rot = num() * Math.PI / 180, fa = flag(), fs = flag();\n"
++"\t\t\t\t\te2 = num() + ox; f2 = num() + oy;\n"
++"\t\t\t\t\tsvgArc(path, x, y, rx, ry, rot, fa, fs, e2, f2); x = e2; y = f2; break;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tcase 'Z': path.closePath(); x = sx; y = sy; break;\n"
++"\t\t\t\tdefault: throw 0;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tlast = C;\n"
++"\t\t\t}\n"
++"\t\t} catch (e) { if (e !== 0) throw e; }\n"
++"\t}\n"
++"\tfunction Path2D(arg) {\n"
++"\t\tif (!(this instanceof Path2D)) throw new TypeError(\"Constructor Path2D requires 'new'\");\n"
++"\t\tdefine(this, '_ops', []);\n"
++"\t\tif (arg instanceof Path2D) this._ops = arg._ops.slice();\n"
++"\t\telse if (arg !== undefined && arg !== null) parseSvgPath(this, arg);\n"
++"\t}\n"
++"\tObject.keys(OPS).forEach(function (name) {\n"
++"\t\tdefine(Path2D.prototype, name, function () {\n"
++"\t\t\tvar a = Array.prototype.slice.call(arguments);\n"
++"\t\t\t/* validate now, as the context would */\n"
++"\t\t\tif ((name === 'arc' && a[2] < 0) || (name === 'arcTo' && a[4] < 0) ||\n"
++"\t\t\t    (name === 'ellipse' && (a[2] < 0 || a[3] < 0)))\n"
++"\t\t\t\tthrow domErr('The radius provided is negative.', 'IndexSizeError');\n"
++"\t\t\tthis._ops.push([name, a]);\n"
++"\t\t});\n"
++"\t});\n"
++"\tdefine(Path2D.prototype, 'addPath', function (p, m) {\n"
++"\t\tif (!(p instanceof Path2D)) throw new TypeError('addPath: not a Path2D');\n"
++"\t\tthis._ops.push(['__add', [p._ops.slice(), matrixInit(m)]]);\n"
++"\t});\n"
++"\tfunction replay(ops, b, m) {\n"
++"\t\tfor (var i = 0; i < ops.length; i++) {\n"
++"\t\t\tvar o = ops[i];\n"
++"\t\t\tif (o[0] === '__add') replay(o[1][0], b, mul(m, o[1][1]));\n"
++"\t\t\telse OPS[o[0]].apply(null, [b, m].concat(o[1]));\n"
++"\t\t}\n"
++"\t}\n"
++"\n"
++"\t/* ---- gradients, patterns, ImageData, TextMetrics ---- */\n"
++"\tfunction CanvasGradient() { throw new TypeError('Illegal constructor'); }\n"
++"\tfunction makeGrad(type, geo) {\n"
++"\t\tvar o = Object.create(CanvasGradient.prototype);\n"
++"\t\tdefine(o, '_t', type); define(o, '_g', geo); define(o, '_st', []);\n"
++"\t\treturn o;\n"
++"\t}\n"
++"\tdefine(CanvasGradient.prototype, 'addColorStop', function (off, color) {\n"
++"\t\toff = +off;\n"
++"\t\tif (!(off >= 0 && off <= 1)) throw domErr('The provided value (' + off + ') is outside the range (0.0, 1.0).', 'IndexSizeError');\n"
++"\t\tvar c = parseColor(String(color));\n"
++"\t\tif (!c) throw domErr(\"The value provided ('\" + color + \"') could not be parsed as a color.\", 'SyntaxError');\n"
++"\t\tvar st = this._st, i = st.length;\n"
++"\t\twhile (i > 0 && st[i - 1][0] > off) i--;\n"
++"\t\tst.splice(i, 0, [off, c]);\n"
++"\t});\n"
++"\tfunction CanvasPattern() { throw new TypeError('Illegal constructor'); }\n"
++"\tdefine(CanvasPattern.prototype, 'setTransform', function (m) { this._m = matrixInit(m); });\n"
++"\tfunction ImageData(a, b, c) {\n"
++"\t\tif (!(this instanceof ImageData)) throw new TypeError(\"Constructor ImageData requires 'new'\");\n"
++"\t\tvar w, h, data;\n"
++"\t\tif (a && typeof a === 'object' && typeof a.length === 'number') {\n"
++"\t\t\tif (!(a instanceof Uint8ClampedArray)) throw new TypeError('ImageData: data is not a Uint8ClampedArray');\n"
++"\t\t\tw = b >>> 0;\n"
++"\t\t\tif (!w || a.length % 4 || (a.length / 4) % w) throw domErr('ImageData: bad width', 'IndexSizeError');\n"
++"\t\t\th = c === undefined ? a.length / 4 / w : c >>> 0;\n"
++"\t\t\tif (h * w * 4 !== a.length) throw domErr('ImageData: bad height', 'IndexSizeError');\n"
++"\t\t\tdata = a;\n"
++"\t\t} else {\n"
++"\t\t\tw = a >>> 0; h = b >>> 0;\n"
++"\t\t\tif (!w || !h) throw domErr('The source width is 0.', 'IndexSizeError');\n"
++"\t\t\tdata = new Uint8ClampedArray(w * h * 4);\n"
++"\t\t}\n"
++"\t\tdefine(this, '_w', w); define(this, '_h', h); define(this, '_d', data);\n"
++"\t}\n"
++"\tObject.defineProperty(ImageData.prototype, 'width', { configurable: true, get: function () { return this._w; } });\n"
++"\tObject.defineProperty(ImageData.prototype, 'height', { configurable: true, get: function () { return this._h; } });\n"
++"\tObject.defineProperty(ImageData.prototype, 'data', { configurable: true, get: function () { return this._d; } });\n"
++"\tObject.defineProperty(ImageData.prototype, 'colorSpace', { configurable: true, get: function () { return 'srgb'; } });\n"
++"\tfunction TextMetrics() { throw new TypeError('Illegal constructor'); }\n"
++"\n"
++"\t/* ---- the context ---- */\n"
++"\tvar OPNAMES = ['source-over', 'source-in', 'source-out', 'source-atop', 'destination-over',\n"
++"\t\t'destination-in', 'destination-out', 'destination-atop', 'lighter', 'copy', 'xor',\n"
++"\t\t'multiply', 'screen', 'darken', 'lighten'];\n"
++"\t/* blend modes drawn as source-over */\n"
++"\tvar OPOTHER = ['overlay', 'color-dodge', 'color-burn', 'hard-light', 'soft-light',\n"
++"\t\t'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'];\n"
++"\tvar BLACK = [0, 0, 0, 0, 1];\n"
++"\tfunction fresh() {\n"
++"\t\treturn { fs: '#000000', fc: BLACK, ss: '#000000', sc: BLACK, lw: 1,\n"
++"\t\t\tcap: 'butt', join: 'miter', ml: 10, dash: [], doff: 0,\n"
++"\t\t\tfont: '10px sans-serif', f: { px: 10, fam: 0, b: 0, i: 0 }, ta: 'start',\n"
++"\t\t\ttb: 'alphabetic', dir: 'inherit', ga: 1, gco: 'source-over', op: 0,\n"
++"\t\t\tm: [1, 0, 0, 1, 0, 0], ise: true, isq: 'low', shb: 0, shc: 'rgba(0, 0, 0, 0)',\n"
++"\t\t\tshx: 0, shy: 0, filter: 'none', ls: '0px', ws: '0px', fk: 'auto', fst: 'normal',\n"
++"\t\t\tfvc: 'normal', tr: 'auto' };\n"
++"\t}\n"
++"\tfunction copyState(s) {\n"
++"\t\tvar o = {}, k;\n"
++"\t\tfor (k in s) o[k] = s[k];\n"
++"\t\to.m = s.m.slice(); o.dash = s.dash.slice();\n"
++"\t\treturn o;\n"
++"\t}\n"
++"\tfunction attrDim(el, name, dflt) {\n"
++"\t\tvar v = el.getAttribute(name);\n"
++"\t\tif (v == null) return dflt;\n"
++"\t\tvar m = /^[\\t\\n\\f\\r ]*\\+?(\\d+)/.exec(String(v));\n"
++"\t\tif (!m) return dflt;\n"
++"\t\tvar n = parseInt(m[1], 10);\n"
++"\t\treturn n >= 0 && n <= 0x7fffffff ? n : dflt;\n"
++"\t}\n"
++"\tfunction CanvasRenderingContext2D() { throw new TypeError('Illegal constructor'); }\n"
++"\tvar C = CanvasRenderingContext2D.prototype;\n"
++"\tfunction makeCtx(el) {\n"
++"\t\tvar c = Object.create(C);\n"
++"\t\tdefine(c, '_el', el);\n"
++"\t\tdefine(c, '_h', cv.create(el, attrDim(el, 'width', 300), attrDim(el, 'height', 150)));\n"
++"\t\tdefine(c, '_s', fresh());\n"
++"\t\tdefine(c, '_stack', []);\n"
++"\t\tdefine(c, '_b', new Builder());\n"
++"\t\treturn c;\n"
++"\t}\n"
++"\tfunction ctxOf(el) {\n"
++"\t\tvar c = el.__vbCtx2d;\n"
++"\t\treturn c && c._el === el ? c : null;\n"
++"\t}\n"
++"\t/* a canvas's size changed (or was set again): it is cleared and its\n"
++"\t * context starts over */\n"
++"\tfunction resetCanvas(el) {\n"
++"\t\tvar c = ctxOf(el);\n"
++"\t\tif (!c) return;\n"
++"\t\tcv.resize(c._h, attrDim(el, 'width', 300), attrDim(el, 'height', 150));\n"
++"\t\tc._s = fresh(); c._stack = []; c._b.clear();\n"
++"\t}\n"
++"\tObject.defineProperty(C, 'canvas', { configurable: true, enumerable: true,\n"
++"\t\tget: function () { return this._el; } });\n"
++"\tfunction prop(name, get, set) {\n"
++"\t\tObject.defineProperty(C, name, { configurable: true, enumerable: true,\n"
++"\t\t\tget: get, set: set });\n"
++"\t}\n"
++"\t/* the colour is kept as its paint, [0, r, g, b, a] (shared, never\n"
++"\t * changed), with its serialization */\n"
++"\tvar serialCache = new WeakMap();\n"
++"\tfunction styleProp(name, sk, ck) {\n"
++"\t\tprop(name, function () { return this._s[sk]; }, function (v) {\n"
++"\t\t\tif (v && typeof v === 'object' && (v instanceof CanvasGradient || v instanceof CanvasPattern)) {\n"
++"\t\t\t\tthis._s[sk] = v; this._s[ck] = null;\n"
++"\t\t\t\treturn;\n"
++"\t\t\t}\n"
++"\t\t\tvar c = colorOf(v);\n"
++"\t\t\tif (!c) return;\n"
++"\t\t\tvar ser = serialCache.get(c);\n"
++"\t\t\tif (ser === undefined) {\n"
++"\t\t\t\tser = [serialColor(c), [0, c[0], c[1], c[2], c[3]]];\n"
++"\t\t\t\tserialCache.set(c, ser);\n"
++"\t\t\t}\n"
++"\t\t\tthis._s[sk] = ser[0]; this._s[ck] = ser[1];\n"
++"\t\t});\n"
++"\t}\n"
++"\tstyleProp('fillStyle', 'fs', 'fc');\n"
++"\tstyleProp('strokeStyle', 'ss', 'sc');\n"
++"\tfunction numProp(name, k, ok) {\n"
++"\t\tprop(name, function () { return this._s[k]; }, function (v) {\n"
++"\t\t\tv = +v;\n"
++"\t\t\tif (isFinite(v) && (!ok || ok(v))) this._s[k] = v;\n"
++"\t\t});\n"
++"\t}\n"
++"\tnumProp('lineWidth', 'lw', function (v) { return v > 0; });\n"
++"\tnumProp('miterLimit', 'ml', function (v) { return v > 0; });\n"
++"\tnumProp('lineDashOffset', 'doff');\n"
++"\tnumProp('globalAlpha', 'ga', function (v) { return v >= 0 && v <= 1; });\n"
++"\tnumProp('shadowBlur', 'shb', function (v) { return v >= 0; });\n"
++"\tnumProp('shadowOffsetX', 'shx');\n"
++"\tnumProp('shadowOffsetY', 'shy');\n"
++"\tfunction enumProp(name, k, values) {\n"
++"\t\tprop(name, function () { return this._s[k]; }, function (v) {\n"
++"\t\t\tv = String(v);\n"
++"\t\t\tif (values.indexOf(v) >= 0) this._s[k] = v;\n"
++"\t\t});\n"
++"\t}\n"
++"\tenumProp('lineCap', 'cap', ['butt', 'round', 'square']);\n"
++"\tenumProp('lineJoin', 'join', ['miter', 'round', 'bevel']);\n"
++"\tenumProp('textAlign', 'ta', ['start', 'end', 'left', 'right', 'center']);\n"
++"\tenumProp('textBaseline', 'tb', ['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom']);\n"
++"\tenumProp('direction', 'dir', ['ltr', 'rtl', 'inherit']);\n"
++"\tenumProp('imageSmoothingQuality', 'isq', ['low', 'medium', 'high']);\n"
++"\tenumProp('fontKerning', 'fk', ['auto', 'normal', 'none']);\n"
++"\tenumProp('fontStretch', 'fst', ['ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed', 'normal',\n"
++"\t\t'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded']);\n"
++"\tenumProp('fontVariantCaps', 'fvc', ['normal', 'small-caps', 'all-small-caps', 'petite-caps',\n"
++"\t\t'all-petite-caps', 'unicase', 'titling-caps']);\n"
++"\tenumProp('textRendering', 'tr', ['auto', 'optimizeSpeed', 'optimizeLegibility', 'geometricPrecision']);\n"
++"\tprop('globalCompositeOperation', function () { return this._s.gco; }, function (v) {\n"
++"\t\tv = String(v);\n"
++"\t\tvar i = OPNAMES.indexOf(v);\n"
++"\t\tif (i < 0 && OPOTHER.indexOf(v) < 0) return;\n"
++"\t\tthis._s.gco = v; this._s.op = i < 0 ? 0 : i;\n"
++"\t});\n"
++"\tprop('imageSmoothingEnabled', function () { return this._s.ise; }, function (v) { this._s.ise = !!v; });\n"
++"\tprop('shadowColor', function () { return this._s.shc; }, function (v) {\n"
++"\t\tvar c = parseColor(String(v));\n"
++"\t\tif (c) this._s.shc = serialColor(c);\n"
++"\t});\n"
++"\tprop('filter', function () { return this._s.filter; }, function (v) { this._s.filter = String(v); });\n"
++"\tprop('letterSpacing', function () { return this._s.ls; }, function (v) { this._s.ls = String(v); });\n"
++"\tprop('wordSpacing', function () { return this._s.ws; }, function (v) { this._s.ws = String(v); });\n"
++"\tprop('font', function () { return this._s.font; }, function (v) {\n"
++"\t\tvar f = parseFont(v);\n"
++"\t\tif (!f) return;\n"
++"\t\tthis._s.font = f.str; this._s.f = f;\n"
++"\t});\n"
++"\n"
++"\tfunction meth(name, fn) { define(C, name, fn); }\n"
++"\tmeth('save', function () { this._stack.push(copyState(this._s)); cv.save(this._h); });\n"
++"\tmeth('restore', function () {\n"
++"\t\tif (!this._stack.length) return;\n"
++"\t\tthis._s = this._stack.pop(); cv.restore(this._h);\n"
++"\t});\n"
++"\tmeth('reset', function () {\n"
++"\t\tcv.resize(this._h, attrDim(this._el, 'width', 300), attrDim(this._el, 'height', 150));\n"
++"\t\tthis._s = fresh(); this._stack = []; this._b.clear();\n"
++"\t});\n"
++"\tmeth('isContextLost', function () { return false; });\n"
++"\tmeth('getContextAttributes', function () {\n"
++"\t\treturn { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false };\n"
++"\t});\n"
++"\t/* transforms */\n"
++"\tmeth('setTransform', function (a, b, c, dd, e, f) {\n"
++"\t\tvar m = arguments.length >= 6 ? [+a, +b, +c, +dd, +e, +f] : matrixInit(a);\n"
++"\t\tif (fin.apply(null, m)) this._s.m = m;\n"
++"\t});\n"
++"\tmeth('resetTransform', function () { this._s.m = [1, 0, 0, 1, 0, 0]; });\n"
++"\tmeth('transform', function (a, b, c, dd, e, f) {\n"
++"\t\tif (fin(a, b, c, dd, e, f)) this._s.m = mul(this._s.m, [a, b, c, dd, e, f]);\n"
++"\t});\n"
++"\tmeth('translate', function (x, y) {\n"
++"\t\tif (fin(x, y)) this._s.m = mul(this._s.m, [1, 0, 0, 1, x, y]);\n"
++"\t});\n"
++"\tmeth('scale', function (x, y) {\n"
++"\t\tif (fin(x, y)) this._s.m = mul(this._s.m, [x, 0, 0, y, 0, 0]);\n"
++"\t});\n"
++"\tmeth('rotate', function (a) {\n"
++"\t\tif (fin(a)) this._s.m = mul(this._s.m, [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a), 0, 0]);\n"
++"\t});\n"
++"\tmeth('getTransform', function () {\n"
++"\t\tvar m = this._s.m;\n"
++"\t\tif (typeof g.DOMMatrix === 'function') {\n"
++"\t\t\ttry { return new g.DOMMatrix(m); } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\treturn { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5],\n"
++"\t\t\tm11: m[0], m12: m[1], m21: m[2], m22: m[3], m41: m[4], m42: m[5],\n"
++"\t\t\tis2D: true, isIdentity: m[0] === 1 && !m[1] && !m[2] && m[3] === 1 && !m[4] && !m[5] };\n"
++"\t});\n"
++"\t/* the path */\n"
++"\tmeth('beginPath', function () { this._b.clear(); });\n"
++"\tObject.keys(OPS).forEach(function (name) {\n"
++"\t\tmeth(name, function () {\n"
++"\t\t\tOPS[name].apply(null, [this._b, this._s.m].concat(Array.prototype.slice.call(arguments)));\n"
++"\t\t});\n"
++"\t});\n"
++"\t/* the shape to draw: the current path, or a Path2D under the current\n"
++"\t * transform; and the fill rule */\n"
++"\tfunction shape(ctx, a, b) {\n"
++"\t\tif (a instanceof Path2D) {\n"
++"\t\t\tvar pb = new Builder();\n"
++"\t\t\treplay(a._ops, pb, ctx._s.m);\n"
++"\t\t\treturn [pb.arrays(), b === 'evenodd'];\n"
++"\t\t}\n"
++"\t\treturn [ctx._b.arrays(), a === 'evenodd'];\n"
++"\t}\n"
++"\tfunction stops(gr) {\n"
++"\t\tvar a = new Float64Array(gr._st.length * 5);\n"
++"\t\tgr._st.forEach(function (s, i) {\n"
++"\t\t\ta[5 * i] = s[0]; a[5 * i + 1] = s[1][0]; a[5 * i + 2] = s[1][1];\n"
++"\t\t\ta[5 * i + 3] = s[1][2]; a[5 * i + 4] = s[1][3];\n"
++"\t\t});\n"
++"\t\treturn a;\n"
++"\t}\n"
++"\t/* an image source: [handle-or-element, width, height], or null when it\n"
++"\t * has nothing to draw yet */\n"
++"\tfunction source(img) {\n"
++"\t\tif (img && img.__vbBitmap) img = img.__vbBitmap;\n"
++"\t\tif (isCanvas(img)) {\n"
++"\t\t\tvar c = ctxOf(img);\n"
++"\t\t\tvar w = attrDim(img, 'width', 300), h = attrDim(img, 'height', 150);\n"
++"\t\t\tif (!w || !h) throw domErr('The image argument is a canvas element with a width or height of 0.', 'InvalidStateError');\n"
++"\t\t\treturn c ? [c._h, w, h] : null;\n"
++"\t\t}\n"
++"\t\tif (isImgEl(img)) {\n"
++"\t\t\tvar sz = cv.imgsize(img);\n"
++"\t\t\treturn sz && sz[0] > 0 && sz[1] > 0 ? [img, sz[0], sz[1]] : null;\n"
++"\t\t}\n"
++"\t\tif (img && img.nodeType === 1) return null;\t/* <video>, <svg image>: nothing yet */\n"
++"\t\tthrow new TypeError(\"Failed to execute 'drawImage': The provided value is not of type '(HTMLImageElement or HTMLCanvasElement or ImageBitmap)'.\");\n"
++"\t}\n"
++"\tfunction paintOf(ctx, style, col) {\n"
++"\t\tvar s = ctx._s, im;\n"
++"\t\tif (col) return col;\n"
++"\t\tif (style instanceof CanvasGradient) {\n"
++"\t\t\tim = inv(s.m);\n"
++"\t\t\tif (!im) return null;\n"
++"\t\t\tvar geo = style._g;\n"
++"\t\t\treturn [style._t].concat(im, geo, [stops(style)]);\n"
++"\t\t}\n"
++"\t\tif (style instanceof CanvasPattern) {\n"
++"\t\t\tvar src = source(style._src);\n"
++"\t\t\tif (!src) return null;\n"
++"\t\t\tim = inv(mul(s.m, style._m || [1, 0, 0, 1, 0, 0]));\n"
++"\t\t\tif (!im) return null;\n"
++"\t\t\tvar r = style._rep;\n"
++"\t\t\treturn [4].concat(im, [src[0], 0, 0, src[1], src[2],\n"
++"\t\t\t\tr === 'repeat' || r === 'repeat-x' ? 1 : 0,\n"
++"\t\t\t\tr === 'repeat' || r === 'repeat-y' ? 1 : 0, s.ise ? 1 : 0]);\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction fillWith(ctx, arrs, evenodd, paint) {\n"
++"\t\tif (paint) cv.fill(ctx._h, arrs[0], arrs[1], evenodd, paint, ctx._s.ga, ctx._s.op);\n"
++"\t}\n"
++"\tfunction dashed(arrs, dash, off, sc) {\n"
++"\t\tvar pts = arrs[0], cnt = arrs[1], cls = arrs[2];\n"
++"\t\tvar total = 0, i, k;\n"
++"\t\tvar pat = dash.map(function (v) { return v * sc; });\n"
++"\t\tfor (i = 0; i < pat.length; i++) total += pat[i];\n"
++"\t\tif (!(total > 0)) return arrs;\n"
++"\t\tvar op = [], oc = [], base = 0;\n"
++"\t\tfor (k = 0; k < cnt.length; k++) {\n"
++"\t\t\tvar n = cnt[k], seg = [];\n"
++"\t\t\tfor (i = 0; i < n; i++) seg.push(pts[2 * (base + i)], pts[2 * (base + i) + 1]);\n"
++"\t\t\tif (cls[k] && n > 1) seg.push(pts[2 * base], pts[2 * base + 1]);\n"
++"\t\t\tbase += n;\n"
++"\t\t\t/* where in the pattern this subpath starts */\n"
++"\t\t\tvar pos = ((off * sc) % total + total) % total, di = 0;\n"
++"\t\t\twhile (pos >= pat[di]) { pos -= pat[di]; di = (di + 1) % pat.length; }\n"
++"\t\t\tvar left = pat[di] - pos, on = !(di & 1), cur = [];\n"
++"\t\t\tif (on) cur.push(seg[0], seg[1]);\n"
++"\t\t\tfor (i = 2; i < seg.length; i += 2) {\n"
++"\t\t\t\tvar x0 = seg[i - 2], y0 = seg[i - 1], x1 = seg[i], y1 = seg[i + 1];\n"
++"\t\t\t\tvar len = Math.hypot(x1 - x0, y1 - y0), t = 0;\n"
++"\t\t\t\twhile (len - t > left) {\n"
++"\t\t\t\t\tt += left;\n"
++"\t\t\t\t\tvar px = x0 + (x1 - x0) * t / len, py = y0 + (y1 - y0) * t / len;\n"
++"\t\t\t\t\tif (on) { cur.push(px, py); op.push(cur); cur = []; }\n"
++"\t\t\t\t\telse cur = [px, py];\n"
++"\t\t\t\t\ton = !on; di = (di + 1) % pat.length; left = pat[di];\n"
++"\t\t\t\t\tif (op.length > 200000) return arrs;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tleft -= len - t;\n"
++"\t\t\t\tif (on) cur.push(x1, y1);\n"
++"\t\t\t}\n"
++"\t\t\tif (on && cur.length >= 4) op.push(cur);\n"
++"\t\t}\n"
++"\t\tvar flat = [];\n"
++"\t\top.forEach(function (c) { flat.push.apply(flat, c); oc.push(c.length / 2); });\n"
++"\t\treturn [new Float64Array(flat), new Int32Array(oc), new Uint8Array(oc.length)];\n"
++"\t}\n"
++"\tvar CAPS = { butt: 0, round: 1, square: 2 }, JOINS = { miter: 0, round: 1, bevel: 2 };\n"
++"\tfunction strokeWith(ctx, arrs) {\n"
++"\t\tvar s = ctx._s, sc = scaleOf(s.m), paint = paintOf(ctx, s.ss, s.sc);\n"
++"\t\tif (!paint || !(sc > 0)) return;\n"
++"\t\tif (s.dash.length) arrs = dashed(arrs, s.dash, s.doff, sc);\n"
++"\t\tcv.stroke(ctx._h, arrs[0], arrs[1], arrs[2], s.lw * sc, CAPS[s.cap], JOINS[s.join], s.ml,\n"
++"\t\t\tpaint, s.ga, s.op);\n"
++"\t}\n"
++"\tmeth('fill', function (a, b) {\n"
++"\t\tvar sh = shape(this, a, b);\n"
++"\t\tfillWith(this, sh[0], sh[1], paintOf(this, this._s.fs, this._s.fc));\n"
++"\t});\n"
++"\tmeth('stroke', function (a) {\n"
++"\t\tstrokeWith(this, shape(this, a)[0]);\n"
++"\t});\n"
++"\tmeth('clip', function (a, b) {\n"
++"\t\tvar sh = shape(this, a, b);\n"
++"\t\tcv.clip(this._h, sh[0][0], sh[0][1], sh[1]);\n"
++"\t});\n"
++"\tfunction rectArrs(m, x, y, w, h) {\n"
++"\t\tvar b = new Builder();\n"
++"\t\tOPS.rect(b, m, x, y, w, h);\n"
++"\t\treturn b.arrays();\n"
++"\t}\n"
++"\t/* fillRect / clearRect / drawImage: the rectangle's corners, in arrays\n"
++"\t * reused call after call (the natives copy what they need) */\n"
++"\tvar RP = new Float64Array(8), RC = new Int32Array([4]);\n"
++"\tfunction rectPts(m, x, y, w, h) {\n"
++"\t\tvar x1 = x + w, y1 = y + h;\n"
++"\t\tRP[0] = m[0] * x + m[2] * y + m[4]; RP[1] = m[1] * x + m[3] * y + m[5];\n"
++"\t\tRP[2] = m[0] * x1 + m[2] * y + m[4]; RP[3] = m[1] * x1 + m[3] * y + m[5];\n"
++"\t\tRP[4] = m[0] * x1 + m[2] * y1 + m[4]; RP[5] = m[1] * x1 + m[3] * y1 + m[5];\n"
++"\t\tRP[6] = m[0] * x + m[2] * y1 + m[4]; RP[7] = m[1] * x + m[3] * y1 + m[5];\n"
++"\t\treturn RP;\n"
++"\t}\n"
++"\tmeth('fillRect', function (x, y, w, h) {\n"
++"\t\tif (!fin(x, y, w, h) || !w || !h) return;\n"
++"\t\tvar s = this._s, paint = s.fc || paintOf(this, s.fs, null);\n"
++"\t\tif (paint) cv.fill(this._h, rectPts(s.m, x, y, w, h), RC, false, paint, s.ga, s.op);\n"
++"\t});\n"
++"\tmeth('strokeRect', function (x, y, w, h) {\n"
++"\t\tif (!fin(x, y, w, h)) return;\n"
++"\t\tstrokeWith(this, rectArrs(this._s.m, x, y, w, h));\n"
++"\t});\n"
++"\tmeth('clearRect', function (x, y, w, h) {\n"
++"\t\tif (!fin(x, y, w, h) || !w || !h) return;\n"
++"\t\t/* destination-out with opaque paint: clears, inside the clip */\n"
++"\t\tcv.fill(this._h, rectPts(this._s.m, x, y, w, h), RC, false, BLACK, 1, 6);\n"
++"\t});\n"
++"\tfunction windAt(arrs, x, y, evenodd) {\n"
++"\t\tvar pts = arrs[0], cnt = arrs[1], base = 0, w = 0, k, i;\n"
++"\t\tfor (k = 0; k < cnt.length; k++) {\n"
++"\t\t\tvar n = cnt[k];\n"
++"\t\t\tfor (i = 0; i < n; i++) {\n"
++"\t\t\t\tvar j = (i + 1) % n;\n"
++"\t\t\t\tvar x0 = pts[2 * (base + i)], y0 = pts[2 * (base + i) + 1];\n"
++"\t\t\t\tvar x1 = pts[2 * (base + j)], y1 = pts[2 * (base + j) + 1];\n"
++"\t\t\t\tif ((y0 <= y) !== (y1 <= y)) {\n"
++"\t\t\t\t\tvar xc = x0 + (y - y0) * (x1 - x0) / (y1 - y0);\n"
++"\t\t\t\t\tif (xc > x) w += y1 > y0 ? 1 : -1;\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t\tbase += n;\n"
++"\t\t}\n"
++"\t\treturn evenodd ? (w & 1) !== 0 : w !== 0;\n"
++"\t}\n"
++"\tmeth('isPointInPath', function (a, b, c, dd) {\n"
++"\t\tif (a instanceof Path2D) {\n"
++"\t\t\tif (!fin(+b, +c)) return false;\n"
++"\t\t\treturn windAt(shape(this, a)[0], +b, +c, dd === 'evenodd');\n"
++"\t\t}\n"
++"\t\tif (!fin(+a, +b)) return false;\n"
++"\t\treturn windAt(this._b.arrays(), +a, +b, c === 'evenodd');\n"
++"\t});\n"
++"\tmeth('isPointInStroke', function (a, b, c) {\n"
++"\t\tvar arrs, x, y;\n"
++"\t\tif (a instanceof Path2D) { arrs = shape(this, a)[0]; x = +b; y = +c; }\n"
++"\t\telse { arrs = this._b.arrays(); x = +a; y = +b; }\n"
++"\t\tif (!fin(x, y)) return false;\n"
++"\t\tvar hw = this._s.lw * scaleOf(this._s.m) / 2, pts = arrs[0], cnt = arrs[1], cls = arrs[2], base = 0;\n"
++"\t\tfor (var k = 0; k < cnt.length; k++) {\n"
++"\t\t\tvar n = cnt[k], segs = cls[k] ? n : n - 1;\n"
++"\t\t\tfor (var i = 0; i < segs; i++) {\n"
++"\t\t\t\tvar j = (i + 1) % n;\n"
++"\t\t\t\tvar x0 = pts[2 * (base + i)], y0 = pts[2 * (base + i) + 1];\n"
++"\t\t\t\tvar x1 = pts[2 * (base + j)], y1 = pts[2 * (base + j) + 1];\n"
++"\t\t\t\tvar dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;\n"
++"\t\t\t\tvar t = l2 ? clamp(((x - x0) * dx + (y - y0) * dy) / l2, 0, 1) : 0;\n"
++"\t\t\t\tif (Math.hypot(x - x0 - t * dx, y - y0 - t * dy) <= hw) return true;\n"
++"\t\t\t}\n"
++"\t\t\tbase += n;\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t});\n"
++"\tmeth('drawFocusIfNeeded', function () { });\n"
++"\tmeth('scrollPathIntoView', function () { });\n"
++"\t/* lines */\n"
++"\tmeth('setLineDash', function (seg) {\n"
++"\t\tif (!seg || typeof seg.length !== 'number') throw new TypeError('setLineDash: not a sequence');\n"
++"\t\tvar a = Array.prototype.slice.call(seg).map(Number);\n"
++"\t\tfor (var i = 0; i < a.length; i++) if (!isFinite(a[i]) || a[i] < 0) return;\n"
++"\t\tif (a.length & 1) a = a.concat(a);\n"
++"\t\tthis._s.dash = a;\n"
++"\t});\n"
++"\tmeth('getLineDash', function () { return this._s.dash.slice(); });\n"
++"\t/* gradients and patterns */\n"
++"\tmeth('createLinearGradient', function (x0, y0, x1, y1) {\n"
++"\t\tif (!fin(x0, y0, x1, y1)) throw new TypeError(\"createLinearGradient: a value is non-finite\");\n"
++"\t\treturn makeGrad(1, [x0, y0, x1, y1]);\n"
++"\t});\n"
++"\tmeth('createRadialGradient', function (x0, y0, r0, x1, y1, r1) {\n"
++"\t\tif (!fin(x0, y0, r0, x1, y1, r1)) throw new TypeError(\"createRadialGradient: a value is non-finite\");\n"
++"\t\tif (r0 < 0 || r1 < 0) throw domErr('The radius provided is negative.', 'IndexSizeError');\n"
++"\t\treturn makeGrad(2, [x0, y0, r0, x1, y1, r1]);\n"
++"\t});\n"
++"\tmeth('createConicGradient', function (a, x, y) {\n"
++"\t\tif (!fin(a, x, y)) throw new TypeError(\"createConicGradient: a value is non-finite\");\n"
++"\t\treturn makeGrad(3, [a, x, y]);\n"
++"\t});\n"
++"\tmeth('createPattern', function (img, rep) {\n"
++"\t\trep = rep === null || rep === undefined || rep === '' ? 'repeat' : String(rep);\n"
++"\t\tif (['repeat', 'repeat-x', 'repeat-y', 'no-repeat'].indexOf(rep) < 0)\n"
++"\t\t\tthrow domErr(\"The provided type ('\" + rep + \"') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'.\", 'SyntaxError');\n"
++"\t\tif (!source(img) && !isCanvas(img)) return null;\n"
++"\t\tvar p = Object.create(CanvasPattern.prototype);\n"
++"\t\tdefine(p, '_src', img); define(p, '_rep', rep); define(p, '_m', [1, 0, 0, 1, 0, 0]);\n"
++"\t\treturn p;\n"
++"\t});\n"
++"\t/* images */\n"
++"\tmeth('drawImage', function (img, a1, a2, a3, a4, a5, a6, a7, a8) {\n"
++"\t\tvar n = arguments.length, src = source(img), sx, sy, sw, sh, dx, dy, dw, dh;\n"
++"\t\tif (n !== 3 && n !== 5 && n !== 9) throw new TypeError('drawImage: 3, 5 or 9 arguments');\n"
++"\t\tif (!src) return;\n"
++"\t\tif (n === 3) { sx = 0; sy = 0; sw = src[1]; sh = src[2]; dx = a1; dy = a2; dw = sw; dh = sh; }\n"
++"\t\telse if (n === 5) { sx = 0; sy = 0; sw = src[1]; sh = src[2]; dx = a1; dy = a2; dw = a3; dh = a4; }\n"
++"\t\telse { sx = a1; sy = a2; sw = a3; sh = a4; dx = a5; dy = a6; dw = a7; dh = a8; }\n"
++"\t\tif (!fin(sx, sy, sw, sh, dx, dy, dw, dh) || !sw || !sh || !dw || !dh) return;\n"
++"\t\t/* the source rectangle, inside the image (the destination shrinks\n"
++"\t\t * with it) */\n"
++"\t\tif (sw < 0) { sx += sw; sw = -sw; }\n"
++"\t\tif (sh < 0) { sy += sh; sh = -sh; }\n"
++"\t\tif (dw < 0) { dx += dw; dw = -dw; }\n"
++"\t\tif (dh < 0) { dy += dh; dh = -dh; }\n"
++"\t\tvar kx = dw / sw, ky = dh / sh;\n"
++"\t\tif (sx < 0) { dx -= sx * kx; dw += sx * kx; sw += sx; sx = 0; }\n"
++"\t\tif (sy < 0) { dy -= sy * ky; dh += sy * ky; sh += sy; sy = 0; }\n"
++"\t\tif (sx + sw > src[1]) { dw -= (sx + sw - src[1]) * kx; sw = src[1] - sx; }\n"
++"\t\tif (sy + sh > src[2]) { dh -= (sy + sh - src[2]) * ky; sh = src[2] - sy; }\n"
++"\t\tif (!(sw > 0 && sh > 0 && dw > 0 && dh > 0)) return;\n"
++"\t\tvar s = this._s, im = inv(s.m);\n"
++"\t\tif (!im) return;\n"
++"\t\t/* device -> user -> source pixels */\n"
++"\t\tvar toSrc = mul([sw / dw, 0, 0, sh / dh, sx - dx * sw / dw, sy - dy * sh / dh], im);\n"
++"\t\tvar paint = [4].concat(toSrc, [src[0], sx, sy, sw, sh, 0, 0, s.ise ? 1 : 0]);\n"
++"\t\tcv.fill(this._h, rectPts(s.m, dx, dy, dw, dh), RC, false, paint, s.ga, s.op);\n"
++"\t});\n"
++"\tmeth('createImageData', function (a, b) {\n"
++"\t\tif (a instanceof ImageData) return new ImageData(a.width, a.height);\n"
++"\t\tvar w = Math.abs(a | 0), h = Math.abs(b | 0);\n"
++"\t\tif (!w || !h) throw domErr('The source width is 0.', 'IndexSizeError');\n"
++"\t\treturn new ImageData(w, h);\n"
++"\t});\n"
++"\tmeth('getImageData', function (x, y, w, h) {\n"
++"\t\tif (!fin(+x, +y, +w, +h)) throw new TypeError('getImageData: non-finite value');\n"
++"\t\tx |= 0; y |= 0; w |= 0; h |= 0;\n"
++"\t\tif (!w || !h) throw domErr('The source ' + (w ? 'height' : 'width') + ' is 0.', 'IndexSizeError');\n"
++"\t\tif (w < 0) { x += w; w = -w; }\n"
++"\t\tif (h < 0) { y += h; h = -h; }\n"
++"\t\treturn new ImageData(new Uint8ClampedArray(cv.get(this._h, x, y, w, h)), w, h);\n"
++"\t});\n"
++"\tmeth('putImageData', function (id, dx, dy, x0, y0, w, h) {\n"
++"\t\tif (!(id instanceof ImageData)) throw new TypeError('putImageData: not an ImageData');\n"
++"\t\tif (!fin(+dx, +dy)) return;\n"
++"\t\tvar iw = id.width, ih = id.height;\n"
++"\t\tif (arguments.length < 7) { x0 = 0; y0 = 0; w = iw; h = ih; }\n"
++"\t\tx0 = +x0 | 0; y0 = +y0 | 0; w = +w | 0; h = +h | 0;\n"
++"\t\tif (w < 0) { x0 += w; w = -w; }\n"
++"\t\tif (h < 0) { y0 += h; h = -h; }\n"
++"\t\tvar x1 = Math.min(iw, x0 + w), y1 = Math.min(ih, y0 + h);\n"
++"\t\tx0 = Math.max(0, x0); y0 = Math.max(0, y0);\n"
++"\t\tif (x1 <= x0 || y1 <= y0) return;\n"
++"\t\tcv.put(this._h, id.data, iw, ih, dx | 0, dy | 0, x0, y0, x1, y1);\n"
++"\t});\n"
++"\t/* text */\n"
++"\tfunction textOf(t) { return String(t).replace(/[\\t\\n\\f\\r]/g, ' '); }\n"
++"\tfunction metrics(ctx, text) {\n"
++"\t\tvar f = ctx._s.f;\n"
++"\t\tvar r = cv.measure(text, f.px, f.fam, f.b, f.i);\n"
++"\t\treturn { w: r[0], asc: r[1], desc: r[2] };\n"
++"\t}\n"
++"\tfunction drawText(ctx, text, x, y, maxW, style, col) {\n"
++"\t\tvar s = ctx._s, f = s.f, sc = scaleOf(s.m);\n"
++"\t\tif (!fin(x, y) || !(sc > 0)) return;\n"
++"\t\ttext = textOf(text);\n"
++"\t\tvar mt = metrics(ctx, text), w = mt.w, px = f.px;\n"
++"\t\tif (maxW !== undefined) {\n"
++"\t\t\tmaxW = +maxW;\n"
++"\t\t\tif (!(maxW > 0)) return;\n"
++"\t\t\tif (w > maxW) { px = px * maxW / w; w = maxW; }\n"
++"\t\t}\n"
++"\t\tvar rtl = s.dir === 'rtl', ta = s.ta;\n"
++"\t\tif (ta === 'start') ta = rtl ? 'right' : 'left';\n"
++"\t\telse if (ta === 'end') ta = rtl ? 'left' : 'right';\n"
++"\t\tvar ox = ta === 'right' ? -w : (ta === 'center' ? -w / 2 : 0);\n"
++"\t\tvar asc = mt.asc * px / f.px, desc = mt.desc * px / f.px, tb = s.tb;\n"
++"\t\tvar oy = tb === 'top' ? asc : tb === 'hanging' ? asc * 0.8 : tb === 'middle' ? (asc - desc) / 2 :\n"
++"\t\t\t(tb === 'bottom' || tb === 'ideographic') ? -desc : 0;\n"
++"\t\tvar paint = paintOf(ctx, style, col);\n"
++"\t\tif (!paint) return;\n"
++"\t\tvar p = tx(s.m, x + ox, y + oy);\n"
++"\t\tcv.text(ctx._h, text, px * sc, f.fam, f.b, f.i, p[0], p[1], paint, s.ga, s.op);\n"
++"\t}\n"
++"\tmeth('fillText', function (t, x, y, maxW) { drawText(this, t, +x, +y, maxW, this._s.fs, this._s.fc); });\n"
++"\t/* outlines are drawn filled (no glyph outlines here) */\n"
++"\tmeth('strokeText', function (t, x, y, maxW) { drawText(this, t, +x, +y, maxW, this._s.ss, this._s.sc); });\n"
++"\tmeth('measureText', function (t) {\n"
++"\t\tvar mt = metrics(this, textOf(t)), s = this._s, ta = s.ta, rtl = s.dir === 'rtl';\n"
++"\t\tif (ta === 'start') ta = rtl ? 'right' : 'left';\n"
++"\t\telse if (ta === 'end') ta = rtl ? 'left' : 'right';\n"
++"\t\tvar left = ta === 'right' ? mt.w : (ta === 'center' ? mt.w / 2 : 0);\n"
++"\t\tvar o = Object.create(TextMetrics.prototype), tb = s.tb;\n"
++"\t\tvar base = tb === 'top' ? mt.asc : tb === 'hanging' ? mt.asc * 0.8 : tb === 'middle' ? (mt.asc - mt.desc) / 2 :\n"
++"\t\t\t(tb === 'bottom' || tb === 'ideographic') ? -mt.desc : 0;\n"
++"\t\tvar v = { width: mt.w, actualBoundingBoxLeft: left, actualBoundingBoxRight: mt.w - left,\n"
++"\t\t\tactualBoundingBoxAscent: mt.asc - base, actualBoundingBoxDescent: mt.desc + base,\n"
++"\t\t\tfontBoundingBoxAscent: mt.asc - base, fontBoundingBoxDescent: mt.desc + base,\n"
++"\t\t\temHeightAscent: mt.asc - base, emHeightDescent: mt.desc + base,\n"
++"\t\t\thangingBaseline: mt.asc * 0.8 - base, alphabeticBaseline: -base,\n"
++"\t\t\tideographicBaseline: -mt.desc - base };\n"
++"\t\tObject.keys(v).forEach(function (k) {\n"
++"\t\t\tObject.defineProperty(o, k, { value: v[k], enumerable: true, configurable: true });\n"
++"\t\t});\n"
++"\t\treturn o;\n"
++"\t});\n"
++"\n"
++"\t/* ---- the element ---- */\n"
++"\tfunction own(name) {\n"
++"\t\tvar o = P, dsc;\n"
++"\t\twhile (o && !(dsc = Object.getOwnPropertyDescriptor(o, name))) o = Object.getPrototypeOf(o);\n"
++"\t\treturn dsc || null;\n"
++"\t}\n"
++"\tfunction acc(name, get, set) {\n"
++"\t\tvar cur = own(name);\n"
++"\t\tif (cur && cur.get && cur.get.__vbCv) return;\n"
++"\t\tvar oget = cur && cur.get, oset = cur && cur.set;\n"
++"\t\tvar gf = function () { return isCanvas(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };\n"
++"\t\tgf.__vbCv = true;\n"
++"\t\tvar sf = function (v) {\n"
++"\t\t\tif (isCanvas(this)) set.call(this, v);\n"
++"\t\t\telse if (oset) oset.call(this, v);\n"
++"\t\t};\n"
++"\t\tObject.defineProperty(P, name, { configurable: true, get: gf, set: sf });\n"
++"\t}\n"
++"\tacc('width', function () { return attrDim(this, 'width', 300); }, function (v) {\n"
++"\t\tthis.setAttribute('width', String(v >>> 0));\n"
++"\t});\n"
++"\tacc('height', function () { return attrDim(this, 'height', 150); }, function (v) {\n"
++"\t\tthis.setAttribute('height', String(v >>> 0));\n"
++"\t});\n"
++"\tvar sa = P.setAttribute;\n"
++"\tif (typeof sa === 'function' && !sa.__vbCv) {\n"
++"\t\tvar w = function (name) {\n"
++"\t\t\tvar r = sa.apply(this, arguments), n = String(name).toLowerCase();\n"
++"\t\t\tif ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);\n"
++"\t\t\treturn r;\n"
++"\t\t};\n"
++"\t\tw.__vbCv = true;\n"
++"\t\tP.setAttribute = w;\n"
++"\t}\n"
++"\tvar ra = P.removeAttribute;\n"
++"\tif (typeof ra === 'function' && !ra.__vbCv) {\n"
++"\t\tvar wr = function (name) {\n"
++"\t\t\tvar r = ra.apply(this, arguments), n = String(name).toLowerCase();\n"
++"\t\t\tif ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);\n"
++"\t\t\treturn r;\n"
++"\t\t};\n"
++"\t\twr.__vbCv = true;\n"
++"\t\tP.removeAttribute = wr;\n"
++"\t}\n"
++"\tvar oldGet = P.getContext, oldURL = P.toDataURL, oldBlob = P.toBlob;\n"
++"\tfunction getContext(type) {\n"
++"\t\tif (!isCanvas(this)) return oldGet ? oldGet.apply(this, arguments) : null;\n"
++"\t\tif (String(type) !== '2d') return null;\n"
++"\t\tvar c = ctxOf(this);\n"
++"\t\tif (!c) {\n"
++"\t\t\tc = makeCtx(this);\n"
++"\t\t\tdefine(this, '__vbCtx2d', c);\n"
++"\t\t}\n"
++"\t\treturn c;\n"
++"\t}\n"
++"\tfunction toDataURL() {\n"
++"\t\tif (!isCanvas(this)) return oldURL ? oldURL.apply(this, arguments) : 'data:,';\n"
++"\t\tif (!attrDim(this, 'width', 300) || !attrDim(this, 'height', 150)) return 'data:,';\n"
++"\t\treturn cv.png(getContext.call(this, '2d')._h, true);\n"
++"\t}\n"
++"\tfunction toBlob(cb) {\n"
++"\t\tif (!isCanvas(this)) return oldBlob ? oldBlob.apply(this, arguments) : undefined;\n"
++"\t\tif (typeof cb !== 'function') throw new TypeError('toBlob: callback is not a function');\n"
++"\t\tvar el = this, blob = null;\n"
++"\t\tif (attrDim(el, 'width', 300) && attrDim(el, 'height', 150) && typeof g.Blob === 'function') {\n"
++"\t\t\ttry { blob = new g.Blob([cv.png(getContext.call(el, '2d')._h, false)], { type: 'image/png' }); }\n"
++"\t\t\tcatch (e) { blob = null; }\n"
++"\t\t}\n"
++"\t\tsetTimeout(function () { cb(blob); }, 0);\n"
++"\t}\n"
++"\tvar targets = [P];\n"
++"\tif (g.HTMLCanvasElement && g.HTMLCanvasElement.prototype && g.HTMLCanvasElement.prototype !== P)\n"
++"\t\ttargets.push(g.HTMLCanvasElement.prototype);\n"
++"\ttargets.forEach(function (T) {\n"
++"\t\tdefine(T, 'getContext', getContext);\n"
++"\t\tdefine(T, 'toDataURL', toDataURL);\n"
++"\t\tdefine(T, 'toBlob', toBlob);\n"
++"\t});\n"
++"\tdefine(C, 'constructor', CanvasRenderingContext2D);\n"
++"\tg.CanvasRenderingContext2D = CanvasRenderingContext2D;\n"
++"\tg.CanvasGradient = CanvasGradient;\n"
++"\tg.CanvasPattern = CanvasPattern;\n"
++"\tg.Path2D = Path2D;\n"
++"\tg.ImageData = ImageData;\n"
++"\tg.TextMetrics = TextMetrics;\n"
++"\t/* createImageBitmap: images and canvases, copied into a canvas */\n"
++"\tg.createImageBitmap = function (img, sx, sy, sw, sh) {\n"
++"\t\tvar nargs = arguments.length;\n"
++"\t\treturn new Promise(function (res, rej) {\n"
++"\t\t\ttry {\n"
++"\t\t\t\tvar c = d.createElement('canvas'), x;\n"
++"\t\t\t\tif (img instanceof ImageData) {\n"
++"\t\t\t\t\tc.width = img.width; c.height = img.height;\n"
++"\t\t\t\t\tc.getContext('2d').putImageData(img, 0, 0);\n"
++"\t\t\t\t} else {\n"
++"\t\t\t\t\tvar src = source(img);\n"
++"\t\t\t\t\tif (!src) { rej(domErr('The source image could not be decoded.', 'InvalidStateError')); return; }\n"
++"\t\t\t\t\tif (nargs >= 5) {\n"
++"\t\t\t\t\t\tc.width = Math.abs(sw); c.height = Math.abs(sh);\n"
++"\t\t\t\t\t\tc.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, Math.abs(sw), Math.abs(sh));\n"
++"\t\t\t\t\t} else {\n"
++"\t\t\t\t\t\tc.width = src[1]; c.height = src[2];\n"
++"\t\t\t\t\t\tc.getContext('2d').drawImage(img, 0, 0);\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t}\n"
++"\t\t\t\tx = { width: c.width, height: c.height, close: function () { } };\n"
++"\t\t\t\tdefine(x, '__vbBitmap', c);\n"
++"\t\t\t\tres(x);\n"
++"\t\t\t} catch (e) { rej(e); }\n"
++"\t\t});\n"
++"\t};\n"
++"})();\n"
++"\n"
+ "/* ---- what an HTML sanitizer walks: attributes, TreeWalker, Range,\n"
+ " * XMLSerializer, the scratch document ---------------------------------\n"
+ " * Closure's sanitizer (google's trending searches, and wherever Google\n"
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -165,4 +165,22 @@
+  * there is none. */
+ const char *macsurf_storage_dir(void);
+ 
++/** VitaBrowser patch 251: one glyph's ink for canvas text -- 8-bit
++ * coverage, `stride` bytes per row, its top-left at (x, y) on the canvas. */
++typedef void (*macsurf_glyph_fn)(void *pw, const unsigned char *cov,
++		int stride, int x, int y, int w, int h);
++
++/** VitaBrowser patch 251: canvas text in the frontend's faces. Sets `len`
++ * bytes of UTF-8 at `px` pixels (family 0 sans-serif, 1 serif, 2
++ * monospace) with the baseline origin at (x, y), handing each glyph's ink
++ * to fn (NULL: measure only).
++ * \return the advance in pixels */
++int macsurf_canvas_glyphs(int px, int family, int bold, int italic,
++		const char *utf8, size_t len, int x, int y, macsurf_glyph_fn fn,
++		void *pw);
++
++/** VitaBrowser patch 251: the face's ascent and descent at `px` pixels. */
++void macsurf_canvas_font_extents(int px, int family, int bold, int italic,
++		int *ascent, int *descent);
++
+ #endif
+diff --git a/content/handlers/javascript/quickjs/macsurf_canvas.c b/content/handlers/javascript/quickjs/macsurf_canvas.c
+new file mode 100644
+--- /dev/null
++++ b/content/handlers/javascript/quickjs/macsurf_canvas.c
+@@ -0,0 +1,1972 @@
++/*
++ * VitaBrowser patch 251: the canvas 2D raster (see macsurf_canvas.h).
++ *
++ * Every <canvas> drawing call was a no-op (fixes1245): charts, games, maps,
++ * QR codes and the image grid of a captcha were blank, and a script reading
++ * its own drawing back (getImageData, toDataURL) got zeros. This is the
++ * pixel side of a real 2D context:
++ *
++ *  - each context keeps premultiplied RGBA pixels in ordinary memory; the
++ *    changed rectangle is copied, unpremultiplied, into the element's bitmap
++ *    (texture memory on the Vita, slow to read back) from a scheduled
++ *    callback, once per batch of drawing, and the element's box redrawn;
++ *  - shapes arrive flattened to polygons in device pixels; the rasteriser
++ *    samples 4 sub-scanlines per row with exact horizontal coverage, by the
++ *    nonzero or even-odd rule;
++ *  - a stroke is the union of convex pieces (a quad per segment, a wedge,
++ *    miter or disc per join, caps), each oriented the same way so the
++ *    nonzero rule merges them: overlaps never cancel or double;
++ *  - paints: a colour, linear / radial / conic gradients (a 256-entry
++ *    table), and images (drawImage and patterns) sampled through the
++ *    inverse transform, nearest or bilinear;
++ *  - the Porter-Duff operators plus lighter, multiply, screen, darken and
++ *    lighten; the clip is a coverage mask, saved and restored with the
++ *    state;
++ *  - text comes from the frontend's own faces (macsurf_canvas_glyphs), so
++ *    it measures as it draws;
++ *  - toDataURL encodes a PNG (stored deflate: no compressor needed).
++ *
++ * Not done: shadows, filters, rotated text (glyphs stay upright; their
++ * origin and size follow the transform), text along a scaled-x transform.
++ */
++
++#ifdef WITH_QUICKJS
++
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#include <dom/dom.h>
++
++#include "utils/errors.h"
++#include "utils/corestrings.h"
++#include "netsurf/bitmap.h"
++#include "desktop/gui_internal.h"
++#include "desktop/gui_table.h"
++#include "content/handlers/html/private.h"
++
++#include "macos9.h"
++#include "macsurf_canvas.h"
++
++/** Sub-scanlines per pixel row. */
++#define CV_SS 4
++/** The largest canvas that gets pixels (a bigger one draws nothing). */
++#define CV_MAX_DIM 4096
++#define CV_MAX_AREA (2048 * 1024)
++/** Clip masks remembered by save(); deeper saves keep the current clip. */
++#define CV_STACK 32
++
++enum cv_op {
++	OP_SOURCE_OVER, OP_SOURCE_IN, OP_SOURCE_OUT, OP_SOURCE_ATOP,
++	OP_DEST_OVER, OP_DEST_IN, OP_DEST_OUT, OP_DEST_ATOP,
++	OP_LIGHTER, OP_COPY, OP_XOR, OP_MULTIPLY, OP_SCREEN, OP_DARKEN,
++	OP_LIGHTEN, OP_COUNT
++};
++
++struct cv {
++	struct dom_node *node;	/**< ref'd; NULL once released */
++	int w, h;
++	uint8_t *px;		/**< premultiplied RGBA, or NULL */
++	uint8_t *clip;		/**< coverage mask w*h, NULL = no clip */
++	bool clip_owned;
++	struct { uint8_t *clip; bool owned; } stack[CV_STACK];
++	int depth, overflow;
++	int dx0, dy0, dx1, dy1;	/**< changed since the last flush */
++	bool scheduled;
++};
++
++struct paint {
++	int type;		/**< 0 colour, 1 linear, 2 radial, 3 conic, 4 image */
++	uint8_t rgba[4];	/**< colour, premultiplied */
++	double inv[6];		/**< device -> paint space */
++	double g[6];		/**< gradient geometry */
++	uint32_t lut[256];	/**< gradient colours, premultiplied RGBA bytes */
++	const uint8_t *img;	/**< image: premultiplied pixels */
++	uint8_t *img_owned;
++	int iw, ih;		/**< its size */
++	double ix, iy;		/**< paint-space position of img's pixel 0,0 */
++	bool rep_x, rep_y, smooth;
++	bool none;		/**< paints nothing (a degenerate gradient) */
++};
++
++struct drawop {
++	struct cv *cv;
++	struct paint *paint;
++	int ga;			/**< globalAlpha, 0..255 */
++	int op;
++	uint8_t *row;		/**< paint colours for one row */
++};
++
++static JSClassID s_cv_class_id;
++static const struct macsurf_canvas_ops *s_ops;
++
++#define DIV255(x) ((((x) + 128) * 257) >> 16)
++/** Coordinates beyond this are pulled in: far outside any canvas, and
++ * float / int conversions stay defined. */
++#define CV_FAR 1e7
++
++/** A script's number as an int: NaN is 0, the rest clamped (a cast of an
++ * out-of-range double is undefined behaviour). */
++static int dtoi(double d)
++{
++	if (!(d == d))
++		return 0;
++	if (d > 1e9) return 1000000000;
++	if (d < -1e9) return -1000000000;
++	return (int)d;
++}
++
++static double clampd(double v, double lo, double hi)
++{
++	return v < lo ? lo : (v > hi ? hi : v);
++}
++
++/* ---- pixels ----------------------------------------------------------- */
++
++static void cv_free_clips(struct cv *cv)
++{
++	int i;
++	if (cv->clip_owned)
++		free(cv->clip);
++	for (i = 0; i < cv->depth; i++)
++		if (cv->stack[i].owned)
++			free(cv->stack[i].clip);
++	cv->clip = NULL;
++	cv->clip_owned = false;
++	cv->depth = cv->overflow = 0;
++}
++
++static void cv_dirty(struct cv *cv, int x0, int y0, int x1, int y1)
++{
++	if (x0 < 0) x0 = 0;
++	if (y0 < 0) y0 = 0;
++	if (x1 > cv->w) x1 = cv->w;
++	if (y1 > cv->h) y1 = cv->h;
++	if (x1 <= x0 || y1 <= y0)
++		return;
++	if (cv->dx1 <= cv->dx0 || cv->dy1 <= cv->dy0) {
++		cv->dx0 = x0; cv->dy0 = y0; cv->dx1 = x1; cv->dy1 = y1;
++	} else {
++		if (x0 < cv->dx0) cv->dx0 = x0;
++		if (y0 < cv->dy0) cv->dy0 = y0;
++		if (x1 > cv->dx1) cv->dx1 = x1;
++		if (y1 > cv->dy1) cv->dy1 = y1;
++	}
++}
++
++static void cv_redraw_node(struct dom_node *node)
++{
++	struct box *box = NULL;
++	html_content *htmlc = NULL;
++	dom_document *doc = NULL;
++
++	if (dom_node_get_user_data(node, corestring_dom___ns_key_box_node_data,
++			(void **)&box) != DOM_NO_ERR || box == NULL)
++		return;
++	if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR ||
++	    doc == NULL)
++		return;
++	if (dom_node_get_user_data(doc,
++			corestring_dom___ns_key_html_content_data,
++			(void **)&htmlc) == DOM_NO_ERR && htmlc != NULL)
++		html__redraw_a_box(htmlc, box);
++	dom_node_unref(doc);
++}
++
++/* The element's bitmap: destroyed with the element, copied with it. */
++static void cv_bitmap_handler(dom_node_operation operation, dom_string *key,
++		void *data, struct dom_node *src, struct dom_node *dst)
++{
++	struct bitmap *bm = data, *nb, *old = NULL;
++	int w, h;
++	size_t stride;
++
++	(void)src;
++	if (data == NULL || !dom_string_isequal(key,
++			corestring_dom___ns_key_canvas_node_data))
++		return;
++	switch (operation) {
++	case DOM_NODE_CLONED:
++		w = guit->bitmap->get_width(bm);
++		h = guit->bitmap->get_height(bm);
++		stride = guit->bitmap->get_rowstride(bm);
++		nb = guit->bitmap->create(w, h, BITMAP_NONE);
++		if (nb == NULL)
++			break;
++		if (guit->bitmap->get_rowstride(nb) == stride)
++			memcpy(guit->bitmap->get_buffer(nb),
++			       guit->bitmap->get_buffer(bm), stride * h);
++		guit->bitmap->modified(nb);
++		if (dom_node_set_user_data(dst,
++				corestring_dom___ns_key_canvas_node_data, nb,
++				cv_bitmap_handler, (void **)&old) == DOM_NO_ERR) {
++			if (old != NULL)
++				guit->bitmap->destroy(old);
++		} else {
++			guit->bitmap->destroy(nb);
++		}
++		break;
++	case DOM_NODE_DELETED:
++		guit->bitmap->destroy(bm);
++		break;
++	default:
++		break;
++	}
++}
++
++static void cv_set_bitmap(struct dom_node *node, struct bitmap *bm)
++{
++	struct bitmap *old = NULL;
++	if (dom_node_set_user_data(node,
++			corestring_dom___ns_key_canvas_node_data, bm,
++			bm != NULL ? cv_bitmap_handler : NULL,
++			(void **)&old) != DOM_NO_ERR) {
++		if (bm != NULL)
++			guit->bitmap->destroy(bm);
++		return;
++	}
++	if (old != NULL && old != bm)
++		guit->bitmap->destroy(old);
++}
++
++/* Copy the changed rectangle into the element's bitmap and redraw it. */
++static void cv_flush(void *p)
++{
++	struct cv *cv = p;
++	struct bitmap *bm = NULL;
++	uint8_t *buf;
++	size_t stride;
++	int x, y;
++
++	cv->scheduled = false;
++	if (cv->node == NULL)
++		return;
++	if (cv->px == NULL) {
++		dom_node_get_user_data(cv->node,
++				corestring_dom___ns_key_canvas_node_data,
++				(void **)&bm);
++		if (bm != NULL) {
++			cv_set_bitmap(cv->node, NULL);
++			cv_redraw_node(cv->node);
++		}
++		cv->dx0 = cv->dx1 = 0;
++		return;
++	}
++	if (cv->dx1 <= cv->dx0 || cv->dy1 <= cv->dy0)
++		return;
++	if (dom_node_get_user_data(cv->node,
++			corestring_dom___ns_key_canvas_node_data,
++			(void **)&bm) != DOM_NO_ERR)
++		bm = NULL;
++	if (bm == NULL || guit->bitmap->get_width(bm) != cv->w ||
++	    guit->bitmap->get_height(bm) != cv->h) {
++		bm = guit->bitmap->create(cv->w, cv->h, BITMAP_NONE);
++		if (bm == NULL)
++			return;
++		memset(guit->bitmap->get_buffer(bm), 0,
++		       guit->bitmap->get_rowstride(bm) * (size_t)cv->h);
++		cv_set_bitmap(cv->node, bm);
++		cv->dx0 = 0; cv->dy0 = 0; cv->dx1 = cv->w; cv->dy1 = cv->h;
++	}
++	buf = guit->bitmap->get_buffer(bm);
++	stride = guit->bitmap->get_rowstride(bm);
++	if (buf == NULL)
++		return;
++	for (y = cv->dy0; y < cv->dy1; y++) {
++		const uint8_t *s = cv->px + ((size_t)y * cv->w + cv->dx0) * 4;
++		uint8_t *d = buf + (size_t)y * stride + (size_t)cv->dx0 * 4;
++		for (x = cv->dx0; x < cv->dx1; x++, s += 4, d += 4) {
++			unsigned a = s[3];
++			if (a == 255 || a == 0) {
++				d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
++			} else {
++				d[0] = (uint8_t)((s[0] * 255 + a / 2) / a);
++				d[1] = (uint8_t)((s[1] * 255 + a / 2) / a);
++				d[2] = (uint8_t)((s[2] * 255 + a / 2) / a);
++			}
++			d[3] = (uint8_t)a;
++		}
++	}
++	guit->bitmap->modified(bm);
++	cv->dx0 = cv->dy0 = cv->dx1 = cv->dy1 = 0;
++	cv_redraw_node(cv->node);
++}
++
++static void cv_changed(struct cv *cv)
++{
++	if (!cv->scheduled && cv->node != NULL) {
++		cv->scheduled = true;
++		macos9_schedule(0, cv_flush, cv);
++	}
++}
++
++static void cv_resize(struct cv *cv, int w, int h)
++{
++	size_t n;
++
++	cv_free_clips(cv);
++	free(cv->px);
++	cv->px = NULL;
++	if (w < 0) w = 0;
++	if (h < 0) h = 0;
++	cv->w = w;
++	cv->h = h;
++	if (w > 0 && h > 0 && w <= CV_MAX_DIM && h <= CV_MAX_DIM &&
++	    (long)w * h <= CV_MAX_AREA) {
++		n = (size_t)w * h * 4;
++		cv->px = macsurf_try_alloc(n);
++		if (cv->px != NULL)
++			memset(cv->px, 0, n);
++	}
++	cv->dx0 = 0; cv->dy0 = 0; cv->dx1 = cv->w; cv->dy1 = cv->h;
++	cv_changed(cv);
++}
++
++/* ---- the rasteriser ---------------------------------------------------- */
++
++struct edge {
++	float x0, y0, y1, dxdy;
++	int dir;
++};
++
++struct cross {
++	float x;
++	int dir;
++};
++
++typedef void (*span_fn)(void *pw, int y, int x0, int x1, const uint8_t *cov);
++
++static int edge_cmp(const void *a, const void *b)
++{
++	const struct edge *ea = a, *eb = b;
++	return (ea->y0 < eb->y0) ? -1 : (ea->y0 > eb->y0) ? 1 : 0;
++}
++
++static void acc_span(float *acc, int width, float xa, float xb, float w)
++{
++	int ia, ib, i;
++	if (xa < 0) xa = 0;
++	if (xb > (float)width) xb = (float)width;
++	if (!(xb > xa))		/* NaN too */
++		return;
++	ia = (int)xa;
++	ib = (int)xb;
++	if (ia == ib) {
++		acc[ia] += (xb - xa) * w;
++		return;
++	}
++	acc[ia] += ((float)(ia + 1) - xa) * w;
++	for (i = ia + 1; i < ib; i++)
++		acc[i] += w;
++	if (ib < width)
++		acc[ib] += (xb - (float)ib) * w;
++}
++
++/**
++ * Rasterise polygons (each subpath implicitly closed) inside the box
++ * [bx0,bx1) x [by0,by1) and hand each row's coverage to fn. With `full`,
++ * every row and column of the box is handed over, covered or not (the
++ * operators that clear what the shape does not cover).
++ */
++static bool raster(const double *pts, const int *counts, int nsub,
++		bool evenodd, int bx0, int by0, int bx1, int by1, bool full,
++		span_fn fn, void *pw)
++{
++	struct edge *e = NULL;
++	struct cross *cr = NULL;
++	int *act = NULL;
++	float *acc = NULL;
++	uint8_t *cov = NULL;
++	int ne = 0, cap = 0, i, k, s, off = 0, y, ry0, ry1, width, nact, next;
++	double minx = 1e30, maxx = -1e30, miny = 1e30, maxy = -1e30;
++	bool ok = false;
++
++	for (s = 0; s < nsub; s++) {
++		int n = counts[s];
++		const double *p = pts + 2 * off;
++		bool finite = true;
++		for (i = 0; i < n; i++)
++			if (!isfinite(p[2 * i]) || !isfinite(p[2 * i + 1]))
++				finite = false;
++		if (finite && n >= 2) {
++			for (i = 0; i < n; i++) {
++				double xa = clampd(p[2 * i], -CV_FAR, CV_FAR);
++				double ya = clampd(p[2 * i + 1], -CV_FAR, CV_FAR);
++				double xb = clampd(p[2 * ((i + 1) % n)], -CV_FAR, CV_FAR);
++				double yb = clampd(p[2 * ((i + 1) % n) + 1], -CV_FAR,
++						CV_FAR);
++				if (ya == yb)
++					continue;
++				if (ne == cap) {
++					struct edge *ne2;
++					cap = cap ? cap * 2 : 64;
++					ne2 = realloc(e, sizeof(*e) * cap);
++					if (ne2 == NULL)
++						goto out;
++					e = ne2;
++				}
++				if (ya < yb) {
++					e[ne].x0 = (float)xa; e[ne].y0 = (float)ya;
++					e[ne].y1 = (float)yb; e[ne].dir = 1;
++				} else {
++					e[ne].x0 = (float)xb; e[ne].y0 = (float)yb;
++					e[ne].y1 = (float)ya; e[ne].dir = -1;
++				}
++				e[ne].dxdy = (float)((xb - xa) / (yb - ya));
++				ne++;
++				if (xa < minx) minx = xa;
++				if (xa > maxx) maxx = xa;
++				if (ya < miny) miny = ya;
++				if (ya > maxy) maxy = ya;
++			}
++		}
++		off += n;
++	}
++	if (!full) {
++		if (ne == 0) {
++			ok = true;
++			goto out;
++		}
++		/* (all within +-CV_FAR: the conversions are defined) */
++		if (floor(minx) > bx0) bx0 = (int)floor(minx);
++		if (ceil(maxx) < bx1) bx1 = (int)ceil(maxx);
++		if (floor(miny) > by0) by0 = (int)floor(miny);
++		if (ceil(maxy) < by1) by1 = (int)ceil(maxy);
++	}
++	if (bx1 <= bx0 || by1 <= by0) {
++		ok = true;
++		goto out;
++	}
++	width = bx1 - bx0;
++	ry0 = by0;
++	ry1 = by1;
++	if (ne > 0)
++		qsort(e, (size_t)ne, sizeof(*e), edge_cmp);
++	cr = malloc(sizeof(*cr) * (ne + 1));
++	act = malloc(sizeof(*act) * (ne + 1));
++	acc = malloc(sizeof(*acc) * (width + 2));
++	cov = malloc((size_t)width + 1);
++	if (cr == NULL || act == NULL || acc == NULL || cov == NULL)
++		goto out;
++	nact = 0;
++	next = 0;
++	for (y = ry0; y < ry1; y++) {
++		int lo = width, hi = -1;
++		memset(acc, 0, sizeof(*acc) * (width + 2));
++		for (s = 0; s < CV_SS; s++) {
++			float sy = (float)y + ((float)s + 0.5f) / CV_SS;
++			int nc = 0, j, wind;
++			float start;
++			while (next < ne && e[next].y0 <= sy)
++				act[nact++] = next++;
++			for (j = 0, k = 0; j < nact; j++)
++				if (e[act[j]].y1 > sy)
++					act[k++] = act[j];
++			nact = k;
++			for (j = 0; j < nact; j++) {
++				const struct edge *ed = &e[act[j]];
++				struct cross c;
++				int m;
++				c.x = ed->x0 + (sy - ed->y0) * ed->dxdy -
++					(float)bx0;
++				c.dir = ed->dir;
++				/* insertion sort by x */
++				for (m = nc; m > 0 && cr[m - 1].x > c.x; m--)
++					cr[m] = cr[m - 1];
++				cr[m] = c;
++				nc++;
++			}
++			wind = 0;
++			start = 0;
++			for (j = 0; j < nc; j++) {
++				int before = wind;
++				bool in0, in1;
++				wind += cr[j].dir;
++				in0 = evenodd ? (before & 1) : before != 0;
++				in1 = evenodd ? (wind & 1) : wind != 0;
++				if (!in0 && in1)
++					start = cr[j].x;
++				else if (in0 && !in1)
++					acc_span(acc, width, start, cr[j].x,
++						 1.0f / CV_SS);
++			}
++		}
++		for (i = 0; i < width; i++) {
++			float a = acc[i];
++			int c = a >= 1.0f ? 255 : (a <= 0.0f ? 0 :
++					(int)(a * 255.0f + 0.5f));
++			cov[i] = (uint8_t)c;
++			if (c != 0) {
++				if (i < lo) lo = i;
++				hi = i;
++			}
++		}
++		if (full)
++			fn(pw, y, bx0, bx1, cov);
++		else if (hi >= lo)
++			fn(pw, y, bx0 + lo, bx0 + hi + 1, cov + lo);
++	}
++	ok = true;
++out:
++	free(e);
++	free(cr);
++	free(act);
++	free(acc);
++	free(cov);
++	return ok;
++}
++
++/* ---- paints ------------------------------------------------------------ */
++
++static void paint_free(struct paint *p)
++{
++	free(p->img_owned);
++	p->img_owned = NULL;
++}
++
++static inline uint32_t pack(unsigned r, unsigned g, unsigned b, unsigned a)
++{
++	uint8_t q[4];
++	uint32_t v;
++	q[0] = (uint8_t)r; q[1] = (uint8_t)g; q[2] = (uint8_t)b; q[3] = (uint8_t)a;
++	memcpy(&v, q, 4);
++	return v;
++}
++
++/** stops: offset, r, g, b, a (0..255, alpha 0..1), sorted by offset. */
++static void build_lut(struct paint *p, const double *st, int n)
++{
++	int i, k = 0;
++
++	if (n <= 0) {
++		p->none = true;
++		return;
++	}
++	for (i = 0; i < 256; i++) {
++		double t = i / 255.0, f, r, g, b, a;
++		while (k + 1 < n && st[5 * (k + 1)] <= t)
++			k++;
++		if (t <= st[0] || n == 1) {
++			r = st[1]; g = st[2]; b = st[3]; a = st[4];
++		} else if (k + 1 >= n) {
++			r = st[5 * k + 1]; g = st[5 * k + 2];
++			b = st[5 * k + 3]; a = st[5 * k + 4];
++		} else {
++			double o0 = st[5 * k], o1 = st[5 * (k + 1)];
++			f = o1 > o0 ? (t - o0) / (o1 - o0) : 1.0;
++			r = st[5 * k + 1] + (st[5 * k + 6] - st[5 * k + 1]) * f;
++			g = st[5 * k + 2] + (st[5 * k + 7] - st[5 * k + 2]) * f;
++			b = st[5 * k + 3] + (st[5 * k + 8] - st[5 * k + 3]) * f;
++			a = st[5 * k + 4] + (st[5 * k + 9] - st[5 * k + 4]) * f;
++		}
++		a = a < 0 ? 0 : (a > 1 ? 1 : a);
++		p->lut[i] = pack((unsigned)(r * a + 0.5), (unsigned)(g * a + 0.5),
++				 (unsigned)(b * a + 0.5), (unsigned)(a * 255 + 0.5));
++	}
++}
++
++static inline uint32_t lut_at(const struct paint *p, double t)
++{
++	int i;
++	if (!(t > 0)) t = 0;	/* NaN too */
++	if (t > 1) t = 1;
++	i = (int)(t * 255.0 + 0.5);
++	return p->lut[i];
++}
++
++static inline uint32_t img_px(const struct paint *p, int x, int y)
++{
++	uint32_t v;
++	if (p->rep_x) {
++		x %= p->iw;
++		if (x < 0) x += p->iw;
++	} else if (x < 0 || x >= p->iw) {
++		return 0;
++	}
++	if (p->rep_y) {
++		y %= p->ih;
++		if (y < 0) y += p->ih;
++	} else if (y < 0 || y >= p->ih) {
++		return 0;
++	}
++	memcpy(&v, p->img + ((size_t)y * p->iw + x) * 4, 4);
++	return v;
++}
++
++static inline int clampi(int v, int lo, int hi)
++{
++	return v < lo ? lo : (v > hi ? hi : v);
++}
++
++static uint32_t img_sample(const struct paint *p, double u, double v)
++{
++	if (p->rep_x && u == u)
++		u = fmod(u, (double)p->iw);
++	if (p->rep_y && v == v)
++		v = fmod(v, (double)p->ih);
++	if (!(u > -CV_FAR && u < CV_FAR && v > -CV_FAR && v < CV_FAR))
++		return 0;
++	if (!p->smooth) {
++		return img_px(p, (int)floor(u), (int)floor(v));
++	} else {
++		double fu = u - 0.5, fv = v - 0.5;
++		int x0 = (int)floor(fu), y0 = (int)floor(fv);
++		int ax = (int)((fu - x0) * 256.0), ay = (int)((fv - y0) * 256.0);
++		int x1 = x0 + 1, y1 = y0 + 1, c;
++		uint32_t q[4];
++		uint8_t out[4], *b[4];
++		uint32_t res;
++		/* clamp to the edge inside the image (drawImage's source
++		 * rectangle), so the border does not fade to transparent */
++		if (!p->rep_x) {
++			if (u < 0 || u > p->iw) return 0;
++			x0 = clampi(x0, 0, p->iw - 1);
++			x1 = clampi(x1, 0, p->iw - 1);
++		}
++		if (!p->rep_y) {
++			if (v < 0 || v > p->ih) return 0;
++			y0 = clampi(y0, 0, p->ih - 1);
++			y1 = clampi(y1, 0, p->ih - 1);
++		}
++		q[0] = img_px(p, x0, y0); q[1] = img_px(p, x1, y0);
++		q[2] = img_px(p, x0, y1); q[3] = img_px(p, x1, y1);
++		for (c = 0; c < 4; c++)
++			b[c] = (uint8_t *)&q[c];
++		for (c = 0; c < 4; c++) {
++			int top = b[0][c] * (256 - ax) + b[1][c] * ax;
++			int bot = b[2][c] * (256 - ax) + b[3][c] * ax;
++			out[c] = (uint8_t)((top * (256 - ay) + bot * ay + 32768) >> 16);
++		}
++		memcpy(&res, out, 4);
++		return res;
++	}
++}
++
++/** Paint colours for pixels x0 .. x0+n-1 of row y. */
++static void paint_row(const struct paint *p, int y, int x0, int n,
++		uint8_t *out)
++{
++	const double *m = p->inv;
++	double cx = x0 + 0.5, cy = y + 0.5;
++	double u = m[0] * cx + m[2] * cy + m[4];
++	double v = m[1] * cx + m[3] * cy + m[5];
++	int i;
++	uint32_t c;
++
++	for (i = 0; i < n; i++, u += m[0], v += m[1]) {
++		switch (p->type) {
++		case 1: {	/* linear: g = x0 y0 dx dy 1/len^2 */
++			double t = ((u - p->g[0]) * p->g[2] +
++				    (v - p->g[1]) * p->g[3]) * p->g[4];
++			c = lut_at(p, t);
++			break;
++		}
++		case 2: {	/* radial: g = x0 y0 r0 x1 y1 r1 */
++			double cdx = p->g[3] - p->g[0], cdy = p->g[4] - p->g[1];
++			double dr = p->g[5] - p->g[2];
++			double pdx = u - p->g[0], pdy = v - p->g[1];
++			double a = cdx * cdx + cdy * cdy - dr * dr;
++			double b = pdx * cdx + pdy * cdy + p->g[2] * dr;
++			double cc = pdx * pdx + pdy * pdy - p->g[2] * p->g[2];
++			double t = -1;
++			bool have = false;
++			if (fabs(a) < 1e-9) {
++				if (fabs(b) > 1e-12) {
++					t = cc / (2 * b);
++					have = p->g[2] + t * dr >= 0;
++				}
++			} else {
++				double disc = b * b - a * cc;
++				if (disc >= 0) {
++					double sq = sqrt(disc);
++					double t1 = (b + sq) / a, t2 = (b - sq) / a;
++					double hi = t1 > t2 ? t1 : t2;
++					double lo = t1 > t2 ? t2 : t1;
++					if (p->g[2] + hi * dr >= 0) {
++						t = hi; have = true;
++					} else if (p->g[2] + lo * dr >= 0) {
++						t = lo; have = true;
++					}
++				}
++			}
++			c = have ? lut_at(p, t) : 0;
++			break;
++		}
++		case 3: {	/* conic: g = start angle, cx, cy */
++			double ang = atan2(v - p->g[2], u - p->g[1]) - p->g[0];
++			double t = ang / (2 * M_PI);
++			t -= floor(t);
++			c = lut_at(p, t);
++			break;
++		}
++		case 4:
++			c = img_sample(p, u - p->ix, v - p->iy);
++			break;
++		default:
++			memcpy(&c, p->rgba, 4);
++			break;
++		}
++		memcpy(out + 4 * i, &c, 4);
++	}
++}
++
++/* ---- compositing -------------------------------------------------------- */
++
++static bool op_unbounded(int op)
++{
++	return op == OP_SOURCE_IN || op == OP_SOURCE_OUT || op == OP_DEST_IN ||
++	       op == OP_DEST_ATOP || op == OP_COPY;
++}
++
++static inline void blend(int op, const uint8_t *s, uint8_t *d)
++{
++	int sa = s[3], da = d[3], c, r[4];
++	switch (op) {
++	case OP_SOURCE_IN:
++		for (c = 0; c < 4; c++) r[c] = DIV255(s[c] * da);
++		break;
++	case OP_SOURCE_OUT:
++		for (c = 0; c < 4; c++) r[c] = DIV255(s[c] * (255 - da));
++		break;
++	case OP_SOURCE_ATOP:
++		for (c = 0; c < 4; c++)
++			r[c] = DIV255(s[c] * da + d[c] * (255 - sa));
++		break;
++	case OP_DEST_OVER:
++		for (c = 0; c < 4; c++) r[c] = d[c] + DIV255(s[c] * (255 - da));
++		break;
++	case OP_DEST_IN:
++		for (c = 0; c < 4; c++) r[c] = DIV255(d[c] * sa);
++		break;
++	case OP_DEST_OUT:
++		for (c = 0; c < 4; c++) r[c] = DIV255(d[c] * (255 - sa));
++		break;
++	case OP_DEST_ATOP:
++		for (c = 0; c < 4; c++)
++			r[c] = DIV255(d[c] * sa + s[c] * (255 - da));
++		break;
++	case OP_LIGHTER:
++		for (c = 0; c < 4; c++) {
++			r[c] = s[c] + d[c];
++			if (r[c] > 255) r[c] = 255;
++		}
++		break;
++	case OP_COPY:
++		for (c = 0; c < 4; c++) r[c] = s[c];
++		break;
++	case OP_XOR:
++		for (c = 0; c < 4; c++)
++			r[c] = DIV255(s[c] * (255 - da) + d[c] * (255 - sa));
++		break;
++	case OP_MULTIPLY:
++	case OP_SCREEN:
++	case OP_DARKEN:
++	case OP_LIGHTEN:
++		for (c = 0; c < 3; c++) {
++			/* separable blends, premultiplied: s(1-da) + d(1-sa) +
++			 * sa.da.B(s/sa, d/da) */
++			int base = DIV255(s[c] * (255 - da) + d[c] * (255 - sa));
++			int x, sd = s[c] * da, ds = d[c] * sa;
++			if (op == OP_MULTIPLY)
++				x = DIV255(s[c] * d[c]);
++			else if (op == OP_SCREEN)
++				x = DIV255(sd + ds - s[c] * d[c]);
++			else if (op == OP_DARKEN)
++				x = DIV255(sd < ds ? sd : ds);
++			else
++				x = DIV255(sd > ds ? sd : ds);
++			r[c] = base + x;
++		}
++		r[3] = sa + da - DIV255(sa * da);
++		break;
++	default:	/* source-over */
++		for (c = 0; c < 4; c++) r[c] = s[c] + DIV255(d[c] * (255 - sa));
++		break;
++	}
++	for (c = 0; c < 4; c++)
++		d[c] = (uint8_t)(r[c] > 255 ? 255 : r[c]);
++}
++
++/** Composite one row: cov (NULL = full) for pixels x0 .. x1-1. */
++static void comp_row(void *pw, int y, int x0, int x1, const uint8_t *cov)
++{
++	struct drawop *dop = pw;
++	struct cv *cv = dop->cv;
++	struct paint *p = dop->paint;
++	uint8_t *d;
++	const uint8_t *clip;
++	bool unb = op_unbounded(dop->op);
++	int i, n;
++	const uint8_t *col;
++
++	if (y < 0 || y >= cv->h || x1 <= 0 || x0 >= cv->w)
++		return;
++	if (x0 < 0) {
++		if (cov != NULL) cov += -x0;
++		x0 = 0;
++	}
++	if (x1 > cv->w) x1 = cv->w;
++	n = x1 - x0;
++	if (n <= 0)
++		return;
++	d = cv->px + ((size_t)y * cv->w + x0) * 4;
++	clip = cv->clip != NULL ? cv->clip + (size_t)y * cv->w + x0 : NULL;
++	if (p->type == 0) {
++		col = NULL;
++	} else {
++		paint_row(p, y, x0, n, dop->row);
++		col = dop->row;
++	}
++	for (i = 0; i < n; i++, d += 4) {
++		int c = cov != NULL ? cov[i] : 255;
++		int k = clip != NULL ? clip[i] : 255, f, j;
++		uint8_t s[4], old[4];
++		const uint8_t *src = col != NULL ? col + 4 * i : p->rgba;
++		if (k == 0 || (c == 0 && !unb))
++			continue;
++		f = DIV255(c * dop->ga);
++		if (f == 255) {
++			memcpy(s, src, 4);
++		} else {
++			for (j = 0; j < 4; j++)
++				s[j] = (uint8_t)DIV255(src[j] * f);
++		}
++		if (dop->op == OP_SOURCE_OVER && k == 255) {
++			int ia = 255 - s[3];
++			if (ia == 0) {
++				memcpy(d, s, 4);
++			} else if (s[3] != 0) {
++				for (j = 0; j < 4; j++)
++					d[j] = (uint8_t)(s[j] + DIV255(d[j] * ia));
++			}
++			continue;
++		}
++		memcpy(old, d, 4);
++		blend(dop->op, s, d);
++		if (k != 255)
++			for (j = 0; j < 4; j++)
++				d[j] = (uint8_t)(old[j] +
++					((d[j] - old[j]) * k + (d[j] >= old[j] ? 127 : -127)) / 255);
++	}
++	cv_dirty(cv, x0, y, x1, y + 1);
++}
++
++/* ---- strokes ----------------------------------------------------------- */
++
++struct polys {
++	double *pts;
++	int *counts;
++	int npts, nsub, cap_pts, cap_sub;
++};
++
++static bool polys_add(struct polys *pl, const double *p, int n)
++{
++	double area = 0;
++	int i;
++
++	if (pl->npts + n > pl->cap_pts) {
++		int c = pl->cap_pts ? pl->cap_pts * 2 : 256;
++		double *np;
++		while (c < pl->npts + n) c *= 2;
++		np = realloc(pl->pts, sizeof(double) * 2 * c);
++		if (np == NULL) return false;
++		pl->pts = np;
++		pl->cap_pts = c;
++	}
++	if (pl->nsub + 1 > pl->cap_sub) {
++		int c = pl->cap_sub ? pl->cap_sub * 2 : 64;
++		int *nc = realloc(pl->counts, sizeof(int) * c);
++		if (nc == NULL) return false;
++		pl->counts = nc;
++		pl->cap_sub = c;
++	}
++	for (i = 0; i < n; i++) {
++		int j = (i + 1) % n;
++		area += p[2 * i] * p[2 * j + 1] - p[2 * j] * p[2 * i + 1];
++	}
++	for (i = 0; i < n; i++) {
++		/* every piece the same way round: overlaps add, never cancel */
++		int k = area < 0 ? n - 1 - i : i;
++		pl->pts[2 * (pl->npts + i)] = p[2 * k];
++		pl->pts[2 * (pl->npts + i) + 1] = p[2 * k + 1];
++	}
++	pl->npts += n;
++	pl->counts[pl->nsub++] = n;
++	return true;
++}
++
++static int circle_steps(double r)
++{
++	double a;
++	int n;
++	if (r <= 0.25)
++		return 8;
++	a = acos(1.0 - 0.1 / r);
++	n = (a > 0) ? (int)ceil(M_PI / a) : 256;
++	return clampi(n, 8, 256);
++}
++
++static bool add_disc(struct polys *pl, double x, double y, double r)
++{
++	double buf[2 * 256];
++	int n = circle_steps(r), i;
++	for (i = 0; i < n; i++) {
++		double a = 2 * M_PI * i / n;
++		buf[2 * i] = x + r * cos(a);
++		buf[2 * i + 1] = y + r * sin(a);
++	}
++	return polys_add(pl, buf, n);
++}
++
++static bool add_quad(struct polys *pl, double ax, double ay, double bx,
++		double by, double cx, double cy, double dx, double dy)
++{
++	double q[8];
++	q[0] = ax; q[1] = ay; q[2] = bx; q[3] = by;
++	q[4] = cx; q[5] = cy; q[6] = dx; q[7] = dy;
++	return polys_add(pl, q, 4);
++}
++
++static bool add_join(struct polys *pl, double px, double py, double d0x,
++		double d0y, double d1x, double d1y, double hw, int join,
++		double miter)
++{
++	double cr = d0x * d1y - d0y * d1x, dot = d0x * d1x + d0y * d1y;
++	double o0x, o0y, o1x, o1y, t[6];
++
++	if (fabs(cr) < 1e-9 && dot > 0)
++		return true;	/* straight on */
++	if (join == 1)
++		return add_disc(pl, px, py, hw);
++	/* the outer side: away from the turn */
++	if (cr > 0) {
++		o0x = d0y * hw; o0y = -d0x * hw;
++		o1x = d1y * hw; o1y = -d1x * hw;
++	} else {
++		o0x = -d0y * hw; o0y = d0x * hw;
++		o1x = -d1y * hw; o1y = d1x * hw;
++	}
++	if (join == 0) {
++		double mx = o0x + o1x, my = o0y + o1y, ml = sqrt(mx * mx + my * my);
++		if (ml > 1e-12) {
++			double cosh = (mx * o0x + my * o0y) / (ml * hw);
++			if (cosh > 1e-9 && 1.0 / cosh <= miter) {
++				double len = hw / cosh;
++				return add_quad(pl, px, py, px + o0x, py + o0y,
++						px + mx / ml * len, py + my / ml * len,
++						px + o1x, py + o1y);
++			}
++		}
++	}
++	t[0] = px; t[1] = py;
++	t[2] = px + o0x; t[3] = py + o0y;
++	t[4] = px + o1x; t[5] = py + o1y;
++	return polys_add(pl, t, 3);
++}
++
++static bool add_cap(struct polys *pl, double px, double py, double dx,
++		double dy, double hw, int cap, bool start)
++{
++	double nx = -dy * hw, ny = dx * hw, ex, ey;
++	if (cap == 1)
++		return add_disc(pl, px, py, hw);
++	if (cap != 2)
++		return true;
++	ex = (start ? -dx : dx) * hw;
++	ey = (start ? -dy : dy) * hw;
++	return add_quad(pl, px + nx, py + ny, px - nx, py - ny,
++			px - nx + ex, py - ny + ey, px + nx + ex, py + ny + ey);
++}
++
++static bool stroke_path(struct polys *pl, const double *pts,
++		const int *counts, const uint8_t *closed, int nsub, double hw,
++		int cap, int join, double miter)
++{
++	int s, off = 0;
++	double *q = NULL;
++	int qcap = 0;
++	bool ok = true;
++
++	for (s = 0; s < nsub && ok; s++) {
++		const double *p = pts + 2 * off;
++		int n = counts[s], m = 0, i, nseg;
++		bool cl = closed != NULL && closed[s];
++
++		off += n;
++		if (n > qcap) {
++			double *nq = realloc(q, sizeof(double) * 2 * n);
++			if (nq == NULL) { ok = false; break; }
++			q = nq;
++			qcap = n;
++		}
++		/* drop repeated points and anything not finite */
++		for (i = 0; i < n; i++) {
++			if (!isfinite(p[2 * i]) || !isfinite(p[2 * i + 1]))
++				continue;
++			if (m > 0 && fabs(p[2 * i] - q[2 * (m - 1)]) < 1e-9 &&
++			    fabs(p[2 * i + 1] - q[2 * (m - 1) + 1]) < 1e-9)
++				continue;
++			q[2 * m] = p[2 * i];
++			q[2 * m + 1] = p[2 * i + 1];
++			m++;
++		}
++		if (cl && m > 1 && fabs(q[0] - q[2 * (m - 1)]) < 1e-9 &&
++		    fabs(q[1] - q[2 * (m - 1) + 1]) < 1e-9)
++			m--;
++		if (m == 0)
++			continue;
++		if (m == 1) {
++			/* a zero-length subpath: a dot for round caps, a
++			 * square for square caps (axis-aligned) */
++			if (n > 1 && cap == 1)
++				ok = add_disc(pl, q[0], q[1], hw);
++			else if (n > 1 && cap == 2)
++				ok = add_quad(pl, q[0] - hw, q[1] - hw, q[0] + hw,
++					q[1] - hw, q[0] + hw, q[1] + hw,
++					q[0] - hw, q[1] + hw);
++			continue;
++		}
++		nseg = cl ? m : m - 1;
++		for (i = 0; i < nseg && ok; i++) {
++			int j = (i + 1) % m;
++			double dx = q[2 * j] - q[2 * i], dy = q[2 * j + 1] - q[2 * i + 1];
++			double len = sqrt(dx * dx + dy * dy), nx, ny;
++			dx /= len; dy /= len;
++			nx = -dy * hw; ny = dx * hw;
++			ok = add_quad(pl, q[2 * i] + nx, q[2 * i + 1] + ny,
++				q[2 * j] + nx, q[2 * j + 1] + ny,
++				q[2 * j] - nx, q[2 * j + 1] - ny,
++				q[2 * i] - nx, q[2 * i + 1] - ny);
++		}
++		/* joins: at every inner vertex, and at all of them when closed */
++		for (i = cl ? 0 : 1; i < (cl ? m : m - 1) && ok; i++) {
++			int a = (i - 1 + m) % m, b = (i + 1) % m;
++			double d0x = q[2 * i] - q[2 * a], d0y = q[2 * i + 1] - q[2 * a + 1];
++			double d1x = q[2 * b] - q[2 * i], d1y = q[2 * b + 1] - q[2 * i + 1];
++			double l0 = sqrt(d0x * d0x + d0y * d0y);
++			double l1 = sqrt(d1x * d1x + d1y * d1y);
++			ok = add_join(pl, q[2 * i], q[2 * i + 1], d0x / l0, d0y / l0,
++				d1x / l1, d1y / l1, hw, join, miter);
++		}
++		if (!cl && ok) {
++			double dx = q[2] - q[0], dy = q[3] - q[1];
++			double l = sqrt(dx * dx + dy * dy);
++			ok = add_cap(pl, q[0], q[1], dx / l, dy / l, hw, cap, true);
++			dx = q[2 * (m - 1)] - q[2 * (m - 2)];
++			dy = q[2 * (m - 1) + 1] - q[2 * (m - 2) + 1];
++			l = sqrt(dx * dx + dy * dy);
++			if (ok)
++				ok = add_cap(pl, q[2 * (m - 1)], q[2 * (m - 1) + 1],
++					dx / l, dy / l, hw, cap, false);
++		}
++	}
++	free(q);
++	return ok;
++}
++
++/* ---- clip --------------------------------------------------------------- */
++
++struct clipjob {
++	struct cv *cv;
++	uint8_t *mask;
++};
++
++static void clip_row(void *pw, int y, int x0, int x1, const uint8_t *cov)
++{
++	struct clipjob *cj = pw;
++	uint8_t *m = cj->mask + (size_t)y * cj->cv->w;
++	const uint8_t *old = cj->cv->clip != NULL ?
++		cj->cv->clip + (size_t)y * cj->cv->w : NULL;
++	int x;
++	for (x = x0; x < x1; x++) {
++		int c = cov[x - x0];
++		m[x] = (uint8_t)(old != NULL ? DIV255(c * old[x]) : c);
++	}
++}
++
++/* ---- JS natives --------------------------------------------------------- */
++
++static struct cv *cv_of(JSValueConst v)
++{
++	return JS_GetOpaque(v, s_cv_class_id);
++}
++
++static void cv_finalizer(JSRuntime *rt, JSValue val)
++{
++	struct cv *cv = JS_GetOpaque(val, s_cv_class_id);
++	(void)rt;
++	if (cv == NULL)
++		return;
++	if (cv->scheduled)
++		macos9_schedule(-1, cv_flush, cv);
++	cv_free_clips(cv);
++	free(cv->px);
++	if (cv->node != NULL)
++		dom_node_unref(cv->node);
++	free(cv);
++}
++
++static JSClassDef s_cv_class = { "CanvasPixels", cv_finalizer, NULL, NULL, NULL };
++
++/** A typed array's elements, when it is of the expected type. */
++static void *typed(JSContext *ctx, JSValueConst v, int type, size_t *n)
++{
++	size_t off = 0, len = 0, bpe = 0, sz = 0;
++	JSValue ab;
++	uint8_t *buf;
++
++	*n = 0;
++	if (JS_GetTypedArrayType(v) != type)
++		return NULL;
++	ab = JS_GetTypedArrayBuffer(ctx, v, &off, &len, &bpe);
++	if (JS_IsException(ab))
++		return NULL;
++	buf = JS_GetArrayBuffer(ctx, &sz, ab);
++	JS_FreeValue(ctx, ab);
++	if (buf == NULL || bpe == 0)
++		return NULL;
++	*n = len / bpe;
++	return buf + off;
++}
++
++static double num_at(JSContext *ctx, JSValueConst arr, uint32_t i)
++{
++	JSValue v = JS_GetPropertyUint32(ctx, arr, i);
++	double d = 0;
++	if (JS_ToFloat64(ctx, &d, v) != 0)
++		d = 0;
++	JS_FreeValue(ctx, v);
++	return d;
++}
++
++static double num_arg(JSContext *ctx, int argc, JSValueConst *argv, int i,
++		double dflt)
++{
++	double d;
++	if (i >= argc || JS_ToFloat64(ctx, &d, argv[i]) != 0)
++		return dflt;
++	return d;
++}
++
++static int int_arg(JSContext *ctx, int argc, JSValueConst *argv, int i,
++		int dflt)
++{
++	return dtoi(num_arg(ctx, argc, argv, i, dflt));
++}
++
++/** Copy a source's pixels (premultiplied) for an image paint: a canvas
++ * handle or an <img> element; the integer rectangle covering sx..sw. */
++static bool image_source(JSContext *ctx, JSValueConst src, double sx,
++		double sy, double sw, double sh, struct paint *p)
++{
++	struct cv *scv = cv_of(src);
++	const uint8_t *buf = NULL;
++	size_t stride = 0;
++	int w = 0, h = 0, x0, y0, x1, y1, x, y;
++	bool premul = false, opaque = false;
++
++	if (scv != NULL) {
++		if (scv->px == NULL)
++			return false;
++		buf = scv->px;
++		w = scv->w;
++		h = scv->h;
++		stride = (size_t)w * 4;
++		premul = true;
++	} else if (s_ops != NULL && s_ops->get_node != NULL &&
++		   s_ops->img_bitmap != NULL) {
++		struct dom_node *n = s_ops->get_node(src);
++		struct bitmap *bm = n != NULL ? s_ops->img_bitmap(ctx, n) : NULL;
++		if (bm == NULL)
++			return false;
++		buf = guit->bitmap->get_buffer(bm);
++		w = guit->bitmap->get_width(bm);
++		h = guit->bitmap->get_height(bm);
++		stride = guit->bitmap->get_rowstride(bm);
++		opaque = guit->bitmap->get_opaque(bm);
++	}
++	if (buf == NULL || w <= 0 || h <= 0)
++		return false;
++	if (sw < 0) { sx += sw; sw = -sw; }
++	if (sh < 0) { sy += sh; sh = -sh; }
++	x0 = clampi(dtoi(floor(sx)), 0, w);
++	y0 = clampi(dtoi(floor(sy)), 0, h);
++	x1 = clampi(dtoi(ceil(sx + sw)), 0, w);
++	y1 = clampi(dtoi(ceil(sy + sh)), 0, h);
++	if (x1 <= x0 || y1 <= y0)
++		return false;
++	p->iw = x1 - x0;
++	p->ih = y1 - y0;
++	p->img_owned = malloc((size_t)p->iw * p->ih * 4);
++	if (p->img_owned == NULL)
++		return false;
++	for (y = 0; y < p->ih; y++) {
++		const uint8_t *s = buf + (size_t)(y0 + y) * stride + (size_t)x0 * 4;
++		uint8_t *d = p->img_owned + (size_t)y * p->iw * 4;
++		if (premul) {
++			memcpy(d, s, (size_t)p->iw * 4);
++			continue;
++		}
++		for (x = 0; x < p->iw; x++, s += 4, d += 4) {
++			unsigned a = opaque ? 255 : s[3];
++			d[0] = (uint8_t)DIV255(s[0] * a);
++			d[1] = (uint8_t)DIV255(s[1] * a);
++			d[2] = (uint8_t)DIV255(s[2] * a);
++			d[3] = (uint8_t)a;
++		}
++	}
++	p->img = p->img_owned;
++	p->ix = x0;
++	p->iy = y0;
++	return true;
++}
++
++/**
++ * A paint from its JS description:
++ *   [0, r, g, b, a]                                  a colour (a 0..1)
++ *   [1, inv x6, x0, y0, x1, y1, stops]               linear gradient
++ *   [2, inv x6, x0, y0, r0, x1, y1, r1, stops]       radial gradient
++ *   [3, inv x6, angle, cx, cy, stops]                conic gradient
++ *   [4, inv x6, source, sx, sy, sw, sh, repx, repy, smooth]   an image
++ * inv maps device pixels to the paint's space (user space for gradients,
++ * the source's pixels for images); stops is a Float64Array of
++ * offset, r, g, b, a.
++ */
++static bool get_paint(JSContext *ctx, JSValueConst v, struct paint *p)
++{
++	int i;
++	memset(p, 0, sizeof(*p));
++	if (!JS_IsObject(v))
++		return false;
++	p->type = dtoi(num_at(ctx, v, 0));
++	if (p->type == 0) {
++		double a = num_at(ctx, v, 4);
++		a = a < 0 ? 0 : (a > 1 ? 1 : a);
++		p->rgba[3] = (uint8_t)(a * 255 + 0.5);
++		for (i = 0; i < 3; i++)
++			p->rgba[i] = (uint8_t)DIV255(clampi(dtoi(num_at(ctx, v,
++					(uint32_t)(1 + i))), 0, 255) * p->rgba[3]);
++		return true;
++	}
++	for (i = 0; i < 6; i++)
++		p->inv[i] = num_at(ctx, v, (uint32_t)(1 + i));
++	if (p->type >= 1 && p->type <= 3) {
++		int ng = p->type == 1 ? 4 : (p->type == 2 ? 6 : 3);
++		JSValue sv;
++		size_t ns = 0;
++		const double *st;
++		for (i = 0; i < ng; i++)
++			p->g[i] = num_at(ctx, v, (uint32_t)(7 + i));
++		sv = JS_GetPropertyUint32(ctx, v, (uint32_t)(7 + ng));
++		st = typed(ctx, sv, JS_TYPED_ARRAY_FLOAT64, &ns);
++		if (st != NULL)
++			build_lut(p, st, (int)(ns / 5));
++		else
++			p->none = true;
++		JS_FreeValue(ctx, sv);
++		if (p->type == 1) {
++			double dx = p->g[2] - p->g[0], dy = p->g[3] - p->g[1];
++			double l2 = dx * dx + dy * dy;
++			if (l2 < 1e-18)
++				p->none = true;
++			p->g[2] = dx;
++			p->g[3] = dy;
++			p->g[4] = l2 > 0 ? 1.0 / l2 : 0;
++		} else if (p->type == 2) {
++			if (p->g[0] == p->g[3] && p->g[1] == p->g[4] &&
++			    p->g[2] == p->g[5])
++				p->none = true;
++		}
++		return true;
++	}
++	if (p->type == 4) {
++		JSValue src = JS_GetPropertyUint32(ctx, v, 7);
++		bool ok = image_source(ctx, src, num_at(ctx, v, 8),
++				num_at(ctx, v, 9), num_at(ctx, v, 10),
++				num_at(ctx, v, 11), p);
++		JS_FreeValue(ctx, src);
++		p->rep_x = num_at(ctx, v, 12) != 0;
++		p->rep_y = num_at(ctx, v, 13) != 0;
++		p->smooth = num_at(ctx, v, 14) != 0;
++		if (!ok)
++			p->none = true;
++		return true;
++	}
++	return false;
++}
++
++/* __cv.create(element, w, h) -> handle */
++static JSValue js_cv_create(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv;
++	struct dom_node *node = NULL;
++	struct bitmap *bm = NULL;
++	JSValue obj;
++	int w = int_arg(ctx, argc, argv, 1, 300);
++	int h = int_arg(ctx, argc, argv, 2, 150);
++
++	(void)this_val;
++	if (argc >= 1 && s_ops != NULL && s_ops->get_node != NULL)
++		node = s_ops->get_node(argv[0]);
++	cv = calloc(1, sizeof(*cv));
++	if (cv == NULL)
++		return JS_ThrowOutOfMemory(ctx);
++	obj = JS_NewObjectClass(ctx, (int)s_cv_class_id);
++	if (JS_IsException(obj)) {
++		free(cv);
++		return obj;
++	}
++	if (node != NULL)
++		cv->node = dom_node_ref(node);
++	JS_SetOpaque(obj, cv);
++	cv_resize(cv, w, h);
++	/* a context made again for the same element (its first one was
++	 * collected) starts from what the element shows */
++	if (cv->node != NULL && cv->px != NULL &&
++	    dom_node_get_user_data(cv->node,
++			corestring_dom___ns_key_canvas_node_data,
++			(void **)&bm) == DOM_NO_ERR && bm != NULL &&
++	    guit->bitmap->get_width(bm) == w &&
++	    guit->bitmap->get_height(bm) == h) {
++		const uint8_t *b = guit->bitmap->get_buffer(bm);
++		size_t stride = guit->bitmap->get_rowstride(bm);
++		int x, y;
++		for (y = 0; b != NULL && y < h; y++) {
++			const uint8_t *s = b + (size_t)y * stride;
++			uint8_t *d = cv->px + (size_t)y * w * 4;
++			for (x = 0; x < w; x++, s += 4, d += 4) {
++				d[0] = (uint8_t)DIV255(s[0] * s[3]);
++				d[1] = (uint8_t)DIV255(s[1] * s[3]);
++				d[2] = (uint8_t)DIV255(s[2] * s[3]);
++				d[3] = s[3];
++			}
++		}
++	}
++	return obj;
++}
++
++/* __cv.resize(handle, w, h): clears it, as setting width/height does */
++static JSValue js_cv_resize(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	(void)this_val;
++	if (cv != NULL)
++		cv_resize(cv, int_arg(ctx, argc, argv, 1, 0),
++			  int_arg(ctx, argc, argv, 2, 0));
++	return JS_UNDEFINED;
++}
++
++static void draw_polys(struct cv *cv, struct paint *p, double alpha, int op,
++		const double *pts, const int *counts, int nsub, bool evenodd)
++{
++	struct drawop dop;
++	bool unb;
++
++	if (cv->px == NULL || p->none || !(alpha > 0) || op < 0 ||
++	    op >= OP_COUNT)
++		return;
++	if (alpha > 1) alpha = 1;
++	dop.cv = cv;
++	dop.paint = p;
++	dop.ga = (int)(alpha * 255 + 0.5);
++	dop.op = op;
++	dop.row = NULL;		/* paint colours: not needed for a colour */
++	if (p->type != 0 && (dop.row = malloc((size_t)cv->w * 4)) == NULL)
++		return;
++	unb = op_unbounded(op);
++	raster(pts, counts, nsub, evenodd, 0, 0, cv->w, cv->h, unb,
++	       comp_row, &dop);
++	free(dop.row);
++	cv_changed(cv);
++}
++
++static int *get_counts(JSContext *ctx, JSValueConst v, int *nsub,
++		size_t npts)
++{
++	size_t n = 0, i, tot = 0;
++	int *c = typed(ctx, v, JS_TYPED_ARRAY_INT32, &n);
++	*nsub = 0;
++	if (c == NULL)
++		return NULL;
++	for (i = 0; i < n; i++) {
++		if (c[i] < 0)
++			return NULL;
++		tot += (size_t)c[i];
++	}
++	if (tot > npts)
++		return NULL;
++	*nsub = (int)n;
++	return c;
++}
++
++/* __cv.fill(handle, pts, counts, evenodd, paint, alpha, op) */
++static JSValue js_cv_fill(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	struct paint p;
++	size_t np = 0;
++	const double *pts;
++	int *counts, nsub;
++
++	(void)this_val;
++	if (cv == NULL || argc < 7)
++		return JS_UNDEFINED;
++	pts = typed(ctx, argv[1], JS_TYPED_ARRAY_FLOAT64, &np);
++	counts = get_counts(ctx, argv[2], &nsub, np / 2);
++	if (pts == NULL || counts == NULL || !get_paint(ctx, argv[4], &p))
++		return JS_UNDEFINED;
++	draw_polys(cv, &p, num_arg(ctx, argc, argv, 5, 1),
++		   int_arg(ctx, argc, argv, 6, 0), pts, counts, nsub,
++		   JS_ToBool(ctx, argv[3]));
++	paint_free(&p);
++	return JS_UNDEFINED;
++}
++
++/* __cv.stroke(handle, pts, counts, closed, width, cap, join, miter, paint,
++ * alpha, op) */
++static JSValue js_cv_stroke(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	struct paint p;
++	struct polys pl;
++	size_t np = 0, ncl = 0;
++	const double *pts;
++	const uint8_t *closed;
++	int *counts, nsub;
++	double width;
++
++	(void)this_val;
++	if (cv == NULL || argc < 11)
++		return JS_UNDEFINED;
++	pts = typed(ctx, argv[1], JS_TYPED_ARRAY_FLOAT64, &np);
++	counts = get_counts(ctx, argv[2], &nsub, np / 2);
++	closed = typed(ctx, argv[3], JS_TYPED_ARRAY_UINT8, &ncl);
++	width = num_arg(ctx, argc, argv, 4, 1);
++	if (pts == NULL || counts == NULL || (closed != NULL &&
++	    ncl < (size_t)nsub) || !(width > 0) || cv->px == NULL)
++		return JS_UNDEFINED;
++	if (!get_paint(ctx, argv[8], &p))
++		return JS_UNDEFINED;
++	memset(&pl, 0, sizeof(pl));
++	if (stroke_path(&pl, pts, counts, closed, nsub, width / 2,
++			int_arg(ctx, argc, argv, 5, 0),
++			int_arg(ctx, argc, argv, 6, 0),
++			num_arg(ctx, argc, argv, 7, 10)) && pl.nsub > 0)
++		draw_polys(cv, &p, num_arg(ctx, argc, argv, 9, 1),
++			   int_arg(ctx, argc, argv, 10, 0), pl.pts,
++			   pl.counts, pl.nsub, false);
++	free(pl.pts);
++	free(pl.counts);
++	paint_free(&p);
++	return JS_UNDEFINED;
++}
++
++/* __cv.clip(handle, pts, counts, evenodd): intersect the clip */
++static JSValue js_cv_clip(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	struct clipjob cj;
++	size_t np = 0;
++	const double *pts;
++	int *counts, nsub;
++
++	(void)this_val;
++	if (cv == NULL || cv->px == NULL || argc < 4)
++		return JS_UNDEFINED;
++	pts = typed(ctx, argv[1], JS_TYPED_ARRAY_FLOAT64, &np);
++	counts = get_counts(ctx, argv[2], &nsub, np / 2);
++	if (pts == NULL || counts == NULL)
++		return JS_UNDEFINED;
++	cj.cv = cv;
++	cj.mask = calloc((size_t)cv->w, (size_t)cv->h);
++	if (cj.mask == NULL)
++		return JS_UNDEFINED;
++	raster(pts, counts, nsub, JS_ToBool(ctx, argv[3]), 0, 0, cv->w, cv->h,
++	       false, clip_row, &cj);
++	if (cv->clip_owned)
++		free(cv->clip);
++	cv->clip = cj.mask;
++	cv->clip_owned = true;
++	return JS_UNDEFINED;
++}
++
++/* __cv.save(handle) / __cv.restore(handle): the clip, with the state */
++static JSValue js_cv_save(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	(void)ctx; (void)this_val;
++	if (cv == NULL)
++		return JS_UNDEFINED;
++	if (cv->depth >= CV_STACK) {
++		cv->overflow++;
++		return JS_UNDEFINED;
++	}
++	cv->stack[cv->depth].clip = cv->clip;
++	cv->stack[cv->depth].owned = cv->clip_owned;
++	cv->depth++;
++	cv->clip_owned = false;	/* the saved entry owns it now */
++	return JS_UNDEFINED;
++}
++
++static JSValue js_cv_restore(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	(void)ctx; (void)this_val;
++	if (cv == NULL)
++		return JS_UNDEFINED;
++	if (cv->overflow > 0) {
++		cv->overflow--;
++		return JS_UNDEFINED;
++	}
++	if (cv->depth == 0)
++		return JS_UNDEFINED;
++	if (cv->clip_owned)
++		free(cv->clip);
++	cv->depth--;
++	cv->clip = cv->stack[cv->depth].clip;
++	cv->clip_owned = cv->stack[cv->depth].owned;
++	return JS_UNDEFINED;
++}
++
++/* __cv.reset(handle): the clip and its stack go (context.reset(), and a
++ * resize) */
++static JSValue js_cv_reset(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	(void)ctx; (void)this_val;
++	if (cv != NULL)
++		cv_free_clips(cv);
++	return JS_UNDEFINED;
++}
++
++static void glyph_cb(void *pw, const unsigned char *cov, int stride, int x,
++		int y, int w, int h)
++{
++	struct drawop *dop = pw;
++	int r;
++	for (r = 0; r < h; r++)
++		comp_row(dop, y + r, x, x + w, cov + (size_t)r * stride);
++}
++
++static void font_args(JSContext *ctx, int argc, JSValueConst *argv, int at,
++		int *px, int *fam, int *bold, int *italic)
++{
++	*px = clampi(dtoi(floor(num_arg(ctx, argc, argv, at, 10) + 0.5)), 1, 512);
++	*fam = clampi(int_arg(ctx, argc, argv, at + 1, 0), 0, 2);
++	*bold = num_arg(ctx, argc, argv, at + 2, 0) != 0;
++	*italic = num_arg(ctx, argc, argv, at + 3, 0) != 0;
++}
++
++/* __cv.text(handle, string, px, family, bold, italic, x, y, paint, alpha,
++ * op) -> advance in device pixels; (x, y) is the baseline origin */
++static JSValue js_cv_text(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	struct paint p;
++	struct drawop dop;
++	const char *s;
++	size_t len;
++	int px, fam, bold, italic, adv = 0;
++	double x, y, alpha;
++
++	(void)this_val;
++	if (cv == NULL || argc < 11)
++		return JS_NewInt32(ctx, 0);
++	font_args(ctx, argc, argv, 2, &px, &fam, &bold, &italic);
++	x = num_arg(ctx, argc, argv, 6, 0);
++	y = num_arg(ctx, argc, argv, 7, 0);
++	alpha = num_arg(ctx, argc, argv, 9, 1);
++	if (cv->px == NULL || !isfinite(x) || !isfinite(y) || !(alpha > 0))
++		return JS_NewInt32(ctx, 0);
++	if (!get_paint(ctx, argv[8], &p))
++		return JS_NewInt32(ctx, 0);
++	s = JS_ToCStringLen(ctx, &len, argv[1]);
++	if (s != NULL && !p.none) {
++		dop.cv = cv;
++		dop.paint = &p;
++		dop.ga = (int)((alpha > 1 ? 1 : alpha) * 255 + 0.5);
++		dop.op = int_arg(ctx, argc, argv, 10, 0);
++		if (dop.op < 0 || dop.op >= OP_COUNT || op_unbounded(dop.op))
++			dop.op = OP_SOURCE_OVER;
++		dop.row = p.type != 0 ? malloc((size_t)cv->w * 4) : NULL;
++		if (dop.row != NULL || p.type == 0) {
++			/* whole pixels: glyphs are rendered at a pixel origin */
++			adv = macsurf_canvas_glyphs(px, fam, bold, italic, s, len,
++				(int)floor(clampd(x, -1e6, 1e6) + 0.5),
++				(int)floor(clampd(y, -1e6, 1e6) + 0.5),
++				glyph_cb, &dop);
++			free(dop.row);
++			cv_changed(cv);
++		}
++	}
++	if (s != NULL)
++		JS_FreeCString(ctx, s);
++	paint_free(&p);
++	return JS_NewInt32(ctx, adv);
++}
++
++/* __cv.measure(string, px, family, bold, italic) -> [width, ascent,
++ * descent] in pixels at that size */
++static JSValue js_cv_measure(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	const char *s;
++	size_t len;
++	int px, fam, bold, italic, w = 0, asc = 0, desc = 0;
++	JSValue a;
++
++	(void)this_val;
++	font_args(ctx, argc, argv, 1, &px, &fam, &bold, &italic);
++	s = argc > 0 ? JS_ToCStringLen(ctx, &len, argv[0]) : NULL;
++	if (s != NULL) {
++		w = macsurf_canvas_glyphs(px, fam, bold, italic, s, len, 0, 0,
++				NULL, NULL);
++		JS_FreeCString(ctx, s);
++	}
++	macsurf_canvas_font_extents(px, fam, bold, italic, &asc, &desc);
++	a = JS_NewArray(ctx);
++	JS_SetPropertyUint32(ctx, a, 0, JS_NewInt32(ctx, w));
++	JS_SetPropertyUint32(ctx, a, 1, JS_NewInt32(ctx, asc));
++	JS_SetPropertyUint32(ctx, a, 2, JS_NewInt32(ctx, desc));
++	return a;
++}
++
++/* __cv.get(handle, x, y, w, h) -> ArrayBuffer of unpremultiplied RGBA */
++static JSValue js_cv_get(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	int x0 = int_arg(ctx, argc, argv, 1, 0);
++	int y0 = int_arg(ctx, argc, argv, 2, 0);
++	int w = int_arg(ctx, argc, argv, 3, 0);
++	int h = int_arg(ctx, argc, argv, 4, 0);
++	uint8_t *buf;
++	size_t n;
++	int x, y;
++	JSValue ab;
++
++	(void)this_val;
++	if (w <= 0 || h <= 0 || (long)w * h > 16L * 1024 * 1024)
++		return JS_ThrowRangeError(ctx, "bad image size");
++	n = (size_t)w * h * 4;
++	buf = calloc(1, n);
++	if (buf == NULL)
++		return JS_ThrowOutOfMemory(ctx);
++	if (cv != NULL && cv->px != NULL) {
++		for (y = 0; y < h; y++) {
++			int sy = y0 + y;
++			if (sy < 0 || sy >= cv->h)
++				continue;
++			for (x = 0; x < w; x++) {
++				int sx = x0 + x;
++				const uint8_t *s;
++				uint8_t *d;
++				unsigned a;
++				if (sx < 0 || sx >= cv->w)
++					continue;
++				s = cv->px + ((size_t)sy * cv->w + sx) * 4;
++				d = buf + ((size_t)y * w + x) * 4;
++				a = s[3];
++				if (a == 0)
++					continue;
++				d[0] = (uint8_t)((s[0] * 255 + a / 2) / a);
++				d[1] = (uint8_t)((s[1] * 255 + a / 2) / a);
++				d[2] = (uint8_t)((s[2] * 255 + a / 2) / a);
++				d[3] = (uint8_t)a;
++			}
++		}
++	}
++	ab = JS_NewArrayBufferCopy(ctx, buf, n);
++	free(buf);
++	return ab;
++}
++
++/* __cv.put(handle, data, iw, ih, dx, dy, x0, y0, x1, y1): data's pixels
++ * x0..x1, y0..y1 at dx+x, dy+y, replacing what is there */
++static JSValue js_cv_put(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	size_t n = 0;
++	const uint8_t *data;
++	int iw, ih, dx, dy, x0, y0, x1, y1, x, y;
++
++	(void)this_val;
++	if (cv == NULL || cv->px == NULL || argc < 10)
++		return JS_UNDEFINED;
++	data = typed(ctx, argv[1], JS_TYPED_ARRAY_UINT8C, &n);
++	if (data == NULL)
++		data = typed(ctx, argv[1], JS_TYPED_ARRAY_UINT8, &n);
++	iw = int_arg(ctx, argc, argv, 2, 0);
++	ih = int_arg(ctx, argc, argv, 3, 0);
++	if (data == NULL || iw <= 0 || ih <= 0 ||
++	    n < (size_t)iw * (size_t)ih * 4)
++		return JS_UNDEFINED;
++	dx = int_arg(ctx, argc, argv, 4, 0);
++	dy = int_arg(ctx, argc, argv, 5, 0);
++	x0 = clampi(int_arg(ctx, argc, argv, 6, 0), 0, iw);
++	y0 = clampi(int_arg(ctx, argc, argv, 7, 0), 0, ih);
++	x1 = clampi(int_arg(ctx, argc, argv, 8, iw), 0, iw);
++	y1 = clampi(int_arg(ctx, argc, argv, 9, ih), 0, ih);
++	for (y = y0; y < y1; y++) {
++		int ty = dy + y;
++		if (ty < 0 || ty >= cv->h)
++			continue;
++		for (x = x0; x < x1; x++) {
++			int tx = dx + x;
++			const uint8_t *s;
++			uint8_t *d;
++			if (tx < 0 || tx >= cv->w)
++				continue;
++			s = data + ((size_t)y * iw + x) * 4;
++			d = cv->px + ((size_t)ty * cv->w + tx) * 4;
++			d[0] = (uint8_t)DIV255(s[0] * s[3]);
++			d[1] = (uint8_t)DIV255(s[1] * s[3]);
++			d[2] = (uint8_t)DIV255(s[2] * s[3]);
++			d[3] = s[3];
++		}
++	}
++	cv_dirty(cv, dx + x0, dy + y0, dx + x1, dy + y1);
++	cv_changed(cv);
++	return JS_UNDEFINED;
++}
++
++/* ---- PNG -------------------------------------------------------------- */
++
++static uint32_t crc_table[256];
++
++static uint32_t crc32_update(uint32_t c, const uint8_t *b, size_t n)
++{
++	size_t i;
++	if (crc_table[1] == 0) {
++		uint32_t k, v;
++		int j;
++		for (k = 0; k < 256; k++) {
++			v = k;
++			for (j = 0; j < 8; j++)
++				v = (v & 1) ? 0xedb88320u ^ (v >> 1) : v >> 1;
++			crc_table[k] = v;
++		}
++	}
++	for (i = 0; i < n; i++)
++		c = crc_table[(c ^ b[i]) & 0xff] ^ (c >> 8);
++	return c;
++}
++
++static uint8_t *put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
++	return p + 4;
++}
++
++static uint8_t *png_chunk(uint8_t *p, const char *type, const uint8_t *data,
++		size_t n)
++{
++	uint8_t *start;
++	p = put32(p, (uint32_t)n);
++	start = p;
++	memcpy(p, type, 4);
++	p += 4;
++	if (n > 0)
++		memcpy(p, data, n);
++	p += n;
++	return put32(p, ~crc32_update(0xffffffffu, start, n + 4));
++}
++
++/** A PNG of the canvas (unpremultiplied RGBA, deflate stored blocks). */
++static uint8_t *png_encode(const struct cv *cv, size_t *out_len)
++{
++	int w = cv->w > 0 ? cv->w : 1, h = cv->h > 0 ? cv->h : 1;
++	size_t raw = (size_t)h * ((size_t)w * 4 + 1);
++	size_t blocks = raw / 65535 + 1;
++	size_t zlen = 2 + raw + blocks * 5 + 4;
++	size_t total = 8 + 25 + 12 + zlen + 12;
++	uint8_t *png = malloc(total), *z, *zp, *p, ihdr[13];
++	uint32_t s1 = 1, s2 = 0;
++	size_t done = 0;
++	int x, y;
++
++	if (png == NULL)
++		return NULL;
++	z = malloc(zlen);
++	if (z == NULL) {
++		free(png);
++		return NULL;
++	}
++	zp = z;
++	*zp++ = 0x78;
++	*zp++ = 0x01;
++	for (y = 0; y < h; y++) {
++		for (x = -1; x < w * 4; x++) {
++			uint8_t b = 0;
++			if (x >= 0 && cv->px != NULL && cv->w > 0 && cv->h > 0) {
++				const uint8_t *s = cv->px +
++					((size_t)y * cv->w + x / 4) * 4;
++				unsigned a = s[3];
++				if ((x & 3) == 3)
++					b = (uint8_t)a;
++				else if (a != 0)
++					b = (uint8_t)((s[x & 3] * 255 + a / 2) / a);
++			}
++			if (done % 65535 == 0) {
++				size_t left = raw - done;
++				size_t bl = left > 65535 ? 65535 : left;
++				*zp++ = left > 65535 ? 0 : 1;
++				*zp++ = (uint8_t)bl;
++				*zp++ = (uint8_t)(bl >> 8);
++				*zp++ = (uint8_t)~bl;
++				*zp++ = (uint8_t)(~bl >> 8);
++			}
++			*zp++ = b;
++			done++;
++			s1 = (s1 + b) % 65521;
++			s2 = (s2 + s1) % 65521;
++		}
++	}
++	zp = put32(zp, (s2 << 16) | s1);
++	p = png;
++	memcpy(p, "\x89PNG\r\n\x1a\n", 8);
++	p += 8;
++	put32(ihdr, (uint32_t)w);
++	put32(ihdr + 4, (uint32_t)h);
++	ihdr[8] = 8;	/* bit depth */
++	ihdr[9] = 6;	/* RGBA */
++	ihdr[10] = ihdr[11] = ihdr[12] = 0;
++	p = png_chunk(p, "IHDR", ihdr, 13);
++	p = png_chunk(p, "IDAT", z, (size_t)(zp - z));
++	p = png_chunk(p, "IEND", NULL, 0);
++	free(z);
++	*out_len = (size_t)(p - png);
++	return png;
++}
++
++/* __cv.png(handle, dataURL) -> "data:image/png;base64,..." or ArrayBuffer */
++static JSValue js_cv_png(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	static const char b64[] =
++		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++	struct cv *cv = argc > 0 ? cv_of(argv[0]) : NULL;
++	uint8_t *png;
++	char *s, *q;
++	size_t n = 0, i;
++	JSValue r;
++
++	(void)this_val;
++	if (cv == NULL)
++		return JS_NULL;
++	png = png_encode(cv, &n);
++	if (png == NULL)
++		return JS_ThrowOutOfMemory(ctx);
++	if (argc < 2 || !JS_ToBool(ctx, argv[1])) {
++		r = JS_NewArrayBufferCopy(ctx, png, n);
++		free(png);
++		return r;
++	}
++	s = malloc(22 + (n + 2) / 3 * 4 + 1);
++	if (s == NULL) {
++		free(png);
++		return JS_ThrowOutOfMemory(ctx);
++	}
++	memcpy(s, "data:image/png;base64,", 22);
++	q = s + 22;
++	for (i = 0; i < n; i += 3) {
++		uint32_t v = (uint32_t)png[i] << 16;
++		if (i + 1 < n) v |= (uint32_t)png[i + 1] << 8;
++		if (i + 2 < n) v |= png[i + 2];
++		*q++ = b64[(v >> 18) & 63];
++		*q++ = b64[(v >> 12) & 63];
++		*q++ = i + 1 < n ? b64[(v >> 6) & 63] : '=';
++		*q++ = i + 2 < n ? b64[v & 63] : '=';
++	}
++	*q = '\0';
++	r = JS_NewString(ctx, s);
++	free(s);
++	free(png);
++	return r;
++}
++
++/* __cv.imgsize(source) -> [w, h] of an <img>'s decoded image or a canvas
++ * handle, or null when it has none (yet) */
++static JSValue js_cv_imgsize(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct cv *scv;
++	int w = 0, h = 0;
++	JSValue a;
++
++	(void)this_val;
++	if (argc < 1)
++		return JS_NULL;
++	scv = cv_of(argv[0]);
++	if (scv != NULL) {
++		w = scv->w;
++		h = scv->h;
++	} else if (s_ops != NULL && s_ops->get_node != NULL &&
++		   s_ops->img_bitmap != NULL) {
++		struct dom_node *n = s_ops->get_node(argv[0]);
++		struct bitmap *bm = n != NULL ? s_ops->img_bitmap(ctx, n) : NULL;
++		if (bm == NULL)
++			return JS_NULL;
++		w = guit->bitmap->get_width(bm);
++		h = guit->bitmap->get_height(bm);
++	}
++	a = JS_NewArray(ctx);
++	JS_SetPropertyUint32(ctx, a, 0, JS_NewInt32(ctx, w));
++	JS_SetPropertyUint32(ctx, a, 1, JS_NewInt32(ctx, h));
++	return a;
++}
++
++/* exported interface documented in macsurf_canvas.h */
++void macsurf_canvas_init_class(JSRuntime *rt)
++{
++	s_cv_class_id = 0;
++	JS_NewClassID(rt, &s_cv_class_id);
++	JS_NewClass(rt, s_cv_class_id, &s_cv_class);
++}
++
++/* exported interface documented in macsurf_canvas.h */
++void macsurf_canvas_install(JSContext *ctx, JSValueConst global,
++		const struct macsurf_canvas_ops *ops)
++{
++	static const struct {
++		const char *name;
++		JSCFunction *fn;
++		int n;
++	} fns[] = {
++		{ "create", js_cv_create, 3 },
++		{ "resize", js_cv_resize, 3 },
++		{ "fill", js_cv_fill, 7 },
++		{ "stroke", js_cv_stroke, 11 },
++		{ "clip", js_cv_clip, 4 },
++		{ "save", js_cv_save, 1 },
++		{ "restore", js_cv_restore, 1 },
++		{ "reset", js_cv_reset, 1 },
++		{ "text", js_cv_text, 11 },
++		{ "measure", js_cv_measure, 5 },
++		{ "get", js_cv_get, 5 },
++		{ "put", js_cv_put, 10 },
++		{ "png", js_cv_png, 2 },
++		{ "imgsize", js_cv_imgsize, 1 },
++	};
++	JSValue o = JS_NewObject(ctx);
++	size_t i;
++
++	s_ops = ops;
++	for (i = 0; i < sizeof(fns) / sizeof(fns[0]); i++)
++		JS_SetPropertyStr(ctx, o, fns[i].name,
++			JS_NewCFunction(ctx, fns[i].fn, fns[i].name, fns[i].n));
++	JS_SetPropertyStr(ctx, global, "__cv", o);
++}
++
++#endif
+diff --git a/content/handlers/javascript/quickjs/macsurf_canvas.h b/content/handlers/javascript/quickjs/macsurf_canvas.h
+new file mode 100644
+--- /dev/null
++++ b/content/handlers/javascript/quickjs/macsurf_canvas.h
+@@ -0,0 +1,39 @@
++/*
++ * VitaBrowser patch 251: the canvas 2D raster.
++ *
++ * A <canvas> element's pixels, the shapes, text and images drawn into them,
++ * and the bitmap the page redraw shows (redraw.c plots the bitmap kept as
++ * the element's corestring_dom___ns_key_canvas_node_data user data). The
++ * JavaScript side -- CanvasRenderingContext2D's state, transforms, paths,
++ * colours and fonts -- is in vita_polyfill.js; it calls the natives
++ * installed here, on the hidden global `__cv`, with device coordinates.
++ */
++
++#ifndef MACSURF_CANVAS_H
++#define MACSURF_CANVAS_H
++
++#ifdef WITH_QUICKJS
++
++#include "quickjs.h"
++
++struct dom_node;
++struct bitmap;
++
++/** What the canvas needs from the bridge. */
++struct macsurf_canvas_ops {
++	/** The DOM node a JS element wrapper stands for, or NULL. */
++	struct dom_node *(*get_node)(JSValueConst val);
++	/** The decoded image an <img> element shows, or NULL. */
++	struct bitmap *(*img_bitmap)(JSContext *ctx, struct dom_node *node);
++};
++
++/** Register the handle class with a runtime (once per runtime). */
++void macsurf_canvas_init_class(JSRuntime *rt);
++
++/** Install `__cv` on a realm's global object. */
++void macsurf_canvas_install(JSContext *ctx, JSValueConst global,
++		const struct macsurf_canvas_ops *ops);
++
++#endif
++
++#endif
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -1482,6 +1482,7 @@
+  */
+ 
+ #define IMG_DETACHED_MAX 32	/**< detached fetches in flight per page */
++#define IMG_KEPT_MAX 24		/**< patch 251: detached images kept decoded */
+ 
+ struct html_img_state {
+ 	struct html_img_state *next;
+@@ -1489,6 +1490,12 @@
+ 	dom_node *node;		/**< ref'd */
+ 	nsurl *url;		/**< ref'd: the URL state describes */
+ 	hlcache_handle *h;	/**< a detached fetch in flight, or NULL */
++	hlcache_handle *kept;	/**< patch 251: the detached image, loaded
++				 * (canvas drawImage reads its bitmap) */
++	unsigned int kept_at;	/**< when it was kept, oldest goes first */
++	bool blocks;		/**< patch 251: a hidden <img> in the document:
++				 * its fetch holds window load back (counted
++				 * in c->base.active) */
+ 	int state;		/**< 0 loading, 1 loaded, 2 broken */
+ 	int w, ht;		/**< natural size when loaded */
+ 	bool queued;		/**< its event waits to be fired */
+@@ -1525,6 +1532,23 @@
+ 	}
+ }
+ 
++/* patch 251: a hidden <img>'s fetch has settled or been superseded: it no
++ * longer holds window load back. The load check runs from img_fire_cb,
++ * after the image's own event, never inside a cache callback. */
++static void img_unblock(struct html_img_state *s)
++{
++	if (!s->blocks)
++		return;
++	s->blocks = false;
++	if (s->c->base.active > 0)
++		s->c->base.active--;
++	s->c->img_unblocked = true;
++	if (!s->c->img_fire_scheduled) {
++		s->c->img_fire_scheduled = true;
++		guit->misc->schedule(0, img_fire_cb, s->c);
++	}
++}
++
+ static void img_release_stale(html_content *c)
+ {
+ 	while (c->img_stale != NULL) {
+@@ -1628,6 +1652,14 @@
+ 			js_fire_script_load(c->js_thread, s->node,
+ 					s->state == 1 ? 1 : 0);
+ 	}
++	if (c->img_unblocked) {
++		/* patch 251: the last hidden image may have been what window
++		 * load waited for */
++		c->img_unblocked = false;
++		if (c->base.active == 0 &&
++		    c->base.status == CONTENT_STATUS_READY)
++			html_proceed_to_done(c);
++	}
+ }
+ 
+ static void img_queue(struct html_img_state *s)
+@@ -1671,6 +1703,8 @@
+ 	if (s == NULL && (s = img_get(c, node)) == NULL)
+ 		return;
+ 	img_retire(c, &s->h);	/* a detached fetch this one overtakes */
++	img_retire(c, &s->kept);	/* patch 251: the box's object has it */
++	img_unblock(s);
+ 	img_set_url(s, o->url);
+ 	s->state = st;
+ 	s->w = s->ht = 0;
+@@ -1700,10 +1734,33 @@
+ 	default:
+ 		return NSERROR_OK;
+ 	}
+-	/* the bitmap is not kept: the cache holds the data for the <img>
++	if (s->state == 1) {
++		/* patch 251: kept, so a canvas can draw it (new Image()
++		 * loaded for drawImage: sprites, tiles, captcha images);
++		 * the oldest of more than IMG_KEPT_MAX goes back to the
++		 * cache. Never released inside this callback. */
++		static unsigned int kept_clock;
++		struct html_img_state *t, *oldest = NULL;
++		int n = 0;
++		img_retire(s->c, &s->kept);
++		s->kept = s->h;
++		s->h = NULL;
++		s->kept_at = ++kept_clock;
++		for (t = s->c->img_states; t != NULL; t = t->next) {
++			if (t->kept == NULL)
++				continue;
++			n++;
++			if (oldest == NULL || t->kept_at < oldest->kept_at)
++				oldest = t;
++		}
++		if (n > IMG_KEPT_MAX && oldest != NULL)
++			img_retire(s->c, &oldest->kept);
++	}
++	/* otherwise not kept: the cache holds the data for the <img>
+ 	 * that usually follows a preload (released from img_fire_cb, not
+ 	 * inside this callback) */
+ 	img_retire(s->c, &s->h);
++	img_unblock(s);
+ 	img_queue(s);
+ 	return NSERROR_OK;
+ }
+@@ -1743,6 +1800,8 @@
+ 		return false;
+ 	}
+ 	img_retire(c, &s->h);
++	img_retire(c, &s->kept);	/* patch 251: a new src */
++	img_unblock(s);
+ 	img_set_url(s, url);
+ 	s->state = 0;
+ 	s->w = s->ht = 0;
+@@ -1759,6 +1818,54 @@
+ }
+ 
+ /* exported interface documented in html/html.h */
++void html_image_fetch_hidden(html_content *c, dom_node *node)
++{
++	dom_string *src = NULL, *lazy = NULL, *name = NULL;
++	struct html_img_state *s;
++	nsurl *url = NULL;
++	bool same = false;
++
++	if (c == NULL || node == NULL || !c->enable_scripting ||
++	    !img_is_img(node))
++		return;
++	/* loading=lazy: browsers do not fetch a hidden lazy image */
++	if (dom_string_create((const uint8_t *)"loading", 7, &name) ==
++	    DOM_NO_ERR) {
++		if (dom_element_get_attribute(node, name, &lazy) !=
++		    DOM_NO_ERR)
++			lazy = NULL;
++		dom_string_unref(name);
++	}
++	if (lazy != NULL) {
++		bool is_lazy = dom_string_length(lazy) == 4 &&
++			strncasecmp(dom_string_data(lazy), "lazy", 4) == 0;
++		dom_string_unref(lazy);
++		if (is_lazy)
++			return;
++	}
++	if (dom_element_get_attribute(node, corestring_dom_src, &src) !=
++	    DOM_NO_ERR || src == NULL)
++		return;
++	/* once per URL: a box-tree rebuild must not fire its load again */
++	s = img_find(c, node);
++	if (s != NULL && s->url != NULL && c->base_url != NULL &&
++	    nsurl_join(c->base_url, dom_string_data(src), &url) == NSERROR_OK) {
++		same = nsurl_compare(s->url, url, NSURL_COMPLETE);
++		nsurl_unref(url);
++	}
++	if (!same && dom_string_length(src) > 0 &&
++	    html_image_fetch_detached(&c->base, node, dom_string_data(src)) &&
++	    (s = img_find(c, node)) != NULL && s->h != NULL && !s->blocks &&
++	    (c->base.status == CONTENT_STATUS_LOADING ||
++	     c->base.status == CONTENT_STATUS_READY)) {
++		/* in the document: window load waits for it */
++		s->blocks = true;
++		c->base.active++;
++	}
++	dom_string_unref(src);
++}
++
++/* exported interface documented in html/html.h */
+ bool html_image_state(struct content *cc, dom_node *node, const char *src,
+ 		int *state, int *width, int *height)
+ {
+@@ -1785,6 +1892,29 @@
+ }
+ 
+ /* exported interface documented in html/html.h */
++struct bitmap *html_image_bitmap(struct content *cc, dom_node *node)
++{
++	html_content *c = (html_content *) cc;
++	struct html_img_state *s;
++	struct box *box = NULL;
++	hlcache_handle *h = NULL;
++
++	if (c == NULL || node == NULL)
++		return NULL;
++	/* in the document: its box's object */
++	if (dom_node_get_user_data(node, corestring_dom___ns_key_box_node_data,
++			(void **)&box) == DOM_NO_ERR && box != NULL &&
++	    box->object != NULL)
++		h = box->object;
++	/* outside it: the image its own fetch loaded */
++	if (h == NULL && (s = img_find(c, node)) != NULL && s->state == 1)
++		h = s->kept;
++	if (h == NULL || content_get_status(h) != CONTENT_STATUS_DONE)
++		return NULL;
++	return content_get_bitmap(h);
++}
++
++/* exported interface documented in html/html.h */
+ void html_image_flush_events(html_content *c)
+ {
+ 	if (c->img_fire_scheduled) {
+@@ -1804,6 +1934,7 @@
+ 		struct html_img_state *s = c->img_states;
+ 		c->img_states = s->next;
+ 		safe_hlcache_handle_release(&s->h);
++		safe_hlcache_handle_release(&s->kept);	/* patch 251 */
+ 		if (s->url != NULL)
+ 			nsurl_unref(s->url);
+ 		dom_node_unref(s->node);
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -124,6 +124,7 @@
+  */
+ /* VitaBrowser patch 250: <img> load / error events and state */
+ struct dom_node;
++struct bitmap;
+ struct content_html_object;
+ struct html_content;
+ /** An <img>'s object fetch has finished (ok) or failed: queue its load or
+@@ -134,11 +135,18 @@
+  * a detached element given a src): load / error fire when it settles. */
+ bool html_image_fetch_detached(struct content *c, struct dom_node *node,
+ 		const char *src);
++/** VitaBrowser patch 251: a display:none <img> -- no box, so no object
++ * fetch -- loads as a detached one does (once per URL). */
++void html_image_fetch_hidden(struct html_content *c, struct dom_node *node);
+ /** What the element's image is: state 0 loading / unknown, 1 loaded,
+  * 2 broken, with its natural size; false when nothing is known. When src
+  * is given and differs from what was loaded, the state is 0. */
+ bool html_image_state(struct content *c, struct dom_node *node,
+ 		const char *src, int *state, int *width, int *height);
++/** VitaBrowser patch 251: the decoded image an <img> shows (its box's
++ * object, or the image its detached fetch loaded), or NULL: what a canvas
++ * drawImage() draws. */
++struct bitmap *html_image_bitmap(struct content *c, struct dom_node *node);
+ /** Fire the queued image events now (before window load). */
+ void html_image_flush_events(struct html_content *c);
+ /** Free the table (at content destruction). */
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -129,6 +129,8 @@
+ 	struct html_img_state *img_states;
+ 	struct html_img_stale *img_stale;	/**< handles to release */
+ 	bool img_fire_scheduled;	/**< img_fire_cb is scheduled */
++	/** patch 251: a hidden <img> that held window load back settled */
++	bool img_unblocked;
+ 	/** Base target */
+ 	char *base_target;
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1569,6 +1569,10 @@
+ 	if (box->type == BOX_NONE || (ns_computed_display(box->style,
+ 			props.node_is_root) == CSS_DISPLAY_NONE &&
+ 			props.node_is_root == false)) {
++		/* VitaBrowser patch 251: a hidden <img> still loads, as in
++		 * browsers (its load event, naturalWidth, a canvas drawImage
++		 * of a hidden sprite sheet) */
++		html_image_fetch_hidden(ctx->content, ctx->n);
+ 		css_select_results_destroy(styles);
+ 		box->styles = NULL;
+ 		box->style = NULL;
+diff --git a/frontends/vita/text.c b/frontends/vita/text.c
+--- a/frontends/vita/text.c
++++ b/frontends/vita/text.c
+@@ -547,6 +547,65 @@
+ }
+ 
+ /* exported interface documented in vita/text.h */
++int vita_text_glyphs(const struct vita_text_style *style, int x, int y,
++		     const char *utf8, size_t len, vita_glyph_fn fn, void *pw)
++{
++	size_t i = 0;
++	int pen = x, pen_q = 0;
++	unsigned char *mono = NULL;
++	size_t mono_size = 0;
++
++	while (i < len) {
++		const struct adv_entry *e =
++			resolve(style, utf8_to_ucs4(utf8 + i, len - i));
++		FT_Face f;
++
++		i = utf8_next(utf8, len, i);
++		if (fn != NULL && e->cp > 0x20 && e->cp != 0xa0 &&
++		    (f = face_at(e->face, e->px)) != NULL &&
++		    FT_Load_Glyph(f, e->gi, FT_LOAD_RENDER) == 0) {
++			FT_Bitmap *bm = &f->glyph->bitmap;
++			int w = (int)bm->width, h = (int)bm->rows, r, c;
++			if (w > 0 && h > 0 && bm->pixel_mode ==
++			    FT_PIXEL_MODE_GRAY && bm->pitch > 0) {
++				fn(pw, bm->buffer, bm->pitch,
++				   pen + f->glyph->bitmap_left,
++				   y - f->glyph->bitmap_top, w, h);
++			} else if (w > 0 && h > 0) {
++				/* mono, or bottom-up rows: as 8-bit rows */
++				if ((size_t)w * h > mono_size) {
++					unsigned char *m = realloc(mono,
++							(size_t)w * h);
++					if (m == NULL)
++						goto next;
++					mono = m;
++					mono_size = (size_t)w * h;
++				}
++				for (r = 0; r < h; r++) {
++					const unsigned char *src = bm->buffer +
++						(bm->pitch >= 0 ? r * bm->pitch :
++						 (h - 1 - r) * -bm->pitch);
++					for (c = 0; c < w; c++)
++						mono[r * w + c] =
++							bm->pixel_mode ==
++							FT_PIXEL_MODE_MONO ?
++							((src[c >> 3] & (0x80 >>
++							(c & 7))) ? 0xff : 0) :
++							src[c];
++				}
++				fn(pw, mono, w, pen + f->glyph->bitmap_left,
++				   y - f->glyph->bitmap_top, w, h);
++			}
++		}
++next:
++		pen_q += e->adv * PLOT_SPACING_SCALE + spacing(style, e->cp);
++		pen = x + vita_text_px(pen_q);
++	}
++	free(mono);
++	return pen - x;
++}
++
++/* exported interface documented in vita/text.h */
+ void vita_text_frame_begin(void)
+ {
+ 	int i;
+diff --git a/frontends/vita/text.h b/frontends/vita/text.h
+--- a/frontends/vita/text.h
++++ b/frontends/vita/text.h
+@@ -119,6 +119,20 @@
+ int vita_text_draw(const struct vita_text_style *style, int x, int y,
+ 		   const char *utf8, size_t len, unsigned int rgba);
+ 
++/** patch 251: one glyph's 8-bit coverage, top-left at (x, y). */
++typedef void (*vita_glyph_fn)(void *pw, const unsigned char *cov,
++			      int stride, int x, int y, int w, int h);
++
++/**
++ * patch 251: render `len` bytes of UTF-8 with the baseline origin at
++ * (x, y), handing each glyph's coverage to fn (canvas text). Glyphs are
++ * rendered by FreeType for the call, not through the screen's atlas.
++ * fn may be NULL to measure.
++ * \return the advance, as vita_text_width() would give it
++ */
++int vita_text_glyphs(const struct vita_text_style *style, int x, int y,
++		     const char *utf8, size_t len, vita_glyph_fn fn, void *pw);
++
+ /** Call at the start of a frame: resets the atlas if it filled up. */
+ void vita_text_frame_begin(void);
+ 
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -59,6 +59,7 @@
+ #include "vita/layout.h"
+ #include "vita/window.h"
+ #include "vita/js_platform.h"
++#include "vita/text.h"
+ 
+ /* Time spent in JavaScript, us, as the bridge reports it. */
+ long vita_js_time_us;
+@@ -650,6 +651,38 @@
+ 	return VITA_DIAG_DIR "LocalStorage/";
+ }
+ 
++/* patch 251: canvas text in the page's own faces */
++static void canvas_style(struct vita_text_style *st, int px, int family,
++			 int bold, int italic)
++{
++	vita_text_style_default(st, px);
++	st->family = family == 1 ? VITA_FAMILY_SERIF :
++		(family == 2 ? VITA_FAMILY_MONO : VITA_FAMILY_SANS);
++	st->bold = bold != 0;
++	st->italic = italic != 0;
++}
++
++/* exported interface documented in quickjs/macos9.h */
++int macsurf_canvas_glyphs(int px, int family, int bold, int italic,
++		const char *utf8, size_t len, int x, int y, macsurf_glyph_fn fn,
++		void *pw)
++{
++	struct vita_text_style st;
++
++	canvas_style(&st, px, family, bold, italic);
++	return vita_text_glyphs(&st, x, y, utf8, len, fn, pw);
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_canvas_font_extents(int px, int family, int bold, int italic,
++		int *ascent, int *descent)
++{
++	struct vita_text_style st;
++
++	canvas_style(&st, px, family, bold, italic);
++	vita_text_extents(&st, ascent, descent);
++}
++
+ /* exported interface documented in vita/js_platform.h */
+ void vita_js_platform_init(void)
+ {
