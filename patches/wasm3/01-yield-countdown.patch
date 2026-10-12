@@ -1,0 +1,59 @@
+# wasm3: call m3_Yield once per N calls and loop iterations (VitaBrowser)
+#
+# wasm3 calls the weak m3_Yield() on every wasm function call and never in
+# loops. VitaBrowser's m3_Yield (macsurf_wasm.c) slices long calls -- it
+# draws a frame and can stop a runaway call -- so it must also be reached
+# from a loop that calls nothing, and it should not cost a function call
+# per wasm call. A countdown (g_m3YieldCountdown, reset by m3_Yield) gates
+# it in both Call and Loop; a trap it returns unwinds the loop.
+--- a/source/m3_core.c
++++ b/source/m3_core.c
+@@ -18,9 +18,13 @@
+     abort();
+ }
+ 
++// VitaBrowser: see m3_exec.h Call / Loop
++i32 g_m3YieldCountdown = 65536;
++
+ M3_WEAK
+ M3Result m3_Yield ()
+ {
++    g_m3YieldCountdown = 65536;
+     return m3Err_none;
+ }
+ 
+--- a/source/m3_exec.h
++++ b/source/m3_exec.h
+@@ -106,10 +106,17 @@
+ #endif
+ 
+ 
++// VitaBrowser: m3_Yield once per g_m3YieldCountdown calls and loop
++// iterations (the embedder's m3_Yield resets it), not on every call.
++extern i32 g_m3YieldCountdown;
++
+ d_m3RetSig  Call  (d_m3OpSig)
+ {
+-    m3ret_t possible_trap = m3_Yield ();
+-    if (UNLIKELY(possible_trap)) return possible_trap;
++    if (UNLIKELY(--g_m3YieldCountdown <= 0))
++    {
++        m3ret_t possible_trap = m3_Yield ();
++        if (UNLIKELY(possible_trap)) return possible_trap;
++    }
+ 
+     nextOpDirect();
+ }
+@@ -845,6 +852,12 @@
+ 
+     do
+     {
++        // VitaBrowser: a loop that calls nothing must yield too
++        if (UNLIKELY(--g_m3YieldCountdown <= 0))
++        {
++            m3ret_t yielded = m3_Yield ();
++            if (UNLIKELY(yielded)) { r = yielded; break; }
++        }
+ #if d_m3EnableStrace >= 3
+         d_m3TracePrint("iter {");
+         trace_rt->callDepth++;
