@@ -3083,10 +3083,44 @@ What 237-248 add:
    receiver.txt; any .dmp from ux0:data/; `mem[page done]` after the
    Guardian (its consent frame is a second page and realm) and github.
 
-## Since run 30 — queued for run 31 (not built yet)
+## Run 31 — hand-off (2026-10-12 02:30; replaces untested run 30)
+
+**Flash this build:** VitaBrowser.vpk `ca45146fbf61`, VitaBrowser-ext.vpk
+`43b08ce3909f`, nsvita.elf `899bfdaaa3f6` (patches through 252, built at
+c939cfc). Run 30 (`6f283bae3a7c`) has no `results\` yet, so run 31 carries
+everything since run 27: **patches 168-252 + patches/quickjs/05-06**, all
+unverified on hardware. Archive `<WORK>/vitabrowser-work/hwtest-2026-10-12-run31/`;
+run 30's reference dumps are now `reference-dumps-run30\` (if run 30's
+results do come back, compare them against those).
+
+Build: clean restage (338 applied + the two known collisions), first
+checked against a scratch application of the same stack -- identical to
+the tree the gates ran on; streams 4/4, renderer 102/102 + 30/30, full
+sim gate exit 0 with no soft accepts (CANVAS251 22/22, fetch stream 8/8
+twice, REFLOW 3/3, interaction 52/52, also at the Vita's pace),
+cross-build green. Reference autotest under device conditions: interact
+**52/52**, js 18/18, 34 dumps -- 32 identical to run 30's; IN-history and
+IN-home-recent differ only in the settings server's port in their text.
+
+**On the device** (run 30's list still applies -- certificates,
+settings, downloads, github, the Guardian, claude.ai -- plus):
+
+1. Autotest (SELECT + SQUARE): every `.plot` SAME against the new
+   reference-dumps (PM-animation is timing-dependent; IN-home-recent /
+   IN-history may differ), interact **52/52**, js 18/18.
+2. **Canvas (251)**: the bundled test page JS-canvas-2d needs the
+   simulator's server, so try real ones: a page with a canvas chart (a
+   stock or weather chart), a canvas game. Note how long a heavy chart
+   takes to appear, and `mem[page done]` after it.
+3. **Images (250, 251)**: a gallery or lightbox site; wikipedia; scroll
+   speed and memory on image-heavy pages.
+4. Watch as always: `refused` stays 0 in log.txt; new DIFFs in
+   receiver.txt; any .dmp from ux0:data/.
+
+### What run 31 adds over run 30 (the queue as it stood)
 
 Patches 249-250 (2026-10-11), sim-verified, full gate green, Vita
-cross-build green; no VPK handed off (run 30 is with the device).
+cross-build green.
 
 - 249: element nodeName is upper case (as tagName); SVG keeps its case.
   Nothing to see directly -- watch sites that misbehaved for no reason.
@@ -3100,8 +3134,8 @@ Patches 251-252 (2026-10-11 night), sim-verified. Full gate (gate 252e,
 both patches): exit 0, no soft accepts -- it ran with GATE_TIMING_SOFT=1
 after four strict runs had failed only JS-reflow-stall check 3 (below),
 and REFLOW passed 3/3 outright. Vita cross-build green (tools/build-vita.sh
-exit 0, 2026-10-12 01:05; no warnings from the new code). No VPK handed
-off: run 30 is with the device.
+exit 0, 2026-10-12 01:05; no warnings from the new code). Handed off in
+run 31 (above).
 
 - **251 canvas 2D draws.** Every drawing call used to be a no-op. Now:
   shapes, strokes (joins, caps, dashes), transforms, clipping, gradients,
