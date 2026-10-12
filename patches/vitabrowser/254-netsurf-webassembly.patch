@@ -1,0 +1,2056 @@
+# netsurf: WebAssembly -- wasm3 behind the WebAssembly API, long calls
+# sliced so the screen keeps drawing (patch 254)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 253)
+#
+# There was no WebAssembly: QuickJS has none. hCaptcha's proof of work
+# (claude.ai's email sign-in) is a WebAssembly module, and so is whatever a
+# site builds with wasm-bindgen or emscripten. docs/wasm-hcaptcha-
+# measurement.md measured the shape: an MVP interpreter runs it; about a
+# minute on the Vita; the UI must not freeze for it.
+#
+#  - wasm3 0.5.0 (tools/fetch-wasm3.sh, pinned by sha256; patches/wasm3/)
+#    built beside libquickjs by tools/build-quickjs.sh (lib/libm3.a,
+#    include/wasm3/), -O3 -fwrapv (wasm3 relies on signed overflow
+#    wrapping; UBSan caught it), linked by frontends/vita/Makefile.
+#  - quickjs/macsurf_wasm.c (new): the natives on the hidden global
+#    __wasm. A module's imports and exports come from its own sections;
+#    an instance is its own wasm3 environment and runtime with a copy of
+#    the bytes; function imports are one trampoline that converts the
+#    arguments and calls the JavaScript function; exported functions are
+#    native functions (no JavaScript wrapper: wasm-bindgen glue crosses
+#    the boundary hundreds of thousands of times). Memory is an
+#    ArrayBuffer over wasm3's own bytes, detached when they move (growth
+#    reallocates) -- checked whenever control leaves WebAssembly -- which
+#    is what wasm-bindgen's "byteLength === 0" cache check expects. A
+#    WebAssembly.Memory made by a script is a runtime with no module yet,
+#    so views made before instantiating stay valid (emscripten). Traps
+#    throw WebAssembly.RuntimeError; an import's exception is carried
+#    through the trap and rethrown as the same value. Re-entrant calls
+#    (an import calling an export) are wasm3's own.
+#  - Slicing: wasm3 called m3_Yield on every wasm call and never in a
+#    loop; patches/wasm3/01 gates it by a countdown in both. Every 200 ms
+#    of a call the frontend draws the page as it is with "WebAssembly
+#    running: N s (O stops)" (macsurf_wasm_slice, vita/main.c); CIRCLE
+#    stops it with a RuntimeError, as does a 300 s cap. No JavaScript, no
+#    timers and no input reach the page meanwhile: the script is still in
+#    the call. (The simulator reads no pad there: its pad drives the
+#    scripted autotest.)
+#  - The runaway-script deadline runs on the script's own clock now (the
+#    real one minus the time spent inside WebAssembly, macsurf_qjs.c), so
+#    a minute of proof of work does not end the script that started it;
+#    JavaScript run by imports counts as before.
+#  - vita_polyfill.js: WebAssembly -- Module (imports / exports /
+#    customSections), Instance, Memory, Table (an instance's funcref
+#    table: get / length), Global, CompileError / LinkError /
+#    RuntimeError, validate, compile, instantiate, compileStreaming /
+#    instantiateStreaming (application/wasm, as Chromium requires).
+#
+# Not done: imported globals and tables, Table.set / grow on an
+# instance's table, shared memory, more than one memory or table,
+# validating function bodies at compile time (wasm3 compiles a function
+# when it is first called; a whole-module compile is seconds on the
+# Vita), and running WebAssembly off the main thread.
+#
+# Gate: testpages/pages/JS-wasm.html, WASM254 15/15 (Chromium 15/15),
+# including two ~5 s calls in one script (past its 8 s budget) during
+# which the frontend draws a frame every 200 ms; tools/test-wasm.sh runs
+# the glue and wasm3 under ASan + UBSan (lifetimes through collections,
+# a call stopped from a slice, 3000 mutated modules).
+diff --git a/content/handlers/javascript/quickjs/Makefile b/content/handlers/javascript/quickjs/Makefile
+--- a/content/handlers/javascript/quickjs/Makefile
++++ b/content/handlers/javascript/quickjs/Makefile
+@@ -11,7 +11,8 @@
+ S_JAVASCRIPT += quickjs/macsurf_qjs.c quickjs/macsurf_qjs_audit.c \
+ 	quickjs/macos9_reconvert.c quickjs/macos9_js_fetch.c \
+ 	quickjs/macos9_content_registry.c quickjs/macsurf_dom_dispatch.c \
+-	quickjs/macsurf_diag_none.c quickjs/macsurf_canvas.c
++	quickjs/macsurf_diag_none.c quickjs/macsurf_canvas.c \
++	quickjs/macsurf_wasm.c
+ 
+ # The bridge as imported, under NetSurf's -Werror warning set. All three are
+ # inert for non-Mac builds, and fixing them would mean editing MacSurf's
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -32,6 +32,7 @@
+ #include "macsurf_timebase.h"
+ #include "macos9_js_fetch.h"
+ #include "macsurf_canvas.h"	/* patch 251 */
++#include "macsurf_wasm.h"	/* patch 254 */
+ #include "macsurf_diag.h"
+ /* fixes1245 (#167) - plot_font_style_t/gui_layout_table for canvas
+  * measureText's real (not fabricated) width query. Neither was pulled in
+@@ -489,6 +490,21 @@
+  * legitimately slow.) */
+ #define QJS_TIMER_TIMEOUT_MS MACSURF_JS_TIMEOUT_MS
+ static double g_qjs_script_deadline = 0.0;
++/* VitaBrowser patch 254: time spent inside WebAssembly. The deadline is on
++ * the script's own clock, the real one minus this: a 40 s proof of work
++ * must not end the page's script that called it (every saved deadline on
++ * the push/pop stack is on the same clock, so none needs rewriting). */
++static double g_qjs_paused_ms = 0.0;
++static double qjs_script_now(void)
++{
++	return macsurf_qjs_get_now() - g_qjs_paused_ms;
++}
++
++void macsurf_qjs_pause_script_clock(double ms)
++{
++	if (ms > 0.0)
++		g_qjs_paused_ms += ms;
++}
+ 
+ /* fixes1037 - timer-callback CPU, separate from top-level script eval. */
+ long   g_timer_fires = 0;  /* exported for audit */
+@@ -565,7 +581,7 @@
+ 	 * (normally nothing) so the script runs to completion. */
+ 	if (budget_ms <= 0.0)
+ 		return prev;
+-	want = macsurf_qjs_get_now() + budget_ms;
++	want = qjs_script_now() + budget_ms;
+ 	if (prev == 0.0 || want < prev)
+ 		g_qjs_script_deadline = want;
+ 	return prev;
+@@ -647,7 +663,8 @@
+ 
+ 	/* Deadline check runs EVERY invocation (cheap): a runaway script is
+ 	 * still bounded to the ~20s eval timeout regardless of the WNE throttle. */
+-	if (g_qjs_script_deadline != 0.0 && now > g_qjs_script_deadline) {
++	if (g_qjs_script_deadline != 0.0 &&
++	    now - g_qjs_paused_ms > g_qjs_script_deadline) {
+ 		g_js_timeout_count++;
+ 		macsurf_debug_log_writef("qjs: DEADLINE hit, aborting script");
+ 		return 1;
+@@ -2240,7 +2257,7 @@
+ 			 * if it had timed out. Only a real deadline can retire
+ 			 * a timer. */
+ 			if (t->live && t->id == due_id[k] && t->ctx == qctx &&
+-			    mydl != 0.0 && macsurf_qjs_get_now() >= mydl) {
++			    mydl != 0.0 && qjs_script_now() >= mydl) {
+ 				macsurf_debug_log_writef(
+ 					"qjs: TIMER TIMEOUT -- repeating timer KILLED");
+ 				timer_slot_clear(t, 1);
+@@ -3573,6 +3590,7 @@
+ 	f = JS_NewCFunction(ctx, qjs_img_fetch, "__vitaImgFetch", 2);
+ 	JS_SetPropertyStr(ctx, global, "__vitaImgFetch", f);	/* 250 */
+ 	macsurf_canvas_install(ctx, global, &qjs_canvas_ops);	/* 251 */
++	macsurf_wasm_install(ctx, global);	/* 254 */
+ 	f = JS_NewCFunction(ctx, qjs_xrealm_iframe_doc_key,
+ 			"__vitaIframeContentDocKey", 1);
+ 	JS_SetPropertyStr(ctx, global, "__vitaIframeContentDocKey", f);
+@@ -11154,6 +11172,7 @@
+ 	JS_NewClassID(rt, &s_blob_class_id);
+ 	JS_NewClass(rt, s_blob_class_id, &s_blob_class);
+ 	macsurf_canvas_init_class(rt);	/* patch 251 */
++	macsurf_wasm_init_class(rt);	/* patch 254 */
+ }
+ 
+ /* ====================================================================== */
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.h b/content/handlers/javascript/quickjs/macsurf_qjs.h
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.h
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.h
+@@ -48,6 +48,10 @@
+ void   macsurf_qjs_deadline_pop(double prev);
+ double macsurf_qjs_default_timeout_ms(void);
+ 
++/* VitaBrowser patch 254: `ms` that were not the script's (spent inside
++ * WebAssembly) -- the runaway deadline's clock stands still for them. */
++void macsurf_qjs_pause_script_clock(double ms);
++
+ /* Timer callbacks wired to setTimeout/setInterval. */
+ void macsurf_qjs_run_timers(struct jscontext *ctx);
+ 
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -179,6 +179,13 @@
+ 		const char *utf8, size_t len, int x, int y, macsurf_glyph_fn fn,
+ 		void *pw);
+ 
++/** VitaBrowser patch 254: a WebAssembly call has run `ms` so far: draw a
++ * frame (the page as it is, and how long). \return nonzero to stop it */
++int macsurf_wasm_slice(unsigned int ms);
++
++/** VitaBrowser patch 254: a call that drew `slices` frames has ended. */
++void macsurf_wasm_done(unsigned int ms, unsigned int slices);
++
+ /** VitaBrowser patch 251: the face's ascent and descent at `px` pixels. */
+ void macsurf_canvas_font_extents(int px, int family, int bold, int italic,
+ 		int *ascent, int *descent);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2627,6 +2627,285 @@
+ 	g.Image = Img;
+ })();
+ 
++/* ---- WebAssembly ---------------------------------------------------------
++ * VitaBrowser patch 254. QuickJS has none; hCaptcha's proof of work and
++ * every wasm-bindgen / emscripten build need it. wasm3 runs the code
++ * (macsurf_wasm.c, the hidden global __wasm); this is the API. Exported
++ * functions are the natives themselves (no wrapper: wasm-bindgen glue
++ * crosses the boundary hundreds of thousands of times). Not done: imported
++ * globals and tables, growing or setting a table, shared memory, and more
++ * than one memory or table. Function bodies are checked when first
++ * called, not at compile. */
++
++(function () {
++	var W = g.__wasm;
++	if (!W || g.WebAssembly) return;
++
++	function errorClass(name) {
++		var E = function (message) {
++			if (!(this instanceof E)) return new E(message);
++			var e = new Error(message === undefined ? '' : String(message));
++			define(this, 'message', e.message);
++			try { define(this, 'stack', e.stack); } catch (x) { /* */ }
++		};
++		E.prototype = Object.create(Error.prototype);
++		define(E.prototype, 'constructor', E);
++		define(E.prototype, 'name', name);
++		Object.defineProperty(E, 'name', { value: name, configurable: true });
++		return E;
++	}
++	var CompileError = errorClass('CompileError');
++	var LinkError = errorClass('LinkError');
++	var RuntimeError = errorClass('RuntimeError');
++
++	/* the natives answer "Kind: message" instead of throwing */
++	function fail(s) {
++		var i = s.indexOf(': '), k = s.slice(0, i), m = s.slice(i + 2);
++		var C = k === 'CompileError' ? CompileError : k === 'LinkError' ? LinkError :
++			k === 'RuntimeError' ? RuntimeError : TypeError;
++		throw new C(m);
++	}
++	function bytesOf(src, who) {
++		if (src instanceof ArrayBuffer || ArrayBuffer.isView(src)) return src;
++		throw new TypeError(who + ': Argument 0 must be a buffer source');
++	}
++	function index(v, what) {
++		var n = Number(v);
++		if (!(n >= 0) || n !== Math.floor(n) || n > 0xffffffff)
++			throw new TypeError(what + ' must be convertible to a valid number');
++		return n;
++	}
++
++	/* ---- Module ---- */
++	function Module(bytes) {
++		if (!(this instanceof Module)) throw new TypeError("WebAssembly.Module must be invoked with 'new'");
++		var r = W.parse(bytesOf(bytes, 'WebAssembly.Module()'));
++		if (typeof r === 'string') fail(r);
++		define(this, '_h', r[0]);
++		define(this, '_imports', r[1]);
++		define(this, '_exports', r[2]);
++	}
++	function isModule(m) { return m instanceof Module && !!m._h; }
++	define(Module, 'imports', function (m) {
++		if (!isModule(m)) throw new TypeError('WebAssembly.Module.imports(): Argument 0 must be a WebAssembly.Module');
++		return m._imports.map(function (i) { return { module: i.module, name: i.name, kind: i.kind }; });
++	});
++	define(Module, 'exports', function (m) {
++		if (!isModule(m)) throw new TypeError('WebAssembly.Module.exports(): Argument 0 must be a WebAssembly.Module');
++		return m._exports.map(function (e) { return { name: e.name, kind: e.kind }; });
++	});
++	define(Module, 'customSections', function (m) {
++		if (!isModule(m)) throw new TypeError('WebAssembly.Module.customSections(): Argument 0 must be a WebAssembly.Module');
++		return [];
++	});
++
++	/* ---- Memory ---- */
++	function Memory(desc) {
++		if (!(this instanceof Memory)) throw new TypeError("WebAssembly.Memory must be invoked with 'new'");
++		if (!desc || typeof desc !== 'object') throw new TypeError('WebAssembly.Memory(): Argument 0 must be a memory descriptor');
++		var initial = index(desc.initial === undefined ? desc.minimum : desc.initial, "WebAssembly.Memory(): Property 'initial'");
++		var max = desc.maximum === undefined ? undefined : index(desc.maximum, "WebAssembly.Memory(): Property 'maximum'");
++		if (initial > 65536 || (max !== undefined && (max > 65536 || max < initial)))
++			throw new RangeError('WebAssembly.Memory(): Property \'initial\': value ' + initial + ' is out of range');
++		/* wasm3's memory from the start: a module importing it loads
++		 * into the same runtime, so views made now stay valid */
++		define(this, '_h', W.newMemory(initial, max));
++		define(this, '_max', max);
++	}
++	function memOf(h) {
++		var m = Object.create(Memory.prototype);
++		define(m, '_h', h);
++		define(m, '_max', undefined);
++		return m;
++	}
++	Object.defineProperty(Memory.prototype, 'buffer', { configurable: true, get: function () {
++		if (!(this instanceof Memory) || !this._h) throw new TypeError('Receiver is not a WebAssembly.Memory');
++		return W.memBuffer(this._h);
++	} });
++	define(Memory.prototype, 'grow', function (delta) {
++		delta = index(delta, 'WebAssembly.Memory.grow(): Argument 0');
++		var old = W.memPages(this._h);
++		if (this._max !== undefined && old + delta > this._max)
++			throw new RangeError('WebAssembly.Memory.grow(): Maximum memory size exceeded');
++		if (W.memGrow(this._h, delta) < 0)
++			throw new RangeError('WebAssembly.Memory.grow(): Unable to grow instance memory');
++		return old;
++	});
++
++	/* ---- Global ---- */
++	var TYPES = ['i32', 'i64', 'f32', 'f64'];
++	function convert(type, v) {
++		if (type === 'i64') return BigInt.asIntN(64, typeof v === 'bigint' ? v : BigInt(v === undefined ? 0 : v));
++		if (v === undefined) v = 0;
++		if (type === 'i32') return v | 0;
++		if (type === 'f32') return Math.fround(+v);
++		return +v;
++	}
++	function Global(desc, v) {
++		if (!(this instanceof Global)) throw new TypeError("WebAssembly.Global must be invoked with 'new'");
++		if (!desc || TYPES.indexOf(desc.value) < 0)
++			throw new TypeError("WebAssembly.Global(): Descriptor property 'value' must be a WebAssembly type");
++		define(this, '_h', null);
++		define(this, '_t', desc.value);
++		define(this, '_m', !!desc.mutable);
++		define(this, '_v', convert(desc.value, v));
++	}
++	Object.defineProperty(Global.prototype, 'value', { configurable: true,
++		get: function () { return this._h ? W.globalGet(this._h, this._i) : this._v; },
++		set: function (v) {
++			if (!this._m) throw new TypeError("WebAssembly.Global.value: Can't set the value of an immutable global.");
++			if (this._h) W.globalSet(this._h, this._i, v);
++			else this._v = convert(this._t, v);
++		} });
++	define(Global.prototype, 'valueOf', function () { return this.value; });
++	function globalOf(h, i) {
++		var o = Object.create(Global.prototype);
++		define(o, '_h', h);
++		define(o, '_i', i);
++		define(o, '_t', W.globalType(h, i));
++		define(o, '_m', true);	/* globalSet refuses an immutable one */
++		return o;
++	}
++
++	/* ---- Table ---- */
++	function Table(desc) {
++		if (!(this instanceof Table)) throw new TypeError("WebAssembly.Table must be invoked with 'new'");
++		if (!desc || (desc.element !== 'anyfunc' && desc.element !== 'funcref'))
++			throw new TypeError("WebAssembly.Table(): Descriptor property 'element' must be a WebAssembly reference type");
++		var n = index(desc.initial, "WebAssembly.Table(): Property 'initial'");
++		define(this, '_h', null);
++		define(this, '_a', new Array(n).fill(null));
++	}
++	Object.defineProperty(Table.prototype, 'length', { configurable: true, get: function () {
++		return this._h ? W.tableLength(this._h) : this._a.length;
++	} });
++	define(Table.prototype, 'get', function (i) {
++		i = index(i, 'WebAssembly.Table.get(): Argument 0');
++		if (!this._h) {
++			if (i >= this._a.length) throw new RangeError('WebAssembly.Table.get(): invalid address');
++			return this._a[i];
++		}
++		var f = W.tableGet(this._h, i);
++		return f < 0 ? null : this._fn(f);
++	});
++	define(Table.prototype, 'set', function (i, v) {
++		if (this._h) throw new RangeError('WebAssembly.Table.set(): not supported on an instance\'s table');
++		i = index(i, 'WebAssembly.Table.set(): Argument 0');
++		if (i >= this._a.length) throw new RangeError('WebAssembly.Table.set(): invalid address');
++		this._a[i] = v === undefined ? null : v;
++	});
++	define(Table.prototype, 'grow', function (n) {
++		if (this._h) throw new RangeError('WebAssembly.Table.grow(): not supported on an instance\'s table');
++		var old = this._a.length;
++		for (var k = 0; k < index(n, 'WebAssembly.Table.grow(): Argument 0'); k++) this._a.push(null);
++		return old;
++	});
++
++	/* ---- Instance ---- */
++	function Instance(module, importObject) {
++		if (!(this instanceof Instance)) throw new TypeError("WebAssembly.Instance must be invoked with 'new'");
++		if (!isModule(module)) throw new TypeError('WebAssembly.Instance(): Argument 0 must be a WebAssembly.Module');
++		var imps = module._imports, funcs = [], mem = null, i;
++		if (imps.length && (importObject === undefined || importObject === null || typeof importObject !== 'object'))
++			throw new TypeError('WebAssembly.Instance(): Imports argument must be present and must be an object');
++		for (i = 0; i < imps.length; i++) {
++			var imp = imps[i], where = 'WebAssembly.Instance(): Import #' + i + ' "' + imp.module + '" "' + imp.name + '"';
++			var mo = importObject[imp.module];
++			if (mo === undefined || mo === null || (typeof mo !== 'object' && typeof mo !== 'function'))
++				throw new TypeError('WebAssembly.Instance(): Import #' + i + ' "' + imp.module + '": module is not an object or function');
++			var v = mo[imp.name];
++			if (imp.kind === 'function') {
++				if (typeof v !== 'function') throw new LinkError(where + ': function import requires a callable');
++				funcs.push(v);
++			} else if (imp.kind === 'memory') {
++				if (!(v instanceof Memory) || !v._h) throw new LinkError(where + ': memory import must be a WebAssembly.Memory object');
++				var pages = W.memPages(v._h);
++				if (pages < imp.minimum) throw new LinkError(where + ': memory import has ' + pages + ' pages which is smaller than the declared initial of ' + imp.minimum);
++				mem = v;
++			} else {
++				throw new LinkError(where + ': imported ' + imp.kind + 's are not supported yet');
++			}
++		}
++		var h = W.instantiate(module._h, funcs, mem ? mem._h : undefined);
++		if (typeof h === 'string') fail(h);
++		var cache = [], table = null;
++		function fn(idx) {
++			if (cache[idx] === undefined) {
++				var f = W.func(h, idx);
++				if (f && typeof f === 'function' && !Object.prototype.hasOwnProperty.call(f, '__vbWasm')) {
++					try { Object.defineProperty(f, 'name', { value: String(idx), configurable: true }); } catch (e) { /* */ }
++					try { define(f, '__vbWasm', true); } catch (e) { /* */ }
++				}
++				cache[idx] = f;
++			}
++			return cache[idx];
++		}
++		var exports = Object.create(null);
++		module._exports.forEach(function (e) {
++			var val;
++			if (e.kind === 'function') val = fn(e.index);
++			else if (e.kind === 'memory') val = mem || (mem = memOf(h));
++			else if (e.kind === 'global') val = globalOf(h, e.index);
++			else {
++				if (!table) {
++					table = Object.create(Table.prototype);
++					define(table, '_h', h);
++					define(table, '_fn', fn);
++				}
++				val = table;
++			}
++			exports[e.name] = val;
++		});
++		define(this, 'exports', Object.freeze(exports));
++	}
++
++	/* ---- the namespace ---- */
++	function later(f) { return new Promise(function (res) { res(); }).then(f); }
++	var WA = {};
++	define(WA, 'Module', Module);
++	define(WA, 'Instance', Instance);
++	define(WA, 'Memory', Memory);
++	define(WA, 'Table', Table);
++	define(WA, 'Global', Global);
++	define(WA, 'CompileError', CompileError);
++	define(WA, 'LinkError', LinkError);
++	define(WA, 'RuntimeError', RuntimeError);
++	define(WA, 'validate', function (bytes) {
++		return typeof W.parse(bytesOf(bytes, 'WebAssembly.validate()')) !== 'string';
++	});
++	define(WA, 'compile', function (bytes) {
++		try { return Promise.resolve(new Module(bytes)); } catch (e) { return Promise.reject(e); }
++	});
++	define(WA, 'instantiate', function (src, imports) {
++		if (src instanceof Module)
++			return later(function () { return new Instance(src, imports); });
++		var m;
++		try { m = new Module(src); } catch (e) { return Promise.reject(e); }
++		return later(function () { return { module: m, instance: new Instance(m, imports) }; });
++	});
++	function body(source, who) {
++		return Promise.resolve(source).then(function (r) {
++			if (!r || typeof r.arrayBuffer !== 'function') throw new TypeError(who + ': Argument 0 must be provided and must be a Response');
++			var ct = r.headers && r.headers.get ? String(r.headers.get('content-type') || '') : '';
++			if (ct.split(';')[0].trim().toLowerCase() !== 'application/wasm')
++				throw new TypeError(who + ": Incorrect response MIME type. Expected 'application/wasm'.");
++			if (r.ok === false) throw new TypeError(who + ': HTTP status code is not ok');
++			return r.arrayBuffer();
++		});
++	}
++	define(WA, 'compileStreaming', function (source) {
++		return body(source, 'WebAssembly.compileStreaming()').then(function (b) { return new Module(b); });
++	});
++	define(WA, 'instantiateStreaming', function (source, imports) {
++		return body(source, 'WebAssembly.instantiateStreaming()').then(function (b) {
++			var m = new Module(b);
++			return { module: m, instance: new Instance(m, imports) };
++		});
++	});
++	try { Object.defineProperty(WA, Symbol.toStringTag, { value: 'WebAssembly', configurable: true }); } catch (e) { /* */ }
++	Object.defineProperty(g, 'WebAssembly', { value: WA, writable: true, configurable: true, enumerable: false });
++})();
++
+ /* ---- canvas 2D: a real drawing context --------------------------------
+  * VitaBrowser patch 251. getContext('2d') returned a context whose every
+  * drawing method did nothing (fixes1245): charts, games, maps, QR codes
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2628,6 +2628,285 @@
+ "\tg.Image = Img;\n"
+ "})();\n"
+ "\n"
++"/* ---- WebAssembly ---------------------------------------------------------\n"
++" * VitaBrowser patch 254. QuickJS has none; hCaptcha's proof of work and\n"
++" * every wasm-bindgen / emscripten build need it. wasm3 runs the code\n"
++" * (macsurf_wasm.c, the hidden global __wasm); this is the API. Exported\n"
++" * functions are the natives themselves (no wrapper: wasm-bindgen glue\n"
++" * crosses the boundary hundreds of thousands of times). Not done: imported\n"
++" * globals and tables, growing or setting a table, shared memory, and more\n"
++" * than one memory or table. Function bodies are checked when first\n"
++" * called, not at compile. */\n"
++"\n"
++"(function () {\n"
++"\tvar W = g.__wasm;\n"
++"\tif (!W || g.WebAssembly) return;\n"
++"\n"
++"\tfunction errorClass(name) {\n"
++"\t\tvar E = function (message) {\n"
++"\t\t\tif (!(this instanceof E)) return new E(message);\n"
++"\t\t\tvar e = new Error(message === undefined ? '' : String(message));\n"
++"\t\t\tdefine(this, 'message', e.message);\n"
++"\t\t\ttry { define(this, 'stack', e.stack); } catch (x) { /* */ }\n"
++"\t\t};\n"
++"\t\tE.prototype = Object.create(Error.prototype);\n"
++"\t\tdefine(E.prototype, 'constructor', E);\n"
++"\t\tdefine(E.prototype, 'name', name);\n"
++"\t\tObject.defineProperty(E, 'name', { value: name, configurable: true });\n"
++"\t\treturn E;\n"
++"\t}\n"
++"\tvar CompileError = errorClass('CompileError');\n"
++"\tvar LinkError = errorClass('LinkError');\n"
++"\tvar RuntimeError = errorClass('RuntimeError');\n"
++"\n"
++"\t/* the natives answer \"Kind: message\" instead of throwing */\n"
++"\tfunction fail(s) {\n"
++"\t\tvar i = s.indexOf(': '), k = s.slice(0, i), m = s.slice(i + 2);\n"
++"\t\tvar C = k === 'CompileError' ? CompileError : k === 'LinkError' ? LinkError :\n"
++"\t\t\tk === 'RuntimeError' ? RuntimeError : TypeError;\n"
++"\t\tthrow new C(m);\n"
++"\t}\n"
++"\tfunction bytesOf(src, who) {\n"
++"\t\tif (src instanceof ArrayBuffer || ArrayBuffer.isView(src)) return src;\n"
++"\t\tthrow new TypeError(who + ': Argument 0 must be a buffer source');\n"
++"\t}\n"
++"\tfunction index(v, what) {\n"
++"\t\tvar n = Number(v);\n"
++"\t\tif (!(n >= 0) || n !== Math.floor(n) || n > 0xffffffff)\n"
++"\t\t\tthrow new TypeError(what + ' must be convertible to a valid number');\n"
++"\t\treturn n;\n"
++"\t}\n"
++"\n"
++"\t/* ---- Module ---- */\n"
++"\tfunction Module(bytes) {\n"
++"\t\tif (!(this instanceof Module)) throw new TypeError(\"WebAssembly.Module must be invoked with 'new'\");\n"
++"\t\tvar r = W.parse(bytesOf(bytes, 'WebAssembly.Module()'));\n"
++"\t\tif (typeof r === 'string') fail(r);\n"
++"\t\tdefine(this, '_h', r[0]);\n"
++"\t\tdefine(this, '_imports', r[1]);\n"
++"\t\tdefine(this, '_exports', r[2]);\n"
++"\t}\n"
++"\tfunction isModule(m) { return m instanceof Module && !!m._h; }\n"
++"\tdefine(Module, 'imports', function (m) {\n"
++"\t\tif (!isModule(m)) throw new TypeError('WebAssembly.Module.imports(): Argument 0 must be a WebAssembly.Module');\n"
++"\t\treturn m._imports.map(function (i) { return { module: i.module, name: i.name, kind: i.kind }; });\n"
++"\t});\n"
++"\tdefine(Module, 'exports', function (m) {\n"
++"\t\tif (!isModule(m)) throw new TypeError('WebAssembly.Module.exports(): Argument 0 must be a WebAssembly.Module');\n"
++"\t\treturn m._exports.map(function (e) { return { name: e.name, kind: e.kind }; });\n"
++"\t});\n"
++"\tdefine(Module, 'customSections', function (m) {\n"
++"\t\tif (!isModule(m)) throw new TypeError('WebAssembly.Module.customSections(): Argument 0 must be a WebAssembly.Module');\n"
++"\t\treturn [];\n"
++"\t});\n"
++"\n"
++"\t/* ---- Memory ---- */\n"
++"\tfunction Memory(desc) {\n"
++"\t\tif (!(this instanceof Memory)) throw new TypeError(\"WebAssembly.Memory must be invoked with 'new'\");\n"
++"\t\tif (!desc || typeof desc !== 'object') throw new TypeError('WebAssembly.Memory(): Argument 0 must be a memory descriptor');\n"
++"\t\tvar initial = index(desc.initial === undefined ? desc.minimum : desc.initial, \"WebAssembly.Memory(): Property 'initial'\");\n"
++"\t\tvar max = desc.maximum === undefined ? undefined : index(desc.maximum, \"WebAssembly.Memory(): Property 'maximum'\");\n"
++"\t\tif (initial > 65536 || (max !== undefined && (max > 65536 || max < initial)))\n"
++"\t\t\tthrow new RangeError('WebAssembly.Memory(): Property \\'initial\\': value ' + initial + ' is out of range');\n"
++"\t\t/* wasm3's memory from the start: a module importing it loads\n"
++"\t\t * into the same runtime, so views made now stay valid */\n"
++"\t\tdefine(this, '_h', W.newMemory(initial, max));\n"
++"\t\tdefine(this, '_max', max);\n"
++"\t}\n"
++"\tfunction memOf(h) {\n"
++"\t\tvar m = Object.create(Memory.prototype);\n"
++"\t\tdefine(m, '_h', h);\n"
++"\t\tdefine(m, '_max', undefined);\n"
++"\t\treturn m;\n"
++"\t}\n"
++"\tObject.defineProperty(Memory.prototype, 'buffer', { configurable: true, get: function () {\n"
++"\t\tif (!(this instanceof Memory) || !this._h) throw new TypeError('Receiver is not a WebAssembly.Memory');\n"
++"\t\treturn W.memBuffer(this._h);\n"
++"\t} });\n"
++"\tdefine(Memory.prototype, 'grow', function (delta) {\n"
++"\t\tdelta = index(delta, 'WebAssembly.Memory.grow(): Argument 0');\n"
++"\t\tvar old = W.memPages(this._h);\n"
++"\t\tif (this._max !== undefined && old + delta > this._max)\n"
++"\t\t\tthrow new RangeError('WebAssembly.Memory.grow(): Maximum memory size exceeded');\n"
++"\t\tif (W.memGrow(this._h, delta) < 0)\n"
++"\t\t\tthrow new RangeError('WebAssembly.Memory.grow(): Unable to grow instance memory');\n"
++"\t\treturn old;\n"
++"\t});\n"
++"\n"
++"\t/* ---- Global ---- */\n"
++"\tvar TYPES = ['i32', 'i64', 'f32', 'f64'];\n"
++"\tfunction convert(type, v) {\n"
++"\t\tif (type === 'i64') return BigInt.asIntN(64, typeof v === 'bigint' ? v : BigInt(v === undefined ? 0 : v));\n"
++"\t\tif (v === undefined) v = 0;\n"
++"\t\tif (type === 'i32') return v | 0;\n"
++"\t\tif (type === 'f32') return Math.fround(+v);\n"
++"\t\treturn +v;\n"
++"\t}\n"
++"\tfunction Global(desc, v) {\n"
++"\t\tif (!(this instanceof Global)) throw new TypeError(\"WebAssembly.Global must be invoked with 'new'\");\n"
++"\t\tif (!desc || TYPES.indexOf(desc.value) < 0)\n"
++"\t\t\tthrow new TypeError(\"WebAssembly.Global(): Descriptor property 'value' must be a WebAssembly type\");\n"
++"\t\tdefine(this, '_h', null);\n"
++"\t\tdefine(this, '_t', desc.value);\n"
++"\t\tdefine(this, '_m', !!desc.mutable);\n"
++"\t\tdefine(this, '_v', convert(desc.value, v));\n"
++"\t}\n"
++"\tObject.defineProperty(Global.prototype, 'value', { configurable: true,\n"
++"\t\tget: function () { return this._h ? W.globalGet(this._h, this._i) : this._v; },\n"
++"\t\tset: function (v) {\n"
++"\t\t\tif (!this._m) throw new TypeError(\"WebAssembly.Global.value: Can't set the value of an immutable global.\");\n"
++"\t\t\tif (this._h) W.globalSet(this._h, this._i, v);\n"
++"\t\t\telse this._v = convert(this._t, v);\n"
++"\t\t} });\n"
++"\tdefine(Global.prototype, 'valueOf', function () { return this.value; });\n"
++"\tfunction globalOf(h, i) {\n"
++"\t\tvar o = Object.create(Global.prototype);\n"
++"\t\tdefine(o, '_h', h);\n"
++"\t\tdefine(o, '_i', i);\n"
++"\t\tdefine(o, '_t', W.globalType(h, i));\n"
++"\t\tdefine(o, '_m', true);\t/* globalSet refuses an immutable one */\n"
++"\t\treturn o;\n"
++"\t}\n"
++"\n"
++"\t/* ---- Table ---- */\n"
++"\tfunction Table(desc) {\n"
++"\t\tif (!(this instanceof Table)) throw new TypeError(\"WebAssembly.Table must be invoked with 'new'\");\n"
++"\t\tif (!desc || (desc.element !== 'anyfunc' && desc.element !== 'funcref'))\n"
++"\t\t\tthrow new TypeError(\"WebAssembly.Table(): Descriptor property 'element' must be a WebAssembly reference type\");\n"
++"\t\tvar n = index(desc.initial, \"WebAssembly.Table(): Property 'initial'\");\n"
++"\t\tdefine(this, '_h', null);\n"
++"\t\tdefine(this, '_a', new Array(n).fill(null));\n"
++"\t}\n"
++"\tObject.defineProperty(Table.prototype, 'length', { configurable: true, get: function () {\n"
++"\t\treturn this._h ? W.tableLength(this._h) : this._a.length;\n"
++"\t} });\n"
++"\tdefine(Table.prototype, 'get', function (i) {\n"
++"\t\ti = index(i, 'WebAssembly.Table.get(): Argument 0');\n"
++"\t\tif (!this._h) {\n"
++"\t\t\tif (i >= this._a.length) throw new RangeError('WebAssembly.Table.get(): invalid address');\n"
++"\t\t\treturn this._a[i];\n"
++"\t\t}\n"
++"\t\tvar f = W.tableGet(this._h, i);\n"
++"\t\treturn f < 0 ? null : this._fn(f);\n"
++"\t});\n"
++"\tdefine(Table.prototype, 'set', function (i, v) {\n"
++"\t\tif (this._h) throw new RangeError('WebAssembly.Table.set(): not supported on an instance\\'s table');\n"
++"\t\ti = index(i, 'WebAssembly.Table.set(): Argument 0');\n"
++"\t\tif (i >= this._a.length) throw new RangeError('WebAssembly.Table.set(): invalid address');\n"
++"\t\tthis._a[i] = v === undefined ? null : v;\n"
++"\t});\n"
++"\tdefine(Table.prototype, 'grow', function (n) {\n"
++"\t\tif (this._h) throw new RangeError('WebAssembly.Table.grow(): not supported on an instance\\'s table');\n"
++"\t\tvar old = this._a.length;\n"
++"\t\tfor (var k = 0; k < index(n, 'WebAssembly.Table.grow(): Argument 0'); k++) this._a.push(null);\n"
++"\t\treturn old;\n"
++"\t});\n"
++"\n"
++"\t/* ---- Instance ---- */\n"
++"\tfunction Instance(module, importObject) {\n"
++"\t\tif (!(this instanceof Instance)) throw new TypeError(\"WebAssembly.Instance must be invoked with 'new'\");\n"
++"\t\tif (!isModule(module)) throw new TypeError('WebAssembly.Instance(): Argument 0 must be a WebAssembly.Module');\n"
++"\t\tvar imps = module._imports, funcs = [], mem = null, i;\n"
++"\t\tif (imps.length && (importObject === undefined || importObject === null || typeof importObject !== 'object'))\n"
++"\t\t\tthrow new TypeError('WebAssembly.Instance(): Imports argument must be present and must be an object');\n"
++"\t\tfor (i = 0; i < imps.length; i++) {\n"
++"\t\t\tvar imp = imps[i], where = 'WebAssembly.Instance(): Import #' + i + ' \"' + imp.module + '\" \"' + imp.name + '\"';\n"
++"\t\t\tvar mo = importObject[imp.module];\n"
++"\t\t\tif (mo === undefined || mo === null || (typeof mo !== 'object' && typeof mo !== 'function'))\n"
++"\t\t\t\tthrow new TypeError('WebAssembly.Instance(): Import #' + i + ' \"' + imp.module + '\": module is not an object or function');\n"
++"\t\t\tvar v = mo[imp.name];\n"
++"\t\t\tif (imp.kind === 'function') {\n"
++"\t\t\t\tif (typeof v !== 'function') throw new LinkError(where + ': function import requires a callable');\n"
++"\t\t\t\tfuncs.push(v);\n"
++"\t\t\t} else if (imp.kind === 'memory') {\n"
++"\t\t\t\tif (!(v instanceof Memory) || !v._h) throw new LinkError(where + ': memory import must be a WebAssembly.Memory object');\n"
++"\t\t\t\tvar pages = W.memPages(v._h);\n"
++"\t\t\t\tif (pages < imp.minimum) throw new LinkError(where + ': memory import has ' + pages + ' pages which is smaller than the declared initial of ' + imp.minimum);\n"
++"\t\t\t\tmem = v;\n"
++"\t\t\t} else {\n"
++"\t\t\t\tthrow new LinkError(where + ': imported ' + imp.kind + 's are not supported yet');\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t\tvar h = W.instantiate(module._h, funcs, mem ? mem._h : undefined);\n"
++"\t\tif (typeof h === 'string') fail(h);\n"
++"\t\tvar cache = [], table = null;\n"
++"\t\tfunction fn(idx) {\n"
++"\t\t\tif (cache[idx] === undefined) {\n"
++"\t\t\t\tvar f = W.func(h, idx);\n"
++"\t\t\t\tif (f && typeof f === 'function' && !Object.prototype.hasOwnProperty.call(f, '__vbWasm')) {\n"
++"\t\t\t\t\ttry { Object.defineProperty(f, 'name', { value: String(idx), configurable: true }); } catch (e) { /* */ }\n"
++"\t\t\t\t\ttry { define(f, '__vbWasm', true); } catch (e) { /* */ }\n"
++"\t\t\t\t}\n"
++"\t\t\t\tcache[idx] = f;\n"
++"\t\t\t}\n"
++"\t\t\treturn cache[idx];\n"
++"\t\t}\n"
++"\t\tvar exports = Object.create(null);\n"
++"\t\tmodule._exports.forEach(function (e) {\n"
++"\t\t\tvar val;\n"
++"\t\t\tif (e.kind === 'function') val = fn(e.index);\n"
++"\t\t\telse if (e.kind === 'memory') val = mem || (mem = memOf(h));\n"
++"\t\t\telse if (e.kind === 'global') val = globalOf(h, e.index);\n"
++"\t\t\telse {\n"
++"\t\t\t\tif (!table) {\n"
++"\t\t\t\t\ttable = Object.create(Table.prototype);\n"
++"\t\t\t\t\tdefine(table, '_h', h);\n"
++"\t\t\t\t\tdefine(table, '_fn', fn);\n"
++"\t\t\t\t}\n"
++"\t\t\t\tval = table;\n"
++"\t\t\t}\n"
++"\t\t\texports[e.name] = val;\n"
++"\t\t});\n"
++"\t\tdefine(this, 'exports', Object.freeze(exports));\n"
++"\t}\n"
++"\n"
++"\t/* ---- the namespace ---- */\n"
++"\tfunction later(f) { return new Promise(function (res) { res(); }).then(f); }\n"
++"\tvar WA = {};\n"
++"\tdefine(WA, 'Module', Module);\n"
++"\tdefine(WA, 'Instance', Instance);\n"
++"\tdefine(WA, 'Memory', Memory);\n"
++"\tdefine(WA, 'Table', Table);\n"
++"\tdefine(WA, 'Global', Global);\n"
++"\tdefine(WA, 'CompileError', CompileError);\n"
++"\tdefine(WA, 'LinkError', LinkError);\n"
++"\tdefine(WA, 'RuntimeError', RuntimeError);\n"
++"\tdefine(WA, 'validate', function (bytes) {\n"
++"\t\treturn typeof W.parse(bytesOf(bytes, 'WebAssembly.validate()')) !== 'string';\n"
++"\t});\n"
++"\tdefine(WA, 'compile', function (bytes) {\n"
++"\t\ttry { return Promise.resolve(new Module(bytes)); } catch (e) { return Promise.reject(e); }\n"
++"\t});\n"
++"\tdefine(WA, 'instantiate', function (src, imports) {\n"
++"\t\tif (src instanceof Module)\n"
++"\t\t\treturn later(function () { return new Instance(src, imports); });\n"
++"\t\tvar m;\n"
++"\t\ttry { m = new Module(src); } catch (e) { return Promise.reject(e); }\n"
++"\t\treturn later(function () { return { module: m, instance: new Instance(m, imports) }; });\n"
++"\t});\n"
++"\tfunction body(source, who) {\n"
++"\t\treturn Promise.resolve(source).then(function (r) {\n"
++"\t\t\tif (!r || typeof r.arrayBuffer !== 'function') throw new TypeError(who + ': Argument 0 must be provided and must be a Response');\n"
++"\t\t\tvar ct = r.headers && r.headers.get ? String(r.headers.get('content-type') || '') : '';\n"
++"\t\t\tif (ct.split(';')[0].trim().toLowerCase() !== 'application/wasm')\n"
++"\t\t\t\tthrow new TypeError(who + \": Incorrect response MIME type. Expected 'application/wasm'.\");\n"
++"\t\t\tif (r.ok === false) throw new TypeError(who + ': HTTP status code is not ok');\n"
++"\t\t\treturn r.arrayBuffer();\n"
++"\t\t});\n"
++"\t}\n"
++"\tdefine(WA, 'compileStreaming', function (source) {\n"
++"\t\treturn body(source, 'WebAssembly.compileStreaming()').then(function (b) { return new Module(b); });\n"
++"\t});\n"
++"\tdefine(WA, 'instantiateStreaming', function (source, imports) {\n"
++"\t\treturn body(source, 'WebAssembly.instantiateStreaming()').then(function (b) {\n"
++"\t\t\tvar m = new Module(b);\n"
++"\t\t\treturn { module: m, instance: new Instance(m, imports) };\n"
++"\t\t});\n"
++"\t});\n"
++"\ttry { Object.defineProperty(WA, Symbol.toStringTag, { value: 'WebAssembly', configurable: true }); } catch (e) { /* */ }\n"
++"\tObject.defineProperty(g, 'WebAssembly', { value: WA, writable: true, configurable: true, enumerable: false });\n"
++"})();\n"
++"\n"
+ "/* ---- canvas 2D: a real drawing context --------------------------------\n"
+ " * VitaBrowser patch 251. getContext('2d') returned a context whose every\n"
+ " * drawing method did nothing (fixes1245): charts, games, maps, QR codes\n"
+diff --git a/content/handlers/javascript/quickjs/macsurf_wasm.c b/content/handlers/javascript/quickjs/macsurf_wasm.c
+new file mode 100644
+--- /dev/null
++++ b/content/handlers/javascript/quickjs/macsurf_wasm.c
+@@ -0,0 +1,1169 @@
++/*
++ * VitaBrowser patch 254: WebAssembly (see macsurf_wasm.h).
++ *
++ * QuickJS has no WebAssembly. hCaptcha's proof of work is a WebAssembly
++ * module (docs/wasm-hcaptcha-measurement.md), and wasm-bindgen / emscripten
++ * output turns up wherever a site ships Rust or C. This is the engine
++ * side: wasm3 runs the code; the natives below give JavaScript what the
++ * WebAssembly API needs.
++ *
++ *  - __wasm.parse(bytes): a module handle, with the module's imports and
++ *    exports read from its own sections (wasm3 keeps export names for
++ *    functions and globals only, not memories and tables), or the error.
++ *    wasm3 parses the structure here; function bodies compile on first
++ *    call, as wasm3 does (a whole-module compile is seconds on the Vita).
++ *  - __wasm.newMemory(pages, maximum): a WebAssembly.Memory made by a
++ *    script -- a wasm3 runtime with no module yet, so its ArrayBuffer is
++ *    wasm3's memory from the start (emscripten keeps the views it made
++ *    before instantiating).
++ *  - __wasm.instantiate(module, functions, memory): an instance -- its own
++ *    wasm3 environment, runtime and copy of the bytes (wasm3 points into
++ *    them), or, for a module importing memory, that memory's runtime,
++ *    which wasm3 then leaves as it is -- with each function import linked
++ *    to a trampoline that calls the JavaScript function; then the start
++ *    function.
++ *  - __wasm.func(instance, index): a JavaScript function for a wasm
++ *    function (an export, or a table entry).
++ *  - __wasm.memBuffer / memGrow / memPages: the memory as an ArrayBuffer
++ *    over wasm3's own bytes. wasm3 reallocates memory when it grows, so
++ *    an ArrayBuffer handed out is detached as soon as the bytes move --
++ *    checked whenever control leaves WebAssembly -- and wasm-bindgen's
++ *    "byteLength === 0" cache check then fetches the new one.
++ *  - __wasm.globalGet / globalSet, tableGet / tableLength, detach.
++ *
++ * Errors: a trap becomes "RuntimeError: ..." for the JavaScript side to
++ * throw as WebAssembly.RuntimeError; an exception thrown by an import is
++ * kept, the call unwinds with a trap, and the same exception is rethrown
++ * from the export call. Re-entrant calls (an import calling an export --
++ * wasm-bindgen does it for every string it returns) are wasm3's own: it
++ * moves the runtime's stack base to the import's frame for the duration.
++ *
++ * Time: the whole call -- slices included -- is subtracted from the
++ * script's runaway clock (macsurf_qjs_pause_script_clock); JavaScript run
++ * by imports counts as usual. A call that runs WASM_CALL_CAP_MS, or that
++ * the user stops in a slice, ends in a RuntimeError.
++ */
++
++#ifdef WITH_QUICKJS
++
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++#pragma GCC diagnostic ignored "-Wstrict-prototypes"
++#pragma GCC diagnostic ignored "-Wmissing-prototypes"
++#pragma GCC diagnostic ignored "-Wredundant-decls"
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++#pragma GCC diagnostic ignored "-Wsign-compare"
++#pragma GCC diagnostic ignored "-Wshadow"
++#include "wasm3.h"
++#include "m3_env.h"
++#include "m3_compile.h"
++#pragma GCC diagnostic pop
++
++#include "macos9.h"
++#include "macsurf_qjs.h"
++#include "macsurf_wasm.h"
++
++/** Frames during a long call: one per this much of it. */
++#define WASM_SLICE_MS 200
++/** A call that runs this long is stopped. */
++#define WASM_CALL_CAP_MS (300 * 1000)
++/** wasm3 calls and loop iterations between two m3_Yield calls. */
++#define WASM_YIELD_EVERY 8192
++/** wasm3's value stack per instance. */
++#define WASM_STACK_BYTES (256 * 1024)
++
++/* wasm3 internals: the countdown (patches/wasm3/01) */
++extern i32 g_m3YieldCountdown;
++
++/* ---- the module's own sections --------------------------------------- */
++
++enum { K_FUNC = 0, K_TABLE = 1, K_MEMORY = 2, K_GLOBAL = 3 };
++
++struct wimport {
++	char *module, *name;
++	int kind;
++	uint32_t index;		/**< function: type index; memory: min pages */
++};
++
++struct wexport {
++	char *name;
++	int kind;
++	uint32_t index;
++};
++
++struct wmod {
++	uint8_t *bytes;
++	size_t len;
++	struct wimport *imps;
++	int nimps;
++	struct wexport *exps;
++	int nexps;
++};
++
++static bool leb_u32(const uint8_t **p, const uint8_t *end, uint32_t *out)
++{
++	uint32_t v = 0;
++	int shift = 0;
++	while (*p < end && shift < 35) {
++		uint8_t b = *(*p)++;
++		v |= (uint32_t)(b & 0x7f) << shift;
++		if (!(b & 0x80)) {
++			*out = v;
++			return true;
++		}
++		shift += 7;
++	}
++	return false;
++}
++
++static char *read_name(const uint8_t **p, const uint8_t *end)
++{
++	uint32_t n;
++	char *s;
++	if (!leb_u32(p, end, &n) || n > (uint32_t)(end - *p))
++		return NULL;
++	s = malloc(n + 1);
++	if (s == NULL)
++		return NULL;
++	memcpy(s, *p, n);
++	s[n] = '\0';
++	*p += n;
++	return s;
++}
++
++static bool skip_limits(const uint8_t **p, const uint8_t *end, uint32_t *min)
++{
++	uint32_t flags, max;
++	if (!leb_u32(p, end, &flags) || !leb_u32(p, end, min))
++		return false;
++	if (flags & 1)
++		return leb_u32(p, end, &max);
++	return true;
++}
++
++static void wmod_free(struct wmod *m)
++{
++	int i;
++	if (m == NULL)
++		return;
++	for (i = 0; i < m->nimps; i++) {
++		free(m->imps[i].module);
++		free(m->imps[i].name);
++	}
++	for (i = 0; i < m->nexps; i++)
++		free(m->exps[i].name);
++	free(m->imps);
++	free(m->exps);
++	free(m->bytes);
++	free(m);
++}
++
++/** The import and export sections; NULL if they are malformed. */
++static const char *wmod_sections(struct wmod *m)
++{
++	const uint8_t *p = m->bytes + 8, *end = m->bytes + m->len;
++	uint32_t i, n;
++
++	while (p < end) {
++		uint8_t id = *p++;
++		uint32_t size;
++		const uint8_t *s, *send;
++		if (!leb_u32(&p, end, &size) || size > (uint32_t)(end - p))
++			return "section size out of bounds";
++		s = p;
++		send = p + size;
++		p = send;
++		if (id == 2) {		/* import */
++			if (!leb_u32(&s, send, &n) || n > 100000)
++				return "malformed import section";
++			m->imps = calloc(n ? n : 1, sizeof(*m->imps));
++			if (m->imps == NULL)
++				return "out of memory";
++			for (i = 0; i < n; i++) {
++				struct wimport *im = &m->imps[m->nimps];
++				uint8_t kind;
++				im->module = read_name(&s, send);
++				im->name = read_name(&s, send);
++				m->nimps++;
++				if (im->module == NULL || im->name == NULL ||
++				    s >= send)
++					return "malformed import";
++				kind = *s++;
++				im->kind = kind;
++				switch (kind) {
++				case K_FUNC:
++					if (!leb_u32(&s, send, &im->index))
++						return "malformed import";
++					break;
++				case K_TABLE:
++					if (s >= send)
++						return "malformed import";
++					s++;	/* element type */
++					if (!skip_limits(&s, send, &im->index))
++						return "malformed import";
++					break;
++				case K_MEMORY:
++					if (!skip_limits(&s, send, &im->index))
++						return "malformed import";
++					break;
++				case K_GLOBAL:
++					if (send - s < 2)
++						return "malformed import";
++					s += 2;
++					break;
++				default:
++					return "unknown import kind";
++				}
++			}
++		} else if (id == 7) {	/* export */
++			if (!leb_u32(&s, send, &n) || n > 100000)
++				return "malformed export section";
++			m->exps = calloc(n ? n : 1, sizeof(*m->exps));
++			if (m->exps == NULL)
++				return "out of memory";
++			for (i = 0; i < n; i++) {
++				struct wexport *ex = &m->exps[m->nexps];
++				ex->name = read_name(&s, send);
++				m->nexps++;
++				if (ex->name == NULL || s >= send)
++					return "malformed export";
++				ex->kind = *s++;
++				if (ex->kind > K_GLOBAL ||
++				    !leb_u32(&s, send, &ex->index))
++					return "malformed export";
++			}
++		}
++	}
++	return NULL;
++}
++
++/* ---- instances --------------------------------------------------------- */
++
++struct wslot {
++	struct winst *inst;
++	JSValue fn;
++};
++
++struct winst {
++	int refs;		/**< the JS handle + each live ArrayBuffer */
++	JSContext *ctx;
++	uint8_t *bytes;		/**< wasm3 points into these */
++	IM3Environment env;
++	IM3Runtime rt;
++	IM3Module mod;
++	struct wslot *slots;
++	int nslots;
++	JSValue pending;	/**< an import's exception, carried through */
++	bool has_pending;
++	JSValue buf;		/**< the memory's current ArrayBuffer, or undefined */
++	uint8_t *buf_ptr;
++	uint32_t buf_len;
++};
++
++static JSClassID s_mod_class, s_inst_class;
++
++static const char s_trap_js[] = "[trap] JavaScript exception in an import";
++static const char s_trap_stop[] = "[trap] interrupted: stopped by the user";
++static const char s_trap_cap[] = "[trap] interrupted: ran too long";
++
++static void inst_unref(struct winst *in)
++{
++	if (--in->refs > 0)
++		return;
++	if (in->rt != NULL)
++		m3_FreeRuntime(in->rt);	/* frees the loaded module */
++	else if (in->mod != NULL)
++		m3_FreeModule(in->mod);
++	if (in->env != NULL)
++		m3_FreeEnvironment(in->env);
++	free(in->slots);
++	free(in->bytes);
++	free(in);
++}
++
++/* QuickJS calls this when the buffer is detached, and again (with NULL)
++ * when a detached buffer is collected: one reference, released once. */
++static void buf_free_cb(JSRuntime *rt, void *opaque, void *ptr)
++{
++	(void)rt;
++	if (ptr != NULL)
++		inst_unref(opaque);
++}
++
++/** The memory's bytes (NULL, 0 when it has none: wasm3's m3_GetMemory
++ * reads the header without checking). */
++static uint8_t *mem_get(struct winst *in, uint32_t *len)
++{
++	*len = 0;
++	if (in->rt == NULL || in->rt->memory.mallocated == NULL)
++		return NULL;
++	return m3_GetMemory(in->rt, len, 0);
++}
++
++/** If the memory moved or changed size, detach the ArrayBuffer handed out. */
++static void mem_check(struct winst *in)
++{
++	uint32_t len = 0;
++	uint8_t *ptr;
++	if (JS_IsUndefined(in->buf) || in->rt == NULL)
++		return;
++	ptr = mem_get(in, &len);
++	if (ptr == in->buf_ptr && len == in->buf_len)
++		return;
++	JS_DetachArrayBuffer(in->ctx, in->buf);
++	JS_FreeValue(in->ctx, in->buf);
++	in->buf = JS_UNDEFINED;
++}
++
++static void mod_finalizer(JSRuntime *rt, JSValue val)
++{
++	(void)rt;
++	wmod_free(JS_GetOpaque(val, s_mod_class));
++}
++
++static void inst_finalizer(JSRuntime *rt, JSValue val)
++{
++	struct winst *in = JS_GetOpaque(val, s_inst_class);
++	int i;
++	if (in == NULL)
++		return;
++	for (i = 0; i < in->nslots; i++)
++		JS_FreeValueRT(rt, in->slots[i].fn);
++	in->nslots = 0;
++	if (in->has_pending)
++		JS_FreeValueRT(rt, in->pending);
++	in->has_pending = false;
++	if (!JS_IsUndefined(in->buf))
++		JS_FreeValueRT(rt, in->buf);
++	in->buf = JS_UNDEFINED;
++	inst_unref(in);
++}
++
++static void inst_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark)
++{
++	struct winst *in = JS_GetOpaque(val, s_inst_class);
++	int i;
++	if (in == NULL)
++		return;
++	for (i = 0; i < in->nslots; i++)
++		JS_MarkValue(rt, in->slots[i].fn, mark);
++	if (in->has_pending)
++		JS_MarkValue(rt, in->pending, mark);
++	JS_MarkValue(rt, in->buf, mark);
++}
++
++static JSClassDef s_mod_def = { "WebAssemblyModuleBytes", mod_finalizer,
++	NULL, NULL, NULL };
++static JSClassDef s_inst_def = { "WebAssemblyInstanceHandle", inst_finalizer,
++	inst_mark, NULL, NULL };
++
++/* ---- time: slices, the cap, the script clock --------------------------- */
++
++static int s_depth;		/**< WebAssembly runs (calls in progress) */
++static double s_seg_t0;		/**< when control last entered WebAssembly */
++static double s_call_t0;	/**< when the outermost call began */
++static double s_last_slice;
++static unsigned int s_slices;
++
++/** Control leaves WebAssembly: its time is not the script's. */
++static void seg_leave(void)
++{
++	double now = macos9_micros();
++	macsurf_qjs_pause_script_clock((now - s_seg_t0) / 1000.0);
++	s_seg_t0 = now;
++}
++
++/* wasm3 calls this every WASM_YIELD_EVERY calls and loop iterations
++ * (patches/wasm3/01); it replaces wasm3's weak default. */
++M3Result m3_Yield(void)
++{
++	double now;
++
++	g_m3YieldCountdown = WASM_YIELD_EVERY;
++	if (s_depth == 0)
++		return m3Err_none;
++	now = macos9_micros();
++	if (now - s_last_slice >= WASM_SLICE_MS * 1000.0) {
++		s_slices++;
++		if (macsurf_wasm_slice((unsigned int)((now - s_call_t0) /
++				1000.0)))
++			return s_trap_stop;
++		s_last_slice = macos9_micros();
++	}
++	if (now - s_call_t0 > WASM_CALL_CAP_MS * 1000.0)
++		return s_trap_cap;
++	return m3Err_none;
++}
++
++static void run_begin(void)
++{
++	double now = macos9_micros();
++	if (s_depth == 0) {
++		s_call_t0 = now;
++		s_last_slice = now;
++		s_slices = 0;
++	}
++	s_depth++;
++	s_seg_t0 = now;
++}
++
++static void run_end(void)
++{
++	seg_leave();
++	if (--s_depth == 0) {
++		double ms = (macos9_micros() - s_call_t0) / 1000.0;
++		if (s_slices > 0) {
++			macsurf_wasm_done((unsigned int)ms, s_slices);
++			macsurf_debug_log_writef("LIFE wasm call: %u ms, %u "
++				"frames drawn during it", (unsigned int)ms,
++				s_slices);
++		}
++	}
++}
++
++/* ---- values -------------------------------------------------------------- */
++
++/* wasm3 keeps each value in a 64-bit slot, from its first byte */
++static JSValue from_slot(JSContext *ctx, uint8_t type, const uint64_t *v)
++{
++	int32_t i;
++	int64_t l;
++	float f;
++	double d;
++	switch (type) {
++	case c_m3Type_i32: memcpy(&i, v, 4); return JS_NewInt32(ctx, i);
++	case c_m3Type_i64: memcpy(&l, v, 8); return JS_NewBigInt64(ctx, l);
++	case c_m3Type_f32: memcpy(&f, v, 4); return JS_NewFloat64(ctx, f);
++	case c_m3Type_f64: memcpy(&d, v, 8); return JS_NewFloat64(ctx, d);
++	default: return JS_UNDEFINED;
++	}
++}
++
++/** JS value -> a wasm value in *out; false with a pending JS exception. */
++static bool to_slot(JSContext *ctx, uint8_t type, JSValueConst v,
++		uint64_t *out)
++{
++	*out = 0;
++	switch (type) {
++	case c_m3Type_i32: {
++		int32_t i;
++		if (JS_ToInt32(ctx, &i, v) < 0) return false;
++		memcpy(out, &i, 4);
++		return true;
++	}
++	case c_m3Type_i64: {
++		int64_t i;
++		if (JS_ToBigInt64(ctx, &i, v) < 0) return false;
++		memcpy(out, &i, 8);
++		return true;
++	}
++	case c_m3Type_f32: {
++		double d;
++		float f;
++		if (JS_ToFloat64(ctx, &d, v) < 0) return false;
++		f = (float)d;
++		memcpy(out, &f, 4);
++		return true;
++	}
++	case c_m3Type_f64: {
++		double d;
++		if (JS_ToFloat64(ctx, &d, v) < 0) return false;
++		memcpy(out, &d, 8);
++		return true;
++	}
++	default:
++		return true;
++	}
++}
++
++/** Throw WebAssembly[kind] (RuntimeError, CompileError, LinkError) with a
++ * wasm3 result's text; a plain Error if the namespace is not there. */
++static JSValue throw_result(JSContext *ctx, const char *kind, M3Result r)
++{
++	const char *msg = r;
++	JSValue g, ns, ctor, e, m;
++
++	if (strncmp(msg, "[trap] ", 7) == 0)
++		msg += 7;
++	g = JS_GetGlobalObject(ctx);
++	ns = JS_GetPropertyStr(ctx, g, "WebAssembly");
++	ctor = JS_IsObject(ns) ? JS_GetPropertyStr(ctx, ns, kind) :
++		JS_UNDEFINED;
++	JS_FreeValue(ctx, ns);
++	JS_FreeValue(ctx, g);
++	if (!JS_IsFunction(ctx, ctor)) {
++		JS_FreeValue(ctx, ctor);
++		return JS_ThrowPlainError(ctx, "%s: %s", kind, msg);
++	}
++	m = JS_NewString(ctx, msg);
++	e = JS_CallConstructor(ctx, ctor, 1, (JSValueConst *)&m);
++	JS_FreeValue(ctx, m);
++	JS_FreeValue(ctx, ctor);
++	if (JS_IsException(e))
++		return e;
++	return JS_Throw(ctx, e);
++}
++
++/** "Kind: message" for the JavaScript side to turn into an error. */
++static JSValue error_string(JSContext *ctx, const char *kind, const char *r)
++{
++	char buf[256];
++	snprintf(buf, sizeof(buf), "%s: %s", kind,
++		 strncmp(r, "[trap] ", 7) == 0 ? r + 7 : r);
++	return JS_NewString(ctx, buf);
++}
++
++/* ---- imports: JavaScript called from WebAssembly ----------------------- */
++
++static const void *trampoline(IM3Runtime rt, IM3ImportContext ictx,
++		uint64_t *sp, void *mem)
++{
++	struct wslot *sl = ictx->userdata;
++	struct winst *in = sl->inst;
++	JSContext *ctx = in->ctx;
++	IM3FuncType ft = ictx->function->funcType;
++	JSValue argv[32], r;
++	int i, n = ft->numArgs;
++	bool ok = true;
++
++	(void)rt; (void)mem;
++	if (n > 32)
++		return "[trap] import with more than 32 parameters";
++	seg_leave();
++	mem_check(in);
++	for (i = 0; i < n; i++)
++		argv[i] = from_slot(ctx, ft->types[ft->numRets + i],
++				sp + ft->numRets + i);
++	r = JS_Call(ctx, sl->fn, JS_UNDEFINED, n, (JSValueConst *)argv);
++	for (i = 0; i < n; i++)
++		JS_FreeValue(ctx, argv[i]);
++	if (JS_IsException(r)) {
++		ok = false;
++	} else {
++		if (ft->numRets == 1)
++			ok = to_slot(ctx, ft->types[0], r, sp);
++		JS_FreeValue(ctx, r);
++	}
++	/* back into WebAssembly */
++	s_seg_t0 = macos9_micros();
++	if (!ok) {
++		if (in->has_pending)
++			JS_FreeValue(ctx, in->pending);
++		in->pending = JS_GetException(ctx);
++		in->has_pending = true;
++		return s_trap_js;
++	}
++	return m3Err_none;
++}
++
++/* ---- calls: WebAssembly called from JavaScript ------------------------- */
++
++static IM3Function inst_func(struct winst *in, uint32_t index,
++		M3Result *err)
++{
++	IM3Function f;
++	*err = NULL;
++	if (in->mod == NULL || index >= in->mod->numFunctions) {
++		*err = "no such function";
++		return NULL;
++	}
++	f = &in->mod->functions[index];
++	if (!f->compiled) {
++		if (f->import.moduleUtf8 != NULL) {
++			*err = "calling an imported function directly";
++			return NULL;
++		}
++		*err = CompileFunction(f);
++		if (*err != NULL)
++			return NULL;
++	}
++	return f;
++}
++
++static JSValue func_call(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv, int magic, JSValue *data)
++{
++	struct winst *in = JS_GetOpaque(data[0], s_inst_class);
++	IM3Function f;
++	IM3FuncType ft;
++	uint64_t args[32], rets[8];
++	const void *argp[32], *retp[8];
++	M3Result r;
++	int i;
++
++	(void)this_val;
++	if (in == NULL)
++		return JS_ThrowTypeError(ctx, "WebAssembly instance is gone");
++	f = inst_func(in, (uint32_t)magic, &r);
++	if (f == NULL)
++		return throw_result(ctx, "CompileError", r);
++	ft = f->funcType;
++	if (ft->numArgs > 32 || ft->numRets > 8)
++		return JS_ThrowRangeError(ctx, "too many parameters");
++	for (i = 0; i < ft->numArgs; i++) {
++		if (!to_slot(ctx, ft->types[ft->numRets + i],
++				i < argc ? argv[i] : JS_UNDEFINED, &args[i]))
++			return JS_EXCEPTION;
++		argp[i] = &args[i];
++	}
++	run_begin();
++	r = m3_Call(f, ft->numArgs, argp);
++	run_end();
++	mem_check(in);
++	if (r != NULL) {
++		if (r == s_trap_js && in->has_pending) {
++			JSValue e = in->pending;
++			in->has_pending = false;
++			return JS_Throw(ctx, e);
++		}
++		return throw_result(ctx, "RuntimeError", r);
++	}
++	if (ft->numRets == 0)
++		return JS_UNDEFINED;
++	for (i = 0; i < ft->numRets; i++)
++		retp[i] = &rets[i];
++	r = m3_GetResults(f, ft->numRets, retp);
++	if (r != NULL)
++		return throw_result(ctx, "RuntimeError", r);
++	if (ft->numRets == 1)
++		return from_slot(ctx, ft->types[0], &rets[0]);
++	{
++		JSValue a = JS_NewArray(ctx);
++		for (i = 0; i < ft->numRets; i++)
++			JS_SetPropertyUint32(ctx, a, (uint32_t)i,
++				from_slot(ctx, ft->types[i], &rets[i]));
++		return a;
++	}
++}
++
++/* ---- the natives --------------------------------------------------------- */
++
++static struct winst *inst_of(JSValueConst v)
++{
++	return JS_GetOpaque(v, s_inst_class);
++}
++
++static const char *kind_name(int k)
++{
++	switch (k) {
++	case K_FUNC: return "function";
++	case K_TABLE: return "table";
++	case K_MEMORY: return "memory";
++	default: return "global";
++	}
++}
++
++/* __wasm.parse(bytes) -> [module, imports, exports] or "CompileError: ..." */
++static JSValue js_parse(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	size_t len = 0, off = 0, bpe = 0;
++	uint8_t *src = NULL;
++	struct wmod *m;
++	const char *err;
++	IM3Environment env;
++	IM3Module tmp = NULL;
++	M3Result r;
++	JSValue h, res, imps, exps;
++	int i;
++
++	(void)this_val;
++	if (argc < 1)
++		return JS_NewString(ctx, "TypeError: no bytes");
++	src = JS_GetArrayBuffer(ctx, &len, argv[0]);
++	if (src == NULL) {
++		JSValue ab;
++		JS_FreeValue(ctx, JS_GetException(ctx));
++		ab = JS_GetTypedArrayBuffer(ctx, argv[0], &off, &len, &bpe);
++		if (JS_IsException(ab)) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			return JS_NewString(ctx, "TypeError: WebAssembly needs "
++				"an ArrayBuffer or a typed array of the bytes");
++		}
++		src = JS_GetArrayBuffer(ctx, &bpe, ab);
++		JS_FreeValue(ctx, ab);
++		if (src == NULL)
++			return JS_NewString(ctx, "TypeError: detached buffer");
++		src += off;
++	}
++	if (len < 8 || memcmp(src, "\0asm", 4) != 0)
++		return JS_NewString(ctx, "CompileError: not a WebAssembly "
++			"module (no \\0asm magic)");
++	if (src[4] != 1 || src[5] || src[6] || src[7])
++		return JS_NewString(ctx, "CompileError: unsupported "
++			"WebAssembly version");
++	m = calloc(1, sizeof(*m));
++	if (m == NULL || (m->bytes = malloc(len)) == NULL) {
++		free(m);
++		return JS_ThrowOutOfMemory(ctx);
++	}
++	memcpy(m->bytes, src, len);
++	m->len = len;
++	err = wmod_sections(m);
++	/* wasm3's own parse: the structure, the function types */
++	env = m3_NewEnvironment();
++	if (env == NULL) {
++		wmod_free(m);
++		return JS_ThrowOutOfMemory(ctx);
++	}
++	r = err == NULL ? m3_ParseModule(env, &tmp, m->bytes, (uint32_t)len) :
++		NULL;
++	if (tmp != NULL)
++		m3_FreeModule(tmp);
++	m3_FreeEnvironment(env);
++	if (err != NULL || r != NULL) {
++		JSValue s = error_string(ctx, "CompileError",
++				err != NULL ? err : r);
++		wmod_free(m);
++		return s;
++	}
++	h = JS_NewObjectClass(ctx, (int)s_mod_class);
++	if (JS_IsException(h)) {
++		wmod_free(m);
++		return h;
++	}
++	JS_SetOpaque(h, m);
++	imps = JS_NewArray(ctx);
++	for (i = 0; i < m->nimps; i++) {
++		JSValue o = JS_NewObject(ctx);
++		JS_SetPropertyStr(ctx, o, "module",
++			JS_NewString(ctx, m->imps[i].module));
++		JS_SetPropertyStr(ctx, o, "name",
++			JS_NewString(ctx, m->imps[i].name));
++		JS_SetPropertyStr(ctx, o, "kind",
++			JS_NewString(ctx, kind_name(m->imps[i].kind)));
++		if (m->imps[i].kind == K_MEMORY)
++			JS_SetPropertyStr(ctx, o, "minimum",
++				JS_NewUint32(ctx, m->imps[i].index));
++		JS_SetPropertyUint32(ctx, imps, (uint32_t)i, o);
++	}
++	exps = JS_NewArray(ctx);
++	for (i = 0; i < m->nexps; i++) {
++		JSValue o = JS_NewObject(ctx);
++		JS_SetPropertyStr(ctx, o, "name",
++			JS_NewString(ctx, m->exps[i].name));
++		JS_SetPropertyStr(ctx, o, "kind",
++			JS_NewString(ctx, kind_name(m->exps[i].kind)));
++		JS_SetPropertyStr(ctx, o, "index",
++			JS_NewUint32(ctx, m->exps[i].index));
++		JS_SetPropertyUint32(ctx, exps, (uint32_t)i, o);
++	}
++	res = JS_NewArray(ctx);
++	JS_SetPropertyUint32(ctx, res, 0, h);
++	JS_SetPropertyUint32(ctx, res, 1, imps);
++	JS_SetPropertyUint32(ctx, res, 2, exps);
++	return res;
++}
++
++static char sig_char(uint8_t t)
++{
++	switch (t) {
++	case c_m3Type_i32: return 'i';
++	case c_m3Type_i64: return 'I';
++	case c_m3Type_f32: return 'f';
++	case c_m3Type_f64: return 'F';
++	default: return 'v';
++	}
++}
++
++/* a runtime of our own: environment, runtime (memory sized by the module,
++ * or by the script for newMemory) */
++static struct winst *inst_new(JSContext *ctx, JSValue *h)
++{
++	struct winst *in = calloc(1, sizeof(*in));
++	if (in == NULL)
++		return NULL;
++	in->refs = 1;
++	in->ctx = ctx;
++	in->buf = JS_UNDEFINED;
++	in->pending = JS_UNDEFINED;
++	*h = JS_NewObjectClass(ctx, (int)s_inst_class);
++	if (JS_IsException(*h)) {
++		free(in);
++		return NULL;
++	}
++	JS_SetOpaque(*h, in);	/* from here the finalizer cleans up */
++	in->env = m3_NewEnvironment();
++	if (in->env != NULL)
++		in->rt = m3_NewRuntime(in->env, WASM_STACK_BYTES, in);
++	if (in->rt == NULL) {
++		JS_FreeValue(ctx, *h);
++		return NULL;
++	}
++	return in;
++}
++
++/* __wasm.newMemory(pages, maximum) -> a memory handle (no module yet) */
++static JSValue js_new_memory(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	uint32_t pages = 0, max = 65536;
++	struct winst *in;
++	JSValue h;
++
++	(void)this_val;
++	if (argc > 0 && JS_ToUint32(ctx, &pages, argv[0]) < 0)
++		return JS_EXCEPTION;
++	if (argc > 1 && !JS_IsUndefined(argv[1]) &&
++	    JS_ToUint32(ctx, &max, argv[1]) < 0)
++		return JS_EXCEPTION;
++	in = inst_new(ctx, &h);
++	if (in == NULL)
++		return JS_ThrowOutOfMemory(ctx);
++	in->rt->memory.maxPages = max ? max : 65536;
++	if (pages > 0 && ResizeMemory(in->rt, pages) != NULL) {
++		JS_FreeValue(ctx, h);
++		return JS_ThrowRangeError(ctx, "WebAssembly.Memory(): could "
++			"not allocate memory");
++	}
++	return h;
++}
++
++/* __wasm.instantiate(module, functions[], memory)
++ *   -> instance handle, or "LinkError: ..." / a thrown RuntimeError */
++static JSValue js_instantiate(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct wmod *m = argc > 0 ? JS_GetOpaque(argv[0], s_mod_class) : NULL;
++	struct winst *mem = argc > 2 ? inst_of(argv[2]) : NULL;
++	struct winst *in;
++	JSValue h;
++	M3Result r;
++	uint32_t k, fi = 0;
++	int i;
++
++	(void)this_val;
++	if (m == NULL || argc < 2)
++		return JS_NewString(ctx, "TypeError: not a WebAssembly.Module");
++	if (mem != NULL) {
++		/* the imported memory's runtime: the module loads into it */
++		if (mem->mod != NULL)
++			return JS_NewString(ctx, "LinkError: a memory in use "
++				"by another instance is not supported");
++		in = mem;
++		h = JS_DupValue(ctx, argv[2]);
++	} else {
++		in = inst_new(ctx, &h);
++		if (in == NULL)
++			return JS_ThrowOutOfMemory(ctx);
++	}
++	in->bytes = malloc(m->len);
++	if (in->bytes == NULL) {
++		JS_FreeValue(ctx, h);
++		return JS_ThrowOutOfMemory(ctx);
++	}
++	memcpy(in->bytes, m->bytes, m->len);
++	r = m3_ParseModule(in->env, &in->mod, in->bytes, (uint32_t)m->len);
++	if (r == NULL) {
++		r = m3_LoadModule(in->rt, in->mod);
++		if (r != NULL)
++			m3_FreeModule(in->mod);
++	}
++	if (r != NULL) {
++		in->mod = NULL;
++		free(in->bytes);
++		in->bytes = NULL;
++		JS_FreeValue(ctx, h);
++		return error_string(ctx, "LinkError", r);
++	}
++	/* function imports -> the JavaScript functions, in import order */
++	in->slots = calloc((size_t)in->mod->numFuncImports + 1,
++			sizeof(*in->slots));
++	if (in->slots == NULL) {
++		JS_FreeValue(ctx, h);
++		return JS_ThrowOutOfMemory(ctx);
++	}
++	for (i = 0; i < m->nimps; i++) {
++		JSValue fn;
++		IM3Function f;
++		char sig[80];
++		size_t p = 0;
++		if (m->imps[i].kind != K_FUNC)
++			continue;
++		if (fi >= in->mod->numFuncImports)
++			break;
++		f = &in->mod->functions[fi];
++		fn = JS_GetPropertyUint32(ctx, argv[1], fi);
++		if (!JS_IsFunction(ctx, fn)) {
++			JS_FreeValue(ctx, fn);
++			JS_FreeValue(ctx, h);
++			return JS_NewString(ctx, "LinkError: an imported "
++				"function is not a function");
++		}
++		in->slots[fi].inst = in;
++		in->slots[fi].fn = fn;
++		in->nslots = (int)fi + 1;
++		sig[p++] = f->funcType->numRets ?
++			sig_char(f->funcType->types[0]) : 'v';
++		sig[p++] = '(';
++		for (k = 0; k < f->funcType->numArgs && p < sizeof(sig) - 2; k++)
++			sig[p++] = sig_char(f->funcType->types[
++					f->funcType->numRets + k]);
++		sig[p++] = ')';
++		sig[p] = '\0';
++		r = m3_LinkRawFunctionEx(in->mod, m->imps[i].module,
++				m->imps[i].name, sig, trampoline,
++				&in->slots[fi]);
++		if (r != NULL && r != m3Err_functionLookupFailed) {
++			JS_FreeValue(ctx, h);
++			return JS_NewString(ctx, "LinkError: an import does "
++				"not match its function type");
++		}
++		fi++;
++	}
++	/* the start function, as a call */
++	run_begin();
++	r = m3_RunStart(in->mod);
++	run_end();
++	if (r != NULL) {
++		JSValue e;
++		if (r == s_trap_js && in->has_pending) {
++			e = in->pending;
++			in->has_pending = false;
++			JS_FreeValue(ctx, h);
++			return JS_Throw(ctx, e);
++		}
++		JS_FreeValue(ctx, h);
++		return throw_result(ctx, "RuntimeError", r);
++	}
++	return h;
++}
++
++/* __wasm.func(instance, index) -> a function calling it */
++static JSValue js_func(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct winst *in = argc > 1 ? inst_of(argv[0]) : NULL;
++	uint32_t idx = 0;
++	IM3Function f;
++	M3Result r;
++	JSValue data[1];
++
++	(void)this_val;
++	if (in == NULL || JS_ToUint32(ctx, &idx, argv[1]) < 0)
++		return JS_NULL;
++	if (in->mod == NULL || idx >= in->mod->numFunctions)
++		return JS_NULL;
++	f = &in->mod->functions[idx];
++	if (idx < in->mod->numFuncImports) {
++		/* an imported function re-exported: the JavaScript function */
++		if ((int)idx < in->nslots)
++			return JS_DupValue(ctx, in->slots[idx].fn);
++		return JS_NULL;
++	}
++	(void)r;
++	data[0] = (JSValue)argv[0];
++	return JS_NewCFunctionData(ctx, func_call, f->funcType->numArgs,
++			(int)idx, 1, data);
++}
++
++/* __wasm.memBuffer(instance) -> ArrayBuffer over the memory */
++static JSValue js_mem_buffer(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct winst *in = argc > 0 ? inst_of(argv[0]) : NULL;
++	uint32_t len = 0;
++	uint8_t *ptr;
++
++	(void)this_val;
++	if (in == NULL || in->rt == NULL)
++		return JS_NULL;
++	mem_check(in);
++	if (!JS_IsUndefined(in->buf))
++		return JS_DupValue(ctx, in->buf);
++	ptr = mem_get(in, &len);
++	if (ptr == NULL) {
++		static uint8_t none[1];
++		ptr = none;
++		len = 0;
++	}
++	in->refs++;	/* released by buf_free_cb */
++	in->buf = JS_NewArrayBuffer(ctx, ptr, len, buf_free_cb, in, false);
++	if (JS_IsException(in->buf)) {
++		in->refs--;
++		in->buf = JS_UNDEFINED;
++		return JS_EXCEPTION;
++	}
++	in->buf_ptr = ptr;
++	in->buf_len = len;
++	return JS_DupValue(ctx, in->buf);
++}
++
++/* __wasm.memGrow(instance, delta) -> the old size in pages, or -1 */
++static JSValue js_mem_grow(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct winst *in = argc > 1 ? inst_of(argv[0]) : NULL;
++	uint32_t delta = 0, old;
++
++	(void)this_val;
++	if (in == NULL || in->rt == NULL ||
++	    JS_ToUint32(ctx, &delta, argv[1]) < 0)
++		return JS_NewInt32(ctx, -1);
++	old = in->rt->memory.numPages;
++	if (delta > 0 && (old + delta < old ||
++	    ResizeMemory(in->rt, old + delta) != NULL))
++		return JS_NewInt32(ctx, -1);
++	mem_check(in);
++	return JS_NewUint32(ctx, old);
++}
++
++static JSValue js_mem_pages(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct winst *in = argc > 0 ? inst_of(argv[0]) : NULL;
++	(void)this_val;
++	if (in == NULL || in->rt == NULL)
++		return JS_NewInt32(ctx, 0);
++	return JS_NewUint32(ctx, in->rt->memory.numPages);
++}
++
++static IM3Global global_at(JSValueConst h, JSContext *ctx, JSValueConst iv)
++{
++	struct winst *in = inst_of(h);
++	uint32_t idx = 0;
++	if (in == NULL || in->mod == NULL || JS_ToUint32(ctx, &idx, iv) < 0 ||
++	    idx >= in->mod->numGlobals)
++		return NULL;
++	return &in->mod->globals[idx];
++}
++
++/* __wasm.globalGet(instance, index) */
++static JSValue js_global_get(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	IM3Global g = argc > 1 ? global_at(argv[0], ctx, argv[1]) : NULL;
++	(void)this_val;
++	if (g == NULL)
++		return JS_UNDEFINED;
++	{
++		uint64_t v;
++		if (g->type == c_m3Type_f32)
++			memcpy(&v, &g->f32Value, 4);
++		else
++			memcpy(&v, &g->intValue, 8);
++		return from_slot(ctx, g->type, &v);
++	}
++}
++
++/* __wasm.globalSet(instance, index, value) */
++static JSValue js_global_set(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	IM3Global g = argc > 2 ? global_at(argv[0], ctx, argv[1]) : NULL;
++	uint64_t v;
++	(void)this_val;
++	if (g == NULL)
++		return JS_UNDEFINED;
++	if (!g->isMutable)
++		return JS_ThrowTypeError(ctx, "can't set the value of an "
++			"immutable global");
++	if (!to_slot(ctx, g->type, argv[2], &v))
++		return JS_EXCEPTION;
++	if (g->type == c_m3Type_f32)
++		memcpy(&g->f32Value, &v, 4);
++	else if (g->type == c_m3Type_i32)
++		g->intValue = (int32_t)(uint32_t)v;
++	else
++		memcpy(&g->intValue, &v, sizeof(v));
++	return JS_UNDEFINED;
++}
++
++/* __wasm.globalType(instance, index) -> "i32" / "i64" / "f32" / "f64" */
++static JSValue js_global_type(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	IM3Global g = argc > 1 ? global_at(argv[0], ctx, argv[1]) : NULL;
++	static const char *const names[] = { "", "i32", "i64", "f32", "f64" };
++	(void)this_val;
++	if (g == NULL || g->type > 4)
++		return JS_UNDEFINED;
++	return JS_NewString(ctx, names[g->type]);
++}
++
++/* __wasm.tableLength(instance), tableGet(instance, i) -> function index
++ * or -1 */
++static JSValue js_table_length(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct winst *in = argc > 0 ? inst_of(argv[0]) : NULL;
++	(void)this_val;
++	if (in == NULL || in->mod == NULL)
++		return JS_NewInt32(ctx, 0);
++	return JS_NewUint32(ctx, in->mod->table0Size);
++}
++
++static JSValue js_table_get(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	struct winst *in = argc > 1 ? inst_of(argv[0]) : NULL;
++	uint32_t i = 0;
++	IM3Function f;
++	(void)this_val;
++	if (in == NULL || in->mod == NULL || JS_ToUint32(ctx, &i, argv[1]) < 0)
++		return JS_NewInt32(ctx, -1);
++	if (i >= in->mod->table0Size || in->mod->table0 == NULL)
++		return JS_ThrowRangeError(ctx, "table index out of bounds");
++	f = in->mod->table0[i];
++	if (f == NULL)
++		return JS_NewInt32(ctx, -1);
++	return JS_NewUint32(ctx, (uint32_t)(f - in->mod->functions));
++}
++
++/* __wasm.detach(arrayBuffer): an imported memory's old buffer, adopted */
++static JSValue js_detach(JSContext *ctx, JSValueConst this_val, int argc,
++		JSValueConst *argv)
++{
++	(void)this_val;
++	if (argc > 0 && JS_IsArrayBuffer(argv[0]))
++		JS_DetachArrayBuffer(ctx, argv[0]);
++	return JS_UNDEFINED;
++}
++
++/* exported interface documented in macsurf_wasm.h */
++void macsurf_wasm_init_class(JSRuntime *rt)
++{
++	s_mod_class = 0;
++	JS_NewClassID(rt, &s_mod_class);
++	JS_NewClass(rt, s_mod_class, &s_mod_def);
++	s_inst_class = 0;
++	JS_NewClassID(rt, &s_inst_class);
++	JS_NewClass(rt, s_inst_class, &s_inst_def);
++}
++
++/* exported interface documented in macsurf_wasm.h */
++void macsurf_wasm_install(JSContext *ctx, JSValueConst global)
++{
++	static const struct {
++		const char *name;
++		JSCFunction *fn;
++		int n;
++	} fns[] = {
++		{ "parse", js_parse, 1 },
++		{ "newMemory", js_new_memory, 2 },
++		{ "instantiate", js_instantiate, 3 },
++		{ "func", js_func, 2 },
++		{ "memBuffer", js_mem_buffer, 1 },
++		{ "memGrow", js_mem_grow, 2 },
++		{ "memPages", js_mem_pages, 1 },
++		{ "globalGet", js_global_get, 2 },
++		{ "globalSet", js_global_set, 3 },
++		{ "globalType", js_global_type, 2 },
++		{ "tableLength", js_table_length, 1 },
++		{ "tableGet", js_table_get, 2 },
++		{ "detach", js_detach, 1 },
++	};
++	JSValue o = JS_NewObject(ctx);
++	size_t i;
++
++	for (i = 0; i < sizeof(fns) / sizeof(fns[0]); i++)
++		JS_SetPropertyStr(ctx, o, fns[i].name,
++			JS_NewCFunction(ctx, fns[i].fn, fns[i].name, fns[i].n));
++	JS_SetPropertyStr(ctx, global, "__wasm", o);
++}
++
++#endif
+diff --git a/content/handlers/javascript/quickjs/macsurf_wasm.h b/content/handlers/javascript/quickjs/macsurf_wasm.h
+new file mode 100644
+--- /dev/null
++++ b/content/handlers/javascript/quickjs/macsurf_wasm.h
+@@ -0,0 +1,31 @@
++/*
++ * VitaBrowser patch 254: WebAssembly.
++ *
++ * wasm3 (tools/fetch-wasm3.sh, an interpreter in portable C) behind the
++ * natives of the hidden global `__wasm`; the WebAssembly namespace itself
++ * -- Module, Instance, Memory, Table, Global, the errors, validate /
++ * compile / instantiate -- is JavaScript, in vita_polyfill.js.
++ *
++ * A long call is sliced: wasm3 calls m3_Yield every few thousand calls and
++ * loop iterations (patches/wasm3/01), and every WASM_SLICE_MS of it the
++ * frontend draws a frame (macsurf_wasm_slice), which may stop the call.
++ * Time inside WebAssembly does not count against the script's runaway
++ * deadline.
++ */
++
++#ifndef MACSURF_WASM_H
++#define MACSURF_WASM_H
++
++#ifdef WITH_QUICKJS
++
++#include "quickjs.h"
++
++/** Register the handle classes with a runtime (once per runtime). */
++void macsurf_wasm_init_class(JSRuntime *rt);
++
++/** Install `__wasm` on a realm's global object. */
++void macsurf_wasm_install(JSContext *ctx, JSValueConst global);
++
++#endif
++
++#endif
+diff --git a/frontends/vita/Makefile b/frontends/vita/Makefile
+--- a/frontends/vita/Makefile
++++ b/frontends/vita/Makefile
+@@ -37,12 +37,15 @@
+ VITA_QUICKJS ?= $(VITA_PREFIX)
+ endif
+ CFLAGS += -I$(VITA_QUICKJS)/include/quickjs
++# WebAssembly (patch 254): wasm3, built beside it (lib/libm3.a,
++# include/wasm3) by the same script.
++CFLAGS += -I$(VITA_QUICKJS)/include/wasm3
+ 
+ ifeq ($(VITA_HOST_SIM),YES)
+ # Host simulator (see Makefile.tools): stand-in SDK headers and library.
+ CFLAGS += -I$(VITA_SIM_INCLUDE) -DVITA_HOST_SIM
+ LDFLAGS += $(VITA_SIM_LIB) $(shell pkg-config --libs freetype2) \
+-	-L$(VITA_QUICKJS)/lib -lquickjs \
++	-L$(VITA_QUICKJS)/lib -lquickjs -lm3 \
+ 	-lpcre2-posix -lpcre2-8 -lz -lm
+ else
+ # vitaSDK libraries. vita2d draws through the GXM; text is FreeType
+@@ -56,7 +59,7 @@
+ # ~3 KB of the alignment boundary fails to package ("Cannot allocate N bytes
+ # for SCE data at end of segment 0; segment 1 overlaps"). Reserve 16 KiB.
+ LDFLAGS += -Wl,--defsym=__sce_headroom=0x4000
+-LDFLAGS += -Wl,-q -L$(VITA_QUICKJS)/lib -lquickjs \
++LDFLAGS += -Wl,-q -L$(VITA_QUICKJS)/lib -lquickjs -lm3 \
+ 	-lvita2d -lfreetype -lpng -ljpeg -lbz2 -lz \
+ 	-lpcre2-posix -lpcre2-8 \
+ 	-lSceDisplay_stub -lSceGxm_stub -lSceSysmodule_stub -lSceCtrl_stub \
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -69,6 +69,7 @@
+ #include "vita/net.h"
+ #include "vita/netlog.h"
+ #include "vita/js_platform.h"
++#include "content/handlers/javascript/quickjs/macos9.h"	/* patch 254 */
+ #include "vita/download.h"
+ #include "vita/resolve.h"
+ #include "vita/input.h"
+@@ -1161,6 +1162,47 @@
+ 			      dump ? " (dumped)" : "");
+ }
+ 
++/* exported interface documented in quickjs/macos9.h
++ *
++ * VitaBrowser patch 254: a long WebAssembly call (hCaptcha's proof of
++ * work: about a minute on the Vita) blocks the main loop; every 200 ms of
++ * it the page is drawn as it stands, with how long it has run, and
++ * CIRCLE stops it. Nothing else runs here -- no timers, no input to the
++ * page -- the script is still inside the call. The simulator reads no pad:
++ * its pad drives the scripted autotest. */
++int macsurf_wasm_slice(unsigned int ms)
++{
++	struct gui_window *gw = vita_window_current();
++	int stop = 0;
++
++	if (gw == NULL)
++		return 0;
++	set_message(0, "WebAssembly running: %u.%u s  (O stops)", ms / 1000,
++		    (ms % 1000) / 100);
++	draw_frame(gw, false, NULL);
++#ifndef VITA_HOST_SIM
++	{
++		SceCtrlData pad;
++		memset(&pad, 0, sizeof(pad));
++		sceCtrlPeekBufferPositive(0, &pad, 1);
++		if (pad.buttons & SCE_CTRL_CIRCLE)
++			stop = 1;
++	}
++#endif
++	if (stop)
++		vita_diag_log("wasm: stopped by the user after %u ms", ms);
++	return stop;
++}
++
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_wasm_done(unsigned int ms, unsigned int slices)
++{
++	set_message(1500, "WebAssembly took %u.%u s", ms / 1000,
++		    (ms % 1000) / 100);
++	vita_diag_log("wasm: a call ran %u ms, %u frames drawn during it", ms,
++		      slices);
++}
++
+ /**
+  * Track whether the current page has a document yet, and log its progress
+  * once a second until it does.

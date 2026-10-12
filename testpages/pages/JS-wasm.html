@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS WebAssembly (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 14px; margin: 8px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 18px; font-weight: bold; }
+p { margin: 1px 0; }
+</style>
+</head>
+<body>
+<div id="sum">WASM254: 0/15 passed</div>
+<div id="rows"></div>
+<script>
+/* patch 254: there was no WebAssembly at all. Three small modules
+ * (WABT's wat2wasm from tools/wasm-fuzz/*.wat; tools/test-wasm.sh runs
+ * the same modules under ASan)
+ * exercise numbers, traps, memory and growth, globals, tables, imports
+ * calling back into exports, exceptions through wasm, imported memory,
+ * streaming, and two long calls (1.4 billion loop iterations each:
+ * about 5 s each in the simulator, which draws frames during them).
+ * Chromium-verified (15/15). Runs at window load; no timers. */
+var W_basic = 'AGFzbQEAAAABKQhgAn9/AX9gAn5+AX5gAXwBfGACfX0BfWAAAGABfwF/YAABf2ACf38AAw8OAAECAwQABQYHBQYGBAYEBAFwAAIFAwEAAQYLAn8BQQcLfwFBAAsHaw8DYWRkAAAFbXVsNjQAAQRzcXJ0AAIGZjMyYWRkAAMEdHJhcAAEA2RpdgAFBHNwaW4ABgFnAwAEZ2V0ZwAHBm1lbW9yeQIABXN0b3JlAAgEZ3JvdwAJA3RibAEAAnQxAAsHc3RhcnRlZAANCAEMCQgBAEEACwIKCwp+DgcAIAAgAWoLBwAgACABfgsFACAAnwsHACAAIAGSCwMAAAsHACAAIAFtCyQBAX8CQANAIABFDQEgASAAc0EBaiEBIABBAWshAAwACwsgAQsEACMACwkAIAAgAToAAAsGACAAQAALBQBB5AALBQBByAELBgBBASQBCwQAIwELCw0BAEEQCwdoaSB3YXNt';
+var W_imports = 'AGFzbQEAAAABCQJgAX8Bf2AAAAIYAgNlbnYCY2IAAANlbnYHdGhyb3dlcgABAwQDAAABBx4DBmNhbGxjYgACBWlubmVyAAMJY2FsbHRocm93AAQKGAMJACAAEABBAWoLBwAgAEECbAsEABABCw==';
+var W_memimport = 'AGFzbQEAAAABBgFgAX8BfwIMAQNlbnYDbWVtAgABAwIBAAcIAQRwZWVrAAAKCQEHACAALQAACwsIAQBB5AALASo=';
+var N = 15, k = 0, done = 0, rows = document.getElementById('rows');
+for (var i = 1; i <= N; i++) {
+	var p = document.createElement('p');
+	p.id = 'r' + i; p.className = 'wait';
+	p.textContent = i + ' waiting (the script never ran)';
+	rows.appendChild(p);
+}
+function t(n, ok, text) {
+	var p = document.getElementById('r' + n);
+	if (p.className === 'pass') return;
+	p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+	if (!ok) return;
+	p.className = 'pass';
+	k++;
+	document.getElementById('sum').textContent = 'WASM254: ' + k + '/' + N + ' passed';
+	document.title = 'JS WebAssembly (' + k + '/' + N + ')';
+}
+function bytes(b64) {
+	var s = atob(b64), a = new Uint8Array(s.length);
+	for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+	return a;
+}
+function run(n, name, fn) {
+	try {
+		var r = fn();
+		if (r && typeof r.then === 'function')
+			r.then(function (v) { t(n, v[0], name + ': ' + v[1]); },
+				function (e) { t(n, false, name + ': rejected ' + e); });
+		else t(n, r[0], name + ': ' + r[1]);
+	} catch (e) { t(n, false, name + ': threw ' + e); }
+}
+function threw(f) { try { f(); return null; } catch (e) { return e; } }
+function checks() {
+	if (typeof WebAssembly !== 'object') { t(1, false, 'no WebAssembly'); return; }
+	var basicBytes = bytes(W_basic);
+	run(1, 'WebAssembly.validate', function () {
+		var a = WebAssembly.validate(basicBytes), b = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 9, 9]));
+		return [a === true && b === false, 'module ' + a + ', garbage ' + b];
+	});
+	var basic = new WebAssembly.Instance(new WebAssembly.Module(basicBytes), {});
+	var e = basic.exports;
+	run(2, 'i32, i64 (BigInt), f64, f32', function () {
+		var a = e.add(2, 3), m = e.mul64(BigInt(3), BigInt(1) << BigInt(40)), s = e.sqrt(2), f = e.f32add(0.1, 0.2);
+		return [a === 5 && m === BigInt(3) << BigInt(40) && s === Math.SQRT2 && f === Math.fround(Math.fround(0.1) + Math.fround(0.2)),
+			a + ' ' + m + ' ' + s + ' ' + f];
+	});
+	run(3, 'Module.exports / Module.imports', function () {
+		var ex = WebAssembly.Module.exports(new WebAssembly.Module(basicBytes)).map(function (x) { return x.name + ':' + x.kind; }).join(',');
+		var im = WebAssembly.Module.imports(new WebAssembly.Module(bytes(W_imports))).map(function (x) { return x.module + '.' + x.name + ':' + x.kind; }).join(',');
+		return [/add:function/.test(ex) && /memory:memory/.test(ex) && /g:global/.test(ex) && /tbl:table/.test(ex) &&
+			im === 'env.cb:function,env.thrower:function', im + ' | ' + ex.length + ' chars'];
+	});
+	run(4, 'the start function ran', function () { return [e.started() === 1, 'started ' + e.started()]; });
+	run(5, 'traps are WebAssembly.RuntimeError', function () {
+		var a = threw(function () { e.trap(); }), b = threw(function () { e.div(1, 0); });
+		return [a instanceof WebAssembly.RuntimeError && b instanceof WebAssembly.RuntimeError && /divide/i.test(String(b.message)),
+			String(a) + ' / ' + String(b)];
+	});
+	run(6, 'memory: data segment and stores seen through memory.buffer', function () {
+		var v = new Uint8Array(e.memory.buffer);
+		var s = String.fromCharCode.apply(null, Array.prototype.slice.call(v, 16, 23));
+		e.store(0, 65);
+		return [s === 'hi wasm' && v[0] === 65 && e.memory instanceof WebAssembly.Memory, '"' + s + '", byte 0 = ' + v[0]];
+	});
+	run(7, 'memory.grow detaches the old buffer', function () {
+		var old = new Uint8Array(e.memory.buffer), g1 = e.grow(1), len = e.memory.buffer.byteLength, g2 = e.memory.grow(1);
+		return [g1 === 1 && old.byteLength === 0 && len === 131072 && g2 === 2 && e.memory.buffer.byteLength === 196608 &&
+			new Uint8Array(e.memory.buffer)[0] === 65,
+			'grow ' + g1 + ', old view ' + old.byteLength + ', then ' + len + ', grow ' + g2];
+	});
+	run(8, 'an exported global, set from JavaScript', function () {
+		var before = e.g.value;
+		e.g.value = 42;
+		return [before === 7 && e.getg() === 42 && e.g instanceof WebAssembly.Global, before + ' -> ' + e.getg()];
+	});
+	run(9, 'an exported table', function () {
+		return [e.tbl.length === 2 && e.tbl.get(0)() === 100 && e.tbl.get(1) === e.t1 && e.t1() === 200,
+			'length ' + e.tbl.length + ', get(0)() ' + e.tbl.get(0)()];
+	});
+	var mod2 = new WebAssembly.Module(bytes(W_imports)), inst2 = null, boom = { boom: 1 };
+	inst2 = new WebAssembly.Instance(mod2, { env: {
+		cb: function (x) { return inst2.exports.inner(x); },
+		thrower: function () { throw boom; } } });
+	run(10, 'an import calling back into an export', function () {
+		var r = inst2.exports.callcb(5);
+		return [r === 11, 'callcb(5) = ' + r];
+	});
+	run(11, 'an exception thrown by an import comes out of the call', function () {
+		var x = threw(function () { inst2.exports.callthrow(); });
+		var y = inst2.exports.callcb(1);
+		return [x === boom && y === 3, 'same object ' + (x === boom) + ', next call ' + y];
+	});
+	run(12, 'CompileError and LinkError', function () {
+		var c = threw(function () { new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 99])); });
+		var l = threw(function () { new WebAssembly.Instance(mod2, { env: {} }); });
+		return [c instanceof WebAssembly.CompileError && l instanceof WebAssembly.LinkError && c instanceof Error,
+			String(c && c.name) + ', ' + String(l && l.name)];
+	});
+	run(13, 'an imported memory keeps the views made before', function () {
+		var mem = new WebAssembly.Memory({ initial: 1 }), v = new Uint8Array(mem.buffer);
+		v[5] = 77;
+		var i3 = new WebAssembly.Instance(new WebAssembly.Module(bytes(W_memimport)), { env: { mem: mem } });
+		return [i3.exports.peek(5) === 77 && i3.exports.peek(100) === 42 && v.byteLength === 65536 && v[100] === 42,
+			'peek ' + i3.exports.peek(5) + ', ' + i3.exports.peek(100) + ', view ' + v.byteLength + '/' + v[100]];
+	});
+	run(14, 'instantiateStreaming (and its MIME check)', function () {
+		var ok = WebAssembly.instantiateStreaming(new Response(basicBytes, { headers: { 'Content-Type': 'application/wasm' } }), {});
+		var bad = WebAssembly.instantiateStreaming(new Response(basicBytes, { headers: { 'Content-Type': 'text/plain' } }), {});
+		return Promise.all([ok, bad.then(function () { return 'resolved'; }, function (x) { return x; })]).then(function (r) {
+			return [r[0].instance.exports.add(20, 22) === 42 && r[1] instanceof TypeError,
+				'add ' + r[0].instance.exports.add(20, 22) + ', text/plain ' + r[1]];
+		});
+	});
+	/* two calls of about 5 s each in the simulator: 10 s in one script,
+	 * past its 8 s runaway budget -- time inside WebAssembly is not the
+	 * script's, so it must still be running to report */
+	run(15, 'two long calls outlast the script budget', function () {
+		var t0 = performance.now(), a = e.spin(1400000000), b = e.spin(1400000000),
+			ms = Math.round(performance.now() - t0);
+		return [a === -174665216 && b === a, 'spin = ' + a + ', ' + b + ' in ' + ms + ' ms'];
+	});
+}
+window.addEventListener('load', checks);
+</script>
+</body>
+</html>

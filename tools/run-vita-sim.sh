@@ -312,6 +312,7 @@ NET-js-element-instanceof http://127.0.0.1:$HP/JS-element-instanceof.html
 NET-js-node-names http://127.0.0.1:$HP/JS-node-names.html
 NET-js-image-load http://127.0.0.1:$HP/JS-image-load.html
 NET-js-canvas-2d http://127.0.0.1:$HP/JS-canvas-2d.html
+NET-js-wasm http://127.0.0.1:$HP/JS-wasm.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -815,7 +816,8 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
-	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22"; do
+	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22" \
+	 "js-wasm WASM254 15"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
@@ -839,6 +841,16 @@ if [ -n "$cvb" ] && [ -n "$cvs" ]; then
 fi
 echo "  js-canvas-2d on screen: ${cvb:-no canvas bitmap plotted}; pixels ${cvpx:-none}"
 [ "$cvpx" = "0,85,170 255,204,0 " ] || o2_bad="$o2_bad js-canvas-2d-screen"
+# Patch 254: JS-wasm's two long calls (about 5 s each) are sliced -- the
+# frontend draws a frame every 200 ms of them (log: "wasm: a call ran N ms,
+# M frames drawn during it"); without slicing the page sat frozen.
+wsl=$(awk '/page [0-9]*\/[0-9]* NET-js-wasm: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/log.txt" 2>/dev/null | grep -o 'wasm: a call ran [0-9]* ms, [0-9]* frames' || true)
+wsn=$(printf '%s\n' "$wsl" | grep -c 'frames' || true)
+wsf=$(printf '%s\n' "$wsl" | sed -n 's/.*ms, \([0-9]*\) frames/\1/p' | sort -n | head -1)
+echo "  js-wasm slicing: ${wsn} long calls, fewest frames in one: ${wsf:-none}"
+[ "${wsn:-0}" -ge 2 ] && [ "${wsf:-0}" -ge 10 ] || o2_bad="$o2_bad js-wasm-slices"
 # innerText (Patch 168): the rendered text, not textContent.
 itp=$(ls "$R"/*NET-js-innertext.plot 2>/dev/null | head -1)
 itr=$(sed -n 's/.*STR \(INNERTEXT: [0-9]*\/[0-9]* passed\).*/\1/p' "$itp" 2>/dev/null | head -1)
