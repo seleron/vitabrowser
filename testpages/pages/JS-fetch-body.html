@@ -23,7 +23,10 @@ p { margin: 0; padding: 1px 6px; font-size: 11px; line-height: 1.3; }
  * Patch 256: binary bodies -- typed arrays, ArrayBuffer, DataView, Blob --
  * go as their exact bytes (hCaptcha's getcaptcha: msgpack, NULs and all),
  * with no Content-Type unless they have one; XHR responseType "arraybuffer",
- * "blob" and "json". */
+ * "blob" and "json".
+ * Patch 257: FormData with files -- a Blob is stored as a File and its bytes
+ * go in the multipart body (they went as nothing); names escaped, text
+ * values UTF-8 with CRLF line breaks. */
 var passed = 0, total = 0, failedNames = [];
 function t(name, cond) {
   total++;
@@ -154,11 +157,80 @@ function fetchBinary() {
     var ct = r.headers.get('X-Echo-Content-Type');
     return r.arrayBuffer().then(function (ab) {
       t('12 fetch Blob body', same(ab, all.subarray(0, 64)) && ct === 'application/x-test');
-      sum();
+      formFiles();
     });
   }).catch(function (e) {
     t('binary fetch failed: ' + (e && e.message), false);
     sum();
+  });
+}
+
+/* the bytes of a multipart body as a latin-1 string (one char per byte) */
+function latin1(ab) {
+  var u = new Uint8Array(ab), s = '';
+  for (var i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  return s;
+}
+function part(body, name) {
+  /* the content of the part whose Content-Disposition names `name` */
+  var at = body.indexOf('name="' + name + '"');
+  if (at < 0) return null;
+  var start = body.indexOf('\r\n\r\n', at) + 4;
+  var end = body.indexOf('\r\n--', start);
+  return { head: body.slice(at, start), data: body.slice(start, end) };
+}
+var allLatin1 = latin1(all.buffer);
+function formFiles() {
+  /* 13: XHR, a FormData with a binary Blob under a filename */
+  var fd = new FormData();
+  fd.append('note', 'hi');
+  fd.append('file', new Blob([all], { type: 'application/x-test' }), 'a.bin');
+  xhr(fd, 'arraybuffer', null, function (x) {
+    var ct = x.getResponseHeader('X-Echo-Content-Type') || '';
+    var b = x.response ? latin1(x.response) : '', p = part(b, 'file');
+    t('13 XHR FormData file bytes',
+      ct.indexOf('multipart/form-data; boundary=') === 0 && p !== null &&
+      p.head.indexOf('filename="a.bin"') >= 0 &&
+      p.head.indexOf('Content-Type: application/x-test') >= 0 &&
+      p.data === allLatin1 && part(b, 'note').data === 'hi');
+    /* 14: fetch, a File keeps its own name and type */
+    var fd2 = new FormData();
+    fd2.append('doc', new File([all.subarray(0, 50)], 'b.dat', { type: 'image/png' }));
+    fetch(echoUrl, { method: 'POST', body: fd2 }).then(function (r) {
+      return r.arrayBuffer();
+    }).then(function (ab) {
+      var p = part(latin1(ab), 'doc');
+      t('14 fetch FormData File bytes', p !== null &&
+        p.head.indexOf('filename="b.dat"') >= 0 &&
+        p.head.indexOf('Content-Type: image/png') >= 0 &&
+        p.data === latin1(all.buffer.slice(0, 50)));
+      /* 15-16: what FormData stores */
+      var fd3 = new FormData();
+      fd3.append('b', new Blob(['xyz']));
+      fd3.append('o', { a: 1 });
+      fd3.append('n', 5);
+      var g = fd3.get('b');
+      t('15 a Blob is stored as a File named "blob"',
+        g instanceof Blob && g.name === 'blob' && g.size === 3);
+      t('16 other values are stored as strings',
+        fd3.get('o') === '[object Object]' && fd3.get('n') === '5');
+      /* 17: text as UTF-8 with CRLF breaks; a name with a quote escaped */
+      var fd4 = new FormData();
+      fd4.append('t', 'caf\u00e9\nline2');
+      fd4.append('q"x', 'v');
+      return fetch(echoUrl, { method: 'POST', body: fd4 });
+    }).then(function (r) {
+      return r.arrayBuffer();
+    }).then(function (ab) {
+      var b = latin1(ab), p = part(b, 't');
+      t('17 text is UTF-8 with CRLF, names escaped',
+        p !== null && p.data === 'caf\u00c3\u00a9\r\nline2' &&
+        b.indexOf('name="q%22x"') >= 0);
+      sum();
+    }).catch(function (e) {
+      t('form files failed: ' + (e && e.message), false);
+      sum();
+    });
   });
 }
 </script>

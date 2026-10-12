@@ -542,7 +542,7 @@ done
 [ "$(ls "$R"/*NET-js-storage*.plot "$R"/*NET-js-mutation*.plot 2>/dev/null | wc -l)" -eq 4 ] || sm_bad=$((sm_bad + 1))
 [ "$sm_bad" -eq 0 ]
 
-# Fetch/XHR request bodies (Patch 140; binary bodies and responseType 256): URLSearchParams serializes to
+# Fetch/XHR request bodies (Patch 140; binary bodies and responseType 256; FormData files 257): URLSearchParams serializes to
 # x-www-form-urlencoded, FormData text fields to multipart. The /echo
 # endpoint returns the raw body for verification.
 echo "== fetch request bodies (JS-fetch-body) =="
@@ -554,7 +554,7 @@ for f in "$R"/*NET-js-fetch-body*.plot; do
 	echo "  $n: ${r:-no summary line (script did not run?)}"
 	grep -o 'STR [0-9]* [^:]*: \(waiting\|FAIL\).*' "$f" | sed 's/^STR /  /'
 	sed -n 's/.*STR \(JS fetch body: [0-9]*\/[0-9]* passed FAILS: .*\)/\1/p' "$f" | head -1 | sed 's/^/  /'
-	[ "$r" = "JS fetch body: 12/12 passed" ] || fb_bad=$((fb_bad + 1))
+	[ "$r" = "JS fetch body: 17/17 passed" ] || fb_bad=$((fb_bad + 1))
 done
 [ "$(ls "$R"/*NET-js-fetch-body*.plot 2>/dev/null | wc -l)" -eq 2 ] || fb_bad=$((fb_bad + 1))
 [ "$fb_bad" -eq 0 ]

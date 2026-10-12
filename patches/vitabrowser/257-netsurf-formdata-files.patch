@@ -1,0 +1,147 @@
+# netsurf: FormData sends files -- a Blob/File entry's bytes go in the
+# multipart body (patch 257)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 256)
+#
+# A script's file upload -- FormData with a Blob or File, sent by
+# XMLHttpRequest or fetch() -- sent every file as an empty part: the
+# multipart encoder (XMLHttpRequest.prototype._encodeFormData) built one
+# string and wrote '' where a file's content belonged, because the request
+# layer could only send text. Patch 256 taught it to send a Blob's bytes,
+# so the body is now a Blob of the parts: headers and text values as UTF-8,
+# each file's own bytes. As in a browser (Chromium checked):
+#
+#  - FormData.append / set store a Blob as a File named by the filename
+#    argument, else the File's own name, else "blob"; any other value as
+#    its string (objects were kept as they were);
+#  - names and filenames escape '"' CR LF as %22 %0D %0A; text values'
+#    line breaks become CRLF;
+#  - fetch() sends the same Blob (extractBody), with the multipart type.
+#
+# Not touched: <form enctype="multipart/form-data"> submitted without
+# script (the engine's own form path; the Vita has no file picker), and
+# Response.formData() still parses url-encoded bodies only.
+#
+# Gate: testpages/pages/JS-fetch-body.html checks 13-17 (file bytes by XHR
+# and by fetch, the stored File, string values, UTF-8 / CRLF / escaped
+# names), 17/17 over http and https (Chromium 17/17; run 34's build
+# 12/17).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -14045,11 +14045,13 @@
+ 
+ 	/* --- FormData ---
+ 	 * Ordered [key,value,filename] triples, not a spec-perfect Map --
+-	 * enough for a script that constructs/populates/reads text entries.
+-	 * Blob has byte semantics; File remains absent. The current request
+-	 * transport does not yet submit a Blob FormData body. Callers may still
+-	 * supply an arbitrary value and its optional filename. Iteration order
+-	 * matches insertion order (spec). */
++	 * enough for a script that constructs/populates/reads entries.
++	 * Iteration order matches insertion order (spec).
++	 * VitaBrowser patch 257: as the spec has it, a Blob value is stored as
++	 * a File named by the filename argument, else its own name, else
++	 * "blob" (File is the polyfill's: a Blob with name/lastModified), and
++	 * any other value as its string; XMLHttpRequest.prototype.
++	 * _encodeFormData sends a File's bytes. */
+ 	macsurf_qjs__safe_eval(ctx,
+ 		"function FormData(form){"
+ 			"this._k=[];this._v=[];this._f=[];"
+@@ -14067,9 +14069,18 @@
+ 			"}"
+ 		"}"
+ 		"FormData.prototype.append=function(k,v,fn){"
++			"var isB=typeof Blob==='function'&&v instanceof Blob;"
++			"if(isB){"
++				"var nm=fn!==undefined?String(fn):"
++					"(typeof v.name==='string'?v.name:'blob');"
++				"if((v.name!==nm||fn!==undefined)&&typeof File==='function')"
++					"v=new File([v],nm,{type:v.type,"
++						"lastModified:v.lastModified});"
++				"fn=nm;"
++			"}"
+ 			"this._k.push(String(k));"
+-			"this._v.push((v&&typeof v==='object')?v:String(v));"
+-			"this._f.push(fn);};"
++			"this._v.push(isB?v:String(v));"
++			"this._f.push(isB?fn:undefined);};"
+ 		"FormData.prototype.get=function(k){"
+ 			"for(var i=0;i<this._k.length;i++)"
+ 				"if(this._k[i]==k)return this._v[i];"
+@@ -14244,30 +14255,36 @@
+ 			"this._fire('readystatechange');"
+ 			"this._fire('progress',received);"
+ 		"};"
+-		/* FormData bodies are not native-fetch-layer aware -- __xhrNativeSend
+-		 * just JS_ToCString()s whatever it is handed. Encode multipart/form-data
+-		 * here in JS (spec boundary format) rather than teaching the native
+-		 * layer a new body type; a plain string/number/etc body passes through
+-		 * unchanged, same as before. */
++		/* multipart/form-data, encoded here in JS (the spec's boundary
++		 * format). Patch 257: the body is a Blob of the parts -- text as
++		 * UTF-8, a File's own bytes -- which the native layer sends as
++		 * bytes (patch 256); a file's content used to go as nothing.
++		 * Names and filenames escape '"' CR LF as %22 %0D %0A, and text
++		 * values' line breaks become CRLF, as in a browser. (A string
++		 * body, without Blob, is the fallback.) */
+ 		"XMLHttpRequest.prototype._encodeFormData=function(fd){"
+ 			"var boundary='----MacSurfFormBoundary'+"
+ 				"Math.random().toString(36).slice(2)+Date.now().toString(36);"
++			"var esc=function(x){return String(x).replace(/\\r/g,'%0D')"
++				".replace(/\\n/g,'%0A').replace(/\"/g,'%22');};"
++			"var hasB=typeof Blob==='function';"
+ 			"var parts=[];"
+ 			"for(var i=0;i<fd._k.length;i++){"
+ 				"var k=fd._k[i],v=fd._v[i],fn=fd._f[i];"
+-				"var isBlob=(v&&typeof v==='object');"
+-				"var name=(isBlob?(fn||v.name||'blob'):null);"
+-				"var head='--'+boundary+'\\r\\nContent-Disposition: form-data; name=\"'+k+'\"';"
++				"var isBlob=hasB&&v instanceof Blob;"
++				"var head='--'+boundary+'\\r\\nContent-Disposition: form-data; name=\"'+esc(k)+'\"';"
+ 				"if(isBlob){"
+-					"head+='; filename=\"'+name+'\"\\r\\nContent-Type: '+"
++					"head+='; filename=\"'+esc(fn!==undefined?fn:(v.name||'blob'))+'\"\\r\\nContent-Type: '+"
+ 						"(v.type||'application/octet-stream')+'\\r\\n\\r\\n';"
++					"parts.push(head,v,'\\r\\n');"
+ 				"}else{"
+ 					"head+='\\r\\n\\r\\n';"
++					"parts.push(head+String(v).replace(/\\r\\n|\\r|\\n/g,'\\r\\n')+'\\r\\n');"
+ 				"}"
+-				"parts.push(head+String(isBlob?'':v)+'\\r\\n');"
+ 			"}"
+ 			"parts.push('--'+boundary+'--\\r\\n');"
+-			"return{body:parts.join(''),contentType:'multipart/form-data; boundary='+boundary};"
++			"return{body:hasB?new Blob(parts):parts.join(''),"
++				"contentType:'multipart/form-data; boundary='+boundary};"
+ 		"};"
+ 		"XMLHttpRequest.prototype.send=function(body){"
+ 			"if(typeof __workLogXHR==='function')"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1069,7 +1069,9 @@
+ 	if (isFn(g.FormData) && body instanceof g.FormData && g.XMLHttpRequest &&
+ 	    isFn(g.XMLHttpRequest.prototype._encodeFormData)) {
+ 		var enc = g.XMLHttpRequest.prototype._encodeFormData(body);
+-		return { text: enc.body, type: enc.contentType };
++		/* patch 257: a Blob of the parts, so a file's bytes go too */
++		return typeof enc.body === 'string' ? { text: enc.body, type: enc.contentType } :
++			{ blob: enc.body, type: enc.contentType };
+ 	}
+ 	if (isFn(g.Blob) && body instanceof g.Blob)
+ 		return { blob: body, type: body.type || '' };
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1070,7 +1070,9 @@
+ "\tif (isFn(g.FormData) && body instanceof g.FormData && g.XMLHttpRequest &&\n"
+ "\t    isFn(g.XMLHttpRequest.prototype._encodeFormData)) {\n"
+ "\t\tvar enc = g.XMLHttpRequest.prototype._encodeFormData(body);\n"
+-"\t\treturn { text: enc.body, type: enc.contentType };\n"
++"\t\t/* patch 257: a Blob of the parts, so a file's bytes go too */\n"
++"\t\treturn typeof enc.body === 'string' ? { text: enc.body, type: enc.contentType } :\n"
++"\t\t\t{ blob: enc.body, type: enc.contentType };\n"
+ "\t}\n"
+ "\tif (isFn(g.Blob) && body instanceof g.Blob)\n"
+ "\t\treturn { blob: body, type: body.type || '' };\n"

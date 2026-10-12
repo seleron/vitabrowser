@@ -4,6 +4,15 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patch 257: FormData sends files (not re-scored)
+
+The gap run 34's hand-off noted: FormData file parts went empty (the
+multipart encoder could only build text). Now a Blob of the parts, sent
+as bytes through 256's path; append/set store Files and strings as
+Chromium does; names escaped, CRLF line breaks. Gate JS-fetch-body 17/17
+(Chromium 17/17; before, 12/17). Not re-scored: no scored site uploads on
+load.
+
 ## 2026-10-12 — patches 255-256: hCaptcha run live; a crash and binary bodies (not re-scored)
 
 WS-B: hCaptcha's hsw run on claude.ai/login in the simulator (docs/

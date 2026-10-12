@@ -3407,7 +3407,8 @@ timing tie, not a change).
 
 (256's binary request bodies have no device check of their own: the gate
 covers them, and file uploads through FormData still send a file's
-contents empty -- a known gap, not this patch.)
+contents empty in this build -- fixed since by patch 257, queued for run
+35 below.)
 
 ### What run 34 adds over run 33: patches 255-256, hCaptcha's hsw run live in the simulator
 
@@ -3463,4 +3464,28 @@ back on later loads, so whether it would clear with more time is
 unmeasured.
 
 (Device checks for these: run 34's list, above, items 2-3.)
+
+## Since run 34 — queued for run 35 (not built yet)
+
+### Patch 257 (2026-10-12): FormData sends files
+
+A script's file upload -- a FormData holding a Blob or File, sent with
+XMLHttpRequest or fetch() -- went out with every file part empty: the
+multipart encoder built one string and wrote nothing where a file's bytes
+belonged, because the request layer could only send text. With 256's
+byte bodies the multipart body is now a Blob of its parts (text as UTF-8,
+each file's own bytes). Brought in line with Chromium on the way:
+`append` / `set` store a Blob as a File named by the filename argument,
+else its own name, else "blob", and any other value as its string; names
+and filenames escape `"` CR LF; text values' line breaks become CRLF.
+Not touched: a `<form enctype="multipart/form-data">` submitted without
+script (the engine's own form path; the Vita frontend has no file
+chooser), and Response.formData() still reads url-encoded bodies only.
+
+Sim-verified: JS-fetch-body checks 13-17 (file bytes by XHR and by fetch,
+the stored File, string values, UTF-8 / CRLF / escaped names), 17/17 over
+http and https (Chromium 17/17; run 34's build 12/17); full sim gate
+exit 0 with no soft accepts; Vita cross-build green. No device check of
+its own (no site on the device's list uploads a file from script); run
+34 is with the device.
 
