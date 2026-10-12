@@ -4,6 +4,19 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-12 — patches 255-256: hCaptcha run live; a crash and binary bodies (not re-scored)
+
+WS-B: hCaptcha's hsw run on claude.ai/login in the simulator (docs/
+wasm-hcaptcha-measurement.md step 3). hsw runs (~590 ms per frame on the
+host); fixed on the way: 255, a NULL box-tree crash when a frame forced a
+relayout mid-load (3 of 4 loads crashed), and 256, binary XHR / fetch
+request bodies (sent as text, cut at NULs) and XHR responseType
+arraybuffer / blob / json. The server then refuses hsw's answer
+(`success: false`); stopped there. Gate JS-fetch-body 12/12 (was 4 checks;
+Chromium 12/12). Not re-scored: neither change is aimed at what the
+scorecard measures (first-load rendering); the gate covers 256, and 255
+was checked on the live site (0 of 4 loads crashed after it).
+
 ## 2026-10-12 — patch 254: WebAssembly (not re-scored)
 
 WS-B / WS-F: the second prerequisite in docs/wasm-hcaptcha-measurement.md.

@@ -114,8 +114,13 @@ on text inputs, buttons, selects, textareas (225).
    WebAssembly with time slicing is the second.
 5. **WebAssembly** (*2026-10-12, patch 254*): wasm3 behind the
    WebAssembly API; long calls draw the page every 200 ms and can be
-   stopped; wasm time is outside the script budget. Next: run hCaptcha's
-   hsw on the device (doc 10, "Since run 32").
+   stopped; wasm time is outside the script budget. *Run live in the
+   simulator 2026-10-12 (patches 255-256, doc 10 "Since run 33"):* hsw
+   runs (~0.6 s per frame on the host, ~20 s on the Vita estimated) and
+   its answer reaches the server, which refuses it (`success: false`) --
+   hsw's fingerprint of this engine, not plumbing. claude.ai's email
+   sign-in stays blocked there; not pursued further (it would mean
+   impersonating Chrome to a bot detector).
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

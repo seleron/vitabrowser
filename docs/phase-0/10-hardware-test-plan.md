@@ -3307,6 +3307,13 @@ cross-build green. Reference autotest under device conditions: interact
 what is new is 254, below -- above all claude.ai's email sign-in, where
 hCaptcha's proof of work should now run.
 
+**Known since hand-off (2026-10-12, sim):** this build can crash on
+claude.ai/login (3 of 4 simulator loads, about 11 s in, while hCaptcha's
+frames set up -- fixed by patch 255), and its hCaptcha step ends in
+`network-error` whatever hsw does (the binary getcaptcha body went out as
+text -- patch 256). Both are queued for run 34, below. If the device
+crashes there, that is this bug: note it and move on.
+
 ### What run 33 adds over run 32
 
 Patch 254 (2026-10-12), sim-verified: full sim gate exit 0, no soft
@@ -3345,3 +3352,63 @@ cross-build green (wasm3 links: nsvita.elf +1 MB).
      Chromium gets an image challenge).
   2. Any page that uses WebAssembly otherwise (a wasm demo, a game):
      note load time and whether it runs.
+
+## Since run 33 — queued for run 34 (not built yet)
+
+### Patches 255-256 (2026-10-12): hCaptcha's hsw, run live in the simulator
+
+claude.ai/login in the simulator, with `hcaptcha.execute()` called from a
+script after 20 s (as the email sign-in does). hsw now runs under
+WebAssembly: both challenge frames instantiate the 0.7 MB module and make
+one long call each -- **about 590 ms on the host** (a frame drawn every
+200 ms during it), plus calls under 200 ms. Chromium spends 250-285 ms per
+frame in hsw's exports, so wasm3 is about 2-2.5x slower on this code, not
+the 7x of the worst function measured in isolation; at the measured 32x
+host-to-Vita factor that is roughly **20 s per frame on the device**, not
+a minute. The run found two engine bugs (sim-verified: full gate exit 0,
+no soft accepts, JS-fetch-body 12/12 over http and https; Vita
+cross-build green):
+
+- **255: the claude.ai sign-in crash.** hCaptcha's challenge frame calls
+  getComputedStyle, which forces a synchronous relayout; the old box tree
+  is dropped, and a "done" message deferred earlier is replayed in the
+  middle of it, scrolling the frame to its URL fragment
+  (`#frame=challenge&...`) through the NULL tree. The fragment lookup now
+  answers "not found" while there is no tree. 3 of 4 loads crashed
+  before, 0 of 4 after.
+- **256: binary request bodies; XHR responseType.** hCaptcha posts its
+  answer as ~32 KB of msgpack from a Uint8Array. XHR sent it as the text
+  "146,218,2,..." (the server: 415), fetch() would have UTF-8-decoded it,
+  and the fetch layer cut every body at its first NUL. Byte bodies --
+  ArrayBuffer, typed arrays, DataView, Blob -- now go as their exact
+  bytes (no Content-Type unless they carry one), and XHR's
+  responseType "arraybuffer" / "blob" / "json" work (the response was
+  always a NUL-cut string). Gate: JS-fetch-body grows from 4 to 12
+  checks, 12/12 over http and https (Chromium 12/12; the build before,
+  4/12).
+
+**Where hCaptcha stands:** the 32 KB answer now reaches the server and
+gets a well-formed reply -- `{"c": <a new hsw request>, "success": false,
+"error-codes": []}` -- where Chromium (same machine, same user agent) gets
+its 4 KB encrypted challenge. hsw fingerprints the browser while it works,
+and probed about 25 interfaces this engine does not have (WebGL,
+OfflineAudioContext, AudioBuffer, NavigatorUAData, Permissions,
+MediaDevices, ServiceWorkerContainer, RTCPeerConnection,
+PerformanceNavigationTiming, ...) under a Chrome 140 user agent; that is
+the likely reason, and making it pass would mean impersonating Chrome to a
+bot detector, which is not a goal. The client reports the refusal as
+`network-error`. So **claude.ai's email sign-in does not get past
+hCaptcha**, now for a reason outside the engine's plumbing.
+
+Also seen: on 1 of 9 simulator loads, Cloudflare put its "Performing
+security verification" page in front of claude.ai/login (a plain curl
+request was challenged too; Chromium from the same machine was not). Its script's first timer callback ran
+past the 8 s runaway budget on the host and was stopped
+(`InternalError: interrupted`), so the page never cleared; it did not come
+back on later loads, so whether it would clear with more time is
+unmeasured.
+
+**On the device (run 34):** claude.ai/login, email, Continue: no crash;
+"WebAssembly running" for roughly 20 s per frame, twice; then hCaptcha
+reports an error (expected, above) -- note the time and `mem[page done]`.
+

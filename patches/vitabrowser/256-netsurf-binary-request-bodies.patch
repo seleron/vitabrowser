@@ -1,0 +1,563 @@
+# netsurf: binary request bodies for XMLHttpRequest and fetch(), XHR
+# responseType arraybuffer / blob / json (patch 256)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 255)
+#
+# Found running hCaptcha live in the simulator (claude.ai's email sign-in,
+# now that WebAssembly runs hsw, patch 254): its getcaptcha POST is a
+# msgpack body of about 32 KB, NULs and all, sent from a Uint8Array with
+# Content-Type application/octet-stream, and its answer is binary too.
+#
+#  - Requests: __xhrNativeSend took the body with JS_ToCString, so a
+#    Uint8Array went out as "146,218,2,..." (api.hcaptcha.com: 415); fetch()
+#    UTF-8 decoded byte bodies first, which mangles binary; and the fetch
+#    layer copied the body with strdup, cutting it at the first NUL. Now an
+#    ArrayBuffer, a typed array or a Blob is sent as its exact bytes (a
+#    DataView through a Uint8Array, a typed Blob with its type), through
+#    fetch_start_body (content/fetch.c): the length rides on struct fetch
+#    for the fetcher's setup, and curl gets CURLOPT_POSTFIELDSIZE (reset to
+#    -1 for every other body: handles are reused). Bytes with no type of
+#    their own go without one, not with curl's default
+#    application/x-www-form-urlencoded. Blob bytes come from the bridge's
+#    native Blob (macsurf_qjs_blob_bytes).
+#  - Responses: XHR's response was always the body as a C string (cut at
+#    the first NUL, UTF-8 decoded). responseType "arraybuffer" and "blob"
+#    now get the exact bytes (a Blob typed by Content-Type), "json" the
+#    parsed value (null if it does not parse), and text is no longer cut at
+#    a NUL. (fetch() responses were already byte-exact, patch 132.)
+#
+# hCaptcha still does not sign anyone in: getcaptcha now answers
+# {"c":<a new hsw request>,"success":false,"error-codes":[]} where Chromium
+# gets its 4 KB encrypted challenge -- hsw fingerprints about 25 APIs this
+# engine lacks (WebGL, OfflineAudioContext, NavigatorUAData, Permissions,
+# MediaDevices, ...) under a Chrome 140 user agent. See
+# docs/wasm-hcaptcha-measurement.md, step 3.
+#
+# Gate: testpages/pages/JS-fetch-body.html grows checks 5-12 (Uint8Array,
+# ArrayBuffer with its type, DataView window, typed Blob both ways,
+# responseType json, fetch with a Uint8Array and a Blob; 300 bytes covering
+# every value), 12/12 over http and https (Chromium 12/12; the build before
+# this patch 4/12).
+diff --git a/content/fetch.h b/content/fetch.h
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -129,6 +129,9 @@
+ 		/** Multipart post data if type is FETCH_POSTDATA_MULTIPART */
+ 		struct fetch_multipart_data *multipart;
+ 	} data;
++	/** VitaBrowser patch 256: a FETCH_POSTDATA_URLENC body's length in
++	 * bytes when it is binary (fetch_start_body); 0: a string */
++	size_t urlenc_len;
+ };
+ 
+ 
+@@ -172,6 +175,22 @@
+ 		    const char *headers[], struct fetch **fetch_out);
+ 
+ /**
++ * As fetch_start(), with a POST body of exactly len bytes, NULs and all.
++ *
++ * VitaBrowser patch 256: a script's binary request body (XMLHttpRequest
++ * send / fetch() with an ArrayBuffer, a typed array or a Blob). The fetcher
++ * reads the length with fetch_post_length() while fetch_start sets it up.
++ */
++nserror fetch_start_body(nsurl *url, nsurl *referer, fetch_callback callback,
++		    void *p, bool only_2xx, const void *body, size_t len,
++		    const char *headers[], struct fetch **fetch_out);
++
++/**
++ * The binary POST body length given to fetch_start_body, or 0.
++ */
++size_t fetch_post_length(struct fetch *fetch);
++
++/**
+  * Abort a fetch.
+  */
+ void fetch_abort(struct fetch *f);
+diff --git a/content/fetch.c b/content/fetch.c
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -101,6 +101,7 @@
+ 	bool fetch_is_active;	/**< This fetch is active. */
+ 	bool tainted_tls;	/**< Transport was degraded (see fetch_set_tainted_tls) */
+ 	fetch_msg_type last_msg;/**< The last message sent for this fetch */
++	size_t post_len;	/**< binary POST body length (patch 256), or 0 */
+ 	struct fetch *r_prev;	/**< Previous active fetch in ::fetch_ring. */
+ 	struct fetch *r_next;	/**< Next active fetch in ::fetch_ring. */
+ };
+@@ -533,6 +534,20 @@
+ 	return NSERROR_OK;
+ }
+ 
++static nserror
++fetch_start_len(nsurl *url,
++	    nsurl *referer,
++	    fetch_callback callback,
++	    void *p,
++	    bool only_2xx,
++	    const char *post_urlenc,
++	    size_t post_len,
++	    const struct fetch_multipart_data *post_multipart,
++	    bool verifiable,
++	    bool downgrade_tls,
++	    const char *headers[],
++	    struct fetch **fetch_out);
++
+ /* exported interface documented in content/fetch.h */
+ nserror
+ fetch_start(nsurl *url,
+@@ -547,6 +562,42 @@
+ 	    const char *headers[],
+ 	    struct fetch **fetch_out)
+ {
++	return fetch_start_len(url, referer, callback, p, only_2xx,
++			post_urlenc, 0, post_multipart, verifiable,
++			downgrade_tls, headers, fetch_out);
++}
++
++/* exported interface documented in content/fetch.h */
++nserror
++fetch_start_body(nsurl *url, nsurl *referer, fetch_callback callback,
++		 void *p, bool only_2xx, const void *body, size_t len,
++		 const char *headers[], struct fetch **fetch_out)
++{
++	return fetch_start_len(url, referer, callback, p, only_2xx,
++			(const char *)body, len, NULL, false, false,
++			headers, fetch_out);
++}
++
++/* exported interface documented in content/fetch.h */
++size_t fetch_post_length(struct fetch *fetch)
++{
++	return fetch->post_len;
++}
++
++static nserror
++fetch_start_len(nsurl *url,
++	    nsurl *referer,
++	    fetch_callback callback,
++	    void *p,
++	    bool only_2xx,
++	    const char *post_urlenc,
++	    size_t post_len,
++	    const struct fetch_multipart_data *post_multipart,
++	    bool verifiable,
++	    bool downgrade_tls,
++	    const char *headers[],
++	    struct fetch **fetch_out)
++{
+ 	struct fetch *fetch;
+ 	lwc_string *scheme;
+ 
+@@ -575,6 +626,7 @@
+ 	fetch->verifiable = verifiable;
+ 	fetch->p = p;
+ 	fetch->host = nsurl_get_component(url, NSURL_HOST);
++	fetch->post_len = (post_urlenc != NULL) ? post_len : 0;
+ 
+ 	if (referer != NULL) {
+ 		fetch->referer = nsurl_ref(referer);
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -422,14 +422,27 @@
+  * allocate postdata
+  */
+ static struct fetch_postdata *
+-fetch_curl_alloc_postdata(const char *post_urlenc,
++fetch_curl_alloc_postdata(const char *post_urlenc, size_t post_len,
+ 			  const struct fetch_multipart_data *post_multipart)
+ {
+ 	struct fetch_postdata *postdata;
+ 	postdata = calloc(1, sizeof(struct fetch_postdata));
+ 	if (postdata != NULL) {
+ 
+-		if (post_urlenc) {
++		if (post_urlenc && post_len > 0) {
++			/* VitaBrowser patch 256: binary, by length */
++			postdata->type = FETCH_POSTDATA_URLENC;
++			postdata->urlenc_len = post_len;
++			postdata->data.urlenc = malloc(post_len + 1);
++			if (postdata->data.urlenc == NULL) {
++				free(postdata);
++				postdata = NULL;
++			} else {
++				memcpy(postdata->data.urlenc, post_urlenc,
++				       post_len);
++				postdata->data.urlenc[post_len] = '\0';
++			}
++		} else if (post_urlenc) {
+ 			postdata->type = FETCH_POSTDATA_URLENC;
+ 			postdata->data.urlenc = strdup(post_urlenc);
+ 			if (postdata->data.urlenc == NULL) {
+@@ -565,7 +578,8 @@
+ 	if (fetch->host == NULL) {
+ 		goto failed;
+ 	}
+-	fetch->postdata = fetch_curl_alloc_postdata(post_urlenc, post_multipart);
++	fetch->postdata = fetch_curl_alloc_postdata(post_urlenc,
++			fetch_post_length(parent_fetch), post_multipart);
+ 	if (fetch->postdata == NULL) {
+ 		goto failed;
+ 	}
+@@ -1349,6 +1363,10 @@
+ 	case FETCH_POSTDATA_URLENC:
+ 		SETOPT(NSCURL_POSTDATA_CURLOPT, NULL);
+ 		SETOPT(CURLOPT_HTTPGET, 0L);
++		/* VitaBrowser patch 256: a binary body has its length (handles
++		 * are reused: -1, curl's strlen, for every other body) */
++		SETOPT(CURLOPT_POSTFIELDSIZE, f->postdata->urlenc_len > 0 ?
++		       (long)f->postdata->urlenc_len : -1L);
+ 		SETOPT(CURLOPT_POSTFIELDS, f->postdata->data.urlenc);
+ 		break;
+ 
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.h b/content/handlers/javascript/quickjs/macsurf_qjs.h
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.h
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.h
+@@ -52,6 +52,11 @@
+  * WebAssembly) -- the runaway deadline's clock stands still for them. */
+ void macsurf_qjs_pause_script_clock(double ms);
+ 
++/* VitaBrowser patch 256: a Blob's bytes and type (borrowed; valid while the
++ * Blob lives), or false when the value is not a Blob. */
++bool macsurf_qjs_blob_bytes(JSValueConst v, const uint8_t **bytes,
++		size_t *len, const char **type);
++
+ /* Timer callbacks wired to setTimeout/setInterval. */
+ void macsurf_qjs_run_timers(struct jscontext *ctx);
+ 
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4371,6 +4371,23 @@
+ 			end - start, type);
+ }
+ 
++/* exported interface documented in macsurf_qjs.h */
++bool macsurf_qjs_blob_bytes(JSValueConst v, const uint8_t **bytes,
++		size_t *len, const char **type)
++{
++	struct qjs_blob *blob;
++
++	if (!JS_IsObject(v))
++		return false;
++	blob = (struct qjs_blob *)JS_GetOpaque(v, s_blob_class_id);
++	if (blob == NULL)
++		return false;
++	*bytes = blob->bytes;
++	*len = blob->len;
++	*type = blob->type;
++	return true;
++}
++
+ static void qjs_blob_install(JSContext *ctx, JSValue global)
+ {
+ 	JSValue proto, ctor, getter;
+@@ -14181,6 +14198,21 @@
+ 		"};"
+ 		"XMLHttpRequest.prototype.__onNativeComplete=function(){"
+ 			"var ok=this.status>=200&&this.status<300;"
++			/* Patch 256: response by responseType -- the bytes the
++			 * native layer kept for "arraybuffer" / "blob", parsed
++			 * JSON (null if it is not) for "json" */
++			"var rt=this.responseType;"
++			"if(rt==='arraybuffer'||rt==='blob'){"
++				"var rb=this.__responseBytes;this.__responseBytes=null;"
++				"if(this.status===0||!rb)this.response=null;"
++				"else if(rt==='arraybuffer')this.response=rb;"
++				"else{var bt=this.getResponseHeader('content-type');"
++					"this.response=new Blob([rb],{type:bt===null?'':bt});}"
++			"}else if(rt==='json'){"
++				"var jv=null;"
++				"if(this.status!==0){try{jv=JSON.parse(this.responseText);}catch(e){}}"
++				"this.response=jv;"
++			"}"
+ 			"if(typeof __workLogXHR==='function')"
+ 				"__workLogXHR('complete',this._method,this._url);"
+ 			"this._partial='';"
+@@ -14252,6 +14284,17 @@
+ 				"if(!hasCT)this._reqHeaders.push('Content-Type: '+enc.contentType);"
+ 				"body=enc.body;"
+ 			"}"
++			/* Patch 256: bytes go as bytes (the native layer takes an
++			 * ArrayBuffer, a typed array or a Blob); a DataView is
++			 * read through a Uint8Array, and a typed Blob says so */
++			"if(typeof DataView!=='undefined'&&body instanceof DataView)"
++				"body=new Uint8Array(body.buffer,body.byteOffset,body.byteLength);"
++			"if(typeof Blob!=='undefined'&&body instanceof Blob&&body.type){"
++				"var hasCT3=false;"
++				"for(var hk=0;hk<this._reqHeaders.length;hk++)"
++					"if(/^content-type\\s*:/i.test(this._reqHeaders[hk])){hasCT3=true;break;}"
++				"if(!hasCT3)this._reqHeaders.push('Content-Type: '+body.type);"
++			"}"
+ 			"if(typeof URLSearchParams!=='undefined'&&body instanceof URLSearchParams){"
+ 				"var hasCT2=false;"
+ 				"for(var hj=0;hj<this._reqHeaders.length;hj++)"
+diff --git a/content/handlers/javascript/quickjs/macos9_js_fetch.c b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+--- a/content/handlers/javascript/quickjs/macos9_js_fetch.c
++++ b/content/handlers/javascript/quickjs/macos9_js_fetch.c
+@@ -96,6 +96,7 @@
+ 	char method[8];			/* upper-cased, NUL-terminated */
+ 	char *body;			/* owned copy of the send() body, or NULL */
+ 	long body_len;
++	int body_bin;			/* body is bytes, not text (patch 256) */
+ 	char *req_headers[QJS_XHR_MAX_REQ_HDRS + 1]; /* NULL-terminated, owned */
+ 
+ 	char *resp_buf;
+@@ -160,6 +161,7 @@
+ 	s->resp_len = 0; s->resp_cap = 0; s->resp_poisoned = 0;
+ 	s->hdr_len = 0; s->hdr_cap = 0; s->hdr_poisoned = 0;
+ 	s->body_len = 0;
++	s->body_bin = 0;
+ 	s->used = 0;
+ 	s->fetch = NULL;
+ }
+@@ -341,9 +343,34 @@
+ 	JS_SetPropertyStr(ctx, s->xhr_obj, "status",
+ 			JS_NewInt32(ctx, s->is_error ? 0 : s->status));
+ 	JS_SetPropertyStr(ctx, s->xhr_obj, "statusText", JS_NewString(ctx, ""));
+-	JS_SetPropertyStr(ctx, s->xhr_obj, "responseText",
+-			JS_NewString(ctx, body));
+-	JS_SetPropertyStr(ctx, s->xhr_obj, "response", JS_NewString(ctx, body));
++	/* Patch 256: responseType "arraybuffer" / "blob" get the exact bytes
++	 * (__onNativeComplete makes `response` of them); text is no longer
++	 * cut at the first NUL */
++	{
++		JSValue rt = JS_GetPropertyStr(ctx, s->xhr_obj, "responseType");
++		const char *rts = JS_IsString(rt) ? JS_ToCString(ctx, rt) : NULL;
++		int as_bytes = rts != NULL && (strcmp(rts, "arraybuffer") == 0 ||
++					       strcmp(rts, "blob") == 0);
++		size_t n = (s->resp_buf != NULL && !s->resp_poisoned &&
++			    s->resp_len > 0) ? (size_t) s->resp_len : 0;
++
++		if (rts != NULL) JS_FreeCString(ctx, rts);
++		JS_FreeValue(ctx, rt);
++		if (as_bytes) {
++			JS_SetPropertyStr(ctx, s->xhr_obj, "__responseBytes",
++				s->is_error ? JS_NULL :
++				JS_NewArrayBufferCopy(ctx,
++					(const uint8_t *) body, n));
++			JS_SetPropertyStr(ctx, s->xhr_obj, "responseText",
++					JS_NewString(ctx, ""));
++			JS_SetPropertyStr(ctx, s->xhr_obj, "response", JS_NULL);
++		} else {
++			JS_SetPropertyStr(ctx, s->xhr_obj, "responseText",
++					JS_NewStringLen(ctx, body, n));
++			JS_SetPropertyStr(ctx, s->xhr_obj, "response",
++					JS_NewStringLen(ctx, body, n));
++		}
++	}
+ 	JS_SetPropertyStr(ctx, s->xhr_obj, "responseURL",
+ 			JS_NewString(ctx, url_str));
+ 	JS_SetPropertyStr(ctx, s->xhr_obj, "__responseHeadersRaw",
+@@ -561,6 +588,7 @@
+ 		strcpy(s->method, "GET");
+ 		if (s->body != NULL) { free(s->body); s->body = NULL; }
+ 		s->body_len = 0;
++		s->body_bin = 0;
+ 	}
+ 	/* 307/308 (and any non-matching case): preserve method + body. */
+ }
+@@ -877,6 +905,11 @@
+ 	 * the fetcher -- so only store it if nothing terminal happened while
+ 	 * the call was in flight. */
+ 	s->fetch_live = 1;
++	if (s->body != NULL && s->body_bin && strcmp(s->method, "GET") != 0)
++		err = fetch_start_body(s->url, referer, xhr_fetch_cb, s, false,
++				s->body, (size_t) s->body_len,
++				(const char **) s->req_headers, &out);
++	else
+ 	err = fetch_start(s->url, referer, xhr_fetch_cb, s,
+ 			false /* only_2xx: XHR must see 4xx/5xx bodies too */,
+ 			(s->body != NULL && strcmp(s->method, "GET") != 0) ?
+@@ -895,6 +928,80 @@
+ 
+ /* ---- JS-callable entry points ---- */
+ 
++/* "Content-Type:" in any case (without <strings.h>, as above) */
++static int
++xhr_is_content_type(const char *h)
++{
++	static const char want[] = "content-type:";
++	size_t i;
++
++	for (i = 0; i < sizeof(want) - 1; i++) {
++		char c = h[i];
++		if (c >= 'A' && c <= 'Z')
++			c += 'a' - 'A';
++		if (c != want[i])
++			return 0;
++	}
++	return 1;
++}
++
++/* VitaBrowser patch 256: the request body as bytes. An ArrayBuffer, a
++ * typed array or a Blob is copied as it is (hCaptcha's getcaptcha is a
++ * msgpack body full of NULs; it was sent as "146,218,2,..." and answered
++ * 415); anything else is its string, as before. 0 on success (s->body is
++ * NULL for no body), -1 out of memory or a throwing toString. */
++static int
++xhr_take_body(JSContext *ctx, JSValueConst v, struct qjs_xhr_slot *s)
++{
++	const uint8_t *bytes = NULL;
++	size_t len = 0;
++	const char *type;
++	const char *str;
++	JSValue buf = JS_UNDEFINED;
++
++	if (JS_IsNull(v) || JS_IsUndefined(v))
++		return 0;
++	if (JS_IsArrayBuffer(v)) {
++		bytes = JS_GetArrayBuffer(ctx, &len, v);
++	} else if (JS_GetTypedArrayType(v) >= 0) {
++		size_t off = 0, n = 0, per = 0;
++		buf = JS_GetTypedArrayBuffer(ctx, v, &off, &n, &per);
++		if (JS_IsException(buf))
++			return -1;
++		bytes = JS_GetArrayBuffer(ctx, &len, buf);
++		if (bytes != NULL && off + n <= len) {
++			bytes += off;
++			len = n;
++		} else {
++			bytes = NULL;
++			len = 0;
++		}
++	} else if (!macsurf_qjs_blob_bytes(v, &bytes, &len, &type)) {
++		str = JS_ToCStringLen(ctx, &len, v);
++		if (str == NULL)
++			return -1;
++		s->body = (char *) malloc(len + 1);
++		if (s->body != NULL) {
++			memcpy(s->body, str, len + 1);
++			s->body_len = (long) len;
++			/* a NUL inside a string would cut it short too */
++			s->body_bin = memchr(str, 0, len) != NULL;
++		}
++		JS_FreeCString(ctx, str);
++		return s->body != NULL ? 0 : -1;
++	}
++	s->body = (char *) malloc(len + 1);
++	if (s->body != NULL) {
++		if (len != 0 && bytes != NULL)
++			memcpy(s->body, bytes, len);
++		s->body[len] = '\0';
++		s->body_len = (long) len;
++		s->body_bin = 1;
++	}
++	JS_FreeValue(ctx, buf);
++	return s->body != NULL ? 0 : -1;
++}
++
+ static JSValue
+ qjs_xhr_native_send(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+@@ -902,7 +1009,6 @@
+ 	struct qjs_xhr_slot *s;
+ 	const char *method_c;
+ 	const char *url_c;
+-	const char *body_c = NULL;
+ 	nsurl *url = NULL;
+ 	nsurl *base;
+ 	nserror err;
+@@ -977,20 +1083,10 @@
+ 	}
+ 	JS_FreeCString(ctx, method_c);
+ 
+-	if (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
+-		body_c = JS_ToCString(ctx, argv[3]);
+-		if (body_c != NULL) {
+-			s->body_len = (long) strlen(body_c);
+-			s->body = (char *) malloc((size_t) s->body_len + 1);
+-			if (s->body == NULL) {
+-				JS_FreeCString(ctx, body_c);
+-				JS_FreeCString(ctx, url_c);
+-				xhr_slot_release(s);
+-				return JS_NewInt32(ctx, -1);
+-			}
+-			memcpy(s->body, body_c, (size_t) s->body_len + 1);
+-			JS_FreeCString(ctx, body_c);
+-		}
++	if (argc > 3 && xhr_take_body(ctx, argv[3], s) != 0) {
++		JS_FreeCString(ctx, url_c);
++		xhr_slot_release(s);
++		return JS_NewInt32(ctx, -1);
+ 	}
+ 
+ 	/* headers: argv[4] is a plain JS array of "Name: value" strings
+@@ -1015,9 +1111,26 @@
+ 		}
+ 		s->req_headers[len32] = NULL;
+ 	}
++	/* Patch 256: bytes with no type of their own go without one, as in a
++	 * browser -- not with curl's default for a POST body,
++	 * application/x-www-form-urlencoded */
++	if (s->body_bin) {
++		int n = 0, typed = 0;
++		while (n < QJS_XHR_MAX_REQ_HDRS && s->req_headers[n] != NULL) {
++			if (xhr_is_content_type(s->req_headers[n]))
++				typed = 1;
++			n++;
++		}
++		if (!typed && n < QJS_XHR_MAX_REQ_HDRS) {
++			s->req_headers[n] = (char *) malloc(sizeof("Content-Type:"));
++			if (s->req_headers[n] != NULL)
++				strcpy(s->req_headers[n], "Content-Type:");
++			s->req_headers[n + 1] = NULL;
++		}
++	}
+ 
+-	macsurf_debug_log_writef("LIFE xhr send method=%s url=%s",
+-			s->method, url_c);
++	macsurf_debug_log_writef("LIFE xhr send method=%s url=%s bytes=%ld%s",
++			s->method, url_c, s->body_len, s->body_bin ? " (binary)" : "");
+ 	JS_FreeCString(ctx, url_c);
+ 
+ 	if (xhr_start_fetch(s) != 0) {
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -1240,14 +1240,14 @@
+ 		if (b && b.type && !h.has('content-type')) h.set('content-type', b.type);
+ 		h.forEach(function (v, k) { list.push(k + ': ' + v); });
+ 		/* The request starts now, as in a browser, unless the body has to
+-		 * be read first (a Blob or a stream). The native layer sends a
+-		 * string body. */
++		 * be read first (a stream). The native layer sends a string as
++		 * text and bytes -- a typed array, a Blob -- as they are (patch
++		 * 256: they were UTF-8 decoded, which mangles binary). */
+ 		if (!b) return start(null);
+ 		if (b.text !== undefined) return start(b.text);
+-		if (b.bytes) return start(new g.TextDecoder().decode(b.bytes));
+-		return (b.blob ? b.blob.text() :
+-			readAllBytes(b.stream).then(function (u) { return new g.TextDecoder().decode(u); }))
+-			.then(start);
++		if (b.bytes) return start(b.bytes);
++		if (b.blob) return start(b.blob);
++		return readAllBytes(b.stream).then(start);
+ 
+ 		function start(payload) {
+ 			return new Promise(function (resolve, reject) {
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -1241,14 +1241,14 @@
+ "\t\tif (b && b.type && !h.has('content-type')) h.set('content-type', b.type);\n"
+ "\t\th.forEach(function (v, k) { list.push(k + ': ' + v); });\n"
+ "\t\t/* The request starts now, as in a browser, unless the body has to\n"
+-"\t\t * be read first (a Blob or a stream). The native layer sends a\n"
+-"\t\t * string body. */\n"
++"\t\t * be read first (a stream). The native layer sends a string as\n"
++"\t\t * text and bytes -- a typed array, a Blob -- as they are (patch\n"
++"\t\t * 256: they were UTF-8 decoded, which mangles binary). */\n"
+ "\t\tif (!b) return start(null);\n"
+ "\t\tif (b.text !== undefined) return start(b.text);\n"
+-"\t\tif (b.bytes) return start(new g.TextDecoder().decode(b.bytes));\n"
+-"\t\treturn (b.blob ? b.blob.text() :\n"
+-"\t\t\treadAllBytes(b.stream).then(function (u) { return new g.TextDecoder().decode(u); }))\n"
+-"\t\t\t.then(start);\n"
++"\t\tif (b.bytes) return start(b.bytes);\n"
++"\t\tif (b.blob) return start(b.blob);\n"
++"\t\treturn readAllBytes(b.stream).then(start);\n"
+ "\n"
+ "\t\tfunction start(payload) {\n"
+ "\t\t\treturn new Promise(function (resolve, reject) {\n"

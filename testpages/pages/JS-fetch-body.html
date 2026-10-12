@@ -18,7 +18,12 @@ p { margin: 0; padding: 1px 6px; font-size: 11px; line-height: 1.3; }
 <script>
 /* Fetch/XHR request body types (Patch 140): URLSearchParams serializes to
  * application/x-www-form-urlencoded; FormData (text fields) to multipart.
- * The /echo endpoint returns the raw body. */
+ * The /echo endpoint returns the raw body, and the request's Content-Type
+ * in X-Echo-Content-Type.
+ * Patch 256: binary bodies -- typed arrays, ArrayBuffer, DataView, Blob --
+ * go as their exact bytes (hCaptcha's getcaptcha: msgpack, NULs and all),
+ * with no Content-Type unless they have one; XHR responseType "arraybuffer",
+ * "blob" and "json". */
 var passed = 0, total = 0, failedNames = [];
 function t(name, cond) {
   total++;
@@ -69,7 +74,7 @@ post(echoUrl, usp).then(function (res) {
       /* 4: string body still works */
       post(echoUrl, 'raw string body').then(function (res4) {
         t('4 string body unchanged', res4.body === 'raw string body');
-        sum();
+        binary();
       });
     });
   };
@@ -78,6 +83,84 @@ post(echoUrl, usp).then(function (res) {
   t('fetch failed: ' + (e && e.message), false);
   sum();
 });
+
+/* every byte value, NULs first, and a high tail */
+var all = new Uint8Array(300);
+for (var i = 0; i < all.length; i++) all[i] = i % 256;
+function same(ab, want) {
+  if (!ab || ab.byteLength !== want.length) return false;
+  var u = new Uint8Array(ab);
+  for (var i = 0; i < want.length; i++) if (u[i] !== want[i]) return false;
+  return true;
+}
+function xhr(body, type, headers, done) {
+  var x = new XMLHttpRequest();
+  x.open('POST', echoUrl, true);
+  if (type) x.responseType = type;
+  for (var k in headers || {}) x.setRequestHeader(k, headers[k]);
+  x.onload = function () { done(x); };
+  x.onerror = function () { done(x); };
+  x.send(body);
+}
+function binary() {
+  /* 5-6: a Uint8Array, back as an ArrayBuffer; no Content-Type */
+  xhr(all, 'arraybuffer', null, function (x) {
+    t('5 XHR Uint8Array body, arraybuffer response',
+      x.response instanceof ArrayBuffer && same(x.response, all));
+    t('6 no Content-Type for bytes',
+      x.getResponseHeader('X-Echo-Content-Type') === '');
+    /* 7: an ArrayBuffer body with its own type (hCaptcha's shape) */
+    xhr(all.buffer, 'arraybuffer',
+        { 'Content-Type': 'application/octet-stream' }, function (x) {
+      t('7 XHR ArrayBuffer body keeps its Content-Type',
+        same(x.response, all) &&
+        x.getResponseHeader('X-Echo-Content-Type') === 'application/octet-stream');
+      /* 8: a DataView sends only its window */
+      xhr(new DataView(all.buffer, 10, 20), 'arraybuffer', null, function (x) {
+        t('8 XHR DataView body is its window',
+          same(x.response, all.subarray(10, 30)));
+        /* 9: a typed Blob, back as a Blob */
+        var b = new Blob([all], { type: 'application/x-test' });
+        xhr(b, 'blob', null, function (x) {
+          var r = x.response;
+          var ok = r instanceof Blob && r.size === all.length &&
+            x.getResponseHeader('X-Echo-Content-Type') === 'application/x-test';
+          (ok ? r.arrayBuffer() : Promise.resolve(null)).then(function (ab) {
+            t('9 XHR Blob body and blob response', ok && same(ab, all));
+            /* 10: responseType json */
+            xhr('{"a":[1,2],"b":"x"}', 'json', null, function (x) {
+              var j = x.response;
+              t('10 XHR responseType json',
+                j !== null && typeof j === 'object' && j.a[1] === 2 && j.b === 'x');
+              fetchBinary();
+            });
+          });
+        });
+      });
+    });
+  });
+}
+function fetchBinary() {
+  /* 11: fetch with a Uint8Array body */
+  fetch(echoUrl, { method: 'POST', body: all }).then(function (r) {
+    var ct = r.headers.get('X-Echo-Content-Type');
+    return r.arrayBuffer().then(function (ab) {
+      t('11 fetch Uint8Array body', same(ab, all) && ct === '');
+      /* 12: fetch with a Blob body */
+      return fetch(echoUrl, { method: 'POST',
+        body: new Blob([all.subarray(0, 64)], { type: 'application/x-test' }) });
+    });
+  }).then(function (r) {
+    var ct = r.headers.get('X-Echo-Content-Type');
+    return r.arrayBuffer().then(function (ab) {
+      t('12 fetch Blob body', same(ab, all.subarray(0, 64)) && ct === 'application/x-test');
+      sum();
+    });
+  }).catch(function (e) {
+    t('binary fetch failed: ' + (e && e.message), false);
+    sum();
+  });
+}
 </script>
 </body>
 </html>

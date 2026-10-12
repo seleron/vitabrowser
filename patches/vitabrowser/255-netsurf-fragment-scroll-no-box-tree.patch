@@ -1,0 +1,39 @@
+# netsurf: no fragment scroll while a reconvert has no box tree -- the
+# claude.ai sign-in crash (patch 255)
+# Generated 2026-10-12
+# Base: seleron/vitabrowser (patch stack through 254)
+#
+# claude.ai/login crashed the simulator about 11 s in, on 3 of 4 loads
+# (SIGSEGV in box_find_by_id(box=NULL)). hCaptcha's challenge frame
+# (newassets.hcaptcha.com/.../hcaptcha.html#frame=challenge&id=...) calls
+# getComputedStyle, which forces a synchronous reconvert
+# (qjs_geometry_flush -> html_reconvert): the old box tree is dropped
+# (layout = NULL) before the new one is built. The reconvert's GETDIMS
+# broadcast then replays a CONTENT_MSG_DONE that content_broadcast had
+# deferred earlier (a reentrant broadcast), and the browser window's DONE
+# handler scrolls to the URL's fragment -- html_get_id_offset walked the
+# NULL tree.
+#
+# html_get_id_offset answers "no such id" while there is no box tree, as
+# frontends/vita/window.c already does for its own walk. The fragment
+# scroll is lost for that one DONE; a frame whose fragment names no
+# element (hCaptcha's never does) loses nothing.
+#
+# Gate: claude.ai/login loaded 4 times in the simulator after the fix
+# without a crash (live site; not in the gate, which is offline).
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -10028,6 +10028,12 @@
+ 		return false;
+ 
+ 	layout = html_get_box_tree(h);
++	/* VitaBrowser patch 255: no box tree while a reconvert rebuilds it --
++	 * and a deferred DONE replayed then scrolls to the fragment (an
++	 * hCaptcha frame's URL has one, and its getComputedStyle forces the
++	 * reconvert) */
++	if (layout == NULL)
++		return false;
+ 
+ 	if ((pos = box_find_by_id(layout, frag_id)) != 0) {
+ 		box_coords(pos, x, y);

@@ -102,6 +102,18 @@ WebAssembly: `WANT WebAssembly` appears on 1 of 21 sites (claude.ai).
      so the UI can repaint during a 40 s call.
 3. Only then is an hCaptcha attempt meaningful, and it would still end
    at an image challenge solved by touch inside a cross-site frame.
+   **Run live in the simulator 2026-10-12** (doc 10, "Since run 33"):
+   hsw runs -- one long call per challenge frame, about 590 ms on the
+   host (Chromium: 250-285 ms in all of a frame's export calls), so
+   roughly 20 s per frame on the Vita rather than the 56 s estimated
+   below. Two engine bugs on the way: a crash when the challenge frame
+   forced a relayout (patch 255), and binary request bodies sent as text
+   (patch 256: getcaptcha's 32 KB msgpack answer got a 415). With both
+   fixed the server answers `success: false` with a fresh hsw request,
+   where Chromium gets its encrypted challenge: hsw's fingerprint of this
+   engine (about 25 interfaces missing under a Chrome user agent) is the
+   likely reason. **Stopped there:** passing would mean impersonating
+   Chrome to a bot detector.
 
 ## How to measure again
 
