@@ -4236,11 +4236,12 @@ were checked against Chromium the same way. Full sim gate exit 0
 `x=0&y=0`, the image rule applied to it -- fixed); Vita cross-build
 green.
 
-Found on the way, not fixed: libhubbub turns `&#13;` into LF; a
+Found on the way, not fixed: libhubbub turns `&#13;` into LF; ~~a
 script's `textarea.value` is the value attribute (so a value set from
-script is not what is submitted); `form.elements.namedItem` is missing;
-a form's `target` naming an iframe navigates the whole window; a parsed
-iframe's `contentWindow.document` is undefined to its parent.
+script is not what is submitted)~~ **fixed in 286-287** (below);
+`form.elements.namedItem` is missing; a form's `target` naming an iframe
+navigates the whole window; a parsed iframe's `contentWindow.document`
+is undefined to its parent.
 
 **On the device (run 39):** the bundled HTML-multipart-* and
 JS-form-submitters pages post to the gate server, which the Vita does not
@@ -4251,3 +4252,50 @@ button entry), a search from DuckDuckGo Lite and from Wikipedia's search
 box (both forms: results as before), and any form you use that has
 several submit buttons or an image button -- report if a site now gets
 the wrong button or none.
+
+### Patches 286-287 (2026-10-13): form controls' values
+
+The highest-value item of 283's "found on the way" list, and wider than
+it read: `value` was one accessor on every element -- its value
+attribute -- so a textarea's value read "" (its value is its text, then
+what is typed or set), and a value a script gave one was neither shown
+nor submitted; a `<select>` had no `options`, `selectedIndex`, `value`,
+`length` or `type` at all; `option.selected` / `value` / `index` were
+missing or read the attribute; a checkbox without a value read "" (not
+"on"); a `<div>` had a value. Pages that read a dropdown or a comment box
+from script got nothing.
+
+- **286 (libdom): a textarea's value.** The text as it is now until a
+  value is set (it was the text at the first read, kept); setting it
+  leaves the text, its default value, alone (it replaced it).
+- **287 (netsurf): the values, per interface, as Chromium has them**
+  (checked case by case): textarea `value` / `defaultValue` /
+  `textLength`; select `options` (a live HTMLOptionsCollection, by index
+  too), `selectedIndex`, `value`, `selectedOptions`, `length`, `type`,
+  `add` / `remove` / `item` / `namedItem`, `form`; option `value` (else
+  its text), `text`, `label`, `selected`, `defaultSelected`, `index`,
+  `form`; checkbox / radio "on"; button, data, param, li, output, meter
+  each their own; other elements none. A script's change shows in the
+  field. A select's selection is HTML's in one place for the field, the
+  submission and scripts: the last option marked in a drop-down, else
+  its first enabled one -- the form sent both of two marked options, and
+  nothing when the first option was disabled.
+
+Not changed: an input's value is still its value attribute (the
+engine's model: a script's value is shown and sent, but also becomes the
+attribute and `defaultValue`, unlike browsers). The Vita has no select
+menu, so a drop-down cannot be picked by hand (older than this); script
+-driven ones now work.
+
+Sim-verified: JS-form-values.html (FORMVAL 8/8, Chromium 8/8), the
+scriptless-forms gate section's new "values" case (a script's textarea,
+select and option values submitted; digest equal to Chromium's), the
+shown field following a script's textarea / select / multi-select change
+(screenshot), the earlier cases unchanged; full sim gate exit 0
+(gate-287); Vita cross-build green.
+
+**On the device (run 39), in addition:** the bundled
+`file:///app0:/testpages/JS-form-values.html` needs no server: FORMVAL
+8/8 expected. Then a site whose dropdown or comment box works by script
+(a sort or filter dropdown, a "characters left" counter): report if it
+now reacts where it did not.
