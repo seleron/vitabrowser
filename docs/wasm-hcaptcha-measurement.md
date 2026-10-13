@@ -254,7 +254,8 @@ pem, n, e, c, ws, clientOptions`) encrypted by hsw; recorded in plain
 text before encryption, the engine's is 24.7 KB to Chromium's 41.8 KB:
 `n` (hsw's fingerprint and proof) 17.8 / 30.4 KB, motionData 5.4 / 9.9 KB,
 `pem` `{}` (no resource-timing entries) where Chromium has its
-api.hcaptcha.com connection timing. `chrome-demo.py --transplant` puts
+api.hcaptcha.com connection timing (since patch 282 the engine's has it
+too, in Chromium's shape: "Resource Timing" below). `chrome-demo.py --transplant` puts
 the engine's own motionData, pdc, pem, ws and clientOptions into
 Chromium's request before encryption: **challenge** (2 of 2). What makes
 the server refuse is inside `n`: hsw's reading of the browser.
@@ -290,7 +291,7 @@ lists DOMPurify, XF, HTML_Element, setImmediate, console, CSS;
 built-in methods have a `prototype` property and accessors are
 anonymous (Chromium: no prototype, "get userAgent");
 `Function.prototype.fileName / lineNumber / columnNumber` (QuickJS's);
-`getEntriesByType('resource')` is always empty.
+`getEntriesByType('resource')` is always empty (fixed in 282).
 
 **Simulator notes.** A script `VITA_SIM_INJECT` runs never gets its
 timers run (setTimeout / setInterval from the injected realm never fire;
@@ -408,6 +409,86 @@ the engine after 281 (797 bytes). Everything Chromium can be given has
 now been given to it -- the surface (5ae275c, 273-280), the request's
 other fields (--transplant), the descriptors inside the collector (280)
 and the timing (this round) -- and it passes every time.
+
+### Resource Timing (2026-10-13, patch 282)
+
+The one gap left on the engine's side that the request itself showed:
+hsw's `pem` field is built from the resource-timing entry of its own
+request to api.hcaptcha.com, and the engine had no resource entries at
+all (`pem` `{}`; Chromium given `{}` by `--mimic` still passed). The
+same gap broke Wikimedia's network probe, which reads its fetch's entry
+back by URL (`getEntriesByName`) and rejected on the first pulse.
+
+Patch 282 records them: the document's stylesheets, scripts, images and
+CSS backgrounds from the engine (the html handler registers each fetch,
+hlcache reports it finished), fetch() and XMLHttpRequest in the
+polyfill; one entry per URL per document, as a browser's memory cache
+makes it. Checked field by field against Chromium (a same-origin and a
+cross-origin image): a cross-origin entry without Timing-Allow-Origin
+shows only startTime, fetchStart, responseEnd and duration -- the
+phases, the sizes, responseStatus 0, nextHopProtocol and contentType
+"" -- and a same-origin one has transferSize = body + 300. The first
+version gave every entry its phases; hsw's `pem` then read
+`{csc, csch: "api.hcaptcha.com", cscrt: 228.9, cscft}` where Chromium's
+reads `cscrt: 0` (its request is cross-origin from hsw's frame), so the
+cross-origin rule went in before the commit.
+
+Measured after 282:
+
+- `pem` in the simulator: `{"csc":196.7,"csch":"api.hcaptcha.com",
+  "cscrt":0,"cscft":196.7}`; Chromium's: `{"csc":38.8,"csch":
+  "api.hcaptcha.com","cscrt":0,"cscft":38.8}` -- the same shape, values
+  that differ by when the frame fetched.
+- The demo: still refused (797 bytes), the encrypted request 29.2 KB
+  (28.7 after 281). The hsw replay is still identical in V8 and wasm3.
+- Wikimedia's own Probenet class, run against the gate's server: 6
+  pulses, each with duration, sizes, status and pulse id, no errors --
+  as in Chromium.
+
+### Where the five rounds leave it
+
+Established, each by measurement:
+
+- **The engine computes what V8 computes.** hsw replayed from a
+  Chromium recording runs identically in wasm3 -- every import argument,
+  result and memory hash.
+- **The refusal is inside `n`**, hsw's fingerprint and proof: the
+  engine's other request fields transplanted into Chromium's request
+  still get a challenge.
+- **Chromium given each difference found still passes:** the missing
+  interfaces, the engine's values and user agent, its network layer,
+  touch input, its window names, layout and key order, blank canvas, the
+  descriptors inside hsw's collector, exact-tenth clocks, 25x / 50x
+  slowness, frame-late timers, and an empty `pem`.
+- **The engine, with the standards deviations among them fixed, is
+  still refused** (patches 268-282: window, prototypes, document and
+  nodes, descriptors, timer clamp, resource timing; the missing
+  interfaces such as WebGL are not built, Chromium passing without
+  them).
+
+Not yet compared, and so where the difference must be:
+
+- **The second half of hsw's run.** The aligned trace (Chromium cut to
+  the engine's surface) makes the same calls as the engine to about
+  halfway, then forks on Object.keys(window) order, which Chromium's
+  unforgeable window properties cannot be made to match. What hsw reads
+  after the fork has been diffed only inside single collector calls,
+  not as a sequence.
+- **Behaviour Chromium cannot be given from a page script:** what
+  QuickJS does differently from V8 itself -- error messages and stack
+  text, number and date formatting, regular-expression and sort
+  details. hsw's glue can read any of it, but no init script can make
+  V8 answer the engine's way, so the "give it to Chromium" method
+  cannot test it (whether hsw does read it is not measured).
+
+The method that has answered everything so far -- transplant one
+difference into Chromium, see if it still passes -- has nothing left to
+transplant. The next step would have to run the engine's answers inside
+Chromium's hsw (replay the engine's import answers into a Chromium
+instance mid-run) or find the server-side rule by elimination, and both
+are larger than any round so far. Each round has fixed real standards
+deviations on the way (268-282); that is the work worth keeping whether
+or not the demo ever passes.
 
 ## How to measure again
 

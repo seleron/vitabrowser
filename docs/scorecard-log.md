@@ -4,6 +4,23 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patch 282 (r57-282-fresh, fresh reference)
+
+Resource Timing: every page's fetches recorded, fetch() and XHR wrapped
+-- scored against a fresh reference: mean **83.2** (r56 83.6), JS error
+counts unchanged on every site. Wikipedia's r55 error ("unhandled
+rejection: undefined", its sampled network probe) cannot show here
+either way -- the probe runs on 1 in 10,000 page views and drew no pulse
+in r56 or r57 -- so it was checked directly: Wikimedia's Probenet class
+against the gate's server, 6 pulses read back, no errors (before: it
+rejected on the first). The mean's fall is two live pages: Wikipedia
+-3.4 (Chrome's reference got a "13 October" donation appeal; scored
+against r56's reference our r57 page reads 1.000 text, 0.698 visual,
+both above r56's own) and Hacker News -4.9 (two stories rotated between
+the reference and our run). Old Reddit +1.1, Stack Overflow +1.1, the
+rest within 0.5. **r56 stays the baseline**: r57's Wikipedia reference
+carries the one-day appeal.
+
 ## 2026-10-13 — patch 281 (r56-281-fresh, fresh reference)
 
 Timers clamped as HTML says and fired on time, and the autotest's

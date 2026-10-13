@@ -142,6 +142,10 @@ on text inputs, buttons, selects, textareas (225).
    timer lateness each given to Chromium leave it passing; the HTML
    timer nesting clamp was missing and timers ran a frame late (both
    fixed); still refused (docs/wasm-hcaptcha-measurement.md, "Timing").
+   *Resource Timing (282):* the page's fetches on its timeline (hsw's
+   `pem` field now in Chromium's shape; Wikimedia's network probe no
+   longer rejects); still refused. Nothing left to transplant into
+   Chromium -- see "Where the five rounds leave it".
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

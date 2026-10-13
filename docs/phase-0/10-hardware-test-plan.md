@@ -3905,3 +3905,30 @@ cross-build green.
 and JS-frame-local's timer chain (check 6) under 1.5 s on the Vita's
 clock. Watch that pages with a setTimeout(0) heartbeat do not keep the
 screen from idling (battery) -- the loop now wakes for due timers.
+
+### Patch 282 (2026-10-13): Resource Timing
+
+- **282: each fetch a PerformanceResourceTiming entry.**
+  `performance.getEntriesByType('resource')` was always empty. The
+  document's stylesheets, scripts, images and CSS backgrounds are
+  recorded by the engine (html handler + hlcache), fetch() and
+  XMLHttpRequest by the polyfill; one entry per URL per document;
+  cross-origin entries without Timing-Allow-Origin show only start, end
+  and duration, as in browsers. Fixes Wikimedia's network probe (it
+  read its fetch's entry back and rejected without one).
+
+Sim-verified: JS-resource-timing (RESTIMING 9/9, Chromium 9/9); full sim
+gate exit 0 (gate-282b); Vita cross-build green.
+
+**On the device (run 38), in addition:** `JS-resource-timing.html` is
+a network page (the gate serves it over HTTP); opened from the bundle,
+`file:///app0:/testpages/JS-resource-timing.html`, a file page's origin
+is opaque, so every entry counts as cross-origin and shows no sizes, as
+in browsers. Expected there (measured in the simulator over file://):
+RESTIMING 2/9 -- checks 5 and 8 pass; 1-4, 6 and 7 fail only on
+"sizes {...}" with the right initiatorType in the entry shown (script,
+link, img, css, fetch, xmlhttprequest); 9 fails "cross-origin: 0
+entries" (no localhost server on the Vita). Anything else -- a check
+failing on "getEntriesByName gave 0 entries", or a crash -- is a fault.
+Watch memory on image-heavy pages: entries are kept per document (at
+most 250, 1024 in all) until the page is left.
