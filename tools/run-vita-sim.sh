@@ -318,6 +318,7 @@ NET-js-form-submit http://127.0.0.1:$HP/JS-form-submit.html
 NET-css-important-operands http://127.0.0.1:$HP/CSS-important-operands.html
 NET-css-style-edit http://127.0.0.1:$HP/CSS-style-edit.html
 NET-js-xorigin-frame-early http://127.0.0.1:$HP/JS-xorigin-frame-early.html
+NET-js-builtins-native http://127.0.0.1:$HP/JS-builtins-native.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -825,7 +826,8 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-wasm WASM254 15" "js-frame-realm REALM 11" \
 	 "css-important-operands IMPORTANT264 3" \
 	 "css-style-edit STYLEEDIT 4" \
-	 "js-xorigin-frame-early XEARLY 3"; do
+	 "js-xorigin-frame-early XEARLY 3" \
+	 "js-builtins-native BUILTIN 8"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)

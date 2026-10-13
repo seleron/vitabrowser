@@ -1,0 +1,384 @@
+# netsurf: the browser's functions look like a browser's -- [native code],
+# names, WebIDL lengths and attributes; window.close / focus / blur
+# (patch 269)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 268)
+#
+# Found tracing hCaptcha's hsw against Chromium (patch 268): it reads the
+# property descriptors of 44 window functions and calls toString() on
+# them. In this engine 24 of them gave their source text -- the bridge's
+# setup scripts and vita_polyfill.js are JavaScript -- where ECMA-262
+# requires a built-in function's toString to have the NativeFunction form;
+# several were anonymous or named for a helper (matchMedia "",
+# getComputedStyle "vgcs", BroadcastChannel "B"), with the helper's
+# parameter count as length; operations were sometimes not enumerable and
+# interface objects were; window.close / focus / blur were missing outside
+# popups. (Chromium given our source-text functions and accessor
+# descriptors still passes hCaptcha, so this is not why it refuses us --
+# it is a standards fix.)
+#
+#  - macsurf_qjs.c qjs_eval_builtin: everything qjs_eval_cached compiles is
+#    the bridge's own text (setup scripts, the polyfill, event-dispatch
+#    snippets -- never a page's), so it is compiled without function
+#    source (JS_SetStripFunctionSource, patches/quickjs/02): toString of a
+#    built-in gives "function name() { [native code] }". A page's functions
+#    keep their source.
+#  - vita_polyfill.js, last section: window's own functions get their
+#    property's name and Chromium's WebIDL length (a table of the 230
+#    non-intrinsic ones both have, tools/hcaptcha/window-ops.js);
+#    operations enumerable, interface objects not, interface prototypes
+#    their @@toStringTag (when the prototype is the constructor's own);
+#    scroll is no longer scrollTo itself; webkitURL / WebKitCSSMatrix stay
+#    aliases; close() closes a window a script opened and otherwise does
+#    nothing (as in browsers), focus() / blur() do nothing; the engine's
+#    helpers (__vita*, _k, ...) no longer enumerate. Left: DOMMatrixReadOnly
+#    / DOMPointReadOnly are DOMMatrix / DOMPoint themselves; window.stop()
+#    does not exist (nothing here can stop a load from script).
+#
+# Gate: testpages/pages/JS-builtins-native.html (BUILTIN 8/8, Chromium
+# 8/8).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -806,6 +806,23 @@
+ 	return h;
+ }
+ 
++/* VitaBrowser patch 269: the browser's own functions are built-in
++ * functions, however they are written, and Function.prototype.toString
++ * of a built-in gives "function name() { [native code] }" (ECMA-262,
++ * NativeFunction syntax) -- it gave the bridge's and the polyfill's source
++ * text. Everything compiled here is the bridge's text (setup scripts, the
++ * polyfill, event-dispatch snippets; never a page's), so it is compiled
++ * without source (patches/quickjs/02); pages' functions keep theirs. */
++static JSValue qjs_eval_builtin(JSContext *ctx, const char *src, size_t len,
++		const char *name, int flags)
++{
++	JSValue v;
++	JS_SetStripFunctionSource(true);
++	v = JS_Eval(ctx, src, len, name, flags);
++	JS_SetStripFunctionSource(false);
++	return v;
++}
++
+ static JSValue qjs_eval_cached(JSContext *ctx, const char *src, size_t len,
+ 		const char *name)
+ {
+@@ -816,7 +833,7 @@
+ 	size_t bc_len = 0;
+ 
+ 	if (len < QJS_BC_CACHE_MIN)
+-		return JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_GLOBAL);
++		return qjs_eval_builtin(ctx, src, len, name, JS_EVAL_TYPE_GLOBAL);
+ 	h = qjs_bc_hash(src, len);
+ 	for (i = 0; i < qjs_bc_cache_n; i++) {
+ 		if (qjs_bc_cache[i].hash == h && qjs_bc_cache[i].len == len) {
+@@ -825,13 +842,13 @@
+ 					JS_READ_OBJ_BYTECODE);
+ 			if (JS_IsException(fn)) {
+ 				JS_FreeValue(ctx, JS_GetException(ctx));
+-				return JS_Eval(ctx, src, len, name,
++				return qjs_eval_builtin(ctx, src, len, name,
+ 						JS_EVAL_TYPE_GLOBAL);
+ 			}
+ 			return JS_EvalFunction(ctx, fn);
+ 		}
+ 	}
+-	fn = JS_Eval(ctx, src, len, name,
++	fn = qjs_eval_builtin(ctx, src, len, name,
+ 			JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+ 	if (JS_IsException(fn))
+ 		return fn;
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -8962,4 +8962,142 @@
+ 		define(P, '__vitaNav', entry);
+ 	} catch (e) { /* */ }
+ })();
++
++/* ---- the browser's functions look like a browser's (patch 269) ----------
++ * window's operations and interface objects are the browser's own: per
++ * WebIDL an operation is an enumerable data property whose function is
++ * named for it with the IDL length (its required arguments), and an
++ * interface object is non-enumerable and named for its interface, whose
++ * prototype's @@toStringTag is that name. Ours were functions the bridge
++ * and this file define as they go: anonymous (matchMedia, scrollTo) or
++ * named for a helper (getComputedStyle was "vgcs", BroadcastChannel "B"),
++ * lengths of the helper's parameter lists, interfaces enumerable,
++ * operations sometimes not. Their source text is fixed in the bridge
++ * (macsurf_qjs.c qjs_eval_builtin: toString gives [native code]). The
++ * table is Chromium's, for every one this engine has (generated
++ * 2026-10-13, tools/hcaptcha/). window.close / focus / blur were missing
++ * outside popups: close() closes a window a script opened and otherwise
++ * does nothing, as in browsers; focus() and blur() do nothing for a
++ * top-level window on a phone-like browser either. The engine's own
++ * helpers (__vita*, _k, ...) stay on window but no longer enumerate. */
++(function () {
++	var T = 'AbortController:0 AbortSignal:0 Attr:0 Audio:0 Blob:0 ' +
++		'BroadcastChannel:1 CDATASection:0 CSSConditionRule:0 ' +
++		'CSSContainerRule:0 CSSFontFaceRule:0 CSSGroupingRule:0 CSSImportRule:0 ' +
++		'CSSKeyframeRule:0 CSSKeyframesRule:0 CSSLayerBlockRule:0 ' +
++		'CSSLayerStatementRule:0 CSSMediaRule:0 CSSNamespaceRule:0 ' +
++		'CSSPageRule:0 CSSRule:0 CSSStyleDeclaration:0 CSSStyleRule:0 ' +
++		'CSSStyleSheet:0 CSSSupportsRule:0 CanvasGradient:0 CanvasPattern:0 ' +
++		'CanvasRenderingContext2D:0 CharacterData:0 Comment:0 ' +
++		'CompositionEvent:1 Crypto:0 CryptoKey:0 CustomElementRegistry:0 ' +
++		'CustomEvent:1 DOMException:0 DOMMatrix:0 DOMMatrixReadOnly:0 ' +
++		'DOMParser:0 DOMPoint:0 DOMPointReadOnly:0 DOMRect:0 DOMRectReadOnly:0 ' +
++		'DOMTokenList:0 Document:0 DocumentFragment:0 DocumentType:0 Element:0 ' +
++		'ErrorEvent:1 Event:1 EventSource:1 EventTarget:0 File:2 FileReader:0 ' +
++		'FocusEvent:1 FontFace:2 FormData:0 HTMLAnchorElement:0 ' +
++		'HTMLAreaElement:0 HTMLAudioElement:0 HTMLBRElement:0 HTMLBaseElement:0 ' +
++		'HTMLBodyElement:0 HTMLButtonElement:0 HTMLCanvasElement:0 ' +
++		'HTMLCollection:0 HTMLDListElement:0 HTMLDataElement:0 ' +
++		'HTMLDataListElement:0 HTMLDetailsElement:0 HTMLDialogElement:0 ' +
++		'HTMLDivElement:0 HTMLDocument:0 HTMLElement:0 HTMLEmbedElement:0 ' +
++		'HTMLFieldSetElement:0 HTMLFormElement:0 HTMLHRElement:0 ' +
++		'HTMLHeadElement:0 HTMLHeadingElement:0 HTMLHtmlElement:0 ' +
++		'HTMLIFrameElement:0 HTMLImageElement:0 HTMLInputElement:0 ' +
++		'HTMLLIElement:0 HTMLLabelElement:0 HTMLLegendElement:0 ' +
++		'HTMLLinkElement:0 HTMLMapElement:0 HTMLMediaElement:0 ' +
++		'HTMLMenuElement:0 HTMLMetaElement:0 HTMLMeterElement:0 ' +
++		'HTMLModElement:0 HTMLOListElement:0 HTMLObjectElement:0 ' +
++		'HTMLOptGroupElement:0 HTMLOptionElement:0 HTMLOutputElement:0 ' +
++		'HTMLParagraphElement:0 HTMLPictureElement:0 HTMLPreElement:0 ' +
++		'HTMLProgressElement:0 HTMLQuoteElement:0 HTMLScriptElement:0 ' +
++		'HTMLSelectElement:0 HTMLSlotElement:0 HTMLSourceElement:0 ' +
++		'HTMLSpanElement:0 HTMLStyleElement:0 HTMLTableCaptionElement:0 ' +
++		'HTMLTableCellElement:0 HTMLTableColElement:0 HTMLTableElement:0 ' +
++		'HTMLTableRowElement:0 HTMLTableSectionElement:0 HTMLTemplateElement:0 ' +
++		'HTMLTextAreaElement:0 HTMLTimeElement:0 HTMLTitleElement:0 ' +
++		'HTMLTrackElement:0 HTMLUListElement:0 HTMLUnknownElement:0 ' +
++		'HTMLVideoElement:0 Headers:0 History:0 IDBDatabase:0 IDBFactory:0 ' +
++		'IDBIndex:0 IDBKeyRange:0 IDBObjectStore:0 IDBOpenDBRequest:0 ' +
++		'IDBRequest:0 IDBTransaction:0 Image:0 ImageData:2 InputEvent:1 ' +
++		'IntersectionObserver:1 KeyboardEvent:1 Location:0 MediaQueryList:0 ' +
++		'MessageChannel:0 MessageEvent:1 MessagePort:0 MouseEvent:1 ' +
++		'MutationObserver:1 MutationRecord:0 NamedNodeMap:0 Navigator:0 Node:0 ' +
++		'NodeIterator:0 NodeList:0 Notification:1 Option:0 Path2D:0 ' +
++		'Performance:0 PerformanceNavigationTiming:0 PerformanceObserver:1 ' +
++		'PointerEvent:1 ProcessingInstruction:0 PromiseRejectionEvent:2 Range:0 ' +
++		'ReadableStream:0 ReadableStreamDefaultReader:1 Request:1 ' +
++		'ResizeObserver:1 Response:0 SVGCircleElement:0 SVGElement:0 ' +
++		'SVGGElement:0 SVGGraphicsElement:0 SVGPathElement:0 SVGRectElement:0 ' +
++		'SVGSVGElement:0 SVGTextElement:0 SVGUseElement:0 Screen:0 ShadowRoot:0 ' +
++		'SharedWorker:1 Storage:0 StyleSheet:0 Text:0 TextDecoder:0 ' +
++		'TextDecoderStream:0 TextEncoder:0 TextEncoderStream:0 TextMetrics:0 ' +
++		'TouchEvent:1 TransformStream:0 TreeWalker:0 UIEvent:1 URL:1 ' +
++		'URLSearchParams:0 WebKitCSSMatrix:0 WebSocket:1 WheelEvent:1 Window:0 ' +
++		'Worker:1 WritableStream:0 WritableStreamDefaultWriter:1 XMLDocument:0 ' +
++		'XMLHttpRequest:0 XMLSerializer:0 alert:0 atob:1 btoa:1 ' +
++		'cancelAnimationFrame:1 cancelIdleCallback:1 clearInterval:0 ' +
++		'clearTimeout:0 confirm:0 createImageBitmap:1 fetch:1 ' +
++		'getComputedStyle:1 getSelection:0 matchMedia:1 open:0 postMessage:1 ' +
++		'print:0 prompt:0 queueMicrotask:1 reportError:1 ' +
++		'requestAnimationFrame:1 requestIdleCallback:1 scroll:0 scrollBy:0 ' +
++		'scrollTo:0 setInterval:1 setTimeout:1 structuredClone:1 webkitURL:1 ';
++	var len = {};
++	T.split(' ').forEach(function (e) { var i = e.indexOf(':'); if (i > 0) len[e.slice(0, i)] = +e.slice(i + 1); });
++	function setFn(f, k, n) {
++		try { if (f.name !== k) Object.defineProperty(f, 'name', { value: k, configurable: true }); } catch (e) { /* */ }
++		try { if (n !== undefined && f.length !== n) Object.defineProperty(f, 'length', { value: n, configurable: true }); } catch (e) { /* */ }
++	}
++	if (!isFn(g.close)) {
++		define(g, 'close', function close() {
++			var popup = 0;
++			try { popup = isFn(g.__vitaOpenerId) ? g.__vitaOpenerId() : 0; } catch (e) { /* */ }
++			if (popup && isFn(g.__vitaCloseSelf)) g.__vitaCloseSelf();
++			else if (g.console && isFn(g.console.warn))
++				g.console.warn('Scripts may close only the windows that were opened by them.');
++		});
++	}
++	if (!isFn(g.focus)) define(g, 'focus', function focus() {});
++	if (!isFn(g.blur)) define(g, 'blur', function blur() {});
++	len.close = 0; len.focus = 0; len.blur = 0;
++	/* EventTarget's, own properties of window here */
++	len.addEventListener = 2; len.removeEventListener = 2; len.dispatchEvent = 1;
++	/* scroll and scrollTo were one function; browsers have two */
++	if (isFn(g.scroll) && g.scroll === g.scrollTo) {
++		var st = g.scrollTo;
++		define(g, 'scroll', function scroll() { return st.apply(this, arguments); });
++	}
++	/* legacy aliases: the very same function, not enumerable */
++	[['webkitURL', 'URL'], ['WebKitCSSMatrix', 'DOMMatrix']].forEach(function (a) {
++		if (isFn(g[a[1]]) && Object.prototype.hasOwnProperty.call(g, a[0]))
++			try { Object.defineProperty(g, a[0], { value: g[a[1]], writable: true, enumerable: false, configurable: true }); } catch (e) { /* */ }
++		delete len[a[0]];
++	});
++	Object.getOwnPropertyNames(g).forEach(function (k) {
++		var d;
++		try { d = Object.getOwnPropertyDescriptor(g, k); } catch (e) { return; }
++		if (!d || !d.configurable) return;
++		if (k.charAt(0) === '_') {
++			if (d.enumerable) { d.enumerable = false; try { Object.defineProperty(g, k, d); } catch (e) { /* */ } }
++			return;
++		}
++		if (!('value' in d) || !isFn(d.value) || !(k in len)) return;
++		var f = d.value, iface = /^[A-Z]/.test(k);
++		/* one function under two names (DOMPoint / DOMPointReadOnly):
++		 * it keeps the name of the one it is */
++		var alias = f.name !== k && f.name && g[f.name] === f;
++		if (!alias) setFn(f, k, len[k]);
++		if (iface && !alias) {
++			var pr = f.prototype;
++			try {
++				if (pr && typeof pr === 'object' && pr.constructor === f &&
++				    !Object.prototype.hasOwnProperty.call(pr, Symbol.toStringTag) &&
++				    Object.prototype.toString.call(pr) === '[object Object]')
++					Object.defineProperty(pr, Symbol.toStringTag, { value: k, configurable: true });
++			} catch (e) { /* */ }
++		}
++		if (d.enumerable === iface) {
++			try { Object.defineProperty(g, k, { value: f, writable: true, enumerable: !iface, configurable: true }); } catch (e) { /* */ }
++		}
++	});
++})();
+ })(this);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -8963,5 +8963,143 @@
+ "\t\tdefine(P, '__vitaNav', entry);\n"
+ "\t} catch (e) { /* */ }\n"
+ "})();\n"
++"\n"
++"/* ---- the browser's functions look like a browser's (patch 269) ----------\n"
++" * window's operations and interface objects are the browser's own: per\n"
++" * WebIDL an operation is an enumerable data property whose function is\n"
++" * named for it with the IDL length (its required arguments), and an\n"
++" * interface object is non-enumerable and named for its interface, whose\n"
++" * prototype's @@toStringTag is that name. Ours were functions the bridge\n"
++" * and this file define as they go: anonymous (matchMedia, scrollTo) or\n"
++" * named for a helper (getComputedStyle was \"vgcs\", BroadcastChannel \"B\"),\n"
++" * lengths of the helper's parameter lists, interfaces enumerable,\n"
++" * operations sometimes not. Their source text is fixed in the bridge\n"
++" * (macsurf_qjs.c qjs_eval_builtin: toString gives [native code]). The\n"
++" * table is Chromium's, for every one this engine has (generated\n"
++" * 2026-10-13, tools/hcaptcha/). window.close / focus / blur were missing\n"
++" * outside popups: close() closes a window a script opened and otherwise\n"
++" * does nothing, as in browsers; focus() and blur() do nothing for a\n"
++" * top-level window on a phone-like browser either. The engine's own\n"
++" * helpers (__vita*, _k, ...) stay on window but no longer enumerate. */\n"
++"(function () {\n"
++"\tvar T = 'AbortController:0 AbortSignal:0 Attr:0 Audio:0 Blob:0 ' +\n"
++"\t\t'BroadcastChannel:1 CDATASection:0 CSSConditionRule:0 ' +\n"
++"\t\t'CSSContainerRule:0 CSSFontFaceRule:0 CSSGroupingRule:0 CSSImportRule:0 ' +\n"
++"\t\t'CSSKeyframeRule:0 CSSKeyframesRule:0 CSSLayerBlockRule:0 ' +\n"
++"\t\t'CSSLayerStatementRule:0 CSSMediaRule:0 CSSNamespaceRule:0 ' +\n"
++"\t\t'CSSPageRule:0 CSSRule:0 CSSStyleDeclaration:0 CSSStyleRule:0 ' +\n"
++"\t\t'CSSStyleSheet:0 CSSSupportsRule:0 CanvasGradient:0 CanvasPattern:0 ' +\n"
++"\t\t'CanvasRenderingContext2D:0 CharacterData:0 Comment:0 ' +\n"
++"\t\t'CompositionEvent:1 Crypto:0 CryptoKey:0 CustomElementRegistry:0 ' +\n"
++"\t\t'CustomEvent:1 DOMException:0 DOMMatrix:0 DOMMatrixReadOnly:0 ' +\n"
++"\t\t'DOMParser:0 DOMPoint:0 DOMPointReadOnly:0 DOMRect:0 DOMRectReadOnly:0 ' +\n"
++"\t\t'DOMTokenList:0 Document:0 DocumentFragment:0 DocumentType:0 Element:0 ' +\n"
++"\t\t'ErrorEvent:1 Event:1 EventSource:1 EventTarget:0 File:2 FileReader:0 ' +\n"
++"\t\t'FocusEvent:1 FontFace:2 FormData:0 HTMLAnchorElement:0 ' +\n"
++"\t\t'HTMLAreaElement:0 HTMLAudioElement:0 HTMLBRElement:0 HTMLBaseElement:0 ' +\n"
++"\t\t'HTMLBodyElement:0 HTMLButtonElement:0 HTMLCanvasElement:0 ' +\n"
++"\t\t'HTMLCollection:0 HTMLDListElement:0 HTMLDataElement:0 ' +\n"
++"\t\t'HTMLDataListElement:0 HTMLDetailsElement:0 HTMLDialogElement:0 ' +\n"
++"\t\t'HTMLDivElement:0 HTMLDocument:0 HTMLElement:0 HTMLEmbedElement:0 ' +\n"
++"\t\t'HTMLFieldSetElement:0 HTMLFormElement:0 HTMLHRElement:0 ' +\n"
++"\t\t'HTMLHeadElement:0 HTMLHeadingElement:0 HTMLHtmlElement:0 ' +\n"
++"\t\t'HTMLIFrameElement:0 HTMLImageElement:0 HTMLInputElement:0 ' +\n"
++"\t\t'HTMLLIElement:0 HTMLLabelElement:0 HTMLLegendElement:0 ' +\n"
++"\t\t'HTMLLinkElement:0 HTMLMapElement:0 HTMLMediaElement:0 ' +\n"
++"\t\t'HTMLMenuElement:0 HTMLMetaElement:0 HTMLMeterElement:0 ' +\n"
++"\t\t'HTMLModElement:0 HTMLOListElement:0 HTMLObjectElement:0 ' +\n"
++"\t\t'HTMLOptGroupElement:0 HTMLOptionElement:0 HTMLOutputElement:0 ' +\n"
++"\t\t'HTMLParagraphElement:0 HTMLPictureElement:0 HTMLPreElement:0 ' +\n"
++"\t\t'HTMLProgressElement:0 HTMLQuoteElement:0 HTMLScriptElement:0 ' +\n"
++"\t\t'HTMLSelectElement:0 HTMLSlotElement:0 HTMLSourceElement:0 ' +\n"
++"\t\t'HTMLSpanElement:0 HTMLStyleElement:0 HTMLTableCaptionElement:0 ' +\n"
++"\t\t'HTMLTableCellElement:0 HTMLTableColElement:0 HTMLTableElement:0 ' +\n"
++"\t\t'HTMLTableRowElement:0 HTMLTableSectionElement:0 HTMLTemplateElement:0 ' +\n"
++"\t\t'HTMLTextAreaElement:0 HTMLTimeElement:0 HTMLTitleElement:0 ' +\n"
++"\t\t'HTMLTrackElement:0 HTMLUListElement:0 HTMLUnknownElement:0 ' +\n"
++"\t\t'HTMLVideoElement:0 Headers:0 History:0 IDBDatabase:0 IDBFactory:0 ' +\n"
++"\t\t'IDBIndex:0 IDBKeyRange:0 IDBObjectStore:0 IDBOpenDBRequest:0 ' +\n"
++"\t\t'IDBRequest:0 IDBTransaction:0 Image:0 ImageData:2 InputEvent:1 ' +\n"
++"\t\t'IntersectionObserver:1 KeyboardEvent:1 Location:0 MediaQueryList:0 ' +\n"
++"\t\t'MessageChannel:0 MessageEvent:1 MessagePort:0 MouseEvent:1 ' +\n"
++"\t\t'MutationObserver:1 MutationRecord:0 NamedNodeMap:0 Navigator:0 Node:0 ' +\n"
++"\t\t'NodeIterator:0 NodeList:0 Notification:1 Option:0 Path2D:0 ' +\n"
++"\t\t'Performance:0 PerformanceNavigationTiming:0 PerformanceObserver:1 ' +\n"
++"\t\t'PointerEvent:1 ProcessingInstruction:0 PromiseRejectionEvent:2 Range:0 ' +\n"
++"\t\t'ReadableStream:0 ReadableStreamDefaultReader:1 Request:1 ' +\n"
++"\t\t'ResizeObserver:1 Response:0 SVGCircleElement:0 SVGElement:0 ' +\n"
++"\t\t'SVGGElement:0 SVGGraphicsElement:0 SVGPathElement:0 SVGRectElement:0 ' +\n"
++"\t\t'SVGSVGElement:0 SVGTextElement:0 SVGUseElement:0 Screen:0 ShadowRoot:0 ' +\n"
++"\t\t'SharedWorker:1 Storage:0 StyleSheet:0 Text:0 TextDecoder:0 ' +\n"
++"\t\t'TextDecoderStream:0 TextEncoder:0 TextEncoderStream:0 TextMetrics:0 ' +\n"
++"\t\t'TouchEvent:1 TransformStream:0 TreeWalker:0 UIEvent:1 URL:1 ' +\n"
++"\t\t'URLSearchParams:0 WebKitCSSMatrix:0 WebSocket:1 WheelEvent:1 Window:0 ' +\n"
++"\t\t'Worker:1 WritableStream:0 WritableStreamDefaultWriter:1 XMLDocument:0 ' +\n"
++"\t\t'XMLHttpRequest:0 XMLSerializer:0 alert:0 atob:1 btoa:1 ' +\n"
++"\t\t'cancelAnimationFrame:1 cancelIdleCallback:1 clearInterval:0 ' +\n"
++"\t\t'clearTimeout:0 confirm:0 createImageBitmap:1 fetch:1 ' +\n"
++"\t\t'getComputedStyle:1 getSelection:0 matchMedia:1 open:0 postMessage:1 ' +\n"
++"\t\t'print:0 prompt:0 queueMicrotask:1 reportError:1 ' +\n"
++"\t\t'requestAnimationFrame:1 requestIdleCallback:1 scroll:0 scrollBy:0 ' +\n"
++"\t\t'scrollTo:0 setInterval:1 setTimeout:1 structuredClone:1 webkitURL:1 ';\n"
++"\tvar len = {};\n"
++"\tT.split(' ').forEach(function (e) { var i = e.indexOf(':'); if (i > 0) len[e.slice(0, i)] = +e.slice(i + 1); });\n"
++"\tfunction setFn(f, k, n) {\n"
++"\t\ttry { if (f.name !== k) Object.defineProperty(f, 'name', { value: k, configurable: true }); } catch (e) { /* */ }\n"
++"\t\ttry { if (n !== undefined && f.length !== n) Object.defineProperty(f, 'length', { value: n, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tif (!isFn(g.close)) {\n"
++"\t\tdefine(g, 'close', function close() {\n"
++"\t\t\tvar popup = 0;\n"
++"\t\t\ttry { popup = isFn(g.__vitaOpenerId) ? g.__vitaOpenerId() : 0; } catch (e) { /* */ }\n"
++"\t\t\tif (popup && isFn(g.__vitaCloseSelf)) g.__vitaCloseSelf();\n"
++"\t\t\telse if (g.console && isFn(g.console.warn))\n"
++"\t\t\t\tg.console.warn('Scripts may close only the windows that were opened by them.');\n"
++"\t\t});\n"
++"\t}\n"
++"\tif (!isFn(g.focus)) define(g, 'focus', function focus() {});\n"
++"\tif (!isFn(g.blur)) define(g, 'blur', function blur() {});\n"
++"\tlen.close = 0; len.focus = 0; len.blur = 0;\n"
++"\t/* EventTarget's, own properties of window here */\n"
++"\tlen.addEventListener = 2; len.removeEventListener = 2; len.dispatchEvent = 1;\n"
++"\t/* scroll and scrollTo were one function; browsers have two */\n"
++"\tif (isFn(g.scroll) && g.scroll === g.scrollTo) {\n"
++"\t\tvar st = g.scrollTo;\n"
++"\t\tdefine(g, 'scroll', function scroll() { return st.apply(this, arguments); });\n"
++"\t}\n"
++"\t/* legacy aliases: the very same function, not enumerable */\n"
++"\t[['webkitURL', 'URL'], ['WebKitCSSMatrix', 'DOMMatrix']].forEach(function (a) {\n"
++"\t\tif (isFn(g[a[1]]) && Object.prototype.hasOwnProperty.call(g, a[0]))\n"
++"\t\t\ttry { Object.defineProperty(g, a[0], { value: g[a[1]], writable: true, enumerable: false, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tdelete len[a[0]];\n"
++"\t});\n"
++"\tObject.getOwnPropertyNames(g).forEach(function (k) {\n"
++"\t\tvar d;\n"
++"\t\ttry { d = Object.getOwnPropertyDescriptor(g, k); } catch (e) { return; }\n"
++"\t\tif (!d || !d.configurable) return;\n"
++"\t\tif (k.charAt(0) === '_') {\n"
++"\t\t\tif (d.enumerable) { d.enumerable = false; try { Object.defineProperty(g, k, d); } catch (e) { /* */ } }\n"
++"\t\t\treturn;\n"
++"\t\t}\n"
++"\t\tif (!('value' in d) || !isFn(d.value) || !(k in len)) return;\n"
++"\t\tvar f = d.value, iface = /^[A-Z]/.test(k);\n"
++"\t\t/* one function under two names (DOMPoint / DOMPointReadOnly):\n"
++"\t\t * it keeps the name of the one it is */\n"
++"\t\tvar alias = f.name !== k && f.name && g[f.name] === f;\n"
++"\t\tif (!alias) setFn(f, k, len[k]);\n"
++"\t\tif (iface && !alias) {\n"
++"\t\t\tvar pr = f.prototype;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tif (pr && typeof pr === 'object' && pr.constructor === f &&\n"
++"\t\t\t\t    !Object.prototype.hasOwnProperty.call(pr, Symbol.toStringTag) &&\n"
++"\t\t\t\t    Object.prototype.toString.call(pr) === '[object Object]')\n"
++"\t\t\t\t\tObject.defineProperty(pr, Symbol.toStringTag, { value: k, configurable: true });\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\tif (d.enumerable === iface) {\n"
++"\t\t\ttry { Object.defineProperty(g, k, { value: f, writable: true, enumerable: !iface, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t});\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
