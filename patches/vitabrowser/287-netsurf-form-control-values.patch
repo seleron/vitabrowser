@@ -1,0 +1,1080 @@
+# netsurf: form controls' values as browsers have them -- textarea,
+# select, option; HTML's selectedness for a select (patch 287)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 286)
+#
+# `value` was one accessor on every element, its value attribute (the
+# bridge's generic reflection). So a textarea read "" -- its value is its
+# text, then what is typed or set -- and a value a script gave it was not
+# what the field showed or the form sent (doc 10, 283's "found, not
+# fixed"); a <select> had no options, selectedIndex, value, length or
+# type; option.selected / value / index were missing or read attributes;
+# a checkbox without a value attribute read "" (browsers: "on"); a <div>
+# had a value. Checked against Chromium case by case:
+#
+#  - vita_polyfill.js, "form controls' values": textarea value (newlines
+#    as LF), defaultValue (its text), textLength; select options (an
+#    HTMLOptionsCollection, live, by index too, item / namedItem / add /
+#    remove / length), selectedIndex, value, selectedOptions, length, type,
+#    multiple, size, form, item, namedItem, add, remove(i); option value
+#    (else its text, whitespace collapsed), text, label, selected,
+#    defaultSelected, disabled, index, form; checkbox / radio "on"; button,
+#    data, param, li (a number), output, meter (a number within min..max)
+#    each their own value; no other element has one.
+#  - macsurf_qjs.c __vitaFormCtl: a textarea's value read and set through
+#    libdom (286) and a select's selection read and picked; the control's
+#    gadget, when laid out, shows the change (form_gadget_sync_with_dom,
+#    form_select_apply_dom).
+#  - form.c form_select_selectedness: which options are selected, as HTML
+#    decides it -- in a drop-down the last option marked selected, else
+#    its first enabled one (unless a script left it with none) -- used by
+#    the gadget, the submission and scripts alike. The submission sent
+#    every option marked selected (a drop-down with two sent both) and
+#    nothing when the first option was disabled and none marked; the gadget
+#    took the first marked, or the first option disabled or not (and marked
+#    it in the DOM). A pick from the menu unmarks every other option in a
+#    drop-down, not only the one shown.
+#
+# An input's value stays its value attribute, the engine's model (a value
+# a script sets is shown and sent, but is also the attribute and
+# defaultValue -- unlike browsers). A select cannot be picked from on the
+# Vita: the frontend has no select menu (older than this; script-driven
+# selects now work).
+#
+# Gate: testpages/pages/JS-form-values.html (FORMVAL 8/8, Chromium 8/8)
+# and tools/run-vita-sim.sh "scriptless form
+# submissions" case "values" (a script's textarea / select / option values
+# submitted, digest equal to Chromium's).
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 9047a0a53..e2eaccab7 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2719,15 +2719,14 @@ box_select(dom_node *n,
+ 	box_add_child(inline_container, inline_box);
+ 	box_add_child(box, inline_container);
+ 
+-	if (gadget->data.select.multiple == false &&
+-			gadget->data.select.num_selected == 0) {
+-		gadget->data.select.current = gadget->data.select.items;
+-		gadget->data.select.current->initial_selected =
+-			gadget->data.select.current->selected = true;
+-		gadget->data.select.num_selected = 1;
+-		dom_html_option_element_set_selected(
+-				gadget->data.select.current->node, true);
+-	}
++	/* VitaBrowser patch 287: the selection HTML gives the options (the
++	 * last marked in a drop-down; with none, the first enabled one),
++	 * as the form submits and scripts read it. It was the first marked,
++	 * and with none the first option, disabled or not, which was then
++	 * marked selected in the DOM. */
++	form_select_apply_dom(gadget, false);
++	if (gadget->data.select.current != NULL)
++		gadget->data.select.current->initial_selected = true;
+ 
+ 	if (gadget->data.select.num_selected == 0)
+ 		inline_box->text = talloc_strdup(content->bctx,
+diff --git a/content/handlers/html/form.c b/content/handlers/html/form.c
+index 4f4cde8fd..98f5eeb50 100644
+--- a/content/handlers/html/form.c
++++ b/content/handlers/html/form.c
+@@ -734,9 +734,148 @@ form_dom_to_data_textarea(dom_html_text_area_element *text_area_element,
+ }
+ 
+ 
++/* VitaBrowser patch 287: an option is disabled by its own attribute or
++ * its optgroup's */
++static bool form_option_disabled(dom_node *option)
++{
++	bool dis = false;
++	dom_node *parent = NULL;
++
++	form_has_attr(option, "disabled", &dis);
++	if (!dis && dom_node_get_parent_node(option, &parent) == DOM_NO_ERR &&
++	    parent != NULL) {
++		dom_string *pn = NULL;
++		if (dom_node_get_node_name(parent, &pn) == DOM_NO_ERR &&
++		    pn != NULL) {
++			if (form_ds_is(pn, "optgroup"))
++				form_has_attr(parent, "disabled", &dis);
++			dom_string_unref(pn);
++		}
++		dom_node_unref(parent);
++	}
++	return dis;
++}
++
++/* VitaBrowser patch 287: a drop-down a script left with nothing selected
++ * (select.value = "no such value", selectedIndex = -1) stays so -- HTML
++ * re-selects the first option only when options change -- so the engine,
++ * whose selectedness is the options' "selected" attributes, notes it on
++ * the select. Any pick of an option clears it. */
++static dom_string *form_none_key(void)
++{
++	static dom_string *key;
++
++	if (key == NULL)
++		dom_string_create((const uint8_t *)"__vita_select_none", 18,
++				&key);
++	return key;
++}
++
++/* exported interface documented in html/form_internal.h */
++void form_select_set_none(dom_node *select, bool none)
++{
++	void *old = NULL;
++	dom_string *key = form_none_key();
++
++	if (key != NULL)
++		dom_node_set_user_data(select, key, none ? (void *)1 : NULL,
++				NULL, &old);
++}
++
++static bool form_select_none(dom_node *select)
++{
++	void *data = NULL;
++	dom_string *key = form_none_key();
++
++	return key != NULL && dom_node_get_user_data(select, key, &data) ==
++			DOM_NO_ERR && data != NULL;
++}
++
++/* exported interface documented in html/form_internal.h */
++nserror form_select_selectedness(dom_node *select, dom_node ***opts_out,
++		bool **sel_out, uint32_t *n_out)
++{
++	dom_html_options_collection *col = NULL;
++	dom_node **opts = NULL;
++	bool *sel = NULL, multiple = false;
++	uint32_t n = 0, i;
++	int32_t last = -1, size = 0;
++	dom_string *sz = NULL;
++
++	*opts_out = NULL;
++	*sel_out = NULL;
++	*n_out = 0;
++	if (dom_html_select_element_get_options(
++			(dom_html_select_element *)select, &col) != DOM_NO_ERR ||
++	    col == NULL)
++		return NSERROR_DOM;
++	if (dom_html_options_collection_get_length(col, &n) != DOM_NO_ERR)
++		n = 0;
++	if (n > 0) {
++		opts = calloc(n, sizeof(*opts));
++		sel = calloc(n, sizeof(*sel));
++		if (opts == NULL || sel == NULL) {
++			free(opts);
++			free(sel);
++			dom_html_options_collection_unref(col);
++			return NSERROR_NOMEM;
++		}
++	}
++	for (i = 0; i < n; i++) {
++		if (dom_html_options_collection_item(col, i, &opts[i]) !=
++				DOM_NO_ERR)
++			opts[i] = NULL;
++		if (opts[i] != NULL)
++			form_has_attr(opts[i], "selected", &sel[i]);
++	}
++	dom_html_options_collection_unref(col);
++
++	form_has_attr(select, "multiple", &multiple);
++	if (form_attr(select, "size", &sz) == DOM_NO_ERR && sz != NULL) {
++		size = atoi(dom_string_data(sz));
++		dom_string_unref(sz);
++	}
++	if (!multiple) {
++		/* one at most: the last option marked selected; with none,
++		 * a drop-down (display size 1) selects its first enabled
++		 * option (HTML "selectedness setting algorithm") */
++		for (i = 0; i < n; i++)
++			if (sel[i])
++				last = (int32_t)i;
++		for (i = 0; i < n; i++)
++			sel[i] = ((int32_t)i == last);
++		if (last < 0 && size <= 1 && !form_select_none(select)) {
++			for (i = 0; i < n; i++) {
++				if (opts[i] != NULL &&
++				    !form_option_disabled(opts[i])) {
++					sel[i] = true;
++					break;
++				}
++			}
++		}
++	}
++	*opts_out = opts;
++	*sel_out = sel;
++	*n_out = n;
++	return NSERROR_OK;
++}
++
++/* exported interface documented in html/form_internal.h */
++void form_select_selectedness_free(dom_node **opts, bool *sel, uint32_t n)
++{
++	uint32_t i;
++
++	for (i = 0; i < n; i++)
++		if (opts[i] != NULL)
++			dom_node_unref(opts[i]);
++	free(opts);
++	free(sel);
++}
++
+ static nserror
+ form_dom_to_data_select_option(dom_html_option_element *option_element,
+ 			      dom_string *keyname,
++			      const bool *keyname_selected,
+ 			      const char *form_charset,
+ 			      const char *docu_charset,
+ 			      struct fetch_multipart_data ***fetch_data_next_ptr)
+@@ -746,12 +885,8 @@ form_dom_to_data_select_option(dom_html_option_element *option_element,
+ 	dom_string *value;
+ 	bool selected;
+ 
+-	exp = dom_html_option_element_get_selected(option_element, &selected);
+-	if (exp != DOM_NO_ERR) {
+-		NSLOG(netsurf, INFO, "Could not get option selected property");
+-		return NSERROR_DOM;
+-	}
+-
++	/* patch 287: the select's selectedness, worked out by the caller */
++	selected = *keyname_selected;
+ 	if (!selected) {
+ 		/* unselected options do not add fetch data entries */
+ 		return NSERROR_OK;
+@@ -817,10 +952,7 @@ form_dom_to_data_select(dom_html_select_element *select_element,
+ 	dom_exception exp; /* the result from DOM operations */
+ 	bool element_disabled;
+ 	dom_string *inputname;
+-	dom_html_options_collection *options = NULL;
+-	uint32_t options_count;
+ 	uint32_t option_index;
+-	dom_node *option_element = NULL;
+ 
+ 	/* check if element is disabled */
+ 	exp = dom_html_select_element_get_disabled(select_element,
+@@ -849,51 +981,35 @@ form_dom_to_data_select(dom_html_select_element *select_element,
+ 		return NSERROR_OK;
+ 	}
+ 
+-	/* get options collection */
+-	exp = dom_html_select_element_get_options(select_element, &options);
+-	if (exp != DOM_NO_ERR) {
+-		NSLOG(netsurf, INFO,
+-		      "Could not get select options collection");
+-		dom_string_unref(inputname);
+-		return NSERROR_DOM;
+-	}
+-
+-	/* get options collection length */
+-	exp = dom_html_options_collection_get_length(options, &options_count);
+-	if (exp != DOM_NO_ERR) {
+-		NSLOG(netsurf, INFO,
+-		      "Could not get select options collection length");
+-		dom_html_options_collection_unref(options);
+-		dom_string_unref(inputname);
+-		return NSERROR_DOM;
+-	}
++	/* VitaBrowser patch 287: the options HTML has selected -- in a
++	 * drop-down the last marked one, or the first enabled one when none
++	 * is (form_select_selectedness) */
++	{
++		dom_node **opts = NULL;
++		bool *sel = NULL;
++		uint32_t count = 0;
+ 
+-	/* iterate over options collection */
+-	for (option_index = 0; option_index < options_count; ++option_index) {
+-		exp = dom_html_options_collection_item(options,
+-						       option_index,
+-						       &option_element);
+-		if (exp != DOM_NO_ERR) {
+-			NSLOG(netsurf, INFO,
+-			      "Could not get options item %"PRId32, option_index);
+-			res = NSERROR_DOM;
+-		} else {
++		res = form_select_selectedness((dom_node *)select_element,
++				&opts, &sel, &count);
++		if (res != NSERROR_OK) {
++			dom_string_unref(inputname);
++			return res;
++		}
++		for (option_index = 0; option_index < count; ++option_index) {
++			if (opts[option_index] == NULL)
++				continue;
+ 			res = form_dom_to_data_select_option(
+-				(dom_html_option_element *)option_element,
++				(dom_html_option_element *)opts[option_index],
+ 				inputname,
++				&sel[option_index],
+ 				form_charset,
+ 				doc_charset,
+ 				fetch_data_next_ptr);
+-
+-			dom_node_unref(option_element);
+-		}
+-
+-		if (res != NSERROR_OK) {
+-			break;
++			if (res != NSERROR_OK)
++				break;
+ 		}
++		form_select_selectedness_free(opts, sel, count);
+ 	}
+-
+-	dom_html_options_collection_unref(options);
+ 	dom_string_unref(inputname);
+ 
+ 	return res;
+@@ -1784,10 +1900,16 @@ form__select_process_selection(html_content *html,
+ 
+ 	inline_box = control->box->children->children;
+ 
++	/* patch 287: an option picked, so not "nothing selected" any more */
++	form_select_set_none((dom_node *)control->node, false);
++
+ 	for (count = 0, o = control->data.select.items;
+ 			o != NULL;
+ 			count++, o = o->next) {
+-		if (!control->data.select.multiple && o->selected) {
++		/* VitaBrowser patch 287: in a drop-down every other option is
++		 * unmarked in the DOM, not only the one shown selected (two
++		 * marked options left one behind, which then won) */
++		if (!control->data.select.multiple) {
+ 			o->selected = false;
+ 			dom_html_option_element_set_selected(o->node, false);
+ 		}
+@@ -1845,6 +1967,57 @@ form__select_process_selection(html_content *html,
+ }
+ 
+ 
++/* exported interface documented in html/form_internal.h */
++void form_select_apply_dom(struct form_control *control, bool redraw)
++{
++	dom_node **opts = NULL;
++	bool *sel = NULL;
++	uint32_t n = 0, i;
++	struct form_option *o;
++	struct box *inline_box;
++
++	if (control == NULL || control->type != GADGET_SELECT ||
++	    control->node == NULL ||
++	    form_select_selectedness((dom_node *)control->node, &opts, &sel,
++			&n) != NSERROR_OK)
++		return;
++	control->data.select.num_selected = 0;
++	control->data.select.current = NULL;
++	for (o = control->data.select.items; o != NULL; o = o->next) {
++		o->selected = false;
++		for (i = 0; i < n; i++) {
++			if (opts[i] == (dom_node *)o->node) {
++				o->selected = sel[i];
++				break;
++			}
++		}
++		if (o->selected) {
++			control->data.select.num_selected++;
++			if (control->data.select.current == NULL ||
++			    !control->data.select.multiple)
++				control->data.select.current = o;
++		}
++	}
++	form_select_selectedness_free(opts, sel, n);
++	if (!redraw || control->box == NULL || control->html == NULL ||
++	    control->box->children == NULL ||
++	    (inline_box = control->box->children->children) == NULL)
++		return;
++	talloc_free(inline_box->text);
++	if (control->data.select.num_selected == 0)
++		inline_box->text = talloc_strdup(control->html->bctx,
++				messages_get("Form_None"));
++	else if (control->data.select.num_selected == 1)
++		inline_box->text = talloc_strdup(control->html->bctx,
++				control->data.select.current->text);
++	else
++		inline_box->text = talloc_strdup(control->html->bctx,
++				messages_get("Form_Many"));
++	inline_box->length = inline_box->text ? strlen(inline_box->text) : 0;
++	inline_box->width = control->box->width;
++	html__redraw_a_box(control->html, control->box);
++}
++
+ /**
+  * Handle a click on the area of the currently opened select menu.
+  *
+diff --git a/content/handlers/html/form_internal.h b/content/handlers/html/form_internal.h
+index ceff77387..17baf4aa6 100644
+--- a/content/handlers/html/form_internal.h
++++ b/content/handlers/html/form_internal.h
+@@ -25,6 +25,9 @@
+ #define NETSURF_HTML_FORM_INTERNAL_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
++
++struct dom_node;	/* patch 287 */
+ 
+ #include "netsurf/form.h"
+ 
+@@ -339,6 +342,42 @@ nserror form_submit(struct nsurl *page_url, struct browser_window *target,
+ 		struct form *form, struct form_control *submit_button);
+ 
+ 
++/**
++ * A select's options and which of them are selected, as HTML decides it
++ * (VitaBrowser patch 287): in a select without "multiple" at most one --
++ * the last marked selected -- or, when none is and it shows one line,
++ * the first enabled option. The engine keeps an option's selectedness in
++ * its "selected" attribute; this is what the gadget shows, the form
++ * submits and scripts read.
++ *
++ * \param select The select element.
++ * \param opts Set to its options (referenced), in order.
++ * \param sel Set to whether each is selected.
++ * \param n Set to their number.
++ * \return NSERROR_OK, or an error and nothing allocated.
++ */
++nserror form_select_selectedness(struct dom_node *select,
++		struct dom_node ***opts, bool **sel, uint32_t *n);
++
++/**
++ * Note that a script left a select with nothing selected (patch 287), or
++ * that it picked an option again.
++ */
++void form_select_set_none(struct dom_node *select, bool none);
++
++/** Release what form_select_selectedness returned. */
++void form_select_selectedness_free(struct dom_node **opts, bool *sel,
++		uint32_t n);
++
++/**
++ * A select gadget's selection taken from the DOM (patch 287): after a
++ * script changed it, or when the gadget is built.
++ *
++ * \param control The select's control.
++ * \param redraw Whether to update its text and redraw it.
++ */
++void form_select_apply_dom(struct form_control *control, bool redraw);
++
+ /**
+  * The form's default button (VitaBrowser patch 283): its first submit
+  * button, which implicit submission (Enter in a field) submits with.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 83cbf0cfd..55efca939 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -12640,6 +12640,118 @@ out:
+ 	free(ps);
+ }
+ 
++/* VitaBrowser patch 287: a form control's state as the engine holds it,
++ * for the value / selectedIndex / selected accessors (vita_polyfill.js):
++ *   __vitaFormCtl(textarea, "get")          its value (the text until
++ *                                           a value is set)
++ *   __vitaFormCtl(textarea, "set", s)       set it; the field shows it
++ *   __vitaFormCtl(select, "sel")            [bool...], which options are
++ *                                           selected (form.c, as HTML)
++ *   __vitaFormCtl(select, "pick", i, mode)  mode 0: option i alone (-1:
++ *                                           none); 1 / 2: option i on /
++ *                                           off; the gadget shows it
++ * The control's gadget, when it has been laid out, is brought in line
++ * (form_gadget_sync_with_dom / form_select_apply_dom). */
++static struct form_control *qjs_form_ctl_for(JSContext *ctx, dom_node *n)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	html_content *html;
++
++	if (owner == NULL || owner->content == NULL ||
++	    owner->content->handler == NULL ||
++	    owner->content->handler->type() != CONTENT_HTML)
++		return NULL;
++	html = (html_content *)owner->content;
++	return html_forms_get_control_for_node(html->forms, n);
++}
++
++static JSValue qjs_form_ctl(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	dom_node *n;
++	const char *op;
++	JSValue ret = JS_UNDEFINED;
++
++	(void)this_val;
++	if (argc < 2 || (n = qjs_get_node(argv[0])) == NULL)
++		return JS_UNDEFINED;
++	op = JS_ToCString(ctx, argv[1]);
++	if (op == NULL)
++		return JS_EXCEPTION;
++	if (strcmp(op, "get") == 0) {
++		dom_string *v = NULL;
++		if (dom_html_text_area_element_get_value(
++				(dom_html_text_area_element *)n, &v) ==
++				DOM_NO_ERR) {
++			ret = v != NULL ? JS_NewStringLen(ctx, dom_string_data(v),
++					dom_string_byte_length(v)) :
++				JS_NewString(ctx, "");
++			if (v != NULL)
++				dom_string_unref(v);
++		}
++	} else if (strcmp(op, "set") == 0 && argc > 2) {
++		size_t len;
++		const char *str = JS_ToCStringLen(ctx, &len, argv[2]);
++		dom_string *v = NULL;
++		if (str == NULL) {
++			JS_FreeCString(ctx, op);
++			return JS_EXCEPTION;
++		}
++		if (dom_string_create((const uint8_t *)str, len, &v) ==
++				DOM_NO_ERR) {
++			struct form_control *c;
++			dom_html_text_area_element_set_value(
++				(dom_html_text_area_element *)n, v);
++			dom_string_unref(v);
++			c = qjs_form_ctl_for(ctx, n);
++			if (c != NULL)
++				form_gadget_sync_with_dom(c);
++		}
++		JS_FreeCString(ctx, str);
++	} else if (strcmp(op, "sel") == 0 || strcmp(op, "pick") == 0) {
++		dom_node **opts = NULL;
++		bool *sel = NULL;
++		uint32_t cnt = 0, i;
++		if (form_select_selectedness(n, &opts, &sel, &cnt) ==
++				NSERROR_OK) {
++			if (op[0] == 's') {
++				ret = JS_NewArray(ctx);
++				for (i = 0; i < cnt; i++)
++					JS_SetPropertyUint32(ctx, ret, i,
++						JS_NewBool(ctx, sel[i]));
++			} else {
++				int32_t idx = -1, mode = 0;
++				struct form_control *c;
++				if (argc > 2)
++					JS_ToInt32(ctx, &idx, argv[2]);
++				if (argc > 3)
++					JS_ToInt32(ctx, &mode, argv[3]);
++				/* nothing picked in a drop-down stays so */
++				form_select_set_none(n, mode == 0 && idx < 0);
++				for (i = 0; i < cnt; i++) {
++					if (opts[i] == NULL)
++						continue;
++					if (mode == 0)
++						dom_html_option_element_set_selected(
++							(dom_html_option_element *)opts[i],
++							(int32_t)i == idx);
++					else if ((int32_t)i == idx)
++						dom_html_option_element_set_selected(
++							(dom_html_option_element *)opts[i],
++							mode == 1);
++				}
++				c = qjs_form_ctl_for(ctx, n);
++				if (c != NULL)
++					form_select_apply_dom(c, true);
++				ret = JS_TRUE;
++			}
++			form_select_selectedness_free(opts, sel, cnt);
++		}
++	}
++	JS_FreeCString(ctx, op);
++	return ret;
++}
++
+ static JSValue qjs_submit_form(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+@@ -13593,6 +13705,7 @@ static void register_browser_globals(JSContext *ctx)
+ 	qjs_set_func(ctx, global, "__vitaBattery", qjs_battery, 0);
+ 	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
+ 	qjs_set_func(ctx, global, "__vitaSubmitForm", qjs_submit_form, 2); /* 263 */
++	qjs_set_func(ctx, global, "__vitaFormCtl", qjs_form_ctl, 2); /* 287 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+ 			qjs_canvas_measure_text_width, 2); /* fixes1245 */
+ 
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 7f47490ce..5d2e1c229 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10145,5 +10145,240 @@
+ "\t\treturn S0.apply(this, arguments);\n"
+ "\t});\n"
+ "})();\n"
++"/* ---- form controls' values: textarea, select, option (patch 287) --------\n"
++" * `value` was one accessor on every element, its value attribute: a\n"
++" * textarea read \"\" (its value is its text, then what is typed or set),\n"
++" * and a value a script gave one was not what the field showed or the\n"
++" * form sent; a <select> had no options, selectedIndex, value, length or\n"
++" * type, and option.selected / value / index were missing or read the\n"
++" * attribute; a checkbox without a value attribute read \"\" (browsers:\n"
++" * \"on\"); a <div> had a value. Now each interface has its own, as in\n"
++" * browsers (Chromium checked case by case). The engine's state is read\n"
++" * and written through __vitaFormCtl (macsurf_qjs.c): a textarea's value\n"
++" * and a select's selection as HTML decides it -- the last option marked\n"
++" * selected in a drop-down, else its first enabled one (form.c) -- the\n"
++" * same the field shows and the form submits. An input's value stays its\n"
++" * value attribute (the engine's model); a value a script sets shows in\n"
++" * the field and is sent. The polyfill runs again when the real document\n"
++" * arrives, so this is put back on each pass. */\n"
++"(function () {\n"
++"\tvar CTL = g.__vitaFormCtl, D = Object.defineProperty, GOPD = Object.getOwnPropertyDescriptor;\n"
++"\tif (typeof CTL !== 'function') return;\n"
++"\tfunction proto(n) { var C = g[n]; return C && C.prototype; }\n"
++"\tfunction acc(P, name, get, set) {\n"
++"\t\tif (!P) return;\n"
++"\t\tvar d = { configurable: true, enumerable: true,\n"
++"\t\t\tget: GOPD({ get [name]() { return get.call(this); } }, name).get };\n"
++"\t\tif (set) d.set = GOPD({ set [name](v) { set.call(this, v); } }, name).set;\n"
++"\t\tD(P, name, d);\n"
++"\t}\n"
++"\tfunction op(P, name, n, f) {\n"
++"\t\tif (!P) return;\n"
++"\t\tvar w = ({ [name]() { return f.apply(this, arguments); } })[name];\n"
++"\t\tD(w, 'length', { value: n, configurable: true });\n"
++"\t\tD(P, name, { value: w, writable: true, enumerable: true, configurable: true });\n"
++"\t}\n"
++"\tfunction str(v) { return v === null ? '' : String(v); }\n"
++"\tvar ws = /[\\t\\n\\f\\r ]+/g;\n"
++"\tfunction text(o) { return String(o.textContent || '').replace(ws, ' ').replace(/^ | $/g, ''); }\n"
++"\n"
++"\t/* textarea: its value, its default (the text), the value's length */\n"
++"\tvar TA = proto('HTMLTextAreaElement');\n"
++"\tfunction taValue(t) { return String(CTL(t, 'get') || '').replace(/\\r\\n?/g, '\\n'); }\n"
++"\tacc(TA, 'value', function () { return taValue(this); },\n"
++"\t\tfunction (v) { CTL(this, 'set', str(v).replace(/\\r\\n?/g, '\\n')); });\n"
++"\tacc(TA, 'defaultValue', function () { return String(this.textContent || ''); },\n"
++"\t\tfunction (v) { this.textContent = str(v); });\n"
++"\tacc(TA, 'textLength', function () { return taValue(this).length; });\n"
++"\n"
++"\t/* select and its options */\n"
++"\tvar SE = proto('HTMLSelectElement'), OP = proto('HTMLOptionElement');\n"
++"\tfunction opts(s) { return Array.prototype.slice.call(s.getElementsByTagName('option')); }\n"
++"\tfunction owner(o) {\n"
++"\t\tfor (var p = o.parentNode, k = 0; p && k < 2; p = p.parentNode, k++) {\n"
++"\t\t\tvar t = p.nodeName;\n"
++"\t\t\tif (t === 'SELECT') return p;\n"
++"\t\t\tif (t !== 'OPTGROUP') return null;\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction sel(s) { var a = CTL(s, 'sel'); return a && a.length !== undefined ? a : []; }\n"
++"\tfunction multiple(s) { return s.hasAttribute('multiple'); }\n"
++"\tfunction pick(s, i, mode) { CTL(s, 'pick', i, mode || 0); }\n"
++"\tfunction selIndex(s) { var a = sel(s); for (var i = 0; i < a.length; i++) if (a[i]) return i; return -1; }\n"
++"\n"
++"\tacc(OP, 'text', function () { return text(this); }, function (v) { this.textContent = str(v); });\n"
++"\tacc(OP, 'value', function () { return this.hasAttribute('value') ? this.getAttribute('value') : text(this); },\n"
++"\t\tfunction (v) { this.setAttribute('value', str(v)); });\n"
++"\tacc(OP, 'label', function () { return this.hasAttribute('label') ? this.getAttribute('label') : text(this); },\n"
++"\t\tfunction (v) { this.setAttribute('label', str(v)); });\n"
++"\tacc(OP, 'defaultSelected', function () { return this.hasAttribute('selected'); },\n"
++"\t\tfunction (v) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); });\n"
++"\tacc(OP, 'disabled', function () { return this.hasAttribute('disabled'); },\n"
++"\t\tfunction (v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); });\n"
++"\tacc(OP, 'index', function () { var s = owner(this); return s ? opts(s).indexOf(this) : 0; });\n"
++"\tacc(OP, 'form', function () { var s = owner(this); return s ? s.form || null : null; });\n"
++"\tacc(OP, 'selected', function () {\n"
++"\t\tvar s = owner(this);\n"
++"\t\tif (!s) return this.hasAttribute('selected');\n"
++"\t\treturn !!sel(s)[opts(s).indexOf(this)];\n"
++"\t}, function (v) {\n"
++"\t\tvar s = owner(this), i;\n"
++"\t\tif (!s) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); return; }\n"
++"\t\ti = opts(s).indexOf(this);\n"
++"\t\tpick(s, i, v ? (multiple(s) ? 1 : 0) : 2);\n"
++"\t});\n"
++"\n"
++"\t/* HTMLOptionsCollection: the select's options, live, by index too */\n"
++"\tvar OC = g.HTMLOptionsCollection;\n"
++"\tif (!OC) {\n"
++"\t\tOC = function HTMLOptionsCollection() { throw new TypeError('Illegal constructor'); };\n"
++"\t\ttry { D(OC.prototype, Symbol.toStringTag, { value: 'HTMLOptionsCollection', configurable: true }); } catch (e) { /* */ }\n"
++"\t\tif (g.HTMLCollection && g.HTMLCollection.prototype) try { Object.setPrototypeOf(OC.prototype, g.HTMLCollection.prototype); } catch (e) { /* */ }\n"
++"\t\tD(g, 'HTMLOptionsCollection', { value: OC, writable: true, configurable: true });\n"
++"\t}\n"
++"\tvar OCP = OC.prototype;\n"
++"\tfunction ocSel(c) { return PV(c).select; }\n"
++"\tacc(OCP, 'length', function () { return opts(ocSel(this)).length; },\n"
++"\t\tfunction (n) { ocSel(this).length = n; });\n"
++"\tacc(OCP, 'selectedIndex', function () { return ocSel(this).selectedIndex; },\n"
++"\t\tfunction (i) { ocSel(this).selectedIndex = i; });\n"
++"\top(OCP, 'item', 1, function (i) { return opts(ocSel(this))[i >>> 0] || null; });\n"
++"\top(OCP, 'namedItem', 1, function (n) { return ocSel(this).namedItem(n); });\n"
++"\top(OCP, 'add', 1, function (el, before) { ocSel(this).add(el, before); });\n"
++"\top(OCP, 'remove', 1, function (i) { ocSel(this).remove(i); });\n"
++"\ttry { D(OCP, Symbol.iterator, { value: Array.prototype[Symbol.iterator], writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\tfunction collection(s) {\n"
++"\t\tvar pv = PV(s);\n"
++"\t\tif (pv.options) return pv.options;\n"
++"\t\tvar base = Object.create(OCP);\n"
++"\t\tPV(base).select = s;\t/* and the Proxy below: methods get it as this */\n"
++"\t\tpv.options = typeof Proxy === 'function' ? new Proxy(base, {\n"
++"\t\t\tget: function (t, k, r) {\n"
++"\t\t\t\tif (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) return opts(s)[+k];\n"
++"\t\t\t\treturn Reflect.get(t, k, r === pv.options ? t : r);\n"
++"\t\t\t},\n"
++"\t\t\thas: function (t, k) {\n"
++"\t\t\t\tif (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) return +k < opts(s).length;\n"
++"\t\t\t\treturn k in t;\n"
++"\t\t\t},\n"
++"\t\t\tset: function (t, k, v) {\n"
++"\t\t\t\tif (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) {\n"
++"\t\t\t\t\tvar a = opts(s), i = +k;\n"
++"\t\t\t\t\tif (v === null || v === undefined) { if (a[i]) a[i].remove(); return true; }\n"
++"\t\t\t\t\twhile (a.length < i) { s.appendChild(s.ownerDocument.createElement('option')); a = opts(s); }\n"
++"\t\t\t\t\tif (a[i]) a[i].parentNode.replaceChild(v, a[i]); else s.appendChild(v);\n"
++"\t\t\t\t\treturn true;\n"
++"\t\t\t\t}\n"
++"\t\t\t\treturn Reflect.set(t, k, v);\n"
++"\t\t\t},\n"
++"\t\t\townKeys: function (t) {\n"
++"\t\t\t\tvar k = [], n = opts(s).length;\n"
++"\t\t\t\tfor (var i = 0; i < n; i++) k.push(String(i));\n"
++"\t\t\t\treturn k.concat(Reflect.ownKeys(t));\n"
++"\t\t\t},\n"
++"\t\t\tgetOwnPropertyDescriptor: function (t, k) {\n"
++"\t\t\t\tif (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) {\n"
++"\t\t\t\t\tvar o = opts(s)[+k];\n"
++"\t\t\t\t\treturn o ? { value: o, writable: true, enumerable: true, configurable: true } : undefined;\n"
++"\t\t\t\t}\n"
++"\t\t\t\treturn Reflect.getOwnPropertyDescriptor(t, k);\n"
++"\t\t\t}\n"
++"\t\t}) : base;\n"
++"\t\tPV(pv.options).select = s;\n"
++"\t\treturn pv.options;\n"
++"\t}\n"
++"\tacc(SE, 'options', function () { return collection(this); });\n"
++"\t/* select.form, as input's: the form its form attribute names, else\n"
++"\t * the nearest form around it */\n"
++"\tif (SE && !('form' in SE)) acc(SE, 'form', function () {\n"
++"\t\tif (this.hasAttribute('form')) {\n"
++"\t\t\tvar f = this.ownerDocument.getElementById(this.getAttribute('form'));\n"
++"\t\t\treturn f && f.nodeName === 'FORM' ? f : null;\n"
++"\t\t}\n"
++"\t\treturn this.closest ? this.closest('form') : null;\n"
++"\t});\n"
++"\tacc(SE, 'length', function () { return opts(this).length; }, function (n) {\n"
++"\t\tn = Number(n) >>> 0;\n"
++"\t\tvar a = opts(this);\n"
++"\t\twhile (a.length > n) a.pop().remove();\n"
++"\t\twhile (a.length < n) { var o = this.ownerDocument.createElement('option'); this.appendChild(o); a.push(o); }\n"
++"\t});\n"
++"\tacc(SE, 'type', function () { return multiple(this) ? 'select-multiple' : 'select-one'; });\n"
++"\tacc(SE, 'multiple', function () { return this.hasAttribute('multiple'); },\n"
++"\t\tfunction (v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); });\n"
++"\tacc(SE, 'size', function () { var n = parseInt(this.getAttribute('size'), 10); return n >= 0 ? n : 0; },\n"
++"\t\tfunction (v) { this.setAttribute('size', String(Number(v) >>> 0)); });\n"
++"\tacc(SE, 'selectedIndex', function () { return selIndex(this); }, function (i) {\n"
++"\t\ti = Number(i) | 0;\n"
++"\t\tpick(this, i >= 0 && i < opts(this).length ? i : -1, 0);\n"
++"\t});\n"
++"\tacc(SE, 'value', function () { var i = selIndex(this); return i < 0 ? '' : opts(this)[i].value; },\n"
++"\t\tfunction (v) {\n"
++"\t\t\tvar a = opts(this), want = str(v), i;\n"
++"\t\t\tfor (i = 0; i < a.length; i++) if (a[i].value === want) break;\n"
++"\t\t\tpick(this, i < a.length ? i : -1, 0);\n"
++"\t\t});\n"
++"\tacc(SE, 'selectedOptions', function () {\n"
++"\t\tvar a = sel(this), o = opts(this), r = [];\n"
++"\t\tfor (var i = 0; i < o.length; i++) if (a[i]) r.push(o[i]);\n"
++"\t\treturn r;\n"
++"\t});\n"
++"\top(SE, 'item', 1, function (i) { return opts(this)[i >>> 0] || null; });\n"
++"\top(SE, 'namedItem', 1, function (n) {\n"
++"\t\tvar a = opts(this); n = String(n);\n"
++"\t\tfor (var i = 0; i < a.length; i++) if (a[i].id === n || a[i].getAttribute('name') === n) return a[i];\n"
++"\t\treturn null;\n"
++"\t});\n"
++"\top(SE, 'add', 1, function (el, before) {\n"
++"\t\tvar ref = typeof before === 'number' ? opts(this)[before] : before;\n"
++"\t\tif (ref && ref.parentNode) ref.parentNode.insertBefore(el, ref);\n"
++"\t\telse this.appendChild(el);\n"
++"\t});\n"
++"\tvar elRemove = g.Element && g.Element.prototype && g.Element.prototype.remove;\n"
++"\top(SE, 'remove', 0, function (i) {\n"
++"\t\tif (arguments.length === 0) { if (elRemove) elRemove.call(this); return; }\n"
++"\t\tvar o = opts(this)[Number(i) | 0];\n"
++"\t\tif (o) o.remove();\n"
++"\t});\n"
++"\n"
++"\t/* input: a checkbox or radio without a value attribute is \"on\" */\n"
++"\tvar IP = proto('HTMLInputElement'), p = IP, dsc = null;\n"
++"\twhile (p && !(dsc = GOPD(p, 'value'))) p = Object.getPrototypeOf(p);\n"
++"\tif (IP && dsc && dsc.get && dsc.get !== PRIV.valueOnGet) {\n"
++"\t\tvar vget = GOPD({ get value() {\n"
++"\t\t\tvar t = String(this.getAttribute('type') || '').toLowerCase();\n"
++"\t\t\tif ((t === 'checkbox' || t === 'radio') && !this.hasAttribute('value')) return 'on';\n"
++"\t\t\treturn dsc.get.call(this);\n"
++"\t\t} }, 'value').get;\n"
++"\t\tPRIV.valueOnGet = vget;\n"
++"\t\tD(IP, 'value', { configurable: true, enumerable: true, get: vget,\n"
++"\t\t\tset: dsc.set ? GOPD({ set value(v) { dsc.set.call(this, v); } }, 'value').set : undefined });\n"
++"\t}\n"
++"\n"
++"\t/* the other elements with a value */\n"
++"\tfunction reflect(n, num) {\n"
++"\t\tacc(proto(n), 'value', num ? function () { var v = parseInt(this.getAttribute('value'), 10); return isNaN(v) ? 0 : v; }\n"
++"\t\t\t: function () { return this.getAttribute('value') || ''; },\n"
++"\t\t\tfunction (v) { this.setAttribute('value', num ? String(Number(v) | 0) : str(v)); });\n"
++"\t}\n"
++"\treflect('HTMLButtonElement'); reflect('HTMLDataElement'); reflect('HTMLParamElement'); reflect('HTMLLIElement', true);\n"
++"\t/* meter: a number, within min..max (default 0..1) */\n"
++"\tfunction num(el, n, d) { var v = parseFloat(el.getAttribute(n)); return isFinite(v) ? v : d; }\n"
++"\tacc(proto('HTMLMeterElement'), 'value', function () {\n"
++"\t\tvar mn = num(this, 'min', 0), mx = Math.max(mn, num(this, 'max', 1));\n"
++"\t\treturn Math.min(mx, Math.max(mn, num(this, 'value', 0)));\n"
++"\t}, function (v) { this.setAttribute('value', String(Number(v))); });\n"
++"\tacc(proto('HTMLOutputElement'), 'value', function () { return String(this.textContent || ''); },\n"
++"\t\tfunction (v) { this.textContent = str(v); });\n"
++"\n"
++"\t/* and no other element has one: off every prototype a plain element\n"
++"\t * has (the bridge's shared class prototype among them) */\n"
++"\tvar probe = g.document && g.document.createElement ? g.document.createElement('div') : null;\n"
++"\tfor (p = probe ? Object.getPrototypeOf(probe) : null; p; p = Object.getPrototypeOf(p)) {\n"
++"\t\tvar d = GOPD(p, 'value');\n"
++"\t\tif (d && d.configurable) try { delete p.value; } catch (e) { /* */ }\n"
++"\t}\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index be9df5bfb..8f3f990a8 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10144,4 +10144,239 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		return S0.apply(this, arguments);
+ 	});
+ })();
++/* ---- form controls' values: textarea, select, option (patch 287) --------
++ * `value` was one accessor on every element, its value attribute: a
++ * textarea read "" (its value is its text, then what is typed or set),
++ * and a value a script gave one was not what the field showed or the
++ * form sent; a <select> had no options, selectedIndex, value, length or
++ * type, and option.selected / value / index were missing or read the
++ * attribute; a checkbox without a value attribute read "" (browsers:
++ * "on"); a <div> had a value. Now each interface has its own, as in
++ * browsers (Chromium checked case by case). The engine's state is read
++ * and written through __vitaFormCtl (macsurf_qjs.c): a textarea's value
++ * and a select's selection as HTML decides it -- the last option marked
++ * selected in a drop-down, else its first enabled one (form.c) -- the
++ * same the field shows and the form submits. An input's value stays its
++ * value attribute (the engine's model); a value a script sets shows in
++ * the field and is sent. The polyfill runs again when the real document
++ * arrives, so this is put back on each pass. */
++(function () {
++	var CTL = g.__vitaFormCtl, D = Object.defineProperty, GOPD = Object.getOwnPropertyDescriptor;
++	if (typeof CTL !== 'function') return;
++	function proto(n) { var C = g[n]; return C && C.prototype; }
++	function acc(P, name, get, set) {
++		if (!P) return;
++		var d = { configurable: true, enumerable: true,
++			get: GOPD({ get [name]() { return get.call(this); } }, name).get };
++		if (set) d.set = GOPD({ set [name](v) { set.call(this, v); } }, name).set;
++		D(P, name, d);
++	}
++	function op(P, name, n, f) {
++		if (!P) return;
++		var w = ({ [name]() { return f.apply(this, arguments); } })[name];
++		D(w, 'length', { value: n, configurable: true });
++		D(P, name, { value: w, writable: true, enumerable: true, configurable: true });
++	}
++	function str(v) { return v === null ? '' : String(v); }
++	var ws = /[\t\n\f\r ]+/g;
++	function text(o) { return String(o.textContent || '').replace(ws, ' ').replace(/^ | $/g, ''); }
++
++	/* textarea: its value, its default (the text), the value's length */
++	var TA = proto('HTMLTextAreaElement');
++	function taValue(t) { return String(CTL(t, 'get') || '').replace(/\r\n?/g, '\n'); }
++	acc(TA, 'value', function () { return taValue(this); },
++		function (v) { CTL(this, 'set', str(v).replace(/\r\n?/g, '\n')); });
++	acc(TA, 'defaultValue', function () { return String(this.textContent || ''); },
++		function (v) { this.textContent = str(v); });
++	acc(TA, 'textLength', function () { return taValue(this).length; });
++
++	/* select and its options */
++	var SE = proto('HTMLSelectElement'), OP = proto('HTMLOptionElement');
++	function opts(s) { return Array.prototype.slice.call(s.getElementsByTagName('option')); }
++	function owner(o) {
++		for (var p = o.parentNode, k = 0; p && k < 2; p = p.parentNode, k++) {
++			var t = p.nodeName;
++			if (t === 'SELECT') return p;
++			if (t !== 'OPTGROUP') return null;
++		}
++		return null;
++	}
++	function sel(s) { var a = CTL(s, 'sel'); return a && a.length !== undefined ? a : []; }
++	function multiple(s) { return s.hasAttribute('multiple'); }
++	function pick(s, i, mode) { CTL(s, 'pick', i, mode || 0); }
++	function selIndex(s) { var a = sel(s); for (var i = 0; i < a.length; i++) if (a[i]) return i; return -1; }
++
++	acc(OP, 'text', function () { return text(this); }, function (v) { this.textContent = str(v); });
++	acc(OP, 'value', function () { return this.hasAttribute('value') ? this.getAttribute('value') : text(this); },
++		function (v) { this.setAttribute('value', str(v)); });
++	acc(OP, 'label', function () { return this.hasAttribute('label') ? this.getAttribute('label') : text(this); },
++		function (v) { this.setAttribute('label', str(v)); });
++	acc(OP, 'defaultSelected', function () { return this.hasAttribute('selected'); },
++		function (v) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); });
++	acc(OP, 'disabled', function () { return this.hasAttribute('disabled'); },
++		function (v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); });
++	acc(OP, 'index', function () { var s = owner(this); return s ? opts(s).indexOf(this) : 0; });
++	acc(OP, 'form', function () { var s = owner(this); return s ? s.form || null : null; });
++	acc(OP, 'selected', function () {
++		var s = owner(this);
++		if (!s) return this.hasAttribute('selected');
++		return !!sel(s)[opts(s).indexOf(this)];
++	}, function (v) {
++		var s = owner(this), i;
++		if (!s) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); return; }
++		i = opts(s).indexOf(this);
++		pick(s, i, v ? (multiple(s) ? 1 : 0) : 2);
++	});
++
++	/* HTMLOptionsCollection: the select's options, live, by index too */
++	var OC = g.HTMLOptionsCollection;
++	if (!OC) {
++		OC = function HTMLOptionsCollection() { throw new TypeError('Illegal constructor'); };
++		try { D(OC.prototype, Symbol.toStringTag, { value: 'HTMLOptionsCollection', configurable: true }); } catch (e) { /* */ }
++		if (g.HTMLCollection && g.HTMLCollection.prototype) try { Object.setPrototypeOf(OC.prototype, g.HTMLCollection.prototype); } catch (e) { /* */ }
++		D(g, 'HTMLOptionsCollection', { value: OC, writable: true, configurable: true });
++	}
++	var OCP = OC.prototype;
++	function ocSel(c) { return PV(c).select; }
++	acc(OCP, 'length', function () { return opts(ocSel(this)).length; },
++		function (n) { ocSel(this).length = n; });
++	acc(OCP, 'selectedIndex', function () { return ocSel(this).selectedIndex; },
++		function (i) { ocSel(this).selectedIndex = i; });
++	op(OCP, 'item', 1, function (i) { return opts(ocSel(this))[i >>> 0] || null; });
++	op(OCP, 'namedItem', 1, function (n) { return ocSel(this).namedItem(n); });
++	op(OCP, 'add', 1, function (el, before) { ocSel(this).add(el, before); });
++	op(OCP, 'remove', 1, function (i) { ocSel(this).remove(i); });
++	try { D(OCP, Symbol.iterator, { value: Array.prototype[Symbol.iterator], writable: true, configurable: true }); } catch (e) { /* */ }
++	function collection(s) {
++		var pv = PV(s);
++		if (pv.options) return pv.options;
++		var base = Object.create(OCP);
++		PV(base).select = s;	/* and the Proxy below: methods get it as this */
++		pv.options = typeof Proxy === 'function' ? new Proxy(base, {
++			get: function (t, k, r) {
++				if (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) return opts(s)[+k];
++				return Reflect.get(t, k, r === pv.options ? t : r);
++			},
++			has: function (t, k) {
++				if (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) return +k < opts(s).length;
++				return k in t;
++			},
++			set: function (t, k, v) {
++				if (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) {
++					var a = opts(s), i = +k;
++					if (v === null || v === undefined) { if (a[i]) a[i].remove(); return true; }
++					while (a.length < i) { s.appendChild(s.ownerDocument.createElement('option')); a = opts(s); }
++					if (a[i]) a[i].parentNode.replaceChild(v, a[i]); else s.appendChild(v);
++					return true;
++				}
++				return Reflect.set(t, k, v);
++			},
++			ownKeys: function (t) {
++				var k = [], n = opts(s).length;
++				for (var i = 0; i < n; i++) k.push(String(i));
++				return k.concat(Reflect.ownKeys(t));
++			},
++			getOwnPropertyDescriptor: function (t, k) {
++				if (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) {
++					var o = opts(s)[+k];
++					return o ? { value: o, writable: true, enumerable: true, configurable: true } : undefined;
++				}
++				return Reflect.getOwnPropertyDescriptor(t, k);
++			}
++		}) : base;
++		PV(pv.options).select = s;
++		return pv.options;
++	}
++	acc(SE, 'options', function () { return collection(this); });
++	/* select.form, as input's: the form its form attribute names, else
++	 * the nearest form around it */
++	if (SE && !('form' in SE)) acc(SE, 'form', function () {
++		if (this.hasAttribute('form')) {
++			var f = this.ownerDocument.getElementById(this.getAttribute('form'));
++			return f && f.nodeName === 'FORM' ? f : null;
++		}
++		return this.closest ? this.closest('form') : null;
++	});
++	acc(SE, 'length', function () { return opts(this).length; }, function (n) {
++		n = Number(n) >>> 0;
++		var a = opts(this);
++		while (a.length > n) a.pop().remove();
++		while (a.length < n) { var o = this.ownerDocument.createElement('option'); this.appendChild(o); a.push(o); }
++	});
++	acc(SE, 'type', function () { return multiple(this) ? 'select-multiple' : 'select-one'; });
++	acc(SE, 'multiple', function () { return this.hasAttribute('multiple'); },
++		function (v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); });
++	acc(SE, 'size', function () { var n = parseInt(this.getAttribute('size'), 10); return n >= 0 ? n : 0; },
++		function (v) { this.setAttribute('size', String(Number(v) >>> 0)); });
++	acc(SE, 'selectedIndex', function () { return selIndex(this); }, function (i) {
++		i = Number(i) | 0;
++		pick(this, i >= 0 && i < opts(this).length ? i : -1, 0);
++	});
++	acc(SE, 'value', function () { var i = selIndex(this); return i < 0 ? '' : opts(this)[i].value; },
++		function (v) {
++			var a = opts(this), want = str(v), i;
++			for (i = 0; i < a.length; i++) if (a[i].value === want) break;
++			pick(this, i < a.length ? i : -1, 0);
++		});
++	acc(SE, 'selectedOptions', function () {
++		var a = sel(this), o = opts(this), r = [];
++		for (var i = 0; i < o.length; i++) if (a[i]) r.push(o[i]);
++		return r;
++	});
++	op(SE, 'item', 1, function (i) { return opts(this)[i >>> 0] || null; });
++	op(SE, 'namedItem', 1, function (n) {
++		var a = opts(this); n = String(n);
++		for (var i = 0; i < a.length; i++) if (a[i].id === n || a[i].getAttribute('name') === n) return a[i];
++		return null;
++	});
++	op(SE, 'add', 1, function (el, before) {
++		var ref = typeof before === 'number' ? opts(this)[before] : before;
++		if (ref && ref.parentNode) ref.parentNode.insertBefore(el, ref);
++		else this.appendChild(el);
++	});
++	var elRemove = g.Element && g.Element.prototype && g.Element.prototype.remove;
++	op(SE, 'remove', 0, function (i) {
++		if (arguments.length === 0) { if (elRemove) elRemove.call(this); return; }
++		var o = opts(this)[Number(i) | 0];
++		if (o) o.remove();
++	});
++
++	/* input: a checkbox or radio without a value attribute is "on" */
++	var IP = proto('HTMLInputElement'), p = IP, dsc = null;
++	while (p && !(dsc = GOPD(p, 'value'))) p = Object.getPrototypeOf(p);
++	if (IP && dsc && dsc.get && dsc.get !== PRIV.valueOnGet) {
++		var vget = GOPD({ get value() {
++			var t = String(this.getAttribute('type') || '').toLowerCase();
++			if ((t === 'checkbox' || t === 'radio') && !this.hasAttribute('value')) return 'on';
++			return dsc.get.call(this);
++		} }, 'value').get;
++		PRIV.valueOnGet = vget;
++		D(IP, 'value', { configurable: true, enumerable: true, get: vget,
++			set: dsc.set ? GOPD({ set value(v) { dsc.set.call(this, v); } }, 'value').set : undefined });
++	}
++
++	/* the other elements with a value */
++	function reflect(n, num) {
++		acc(proto(n), 'value', num ? function () { var v = parseInt(this.getAttribute('value'), 10); return isNaN(v) ? 0 : v; }
++			: function () { return this.getAttribute('value') || ''; },
++			function (v) { this.setAttribute('value', num ? String(Number(v) | 0) : str(v)); });
++	}
++	reflect('HTMLButtonElement'); reflect('HTMLDataElement'); reflect('HTMLParamElement'); reflect('HTMLLIElement', true);
++	/* meter: a number, within min..max (default 0..1) */
++	function num(el, n, d) { var v = parseFloat(el.getAttribute(n)); return isFinite(v) ? v : d; }
++	acc(proto('HTMLMeterElement'), 'value', function () {
++		var mn = num(this, 'min', 0), mx = Math.max(mn, num(this, 'max', 1));
++		return Math.min(mx, Math.max(mn, num(this, 'value', 0)));
++	}, function (v) { this.setAttribute('value', String(Number(v))); });
++	acc(proto('HTMLOutputElement'), 'value', function () { return String(this.textContent || ''); },
++		function (v) { this.textContent = str(v); });
++
++	/* and no other element has one: off every prototype a plain element
++	 * has (the bridge's shared class prototype among them) */
++	var probe = g.document && g.document.createElement ? g.document.createElement('div') : null;
++	for (p = probe ? Object.getPrototypeOf(probe) : null; p; p = Object.getPrototypeOf(p)) {
++		var d = GOPD(p, 'value');
++		if (d && d.configurable) try { delete p.value; } catch (e) { /* */ }
++	}
++})();
+ })(this);

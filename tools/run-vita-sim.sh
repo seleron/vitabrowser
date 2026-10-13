@@ -330,6 +330,7 @@ NET-js-node-shape http://127.0.0.1:$HP/JS-node-shape.html
 NET-js-descriptors http://127.0.0.1:$HP/JS-descriptors.html
 NET-js-timer-nesting http://127.0.0.1:$HP/JS-timer-nesting.html
 NET-js-resource-timing http://127.0.0.1:$HP/JS-resource-timing.html
+NET-js-form-values http://127.0.0.1:$HP/JS-form-values.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -843,7 +844,8 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-builtin-shape BSHAPE 8" "js-api-protos APIPROTO 7" \
 	 "js-window-order WINORDER 5" "js-document-shape DOCSHAPE 6" \
 	 "js-node-shape NODESHAPE 6" "js-descriptors DESCRIPTORS 7" \
-	 "js-timer-nesting TIMERNEST 4" "js-resource-timing RESTIMING 9"; do
+	 "js-timer-nesting TIMERNEST 4" "js-resource-timing RESTIMING 9" \
+	 "js-form-values FORMVAL 8"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
@@ -1235,7 +1237,10 @@ grep -q 'page NET-dns-hang settled' "$R/log.txt" || dbad=$((dbad + 1))
 # dirname entry, a disabled fieldset's control sent, a form="" control
 # missing, the first submit button sent with no submitter, an image
 # submitter abandoning the submission, windows-1252 "?" for the euro and
-# for what it lacks, an unknown file type sent as text/plain.
+# for what it lacks, an unknown file type sent as text/plain. Patch 287
+# ("values"): what a script set -- a textarea's value, a select's value,
+# an option selected -- is what is sent; a drop-down with two options
+# marked sends the last (it sent both).
 echo "== scriptless form submissions =="
 FS="$OUT/forms"
 rm -rf "$FS"; mkdir -p "$FS/ux0:data/VitaBrowser"
@@ -1246,7 +1251,7 @@ printf 'upload line 1\r\nline 2\n\000\001\376\377 end' > "$FU"
 FB="http://127.0.0.1:$HP"
 printf 'settle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-form.html\nsettle 3000\ntap 160 135\nsettle 3000\nnav %s/HTML-multipart-1252.html\nsettle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-upload.html\nsettle 3000\ntap 160 65\nsettle 1500\ntap 160 135\nsettle 3000\n' \
 	"$FB" "$FB" "$FB" > "$FS/script.txt"
-for c in img imgnoname nosub submit button; do
+for c in img imgnoname nosub submit button values; do
 	printf 'nav %s/JS-form-submitters.html?%s\nsettle 3000\n' "$FB" "$c" >> "$FS/script.txt"
 done
 echo quit >> "$FS/script.txt"
@@ -1265,7 +1270,7 @@ for w in "multipart ok f3b471b28781" "urlencoded ok 7e9ed1917f53" \
 	 "w1252 ok 01804f0f31bf" "upload ok a866dd8b3405" \
 	 "img ok f147644a4326" "imgnoname ok 9663aca848e0" \
 	 "nosub ok 22de21b23e38" "submit ok 22de21b23e38" \
-	 "button ok 0ded7fa40b3c"; do
+	 "button ok 0ded7fa40b3c" "values ok 6c222d589e0b"; do
 	set -- $w
 	g=$(printf '%s\n' "$fgot" | grep "^FORMCHECK $1 " | tail -1)
 	echo "  $1: ${g:-no submission} (Chromium: FORMCHECK $w)"
