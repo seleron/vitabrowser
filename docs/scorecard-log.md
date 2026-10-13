@@ -4,6 +4,44 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — run 37 build, fresh Chrome reference (r51-full-267-fresh)
+
+No engine change: the run 37 hand-off build (patches 168-267, restaged
+from c7b26d1, full gate green) scored against a **fresh** Chrome
+reference, as r49 asked -- its BBC and Hacker News references were two
+days stale. All 21 sites loaded, JS error counts unchanged from r49;
+oldreddit (ours and Chrome's both "Welcome to Reddit") and ddglite
+(Chrome's side walled) stay out of the tier means as before.
+
+| tier | r49 (r45 ref) | r51 (fresh ref) |
+|---|---|---|
+| static | 86.6 | 86.6 |
+| wiki | 85.1 | 88.2 |
+| news | 82.3 | 85.9 |
+| forum | 79.9 | 87.7 |
+| wordpress | 77.3 | 77.3 |
+| jquery | 88.6 | 88.6 |
+| docs | 82.3 | 82.3 |
+| search | 78.6 | 79.7 |
+| spa | 78.2 | 78.2 |
+| **all** | **81.8** | **83.7** |
+
+| site | r49 | r51 | note |
+|---|---|---|---|
+| hackernews | 75.3 | 89.4 | the stale reference: r50's fresh one gave 91.0; text 0.96 now (the front page turned over) |
+| bbc | 80.4 | 89.4 | the stale reference (r49 checked 89.6 against a fresh one) |
+| wikipedia | 81.6 | 87.9 | no fundraising banner this load (served at random) |
+| cnnlite | 85.5 | 88.8 | live headlines |
+| stackoverflow | 84.6 | 85.9 | still clears the challenge on the first load |
+| guardian | 80.5 | 81.4 | |
+| rte, google, ddglite, oldreddit | | +1.1 to +1.4 | live drift |
+
+Seven references came back byte-identical to r45's (github, youtube,
+claude, mdn, jquery, wpnews, archwiki): those pages have not changed, and
+their scores are r49's to the digit. So the +1.9 mean is all reference
+freshness and live content, not this build -- r51 is the baseline for
+the next change (`--reuse-ref r51-full-267-fresh`).
+
 ## 2026-10-13 — patches 260-267: Cloudflare's challenge passes (r49-full-267)
 
 Chosen from r45 (mean 80.1): the lowest tier was forum (54.9), and its
