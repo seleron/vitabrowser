@@ -1,0 +1,589 @@
+# netsurf: named access -- form.elements.namedItem and the
+# HTMLFormControlsCollection, RadioNodeList, form[name], document.forms,
+# document[name] (patch 288)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 287)
+#
+# form.elements was a new Array of the form's descendants on every read
+# (querySelectorAll): no namedItem (doc 10, 283's "found, not fixed"), no
+# elements.q, image buttons in it, a control outside the form
+# (form="id") missing. form.q, form[0], form.length, document.forms.myform
+# and document.myform were undefined -- the classic DOM older pages script
+# forms with (document.myform.q.value). As in Chromium (checked case by
+# case), vita_polyfill.js "named access":
+#
+#  - form.elements: an HTMLFormControlsCollection, the same object each
+#    read, live -- the listed elements (button, fieldset, input, object,
+#    output, select, textarea) whose form owner is the form, image buttons
+#    not -- by index, by id or name, namedItem, item, iterable; several
+#    sharing a name are a RadioNodeList (live; value: the checked radio's,
+#    setting it checks the radio with that value).
+#  - a form by name (its controls, else its images) and by index, and
+#    form.length.
+#  - document.forms: an HTMLCollection, by index and by name or id
+#    (namedItem).
+#  - document by name: forms, images, embeds, objects with that name, and
+#    objects and named images with that id (several: a collection); an
+#    iframe by name, its window.
+#  - a radio button set checked by script unchecks the others of its group
+#    (the same name and form owner); script-set checked was a plain
+#    attribute, so a group could hold two.
+#
+# Named access comes from a Proxy above HTMLFormElement.prototype and
+# Document.prototype: a lookup that misses every real member arrives there
+# with the form or document it was made on, so the wrappers get no own
+# properties (patches 278-279). Unlike browsers, a form's named controls do
+# not shadow its built-in members (<input name="submit"> leaves
+# form.submit the method) -- only an exotic form object could do that.
+#
+# Not done: a parsed iframe's contentWindow is still the frame shim (no
+# document): the frame's document lives in its own content and script
+# heap, and handing its window to the parent is cross-heap work of its
+# own.
+#
+# Gate: testpages/pages/JS-form-named.html (FORMNAMED 7/7, Chromium 7/7).
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 5d2e1c229..810ddafb5 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10380,5 +10380,268 @@
+ "\t\tif (d && d.configurable) try { delete p.value; } catch (e) { /* */ }\n"
+ "\t}\n"
+ "})();\n"
++"/* ---- named access: form.elements, RadioNodeList, form[name],\n"
++" * document.forms, document[name] (patch 288) --------------------------\n"
++" * form.elements was a new Array of the form's descendants on each read\n"
++" * (querySelectorAll): no namedItem, no elements.q, image buttons in it,\n"
++" * a control outside the form (form=\"id\") missing; form.q, form.length,\n"
++" * form[0], document.forms.myform and document.myform were undefined --\n"
++" * the classic DOM most older pages script forms with\n"
++" * (document.myform.q.value). As in browsers (Chromium checked):\n"
++" *  - form.elements: an HTMLFormControlsCollection, the same object each\n"
++" *    time, live -- the listed elements whose form owner is the form (its\n"
++" *    form attribute names it, else it is inside it), image buttons not;\n"
++" *    by index, by id or name (also namedItem), a RadioNodeList when\n"
++" *    several share it (value: the checked radio's);\n"
++" *  - a form by index and by name (its controls, else its images) and\n"
++" *    form.length;\n"
++" *  - document.forms: an HTMLCollection, by index and by name or id;\n"
++" *  - document by name: its forms, images, embeds, objects with that name\n"
++" *    and objects and named images with that id (several: a collection),\n"
++" *    an iframe by name its window.\n"
++" * Named access comes from a Proxy above the form's and the document's\n"
++" * prototypes: a lookup that misses every real member arrives there with\n"
++" * the form or document it was made on, so no own properties are added\n"
++" * (patches 278-279). */\n"
++"(function () {\n"
++"\tvar d = g.document, D = Object.defineProperty, GOPD = Object.getOwnPropertyDescriptor;\n"
++"\tif (!d || typeof Proxy !== 'function') return;\n"
++"\tvar IDX = /^(0|[1-9][0-9]*)$/;\n"
++"\tfunction proto(n) { var C = g[n]; return C && C.prototype; }\n"
++"\tfunction acc(P, name, get) {\n"
++"\t\tif (!P) return;\n"
++"\t\tD(P, name, { configurable: true, enumerable: true,\n"
++"\t\t\tget: GOPD({ get [name]() { return get.call(this); } }, name).get });\n"
++"\t}\n"
++"\tfunction op(P, name, n, f) {\n"
++"\t\tvar w = ({ [name]() { return f.apply(this, arguments); } })[name];\n"
++"\t\tD(w, 'length', { value: n, configurable: true });\n"
++"\t\tD(P, name, { value: w, writable: true, enumerable: true, configurable: true });\n"
++"\t}\n"
++"\tfunction cls(name, parent) {\n"
++"\t\tvar C = g[name];\n"
++"\t\tif (!C) {\n"
++"\t\t\tC = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];\n"
++"\t\t\tif (parent) try { Object.setPrototypeOf(C.prototype, parent); } catch (e) { /* */ }\n"
++"\t\t\ttry { D(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t\tD(g, name, { value: C, writable: true, configurable: true });\n"
++"\t\t}\n"
++"\t\treturn C.prototype;\n"
++"\t}\n"
++"\tvar HC = proto('HTMLCollection'), NL = proto('NodeList');\n"
++"\tvar FCP = cls('HTMLFormControlsCollection', HC), RNP = cls('RadioNodeList', NL);\n"
++"\tvar LISTED = 'button,fieldset,input,object,output,select,textarea';\n"
++"\n"
++"\t/* a listed element's form owner */\n"
++"\tfunction owner(el) {\n"
++"\t\tif (el.hasAttribute('form')) {\n"
++"\t\t\tvar id = el.getAttribute('form'), f = id ? el.ownerDocument.getElementById(id) : null;\n"
++"\t\t\treturn f && f.nodeName === 'FORM' ? f : null;\n"
++"\t\t}\n"
++"\t\tfor (var p = el.parentNode; p; p = p.parentNode) if (p.nodeName === 'FORM') return p;\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction isImageButton(el) {\n"
++"\t\treturn el.nodeName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'image';\n"
++"\t}\n"
++"\t/* the form's controls, in tree order */\n"
++"\tfunction controls(form) {\n"
++"\t\tvar doc = form.ownerDocument || d, all = doc.querySelector('[form]') ?\n"
++"\t\t\tdoc.querySelectorAll(LISTED) : form.querySelectorAll(LISTED), r = [];\n"
++"\t\tfor (var i = 0; i < all.length; i++)\n"
++"\t\t\tif (!isImageButton(all[i]) && owner(all[i]) === form) r.push(all[i]);\n"
++"\t\treturn r;\n"
++"\t}\n"
++"\tfunction named(el, n) { return el.id === n || el.getAttribute('name') === n; }\n"
++"\n"
++"\t/* a live list over a source of elements */\n"
++"\tfunction live(P, src, extra) {\n"
++"\t\tvar base = Object.create(P);\n"
++"\t\tvar p = new Proxy(base, {\n"
++"\t\t\tget: function (t, k, r) {\n"
++"\t\t\t\tif (typeof k === 'string' && IDX.test(k)) return src()[+k];\n"
++"\t\t\t\tif (k in t || typeof k !== 'string' || !extra) return Reflect.get(t, k, r === p ? t : r);\n"
++"\t\t\t\tvar v = extra(k);\n"
++"\t\t\t\treturn v === null ? undefined : v;\n"
++"\t\t\t},\n"
++"\t\t\thas: function (t, k) {\n"
++"\t\t\t\tif (typeof k === 'string' && IDX.test(k)) return +k < src().length;\n"
++"\t\t\t\treturn k in t || (typeof k === 'string' && !!extra && extra(k) !== null);\n"
++"\t\t\t},\n"
++"\t\t\townKeys: function (t) {\n"
++"\t\t\t\tvar k = [], n = src().length;\n"
++"\t\t\t\tfor (var i = 0; i < n; i++) k.push(String(i));\n"
++"\t\t\t\treturn k.concat(Reflect.ownKeys(t));\n"
++"\t\t\t},\n"
++"\t\t\tgetOwnPropertyDescriptor: function (t, k) {\n"
++"\t\t\t\tif (typeof k === 'string' && IDX.test(k)) {\n"
++"\t\t\t\t\tvar e = src()[+k];\n"
++"\t\t\t\t\treturn e ? { value: e, writable: false, enumerable: true, configurable: true } : undefined;\n"
++"\t\t\t\t}\n"
++"\t\t\t\treturn Reflect.getOwnPropertyDescriptor(t, k);\n"
++"\t\t\t},\n"
++"\t\t\tset: function (t, k, v) {\n"
++"\t\t\t\tif (typeof k === 'string' && IDX.test(k)) return true;\t/* read-only, as browsers */\n"
++"\t\t\t\treturn Reflect.set(t, k, v);\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t\tPV(base).src = PV(p).src = src;\n"
++"\t\treturn p;\n"
++"\t}\n"
++"\tfunction srcOf(c) { var s = PV(c).src; if (!s) throw new TypeError('Illegal invocation'); return s(); }\n"
++"\t[FCP, RNP].forEach(function (P) {\n"
++"\t\tD(P, 'length', { configurable: true, enumerable: true, get: GOPD({ get length() { return srcOf(this).length; } }, 'length').get });\n"
++"\t\top(P, 'item', 1, function (i) { return srcOf(this)[Number(i) >>> 0] || null; });\n"
++"\t\ttry { D(P, Symbol.iterator, { value: Array.prototype[Symbol.iterator], writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t});\n"
++"\tif (!GOPD(RNP, 'forEach')) op(RNP, 'forEach', 1, function (f, t) { srcOf(this).forEach(f, t); });\n"
++"\t/* a radio button checked unchecks the others of its group -- the same\n"
++"\t * name, the same form owner (or none, in the same tree) -- as in\n"
++"\t * browsers; script-set checked was a plain attribute, so a group\n"
++"\t * could hold two (RadioNodeList.value= below relies on it) */\n"
++"\tvar IP = proto('HTMLInputElement'), cdsc = null, cp = IP;\n"
++"\twhile (cp && !(cdsc = GOPD(cp, 'checked'))) cp = Object.getPrototypeOf(cp);\n"
++"\tif (IP && cdsc && cdsc.set && cdsc.set !== PRIV.radioSet) {\n"
++"\t\tvar rset = GOPD({ set checked(v) {\n"
++"\t\t\tcdsc.set.call(this, v);\n"
++"\t\t\tif (!v || String(this.getAttribute('type') || '').toLowerCase() !== 'radio') return;\n"
++"\t\t\tvar n = this.getAttribute('name'), f = owner(this), self = this;\n"
++"\t\t\tif (!n) return;\n"
++"\t\t\tvar scope = f ? controls(f) : Array.prototype.slice.call((this.getRootNode ? this.getRootNode() : this.ownerDocument).querySelectorAll('input'));\n"
++"\t\t\tscope.forEach(function (o) {\n"
++"\t\t\t\tif (o !== self && o.nodeName === 'INPUT' && o.getAttribute('name') === n &&\n"
++"\t\t\t\t    String(o.getAttribute('type') || '').toLowerCase() === 'radio' && owner(o) === f && o.checked)\n"
++"\t\t\t\t\tcdsc.set.call(o, false);\n"
++"\t\t\t});\n"
++"\t\t} }, 'checked').set;\n"
++"\t\tPRIV.radioSet = rset;\n"
++"\t\tD(IP, 'checked', { configurable: true, enumerable: true, get: cdsc.get, set: rset });\n"
++"\t}\n"
++"\n"
++"\t/* RadioNodeList.value: the checked radio button's value */\n"
++"\tD(RNP, 'value', { configurable: true, enumerable: true,\n"
++"\t\tget: GOPD({ get value() {\n"
++"\t\t\tvar a = srcOf(this);\n"
++"\t\t\tfor (var i = 0; i < a.length; i++)\n"
++"\t\t\t\tif (a[i].nodeName === 'INPUT' && String(a[i].getAttribute('type') || '').toLowerCase() === 'radio' && a[i].checked)\n"
++"\t\t\t\t\treturn a[i].hasAttribute('value') ? a[i].getAttribute('value') : 'on';\n"
++"\t\t\treturn '';\n"
++"\t\t} }, 'value').get,\n"
++"\t\tset: GOPD({ set value(v) {\n"
++"\t\t\tvar a = srcOf(this);\n"
++"\t\t\tv = String(v);\n"
++"\t\t\tfor (var i = 0; i < a.length; i++)\n"
++"\t\t\t\tif (a[i].nodeName === 'INPUT' && String(a[i].getAttribute('type') || '').toLowerCase() === 'radio' &&\n"
++"\t\t\t\t    (a[i].hasAttribute('value') ? a[i].getAttribute('value') : 'on') === v) { a[i].checked = true; return; }\n"
++"\t\t} }, 'value').set });\n"
++"\n"
++"\t/* one element, several (a live RadioNodeList), or null */\n"
++"\tfunction one(src) {\n"
++"\t\tvar a = src();\n"
++"\t\treturn a.length === 0 ? null : a.length === 1 ? a[0] : live(RNP, src);\n"
++"\t}\n"
++"\tfunction controlsNamed(form, n) {\n"
++"\t\treturn function () { return controls(form).filter(function (e) { return named(e, n); }); };\n"
++"\t}\n"
++"\top(FCP, 'namedItem', 1, function (n) {\n"
++"\t\tvar form = PV(this).form;\n"
++"\t\tif (!form) throw new TypeError('Illegal invocation');\n"
++"\t\treturn n === '' ? null : one(controlsNamed(form, String(n)));\n"
++"\t});\n"
++"\tvar FP = proto('HTMLFormElement');\n"
++"\tif (FP) {\n"
++"\t\tacc(FP, 'elements', function () {\n"
++"\t\t\tvar pv = PV(this), form = this;\n"
++"\t\t\tif (!pv.elements) {\n"
++"\t\t\t\tpv.elements = live(FCP, function () { return controls(form); },\n"
++"\t\t\t\t\tfunction (k) { return k === '' ? null : one(controlsNamed(form, k)); });\n"
++"\t\t\t\tPV(pv.elements).form = form;\n"
++"\t\t\t}\n"
++"\t\t\treturn pv.elements;\n"
++"\t\t});\n"
++"\t\tacc(FP, 'length', function () { return controls(this).length; });\n"
++"\t}\n"
++"\t/* the form's named and indexed access */\n"
++"\tfunction formNamed(form, n) {\n"
++"\t\tvar v = one(controlsNamed(form, n));\n"
++"\t\tif (v !== null) return v;\n"
++"\t\treturn one(function () {\n"
++"\t\t\treturn Array.prototype.filter.call(form.ownerDocument.getElementsByTagName('img'),\n"
++"\t\t\t\tfunction (i) { return named(i, n) && owner(i) === form; });\n"
++"\t\t});\n"
++"\t}\n"
++"\tfunction isA(o, P) { try { return o !== P && P.isPrototypeOf(o); } catch (e) { return false; } }\n"
++"\tfunction above(P, lookup) {\n"
++"\t\tvar parent = Object.getPrototypeOf(P);\n"
++"\t\tif (!parent || PRIV.namedAbove && PRIV.namedAbove.indexOf(parent) >= 0) return;\n"
++"\t\tvar px = new Proxy(parent, {\n"
++"\t\t\tget: function (t, k, r) {\n"
++"\t\t\t\tif (typeof k === 'string' && !(k in t) && isA(r, P)) {\n"
++"\t\t\t\t\tvar v = lookup(r, k);\n"
++"\t\t\t\t\tif (v !== undefined && v !== null) return v;\n"
++"\t\t\t\t}\n"
++"\t\t\t\treturn Reflect.get(t, k, r);\n"
++"\t\t\t}\n"
++"\t\t});\n"
++"\t\ttry { Object.setPrototypeOf(P, px); } catch (e) { return; }\n"
++"\t\t(PRIV.namedAbove || (PRIV.namedAbove = [])).push(px);\n"
++"\t}\n"
++"\tif (FP) above(FP, function (form, k) {\n"
++"\t\tif (IDX.test(k)) return controls(form)[+k];\n"
++"\t\treturn k === '' ? null : formNamed(form, k);\n"
++"\t});\n"
++"\n"
++"\t/* document.forms, and the document's named access */\n"
++"\tvar DP = proto('Document');\n"
++"\tfunction docForms(doc) { return function () { return Array.prototype.slice.call(doc.getElementsByTagName('form')); }; }\n"
++"\t/* a plain HTMLCollection over our own source (document.forms, several\n"
++"\t * named elements): HTMLCollection.prototype's own length / item work\n"
++"\t * only on the bridge's collections, so these have theirs */\n"
++"\tvar HCP = Object.create(HC || Object.prototype);\n"
++"\tD(HCP, 'length', { configurable: true, enumerable: true, get: GOPD({ get length() { return srcOf(this).length; } }, 'length').get });\n"
++"\top(HCP, 'item', 1, function (i) { return srcOf(this)[Number(i) >>> 0] || null; });\n"
++"\top(HCP, 'namedItem', 1, function (n) {\n"
++"\t\tvar a = srcOf(this); n = String(n);\n"
++"\t\tfor (var i = 0; i < a.length; i++) if (named(a[i], n)) return a[i];\n"
++"\t\treturn null;\n"
++"\t});\n"
++"\ttry { D(HCP, Symbol.iterator, { value: Array.prototype[Symbol.iterator], writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\tif (DP) {\n"
++"\t\tvar dd = null;\n"
++"\t\tfor (var p = d; p && !(dd = GOPD(p, 'forms')); p = Object.getPrototypeOf(p)) { /* where it is */ }\n"
++"\t\tD(p || DP, 'forms', { configurable: true, enumerable: true,\n"
++"\t\t\tget: GOPD({ get forms() {\n"
++"\t\t\t\tvar pv = PV(this), doc = this;\n"
++"\t\t\t\tif (!pv.forms) {\n"
++"\t\t\t\t\tpv.forms = live(HCP, docForms(doc), function (k) {\n"
++"\t\t\t\t\t\tvar a = docForms(doc)().filter(function (f) { return named(f, k); });\n"
++"\t\t\t\t\t\treturn a[0] || null;\n"
++"\t\t\t\t\t});\n"
++"\t\t\t\t}\n"
++"\t\t\t\treturn pv.forms;\n"
++"\t\t\t} }, 'forms').get });\n"
++"\t\tif (HC && !GOPD(HC, 'namedItem')) { /* the bridge's HTMLCollection has its own */ }\n"
++"\t\tabove(DP, function (doc, k) {\n"
++"\t\t\tif (k === '' || IDX.test(k)) return null;\n"
++"\t\t\tvar hits = [], all = doc.querySelectorAll('form[name],img[name],embed[name],object[name],iframe[name],object[id],img[id]');\n"
++"\t\t\tfor (var i = 0; i < all.length; i++) {\n"
++"\t\t\t\tvar e = all[i], t = e.nodeName;\n"
++"\t\t\t\tif (e.getAttribute('name') === k && t !== 'IFRAME') hits.push(e);\n"
++"\t\t\t\telse if (t === 'IFRAME' && e.getAttribute('name') === k) hits.push(e.contentWindow || e);\n"
++"\t\t\t\telse if (e.id === k && (t === 'OBJECT' || (t === 'IMG' && e.hasAttribute('name')))) hits.push(e);\n"
++"\t\t\t}\n"
++"\t\t\tif (hits.length === 0) return null;\n"
++"\t\t\tif (hits.length === 1) return hits[0];\n"
++"\t\t\treturn live(HCP, function () { return hits; });\n"
++"\t\t});\n"
++"\t}\n"
++"\t/* HTMLCollection.namedItem for the forms collection */\n"
++"\tif (HC && !GOPD(HC, 'namedItem'))\n"
++"\t\top(HC, 'namedItem', 1, function (n) {\n"
++"\t\t\tn = String(n);\n"
++"\t\t\tfor (var i = 0; i < this.length; i++) if (this[i] && named(this[i], n)) return this[i];\n"
++"\t\t\treturn null;\n"
++"\t\t});\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 8f3f990a8..06693eb5a 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10379,4 +10379,267 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		if (d && d.configurable) try { delete p.value; } catch (e) { /* */ }
+ 	}
+ })();
++/* ---- named access: form.elements, RadioNodeList, form[name],
++ * document.forms, document[name] (patch 288) --------------------------
++ * form.elements was a new Array of the form's descendants on each read
++ * (querySelectorAll): no namedItem, no elements.q, image buttons in it,
++ * a control outside the form (form="id") missing; form.q, form.length,
++ * form[0], document.forms.myform and document.myform were undefined --
++ * the classic DOM most older pages script forms with
++ * (document.myform.q.value). As in browsers (Chromium checked):
++ *  - form.elements: an HTMLFormControlsCollection, the same object each
++ *    time, live -- the listed elements whose form owner is the form (its
++ *    form attribute names it, else it is inside it), image buttons not;
++ *    by index, by id or name (also namedItem), a RadioNodeList when
++ *    several share it (value: the checked radio's);
++ *  - a form by index and by name (its controls, else its images) and
++ *    form.length;
++ *  - document.forms: an HTMLCollection, by index and by name or id;
++ *  - document by name: its forms, images, embeds, objects with that name
++ *    and objects and named images with that id (several: a collection),
++ *    an iframe by name its window.
++ * Named access comes from a Proxy above the form's and the document's
++ * prototypes: a lookup that misses every real member arrives there with
++ * the form or document it was made on, so no own properties are added
++ * (patches 278-279). */
++(function () {
++	var d = g.document, D = Object.defineProperty, GOPD = Object.getOwnPropertyDescriptor;
++	if (!d || typeof Proxy !== 'function') return;
++	var IDX = /^(0|[1-9][0-9]*)$/;
++	function proto(n) { var C = g[n]; return C && C.prototype; }
++	function acc(P, name, get) {
++		if (!P) return;
++		D(P, name, { configurable: true, enumerable: true,
++			get: GOPD({ get [name]() { return get.call(this); } }, name).get });
++	}
++	function op(P, name, n, f) {
++		var w = ({ [name]() { return f.apply(this, arguments); } })[name];
++		D(w, 'length', { value: n, configurable: true });
++		D(P, name, { value: w, writable: true, enumerable: true, configurable: true });
++	}
++	function cls(name, parent) {
++		var C = g[name];
++		if (!C) {
++			C = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
++			if (parent) try { Object.setPrototypeOf(C.prototype, parent); } catch (e) { /* */ }
++			try { D(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }
++			D(g, name, { value: C, writable: true, configurable: true });
++		}
++		return C.prototype;
++	}
++	var HC = proto('HTMLCollection'), NL = proto('NodeList');
++	var FCP = cls('HTMLFormControlsCollection', HC), RNP = cls('RadioNodeList', NL);
++	var LISTED = 'button,fieldset,input,object,output,select,textarea';
++
++	/* a listed element's form owner */
++	function owner(el) {
++		if (el.hasAttribute('form')) {
++			var id = el.getAttribute('form'), f = id ? el.ownerDocument.getElementById(id) : null;
++			return f && f.nodeName === 'FORM' ? f : null;
++		}
++		for (var p = el.parentNode; p; p = p.parentNode) if (p.nodeName === 'FORM') return p;
++		return null;
++	}
++	function isImageButton(el) {
++		return el.nodeName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'image';
++	}
++	/* the form's controls, in tree order */
++	function controls(form) {
++		var doc = form.ownerDocument || d, all = doc.querySelector('[form]') ?
++			doc.querySelectorAll(LISTED) : form.querySelectorAll(LISTED), r = [];
++		for (var i = 0; i < all.length; i++)
++			if (!isImageButton(all[i]) && owner(all[i]) === form) r.push(all[i]);
++		return r;
++	}
++	function named(el, n) { return el.id === n || el.getAttribute('name') === n; }
++
++	/* a live list over a source of elements */
++	function live(P, src, extra) {
++		var base = Object.create(P);
++		var p = new Proxy(base, {
++			get: function (t, k, r) {
++				if (typeof k === 'string' && IDX.test(k)) return src()[+k];
++				if (k in t || typeof k !== 'string' || !extra) return Reflect.get(t, k, r === p ? t : r);
++				var v = extra(k);
++				return v === null ? undefined : v;
++			},
++			has: function (t, k) {
++				if (typeof k === 'string' && IDX.test(k)) return +k < src().length;
++				return k in t || (typeof k === 'string' && !!extra && extra(k) !== null);
++			},
++			ownKeys: function (t) {
++				var k = [], n = src().length;
++				for (var i = 0; i < n; i++) k.push(String(i));
++				return k.concat(Reflect.ownKeys(t));
++			},
++			getOwnPropertyDescriptor: function (t, k) {
++				if (typeof k === 'string' && IDX.test(k)) {
++					var e = src()[+k];
++					return e ? { value: e, writable: false, enumerable: true, configurable: true } : undefined;
++				}
++				return Reflect.getOwnPropertyDescriptor(t, k);
++			},
++			set: function (t, k, v) {
++				if (typeof k === 'string' && IDX.test(k)) return true;	/* read-only, as browsers */
++				return Reflect.set(t, k, v);
++			}
++		});
++		PV(base).src = PV(p).src = src;
++		return p;
++	}
++	function srcOf(c) { var s = PV(c).src; if (!s) throw new TypeError('Illegal invocation'); return s(); }
++	[FCP, RNP].forEach(function (P) {
++		D(P, 'length', { configurable: true, enumerable: true, get: GOPD({ get length() { return srcOf(this).length; } }, 'length').get });
++		op(P, 'item', 1, function (i) { return srcOf(this)[Number(i) >>> 0] || null; });
++		try { D(P, Symbol.iterator, { value: Array.prototype[Symbol.iterator], writable: true, configurable: true }); } catch (e) { /* */ }
++	});
++	if (!GOPD(RNP, 'forEach')) op(RNP, 'forEach', 1, function (f, t) { srcOf(this).forEach(f, t); });
++	/* a radio button checked unchecks the others of its group -- the same
++	 * name, the same form owner (or none, in the same tree) -- as in
++	 * browsers; script-set checked was a plain attribute, so a group
++	 * could hold two (RadioNodeList.value= below relies on it) */
++	var IP = proto('HTMLInputElement'), cdsc = null, cp = IP;
++	while (cp && !(cdsc = GOPD(cp, 'checked'))) cp = Object.getPrototypeOf(cp);
++	if (IP && cdsc && cdsc.set && cdsc.set !== PRIV.radioSet) {
++		var rset = GOPD({ set checked(v) {
++			cdsc.set.call(this, v);
++			if (!v || String(this.getAttribute('type') || '').toLowerCase() !== 'radio') return;
++			var n = this.getAttribute('name'), f = owner(this), self = this;
++			if (!n) return;
++			var scope = f ? controls(f) : Array.prototype.slice.call((this.getRootNode ? this.getRootNode() : this.ownerDocument).querySelectorAll('input'));
++			scope.forEach(function (o) {
++				if (o !== self && o.nodeName === 'INPUT' && o.getAttribute('name') === n &&
++				    String(o.getAttribute('type') || '').toLowerCase() === 'radio' && owner(o) === f && o.checked)
++					cdsc.set.call(o, false);
++			});
++		} }, 'checked').set;
++		PRIV.radioSet = rset;
++		D(IP, 'checked', { configurable: true, enumerable: true, get: cdsc.get, set: rset });
++	}
++
++	/* RadioNodeList.value: the checked radio button's value */
++	D(RNP, 'value', { configurable: true, enumerable: true,
++		get: GOPD({ get value() {
++			var a = srcOf(this);
++			for (var i = 0; i < a.length; i++)
++				if (a[i].nodeName === 'INPUT' && String(a[i].getAttribute('type') || '').toLowerCase() === 'radio' && a[i].checked)
++					return a[i].hasAttribute('value') ? a[i].getAttribute('value') : 'on';
++			return '';
++		} }, 'value').get,
++		set: GOPD({ set value(v) {
++			var a = srcOf(this);
++			v = String(v);
++			for (var i = 0; i < a.length; i++)
++				if (a[i].nodeName === 'INPUT' && String(a[i].getAttribute('type') || '').toLowerCase() === 'radio' &&
++				    (a[i].hasAttribute('value') ? a[i].getAttribute('value') : 'on') === v) { a[i].checked = true; return; }
++		} }, 'value').set });
++
++	/* one element, several (a live RadioNodeList), or null */
++	function one(src) {
++		var a = src();
++		return a.length === 0 ? null : a.length === 1 ? a[0] : live(RNP, src);
++	}
++	function controlsNamed(form, n) {
++		return function () { return controls(form).filter(function (e) { return named(e, n); }); };
++	}
++	op(FCP, 'namedItem', 1, function (n) {
++		var form = PV(this).form;
++		if (!form) throw new TypeError('Illegal invocation');
++		return n === '' ? null : one(controlsNamed(form, String(n)));
++	});
++	var FP = proto('HTMLFormElement');
++	if (FP) {
++		acc(FP, 'elements', function () {
++			var pv = PV(this), form = this;
++			if (!pv.elements) {
++				pv.elements = live(FCP, function () { return controls(form); },
++					function (k) { return k === '' ? null : one(controlsNamed(form, k)); });
++				PV(pv.elements).form = form;
++			}
++			return pv.elements;
++		});
++		acc(FP, 'length', function () { return controls(this).length; });
++	}
++	/* the form's named and indexed access */
++	function formNamed(form, n) {
++		var v = one(controlsNamed(form, n));
++		if (v !== null) return v;
++		return one(function () {
++			return Array.prototype.filter.call(form.ownerDocument.getElementsByTagName('img'),
++				function (i) { return named(i, n) && owner(i) === form; });
++		});
++	}
++	function isA(o, P) { try { return o !== P && P.isPrototypeOf(o); } catch (e) { return false; } }
++	function above(P, lookup) {
++		var parent = Object.getPrototypeOf(P);
++		if (!parent || PRIV.namedAbove && PRIV.namedAbove.indexOf(parent) >= 0) return;
++		var px = new Proxy(parent, {
++			get: function (t, k, r) {
++				if (typeof k === 'string' && !(k in t) && isA(r, P)) {
++					var v = lookup(r, k);
++					if (v !== undefined && v !== null) return v;
++				}
++				return Reflect.get(t, k, r);
++			}
++		});
++		try { Object.setPrototypeOf(P, px); } catch (e) { return; }
++		(PRIV.namedAbove || (PRIV.namedAbove = [])).push(px);
++	}
++	if (FP) above(FP, function (form, k) {
++		if (IDX.test(k)) return controls(form)[+k];
++		return k === '' ? null : formNamed(form, k);
++	});
++
++	/* document.forms, and the document's named access */
++	var DP = proto('Document');
++	function docForms(doc) { return function () { return Array.prototype.slice.call(doc.getElementsByTagName('form')); }; }
++	/* a plain HTMLCollection over our own source (document.forms, several
++	 * named elements): HTMLCollection.prototype's own length / item work
++	 * only on the bridge's collections, so these have theirs */
++	var HCP = Object.create(HC || Object.prototype);
++	D(HCP, 'length', { configurable: true, enumerable: true, get: GOPD({ get length() { return srcOf(this).length; } }, 'length').get });
++	op(HCP, 'item', 1, function (i) { return srcOf(this)[Number(i) >>> 0] || null; });
++	op(HCP, 'namedItem', 1, function (n) {
++		var a = srcOf(this); n = String(n);
++		for (var i = 0; i < a.length; i++) if (named(a[i], n)) return a[i];
++		return null;
++	});
++	try { D(HCP, Symbol.iterator, { value: Array.prototype[Symbol.iterator], writable: true, configurable: true }); } catch (e) { /* */ }
++	if (DP) {
++		var dd = null;
++		for (var p = d; p && !(dd = GOPD(p, 'forms')); p = Object.getPrototypeOf(p)) { /* where it is */ }
++		D(p || DP, 'forms', { configurable: true, enumerable: true,
++			get: GOPD({ get forms() {
++				var pv = PV(this), doc = this;
++				if (!pv.forms) {
++					pv.forms = live(HCP, docForms(doc), function (k) {
++						var a = docForms(doc)().filter(function (f) { return named(f, k); });
++						return a[0] || null;
++					});
++				}
++				return pv.forms;
++			} }, 'forms').get });
++		if (HC && !GOPD(HC, 'namedItem')) { /* the bridge's HTMLCollection has its own */ }
++		above(DP, function (doc, k) {
++			if (k === '' || IDX.test(k)) return null;
++			var hits = [], all = doc.querySelectorAll('form[name],img[name],embed[name],object[name],iframe[name],object[id],img[id]');
++			for (var i = 0; i < all.length; i++) {
++				var e = all[i], t = e.nodeName;
++				if (e.getAttribute('name') === k && t !== 'IFRAME') hits.push(e);
++				else if (t === 'IFRAME' && e.getAttribute('name') === k) hits.push(e.contentWindow || e);
++				else if (e.id === k && (t === 'OBJECT' || (t === 'IMG' && e.hasAttribute('name')))) hits.push(e);
++			}
++			if (hits.length === 0) return null;
++			if (hits.length === 1) return hits[0];
++			return live(HCP, function () { return hits; });
++		});
++	}
++	/* HTMLCollection.namedItem for the forms collection */
++	if (HC && !GOPD(HC, 'namedItem'))
++		op(HC, 'namedItem', 1, function (n) {
++			n = String(n);
++			for (var i = 0; i < this.length; i++) if (this[i] && named(this[i], n)) return this[i];
++			return null;
++		});
++})();
+ })(this);

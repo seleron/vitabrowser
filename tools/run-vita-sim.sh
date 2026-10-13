@@ -331,6 +331,7 @@ NET-js-descriptors http://127.0.0.1:$HP/JS-descriptors.html
 NET-js-timer-nesting http://127.0.0.1:$HP/JS-timer-nesting.html
 NET-js-resource-timing http://127.0.0.1:$HP/JS-resource-timing.html
 NET-js-form-values http://127.0.0.1:$HP/JS-form-values.html
+NET-js-form-named http://127.0.0.1:$HP/JS-form-named.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -845,7 +846,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-window-order WINORDER 5" "js-document-shape DOCSHAPE 6" \
 	 "js-node-shape NODESHAPE 6" "js-descriptors DESCRIPTORS 7" \
 	 "js-timer-nesting TIMERNEST 4" "js-resource-timing RESTIMING 9" \
-	 "js-form-values FORMVAL 8"; do
+	 "js-form-values FORMVAL 8" "js-form-named FORMNAMED 7"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
