@@ -1,0 +1,813 @@
+# netsurf: Resource Timing -- each fetch a PerformanceResourceTiming entry
+# on the page's timeline (patch 282)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 281)
+#
+# performance.getEntriesByType('resource') was always empty: nothing
+# recorded a fetch. Wikimedia's network probe (ext.wikimediaEvents
+# networkprobe, run on a sampled page view) fetches each measure-*.wikimedia
+# .org target and reads its entry back with getEntriesByName(url): with
+# none, extractProbeData read a field of undefined, the probe's promise
+# rejected with undefined, and the scorecard logged Wikipedia's "unhandled
+# rejection: undefined". hCaptcha's hsw and other fingerprint scripts walk
+# the resource entries too.
+#
+#  - the engine: the html handler registers each subresource fetch it
+#    starts with the QuickJS bridge (macsurf_rt_begin: <link> stylesheets
+#    "link", scripts "script", images and replaced src "img", CSS
+#    backgrounds "css", detached images -- new Image(), images outside the
+#    tree -- "img"); hlcache reports DONE / ERROR and each handle's release
+#    (macsurf_rt_event, weak no-ops in macsurf_frontend_stubs.c for builds
+#    without the bridge). A finished fetch is an entry kept per document --
+#    URL, initiator, start and end on the engine's clock, body size, HTTP
+#    status, Content-Type, Timing-Allow-Origin -- until the document's
+#    realm reads its timeline
+#    (__vitaResourceTake: times from the realm's time origin, in 100 us
+#    steps as performance.now). A URL is one entry per document, as a
+#    browser's memory cache makes it: the engine fetches a stylesheet
+#    twice (it is discovered again) and rebuilt boxes' images again, from
+#    its cache. Entries die with their document (macsurf_js_notify_content
+#    _freed); at most 250 per document, 1024 in all.
+#  - vita_polyfill.js: the entries are PerformanceResourceTiming objects
+#    (patch 270's interface, which had only the navigation entry) with the
+#    Level 2/3 attributes and toJSON, merged into getEntries,
+#    getEntriesByType('resource') and getEntriesByName (startTime order);
+#    fetch() and XMLHttpRequest are recorded here ("fetch" when the
+#    response arrives, "xmlhttprequest" at loadend); clearResourceTimings /
+#    setResourceTimingBufferSize work on the buffer (250, as browsers;
+#    resourcetimingbufferfull fires when it is full). What the engine does
+#    not measure reads as a browser reports a reused connection: the
+#    network phases equal fetchStart, the response starts when it ends
+#    (subresources) or when headers arrive (fetch), the sizes are the body
+#    as received (transferSize + 300 for the headers, as Chromium). A
+#    cross-origin entry without a Timing-Allow-Origin naming this origin
+#    shows only startTime / fetchStart / responseEnd / duration -- phases,
+#    sizes, nextHopProtocol 0 or "" -- and one neither same-origin nor
+#    CORS (an image or script from elsewhere) no responseStatus or
+#    contentType, as the specification and Chromium (checked field by
+#    field on a localhost-vs-127.0.0.1 image). The polyfill runs again when the real document arrives
+#    and that pass defines fetch anew, so the hooks are put back on each
+#    pass (the buffer is kept from the first).
+#
+# Not recorded: @import-ed stylesheets and fonts (fetched by the CSS
+# handler, not the document), iframes' own documents, navigations;
+# PerformanceObserver still delivers nothing for 'resource'.
+#
+# hCaptcha: hsw's request field pem, {} before (no entries), now carries
+# its api.hcaptcha.com entry as Chromium's does, in Chromium's shape
+# ({csc, csch, cscrt: 0, cscft}: cross-origin, so requestStart reads 0).
+# The demo still refuses (797 bytes); the hsw replay is identical.
+#
+# Wikimedia's own Probenet class, run against the gate server (scratch, not
+# committed): 6 pulses, every one with duration, sizes, status and pulse id,
+# no errors -- the same as Chromium; before, it rejected on the first pulse.
+#
+# Gate: testpages/pages/JS-resource-timing.html (RESTIMING 9/9, Chromium
+# 9/9; the build before passes 0).
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 36e9158a4..ad090afac 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -42,6 +42,9 @@
+ 
+ #include "html/html.h"
+ #include "html/private.h"
++
++/* VitaBrowser patch 282: Resource Timing (macsurf_frontend_stubs.c) */
++void macsurf_rt_begin(void *parent, void *handle, const char *initiator);
+ #include "html/css.h"
+ 
+ #ifdef WITH_QUICKJS
+@@ -601,6 +604,9 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	if (ns_error != NSERROR_OK)
+ 		goto no_memory;
+ 
++	macsurf_rt_begin(&htmlc->base,	/* patch 282 */
++			htmlc->stylesheets[htmlc->stylesheet_count].sheet, "link");
++
+ 	htmlc->stylesheet_count++;
+ 
+ 	htmlc->base.active++;
+diff --git a/content/handlers/html/macsurf_frontend_stubs.c b/content/handlers/html/macsurf_frontend_stubs.c
+index f794e07db..4d26986ea 100644
+--- a/content/handlers/html/macsurf_frontend_stubs.c
++++ b/content/handlers/html/macsurf_frontend_stubs.c
+@@ -409,3 +409,19 @@ __attribute__((weak)) void macsurf_debug_log_reconv_flush(int on)
+ /* Cascade probe flag: html.c sets it around the cascade call for the
+  * frontend's timing probe; nothing functional depends on its value. */
+ int macsurf__cascade_probe_armed = 0;
++
++/* VitaBrowser patch 282: Resource Timing. The QuickJS bridge
++ * (macsurf_qjs.c) records a document's subresource fetches: the html
++ * handler registers each it starts, hlcache reports DONE / ERROR (msg) or
++ * the handle's release (-1). Builds
++ * without the bridge keep these no-ops. */
++__attribute__((weak)) void macsurf_rt_begin(void *parent, void *handle,
++		const char *initiator)
++{
++	(void)parent; (void)handle; (void)initiator;
++}
++
++__attribute__((weak)) void macsurf_rt_event(void *handle, int msg)
++{
++	(void)handle; (void)msg;
++}
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index fca286614..ec314e8b2 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -43,6 +43,9 @@
+ 
+ #include "html/html.h"
+ #include "html/private.h"
++
++/* VitaBrowser patch 282: Resource Timing (macsurf_frontend_stubs.c) */
++void macsurf_rt_begin(void *parent, void *handle, const char *initiator);
+ #include "html/interaction.h"
+ #include "html/box.h"
+ #include "html/box_inspect.h"
+@@ -987,6 +990,9 @@ static bool html_replace_object(struct content_html_object *object, nsurl *url)
+ 	if (error != NSERROR_OK)
+ 		return false;
+ 
++	macsurf_rt_begin(&c->base, object->content,	/* patch 282 */
++			object->background ? "css" : "img");
++
+ 	for (page = c; page != NULL; page = page->page) {
+ 		page->base.active++;
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+@@ -1418,6 +1424,8 @@ html_fetch_object(html_content *c,
+ 		free(object);
+ 		return error != NSERROR_NOMEM;
+ 	}
++	macsurf_rt_begin(&c->base, object->content,	/* patch 282 */
++			background ? "css" : "img");
+ 
+ 	/* fixes978 - ledger, not a log line. The fixes966 per-fetch probe that
+ 	 * lived here has been answered (Stage 0b: the speculative fetch earns
+@@ -1812,6 +1820,8 @@ bool html_image_fetch_detached(struct content *cc, dom_node *node,
+ 		s->h = NULL;
+ 		s->state = 2;
+ 		img_queue(s);
++	} else {
++		macsurf_rt_begin(&c->base, s->h, "img");	/* patch 282 */
+ 	}
+ 	nsurl_unref(url);
+ 	return true;
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index d4a08bb81..43a53e30f 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -43,6 +43,9 @@
+ 
+ #include "html/html.h"
+ #include "html/private.h"
++
++/* VitaBrowser patch 282: Resource Timing (macsurf_frontend_stubs.c) */
++void macsurf_rt_begin(void *parent, void *handle, const char *initiator);
+ #include "netsurf/misc.h"
+ #include "desktop/gui_internal.h"
+ #include "macsurf_debug.h"
+@@ -1208,6 +1211,8 @@ exec_src_script(html_content *c,
+ 					   &child,
+ 					   CONTENT_SCRIPT,
+ 					   &nscript->data.handle);
++	if (ns_error == NSERROR_OK)	/* patch 282 */
++		macsurf_rt_begin(&c->base, nscript->data.handle, "script");
+ 
+ 	/* fixes1253 (#167) - hlcache_handle_retrieve failing here (most
+ 	 * commonly the HTTPS fetcher's ops.setup() finding every
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 21a87089e..83cbf0cfd 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -71,6 +71,9 @@
+ #include "content/fetch.h"
+ #include "content/urldb.h"
+ #include "content/content_protected.h"
++#include "content/hlcache.h"	/* patch 282: Resource Timing */
++#include "netsurf/content.h"	/* patch 282: hlcache_handle_get_url */
++#include "content/llcache.h"	/* patch 282: llcache_handle_get_header */
+ #include "content/content_factory.h"
+ #include "macos9_reconvert.h"
+ #ifdef __vita__
+@@ -3969,6 +3972,200 @@ static JSValue qjs_document_cookie_set(JSContext *ctx, JSValueConst this_val,
+ 	return JS_UNDEFINED;
+ }
+ 
++/* ---- Resource Timing (VitaBrowser patch 282) ----------------------------
++ * A page's fetches as PerformanceResourceTiming entries: the html handler
++ * registers each subresource fetch it starts (macsurf_rt_begin: <link>
++ * stylesheets, scripts, images / objects / CSS backgrounds) and hlcache
++ * reports its completion (macsurf_rt_event); the finished entry waits
++ * here, keyed by its document's content, until that document's realm
++ * reads its timeline (__vitaResourceTake, vita_polyfill.js). fetch() and
++ * XMLHttpRequest are recorded by the polyfill itself. Times are the
++ * engine's clock (macsurf_qjs_get_now); the realm's time origin is taken
++ * off when they are handed over. A URL is one entry per document, as a
++ * browser's memory cache makes it: the engine fetches some again (a
++ * stylesheet is discovered twice, a box tree rebuilt) from its cache, so
++ * an entry stays here, marked handed over, until its document dies. */
++void macsurf_rt_begin(void *parent, void *handle, const char *initiator);
++void macsurf_rt_event(void *handle, int msg);
++
++#define RT_PENDING 512
++#define RT_ENTRIES 1024
++#define RT_PER_DOCUMENT 250	/* a browser's default buffer size */
++struct rt_pending {
++	void *handle;
++	struct content *parent;
++	const char *initiator;
++	double start;
++};
++struct rt_entry {
++	struct content *parent;
++	char *url;
++	const char *initiator;
++	double start, end;
++	long size;
++	long status;
++	char *mime;	/* the response's Content-Type, "" if none */
++	char *tao;	/* its Timing-Allow-Origin, NULL if none */
++	bool taken;	/* handed to the realm */
++};
++static struct rt_pending s_rt_pending[RT_PENDING];
++static unsigned int s_rt_pnext;
++static struct rt_entry s_rt[RT_ENTRIES];
++static int s_rt_n;
++
++static void rt_free(struct rt_entry *e)
++{
++	free(e->url);
++	free(e->mime);
++	free(e->tao);
++}
++
++static void rt_record(struct content *parent, struct hlcache_handle *h,
++		const char *initiator, double start)
++{
++	struct content *c = hlcache_handle_get_content(h);
++	struct nsurl *u = hlcache_handle_get_url(h);
++	struct rt_entry *e;
++	const char *tao;
++	size_t size = 0;
++	int i, mine = 0;
++
++	if (parent == NULL || c == NULL || u == NULL)
++		return;
++	for (i = 0; i < s_rt_n; i++) {
++		if (s_rt[i].parent != parent)
++			continue;
++		if (strcmp(s_rt[i].url, nsurl_access(u)) == 0)
++			return;
++		mine++;
++	}
++	if (mine >= RT_PER_DOCUMENT)
++		return;
++	if (s_rt_n == RT_ENTRIES) {	/* drop the oldest */
++		rt_free(&s_rt[0]);
++		memmove(&s_rt[0], &s_rt[1], sizeof(s_rt[0]) * (RT_ENTRIES - 1));
++		s_rt_n--;
++	}
++	(void)content_get_source_data(h, &size);
++	e = &s_rt[s_rt_n];
++	e->url = strdup(nsurl_access(u));
++	if (e->url == NULL)
++		return;
++	/* the type is the response's Content-Type, as browsers report it
++	 * (the engine's own is sniffed), else the engine's */
++	tao = c->llcache != NULL ?
++		llcache_handle_get_header(c->llcache, "Content-Type") : NULL;
++	e->mime = strdup(tao != NULL ? tao : c->mime_type != NULL ?
++			lwc_string_data(c->mime_type) : "");
++	tao = c->llcache != NULL ?
++		llcache_handle_get_header(c->llcache, "Timing-Allow-Origin") : NULL;
++	e->tao = tao != NULL ? strdup(tao) : NULL;
++	if (e->mime == NULL) {
++		rt_free(e);
++		return;
++	}
++	e->parent = parent;
++	e->initiator = initiator;
++	e->start = start;
++	e->end = macsurf_qjs_get_now();
++	e->size = (long)size;
++	e->status = c->http_code;
++	e->taken = false;
++	s_rt_n++;
++}
++
++/* exported interface documented in macsurf_frontend_stubs.c */
++void macsurf_rt_begin(void *parent, void *handle, const char *initiator)
++{
++	struct rt_pending *p;
++
++	if (parent == NULL || handle == NULL)
++		return;
++	/* a cached content can be caught up to done inside the retrieve */
++	if (hlcache_handle_get_content(handle) != NULL &&
++	    content_get_status(handle) == CONTENT_STATUS_DONE) {
++		rt_record(parent, handle, initiator, macsurf_qjs_get_now());
++		return;
++	}
++	macsurf_rt_event(handle, -1);	/* a handle address used before */
++	p = &s_rt_pending[s_rt_pnext++ % RT_PENDING];
++	p->handle = handle;
++	p->parent = parent;
++	p->initiator = initiator;
++	p->start = macsurf_qjs_get_now();
++}
++
++/* exported interface documented in macsurf_frontend_stubs.c */
++void macsurf_rt_event(void *handle, int msg)
++{
++	int i;
++
++	/* -1: the handle is released (hlcache_handle_release) */
++	if (msg != CONTENT_MSG_DONE && msg != CONTENT_MSG_ERROR && msg != -1)
++		return;
++	for (i = 0; i < RT_PENDING; i++) {
++		struct rt_pending *p = &s_rt_pending[i];
++		if (p->handle != handle)
++			continue;
++		if (msg == CONTENT_MSG_DONE)
++			rt_record(p->parent, handle, p->initiator, p->start);
++		p->handle = NULL;
++	}
++}
++
++static void rt_forget(struct content *c)
++{
++	int i, j = 0;
++
++	for (i = 0; i < RT_PENDING; i++)
++		if (s_rt_pending[i].parent == c)
++			s_rt_pending[i].handle = NULL;
++	for (i = 0; i < s_rt_n; i++) {
++		if (s_rt[i].parent == c) { rt_free(&s_rt[i]); continue; }
++		s_rt[j++] = s_rt[i];
++	}
++	s_rt_n = j;
++}
++
++/* __vitaResourceTake() -> this realm's entries finished since the last
++ * call: [[url, initiatorType, startTime, responseEnd, size, status, type,
++ * Timing-Allow-Origin or null], ...],
++ * times in ms from the realm's time origin, 100 us steps (patch 270) */
++static JSValue qjs_rt_take(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_realm_owner *o = qjs_owner_for_ctx(ctx);
++	JSValue arr = JS_NewArray(ctx);
++	uint32_t n = 0;
++	int i;
++
++	(void)this_val; (void)argc; (void)argv;
++	if (o == NULL || o->content == NULL)
++		return arr;
++	for (i = 0; i < s_rt_n; i++) {
++		struct rt_entry *e = &s_rt[i];
++		if (e->parent != o->content || e->taken)
++			continue;
++		e->taken = true;
++		{
++			JSValue r = JS_NewArray(ctx);
++			JS_SetPropertyUint32(ctx, r, 0, JS_NewString(ctx, e->url));
++			JS_SetPropertyUint32(ctx, r, 1, JS_NewString(ctx, e->initiator));
++			JS_SetPropertyUint32(ctx, r, 2, JS_NewFloat64(ctx,
++				floor((e->start - o->t_origin) * 10.0) / 10.0));
++			JS_SetPropertyUint32(ctx, r, 3, JS_NewFloat64(ctx,
++				floor((e->end - o->t_origin) * 10.0) / 10.0));
++			JS_SetPropertyUint32(ctx, r, 4, JS_NewInt64(ctx, e->size));
++			JS_SetPropertyUint32(ctx, r, 5, JS_NewInt64(ctx, e->status));
++			JS_SetPropertyUint32(ctx, r, 6, JS_NewString(ctx, e->mime));
++			JS_SetPropertyUint32(ctx, r, 7, e->tao != NULL ?
++				JS_NewString(ctx, e->tao) : JS_NULL);
++			JS_SetPropertyUint32(ctx, arr, n++, r);
++		}
++	}
++	return arr;
++}
++
+ /* Stage 1 death-row hook (fixes565, QuickJS port of the Duktape
+  * macsurf_js_notify_content_freed). The owner records intentionally hold raw
+  * content pointers, so clear every matching realm immediately before its
+@@ -3978,6 +4175,7 @@ macsurf_js_notify_content_freed(struct content *c)
+ {
+ 	struct jsheap *h;
+ 	struct qjs_realm_owner *owner;
++	rt_forget(c);	/* patch 282 */
+ 	for (owner = g_qjs_realm_owners; owner != NULL; owner = owner->next) {
+ 		if (owner->content == c) {
+ 			if (g_qjs_document == owner->document)
+@@ -13425,6 +13623,7 @@ static void register_browser_globals(JSContext *ctx)
+ 	/* --- timers --- */
+ 	qjs_set_func(ctx, global, "setTimeout",    qjs_settimeout,  2);
+ 	qjs_set_func(ctx, global, "__msRafTimeout", qjs_raf_timeout, 1);	/* patch 281 */
++	qjs_set_func(ctx, global, "__vitaResourceTake", qjs_rt_take, 0);	/* patch 282 */
+ 	qjs_set_func(ctx, global, "setInterval",   qjs_setinterval, 2);
+ 	qjs_set_func(ctx, global, "clearTimeout",  qjs_cleartimeout, 1);
+ 	qjs_set_func(ctx, global, "clearInterval", qjs_cleartimeout, 1);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 78a96ab45..7f47490ce 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -9014,6 +9014,7 @@
+ "\tvar P = g.performance;\n"
+ "\tif (!P || !isFn(P.now) || PRIV.userTiming) return;\n"
+ "\tvar I = new WeakMap(), marks = [], measures = [];\n"
++"\tPRIV.entryData = I;\t/* patch 282: resource entries are entries too */\n"
+ "\tfunction illegal() { throw new TypeError('Illegal constructor'); }\n"
+ "\tvar Entry = function PerformanceEntry() { illegal(); };\n"
+ "\tvar RT = function PerformanceResourceTiming() { illegal(); };\n"
+@@ -9980,5 +9981,169 @@
+ "\t\t\ttry { Object.setPrototypeOf(sp, g.Storage.prototype); } catch (e) { /* */ }\n"
+ "\t});\n"
+ "})();\n"
++"/* ---- Resource Timing: the page's fetches on its timeline (patch 282) -----\n"
++" * performance.getEntriesByType('resource') was always empty: nothing\n"
++" * recorded a fetch. Wikimedia's network probe fetches a URL and reads its\n"
++" * entry back (getEntriesByName(url)): with none it threw and its promise\n"
++" * rejected, a JS error on Wikipedia whenever the probe ran; and fingerprint\n"
++" * scripts walk the resource entries. Now each fetch is a\n"
++" * PerformanceResourceTiming: the document's stylesheets, scripts, images\n"
++" * and CSS backgrounds from the engine (macsurf_qjs.c, __vitaResourceTake),\n"
++" * fetch() and XMLHttpRequest recorded here. What the engine does not\n"
++" * measure reads as a browser reports a reused connection: the network\n"
++" * phases equal fetchStart, the response starts when it ends (subresources)\n"
++" * or when its headers arrive (fetch), sizes are the body as received\n"
++" * (encoded and decoded alike: the engine decodes as it fetches;\n"
++" * transferSize adds 300 for the headers, as Chromium does). A cross-origin\n"
++" * entry without a Timing-Allow-Origin header that names this origin shows\n"
++" * only its start, end and duration -- the phases and sizes read 0 -- and\n"
++" * one that is neither same-origin nor CORS (an image or script from\n"
++" * elsewhere) no status or type either, as Resource Timing specifies and\n"
++" * browsers do. The buffer holds 250, as a browser's, until\n"
++" * setResourceTimingBufferSize.\n"
++" * The polyfill runs again when the real document arrives, and that pass\n"
++" * defines fetch anew: the buffer is kept from the first pass, the hooks\n"
++" * are put back on each. */\n"
++"(function () {\n"
++"\tvar P = g.performance, PP = P && Object.getPrototypeOf(P), RT = g.PerformanceResourceTiming, E = PRIV.entryData;\n"
++"\tif (!PP || !RT || !RT.prototype || !E) return;\n"
++"\tvar RP = RT.prototype, D = Object.defineProperty, st = PRIV.resourceTiming;\n"
++"\tif (!st) st = PRIV.resourceTiming = { list: [], limit: 250, hooks: {} };\n"
++"\tvar list = st.list, hooks = st.hooks;\n"
++"\tfunction rec(e) {\n"
++"\t\tvar r = E.get(e);\n"
++"\t\tif (r && r.entryType === 'resource') return r;\n"
++"\t\tif (RP.isPrototypeOf(e)) return null;\t/* the navigation entry */\n"
++"\t\tthrow new TypeError('Illegal invocation');\n"
++"\t}\n"
++"\tfunction at(k) { return function (r) { return r[k]; }; }\n"
++"\tfunction timed(k) { return function (r) { return r.tao ? r[k] : 0; }; }\t/* Timing-Allow-Origin */\n"
++"\tfunction zero() { return 0; }\n"
++"\tvar FIELDS = [\n"
++"\t\t['initiatorType', at('initiatorType')], ['deliveryType', function () { return ''; }],\n"
++"\t\t['nextHopProtocol', function (r) { return r.tao ? 'http/1.1' : ''; }],\n"
++"\t\t['renderBlockingStatus', function () { return 'non-blocking'; }],\n"
++"\t\t['contentType', function (r) { return r.open ? r.type : ''; }], ['contentEncoding', function () { return ''; }],\n"
++"\t\t['workerStart', zero], ['redirectStart', zero], ['redirectEnd', zero], ['fetchStart', at('startTime')],\n"
++"\t\t['domainLookupStart', timed('startTime')], ['domainLookupEnd', timed('startTime')],\n"
++"\t\t['connectStart', timed('startTime')],\n"
++"\t\t['secureConnectionStart', function (r) { return r.tao && /^https:/.test(r.name) ? r.startTime : 0; }],\n"
++"\t\t['connectEnd', timed('startTime')], ['requestStart', timed('startTime')], ['responseStart', timed('responseStart')],\n"
++"\t\t['firstInterimResponseStart', zero], ['finalResponseHeadersStart', timed('responseStart')],\n"
++"\t\t['responseEnd', at('responseEnd')], ['transferSize', function (r) { return r.tao && r.size ? r.size + 300 : 0; }],\n"
++"\t\t['encodedBodySize', timed('size')], ['decodedBodySize', timed('size')],\n"
++"\t\t['responseStatus', function (r) { return r.open ? r.status : 0; }], ['serverTiming', function () { return []; }]];\n"
++"\tFIELDS.forEach(function (f) {\n"
++"\t\tif (Object.prototype.hasOwnProperty.call(RP, f[0])) return;\n"
++"\t\tvar k = f[0], fn = f[1];\n"
++"\t\tD(RP, k, { get: Object.getOwnPropertyDescriptor({ get [k]() { var r = rec(this); return r ? fn(r) : undefined; } }, k).get,\n"
++"\t\t\tenumerable: true, configurable: true });\n"
++"\t});\n"
++"\tif (!Object.prototype.hasOwnProperty.call(RP, 'toJSON'))\n"
++"\t\tD(RP, 'toJSON', { value: ({ toJSON() {\n"
++"\t\t\tvar o = { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }, t = this;\n"
++"\t\t\tFIELDS.forEach(function (f) { o[f[0]] = t[f[0]]; });\n"
++"\t\t\treturn o; } }).toJSON, writable: true, enumerable: true, configurable: true });\n"
++"\tfunction add(r) {\n"
++"\t\tif (list.length >= st.limit) {\n"
++"\t\t\ttry { if (typeof P.dispatchEvent === 'function') P.dispatchEvent(new Event('resourcetimingbufferfull')); } catch (e) { /* */ }\n"
++"\t\t\tif (list.length >= st.limit) return;\n"
++"\t\t}\n"
++"\t\tvar e = Object.create(RP);\n"
++"\t\tr.entryType = 'resource';\n"
++"\t\tr.duration = Math.max(0, r.responseEnd - r.startTime);\n"
++"\t\tE.set(e, r);\n"
++"\t\tlist.push(e);\n"
++"\t}\n"
++"\tfunction origin(u) { try { return new URL(u).origin; } catch (e) { return null; } }\n"
++"\tfunction same(u) { var o = origin(u); return o !== null && o !== 'null' && o === origin(g.location.href); }\n"
++"\t/* the Timing-Allow-Origin check: same-origin, or the header has * or this origin */\n"
++"\tfunction allowed(u, tao) {\n"
++"\t\tif (same(u)) return true;\n"
++"\t\tvar me = origin(g.location.href);\n"
++"\t\treturn typeof tao === 'string' && tao.split(',').some(function (v) { v = v.trim(); return v === '*' || v === me; });\n"
++"\t}\n"
++"\tfunction essence(t) { return typeof t === 'string' ? t.split(';')[0].trim().toLowerCase() : ''; }\n"
++"\tfunction pull() {\n"
++"\t\tvar a;\n"
++"\t\ttry { a = typeof g.__vitaResourceTake === 'function' ? g.__vitaResourceTake() : null; } catch (e) { a = null; }\n"
++"\t\tif (!a) return;\n"
++"\t\tfor (var i = 0; i < a.length; i++)\n"
++"\t\t\tadd({ name: a[i][0], initiatorType: a[i][1], startTime: a[i][2], responseStart: a[i][3],\n"
++"\t\t\t\tresponseEnd: a[i][3], size: a[i][4], status: a[i][5] || 200, type: essence(a[i][6]),\n"
++"\t\t\t\ttao: allowed(a[i][0], a[i][7]), open: same(a[i][0]) });\n"
++"\t}\n"
++"\tfunction ordered(a) {\n"
++"\t\treturn a.map(function (e, i) { return [e, i]; }).sort(function (x, y) {\n"
++"\t\t\treturn (x[0].startTime - y[0].startTime) || (x[1] - y[1]);\n"
++"\t\t}).map(function (x) { return x[0]; });\n"
++"\t}\n"
++"\t/* method k of obj as an operation (WebIDL: enumerable, named, its\n"
++"\t * length), unless this file's own is still there */\n"
++"\tfunction op(obj, k, n, f) {\n"
++"\t\tif (hooks[k] && obj[k] === hooks[k]) return;\n"
++"\t\tvar w = ({ [k]() { return f.apply(this, arguments); } })[k];\n"
++"\t\tD(w, 'length', { value: n, configurable: true });\n"
++"\t\tvar d = Object.getOwnPropertyDescriptor(obj, k);\n"
++"\t\tif (d && !d.configurable) return;\n"
++"\t\tD(obj, k, { value: w, writable: true, enumerable: d ? d.enumerable : true, configurable: true });\n"
++"\t\thooks[k] = w;\n"
++"\t}\n"
++"\tfunction was(obj, k) { var f = obj[k]; return typeof f === 'function' && f !== hooks[k] ? f : null; }\n"
++"\tvar gE = was(PP, 'getEntries'), gT = was(PP, 'getEntriesByType'), gN = was(PP, 'getEntriesByName');\n"
++"\tif (gE) op(PP, 'getEntries', 0, function () { pull(); return ordered(gE.call(this).concat(list)); });\n"
++"\tif (gT) op(PP, 'getEntriesByType', 1, function (type) {\n"
++"\t\tpull(); var r = gT.apply(this, arguments);\n"
++"\t\treturn String(type) === 'resource' ? ordered(r.concat(list)) : r;\n"
++"\t});\n"
++"\tif (gN) op(PP, 'getEntriesByName', 1, function (name, type) {\n"
++"\t\tpull(); var r = gN.apply(this, arguments), n = String(name);\n"
++"\t\tvar mine = type === undefined || String(type) === 'resource' ? list.filter(function (e) { return E.get(e).name === n; }) : [];\n"
++"\t\treturn ordered(r.concat(mine));\n"
++"\t});\n"
++"\top(PP, 'clearResourceTimings', 0, function () { pull(); list.length = 0; });\n"
++"\top(PP, 'setResourceTimingBufferSize', 1, function (n) { st.limit = Number(n) >>> 0; });\n"
++"\tfunction abs(u) { try { return new URL(String(u), g.location.href).href; } catch (e) { return String(u); } }\n"
++"\t/* fetch(): an entry when its response arrives */\n"
++"\tvar F0 = was(g, 'fetch');\n"
++"\tif (F0) op(g, 'fetch', 1, function (input, init) {\n"
++"\t\tvar t0 = P.now(), url = abs(g.Request && input instanceof g.Request ? input.url : input);\n"
++"\t\treturn F0.apply(this, arguments).then(function (resp) {\n"
++"\t\t\tvar t1 = P.now(), len = 0, type = '', tao = null;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tlen = Number(resp.headers.get('content-length')) || 0;\n"
++"\t\t\t\ttype = essence(resp.headers.get('content-type'));\n"
++"\t\t\t\ttao = resp.headers.get('timing-allow-origin');\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t\tadd({ name: url, initiatorType: 'fetch', startTime: t0, responseStart: t1, responseEnd: t1, size: len,\n"
++"\t\t\t\tstatus: resp.status, type: type, tao: allowed(url, tao), open: resp.type !== 'opaque' });\n"
++"\t\t\treturn resp;\n"
++"\t\t});\n"
++"\t});\n"
++"\t/* XMLHttpRequest: an entry when it ends with a response */\n"
++"\tvar XP = g.XMLHttpRequest && g.XMLHttpRequest.prototype, O0 = XP && was(XP, 'open'), S0 = XP && was(XP, 'send');\n"
++"\tif (O0) op(XP, 'open', 2, function (method, url) { PV(this).rtUrl = abs(url); return O0.apply(this, arguments); });\n"
++"\tif (S0) op(XP, 'send', 0, function (body) {\n"
++"\t\tvar x = this, pv = PV(x);\n"
++"\t\tif (!pv.rtHooked) {\n"
++"\t\t\tpv.rtHooked = true;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tx.addEventListener('loadend', function () {\n"
++"\t\t\t\t\tvar q = PV(x), t1 = P.now(), n = 0, type = '', tao = null;\n"
++"\t\t\t\t\tif (!q.rtUrl || !x.status) return;\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tn = x.responseType === '' || x.responseType === 'text' ? String(x.responseText).length : (x.response && x.response.byteLength) || 0;\n"
++"\t\t\t\t\t\ttype = essence(x.getResponseHeader('content-type'));\n"
++"\t\t\t\t\t\ttao = x.getResponseHeader('timing-allow-origin');\n"
++"\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t\tadd({ name: q.rtUrl, initiatorType: 'xmlhttprequest', startTime: q.rtStart, responseStart: t1, responseEnd: t1,\n"
++"\t\t\t\t\t\tsize: n, status: x.status, type: type, tao: allowed(q.rtUrl, tao), open: true });\n"
++"\t\t\t\t});\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\tpv.rtStart = P.now();\n"
++"\t\treturn S0.apply(this, arguments);\n"
++"\t});\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 3a33ee157..be9df5bfb 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -9013,6 +9013,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	var P = g.performance;
+ 	if (!P || !isFn(P.now) || PRIV.userTiming) return;
+ 	var I = new WeakMap(), marks = [], measures = [];
++	PRIV.entryData = I;	/* patch 282: resource entries are entries too */
+ 	function illegal() { throw new TypeError('Illegal constructor'); }
+ 	var Entry = function PerformanceEntry() { illegal(); };
+ 	var RT = function PerformanceResourceTiming() { illegal(); };
+@@ -9979,4 +9980,168 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 			try { Object.setPrototypeOf(sp, g.Storage.prototype); } catch (e) { /* */ }
+ 	});
+ })();
++/* ---- Resource Timing: the page's fetches on its timeline (patch 282) -----
++ * performance.getEntriesByType('resource') was always empty: nothing
++ * recorded a fetch. Wikimedia's network probe fetches a URL and reads its
++ * entry back (getEntriesByName(url)): with none it threw and its promise
++ * rejected, a JS error on Wikipedia whenever the probe ran; and fingerprint
++ * scripts walk the resource entries. Now each fetch is a
++ * PerformanceResourceTiming: the document's stylesheets, scripts, images
++ * and CSS backgrounds from the engine (macsurf_qjs.c, __vitaResourceTake),
++ * fetch() and XMLHttpRequest recorded here. What the engine does not
++ * measure reads as a browser reports a reused connection: the network
++ * phases equal fetchStart, the response starts when it ends (subresources)
++ * or when its headers arrive (fetch), sizes are the body as received
++ * (encoded and decoded alike: the engine decodes as it fetches;
++ * transferSize adds 300 for the headers, as Chromium does). A cross-origin
++ * entry without a Timing-Allow-Origin header that names this origin shows
++ * only its start, end and duration -- the phases and sizes read 0 -- and
++ * one that is neither same-origin nor CORS (an image or script from
++ * elsewhere) no status or type either, as Resource Timing specifies and
++ * browsers do. The buffer holds 250, as a browser's, until
++ * setResourceTimingBufferSize.
++ * The polyfill runs again when the real document arrives, and that pass
++ * defines fetch anew: the buffer is kept from the first pass, the hooks
++ * are put back on each. */
++(function () {
++	var P = g.performance, PP = P && Object.getPrototypeOf(P), RT = g.PerformanceResourceTiming, E = PRIV.entryData;
++	if (!PP || !RT || !RT.prototype || !E) return;
++	var RP = RT.prototype, D = Object.defineProperty, st = PRIV.resourceTiming;
++	if (!st) st = PRIV.resourceTiming = { list: [], limit: 250, hooks: {} };
++	var list = st.list, hooks = st.hooks;
++	function rec(e) {
++		var r = E.get(e);
++		if (r && r.entryType === 'resource') return r;
++		if (RP.isPrototypeOf(e)) return null;	/* the navigation entry */
++		throw new TypeError('Illegal invocation');
++	}
++	function at(k) { return function (r) { return r[k]; }; }
++	function timed(k) { return function (r) { return r.tao ? r[k] : 0; }; }	/* Timing-Allow-Origin */
++	function zero() { return 0; }
++	var FIELDS = [
++		['initiatorType', at('initiatorType')], ['deliveryType', function () { return ''; }],
++		['nextHopProtocol', function (r) { return r.tao ? 'http/1.1' : ''; }],
++		['renderBlockingStatus', function () { return 'non-blocking'; }],
++		['contentType', function (r) { return r.open ? r.type : ''; }], ['contentEncoding', function () { return ''; }],
++		['workerStart', zero], ['redirectStart', zero], ['redirectEnd', zero], ['fetchStart', at('startTime')],
++		['domainLookupStart', timed('startTime')], ['domainLookupEnd', timed('startTime')],
++		['connectStart', timed('startTime')],
++		['secureConnectionStart', function (r) { return r.tao && /^https:/.test(r.name) ? r.startTime : 0; }],
++		['connectEnd', timed('startTime')], ['requestStart', timed('startTime')], ['responseStart', timed('responseStart')],
++		['firstInterimResponseStart', zero], ['finalResponseHeadersStart', timed('responseStart')],
++		['responseEnd', at('responseEnd')], ['transferSize', function (r) { return r.tao && r.size ? r.size + 300 : 0; }],
++		['encodedBodySize', timed('size')], ['decodedBodySize', timed('size')],
++		['responseStatus', function (r) { return r.open ? r.status : 0; }], ['serverTiming', function () { return []; }]];
++	FIELDS.forEach(function (f) {
++		if (Object.prototype.hasOwnProperty.call(RP, f[0])) return;
++		var k = f[0], fn = f[1];
++		D(RP, k, { get: Object.getOwnPropertyDescriptor({ get [k]() { var r = rec(this); return r ? fn(r) : undefined; } }, k).get,
++			enumerable: true, configurable: true });
++	});
++	if (!Object.prototype.hasOwnProperty.call(RP, 'toJSON'))
++		D(RP, 'toJSON', { value: ({ toJSON() {
++			var o = { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }, t = this;
++			FIELDS.forEach(function (f) { o[f[0]] = t[f[0]]; });
++			return o; } }).toJSON, writable: true, enumerable: true, configurable: true });
++	function add(r) {
++		if (list.length >= st.limit) {
++			try { if (typeof P.dispatchEvent === 'function') P.dispatchEvent(new Event('resourcetimingbufferfull')); } catch (e) { /* */ }
++			if (list.length >= st.limit) return;
++		}
++		var e = Object.create(RP);
++		r.entryType = 'resource';
++		r.duration = Math.max(0, r.responseEnd - r.startTime);
++		E.set(e, r);
++		list.push(e);
++	}
++	function origin(u) { try { return new URL(u).origin; } catch (e) { return null; } }
++	function same(u) { var o = origin(u); return o !== null && o !== 'null' && o === origin(g.location.href); }
++	/* the Timing-Allow-Origin check: same-origin, or the header has * or this origin */
++	function allowed(u, tao) {
++		if (same(u)) return true;
++		var me = origin(g.location.href);
++		return typeof tao === 'string' && tao.split(',').some(function (v) { v = v.trim(); return v === '*' || v === me; });
++	}
++	function essence(t) { return typeof t === 'string' ? t.split(';')[0].trim().toLowerCase() : ''; }
++	function pull() {
++		var a;
++		try { a = typeof g.__vitaResourceTake === 'function' ? g.__vitaResourceTake() : null; } catch (e) { a = null; }
++		if (!a) return;
++		for (var i = 0; i < a.length; i++)
++			add({ name: a[i][0], initiatorType: a[i][1], startTime: a[i][2], responseStart: a[i][3],
++				responseEnd: a[i][3], size: a[i][4], status: a[i][5] || 200, type: essence(a[i][6]),
++				tao: allowed(a[i][0], a[i][7]), open: same(a[i][0]) });
++	}
++	function ordered(a) {
++		return a.map(function (e, i) { return [e, i]; }).sort(function (x, y) {
++			return (x[0].startTime - y[0].startTime) || (x[1] - y[1]);
++		}).map(function (x) { return x[0]; });
++	}
++	/* method k of obj as an operation (WebIDL: enumerable, named, its
++	 * length), unless this file's own is still there */
++	function op(obj, k, n, f) {
++		if (hooks[k] && obj[k] === hooks[k]) return;
++		var w = ({ [k]() { return f.apply(this, arguments); } })[k];
++		D(w, 'length', { value: n, configurable: true });
++		var d = Object.getOwnPropertyDescriptor(obj, k);
++		if (d && !d.configurable) return;
++		D(obj, k, { value: w, writable: true, enumerable: d ? d.enumerable : true, configurable: true });
++		hooks[k] = w;
++	}
++	function was(obj, k) { var f = obj[k]; return typeof f === 'function' && f !== hooks[k] ? f : null; }
++	var gE = was(PP, 'getEntries'), gT = was(PP, 'getEntriesByType'), gN = was(PP, 'getEntriesByName');
++	if (gE) op(PP, 'getEntries', 0, function () { pull(); return ordered(gE.call(this).concat(list)); });
++	if (gT) op(PP, 'getEntriesByType', 1, function (type) {
++		pull(); var r = gT.apply(this, arguments);
++		return String(type) === 'resource' ? ordered(r.concat(list)) : r;
++	});
++	if (gN) op(PP, 'getEntriesByName', 1, function (name, type) {
++		pull(); var r = gN.apply(this, arguments), n = String(name);
++		var mine = type === undefined || String(type) === 'resource' ? list.filter(function (e) { return E.get(e).name === n; }) : [];
++		return ordered(r.concat(mine));
++	});
++	op(PP, 'clearResourceTimings', 0, function () { pull(); list.length = 0; });
++	op(PP, 'setResourceTimingBufferSize', 1, function (n) { st.limit = Number(n) >>> 0; });
++	function abs(u) { try { return new URL(String(u), g.location.href).href; } catch (e) { return String(u); } }
++	/* fetch(): an entry when its response arrives */
++	var F0 = was(g, 'fetch');
++	if (F0) op(g, 'fetch', 1, function (input, init) {
++		var t0 = P.now(), url = abs(g.Request && input instanceof g.Request ? input.url : input);
++		return F0.apply(this, arguments).then(function (resp) {
++			var t1 = P.now(), len = 0, type = '', tao = null;
++			try {
++				len = Number(resp.headers.get('content-length')) || 0;
++				type = essence(resp.headers.get('content-type'));
++				tao = resp.headers.get('timing-allow-origin');
++			} catch (e) { /* */ }
++			add({ name: url, initiatorType: 'fetch', startTime: t0, responseStart: t1, responseEnd: t1, size: len,
++				status: resp.status, type: type, tao: allowed(url, tao), open: resp.type !== 'opaque' });
++			return resp;
++		});
++	});
++	/* XMLHttpRequest: an entry when it ends with a response */
++	var XP = g.XMLHttpRequest && g.XMLHttpRequest.prototype, O0 = XP && was(XP, 'open'), S0 = XP && was(XP, 'send');
++	if (O0) op(XP, 'open', 2, function (method, url) { PV(this).rtUrl = abs(url); return O0.apply(this, arguments); });
++	if (S0) op(XP, 'send', 0, function (body) {
++		var x = this, pv = PV(x);
++		if (!pv.rtHooked) {
++			pv.rtHooked = true;
++			try {
++				x.addEventListener('loadend', function () {
++					var q = PV(x), t1 = P.now(), n = 0, type = '', tao = null;
++					if (!q.rtUrl || !x.status) return;
++					try {
++						n = x.responseType === '' || x.responseType === 'text' ? String(x.responseText).length : (x.response && x.response.byteLength) || 0;
++						type = essence(x.getResponseHeader('content-type'));
++						tao = x.getResponseHeader('timing-allow-origin');
++					} catch (e) { /* */ }
++					add({ name: q.rtUrl, initiatorType: 'xmlhttprequest', startTime: q.rtStart, responseStart: t1, responseEnd: t1,
++						size: n, status: x.status, type: type, tao: allowed(q.rtUrl, tao), open: true });
++				});
++			} catch (e) { /* */ }
++		}
++		pv.rtStart = P.now();
++		return S0.apply(this, arguments);
++	});
++})();
+ })(this);
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 4ff8922ed..c5055833f 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -337,6 +337,9 @@ static bool hlcache_type_is_acceptable(lwc_string *mime_type,
+  * \param data	Data for message
+  * \param pw	Pointer to private data (hlcache_handle)
+  */
++/* VitaBrowser patch 282: Resource Timing (macsurf_frontend_stubs.c) */
++void macsurf_rt_event(void *handle, int msg);
++
+ static void hlcache_content_callback(struct content *c, content_msg msg,
+ 		const union content_msg_data *data, void *pw)
+ {
+@@ -344,6 +347,8 @@ static void hlcache_content_callback(struct content *c, content_msg msg,
+ 	nserror error = NSERROR_OK;
+ 	hlcache_event event;
+ 
++	macsurf_rt_event(handle, (int)msg);
++
+ 	/* fixes97: dropped - fires for every broadcast forward, dominant. */
+ 
+ 	memset(&event, 0, sizeof(event));
+@@ -494,6 +499,7 @@ static nserror hlcache_find_content(hlcache_retrieval_ctx *ctx,
+ 
+ 			if (ctx->handle->cb != NULL) {
+ 				event.type = CONTENT_MSG_DONE;
++				macsurf_rt_event(ctx->handle, CONTENT_MSG_DONE);
+ 				ctx->handle->cb(ctx->handle, &event,
+ 						ctx->handle->pw);
+ 			}
+@@ -1013,6 +1019,8 @@ nserror hlcache_handle_release(hlcache_handle *handle)
+ 		}
+ 	}
+ 
++	macsurf_rt_event(handle, -1);	/* patch 282: forget an unfinished fetch */
++
+ 	/* fixes450: log every release so we can cross-ref against ZOMBIE / crash */
+ 	macsurf_debug_log_writef(
+ 		"hlcache_release: handle=%p entry=%p",

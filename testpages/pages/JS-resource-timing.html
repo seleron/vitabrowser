@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS resource timing (script not run)</title>
+<link rel="stylesheet" href="JS-resource-timing.css?rt">
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+p { margin: 2px 0; font-size: 12px; }
+</style>
+<script src="JS-resource-timing.js?rt"></script>
+</head>
+<body>
+<div id="sum">RESTIMING: 0/9 passed</div>
+<p id="r1" class="wait">1 waiting</p>
+<p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+<p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+<p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
+<p id="r9" class="wait">9 waiting</p>
+<div id="bg"></div>
+<img src="bs-bmp50.png?rt-img" width="50" height="50" alt="">
+<img id="xo" width="50" height="50" alt="">
+<script>
+/* patch 282: Resource Timing -- every fetch the page makes is a
+ * PerformanceResourceTiming entry on its timeline (getEntries,
+ * getEntriesByType('resource'), getEntriesByName(url)): the stylesheet,
+ * script, image and CSS background, fetch() and XMLHttpRequest. Wikimedia's
+ * network probe reads its fetch's entry back by name. A cross-origin image
+ * (localhost: the same server, another origin) without Timing-Allow-Origin
+ * shows only its start, end and duration. Chromium-verified. */
+(function () {
+	var k = 0, N = 9, base = location.href.replace(/[^\/]*$/, ''),
+	    xo = location.protocol + '//localhost:' + location.port + '/bs-bmp50.png?rt-xo';
+	$('xo').src = xo;
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'RESTIMING: ' + k + '/' + N + ' passed';
+		document.title = 'JS resource timing (' + k + '/' + N + ')';
+	}
+	function check(n, f, text) {
+		try { var r = f(); t(n, r === true, text + (r === true ? '' : ': ' + r)); }
+		catch (e) { t(n, false, text + ': ' + e); }
+	}
+	function one(file, type) {
+		var a = performance.getEntriesByName(base + file);
+		if (a.length !== 1) return 'getEntriesByName gave ' + a.length + ' entries';
+		var e = a[0];
+		if (!(e instanceof PerformanceResourceTiming)) return 'not a PerformanceResourceTiming';
+		if (e.entryType !== 'resource') return 'entryType ' + e.entryType;
+		if (e.initiatorType !== type) return 'initiatorType ' + e.initiatorType;
+		if (!(e.startTime > 0 && e.duration >= 0 && e.responseEnd >= e.startTime &&
+		      e.fetchStart === e.startTime && e.responseStart <= e.responseEnd)) return 'times ' + JSON.stringify(e);
+		if (!(e.decodedBodySize > 0 && e.encodedBodySize > 0 && e.transferSize >= 0)) return 'sizes ' + JSON.stringify(e);
+		if (e.responseStatus !== undefined && e.responseStatus !== 200) return 'status ' + e.responseStatus;
+		return true;
+	}
+	window.addEventListener('load', function () {
+		check(1, function () { return window.rtScriptRan === true && one('JS-resource-timing.js?rt', 'script'); }, 'the script is a "script" entry');
+		check(2, function () { return one('JS-resource-timing.css?rt', 'link'); }, 'the stylesheet is a "link" entry');
+		check(3, function () { return one('bs-bmp50.png?rt-img', 'img'); }, 'the image is an "img" entry');
+		check(4, function () { return one('bs-bmp50.png?rt-bg', 'css'); }, 'the CSS background is a "css" entry');
+		check(9, function () {
+			var a = performance.getEntriesByName(xo), s = performance.getEntriesByName(base + 'bs-bmp50.png?rt-img')[0];
+			if (a.length !== 1) return 'cross-origin: ' + a.length + ' entries';
+			var e = a[0], z = ['domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart',
+				'requestStart', 'responseStart', 'transferSize', 'encodedBodySize', 'decodedBodySize', 'responseStatus'];
+			var nz = z.filter(function (k) { return e[k] !== 0; });
+			if (nz.length) return 'cross-origin, not 0: ' + nz.join(' ');
+			if (!(e.fetchStart === e.startTime && e.responseEnd > 0 && e.duration >= 0)) return 'cross-origin times ' + JSON.stringify(e);
+			if (e.nextHopProtocol !== '' || e.contentType !== '') return 'cross-origin protocol / type ' + e.nextHopProtocol + ' ' + e.contentType;
+			if (s.contentType !== 'image/png' || s.transferSize !== s.encodedBodySize + 300 || s.requestStart < s.startTime)
+				return 'same-origin type ' + s.contentType + ' transfer ' + s.transferSize + ' body ' + s.encodedBodySize;
+			return true;
+		}, 'a cross-origin image shows no phases, sizes, status (no Timing-Allow-Origin)');
+		check(5, function () {
+			var a = performance.getEntriesByType('resource'), all = performance.getEntries();
+			if (a.length < 4) return a.length + ' resource entries';
+			for (var i = 1; i < a.length; i++) if (a[i].startTime < a[i - 1].startTime) return 'not in startTime order';
+			if (a.some(function (e) { return all.indexOf(e) < 0; })) return 'getEntries() lacks them';
+			var j = a[0].toJSON();
+			if (j.entryType !== 'resource' || typeof j.initiatorType !== 'string' || typeof j.decodedBodySize !== 'number') return 'toJSON ' + JSON.stringify(j);
+			if (performance.getEntriesByName(a[0].name, 'mark').length) return 'getEntriesByName(name, "mark") found it';
+			return true;
+		}, 'getEntries / getEntriesByType order them, toJSON');
+		var fu = 'fetch-data.json?rt-fetch';
+		fetch(fu).then(function (r) { return r.blob(); }).then(function () {
+			check(6, function () { return one(fu, 'fetch'); }, 'fetch() is a "fetch" entry, by name once its body is read');
+			var x = new XMLHttpRequest(), xu = 'fetch-data.json?rt-xhr';
+			x.open('GET', xu, true);
+			x.onreadystatechange = function () {
+				if (x.readyState !== 4) return;
+				setTimeout(function () {
+					check(7, function () { return one(xu, 'xmlhttprequest'); }, 'XMLHttpRequest is an "xmlhttprequest" entry');
+					check(8, function () {
+						var n = performance.getEntriesByType('resource').length;
+						performance.clearResourceTimings();
+						var m = performance.getEntriesByType('resource').length;
+						return n >= 6 && m === 0 ? true : n + ' then ' + m + ' after clearResourceTimings()';
+					}, 'clearResourceTimings() empties the buffer');
+				}, 0);
+			};
+			x.send();
+		}, function (e) { t(6, false, 'fetch failed: ' + e); });
+	});
+})();
+</script>
+</body>
+</html>
