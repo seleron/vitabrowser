@@ -1,0 +1,74 @@
+# libdom: a control's form attribute names its form (patch 284)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 283)
+#
+# <input form="f"> outside its form -- or inside another -- belongs to the
+# form whose id it names, and to no form when the id names nothing or not a
+# form (HTML "reset the form owner"). _dom_form_owner, which decides a
+# form's elements (and so what a submission sends), used the parser's
+# record and then the nearest <form> ancestor only: a control outside its
+# form was never submitted, and one naming no form was submitted with its
+# ancestor. The attribute is looked up first now (by id, through the
+# document).
+#
+# Gate (with 283, 285): HTML-multipart-form.html's "outside" control and
+# its "elsewhere" control (form="nosuchform"), in the multipart digest.
+diff --git a/src/html/html_form_element.c b/src/html/html_form_element.c
+index e089644..2ed1001 100644
+--- a/src/html/html_form_element.c
++++ b/src/html/html_form_element.c
+@@ -20,6 +20,8 @@
+ #include "html/html_document.h"
+ 
+ #include "core/node.h"
++#include "core/element.h"	/* patch 284 */
++#include "core/document.h"	/* patch 284 */
+ #include "utils/utils.h"
+ 
+ static const struct dom_element_protected_vtable _protect_vtable = {
+@@ -304,11 +306,45 @@ dom_exception dom_html_form_element_reset(dom_html_form_element *ele)
+  * none, and its owner is then its nearest <form> ancestor, as the HTML
+  * standard has it -- it belonged to no form, so a form a script built
+  * submitted no fields (Cloudflare's challenge answer arrived empty). */
++/* VitaBrowser (patch 284): a control with a form content attribute
++ * belongs to the form whose id that names, and to no form when it names
++ * nothing or something else -- before the parser's record and any
++ * ancestor. A control outside its form (<input form="f">), which HTML
++ * submits with it, was in no form's elements and was never sent. */
+ static struct dom_html_form_element *_dom_form_owner(
+ 		struct dom_node_internal *node, struct dom_html_document *doc,
+ 		struct dom_html_form_element *recorded)
+ {
+ 	struct dom_node_internal *n;
++	dom_string *fid = NULL, *attr = NULL;
++	dom_exception err;
++
++	/* the attribute name, lower case (the element names are not) */
++	if (dom_string_create((const uint8_t *) "form", 4, &attr) != DOM_NO_ERR)
++		attr = NULL;
++	err = attr == NULL ? DOM_NO_MEM_ERR :
++		_dom_element_get_attribute((struct dom_element *) node, attr,
++				&fid);
++	if (attr != NULL)
++		dom_string_unref(attr);
++	if (err == DOM_NO_ERR && fid != NULL) {
++		struct dom_element *el = NULL;
++		struct dom_html_form_element *owner = NULL;
++
++		if (dom_string_byte_length(fid) > 0 &&
++		    _dom_document_get_element_by_id((dom_document *) doc, fid,
++				&el) == DOM_NO_ERR && el != NULL) {
++			struct dom_node_internal *e =
++					(struct dom_node_internal *) el;
++			if (e->name != NULL && dom_string_caseless_isequal(
++					e->name,
++					doc->elements[DOM_HTML_ELEMENT_TYPE_FORM]))
++				owner = (struct dom_html_form_element *) el;
++			dom_node_unref(el);
++		}
++		dom_string_unref(fid);
++		return owner;
++	}
+ 
+ 	if (recorded != NULL)
+ 		return recorded;
