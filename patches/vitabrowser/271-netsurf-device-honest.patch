@@ -1,0 +1,267 @@
+# netsurf: what navigator and screen say about the device, honestly
+# (patch 271)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 270)
+#
+#  - screen was a desktop's 1024x768 (avail 1024x740); it is the Vita's
+#    960x544, all of it the browser's, colorDepth and pixelDepth 24,
+#    availLeft / availTop 0; screen.orientation is landscape-primary at
+#    angle 0 and lock() is NotSupportedError (the screen does not turn).
+#  - navigator.plugins / mimeTypes were undefined: empty PluginArray /
+#    MimeTypeArray, as a browser without plugins or a PDF viewer has
+#    (pdfViewerEnabled is false).
+#  - navigator.permissions.query() said "prompt" for anything -- that the
+#    browser could ask. It cannot grant location, camera, microphone,
+#    notifications, push, sensors, clipboard...: those are "denied";
+#    storage-access and local-network-access are "granted" (nothing here
+#    restricts third-party storage or local-network requests); each in a
+#    PermissionStatus. The names are Chromium's 26 PermissionName values;
+#    any other is a TypeError, as there (claude.ai queries storage-access).
+#  - navigator.clipboard.writeText() / write() resolved though nothing was
+#    copied (there is no clipboard here); they reject with NotAllowedError.
+#  Not added, on purpose: mediaDevices, speechSynthesis, WebGL,
+#  AudioContext, RTCPeerConnection... -- an empty stand-in would make a
+#  page's feature test say the browser has what it has not. (Chromium
+#  without all of those still passes hCaptcha: docs/wasm-hcaptcha-
+#  measurement.md.)
+#
+# Gate: testpages/pages/JS-device-honest.html checks 1-5 (DEVICE, with
+# 272; Chromium 6/6 at a 960x544 viewport -- its permission states are
+# its own, so they are checked by type, and headless Chromium lets
+# orientation.lock() succeed, so lock() is only required to settle).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -14176,7 +14176,11 @@
+ 		"Object.defineProperty(this,'pageYOffset',{configurable:true,"
+ 			"get:function(){return __scrollY();}});"
+ 		"this.devicePixelRatio=1;"
+-		"this.screen={width:1024,height:768,availWidth:1024,availHeight:740,colorDepth:24};"
++		/* VitaBrowser patch 271: the screen is the Vita's, 960x544 in
++		 * 24-bit colour, all of it the browser's (it said 1024x768, a
++		 * desktop's, which no Vita has) */
++		"this.screen={width:960,height:544,availWidth:960,availHeight:544,"
++			"availLeft:0,availTop:0,colorDepth:24,pixelDepth:24};"
+ 		"this.performance={"
+ 			"now:function(){return __macsurf_monotonic_ms();},"
+ 			"getEntriesByType:function(){return [];},"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -9129,6 +9129,106 @@
+ 	define(P, '__vitaUserTiming', true);
+ })();
+ 
++/* ---- what navigator and screen say about the device, honestly (271) ----
++ *  - Plugins: none. navigator.plugins / mimeTypes were undefined; a
++ *    browser without plugins, and without a PDF viewer (pdfViewerEnabled
++ *    is false), has empty PluginArray / MimeTypeArray objects.
++ *  - Permissions: query() answered "prompt" for anything, which says the
++ *    browser could ask. It cannot grant location, camera, microphone,
++ *    notifications, push, sensors, clipboard, ...: those are "denied";
++ *    storage-access and local-network-access are "granted" (nothing here
++ *    restricts either); each in a PermissionStatus. A name Chromium does
++ *    not know is a TypeError, as there.
++ *  - screen.orientation: the Vita's screen is landscape and does not turn
++ *    (landscape-primary, angle 0); lock() is not supported.
++ *  - Clipboard: there is none here, so writeText() / write() reject
++ *    (NotAllowedError) instead of resolving as though the text was copied.
++ * Not added, on purpose: navigator.mediaDevices, speechSynthesis, WebGL,
++ * AudioContext and the like -- this browser has none of them, and an
++ * empty stand-in would make a page's feature test say it has. */
++(function () {
++	var n = g.navigator;
++	if (!n || n.__vitaHonest) return;
++	function illegal() { throw new TypeError('Illegal constructor'); }
++	function iface(name, f, parent) {
++		if (parent) Object.setPrototypeOf(f.prototype, parent.prototype);
++		try { Object.defineProperty(f.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }
++		if (!g[name]) define(g, name, f);
++		return f;
++	}
++	function setNav(k, v) {
++		try { Object.defineProperty(n, k, { value: v, configurable: true, enumerable: true, writable: false }); } catch (e) { /* */ }
++	}
++	var PluginArray = iface('PluginArray', function PluginArray() { illegal(); });
++	var MimeTypeArray = iface('MimeTypeArray', function MimeTypeArray() { illegal(); });
++	iface('Plugin', function Plugin() { illegal(); });
++	iface('MimeType', function MimeType() { illegal(); });
++	[PluginArray, MimeTypeArray].forEach(function (C) {
++		var pr = C.prototype;
++		Object.defineProperty(pr, 'length', { get: function () { return 0; }, enumerable: true, configurable: true });
++		define(pr, 'item', function item(index) { return null; });
++		define(pr, 'namedItem', function namedItem(name) { return null; });
++		pr[Symbol.iterator] = Array.prototype[Symbol.iterator];
++	});
++	define(PluginArray.prototype, 'refresh', function refresh() {});
++	if (n.plugins === undefined) setNav('plugins', Object.create(PluginArray.prototype));
++	if (n.mimeTypes === undefined) setNav('mimeTypes', Object.create(MimeTypeArray.prototype));
++
++	var ET = g.EventTarget;
++	function eventTarget(proto) {
++		var o = isFn(ET) ? new ET() : {};
++		Object.setPrototypeOf(o, proto);
++		return o;
++	}
++	var PS = iface('PermissionStatus', function PermissionStatus() { illegal(); }, ET);
++	var Perms = iface('Permissions', function Permissions() { illegal(); });
++	/* Chromium's PermissionName values. This engine restricts neither
++	 * third-party storage nor requests to the local network, so those two
++	 * are granted; it can grant none of the rest. */
++	var NAMES = ['accelerometer', 'background-fetch', 'background-sync', 'camera',
++		'captured-surface-control', 'clipboard-read', 'clipboard-write', 'display-capture',
++		'geolocation', 'gyroscope', 'idle-detection', 'keyboard-lock', 'local-fonts',
++		'local-network-access', 'magnetometer', 'microphone', 'midi', 'notifications',
++		'payment-handler', 'periodic-background-sync', 'persistent-storage', 'pointer-lock',
++		'push', 'screen-wake-lock', 'storage-access', 'window-management'];
++	var GRANTED = { 'storage-access': 1, 'local-network-access': 1 };
++	define(Perms.prototype, 'query', function query(permissionDesc) {
++		if (arguments.length < 1)
++			return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
++		var name = permissionDesc && permissionDesc.name;
++		if (NAMES.indexOf(String(name)) < 0)
++			return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '" + name + "' is not a valid enum value of type PermissionName."));
++		var st = eventTarget(PS.prototype);
++		Object.defineProperty(st, 'name', { value: String(name), enumerable: true });
++		Object.defineProperty(st, 'state', { value: GRANTED[name] ? 'granted' : 'denied', enumerable: true });
++		st.onchange = null;
++		return Promise.resolve(st);
++	});
++	setNav('permissions', Object.create(Perms.prototype));
++
++	var s = g.screen;
++	if (s && s.orientation === undefined) {
++		var SO = iface('ScreenOrientation', function ScreenOrientation() { illegal(); }, ET);
++		var o = eventTarget(SO.prototype);
++		Object.defineProperty(SO.prototype, 'type', { get: function () { return 'landscape-primary'; }, enumerable: true, configurable: true });
++		Object.defineProperty(SO.prototype, 'angle', { get: function () { return 0; }, enumerable: true, configurable: true });
++		define(SO.prototype, 'lock', function lock(orientation) {
++			return Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError'));
++		});
++		define(SO.prototype, 'unlock', function unlock() {});
++		o.onchange = null;
++		try { Object.defineProperty(s, 'orientation', { value: o, enumerable: true, configurable: true }); } catch (e) { /* */ }
++	}
++
++	var cb = n.clipboard;
++	if (cb) {
++		var no = function () { return Promise.reject(new DOMException('Write permission denied.', 'NotAllowedError')); };
++		define(cb, 'writeText', function writeText(data) { return no(); });
++		define(cb, 'write', function write(data) { return no(); });
++	}
++	define(n, '__vitaHonest', true);
++})();
++
+ /* ---- the browser's functions look like a browser's (patch 269) ----------
+  * window's operations and interface objects are the browser's own: per
+  * WebIDL an operation is an enumerable data property whose function is
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -9130,6 +9130,106 @@
+ "\tdefine(P, '__vitaUserTiming', true);\n"
+ "})();\n"
+ "\n"
++"/* ---- what navigator and screen say about the device, honestly (271) ----\n"
++" *  - Plugins: none. navigator.plugins / mimeTypes were undefined; a\n"
++" *    browser without plugins, and without a PDF viewer (pdfViewerEnabled\n"
++" *    is false), has empty PluginArray / MimeTypeArray objects.\n"
++" *  - Permissions: query() answered \"prompt\" for anything, which says the\n"
++" *    browser could ask. It cannot grant location, camera, microphone,\n"
++" *    notifications, push, sensors, clipboard, ...: those are \"denied\";\n"
++" *    storage-access and local-network-access are \"granted\" (nothing here\n"
++" *    restricts either); each in a PermissionStatus. A name Chromium does\n"
++" *    not know is a TypeError, as there.\n"
++" *  - screen.orientation: the Vita's screen is landscape and does not turn\n"
++" *    (landscape-primary, angle 0); lock() is not supported.\n"
++" *  - Clipboard: there is none here, so writeText() / write() reject\n"
++" *    (NotAllowedError) instead of resolving as though the text was copied.\n"
++" * Not added, on purpose: navigator.mediaDevices, speechSynthesis, WebGL,\n"
++" * AudioContext and the like -- this browser has none of them, and an\n"
++" * empty stand-in would make a page's feature test say it has. */\n"
++"(function () {\n"
++"\tvar n = g.navigator;\n"
++"\tif (!n || n.__vitaHonest) return;\n"
++"\tfunction illegal() { throw new TypeError('Illegal constructor'); }\n"
++"\tfunction iface(name, f, parent) {\n"
++"\t\tif (parent) Object.setPrototypeOf(f.prototype, parent.prototype);\n"
++"\t\ttry { Object.defineProperty(f.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tif (!g[name]) define(g, name, f);\n"
++"\t\treturn f;\n"
++"\t}\n"
++"\tfunction setNav(k, v) {\n"
++"\t\ttry { Object.defineProperty(n, k, { value: v, configurable: true, enumerable: true, writable: false }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tvar PluginArray = iface('PluginArray', function PluginArray() { illegal(); });\n"
++"\tvar MimeTypeArray = iface('MimeTypeArray', function MimeTypeArray() { illegal(); });\n"
++"\tiface('Plugin', function Plugin() { illegal(); });\n"
++"\tiface('MimeType', function MimeType() { illegal(); });\n"
++"\t[PluginArray, MimeTypeArray].forEach(function (C) {\n"
++"\t\tvar pr = C.prototype;\n"
++"\t\tObject.defineProperty(pr, 'length', { get: function () { return 0; }, enumerable: true, configurable: true });\n"
++"\t\tdefine(pr, 'item', function item(index) { return null; });\n"
++"\t\tdefine(pr, 'namedItem', function namedItem(name) { return null; });\n"
++"\t\tpr[Symbol.iterator] = Array.prototype[Symbol.iterator];\n"
++"\t});\n"
++"\tdefine(PluginArray.prototype, 'refresh', function refresh() {});\n"
++"\tif (n.plugins === undefined) setNav('plugins', Object.create(PluginArray.prototype));\n"
++"\tif (n.mimeTypes === undefined) setNav('mimeTypes', Object.create(MimeTypeArray.prototype));\n"
++"\n"
++"\tvar ET = g.EventTarget;\n"
++"\tfunction eventTarget(proto) {\n"
++"\t\tvar o = isFn(ET) ? new ET() : {};\n"
++"\t\tObject.setPrototypeOf(o, proto);\n"
++"\t\treturn o;\n"
++"\t}\n"
++"\tvar PS = iface('PermissionStatus', function PermissionStatus() { illegal(); }, ET);\n"
++"\tvar Perms = iface('Permissions', function Permissions() { illegal(); });\n"
++"\t/* Chromium's PermissionName values. This engine restricts neither\n"
++"\t * third-party storage nor requests to the local network, so those two\n"
++"\t * are granted; it can grant none of the rest. */\n"
++"\tvar NAMES = ['accelerometer', 'background-fetch', 'background-sync', 'camera',\n"
++"\t\t'captured-surface-control', 'clipboard-read', 'clipboard-write', 'display-capture',\n"
++"\t\t'geolocation', 'gyroscope', 'idle-detection', 'keyboard-lock', 'local-fonts',\n"
++"\t\t'local-network-access', 'magnetometer', 'microphone', 'midi', 'notifications',\n"
++"\t\t'payment-handler', 'periodic-background-sync', 'persistent-storage', 'pointer-lock',\n"
++"\t\t'push', 'screen-wake-lock', 'storage-access', 'window-management'];\n"
++"\tvar GRANTED = { 'storage-access': 1, 'local-network-access': 1 };\n"
++"\tdefine(Perms.prototype, 'query', function query(permissionDesc) {\n"
++"\t\tif (arguments.length < 1)\n"
++"\t\t\treturn Promise.reject(new TypeError(\"Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present.\"));\n"
++"\t\tvar name = permissionDesc && permissionDesc.name;\n"
++"\t\tif (NAMES.indexOf(String(name)) < 0)\n"
++"\t\t\treturn Promise.reject(new TypeError(\"Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '\" + name + \"' is not a valid enum value of type PermissionName.\"));\n"
++"\t\tvar st = eventTarget(PS.prototype);\n"
++"\t\tObject.defineProperty(st, 'name', { value: String(name), enumerable: true });\n"
++"\t\tObject.defineProperty(st, 'state', { value: GRANTED[name] ? 'granted' : 'denied', enumerable: true });\n"
++"\t\tst.onchange = null;\n"
++"\t\treturn Promise.resolve(st);\n"
++"\t});\n"
++"\tsetNav('permissions', Object.create(Perms.prototype));\n"
++"\n"
++"\tvar s = g.screen;\n"
++"\tif (s && s.orientation === undefined) {\n"
++"\t\tvar SO = iface('ScreenOrientation', function ScreenOrientation() { illegal(); }, ET);\n"
++"\t\tvar o = eventTarget(SO.prototype);\n"
++"\t\tObject.defineProperty(SO.prototype, 'type', { get: function () { return 'landscape-primary'; }, enumerable: true, configurable: true });\n"
++"\t\tObject.defineProperty(SO.prototype, 'angle', { get: function () { return 0; }, enumerable: true, configurable: true });\n"
++"\t\tdefine(SO.prototype, 'lock', function lock(orientation) {\n"
++"\t\t\treturn Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError'));\n"
++"\t\t});\n"
++"\t\tdefine(SO.prototype, 'unlock', function unlock() {});\n"
++"\t\to.onchange = null;\n"
++"\t\ttry { Object.defineProperty(s, 'orientation', { value: o, enumerable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\n"
++"\tvar cb = n.clipboard;\n"
++"\tif (cb) {\n"
++"\t\tvar no = function () { return Promise.reject(new DOMException('Write permission denied.', 'NotAllowedError')); };\n"
++"\t\tdefine(cb, 'writeText', function writeText(data) { return no(); });\n"
++"\t\tdefine(cb, 'write', function write(data) { return no(); });\n"
++"\t}\n"
++"\tdefine(n, '__vitaHonest', true);\n"
++"})();\n"
++"\n"
+ "/* ---- the browser's functions look like a browser's (patch 269) ----------\n"
+ " * window's operations and interface objects are the browser's own: per\n"
+ " * WebIDL an operation is an enumerable data property whose function is\n"
