@@ -1,0 +1,85 @@
+# netsurf: VITA_SIM_INJECT -- a script run in every realm, simulator only
+# (patch 268)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 267)
+#
+# A measuring tool, what Playwright's init scripts are to Chromium: with
+# VITA_SIM_INJECT=<file> the simulator evaluates that file in every realm
+# right after the polyfill -- every page and every frame, cross-origin
+# ones included -- before the page's own scripts. Built to trace hCaptcha's
+# hsw (its WebAssembly imports, Reflect.has / get, swallowed exceptions,
+# its XHRs) inside api.hcaptcha.com's frames and compare it, call by call,
+# with Chromium (tools/hcaptcha/, docs/wasm-hcaptcha-measurement.md).
+# Compiled out of the Vita build (#ifndef __vita__: no environment there).
+#
+# Gate: none of its own (the gate does not set the variable).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -17168,6 +17168,7 @@
+ }
+ 
+ static void qjs_vita_polyfill(JSContext *ctx);
++static void qjs_sim_inject(JSContext *ctx);
+ 
+ static JSContext *qjs_build_context(struct jsheap *heap,
+ 		dom_document *document, struct content *content)
+@@ -17227,6 +17228,7 @@
+ 	MS_LOG("qjs: xrealm_register"); macsurf_qjs_xrealm_register(ctx);
+ 	MS_LOG("qjs: dom_install");     qjs_dom_install(ctx);
+ 	MS_LOG("qjs: vita_polyfill");   qjs_vita_polyfill(ctx);
++	qjs_sim_inject(ctx);
+ 	JS_SetGlobalDeclsConfigurable(ctx, false);
+ 	macsurf_debug_log_writef("LIFE realm built: %ld us",
+ 			(long)(macos9_micros() - t_build));
+@@ -17256,6 +17258,50 @@
+ 			(long)(macos9_micros() - t0));
+ }
+ 
++/* VitaBrowser, simulator only: VITA_SIM_INJECT=<file> evaluates that
++ * script in every realm right after the polyfill -- every page and every
++ * frame, cross-origin ones included, before the page's own scripts (what
++ * an init script is to Playwright). For measuring what a third-party
++ * frame's code does here against Chromium (tools/hcaptcha/). The Vita
++ * build has no environment, so none of this is compiled there. */
++static void qjs_sim_inject(JSContext *ctx)
++{
++#ifndef __vita__
++	static char *src;
++	static long len = -1;
++	JSValue v;
++	if (len < 0) {
++		const char *path = getenv("VITA_SIM_INJECT");
++		FILE *f = path ? fopen(path, "rb") : NULL;
++		len = 0;
++		if (f) {
++			fseek(f, 0, SEEK_END);
++			len = ftell(f);
++			fseek(f, 0, SEEK_SET);
++			src = malloc(len + 1);
++			if (src && fread(src, 1, len, f) == (size_t)len)
++				src[len] = 0;
++			else
++				len = 0;
++			fclose(f);
++			macsurf_debug_log_writef("LIFE sim inject: %s, %ld bytes",
++					path, len);
++		}
++	}
++	if (len <= 0)
++		return;
++	v = JS_Eval(ctx, src, len, "<sim-inject>", JS_EVAL_TYPE_GLOBAL);
++	if (JS_IsException(v)) {
++		JSValue exc = JS_GetException(ctx);
++		qjs_log_exc(ctx, exc, "sim_inject", "<sim-inject>");
++		JS_FreeValue(ctx, exc);
++	}
++	JS_FreeValue(ctx, v);
++#else
++	(void)ctx;
++#endif
++}
++
+ /* fixes593 - QuickJS capability self-test. Runs a battery of JS through the
+  * engine at first heap creation, BEFORE any page loads, and logs PASS/FAIL +
+  * the actual value. Purpose: prove the CW8 QuickJS port is fundamentally sound
