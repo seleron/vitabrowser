@@ -3564,6 +3564,9 @@ its own.
 
 ## Run 36 — hand-off (2026-10-12 22:50; replaces untested run 35)
 
+**Superseded by run 37 (below) before it was tested.** Its checklist
+carries over to run 37 unchanged.
+
 **Flash this build:** VitaBrowser.vpk `3e2d6fedffba`, VitaBrowser-ext.vpk
 `9e2d0fea1731`, nsvita.elf `1afa56c1c4a5` (patches through 259, built at
 d8e8db0 = origin/master). Run 35 (`b98697013725`) has no `results\` yet,
@@ -3616,9 +3619,52 @@ Sim-verified: JS-fetch-body checks 23-30, 30/30 over http and https
 own (scripts on the device's sites do not build Requests with bodies
 that we know of).
 
-## Since run 36 — queued for run 37 (not built yet)
+## Run 37 — hand-off (2026-10-13 05:30; replaces untested run 36)
 
-### Patches 260-267 (2026-10-13): Cloudflare's challenge passes -- Stack Overflow loads
+**Flash this build:** VitaBrowser.vpk `fb883da1ec02`, VitaBrowser-ext.vpk
+`ddbaf5fc849a`, nsvita.elf `b50852be6b3f` (patches through 267, built at
+c7b26d1 = origin/master). Full SHA256 of VitaBrowser.vpk:
+`fb883da1ec028a606b8c95da8fd731ba60f27748792c4cb7b7d00680370a4c1f`.
+Run 36 (`3e2d6fedffba`) has no `results\` yet, so run 37 carries
+everything since run 27: **patches 168-267 + patches/quickjs/05-06 +
+patches/wasm3/01**, all unverified on hardware. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-13-run37/` (SHA256SUMS, reference
+dumps, the reference run in `sim/`); run 36's reference dumps are now
+`reference-dumps-run36\`. Only run 37's VPKs are in
+`Desktop\VitaBrowser-hwtest\`.
+
+Build: clean restage from origin/master (353 applied + the two known
+collisions), checked first against a scratch application of the same
+stack -- identical to the tree the gates ran on (backup
+`applytest-backup-pre-run37-20261013-0507.tar.gz`); streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(`gate-run37.log`: JS-fetch-body 30/30 over http and https, WASM254
+15/15, REFLOW 3/3, CANVAS251 22/22, REALM 11/11, IMPORTANT264 3/3,
+STYLEEDIT 4/4, XEARLY 3/3, interaction 52/52 also at the Vita's pace),
+cross-build green. Reference autotest under device conditions: interact
+**52/52**, js 18/18, 34 dumps -- all 34 identical to run 36's.
+
+**On the device:** start `receive-results.bat` first, then:
+
+1. Run 35's list, above, unchanged: the autotest (every `.plot` SAME,
+   IN-history / IN-home-recent may differ in order; interact **52/52**,
+   js 18/18), the claude.ai email sign-in (no crash, "WebAssembly
+   running" about 20 s per frame twice, then an expected hCaptcha error),
+   CIRCLE stopping WebAssembly, and any other WebAssembly page.
+2. **Stack Overflow (260-265):** stackoverflow.com/questions. Expect the
+   "Just a moment..." page, then the question list (sidebar, survey
+   banner; the OneTrust cookie banner must not crash it -- 264). Report
+   how long the challenge takes on the Vita (about 5 s in the simulator;
+   the work is mostly script), whether the page then scrolls normally,
+   and `mem[page done]` in log.txt.
+3. **The Guardian (266-267):** theguardian.com/uk. Expect a styled page
+   (not plain black-on-white text) with the "Personalised advertising"
+   consent dialog over it. Report how long until it is styled, whether the
+   dialog appears and can be dismissed, and `mem[page done]`.
+
+### What run 37 adds over run 36
+
+#### Patches 260-267 (2026-10-13): Cloudflare's challenge passes -- Stack Overflow loads
 
 The scorecard's lowest tier is forum, and its fixable site, Stack
 Overflow, never got past Cloudflare's "Just a moment..." page (claude.ai
@@ -3691,9 +3737,5 @@ ignores row-gap
 (10 vs Chromium's 17 px); getComputedStyle does not report border-radius,
 row-gap, box-shadow, tab-size or aspect-ratio.
 
-**On the device (run 37):** stackoverflow.com/questions: the "Just a
-moment..." page, then the question list. Note how long the challenge
-takes on the Vita (5 s in the simulator; the work is mostly script) and
-whether the page then scrolls normally. theguardian.com/uk: styled, with
-the "Personalised advertising" consent dialog over it.
+(Device checks for these: run 37's list, above, items 2-3.)
 
