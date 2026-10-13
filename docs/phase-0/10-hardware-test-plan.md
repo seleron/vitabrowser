@@ -4239,9 +4239,10 @@ green.
 Found on the way, not fixed: libhubbub turns `&#13;` into LF; ~~a
 script's `textarea.value` is the value attribute (so a value set from
 script is not what is submitted)~~ **fixed in 286-287** (below);
-`form.elements.namedItem` is missing; a form's `target` naming an iframe
-navigates the whole window; a parsed iframe's `contentWindow.document`
-is undefined to its parent.
+~~`form.elements.namedItem` is missing~~ **fixed in 288** (below); a
+form's `target` naming an iframe navigates the whole window; a parsed
+iframe's `contentWindow.document` is undefined to its parent (still
+open: see 288).
 
 **On the device (run 39):** the bundled HTML-multipart-* and
 JS-form-submitters pages post to the gate server, which the Vita does not
@@ -4299,3 +4300,43 @@ shown field following a script's textarea / select / multi-select change
 8/8 expected. Then a site whose dropdown or comment box works by script
 (a sort or filter dropdown, a "characters left" counter): report if it
 now reacts where it did not.
+
+### Patch 288 (2026-10-13): named access -- form.elements and friends
+
+The next item of 283's "found on the way" list, and again wider than it
+read: `form.elements` was a new Array of the form's descendants on every
+read, so it had no `namedItem`, no `elements.q`, held image buttons and
+missed a `form="id"` control outside the form; `form.q`, `form[0]`,
+`form.length`, `document.forms.myform` and `document.myform` were all
+undefined -- the classic DOM older pages script their forms with
+(`document.myform.q.value`).
+
+- **288 (netsurf): named access as Chromium has it** (checked case by
+  case): `form.elements` an HTMLFormControlsCollection (the same object,
+  live; the listed elements whose form owner is the form, image buttons
+  not) by index, id or name, with `namedItem` / `item`, and a
+  RadioNodeList (`value` read and set) where several share a name; a form
+  by name and index and `form.length`; `document.forms` by name and id;
+  `document.<name>` for forms, images, embeds, objects and iframes (a
+  frame's window). A radio set checked by script unchecks the rest of its
+  group (it left two checked). Named access comes from a Proxy above the
+  form's and the document's prototype, so element wrappers get no own
+  properties (278-279).
+
+Not done: a form's named controls do not shadow its built-in members as
+in browsers (`<input name="submit">` leaves `form.submit` the method);
+and a parsed iframe's `contentWindow` is still the frame shim with no
+`document` -- the frame's document lives in its own content and script
+heap, so giving the parent its window is cross-heap work of its own, not
+part of this.
+
+Sim-verified: JS-form-named.html (FORMNAMED 7/7, Chromium 7/7; 7/7 from
+the bundle over file://); the shape and descriptor pages (DOCSHAPE,
+DESCRIPTORS, APIPROTO, WINORDER, BSHAPE, INSTOF, NODESHAPE...) unchanged;
+full sim gate exit 0 (gate-288); Vita cross-build green.
+
+**On the device (run 39), in addition:** the bundled
+`file:///app0:/testpages/JS-form-named.html`: FORMNAMED 7/7 expected
+(no server needed). Then an older site that scripts its forms by name (a
+search or login form driven by `document.<form>.<field>`): report if it
+now works where it did not.
