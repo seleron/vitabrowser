@@ -118,9 +118,12 @@ on text inputs, buttons, selects, textareas (225).
    simulator 2026-10-12 (patches 255-256, doc 10 "Since run 33"):* hsw
    runs (~0.6 s per frame on the host, ~20 s on the Vita estimated) and
    its answer reaches the server, which refuses it (`success: false`) --
-   hsw's fingerprint of this engine, not plumbing. claude.ai's email
-   sign-in stays blocked there; not pursued further (it would mean
-   impersonating Chrome to a bot detector).
+   not plumbing. claude.ai's email sign-in stays blocked there.
+   *2026-10-13:* not the fingerprint either -- Chromium without the
+   interfaces this engine lacks, with its values or network stack, still
+   passes, and the engine is refused under any user agent; hsw computes
+   something different here (docs/wasm-hcaptcha-measurement.md, "Why
+   hCaptcha refuses us"). Next: trace hsw's import calls in both engines.
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

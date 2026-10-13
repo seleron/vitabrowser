@@ -110,10 +110,73 @@ WebAssembly: `WANT WebAssembly` appears on 1 of 21 sites (claude.ai).
    forced a relayout (patch 255), and binary request bodies sent as text
    (patch 256: getcaptcha's 32 KB msgpack answer got a 415). With both
    fixed the server answers `success: false` with a fresh hsw request,
-   where Chromium gets its encrypted challenge: hsw's fingerprint of this
-   engine (about 25 interfaces missing under a Chrome user agent) is the
-   likely reason. **Stopped there:** passing would mean impersonating
-   Chrome to a bot detector.
+   where Chromium gets its encrypted challenge. The guess then -- hsw's
+   fingerprint of this engine, about 25 interfaces missing under a Chrome
+   user agent -- was **tested 2026-10-13 and is wrong**: see below.
+
+## Why hCaptcha refuses us: what it is not (2026-10-13)
+
+Measured on hCaptcha's public demo (accounts.hcaptcha.com/demo: the same
+hsw, and no sign-in email is sent), simulator at c7b26d1 (patches
+168-267). Tools: `tools/hcaptcha/` (the scripts are kept this time).
+
+**The refusal.** Tapping the checkbox in the simulator posts a 25-26 KB
+getcaptcha body and gets 797 bytes back: `success: false` with a fresh
+hsw request. Headless Chromium (same machine, same Chrome 140 Android user
+agent, 960x544) posts 36-43 KB and gets its 2.4 KB encrypted challenge.
+The body is msgpack `[<the hsw request>, <a blob hsw encrypts>]`, so what
+differs inside it cannot be read.
+
+**What hCaptcha's frame reads.** `chrome-demo.py --log-access` logs every
+global and every navigator / screen / performance / document / canvas /
+WebGL / audio member hCaptcha's frames read in Chromium: 253 distinct
+items, every run the same. Checked one by one in the simulator, 60 are
+missing here: WebGL and WebGL2 (getContext and 20 methods),
+OfflineAudioContext / AudioBuffer / AnalyserNode (oscillator, compressor,
+startRendering, getChannelData), the interface objects NavigatorUAData,
+Permissions, NetworkInformation, StorageManager, SubtleCrypto,
+DOMStringList, PerformanceResourceTiming, MediaSource, MediaRecorder,
+OffscreenCanvas, RTCPeerConnection, SVGTextContentElement, Temporal;
+navigator.plugins / mimeTypes / mediaDevices / keyboard /
+webkitTemporaryStorage; performance.memory, screen.pixelDepth,
+document.featurePolicy, window.caches / clientInformation / close /
+speechSynthesis. (Against all of Chrome's window, 712 interfaces are
+missing; hCaptcha reads these 60.)
+
+**Each difference given to Chromium; it still gets the challenge:**
+
+| Chromium given | getcaptcha answer |
+|---|---|
+| nothing (baseline) | challenge |
+| all 60 missing items deleted (checked inside hCaptcha's frames) | challenge |
+| its window cut to the engine's 486 globals (from 1230) | challenge |
+| the engine's navigator and screen values (vendor "Anthropic/MPLS", product "MacSurf", 1 core, 1024x768, ...) and time zone (Etc/GMT-1) | challenge |
+| requests to api.hcaptcha.com sent by a non-Chrome HTTP stack (Playwright's Node client, other TLS), sec-* headers dropped | challenge |
+| a touch tap, or a click with no pointer movement before it | challenge |
+| CPU throttled 4x and 12x | challenge |
+| all of the above that combine (gap deleted, values, Node transport, touch) | challenge |
+
+**And the engine is refused whoever it says it is:** the simulator with
+the firefox preset and with its own `vita` user agent ("PlayStation Vita
+3.65 ... NetSurf/3.12 VitaBrowser/0.1") gets the same 797-byte refusal.
+
+**wasm3 is not miscomputing hsw's arithmetic** (as far as a differential
+reaches): `wasm-diff/run.sh` exports hsw's 436 functions whose call trees
+are import-free and calls each with the same seeded arguments in V8 and in
+our wasm3 build: 426 identical in results, traps and a CRC of memory
+after every call; the others all differ only where a garbage size made V8
+grow memory to ~3 GB and wasm3 refuse. Random arguments mostly trap
+early, so this covers less than hsw's real run does.
+
+**So:** it is not hCaptcha disliking a non-Chrome browser -- not the
+missing interfaces, not the values, not the user agent, not the network
+layer, not speed. hsw computes something different in this engine (its
+encrypted payload is 10-16 KB smaller), most likely one of its 182 glue
+imports throwing or answering wrongly where Chromium does not, recorded
+by hsw and refused by the server. Implementing the missing interfaces
+would not move the result (Chromium without them passes). The next
+measurement: trace hsw's import calls (name, arguments, result or
+exception) in both engines and compare them in order.
 
 ## How to measure again
 

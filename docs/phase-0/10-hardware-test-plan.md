@@ -3454,7 +3454,11 @@ OfflineAudioContext, AudioBuffer, NavigatorUAData, Permissions,
 MediaDevices, ServiceWorkerContainer, RTCPeerConnection,
 PerformanceNavigationTiming, ...) under a Chrome 140 user agent; that is
 the likely reason, and making it pass would mean impersonating Chrome to a
-bot detector, which is not a goal. The client reports the refusal as
+bot detector, which is not a goal. (*2026-10-13: tested, and not the
+reason -- Chromium with those interfaces deleted, or given this engine's
+values, network stack or user agent, still gets its challenge; the engine
+is refused under any user agent. See docs/wasm-hcaptcha-measurement.md,
+"Why hCaptcha refuses us".*) The client reports the refusal as
 `network-error`. So **claude.ai's email sign-in does not get past
 hCaptcha**, now for a reason outside the engine's plumbing.
 
