@@ -3625,6 +3625,9 @@ that we know of).
 
 ## Run 37 — hand-off (2026-10-13 05:30; replaces untested run 36)
 
+**Superseded by run 38 (below) before it was tested.** Its checklist
+carries over to run 38 unchanged.
+
 **Flash this build:** VitaBrowser.vpk `fb883da1ec02`, VitaBrowser-ext.vpk
 `ddbaf5fc849a`, nsvita.elf `b50852be6b3f` (patches through 267, built at
 c7b26d1 = origin/master). Full SHA256 of VitaBrowser.vpk:
@@ -3743,9 +3746,255 @@ row-gap, box-shadow, tab-size or aspect-ratio.
 
 (Device checks for these: run 37's list, above, items 2-3.)
 
-## Since run 37 — queued for run 38 (not built yet)
+## Run 38 — hand-off (2026-10-13 18:30; replaces untested run 37)
 
-### Patches 268-272 (2026-10-13): what the engine says about itself, honestly
+**Flash this build:** VitaBrowser.vpk `7a597a16f31c`, VitaBrowser-ext.vpk
+`31cea4579189`, nsvita.elf `907f7c99e7e5` (patches through 282, built at
+43a36c2 = origin/master). Full SHA256 of VitaBrowser.vpk:
+`7a597a16f31ce0a67da8204f920bbf37d6ce8e82d7efbc6decf6ec2176b9983e`.
+Run 37 (`fb883da1ec02`) has no `results\` yet, so run 38 carries
+everything since run 27: **patches 168-282 + patches/quickjs/05-06 +
+patches/wasm3/01**, all unverified on hardware. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-13-run38/` (SHA256SUMS, reference
+dumps, the reference run in `sim/`); run 37's reference dumps are now
+`reference-dumps-run37\`. Only run 38's VPKs are in
+`Desktop\VitaBrowser-hwtest\` (where `receive-results.bat` is and
+`results\` lands); the same VPKs, nsvita.elf, SHA256SUMS and reference
+dumps are also in `C:\Users\seleron\VitaBrowser-hwtest\` (new; both
+checked with `sha256sum -c`).
+
+Build: clean restage from origin/master (368 applied + the two known
+collisions), checked first against a scratch application of the same
+stack -- every patched source identical to the tree the gates ran on
+(backup `applytest-backup-pre-run38-20261013-1705.tar.gz`); streams 4/4,
+renderer 102/102 + 30/30, full sim gate exit 0 with no soft accepts
+(`gate-run38.log`: JS-fetch-body 30/30 over http and https, WASM254
+15/15, REFLOW 3/3, CANVAS251 22/22, REALM 11/11, IMPORTANT264 3/3,
+STYLEEDIT 4/4, XEARLY 3/3, DESCRIPTORS 7/7, TIMERNEST 4/4, RESTIMING 9/9,
+interaction 52/52 also at the Vita's pace), cross-build green.
+Reference autotest under device conditions: interact **52/52**, js
+18/18, 34 dumps -- all 34 identical to run 37's.
+
+**On the device:** start `receive-results.bat` first, then:
+
+1. **The autotest** (SELECT + SQUARE): every `.plot` SAME against
+   `reference-dumps\` (IN-history / IN-home-recent may differ in order;
+   07-PM-animation is time-varying), interact **52/52**, js **18/18**;
+   `bitmaps: ... 0 refused` after every page; no crash.
+2. **Run 37's list, unchanged:** the claude.ai email sign-in (no crash,
+   "WebAssembly running" about 20 s per frame twice, then an expected
+   hCaptcha error), CIRCLE stopping WebAssembly; stackoverflow.com/questions
+   ("Just a moment...", then the question list; report the challenge time
+   and `mem[page done]`); theguardian.com/uk (styled, the "Personalised
+   advertising" consent dialog, dismissable; report the time and
+   `mem[page done]`).
+3. **The new bundled pages** (open each as
+   `file:///app0:/testpages/<page>.html`; expected exactly as in the table
+   below): JS-device-honest (DEVICE 6/6; check 6's battery reading against
+   the Vita's own indicator, plugged in and unplugged), JS-perf-timing
+   (PERFTIME 10/10), JS-builtins-native (BUILTIN 8/8), JS-window-proto
+   (WINPROTO 6/6), JS-builtin-shape (BSHAPE 8/8), JS-api-protos (APIPROTO
+   7/7), JS-window-order (WINORDER 5/5), JS-document-shape (DOCSHAPE 6/6),
+   JS-node-shape (NODESHAPE 6/6), JS-descriptors (DESCRIPTORS 7/7),
+   JS-timer-nesting (TIMERNEST 4/4), JS-frame-local (3/6: check 6, the
+   300-link timer chain, under 1.5 s on the Vita's clock), and
+   JS-resource-timing (**RESTIMING 2/9 by design** over file://: checks 5
+   and 8 pass; 1-4, 6, 7 fail only on "sizes {...}" with the right
+   initiatorType -- script, link, img, css, fetch, xmlhttprequest; 9 fails
+   "cross-origin: 0 entries". "getEntriesByName gave 0 entries" or a crash
+   is a fault).
+4. **Script-heavy sites** (Google, the Guardian, YouTube, a page with an
+   embedded video or a consent iframe): every built-in now goes through a
+   stand-in (275-276), element.style and iframes changed shape (280), and
+   the loop wakes for due timers (281) -- report any site that worked in
+   run 37's list and does not now, slower script-heavy pages, and whether
+   a page with a setTimeout(0) heartbeat keeps the screen from idling
+   (battery). Wikipedia: no change expected on screen (282 only fixes its
+   sampled network probe).
+
+#### Every bundled page: expected output over file:// (run 38)
+
+Measured in the simulator with the run 38 build, under device conditions
+(each page opened as `file:///app0:/testpages/<page>.html`, network log
+off, read 25 s after load; 164 pages, none crashed). A page with no
+summary line is a visual page: compare it with the reference dumps /
+screenshots, not a count. Every page marked partial passes in full over
+HTTP in the gate -- what fails from file:// is a check that needs the gate
+server (slow/, /echo, /progress-stream, /sse, /split-utf8, /slow-headers,
+/fetch-count, a second https origin) or an http(s) URL. Anything that
+differs from this table on the Vita is worth reporting; slower pages may
+need a few seconds more to reach it.
+
+| page | final title | summary line (`#sum`) | note |
+|---|---|---|---|
+| CSS-account-bar | CSS account bar (5/5) | ACCTBAR: 5/5 passed |  |
+| CSS-appearance | APPEAR: 6/6 passed | APPEAR: 6/6 passed |  |
+| CSS-background-size-pct | CSS background-size percentage |  |  |
+| CSS-box-shadow | CSS box-shadow and borders |  |  |
+| CSS-census | CSS census rewrites (5/5) | CENSUS: 5/5 passed |  |
+| CSS-ch-unit | CSS ch unit (2/2) | CHUNIT210: 2/2 passed |  |
+| CSS-flex-header | CSS flex header (6/6) | FLEXHDR: 6/6 passed |  |
+| CSS-flow-root | CSS flow-root (4/4) | FLOWROOT204: 4/4 passed |  |
+| CSS-fractional-spacing | CSS fractional spacing (4/4) | FRACSP227: 4/4 passed |  |
+| CSS-grid-autofill | CSS grid auto-fill (8/8) | GRIDFILL206: 8/8 passed |  |
+| CSS-important-operands | CSS !important operands (3/3) | IMPORTANT264: 3/3 passed |  |
+| CSS-inline-block-space-font | CSS inline-block space font (4/4) | IBFONT226: 4/4 passed |  |
+| CSS-inline-block-space | CSS inline-block space (5/5) | IBSPACE221: 5/5 passed |  |
+| CSS-inline-grid | CSS inline-grid (4/4) | INLINEGRID: 4/4 passed |  |
+| CSS-inline-outranks | CSS inline style outranks (4/4) | INLINE236: 4/4 passed |  |
+| CSS-inline-space | CSS inline leading space |  |  |
+| CSS-intrinsic-width | CSS intrinsic widths (5/5) | INTRINSIC: 5/5 passed |  |
+| CSS-is-where | CSS :is() and :where() |  |  |
+| CSS-late-link | CSS late link (2/3) | LATELINK: 2/3 passed | check 3 fails ("rgb(0, 0, 0)"): its late sheet comes from the gate server's slow/ (3/3 over HTTP) |
+| CSS-letter-spacing | CSS letter spacing (3/3) | SPACING220: 3/3 passed |  |
+| CSS-line-clamp | CSS line clamp (4/4) | CLAMP208: 4/4 passed |  |
+| CSS-line-height-normal | CSS line-height normal (3/3) | LINEH214: 3/3 passed |  |
+| CSS-mask-icon | CSS mask icon |  |  |
+| CSS-media-features | CSS media features (4/4) | MQFEAT213: 4/4 passed |  |
+| CSS-modern-color | CSS modern colours and at-rules |  |  |
+| CSS-nesting | CSS nesting (6/6) | NEST211: 6/6 passed |  |
+| CSS-opacity-group | CSS group opacity and light-dark() |  |  |
+| CSS-overflow-viewport | CSS overflow to viewport |  |  |
+| CSS-overflow-x | CSS overflow x |  |  |
+| CSS-rewrite-bigsheet | CSS rewrite on a big sheet |  |  |
+| CSS-sibling-class | CSS sibling class precise (6/6) | SIB186: 6/6 passed |  |
+| CSS-spacing | CSS spacing, calc and layout |  |  |
+| CSS-style-edit | CSS style edit (4/4) | STYLEEDIT: 4/4 passed |  |
+| CSS-supports-absent | CSS supports absent (3/3) | SUPABS216: 3/3 passed |  |
+| CSS-svg-size | CSS svg size (5/5) | SVGSIZE217: 5/5 passed |  |
+| CSS-table-caption | CSS table caption (8/8) | CAPTION201: 8/8 passed |  |
+| CSS-viewport-units | CSS viewport units (4/4) | VUNITS207: 4/4 passed |  |
+| HTML-checkbox-size | HTML checkbox size (4/4) | CHECKBOX224: 4/4 passed |  |
+| HTML-control-margins | HTML control margins (3/3) | CTLMARGIN225: 3/3 passed |  |
+| HTML-embed-placeholders | HTML embed placeholders (4/4) |  |  |
+| HTML-fieldset-legend | HTML fieldset legend (5/5) | FIELDSET222: 5/5 passed |  |
+| HTML-hidden-details | HTML hidden details (9/9) | HIDDEN203: 9/9 passed |  |
+| HTML-legend-reset | HTML legend reset (4/4) | LEGEND228: 4/4 passed |  |
+| HTML-progress-meter | HTML progress meter (5/5) | PROGRESS218: 5/5 passed |  |
+| HTML-range-color | HTML range color (4/4) | RANGECOL223: 4/4 passed |  |
+| IMG-svg | IMG svg |  |  |
+| IN-block | IN block | IN block: 2/2 passed |  |
+| IN-download | IN download |  |  |
+| IN-events | IN events |  |  |
+| IN-find | IN find |  |  |
+| IN-form | IN form |  |  |
+| IN-links | IN links |  |  |
+| IN-range | IN range |  |  |
+| IN-rebuild | IN rebuild |  |  |
+| IN-target | IN target |  |  |
+| JS-abspos191 | JS abspos earlier (2/2) | ABSPOS191: 2/2 passed |  |
+| JS-api-protos | JS API prototypes (7/7) | APIPROTO: 7/7 passed |  |
+| JS-apis | JS apis 173/176 | APIS: 173/176 present | as the gate: 3 APIs absent by design |
+| JS-appearance196 | PASS t1 appearance=auto [auto] PASS t1 webkitAppearance=auto... |  |  |
+| JS-attach-shadow | JS attachShadow (7/7) | SHADOW: 7/7 passed |  |
+| JS-block-class-sibling | JS block class sibling (3/3) | BLOCKSIB: 3/3 passed |  |
+| JS-block-class-stall | JS block class stall (7/7) | BLOCKCLASS: 7/7 passed |  |
+| JS-block-sibling-insert | JS block sibling insert (4/4) | SIBINS: 4/4 passed |  |
+| JS-builtin-shape | JS built-in shape (8/8) | BSHAPE: 8/8 passed |  |
+| JS-builtins-native | JS built-ins (8/8) | BUILTIN: 8/8 passed |  |
+| JS-canvas-2d | JS canvas 2D (22/22) | CANVAS251: 22/22 passed |  |
+| JS-chardata | JS character data (5/5) | CHARDATA: 5/5 passed |  |
+| JS-class-stall | JS class stall (7/7) | CLASSSTALL: 7/7 passed |  |
+| JS-computed-alpha | JS computed alpha (4/4) | ALPHA212: 4/4 passed |  |
+| JS-computed-unboxed | JS computed style without a box (7/7) | UNBOXED: 7/7 passed |  |
+| JS-crypto-subtle | JS crypto subtle (5/5) | SUBTLE215: 5/5 passed |  |
+| JS-cssom-190 | CSSOM190: 2/2 passed |  |  |
+| JS-cssom | JS CSSOM (styleSheets, cssRules, insertRule) | CSSOM: 8/8 passed |  |
+| JS-custom-elements | JS custom elements (7/7) | CUSTOMEL: 7/7 passed |  |
+| JS-descriptors | JS descriptors (7/7) | DESCRIPTORS: 7/7 passed |  |
+| JS-device-honest | JS device surface (6/6) | DEVICE: 6/6 passed |  |
+| JS-document-shape | JS document shape (6/6) | DOCSHAPE: 6/6 passed |  |
+| JS-dom-stall | JS DOM stall (8/8) | DOMSTALL: 8/8 passed |  |
+| JS-dom | JS dom | JS: 13/13 passed |  |
+| JS-element-instanceof | JS element instanceof (6/6) | INSTOF: 6/6 passed |  |
+| JS-event-order | JS event order (5/5) | EVORDER: 5/5 passed |  |
+| JS-fetch-body | JS fetch body | JS fetch body: 14/30 passed FAILS: 1 URLSearchParams body arrives; 2 X... | 16 checks fail: they post to the gate server's /echo (30/30 over HTTP) |
+| JS-fetch-headers | JS fetch headers | JS fetch headers: script did not run | check 1 fails and the summary stays "script did not run": /slow-headers is the gate server's (3/3 over HTTP) |
+| JS-fetch-stream | JS fetch stream | JS fetch stream: script did not run | checks fail on a 404 body: /progress-stream, /split-utf8 and /sse are the gate server's (8/8 over HTTP) |
+| JS-fetch | JS fetch | JS fetch: 5/5 passed |  |
+| JS-flex-stretch-maxheight | JS flex stretch max-height (4/4) | STRMAX194: 4/4 passed |  |
+| JS-flex195 | JS flex195 (4/4) | FLEX195: 4/4 passed |  |
+| JS-form-submit | Not found |  | navigates to "Not found": the form posts to the gate server's /echo |
+| JS-frame-local | JS script-made frames (3/6) |  | checks 2-4 stay "waiting" (their same-origin frame does not load from file://); 1, 5, 6 pass -- 6 "timer chain: 300 links in ~1255 ms" (6/6 over HTTP) |
+| JS-frame-realm | JS frame realm (11/11) | REALM: 11/11 passed |  |
+| JS-has193 | JS :has() gaps (6/6) | HAS193: 6/6 passed |  |
+| JS-history-first | HISTFIRST 1 |  | as Chromium (HISTFIRST 1) |
+| JS-history | JS history | JS history: 30/30 passed |  |
+| JS-image-load | JS image load (10/11) | IMGLOAD: 10/11 passed | check 6 fails "...120, file:///app0:/testpages/lazyimg-02.png": the image loads (120 wide) but the check wants an http(s) URL (11/11 over HTTP) |
+| JS-import-meta | JS import.meta (4/4) | IMPORTMETA: 4/4 passed |  |
+| JS-importmap | JS import maps (4/4) | IMPORTMAP: 4/4 passed |  |
+| JS-inline-rect | JS inline rect (6/6) | INLINERECT: 6/6 passed |  |
+| JS-innerhtml-raw | JS innerHTML raw text (6/6) | IHRAW: 6/6 passed |  |
+| JS-innertext | JS innerText (rendered text) | INNERTEXT: 9/9 passed |  |
+| JS-interfaces | JS interface objects (9/9) | IFACES: 9/9 passed |  |
+| JS-lazyimg | JS lazy images below the fold (0/4) | LAZYIMG: 0/4 passed | check 1 "rejected: SyntaxError: unexpected token: '<'": /fetch-count is the gate server's (4/4 over HTTP) |
+| JS-list-nested-stall | JS list nested stall (7/7) | LISTNEST: 7/7 passed |  |
+| JS-list-structural | JS list structural (6/6) | LISTSTRUCT: 6/6 passed |  |
+| JS-module-async | JS import() without freezing (4/4) | MODASYNC: 4/4 passed |  |
+| JS-module-dedupe | JS module fetch dedupe (script not run) | MODDUP: 0/5 passed | "could not load module .../slow/js-moddup-shared.js": slow/ and /fetch-count are the gate server's (5/5 over HTTP) |
+| JS-module-static-async | JS static modules without freezing (1/5) | MODSTATIC: 1/5 passed | checks 1, 2, 4, 5 fail: its leaves come from the gate server's slow/ (5/5 over HTTP) |
+| JS-module | JS module (script not run) | MODULES: 6/6 passed | the title is not updated by this page; the summary is what counts |
+| JS-mutation | JS mutation observer | JS mutation: 7/7 passed |  |
+| JS-nan-constants | JS NaN constants (4/4) | NANCONST: 4/4 passed |  |
+| JS-node-names | JS node names (8/8) | NODENAME: 8/8 passed |  |
+| JS-node-shape | JS node shape (6/6) | NODESHAPE: 6/6 passed |  |
+| JS-offsetparent | JS offsetParent (8/8) | OFFPARENT: 8/8 passed |  |
+| JS-parse-tail | JS parse tail (script not run) | PARSETAIL: 2/2 passed | the title is not updated by this page; the summary is what counts |
+| JS-perf-timing | JS performance timing (10/10) | PERFTIME: 10/10 passed |  |
+| JS-perfobserver | JS PerformanceObserver (2/2) | PERFOBS: 2/2 passed |  |
+| JS-popup | JS popup (4/4) | POPUP: 4/4 passed |  |
+| JS-reflow-stall | JS reflow stall (1/3) | REFLOW: 1/3 passed | checks 1-2 fail ("late images laid out: 0/4"): the late images come from slow/ (3/3 over HTTP) |
+| JS-resource-timing | JS resource timing (2/9) | RESTIMING: 2/9 passed | by design (patch 282 note): checks 5, 8 pass; 1-4, 6, 7 fail only on "sizes {...}" (opaque file: origin); 9 "cross-origin: 0 entries" (no localhost server) -- 9/9 over HTTP |
+| JS-sanitize | JS sanitizer primitives | SANITIZE: 7/7 passed |  |
+| JS-scratch-doc | JS scratch documents (6/6) | SCRATCHDOC: 6/6 passed |  |
+| JS-scriptload | JS script load events (4/4) | SCRIPTLOAD: 4/4 passed |  |
+| JS-selector-list-long | JS long selector lists (4/4) | LONGLIST: 4/4 passed |  |
+| JS-selectors | JS selectors (85/85) | SELECTORS: 85/85 passed |  |
+| JS-storage | JS storage | JS storage: 15/15 passed |  |
+| JS-streaming | JS streaming | JS streaming: 4/7 passed | 3 checks fail: /progress-stream and /sse are the gate server's (7/7 over HTTP) |
+| JS-template-text | JS template text (4/4) | TPLTEXT: 4/4 passed |  |
+| JS-timer-nesting | JS timer nesting (4/4) | TIMERNEST: 4/4 passed |  |
+| JS-wasm | JS WebAssembly (15/15) | WASM254: 15/15 passed |  |
+| JS-window-order | JS window key order (5/5) | WINORDER: 5/5 passed |  |
+| JS-window-proto | JS window prototype (6/6) | WINPROTO: 6/6 passed |  |
+| JS-window | JS window done | JS window: 11/11 passed |  |
+| JS-xorigin-frame-child | cross-origin child |  | helper page (opened by JS-xorigin-frame) |
+| JS-xorigin-frame-early | JS frame made during load (script not run) |  | checks 1-2 fail "never loaded": the https origin is the gate server's (3/3 over HTTP) |
+| JS-xorigin-frame | JS cross-origin script-made frame (1/9) |  | 8 checks fail: the frame is on the gate server's https origin (9/9 over HTTP) |
+| JS-xrealm | JS cross-realm frames (4/4) |  |  |
+| L1-layout-basics | L1 layout basics |  |  |
+| L2-macsurf-css | L2 MacSurf CSS additions |  |  |
+| L3-grid | L3 grid |  |  |
+| L4-flex | L4 flex |  |  |
+| PM-animation | PM animation probe |  |  |
+| PM-gradient | gradient plotter probe |  |  |
+| PM-link | external link probe |  |  |
+| PM-macsurf-grid | MacSurf grid probe |  |  |
+| PM-shadow-clip | PM shadow clip probe |  |  |
+| PM-shadow | PM shadow probe |  |  |
+| PM-tagtype | tag-type probe |  |  |
+| PROBE-cascade | probe cascade |  |  |
+| PROBE-forms | probe forms |  |  |
+| PROBE-ib-space | probe ib space |  |  |
+| PROBE-input-value | probe input value |  |  |
+| PROBE-modern-css | probe done |  |  |
+| PROBE-nan | probe nan |  |  |
+| PROBE-numconst | probe numconst |  |  |
+| PROBE-range-script | probe range script |  |  |
+| PROBE-replaced | probe replaced |  |  |
+| PROBE-review | probe review |  |  |
+| PROBE-svg-size | probe svg size |  |  |
+| PROBE-text | probe text |  |  |
+| VT-calibration | VT calibration |  |  |
+| VT-images | VT images |  |  |
+| VT-scroll | VT scroll |  |  |
+| VT-text | VT text |  |  |
+| js-popup-child | popup child |  | helper page (opened by JS-popup) |
+| js-xrealm-child | xrealm child |  | helper page (opened by JS-xrealm) |
+
+### What run 38 adds over run 37
+
+#### Patches 268-272 (2026-10-13): what the engine says about itself, honestly
 
 Came out of the hCaptcha question (docs/wasm-hcaptcha-measurement.md,
 "Why hCaptcha refuses us"): the engine is refused whatever it reports,
@@ -3798,7 +4047,7 @@ DEVICE 6/6 and PERFTIME 10/10 expected. Check 6 shows the battery the
 browser reads ("level 0.85, charging false, dischargingTime ..."): compare
 it with the Vita's own battery indicator, plugged in and unplugged.
 
-### Patches 273-277 (2026-10-13): the platform shaped as a browser's
+#### Patches 273-277 (2026-10-13): the platform shaped as a browser's
 
 The standards gaps the hCaptcha record/compare found (docs/wasm-hcaptcha-
 measurement.md, "Record, replay"), fixed as what they are. None of them
@@ -3848,7 +4097,7 @@ YouTube): every built-in method now goes through a stand-in, so watch
 for a site that worked in run 37 and now does not, and for slower
 script-heavy pages.
 
-### Patches 278-280 (2026-10-13): document, nodes and descriptors
+#### Patches 278-280 (2026-10-13): document, nodes and descriptors
 
 The hCaptcha record/compare's next findings (docs/wasm-hcaptcha-
 measurement.md, "fourth round"), fixed as standards bugs. The demo still
@@ -3886,7 +4135,7 @@ listener on the event's target fires twice per event; a
 createHTMLDocument document's querySelector misses nodes appended after it
 was made.
 
-### Patch 281 (2026-10-13): timers
+#### Patch 281 (2026-10-13): timers
 
 - **281: HTML's timer nesting clamp; timers on time.** A timer set more
   than five timer tasks deep waits at least 4 ms (setTimeout(0) chains
@@ -3906,7 +4155,7 @@ and JS-frame-local's timer chain (check 6) under 1.5 s on the Vita's
 clock. Watch that pages with a setTimeout(0) heartbeat do not keep the
 screen from idling (battery) -- the loop now wakes for due timers.
 
-### Patch 282 (2026-10-13): Resource Timing
+#### Patch 282 (2026-10-13): Resource Timing
 
 - **282: each fetch a PerformanceResourceTiming entry.**
   `performance.getEntriesByType('resource')` was always empty. The
