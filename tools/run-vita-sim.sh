@@ -333,6 +333,7 @@ NET-js-resource-timing http://127.0.0.1:$HP/JS-resource-timing.html
 NET-js-form-values http://127.0.0.1:$HP/JS-form-values.html
 NET-js-form-named http://127.0.0.1:$HP/JS-form-named.html
 NET-js-form-target http://127.0.0.1:$HP/JS-form-target.html
+NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -848,7 +849,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-node-shape NODESHAPE 6" "js-descriptors DESCRIPTORS 7" \
 	 "js-timer-nesting TIMERNEST 4" "js-resource-timing RESTIMING 9" \
 	 "js-form-values FORMVAL 8" "js-form-named FORMNAMED 7" \
-	 "js-form-target FORMTARGET 5"; do
+	 "js-form-target FORMTARGET 5" "js-charref CHARREF 6"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
@@ -1273,7 +1274,7 @@ frc=0
 kill $HTTPD 2>/dev/null || true
 fgot=$(sed -n 's/.*gw title: \(FORMCHECK .*\)/\1/p' "$FS/ux0:data/VitaBrowser/log.txt" 2>/dev/null | uniq)
 fbad=
-for w in "multipart ok f3b471b28781" "urlencoded ok 7e9ed1917f53" \
+for w in "multipart ok fcd2da030618" "urlencoded ok 7e9ed1917f53" \
 	 "w1252 ok 01804f0f31bf" "upload ok a866dd8b3405" \
 	 "img ok f147644a4326" "imgnoname ok 9663aca848e0" \
 	 "nosub ok 22de21b23e38" "submit ok 22de21b23e38" \
