@@ -4,6 +4,44 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — r52 re-scored: 268-272 on r51's reference (r52-272-r51ref)
+
+The task said r52 on r51's reference, and r52-272 (06:56) predates the
+polyfill's final edit, so the committed build (gate re-run green on it)
+was scored again: simulator side fresh (r52b-272, 08:33), Chrome side
+r51's (`--rescore` with `--reuse-ref r51-full-267-fresh/ref`).
+Control: r51's own logs rescored the same way reproduce r51 exactly
+(83.7, every site).
+
+| site | r51 (267) | r52 on r51's ref | r52 on a ref taken with it (08:33) |
+|---|---|---|---|
+| rte | 84.2 | 74.0 | 84.5 |
+| google | 79.7 | 67.4 | 79.9 |
+| hackernews | 89.4 | 83.2 | 91.0 |
+| bbc | 89.4 | 84.7 | 89.4 |
+| guardian | 81.4 | 78.6 | 81.6 |
+| stackoverflow | 85.9 | 84.9 | 86.3 |
+| cnnlite | 88.8 | 88.3 | 88.2 |
+| the other 14 | | identical | identical |
+| **mean (tiers)** | **83.7** | **81.7** | **83.8** |
+
+Every drop is text recall on a live page against a reference three hours
+older than it (news front pages, Google's trending block); the same
+simulator output against a reference taken alongside it scores at or
+above r51 on each of those sites. Static, docs, wordpress, jquery, spa
+and wiki sites are identical to the decimal, JS error counts unchanged.
+**268-272 change nothing the scorecard sees** (r53's eight-site fresh
+run says the same). Baselines: `r52-272-r51ref` with `--reuse-ref
+r51-full-267-fresh`, or `r52b-272` with `--reuse-ref ref-0833-fresh`
+for a reference from the same hour.
+
+Tool fix with it: `--reuse-ref DIR` without a `DIR/ref.json` took a fresh
+Chrome reference and wrote it into DIR -- given a run's directory
+(r51-full-267-fresh, as the r51 entry below writes it), into that run's.
+It now also accepts a run's directory (uses DIR/ref) and otherwise
+stops with an error. Correction to the r53 entry: r51 did score rte
+(84.2).
+
 ## 2026-10-13 — patches 268-272 scored, fresh Chrome reference (r53-272-freshref)
 
 r52-272 scored the 268-272 stack on r51's reference (mean 82.4) just
@@ -21,7 +59,7 @@ tiers 269-272 touch (wiki / news / forum / search / spa): mean
 | stackoverflow | 85.9 | 85.2 | -0.7, live question list |
 | google | 79.7 | 79.7 | |
 | claude | 75.4 | 75.4 | |
-| rte | not in r51's site table | 86.2 | |
+| rte | 84.2 | 86.2 | +2.0, live front page |
 
 No site dropped more than 0.7 points and the set is live content:
 268-272 (native-code built-ins, 100 us timers, honest screen / plugins /

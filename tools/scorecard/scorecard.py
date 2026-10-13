@@ -371,7 +371,15 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     refdir = a.reuse_ref or os.path.join(a.out, "ref")
-    if a.reuse_ref and os.path.isfile(os.path.join(refdir, "ref.json")):
+    # a run's directory names its reference too (DIR/ref). A --reuse-ref
+    # without a ref.json is an error: it used to take a fresh reference and
+    # write it into that directory -- into another run's, when given one.
+    if a.reuse_ref and not os.path.isfile(os.path.join(refdir, "ref.json")):
+        if os.path.isfile(os.path.join(refdir, "ref", "ref.json")):
+            refdir = os.path.join(refdir, "ref")
+        else:
+            ap.error("--reuse-ref %s: no ref.json there or in its ref/" % refdir)
+    if a.reuse_ref:
         ref = json.load(open(os.path.join(refdir, "ref.json")))
     else:
         ref = run_chrome(refdir, sites, a.settle)

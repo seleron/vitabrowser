@@ -125,7 +125,8 @@ on text inputs, buttons, selects, textareas (225).
    something different here (docs/wasm-hcaptcha-measurement.md, "Why
    hCaptcha refuses us"). Traced call by call in both engines (patch
    268): same requests, same swallowed exceptions; the standards gaps
-   it found are fixed (269-272) and the demo still refuses. Next, if
+   it found are fixed (269-272) and the demo still refuses (gate
+   green; scorecard r52: no site moves but live content). Next, if
    pursued: replay hsw's import results through wasm3 and V8.
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
@@ -372,6 +373,9 @@ Cloudflare behaviour on the device's residential IP.
    cause; count how many sites share it.
 3. Fix the cause with the most sites; add a test page and gate (with a
    disarm check); run the suite.
-4. Re-score with the same Chrome reference; record the delta in
-   `docs/scorecard-log.md`.
+4. Re-score with the same Chrome reference (`--reuse-ref <run>/ref`, or
+   the run's directory); record the delta in `docs/scorecard-log.md`.
+   News and search pages drift within hours: a drop there is checked
+   against a reference taken with the run before it is called a
+   regression (r52).
 5. One bulk device run per batch (feedback: device runs are costly).
