@@ -1,0 +1,629 @@
+# netsurf: element, text, comment and fragment nodes have no own properties;
+# tagName / nodeName / nodeType are the prototypes' getters (patch 279)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 278)
+#
+# In a browser a node has no own properties: tagName is an Element.prototype
+# getter, nodeName / nodeType Node.prototype's. Here every wrapper carried
+# tagName, nodeName, nodeType and __ptr (never read), and once used, the
+# bridge's caches -- _L / _LC / _LR (listeners, capture flags, registered
+# pairs), _H (on<event> handlers), __st / __cl / __ds (style, classList,
+# dataset) -- and an SVG element __vbNS; a text node an own appendChild, a
+# fragment eleven own members (appendChild, removeChild, insertBefore,
+# children, textContent and their __get* / __set* backends, as closures per
+# fragment).
+#
+#  - macsurf_qjs.c: Node.prototype getters nodeType / nodeName and
+#    Element.prototype tagName, read from the node (qjs_el_names: patch
+#    249's casing rules, factored out of qjs_wrap_element; the strings are
+#    atoms, one per tag name); DocumentFragment.prototype textContent (the
+#    same this-based functions the closures used); CharacterData.prototype
+#    appendChild (the no-op text nodes had). The caches and __vbNS go to the
+#    object's private record (qjs_priv_get / qjs_priv_set in C,
+#    __vitaP(this) in the bridge's scripts). Node.prototype's methods serve
+#    fragments (they did already for everything else).
+#  - vita_polyfill.js: namespaceURI / localName read __vbNS from the record;
+#    element.attributes builds its Attr objects with defineProperty (Attr
+#    inherits Node.prototype's getter-only nodeName / nodeType now, and the
+#    strict-mode assignments threw: the first gate caught it, JS-sanitize
+#    5/7).
+#
+# Found on the way, older than this patch: a capture listener on the event's
+# target fires twice per event (dispatchEvent and click() alike).
+#
+# Gate: testpages/pages/JS-node-shape.html (NODESHAPE 6/6, Chromium 6/6; the
+# build before fails 1-4).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 97c8bb39f..8258a8b86 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1565,6 +1565,24 @@ static JSValue qjs_priv(JSContext *ctx, JSValueConst obj)
+ 	return r;
+ }
+ 
++/* patch 279: get / set one field of an object's private record */
++static JSValue qjs_priv_get(JSContext *ctx, JSValueConst obj, const char *k)
++{
++	JSValue r = qjs_priv(ctx, obj);
++	JSValue v = JS_GetPropertyStr(ctx, r, k);
++	JS_FreeValue(ctx, r);
++	return v;
++}
++
++static int qjs_priv_set(JSContext *ctx, JSValueConst obj, const char *k,
++		JSValue v)
++{
++	JSValue r = qjs_priv(ctx, obj);
++	int ret = JS_SetPropertyStr(ctx, r, k, v);
++	JS_FreeValue(ctx, r);
++	return ret;
++}
++
+ /* History API Phase B (Patch 136): evaluate history.__traverse(delta) in
+  * ctx. The JS shim keeps the pushState session entries; this returns true
+  * when one was shown (popstate already fired), false when the step leaves
+@@ -4689,54 +4707,17 @@ static void qjs_wrap_set_family_proto(JSContext *ctx, JSValue obj,
+  *     is returned (node identity holds).  The wrapper's own ref is untouched.
+  * In both cases the wrapper's node ref and doc keepalive are released SOLELY by
+  * qjs_el_finalizer / qjs_wrap_drain - nothing else unrefs that node. */
+-static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
++/* patch 279: an element's lower- and upper-case names (tag_lc / tag_uc,
++ * 128 bytes each) and its foreign namespace (SVG / MathML) or NULL -- for
++ * the wrapper's prototype lookup and for tagName / nodeName, which are
++ * Element.prototype / Node.prototype getters now (patch 249's rules). */
++static const char *qjs_el_names(dom_element *el, char *tag_lc, char *tag_uc)
+ {
+-	dom_node *node = (dom_node *)el;
+-	struct qjs_wrap_entry *hit;
+-	dom_node *owner_doc;
+-	JSValue obj;
+ 	dom_string *tag_ds = NULL;
+ 	const char *tag_str = "";
+-	char tag_lc[128];
+-	char tag_uc[128];
+-	const char *foreign_ns = NULL;	/* patch 249: SVG / MathML */
++	const char *foreign_ns = NULL;
+ 	int i;
+ 
+-	if (el == NULL) return JS_NULL;
+-
+-	hit = qjs_wrap_lookup(JS_GetRuntime(ctx), node);
+-	if (hit != NULL) {
+-		/* HIT: release the caller's transferred ref; the existing wrapper
+-		 * already owns the node's single ref.  Hand back a new reference
+-		 * to the same object so identity holds. */
+-		macsurf_dom_node_unref(node);
+-		return JS_DupValue(ctx, hit->val);
+-	}
+-
+-	/* MISS: build the single wrapper for this node. */
+-	obj = JS_NewObjectClass(ctx, (int)s_el_class_id);
+-	if (JS_IsException(obj)) {
+-		macsurf_dom_node_unref(node);   /* consume transferred ref */
+-		return JS_NULL;
+-	}
+-	JS_SetOpaque(obj, el);                  /* adopt the transferred node ref */
+-
+-	/* Keepalive: own one ref on the current document so it outlives this
+-	 * wrapper no matter which scope (content vs heap) tears down first. */
+-	owner_doc = (dom_node *)qjs_document_for_ctx(ctx);
+-	if (owner_doc) macsurf_dom_node_ref(owner_doc);
+-
+-	if (qjs_wrap_insert(node, owner_doc, obj, JS_GetRuntime(ctx)) == 0) {
+-		/* malloc failed: degrade to a dead wrapper rather than leak or
+-		 * crash.  Drop BOTH refs now and null the opaque so the finalizer
+-		 * and the accessor guard both no-op on this object. */
+-		JS_SetOpaque(obj, NULL);
+-		macsurf_dom_node_unref(node);
+-		if (owner_doc) macsurf_dom_node_unref(owner_doc);
+-		return obj;
+-	}
+-
+-	/* tagName / nodeName */
+ 	if (macsurf_dom_element_get_tag_name(el, &tag_ds) == DOM_NO_ERR
+ 	    && tag_ds != NULL) {
+ 		tag_str = dom_string_data(tag_ds);
+@@ -4795,6 +4776,130 @@ static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
+ 		}
+ 	}
+ 	if (tag_ds) macsurf_dom_string_unref(tag_ds);
++	return foreign_ns;
++}
++
++/* patch 279: nodeType, nodeName and tagName, read from the node --
++ * Node.prototype's and Element.prototype's getters, as in browsers (they
++ * were own properties of every wrapper). Anything without a node (a
++ * scratch document, a stand-in object) reads undefined, as it did. */
++static JSValue qjs_node_get_type(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	dom_node *n = qjs_get_node(this_val);
++	dom_node_type t = 0;
++
++	(void)argc; (void)argv;
++	if (n == NULL) return JS_UNDEFINED;
++	macsurf_dom_node_get_node_type(n, &t);
++	return t ? JS_NewInt32(ctx, (int)t) : JS_UNDEFINED;
++}
++
++static JSValue qjs_names_value(JSContext *ctx, const char *name)
++{
++	/* atoms: the runtime keeps one string per tag name */
++	JSAtom a = JS_NewAtom(ctx, name);
++	JSValue v = JS_AtomToString(ctx, a);
++	JS_FreeAtom(ctx, a);
++	return v;
++}
++
++static JSValue qjs_node_get_name(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	dom_node *n = qjs_get_node(this_val);
++	dom_node_type t = 0;
++	char lc[128], uc[128];
++
++	(void)argc; (void)argv;
++	if (n == NULL) return JS_UNDEFINED;
++	macsurf_dom_node_get_node_type(n, &t);
++	switch ((int)t) {
++	case 1:
++		qjs_el_names((dom_element *)n, lc, uc);
++		return qjs_names_value(ctx, uc);
++	case 3: return qjs_names_value(ctx, "#text");
++	case 4: return qjs_names_value(ctx, "#cdata-section");
++	case 8: return qjs_names_value(ctx, "#comment");
++	case 9: return qjs_names_value(ctx, "#document");
++	case 11: return qjs_names_value(ctx, "#document-fragment");
++	default: return JS_UNDEFINED;
++	}
++}
++
++static JSValue qjs_el_get_tag_name(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	dom_node *n = qjs_get_node(this_val);
++	dom_node_type t = 0;
++	char lc[128], uc[128];
++
++	(void)argc; (void)argv;
++	if (n == NULL) return JS_UNDEFINED;
++	macsurf_dom_node_get_node_type(n, &t);
++	if ((int)t != 1) return JS_UNDEFINED;
++	qjs_el_names((dom_element *)n, lc, uc);
++	return qjs_names_value(ctx, uc);
++}
++
++static void qjs_def_getter(JSContext *ctx, JSValueConst proto,
++		const char *name, JSCFunction *fn)
++{
++	char gn[64];
++	JSAtom atom = JS_NewAtom(ctx, name);
++
++	snprintf(gn, sizeof gn, "get %s", name);
++	JS_DefinePropertyGetSet(ctx, proto, atom, JS_NewCFunction(ctx, fn, gn, 0),
++			JS_UNDEFINED, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
++	JS_FreeAtom(ctx, atom);
++}
++
++static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
++{
++	dom_node *node = (dom_node *)el;
++	struct qjs_wrap_entry *hit;
++	dom_node *owner_doc;
++	JSValue obj;
++	char tag_lc[128];
++	char tag_uc[128];
++	const char *foreign_ns = NULL;	/* patch 249: SVG / MathML */
++
++	if (el == NULL) return JS_NULL;
++
++	hit = qjs_wrap_lookup(JS_GetRuntime(ctx), node);
++	if (hit != NULL) {
++		/* HIT: release the caller's transferred ref; the existing wrapper
++		 * already owns the node's single ref.  Hand back a new reference
++		 * to the same object so identity holds. */
++		macsurf_dom_node_unref(node);
++		return JS_DupValue(ctx, hit->val);
++	}
++
++	/* MISS: build the single wrapper for this node. */
++	obj = JS_NewObjectClass(ctx, (int)s_el_class_id);
++	if (JS_IsException(obj)) {
++		macsurf_dom_node_unref(node);   /* consume transferred ref */
++		return JS_NULL;
++	}
++	JS_SetOpaque(obj, el);                  /* adopt the transferred node ref */
++
++	/* Keepalive: own one ref on the current document so it outlives this
++	 * wrapper no matter which scope (content vs heap) tears down first. */
++	owner_doc = (dom_node *)qjs_document_for_ctx(ctx);
++	if (owner_doc) macsurf_dom_node_ref(owner_doc);
++
++	if (qjs_wrap_insert(node, owner_doc, obj, JS_GetRuntime(ctx)) == 0) {
++		/* malloc failed: degrade to a dead wrapper rather than leak or
++		 * crash.  Drop BOTH refs now and null the opaque so the finalizer
++		 * and the accessor guard both no-op on this object. */
++		JS_SetOpaque(obj, NULL);
++		macsurf_dom_node_unref(node);
++		if (owner_doc) macsurf_dom_node_unref(owner_doc);
++		return obj;
++	}
++
++	/* tagName / nodeName */
++	foreign_ns = qjs_el_names(el, tag_lc, tag_uc);
+ 
+ 	/* fixes1127 -- route the wrapper through its tag's constructor
+ 	 * prototype so instanceof answers truthfully for the whole DOM family
+@@ -4814,14 +4919,10 @@ static JSValue qjs_wrap_element(JSContext *ctx, dom_element *el)
+ 	 * === 'A'` was never true), and a foreign element keeps its case (both
+ 	 * above). The lowercase form still feeds the constructor prototype
+ 	 * lookup above. */
+-	JS_SetPropertyStr(ctx, obj, "tagName",  JS_NewString(ctx, tag_uc));
+-	JS_SetPropertyStr(ctx, obj, "nodeName", JS_NewString(ctx, tag_uc));
++	/* patch 279: tagName / nodeName / nodeType are the prototypes'
++	 * getters (qjs_node_get_name ...); the namespace mark is private */
+ 	if (foreign_ns != NULL)
+-		JS_DefinePropertyValueStr(ctx, obj, "__vbNS",
+-				JS_NewString(ctx, foreign_ns), JS_PROP_CONFIGURABLE);
+-	JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, 1));
+-	JS_SetPropertyStr(ctx, obj, "__ptr",
+-		JS_NewInt64(ctx, (long long)(size_t)el));
++		qjs_priv_set(ctx, obj, "__vbNS", JS_NewString(ctx, foreign_ns));
+ 
+ 	/* fixesXXXX (#211) — the whole method surface (event bridge, attributes,
+ 	 * textContent/innerHTML, mutation, query, classList/style/dataset,
+@@ -6808,7 +6909,7 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		"};"
+ 		"return cl;};"
+ 		"Object.defineProperty(P,'classList',{get:function(){"
+-		"if(!this.__cl)this.__cl=mk.call(this);return this.__cl;},"
++		"if(!__vitaP(this).__cl)__vitaP(this).__cl=mk.call(this);return __vitaP(this).__cl;},"
+ 		"configurable:true});"
+ 		"Object.defineProperty(P,'className',{"
+ 		"get:function(){return this.getAttribute('class')||'';},"
+@@ -6907,7 +7008,7 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		"t[k]=v;return true;}});"
+ 		"return p;};"
+ 		"Object.defineProperty(P,'dataset',{get:function(){"
+-		"if(!this.__ds)this.__ds=mk.call(this);return this.__ds;},"
++		"if(!__vitaP(this).__ds)__vitaP(this).__ds=mk.call(this);return __vitaP(this).__ds;},"
+ 		"configurable:true});"
+ 		"})();"
+ 		/* style proxy -- lazy per-instance factory (see classList note) */
+@@ -6954,7 +7055,7 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		"configurable:true,enumerable:true});})(PS[i]);"
+ 		"return sp;};"
+ 		"Object.defineProperty(P,'style',{get:function(){"
+-		"if(!this.__st)this.__st=mk.call(this);return this.__st;},"
++		"if(!__vitaP(this).__st)__vitaP(this).__st=mk.call(this);return __vitaP(this).__st;},"
+ 		"configurable:true});"
+ 		"})();"
+ 		/* matches - tag, #id, .class, [attr], compound */
+@@ -7129,9 +7230,9 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		"P.__msFireLocal=function(ev){"
+ 		"var t=ev&&ev.type||'';"
+ 		"var ph=(ev&&ev.eventPhase)||0;"
+-		"if(this._L&&this._L[t]){"
+-		"var a=this._L[t].slice();"
+-		"var c=(this._LC&&this._LC[t])?this._LC[t].slice():null;"
++		"if(__vitaP(this)._L&&__vitaP(this)._L[t]){"
++		"var a=__vitaP(this)._L[t].slice();"
++		"var c=(__vitaP(this)._LC&&__vitaP(this)._LC[t])?__vitaP(this)._LC[t].slice():null;"
+ 		"var i;for(i=0;i<a.length;i++){"
+ 		/* stopImmediatePropagation, observed BETWEEN handlers -- see
+ 		 * qjs_ev_stop_immediate_data. Checked before each call so the
+@@ -7147,7 +7248,7 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		"if(ev&&ev.__msStopNow)return true;"
+ 		/* on* handlers are non-capture by definition, so they must never
+ 		 * run in the capturing phase. */
+-		"if(ph!==1&&this._H&&this._H[t]){try{this._H[t].call(this,ev);}"
++		"if(ph!==1&&__vitaP(this)._H&&__vitaP(this)._H[t]){try{__vitaP(this)._H[t].call(this,ev);}"
+ 		"catch(e){try{console.error('LIFE jsevent on'+t+' threw: '+"
+ 		"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}}}"
+ 		"return true;};"
+@@ -9700,11 +9801,11 @@ static JSValue qjs_el_add_event_listener_data(JSContext *ctx,
+ 	}
+ 
+ 	/* JS-side registry, unchanged shape: el._L[type] is an array of fns. */
+-	L = JS_GetPropertyStr(ctx, this_val, "_L");
++	L = qjs_priv_get(ctx, this_val, "_L");
+ 	if (!JS_IsObject(L)) {
+ 		JS_FreeValue(ctx, L);
+ 		L = JS_NewObject(ctx);
+-		JS_SetPropertyStr(ctx, this_val, "_L", JS_DupValue(ctx, L));
++		qjs_priv_set(ctx, this_val, "_L", JS_DupValue(ctx, L));
+ 	}
+ 	arr = JS_GetPropertyStr(ctx, L, type_c);
+ 	if (JS_IsUndefined(arr) || JS_IsNull(arr)) {
+@@ -9728,11 +9829,11 @@ static JSValue qjs_el_add_event_listener_data(JSContext *ctx,
+ 	 * __msFireLocal must fire only the listeners belonging to the phase
+ 	 * libdom is currently in, and until now it had no way to tell them
+ 	 * apart. removeEventListener splices this in lockstep with _L. */
+-	C = JS_GetPropertyStr(ctx, this_val, "_LC");
++	C = qjs_priv_get(ctx, this_val, "_LC");
+ 	if (!JS_IsObject(C)) {
+ 		JS_FreeValue(ctx, C);
+ 		C = JS_NewObject(ctx);
+-		JS_SetPropertyStr(ctx, this_val, "_LC", JS_DupValue(ctx, C));
++		qjs_priv_set(ctx, this_val, "_LC", JS_DupValue(ctx, C));
+ 	}
+ 	carr = JS_GetPropertyStr(ctx, C, type_c);
+ 	if (JS_IsUndefined(carr) || JS_IsNull(carr)) {
+@@ -9760,11 +9861,11 @@ static JSValue qjs_el_add_event_listener_data(JSContext *ctx,
+ 		strcpy(key, type_c);
+ 		/* octal escape, not \x01: a hex escape would swallow the letter */
+ 		strcat(key, capture ? "\001C" : "\001B");
+-		R = JS_GetPropertyStr(ctx, this_val, "_LR");
++		R = qjs_priv_get(ctx, this_val, "_LR");
+ 		if (!JS_IsObject(R)) {
+ 			JS_FreeValue(ctx, R);
+ 			R = JS_NewObject(ctx);
+-			JS_SetPropertyStr(ctx, this_val, "_LR",
++			qjs_priv_set(ctx, this_val, "_LR",
+ 					JS_DupValue(ctx, R));
+ 		}
+ 		seen = JS_GetPropertyStr(ctx, R, key);
+@@ -9795,7 +9896,7 @@ static void qjs_lc_splice_at(JSContext *ctx, JSValueConst el,
+ {
+ 	JSValue C, carr, sp;
+ 
+-	C = JS_GetPropertyStr(ctx, el, "_LC");
++	C = qjs_priv_get(ctx, el, "_LC");
+ 	if (!JS_IsObject(C)) { JS_FreeValue(ctx, C); return; }
+ 
+ 	carr = JS_GetPropertyStr(ctx, C, type_c);
+@@ -9830,7 +9931,7 @@ static JSValue qjs_el_remove_event_listener_data(JSContext *ctx,
+ 	type_c = JS_ToCString(ctx, argv[0]);
+ 	if (type_c == NULL) return JS_UNDEFINED;
+ 
+-	L = JS_GetPropertyStr(ctx, this_val, "_L");
++	L = qjs_priv_get(ctx, this_val, "_L");
+ 	if (JS_IsObject(L)) {
+ 		arr = JS_GetPropertyStr(ctx, L, type_c);
+ 		if (JS_IsObject(arr)) {
+@@ -10007,11 +10108,11 @@ void macsurf_qjs_bind_inline_handlers(struct dom_node *node)
+ 			JS_FreeValue(ctx, wrapper);
+ 			continue;
+ 		}
+-		H = JS_GetPropertyStr(ctx, wrapper, "_H");
++		H = qjs_priv_get(ctx, wrapper, "_H");
+ 		if (!JS_IsObject(H)) {
+ 			JS_FreeValue(ctx, H);
+ 			H = JS_NewObject(ctx);
+-			JS_SetPropertyStr(ctx, wrapper, "_H",
++			qjs_priv_set(ctx, wrapper, "_H",
+ 					JS_DupValue(ctx, H));
+ 		}
+ 		type = names[i] + 2;            /* "onclick" -> "click" */
+@@ -10145,8 +10246,7 @@ static JSValue qjs_wrap_text_node(JSContext *ctx, dom_text *tn)
+ 		if (wt == 0) wt = 3;
+ 		if (wt == 8) wname = "#comment";
+ 		else if (wt == 4) wname = "#cdata-section";
+-		JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, (int) wt));
+-		JS_SetPropertyStr(ctx, obj, "nodeName", JS_NewString(ctx, wname));
++		(void)wname;	/* patch 279: Node.prototype's getters */
+ 		/* fixes1127 -- real family prototype: text/comment/CDATA wrappers
+ 		 * answer instanceof Text/CharacterData/Node truthfully and must NOT
+ 		 * answer instanceof HTMLElement (the shared class proto alone would
+@@ -10155,8 +10255,6 @@ static JSValue qjs_wrap_text_node(JSContext *ctx, dom_text *tn)
+ 		qjs_wrap_set_family_proto(ctx, obj,
+ 			(wt == 8) ? "Comment" : (wt == 4) ? "CharacterData" : "Text");
+ 	}
+-	JS_SetPropertyStr(ctx, obj, "__ptr",
+-		JS_NewInt64(ctx, (long long) (size_t) tn));
+ 
+ 	/* fixes1170 (#211) - nodeValue/data/textContent live on
+ 	 * CharacterData.prototype and parentNode + the node-level traversal
+@@ -10165,9 +10263,7 @@ static JSValue qjs_wrap_text_node(JSContext *ctx, dom_text *tn)
+ 	 * the appendChild no-op below -- zero per-node closures. The family
+ 	 * proto set above chains Text/Comment/CharacterData -> CharacterData ->
+ 	 * Node, which is what makes those reachable. */
+-	JS_SetPropertyStr(ctx, obj, "appendChild",
+-		JS_NewCFunction(ctx, qjs_text_append_child_noop,
+-				"appendChild", 1));
++	/* patch 279: the appendChild no-op is CharacterData.prototype's */
+ 
+ 	return obj;
+ }
+@@ -10264,8 +10360,6 @@ static JSValue qjs_wrap_fragment(JSContext *ctx, dom_document_fragment *frag)
+ 	struct qjs_wrap_entry *hit;
+ 	dom_node *owner_doc;
+ 	JSValue obj;
+-	JSValue data[1];
+-	JSValue f;
+ 
+ 	if (frag == NULL) return JS_NULL;
+ 
+@@ -10292,45 +10386,9 @@ static JSValue qjs_wrap_fragment(JSContext *ctx, dom_document_fragment *frag)
+ 		return obj;
+ 	}
+ 
+-	JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, 11));
+-	JS_SetPropertyStr(ctx, obj, "nodeName",
+-			JS_NewString(ctx, "#document-fragment"));
+-	JS_SetPropertyStr(ctx, obj, "__ptr",
+-			JS_NewInt64(ctx, (long long) (size_t) frag));
+-
+-	data[0] = JS_DupValue(ctx, obj);
+-	f = JS_NewCFunctionData(ctx, qjs_el_append_child_data, 1, 0, 1, data);
+-	JS_SetPropertyStr(ctx, obj, "appendChild", f);
+-	f = JS_NewCFunctionData(ctx, qjs_el_remove_child_data, 1, 0, 1, data);
+-	JS_SetPropertyStr(ctx, obj, "removeChild", f);
+-	f = JS_NewCFunctionData(ctx, qjs_el_insert_before_data, 2, 0, 1, data);
+-	JS_SetPropertyStr(ctx, obj, "insertBefore", f);
+-	f = JS_NewCFunctionData(ctx, qjs_el_get_children_data, 0, 0, 1, data);
+-	JS_SetPropertyStr(ctx, obj, "__getChildren", f);
+-	f = JS_NewCFunctionData(ctx, qjs_el_get_text_content_data, 0, 0, 1, data);
+-	JS_SetPropertyStr(ctx, obj, "__getTextContent", f);
+-	f = JS_NewCFunctionData(ctx, qjs_el_set_text_content_data, 1, 0, 1, data);
+-	JS_SetPropertyStr(ctx, obj, "__setTextContent", f);
+-	JS_FreeValue(ctx, data[0]);
+-
+-	{
+-		JSAtom atom;
+-		JSValue getter;
+-
+-		atom = JS_NewAtom(ctx, "children");
+-		getter = JS_GetPropertyStr(ctx, obj, "__getChildren");
+-		JS_DefinePropertyGetSet(ctx, obj, atom, getter, JS_UNDEFINED,
+-				JS_PROP_CONFIGURABLE);
+-		JS_FreeAtom(ctx, atom);
+-
+-
+-		atom = JS_NewAtom(ctx, "textContent");
+-		JS_DefinePropertyGetSet(ctx, obj, atom,
+-				JS_GetPropertyStr(ctx, obj, "__getTextContent"),
+-				JS_GetPropertyStr(ctx, obj, "__setTextContent"),
+-				JS_PROP_CONFIGURABLE);
+-		JS_FreeAtom(ctx, atom);
+-	}
++	/* patch 279: nodeType / nodeName are Node.prototype's getters, the
++	 * methods Node.prototype's, textContent DocumentFragment.prototype's
++	 * (qjs_el_install_proto_surface): a fragment has no own properties */
+ 
+ 	/* fixes1170 (#211) - parentNode + the node-level traversal surface are on
+ 	 * Node.prototype (qjs_el_install_proto_surface), reached through the
+@@ -12019,8 +12077,38 @@ static void qjs_el_install_proto_surface(JSContext *ctx, JSValue proto)
+ 	node_proto = qjs_ctor_proto_by_name(ctx, "Node");
+ 	if (JS_IsObject(node_proto)) {
+ 		qjs_install_node_traversal(ctx, node_proto);
++		/* patch 279 */
++		qjs_def_getter(ctx, node_proto, "nodeType", qjs_node_get_type);
++		qjs_def_getter(ctx, node_proto, "nodeName", qjs_node_get_name);
+ 		JS_FreeValue(ctx, node_proto);
+ 	}
++	/* patch 279: what each wrapper carried as its own properties */
++	{
++		JSValue ep = qjs_ctor_proto_by_name(ctx, "Element");
++		JSValue fp = qjs_ctor_proto_by_name(ctx, "DocumentFragment");
++		JSValue cp = qjs_ctor_proto_by_name(ctx, "CharacterData");
++		if (JS_IsObject(ep))
++			qjs_def_getter(ctx, ep, "tagName", qjs_el_get_tag_name);
++		if (JS_IsObject(fp)) {
++			JSAtom atom = JS_NewAtom(ctx, "textContent");
++			JS_DefinePropertyGetSet(ctx, fp, atom,
++				JS_NewCFunctionData(ctx, qjs_el_get_text_content_data,
++						0, 0, 0, NULL),
++				JS_NewCFunctionData(ctx, qjs_el_set_text_content_data,
++						1, 0, 0, NULL),
++				JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
++			JS_FreeAtom(ctx, atom);
++		}
++		if (JS_IsObject(cp))
++			JS_DefinePropertyValueStr(ctx, cp, "appendChild",
++				JS_NewCFunction(ctx, qjs_text_append_child_noop,
++						"appendChild", 1),
++				JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE |
++				JS_PROP_ENUMERABLE);
++		JS_FreeValue(ctx, ep);
++		JS_FreeValue(ctx, fp);
++		JS_FreeValue(ctx, cp);
++	}
+ 
+ 	/* CharacterData surface — nodeValue/data/textContent getter/setter pairs
+ 	 * for text/comment/CDATA wrappers. They share the shape and all reach
+@@ -12075,9 +12163,9 @@ static void qjs_el_install_proto(JSContext *ctx)
+ 		"var p={};var i;"
+ 		"for(i=0;i<n.length;i++){(function(k){"
+ 		"Object.defineProperty(p,'on'+k,{configurable:true,enumerable:false,"
+-		"get:function(){return (this._H&&this._H[k])||null;},"
+-		"set:function(v){if(!this._H)this._H={};"
+-		"this._H[k]=(typeof v==='function')?v:null;"
++		"get:function(){return (__vitaP(this)._H&&__vitaP(this)._H[k])||null;},"
++		"set:function(v){if(!__vitaP(this)._H)__vitaP(this)._H={};"
++		"__vitaP(this)._H[k]=(typeof v==='function')?v:null;"
+ 		/* fixes996 -- tell libdom this node wants the event, or a real
+ 		 * click never dispatches here and _H is never read. */
+ 		"if(v&&this.__msRegEvent){try{this.__msRegEvent(k);}catch(e){}}"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index bf74474d5..8cdf0d9b1 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -20,6 +20,9 @@
+ " * selection, ...) in a record per object that no page can see -- they\n"
+ " * were properties of the functions and elements themselves */\n"
+ "if (!PRIV.pv) PRIV.pv = new WeakMap();\n"
++"/* an element's foreign namespace, set by the bridge in its private record\n"
++" * (macsurf_qjs.c qjs_wrap_element, patch 279) */\n"
++"function nsOf(el) { return typeof g.__vitaP === 'function' && el && typeof el === 'object' ? g.__vitaP(el).__vbNS : undefined; }\n"
+ "function PV(o) {\n"
+ "\tif (o === null || (typeof o !== 'object' && typeof o !== 'function')) return {};\n"
+ "\tvar r = PRIV.pv.get(o);\n"
+@@ -4250,10 +4253,14 @@
+ "\t\t\tvar el = this, ns = names(el), list = [], i;\n"
+ "\t\t\tfor (i = 0; i < ns.length; i++) {\n"
+ "\t\t\t\tvar a = Object.create(Attr && Attr.prototype ? Attr.prototype : Object.prototype);\n"
+-"\t\t\t\ta.name = a.nodeName = a.localName = ns[i];\n"
+-"\t\t\t\ta.value = a.nodeValue = a.textContent = el.getAttribute(ns[i]);\n"
+-"\t\t\t\ta.namespaceURI = null; a.prefix = null; a.specified = true;\n"
+-"\t\t\t\ta.nodeType = 2; a.ownerElement = el;\n"
++"\t\t\t\t/* defined, not assigned: Attr inherits Node.prototype's\n"
++"\t\t\t\t * getter-only nodeName / nodeType (patch 279) */\n"
++"\t\t\t\tvar v = el.getAttribute(ns[i]);\n"
++"\t\t\t\t[['name', ns[i]], ['nodeName', ns[i]], ['localName', ns[i]], ['value', v], ['nodeValue', v],\n"
++"\t\t\t\t ['textContent', v], ['namespaceURI', null], ['prefix', null], ['specified', true],\n"
++"\t\t\t\t ['nodeType', 2], ['ownerElement', el]].forEach(function (p) {\n"
++"\t\t\t\t\tObject.defineProperty(a, p[0], { value: p[1], writable: true, enumerable: true, configurable: true });\n"
++"\t\t\t\t});\n"
+ "\t\t\t\tlist.push(a);\n"
+ "\t\t\t\tif (!(ns[i] in list) && !/^\\d/.test(ns[i]))\n"
+ "\t\t\t\t\ttry { Object.defineProperty(list, ns[i], { value: a, configurable: true }); } catch (e) { /* */ }\n"
+@@ -5214,10 +5221,10 @@
+ "\t * guessed from a list of ten SVG tag names */\n"
+ "\tacc(E, 'localName', function () {\n"
+ "\t\tvar t = String(this.tagName || '');\n"
+-"\t\treturn this.__vbNS ? t : t.toLowerCase();\n"
++"\t\treturn nsOf(this) ? t : t.toLowerCase();\n"
+ "\t});\n"
+ "\tacc(E, 'namespaceURI', function () {\n"
+-"\t\treturn this.__vbNS || 'http://www.w3.org/1999/xhtml';\n"
++"\t\treturn nsOf(this) || 'http://www.w3.org/1999/xhtml';\n"
+ "\t});\n"
+ "\t/* innerText is the RENDERED text, not textContent: <script>,\n"
+ "\t * <style>, <template>, <noscript> and [hidden] / display:none\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 9955fadc3..7aa2a137b 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -19,6 +19,9 @@ if (!PRIV) {
+  * selection, ...) in a record per object that no page can see -- they
+  * were properties of the functions and elements themselves */
+ if (!PRIV.pv) PRIV.pv = new WeakMap();
++/* an element's foreign namespace, set by the bridge in its private record
++ * (macsurf_qjs.c qjs_wrap_element, patch 279) */
++function nsOf(el) { return typeof g.__vitaP === 'function' && el && typeof el === 'object' ? g.__vitaP(el).__vbNS : undefined; }
+ function PV(o) {
+ 	if (o === null || (typeof o !== 'object' && typeof o !== 'function')) return {};
+ 	var r = PRIV.pv.get(o);
+@@ -4249,10 +4252,14 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			var el = this, ns = names(el), list = [], i;
+ 			for (i = 0; i < ns.length; i++) {
+ 				var a = Object.create(Attr && Attr.prototype ? Attr.prototype : Object.prototype);
+-				a.name = a.nodeName = a.localName = ns[i];
+-				a.value = a.nodeValue = a.textContent = el.getAttribute(ns[i]);
+-				a.namespaceURI = null; a.prefix = null; a.specified = true;
+-				a.nodeType = 2; a.ownerElement = el;
++				/* defined, not assigned: Attr inherits Node.prototype's
++				 * getter-only nodeName / nodeType (patch 279) */
++				var v = el.getAttribute(ns[i]);
++				[['name', ns[i]], ['nodeName', ns[i]], ['localName', ns[i]], ['value', v], ['nodeValue', v],
++				 ['textContent', v], ['namespaceURI', null], ['prefix', null], ['specified', true],
++				 ['nodeType', 2], ['ownerElement', el]].forEach(function (p) {
++					Object.defineProperty(a, p[0], { value: p[1], writable: true, enumerable: true, configurable: true });
++				});
+ 				list.push(a);
+ 				if (!(ns[i] in list) && !/^\d/.test(ns[i]))
+ 					try { Object.defineProperty(list, ns[i], { value: a, configurable: true }); } catch (e) { /* */ }
+@@ -5213,10 +5220,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	 * guessed from a list of ten SVG tag names */
+ 	acc(E, 'localName', function () {
+ 		var t = String(this.tagName || '');
+-		return this.__vbNS ? t : t.toLowerCase();
++		return nsOf(this) ? t : t.toLowerCase();
+ 	});
+ 	acc(E, 'namespaceURI', function () {
+-		return this.__vbNS || 'http://www.w3.org/1999/xhtml';
++		return nsOf(this) || 'http://www.w3.org/1999/xhtml';
+ 	});
+ 	/* innerText is the RENDERED text, not textContent: <script>,
+ 	 * <style>, <template>, <noscript> and [hidden] / display:none

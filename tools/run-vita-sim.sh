@@ -326,6 +326,7 @@ NET-js-builtin-shape http://127.0.0.1:$HP/JS-builtin-shape.html
 NET-js-api-protos http://127.0.0.1:$HP/JS-api-protos.html
 NET-js-window-order http://127.0.0.1:$HP/JS-window-order.html
 NET-js-document-shape http://127.0.0.1:$HP/JS-document-shape.html
+NET-js-node-shape http://127.0.0.1:$HP/JS-node-shape.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -837,7 +838,8 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-builtins-native BUILTIN 8" "js-perf-timing PERFTIME 10" \
 	 "js-device-honest DEVICE 6" "js-window-proto WINPROTO 6" \
 	 "js-builtin-shape BSHAPE 8" "js-api-protos APIPROTO 7" \
-	 "js-window-order WINORDER 5" "js-document-shape DOCSHAPE 6"; do
+	 "js-window-order WINORDER 5" "js-document-shape DOCSHAPE 6" \
+	 "js-node-shape NODESHAPE 6"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
