@@ -1,0 +1,383 @@
+# netsurf: HTML's timer nesting clamp; the main loop wakes for the next
+# timer (patch 281)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 280)
+#
+# hCaptcha's hsw times the browser (docs/wasm-hcaptcha-measurement.md,
+# "Timing"); measuring the clocks and the event loop the same way in both
+# engines found one standards deviation and one inaccuracy:
+#
+#  - HTML: "if nesting level is greater than 5, and timeout is less than 4,
+#    then set timeout to 4". setTimeout(fn, 0) chained ten deep ran every
+#    link at 0 ms here; Chromium 0 ... 0, then 4 ms from the seventh.
+#    macsurf_qjs.c: each timer keeps its nesting level (the running timer
+#    task's + 1, 0 outside one; an interval's rises each run), callbacks run
+#    at their level, and a timer set above level 5 waits at least 4 ms.
+#    requestAnimationFrame's timer (__msRafTimeout) is not a timer task, as
+#    in browsers: a frame callback's setTimeout(0) is not clamped.
+#  - the frontend's idle loop slept a whole frame (16 ms) between passes, so
+#    a timer was due up to 16 ms late (setTimeout(50) fired at 64 ms; the
+#    new 4 ms clamp would have been 16). frontends/vita/main.c sleeps until
+#    the next JavaScript timer is due when that is sooner than a frame
+#    (macsurf_qjs_next_timer_ms; at least 1 ms): setTimeout(50) fires at
+#    50 ms, a clamped link after 4.
+#  - while a page paints the loop does not idle, so the event-loop pump
+#    (qjs_pump_heap_due) now also waits for a timer due within 4.5 ms,
+#    inside its existing 10 ms budget (macsurf_platform_sleep_ms, a new
+#    macos9.h hook: sceKernelDelayThread). Without it the first gate run
+#    failed JS-frame-local's 300-link setTimeout(fn, 1) chain (each clamped
+#    link waited a frame); now the chain takes 1.20 s, Chromium 1.21 s.
+#  - a page has not settled (frontends/vita/main.c page_settled, the
+#    autotest's "done" -- and so its dump) while a script runs a chain of
+#    short timers (macsurf_qjs_timer_chain_active: a live timer set with at
+#    most 4 ms and due within 4.5 ms; animation intervals of a frame or
+#    more do not count) -- for at most VITA_SETTLE_CHAIN_MS (4 s) into the
+#    page, since a setTimeout(fn, 0) heartbeat never ends (the stall gate
+#    pages have one; unbounded, they waited out the 20 s timeout). The
+#    second gate run read JS-frame-local while its chain, now 1.2 s as in
+#    Chromium, was still running.
+#
+# Chromium given this engine's timer lateness, or its exact-tenth clock
+# values, or 25x / 50x CPU throttling, still passes hCaptcha; the demo
+# still refuses the engine -- this is a standards / accuracy fix.
+#
+# Gate: testpages/pages/JS-timer-nesting.html (TIMERNEST 4/4, Chromium 4/4;
+# the build before fails 1-2).
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+index 374e5c7d0..ff5c47b14 100644
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -167,6 +167,10 @@ void macsurf_window_close_self(struct content *c);
+  * no battery information at all (the simulator), 1 otherwise. */
+ int macsurf_battery(double *level, int *charging, double *discharging_s);
+ 
++/** VitaBrowser patch 281: sleep the calling (main) thread for about ms
++ * milliseconds -- the event loop waiting for a timer due that soon. */
++void macsurf_platform_sleep_ms(double ms);
++
+ /** The directory localStorage files live in, ending in '/', or NULL when
+  * there is none. */
+ const char *macsurf_storage_dir(void);
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index ab9d4ea89..21a87089e 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1845,6 +1845,7 @@ struct qjs_timer {
+ 	int        repeating;
+ 	double     interval_ms;
+ 	int        live;
++	int        nesting;	/* VitaBrowser patch 281: HTML timer nesting level */
+ 	JSContext *ctx;		/* owner of `fn` AND `args` - see the note above */
+ 	JSValue    fn;
+ 	/* fixes876 - setTimeout(fn, delay, a, b): the extra arguments, duped at
+@@ -2048,6 +2049,15 @@ static struct qjs_timer *timer_alloc(void)
+ 	return victim;
+ }
+ 
++/* VitaBrowser patch 281: HTML's timer nesting level -- the level of the
++ * timer task now running (0 outside one). A timer set at a level above 5
++ * waits at least 4 ms ("if nesting level is greater than 5, and timeout is
++ * less than 4, then set timeout to 4"); an interval's level rises with each
++ * run. Every browser does this, and a page can tell: setTimeout(fn, 0)
++ * chained ten deep ran every link at 0 ms here, at 4 ms from the sixth in
++ * Chromium. Animation frames are not timer tasks (qjs_raf_timeout). */
++static int s_timer_nesting = 0;
++
+ static JSValue qjs_settimeout_impl(JSContext *ctx,
+ 		JSValueConst this_val, int argc, JSValueConst *argv,
+ 		int repeating)
+@@ -2061,7 +2071,9 @@ static JSValue qjs_settimeout_impl(JSContext *ctx,
+ 	(void)this_val;
+ 	if (argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_NewInt32(ctx, 0);
+ 	if (argc >= 2) JS_ToFloat64(ctx, &delay_ms, argv[1]);
+-	if (delay_ms < 0.0) delay_ms = 0.0;
++	if (delay_ms < 0.0 || delay_ms != delay_ms) delay_ms = 0.0;
++	if (repeating != 2 && s_timer_nesting > 5 && delay_ms < 4.0)
++		delay_ms = 4.0;
+ 
+ 	t = timer_alloc();
+ 	if (t == NULL) return JS_NewInt32(ctx, 0);
+@@ -2072,9 +2084,11 @@ static JSValue qjs_settimeout_impl(JSContext *ctx,
+ 	t->id = id;
+ 	g_timer_created++;   /* fixes1273 */
+ 	t->expiry_ms = macsurf_qjs_get_now() + delay_ms;
+-	t->repeating = repeating;
++	t->repeating = repeating == 1;
+ 	t->interval_ms = delay_ms;
+ 	t->live = 1;
++	/* an animation frame's timer (repeating == 2) runs outside nesting */
++	t->nesting = repeating == 2 ? 0 : s_timer_nesting + 1;
+ 
+ 	/* fixes876 - capture setTimeout(fn, delay, a, b, ...)'s trailing args.
+ 	 * Dropping these is why requestAnimationFrame callbacks saw `undefined`
+@@ -2117,6 +2131,19 @@ static JSValue qjs_setinterval(JSContext *ctx, JSValueConst this_val,
+ 	return qjs_settimeout_impl(ctx, this_val, argc, argv, 1);
+ }
+ 
++/* patch 281: requestAnimationFrame's timer -- not a timer task, so neither
++ * clamped nor raising the nesting level of what its callback sets */
++static JSValue qjs_raf_timeout(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	JSValue a[2];
++
++	if (argc < 1) return JS_NewInt32(ctx, 0);
++	a[0] = argv[0];
++	a[1] = JS_NewInt32(ctx, 16);
++	return qjs_settimeout_impl(ctx, this_val, 2, a, 2);
++}
++
+ static JSValue qjs_cleartimeout(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+@@ -2289,6 +2316,37 @@ static int qjs_timers_due(JSContext *qctx, double now)
+ 	return 0;
+ }
+ 
++/* exported interface documented in macsurf_qjs.h (patch 281) */
++int macsurf_qjs_timer_chain_active(void)
++{
++	double now = macsurf_qjs_get_now();
++	int i;
++
++	for (i = 0; i < QJS_MAX_TIMERS; i++) {
++		const struct qjs_timer *t = &s_timer_arena[i];
++		if (t->live && t->interval_ms <= 4.0 &&
++		    t->expiry_ms - now <= 4.5)
++			return 1;
++	}
++	return 0;
++}
++
++/* exported interface documented in macsurf_qjs.h (patch 281) */
++double macsurf_qjs_next_timer_ms(void)
++{
++	double now = macsurf_qjs_get_now(), best = -1.0;
++	int i;
++
++	for (i = 0; i < QJS_MAX_TIMERS; i++) {
++		double d;
++		if (!s_timer_arena[i].live) continue;
++		d = s_timer_arena[i].expiry_ms - now;
++		if (d < 0.0) d = 0.0;
++		if (best < 0.0 || d < best) best = d;
++	}
++	return best;
++}
++
+ void macsurf_qjs_run_timers(struct jscontext *ctx)
+ {
+ 	double now;
+@@ -2296,6 +2354,7 @@ void macsurf_qjs_run_timers(struct jscontext *ctx)
+ 	int due_idx[QJS_MAX_TIMERS];
+ 	int due_id[QJS_MAX_TIMERS];
+ 	int ndue;
++	int run_level = 0, prev_level = 0;	/* patch 281 */
+ 	int k;
+ 	int i;
+ 
+@@ -2372,7 +2431,11 @@ void macsurf_qjs_run_timers(struct jscontext *ctx)
+ 		for (a = 0; a < call_nargs; a++)
+ 			call_args[a] = JS_DupValue(qctx, t->args[a]);
+ 
++		run_level = t->nesting;		/* patch 281 */
+ 		if (t->repeating) {
++			if (t->nesting > 5 && t->interval_ms < 4.0)
++				t->interval_ms = 4.0;
++			t->nesting++;
+ 			t->expiry_ms = macsurf_qjs_get_now() + t->interval_ms;
+ 		} else {
+ 			timer_slot_clear(t, 1);
+@@ -2410,7 +2473,10 @@ void macsurf_qjs_run_timers(struct jscontext *ctx)
+ 		 * JS_UNDEFINED left strict-mode callbacks with `this === undefined`. */
+ 		this_obj = JS_GetGlobalObject(qctx);
+ 		qjs_task_push(MACSURF_JS_TASK_TIMER);
++		prev_level = s_timer_nesting;
++		s_timer_nesting = run_level;
+ 		ret = JS_Call(qctx, fn, this_obj, call_nargs, call_args);
++		s_timer_nesting = prev_level;
+ 		{	/* fixes1037 */
+ 			extern double macos9_micros(void);
+ 			double dt = macos9_micros() - g_timer_t0;
+@@ -13358,6 +13424,7 @@ static void register_browser_globals(JSContext *ctx)
+ 
+ 	/* --- timers --- */
+ 	qjs_set_func(ctx, global, "setTimeout",    qjs_settimeout,  2);
++	qjs_set_func(ctx, global, "__msRafTimeout", qjs_raf_timeout, 1);	/* patch 281 */
+ 	qjs_set_func(ctx, global, "setInterval",   qjs_setinterval, 2);
+ 	qjs_set_func(ctx, global, "clearTimeout",  qjs_cleartimeout, 1);
+ 	qjs_set_func(ctx, global, "clearInterval", qjs_cleartimeout, 1);
+@@ -13391,10 +13458,10 @@ static void register_browser_globals(JSContext *ctx)
+ 	 * case, not because the two compete. */
+ 	macsurf_qjs__safe_eval(ctx,
+ 		"function requestAnimationFrame(fn){"
+-			"return setTimeout(function(){"
++			"return __msRafTimeout(function(){"
+ 				"try{__msRafFired();}catch(e){}"
+ 				"fn(__macsurf_monotonic_ms());"
+-			"},16);"
++			"});"
+ 		"}"
+ 		"function cancelAnimationFrame(id){"
+ 			"clearTimeout(id);"
+@@ -21538,6 +21605,22 @@ static void qjs_pump_heap_once(struct jsheap *h)
+  * heap has due timers or pending jobs, within QJS_PUMP_BUDGET_MS, and stop
+  * if a callback started a reconvert (JS must not run during one) or tore
+  * the heap down. */
++/* patch 281: ms until this context's earliest timer, or -1 with none */
++static double qjs_next_due_in(JSContext *qctx)
++{
++	double now = macsurf_qjs_get_now(), best = -1.0;
++	int i;
++
++	for (i = 0; i < QJS_MAX_TIMERS; i++) {
++		double d;
++		if (!qjs_timer_owned_by(&s_timer_arena[i], qctx)) continue;
++		d = s_timer_arena[i].expiry_ms - now;
++		if (d < 0.0) d = 0.0;
++		if (best < 0.0 || d < best) best = d;
++	}
++	return best;
++}
++
+ static void qjs_pump_heap_due(struct jsheap *h)
+ {
+ 	extern int macsurf_reconvert_in_progress;
+@@ -21553,8 +21636,17 @@ static void qjs_pump_heap_due(struct jsheap *h)
+ 			return;
+ 		if (!(h->ctx != NULL &&
+ 		      qjs_timers_due(h->ctx, macsurf_qjs_get_now())) &&
+-		    !(h->rt != NULL && JS_IsJobPending(h->rt)))
+-			return;
++		    !(h->rt != NULL && JS_IsJobPending(h->rt))) {
++			/* patch 281: a timer HTML clamps to 4 ms (a link deep in
++			 * a setTimeout chain) is waited for here, inside the
++			 * budget, instead of a whole frame later (a 300-link
++			 * setTimeout(fn, 1) chain: Chromium 1.2 s) */
++			double nx = h->ctx != NULL ? qjs_next_due_in(h->ctx) : -1.0;
++			if (nx < 0.0 || nx > 4.5 ||
++			    macsurf_qjs_get_now() - t0 + nx >= QJS_PUMP_BUDGET_MS)
++				return;
++			macsurf_platform_sleep_ms(nx);
++		}
+ 	}
+ }
+ 
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.h b/content/handlers/javascript/quickjs/macsurf_qjs.h
+index 67b68ca07..66c836529 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.h
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.h
+@@ -59,6 +59,14 @@ bool macsurf_qjs_blob_bytes(JSValueConst v, const uint8_t **bytes,
+ 
+ /* Timer callbacks wired to setTimeout/setInterval. */
+ void macsurf_qjs_run_timers(struct jscontext *ctx);
++/* VitaBrowser patch 281: milliseconds until the earliest live timer is due
++ * (0 if one already is), or -1 with none -- so a frontend idling between
++ * frames can wake for it instead of a whole frame later. */
++double macsurf_qjs_next_timer_ms(void);
++/* VitaBrowser patch 281: whether a script is running a chain of short
++ * timers (one due within 4 ms, set with a delay of at most 4 ms): its page
++ * has not settled yet, however quiet the screen is. */
++int macsurf_qjs_timer_chain_active(void);
+ 
+ /* Fatal handler  -  called when the engine hits an unrecoverable error. */
+ void macsurf_qjs_fatal(JSRuntime *rt, const char *msg);
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+index 839df28dc..4ca698e94 100644
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -419,6 +419,14 @@ void macsurf_window_close_self(struct content *c)
+ 		vita_popup_close_later(vita_window_popup_id(bw->window));
+ }
+ 
++/* exported interface documented in quickjs/macos9.h */
++void macsurf_platform_sleep_ms(double ms)
++{
++	if (ms < 0.1) ms = 0.1;
++	if (ms > 16.0) ms = 16.0;
++	sceKernelDelayThread((unsigned int)(ms * 1000.0));
++}
++
+ /* exported interface documented in quickjs/macos9.h */
+ int macsurf_battery(double *level, int *charging, double *discharging_s)
+ {
+diff --git a/frontends/vita/main.c b/frontends/vita/main.c
+index 5a2a04f55..dc260cf7e 100644
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -82,6 +82,8 @@
+ /* The QuickJS bridge's event-loop pump (quickjs/macsurf_qjs.c) and its
+  * relayout driver's per-content query (quickjs/macos9_reconvert.c). */
+ void macsurf_qjs_pump_all(void);
++double macsurf_qjs_next_timer_ms(void);	/* patch 281 */
++int macsurf_qjs_timer_chain_active(void);	/* patch 281 */
+ int macos9_reconvert_pending_for(void *cv);
+ #include "vita/fetch.h"
+ #include "vita/file.h"
+@@ -112,6 +114,9 @@ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ 
+ /** Give up waiting for a page to settle after this long (autotest). */
+ #define VITA_SETTLE_TIMEOUT_MS 20000
++/** Patch 281: how long into a page a running short-timer chain still
++ * keeps it from settling (a 300-link setTimeout chain takes 1.2 s). */
++#define VITA_SETTLE_CHAIN_MS 4000
+ 
+ /** Frames per page whose timing is logged individually. */
+ #define VITA_LOGGED_FRAMES 3
+@@ -468,6 +473,16 @@ static bool page_settled(struct gui_window *gw)
+ 		vita_stats.last_frame_ms = now;
+ 		return false;
+ 	}
++	/* Nor while a script runs a chain of short timers (patch 281: HTML
++	 * clamps chained ones to 4 ms, so a 300-link chain takes 1.2 s, as
++	 * in Chromium; animation intervals of a frame or more do not count)
++	 * -- for at most VITA_SETTLE_CHAIN_MS after the page's load, since a
++	 * script's setTimeout(fn, 0) heartbeat never ends. */
++	if (macsurf_qjs_timer_chain_active() &&
++	    now - vita_stats.nav_ms < VITA_SETTLE_CHAIN_MS) {
++		vita_stats.last_frame_ms = now;
++		return false;
++	}
+ 	return now - vita_stats.last_frame_ms >= VITA_SETTLE_MS;
+ }
+ 
+@@ -1171,6 +1186,17 @@ static void draw_frame(struct gui_window *gw, bool dump, const char *snap)
+  * CIRCLE stops it. Nothing else runs here -- no timers, no input to the
+  * page -- the script is still inside the call. The simulator reads no pad:
+  * its pad drives the scripted autotest. */
++/* VitaBrowser patch 281: how long the main loop may idle -- a frame, or
++ * less when a JavaScript timer is due sooner (at least 1 ms) */
++static unsigned int vita_idle_us(void)
++{
++	double ms = macsurf_qjs_next_timer_ms();
++
++	if (ms < 0.0 || ms >= 16.0) return 16 * 1000;
++	if (ms < 1.0) return 1000;
++	return (unsigned int)(ms * 1000.0);
++}
++
+ int macsurf_wasm_slice(unsigned int ms)
+ {
+ 	struct gui_window *gw = vita_window_current();
+@@ -1302,7 +1328,7 @@ static void vita_run(struct browser_window *bw0)
+ 			vita_diag_engine_flush();
+ 		}
+ 		if (gw == NULL) {
+-			sceKernelDelayThread(16 * 1000);
++			sceKernelDelayThread(vita_idle_us());
+ 			continue;
+ 		}
+ 		watch_load(gw);
+@@ -1386,8 +1412,10 @@ static void vita_run(struct browser_window *bw0)
+ 			if (kind != FRAME_NONE)
+ 				autotest_post(gw, bw, kind);
+ 		} else {
+-			/* Nothing to paint: yield for about a frame. */
+-			sceKernelDelayThread(16 * 1000);
++			/* Nothing to paint: yield for about a frame -- or until
++			 * a JavaScript timer is due (patch 281: a 4 ms timer
++			 * waited 16, and HTML clamps chained ones to 4). */
++			sceKernelDelayThread(vita_idle_us());
+ 		}
+ 	}
+ 	vita_diag_log("quit requested");
