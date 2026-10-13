@@ -1,0 +1,1847 @@
+# netsurf: the APIs live on the interface prototypes; the engine's
+# internals out of the page's sight (patch 276)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 275)
+#
+# In browsers navigator, screen, performance, crypto, history and
+# screen.orientation have no own properties (Reflect.ownKeys(navigator) is
+# [] in Chromium): their attributes are accessors and their operations
+# methods of Navigator.prototype, Screen.prototype, ... The bridge made them
+# plain objects with own members -- navigator 29, performance 17, history
+# 13, screen 9 -- engine internals among them (__vitaHonest, __vitaNav,
+# __vitaUserTiming, __setUrlDisplay, __traverse, ...), and
+# Crypto.prototype.randomUUID did not exist (hsw checks for it and takes a
+# different path without it).
+#
+#  - vita_polyfill.js, last section: each own member moves to the object's
+#    interface prototype -- an operation as it is, a value as a read-only
+#    accessor "get x" over this object's value (history.scrollRestoration
+#    and on<event> handlers with a setter too); read through another
+#    object it throws "Illegal invocation", as in Chromium.
+#  - the polyfill's own state about objects -- the marks it puts on its
+#    wrappers (__vbCD, __vbNat, __vbHat, ...) and per-element state
+#    (selection, custom validity, <details>/<dialog> expandos, canvas
+#    contexts) -- moves from properties of those functions and elements to
+#    a private per-object record (PV(), a WeakMap on __vitaPriv), so
+#    Object.getOwnPropertyNames(element.matches) is length, name. Patch
+#    275's stand-ins share their original's record. Left as they are:
+#    __vbNS (set by the bridge in C) and the window globals the bridge
+#    calls by name (__vbTapFocus, __vbSelectorMatch, __vbCustomEl).
+#  - navigator / performance flags -> __vitaPriv (not enumerable).
+#  - macsurf_qjs.c: history's engine hooks (__setUrlDisplay,
+#    __nativeLength, __traverse, __atForwardEnd, __hasPushState) live on
+#    __vitaHistory (not enumerable) and every caller (the L/R traversal,
+#    the pushState shim) uses it; the EventTarget shim keeps listeners in
+#    a WeakMap instead of an own __msEventTargetListeners.
+#
+# Not in this patch: document (136 own members, internals among them) and
+# elements (tagName / nodeName / nodeType / __ptr own) -- several document
+# objects exist at once (DOMParser, createHTMLDocument), which needs its
+# own care.
+#
+# Found by the hCaptcha record/compare (docs/wasm-hcaptcha-measurement.md,
+# "Record, replay"); Chromium given this engine's own-property layout still
+# passes, and the demo still refuses the engine.
+#
+# Gate: testpages/pages/JS-api-protos.html (APIPROTO 7/7, Chromium 7/7;
+# the build before fails at least 1, 2, 3, 7).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 846c0c0ec..c964d3261 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1553,7 +1553,7 @@ static bool qjs_history_traverse_step(JSContext *ctx, int delta)
+ 
+ 	if (ctx == NULL || (delta != -1 && delta != 1))
+ 		return false;
+-	snprintf(src, sizeof(src), "history.__traverse(%d)", delta);
++	snprintf(src, sizeof(src), "__vitaHistory.__traverse(%d)", delta);
+ 	v = JS_Eval(ctx, src, strlen(src), "<history>", JS_EVAL_TYPE_GLOBAL);
+ 	if (JS_IsException(v)) {
+ 		JS_FreeValue(ctx, v);
+@@ -1630,9 +1630,9 @@ static JSValue qjs_history_forward(JSContext *ctx, JSValueConst this_val,
+ 	 * the native history. */
+ 	if (!qjs_history_traverse_step(ctx, 1)) {
+ 		bool atEnd = qjs_history_js_bool(ctx,
+-		    "history.__atForwardEnd?history.__atForwardEnd():false");
++		    "__vitaHistory.__atForwardEnd?__vitaHistory.__atForwardEnd():false");
+ 		bool hasPS = qjs_history_js_bool(ctx,
+-		    "history.__hasPushState?history.__hasPushState():false");
++		    "__vitaHistory.__hasPushState?__vitaHistory.__hasPushState():false");
+ 		if (!(atEnd && hasPS))
+ 			macsurf_window_history(qjs_get_content_for_ctx(ctx), 1);
+ 	}
+@@ -1682,9 +1682,9 @@ static JSValue qjs_history_go(JSContext *ctx, JSValueConst this_val,
+ 					 * entries; back past entry 0 (or any step with no
+ 					 * pushState) goes native. */
+ 					bool atEnd = qjs_history_js_bool(ctx,
+-					    "history.__atForwardEnd?history.__atForwardEnd():false");
++					    "__vitaHistory.__atForwardEnd?__vitaHistory.__atForwardEnd():false");
+ 					bool hasPS = qjs_history_js_bool(ctx,
+-					    "history.__hasPushState?history.__hasPushState():false");
++					    "__vitaHistory.__hasPushState?__vitaHistory.__hasPushState():false");
+ 					if (!(delta > 0 && atEnd && hasPS))
+ 						macsurf_window_history(
+ 							qjs_get_content_for_ctx(ctx),
+@@ -14991,8 +14991,15 @@ static void register_browser_globals(JSContext *ctx)
+ 	qjs_set_func(ctx, history_obj, "back",    qjs_history_back,    0);
+ 	qjs_set_func(ctx, history_obj, "forward", qjs_history_forward, 0);
+ 	qjs_set_func(ctx, history_obj, "go",      qjs_history_go,      1);
+-	qjs_set_func(ctx, history_obj, "__setUrlDisplay", qjs_history_set_url_display, 1);
+-	qjs_set_func(ctx, history_obj, "__nativeLength", qjs_history_native_length, 0);
++	/* VitaBrowser patch 276: the engine's hooks live on __vitaHistory (not
++	 * enumerable), not as history's own properties a page can see */
++	{
++		JSValue hp = JS_NewObject(ctx);
++		qjs_set_func(ctx, hp, "__setUrlDisplay", qjs_history_set_url_display, 1);
++		qjs_set_func(ctx, hp, "__nativeLength", qjs_history_native_length, 0);
++		JS_DefinePropertyValueStr(ctx, global, "__vitaHistory", hp,
++				JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
++	}
+ 	JS_SetPropertyStr(ctx, history_obj, "length", JS_NewInt32(ctx, 0));
+ 	JS_SetPropertyStr(ctx, global, "history", history_obj);
+ 
+@@ -15072,7 +15079,7 @@ static void register_browser_globals(JSContext *ctx)
+ 		"      _entries[_idx]={state:s,url:url};"
+ 		"    }"
+ 		"    _shownUrl=url;"
+-		"    try{history.__setUrlDisplay(url);}catch(e){}"
++		"    try{__vitaHistory.__setUrlDisplay(url);}catch(e){}"
+ 		"  }"
+ 		"  function _firePop(e){"
+ 		"    var ev=null;"
+@@ -15082,7 +15089,7 @@ static void register_browser_globals(JSContext *ctx)
+ 		"  }"
+ 		"  function _show(e){"
+ 		"    _shownUrl=e.url;"
+-		"    try{history.__setUrlDisplay(e.url);}catch(err){}"
++		"    try{__vitaHistory.__setUrlDisplay(e.url);}catch(err){}"
+ 		"    _firePop(e);"
+ 		"  }"
+ 		"  function _step(d){"
+@@ -15092,9 +15099,9 @@ static void register_browser_globals(JSContext *ctx)
+ 		"    _show(_entries[_idx]);"
+ 		"    return 1;"
+ 		"  }"
+-		"  history.__traverse=function(d){return _step(d<0?-1:1);};"
+-		"  history.__atForwardEnd=function(){return _idx===_entries.length-1;};"
+-		"  history.__hasPushState=function(){return _entries.length>1;};"
++		"  __vitaHistory.__traverse=function(d){return _step(d<0?-1:1);};"
++		"  __vitaHistory.__atForwardEnd=function(){return _idx===_entries.length-1;};"
++		"  __vitaHistory.__hasPushState=function(){return _entries.length>1;};"
+ 		"  history.pushState=function(s,t,u){_pushReplace(s,u,true);};"
+ 		"  history.replaceState=function(s,t,u){_pushReplace(s,u,false);};"
+ 		"  try{"
+@@ -15118,7 +15125,7 @@ static void register_browser_globals(JSContext *ctx)
+ 		"    Object.defineProperty(history,'length',{"
+ 		"      get:function(){"
+ 		"        var n=1;"
+-		"        try{if(history.__nativeLength)n=history.__nativeLength()||1;}"
++		"        try{if(__vitaHistory.__nativeLength)n=__vitaHistory.__nativeLength()||1;}"
+ 		"        catch(e2){}"
+ 		"        return n+_entries.length-1;"
+ 		"      },"
+@@ -15429,16 +15436,17 @@ static void register_browser_globals(JSContext *ctx)
+ 		 * probe is installed, because that probe deliberately sits above
+ 		 * the real Window prototype. */
+ 		"if(typeof g.EventTarget==='undefined'){"
+-		"g.EventTarget=function EventTarget(){this.__msEventTargetListeners={};};"
++		"var L=new WeakMap();"
++		"g.EventTarget=function EventTarget(){};"
+ 		"g.EventTarget.prototype.addEventListener=function(t,fn){"
+ 		"if(typeof fn!=='function')return;"
+-		"var k=String(t),m=this.__msEventTargetListeners||(this.__msEventTargetListeners={}),a=m[k]||(m[k]=[]);"
++		"var k=String(t),m=L.get(this),a;if(!m)L.set(this,m={});a=m[k]||(m[k]=[]);"
+ 		"if(a.indexOf(fn)<0)a.push(fn);};"
+ 		"g.EventTarget.prototype.removeEventListener=function(t,fn){"
+-		"var m=this.__msEventTargetListeners,a=m&&m[String(t)],i;if(!a)return;"
++		"var m=L.get(this),a=m&&m[String(t)],i;if(!a)return;"
+ 		"for(i=a.length-1;i>=0;i--)if(a[i]===fn)a.splice(i,1);};"
+ 		"g.EventTarget.prototype.dispatchEvent=function(ev){"
+-		"var t=ev&&ev.type,m=this.__msEventTargetListeners,a=t&&m&&m[String(t)],i,copy;"
++		"var t=ev&&ev.type,m=L.get(this),a=t&&m&&m[String(t)],i,copy;"
+ 		"if(!a)return true;copy=a.slice();"
+ 		"for(i=0;i<copy.length;i++)copy[i].call(this,ev);"
+ 		"return !(ev&&ev.defaultPrevented);};"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 5fbf0dda3..81decfbf5 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -9,6 +9,24 @@
+ "(function (g) {\n"
+ "'use strict';\n"
+ "\n"
++"/* the engine's own state about the page's objects (patch 276): kept here,\n"
++" * not on navigator / performance, where a page sees its own properties */\n"
++"var PRIV = g.__vitaPriv;\n"
++"if (!PRIV) {\n"
++"\tPRIV = {};\n"
++"\tObject.defineProperty(g, '__vitaPriv', { value: PRIV });\n"
++"}\n"
++"/* this file's marks and per-object state (__vbCD, __vbNat, an element's\n"
++" * selection, ...) in a record per object that no page can see -- they\n"
++" * were properties of the functions and elements themselves */\n"
++"if (!PRIV.pv) PRIV.pv = new WeakMap();\n"
++"function PV(o) {\n"
++"\tif (o === null || (typeof o !== 'object' && typeof o !== 'function')) return {};\n"
++"\tvar r = PRIV.pv.get(o);\n"
++"\tif (!r) { r = {}; PRIV.pv.set(o, r); }\n"
++"\treturn r;\n"
++"}\n"
++"\n"
+ "function define(obj, name, value) {\n"
+ "\tObject.defineProperty(obj, name, { value: value, writable: true,\n"
+ "\t\tconfigurable: true, enumerable: false });\n"
+@@ -2086,7 +2104,7 @@
+ "\t * the element's `sheet` getter -- installed only if missing -- kept\n"
+ "\t * making rules of the first run's, so `rule instanceof CSSStyleRule`\n"
+ "\t * was false and google's safe-CSS sanitizer threw */\n"
+-"\tif (g.CSSStyleSheet && g.CSSStyleSheet.__vbCssom) return;\n"
++"\tif (g.CSSStyleSheet && PV(g.CSSStyleSheet).__vbCssom) return;\n"
+ "\n"
+ "\tfunction klass(name, parent, ctor) {\n"
+ "\t\tvar F = ctor || function () { throw new TypeError('Illegal constructor'); };\n"
+@@ -2128,7 +2146,7 @@
+ "\t\tinitSheet(this, null);\n"
+ "\t});\n"
+ "\tvar DeclBase = typeof g.CSSStyleDeclaration === 'function' ? g.CSSStyleDeclaration : null;\n"
+-"\tdefine(CSSStyleSheet, '__vbCssom', true);\n"
++"\tPV(CSSStyleSheet).__vbCssom = true;\n"
+ "\n"
+ "\t/* ---- parsing: a brace/string/comment-aware scan, no tokenizer ---- */\n"
+ "\tvar TOK = /[\"'{}()\\[\\];\\\\]|\\/\\*/g;\n"
+@@ -2548,11 +2566,11 @@
+ "\n"
+ "\t/* one sheet per owner, kept on the element (it points back at it) */\n"
+ "\tfunction sheetOf(n) {\n"
+-"\t\tvar sh = n.__vbSheet;\n"
++"\t\tvar sh = PV(n).__vbSheet;\n"
+ "\t\tif (!sh) {\n"
+ "\t\t\tsh = Object.create(CSSStyleSheet.prototype);\n"
+ "\t\t\tinitSheet(sh, n);\n"
+-"\t\t\ttry { define(n, '__vbSheet', sh); } catch (e) { /* */ }\n"
++"\t\t\ttry { PV(n).__vbSheet = sh; } catch (e) { /* */ }\n"
+ "\t\t}\n"
+ "\t\treturn sh;\n"
+ "\t}\n"
+@@ -2573,14 +2591,14 @@
+ "\tfunction connected(n) {\n"
+ "\t\tvar top = n, i = 0;\n"
+ "\t\twhile (top.parentNode && i++ < 4096) top = top.parentNode;\n"
+-"\t\treturn top.nodeType === 9 || !!top.__vbDocRoot;\n"
++"\t\treturn top.nodeType === 9 || !!PV(top).__vbDocRoot;\n"
+ "\t}\n"
+ "\t/* The bridge's createHTMLDocument() is a stand-in: its head, body and\n"
+ "\t * documentElement are three detached elements of THIS document, so\n"
+ "\t * nothing in it looked connected. Join them as a document's are and\n"
+ "\t * mark the root. */\n"
+ "\tvar impl = d.implementation;\n"
+-"\tif (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vb) {\n"
++"\tif (impl && typeof impl.createHTMLDocument === 'function' && !PV(impl.createHTMLDocument).__vb) {\n"
+ "\t\tvar chd = impl.createHTMLDocument, wrapped = function () {\n"
+ "\t\t\tvar doc = chd.apply(this, arguments);\n"
+ "\t\t\ttry {\n"
+@@ -2588,12 +2606,12 @@
+ "\t\t\t\tif (root && root.nodeType === 1 && doc !== d) {\n"
+ "\t\t\t\t\tif (doc.head && !doc.head.parentNode) root.appendChild(doc.head);\n"
+ "\t\t\t\t\tif (doc.body && !doc.body.parentNode) root.appendChild(doc.body);\n"
+-"\t\t\t\t\tdefine(root, '__vbDocRoot', true);\n"
++"\t\t\t\t\tPV(root).__vbDocRoot = true;\n"
+ "\t\t\t\t}\n"
+ "\t\t\t} catch (e) { /* */ }\n"
+ "\t\t\treturn doc;\n"
+ "\t\t};\n"
+-"\t\twrapped.__vb = true;\n"
++"\t\tPV(wrapped).__vb = true;\n"
+ "\t\ttry { impl.createHTMLDocument = wrapped; } catch (e) { /* */ }\n"
+ "\t}\n"
+ "\tvar E = Object.getPrototypeOf(d.createElement('section'));\n"
+@@ -2629,9 +2647,9 @@
+ "\t\treturn Array.prototype.slice.call(r);\n"
+ "\t}\n"
+ "\tfunction hat(doc) {\n"
+-"\t\tif (!doc || doc === d || typeof doc !== 'object' || doc.__vbHat) return doc;\n"
++"\t\tif (!doc || doc === d || typeof doc !== 'object' || PV(doc).__vbHat) return doc;\n"
+ "\t\ttry {\n"
+-"\t\t\tObject.defineProperty(doc, '__vbHat', { value: true });\n"
++"\t\t\tPV(doc).__vbHat = true;\n"
+ "\t\t\tdoc.getElementsByTagName = function (t) { return byTag(this, t); };\n"
+ "\t\t\tif (typeof doc.getElementsByClassName !== 'function' ||\n"
+ "\t\t\t    !doc.documentElement)\n"
+@@ -2649,28 +2667,28 @@
+ "\t\treturn doc;\n"
+ "\t}\n"
+ "\tvar DP = g.DOMParser && g.DOMParser.prototype;\n"
+-"\tif (DP && typeof DP.parseFromString === 'function' && !DP.parseFromString.__vbHat) {\n"
++"\tif (DP && typeof DP.parseFromString === 'function' && !PV(DP.parseFromString).__vbHat) {\n"
+ "\t\tvar pfs = DP.parseFromString, w1 = function () {\n"
+ "\t\t\treturn hat(pfs.apply(this, arguments));\n"
+ "\t\t};\n"
+-"\t\tw1.__vbHat = true;\n"
++"\t\tPV(w1).__vbHat = true;\n"
+ "\t\tDP.parseFromString = w1;\n"
+ "\t}\n"
+ "\tvar impl = d.implementation;\n"
+ "\tif (impl && typeof impl.createHTMLDocument === 'function' &&\n"
+-"\t    !impl.createHTMLDocument.__vbHat) {\n"
++"\t    !PV(impl.createHTMLDocument).__vbHat) {\n"
+ "\t\tvar chd = impl.createHTMLDocument, w2 = function () {\n"
+ "\t\t\treturn hat(chd.apply(this, arguments));\n"
+ "\t\t};\n"
+-"\t\tw2.__vbHat = true;\n"
+-"\t\tw2.__vb = chd.__vb;\n"
++"\t\tPV(w2).__vbHat = true;\n"
++"\t\tPV(w2).__vb = PV(chd).__vb;\n"
+ "\t\ttry { impl.createHTMLDocument = w2; } catch (e) { /* */ }\n"
+ "\t}\n"
+ "\t/* document methods follow `this` to another document */\n"
+ "\t['getElementsByTagName', 'getElementsByClassName', 'getElementById',\n"
+ "\t 'querySelector', 'querySelectorAll'].forEach(function (name) {\n"
+ "\t\tvar f = d[name];\n"
+-"\t\tif (typeof f !== 'function' || f.__vbThis) return;\n"
++"\t\tif (typeof f !== 'function' || PV(f).__vbThis) return;\n"
+ "\t\tvar w = function () {\n"
+ "\t\t\tvar o = this;\n"
+ "\t\t\tif (o && o !== d && o !== g && typeof o === 'object' &&\n"
+@@ -2679,7 +2697,7 @@
+ "\t\t\t\treturn o[name].apply(o, arguments);\n"
+ "\t\t\treturn f.apply(d, arguments);\n"
+ "\t\t};\n"
+-"\t\tw.__vbThis = true;\n"
++"\t\tPV(w).__vbThis = true;\n"
+ "\t\ttry { d[name] = w; } catch (e) { /* */ }\n"
+ "\t});\n"
+ "})();\n"
+@@ -2719,10 +2737,10 @@
+ "\t}\n"
+ "\tfunction acc(name, get, set) {\n"
+ "\t\tvar cur = own(name);\n"
+-"\t\tif (cur && cur.get && cur.get.__vbImg) return;\n"
++"\t\tif (cur && cur.get && PV(cur.get).__vbImg) return;\n"
+ "\t\tvar oget = cur && cur.get, oset = cur && cur.set;\n"
+ "\t\tvar gf = function () { return isImg(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };\n"
+-"\t\tgf.__vbImg = true;\n"
++"\t\tPV(gf).__vbImg = true;\n"
+ "\t\tvar sf = function (v) {\n"
+ "\t\t\tif (isImg(this) && set) set.call(this, v, oset);\n"
+ "\t\t\telse if (oset) oset.call(this, v);\n"
+@@ -2758,16 +2776,16 @@
+ "\t\tstartFetch(this);\n"
+ "\t});\n"
+ "\tvar sa = P.setAttribute;\n"
+-"\tif (typeof sa === 'function' && !sa.__vbImg) {\n"
++"\tif (typeof sa === 'function' && !PV(sa).__vbImg) {\n"
+ "\t\tvar w = function (name, v) {\n"
+ "\t\t\tvar r = sa.apply(this, arguments);\n"
+ "\t\t\tif (isImg(this) && String(name).toLowerCase() === 'src') startFetch(this);\n"
+ "\t\t\treturn r;\n"
+ "\t\t};\n"
+-"\t\tw.__vbImg = true;\n"
++"\t\tPV(w).__vbImg = true;\n"
+ "\t\tP.setAttribute = w;\n"
+ "\t}\n"
+-"\tif (!P.decode || !P.decode.__vbImg) {\n"
++"\tif (!P.decode || !PV(P.decode).__vbImg) {\n"
+ "\t\tvar dec = function () {\n"
+ "\t\t\tvar el = this;\n"
+ "\t\t\treturn new Promise(function (res, rej) {\n"
+@@ -2782,7 +2800,7 @@
+ "\t\t\t\tel.addEventListener('error', function () { rej(new Error('EncodingError: the image cannot be decoded')); });\n"
+ "\t\t\t});\n"
+ "\t\t};\n"
+-"\t\tdec.__vbImg = true;\n"
++"\t\tPV(dec).__vbImg = true;\n"
+ "\t\tP.decode = dec;\n"
+ "\t}\n"
+ "\t/* new Image(w, h) is an <img> */\n"
+@@ -3002,9 +3020,9 @@
+ "\t\tfunction fn(idx) {\n"
+ "\t\t\tif (cache[idx] === undefined) {\n"
+ "\t\t\t\tvar f = W.func(h, idx);\n"
+-"\t\t\t\tif (f && typeof f === 'function' && !Object.prototype.hasOwnProperty.call(f, '__vbWasm')) {\n"
++"\t\t\t\tif (f && typeof f === 'function' && !(PV(f).__vbWasm !== undefined)) {\n"
+ "\t\t\t\t\ttry { Object.defineProperty(f, 'name', { value: String(idx), configurable: true }); } catch (e) { /* */ }\n"
+-"\t\t\t\t\ttry { define(f, '__vbWasm', true); } catch (e) { /* */ }\n"
++"\t\t\t\t\ttry { PV(f).__vbWasm = true; } catch (e) { /* */ }\n"
+ "\t\t\t\t}\n"
+ "\t\t\t\tcache[idx] = f;\n"
+ "\t\t\t}\n"
+@@ -3625,7 +3643,7 @@
+ "\t\treturn c;\n"
+ "\t}\n"
+ "\tfunction ctxOf(el) {\n"
+-"\t\tvar c = el.__vbCtx2d;\n"
++"\t\tvar c = PV(el).__vbCtx2d;\n"
+ "\t\treturn c && c._el === el ? c : null;\n"
+ "\t}\n"
+ "\t/* a canvas's size changed (or was set again): it is cleared and its\n"
+@@ -3783,7 +3801,7 @@
+ "\t/* an image source: [handle-or-element, width, height], or null when it\n"
+ "\t * has nothing to draw yet */\n"
+ "\tfunction source(img) {\n"
+-"\t\tif (img && img.__vbBitmap) img = img.__vbBitmap;\n"
++"\t\tif (img && PV(img).__vbBitmap) img = PV(img).__vbBitmap;\n"
+ "\t\tif (isCanvas(img)) {\n"
+ "\t\t\tvar c = ctxOf(img);\n"
+ "\t\t\tvar w = attrDim(img, 'width', 300), h = attrDim(img, 'height', 150);\n"
+@@ -4101,10 +4119,10 @@
+ "\t}\n"
+ "\tfunction acc(name, get, set) {\n"
+ "\t\tvar cur = own(name);\n"
+-"\t\tif (cur && cur.get && cur.get.__vbCv) return;\n"
++"\t\tif (cur && cur.get && PV(cur.get).__vbCv) return;\n"
+ "\t\tvar oget = cur && cur.get, oset = cur && cur.set;\n"
+ "\t\tvar gf = function () { return isCanvas(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };\n"
+-"\t\tgf.__vbCv = true;\n"
++"\t\tPV(gf).__vbCv = true;\n"
+ "\t\tvar sf = function (v) {\n"
+ "\t\t\tif (isCanvas(this)) set.call(this, v);\n"
+ "\t\t\telse if (oset) oset.call(this, v);\n"
+@@ -4118,23 +4136,23 @@
+ "\t\tthis.setAttribute('height', String(v >>> 0));\n"
+ "\t});\n"
+ "\tvar sa = P.setAttribute;\n"
+-"\tif (typeof sa === 'function' && !sa.__vbCv) {\n"
++"\tif (typeof sa === 'function' && !PV(sa).__vbCv) {\n"
+ "\t\tvar w = function (name) {\n"
+ "\t\t\tvar r = sa.apply(this, arguments), n = String(name).toLowerCase();\n"
+ "\t\t\tif ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);\n"
+ "\t\t\treturn r;\n"
+ "\t\t};\n"
+-"\t\tw.__vbCv = true;\n"
++"\t\tPV(w).__vbCv = true;\n"
+ "\t\tP.setAttribute = w;\n"
+ "\t}\n"
+ "\tvar ra = P.removeAttribute;\n"
+-"\tif (typeof ra === 'function' && !ra.__vbCv) {\n"
++"\tif (typeof ra === 'function' && !PV(ra).__vbCv) {\n"
+ "\t\tvar wr = function (name) {\n"
+ "\t\t\tvar r = ra.apply(this, arguments), n = String(name).toLowerCase();\n"
+ "\t\t\tif ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);\n"
+ "\t\t\treturn r;\n"
+ "\t\t};\n"
+-"\t\twr.__vbCv = true;\n"
++"\t\tPV(wr).__vbCv = true;\n"
+ "\t\tP.removeAttribute = wr;\n"
+ "\t}\n"
+ "\tvar oldGet = P.getContext, oldURL = P.toDataURL, oldBlob = P.toBlob;\n"
+@@ -4144,7 +4162,7 @@
+ "\t\tvar c = ctxOf(this);\n"
+ "\t\tif (!c) {\n"
+ "\t\t\tc = makeCtx(this);\n"
+-"\t\t\tdefine(this, '__vbCtx2d', c);\n"
++"\t\t\tPV(this).__vbCtx2d = c;\n"
+ "\t\t}\n"
+ "\t\treturn c;\n"
+ "\t}\n"
+@@ -4199,7 +4217,7 @@
+ "\t\t\t\t\t}\n"
+ "\t\t\t\t}\n"
+ "\t\t\t\tx = { width: c.width, height: c.height, close: function () { } };\n"
+-"\t\t\t\tdefine(x, '__vbBitmap', c);\n"
++"\t\t\t\tPV(x).__vbBitmap = c;\n"
+ "\t\t\t\tres(x);\n"
+ "\t\t\t} catch (e) { rej(e); }\n"
+ "\t\t});\n"
+@@ -4483,7 +4501,7 @@
+ "\n"
+ "\t/* the scratch document: the factories a parser or sanitizer calls */\n"
+ "\tvar impl = d.implementation;\n"
+-"\tif (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vbFactories) {\n"
++"\tif (impl && typeof impl.createHTMLDocument === 'function' && !PV(impl.createHTMLDocument).__vbFactories) {\n"
+ "\t\tvar chd = impl.createHTMLDocument, wrap = function () {\n"
+ "\t\t\tvar doc = chd.apply(this, arguments);\n"
+ "\t\t\tif (doc && doc !== d) {\n"
+@@ -4496,8 +4514,8 @@
+ "\t\t\t}\n"
+ "\t\t\treturn doc;\n"
+ "\t\t};\n"
+-"\t\twrap.__vb = chd.__vb;\n"
+-"\t\twrap.__vbFactories = true;\n"
++"\t\tPV(wrap).__vb = PV(chd).__vb;\n"
++"\t\tPV(wrap).__vbFactories = true;\n"
+ "\t\ttry { impl.createHTMLDocument = wrap; } catch (e) { /* */ }\n"
+ "\t}\n"
+ "})();\n"
+@@ -4765,7 +4783,7 @@
+ "\t\tvar pn = n.parentNode;\n"
+ "\t\tif (pn && pn.nodeType === 9) return true;\n"
+ "\t\tif (n.ownerDocument && n.ownerDocument.documentElement === n) return true;\n"
+-"\t\treturn !!n.__vbDocRoot;\n"
++"\t\treturn !!PV(n).__vbDocRoot;\n"
+ "\t}\n"
+ "\tvar FORM = /^(input|button|select|textarea|optgroup|option|fieldset)$/;\n"
+ "\tfunction disabled(n) {\n"
+@@ -5103,11 +5121,11 @@
+ "\t/* The bridge installs the document's querySelector(All) again after\n"
+ "\t * this file's first run (qjs_dom_install runs twice per context, and\n"
+ "\t * this file with it): wrap whatever native is there, once. */\n"
+-"\tfunction nativeOf(f) { return f && f.__vbNat ? f.__vbNat : f; }\n"
++"\tfunction nativeOf(f) { return f && PV(f).__vbNat ? PV(f).__vbNat : f; }\n"
+ "\tfunction wrapQuery(o) {\n"
+ "\t\tif (!o) return;\n"
+ "\t\tvar qa = o.querySelectorAll, q1 = o.querySelector;\n"
+-"\t\tif (typeof qa === 'function' && !qa.__vbNat) {\n"
++"\t\tif (typeof qa === 'function' && !PV(qa).__vbNat) {\n"
+ "\t\t\tvar natAll = qa, wa = function (sel) {\n"
+ "\t\t\t\tsel = String(sel);\n"
+ "\t\t\t\tparse(sel);\t/* an invalid selector throws SyntaxError */\n"
+@@ -5116,10 +5134,10 @@
+ "\t\t\t\t\t\tnatAll.call(this, sel);\n"
+ "\t\t\t\treturn jsQuery(this, sel, false, natAll);\n"
+ "\t\t\t};\n"
+-"\t\t\twa.__vbNat = natAll;\n"
++"\t\t\tPV(wa).__vbNat = natAll;\n"
+ "\t\t\tdefine(o, 'querySelectorAll', wa);\n"
+ "\t\t}\n"
+-"\t\tif (typeof q1 === 'function' && !q1.__vbNat) {\n"
++"\t\tif (typeof q1 === 'function' && !PV(q1).__vbNat) {\n"
+ "\t\t\tvar nat1 = q1, all = nativeOf(o.querySelectorAll), w1 = function (sel) {\n"
+ "\t\t\t\tsel = String(sel);\n"
+ "\t\t\t\tparse(sel);\n"
+@@ -5129,12 +5147,12 @@
+ "\t\t\t\t}\n"
+ "\t\t\t\treturn jsQuery(this, sel, true, all);\n"
+ "\t\t\t};\n"
+-"\t\t\tw1.__vbNat = nat1;\n"
++"\t\t\tPV(w1).__vbNat = nat1;\n"
+ "\t\t\tdefine(o, 'querySelector', w1);\n"
+ "\t\t}\n"
+ "\t}\n"
+-"\tif (!E.matches || !E.matches.__vbSel) {\n"
+-"\t\tmatches.__vbSel = true;\n"
++"\tif (!E.matches || !PV(E.matches).__vbSel) {\n"
++"\t\tPV(matches).__vbSel = true;\n"
+ "\t\tdefine(E, 'matches', matches);\n"
+ "\t\tdefine(E, 'webkitMatchesSelector', matches);\n"
+ "\t\tdefine(E, 'msMatchesSelector', matches);\n"
+@@ -5354,23 +5372,23 @@
+ "\t\t});\n"
+ "\t\tacc(P, 'maxLength', function () { var v = parseInt(this.getAttribute('maxlength'), 10); return isNaN(v) ? -1 : v; },\n"
+ "\t\t\tfunction (v) { this.setAttribute('maxlength', String(v)); });\n"
+-"\t\tacc(P, 'selectionStart', function () { return this.__vbSelS != null ? this.__vbSelS : String(this.value || '').length; },\n"
+-"\t\t\tfunction (v) { this.__vbSelS = v; });\n"
+-"\t\tacc(P, 'selectionEnd', function () { return this.__vbSelE != null ? this.__vbSelE : String(this.value || '').length; },\n"
+-"\t\t\tfunction (v) { this.__vbSelE = v; });\n"
++"\t\tacc(P, 'selectionStart', function () { return PV(this).__vbSelS != null ? PV(this).__vbSelS : String(this.value || '').length; },\n"
++"\t\t\tfunction (v) { PV(this).__vbSelS = v; });\n"
++"\t\tacc(P, 'selectionEnd', function () { return PV(this).__vbSelE != null ? PV(this).__vbSelE : String(this.value || '').length; },\n"
++"\t\t\tfunction (v) { PV(this).__vbSelE = v; });\n"
+ "\t\tacc(P, 'selectionDirection', function () { return 'none'; });\n"
+-"\t\tfn(P, 'setSelectionRange', function (a, b) { this.__vbSelS = a; this.__vbSelE = b; });\n"
+-"\t\tfn(P, 'select', function () { this.__vbSelS = 0; this.__vbSelE = String(this.value || '').length; });\n"
++"\t\tfn(P, 'setSelectionRange', function (a, b) { PV(this).__vbSelS = a; PV(this).__vbSelE = b; });\n"
++"\t\tfn(P, 'select', function () { PV(this).__vbSelS = 0; PV(this).__vbSelE = String(this.value || '').length; });\n"
+ "\t\tfn(P, 'setRangeText', function (t) { this.value = String(t); });\n"
+ "\t\tacc(P, 'willValidate', function () { return !this.disabled; });\n"
+-"\t\tacc(P, 'validationMessage', function () { return this.__vbCustomValidity || ''; });\n"
+-"\t\tfn(P, 'setCustomValidity', function (m) { this.__vbCustomValidity = String(m || ''); });\n"
++"\t\tacc(P, 'validationMessage', function () { return PV(this).__vbCustomValidity || ''; });\n"
++"\t\tfn(P, 'setCustomValidity', function (m) { PV(this).__vbCustomValidity = String(m || ''); });\n"
+ "\t\tacc(P, 'validity', function () {\n"
+ "\t\t\tvar v = String(this.value || ''), req = this.hasAttribute && this.hasAttribute('required');\n"
+ "\t\t\tvar type = String(this.getAttribute && this.getAttribute('type') || '').toLowerCase();\n"
+ "\t\t\tvar missing = !!(req && !v);\n"
+ "\t\t\tvar typeMismatch = !!(v && type === 'email' && !/^[^@\\s]+@[^@\\s]+$/.test(v));\n"
+-"\t\t\tvar custom = !!this.__vbCustomValidity;\n"
++"\t\t\tvar custom = !!PV(this).__vbCustomValidity;\n"
+ "\t\t\tvar pat = this.getAttribute && this.getAttribute('pattern'), patMis = false;\n"
+ "\t\t\tif (v && pat) { try { patMis = !new RegExp('^(?:' + pat + ')$').test(v); } catch (e) { /* */ } }\n"
+ "\t\t\tvar ml = parseInt(this.getAttribute && this.getAttribute('minlength'), 10);\n"
+@@ -5501,14 +5519,14 @@
+ "\t\tif (!o) return;\n"
+ "\t\t['data', 'nodeValue', 'textContent'].forEach(function (n) {\n"
+ "\t\t\tvar dsc = findAcc(o, n);\n"
+-"\t\t\tif (!dsc || typeof dsc.set !== 'function' || typeof dsc.get !== 'function' || dsc.set.__vbCD) return;\n"
++"\t\t\tif (!dsc || typeof dsc.set !== 'function' || typeof dsc.get !== 'function' || PV(dsc.set).__vbCD) return;\n"
+ "\t\t\tvar setter = function (v) {\n"
+ "\t\t\t\tvar old = null;\n"
+ "\t\t\t\ttry { old = dsc.get.call(this); } catch (e) { /* */ }\n"
+ "\t\t\t\tdsc.set.call(this, v);\n"
+ "\t\t\t\tqueueCD(this, old);\n"
+ "\t\t\t};\n"
+-"\t\t\tsetter.__vbCD = true;\n"
++"\t\t\tPV(setter).__vbCD = true;\n"
+ "\t\t\ttry {\n"
+ "\t\t\t\tObject.defineProperty(o, n, { configurable: true, enumerable: dsc.enumerable,\n"
+ "\t\t\t\t\tget: dsc.get, set: setter });\n"
+@@ -5516,7 +5534,7 @@
+ "\t\t});\n"
+ "\t});\n"
+ "\t/* delivery that honours characterData (and the *OldValue options) */\n"
+-"\tif (typeof g.__msDeliverMutations === 'function' && !g.__msDeliverMutations.__vbCD) {\n"
++"\tif (typeof g.__msDeliverMutations === 'function' && !PV(g.__msDeliverMutations).__vbCD) {\n"
+ "\t\tvar deliver = function () {\n"
+ "\t\t\tvar list = g.__msMutObservers, pending = g.__msMutPending.splice(0), i, j, k;\n"
+ "\t\t\tg.__msMutScheduled = false;\n"
+@@ -5547,7 +5565,7 @@
+ "\t\t\t\t}\n"
+ "\t\t\t}\n"
+ "\t\t};\n"
+-"\t\tdeliver.__vbCD = true;\n"
++"\t\tPV(deliver).__vbCD = true;\n"
+ "\t\tg.__msDeliverMutations = deliver;\n"
+ "\t}\n"
+ "\t[T, CP].forEach(function (o) {\n"
+@@ -5583,8 +5601,8 @@
+ "\t/* The engine assigns document.currentScript around each script\n"
+ "\t * (js_set_current_script): a getter alone made that assignment throw\n"
+ "\t * and left currentScript null for every script. */\n"
+-"\tacc(d, 'currentScript', function () { return d.__vbCurrentScript || null; },\n"
+-"\t\tfunction (v) { d.__vbCurrentScript = v || null; });\n"
++"\tacc(d, 'currentScript', function () { return PV(d).__vbCurrentScript || null; },\n"
++"\t\tfunction (v) { PV(d).__vbCurrentScript = v || null; });\n"
+ "\t/* document.styleSheets: the CSSOM section above */\n"
+ "\tvar adopted = [];\n"
+ "\tacc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });\n"
+@@ -5966,8 +5984,8 @@
+ "\t\t}\n"
+ "\t\t/* run C's constructor on el (once) */\n"
+ "\t\tfunction construct(el, C) {\n"
+-"\t\t\tif (!el || el.__vbConstructed) return;\n"
+-"\t\t\tel.__vbConstructed = true;\n"
++"\t\t\tif (!el || PV(el).__vbConstructed) return;\n"
++"\t\t\tPV(el).__vbConstructed = true;\n"
+ "\t\t\tbuilding.push({ el: el, C: C });\n"
+ "\t\t\ttry { new C(); } catch (e) {\n"
+ "\t\t\t\ttry { Object.setPrototypeOf(el, C.prototype); } catch (x) { /* */ }\n"
+@@ -5984,8 +6002,8 @@
+ "\t\t\t}\n"
+ "\t\t}\n"
+ "\t\tfunction connect(el) {\n"
+-"\t\t\tif (el.__vbConnected || !connected(el)) return;\n"
+-"\t\t\tel.__vbConnected = true;\n"
++"\t\t\tif (PV(el).__vbConnected || !connected(el)) return;\n"
++"\t\t\tPV(el).__vbConnected = true;\n"
+ "\t\t\tif (typeof el.connectedCallback === 'function') {\n"
+ "\t\t\t\ttry { el.connectedCallback(); } catch (e) {\n"
+ "\t\t\t\t\ttry { console.error('customElement ' + lname(el) + ' connectedCallback: ' + e); } catch (x) { /* */ } }\n"
+@@ -6013,8 +6031,8 @@
+ "\t\t\t}\n"
+ "\t\t\tfor (i = 0; i < all.length; i++) {\n"
+ "\t\t\t\tvar el = all[i];\n"
+-"\t\t\t\tif (!el.__vbConnected || connected(el)) continue;\n"
+-"\t\t\t\tel.__vbConnected = false;\n"
++"\t\t\t\tif (!PV(el).__vbConnected || connected(el)) continue;\n"
++"\t\t\t\tPV(el).__vbConnected = false;\n"
+ "\t\t\t\tif (typeof el.disconnectedCallback === 'function') {\n"
+ "\t\t\t\t\ttry { el.disconnectedCallback(); } catch (e) { /* */ }\n"
+ "\t\t\t\t}\n"
+@@ -6033,7 +6051,7 @@
+ "\t\t\t\t\t\tattrMO = new MutationObserver(function (ms) {\n"
+ "\t\t\t\t\t\t\tms.forEach(function (m) {\n"
+ "\t\t\t\t\t\t\t\tvar el = m.target, C2 = el && el.nodeType === 1 && defs[lname(el)];\n"
+-"\t\t\t\t\t\t\t\tif (C2 && el.__vbConstructed)\n"
++"\t\t\t\t\t\t\t\tif (C2 && PV(el).__vbConstructed)\n"
+ "\t\t\t\t\t\t\t\t\tattrCb(el, C2, m.attributeName, m.oldValue, el.getAttribute(m.attributeName));\n"
+ "\t\t\t\t\t\t\t});\n"
+ "\t\t\t\t\t\t});\n"
+@@ -6076,7 +6094,7 @@
+ "\t * upgraded). */\n"
+ "\t(function () {\n"
+ "\t\tvar CE = g.__vbCustomEl, NHE = g.HTMLElement;\n"
+-"\t\tif (!CE || typeof NHE !== 'function' || NHE.__vbHE) return;\n"
++"\t\tif (!CE || typeof NHE !== 'function' || PV(NHE).__vbHE) return;\n"
+ "\t\tvar HE = function HTMLElement() {\n"
+ "\t\t\tvar nt = new.target, b = CE.building, top = b[b.length - 1], el;\n"
+ "\t\t\tif (!nt) throw new TypeError('Illegal constructor');\n"
+@@ -6086,13 +6104,13 @@
+ "\t\t\t} else {\n"
+ "\t\t\t\tvar nm = CE.nameOf(nt), cr = d.createElement;\n"
+ "\t\t\t\tif (!nm) throw new TypeError('Illegal constructor');\n"
+-"\t\t\t\tel = (cr && cr.__vbNat ? cr.__vbNat : cr).call(d, nm);\n"
+-"\t\t\t\tel.__vbConstructed = true;\n"
++"\t\t\t\tel = (cr && PV(cr).__vbNat ? PV(cr).__vbNat : cr).call(d, nm);\n"
++"\t\t\t\tPV(el).__vbConstructed = true;\n"
+ "\t\t\t}\n"
+ "\t\t\tObject.setPrototypeOf(el, nt.prototype);\n"
+ "\t\t\treturn el;\n"
+ "\t\t};\n"
+-"\t\tHE.__vbHE = true;\n"
++"\t\tPV(HE).__vbHE = true;\n"
+ "\t\tHE.prototype = NHE.prototype;\n"
+ "\t\ttry { Object.setPrototypeOf(HE, NHE); } catch (e) { /* */ }\n"
+ "\t\ttry { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }\n"
+@@ -6104,14 +6122,14 @@
+ "\t * with it), so the wrapping is redone on every run, once per native. */\n"
+ "\t(function () {\n"
+ "\t\tvar CE = g.__vbCustomEl, cr = d.createElement;\n"
+-"\t\tif (!CE || typeof cr !== 'function' || cr.__vbNat) return;\n"
++"\t\tif (!CE || typeof cr !== 'function' || PV(cr).__vbNat) return;\n"
+ "\t\tvar w = function (name, opts) {\n"
+ "\t\t\tvar el = cr.apply(this, arguments);\n"
+ "\t\t\tvar C = CE.defs[String(name).toLowerCase()];\n"
+ "\t\t\tif (C && el) CE.construct(el, C);\n"
+ "\t\t\treturn el;\n"
+ "\t\t};\n"
+-"\t\tw.__vbNat = cr;\n"
++"\t\tPV(w).__vbNat = cr;\n"
+ "\t\td.createElement = w;\n"
+ "\t})();\n"
+ "\t/* patch 242: a minimal Shadow DOM API -- Element.attachShadow, a\n"
+@@ -6153,7 +6171,7 @@
+ "\t\t * stub: there was no attachShadow to make one) */\n"
+ "\t\tg.ShadowRoot = SR;\n"
+ "\t\tEP.attachShadow = function attachShadow(init) {\n"
+-"\t\t\tif (this.__vbShadow)\n"
++"\t\t\tif (PV(this).__vbShadow)\n"
+ "\t\t\t\tthrow new DOMException('Shadow root cannot be created on a host which already hosts a shadow tree.', 'NotSupportedError');\n"
+ "\t\t\tvar r = d.createDocumentFragment(), host = this;\n"
+ "\t\t\tvar mode = init && init.mode === 'closed' ? 'closed' : 'open';\n"
+@@ -6164,7 +6182,7 @@
+ "\t\t\t\tObject.defineProperty(r, 'delegatesFocus', { value: !!(init && init.delegatesFocus), configurable: true });\n"
+ "\t\t\t\tObject.defineProperty(r, 'adoptedStyleSheets', { value: [], writable: true, configurable: true });\n"
+ "\t\t\t} catch (e) { /* */ }\n"
+-"\t\t\tthis.__vbShadow = r;\n"
++"\t\t\tPV(this).__vbShadow = r;\n"
+ "\t\t\tif (mode === 'open') {\n"
+ "\t\t\t\ttry { Object.defineProperty(this, 'shadowRoot', { get: function () { return r; }, configurable: true }); } catch (e) { /* */ }\n"
+ "\t\t\t}\n"
+@@ -6505,7 +6523,7 @@
+ "\t\t * keeps the plain prototype test. */\n"
+ "\t\tvar E = g[name];\n"
+ "\t\tif (typeof E === 'function') {\n"
+-"\t\t\tif (tags.length && !E.__vbInst) {\n"
++"\t\t\tif (tags.length && !PV(E).__vbInst) {\n"
+ "\t\t\t\ttry {\n"
+ "\t\t\t\t\tObject.defineProperty(E, Symbol.hasInstance, { configurable: true,\n"
+ "\t\t\t\t\t\tvalue: function (x) {\n"
+@@ -6518,7 +6536,7 @@
+ "\t\t\t\t\t\t\t\treturn false;\n"
+ "\t\t\t\t\t\t\treturn tags.indexOf(String(x.localName || x.tagName || '').toLowerCase()) >= 0;\n"
+ "\t\t\t\t\t\t} });\n"
+-"\t\t\t\t\tObject.defineProperty(E, '__vbInst', { value: true });\n"
++"\t\t\t\t\tPV(E).__vbInst = true;\n"
+ "\t\t\t\t} catch (e) { /* */ }\n"
+ "\t\t\t}\n"
+ "\t\t\treturn;\n"
+@@ -8018,16 +8036,16 @@
+ "\t\tcur = el;\n"
+ "\t\td.__vitaFocus = el;\n"
+ "\t\tif (prev && connected(prev)) {\n"
+-"\t\t\tif (isTextField(prev) && prev.__vbFocusValue !== undefined &&\n"
+-"\t\t\t\t\tString(prev.value == null ? '' : prev.value) !== prev.__vbFocusValue)\n"
++"\t\t\tif (isTextField(prev) && PV(prev).__vbFocusValue !== undefined &&\n"
++"\t\t\t\t\tString(prev.value == null ? '' : prev.value) !== PV(prev).__vbFocusValue)\n"
+ "\t\t\t\tfireSimple(prev, 'change');\n"
+-"\t\t\tprev.__vbFocusValue = undefined;\n"
++"\t\t\tPV(prev).__vbFocusValue = undefined;\n"
+ "\t\t\tfire(prev, 'blur', false, el);\n"
+ "\t\t\tfire(prev, 'focusout', true, el);\n"
+ "\t\t}\n"
+ "\t\t/* a blur handler may have moved focus elsewhere already */\n"
+ "\t\tif (el && cur === el) {\n"
+-"\t\t\tel.__vbFocusValue = isTextField(el) ? String(el.value == null ? '' : el.value) : undefined;\n"
++"\t\t\tPV(el).__vbFocusValue = isTextField(el) ? String(el.value == null ? '' : el.value) : undefined;\n"
+ "\t\t\tfire(el, 'focus', false, prev);\n"
+ "\t\t\tif (cur === el) fire(el, 'focusin', true, prev);\n"
+ "\t\t}\n"
+@@ -8301,7 +8319,7 @@
+ "\t * prototype (patch 218 found this), so every accessor here checks\n"
+ "\t * the tag and behaves as a plain property on other elements. */\n"
+ "\tfunction isTag(el, t) { return tagOf(el) === t; }\n"
+-"\tfunction expando(el, n) { return el['__vbx_' + n]; }\n"
++"\tfunction expando(el, n) { return PV(el)['__vbx_' + n]; }\n"
+ "\tvar DP = protoOf('details'), GP = protoOf('dialog');\n"
+ "\t(function () {\n"
+ "\t\t/* one 'open' accessor serving both tags, on whichever\n"
+@@ -8322,7 +8340,7 @@
+ "\t\t\t\t\t\treturn this.hasAttribute('open');\n"
+ "\t\t\t\t\t},\n"
+ "\t\t\t\t\tset: function (v) {\n"
+-"\t\t\t\t\t\tif (tags.indexOf(tagOf(this)) < 0) { this.__vbx_open = v; return; }\n"
++"\t\t\t\t\t\tif (tags.indexOf(tagOf(this)) < 0) { PV(this).__vbx_open = v; return; }\n"
+ "\t\t\t\t\t\tif (v) this.setAttribute('open', '');\n"
+ "\t\t\t\t\t\telse this.removeAttribute('open');\n"
+ "\t\t\t\t\t} });\n"
+@@ -8351,11 +8369,11 @@
+ "\t\t\ttry { Object.defineProperty(GP, 'returnValue', { configurable: true, enumerable: true,\n"
+ "\t\t\t\tget: function () {\n"
+ "\t\t\t\t\tif (!isTag(this, 'DIALOG')) return expando(this, 'returnValue');\n"
+-"\t\t\t\t\treturn this.__vbReturnValue === undefined ? '' : this.__vbReturnValue;\n"
++"\t\t\t\t\treturn PV(this).__vbReturnValue === undefined ? '' : PV(this).__vbReturnValue;\n"
+ "\t\t\t\t},\n"
+ "\t\t\t\tset: function (v) {\n"
+-"\t\t\t\t\tif (!isTag(this, 'DIALOG')) { this.__vbx_returnValue = v; return; }\n"
+-"\t\t\t\t\tthis.__vbReturnValue = String(v);\n"
++"\t\t\t\t\tif (!isTag(this, 'DIALOG')) { PV(this).__vbx_returnValue = v; return; }\n"
++"\t\t\t\t\tPV(this).__vbReturnValue = String(v);\n"
+ "\t\t\t\t} }); } catch (e) { /* */ }\n"
+ "\t\t}\n"
+ "\t}\n"
+@@ -8374,12 +8392,12 @@
+ "\tvar target = typeof g.addEventListener === 'function' ? g : d;\n"
+ "\tif (!target.addEventListener) return;\n"
+ "\ttarget.addEventListener('click', function (e) {\n"
+-"\t\tif (!e || e.defaultPrevented || e.__vbToggled) return;\n"
++"\t\tif (!e || e.defaultPrevented || PV(e).__vbToggled) return;\n"
+ "\t\tvar det = toggler(e.target);\n"
+ "\t\tif (!det) return;\n"
+ "\t\t/* once per click: the listener can see one event twice here\n"
+ "\t\t * (window listeners are also reached through the document) */\n"
+-"\t\ttry { e.__vbToggled = true; } catch (x) { /* */ }\n"
++"\t\ttry { PV(e).__vbToggled = true; } catch (x) { /* */ }\n"
+ "\t\tif (det.hasAttribute('open')) det.removeAttribute('open');\n"
+ "\t\telse det.setAttribute('open', '');\n"
+ "\t\tlater(function () { fire(det, 'toggle'); });\n"
+@@ -8634,7 +8652,7 @@
+ "\t\tObject.defineProperty(k, 'algorithm', { value: { name: 'HMAC', hash: { name: hash },\n"
+ "\t\t\tlength: raw.length * 8 }, enumerable: true });\n"
+ "\t\tObject.defineProperty(k, 'usages', { value: (usages || []).slice(0), enumerable: true });\n"
+-"\t\tObject.defineProperty(k, '__vbRaw', { value: raw });\n"
++"\t\tPV(k).__vbRaw = raw;\n"
+ "\t\treturn k;\n"
+ "\t}\n"
+ "\tfunction run(fn) {\n"
+@@ -8665,26 +8683,26 @@
+ "\t\t},\n"
+ "\t\texportKey: function (format, key) {\n"
+ "\t\t\treturn run(function () {\n"
+-"\t\t\t\tif (format !== 'raw' || !key || !key.__vbRaw || !key.extractable)\n"
++"\t\t\t\tif (format !== 'raw' || !key || !PV(key).__vbRaw || !key.extractable)\n"
+ "\t\t\t\t\tthrow new DOMException('key is not extractable as raw',\n"
+ "\t\t\t\t\t\t\t'InvalidAccessError');\n"
+-"\t\t\t\treturn new Uint8Array(key.__vbRaw).buffer;\n"
++"\t\t\t\treturn new Uint8Array(PV(key).__vbRaw).buffer;\n"
+ "\t\t\t});\n"
+ "\t\t},\n"
+ "\t\tsign: function (alg, key, data) {\n"
+ "\t\t\treturn run(function () {\n"
+-"\t\t\t\tif (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)\n"
++"\t\t\t\tif (algName(alg) !== 'HMAC' || !key || !PV(key).__vbRaw)\n"
+ "\t\t\t\t\tthrow new DOMException('sign: only HMAC is supported',\n"
+ "\t\t\t\t\t\t\t'NotSupportedError');\n"
+-"\t\t\t\treturn hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)).buffer;\n"
++"\t\t\t\treturn hmac(key.algorithm.hash.name, PV(key).__vbRaw, bytes(data)).buffer;\n"
+ "\t\t\t});\n"
+ "\t\t},\n"
+ "\t\tverify: function (alg, key, sig, data) {\n"
+ "\t\t\treturn run(function () {\n"
+-"\t\t\t\tif (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)\n"
++"\t\t\t\tif (algName(alg) !== 'HMAC' || !key || !PV(key).__vbRaw)\n"
+ "\t\t\t\t\tthrow new DOMException('verify: only HMAC is supported',\n"
+ "\t\t\t\t\t\t\t'NotSupportedError');\n"
+-"\t\t\t\tvar m = hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)),\n"
++"\t\t\t\tvar m = hmac(key.algorithm.hash.name, PV(key).__vbRaw, bytes(data)),\n"
+ "\t\t\t\t\ts = bytes(sig), d = m.length ^ s.length, i;\n"
+ "\t\t\t\tfor (i = 0; i < m.length && i < s.length; i++) d |= m[i] ^ s[i];\n"
+ "\t\t\t\treturn d === 0;\n"
+@@ -8729,24 +8747,24 @@
+ "\tfunction reflect(P, n, dflt, TAG) {\n"
+ "\t\tif (!P) return;\n"
+ "\t\tvar prev = Object.getOwnPropertyDescriptor(P, n);\n"
+-"\t\tif (prev && !(prev.get && prev.get.__vb218) && shared.indexOf(P) >= 0)\n"
++"\t\tif (prev && !(prev.get && PV(prev.get).__vb218) && shared.indexOf(P) >= 0)\n"
+ "\t\t\treturn;\n"
+-"\t\tvar pg = prev && prev.get && prev.get.__vb218 ? prev.get : null;\n"
+-"\t\tvar ps = prev && prev.set && prev.get && prev.get.__vb218 ? prev.set : null;\n"
++"\t\tvar pg = prev && prev.get && PV(prev.get).__vb218 ? prev.get : null;\n"
++"\t\tvar ps = prev && prev.set && prev.get && PV(prev.get).__vb218 ? prev.set : null;\n"
+ "\t\tvar get = function () {\n"
+ "\t\t\tif (tagOf(this) !== TAG)\n"
+-"\t\t\t\treturn pg ? pg.call(this) : this['__vbx_' + n];\n"
++"\t\t\t\treturn pg ? pg.call(this) : PV(this)['__vbx_' + n];\n"
+ "\t\t\tvar v = this.getAttribute(n), f = (v === null || v === '') ? NaN : Number(v);\n"
+ "\t\t\tif (isFinite(f)) return f;\n"
+ "\t\t\treturn typeof dflt === 'function' ? dflt(this) : dflt;\n"
+ "\t\t};\n"
+-"\t\tget.__vb218 = true;\n"
++"\t\tPV(get).__vb218 = true;\n"
+ "\t\ttry {\n"
+ "\t\t\tObject.defineProperty(P, n, { configurable: true, enumerable: true,\n"
+ "\t\t\t\tget: get,\n"
+ "\t\t\t\tset: function (v) {\n"
+ "\t\t\t\t\tif (tagOf(this) !== TAG) {\n"
+-"\t\t\t\t\t\tif (ps) ps.call(this, v); else this['__vbx_' + n] = v;\n"
++"\t\t\t\t\t\tif (ps) ps.call(this, v); else PV(this)['__vbx_' + n] = v;\n"
+ "\t\t\t\t\t\treturn;\n"
+ "\t\t\t\t\t}\n"
+ "\t\t\t\t\tthis.setAttribute(n, String(+v));\n"
+@@ -8767,7 +8785,7 @@
+ "\t\ttry {\n"
+ "\t\t\tObject.defineProperty(PP, 'position', { configurable: true, enumerable: true,\n"
+ "\t\t\t\tget: function () {\n"
+-"\t\t\t\t\tif (tagOf(this) !== 'PROGRESS') return this.__vbx_position;\n"
++"\t\t\t\t\tif (tagOf(this) !== 'PROGRESS') return PV(this).__vbx_position;\n"
+ "\t\t\t\t\tif (!this.hasAttribute('value')) return -1;\n"
+ "\t\t\t\t\tvar m = num(this, 'max', 1);\n"
+ "\t\t\t\t\tif (m <= 0) m = 1;\n"
+@@ -8865,7 +8883,7 @@
+ " * engine does not measure read 0, as a browser's do when it may not tell. */\n"
+ "(function () {\n"
+ "\tvar P = g.performance, d = g.document;\n"
+-"\tif (!P || !isFn(P.now) || !d || P.__vitaNav) return;\n"
++"\tif (!P || !isFn(P.now) || !d || PRIV.nav) return;\n"
+ "\tvar origin = Date.now() - P.now(), t = { resp: P.now() };\n"
+ "\tfunction mark(k) { if (!t[k]) t[k] = P.now(); }\n"
+ "\tfunction get(k) { return t[k] || 0; }\n"
+@@ -8960,7 +8978,7 @@
+ "\t\t\treturn String(name) === entry.name && (type === undefined || type === 'navigation') ?\n"
+ "\t\t\t\t[entry].concat(r) : r;\n"
+ "\t\t};\n"
+-"\t\tdefine(P, '__vitaNav', entry);\n"
++"\t\tPRIV.nav = entry;\n"
+ "\t} catch (e) { /* */ }\n"
+ "})();\n"
+ "\n"
+@@ -8981,7 +8999,7 @@
+ " * the engine (macsurf_qjs.c __vitaJsHeap), in 100 KB steps. */\n"
+ "(function () {\n"
+ "\tvar P = g.performance;\n"
+-"\tif (!P || !isFn(P.now) || P.__vitaUserTiming) return;\n"
++"\tif (!P || !isFn(P.now) || PRIV.userTiming) return;\n"
+ "\tvar I = new WeakMap(), marks = [], measures = [];\n"
+ "\tfunction illegal() { throw new TypeError('Illegal constructor'); }\n"
+ "\tvar Entry = function PerformanceEntry() { illegal(); };\n"
+@@ -9033,7 +9051,7 @@
+ "\t\ttry { Object.defineProperty(p[0].prototype, Symbol.toStringTag, { value: p[1], configurable: true }); } catch (e) { /* */ }\n"
+ "\t\tif (!g[p[1]]) define(g, p[1], p[0]);\n"
+ "\t});\n"
+-"\tif (P.__vitaNav) try { Object.setPrototypeOf(Object.getPrototypeOf(P.__vitaNav), RT.prototype); } catch (e) { /* */ }\n"
++"\tif (PRIV.nav) try { Object.setPrototypeOf(Object.getPrototypeOf(PRIV.nav), RT.prototype); } catch (e) { /* */ }\n"
+ "\tfunction toTime(m, what) {\n"
+ "\t\tif (typeof m === 'number') {\n"
+ "\t\t\tif (m < 0) throw new TypeError(\"'\" + what + \"' cannot have a negative time stamp.\");\n"
+@@ -9127,7 +9145,7 @@
+ "\t\t\treturn { jsHeapSizeLimit: step(h[2]), totalJSHeapSize: step(h[1]), usedJSHeapSize: step(h[0]) };\n"
+ "\t\t} });\n"
+ "\t}\n"
+-"\tdefine(P, '__vitaUserTiming', true);\n"
++"\tPRIV.userTiming = true;\n"
+ "})();\n"
+ "\n"
+ "/* ---- what navigator and screen say about the device, honestly (271) ----\n"
+@@ -9149,7 +9167,7 @@
+ " * empty stand-in would make a page's feature test say it has. */\n"
+ "(function () {\n"
+ "\tvar n = g.navigator;\n"
+-"\tif (!n || n.__vitaHonest) return;\n"
++"\tif (!n || PRIV.honest) return;\n"
+ "\tfunction illegal() { throw new TypeError('Illegal constructor'); }\n"
+ "\tfunction iface(name, f, parent) {\n"
+ "\t\tif (parent) Object.setPrototypeOf(f.prototype, parent.prototype);\n"
+@@ -9227,7 +9245,7 @@
+ "\t\tdefine(cb, 'writeText', function writeText(data) { return no(); });\n"
+ "\t\tdefine(cb, 'write', function write(data) { return no(); });\n"
+ "\t}\n"
+-"\tdefine(n, '__vitaHonest', true);\n"
++"\tPRIV.honest = true;\n"
+ "})();\n"
+ "\n"
+ "/* ---- Battery Status: navigator.getBattery() (patch 272) -----------------\n"
+@@ -9494,6 +9512,9 @@
+ "\t * wrapping again must still find it (a characterData setter wrapped\n"
+ "\t * twice queued every record twice) */\n"
+ "\tfunction marks(f, w) {\n"
++"\t\t/* the marks live in the original's private record (patch 276) */\n"
++"\t\tvar rec = PRIV.pv && PRIV.pv.get(f);\n"
++"\t\tif (rec) PRIV.pv.set(w, rec);\n"
+ "\t\tObject.getOwnPropertyNames(f).forEach(function (k) {\n"
+ "\t\t\tif (k === 'length' || k === 'name' || k === 'prototype') return;\n"
+ "\t\t\ttry { Object.defineProperty(w, k, Object.getOwnPropertyDescriptor(f, k)); } catch (e) { /* */ }\n"
+@@ -9570,5 +9591,65 @@
+ "\t\ttry { delete Function.prototype[k]; } catch (e) { /* */ }\n"
+ "\t});\n"
+ "})();\n"
++"/* ---- the APIs live on the interface prototypes (patch 276) ---------------\n"
++" * In a browser navigator, screen, performance, crypto, history and\n"
++" * screen.orientation have no own properties at all (Reflect.ownKeys\n"
++" * (navigator) is [] in Chromium): every attribute is an accessor and every\n"
++" * operation a method of Navigator.prototype, Screen.prototype, ... Here the\n"
++" * bridge built them as plain objects with their members as own properties\n"
++" * (navigator 29, performance 17, history 13, screen 9), engine internals\n"
++" * among them, and Crypto.prototype had no randomUUID. Each own member moves\n"
++" * to the object's interface prototype: an operation as it is, a value as a\n"
++" * read-only accessor (\"get userAgent\") over this object's value, an\n"
++" * attribute the platform lets a page set (history.scrollRestoration, an\n"
++" * on<event> handler) with a setter as well. Reading one through another\n"
++" * object throws \"Illegal invocation\", as in Chromium. The internals moved\n"
++" * off these objects in the same patch (__vitaPriv, __vitaHistory, the\n"
++" * EventTarget shim's listener map). */\n"
++"(function () {\n"
++"\tvar vals = new WeakMap();\n"
++"\tvar SETTABLE = { scrollRestoration: 1 };\n"
++"\tfunction hoist(o, P) {\n"
++"\t\tif (!o || !P || P === Object.prototype || o === P) return;\n"
++"\t\tvar own = Object.getOwnPropertyNames(o);\n"
++"\t\tif (!own.length) return;\n"
++"\t\tvar store = vals.get(o);\n"
++"\t\tif (!store) { store = {}; vals.set(o, store); }\n"
++"\t\town.forEach(function (k) {\n"
++"\t\t\tvar d;\n"
++"\t\t\ttry { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { return; }\n"
++"\t\t\tif (!d || !d.configurable) return;\n"
++"\t\t\tvar pd;\n"
++"\t\t\tif ('value' in d && typeof d.value === 'function') {\n"
++"\t\t\t\tpd = { value: d.value, writable: true, enumerable: true, configurable: true };\n"
++"\t\t\t} else if ('value' in d) {\n"
++"\t\t\t\tstore[k] = d.value;\n"
++"\t\t\t\tvar set = (SETTABLE[k] || /^on/.test(k)) ? Object.getOwnPropertyDescriptor({\n"
++"\t\t\t\t\tset [k](v) { var s = vals.get(this); if (!s) throw new TypeError('Illegal invocation'); s[k] = v; } }, k).set : undefined;\n"
++"\t\t\t\tpd = { get: Object.getOwnPropertyDescriptor({ get [k]() {\n"
++"\t\t\t\t\tvar s = vals.get(this); if (!s) throw new TypeError('Illegal invocation'); return s[k]; } }, k).get,\n"
++"\t\t\t\t\tset: set, enumerable: true, configurable: true };\n"
++"\t\t\t} else {\n"
++"\t\t\t\tpd = { get: d.get, set: d.set, enumerable: true, configurable: true };\n"
++"\t\t\t}\n"
++"\t\t\ttry {\n"
++"\t\t\t\tif (!Object.prototype.hasOwnProperty.call(P, k)) Object.defineProperty(P, k, pd);\n"
++"\t\t\t\tdelete o[k];\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t}\n"
++"\tfunction protoOf(o, F) {\n"
++"\t\tvar P = F && F.prototype;\n"
++"\t\tif (o && P && Object.getPrototypeOf(o) !== P) try { Object.setPrototypeOf(o, P); } catch (e) { /* */ }\n"
++"\t\treturn o ? Object.getPrototypeOf(o) : null;\n"
++"\t}\n"
++"\t[['navigator', 'Navigator'], ['screen', 'Screen'], ['performance', 'Performance'],\n"
++"\t ['crypto', 'Crypto'], ['history', 'History']].forEach(function (p) {\n"
++"\t\tvar o;\n"
++"\t\ttry { o = g[p[0]]; } catch (e) { return; }\n"
++"\t\thoist(o, protoOf(o, g[p[1]]));\n"
++"\t});\n"
++"\ttry { if (g.screen && g.screen.orientation) hoist(g.screen.orientation, protoOf(g.screen.orientation, g.ScreenOrientation)); } catch (e) { /* */ }\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index a70c67e3d..26649fdfd 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -8,6 +8,24 @@
+ (function (g) {
+ 'use strict';
+ 
++/* the engine's own state about the page's objects (patch 276): kept here,
++ * not on navigator / performance, where a page sees its own properties */
++var PRIV = g.__vitaPriv;
++if (!PRIV) {
++	PRIV = {};
++	Object.defineProperty(g, '__vitaPriv', { value: PRIV });
++}
++/* this file's marks and per-object state (__vbCD, __vbNat, an element's
++ * selection, ...) in a record per object that no page can see -- they
++ * were properties of the functions and elements themselves */
++if (!PRIV.pv) PRIV.pv = new WeakMap();
++function PV(o) {
++	if (o === null || (typeof o !== 'object' && typeof o !== 'function')) return {};
++	var r = PRIV.pv.get(o);
++	if (!r) { r = {}; PRIV.pv.set(o, r); }
++	return r;
++}
++
+ function define(obj, name, value) {
+ 	Object.defineProperty(obj, name, { value: value, writable: true,
+ 		configurable: true, enumerable: false });
+@@ -2085,7 +2103,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	 * the element's `sheet` getter -- installed only if missing -- kept
+ 	 * making rules of the first run's, so `rule instanceof CSSStyleRule`
+ 	 * was false and google's safe-CSS sanitizer threw */
+-	if (g.CSSStyleSheet && g.CSSStyleSheet.__vbCssom) return;
++	if (g.CSSStyleSheet && PV(g.CSSStyleSheet).__vbCssom) return;
+ 
+ 	function klass(name, parent, ctor) {
+ 		var F = ctor || function () { throw new TypeError('Illegal constructor'); };
+@@ -2127,7 +2145,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		initSheet(this, null);
+ 	});
+ 	var DeclBase = typeof g.CSSStyleDeclaration === 'function' ? g.CSSStyleDeclaration : null;
+-	define(CSSStyleSheet, '__vbCssom', true);
++	PV(CSSStyleSheet).__vbCssom = true;
+ 
+ 	/* ---- parsing: a brace/string/comment-aware scan, no tokenizer ---- */
+ 	var TOK = /["'{}()\[\];\\]|\/\*/g;
+@@ -2547,11 +2565,11 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 
+ 	/* one sheet per owner, kept on the element (it points back at it) */
+ 	function sheetOf(n) {
+-		var sh = n.__vbSheet;
++		var sh = PV(n).__vbSheet;
+ 		if (!sh) {
+ 			sh = Object.create(CSSStyleSheet.prototype);
+ 			initSheet(sh, n);
+-			try { define(n, '__vbSheet', sh); } catch (e) { /* */ }
++			try { PV(n).__vbSheet = sh; } catch (e) { /* */ }
+ 		}
+ 		return sh;
+ 	}
+@@ -2572,14 +2590,14 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	function connected(n) {
+ 		var top = n, i = 0;
+ 		while (top.parentNode && i++ < 4096) top = top.parentNode;
+-		return top.nodeType === 9 || !!top.__vbDocRoot;
++		return top.nodeType === 9 || !!PV(top).__vbDocRoot;
+ 	}
+ 	/* The bridge's createHTMLDocument() is a stand-in: its head, body and
+ 	 * documentElement are three detached elements of THIS document, so
+ 	 * nothing in it looked connected. Join them as a document's are and
+ 	 * mark the root. */
+ 	var impl = d.implementation;
+-	if (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vb) {
++	if (impl && typeof impl.createHTMLDocument === 'function' && !PV(impl.createHTMLDocument).__vb) {
+ 		var chd = impl.createHTMLDocument, wrapped = function () {
+ 			var doc = chd.apply(this, arguments);
+ 			try {
+@@ -2587,12 +2605,12 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				if (root && root.nodeType === 1 && doc !== d) {
+ 					if (doc.head && !doc.head.parentNode) root.appendChild(doc.head);
+ 					if (doc.body && !doc.body.parentNode) root.appendChild(doc.body);
+-					define(root, '__vbDocRoot', true);
++					PV(root).__vbDocRoot = true;
+ 				}
+ 			} catch (e) { /* */ }
+ 			return doc;
+ 		};
+-		wrapped.__vb = true;
++		PV(wrapped).__vb = true;
+ 		try { impl.createHTMLDocument = wrapped; } catch (e) { /* */ }
+ 	}
+ 	var E = Object.getPrototypeOf(d.createElement('section'));
+@@ -2628,9 +2646,9 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		return Array.prototype.slice.call(r);
+ 	}
+ 	function hat(doc) {
+-		if (!doc || doc === d || typeof doc !== 'object' || doc.__vbHat) return doc;
++		if (!doc || doc === d || typeof doc !== 'object' || PV(doc).__vbHat) return doc;
+ 		try {
+-			Object.defineProperty(doc, '__vbHat', { value: true });
++			PV(doc).__vbHat = true;
+ 			doc.getElementsByTagName = function (t) { return byTag(this, t); };
+ 			if (typeof doc.getElementsByClassName !== 'function' ||
+ 			    !doc.documentElement)
+@@ -2648,28 +2666,28 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		return doc;
+ 	}
+ 	var DP = g.DOMParser && g.DOMParser.prototype;
+-	if (DP && typeof DP.parseFromString === 'function' && !DP.parseFromString.__vbHat) {
++	if (DP && typeof DP.parseFromString === 'function' && !PV(DP.parseFromString).__vbHat) {
+ 		var pfs = DP.parseFromString, w1 = function () {
+ 			return hat(pfs.apply(this, arguments));
+ 		};
+-		w1.__vbHat = true;
++		PV(w1).__vbHat = true;
+ 		DP.parseFromString = w1;
+ 	}
+ 	var impl = d.implementation;
+ 	if (impl && typeof impl.createHTMLDocument === 'function' &&
+-	    !impl.createHTMLDocument.__vbHat) {
++	    !PV(impl.createHTMLDocument).__vbHat) {
+ 		var chd = impl.createHTMLDocument, w2 = function () {
+ 			return hat(chd.apply(this, arguments));
+ 		};
+-		w2.__vbHat = true;
+-		w2.__vb = chd.__vb;
++		PV(w2).__vbHat = true;
++		PV(w2).__vb = PV(chd).__vb;
+ 		try { impl.createHTMLDocument = w2; } catch (e) { /* */ }
+ 	}
+ 	/* document methods follow `this` to another document */
+ 	['getElementsByTagName', 'getElementsByClassName', 'getElementById',
+ 	 'querySelector', 'querySelectorAll'].forEach(function (name) {
+ 		var f = d[name];
+-		if (typeof f !== 'function' || f.__vbThis) return;
++		if (typeof f !== 'function' || PV(f).__vbThis) return;
+ 		var w = function () {
+ 			var o = this;
+ 			if (o && o !== d && o !== g && typeof o === 'object' &&
+@@ -2678,7 +2696,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				return o[name].apply(o, arguments);
+ 			return f.apply(d, arguments);
+ 		};
+-		w.__vbThis = true;
++		PV(w).__vbThis = true;
+ 		try { d[name] = w; } catch (e) { /* */ }
+ 	});
+ })();
+@@ -2718,10 +2736,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ 	function acc(name, get, set) {
+ 		var cur = own(name);
+-		if (cur && cur.get && cur.get.__vbImg) return;
++		if (cur && cur.get && PV(cur.get).__vbImg) return;
+ 		var oget = cur && cur.get, oset = cur && cur.set;
+ 		var gf = function () { return isImg(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };
+-		gf.__vbImg = true;
++		PV(gf).__vbImg = true;
+ 		var sf = function (v) {
+ 			if (isImg(this) && set) set.call(this, v, oset);
+ 			else if (oset) oset.call(this, v);
+@@ -2757,16 +2775,16 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		startFetch(this);
+ 	});
+ 	var sa = P.setAttribute;
+-	if (typeof sa === 'function' && !sa.__vbImg) {
++	if (typeof sa === 'function' && !PV(sa).__vbImg) {
+ 		var w = function (name, v) {
+ 			var r = sa.apply(this, arguments);
+ 			if (isImg(this) && String(name).toLowerCase() === 'src') startFetch(this);
+ 			return r;
+ 		};
+-		w.__vbImg = true;
++		PV(w).__vbImg = true;
+ 		P.setAttribute = w;
+ 	}
+-	if (!P.decode || !P.decode.__vbImg) {
++	if (!P.decode || !PV(P.decode).__vbImg) {
+ 		var dec = function () {
+ 			var el = this;
+ 			return new Promise(function (res, rej) {
+@@ -2781,7 +2799,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				el.addEventListener('error', function () { rej(new Error('EncodingError: the image cannot be decoded')); });
+ 			});
+ 		};
+-		dec.__vbImg = true;
++		PV(dec).__vbImg = true;
+ 		P.decode = dec;
+ 	}
+ 	/* new Image(w, h) is an <img> */
+@@ -3001,9 +3019,9 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		function fn(idx) {
+ 			if (cache[idx] === undefined) {
+ 				var f = W.func(h, idx);
+-				if (f && typeof f === 'function' && !Object.prototype.hasOwnProperty.call(f, '__vbWasm')) {
++				if (f && typeof f === 'function' && !(PV(f).__vbWasm !== undefined)) {
+ 					try { Object.defineProperty(f, 'name', { value: String(idx), configurable: true }); } catch (e) { /* */ }
+-					try { define(f, '__vbWasm', true); } catch (e) { /* */ }
++					try { PV(f).__vbWasm = true; } catch (e) { /* */ }
+ 				}
+ 				cache[idx] = f;
+ 			}
+@@ -3624,7 +3642,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		return c;
+ 	}
+ 	function ctxOf(el) {
+-		var c = el.__vbCtx2d;
++		var c = PV(el).__vbCtx2d;
+ 		return c && c._el === el ? c : null;
+ 	}
+ 	/* a canvas's size changed (or was set again): it is cleared and its
+@@ -3782,7 +3800,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	/* an image source: [handle-or-element, width, height], or null when it
+ 	 * has nothing to draw yet */
+ 	function source(img) {
+-		if (img && img.__vbBitmap) img = img.__vbBitmap;
++		if (img && PV(img).__vbBitmap) img = PV(img).__vbBitmap;
+ 		if (isCanvas(img)) {
+ 			var c = ctxOf(img);
+ 			var w = attrDim(img, 'width', 300), h = attrDim(img, 'height', 150);
+@@ -4100,10 +4118,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	}
+ 	function acc(name, get, set) {
+ 		var cur = own(name);
+-		if (cur && cur.get && cur.get.__vbCv) return;
++		if (cur && cur.get && PV(cur.get).__vbCv) return;
+ 		var oget = cur && cur.get, oset = cur && cur.set;
+ 		var gf = function () { return isCanvas(this) ? get.call(this) : (oget ? oget.call(this) : undefined); };
+-		gf.__vbCv = true;
++		PV(gf).__vbCv = true;
+ 		var sf = function (v) {
+ 			if (isCanvas(this)) set.call(this, v);
+ 			else if (oset) oset.call(this, v);
+@@ -4117,23 +4135,23 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		this.setAttribute('height', String(v >>> 0));
+ 	});
+ 	var sa = P.setAttribute;
+-	if (typeof sa === 'function' && !sa.__vbCv) {
++	if (typeof sa === 'function' && !PV(sa).__vbCv) {
+ 		var w = function (name) {
+ 			var r = sa.apply(this, arguments), n = String(name).toLowerCase();
+ 			if ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);
+ 			return r;
+ 		};
+-		w.__vbCv = true;
++		PV(w).__vbCv = true;
+ 		P.setAttribute = w;
+ 	}
+ 	var ra = P.removeAttribute;
+-	if (typeof ra === 'function' && !ra.__vbCv) {
++	if (typeof ra === 'function' && !PV(ra).__vbCv) {
+ 		var wr = function (name) {
+ 			var r = ra.apply(this, arguments), n = String(name).toLowerCase();
+ 			if ((n === 'width' || n === 'height') && isCanvas(this)) resetCanvas(this);
+ 			return r;
+ 		};
+-		wr.__vbCv = true;
++		PV(wr).__vbCv = true;
+ 		P.removeAttribute = wr;
+ 	}
+ 	var oldGet = P.getContext, oldURL = P.toDataURL, oldBlob = P.toBlob;
+@@ -4143,7 +4161,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		var c = ctxOf(this);
+ 		if (!c) {
+ 			c = makeCtx(this);
+-			define(this, '__vbCtx2d', c);
++			PV(this).__vbCtx2d = c;
+ 		}
+ 		return c;
+ 	}
+@@ -4198,7 +4216,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 					}
+ 				}
+ 				x = { width: c.width, height: c.height, close: function () { } };
+-				define(x, '__vbBitmap', c);
++				PV(x).__vbBitmap = c;
+ 				res(x);
+ 			} catch (e) { rej(e); }
+ 		});
+@@ -4482,7 +4500,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 
+ 	/* the scratch document: the factories a parser or sanitizer calls */
+ 	var impl = d.implementation;
+-	if (impl && typeof impl.createHTMLDocument === 'function' && !impl.createHTMLDocument.__vbFactories) {
++	if (impl && typeof impl.createHTMLDocument === 'function' && !PV(impl.createHTMLDocument).__vbFactories) {
+ 		var chd = impl.createHTMLDocument, wrap = function () {
+ 			var doc = chd.apply(this, arguments);
+ 			if (doc && doc !== d) {
+@@ -4495,8 +4513,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			}
+ 			return doc;
+ 		};
+-		wrap.__vb = chd.__vb;
+-		wrap.__vbFactories = true;
++		PV(wrap).__vb = PV(chd).__vb;
++		PV(wrap).__vbFactories = true;
+ 		try { impl.createHTMLDocument = wrap; } catch (e) { /* */ }
+ 	}
+ })();
+@@ -4764,7 +4782,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		var pn = n.parentNode;
+ 		if (pn && pn.nodeType === 9) return true;
+ 		if (n.ownerDocument && n.ownerDocument.documentElement === n) return true;
+-		return !!n.__vbDocRoot;
++		return !!PV(n).__vbDocRoot;
+ 	}
+ 	var FORM = /^(input|button|select|textarea|optgroup|option|fieldset)$/;
+ 	function disabled(n) {
+@@ -5102,11 +5120,11 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	/* The bridge installs the document's querySelector(All) again after
+ 	 * this file's first run (qjs_dom_install runs twice per context, and
+ 	 * this file with it): wrap whatever native is there, once. */
+-	function nativeOf(f) { return f && f.__vbNat ? f.__vbNat : f; }
++	function nativeOf(f) { return f && PV(f).__vbNat ? PV(f).__vbNat : f; }
+ 	function wrapQuery(o) {
+ 		if (!o) return;
+ 		var qa = o.querySelectorAll, q1 = o.querySelector;
+-		if (typeof qa === 'function' && !qa.__vbNat) {
++		if (typeof qa === 'function' && !PV(qa).__vbNat) {
+ 			var natAll = qa, wa = function (sel) {
+ 				sel = String(sel);
+ 				parse(sel);	/* an invalid selector throws SyntaxError */
+@@ -5115,10 +5133,10 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 						natAll.call(this, sel);
+ 				return jsQuery(this, sel, false, natAll);
+ 			};
+-			wa.__vbNat = natAll;
++			PV(wa).__vbNat = natAll;
+ 			define(o, 'querySelectorAll', wa);
+ 		}
+-		if (typeof q1 === 'function' && !q1.__vbNat) {
++		if (typeof q1 === 'function' && !PV(q1).__vbNat) {
+ 			var nat1 = q1, all = nativeOf(o.querySelectorAll), w1 = function (sel) {
+ 				sel = String(sel);
+ 				parse(sel);
+@@ -5128,12 +5146,12 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				}
+ 				return jsQuery(this, sel, true, all);
+ 			};
+-			w1.__vbNat = nat1;
++			PV(w1).__vbNat = nat1;
+ 			define(o, 'querySelector', w1);
+ 		}
+ 	}
+-	if (!E.matches || !E.matches.__vbSel) {
+-		matches.__vbSel = true;
++	if (!E.matches || !PV(E.matches).__vbSel) {
++		PV(matches).__vbSel = true;
+ 		define(E, 'matches', matches);
+ 		define(E, 'webkitMatchesSelector', matches);
+ 		define(E, 'msMatchesSelector', matches);
+@@ -5353,23 +5371,23 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		});
+ 		acc(P, 'maxLength', function () { var v = parseInt(this.getAttribute('maxlength'), 10); return isNaN(v) ? -1 : v; },
+ 			function (v) { this.setAttribute('maxlength', String(v)); });
+-		acc(P, 'selectionStart', function () { return this.__vbSelS != null ? this.__vbSelS : String(this.value || '').length; },
+-			function (v) { this.__vbSelS = v; });
+-		acc(P, 'selectionEnd', function () { return this.__vbSelE != null ? this.__vbSelE : String(this.value || '').length; },
+-			function (v) { this.__vbSelE = v; });
++		acc(P, 'selectionStart', function () { return PV(this).__vbSelS != null ? PV(this).__vbSelS : String(this.value || '').length; },
++			function (v) { PV(this).__vbSelS = v; });
++		acc(P, 'selectionEnd', function () { return PV(this).__vbSelE != null ? PV(this).__vbSelE : String(this.value || '').length; },
++			function (v) { PV(this).__vbSelE = v; });
+ 		acc(P, 'selectionDirection', function () { return 'none'; });
+-		fn(P, 'setSelectionRange', function (a, b) { this.__vbSelS = a; this.__vbSelE = b; });
+-		fn(P, 'select', function () { this.__vbSelS = 0; this.__vbSelE = String(this.value || '').length; });
++		fn(P, 'setSelectionRange', function (a, b) { PV(this).__vbSelS = a; PV(this).__vbSelE = b; });
++		fn(P, 'select', function () { PV(this).__vbSelS = 0; PV(this).__vbSelE = String(this.value || '').length; });
+ 		fn(P, 'setRangeText', function (t) { this.value = String(t); });
+ 		acc(P, 'willValidate', function () { return !this.disabled; });
+-		acc(P, 'validationMessage', function () { return this.__vbCustomValidity || ''; });
+-		fn(P, 'setCustomValidity', function (m) { this.__vbCustomValidity = String(m || ''); });
++		acc(P, 'validationMessage', function () { return PV(this).__vbCustomValidity || ''; });
++		fn(P, 'setCustomValidity', function (m) { PV(this).__vbCustomValidity = String(m || ''); });
+ 		acc(P, 'validity', function () {
+ 			var v = String(this.value || ''), req = this.hasAttribute && this.hasAttribute('required');
+ 			var type = String(this.getAttribute && this.getAttribute('type') || '').toLowerCase();
+ 			var missing = !!(req && !v);
+ 			var typeMismatch = !!(v && type === 'email' && !/^[^@\s]+@[^@\s]+$/.test(v));
+-			var custom = !!this.__vbCustomValidity;
++			var custom = !!PV(this).__vbCustomValidity;
+ 			var pat = this.getAttribute && this.getAttribute('pattern'), patMis = false;
+ 			if (v && pat) { try { patMis = !new RegExp('^(?:' + pat + ')$').test(v); } catch (e) { /* */ } }
+ 			var ml = parseInt(this.getAttribute && this.getAttribute('minlength'), 10);
+@@ -5500,14 +5518,14 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		if (!o) return;
+ 		['data', 'nodeValue', 'textContent'].forEach(function (n) {
+ 			var dsc = findAcc(o, n);
+-			if (!dsc || typeof dsc.set !== 'function' || typeof dsc.get !== 'function' || dsc.set.__vbCD) return;
++			if (!dsc || typeof dsc.set !== 'function' || typeof dsc.get !== 'function' || PV(dsc.set).__vbCD) return;
+ 			var setter = function (v) {
+ 				var old = null;
+ 				try { old = dsc.get.call(this); } catch (e) { /* */ }
+ 				dsc.set.call(this, v);
+ 				queueCD(this, old);
+ 			};
+-			setter.__vbCD = true;
++			PV(setter).__vbCD = true;
+ 			try {
+ 				Object.defineProperty(o, n, { configurable: true, enumerable: dsc.enumerable,
+ 					get: dsc.get, set: setter });
+@@ -5515,7 +5533,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		});
+ 	});
+ 	/* delivery that honours characterData (and the *OldValue options) */
+-	if (typeof g.__msDeliverMutations === 'function' && !g.__msDeliverMutations.__vbCD) {
++	if (typeof g.__msDeliverMutations === 'function' && !PV(g.__msDeliverMutations).__vbCD) {
+ 		var deliver = function () {
+ 			var list = g.__msMutObservers, pending = g.__msMutPending.splice(0), i, j, k;
+ 			g.__msMutScheduled = false;
+@@ -5546,7 +5564,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				}
+ 			}
+ 		};
+-		deliver.__vbCD = true;
++		PV(deliver).__vbCD = true;
+ 		g.__msDeliverMutations = deliver;
+ 	}
+ 	[T, CP].forEach(function (o) {
+@@ -5582,8 +5600,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	/* The engine assigns document.currentScript around each script
+ 	 * (js_set_current_script): a getter alone made that assignment throw
+ 	 * and left currentScript null for every script. */
+-	acc(d, 'currentScript', function () { return d.__vbCurrentScript || null; },
+-		function (v) { d.__vbCurrentScript = v || null; });
++	acc(d, 'currentScript', function () { return PV(d).__vbCurrentScript || null; },
++		function (v) { PV(d).__vbCurrentScript = v || null; });
+ 	/* document.styleSheets: the CSSOM section above */
+ 	var adopted = [];
+ 	acc(d, 'adoptedStyleSheets', function () { return adopted; }, function (v) { adopted = v || []; });
+@@ -5965,8 +5983,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		}
+ 		/* run C's constructor on el (once) */
+ 		function construct(el, C) {
+-			if (!el || el.__vbConstructed) return;
+-			el.__vbConstructed = true;
++			if (!el || PV(el).__vbConstructed) return;
++			PV(el).__vbConstructed = true;
+ 			building.push({ el: el, C: C });
+ 			try { new C(); } catch (e) {
+ 				try { Object.setPrototypeOf(el, C.prototype); } catch (x) { /* */ }
+@@ -5983,8 +6001,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			}
+ 		}
+ 		function connect(el) {
+-			if (el.__vbConnected || !connected(el)) return;
+-			el.__vbConnected = true;
++			if (PV(el).__vbConnected || !connected(el)) return;
++			PV(el).__vbConnected = true;
+ 			if (typeof el.connectedCallback === 'function') {
+ 				try { el.connectedCallback(); } catch (e) {
+ 					try { console.error('customElement ' + lname(el) + ' connectedCallback: ' + e); } catch (x) { /* */ } }
+@@ -6012,8 +6030,8 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			}
+ 			for (i = 0; i < all.length; i++) {
+ 				var el = all[i];
+-				if (!el.__vbConnected || connected(el)) continue;
+-				el.__vbConnected = false;
++				if (!PV(el).__vbConnected || connected(el)) continue;
++				PV(el).__vbConnected = false;
+ 				if (typeof el.disconnectedCallback === 'function') {
+ 					try { el.disconnectedCallback(); } catch (e) { /* */ }
+ 				}
+@@ -6032,7 +6050,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 						attrMO = new MutationObserver(function (ms) {
+ 							ms.forEach(function (m) {
+ 								var el = m.target, C2 = el && el.nodeType === 1 && defs[lname(el)];
+-								if (C2 && el.__vbConstructed)
++								if (C2 && PV(el).__vbConstructed)
+ 									attrCb(el, C2, m.attributeName, m.oldValue, el.getAttribute(m.attributeName));
+ 							});
+ 						});
+@@ -6075,7 +6093,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	 * upgraded). */
+ 	(function () {
+ 		var CE = g.__vbCustomEl, NHE = g.HTMLElement;
+-		if (!CE || typeof NHE !== 'function' || NHE.__vbHE) return;
++		if (!CE || typeof NHE !== 'function' || PV(NHE).__vbHE) return;
+ 		var HE = function HTMLElement() {
+ 			var nt = new.target, b = CE.building, top = b[b.length - 1], el;
+ 			if (!nt) throw new TypeError('Illegal constructor');
+@@ -6085,13 +6103,13 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			} else {
+ 				var nm = CE.nameOf(nt), cr = d.createElement;
+ 				if (!nm) throw new TypeError('Illegal constructor');
+-				el = (cr && cr.__vbNat ? cr.__vbNat : cr).call(d, nm);
+-				el.__vbConstructed = true;
++				el = (cr && PV(cr).__vbNat ? PV(cr).__vbNat : cr).call(d, nm);
++				PV(el).__vbConstructed = true;
+ 			}
+ 			Object.setPrototypeOf(el, nt.prototype);
+ 			return el;
+ 		};
+-		HE.__vbHE = true;
++		PV(HE).__vbHE = true;
+ 		HE.prototype = NHE.prototype;
+ 		try { Object.setPrototypeOf(HE, NHE); } catch (e) { /* */ }
+ 		try { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }
+@@ -6103,14 +6121,14 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	 * with it), so the wrapping is redone on every run, once per native. */
+ 	(function () {
+ 		var CE = g.__vbCustomEl, cr = d.createElement;
+-		if (!CE || typeof cr !== 'function' || cr.__vbNat) return;
++		if (!CE || typeof cr !== 'function' || PV(cr).__vbNat) return;
+ 		var w = function (name, opts) {
+ 			var el = cr.apply(this, arguments);
+ 			var C = CE.defs[String(name).toLowerCase()];
+ 			if (C && el) CE.construct(el, C);
+ 			return el;
+ 		};
+-		w.__vbNat = cr;
++		PV(w).__vbNat = cr;
+ 		d.createElement = w;
+ 	})();
+ 	/* patch 242: a minimal Shadow DOM API -- Element.attachShadow, a
+@@ -6152,7 +6170,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		 * stub: there was no attachShadow to make one) */
+ 		g.ShadowRoot = SR;
+ 		EP.attachShadow = function attachShadow(init) {
+-			if (this.__vbShadow)
++			if (PV(this).__vbShadow)
+ 				throw new DOMException('Shadow root cannot be created on a host which already hosts a shadow tree.', 'NotSupportedError');
+ 			var r = d.createDocumentFragment(), host = this;
+ 			var mode = init && init.mode === 'closed' ? 'closed' : 'open';
+@@ -6163,7 +6181,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 				Object.defineProperty(r, 'delegatesFocus', { value: !!(init && init.delegatesFocus), configurable: true });
+ 				Object.defineProperty(r, 'adoptedStyleSheets', { value: [], writable: true, configurable: true });
+ 			} catch (e) { /* */ }
+-			this.__vbShadow = r;
++			PV(this).__vbShadow = r;
+ 			if (mode === 'open') {
+ 				try { Object.defineProperty(this, 'shadowRoot', { get: function () { return r; }, configurable: true }); } catch (e) { /* */ }
+ 			}
+@@ -6504,7 +6522,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		 * keeps the plain prototype test. */
+ 		var E = g[name];
+ 		if (typeof E === 'function') {
+-			if (tags.length && !E.__vbInst) {
++			if (tags.length && !PV(E).__vbInst) {
+ 				try {
+ 					Object.defineProperty(E, Symbol.hasInstance, { configurable: true,
+ 						value: function (x) {
+@@ -6517,7 +6535,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 								return false;
+ 							return tags.indexOf(String(x.localName || x.tagName || '').toLowerCase()) >= 0;
+ 						} });
+-					Object.defineProperty(E, '__vbInst', { value: true });
++					PV(E).__vbInst = true;
+ 				} catch (e) { /* */ }
+ 			}
+ 			return;
+@@ -8017,16 +8035,16 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		cur = el;
+ 		d.__vitaFocus = el;
+ 		if (prev && connected(prev)) {
+-			if (isTextField(prev) && prev.__vbFocusValue !== undefined &&
+-					String(prev.value == null ? '' : prev.value) !== prev.__vbFocusValue)
++			if (isTextField(prev) && PV(prev).__vbFocusValue !== undefined &&
++					String(prev.value == null ? '' : prev.value) !== PV(prev).__vbFocusValue)
+ 				fireSimple(prev, 'change');
+-			prev.__vbFocusValue = undefined;
++			PV(prev).__vbFocusValue = undefined;
+ 			fire(prev, 'blur', false, el);
+ 			fire(prev, 'focusout', true, el);
+ 		}
+ 		/* a blur handler may have moved focus elsewhere already */
+ 		if (el && cur === el) {
+-			el.__vbFocusValue = isTextField(el) ? String(el.value == null ? '' : el.value) : undefined;
++			PV(el).__vbFocusValue = isTextField(el) ? String(el.value == null ? '' : el.value) : undefined;
+ 			fire(el, 'focus', false, prev);
+ 			if (cur === el) fire(el, 'focusin', true, prev);
+ 		}
+@@ -8300,7 +8318,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	 * prototype (patch 218 found this), so every accessor here checks
+ 	 * the tag and behaves as a plain property on other elements. */
+ 	function isTag(el, t) { return tagOf(el) === t; }
+-	function expando(el, n) { return el['__vbx_' + n]; }
++	function expando(el, n) { return PV(el)['__vbx_' + n]; }
+ 	var DP = protoOf('details'), GP = protoOf('dialog');
+ 	(function () {
+ 		/* one 'open' accessor serving both tags, on whichever
+@@ -8321,7 +8339,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 						return this.hasAttribute('open');
+ 					},
+ 					set: function (v) {
+-						if (tags.indexOf(tagOf(this)) < 0) { this.__vbx_open = v; return; }
++						if (tags.indexOf(tagOf(this)) < 0) { PV(this).__vbx_open = v; return; }
+ 						if (v) this.setAttribute('open', '');
+ 						else this.removeAttribute('open');
+ 					} });
+@@ -8350,11 +8368,11 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 			try { Object.defineProperty(GP, 'returnValue', { configurable: true, enumerable: true,
+ 				get: function () {
+ 					if (!isTag(this, 'DIALOG')) return expando(this, 'returnValue');
+-					return this.__vbReturnValue === undefined ? '' : this.__vbReturnValue;
++					return PV(this).__vbReturnValue === undefined ? '' : PV(this).__vbReturnValue;
+ 				},
+ 				set: function (v) {
+-					if (!isTag(this, 'DIALOG')) { this.__vbx_returnValue = v; return; }
+-					this.__vbReturnValue = String(v);
++					if (!isTag(this, 'DIALOG')) { PV(this).__vbx_returnValue = v; return; }
++					PV(this).__vbReturnValue = String(v);
+ 				} }); } catch (e) { /* */ }
+ 		}
+ 	}
+@@ -8373,12 +8391,12 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	var target = typeof g.addEventListener === 'function' ? g : d;
+ 	if (!target.addEventListener) return;
+ 	target.addEventListener('click', function (e) {
+-		if (!e || e.defaultPrevented || e.__vbToggled) return;
++		if (!e || e.defaultPrevented || PV(e).__vbToggled) return;
+ 		var det = toggler(e.target);
+ 		if (!det) return;
+ 		/* once per click: the listener can see one event twice here
+ 		 * (window listeners are also reached through the document) */
+-		try { e.__vbToggled = true; } catch (x) { /* */ }
++		try { PV(e).__vbToggled = true; } catch (x) { /* */ }
+ 		if (det.hasAttribute('open')) det.removeAttribute('open');
+ 		else det.setAttribute('open', '');
+ 		later(function () { fire(det, 'toggle'); });
+@@ -8633,7 +8651,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		Object.defineProperty(k, 'algorithm', { value: { name: 'HMAC', hash: { name: hash },
+ 			length: raw.length * 8 }, enumerable: true });
+ 		Object.defineProperty(k, 'usages', { value: (usages || []).slice(0), enumerable: true });
+-		Object.defineProperty(k, '__vbRaw', { value: raw });
++		PV(k).__vbRaw = raw;
+ 		return k;
+ 	}
+ 	function run(fn) {
+@@ -8664,26 +8682,26 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		},
+ 		exportKey: function (format, key) {
+ 			return run(function () {
+-				if (format !== 'raw' || !key || !key.__vbRaw || !key.extractable)
++				if (format !== 'raw' || !key || !PV(key).__vbRaw || !key.extractable)
+ 					throw new DOMException('key is not extractable as raw',
+ 							'InvalidAccessError');
+-				return new Uint8Array(key.__vbRaw).buffer;
++				return new Uint8Array(PV(key).__vbRaw).buffer;
+ 			});
+ 		},
+ 		sign: function (alg, key, data) {
+ 			return run(function () {
+-				if (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)
++				if (algName(alg) !== 'HMAC' || !key || !PV(key).__vbRaw)
+ 					throw new DOMException('sign: only HMAC is supported',
+ 							'NotSupportedError');
+-				return hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)).buffer;
++				return hmac(key.algorithm.hash.name, PV(key).__vbRaw, bytes(data)).buffer;
+ 			});
+ 		},
+ 		verify: function (alg, key, sig, data) {
+ 			return run(function () {
+-				if (algName(alg) !== 'HMAC' || !key || !key.__vbRaw)
++				if (algName(alg) !== 'HMAC' || !key || !PV(key).__vbRaw)
+ 					throw new DOMException('verify: only HMAC is supported',
+ 							'NotSupportedError');
+-				var m = hmac(key.algorithm.hash.name, key.__vbRaw, bytes(data)),
++				var m = hmac(key.algorithm.hash.name, PV(key).__vbRaw, bytes(data)),
+ 					s = bytes(sig), d = m.length ^ s.length, i;
+ 				for (i = 0; i < m.length && i < s.length; i++) d |= m[i] ^ s[i];
+ 				return d === 0;
+@@ -8728,24 +8746,24 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	function reflect(P, n, dflt, TAG) {
+ 		if (!P) return;
+ 		var prev = Object.getOwnPropertyDescriptor(P, n);
+-		if (prev && !(prev.get && prev.get.__vb218) && shared.indexOf(P) >= 0)
++		if (prev && !(prev.get && PV(prev.get).__vb218) && shared.indexOf(P) >= 0)
+ 			return;
+-		var pg = prev && prev.get && prev.get.__vb218 ? prev.get : null;
+-		var ps = prev && prev.set && prev.get && prev.get.__vb218 ? prev.set : null;
++		var pg = prev && prev.get && PV(prev.get).__vb218 ? prev.get : null;
++		var ps = prev && prev.set && prev.get && PV(prev.get).__vb218 ? prev.set : null;
+ 		var get = function () {
+ 			if (tagOf(this) !== TAG)
+-				return pg ? pg.call(this) : this['__vbx_' + n];
++				return pg ? pg.call(this) : PV(this)['__vbx_' + n];
+ 			var v = this.getAttribute(n), f = (v === null || v === '') ? NaN : Number(v);
+ 			if (isFinite(f)) return f;
+ 			return typeof dflt === 'function' ? dflt(this) : dflt;
+ 		};
+-		get.__vb218 = true;
++		PV(get).__vb218 = true;
+ 		try {
+ 			Object.defineProperty(P, n, { configurable: true, enumerable: true,
+ 				get: get,
+ 				set: function (v) {
+ 					if (tagOf(this) !== TAG) {
+-						if (ps) ps.call(this, v); else this['__vbx_' + n] = v;
++						if (ps) ps.call(this, v); else PV(this)['__vbx_' + n] = v;
+ 						return;
+ 					}
+ 					this.setAttribute(n, String(+v));
+@@ -8766,7 +8784,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		try {
+ 			Object.defineProperty(PP, 'position', { configurable: true, enumerable: true,
+ 				get: function () {
+-					if (tagOf(this) !== 'PROGRESS') return this.__vbx_position;
++					if (tagOf(this) !== 'PROGRESS') return PV(this).__vbx_position;
+ 					if (!this.hasAttribute('value')) return -1;
+ 					var m = num(this, 'max', 1);
+ 					if (m <= 0) m = 1;
+@@ -8864,7 +8882,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+  * engine does not measure read 0, as a browser's do when it may not tell. */
+ (function () {
+ 	var P = g.performance, d = g.document;
+-	if (!P || !isFn(P.now) || !d || P.__vitaNav) return;
++	if (!P || !isFn(P.now) || !d || PRIV.nav) return;
+ 	var origin = Date.now() - P.now(), t = { resp: P.now() };
+ 	function mark(k) { if (!t[k]) t[k] = P.now(); }
+ 	function get(k) { return t[k] || 0; }
+@@ -8959,7 +8977,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 			return String(name) === entry.name && (type === undefined || type === 'navigation') ?
+ 				[entry].concat(r) : r;
+ 		};
+-		define(P, '__vitaNav', entry);
++		PRIV.nav = entry;
+ 	} catch (e) { /* */ }
+ })();
+ 
+@@ -8980,7 +8998,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+  * the engine (macsurf_qjs.c __vitaJsHeap), in 100 KB steps. */
+ (function () {
+ 	var P = g.performance;
+-	if (!P || !isFn(P.now) || P.__vitaUserTiming) return;
++	if (!P || !isFn(P.now) || PRIV.userTiming) return;
+ 	var I = new WeakMap(), marks = [], measures = [];
+ 	function illegal() { throw new TypeError('Illegal constructor'); }
+ 	var Entry = function PerformanceEntry() { illegal(); };
+@@ -9032,7 +9050,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		try { Object.defineProperty(p[0].prototype, Symbol.toStringTag, { value: p[1], configurable: true }); } catch (e) { /* */ }
+ 		if (!g[p[1]]) define(g, p[1], p[0]);
+ 	});
+-	if (P.__vitaNav) try { Object.setPrototypeOf(Object.getPrototypeOf(P.__vitaNav), RT.prototype); } catch (e) { /* */ }
++	if (PRIV.nav) try { Object.setPrototypeOf(Object.getPrototypeOf(PRIV.nav), RT.prototype); } catch (e) { /* */ }
+ 	function toTime(m, what) {
+ 		if (typeof m === 'number') {
+ 			if (m < 0) throw new TypeError("'" + what + "' cannot have a negative time stamp.");
+@@ -9126,7 +9144,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 			return { jsHeapSizeLimit: step(h[2]), totalJSHeapSize: step(h[1]), usedJSHeapSize: step(h[0]) };
+ 		} });
+ 	}
+-	define(P, '__vitaUserTiming', true);
++	PRIV.userTiming = true;
+ })();
+ 
+ /* ---- what navigator and screen say about the device, honestly (271) ----
+@@ -9148,7 +9166,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+  * empty stand-in would make a page's feature test say it has. */
+ (function () {
+ 	var n = g.navigator;
+-	if (!n || n.__vitaHonest) return;
++	if (!n || PRIV.honest) return;
+ 	function illegal() { throw new TypeError('Illegal constructor'); }
+ 	function iface(name, f, parent) {
+ 		if (parent) Object.setPrototypeOf(f.prototype, parent.prototype);
+@@ -9226,7 +9244,7 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		define(cb, 'writeText', function writeText(data) { return no(); });
+ 		define(cb, 'write', function write(data) { return no(); });
+ 	}
+-	define(n, '__vitaHonest', true);
++	PRIV.honest = true;
+ })();
+ 
+ /* ---- Battery Status: navigator.getBattery() (patch 272) -----------------
+@@ -9493,6 +9511,9 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	 * wrapping again must still find it (a characterData setter wrapped
+ 	 * twice queued every record twice) */
+ 	function marks(f, w) {
++		/* the marks live in the original's private record (patch 276) */
++		var rec = PRIV.pv && PRIV.pv.get(f);
++		if (rec) PRIV.pv.set(w, rec);
+ 		Object.getOwnPropertyNames(f).forEach(function (k) {
+ 			if (k === 'length' || k === 'name' || k === 'prototype') return;
+ 			try { Object.defineProperty(w, k, Object.getOwnPropertyDescriptor(f, k)); } catch (e) { /* */ }
+@@ -9569,4 +9590,64 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		try { delete Function.prototype[k]; } catch (e) { /* */ }
+ 	});
+ })();
++/* ---- the APIs live on the interface prototypes (patch 276) ---------------
++ * In a browser navigator, screen, performance, crypto, history and
++ * screen.orientation have no own properties at all (Reflect.ownKeys
++ * (navigator) is [] in Chromium): every attribute is an accessor and every
++ * operation a method of Navigator.prototype, Screen.prototype, ... Here the
++ * bridge built them as plain objects with their members as own properties
++ * (navigator 29, performance 17, history 13, screen 9), engine internals
++ * among them, and Crypto.prototype had no randomUUID. Each own member moves
++ * to the object's interface prototype: an operation as it is, a value as a
++ * read-only accessor ("get userAgent") over this object's value, an
++ * attribute the platform lets a page set (history.scrollRestoration, an
++ * on<event> handler) with a setter as well. Reading one through another
++ * object throws "Illegal invocation", as in Chromium. The internals moved
++ * off these objects in the same patch (__vitaPriv, __vitaHistory, the
++ * EventTarget shim's listener map). */
++(function () {
++	var vals = new WeakMap();
++	var SETTABLE = { scrollRestoration: 1 };
++	function hoist(o, P) {
++		if (!o || !P || P === Object.prototype || o === P) return;
++		var own = Object.getOwnPropertyNames(o);
++		if (!own.length) return;
++		var store = vals.get(o);
++		if (!store) { store = {}; vals.set(o, store); }
++		own.forEach(function (k) {
++			var d;
++			try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { return; }
++			if (!d || !d.configurable) return;
++			var pd;
++			if ('value' in d && typeof d.value === 'function') {
++				pd = { value: d.value, writable: true, enumerable: true, configurable: true };
++			} else if ('value' in d) {
++				store[k] = d.value;
++				var set = (SETTABLE[k] || /^on/.test(k)) ? Object.getOwnPropertyDescriptor({
++					set [k](v) { var s = vals.get(this); if (!s) throw new TypeError('Illegal invocation'); s[k] = v; } }, k).set : undefined;
++				pd = { get: Object.getOwnPropertyDescriptor({ get [k]() {
++					var s = vals.get(this); if (!s) throw new TypeError('Illegal invocation'); return s[k]; } }, k).get,
++					set: set, enumerable: true, configurable: true };
++			} else {
++				pd = { get: d.get, set: d.set, enumerable: true, configurable: true };
++			}
++			try {
++				if (!Object.prototype.hasOwnProperty.call(P, k)) Object.defineProperty(P, k, pd);
++				delete o[k];
++			} catch (e) { /* */ }
++		});
++	}
++	function protoOf(o, F) {
++		var P = F && F.prototype;
++		if (o && P && Object.getPrototypeOf(o) !== P) try { Object.setPrototypeOf(o, P); } catch (e) { /* */ }
++		return o ? Object.getPrototypeOf(o) : null;
++	}
++	[['navigator', 'Navigator'], ['screen', 'Screen'], ['performance', 'Performance'],
++	 ['crypto', 'Crypto'], ['history', 'History']].forEach(function (p) {
++		var o;
++		try { o = g[p[0]]; } catch (e) { return; }
++		hoist(o, protoOf(o, g[p[1]]));
++	});
++	try { if (g.screen && g.screen.orientation) hoist(g.screen.orientation, protoOf(g.screen.orientation, g.ScreenOrientation)); } catch (e) { /* */ }
++})();
+ })(this);
