@@ -4,6 +4,39 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patches 260-267: Cloudflare's challenge passes (r49-full-267)
+
+Chosen from r45 (mean 80.1): the lowest tier was forum (54.9), and its
+fixable site, Stack Overflow (18.2), never got past Cloudflare's "Just a
+moment..." page. Six engine bugs in the challenge's path (260-265: blank
+frame realm, Document.prototype methods, Navigation Timing, script form
+submission, libcss !important operands, libdom form owner); two more found
+when 262 regressed the Guardian (266: an edited or late stylesheet never
+restyled the page; 267: a box-less iframe made during the load never
+loaded). Full gate green first. Same Chrome reference as r45
+(`--reuse-ref r45-full-259`).
+
+| tier | r45 | r49 |
+|---|---|---|
+| forum | 54.9 | 79.9 |
+| news | 84.9 | 82.3 |
+| wiki | 88.2 | 85.1 |
+| **all** | **80.1** | **81.8** |
+
+| site | r45 | r49 | note |
+|---|---|---|---|
+| stackoverflow | 18.2 | 84.6 | the challenge passes in ~5 s; question list, sidebar |
+| guardian | 80.8 | 80.5 | r46 (262, before 266): 70.2, unstyled; r47 (266): 73.1, no consent dialog; 267 restores it |
+| wikipedia | 87.9 | 81.6 | its fundraising banner, served at random (both builds, 1 run in 2) |
+| bbc | 89.5 | 80.4 | live text drift: fresh reference, 259 build 89.4 vs current 89.6 |
+| hackernews | 91.5 | 75.3 | live text drift: fresh reference, 266 and 267 builds both 91.0 |
+| google | 80.4 | 78.6 | trending topics drift |
+
+The drops are the live sites moving against a two-day-old reference, each
+checked by scoring the old and new builds against one fresh reference;
+the only real change outside forum is Stack Overflow's. Next re-score
+should take a fresh reference.
+
 ## 2026-10-12 — patch 259: Request bodies (not re-scored)
 
 Request had no body readers (text / json / formData / arrayBuffer / blob

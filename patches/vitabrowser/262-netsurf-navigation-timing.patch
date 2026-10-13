@@ -1,0 +1,361 @@
+# netsurf: Navigation Timing; performance.now() counts from the page's
+# start (patch 262)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 261)
+#
+# performance.getEntriesByType('navigation') was [], performance.timing
+# had only navigationStart, and timeOrigin and now() were the engine's
+# uptime. Cloudflare's challenge polls the navigation entry every 550 ms
+# until the page has loaded, and polled forever.
+#
+#  - quickjs/macsurf_qjs.c: each realm's time origin is the start of the
+#    navigation that made it (the browser window's last_action, read in
+#    js_newthread), as a browser's is; __macsurf_monotonic_ms()
+#    (performance.now(), animation-frame timestamps) and native events'
+#    timeStamp count from it. So responseStart includes the network's wait:
+#    the Guardian reads it to decide whether the page is "performing
+#    poorly" (with no entry at all it always was).
+#  - vita_polyfill.js: performance.timeOrigin is that moment on the epoch
+#    clock; one PerformanceNavigationTiming entry (getEntries,
+#    getEntriesByType, getEntriesByName) and performance.timing over it
+#    record the moments the page reaches -- its response (the realm is made
+#    when the document starts to parse), interactive, DOMContentLoaded,
+#    complete, load. Network phases the engine does not measure read 0.
+#
+# Gate: JS-frame-realm.html checks 8-11.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -41,6 +41,7 @@
+ #include "netsurf/plot_style.h"
+ #include "netsurf/layout.h"
+ #include "content/handlers/html/private.h"
++#include <nsutils/time.h>	/* patch 262: navigation start */
+ #include "content/handlers/html/html.h"	/* patch 250: html_image_* */
+ /* fixes1011 (Phase 3) - the box tree, for the layout metrics. box.h defines
+  * struct box and the LEFT/RIGHT/TOP/BOTTOM edge indices; box_inspect.h has
+@@ -218,10 +219,18 @@
+ 	struct jsheap *heap;
+ 	dom_document *document;
+ 	struct content *content;
++	/* VitaBrowser patch 262: the realm's time origin (macsurf_qjs_get_now
++	 * at the start of the navigation that made it); performance.now(),
++	 * animation frame and native event timestamps count from it */
++	double t_origin;
+ 	struct qjs_realm_owner *next;
+ };
+ 
+ static struct qjs_realm_owner *g_qjs_realm_owners = NULL;
++/* VitaBrowser patch 262: ms since the navigation began, for the realm
++ * js_newthread is building (its time origin is that start, as a browser's
++ * is: the document's responseStart then includes the network's wait) */
++static double g_qjs_nav_elapsed_ms = 0.0;
+ static unsigned long qjs_ctx_gen(JSContext *ctx);
+ int js_realm_valid_for_content(struct jsthread *thread,
+ 		struct content *content, unsigned long generation);
+@@ -257,6 +266,10 @@
+ 	owner->heap = heap;
+ 	owner->document = document;
+ 	owner->content = content;
++	{
++		double macsurf_qjs_get_now(void);
++		owner->t_origin = macsurf_qjs_get_now() - g_qjs_nav_elapsed_ms;
++	}
+ 	owner->next = g_qjs_realm_owners;
+ 	g_qjs_realm_owners = owner;
+ 	return 1;
+@@ -1151,11 +1164,20 @@
+ /* monotonic clock for performance.now()                               */
+ /* ------------------------------------------------------------------ */
+ 
++/* VitaBrowser patch 262: ms since this realm's time origin (it was the
++ * engine's uptime: performance.now() never started from the page) */
++static double qjs_realm_now(JSContext *ctx)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	double now = macsurf_qjs_get_now();
++	return owner != NULL ? now - owner->t_origin : now;
++}
++
+ static JSValue qjs_monotonic_ms(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+ 	(void)this_val; (void)argc; (void)argv;
+-	return JS_NewFloat64(ctx, macsurf_qjs_get_now());
++	return JS_NewFloat64(ctx, qjs_realm_now(ctx));
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -8919,7 +8941,7 @@
+ 		JS_SetPropertyStr(ctx, evobj, "defaultPrevented",
+ 				JS_NewBool(ctx, b));
+ 		JS_SetPropertyStr(ctx, evobj, "timeStamp",
+-				JS_NewFloat64(ctx, macsurf_qjs_get_now()));
++				JS_NewFloat64(ctx, qjs_realm_now(ctx)));
+ 		/* isTrusted is TRUE only here -- this is the native UI path.
+ 		 * Anything from `new Event` / dispatchEvent reports false, and some
+ 		 * libraries branch on it to reject synthetic input. */
+@@ -19322,8 +19344,20 @@
+ 		 * response that arrives after navigation would JS_Call into
+ 		 * freed heap from xhr_deliver(). */
+ 		macos9_js_fetch_flush(heap->ctx);
++		{
++			struct browser_window *nbw = win_priv;
++			uint64_t nms = 0;
++			g_qjs_nav_elapsed_ms = 0.0;
++			if (nbw != NULL && nbw->last_action != 0 &&
++			    nsu_getmonotonic_ms(&nms) == NSUERROR_OK &&
++			    nms >= nbw->last_action &&
++			    nms - nbw->last_action < 600000)
++				g_qjs_nav_elapsed_ms =
++					(double)(nms - nbw->last_action);
++		}
+ 		fresh = qjs_build_context(heap, htmlc->document,
+ 				(struct content *)htmlc);
++		g_qjs_nav_elapsed_ms = 0.0;
+ 		if (fresh != NULL) {
+ 			int dropped;
+ 			qjs_owner_unregister(heap->ctx);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -8809,4 +8809,117 @@
+ 	define(g, '__vitaDocMethodsToProto', move);
+ 	move();
+ })();
++
++/* ---- Navigation Timing (patch 262) ---------------------------------------
++ * performance had no navigation entry (getEntriesByType('navigation') was
++ * []), no performance.timing beyond navigationStart, and its timeOrigin
++ * and now() were the engine's uptime. Cloudflare's challenge polls the
++ * navigation entry every 550 ms until the page has loaded, and waited
++ * forever. now() (and animation-frame and event timestamps) now count from
++ * this realm's start (macsurf_qjs.c), timeOrigin is that moment on the
++ * epoch clock, and one PerformanceNavigationTiming entry -- with
++ * performance.timing over it -- records the moments this page reaches:
++ * its response (the realm is made when the document starts to parse),
++ * interactive, DOMContentLoaded, complete and load. Network phases the
++ * engine does not measure read 0, as a browser's do when it may not tell. */
++(function () {
++	var P = g.performance, d = g.document;
++	if (!P || !isFn(P.now) || !d || P.__vitaNav) return;
++	var origin = Date.now() - P.now(), t = { resp: P.now() };
++	function mark(k) { if (!t[k]) t[k] = P.now(); }
++	function get(k) { return t[k] || 0; }
++	try {
++		d.addEventListener('readystatechange', function () {
++			if (d.readyState === 'interactive') mark('interactive');
++			if (d.readyState === 'complete') mark('complete');
++		});
++		d.addEventListener('DOMContentLoaded', function () {
++			mark('interactive'); mark('dcl');
++			setTimeout(function () { mark('dclEnd'); }, 0);
++		});
++		g.addEventListener('load', function () {
++			mark('interactive'); mark('dcl'); mark('dclEnd'); mark('complete'); mark('load');
++			setTimeout(function () { mark('loadEnd'); }, 0);
++		});
++	} catch (e) { /* */ }
++	var NavTiming = function PerformanceNavigationTiming() {
++		throw new TypeError('Illegal constructor');
++	};
++	var NP = NavTiming.prototype;
++	var fields = {
++		name: function () { return String(g.location && g.location.href); },
++		entryType: function () { return 'navigation'; },
++		startTime: function () { return 0; },
++		duration: function () { return get('loadEnd'); },
++		initiatorType: function () { return 'navigation'; },
++		nextHopProtocol: function () { return 'http/1.1'; },
++		deliveryType: function () { return ''; },
++		renderBlockingStatus: function () { return 'non-blocking'; },
++		workerStart: 0, redirectStart: 0, redirectEnd: 0, fetchStart: 0,
++		domainLookupStart: 0, domainLookupEnd: 0, connectStart: 0, connectEnd: 0,
++		secureConnectionStart: 0, requestStart: 0,
++		responseStart: function () { return get('resp'); },
++		responseEnd: function () { return get('resp'); },
++		transferSize: 0, encodedBodySize: 0, decodedBodySize: 0,
++		serverTiming: function () { return []; },
++		unloadEventStart: 0, unloadEventEnd: 0,
++		domInteractive: function () { return get('interactive'); },
++		domContentLoadedEventStart: function () { return get('dcl'); },
++		domContentLoadedEventEnd: function () { return get('dclEnd'); },
++		domComplete: function () { return get('complete'); },
++		loadEventStart: function () { return get('load'); },
++		loadEventEnd: function () { return get('loadEnd'); },
++		type: function () { return 'navigate'; },
++		redirectCount: 0, activationStart: 0
++	};
++	Object.keys(fields).forEach(function (k) {
++		var f = fields[k];
++		Object.defineProperty(NP, k, { configurable: true, enumerable: true,
++			get: typeof f === 'function' ? f : function () { return f; } });
++	});
++	define(NP, 'toJSON', function toJSON() {
++		var o = {};
++		Object.keys(fields).forEach(function (k) { o[k] = this[k]; }, this);
++		return o;
++	});
++	try { Object.defineProperty(NP, Symbol.toStringTag, { value: 'PerformanceNavigationTiming', configurable: true }); } catch (e) { /* */ }
++	var entry = Object.create(NP);
++	if (!g.PerformanceNavigationTiming) define(g, 'PerformanceNavigationTiming', NavTiming);
++	var timing = {};
++	[['navigationStart', 0], ['fetchStart', 0], ['domainLookupStart', 0], ['domainLookupEnd', 0],
++	 ['connectStart', 0], ['connectEnd', 0], ['requestStart', 0], ['responseStart', 'resp'],
++	 ['responseEnd', 'resp'], ['domLoading', 'resp'], ['domInteractive', 'interactive'],
++	 ['domContentLoadedEventStart', 'dcl'], ['domContentLoadedEventEnd', 'dclEnd'],
++	 ['domComplete', 'complete'], ['loadEventStart', 'load'], ['loadEventEnd', 'loadEnd']
++	].forEach(function (p) {
++		Object.defineProperty(timing, p[0], { enumerable: true, configurable: true,
++			get: function () {
++				if (p[1] === 0) return Math.round(origin);
++				return t[p[1]] ? Math.round(origin + t[p[1]]) : 0;
++			} });
++	});
++	['unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
++	 'secureConnectionStart'].forEach(function (k) { timing[k] = 0; });
++	define(timing, 'toJSON', function toJSON() {
++		var o = {}, k; for (k in this) if (typeof this[k] === 'number') o[k] = this[k]; return o;
++	});
++	var byType = P.getEntriesByType, all = P.getEntries, byName = P.getEntriesByName;
++	try {
++		Object.defineProperty(P, 'timeOrigin', { value: origin, configurable: true, enumerable: true });
++		Object.defineProperty(P, 'timing', { value: timing, configurable: true, enumerable: true });
++		P.getEntriesByType = function getEntriesByType(type) {
++			var r = isFn(byType) ? byType.call(P, type) || [] : [];
++			return String(type) === 'navigation' ? [entry].concat(r) : r;
++		};
++		P.getEntries = function getEntries() {
++			return [entry].concat(isFn(all) ? all.call(P) || [] : []);
++		};
++		P.getEntriesByName = function getEntriesByName(name, type) {
++			var r = isFn(byName) ? byName.call(P, name, type) || [] : [];
++			return String(name) === entry.name && (type === undefined || type === 'navigation') ?
++				[entry].concat(r) : r;
++		};
++		define(P, '__vitaNav', entry);
++	} catch (e) { /* */ }
++})();
+ })(this);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -8810,5 +8810,118 @@
+ "\tdefine(g, '__vitaDocMethodsToProto', move);\n"
+ "\tmove();\n"
+ "})();\n"
++"\n"
++"/* ---- Navigation Timing (patch 262) ---------------------------------------\n"
++" * performance had no navigation entry (getEntriesByType('navigation') was\n"
++" * []), no performance.timing beyond navigationStart, and its timeOrigin\n"
++" * and now() were the engine's uptime. Cloudflare's challenge polls the\n"
++" * navigation entry every 550 ms until the page has loaded, and waited\n"
++" * forever. now() (and animation-frame and event timestamps) now count from\n"
++" * this realm's start (macsurf_qjs.c), timeOrigin is that moment on the\n"
++" * epoch clock, and one PerformanceNavigationTiming entry -- with\n"
++" * performance.timing over it -- records the moments this page reaches:\n"
++" * its response (the realm is made when the document starts to parse),\n"
++" * interactive, DOMContentLoaded, complete and load. Network phases the\n"
++" * engine does not measure read 0, as a browser's do when it may not tell. */\n"
++"(function () {\n"
++"\tvar P = g.performance, d = g.document;\n"
++"\tif (!P || !isFn(P.now) || !d || P.__vitaNav) return;\n"
++"\tvar origin = Date.now() - P.now(), t = { resp: P.now() };\n"
++"\tfunction mark(k) { if (!t[k]) t[k] = P.now(); }\n"
++"\tfunction get(k) { return t[k] || 0; }\n"
++"\ttry {\n"
++"\t\td.addEventListener('readystatechange', function () {\n"
++"\t\t\tif (d.readyState === 'interactive') mark('interactive');\n"
++"\t\t\tif (d.readyState === 'complete') mark('complete');\n"
++"\t\t});\n"
++"\t\td.addEventListener('DOMContentLoaded', function () {\n"
++"\t\t\tmark('interactive'); mark('dcl');\n"
++"\t\t\tsetTimeout(function () { mark('dclEnd'); }, 0);\n"
++"\t\t});\n"
++"\t\tg.addEventListener('load', function () {\n"
++"\t\t\tmark('interactive'); mark('dcl'); mark('dclEnd'); mark('complete'); mark('load');\n"
++"\t\t\tsetTimeout(function () { mark('loadEnd'); }, 0);\n"
++"\t\t});\n"
++"\t} catch (e) { /* */ }\n"
++"\tvar NavTiming = function PerformanceNavigationTiming() {\n"
++"\t\tthrow new TypeError('Illegal constructor');\n"
++"\t};\n"
++"\tvar NP = NavTiming.prototype;\n"
++"\tvar fields = {\n"
++"\t\tname: function () { return String(g.location && g.location.href); },\n"
++"\t\tentryType: function () { return 'navigation'; },\n"
++"\t\tstartTime: function () { return 0; },\n"
++"\t\tduration: function () { return get('loadEnd'); },\n"
++"\t\tinitiatorType: function () { return 'navigation'; },\n"
++"\t\tnextHopProtocol: function () { return 'http/1.1'; },\n"
++"\t\tdeliveryType: function () { return ''; },\n"
++"\t\trenderBlockingStatus: function () { return 'non-blocking'; },\n"
++"\t\tworkerStart: 0, redirectStart: 0, redirectEnd: 0, fetchStart: 0,\n"
++"\t\tdomainLookupStart: 0, domainLookupEnd: 0, connectStart: 0, connectEnd: 0,\n"
++"\t\tsecureConnectionStart: 0, requestStart: 0,\n"
++"\t\tresponseStart: function () { return get('resp'); },\n"
++"\t\tresponseEnd: function () { return get('resp'); },\n"
++"\t\ttransferSize: 0, encodedBodySize: 0, decodedBodySize: 0,\n"
++"\t\tserverTiming: function () { return []; },\n"
++"\t\tunloadEventStart: 0, unloadEventEnd: 0,\n"
++"\t\tdomInteractive: function () { return get('interactive'); },\n"
++"\t\tdomContentLoadedEventStart: function () { return get('dcl'); },\n"
++"\t\tdomContentLoadedEventEnd: function () { return get('dclEnd'); },\n"
++"\t\tdomComplete: function () { return get('complete'); },\n"
++"\t\tloadEventStart: function () { return get('load'); },\n"
++"\t\tloadEventEnd: function () { return get('loadEnd'); },\n"
++"\t\ttype: function () { return 'navigate'; },\n"
++"\t\tredirectCount: 0, activationStart: 0\n"
++"\t};\n"
++"\tObject.keys(fields).forEach(function (k) {\n"
++"\t\tvar f = fields[k];\n"
++"\t\tObject.defineProperty(NP, k, { configurable: true, enumerable: true,\n"
++"\t\t\tget: typeof f === 'function' ? f : function () { return f; } });\n"
++"\t});\n"
++"\tdefine(NP, 'toJSON', function toJSON() {\n"
++"\t\tvar o = {};\n"
++"\t\tObject.keys(fields).forEach(function (k) { o[k] = this[k]; }, this);\n"
++"\t\treturn o;\n"
++"\t});\n"
++"\ttry { Object.defineProperty(NP, Symbol.toStringTag, { value: 'PerformanceNavigationTiming', configurable: true }); } catch (e) { /* */ }\n"
++"\tvar entry = Object.create(NP);\n"
++"\tif (!g.PerformanceNavigationTiming) define(g, 'PerformanceNavigationTiming', NavTiming);\n"
++"\tvar timing = {};\n"
++"\t[['navigationStart', 0], ['fetchStart', 0], ['domainLookupStart', 0], ['domainLookupEnd', 0],\n"
++"\t ['connectStart', 0], ['connectEnd', 0], ['requestStart', 0], ['responseStart', 'resp'],\n"
++"\t ['responseEnd', 'resp'], ['domLoading', 'resp'], ['domInteractive', 'interactive'],\n"
++"\t ['domContentLoadedEventStart', 'dcl'], ['domContentLoadedEventEnd', 'dclEnd'],\n"
++"\t ['domComplete', 'complete'], ['loadEventStart', 'load'], ['loadEventEnd', 'loadEnd']\n"
++"\t].forEach(function (p) {\n"
++"\t\tObject.defineProperty(timing, p[0], { enumerable: true, configurable: true,\n"
++"\t\t\tget: function () {\n"
++"\t\t\t\tif (p[1] === 0) return Math.round(origin);\n"
++"\t\t\t\treturn t[p[1]] ? Math.round(origin + t[p[1]]) : 0;\n"
++"\t\t\t} });\n"
++"\t});\n"
++"\t['unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',\n"
++"\t 'secureConnectionStart'].forEach(function (k) { timing[k] = 0; });\n"
++"\tdefine(timing, 'toJSON', function toJSON() {\n"
++"\t\tvar o = {}, k; for (k in this) if (typeof this[k] === 'number') o[k] = this[k]; return o;\n"
++"\t});\n"
++"\tvar byType = P.getEntriesByType, all = P.getEntries, byName = P.getEntriesByName;\n"
++"\ttry {\n"
++"\t\tObject.defineProperty(P, 'timeOrigin', { value: origin, configurable: true, enumerable: true });\n"
++"\t\tObject.defineProperty(P, 'timing', { value: timing, configurable: true, enumerable: true });\n"
++"\t\tP.getEntriesByType = function getEntriesByType(type) {\n"
++"\t\t\tvar r = isFn(byType) ? byType.call(P, type) || [] : [];\n"
++"\t\t\treturn String(type) === 'navigation' ? [entry].concat(r) : r;\n"
++"\t\t};\n"
++"\t\tP.getEntries = function getEntries() {\n"
++"\t\t\treturn [entry].concat(isFn(all) ? all.call(P) || [] : []);\n"
++"\t\t};\n"
++"\t\tP.getEntriesByName = function getEntriesByName(name, type) {\n"
++"\t\t\tvar r = isFn(byName) ? byName.call(P, name, type) || [] : [];\n"
++"\t\t\treturn String(name) === entry.name && (type === undefined || type === 'navigation') ?\n"
++"\t\t\t\t[entry].concat(r) : r;\n"
++"\t\t};\n"
++"\t\tdefine(P, '__vitaNav', entry);\n"
++"\t} catch (e) { /* */ }\n"
++"})();\n"
+ "})(this);\n"
+ "\n"

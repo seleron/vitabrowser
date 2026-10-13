@@ -313,6 +313,11 @@ NET-js-node-names http://127.0.0.1:$HP/JS-node-names.html
 NET-js-image-load http://127.0.0.1:$HP/JS-image-load.html
 NET-js-canvas-2d http://127.0.0.1:$HP/JS-canvas-2d.html
 NET-js-wasm http://127.0.0.1:$HP/JS-wasm.html
+NET-js-frame-realm http://127.0.0.1:$HP/JS-frame-realm.html
+NET-js-form-submit http://127.0.0.1:$HP/JS-form-submit.html
+NET-css-important-operands http://127.0.0.1:$HP/CSS-important-operands.html
+NET-css-style-edit http://127.0.0.1:$HP/CSS-style-edit.html
+NET-js-xorigin-frame-early http://127.0.0.1:$HP/JS-xorigin-frame-early.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -817,7 +822,10 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
 	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22" \
-	 "js-wasm WASM254 15"; do
+	 "js-wasm WASM254 15" "js-frame-realm REALM 11" \
+	 "css-important-operands IMPORTANT264 3" \
+	 "css-style-edit STYLEEDIT 4" \
+	 "js-xorigin-frame-early XEARLY 3"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
@@ -825,6 +833,15 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	[ -n "$gp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$gp" | sed 's/^STR /  /'
 	[ "$gr" = "$2: $3/$3 passed" ] || o2_bad="$o2_bad $1"
 done
+# Patches 263 + 265: a form a script builds is submitted by a hidden submit
+# button's click(), with its fields -- the page's dump is the gate httpd's
+# /echo answer, the request body: three pre-checks passed, the submit
+# event fired, the fields encoded. Before: nothing was submitted (263), or
+# an empty body (265).
+fsp=$(ls "$R"/*NET-js-form-submit.plot 2>/dev/null | head -1)
+fsr=$(grep -a -o 'res=passed3of3&ev=fired&k=v+1' "$fsp" 2>/dev/null | head -1)
+echo "  js-form-submit: ${fsr:-no echoed body (the form was not submitted)}"
+[ "$fsr" = "res=passed3of3&ev=fired&k=v+1" ] || o2_bad="$o2_bad js-form-submit"
 # Patch 251: the page's own canvas reaches the screen -- its bitmap is
 # plotted at the canvas's size, and the autotest's snapshot shows the
 # drawing there (the disc's blue at its centre, the yellow ground near a
@@ -1139,7 +1156,9 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 # Script-made frames (Patch 143) and timer chains (Patch 141): a same-
 # origin or blank frame a script makes fires load and has a same-realm
 # contentWindow with eval (Google's BotGuard runs in one); a cross-origin
-# one gets no made-up load; 300 chained setTimeout(fn, 1) finish quickly.
+# one gets no made-up window (patch 267: it is fetched, and fires load when
+# the fetch ends, failed or not, as in Chromium); 300 chained
+# setTimeout(fn, 1) finish quickly.
 echo "== script-made frames + timer chains (JS-frame-local) =="
 fl=$(ls "$R"/*NET-js-frame-local.plot 2>/dev/null | head -1)
 flr=$(sed -n 's/.*STR \(FRAMELOCAL: [0-9]*\/[0-9]* passed\).*/\1/p' "$fl" 2>/dev/null | head -1)

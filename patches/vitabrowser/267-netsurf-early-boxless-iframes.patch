@@ -1,0 +1,64 @@
+# netsurf: a box-less iframe a script makes while the page loads is loaded
+# (patch 267)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 266)
+#
+# Patch 244 loads a cross-origin iframe a script inserts, boxed or not
+# (display:none), by asking the window to look for new frames -- but only
+# when the insertion comes after the page is ready. One inserted while the
+# page was still loading was left to the window's first frame pass, which
+# makes windows for the frames with a box only: a box-less one was never
+# fetched, unless some boxed frame also new happened to start a search.
+#
+#  - html/dom_event.c: an iframe inserted before the page is ready marks
+#    the page as wanting a frame search.
+#  - desktop/frames.c: the window's first frame pass honours that mark,
+#    also when the page has no boxed frames at all (it returned early).
+#
+# Found with patch 262: the Guardian, judged a fast page, ran its consent
+# code before the load ended, and Sourcepoint's frame (its container
+# display:none until the frame says "show") never loaded -- no consent
+# dialog (scorecard visual 0.52 -> 0.33).
+#
+# Gate: testpages/pages/JS-xorigin-frame-early.html (XEARLY 3/3, Chromium
+# 3/3; the build before loads neither hidden frame).
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -711,6 +711,13 @@
+ 			if (htmlc->base.status == CONTENT_STATUS_READY ||
+ 			    htmlc->base.status == CONTENT_STATUS_DONE)
+ 				html_iframe_added_late(htmlc);
++			else
++				/* patch 267: one a script inserts while the
++				 * page loads is looked for when the window
++				 * makes the page's frames: a box-less one was
++				 * never loaded (the Guardian's consent frame,
++				 * once its scripts ran before the load ended) */
++				htmlc->iframe_sync_wanted = true;
+ 			break;
+ #endif
+ 
+diff --git a/desktop/frames.c b/desktop/frames.c
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -282,6 +282,8 @@
+ 	free(window);
+ }
+ 
++static void browser_window_sync_iframes(void *p);
++
+ /* exported function documented in desktop/frames.h */
+ nserror browser_window_create_iframes(struct browser_window *bw)
+ {
+@@ -302,6 +304,10 @@
+ 	/* obtain the iframes for this content */
+ 	iframe = html_get_iframe(bw->current_content);
+ 	if (iframe == NULL) {
++		/* patch 267: none with a box, but a script may have made
++		 * box-less ones while the page loaded */
++		if (html_iframe_sync_wanted(bw->current_content))
++			guit->misc->schedule(0, browser_window_sync_iframes, bw);
+ 		return NSERROR_OK;
+ 	}
+ 

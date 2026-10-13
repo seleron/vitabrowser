@@ -1,0 +1,128 @@
+# netsurf: the document's methods are Document.prototype's (patch 261)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 260)
+#
+# The bridge put querySelector, querySelectorAll, getElementById,
+# createElement, createTextNode ... on the document object itself;
+# Document.prototype had only its constructor. Cloudflare's challenge
+# hooks Document.prototype.querySelector with new Proxy(...) -- the target
+# was undefined, "TypeError: not an object", and the challenge stopped.
+# In browsers `document` has no own methods.
+#
+#  - vita_polyfill.js: __vitaDocMethodsToProto moves the document-level
+#    methods to Document.prototype (they still act on this realm's
+#    document; a detached document has its own), and runs once.
+#  - quickjs/macsurf_qjs.c: qjs_dom_install installs the methods again
+#    when a document is bound to the realm; it now calls the same hook,
+#    so the newest functions take the prototype's place.
+#
+# Gate: JS-frame-realm.html checks 6-7 (the methods' place, and a Proxy on
+# Document.prototype.querySelector seeing document.querySelector calls).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -12353,6 +12353,17 @@
+ 			JS_FreeValue(ctx, fn);
+ 		}
+ 	}
++	/* VitaBrowser patch 261: the methods just installed on the document
++	 * go to Document.prototype (vita_polyfill.js; absent on the first
++	 * install, which precedes the polyfill -- it moves them itself) */
++	{
++		static const char move_src[] =
++			"if(typeof __vitaDocMethodsToProto==='function')"
++			"__vitaDocMethodsToProto();";
++		JSValue r = JS_Eval(ctx, move_src, sizeof(move_src) - 1,
++				"<doc-proto>", JS_EVAL_TYPE_GLOBAL);
++		JS_FreeValue(ctx, r);
++	}
+ 	JS_FreeValue(ctx, doc);
+ 	JS_FreeValue(ctx, global);
+ }
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -8774,4 +8774,39 @@
+ 			set: dsc.set ? function (x) { dsc.set.call(this, x); } : undefined });
+ 	} catch (e) { /* */ }
+ })();
++
++/* ---- the document's methods live on Document.prototype (patch 261) -----
++ * The bridge put querySelector, getElementById, createElement ... on the
++ * document object itself, so Document.prototype.querySelector was
++ * undefined: Cloudflare's challenge wraps it -- new Proxy(Document.
++ * prototype.querySelector, {apply}) -- threw "not an object", and the
++ * page never cleared. As in browsers they are Document.prototype's now
++ * and `document` has none of its own; they still act on this realm's
++ * document (a detached one has its own). */
++(function () {
++	var NAMES = ['getElementById', 'querySelector', 'querySelectorAll', 'createElement', 'createElementNS',
++	 'createTextNode', 'createComment', 'createDocumentFragment', 'createEvent', 'createRange',
++	 'createTreeWalker', 'createNodeIterator', 'getElementsByTagName', 'getElementsByClassName',
++	 'getElementsByName', 'write', 'writeln', 'open', 'close', 'execCommand',
++	 'queryCommandSupported', 'queryCommandEnabled', 'getSelection', 'hasFocus', 'importNode',
++	 'adoptNode', 'elementFromPoint', 'elementsFromPoint'];
++	/* Also run by the bridge each time it (re)installs the document's
++	 * methods (macsurf_qjs.c qjs_dom_install: when a document is bound),
++	 * so the newest take the prototype's place. */
++	function move() {
++		var D = g.Document && g.Document.prototype, doc = g.document;
++		if (!D || !doc || !(doc instanceof g.Document)) return;
++		NAMES.forEach(function (k) {
++			var d = Object.getOwnPropertyDescriptor(doc, k);
++			if (!d || typeof d.value !== 'function' || !d.configurable) return;
++			try {
++				Object.defineProperty(D, k, { value: d.value, writable: true, enumerable: true,
++					configurable: true });
++				delete doc[k];
++			} catch (e) { /* */ }
++		});
++	}
++	define(g, '__vitaDocMethodsToProto', move);
++	move();
++})();
+ })(this);
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -8775,5 +8775,40 @@
+ "\t\t\tset: dsc.set ? function (x) { dsc.set.call(this, x); } : undefined });\n"
+ "\t} catch (e) { /* */ }\n"
+ "})();\n"
++"\n"
++"/* ---- the document's methods live on Document.prototype (patch 261) -----\n"
++" * The bridge put querySelector, getElementById, createElement ... on the\n"
++" * document object itself, so Document.prototype.querySelector was\n"
++" * undefined: Cloudflare's challenge wraps it -- new Proxy(Document.\n"
++" * prototype.querySelector, {apply}) -- threw \"not an object\", and the\n"
++" * page never cleared. As in browsers they are Document.prototype's now\n"
++" * and `document` has none of its own; they still act on this realm's\n"
++" * document (a detached one has its own). */\n"
++"(function () {\n"
++"\tvar NAMES = ['getElementById', 'querySelector', 'querySelectorAll', 'createElement', 'createElementNS',\n"
++"\t 'createTextNode', 'createComment', 'createDocumentFragment', 'createEvent', 'createRange',\n"
++"\t 'createTreeWalker', 'createNodeIterator', 'getElementsByTagName', 'getElementsByClassName',\n"
++"\t 'getElementsByName', 'write', 'writeln', 'open', 'close', 'execCommand',\n"
++"\t 'queryCommandSupported', 'queryCommandEnabled', 'getSelection', 'hasFocus', 'importNode',\n"
++"\t 'adoptNode', 'elementFromPoint', 'elementsFromPoint'];\n"
++"\t/* Also run by the bridge each time it (re)installs the document's\n"
++"\t * methods (macsurf_qjs.c qjs_dom_install: when a document is bound),\n"
++"\t * so the newest take the prototype's place. */\n"
++"\tfunction move() {\n"
++"\t\tvar D = g.Document && g.Document.prototype, doc = g.document;\n"
++"\t\tif (!D || !doc || !(doc instanceof g.Document)) return;\n"
++"\t\tNAMES.forEach(function (k) {\n"
++"\t\t\tvar d = Object.getOwnPropertyDescriptor(doc, k);\n"
++"\t\t\tif (!d || typeof d.value !== 'function' || !d.configurable) return;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tObject.defineProperty(D, k, { value: d.value, writable: true, enumerable: true,\n"
++"\t\t\t\t\tconfigurable: true });\n"
++"\t\t\t\tdelete doc[k];\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t}\n"
++"\tdefine(g, '__vitaDocMethodsToProto', move);\n"
++"\tmove();\n"
++"})();\n"
+ "})(this);\n"
+ "\n"

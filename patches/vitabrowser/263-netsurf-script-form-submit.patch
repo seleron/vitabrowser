@@ -1,0 +1,307 @@
+# netsurf: a script submits a form -- submit(), requestSubmit(), a submit
+# button's click() (patch 263)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 262)
+#
+# Element click() fired the click event and nothing else ("deliberately
+# does NOT perform the default action"), and form.submit() and
+# requestSubmit() went through a click on a submit control: no script
+# could submit a form. Cloudflare's challenge ends by building a form and
+# clicking its hidden submit button; Stack Overflow never cleared.
+#
+#  - quickjs/macsurf_qjs.c: __vitaSubmitForm(form, submitter) -- the
+#    engine's own submission (form_submit: encoding, method, target), run
+#    from the main loop; it waits while the page is not yet shown (an
+#    inline script submitting during the parse) and gives up if the page
+#    has gone. A form made after the parse gets its record
+#    (html_forms_form_for_node), and its action is resolved against the
+#    document's base (form_submit takes an absolute URL).
+#  - vita_polyfill.js: click() fires the click event and, unless it was
+#    cancelled, a submit button's (button / input type submit or image)
+#    activation behaviour: its form's requestSubmit(button) -- the submit
+#    event, then the submission. form.submit() submits with no event.
+#
+# The fields a script appended reach the request with patch 265 (libdom).
+#
+# Gate: testpages/pages/JS-form-submit.html -- three pre-checks, then the
+# hidden-button submission; the gate httpd's /echo answers with the body,
+# "res=passed3of3&ev=fired&k=v+1" (Chromium: the same).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -42,6 +42,7 @@
+ #include "netsurf/layout.h"
+ #include "content/handlers/html/private.h"
+ #include <nsutils/time.h>	/* patch 262: navigation start */
++#include "content/handlers/html/form_internal.h"	/* patch 263: form_submit */
+ #include "content/handlers/html/html.h"	/* patch 250: html_image_* */
+ /* fixes1011 (Phase 3) - the box tree, for the layout metrics. box.h defines
+  * struct box and the LEFT/RIGHT/TOP/BOTTOM edge indices; box_inspect.h has
+@@ -12073,6 +12074,117 @@
+ 	}
+ }
+ 
++/* VitaBrowser patch 263: a script submits a form.
++ *
++ * __vitaSubmitForm(form, submitter) -- the engine's own submission (field
++ * encoding, method, enctype, target) of a form element, as a click on a
++ * submit control does, for vita_polyfill.js's form.submit(),
++ * requestSubmit() and a submit button's click(). It runs from the main
++ * loop, not inside the script: the page's realm must still be the same
++ * then, or nothing happens. A form a script made after the page was
++ * parsed gets its record here (html_forms_form_for_node). */
++struct qjs_pending_submit {
++	JSContext *ctx;
++	unsigned long gen;
++	struct content *content;
++	dom_node *form;
++	dom_node *submitter;	/* or NULL */
++	int tries;		/* passes waited for the page to be shown */
++};
++
++static void qjs_submit_form_cb(void *p)
++{
++	struct qjs_pending_submit *ps = p;
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ps->ctx);
++	html_content *html;
++	struct form *form;
++	struct form_control *ctl = NULL;
++	struct browser_window *target;
++	nserror res;
++
++	if (owner == NULL || owner->content != ps->content ||
++	    qjs_ctx_gen(ps->ctx) != ps->gen || ps->content == NULL ||
++	    ps->content->handler == NULL ||
++	    ps->content->handler->type() != CONTENT_HTML) {
++		macsurf_debug_log_writef("LIFE js submit: page gone, dropped");
++		goto out;
++	}
++	html = (html_content *)ps->content;
++	/* A script that submits while the page is still parsing (an inline
++	 * script) runs before the page has its window: wait for it, a few
++	 * seconds at most, as a browser submits once it can navigate. */
++	if (html->bw == NULL || html->encoding == NULL) {
++		if (++ps->tries <= 100) {
++			macos9_schedule(100, qjs_submit_form_cb, ps);
++			return;
++		}
++		macsurf_debug_log_writef("LIFE js submit: page never shown, dropped");
++		goto out;
++	}
++	form = html_forms_form_for_node(&html->forms, html->encoding,
++			ps->form);
++	if (form == NULL) {
++		macsurf_debug_log_writef("LIFE js submit: no form record");
++		goto out;
++	}
++	if (ps->submitter != NULL) {
++		ctl = html_forms_get_control_for_node(html->forms,
++				ps->submitter);
++		if (ctl != NULL && ctl->form == NULL)
++			ctl->form = form;
++	}
++	/* form_submit takes the action as an absolute URL: resolve it
++	 * against the document's base (an empty action is the document) */
++	{
++		nsurl *base = html->base_url != NULL ? html->base_url :
++				content_get_url(ps->content), *abs = NULL;
++		const char *a = form->action != NULL ? form->action : "";
++		if (base != NULL && nsurl_join(base, a[0] != '\0' ? a :
++				nsurl_access(content_get_url(ps->content)),
++				&abs) == NSERROR_OK) {
++			char *dup = strdup(nsurl_access(abs));
++			if (dup != NULL) {
++				free(form->action);
++				form->action = dup;
++			}
++			nsurl_unref(abs);
++		}
++	}
++	target = browser_window_find_target(html->bw, form->target, 0);
++	res = form_submit(content_get_url(ps->content), target, form, ctl);
++	macsurf_debug_log_writef("LIFE js submit: form_submit -> %d", (int)res);
++out:
++	dom_node_unref(ps->form);
++	if (ps->submitter != NULL)
++		dom_node_unref(ps->submitter);
++	free(ps);
++}
++
++static JSValue qjs_submit_form(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	struct qjs_pending_submit *ps;
++	dom_node *form, *sub = NULL;
++
++	(void)this_val;
++	if (argc < 1 || owner == NULL || owner->content == NULL ||
++	    (form = qjs_get_node(argv[0])) == NULL)
++		return JS_FALSE;
++	if (argc > 1 && JS_IsObject(argv[1]))
++		sub = qjs_get_node(argv[1]);
++	ps = calloc(1, sizeof(*ps));
++	if (ps == NULL)
++		return JS_FALSE;
++	ps->ctx = ctx;
++	ps->gen = qjs_ctx_gen(ctx);
++	ps->content = owner->content;
++	ps->form = dom_node_ref(form);
++	ps->submitter = sub != NULL ? dom_node_ref(sub) : NULL;
++	macos9_schedule(0, qjs_submit_form_cb, ps);
++	return JS_TRUE;
++}
++
+ static void qjs_dom_install(JSContext *ctx)
+ {
+ 	JSValue global = JS_GetGlobalObject(ctx);
+@@ -12995,6 +13107,7 @@
+ 	/* --- monotonic clock for performance.now() --- */
+ 	qjs_set_func(ctx, global, "__macsurf_monotonic_ms", qjs_monotonic_ms, 0);
+ 	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
++	qjs_set_func(ctx, global, "__vitaSubmitForm", qjs_submit_form, 2); /* 263 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+ 			qjs_canvas_measure_text_width, 2); /* fixes1245 */
+ 
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -5398,15 +5398,21 @@
+ 	fn(F, 'reportValidity', function () { return this.checkValidity(); });
+ 	fn(F, 'requestSubmit', function (btn) {
+ 		/* script-driven submit: fire the event; if nobody cancels it,
+-		 * navigate like a GET/POST form would, through a click on a
+-		 * submit control (the engine owns form encoding) */
++		 * the engine submits the form (it owns form encoding) */
+ 		var ev = new Event('submit', { bubbles: true, cancelable: true });
+ 		try { ev.submitter = btn || null; } catch (e) { /* */ }
+ 		if (this.dispatchEvent(ev) === false || ev.defaultPrevented) return;
+-		fn.nativeSubmit(this);
++		fn.nativeSubmit(this, btn || null);
+ 	});
+-	fn(F, 'submit', function () { fn.nativeSubmit(this); });
+-	fn.nativeSubmit = function (form) {
++	/* form.submit(): no submit event, as in browsers */
++	fn(F, 'submit', function () { fn.nativeSubmit(this, null); });
++	/* VitaBrowser patch 263: the engine's submission of the form
++	 * (macsurf_qjs.c __vitaSubmitForm). It went through a click on a
++	 * submit control, and a script's click() never submitted anything:
++	 * form.submit(), requestSubmit() and button.click() did nothing --
++	 * Cloudflare's challenge ends by clicking a hidden submit button. */
++	fn.nativeSubmit = function (form, submitter) {
++		if (isFn(g.__vitaSubmitForm)) { g.__vitaSubmitForm(form, submitter); return; }
+ 		var b = form.querySelector('button[type=submit],input[type=submit],button:not([type])');
+ 		if (!b) {
+ 			b = d.createElement('input'); b.type = 'submit'; b.style.display = 'none';
+@@ -5414,6 +5420,40 @@
+ 		}
+ 		if (typeof b.click === 'function') b.click();
+ 	};
++	/* click(): the click event, then -- unless it was cancelled -- a
++	 * submit button's activation behaviour, submitting its form through
++	 * requestSubmit (so the form's submit event fires first). */
++	(function () {
++		var o = d.createElement('button'), owner = null;
++		while (o && !owner) {
++			if (Object.prototype.hasOwnProperty.call(o, 'click')) owner = o;
++			o = Object.getPrototypeOf(o);
++		}
++		if (!owner) return;
++		function formOf(el) {
++			var f = null;
++			try { f = el.form; } catch (e) { /* */ }
++			if (f && f.tagName && String(f.tagName).toUpperCase() === 'FORM') return f;
++			try { return el.closest ? el.closest('form') : null; } catch (e) { return null; }
++		}
++		function isSubmitter(el) {
++			var tag = String(el.tagName || '').toUpperCase(), t;
++			if (el.hasAttribute && el.hasAttribute('disabled')) return false;
++			t = String((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();
++			if (tag === 'BUTTON') return t === '' || t === 'submit' || (t !== 'button' && t !== 'reset');
++			if (tag === 'INPUT') return t === 'submit' || t === 'image';
++			return false;
++		}
++		define(owner, 'click', function click() {
++			var ev, f;
++			try { ev = new g.MouseEvent('click', { bubbles: true, cancelable: true, view: g }); }
++			catch (e) { ev = new Event('click', { bubbles: true, cancelable: true }); }
++			var go = this.dispatchEvent ? this.dispatchEvent(ev) : true;
++			if (go === false || ev.defaultPrevented || !isSubmitter(this)) return;
++			f = formOf(this);
++			if (f && isFn(f.requestSubmit)) f.requestSubmit(this);
++		});
++	})();
+ 	acc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });
+ 	/* text nodes */
+ 	acc(T, 'length', function () { return String(this.data || this.nodeValue || '').length; });
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -5399,15 +5399,21 @@
+ "\tfn(F, 'reportValidity', function () { return this.checkValidity(); });\n"
+ "\tfn(F, 'requestSubmit', function (btn) {\n"
+ "\t\t/* script-driven submit: fire the event; if nobody cancels it,\n"
+-"\t\t * navigate like a GET/POST form would, through a click on a\n"
+-"\t\t * submit control (the engine owns form encoding) */\n"
++"\t\t * the engine submits the form (it owns form encoding) */\n"
+ "\t\tvar ev = new Event('submit', { bubbles: true, cancelable: true });\n"
+ "\t\ttry { ev.submitter = btn || null; } catch (e) { /* */ }\n"
+ "\t\tif (this.dispatchEvent(ev) === false || ev.defaultPrevented) return;\n"
+-"\t\tfn.nativeSubmit(this);\n"
++"\t\tfn.nativeSubmit(this, btn || null);\n"
+ "\t});\n"
+-"\tfn(F, 'submit', function () { fn.nativeSubmit(this); });\n"
+-"\tfn.nativeSubmit = function (form) {\n"
++"\t/* form.submit(): no submit event, as in browsers */\n"
++"\tfn(F, 'submit', function () { fn.nativeSubmit(this, null); });\n"
++"\t/* VitaBrowser patch 263: the engine's submission of the form\n"
++"\t * (macsurf_qjs.c __vitaSubmitForm). It went through a click on a\n"
++"\t * submit control, and a script's click() never submitted anything:\n"
++"\t * form.submit(), requestSubmit() and button.click() did nothing --\n"
++"\t * Cloudflare's challenge ends by clicking a hidden submit button. */\n"
++"\tfn.nativeSubmit = function (form, submitter) {\n"
++"\t\tif (isFn(g.__vitaSubmitForm)) { g.__vitaSubmitForm(form, submitter); return; }\n"
+ "\t\tvar b = form.querySelector('button[type=submit],input[type=submit],button:not([type])');\n"
+ "\t\tif (!b) {\n"
+ "\t\t\tb = d.createElement('input'); b.type = 'submit'; b.style.display = 'none';\n"
+@@ -5415,6 +5421,40 @@
+ "\t\t}\n"
+ "\t\tif (typeof b.click === 'function') b.click();\n"
+ "\t};\n"
++"\t/* click(): the click event, then -- unless it was cancelled -- a\n"
++"\t * submit button's activation behaviour, submitting its form through\n"
++"\t * requestSubmit (so the form's submit event fires first). */\n"
++"\t(function () {\n"
++"\t\tvar o = d.createElement('button'), owner = null;\n"
++"\t\twhile (o && !owner) {\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(o, 'click')) owner = o;\n"
++"\t\t\to = Object.getPrototypeOf(o);\n"
++"\t\t}\n"
++"\t\tif (!owner) return;\n"
++"\t\tfunction formOf(el) {\n"
++"\t\t\tvar f = null;\n"
++"\t\t\ttry { f = el.form; } catch (e) { /* */ }\n"
++"\t\t\tif (f && f.tagName && String(f.tagName).toUpperCase() === 'FORM') return f;\n"
++"\t\t\ttry { return el.closest ? el.closest('form') : null; } catch (e) { return null; }\n"
++"\t\t}\n"
++"\t\tfunction isSubmitter(el) {\n"
++"\t\t\tvar tag = String(el.tagName || '').toUpperCase(), t;\n"
++"\t\t\tif (el.hasAttribute && el.hasAttribute('disabled')) return false;\n"
++"\t\t\tt = String((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();\n"
++"\t\t\tif (tag === 'BUTTON') return t === '' || t === 'submit' || (t !== 'button' && t !== 'reset');\n"
++"\t\t\tif (tag === 'INPUT') return t === 'submit' || t === 'image';\n"
++"\t\t\treturn false;\n"
++"\t\t}\n"
++"\t\tdefine(owner, 'click', function click() {\n"
++"\t\t\tvar ev, f;\n"
++"\t\t\ttry { ev = new g.MouseEvent('click', { bubbles: true, cancelable: true, view: g }); }\n"
++"\t\t\tcatch (e) { ev = new Event('click', { bubbles: true, cancelable: true }); }\n"
++"\t\t\tvar go = this.dispatchEvent ? this.dispatchEvent(ev) : true;\n"
++"\t\t\tif (go === false || ev.defaultPrevented || !isSubmitter(this)) return;\n"
++"\t\t\tf = formOf(this);\n"
++"\t\t\tif (f && isFn(f.requestSubmit)) f.requestSubmit(this);\n"
++"\t\t});\n"
++"\t})();\n"
+ "\tacc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });\n"
+ "\t/* text nodes */\n"
+ "\tacc(T, 'length', function () { return String(this.data || this.nodeValue || '').length; });\n"

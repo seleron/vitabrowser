@@ -1,0 +1,117 @@
+# libcss: !important no longer flags the operands of the properties
+# MacSurf and VitaBrowser added (patch 264)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 263)
+#
+# css__make_style_important walks a declaration's bytecode setting the
+# important flag on each opcode, skipping operands per property; it knew
+# none of the properties added since upstream. Their operands were flagged
+# as opcodes: "row-gap: 8px !important" laid out 9px (8.0 | 1.0 in
+# libcss's fixed point), "border-radius: 10px !important" drew 11px, and a
+# box-shadow list derailed the walk -- the cascade then dispatched a
+# garbage opcode through prop_dispatch: Stack Overflow's OneTrust banner
+# rule crashed the browser (SIGSEGV in cascade_style). The same walker
+# flags var()-resolved declarations (custom_properties.c).
+#
+# Cases for the 22 such properties, each mirroring its cascade function:
+# accent-color, caret-color, text-decoration-color (colour); aspect-ratio,
+# background-size, tab-size, text-decoration-thickness and five MacSurf
+# one-word properties; border-radius, row-gap (length + unit); dot-grid and
+# stripe backgrounds (two colours); text-shadow (4); transform (5); grid
+# rows (8); grid (9); gradient (2, 7 or 9 by kind); box-shadow (count, 6
+# per shadow).
+#
+# Gate: testpages/pages/CSS-important-operands.html (IMPORTANT264 3/3,
+# Chromium 3/3): row-gap with and without !important, the OneTrust rule,
+# and row-gap after twelve !important declarations. The build before this
+# patch crashes on the page.
+diff --git a/src/parse/important.c b/src/parse/important.c
+--- a/src/parse/important.c
++++ b/src/parse/important.c
+@@ -469,6 +469,86 @@
+ 					offset++; /* z index */
+ 				break;
+ 
++			/* VitaBrowser (patch 264): the properties MacSurf and
++			 * VitaBrowser added. With no case here their operands
++			 * were taken for opcodes and given the important flag:
++			 * "border-radius: 10px !important" drew 11px (0x2800 |
++			 * 0x400), and box-shadow's list derailed the walk -- the
++			 * cascade then jumped through a garbage handler (Stack
++			 * Overflow's OneTrust banner crashed the browser). Each
++			 * case mirrors the property's cascade function
++			 * (select/properties/s_*.c). */
++			case CSS_PROP_ACCENT_COLOR:
++			case CSS_PROP_CARET_COLOR:
++			case CSS_PROP_TEXT_DECORATION_COLOR:
++				if (value == 0x0080)
++					offset++; /* colour */
++				break;
++
++			case CSS_PROP_ASPECT_RATIO:
++			case CSS_PROP_BACKGROUND_SIZE:
++			case CSS_PROP_TAB_SIZE:
++			case CSS_PROP_TEXT_DECORATION_THICKNESS:
++			case CSS_PROP_MACSURF_ANIMATION_OPACITY:
++			case CSS_PROP_MACSURF_ANIMATION_ROTATE:
++			case CSS_PROP_MACSURF_GRID_COL_SPAN:
++			case CSS_PROP_MACSURF_GRID_FLOW:
++			case CSS_PROP_MACSURF_OBJECT_POSITION:
++				if (value == 0x0080)
++					offset++; /* one packed word */
++				break;
++
++			case CSS_PROP_BORDER_RADIUS:
++			case CSS_PROP_ROW_GAP:
++				if (value == 0x0080)
++					offset += 2; /* length + units */
++				break;
++
++			case CSS_PROP_MACSURF_DOTGRID:
++			case CSS_PROP_MACSURF_HSTRIPE_BG:
++				if (value == 0x0080)
++					offset += 2; /* two colours */
++				break;
++
++			case CSS_PROP_MACSURF_TEXT_SHADOW:
++				if (value == 0x0080)
++					offset += 4; /* h, v, blur, colour */
++				break;
++
++			case CSS_PROP_MACSURF_TRANSFORM:
++				if (value == 0x0080 || value == 0x0081)
++					offset += 5; /* rotation, tx, ty, sx, sy */
++				break;
++
++			case CSS_PROP_MACSURF_GRID_ROWS:
++				if (value == 0x0080)
++					offset += 8; /* MACSURF_GRID_TRACK_MAX */
++				break;
++
++			case CSS_PROP_MACSURF_GRID:
++				if (value == 0x0080)
++					offset += 1 + 8; /* packed + tracks */
++				break;
++
++			case CSS_PROP_MACSURF_GRADIENT:
++				if (value == 0x0080 || value == 0x00C0)
++					offset += 2; /* two colours */
++				else if (value == 0x0100)
++					offset += 7; /* radial: colours + 5 */
++				else if (value == 0x0180)
++					offset += 9; /* extended linear */
++				break;
++
++			case CSS_PROP_BOX_SHADOW:
++				/* count, then 6 words per shadow */
++				if (value == 0x0080 && offset < length) {
++					css_fixed n = (css_fixed) bytecode[offset];
++					offset += 1;
++					if (n > 0)
++						offset += 6 * (uint32_t) n;
++				}
++				break;
++
+ 			default:
+ 				break;
+ 			}

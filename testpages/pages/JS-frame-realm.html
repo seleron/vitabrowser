@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS frame realm (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+p { margin: 2px 0; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="sum">REALM: 0/11 passed</div>
+<p id="r1" class="wait">1 waiting (the script never ran)</p>
+<p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+<p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+<p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
+<p id="r9" class="wait">9 waiting</p>
+<p id="r10" class="wait">10 waiting (load)</p>
+<p id="r11" class="wait">11 waiting (animation frame)</p>
+<script>
+/* Found running Stack Overflow's Cloudflare challenge (it never cleared):
+ *  - patch 260: a blank iframe a script makes is a realm of its own --
+ *    its own Object, Array, Function, eval; `this` in its code is its
+ *    window; about:blank; a finished document; no window once removed. It
+ *    was the page's window under another name, with the page's eval.
+ *  - patch 261: querySelector, getElementById, createElement ... are
+ *    Document.prototype's, not the document's own (Cloudflare wraps
+ *    Document.prototype.querySelector in a Proxy: it was undefined).
+ *  - patch 262: Navigation Timing -- one PerformanceNavigationTiming
+ *    entry, performance.timing, timeOrigin on the epoch clock, now() from
+ *    the page's start (it was the engine's uptime); animation frames on
+ *    the same clock.
+ * Chromium-verified. */
+(function () {
+	var k = 0, N = 11;
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'REALM: ' + k + '/' + N + ' passed';
+		document.title = 'JS frame realm (' + k + '/' + N + ')';
+	}
+	function check(n, f, text) {
+		try { var r = f(); t(n, r === true, text + (r === true ? '' : ': ' + r)); }
+		catch (e) { t(n, false, text + ': ' + e); }
+	}
+	var f = document.createElement('iframe');
+	f.setAttribute('sandbox', 'allow-same-origin');
+	f.style.display = 'none';
+	document.body.appendChild(f);
+	var w = f.contentWindow, ev = w.eval, F = w.Function;
+	check(1, function () {
+		return (ev('[]') instanceof Array === false && w.Array !== Array &&
+			w.Object !== Object && ev('[]') instanceof w.Array) ||
+			'iframe [] instanceof Array=' + (ev('[]') instanceof Array);
+	}, 'a script-made blank frame has its own realm');
+	check(2, function () {
+		return (ev('this') === w && F('return this')() === w && ev('typeof window') === 'object') ||
+			'eval this===w ' + (ev('this') === w);
+	}, 'its code runs with the frame window as `this`');
+	check(3, function () {
+		return (String(w.location) === 'about:blank' && w.document.readyState === 'complete' &&
+			w.parent === window && w.frameElement === f) ||
+			String(w.location) + ' ' + (w.document && w.document.readyState);
+	}, 'about:blank, a finished document, parent and frameElement');
+	check(5, function () {
+		return (typeof w.setTimeout === 'function' && typeof w.navigator === 'object' &&
+			typeof w.document.createElement === 'function' &&
+			Object.getOwnPropertyNames(w).length > 100) ||
+			'own names ' + Object.getOwnPropertyNames(w).length;
+	}, 'the frame window has the browser APIs');
+	f.remove();
+	check(4, function () {
+		return (f.contentWindow === null && ev('1 + 1') === 2 && new F('a', 'return a * 2')(4) === 8) ||
+			'contentWindow ' + f.contentWindow;
+	}, 'removed: no window, but its eval and Function still run');
+	check(6, function () {
+		var h = Object.prototype.hasOwnProperty;
+		return (typeof Document.prototype.querySelector === 'function' &&
+			typeof Document.prototype.getElementById === 'function' &&
+			typeof Document.prototype.createElement === 'function' &&
+			!h.call(document, 'querySelector') && !h.call(document, 'getElementById') &&
+			!h.call(document, 'createElement') &&
+			document.querySelector === Document.prototype.querySelector) ||
+			'proto qS ' + typeof Document.prototype.querySelector +
+			', own ' + h.call(document, 'querySelector');
+	}, 'the document\'s methods are Document.prototype\'s');
+	check(7, function () {
+		var orig = Document.prototype.querySelector, seen = 0, r;
+		Document.prototype.querySelector = new Proxy(orig, {
+			apply: function (fn, self, args) { seen++; return Reflect.apply(fn, self, args); }
+		});
+		try { r = document.querySelector('#sum'); }
+		finally { Document.prototype.querySelector = orig; }
+		return (seen === 1 && r === $('sum')) || 'seen ' + seen;
+	}, 'a Proxy on Document.prototype.querySelector sees document.querySelector');
+	check(8, function () {
+		var e = performance.getEntriesByType('navigation');
+		return (e.length === 1 && e[0].entryType === 'navigation' && e[0].type === 'navigate' &&
+			e[0].name === location.href && e[0].startTime === 0 &&
+			Object.prototype.toString.call(e[0]) === '[object PerformanceNavigationTiming]' &&
+			typeof e[0].toJSON === 'function' && performance.getEntries().indexOf(e[0]) >= 0) ||
+			'entries ' + e.length;
+	}, 'one navigation entry');
+	check(9, function () {
+		var o = performance.timeOrigin, d = o + performance.now() - Date.now();
+		return (o > 1.5e12 && Math.abs(d) < 1000 && performance.now() < 120000 &&
+			Math.abs(performance.timing.navigationStart - o) < 2) ||
+			'timeOrigin ' + o + ' now ' + performance.now();
+	}, 'timeOrigin is the epoch time of the page\'s start; now() counts from it');
+	window.addEventListener('load', function () {
+		setTimeout(function () {
+			check(10, function () {
+				var e = performance.getEntriesByType('navigation')[0], tm = performance.timing;
+				return (e.loadEventStart > 0 && e.loadEventEnd >= e.loadEventStart &&
+					e.domContentLoadedEventStart > 0 &&
+					e.domContentLoadedEventStart <= e.loadEventStart &&
+					e.domComplete <= e.loadEventStart && e.duration === e.loadEventEnd &&
+					tm.loadEventEnd >= tm.navigationStart && tm.loadEventEnd > 0) ||
+					JSON.stringify(e.toJSON()).slice(0, 200);
+			}, 'after load: DOMContentLoaded, complete and load recorded');
+		}, 50);
+		requestAnimationFrame(function (ts) {
+			check(11, function () {
+				return (Math.abs(ts - performance.now()) < 1000) ||
+					'frame ' + ts + ' now ' + performance.now();
+			}, 'animation-frame timestamps are on performance.now()\'s clock');
+		});
+	});
+})();
+</script>
+</body>
+</html>

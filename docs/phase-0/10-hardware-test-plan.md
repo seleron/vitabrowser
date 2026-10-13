@@ -3616,3 +3616,84 @@ Sim-verified: JS-fetch-body checks 23-30, 30/30 over http and https
 own (scripts on the device's sites do not build Requests with bodies
 that we know of).
 
+## Since run 36 — queued for run 37 (not built yet)
+
+### Patches 260-267 (2026-10-13): Cloudflare's challenge passes -- Stack Overflow loads
+
+The scorecard's lowest tier is forum, and its fixable site, Stack
+Overflow, never got past Cloudflare's "Just a moment..." page (claude.ai
+sometimes shows the same page). Cloudflare's script spun forever here,
+where Chromium spends 22 ms on the same challenge. Followed through the
+script -- comparing Chromium and the engine call by call, and confirming
+each suspect by giving Chromium the engine's behaviour -- it was six
+engine bugs, each a real difference from browsers:
+
+- **260: a blank iframe a script makes is a realm of its own** (its own
+  Object, Array, Function, eval; `this` is the frame's window;
+  about:blank; a finished document; no window once removed). It was the
+  page's window under another name (patch 143), and Chromium given that
+  stand-in fails the challenge too.
+- **261: the document's methods are Document.prototype's** (they were the
+  document's own; Cloudflare wraps Document.prototype.querySelector in a
+  Proxy, which threw).
+- **262: Navigation Timing** -- a PerformanceNavigationTiming entry,
+  performance.timing, timeOrigin on the epoch clock at the navigation's
+  start, and performance.now() counting from it (it was the engine's
+  uptime). Cloudflare polls the entry until the page has loaded.
+- **263: scripts can submit forms** -- form.submit(), requestSubmit() and a
+  submit button's click() did nothing; the challenge ends by clicking a
+  hidden submit button.
+- **264 (libcss): !important no longer corrupts the properties MacSurf /
+  VitaBrowser added** -- their operands were flagged as opcodes:
+  "row-gap: 8px !important" laid out 9px, "border-radius: 10px
+  !important" drew 11px, and a box-shadow list crashed the browser
+  (Stack Overflow's OneTrust banner, once the challenge passed).
+- **265 (libdom): a control a script appends belongs to its enclosing
+  form** -- a form built by script submitted no fields.
+- **266: a stylesheet that changes after layout restyles the page** -- the
+  re-cascade was requested with an "unknown change" mark the rebuild
+  scheduler declined, so no <style> a script edited (textContent, CSSOM,
+  CSS-in-JS) ever restyled elements already laid out; and a sheet that
+  finished mid-rebuild skipped the refresh. Found because 262 regressed
+  the Guardian: with a navigation entry it judges itself a fast page,
+  hydrates every island, emotion edits the 640 KB style element, and the
+  whole sheet applied to nothing (unstyled page). With 266 it is styled
+  again.
+- **267: a box-less iframe a script makes while the page loads is
+  loaded** -- patch 244 searched for new frames only for insertions after
+  the page was ready; the window's first frame pass made windows for
+  boxed frames alone. The Guardian's consent code, now run before the load
+  ended, made Sourcepoint's frame (in a display:none container) and it
+  never loaded: no consent dialog. With 267 the dialog is back.
+  JS-frame-local check 5 (from patch 143: "a cross-origin frame gets no
+  made-up load event") now sees a real load -- its frame is fetched, the
+  fetch fails, and Chromium fires load for that too (an error page); the
+  check now asks that the frame's window is not the page's and hands out
+  no document (Chromium 6/6).
+
+Result: Stack Overflow clears the challenge in about 5 s in the simulator
+and renders (the question list, sidebar, survey banner). The
+Guardian, regressed by 262 on the way, is styled and shows its consent
+dialog again. Scorecard r49 (same reference as r45): stackoverflow 18.2
+-> 84.6, forum tier 54.9 -> 79.9, mean 80.1 -> 81.8 (docs/scorecard-log.md;
+the other moves are live-site drift, checked against a fresh reference).
+
+Sim-verified: full gate (see the commit), new gate pages JS-frame-realm
+(REALM 11/11, Chromium 11/11; the build before 1/11), JS-form-submit (the
+echoed body "res=passed3of3&ev=fired&k=v+1", as Chromium), and
+CSS-important-operands (IMPORTANT264 3/3, Chromium 3/3; the build before
+crashes on it), CSS-style-edit (STYLEEDIT 4/4, Chromium 4/4; the build
+before fails the textContent edit) and JS-xorigin-frame-early (XEARLY
+3/3, Chromium 3/3; the build before loads neither hidden frame). Also
+found, not fixed: a cross-origin frame's contentDocument is a stub
+object (patch 143's shimDoc), where browsers give null; a flex column
+ignores row-gap
+(10 vs Chromium's 17 px); getComputedStyle does not report border-radius,
+row-gap, box-shadow, tab-size or aspect-ratio.
+
+**On the device (run 37):** stackoverflow.com/questions: the "Just a
+moment..." page, then the question list. Note how long the challenge
+takes on the Vita (5 s in the simulator; the work is mostly script) and
+whether the page then scrolls normally. theguardian.com/uk: styled, with
+the "Personalised advertising" consent dialog over it.
+

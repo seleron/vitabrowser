@@ -1,0 +1,105 @@
+# netsurf: a stylesheet that changes after layout restyles the page
+# (patch 266)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 265)
+#
+# A <style> a script edits after the page is laid out -- textContent,
+# CSSOM insertRule, CSS-in-JS -- or a sheet that arrives late is re-parsed,
+# and html_convert_css_callback then remakes the selection context and
+# marks the page dirty so it re-cascades. Two things stopped that:
+#
+#  - quickjs/macos9_reconvert.c: the mark is an "unknown change"
+#    (macos9_js_mark_dom_dirty, documented as "always the full rebuild"),
+#    and the rebuild policy declined unknown changes -- single or
+#    coalesced. So no edited or late sheet ever restyled elements already
+#    laid out (a <style> edited after load: Chromium 77 px, here 50). It
+#    is a full rebuild now.
+#  - html/css.c: a sheet that finished while a rebuild was under way (no
+#    box tree) skipped the refresh altogether; it is retried every 50 ms
+#    until the tree is back, and cancelled with the page's sheets.
+#
+# Found with patch 262: the Guardian, judged a fast page once it had a
+# navigation entry, hydrates every island, whose emotion code edits the
+# page's 640 KB style element -- the whole sheet then applied to nothing
+# and the page rendered unstyled (scorecard 80.8 -> 70.2).
+#
+# Gate: testpages/pages/CSS-style-edit.html (STYLEEDIT 4/4, Chromium 4/4;
+# the build before fails the textContent edit).
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -92,6 +92,28 @@
+ 	c->select_ctx = fresh;
+ }
+ 
++/* VitaBrowser patch 266: a sheet that finished while the page had no
++ * box tree (a rebuild under way) still has to reach the selection
++ * context -- the old one was taken out when its <style> changed, so
++ * without this every rule in it was dead from then on (the Guardian's
++ * 640 KB emotion sheet, edited by hydration as a rebuild began: the page
++ * rendered unstyled). Retried each 50 ms until the tree is back. */
++static void html_css_deferred_refresh(void *pw)
++{
++	html_content *c = pw;
++
++	if (c->aborted || !c->conversion_begun)
++		return;
++	if (c->layout == NULL) {
++		guit->misc->schedule(50, html_css_deferred_refresh, c);
++		return;
++	}
++	html_css_refresh_selection_context(c);
++#ifdef WITH_QUICKJS
++	macos9_js_mark_dom_dirty(&c->base);
++#endif
++}
++
+ static nsurl *html_default_stylesheet_url;
+ static nsurl *html_adblock_stylesheet_url;
+ static nsurl *html_quirks_stylesheet_url;
+@@ -198,6 +220,12 @@
+ #ifdef WITH_QUICKJS
+ 		macos9_js_mark_dom_dirty(&parent->base);
+ #endif
++	} else if ((event->type == CONTENT_MSG_DONE ||
++		    event->type == CONTENT_MSG_ERROR) &&
++		   parent->conversion_begun && parent->layout == NULL &&
++		   !parent->aborted) {
++		/* patch 266: mid-rebuild -- refresh once the tree is back */
++		guit->misc->schedule(50, html_css_deferred_refresh, parent);
+ 	}
+ 
+ 	if (html_can_begin_conversion(parent)) {
+@@ -625,6 +653,7 @@
+ 	unsigned int i;
+ 
+ 	guit->misc->schedule(-1, html_css_process_modified_styles, html);
++	guit->misc->schedule(-1, html_css_deferred_refresh, html);	/* 266 */
+ 
+ 	for (i = 0; i != html->stylesheet_count; i++) {
+ 		if (html->stylesheets[i].sheet != NULL) {
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -183,6 +183,11 @@
+ {
+ 	(void)multi;
+ 	switch (kind) {
++	/* VitaBrowser patch 266: an explicit "something changed" mark
++	 * (macos9_js_mark_dom_dirty -- a stylesheet that changed or arrived
++	 * after layout) is the full rebuild it was documented to be; it was
++	 * declined, so no late or edited sheet ever restyled the page */
++	case MACOS9_DOMMUT_UNKNOWN:
+ 	case MACOS9_DOMMUT_INNERHTML:
+ 	case MACOS9_DOMMUT_APPENDCHILD:
+ 	case MACOS9_DOMMUT_REMOVECHILD:
+@@ -199,7 +204,8 @@
+ 
+ static int macsurf_render_mask_is_structural(unsigned long mask)
+ {
+-	return (mask & ((1UL << MACOS9_DOMMUT_INNERHTML) |
++	return (mask & ((1UL << MACOS9_DOMMUT_UNKNOWN) |	/* patch 266 */
++		(1UL << MACOS9_DOMMUT_INNERHTML) |
+ 		(1UL << MACOS9_DOMMUT_APPENDCHILD) |
+ 		(1UL << MACOS9_DOMMUT_REMOVECHILD) |
+ 		(1UL << MACOS9_DOMMUT_INSERTBEFORE) |

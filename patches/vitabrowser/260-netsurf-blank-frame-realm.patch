@@ -1,0 +1,289 @@
+# netsurf: a blank iframe a script makes is a realm of its own (patch 260)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 259)
+#
+# Stack Overflow (and claude.ai, at times) sit behind Cloudflare's
+# "Just a moment..." challenge, which never cleared here: its script
+# evaluates its decoded program through a script-made blank iframe and
+# enumerates one frame's globals. Patch 143 gave such a frame a stand-in
+# window -- Object.create(the page's window) with the page's eval -- so
+# the program ran in the page's realm, `this` was not the frame's window,
+# its location was the page's, its document unfinished, and the frame kept
+# a window after removal. Given that same stand-in, Chromium never passes
+# the challenge either.
+#
+#  - quickjs/macsurf_qjs.c: __vitaNewRealm() -- a new context in the page's
+#    runtime with the standard intrinsics (its own Object, Array, Function,
+#    eval ...), returned as its global object. The context is a GC object:
+#    it lives while anything of it does.
+#  - vita_polyfill.js: localWindow() builds the frame's window on such a
+#    realm, with the page's browser APIs on it (functions as they are,
+#    accessors read through the page), location about:blank, a detached
+#    document whose readyState is "complete", parent / top / frameElement;
+#    contentWindow and contentDocument are null once the frame is out of
+#    the document. Without the native, the old stand-in.
+#
+# Google's BotGuard (patch 143's reason) still evaluates into the frame:
+# the frame's eval is now the frame realm's own.
+#
+# Gate: testpages/pages/JS-frame-realm.html (REALM, with 261 and 262)
+# checks 1-5, Chromium 11/11; the build before 1/11.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1113,6 +1113,41 @@
+  * pure-JS versions in the polyfill string. */
+ 
+ /* ------------------------------------------------------------------ */
++/* VitaBrowser patch 260: a realm for a blank script-made iframe        */
++/* ------------------------------------------------------------------ */
++
++/* __vitaNewRealm(): the global object of a new realm in this runtime --
++ * its own Object, Array, Function, eval, ... -- for vita_polyfill.js to
++ * make into a frame's window (it adds the browser APIs). The context is
++ * a GC object: it lives while anything of it does (its global, its
++ * functions), so this reference is dropped at once. */
++static JSValue qjs_new_realm(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	JSContext *sub;
++	JSValue global;
++
++	(void)this_val; (void)argc; (void)argv;
++	sub = JS_NewContextRaw(JS_GetRuntime(ctx));
++	if (sub == NULL)
++		return JS_ThrowOutOfMemory(ctx);
++	JS_AddIntrinsicBaseObjects(sub);
++	JS_AddIntrinsicDate(sub);
++	JS_AddIntrinsicEval(sub);
++	JS_AddIntrinsicRegExp(sub);
++	JS_AddIntrinsicJSON(sub);
++	JS_AddIntrinsicProxy(sub);
++	JS_AddIntrinsicMapSet(sub);
++	JS_AddIntrinsicTypedArrays(sub);
++	JS_AddIntrinsicPromise(sub);
++	JS_AddIntrinsicWeakRef(sub);
++	JS_AddIntrinsicAToB(sub);
++	global = JS_GetGlobalObject(sub);
++	JS_FreeContext(sub);
++	return global;
++}
++
++/* ------------------------------------------------------------------ */
+ /* monotonic clock for performance.now()                               */
+ /* ------------------------------------------------------------------ */
+ 
+@@ -12926,6 +12961,7 @@
+ 
+ 	/* --- monotonic clock for performance.now() --- */
+ 	qjs_set_func(ctx, global, "__macsurf_monotonic_ms", qjs_monotonic_ms, 0);
++	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+ 			qjs_canvas_measure_text_width, 2); /* fixes1245 */
+ 
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -7084,15 +7084,79 @@
+ 				function localFrame(el) {
+ 					return scriptMade(el) && sameOrigin(el);
+ 				}
++				/* patch 260: a frame out of the document has no window
++				 * (contentWindow / contentDocument null, as in browsers) */
++				function inDoc(el) {
++					try {
++						if (typeof el.isConnected === 'boolean') return el.isConnected;
++						return g.document.documentElement.contains(el);
++					} catch (e) { return true; }
++				}
++				/* VitaBrowser patch 260: the window is a realm of its
++				 * own (__vitaNewRealm: its own Object, Array, Function,
++				 * eval, and `this` in its code is the window), with the
++				 * page's browser APIs on it -- functions as they are,
++				 * accessors read through the page -- an about:blank
++				 * location and a finished detached document. It was
++				 * Object.create(page window) with the page's eval:
++				 * Cloudflare's challenge evaluates its program in a
++				 * fresh frame and enumerates one frame's globals, and
++				 * never passed (Chromium given that stand-in: the same).
++				 * Without the native, the old stand-in. */
++				var OWN_FRAME = { window: 1, self: 1, frames: 1, globalThis: 1, parent: 1, top: 1,
++					frameElement: 1, document: 1, location: 1, opener: 1, length: 1, name: 1,
++					closed: 1, postMessage: 1, eval: 1, origin: 1 };
++				function blankLocation() {
++					var loc = { href: 'about:blank', protocol: 'about:', host: '', hostname: '',
++						port: '', pathname: 'blank', search: '', hash: '',
++						origin: String(g.location && g.location.origin || 'null'),
++						assign: function () {}, replace: function () {}, reload: function () {},
++						toString: function () { return 'about:blank'; } };
++					return loc;
++				}
++				function realmWindow() {
++					var w = null, names, i;
++					try { w = isFn(g.__vitaNewRealm) ? g.__vitaNewRealm() : null; } catch (e) { w = null; }
++					if (!w) return null;
++					names = Object.getOwnPropertyNames(g);
++					for (i = 0; i < names.length; i++) {
++						var k = names[i], d;
++						if (OWN_FRAME[k] === 1 || k.slice(0, 2) === '__' ||
++						    Object.prototype.hasOwnProperty.call(w, k)) continue;
++						try { d = Object.getOwnPropertyDescriptor(g, k); } catch (e) { continue; }
++						if (!d) continue;
++						if (d.get || d.set) {
++							(function (k, d) {
++								try {
++									Object.defineProperty(w, k, { configurable: true, enumerable: d.enumerable,
++										get: d.get ? function () { return d.get.call(g); } : undefined,
++										set: d.set ? function (v) { d.set.call(g, v); } : undefined });
++								} catch (e) { /* */ }
++							})(k, d);
++						} else {
++							try { Object.defineProperty(w, k, d); } catch (e) { /* */ }
++						}
++					}
++					return w;
++				}
+ 				function localWindow(el) {
+ 					/* kept on the element, not in a WeakMap: w points
+ 					 * back at el, and a WeakMap value that holds its own
+ 					 * key is never collected (QuickJS asserted at exit) */
+ 					var w = el.__vitaLocalWin, doc = null;
+ 					if (w) return w;
+-					w = Object.create(g);
+ 					try { doc = g.document.implementation.createHTMLDocument(''); } catch (e) { /* */ }
+-					w.eval = function (src) { return (0, g.eval)(src); };
++					if (doc) {
++						try { if (doc.readyState !== 'complete') Object.defineProperty(doc, 'readyState', { value: 'complete', configurable: true }); } catch (e) { /* */ }
++					}
++					w = realmWindow();
++					if (w) {
++						w.location = blankLocation();
++						w.opener = null; w.name = ''; w.closed = false; w.length = 0;
++					} else {
++						w = Object.create(g);
++						w.eval = function (src) { return (0, g.eval)(src); };
++					}
+ 					w.window = w; w.self = w; w.frames = w;
+ 					w.parent = g; w.top = g.top || g; w.frameElement = el;
+ 					w.document = doc;
+@@ -7131,7 +7195,7 @@
+ 								/* I may be the prototype every element
+ 								 * shares: only an iframe has a window */
+ 								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
+-								if (localFrame(this)) return localWindow(this);
++								if (localFrame(this)) return inDoc(this) ? localWindow(this) : null;
+ 								var w = winCache.get(this);
+ 								if (!w) {
+ 									var self = this;
+@@ -7148,7 +7212,7 @@
+ 							try {
+ 								if (frameKey !== null) return null;
+ 								if (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;
+-								if (localFrame(this)) return localWindow(this).document;
++								if (localFrame(this)) return inDoc(this) ? localWindow(this).document : null;
+ 								return shimDoc(labelOf(this));
+ 							} catch (e) { return null; }
+ 						}
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -7085,15 +7085,79 @@
+ "\t\t\t\tfunction localFrame(el) {\n"
+ "\t\t\t\t\treturn scriptMade(el) && sameOrigin(el);\n"
+ "\t\t\t\t}\n"
++"\t\t\t\t/* patch 260: a frame out of the document has no window\n"
++"\t\t\t\t * (contentWindow / contentDocument null, as in browsers) */\n"
++"\t\t\t\tfunction inDoc(el) {\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tif (typeof el.isConnected === 'boolean') return el.isConnected;\n"
++"\t\t\t\t\t\treturn g.document.documentElement.contains(el);\n"
++"\t\t\t\t\t} catch (e) { return true; }\n"
++"\t\t\t\t}\n"
++"\t\t\t\t/* VitaBrowser patch 260: the window is a realm of its\n"
++"\t\t\t\t * own (__vitaNewRealm: its own Object, Array, Function,\n"
++"\t\t\t\t * eval, and `this` in its code is the window), with the\n"
++"\t\t\t\t * page's browser APIs on it -- functions as they are,\n"
++"\t\t\t\t * accessors read through the page -- an about:blank\n"
++"\t\t\t\t * location and a finished detached document. It was\n"
++"\t\t\t\t * Object.create(page window) with the page's eval:\n"
++"\t\t\t\t * Cloudflare's challenge evaluates its program in a\n"
++"\t\t\t\t * fresh frame and enumerates one frame's globals, and\n"
++"\t\t\t\t * never passed (Chromium given that stand-in: the same).\n"
++"\t\t\t\t * Without the native, the old stand-in. */\n"
++"\t\t\t\tvar OWN_FRAME = { window: 1, self: 1, frames: 1, globalThis: 1, parent: 1, top: 1,\n"
++"\t\t\t\t\tframeElement: 1, document: 1, location: 1, opener: 1, length: 1, name: 1,\n"
++"\t\t\t\t\tclosed: 1, postMessage: 1, eval: 1, origin: 1 };\n"
++"\t\t\t\tfunction blankLocation() {\n"
++"\t\t\t\t\tvar loc = { href: 'about:blank', protocol: 'about:', host: '', hostname: '',\n"
++"\t\t\t\t\t\tport: '', pathname: 'blank', search: '', hash: '',\n"
++"\t\t\t\t\t\torigin: String(g.location && g.location.origin || 'null'),\n"
++"\t\t\t\t\t\tassign: function () {}, replace: function () {}, reload: function () {},\n"
++"\t\t\t\t\t\ttoString: function () { return 'about:blank'; } };\n"
++"\t\t\t\t\treturn loc;\n"
++"\t\t\t\t}\n"
++"\t\t\t\tfunction realmWindow() {\n"
++"\t\t\t\t\tvar w = null, names, i;\n"
++"\t\t\t\t\ttry { w = isFn(g.__vitaNewRealm) ? g.__vitaNewRealm() : null; } catch (e) { w = null; }\n"
++"\t\t\t\t\tif (!w) return null;\n"
++"\t\t\t\t\tnames = Object.getOwnPropertyNames(g);\n"
++"\t\t\t\t\tfor (i = 0; i < names.length; i++) {\n"
++"\t\t\t\t\t\tvar k = names[i], d;\n"
++"\t\t\t\t\t\tif (OWN_FRAME[k] === 1 || k.slice(0, 2) === '__' ||\n"
++"\t\t\t\t\t\t    Object.prototype.hasOwnProperty.call(w, k)) continue;\n"
++"\t\t\t\t\t\ttry { d = Object.getOwnPropertyDescriptor(g, k); } catch (e) { continue; }\n"
++"\t\t\t\t\t\tif (!d) continue;\n"
++"\t\t\t\t\t\tif (d.get || d.set) {\n"
++"\t\t\t\t\t\t\t(function (k, d) {\n"
++"\t\t\t\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\t\t\t\tObject.defineProperty(w, k, { configurable: true, enumerable: d.enumerable,\n"
++"\t\t\t\t\t\t\t\t\t\tget: d.get ? function () { return d.get.call(g); } : undefined,\n"
++"\t\t\t\t\t\t\t\t\t\tset: d.set ? function (v) { d.set.call(g, v); } : undefined });\n"
++"\t\t\t\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t\t\t\t})(k, d);\n"
++"\t\t\t\t\t\t} else {\n"
++"\t\t\t\t\t\t\ttry { Object.defineProperty(w, k, d); } catch (e) { /* */ }\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\treturn w;\n"
++"\t\t\t\t}\n"
+ "\t\t\t\tfunction localWindow(el) {\n"
+ "\t\t\t\t\t/* kept on the element, not in a WeakMap: w points\n"
+ "\t\t\t\t\t * back at el, and a WeakMap value that holds its own\n"
+ "\t\t\t\t\t * key is never collected (QuickJS asserted at exit) */\n"
+ "\t\t\t\t\tvar w = el.__vitaLocalWin, doc = null;\n"
+ "\t\t\t\t\tif (w) return w;\n"
+-"\t\t\t\t\tw = Object.create(g);\n"
+ "\t\t\t\t\ttry { doc = g.document.implementation.createHTMLDocument(''); } catch (e) { /* */ }\n"
+-"\t\t\t\t\tw.eval = function (src) { return (0, g.eval)(src); };\n"
++"\t\t\t\t\tif (doc) {\n"
++"\t\t\t\t\t\ttry { if (doc.readyState !== 'complete') Object.defineProperty(doc, 'readyState', { value: 'complete', configurable: true }); } catch (e) { /* */ }\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\tw = realmWindow();\n"
++"\t\t\t\t\tif (w) {\n"
++"\t\t\t\t\t\tw.location = blankLocation();\n"
++"\t\t\t\t\t\tw.opener = null; w.name = ''; w.closed = false; w.length = 0;\n"
++"\t\t\t\t\t} else {\n"
++"\t\t\t\t\t\tw = Object.create(g);\n"
++"\t\t\t\t\t\tw.eval = function (src) { return (0, g.eval)(src); };\n"
++"\t\t\t\t\t}\n"
+ "\t\t\t\t\tw.window = w; w.self = w; w.frames = w;\n"
+ "\t\t\t\t\tw.parent = g; w.top = g.top || g; w.frameElement = el;\n"
+ "\t\t\t\t\tw.document = doc;\n"
+@@ -7132,7 +7196,7 @@
+ "\t\t\t\t\t\t\t\t/* I may be the prototype every element\n"
+ "\t\t\t\t\t\t\t\t * shares: only an iframe has a window */\n"
+ "\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
+-"\t\t\t\t\t\t\t\tif (localFrame(this)) return localWindow(this);\n"
++"\t\t\t\t\t\t\t\tif (localFrame(this)) return inDoc(this) ? localWindow(this) : null;\n"
+ "\t\t\t\t\t\t\t\tvar w = winCache.get(this);\n"
+ "\t\t\t\t\t\t\t\tif (!w) {\n"
+ "\t\t\t\t\t\t\t\t\tvar self = this;\n"
+@@ -7149,7 +7213,7 @@
+ "\t\t\t\t\t\t\ttry {\n"
+ "\t\t\t\t\t\t\t\tif (frameKey !== null) return null;\n"
+ "\t\t\t\t\t\t\t\tif (String(this.tagName).toUpperCase() !== 'IFRAME') return undefined;\n"
+-"\t\t\t\t\t\t\t\tif (localFrame(this)) return localWindow(this).document;\n"
++"\t\t\t\t\t\t\t\tif (localFrame(this)) return inDoc(this) ? localWindow(this).document : null;\n"
+ "\t\t\t\t\t\t\t\treturn shimDoc(labelOf(this));\n"
+ "\t\t\t\t\t\t\t} catch (e) { return null; }\n"
+ "\t\t\t\t\t\t}\n"
