@@ -1,0 +1,249 @@
+# netsurf: a form or link whose target names an iframe loads there, not
+# over the whole page (patch 289)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 288)
+#
+# A target name is found among the page's browser windows, and an iframe
+# had one only when it had a src and a box. So a form or link targeting an
+# iframe with no src (declared before or after the form, or made by a
+# script) or a display:none one found no window, and its result replaced
+# the whole page (doc 10, 283's "found, not fixed"). In browsers each
+# iframe is a browsing context with its name: the result loads in it.
+#
+#  - box_special.c box_iframe: a named iframe without src gets its iframe
+#    record with no URL, so it has a window -- shown in its box, loading
+#    nothing until something is sent there (it was a placeholder box). An
+#    iframe with neither src nor name stays a placeholder.
+#  - frames.c: a script-made named iframe without src gets its empty window
+#    too (browser_window_iframe_is_new / sync); and
+#    browser_window_iframe_for_name finds the <iframe name=...> in a page
+#    that has no window yet -- display:none, not laid out -- and makes it a
+#    box-less one (patch 244's kind), empty.
+#  - browser_window.c browser_window_find_target: when no window has the
+#    name, the requesting page's iframes and its parents' are asked
+#    (browser_window_iframe_for_name) before the result goes anywhere else.
+#
+# Nothing is loaded that was not before: the new windows stay empty until
+# a form or link targets them (patch 244: blank and same-origin script-made
+# frames keep their in-page realm, and are not loaded again).
+#
+# Found on the way, not fixed: a script's a.click() on a link does not
+# follow it (with or without a target): the polyfill's click() activates
+# submit buttons only.
+#
+# Gate: testpages/pages/JS-form-target.html (FORMTARGET 5/5: forms into an
+# iframe with no src, about:blank, display:none, script-made, declared
+# after the form; Chromium 5/5) and tools/run-vita-sim.sh "scriptless form
+# submissions": a tapped Send button and a tapped link into iframes
+# (FORMTARGET tap tapped,link, as Chromium).
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index e2eaccab7..5788273dd 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1176,25 +1176,44 @@ box_iframe(dom_node *n,
+ 
+ 	/* get frame URL */
+ 	err = dom_element_get_attribute(n, corestring_dom_src, &s);
+-	if (err != DOM_NO_ERR || s == NULL)
+-		return box_iframe_placeholder(box, convert_children);
+-	if (box_extract_link(content, s, content->base_url, &url) == false) {
++	if (err != DOM_NO_ERR || s == NULL || dom_string_byte_length(s) == 0) {
++		/* VitaBrowser patch 289: an iframe with no src is still a
++		 * browsing context (about:blank), and a named one is where a
++		 * form or link with that target goes -- it went to the whole
++		 * window. It gets its record and window, which load nothing
++		 * until something is sent there (url NULL). */
++		dom_string *nm = NULL;
++		bool named = false;
++		if (s != NULL)
++			dom_string_unref(s);
++		if (dom_element_get_attribute(n, corestring_dom_name, &nm) ==
++				DOM_NO_ERR && nm != NULL) {
++			named = dom_string_byte_length(nm) > 0;
++			dom_string_unref(nm);
++		}
++		if (!named)
++			return box_iframe_placeholder(box, convert_children);
++		url = NULL;
++	} else {
++		if (box_extract_link(content, s, content->base_url, &url) ==
++				false) {
++			dom_string_unref(s);
++			return false;
++		}
+ 		dom_string_unref(s);
+-		return false;
+-	}
+-	dom_string_unref(s);
+-	if (url == NULL)
+-		return true;
++		if (url == NULL)
++			return true;
+ 
+-	/* don't include ourself */
+-	if (nsurl_compare(content->base_url, url, NSURL_COMPLETE)) {
+-		nsurl_unref(url);
+-		return true;
++		/* don't include ourself */
++		if (nsurl_compare(content->base_url, url, NSURL_COMPLETE)) {
++			nsurl_unref(url);
++			return true;
++		}
+ 	}
+ 
+ 	/* fixes451: skip video-embed domains MacSurf cannot render.
+ 	 * These iframes waste connections and delay page conversion. */
+-	{
++	if (url != NULL) {
+ 		lwc_string *host;
+ 		const char *hd;
+ 		int hl;
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 53f5f3a7f..4b6ea8cf3 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -4770,6 +4770,18 @@ browser_window_find_target(struct browser_window *bw,
+ 	if (bw_target)
+ 		return bw_target;
+ 
++	/* VitaBrowser patch 289: an <iframe name=target> in this page or a
++	 * page above it that has no window yet (display:none, not laid
++	 * out) gets one now -- the result went to the whole window */
++	{
++		struct browser_window *b;
++		for (b = bw; b != NULL; b = b->parent) {
++			bw_target = browser_window_iframe_for_name(b, target);
++			if (bw_target != NULL)
++				return bw_target;
++		}
++	}
++
+ 	/* we require a new window using the target name */
+ 	if (!nsoption_bool(target_blank))
+ 		return bw;
+diff --git a/desktop/frames.c b/desktop/frames.c
+index 21c5e7fff..45523749c 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -437,11 +437,16 @@ browser_window_iframe_is_new(struct browser_window *bw,
+ {
+ 	int i;
+ 
+-	if (cur->box == NULL || cur->box->node == NULL || cur->url == NULL)
++	if (cur->box == NULL || cur->box->node == NULL)
++		return false;
++	/* patch 289: a named frame with no src gets its (empty) window */
++	if (cur->url == NULL && (cur->name == NULL || *cur->name == '\0'))
+ 		return false;
+ 	for (i = 0; i < bw->iframe_count; i++)
+ 		if (bw->iframes[i]->iframe_node == cur->box->node)
+ 			return false;
++	if (cur->url == NULL)
++		return true;
+ 	return !nsurl_compare(cur->url,
+ 			hlcache_handle_get_url(bw->current_content),
+ 			NSURL_SCHEME | NSURL_HOST | NSURL_PORT);
+@@ -490,6 +495,8 @@ static void browser_window_sync_iframes(void *p)
+ 		if (!browser_window_iframe_add(bw, window))
+ 			return;
+ 		made++;
++		if (cur->url == NULL)	/* patch 289: nothing to load */
++			continue;
+ 		NSLOG(netsurf, INFO, "script-made iframe %s as %s",
+ 		      nsurl_access(cur->url), key);
+ 		browser_window_navigate(window, cur->url,
+@@ -601,6 +608,72 @@ static void browser_window_sync_iframes(void *p)
+ }
+ 
+ 
++/* exported function documented in desktop/frames.h */
++struct browser_window *
++browser_window_iframe_for_name(struct browser_window *bw, const char *name)
++{
++	dom_document *doc;
++	dom_string *tag = NULL, *namename = NULL;
++	dom_nodelist *list = NULL;
++	struct browser_window *found = NULL;
++	uint32_t n = 0, k;
++	int i;
++
++	if (bw == NULL || name == NULL || *name == '\0' ||
++	    bw->current_content == NULL ||
++	    content_get_type(bw->current_content) != CONTENT_HTML ||
++	    (doc = html_get_document(bw->current_content)) == NULL)
++		return NULL;
++	if (dom_string_create((const uint8_t *)"iframe", 6, &tag) !=
++			DOM_NO_ERR ||
++	    dom_string_create((const uint8_t *)"name", 4, &namename) !=
++			DOM_NO_ERR ||
++	    dom_document_get_elements_by_tag_name(doc, tag, &list) !=
++			DOM_NO_ERR || list == NULL ||
++	    dom_nodelist_get_length(list, &n) != DOM_NO_ERR)
++		n = 0;
++	for (k = 0; k < n && found == NULL; k++) {
++		dom_node *node = NULL;
++		dom_string *nm = NULL;
++		bool match;
++
++		if (dom_nodelist_item(list, k, &node) != DOM_NO_ERR ||
++		    node == NULL)
++			continue;
++		dom_element_get_attribute((dom_element *)node, namename, &nm);
++		match = nm != NULL && strcasecmp(dom_string_data(nm), name) == 0;
++		if (nm != NULL)
++			dom_string_unref(nm);
++		if (match) {
++			for (i = 0; i < bw->iframe_count; i++)
++				if (bw->iframes[i]->iframe_node == node)
++					found = bw->iframes[i];
++			if (found == NULL) {
++				struct browser_window *window =
++						calloc(1, sizeof(*window));
++				if (window != NULL) {
++					window->name = strdup(name);
++					browser_window_iframe_setup_boxless(bw,
++							window, node, name);
++					window->script_made = true;
++					if (browser_window_iframe_add(bw, window))
++						found = window;
++					NSLOG(netsurf, INFO, "iframe %s: a window "
++					      "made for its target", name);
++				}
++			}
++		}
++		dom_node_unref(node);
++	}
++	if (list != NULL)
++		dom_nodelist_unref(list);
++	if (tag != NULL)
++		dom_string_unref(tag);
++	if (namename != NULL)
++		dom_string_unref(namename);
++	return found;
++}
++
+ /* exported function documented in desktop/frames.h */
+ void browser_window_recalculate_iframes(struct browser_window *bw)
+ {
+diff --git a/desktop/frames.h b/desktop/frames.h
+index dda31824b..9787a6c3c 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -83,4 +83,17 @@ void browser_window_scroll_callback(void *client_data,
+  */
+ void browser_window_handle_scrollbars(struct browser_window *bw);
+ 
++/**
++ * VitaBrowser patch 289: the window for the iframe named name in bw's
++ * page, made (box-less, empty) if it has none -- a display:none frame, or
++ * one not laid out yet -- so a form or link with that target loads there
++ * and not over the whole page.
++ *
++ * \param bw The window whose page holds the iframe.
++ * \param name The target name.
++ * \return The frame's window, or NULL when the page has no such iframe.
++ */
++struct browser_window *browser_window_iframe_for_name(
++		struct browser_window *bw, const char *name);
++
+ #endif
