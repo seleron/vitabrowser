@@ -1,0 +1,728 @@
+# netsurf: a form's entries as HTML builds them -- line breaks, charsets,
+# submitters, disabled fieldsets, dirname, _charset_ (patch 283)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 282)
+#
+# A <form> submitted without script goes through the engine's own form
+# path (form_submit -> form_dom_to_data), which 257 left alone. Its body,
+# compared with Chromium's for the same forms part by part (the gate
+# server's /form-check, below), differed in what the entries were, for
+# every enctype:
+#
+#  - line breaks: names and values are sent with CR LF (a textarea's
+#    "line1\nline2" went as LF; a name's line break as %0A, Chromium's
+#    %0D%0A). File names keep their bytes (the encoder escapes them).
+#  - the charset: UTF-8 and the windows-1252 family (iso-8859-1, latin1,
+#    us-ascii are its labels, per the Encoding Standard) are encoded here,
+#    a character the encoding lacks as "&#N;" as HTML says; the Vita's
+#    iconv-free converter treated windows-1252 as Latin-1 (the euro and
+#    0x80-0x9F lost) and wrote "?" for the rest.
+#  - a hidden input named _charset_ sends the encoding's name ("UTF-8",
+#    "windows-1252"); it sent its own value.
+#  - dirname: a text / search input or a textarea with a dirname attribute
+#    adds "<dirname>=ltr|rtl" (its dir, an ancestor's, or "auto": the
+#    value's first strong character).
+#  - disabled: a control inside a disabled <fieldset> is disabled (not in
+#    that fieldset's first legend); a disabled option, or one in a disabled
+#    optgroup, is not sent. Only the element's own attribute counted.
+#  - a control with an empty name is not sent.
+#  - the submitter: only the button that submitted the form is sent. With
+#    none -- form.submit(), requestSubmit() -- the first submit input or
+#    button was taken as the submitter and sent. Implicit submission (Enter
+#    in a field) now goes with the form's default button, and not at all
+#    when that button is disabled (form_default_button, box_textarea.c).
+#  - an image button activated without a pointer (requestSubmit, click(),
+#    the keyboard) sends "name.x=0", "name.y=0" ("x", "y" when nameless);
+#    with no click coordinates the whole submission was abandoned.
+#  - an element type the code does not handle is skipped; it abandoned the
+#    submission.
+#
+# Not changed: the multipart encoder itself (libcurl's mime API: a valid
+# random boundary, names and filenames %-escaped for '"' CR LF, as
+# Chromium), which already matched part for part once the entries did.
+#
+# Found on the way, not fixed: libhubbub turns "&#13;" into LF (the
+# standard keeps CR), so a value written "a&#13;&#10;b" sends two line
+# breaks; a script's textarea.value / input.value is the value attribute
+# (the bridge's generic reflection), so a textarea's value set from script
+# is not what is submitted; form.elements.namedItem is missing; a form's
+# target naming an iframe navigates the whole window; a parsed iframe's
+# contentWindow.document is undefined to its parent.
+#
+# Gate (with 284, 285): tools/run-vita-sim.sh "scriptless form
+# submissions" -- nine submissions, each "FORMCHECK <case> ok <digest>"
+# equal to Chromium's.
+diff --git a/content/handlers/html/box_textarea.c b/content/handlers/html/box_textarea.c
+index d009ffd..5032a84 100644
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -130,10 +130,17 @@ nserror box_textarea_keypress(html_content *html, struct box *box, uint32_t key)
+ 	case NS_KEY_NL:
+ 	case NS_KEY_CR:
+ 		if (form) {
+-			res = form_submit(content_get_url(c),
+-					  html->bw,
+-					  form,
+-					  NULL);
++			/* VitaBrowser patch 283: implicit submission goes with
++			 * the form's default button (it is sent with the data),
++			 * and not at all when that button is disabled */
++			bool dis;
++			struct form_control *def = form_default_button(form,
++					&dis);
++			if (!dis)
++				res = form_submit(content_get_url(c),
++						  html->bw,
++						  form,
++						  def);
+ 		}
+ 		break;
+ 
+diff --git a/content/handlers/html/form.c b/content/handlers/html/form.c
+index 477aa6d..4f4cde8 100644
+--- a/content/handlers/html/form.c
++++ b/content/handlers/html/form.c
+@@ -132,6 +132,86 @@ static plot_font_style_t plot_fstyle_entry = {
+  *                 used iff converting to charset fails
+  * \return Pointer to converted string (on heap, caller frees), or NULL
+  */
++/* VitaBrowser patch 283: the encodings a form submission is made in
++ * without iconv, by their WHATWG names. Per the Encoding Standard the
++ * labels iso-8859-1, latin1 and us-ascii all mean windows-1252. */
++enum form_cs { FORM_CS_OTHER, FORM_CS_UTF8, FORM_CS_1252 };
++
++static enum form_cs form_charset_kind(const char *name)
++{
++	static const char *const w1252[] = { "windows-1252", "cp1252",
++		"x-cp1252", "iso-8859-1", "iso8859-1", "iso_8859-1",
++		"iso-ir-100", "latin1", "l1", "csisolatin1", "ibm819",
++		"cp819", "us-ascii", "ascii", "ansi_x3.4-1968", NULL };
++	char n[32];
++	size_t i;
++
++	if (name == NULL)
++		return FORM_CS_OTHER;
++	for (i = 0; name[i] != '\0' && name[i] != '/' && i + 1 < sizeof(n); i++)
++		n[i] = ascii_to_lower(name[i]);
++	n[i] = '\0';
++	if (strcmp(n, "utf-8") == 0 || strcmp(n, "utf8") == 0 ||
++	    strcmp(n, "unicode-1-1-utf-8") == 0)
++		return FORM_CS_UTF8;
++	for (i = 0; w1252[i] != NULL; i++)
++		if (strcmp(n, w1252[i]) == 0)
++			return FORM_CS_1252;
++	return FORM_CS_OTHER;
++}
++
++/* the name HTML gives the encoding (what _charset_ is sent as) */
++static const char *form_charset_name(const char *charset)
++{
++	switch (form_charset_kind(charset)) {
++	case FORM_CS_UTF8: return "UTF-8";
++	case FORM_CS_1252: return "windows-1252";
++	default: return charset;
++	}
++}
++
++/* windows-1252 bytes 0x80-0x9F as Unicode (the five unassigned bytes
++ * are their C1 controls, as the Encoding Standard has it) */
++static const uint16_t form_cp1252_c1[32] = {
++	0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
++	0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
++	0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
++	0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178 };
++
++/**
++ * UTF-8 to windows-1252 as HTML encodes a form: a character the
++ * encoding lacks becomes a decimal character reference "&#N;" (it was
++ * a "?", and the euro and the other 0x80-0x9F characters were lost).
++ */
++static char *form_encode_1252(const char *item, size_t len)
++{
++	size_t i = 0, o = 0;
++	char *out = malloc(len * 10 + 1);	/* "&#1114111;" per byte at most */
++
++	if (out == NULL)
++		return NULL;
++	while (i < len) {
++		uint32_t c = utf8_to_ucs4(item + i, len - i);
++		size_t n = utf8_next(item, len, i) - i;
++		int b = -1, k;
++
++		i += (n == 0) ? 1 : n;
++		if (c < 0x80 || (c >= 0xA0 && c <= 0xFF)) {
++			b = (int)c;
++		} else {
++			for (k = 0; k < 32; k++)
++				if (form_cp1252_c1[k] == c)
++					b = 0x80 + k;
++		}
++		if (b >= 0)
++			out[o++] = (char)b;
++		else
++			o += sprintf(out + o, "&#%lu;", (unsigned long)c);
++	}
++	out[o] = '\0';
++	return out;
++}
++
+ static char *
+ form_encode_item(const char *item,
+ 		 uint32_t len,
+@@ -145,6 +225,21 @@ form_encode_item(const char *item,
+ 	if (!item || !charset)
+ 		return NULL;
+ 
++	/* VitaBrowser patch 283: UTF-8 and windows-1252 directly */
++	switch (form_charset_kind(charset)) {
++	case FORM_CS_UTF8:
++		ret = malloc((size_t)len + 1);
++		if (ret != NULL) {
++			memcpy(ret, item, len);
++			ret[len] = '\0';
++		}
++		return ret;
++	case FORM_CS_1252:
++		return form_encode_1252(item, len);
++	default:
++		break;
++	}
++
+ 	snprintf(cset, sizeof cset, "%s//TRANSLIT", charset);
+ 
+ 	err = utf8_to_enc(item, cset, 0, &ret);
+@@ -246,6 +341,36 @@ fetch_data_list_add_sname(const char *name,
+ }
+ 
+ 
++/**
++ * VitaBrowser patch 283: a name or value with its line breaks -- CR LF,
++ * a lone CR, a lone LF -- as CR LF, as HTML submits every entry (a
++ * textarea's "a\nb" went as "a\nb"; Chromium sends "a\r\nb", and
++ * %0D%0A in a URL-encoded body).
++ */
++static char *form_crlf(const char *s, size_t len)
++{
++	size_t i, o = 0;
++	char *out = malloc(len * 2 + 1);
++
++	if (out == NULL)
++		return NULL;
++	for (i = 0; i < len; i++) {
++		if (s[i] == '\r') {
++			out[o++] = '\r';
++			out[o++] = '\n';
++			if (i + 1 < len && s[i + 1] == '\n')
++				i++;
++		} else if (s[i] == '\n') {
++			out[o++] = '\r';
++			out[o++] = '\n';
++		} else {
++			out[o++] = s[i];
++		}
++	}
++	out[o] = '\0';
++	return out;
++}
++
+ /**
+  * append DOM string name/value pair to a multipart data list
+  *
+@@ -266,19 +391,27 @@ fetch_data_list_add(dom_string *name,
+ 		    struct fetch_multipart_data ***fetch_data_next_ptr)
+ {
+ 	struct fetch_multipart_data *fetch_data;
++	char *norm;
+ 
+ 	assert(name != NULL);
+ 
++	/* VitaBrowser patch 283: a control with an empty name is not
++	 * submitted (HTML: "if the field's name is the empty string,
++	 * continue") */
++	if (dom_string_byte_length(name) == 0)
++		return NSERROR_OK;
++
+ 	fetch_data = calloc(1, sizeof(*fetch_data));
+ 	if (fetch_data == NULL) {
+ 		NSLOG(netsurf, INFO, "failed allocation for fetch data");
+ 		return NSERROR_NOMEM;
+ 	}
+ 
+-	fetch_data->name = form_encode_item(dom_string_data(name),
+-					    dom_string_byte_length(name),
+-					    form_charset,
+-					    docu_charset);
++	norm = form_crlf(dom_string_data(name), dom_string_byte_length(name));
++	fetch_data->name = norm == NULL ? NULL :
++			form_encode_item(norm, strlen(norm),
++					 form_charset, docu_charset);
++	free(norm);
+ 	if (fetch_data->name == NULL) {
+ 		NSLOG(netsurf, INFO, "Could not encode name for fetch data");
+ 		free(fetch_data);
+@@ -287,11 +420,20 @@ fetch_data_list_add(dom_string *name,
+ 
+ 	if (value == NULL) {
+ 		fetch_data->value = strdup("");
+-	} else {
++	} else if (rawfile != NULL) {
++		/* a file's name keeps its bytes (the multipart encoder
++		 * escapes CR, LF and quote in it) */
+ 		fetch_data->value = form_encode_item(dom_string_data(value),
+ 						     dom_string_byte_length(value),
+ 						     form_charset,
+ 						     docu_charset);
++	} else {
++		norm = form_crlf(dom_string_data(value),
++				 dom_string_byte_length(value));
++		fetch_data->value = norm == NULL ? NULL :
++				form_encode_item(norm, strlen(norm),
++						 form_charset, docu_charset);
++		free(norm);
+ 	}
+ 	if (fetch_data->value == NULL) {
+ 		NSLOG(netsurf, INFO, "Could not encode value for fetch data");
+@@ -322,6 +464,198 @@ fetch_data_list_add(dom_string *name,
+ }
+ 
+ 
++/* VitaBrowser patch 283: a DOM string is this ASCII word, any case */
++static bool form_ds_is(dom_string *ds, const char *word)
++{
++	size_t n = strlen(word);
++	return ds != NULL && dom_string_byte_length(ds) == n &&
++		strncasecmp(dom_string_data(ds), word, n) == 0;
++}
++
++/* VitaBrowser patch 283: an element's attribute by its name, NULL if it
++ * has none (the names are not in the corestring set) */
++static dom_exception form_attr(dom_node *node, const char *name,
++		dom_string **value)
++{
++	dom_string *key;
++	dom_exception exp;
++
++	*value = NULL;
++	exp = dom_string_create((const uint8_t *)name, strlen(name), &key);
++	if (exp != DOM_NO_ERR)
++		return exp;
++	exp = dom_element_get_attribute(node, key, value);
++	dom_string_unref(key);
++	return exp;
++}
++
++static dom_exception form_has_attr(dom_node *node, const char *name,
++		bool *has)
++{
++	dom_string *v = NULL;
++	dom_exception exp = form_attr(node, name, &v);
++
++	*has = (exp == DOM_NO_ERR && v != NULL);
++	if (v != NULL)
++		dom_string_unref(v);
++	return exp;
++}
++
++/**
++ * VitaBrowser patch 283: whether a control is disabled -- its own
++ * disabled attribute, or a disabled <fieldset> it is inside, unless it is
++ * inside that fieldset's first <legend> (HTML "actually disabled"). Only
++ * the element's own attribute was checked: a control in a disabled
++ * fieldset was submitted.
++ */
++static bool form_node_disabled(dom_node *node)
++{
++	dom_node *n = node, *child = NULL;
++	bool disabled = false;
++
++	if (form_has_attr((dom_node *)node, "disabled", &disabled) != DOM_NO_ERR || disabled)
++		return disabled;
++	dom_node_ref(n);
++	while (!disabled) {
++		dom_node *parent = NULL;
++		dom_string *pname = NULL;
++		dom_node_type type;
++
++		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR ||
++		    parent == NULL)
++			break;
++		if (child != NULL)
++			dom_node_unref(child);
++		child = n;
++		n = parent;
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++		    type != DOM_ELEMENT_NODE)
++			break;
++		if (dom_node_get_node_name(n, &pname) != DOM_NO_ERR ||
++		    pname == NULL)
++			break;
++		if (form_ds_is(pname, "fieldset")) {
++			bool fsdis = false;
++			form_has_attr((dom_node *)n, "disabled", &fsdis);
++			if (fsdis) {
++				/* the first legend child is exempt */
++				dom_node *c = NULL, *next;
++				dom_node_get_first_child(n, &c);
++				while (c != NULL) {
++					dom_string *cn = NULL;
++					dom_node_type ct;
++					bool legend = false;
++					if (dom_node_get_node_type(c, &ct) ==
++							DOM_NO_ERR &&
++					    ct == DOM_ELEMENT_NODE &&
++					    dom_node_get_node_name(c, &cn) ==
++							DOM_NO_ERR &&
++					    cn != NULL) {
++						legend = form_ds_is(cn, "legend");
++						dom_string_unref(cn);
++					}
++					if (legend)
++						break;
++					next = NULL;
++					dom_node_get_next_sibling(c, &next);
++					dom_node_unref(c);
++					c = next;
++				}
++				disabled = (c == NULL || c != child);
++				if (c != NULL)
++					dom_node_unref(c);
++			}
++		}
++		dom_string_unref(pname);
++	}
++	dom_node_unref(n);
++	if (child != NULL)
++		dom_node_unref(child);
++	return disabled;
++}
++
++/**
++ * VitaBrowser patch 283: a text field's dirname entry -- the name its
++ * dirname attribute gives, with "ltr" or "rtl", the element's
++ * directionality (its own or an ancestor's dir attribute; "auto": the
++ * first strong character of its value). It was not sent.
++ */
++static nserror
++form_dom_to_data_dirname(dom_node *node, dom_string *value,
++			 const char *form_charset, const char *doc_charset,
++			 struct fetch_multipart_data ***fetch_data_next_ptr)
++{
++	dom_string *dirname = NULL, *dir = NULL, *dirval;
++	dom_node *n = node;
++	const char *d = "ltr";
++	nserror res;
++
++	if (form_attr(node, "dirname", &dirname) != DOM_NO_ERR || dirname == NULL)
++		return NSERROR_OK;
++	if (dom_string_byte_length(dirname) == 0) {
++		dom_string_unref(dirname);
++		return NSERROR_OK;
++	}
++	dom_node_ref(n);
++	while (n != NULL) {
++		dom_node *parent = NULL;
++		dom_node_type type;
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++		    type != DOM_ELEMENT_NODE)
++			break;
++		if (form_attr(n, "dir", &dir) ==
++				DOM_NO_ERR && dir != NULL) {
++			if (form_ds_is(dir, "rtl")) {
++				d = "rtl";
++				break;
++			}
++			if (form_ds_is(dir, "ltr"))
++				break;
++			if (n == node && form_ds_is(dir, "auto")) {
++				/* the first strong character: Hebrew,
++				 * Arabic, Syriac, Thaana, NKo... are RTL */
++				const char *v = value ? dom_string_data(value) : "";
++				size_t vl = value ? dom_string_byte_length(value) : 0, i = 0;
++				while (i < vl) {
++					uint32_t c = utf8_to_ucs4(v + i, vl - i);
++					size_t k = utf8_next(v, vl, i) - i;
++					i += (k == 0) ? 1 : k;
++					if ((c >= 0x0590 && c <= 0x08FF) ||
++					    (c >= 0xFB1D && c <= 0xFDFF) ||
++					    (c >= 0xFE70 && c <= 0xFEFF)) {
++						d = "rtl";
++						break;
++					}
++					if ((c >= 'A' && c <= 'Z') ||
++					    (c >= 'a' && c <= 'z') ||
++					    (c >= 0xC0 && c < 0x0590))
++						break;
++				}
++				break;
++			}
++			dom_string_unref(dir);
++			dir = NULL;
++		}
++		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR)
++			parent = NULL;
++		dom_node_unref(n);
++		n = parent;
++	}
++	if (dir != NULL)
++		dom_string_unref(dir);
++	if (n != NULL)
++		dom_node_unref(n);
++	if (dom_string_create((const uint8_t *)d, 3, &dirval) != DOM_NO_ERR) {
++		dom_string_unref(dirname);
++		return NSERROR_NOMEM;
++	}
++	res = fetch_data_list_add(dirname, dirval, NULL, form_charset,
++				  doc_charset, fetch_data_next_ptr);
++	dom_string_unref(dirval);
++	dom_string_unref(dirname);
++	return res;
++}
++
+ /**
+  * process form HTMLTextAreaElement into multipart data.
+  *
+@@ -388,6 +722,10 @@ form_dom_to_data_textarea(dom_html_text_area_element *text_area_element,
+ 				  form_charset,
+ 				  doc_charset,
+ 				  fetch_data_next_ptr);
++	if (res == NSERROR_OK)	/* patch 283 */
++		res = form_dom_to_data_dirname((dom_node *)text_area_element,
++				inputvalue, form_charset, doc_charset,
++				fetch_data_next_ptr);
+ 
+ 	dom_string_unref(inputvalue);
+ 	dom_string_unref(inputname);
+@@ -419,6 +757,27 @@ form_dom_to_data_select_option(dom_html_option_element *option_element,
+ 		return NSERROR_OK;
+ 	}
+ 
++	/* VitaBrowser patch 283: nor do disabled ones, or ones in a
++	 * disabled optgroup */
++	{
++		bool dis = false;
++		dom_node *parent = NULL;
++		form_has_attr((dom_node *)option_element, "disabled", &dis);
++		if (!dis && dom_node_get_parent_node(option_element,
++				&parent) == DOM_NO_ERR && parent != NULL) {
++			dom_string *pn = NULL;
++			if (dom_node_get_node_name(parent, &pn) == DOM_NO_ERR &&
++			    pn != NULL) {
++				if (form_ds_is(pn, "optgroup"))
++					form_has_attr((dom_node *)parent, "disabled", &dis);
++				dom_string_unref(pn);
++			}
++			dom_node_unref(parent);
++		}
++		if (dis)
++			return NSERROR_OK;
++	}
++
+ 	exp = dom_html_option_element_get_value(option_element, &value);
+ 	if (exp != DOM_NO_ERR) {
+ 		NSLOG(netsurf, INFO, "Could not get option value");
+@@ -553,10 +912,10 @@ form_dom_to_data_input_submit(dom_html_input_element *input_element,
+ 	dom_string *inputvalue;
+ 	nserror res;
+ 
+-	if (*submit_button == NULL) {
+-		/* caller specified no button so use this one */
+-		*submit_button = (dom_html_element *)input_element;
+-	} else if (*submit_button != (dom_html_element *)input_element) {
++	/* VitaBrowser patch 283: only the button that submitted the form
++	 * (with none -- form.submit(), requestSubmit() -- no button: every
++	 * submit input was sent then) */
++	if (*submit_button != (dom_html_element *)input_element) {
+ 		return NSERROR_OK;
+ 	}
+ 
+@@ -607,9 +966,23 @@ form_dom_to_data_input_image(dom_html_input_element *input_element,
+ 		return NSERROR_DOM;
+ 	}
+ 
+-	if (coords == NULL) {
+-		NSLOG(netsurf, INFO, "No XY data on the image input");
+-		return NSERROR_DOM;
++	/* VitaBrowser patch 283: an image button activated without a
++	 * pointer -- by script (requestSubmit, click()) or the keyboard --
++	 * submits at (0, 0), as browsers do; without coordinates the whole
++	 * submission was abandoned. A nameless one sends "x" and "y". */
++	{
++		static struct image_input_coords zero;
++		if (coords == NULL)
++			coords = &zero;
++	}
++
++	if (inputname == NULL || dom_string_byte_length(inputname) == 0) {
++		res = fetch_data_list_add_sname("", "x", coords->x,
++						fetch_data_next_ptr);
++		if (res == NSERROR_OK)
++			res = fetch_data_list_add_sname("", "y", coords->y,
++							fetch_data_next_ptr);
++		return res;
+ 	}
+ 
+ 	/* encode input name once */
+@@ -749,6 +1122,27 @@ form_dom_to_data_input_text(dom_html_input_element *input_element,
+ 		return NSERROR_DOM;
+ 	}
+ 
++	/* VitaBrowser patch 283: a hidden input named _charset_ sends the
++	 * name of the encoding the form is submitted in */
++	if (dom_string_byte_length(inputname) == 9 &&
++	    strncasecmp(dom_string_data(inputname), "_charset_", 9) == 0) {
++		dom_string *type = NULL;
++		if (dom_html_input_element_get_type(input_element, &type) ==
++				DOM_NO_ERR && type != NULL) {
++			if (form_ds_is(type, "hidden")) {
++				const char *cs = form_charset_name(charset);
++				dom_string *csv;
++				if (dom_string_create((const uint8_t *)cs,
++						strlen(cs), &csv) == DOM_NO_ERR) {
++					if (inputvalue != NULL)
++						dom_string_unref(inputvalue);
++					inputvalue = csv;
++				}
++			}
++			dom_string_unref(type);
++		}
++	}
++
+ 	/* add key/value pair to fetch data list */
+ 	res = fetch_data_list_add(inputname,
+ 				  inputvalue,
+@@ -757,7 +1151,23 @@ form_dom_to_data_input_text(dom_html_input_element *input_element,
+ 				  document_charset,
+ 				  fetch_data_next_ptr);
+ 
+-	dom_string_unref(inputvalue);
++	/* patch 283: text and search fields send their dirname entry */
++	if (res == NSERROR_OK) {
++		dom_string *type = NULL;
++		if (dom_html_input_element_get_type(input_element, &type) ==
++				DOM_NO_ERR && type != NULL) {
++			if (form_ds_is(type, "text") ||
++			    form_ds_is(type, "search"))
++				res = form_dom_to_data_dirname(
++					(dom_node *)input_element, inputvalue,
++					charset, document_charset,
++					fetch_data_next_ptr);
++			dom_string_unref(type);
++		}
++	}
++
++	if (inputvalue != NULL)
++		dom_string_unref(inputvalue);
+ 
+ 	return res;
+ }
+@@ -811,7 +1221,21 @@ form_dom_to_data_input(dom_html_input_element *input_element,
+ 	}
+ 
+ 	if (inputname == NULL) {
+-		/* element with no name is not converted */
++		/* element with no name is not converted -- except the image
++		 * button that submitted the form (patch 283: "x", "y") */
++		dom_string *t = NULL;
++		bool image = false;
++		if (*submit_button == (dom_html_element *)input_element &&
++		    dom_html_input_element_get_type(input_element, &t) ==
++				DOM_NO_ERR && t != NULL) {
++			image = dom_string_caseless_isequal(t,
++					corestring_dom_image);
++			dom_string_unref(t);
++		}
++		if (image)
++			return form_dom_to_data_input_image(input_element,
++					NULL, charset, document_charset,
++					submit_button, fetch_data_next_ptr);
+ 		return NSERROR_OK;
+ 	}
+ 
+@@ -952,11 +1376,9 @@ form_dom_to_data_button(dom_html_button_element *button_element,
+ 	}
+ 	dom_string_unref(inputtype);
+ 
+-	/* only submision button generates an element */
+-	if (*submit_button == NULL) {
+-		/* no submission button selected yet so use this one */
+-		*submit_button = (dom_html_element *)button_element;
+-	}
++	/* only the button that submitted the form generates an entry
++	 * (VitaBrowser patch 283: with no submitter, none -- the first
++	 * submit button was taken for one) */
+ 	if (*submit_button != (dom_html_element *)button_element) {
+ 		return NSERROR_OK;
+ 	}
+@@ -1147,7 +1569,11 @@ form_dom_to_data(struct form *form,
+ 			goto form_dom_to_data_error;
+ 		}
+ 
+-		if (dom_string_isequal(nodename, corestring_dom_TEXTAREA)) {
++		/* VitaBrowser patch 283: a control in a disabled fieldset is
++		 * disabled too */
++		if (form_node_disabled(element)) {
++			res = NSERROR_OK;
++		} else if (dom_string_isequal(nodename, corestring_dom_TEXTAREA)) {
+ 			/* Form element is HTMLTextAreaElement */
+ 			res = form_dom_to_data_textarea(
+ 				(dom_html_text_area_element *)element,
+@@ -1182,12 +1608,13 @@ form_dom_to_data(struct form *form,
+ 				&fetch_data_next);
+ 
+ 		} else {
+-			/* Form element is not handled */
++			/* Form element is not handled: patch 283 skips it (it
++			 * abandoned the whole submission) */
+ 			NSLOG(netsurf, INFO,
+ 			      "Unhandled element type: %*s",
+ 			      (int)dom_string_byte_length(nodename),
+ 			      dom_string_data(nodename));
+-			res = NSERROR_DOM;
++			res = NSERROR_OK;
+ 
+ 		}
+ 
+@@ -2770,6 +3197,22 @@ form_submit(nsurl *page_url,
+ }
+ 
+ 
++/* exported interface documented in html/form_internal.h */
++struct form_control *form_default_button(struct form *form, bool *disabled)
++{
++	struct form_control *c;
++
++	*disabled = false;
++	for (c = form->controls; c != NULL; c = c->next) {
++		if (c->type == GADGET_SUBMIT || c->type == GADGET_IMAGE) {
++			*disabled = c->node != NULL &&
++				form_node_disabled((dom_node *)c->node);
++			return c;
++		}
++	}
++	return NULL;
++}
++
+ /* exported interface documented in html/form_internal.h */
+ void form_gadget_update_value(struct form_control *control, char *value)
+ {
+diff --git a/content/handlers/html/form_internal.h b/content/handlers/html/form_internal.h
+index 9f52455..ceff773 100644
+--- a/content/handlers/html/form_internal.h
++++ b/content/handlers/html/form_internal.h
+@@ -339,6 +339,16 @@ nserror form_submit(struct nsurl *page_url, struct browser_window *target,
+ 		struct form *form, struct form_control *submit_button);
+ 
+ 
++/**
++ * The form's default button (VitaBrowser patch 283): its first submit
++ * button, which implicit submission (Enter in a field) submits with.
++ *
++ * \param form The form.
++ * \param disabled Set to whether that button is disabled.
++ * \return The button, or NULL when the form has none.
++ */
++struct form_control *form_default_button(struct form *form, bool *disabled);
++
+ /**
+  * Update gadget value.
+  */
