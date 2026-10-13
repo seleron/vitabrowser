@@ -1,0 +1,518 @@
+# netsurf: descriptors as WebIDL and ECMAScript define them -- what
+# hCaptcha's collector reads (patch 280)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 279)
+#
+# hsw's main collector call, compared with Chromium's after 273-279
+# (docs/wasm-hcaptcha-measurement.md), still read different descriptors:
+#
+#  A. WebIDL operations and attributes on the interface prototypes are
+#     enumerable and an operation is named for its property; 346 of 998
+#     here were not enumerable (getContext, toDataURL, measureText,
+#     Permissions.query, ...), 12 misnamed (Node.prototype.appendChild
+#     anonymous, URL.prototype.toString, ...).
+#  B. Intl objects: [object Intl.DateTimeFormat] ... (they said
+#     [object Object]); their methods named and not enumerable, as
+#     ECMAScript built-ins are (resolvedOptions was anonymous, enumerable).
+#  C. window's attributes are accessors -- navigator, screen, crypto,
+#     localStorage, document, top, ... ([Replaceable] ones -- self, frames,
+#     screen, innerWidth, devicePixelRatio, performance, ... -- take a value
+#     set on them; name and opener keep one); here data properties, the
+#     viewport ones not enumerable. console, CSS, NodeFilter stop
+#     enumerating.
+#  D. document.location enumerates (it stays configurable: the bridge
+#     redefines it).
+#  E. contentWindow / contentDocument are HTMLIFrameElement.prototype's,
+#     not every element's; and an iframe / img wrapper gets its interface's
+#     prototype (macsurf_qjs.c qjs_dom_ctor_proto built "HTMLIframeElement",
+#     "HTMLImgElement": both were [object HTMLElement], instanceof only by a
+#     hasInstance stand-in; the table now covers iframe, img, h1-h6, br, hr,
+#     li, fieldset, optgroup, datalist, q / blockquote, ins / del, colgroup,
+#     thead / tbody / tfoot).
+#  F. getComputedStyle's result and element.style are CSSStyleDeclarations
+#     (prototype CSSStyleDeclaration.prototype, which holds nothing they
+#     could inherit by mistake); the computed style's __inline goes to the
+#     private record.
+#  G. localStorage / sessionStorage are Storages ([object Storage]).
+#  Also: the polyfill's six __vita marks on functions go to the private
+#  record, as the __vb ones did in 276.
+#
+# The demo still refuses the engine (797 bytes).
+#
+# Gate: testpages/pages/JS-descriptors.html (DESCRIPTORS 7/7, Chromium 7/7;
+# the build before fails 1-6).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index 8258a8b86..ab9d4ea89 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4636,6 +4636,28 @@ static JSValue qjs_ctor_proto_by_name(JSContext *ctx, const char *ctor_name)
+  * Returns an owned JSValue (caller frees) or JS_NULL when the tag has no
+  * constructor (wrapper keeps the class proto; per-tag instanceof stays false
+  * exactly as before, family instanceof still true). */
++/* patch 280: tags whose interface name is not "HTML" + Tag + "Element" */
++static const char *qjs_tag_iface(const char *tag_lc)
++{
++	static const char *const map[][2] = {
++		{ "iframe", "HTMLIFrameElement" }, { "img", "HTMLImageElement" },
++		{ "h1", "HTMLHeadingElement" }, { "h2", "HTMLHeadingElement" },
++		{ "h3", "HTMLHeadingElement" }, { "h4", "HTMLHeadingElement" },
++		{ "h5", "HTMLHeadingElement" }, { "h6", "HTMLHeadingElement" },
++		{ "br", "HTMLBRElement" }, { "hr", "HTMLHRElement" },
++		{ "li", "HTMLLIElement" }, { "fieldset", "HTMLFieldSetElement" },
++		{ "optgroup", "HTMLOptGroupElement" }, { "datalist", "HTMLDataListElement" },
++		{ "blockquote", "HTMLQuoteElement" }, { "q", "HTMLQuoteElement" },
++		{ "del", "HTMLModElement" }, { "ins", "HTMLModElement" },
++		{ "colgroup", "HTMLTableColElement" }, { "thead", "HTMLTableSectionElement" },
++		{ "tbody", "HTMLTableSectionElement" }, { "tfoot", "HTMLTableSectionElement" },
++		{ NULL, NULL } };
++	int i;
++	for (i = 0; map[i][0] != NULL; i++)
++		if (strcmp(map[i][0], tag_lc) == 0) return map[i][1];
++	return NULL;
++}
++
+ static JSValue qjs_dom_ctor_proto(JSContext *ctx, const char *tag_lc)
+ {
+ 	char name[48];
+@@ -4666,6 +4688,12 @@ static JSValue qjs_dom_ctor_proto(JSContext *ctx, const char *tag_lc)
+ 		strcpy(name, "HTMLTableCaptionElement");
+ 	} else if (strcmp(tag_lc, "col") == 0) {
+ 		strcpy(name, "HTMLTableColElement");
++	} else if (qjs_tag_iface(tag_lc) != NULL) {
++		/* patch 280: the rest the naive build misses (it made
++		 * "HTMLIframeElement", "HTMLImgElement": an iframe and an img
++		 * were [object HTMLElement], instanceof only by a hasInstance
++		 * stand-in) */
++		strcpy(name, qjs_tag_iface(tag_lc));
+ 	} else {
+ 		n = 4;	/* "HTML" */
+ 		strcpy(name, "HTML");
+@@ -7055,7 +7083,11 @@ static void qjs_el_install_js_helpers(JSContext *ctx, JSValue proto)
+ 		"configurable:true,enumerable:true});})(PS[i]);"
+ 		"return sp;};"
+ 		"Object.defineProperty(P,'style',{get:function(){"
+-		"if(!__vitaP(this).__st)__vitaP(this).__st=mk.call(this);return __vitaP(this).__st;},"
++		"if(!__vitaP(this).__st){__vitaP(this).__st=mk.call(this);"
++		/* patch 280: a CSSStyleDeclaration, as in browsers */
++		"try{if(typeof CSSStyleDeclaration==='function')"
++		"Object.setPrototypeOf(__vitaP(this).__st,CSSStyleDeclaration.prototype);}catch(e){}}"
++		"return __vitaP(this).__st;},"
+ 		"configurable:true});"
+ 		"})();"
+ 		/* matches - tag, #id, .class, [attr], compound */
+@@ -8928,7 +8960,7 @@ static JSValue qjs_get_computed_style(JSContext *ctx, JSValueConst this_val,
+ 	if (argc >= 1 && JS_IsObject(argv[0])) {
+ 		inline_style = JS_GetPropertyStr(ctx, argv[0], "style");
+ 	}
+-	JS_SetPropertyStr(ctx, out, "__inline", inline_style);
++	qjs_priv_set(ctx, out, "__inline", inline_style);	/* patch 280 */
+ 	return out;
+ }
+ 
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 8cdf0d9b1..78a96ab45 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6672,7 +6672,7 @@
+ "\t\tif (o !== probe && Object.getOwnPropertyDescriptor(o, 'href')) P = o;\n"
+ "\tif (!P) P = g.HTMLElement && g.HTMLElement.prototype;\n"
+ "\tvar had = P && Object.getOwnPropertyDescriptor(P, 'href');\n"
+-"\tif (!P || (had && had.get && had.get.__vita)) return;\n"
++"\tif (!P || (had && had.get && PV(had.get).__vita)) return;\n"
+ "\tfunction isLink(el) {\n"
+ "\t\tvar t = el && el.tagName ? String(el.tagName).toUpperCase() : '';\n"
+ "\t\treturn t === 'A' || t === 'AREA';\n"
+@@ -6695,7 +6695,7 @@
+ "\t\t\tvar a = this.getAttribute ? this.getAttribute('href') : null;\n"
+ "\t\t\treturn a === null ? undefined : a;\n"
+ "\t}\n"
+-"\threfGet.__vita = true;\n"
++"\tPV(hrefGet).__vita = true;\n"
+ "\tObject.defineProperty(P, 'href', {\n"
+ "\t\tconfigurable: true,\n"
+ "\t\tget: hrefGet,\n"
+@@ -6784,7 +6784,7 @@
+ "\n"
+ "(function () {\n"
+ "\tvar gcs = g.getComputedStyle;\n"
+-"\tif (typeof gcs !== 'function' || typeof Proxy !== 'function' || gcs.__vita) return;\n"
++"\tif (typeof gcs !== 'function' || typeof Proxy !== 'function' || PV(gcs).__vita) return;\n"
+ "\tvar INITIAL = {\n"
+ "\t\tanimationName: 'none', animationDuration: '0s', animationDelay: '0s',\n"
+ "\t\tanimationIterationCount: '1', animationDirection: 'normal', animationFillMode: 'none',\n"
+@@ -6823,6 +6823,9 @@
+ "\t\tif (!el || typeof el !== 'object')\n"
+ "\t\t\tthrow new TypeError(\"Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.\");\n"
+ "\t\tvar base = gcs.call(g, el, pseudo) || {}, inl = el.style || null;\n"
++"\t\t/* patch 280: a CSSStyleDeclaration, as in browsers */\n"
++"\t\tif (g.CSSStyleDeclaration && Object.getPrototypeOf(base) === Object.prototype)\n"
++"\t\t\ttry { Object.setPrototypeOf(base, g.CSSStyleDeclaration.prototype); } catch (e) { /* */ }\n"
+ "\t\tfunction read(k) {\n"
+ "\t\t\tvar v = base[k];\n"
+ "\t\t\tif (v !== undefined && v !== null && typeof v !== 'function') return String(v);\n"
+@@ -6841,7 +6844,7 @@
+ "\t\t\t}\n"
+ "\t\t});\n"
+ "\t};\n"
+-"\tvgcs.__vita = true;\n"
++"\tPV(vgcs).__vita = true;\n"
+ "\tdefine(g, 'getComputedStyle', vgcs);\n"
+ "})();\n"
+ "\n"
+@@ -7306,7 +7309,7 @@
+ "\tvoid ric;\n"
+ "\t/* console.error(err): the log gets where it was thrown, too. */\n"
+ "\tvar c = g.console, ce = c && c.error;\n"
+-"\tif (typeof ce === 'function' && !ce.__vita) {\n"
++"\tif (typeof ce === 'function' && !PV(ce).__vita) {\n"
+ "\t\tc.error = function vitaError() {\n"
+ "\t\t\tce.apply(c, arguments);\n"
+ "\t\t\tfor (var i = 0; i < arguments.length; i++) {\n"
+@@ -7315,7 +7318,7 @@
+ "\t\t\t\t\tce.call(c, '  at: ' + a.stack.split('\\n').slice(0, 4).join(' | '));\n"
+ "\t\t\t}\n"
+ "\t\t};\n"
+-"\t\tc.error.__vita = true;\n"
++"\t\tPV(c.error).__vita = true;\n"
+ "\t}\n"
+ "})();\n"
+ "\n"
+@@ -9847,5 +9850,135 @@
+ "\t\ttry { Object.defineProperty(P, k, pd); delete d[k]; } catch (e) { /* */ }\n"
+ "\t});\n"
+ "})();\n"
++"/* ---- descriptors as WebIDL and ECMAScript define them (patch 280) -------\n"
++" * What hCaptcha's collector (hsw) reads, compared with Chromium's:\n"
++" * A. A WebIDL operation or attribute on an interface prototype is\n"
++" *    enumerable and an operation is named for its property; here 346 of\n"
++" *    998 were not enumerable (getContext, toDataURL, ...) and 12 misnamed\n"
++" *    (Node.prototype.appendChild anonymous).\n"
++" * B. Intl objects are [object Intl.DateTimeFormat] ...; their methods\n"
++" *    ECMAScript's: named, not enumerable.\n"
++" * C. window's attributes are accessors (navigator, screen, crypto,\n"
++" *    localStorage, ...; self / frames / screen / devicePixelRatio ...\n"
++" *    [Replaceable]: setting one replaces it with the value); here data\n"
++" *    properties. console, CSS and NodeFilter do not enumerate.\n"
++" * D. document.location enumerates.\n"
++" * E. contentWindow / contentDocument are HTMLIFrameElement.prototype's,\n"
++" *    not every element's.\n"
++" * F. getComputedStyle's result and element.style are CSSStyleDeclarations.\n"
++" * G. localStorage / sessionStorage are Storages. */\n"
++"(function () {\n"
++"\tvar hasOwn = Object.prototype.hasOwnProperty, D = Object.defineProperty, G = Object.getOwnPropertyDescriptor;\n"
++"\tvar ES = /^(Object|Function|Array|Number|Boolean|String|Symbol|Date|RegExp|Promise|Math|JSON|Reflect|Proxy|Intl|Atomics|Map|Set|WeakMap|WeakSet|WeakRef|BigInt|DataView|ArrayBuffer|SharedArrayBuffer|Iterator|FinalizationRegistry|DisposableStack|AsyncDisposableStack|WebAssembly|\\w*Error|\\w*Array)$/;\n"
++"\tvar named = new WeakMap();\n"
++"\tfunction method(f, k) {\n"
++"\t\tvar w = ({ [k]() { return f.apply(this, arguments); } })[k];\n"
++"\t\ttry { D(w, 'length', { value: f.length, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tvar r = PRIV.pv && PRIV.pv.get(f); if (r) PRIV.pv.set(w, r);\n"
++"\t\treturn w;\n"
++"\t}\n"
++"\tfunction nameFn(f, k) {\n"
++"\t\tif (f.name === k) return f;\n"
++"\t\tvar had = named.get(f);\n"
++"\t\tif (had === undefined && hasOwn.call(f, 'name') && G(f, 'name').configurable) {\n"
++"\t\t\tnamed.set(f, k);\n"
++"\t\t\ttry { D(f, 'name', { value: k, configurable: true }); return f; } catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\treturn method(f, k);\n"
++"\t}\n"
++"\t/* A */\n"
++"\tfunction webidl(P) {\n"
++"\t\tObject.getOwnPropertyNames(P).forEach(function (k) {\n"
++"\t\t\tif (k === 'constructor' || k.charAt(0) === '_') return;\n"
++"\t\t\tvar d = G(P, k);\n"
++"\t\t\tif (!d || !d.configurable) return;\n"
++"\t\t\tvar ch = !d.enumerable;\n"
++"\t\t\td.enumerable = true;\n"
++"\t\t\tif ('value' in d && typeof d.value === 'function' && !/^[A-Z]/.test(k) && d.value.name !== k) { d.value = nameFn(d.value, k); ch = true; }\n"
++"\t\t\tif (ch) try { D(P, k, d); } catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t}\n"
++"\tObject.getOwnPropertyNames(g).forEach(function (k) {\n"
++"\t\tif (!/^[A-Z]/.test(k) || ES.test(k)) return;\n"
++"\t\tvar F;\n"
++"\t\ttry { F = g[k]; } catch (e) { return; }\n"
++"\t\tif (typeof F === 'function' && F.prototype && F.prototype.constructor === F) webidl(F.prototype);\n"
++"\t});\n"
++"\t/* B */\n"
++"\tif (g.Intl) Object.getOwnPropertyNames(g.Intl).forEach(function (k) {\n"
++"\t\tvar F = g.Intl[k];\n"
++"\t\tif (typeof F !== 'function' || !F.prototype) return;\n"
++"\t\tvar P = F.prototype;\n"
++"\t\tif (!hasOwn.call(P, Symbol.toStringTag)) try { D(P, Symbol.toStringTag, { value: 'Intl.' + k, configurable: true }); } catch (e) { /* */ }\n"
++"\t\tObject.getOwnPropertyNames(P).forEach(function (m) {\n"
++"\t\t\tif (m === 'constructor') return;\n"
++"\t\t\tvar d = G(P, m);\n"
++"\t\t\tif (!d || !d.configurable) return;\n"
++"\t\t\td.enumerable = false;\n"
++"\t\t\tif ('value' in d && typeof d.value === 'function') d.value = nameFn(d.value, m);\n"
++"\t\t\ttry { D(P, m, d); } catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t});\n"
++"\t/* C: Chromium 140's descriptor for each: g = getter, s = a setter\n"
++"\t * (r: [Replaceable], v: a value it keeps), e = enumerable */\n"
++"\tvar W = { window: 'ge', self: 'gre', document: 'ge', name: 'gve', customElements: 'ge', history: 'ge',\n"
++"\t\tclosed: 'ge', frames: 'gre', length: 'gre', top: 'ge', opener: 'gve', parent: 'gre', frameElement: 'ge',\n"
++"\t\tnavigator: 'ge', origin: 'gre', screen: 'gre', innerWidth: 'gre', innerHeight: 'gre', scrollX: 'gre',\n"
++"\t\tpageXOffset: 'gre', scrollY: 'gre', pageYOffset: 'gre', visualViewport: 'gre', outerWidth: 'gre',\n"
++"\t\touterHeight: 'gre', devicePixelRatio: 'gre', isSecureContext: 'ge', performance: 'gre', crypto: 'ge',\n"
++"\t\tindexedDB: 'ge', localStorage: 'ge', sessionStorage: 'ge' };\n"
++"\tvar wv = PRIV.wv || (PRIV.wv = {});\n"
++"\tObject.keys(W).forEach(function (k) {\n"
++"\t\tvar d = G(g, k), spec = W[k];\n"
++"\t\tif (!d || !d.configurable) return;\n"
++"\t\tvar get, set;\n"
++"\t\tif ('value' in d) {\n"
++"\t\t\twv[k] = d.value;\n"
++"\t\t\tget = (k === 'window' || k === 'self' || k === 'frames') ? function () { return g; } : function () { return wv[k]; };\n"
++"\t\t} else {\n"
++"\t\t\tget = d.get;\n"
++"\t\t}\n"
++"\t\tif (spec.indexOf('v') >= 0) set = function (v) { wv[k] = v; };\n"
++"\t\telse if (spec.indexOf('r') >= 0) set = d.set || function (v) { D(g, k, { value: v, writable: true, enumerable: true, configurable: true }); };\n"
++"\t\tvar gt = get, st = set;\n"
++"\t\ttry {\n"
++"\t\t\tD(g, k, { get: Object.getOwnPropertyDescriptor({ get [k]() { return gt.call(this); } }, k).get,\n"
++"\t\t\t\tset: st && Object.getOwnPropertyDescriptor({ set [k](v) { st.call(this, v); } }, k).set,\n"
++"\t\t\t\tenumerable: spec.indexOf('e') >= 0, configurable: true });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t});\n"
++"\t['console', 'CSS', 'NodeFilter'].forEach(function (k) {\n"
++"\t\tvar d = G(g, k);\n"
++"\t\tif (d && d.configurable && d.enumerable) { d.enumerable = false; try { D(g, k, d); } catch (e) { /* */ } }\n"
++"\t});\n"
++"\t/* D */\n"
++"\tvar doc = g.document, dl = doc && G(doc, 'location');\n"
++"\tif (dl && dl.configurable && !dl.enumerable) { dl.enumerable = true; try { D(doc, 'location', dl); } catch (e) { /* */ } }\n"
++"\t/* E */\n"
++"\tvar IF = g.HTMLIFrameElement && g.HTMLIFrameElement.prototype;\n"
++"\t/* the bridge's accessor lives on its shared element prototype (and\n"
++"\t * is lifted to Element.prototype): every layer below\n"
++"\t * HTMLIFrameElement.prototype in an iframe's chain gives it up */\n"
++"\tvar ifr = null;\n"
++"\ttry { ifr = doc && doc.createElement('iframe'); } catch (e) { /* */ }\n"
++"\tif (IF && ifr && IF.isPrototypeOf(ifr)) ['contentWindow', 'contentDocument'].forEach(function (k) {\n"
++"\t\tvar layers = [], d = null, p;\n"
++"\t\tfor (p = Object.getPrototypeOf(IF); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) layers.push(p);\n"
++"\t\tlayers.forEach(function (h) { if (!d && hasOwn.call(h, k)) d = G(h, k); });\n"
++"\t\tif (!d) return;\n"
++"\t\ttry {\n"
++"\t\t\tif (!hasOwn.call(IF, k)) D(IF, k, { get: d.get, set: undefined, enumerable: true, configurable: true });\n"
++"\t\t\tlayers.forEach(function (h) { if (hasOwn.call(h, k)) delete h[k]; });\n"
++"\t\t} catch (e) { /* */ }\n"
++"\t});\n"
++"\t/* G */\n"
++"\tif (g.Storage && g.Storage.prototype) ['localStorage', 'sessionStorage'].forEach(function (k) {\n"
++"\t\tvar st;\n"
++"\t\ttry { st = g[k]; } catch (e) { return; }\n"
++"\t\tvar sp = st && Object.getPrototypeOf(st);\n"
++"\t\tif (sp && sp !== g.Storage.prototype && Object.getPrototypeOf(sp) === Object.prototype)\n"
++"\t\t\ttry { Object.setPrototypeOf(sp, g.Storage.prototype); } catch (e) { /* */ }\n"
++"\t});\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 7aa2a137b..3a33ee157 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6671,7 +6671,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		if (o !== probe && Object.getOwnPropertyDescriptor(o, 'href')) P = o;
+ 	if (!P) P = g.HTMLElement && g.HTMLElement.prototype;
+ 	var had = P && Object.getOwnPropertyDescriptor(P, 'href');
+-	if (!P || (had && had.get && had.get.__vita)) return;
++	if (!P || (had && had.get && PV(had.get).__vita)) return;
+ 	function isLink(el) {
+ 		var t = el && el.tagName ? String(el.tagName).toUpperCase() : '';
+ 		return t === 'A' || t === 'AREA';
+@@ -6694,7 +6694,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			var a = this.getAttribute ? this.getAttribute('href') : null;
+ 			return a === null ? undefined : a;
+ 	}
+-	hrefGet.__vita = true;
++	PV(hrefGet).__vita = true;
+ 	Object.defineProperty(P, 'href', {
+ 		configurable: true,
+ 		get: hrefGet,
+@@ -6783,7 +6783,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 
+ (function () {
+ 	var gcs = g.getComputedStyle;
+-	if (typeof gcs !== 'function' || typeof Proxy !== 'function' || gcs.__vita) return;
++	if (typeof gcs !== 'function' || typeof Proxy !== 'function' || PV(gcs).__vita) return;
+ 	var INITIAL = {
+ 		animationName: 'none', animationDuration: '0s', animationDelay: '0s',
+ 		animationIterationCount: '1', animationDirection: 'normal', animationFillMode: 'none',
+@@ -6822,6 +6822,9 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		if (!el || typeof el !== 'object')
+ 			throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
+ 		var base = gcs.call(g, el, pseudo) || {}, inl = el.style || null;
++		/* patch 280: a CSSStyleDeclaration, as in browsers */
++		if (g.CSSStyleDeclaration && Object.getPrototypeOf(base) === Object.prototype)
++			try { Object.setPrototypeOf(base, g.CSSStyleDeclaration.prototype); } catch (e) { /* */ }
+ 		function read(k) {
+ 			var v = base[k];
+ 			if (v !== undefined && v !== null && typeof v !== 'function') return String(v);
+@@ -6840,7 +6843,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 			}
+ 		});
+ 	};
+-	vgcs.__vita = true;
++	PV(vgcs).__vita = true;
+ 	define(g, 'getComputedStyle', vgcs);
+ })();
+ 
+@@ -7305,7 +7308,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	void ric;
+ 	/* console.error(err): the log gets where it was thrown, too. */
+ 	var c = g.console, ce = c && c.error;
+-	if (typeof ce === 'function' && !ce.__vita) {
++	if (typeof ce === 'function' && !PV(ce).__vita) {
+ 		c.error = function vitaError() {
+ 			ce.apply(c, arguments);
+ 			for (var i = 0; i < arguments.length; i++) {
+@@ -7314,7 +7317,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 					ce.call(c, '  at: ' + a.stack.split('\n').slice(0, 4).join(' | '));
+ 			}
+ 		};
+-		c.error.__vita = true;
++		PV(c.error).__vita = true;
+ 	}
+ })();
+ 
+@@ -9846,4 +9849,134 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 		try { Object.defineProperty(P, k, pd); delete d[k]; } catch (e) { /* */ }
+ 	});
+ })();
++/* ---- descriptors as WebIDL and ECMAScript define them (patch 280) -------
++ * What hCaptcha's collector (hsw) reads, compared with Chromium's:
++ * A. A WebIDL operation or attribute on an interface prototype is
++ *    enumerable and an operation is named for its property; here 346 of
++ *    998 were not enumerable (getContext, toDataURL, ...) and 12 misnamed
++ *    (Node.prototype.appendChild anonymous).
++ * B. Intl objects are [object Intl.DateTimeFormat] ...; their methods
++ *    ECMAScript's: named, not enumerable.
++ * C. window's attributes are accessors (navigator, screen, crypto,
++ *    localStorage, ...; self / frames / screen / devicePixelRatio ...
++ *    [Replaceable]: setting one replaces it with the value); here data
++ *    properties. console, CSS and NodeFilter do not enumerate.
++ * D. document.location enumerates.
++ * E. contentWindow / contentDocument are HTMLIFrameElement.prototype's,
++ *    not every element's.
++ * F. getComputedStyle's result and element.style are CSSStyleDeclarations.
++ * G. localStorage / sessionStorage are Storages. */
++(function () {
++	var hasOwn = Object.prototype.hasOwnProperty, D = Object.defineProperty, G = Object.getOwnPropertyDescriptor;
++	var ES = /^(Object|Function|Array|Number|Boolean|String|Symbol|Date|RegExp|Promise|Math|JSON|Reflect|Proxy|Intl|Atomics|Map|Set|WeakMap|WeakSet|WeakRef|BigInt|DataView|ArrayBuffer|SharedArrayBuffer|Iterator|FinalizationRegistry|DisposableStack|AsyncDisposableStack|WebAssembly|\w*Error|\w*Array)$/;
++	var named = new WeakMap();
++	function method(f, k) {
++		var w = ({ [k]() { return f.apply(this, arguments); } })[k];
++		try { D(w, 'length', { value: f.length, configurable: true }); } catch (e) { /* */ }
++		var r = PRIV.pv && PRIV.pv.get(f); if (r) PRIV.pv.set(w, r);
++		return w;
++	}
++	function nameFn(f, k) {
++		if (f.name === k) return f;
++		var had = named.get(f);
++		if (had === undefined && hasOwn.call(f, 'name') && G(f, 'name').configurable) {
++			named.set(f, k);
++			try { D(f, 'name', { value: k, configurable: true }); return f; } catch (e) { /* */ }
++		}
++		return method(f, k);
++	}
++	/* A */
++	function webidl(P) {
++		Object.getOwnPropertyNames(P).forEach(function (k) {
++			if (k === 'constructor' || k.charAt(0) === '_') return;
++			var d = G(P, k);
++			if (!d || !d.configurable) return;
++			var ch = !d.enumerable;
++			d.enumerable = true;
++			if ('value' in d && typeof d.value === 'function' && !/^[A-Z]/.test(k) && d.value.name !== k) { d.value = nameFn(d.value, k); ch = true; }
++			if (ch) try { D(P, k, d); } catch (e) { /* */ }
++		});
++	}
++	Object.getOwnPropertyNames(g).forEach(function (k) {
++		if (!/^[A-Z]/.test(k) || ES.test(k)) return;
++		var F;
++		try { F = g[k]; } catch (e) { return; }
++		if (typeof F === 'function' && F.prototype && F.prototype.constructor === F) webidl(F.prototype);
++	});
++	/* B */
++	if (g.Intl) Object.getOwnPropertyNames(g.Intl).forEach(function (k) {
++		var F = g.Intl[k];
++		if (typeof F !== 'function' || !F.prototype) return;
++		var P = F.prototype;
++		if (!hasOwn.call(P, Symbol.toStringTag)) try { D(P, Symbol.toStringTag, { value: 'Intl.' + k, configurable: true }); } catch (e) { /* */ }
++		Object.getOwnPropertyNames(P).forEach(function (m) {
++			if (m === 'constructor') return;
++			var d = G(P, m);
++			if (!d || !d.configurable) return;
++			d.enumerable = false;
++			if ('value' in d && typeof d.value === 'function') d.value = nameFn(d.value, m);
++			try { D(P, m, d); } catch (e) { /* */ }
++		});
++	});
++	/* C: Chromium 140's descriptor for each: g = getter, s = a setter
++	 * (r: [Replaceable], v: a value it keeps), e = enumerable */
++	var W = { window: 'ge', self: 'gre', document: 'ge', name: 'gve', customElements: 'ge', history: 'ge',
++		closed: 'ge', frames: 'gre', length: 'gre', top: 'ge', opener: 'gve', parent: 'gre', frameElement: 'ge',
++		navigator: 'ge', origin: 'gre', screen: 'gre', innerWidth: 'gre', innerHeight: 'gre', scrollX: 'gre',
++		pageXOffset: 'gre', scrollY: 'gre', pageYOffset: 'gre', visualViewport: 'gre', outerWidth: 'gre',
++		outerHeight: 'gre', devicePixelRatio: 'gre', isSecureContext: 'ge', performance: 'gre', crypto: 'ge',
++		indexedDB: 'ge', localStorage: 'ge', sessionStorage: 'ge' };
++	var wv = PRIV.wv || (PRIV.wv = {});
++	Object.keys(W).forEach(function (k) {
++		var d = G(g, k), spec = W[k];
++		if (!d || !d.configurable) return;
++		var get, set;
++		if ('value' in d) {
++			wv[k] = d.value;
++			get = (k === 'window' || k === 'self' || k === 'frames') ? function () { return g; } : function () { return wv[k]; };
++		} else {
++			get = d.get;
++		}
++		if (spec.indexOf('v') >= 0) set = function (v) { wv[k] = v; };
++		else if (spec.indexOf('r') >= 0) set = d.set || function (v) { D(g, k, { value: v, writable: true, enumerable: true, configurable: true }); };
++		var gt = get, st = set;
++		try {
++			D(g, k, { get: Object.getOwnPropertyDescriptor({ get [k]() { return gt.call(this); } }, k).get,
++				set: st && Object.getOwnPropertyDescriptor({ set [k](v) { st.call(this, v); } }, k).set,
++				enumerable: spec.indexOf('e') >= 0, configurable: true });
++		} catch (e) { /* */ }
++	});
++	['console', 'CSS', 'NodeFilter'].forEach(function (k) {
++		var d = G(g, k);
++		if (d && d.configurable && d.enumerable) { d.enumerable = false; try { D(g, k, d); } catch (e) { /* */ } }
++	});
++	/* D */
++	var doc = g.document, dl = doc && G(doc, 'location');
++	if (dl && dl.configurable && !dl.enumerable) { dl.enumerable = true; try { D(doc, 'location', dl); } catch (e) { /* */ } }
++	/* E */
++	var IF = g.HTMLIFrameElement && g.HTMLIFrameElement.prototype;
++	/* the bridge's accessor lives on its shared element prototype (and
++	 * is lifted to Element.prototype): every layer below
++	 * HTMLIFrameElement.prototype in an iframe's chain gives it up */
++	var ifr = null;
++	try { ifr = doc && doc.createElement('iframe'); } catch (e) { /* */ }
++	if (IF && ifr && IF.isPrototypeOf(ifr)) ['contentWindow', 'contentDocument'].forEach(function (k) {
++		var layers = [], d = null, p;
++		for (p = Object.getPrototypeOf(IF); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) layers.push(p);
++		layers.forEach(function (h) { if (!d && hasOwn.call(h, k)) d = G(h, k); });
++		if (!d) return;
++		try {
++			if (!hasOwn.call(IF, k)) D(IF, k, { get: d.get, set: undefined, enumerable: true, configurable: true });
++			layers.forEach(function (h) { if (hasOwn.call(h, k)) delete h[k]; });
++		} catch (e) { /* */ }
++	});
++	/* G */
++	if (g.Storage && g.Storage.prototype) ['localStorage', 'sessionStorage'].forEach(function (k) {
++		var st;
++		try { st = g[k]; } catch (e) { return; }
++		var sp = st && Object.getPrototypeOf(st);
++		if (sp && sp !== g.Storage.prototype && Object.getPrototypeOf(sp) === Object.prototype)
++			try { Object.setPrototypeOf(sp, g.Storage.prototype); } catch (e) { /* */ }
++	});
++})();
+ })(this);
