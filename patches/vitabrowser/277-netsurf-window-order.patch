@@ -1,0 +1,360 @@
+# netsurf: window's own properties in a browser's order; the engine's
+# helpers stop enumerating (patch 277)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 276)
+#
+# Object.keys(window) and Object.getOwnPropertyNames(window) list a
+# global's properties in creation order. A browser makes the ECMAScript
+# intrinsics, window's attributes and operations in IDL order, its event
+# handlers and interface objects, its newest APIs last; a page's globals
+# follow. Fingerprinters read the tail: hCaptcha's hsw takes the
+# descriptors of the last 24 keys of Object.keys(window) (in Chromium
+# fetchLater, getScreenDetails, queryLocalFonts, ... then the page's own
+# globals). Here the tail was whatever the bridge defined last
+# (onpageshow, onpagehide, onbeforeunload, onunload, ...) -- the fork the
+# hCaptcha trace hit at call 4401.
+#
+#  - vita_polyfill.js, last section: window's configurable own
+#    properties are made again, once per realm -- the engine's own names
+#    first, then the 413 that Chromium 140 also has, in Chromium's order
+#    (the list in the section) -- so the tail is now ... setTimeout,
+#    structuredClone, ontouchcancel ... ontouchstart, then the page's
+#    globals, as in Chromium. Every property keeps its descriptor; the
+#    section looks nothing up on the global while it works (Object itself
+#    is taken away and put back). 2 ms of realm build on the host.
+#  - DOMPurify, XF, HTML_Element, setImmediate, clearImmediate (the
+#    engine's, no web API) stop enumerating, as __vita* did in 269.
+#  - fixed on the way: in the document-less realm the engine builds first,
+#    the 2026-09-26 "DOM surface" section's helpers put Text's length
+#    accessor on Object.prototype (a stub text node there is a plain
+#    object) -- every object in that realm had a length; acc() / fn() now
+#    refuse Object.prototype.
+#
+# With Chromium given this engine's window (names, enumerability, order),
+# the hCaptcha trace now stays aligned through the walk (to call 5418,
+# where the page's own globals differ); Chromium still passes, and the
+# demo still refuses the engine.
+#
+# Gate: testpages/pages/JS-window-order.html (WINORDER 5/5, Chromium 5/5;
+# the build before fails 1-3).
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index 81decfbf5..e88b4964f 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -5174,8 +5174,11 @@
+ "\tif (!d) return;\n"
+ "\tvar el = d.createElement('section'), E = Object.getPrototypeOf(el);\n"
+ "\tvar T = Object.getPrototypeOf(d.createTextNode(''));\n"
++"\t/* never Object.prototype: in the document-less realm the engine makes\n"
++"\t * first, a stub text node is a plain object, and Text's length landed\n"
++"\t * on every object there (patch 277) */\n"
+ "\tfunction acc(o, n, get, set) {\n"
+-"\t\tif (!o) return;\n"
++"\t\tif (!o || o === Object.prototype) return;\n"
+ "\t\ttry {\n"
+ "\t\t\tvar have = Object.getOwnPropertyDescriptor(o, n);\n"
+ "\t\t\tif (have || (n in o && o[n] !== undefined)) return;\n"
+@@ -5183,7 +5186,7 @@
+ "\t\ttry { Object.defineProperty(o, n, { get: get, set: set, configurable: true }); } catch (e) { /* */ }\n"
+ "\t}\n"
+ "\tfunction fn(o, n, f) {\n"
+-"\t\tif (!o || typeof o[n] === 'function') return;\n"
++"\t\tif (!o || o === Object.prototype || typeof o[n] === 'function') return;\n"
+ "\t\ttry { Object.defineProperty(o, n, { value: f, writable: true, configurable: true }); } catch (e) { /* */ }\n"
+ "\t}\n"
+ "\tfunction parentEl() { var p = this.parentNode; return p && p.nodeType === 1 ? p : null; }\n"
+@@ -9651,5 +9654,134 @@
+ "\t});\n"
+ "\ttry { if (g.screen && g.screen.orientation) hoist(g.screen.orientation, protoOf(g.screen.orientation, g.ScreenOrientation)); } catch (e) { /* */ }\n"
+ "})();\n"
++"/* ---- window's own properties in a browser's order (patch 277) -----------\n"
++" * Object.keys(window) and Object.getOwnPropertyNames(window) list a\n"
++" * global's properties in the order they were made. A browser makes the\n"
++" * ECMAScript intrinsics, then window's attributes and operations in IDL\n"
++" * order, its event handlers and interface objects, its newest APIs last;\n"
++" * pages' globals follow. Fingerprinters read the tail (hCaptcha's hsw\n"
++" * reads the descriptors of the last 24 keys: in Chromium fetchLater,\n"
++" * getScreenDetails, queryLocalFonts, ...); here the tail was whatever the\n"
++" * bridge happened to define last (onpageshow, onpagehide, onbeforeunload,\n"
++" * ...). Window's configurable own properties are made again: the engine's\n"
++" * own first, then those a browser has, in Chromium's order (the list\n"
++" * below: Chromium 140's names that this engine has). The engine's helpers\n"
++" * that are no web API (DOMPurify, XF, HTML_Element, setImmediate,\n"
++" * clearImmediate) stop enumerating, as patch 269 did for __vita*. Only\n"
++" * order and enumerability change; every property keeps its value. */\n"
++"(function () {\n"
++"\t/* the globals are taken away and put back: nothing below may look one\n"
++"\t * up (Object itself is among them) */\n"
++"\tvar hasOwn = Object.prototype.hasOwnProperty, DP = Object.defineProperty,\n"
++"\t\tGOPD = Object.getOwnPropertyDescriptor, GOPN = Object.getOwnPropertyNames;\n"
++"\tif (PRIV.ordered) return;\n"
++"\tPRIV.ordered = true;\n"
++"\tvar ORDER = (\n"
++"\t\t'Object Function Array Number parseFloat parseInt Infinity NaN ' +\n"
++"\t\t'undefined Boolean String Symbol Date Promise RegExp Error ' +\n"
++"\t\t'AggregateError EvalError RangeError ReferenceError SyntaxError ' +\n"
++"\t\t'TypeError URIError globalThis JSON Math Intl ArrayBuffer Atomics ' +\n"
++"\t\t'Uint8Array Int8Array Uint16Array Int16Array Uint32Array ' +\n"
++"\t\t'Int32Array BigUint64Array BigInt64Array Uint8ClampedArray ' +\n"
++"\t\t'Float32Array Float64Array DataView Map BigInt Set Iterator ' +\n"
++"\t\t'WeakMap WeakSet Proxy Reflect FinalizationRegistry WeakRef ' +\n"
++"\t\t'decodeURI decodeURIComponent encodeURI encodeURIComponent escape ' +\n"
++"\t\t'unescape eval isFinite isNaN console Option Image Audio webkitURL ' +\n"
++"\t\t'WebKitCSSMatrix XMLSerializer XMLHttpRequest XMLDocument ' +\n"
++"\t\t'WritableStreamDefaultWriter WritableStream Worker Window ' +\n"
++"\t\t'WheelEvent WebSocket URLSearchParams URL UIEvent TreeWalker ' +\n"
++"\t\t'TransformStream TouchEvent TextMetrics TextEncoderStream ' +\n"
++"\t\t'TextEncoder TextDecoderStream TextDecoder Text StyleSheet Storage ' +\n"
++"\t\t'ShadowRoot ScreenOrientation Screen SVGUseElement SVGTextElement ' +\n"
++"\t\t'SVGSVGElement SVGRectElement SVGPathElement SVGGraphicsElement ' +\n"
++"\t\t'SVGGElement SVGElement SVGCircleElement Response ResizeObserver ' +\n"
++"\t\t'Request ReadableStreamDefaultReader ReadableStream Range ' +\n"
++"\t\t'PromiseRejectionEvent ProcessingInstruction PointerEvent ' +\n"
++"\t\t'PluginArray Plugin Permissions PermissionStatus ' +\n"
++"\t\t'PerformanceResourceTiming PerformanceObserver ' +\n"
++"\t\t'PerformanceNavigationTiming PerformanceNavigation ' +\n"
++"\t\t'PerformanceMeasure PerformanceMark PerformanceEntry Performance ' +\n"
++"\t\t'Path2D NodeList NodeIterator NodeFilter Node Navigator ' +\n"
++"\t\t'NamedNodeMap MutationRecord MutationObserver MouseEvent ' +\n"
++"\t\t'MimeTypeArray MimeType MessagePort MessageEvent MessageChannel ' +\n"
++"\t\t'MediaQueryList Location KeyboardEvent IntersectionObserver ' +\n"
++"\t\t'InputEvent ImageData IDBTransaction IDBRequest IDBOpenDBRequest ' +\n"
++"\t\t'IDBObjectStore IDBKeyRange IDBIndex IDBFactory IDBDatabase ' +\n"
++"\t\t'History Headers HTMLVideoElement HTMLUnknownElement ' +\n"
++"\t\t'HTMLUListElement HTMLTrackElement HTMLTitleElement ' +\n"
++"\t\t'HTMLTimeElement HTMLTextAreaElement HTMLTemplateElement ' +\n"
++"\t\t'HTMLTableSectionElement HTMLTableRowElement HTMLTableElement ' +\n"
++"\t\t'HTMLTableColElement HTMLTableCellElement HTMLTableCaptionElement ' +\n"
++"\t\t'HTMLStyleElement HTMLSpanElement HTMLSourceElement ' +\n"
++"\t\t'HTMLSlotElement HTMLSelectElement HTMLScriptElement ' +\n"
++"\t\t'HTMLQuoteElement HTMLProgressElement HTMLPreElement ' +\n"
++"\t\t'HTMLPictureElement HTMLParagraphElement HTMLOutputElement ' +\n"
++"\t\t'HTMLOptionElement HTMLOptGroupElement HTMLObjectElement ' +\n"
++"\t\t'HTMLOListElement HTMLModElement HTMLMeterElement HTMLMetaElement ' +\n"
++"\t\t'HTMLMenuElement HTMLMediaElement HTMLMapElement HTMLLinkElement ' +\n"
++"\t\t'HTMLLegendElement HTMLLabelElement HTMLLIElement HTMLInputElement ' +\n"
++"\t\t'HTMLImageElement HTMLIFrameElement HTMLHtmlElement ' +\n"
++"\t\t'HTMLHeadingElement HTMLHeadElement HTMLHRElement HTMLFormElement ' +\n"
++"\t\t'HTMLFieldSetElement HTMLEmbedElement HTMLElement HTMLDocument ' +\n"
++"\t\t'HTMLDivElement HTMLDialogElement HTMLDetailsElement ' +\n"
++"\t\t'HTMLDataListElement HTMLDataElement HTMLDListElement ' +\n"
++"\t\t'HTMLCollection HTMLCanvasElement HTMLButtonElement ' +\n"
++"\t\t'HTMLBodyElement HTMLBaseElement HTMLBRElement HTMLAudioElement ' +\n"
++"\t\t'HTMLAreaElement HTMLAnchorElement FormData FontFace FocusEvent ' +\n"
++"\t\t'FileReader File EventTarget EventSource Event ErrorEvent Element ' +\n"
++"\t\t'DocumentType DocumentFragment Document DOMTokenList ' +\n"
++"\t\t'DOMRectReadOnly DOMRect DOMPointReadOnly DOMPoint DOMParser ' +\n"
++"\t\t'DOMMatrixReadOnly DOMMatrix DOMException CustomEvent ' +\n"
++"\t\t'CustomElementRegistry Crypto CompositionEvent Comment ' +\n"
++"\t\t'CharacterData CanvasRenderingContext2D CanvasPattern ' +\n"
++"\t\t'CanvasGradient CSSSupportsRule CSSStyleSheet CSSStyleRule ' +\n"
++"\t\t'CSSStyleDeclaration CSSRule CSSPageRule CSSNamespaceRule ' +\n"
++"\t\t'CSSMediaRule CSSLayerStatementRule CSSLayerBlockRule ' +\n"
++"\t\t'CSSKeyframesRule CSSKeyframeRule CSSImportRule CSSGroupingRule ' +\n"
++"\t\t'CSSFontFaceRule CSSContainerRule CSSConditionRule CSS ' +\n"
++"\t\t'CDATASection BroadcastChannel Blob Attr AbortSignal ' +\n"
++"\t\t'AbortController window self document name location customElements ' +\n"
++"\t\t'history closed frames length top opener parent frameElement ' +\n"
++"\t\t'navigator origin screen innerWidth innerHeight scrollX ' +\n"
++"\t\t'pageXOffset scrollY pageYOffset visualViewport outerWidth ' +\n"
++"\t\t'outerHeight devicePixelRatio onbeforeinput onblur onchange ' +\n"
++"\t\t'onclick oncontextmenu ondblclick ondrag ondragend ondragenter ' +\n"
++"\t\t'ondragleave ondragover ondragstart ondrop onerror onfocus oninput ' +\n"
++"\t\t'oninvalid onkeydown onkeypress onkeyup onload onmousedown ' +\n"
++"\t\t'onmouseenter onmouseleave onmousemove onmouseout onmouseover ' +\n"
++"\t\t'onmouseup onreset onresize onscroll onselect onsubmit ontoggle ' +\n"
++"\t\t'onwheel onpointerdown onpointermove onpointerup onpointercancel ' +\n"
++"\t\t'onpointerover onpointerout onpointerenter onpointerleave ' +\n"
++"\t\t'onselectstart onselectionchange onanimationend ' +\n"
++"\t\t'onanimationiteration onanimationstart ontransitionrun ' +\n"
++"\t\t'ontransitionstart ontransitionend onbeforeunload onhashchange ' +\n"
++"\t\t'onmessage onmessageerror onoffline ononline onpagehide onpageshow ' +\n"
++"\t\t'onpopstate onrejectionhandled onstorage onunhandledrejection ' +\n"
++"\t\t'onunload isSecureContext performance crypto indexedDB ' +\n"
++"\t\t'localStorage sessionStorage alert atob blur btoa ' +\n"
++"\t\t'cancelAnimationFrame cancelIdleCallback clearInterval ' +\n"
++"\t\t'clearTimeout close confirm createImageBitmap fetch focus ' +\n"
++"\t\t'getComputedStyle getSelection matchMedia open postMessage print ' +\n"
++"\t\t'prompt queueMicrotask reportError requestAnimationFrame ' +\n"
++"\t\t'requestIdleCallback scroll scrollBy scrollTo setInterval ' +\n"
++"\t\t'setTimeout structuredClone SuppressedError DisposableStack ' +\n"
++"\t\t'AsyncDisposableStack Float16Array WebAssembly ontouchcancel ' +\n"
++"\t\t'ontouchend ontouchmove ontouchstart Notification SharedWorker '\n"
++"\t).split(' ').filter(Boolean);\n"
++"\tvar known = Object.create(null), i;\n"
++"\tfor (i = 0; i < ORDER.length; i++) known[ORDER[i]] = 1;\n"
++"\t['DOMPurify', 'XF', 'HTML_Element', 'setImmediate', 'clearImmediate'].forEach(function (k) {\n"
++"\t\tvar d = GOPD(g, k);\n"
++"\t\tif (d && d.configurable && d.enumerable) { d.enumerable = false; try { DP(g, k, d); } catch (e) { /* */ } }\n"
++"\t});\n"
++"\tfunction remake(k) {\n"
++"\t\tvar d = GOPD(g, k);\n"
++"\t\tif (!d || !d.configurable) return;\n"
++"\t\ttry { delete g[k]; DP(g, k, d); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tvar names = GOPN(g);\n"
++"\tfor (i = 0; i < names.length; i++) if (!known[names[i]]) remake(names[i]);\n"
++"\tfor (i = 0; i < ORDER.length; i++) if (hasOwn.call(g, ORDER[i])) remake(ORDER[i]);\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 26649fdfd..4486654c2 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -5173,8 +5173,11 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 	if (!d) return;
+ 	var el = d.createElement('section'), E = Object.getPrototypeOf(el);
+ 	var T = Object.getPrototypeOf(d.createTextNode(''));
++	/* never Object.prototype: in the document-less realm the engine makes
++	 * first, a stub text node is a plain object, and Text's length landed
++	 * on every object there (patch 277) */
+ 	function acc(o, n, get, set) {
+-		if (!o) return;
++		if (!o || o === Object.prototype) return;
+ 		try {
+ 			var have = Object.getOwnPropertyDescriptor(o, n);
+ 			if (have || (n in o && o[n] !== undefined)) return;
+@@ -5182,7 +5185,7 @@ if (typeof g.DOMPoint === 'undefined') { define(g, 'DOMPoint', DOMPoint); define
+ 		try { Object.defineProperty(o, n, { get: get, set: set, configurable: true }); } catch (e) { /* */ }
+ 	}
+ 	function fn(o, n, f) {
+-		if (!o || typeof o[n] === 'function') return;
++		if (!o || o === Object.prototype || typeof o[n] === 'function') return;
+ 		try { Object.defineProperty(o, n, { value: f, writable: true, configurable: true }); } catch (e) { /* */ }
+ 	}
+ 	function parentEl() { var p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
+@@ -9650,4 +9653,133 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	});
+ 	try { if (g.screen && g.screen.orientation) hoist(g.screen.orientation, protoOf(g.screen.orientation, g.ScreenOrientation)); } catch (e) { /* */ }
+ })();
++/* ---- window's own properties in a browser's order (patch 277) -----------
++ * Object.keys(window) and Object.getOwnPropertyNames(window) list a
++ * global's properties in the order they were made. A browser makes the
++ * ECMAScript intrinsics, then window's attributes and operations in IDL
++ * order, its event handlers and interface objects, its newest APIs last;
++ * pages' globals follow. Fingerprinters read the tail (hCaptcha's hsw
++ * reads the descriptors of the last 24 keys: in Chromium fetchLater,
++ * getScreenDetails, queryLocalFonts, ...); here the tail was whatever the
++ * bridge happened to define last (onpageshow, onpagehide, onbeforeunload,
++ * ...). Window's configurable own properties are made again: the engine's
++ * own first, then those a browser has, in Chromium's order (the list
++ * below: Chromium 140's names that this engine has). The engine's helpers
++ * that are no web API (DOMPurify, XF, HTML_Element, setImmediate,
++ * clearImmediate) stop enumerating, as patch 269 did for __vita*. Only
++ * order and enumerability change; every property keeps its value. */
++(function () {
++	/* the globals are taken away and put back: nothing below may look one
++	 * up (Object itself is among them) */
++	var hasOwn = Object.prototype.hasOwnProperty, DP = Object.defineProperty,
++		GOPD = Object.getOwnPropertyDescriptor, GOPN = Object.getOwnPropertyNames;
++	if (PRIV.ordered) return;
++	PRIV.ordered = true;
++	var ORDER = (
++		'Object Function Array Number parseFloat parseInt Infinity NaN ' +
++		'undefined Boolean String Symbol Date Promise RegExp Error ' +
++		'AggregateError EvalError RangeError ReferenceError SyntaxError ' +
++		'TypeError URIError globalThis JSON Math Intl ArrayBuffer Atomics ' +
++		'Uint8Array Int8Array Uint16Array Int16Array Uint32Array ' +
++		'Int32Array BigUint64Array BigInt64Array Uint8ClampedArray ' +
++		'Float32Array Float64Array DataView Map BigInt Set Iterator ' +
++		'WeakMap WeakSet Proxy Reflect FinalizationRegistry WeakRef ' +
++		'decodeURI decodeURIComponent encodeURI encodeURIComponent escape ' +
++		'unescape eval isFinite isNaN console Option Image Audio webkitURL ' +
++		'WebKitCSSMatrix XMLSerializer XMLHttpRequest XMLDocument ' +
++		'WritableStreamDefaultWriter WritableStream Worker Window ' +
++		'WheelEvent WebSocket URLSearchParams URL UIEvent TreeWalker ' +
++		'TransformStream TouchEvent TextMetrics TextEncoderStream ' +
++		'TextEncoder TextDecoderStream TextDecoder Text StyleSheet Storage ' +
++		'ShadowRoot ScreenOrientation Screen SVGUseElement SVGTextElement ' +
++		'SVGSVGElement SVGRectElement SVGPathElement SVGGraphicsElement ' +
++		'SVGGElement SVGElement SVGCircleElement Response ResizeObserver ' +
++		'Request ReadableStreamDefaultReader ReadableStream Range ' +
++		'PromiseRejectionEvent ProcessingInstruction PointerEvent ' +
++		'PluginArray Plugin Permissions PermissionStatus ' +
++		'PerformanceResourceTiming PerformanceObserver ' +
++		'PerformanceNavigationTiming PerformanceNavigation ' +
++		'PerformanceMeasure PerformanceMark PerformanceEntry Performance ' +
++		'Path2D NodeList NodeIterator NodeFilter Node Navigator ' +
++		'NamedNodeMap MutationRecord MutationObserver MouseEvent ' +
++		'MimeTypeArray MimeType MessagePort MessageEvent MessageChannel ' +
++		'MediaQueryList Location KeyboardEvent IntersectionObserver ' +
++		'InputEvent ImageData IDBTransaction IDBRequest IDBOpenDBRequest ' +
++		'IDBObjectStore IDBKeyRange IDBIndex IDBFactory IDBDatabase ' +
++		'History Headers HTMLVideoElement HTMLUnknownElement ' +
++		'HTMLUListElement HTMLTrackElement HTMLTitleElement ' +
++		'HTMLTimeElement HTMLTextAreaElement HTMLTemplateElement ' +
++		'HTMLTableSectionElement HTMLTableRowElement HTMLTableElement ' +
++		'HTMLTableColElement HTMLTableCellElement HTMLTableCaptionElement ' +
++		'HTMLStyleElement HTMLSpanElement HTMLSourceElement ' +
++		'HTMLSlotElement HTMLSelectElement HTMLScriptElement ' +
++		'HTMLQuoteElement HTMLProgressElement HTMLPreElement ' +
++		'HTMLPictureElement HTMLParagraphElement HTMLOutputElement ' +
++		'HTMLOptionElement HTMLOptGroupElement HTMLObjectElement ' +
++		'HTMLOListElement HTMLModElement HTMLMeterElement HTMLMetaElement ' +
++		'HTMLMenuElement HTMLMediaElement HTMLMapElement HTMLLinkElement ' +
++		'HTMLLegendElement HTMLLabelElement HTMLLIElement HTMLInputElement ' +
++		'HTMLImageElement HTMLIFrameElement HTMLHtmlElement ' +
++		'HTMLHeadingElement HTMLHeadElement HTMLHRElement HTMLFormElement ' +
++		'HTMLFieldSetElement HTMLEmbedElement HTMLElement HTMLDocument ' +
++		'HTMLDivElement HTMLDialogElement HTMLDetailsElement ' +
++		'HTMLDataListElement HTMLDataElement HTMLDListElement ' +
++		'HTMLCollection HTMLCanvasElement HTMLButtonElement ' +
++		'HTMLBodyElement HTMLBaseElement HTMLBRElement HTMLAudioElement ' +
++		'HTMLAreaElement HTMLAnchorElement FormData FontFace FocusEvent ' +
++		'FileReader File EventTarget EventSource Event ErrorEvent Element ' +
++		'DocumentType DocumentFragment Document DOMTokenList ' +
++		'DOMRectReadOnly DOMRect DOMPointReadOnly DOMPoint DOMParser ' +
++		'DOMMatrixReadOnly DOMMatrix DOMException CustomEvent ' +
++		'CustomElementRegistry Crypto CompositionEvent Comment ' +
++		'CharacterData CanvasRenderingContext2D CanvasPattern ' +
++		'CanvasGradient CSSSupportsRule CSSStyleSheet CSSStyleRule ' +
++		'CSSStyleDeclaration CSSRule CSSPageRule CSSNamespaceRule ' +
++		'CSSMediaRule CSSLayerStatementRule CSSLayerBlockRule ' +
++		'CSSKeyframesRule CSSKeyframeRule CSSImportRule CSSGroupingRule ' +
++		'CSSFontFaceRule CSSContainerRule CSSConditionRule CSS ' +
++		'CDATASection BroadcastChannel Blob Attr AbortSignal ' +
++		'AbortController window self document name location customElements ' +
++		'history closed frames length top opener parent frameElement ' +
++		'navigator origin screen innerWidth innerHeight scrollX ' +
++		'pageXOffset scrollY pageYOffset visualViewport outerWidth ' +
++		'outerHeight devicePixelRatio onbeforeinput onblur onchange ' +
++		'onclick oncontextmenu ondblclick ondrag ondragend ondragenter ' +
++		'ondragleave ondragover ondragstart ondrop onerror onfocus oninput ' +
++		'oninvalid onkeydown onkeypress onkeyup onload onmousedown ' +
++		'onmouseenter onmouseleave onmousemove onmouseout onmouseover ' +
++		'onmouseup onreset onresize onscroll onselect onsubmit ontoggle ' +
++		'onwheel onpointerdown onpointermove onpointerup onpointercancel ' +
++		'onpointerover onpointerout onpointerenter onpointerleave ' +
++		'onselectstart onselectionchange onanimationend ' +
++		'onanimationiteration onanimationstart ontransitionrun ' +
++		'ontransitionstart ontransitionend onbeforeunload onhashchange ' +
++		'onmessage onmessageerror onoffline ononline onpagehide onpageshow ' +
++		'onpopstate onrejectionhandled onstorage onunhandledrejection ' +
++		'onunload isSecureContext performance crypto indexedDB ' +
++		'localStorage sessionStorage alert atob blur btoa ' +
++		'cancelAnimationFrame cancelIdleCallback clearInterval ' +
++		'clearTimeout close confirm createImageBitmap fetch focus ' +
++		'getComputedStyle getSelection matchMedia open postMessage print ' +
++		'prompt queueMicrotask reportError requestAnimationFrame ' +
++		'requestIdleCallback scroll scrollBy scrollTo setInterval ' +
++		'setTimeout structuredClone SuppressedError DisposableStack ' +
++		'AsyncDisposableStack Float16Array WebAssembly ontouchcancel ' +
++		'ontouchend ontouchmove ontouchstart Notification SharedWorker '
++	).split(' ').filter(Boolean);
++	var known = Object.create(null), i;
++	for (i = 0; i < ORDER.length; i++) known[ORDER[i]] = 1;
++	['DOMPurify', 'XF', 'HTML_Element', 'setImmediate', 'clearImmediate'].forEach(function (k) {
++		var d = GOPD(g, k);
++		if (d && d.configurable && d.enumerable) { d.enumerable = false; try { DP(g, k, d); } catch (e) { /* */ } }
++	});
++	function remake(k) {
++		var d = GOPD(g, k);
++		if (!d || !d.configurable) return;
++		try { delete g[k]; DP(g, k, d); } catch (e) { /* */ }
++	}
++	var names = GOPN(g);
++	for (i = 0; i < names.length; i++) if (!known[names[i]]) remake(names[i]);
++	for (i = 0; i < ORDER.length; i++) if (hasOwn.call(g, ORDER[i])) remake(ORDER[i]);
++})();
+ })(this);
