@@ -42,6 +42,9 @@ gcc $SAN -no-pie "$OUT"/obj/*.o "$QJ/lib/libquickjs.a" -lm -lpthread -o "$OUT/ha
 # the polyfill's WebAssembly section, with what it expects around it
 { echo 'var g = globalThis;'
   echo 'function define(o, n, v) { Object.defineProperty(o, n, { value: v, writable: true, configurable: true, enumerable: false }); }'
+  # the polyfill's private per-object record (patch 276)
+  echo 'var PRIV = { pv: new WeakMap() };'
+  echo 'function PV(o) { if (o === null || (typeof o !== "object" && typeof o !== "function")) return {}; var r = PRIV.pv.get(o); if (!r) { r = {}; PRIV.pv.set(o, r); } return r; }'
   sed -n '/^\/\* ---- WebAssembly ----/,/^\/\* ---- canvas 2D: a real drawing context/p' "$Q/vita_polyfill.js" | sed '$d'
 } > "$OUT/poly.js"
 for m in basic imports memimport; do

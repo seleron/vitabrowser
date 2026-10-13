@@ -43,6 +43,10 @@ which (if any) turns the challenge into the refusal the engine gets
                      the engine's); FILE's motionData keeps Chromium's own
                      timestamps shifted onto the engine's events
   --fields LIST      which fields (default motionData,pdc,pem,ws,clientOptions)
+  --order FILE       window's configurable own properties are made again in
+                     FILE's order (one name per line: the engine's
+                     Object.getOwnPropertyNames(window)), after the other
+                     flags -- so the two runs enumerate window alike
   --log-access       print every global / prototype member hCaptcha's frames
                      read (FPACC lines), to compare with the engine's surface
   --record DIR       record hsw for replay (hsw-record.js): DIR/<frame>.rec
@@ -129,6 +133,7 @@ def main():
     ap.add_argument("--no-proto-uuid", action="store_true")
     ap.add_argument("--transplant")
     ap.add_argument("--fields", default="motionData,pdc,pem,ws,clientOptions")
+    ap.add_argument("--order")
     ap.add_argument("--log-access", action="store_true")
     ap.add_argument("--record")
     a = ap.parse_args()
@@ -209,6 +214,12 @@ def main():
                  "writable:false,enumerable:false,configurable:true});")
     if a.enum_keys:
         init += enum_init
+    if a.order:
+        order = [l.strip() for l in open(a.order) if l.strip()]
+        init += ("(function(N){var D=Object.defineProperty,G=Object.getOwnPropertyDescriptor,"
+                 "H=Object.prototype.hasOwnProperty;for(var i=0;i<N.length;i++){var k=N[i];"
+                 "if(!H.call(window,k))continue;var d=G(window,k);if(!d||!d.configurable)continue;"
+                 "try{delete window[k];D(window,k,d)}catch(e){}}})(%s);" % json.dumps(order))
     slow = max(1, a.cpu / 3)
     out, sizes = [], []
     with sync_playwright() as pw:

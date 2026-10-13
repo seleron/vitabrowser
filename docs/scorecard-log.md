@@ -4,6 +4,20 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patches 273-277 (r54-277-fresh, fresh reference)
+
+The platform-shape batch (window a Window, built-ins shaped, APIs on
+the interface prototypes, Chromium's key order) touches every script,
+so the build was scored against a fresh Chrome reference taken with it
+and compared with r52b-272 (the 268-272 build on its own same-hour
+reference): mean **83.4** (r52b 83.8). JS error counts unchanged on all
+21 sites; every static / docs / jquery / wordpress / spa site identical.
+The drops are on the reference side: Wikipedia's visual 0.698 -> 0.541
+is Chrome's reference now opening with Wikipedia's "install the app"
+banner (our render is pixel-identical to r52b's); rte / cnnlite are
+live front pages, oldreddit and ddglite walled as before. Load times
+within run-to-run noise. r54 is the baseline for the next change.
+
 ## 2026-10-13 — r52 re-scored: 268-272 on r51's reference (r52-272-r51ref)
 
 The task said r52 on r51's reference, and r52-272 (06:56) predates the

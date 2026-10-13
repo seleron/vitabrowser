@@ -306,6 +306,38 @@ past call 4401. The transplant can go one level deeper: hsw's own
 collected values are JSON-like before they are packed into `n`, so the
 same JSON hook may show them in plain text.
 
+### The surface fixed, the key order matched (2026-10-13, third round)
+
+Patches 273-277 fix the standards deviations listed above: window is a
+Window (273), built-ins have a built-in's shape and every interface its
+tag (275), navigator / screen / performance / crypto / history keep
+their members on their prototypes with Crypto.prototype.randomUUID, and
+the engine's internals are out of the page's sight (276), window's own
+properties come in Chromium's order and the engine's helpers do not
+enumerate (277). After each, the demo still refuses the engine (797
+bytes), and the wasm replay stays identical in V8 and the engine.
+
+**The key-order fork (call 4401), explained.** hsw takes
+Object.getOwnPropertyDescriptor(window, k) for the last 24 keys of
+Object.keys(window) (index 121 of 145 in both engines then). Chromium's
+last keys are its newest APIs (fetchLater, getScreenDetails,
+queryLocalFonts, ...) and then the page's globals (Raven, _sharedLibs,
+hsw); the engine's were the bridge's last-defined handlers (onpageshow,
+onpagehide, onbeforeunload, ...). Patch 277 re-creates window's
+properties in Chromium's order: the engine's tail is now ... setTimeout,
+structuredClone, ontouchcancel ... ontouchstart, Raven, _sharedLibs,
+hsw. `chrome-demo.py --order FILE` gives Chromium the engine's order;
+with it (and --touch: Chrome on a phone has ontouch* as accessors, as
+the engine does) and the engine's document layout, the aligned trace
+runs through the walk to call 5418, where the page's own globals differ
+by one at walk time -- and Chromium still gets its challenge.
+
+So the order and the shape are matched and the refusal stands. What the
+aligned trace still differs on before 5418 is document's own-property
+layout (136 own members, Chromium 1; given to Chromium, it still passes)
+and values (clocks, memory sizes). What is left to examine: past 5418,
+and the parts of `n` no trace shows (hsw's own timing measurements).
+
 ## How to measure again
 
 The scripts were scratch files; the method:

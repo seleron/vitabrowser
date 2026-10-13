@@ -3797,3 +3797,53 @@ the run (mean 83.8; docs/scorecard-log.md).
 DEVICE 6/6 and PERFTIME 10/10 expected. Check 6 shows the battery the
 browser reads ("level 0.85, charging false, dischargingTime ..."): compare
 it with the Vita's own battery indicator, plugged in and unplugged.
+
+### Patches 273-277 (2026-10-13): the platform shaped as a browser's
+
+The standards gaps the hCaptcha record/compare found (docs/wasm-hcaptcha-
+measurement.md, "Record, replay"), fixed as what they are. None of them
+is the hCaptcha refusal (Chromium given each still passes; the demo still
+refuses the engine).
+
+- **273: window is a Window.** `Object.prototype.toString(window)` said
+  `[object global]` (QuickJS-ng's own tag); window's first prototype was
+  the bridge's WANT census object. Now window -> Window.prototype ->
+  WindowProperties (the census object, still logging misses) ->
+  EventTarget.prototype; TEMPORARY / PERSISTENT.
+- **274: 256 network test pages** (the gate's list passed 128).
+- **275: built-ins shaped as built-ins.** 504 of 870 operations had a
+  prototype property and could be new'd, 542 of 575 accessors were
+  anonymous: method-shaped stand-ins, accessors named "get x"; every
+  interface prototype its own @@toStringTag (`String(document.body)`
+  said `[object EventTarget]`); 18 polyfill accessors configurable and
+  enumerable; QuickJS's Function.prototype.fileName / lineNumber /
+  columnNumber gone.
+- **276: the APIs on the interface prototypes.** navigator, screen,
+  performance, crypto, history, screen.orientation have no own
+  properties (navigator had 29); Crypto.prototype.randomUUID; the
+  engine's history hooks on __vitaHistory, the EventTarget shim's
+  listeners in a WeakMap, the polyfill's ~30 marks and per-element
+  fields in a private per-object record. Not yet: document (136 own
+  members) and elements (__ptr, ...).
+- **277: window's own properties in Chromium's order** (fingerprinters
+  read the tail of Object.keys(window)); DOMPurify, XF, HTML_Element,
+  setImmediate / clearImmediate stop enumerating; a pre-existing bug
+  fixed (Text's length accessor landed on Object.prototype in the
+  document-less startup realm).
+
+Sim-verified: gate pages JS-window-proto (WINPROTO 6/6), JS-builtin-shape
+(BSHAPE 8/8), JS-api-protos (APIPROTO 7/7), JS-window-order (WINORDER
+5/5), each Chromium-verified; full sim gate exit 0 after each patch
+(gate-273 ... gate-277; the first 275 gate caught a double-wrapped
+characterData setter, JS-chardata 4/5, fixed before the commit); a
+scratch application of the whole stack (363 + the two known collisions)
+reproduces the gated tree; tools/test-wasm.sh ASan + UBSan clean and the
+hsw replay identical in V8 and the engine.
+
+**On the device (run 38), in addition:** open the bundled
+`JS-window-proto.html`, `JS-builtin-shape.html`, `JS-api-protos.html`,
+`JS-window-order.html`: 6/6, 8/8, 7/7, 5/5 expected. Then browse two or
+three script-heavy sites from the usual list (Google, the Guardian,
+YouTube): every built-in method now goes through a stand-in, so watch
+for a site that worked in run 37 and now does not, and for slower
+script-heavy pages.

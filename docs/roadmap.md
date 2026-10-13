@@ -131,8 +131,12 @@ on text inputs, buttons, selects, textareas (225).
    hsw run identically, and with the engine's whole request but `n`
    transplanted Chromium still passes -- the refusal is in hsw's
    fingerprint `n`; ten more surface differences given to Chromium all
-   pass. Next, if pursued: key order and the native-function shape
-   (docs/wasm-hcaptcha-measurement.md, "Record, replay").
+   pass. *Patches 273-277:* key order and the native-function shape
+   matched (window a Window, built-ins shaped, APIs on prototypes,
+   Chromium's key order); the aligned trace now runs to call 5418 and the
+   demo still refuses. Left: document's own layout (and elements'), the
+   trace past 5418, hsw's timing (docs/wasm-hcaptcha-measurement.md,
+   "third round").
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 
