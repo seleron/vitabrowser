@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS performance timing (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+p { margin: 2px 0; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="sum">PERFTIME: 0/10 passed</div>
+<p id="r1" class="wait">1 waiting</p>
+<p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+<p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+<p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
+<p id="r9" class="wait">9 waiting</p>
+<p id="r10" class="wait">10 waiting</p>
+<script>
+/* patch 270: performance.now() in 100 us steps (High Resolution Time,
+ * not cross-origin isolated; it was the raw 0.1 us clock); User Timing
+ * L3 -- mark() / measure() record entries (they did nothing), measure's
+ * argument forms and errors, getEntries* in time order, clearMarks /
+ * clearMeasures, the PerformanceMark constructor; the navigation entry
+ * is a PerformanceResourceTiming and a PerformanceEntry;
+ * performance.toJSON() and memory. Chromium-verified. */
+(function () {
+	var k = 0, N = 10;
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'PERFTIME: ' + k + '/' + N + ' passed';
+		document.title = 'JS performance timing (' + k + '/' + N + ')';
+	}
+	function check(n, f, text) {
+		try { var r = f(); t(n, r === true, text + (r === true ? '' : ': ' + r)); }
+		catch (e) { t(n, false, text + ': ' + e); }
+	}
+	function later(n, p, text) {
+		Promise.resolve().then(p).then(function (r) { t(n, r === true, text + (r === true ? '' : ': ' + r)); },
+			function (e) { t(n, false, text + ': ' + e); });
+	}
+	check(1, function () {
+		var bad = 0, i, v;
+		for (i = 0; i < 300; i++) { v = performance.now() * 10; if (Math.abs(v - Math.round(v)) > 1e-4) bad++; }
+		return bad === 0 || bad + ' of 300 readings finer than 100 us';
+	}, 'now() is coarsened to 100 us');
+	check(2, function () {
+		var m = performance.mark('a', { detail: { x: [1, 2] } });
+		return (m instanceof PerformanceMark && m instanceof PerformanceEntry && m.entryType === 'mark' &&
+			m.name === 'a' && m.duration === 0 && m.detail.x[1] === 2 && typeof m.startTime === 'number') ||
+			'got ' + Object.prototype.toString.call(m);
+	}, 'mark() returns a PerformanceMark');
+	check(3, function () {
+		var a = performance.mark('s', { startTime: 10 }), b = performance.mark('e', { startTime: 25.5 });
+		var m = performance.measure('se', 's', 'e');
+		return (m instanceof PerformanceMeasure && m.startTime === 10 && m.duration === 15.5 && m.detail === null) ||
+			JSON.stringify(m && m.toJSON());
+	}, 'measure() between two marks');
+	check(4, function () {
+		var m = performance.measure('opt', { start: 5, duration: 7, detail: 'd' });
+		var n = performance.measure('opt2', { end: 30, duration: 10 });
+		return (m.startTime === 5 && m.duration === 7 && m.detail === 'd' && n.startTime === 20 && n.duration === 10) ||
+			JSON.stringify([m.toJSON(), n.toJSON()]);
+	}, 'measure() with options');
+	check(5, function () {
+		var errs = [];
+		try { performance.measure('x', 'no-such-mark'); errs.push('none'); } catch (e) { errs.push(e.name); }
+		try { performance.mark('navigationStart'); errs.push('none'); } catch (e) { errs.push(e.name); }
+		try { performance.measure('x', { start: 1, end: 2, duration: 1 }); errs.push('none'); } catch (e) { errs.push(e.name); }
+		try { performance.measure('x', { start: 1 }, 'e'); errs.push('none'); } catch (e) { errs.push(e.name); }
+		return errs.join() === 'SyntaxError,SyntaxError,TypeError,TypeError' || errs.join();
+	}, 'the errors measure() and mark() throw');
+	check(6, function () {
+		/* (as a set: Chromium returns marks in recording order, the spec's
+		 * filter-buffer step sorts them by startTime) */
+		var marks = performance.getEntriesByType('mark').map(function (e) { return e.name; }).sort().join();
+		var byName = performance.getEntriesByName('se').length + performance.getEntriesByName('se', 'mark').length;
+		var all = performance.getEntries(), sorted = all.every(function (e, i) { return !i || all[i - 1].startTime <= e.startTime; });
+		return (marks === 'a,e,s' && byName === 1 && sorted) || marks + ' ' + byName + ' ' + sorted;
+	}, 'getEntriesByType / ByName, getEntries in time order');
+	check(7, function () {
+		performance.clearMarks('a');
+		var x = new PerformanceMark('free', { startTime: 3 });
+		var names = performance.getEntriesByType('mark').map(function (e) { return e.name; }).sort().join();
+		performance.clearMeasures();
+		return (names === 'e,s' && x.startTime === 3 && performance.getEntriesByType('measure').length === 0) || names;
+	}, 'clearMarks / clearMeasures; new PerformanceMark is not recorded');
+	check(8, function () {
+		var n = performance.getEntriesByType('navigation')[0];
+		return (n instanceof PerformanceNavigationTiming && n instanceof PerformanceResourceTiming &&
+			n instanceof PerformanceEntry) || 'nav entry ' + Object.prototype.toString.call(n);
+	}, 'the navigation entry is a PerformanceResourceTiming');
+	check(9, function () {
+		var j = performance.toJSON();
+		return (typeof j.timeOrigin === 'number' && typeof j.timing === 'object' && performance.navigation.type === 0) ||
+			JSON.stringify(j).slice(0, 80);
+	}, 'performance.toJSON(), performance.navigation');
+	check(10, function () {
+		var m = performance.memory;
+		return (m && m.usedJSHeapSize > 0 && m.usedJSHeapSize <= m.totalJSHeapSize && m.totalJSHeapSize <= m.jsHeapSizeLimit) ||
+			JSON.stringify(m);
+	}, 'performance.memory');
+})();
+</script>
+</body>
+</html>

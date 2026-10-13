@@ -1,0 +1,447 @@
+# netsurf: performance.now() in 100 us steps; User Timing; the entry
+# interfaces; performance.memory (patch 270)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 269)
+#
+#  - macsurf_qjs.c qjs_monotonic_ms: what scripts read (performance.now(),
+#    animation-frame and event timestamps, timeOrigin) is coarsened to 100
+#    microseconds, as High Resolution Time requires of a page that is not
+#    cross-origin isolated (Chromium: 100 us). It was the raw clock in 0.1
+#    us steps -- the timer precision cache-timing attacks need. The
+#    engine's own timing keeps the full clock.
+#  - vita_polyfill.js: performance.mark() / measure() did nothing. Now User
+#    Timing Level 3: marks (detail cloned), measures between mark names,
+#    Navigation Timing attribute names or times, or from an options
+#    dictionary, with the spec's SyntaxError / TypeError cases; in
+#    getEntries() / ByType / ByName in time order with the navigation
+#    entry; clearMarks / clearMeasures; new PerformanceMark(). Interfaces
+#    PerformanceEntry, PerformanceResourceTiming (now the navigation
+#    entry's parent), PerformanceMark, PerformanceMeasure,
+#    PerformanceNavigation (performance.navigation), performance.toJSON().
+#    PerformanceObserver still delivers nothing, so supportedEntryTypes
+#    stays [].
+#  - performance.memory (Chromium's): this runtime's script heap from
+#    JS_ComputeMemoryUsage (__vitaJsHeap, a reading kept for 1 s), in 100
+#    KB steps.
+#
+# Gate: testpages/pages/JS-perf-timing.html (PERFTIME 10/10, Chromium
+# 10/10; Chromium lists marks in recording order where the spec sorts by
+# startTime, so that check compares them as a set).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -18,6 +18,7 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <math.h>
+ #include <string.h>
+ #include <strings.h>
+ #include <ctype.h>
+@@ -1191,11 +1192,45 @@
+ 	return owner != NULL ? now - owner->t_origin : now;
+ }
+ 
++/* VitaBrowser patch 270: what scripts read -- performance.now(), and the
++ * animation-frame and event timestamps and timeOrigin built on it -- is
++ * coarsened to 100 microseconds, as High Resolution Time requires of a
++ * page that is not cross-origin isolated (the timer precision Spectre-type
++ * attacks need; browsers clamp to 100 us). It was the raw clock, 0.1 us
++ * steps. The engine's own timing keeps the full clock. */
+ static JSValue qjs_monotonic_ms(JSContext *ctx, JSValueConst this_val,
+ 		int argc, JSValueConst *argv)
+ {
+ 	(void)this_val; (void)argc; (void)argv;
+-	return JS_NewFloat64(ctx, qjs_realm_now(ctx));
++	return JS_NewFloat64(ctx, floor(qjs_realm_now(ctx) * 10.0) / 10.0);
++}
++
++/* VitaBrowser patch 270: __vitaJsHeap() -> [used, allocated, limit] in
++ * bytes, this runtime's script heap, for performance.memory (the
++ * polyfill). Walking the heap costs time on a big page, so a reading is
++ * kept for a second; the polyfill rounds it to 100 KB, about the detail
++ * Chromium gives without its precise-memory-info switch. */
++static JSValue qjs_js_heap(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	static JSRuntime *rt_last;
++	static double t_last = -1e9;
++	static JSMemoryUsage mu;
++	JSRuntime *rt = JS_GetRuntime(ctx);
++	double now = macsurf_qjs_get_now();
++	JSValue a;
++	(void)this_val; (void)argc; (void)argv;
++	if (rt != rt_last || now - t_last > 1000.0) {
++		JS_ComputeMemoryUsage(rt, &mu);
++		rt_last = rt;
++		t_last = now;
++	}
++	a = JS_NewArray(ctx);
++	JS_SetPropertyUint32(ctx, a, 0, JS_NewFloat64(ctx, (double)mu.memory_used_size));
++	JS_SetPropertyUint32(ctx, a, 1, JS_NewFloat64(ctx, (double)mu.malloc_size));
++	JS_SetPropertyUint32(ctx, a, 2, JS_NewFloat64(ctx,
++			mu.malloc_limit > 0 ? (double)mu.malloc_limit : 0.0));
++	return a;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -13123,6 +13158,7 @@
+ 
+ 	/* --- monotonic clock for performance.now() --- */
+ 	qjs_set_func(ctx, global, "__macsurf_monotonic_ms", qjs_monotonic_ms, 0);
++	qjs_set_func(ctx, global, "__vitaJsHeap", qjs_js_heap, 0);
+ 	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
+ 	qjs_set_func(ctx, global, "__vitaSubmitForm", qjs_submit_form, 2); /* 263 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -8963,6 +8963,172 @@
+ 	} catch (e) { /* */ }
+ })();
+ 
++/* ---- User Timing, the entry interfaces, performance.memory (patch 270) ---
++ * performance.mark() and measure() did nothing and returned undefined, and
++ * there was no PerformanceEntry to test entries against. Now User Timing
++ * Level 3: mark() records a PerformanceMark (detail cloned), measure()
++ * takes start / end as mark names, Navigation Timing attribute names or
++ * times, or an options dictionary (start, end, duration, detail), with the
++ * spec's errors (SyntaxError for an unknown mark, TypeError for
++ * contradictory options); both are in getEntries() / ByType / ByName in
++ * time order with the navigation entry, and clearMarks / clearMeasures
++ * remove them. PerformanceEntry, PerformanceResourceTiming (the navigation
++ * entry's parent interface), PerformanceMark, PerformanceMeasure and
++ * PerformanceNavigation are the interfaces they belong to. PerformanceObserver
++ * still delivers no entries, so its supportedEntryTypes stays empty.
++ * performance.memory (Chromium's) gives this runtime's script heap from
++ * the engine (macsurf_qjs.c __vitaJsHeap), in 100 KB steps. */
++(function () {
++	var P = g.performance;
++	if (!P || !isFn(P.now) || P.__vitaUserTiming) return;
++	var I = new WeakMap(), marks = [], measures = [];
++	function illegal() { throw new TypeError('Illegal constructor'); }
++	var Entry = function PerformanceEntry() { illegal(); };
++	var RT = function PerformanceResourceTiming() { illegal(); };
++	var Measure = function PerformanceMeasure() { illegal(); };
++	var Nav = function PerformanceNavigation() { illegal(); };
++	function attr(proto, k, f) { Object.defineProperty(proto, k, { get: f, enumerable: true, configurable: true }); }
++	function own(e) { var v = I.get(e); if (!v) throw new TypeError('Illegal invocation'); return v; }
++	['name', 'entryType', 'startTime', 'duration'].forEach(function (k) {
++		attr(Entry.prototype, k, function () { return own(this)[k]; });
++	});
++	define(Entry.prototype, 'toJSON', function toJSON() {
++		return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
++	});
++	function clone(v) {
++		if (v === undefined || v === null) return null;
++		return isFn(g.structuredClone) ? g.structuredClone(v) : JSON.parse(JSON.stringify(v));
++	}
++	var TIMING = ['navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
++		'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
++		'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading',
++		'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
++		'loadEventStart', 'loadEventEnd'];
++	function make(proto, type, name, start, dur, detail) {
++		var e = Object.create(proto);
++		I.set(e, { name: name, entryType: type, startTime: start, duration: dur, detail: detail });
++		return e;
++	}
++	var Mark = function PerformanceMark(markName, markOptions) {
++		if (!new.target) throw new TypeError("Failed to construct 'PerformanceMark': Please use the 'new' operator");
++		if (arguments.length < 1) throw new TypeError("Failed to construct 'PerformanceMark': 1 argument required, but only 0 present.");
++		var name = String(markName), o = markOptions == null ? {} : markOptions;
++		if (TIMING.indexOf(name) >= 0) throw new DOMException("'" + name + "' is part of the PerformanceTiming interface, and cannot be used as a mark name.", 'SyntaxError');
++		var st = o.startTime === undefined ? P.now() : Number(o.startTime);
++		if (!(st >= 0)) throw new TypeError("'" + name + "' cannot have a negative start time.");
++		I.set(this, { name: name, entryType: 'mark', startTime: st, duration: 0, detail: clone(o.detail) });
++	};
++	Object.setPrototypeOf(Mark.prototype, Entry.prototype);
++	Object.setPrototypeOf(Measure.prototype, Entry.prototype);
++	Object.setPrototypeOf(RT.prototype, Entry.prototype);
++	[Mark, Measure].forEach(function (C) {
++		attr(C.prototype, 'detail', function () { return own(this).detail; });
++		define(C.prototype, 'toJSON', function toJSON() {
++			var o = Entry.prototype.toJSON.call(this); o.detail = this.detail; return o;
++		});
++	});
++	[[Entry, 'PerformanceEntry'], [RT, 'PerformanceResourceTiming'], [Mark, 'PerformanceMark'],
++	 [Measure, 'PerformanceMeasure'], [Nav, 'PerformanceNavigation']].forEach(function (p) {
++		try { Object.defineProperty(p[0].prototype, Symbol.toStringTag, { value: p[1], configurable: true }); } catch (e) { /* */ }
++		if (!g[p[1]]) define(g, p[1], p[0]);
++	});
++	if (P.__vitaNav) try { Object.setPrototypeOf(Object.getPrototypeOf(P.__vitaNav), RT.prototype); } catch (e) { /* */ }
++	function toTime(m, what) {
++		if (typeof m === 'number') {
++			if (m < 0) throw new TypeError("'" + what + "' cannot have a negative time stamp.");
++			return m;
++		}
++		m = String(m);
++		if (TIMING.indexOf(m) >= 0) {
++			var t = P.timing ? P.timing[m] : 0;
++			if (!t) throw new DOMException("'" + m + "' is empty: either the event hasn't happened yet, or it would provide cross-origin timing information.", 'InvalidAccessError');
++			return t - P.timing.navigationStart;
++		}
++		for (var i = marks.length - 1; i >= 0; i--) if (I.get(marks[i]).name === m) return I.get(marks[i]).startTime;
++		throw new DOMException("The mark '" + m + "' does not exist.", 'SyntaxError');
++	}
++	define(P, 'mark', function mark(markName, markOptions) {
++		if (arguments.length < 1) throw new TypeError("Failed to execute 'mark' on 'Performance': 1 argument required, but only 0 present.");
++		var e = new Mark(markName, markOptions);
++		marks.push(e);
++		return e;
++	});
++	define(P, 'measure', function measure(measureName, startOrOptions, endMark) {
++		if (arguments.length < 1) throw new TypeError("Failed to execute 'measure' on 'Performance': 1 argument required, but only 0 present.");
++		var name = String(measureName), o = null, start, end;
++		if (startOrOptions !== null && typeof startOrOptions === 'object' &&
++		    (startOrOptions.start !== undefined || startOrOptions.end !== undefined ||
++		     startOrOptions.duration !== undefined || startOrOptions.detail !== undefined)) {
++			o = startOrOptions;
++			if (endMark !== undefined) throw new TypeError("If a non-empty PerformanceMeasureOptions object was passed, |end_mark| must not be passed.");
++			if (o.start === undefined && o.end === undefined) throw new TypeError("If a non-empty PerformanceMeasureOptions object was passed, at least one of its 'start' or 'end' properties must be present.");
++			if (o.start !== undefined && o.duration !== undefined && o.end !== undefined) throw new TypeError("If a non-empty PerformanceMeasureOptions object was passed, it must not have all of its 'start', 'duration', and 'end' properties defined");
++		}
++		if (endMark !== undefined) end = toTime(endMark, 'end');
++		else if (o && o.end !== undefined) end = toTime(o.end, 'end');
++		else if (o && o.start !== undefined && o.duration !== undefined) end = toTime(o.start, 'start') + toTime(Number(o.duration), 'duration');
++		else end = P.now();
++		if (o && o.start !== undefined) start = toTime(o.start, 'start');
++		else if (o && o.duration !== undefined && o.end !== undefined) start = end - toTime(Number(o.duration), 'duration');
++		else if (!o && startOrOptions !== undefined && startOrOptions !== null && typeof startOrOptions !== 'object') start = toTime(startOrOptions, 'start');
++		else start = 0;
++		var e = make(Measure.prototype, 'measure', name, start, end - start, clone(o ? o.detail : null));
++		measures.push(e);
++		return e;
++	});
++	function drop(list, name) {
++		for (var i = list.length - 1; i >= 0; i--)
++			if (name === undefined || I.get(list[i]).name === String(name)) list.splice(i, 1);
++	}
++	define(P, 'clearMarks', function clearMarks(markName) { drop(marks, markName); });
++	define(P, 'clearMeasures', function clearMeasures(measureName) { drop(measures, measureName); });
++	var base = P.getEntries, baseType = P.getEntriesByType, baseName = P.getEntriesByName;
++	function ordered(a) {
++		return a.map(function (e, i) { return [e, i]; }).sort(function (x, y) {
++			return (x[0].startTime - y[0].startTime) || (x[1] - y[1]);
++		}).map(function (x) { return x[0]; });
++	}
++	define(P, 'getEntries', function getEntries() {
++		return ordered((isFn(base) ? base.call(P) || [] : []).concat(marks, measures));
++	});
++	define(P, 'getEntriesByType', function getEntriesByType(type) {
++		type = String(type);
++		var r = isFn(baseType) ? baseType.call(P, type) || [] : [];
++		return ordered(r.concat(type === 'mark' ? marks : type === 'measure' ? measures : []));
++	});
++	define(P, 'getEntriesByName', function getEntriesByName(name, type) {
++		name = String(name);
++		var r = isFn(baseName) ? baseName.call(P, name, type) || [] : [];
++		var mine = marks.concat(measures).filter(function (e) {
++			var v = I.get(e); return v.name === name && (type === undefined || v.entryType === String(type));
++		});
++		return ordered(r.concat(mine));
++	});
++	if (!P.navigation) {
++		var nav = Object.create(Nav.prototype);
++		Object.defineProperty(Nav.prototype, 'type', { get: function () { return 0; }, enumerable: true, configurable: true });
++		Object.defineProperty(Nav.prototype, 'redirectCount', { get: function () { return 0; }, enumerable: true, configurable: true });
++		[['TYPE_NAVIGATE', 0], ['TYPE_RELOAD', 1], ['TYPE_BACK_FORWARD', 2], ['TYPE_RESERVED', 255]].forEach(function (c) {
++			Object.defineProperty(Nav, c[0], { value: c[1], enumerable: true });
++			Object.defineProperty(Nav.prototype, c[0], { value: c[1], enumerable: true });
++		});
++		define(Nav.prototype, 'toJSON', function toJSON() { return { type: 0, redirectCount: 0 }; });
++		try { Object.defineProperty(P, 'navigation', { value: nav, configurable: true, enumerable: true }); } catch (e) { /* */ }
++	}
++	define(P, 'toJSON', function toJSON() {
++		return { timeOrigin: P.timeOrigin, timing: P.timing && isFn(P.timing.toJSON) ? P.timing.toJSON() : P.timing,
++			navigation: P.navigation && isFn(P.navigation.toJSON) ? P.navigation.toJSON() : P.navigation };
++	});
++	if (isFn(g.__vitaJsHeap) && P.memory === undefined) {
++		var step = function (b) { return Math.round(b / 102400) * 102400; };
++		Object.defineProperty(P, 'memory', { configurable: true, enumerable: true, get: function () {
++			var h = g.__vitaJsHeap();
++			return { jsHeapSizeLimit: step(h[2]), totalJSHeapSize: step(h[1]), usedJSHeapSize: step(h[0]) };
++		} });
++	}
++	define(P, '__vitaUserTiming', true);
++})();
++
+ /* ---- the browser's functions look like a browser's (patch 269) ----------
+  * window's operations and interface objects are the browser's own: per
+  * WebIDL an operation is an enumerable data property whose function is
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -8964,6 +8964,172 @@
+ "\t} catch (e) { /* */ }\n"
+ "})();\n"
+ "\n"
++"/* ---- User Timing, the entry interfaces, performance.memory (patch 270) ---\n"
++" * performance.mark() and measure() did nothing and returned undefined, and\n"
++" * there was no PerformanceEntry to test entries against. Now User Timing\n"
++" * Level 3: mark() records a PerformanceMark (detail cloned), measure()\n"
++" * takes start / end as mark names, Navigation Timing attribute names or\n"
++" * times, or an options dictionary (start, end, duration, detail), with the\n"
++" * spec's errors (SyntaxError for an unknown mark, TypeError for\n"
++" * contradictory options); both are in getEntries() / ByType / ByName in\n"
++" * time order with the navigation entry, and clearMarks / clearMeasures\n"
++" * remove them. PerformanceEntry, PerformanceResourceTiming (the navigation\n"
++" * entry's parent interface), PerformanceMark, PerformanceMeasure and\n"
++" * PerformanceNavigation are the interfaces they belong to. PerformanceObserver\n"
++" * still delivers no entries, so its supportedEntryTypes stays empty.\n"
++" * performance.memory (Chromium's) gives this runtime's script heap from\n"
++" * the engine (macsurf_qjs.c __vitaJsHeap), in 100 KB steps. */\n"
++"(function () {\n"
++"\tvar P = g.performance;\n"
++"\tif (!P || !isFn(P.now) || P.__vitaUserTiming) return;\n"
++"\tvar I = new WeakMap(), marks = [], measures = [];\n"
++"\tfunction illegal() { throw new TypeError('Illegal constructor'); }\n"
++"\tvar Entry = function PerformanceEntry() { illegal(); };\n"
++"\tvar RT = function PerformanceResourceTiming() { illegal(); };\n"
++"\tvar Measure = function PerformanceMeasure() { illegal(); };\n"
++"\tvar Nav = function PerformanceNavigation() { illegal(); };\n"
++"\tfunction attr(proto, k, f) { Object.defineProperty(proto, k, { get: f, enumerable: true, configurable: true }); }\n"
++"\tfunction own(e) { var v = I.get(e); if (!v) throw new TypeError('Illegal invocation'); return v; }\n"
++"\t['name', 'entryType', 'startTime', 'duration'].forEach(function (k) {\n"
++"\t\tattr(Entry.prototype, k, function () { return own(this)[k]; });\n"
++"\t});\n"
++"\tdefine(Entry.prototype, 'toJSON', function toJSON() {\n"
++"\t\treturn { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };\n"
++"\t});\n"
++"\tfunction clone(v) {\n"
++"\t\tif (v === undefined || v === null) return null;\n"
++"\t\treturn isFn(g.structuredClone) ? g.structuredClone(v) : JSON.parse(JSON.stringify(v));\n"
++"\t}\n"
++"\tvar TIMING = ['navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',\n"
++"\t\t'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',\n"
++"\t\t'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading',\n"
++"\t\t'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',\n"
++"\t\t'loadEventStart', 'loadEventEnd'];\n"
++"\tfunction make(proto, type, name, start, dur, detail) {\n"
++"\t\tvar e = Object.create(proto);\n"
++"\t\tI.set(e, { name: name, entryType: type, startTime: start, duration: dur, detail: detail });\n"
++"\t\treturn e;\n"
++"\t}\n"
++"\tvar Mark = function PerformanceMark(markName, markOptions) {\n"
++"\t\tif (!new.target) throw new TypeError(\"Failed to construct 'PerformanceMark': Please use the 'new' operator\");\n"
++"\t\tif (arguments.length < 1) throw new TypeError(\"Failed to construct 'PerformanceMark': 1 argument required, but only 0 present.\");\n"
++"\t\tvar name = String(markName), o = markOptions == null ? {} : markOptions;\n"
++"\t\tif (TIMING.indexOf(name) >= 0) throw new DOMException(\"'\" + name + \"' is part of the PerformanceTiming interface, and cannot be used as a mark name.\", 'SyntaxError');\n"
++"\t\tvar st = o.startTime === undefined ? P.now() : Number(o.startTime);\n"
++"\t\tif (!(st >= 0)) throw new TypeError(\"'\" + name + \"' cannot have a negative start time.\");\n"
++"\t\tI.set(this, { name: name, entryType: 'mark', startTime: st, duration: 0, detail: clone(o.detail) });\n"
++"\t};\n"
++"\tObject.setPrototypeOf(Mark.prototype, Entry.prototype);\n"
++"\tObject.setPrototypeOf(Measure.prototype, Entry.prototype);\n"
++"\tObject.setPrototypeOf(RT.prototype, Entry.prototype);\n"
++"\t[Mark, Measure].forEach(function (C) {\n"
++"\t\tattr(C.prototype, 'detail', function () { return own(this).detail; });\n"
++"\t\tdefine(C.prototype, 'toJSON', function toJSON() {\n"
++"\t\t\tvar o = Entry.prototype.toJSON.call(this); o.detail = this.detail; return o;\n"
++"\t\t});\n"
++"\t});\n"
++"\t[[Entry, 'PerformanceEntry'], [RT, 'PerformanceResourceTiming'], [Mark, 'PerformanceMark'],\n"
++"\t [Measure, 'PerformanceMeasure'], [Nav, 'PerformanceNavigation']].forEach(function (p) {\n"
++"\t\ttry { Object.defineProperty(p[0].prototype, Symbol.toStringTag, { value: p[1], configurable: true }); } catch (e) { /* */ }\n"
++"\t\tif (!g[p[1]]) define(g, p[1], p[0]);\n"
++"\t});\n"
++"\tif (P.__vitaNav) try { Object.setPrototypeOf(Object.getPrototypeOf(P.__vitaNav), RT.prototype); } catch (e) { /* */ }\n"
++"\tfunction toTime(m, what) {\n"
++"\t\tif (typeof m === 'number') {\n"
++"\t\t\tif (m < 0) throw new TypeError(\"'\" + what + \"' cannot have a negative time stamp.\");\n"
++"\t\t\treturn m;\n"
++"\t\t}\n"
++"\t\tm = String(m);\n"
++"\t\tif (TIMING.indexOf(m) >= 0) {\n"
++"\t\t\tvar t = P.timing ? P.timing[m] : 0;\n"
++"\t\t\tif (!t) throw new DOMException(\"'\" + m + \"' is empty: either the event hasn't happened yet, or it would provide cross-origin timing information.\", 'InvalidAccessError');\n"
++"\t\t\treturn t - P.timing.navigationStart;\n"
++"\t\t}\n"
++"\t\tfor (var i = marks.length - 1; i >= 0; i--) if (I.get(marks[i]).name === m) return I.get(marks[i]).startTime;\n"
++"\t\tthrow new DOMException(\"The mark '\" + m + \"' does not exist.\", 'SyntaxError');\n"
++"\t}\n"
++"\tdefine(P, 'mark', function mark(markName, markOptions) {\n"
++"\t\tif (arguments.length < 1) throw new TypeError(\"Failed to execute 'mark' on 'Performance': 1 argument required, but only 0 present.\");\n"
++"\t\tvar e = new Mark(markName, markOptions);\n"
++"\t\tmarks.push(e);\n"
++"\t\treturn e;\n"
++"\t});\n"
++"\tdefine(P, 'measure', function measure(measureName, startOrOptions, endMark) {\n"
++"\t\tif (arguments.length < 1) throw new TypeError(\"Failed to execute 'measure' on 'Performance': 1 argument required, but only 0 present.\");\n"
++"\t\tvar name = String(measureName), o = null, start, end;\n"
++"\t\tif (startOrOptions !== null && typeof startOrOptions === 'object' &&\n"
++"\t\t    (startOrOptions.start !== undefined || startOrOptions.end !== undefined ||\n"
++"\t\t     startOrOptions.duration !== undefined || startOrOptions.detail !== undefined)) {\n"
++"\t\t\to = startOrOptions;\n"
++"\t\t\tif (endMark !== undefined) throw new TypeError(\"If a non-empty PerformanceMeasureOptions object was passed, |end_mark| must not be passed.\");\n"
++"\t\t\tif (o.start === undefined && o.end === undefined) throw new TypeError(\"If a non-empty PerformanceMeasureOptions object was passed, at least one of its 'start' or 'end' properties must be present.\");\n"
++"\t\t\tif (o.start !== undefined && o.duration !== undefined && o.end !== undefined) throw new TypeError(\"If a non-empty PerformanceMeasureOptions object was passed, it must not have all of its 'start', 'duration', and 'end' properties defined\");\n"
++"\t\t}\n"
++"\t\tif (endMark !== undefined) end = toTime(endMark, 'end');\n"
++"\t\telse if (o && o.end !== undefined) end = toTime(o.end, 'end');\n"
++"\t\telse if (o && o.start !== undefined && o.duration !== undefined) end = toTime(o.start, 'start') + toTime(Number(o.duration), 'duration');\n"
++"\t\telse end = P.now();\n"
++"\t\tif (o && o.start !== undefined) start = toTime(o.start, 'start');\n"
++"\t\telse if (o && o.duration !== undefined && o.end !== undefined) start = end - toTime(Number(o.duration), 'duration');\n"
++"\t\telse if (!o && startOrOptions !== undefined && startOrOptions !== null && typeof startOrOptions !== 'object') start = toTime(startOrOptions, 'start');\n"
++"\t\telse start = 0;\n"
++"\t\tvar e = make(Measure.prototype, 'measure', name, start, end - start, clone(o ? o.detail : null));\n"
++"\t\tmeasures.push(e);\n"
++"\t\treturn e;\n"
++"\t});\n"
++"\tfunction drop(list, name) {\n"
++"\t\tfor (var i = list.length - 1; i >= 0; i--)\n"
++"\t\t\tif (name === undefined || I.get(list[i]).name === String(name)) list.splice(i, 1);\n"
++"\t}\n"
++"\tdefine(P, 'clearMarks', function clearMarks(markName) { drop(marks, markName); });\n"
++"\tdefine(P, 'clearMeasures', function clearMeasures(measureName) { drop(measures, measureName); });\n"
++"\tvar base = P.getEntries, baseType = P.getEntriesByType, baseName = P.getEntriesByName;\n"
++"\tfunction ordered(a) {\n"
++"\t\treturn a.map(function (e, i) { return [e, i]; }).sort(function (x, y) {\n"
++"\t\t\treturn (x[0].startTime - y[0].startTime) || (x[1] - y[1]);\n"
++"\t\t}).map(function (x) { return x[0]; });\n"
++"\t}\n"
++"\tdefine(P, 'getEntries', function getEntries() {\n"
++"\t\treturn ordered((isFn(base) ? base.call(P) || [] : []).concat(marks, measures));\n"
++"\t});\n"
++"\tdefine(P, 'getEntriesByType', function getEntriesByType(type) {\n"
++"\t\ttype = String(type);\n"
++"\t\tvar r = isFn(baseType) ? baseType.call(P, type) || [] : [];\n"
++"\t\treturn ordered(r.concat(type === 'mark' ? marks : type === 'measure' ? measures : []));\n"
++"\t});\n"
++"\tdefine(P, 'getEntriesByName', function getEntriesByName(name, type) {\n"
++"\t\tname = String(name);\n"
++"\t\tvar r = isFn(baseName) ? baseName.call(P, name, type) || [] : [];\n"
++"\t\tvar mine = marks.concat(measures).filter(function (e) {\n"
++"\t\t\tvar v = I.get(e); return v.name === name && (type === undefined || v.entryType === String(type));\n"
++"\t\t});\n"
++"\t\treturn ordered(r.concat(mine));\n"
++"\t});\n"
++"\tif (!P.navigation) {\n"
++"\t\tvar nav = Object.create(Nav.prototype);\n"
++"\t\tObject.defineProperty(Nav.prototype, 'type', { get: function () { return 0; }, enumerable: true, configurable: true });\n"
++"\t\tObject.defineProperty(Nav.prototype, 'redirectCount', { get: function () { return 0; }, enumerable: true, configurable: true });\n"
++"\t\t[['TYPE_NAVIGATE', 0], ['TYPE_RELOAD', 1], ['TYPE_BACK_FORWARD', 2], ['TYPE_RESERVED', 255]].forEach(function (c) {\n"
++"\t\t\tObject.defineProperty(Nav, c[0], { value: c[1], enumerable: true });\n"
++"\t\t\tObject.defineProperty(Nav.prototype, c[0], { value: c[1], enumerable: true });\n"
++"\t\t});\n"
++"\t\tdefine(Nav.prototype, 'toJSON', function toJSON() { return { type: 0, redirectCount: 0 }; });\n"
++"\t\ttry { Object.defineProperty(P, 'navigation', { value: nav, configurable: true, enumerable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tdefine(P, 'toJSON', function toJSON() {\n"
++"\t\treturn { timeOrigin: P.timeOrigin, timing: P.timing && isFn(P.timing.toJSON) ? P.timing.toJSON() : P.timing,\n"
++"\t\t\tnavigation: P.navigation && isFn(P.navigation.toJSON) ? P.navigation.toJSON() : P.navigation };\n"
++"\t});\n"
++"\tif (isFn(g.__vitaJsHeap) && P.memory === undefined) {\n"
++"\t\tvar step = function (b) { return Math.round(b / 102400) * 102400; };\n"
++"\t\tObject.defineProperty(P, 'memory', { configurable: true, enumerable: true, get: function () {\n"
++"\t\t\tvar h = g.__vitaJsHeap();\n"
++"\t\t\treturn { jsHeapSizeLimit: step(h[2]), totalJSHeapSize: step(h[1]), usedJSHeapSize: step(h[0]) };\n"
++"\t\t} });\n"
++"\t}\n"
++"\tdefine(P, '__vitaUserTiming', true);\n"
++"})();\n"
++"\n"
+ "/* ---- the browser's functions look like a browser's (patch 269) ----------\n"
+ " * window's operations and interface objects are the browser's own: per\n"
+ " * WebIDL an operation is an enumerable data property whose function is\n"
