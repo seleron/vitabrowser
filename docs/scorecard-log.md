@@ -4,6 +4,32 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patches 268-272 scored, fresh Chrome reference (r53-272-freshref)
+
+r52-272 scored the 268-272 stack on r51's reference (mean 82.4) just
+before the polyfill's final edit (06:57) landed; r53 re-scores the
+current build on a **fresh** Chrome reference, the eight sites of the
+tiers 269-272 touch (wiki / news / forum / search / spa): mean
+**84.7**, JS error counts unchanged (bbc 1, guardian 2, claude 1).
+
+| site | r51 (267) | r53 (268-272) | note |
+|---|---|---|---|
+| hackernews | 89.4 | 92.2 | +2.8, live front page |
+| bbc | 89.4 | 89.3 | |
+| wikipedia | 87.9 | 87.9 | |
+| guardian | 81.4 | 81.5 | |
+| stackoverflow | 85.9 | 85.2 | -0.7, live question list |
+| google | 79.7 | 79.7 | |
+| claude | 75.4 | 75.4 | |
+| rte | not in r51's site table | 86.2 | |
+
+No site dropped more than 0.7 points and the set is live content:
+268-272 (native-code built-ins, 100 us timers, honest screen / plugins /
+permissions, getBattery from the hardware) regressed nothing the
+scorecard can see -- expected, they are honesty fixes, not layout work.
+r53 is the baseline for the next change (`--reuse-ref
+r53-272-freshref`).
+
 ## 2026-10-13 — run 37 build, fresh Chrome reference (r51-full-267-fresh)
 
 No engine change: the run 37 hand-off build (patches 168-267, restaged
