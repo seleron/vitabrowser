@@ -3885,3 +3885,23 @@ Found on the way, older than these patches (not fixed): a capture
 listener on the event's target fires twice per event; a
 createHTMLDocument document's querySelector misses nodes appended after it
 was made.
+
+### Patch 281 (2026-10-13): timers
+
+- **281: HTML's timer nesting clamp; timers on time.** A timer set more
+  than five timer tasks deep waits at least 4 ms (setTimeout(0) chains
+  ran every link at 0 ms); requestAnimationFrame is not a timer task. The
+  idle loop sleeps until the next JavaScript timer instead of a flat
+  16 ms, and the event-loop pump waits (inside its 10 ms budget) for a
+  timer due within 4.5 ms: setTimeout(50) fires at 50 ms (64 before). The
+  autotest waits up to 4 s into a page for a running short-timer chain.
+
+Sim-verified: JS-timer-nesting (TIMERNEST 4/4, Chromium 4/4); full sim
+gate exit 0 (gate-281d, after three failing runs fixed on the way: the
+300-link chain read early twice, the stall pages held for 20 s); Vita
+cross-build green.
+
+**On the device (run 38), in addition:** `JS-timer-nesting.html` 4/4,
+and JS-frame-local's timer chain (check 6) under 1.5 s on the Vita's
+clock. Watch that pages with a setTimeout(0) heartbeat do not keep the
+screen from idling (battery) -- the loop now wakes for due timers.

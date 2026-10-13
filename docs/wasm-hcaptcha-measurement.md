@@ -370,6 +370,45 @@ Chromium, compare the call that reads getOwnPropertyNames(window)).
 After 280 the demo still refuses (797 bytes; the engine's request is 21.2
 KB, from ~23.5). Next: hsw's own timing measurements.
 
+### Timing (2026-10-13, fifth round)
+
+What hsw measures with the clocks, measured the same way in both engines
+(tools/hcaptcha/timing/: a clock probe that logs every performance.now()
+and Date.now() value read in hCaptcha's frames, with no other overhead --
+the record/replay recorder cannot be used for timing: its per-call memory
+work, ~1.5 ms an import call in Chromium, swamps what is timed).
+
+- **What hsw times.** A busy loop on the clock (run until
+  performance.now() changes: Chromium 80-98 such runs a page, median
+  67-76 reads per 100 us tick; the engine 40, median 28) and a DOM
+  benchmark (128 setAttribute calls between two clock reads, eight
+  times). In the challenge frame Chromium reads performance.now() 9300-
+  11500 times and Date.now() 439; the engine 1700 and 39.
+- **The values' shape.** The engine's performance.now() is always an
+  exact tenth of a ms (patch 270's rounding); Chromium's carry the
+  arithmetic's residue (325.20000000298023: 17 % exact). Given to
+  Chromium (timing/clean-tenths.js): challenge, 3 of 3.
+- **Speed.** Chromium throttled 25x and 50x: challenge. Its request then
+  shrinks to 25-28 KB, the engine's size: hsw collects as much as its
+  time allows, which is all the engine's smaller payload ever was.
+- **The clocks' consistency.** Date.now() - performance.now() held within
+  5 ms through hsw's run in the engine (no WSL clock step landed in it).
+- **The event loop** (timing/event-loop.html): requestAnimationFrame 16.1
+  ms apart (Chromium 16.7). setTimeout(fn, 0) chained ten deep ran every
+  link at 0 ms -- HTML clamps a timer set more than five timer tasks deep
+  to 4 ms (Chromium: 4 ms from the seventh) -- and timers ran up to a
+  frame late (setTimeout(50) at 64 ms). Chromium given frame-late timers
+  (timing/late-timers.js): challenge, 3 of 3. Both fixed anyway as what
+  they are (patch 281: the nesting clamp, and the loop and the pump wake
+  for the next timer -- setTimeout(50) at 50 ms, a clamped link after 4).
+
+So hsw's timing is not the refusal either: clock shape, speed and timer
+behaviour each given to Chromium leave it passing, and the demo refuses
+the engine after 281 (797 bytes). Everything Chromium can be given has
+now been given to it -- the surface (5ae275c, 273-280), the request's
+other fields (--transplant), the descriptors inside the collector (280)
+and the timing (this round) -- and it passes every time.
+
 ## How to measure again
 
 The scripts were scratch files; the method:

@@ -138,8 +138,10 @@ on text inputs, buttons, selects, textareas (225).
    (private records for the engine's internals), and the descriptors
    hsw's collector reads inside one call (enumerable operations, window
    accessors, Intl, iframe / img interfaces, CSSStyleDeclaration,
-   Storage); still refused. Next: hsw's own timing
-   (docs/wasm-hcaptcha-measurement.md, "fourth round").
+   Storage); still refused. *Timing (281):* clock shape, speed and
+   timer lateness each given to Chromium leave it passing; the HTML
+   timer nesting clamp was missing and timers ran a frame late (both
+   fixed); still refused (docs/wasm-hcaptcha-measurement.md, "Timing").
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

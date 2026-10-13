@@ -4,6 +4,17 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patch 281 (r56-281-fresh, fresh reference)
+
+Timers clamped as HTML says and fired on time, and the autotest's
+settle waiting for short-timer chains -- every page's event loop, so
+scored against a fresh reference: mean **83.6** (r55 83.7), JS error
+counts unchanged (Wikipedia's one from r55 gone: no network pulse drawn
+this run); only Hacker News moved by more than 0.5 (-1.9, its live front
+page: same stories, new scores, text 0.97 -> 0.94). Load times down where
+timers carried the page (the Guardian 4.4 -> 1.1 s, GitHub 14.3 -> 9.8 s),
+up nowhere by more than 0.5 s. r56 is the baseline.
+
 ## 2026-10-13 — patches 278-280 (r55-280-fresh, fresh reference)
 
 Document, nodes and descriptors browser-shaped (window attributes as

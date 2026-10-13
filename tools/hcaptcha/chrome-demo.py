@@ -47,6 +47,8 @@ which (if any) turns the challenge into the refusal the engine gets
                      FILE's order (one name per line: the engine's
                      Object.getOwnPropertyNames(window)), after the other
                      flags -- so the two runs enumerate window alike
+  --init FILE        one more init script (e.g. timing-probe.js); console
+                     lines it writes that start with TMREC are printed
   --log-access       print every global / prototype member hCaptcha's frames
                      read (FPACC lines), to compare with the engine's surface
   --record DIR       record hsw for replay (hsw-record.js): DIR/<frame>.rec
@@ -134,6 +136,7 @@ def main():
     ap.add_argument("--transplant")
     ap.add_argument("--fields", default="motionData,pdc,pem,ws,clientOptions")
     ap.add_argument("--order")
+    ap.add_argument("--init", action="append", default=[])
     ap.add_argument("--log-access", action="store_true")
     ap.add_argument("--record")
     a = ap.parse_args()
@@ -240,6 +243,8 @@ def main():
                     f.write(body + "\n")
             ctx.expose_binding("__hswRec", rec)
             ctx.add_init_script(path=os.path.join(HERE, "hsw-record.js"))
+        for f in a.init:
+            ctx.add_init_script(path=f)
         if a.log_access:
             ctx.add_init_script(path=os.path.join(HERE, "access-log.js"))
         if init:
@@ -254,7 +259,7 @@ def main():
         p = ctx.new_page()
         if a.cpu > 1:
             ctx.new_cdp_session(p).send("Emulation.setCPUThrottlingRate", {"rate": a.cpu})
-        p.on("console", lambda m: print(m.text) if m.text.startswith(("FPACC", "INITERR", "TRANSPLANT")) else None)
+        p.on("console", lambda m: print(m.text) if m.text.startswith(("FPACC", "INITERR", "TRANSPLANT", "TMREC")) else None)
         p.on("request", lambda r: sizes.append(len(r.post_data_buffer or b""))
              if "getcaptcha" in r.url else None)
 
