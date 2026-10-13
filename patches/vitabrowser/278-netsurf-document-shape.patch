@@ -1,0 +1,469 @@
+# netsurf: document keeps its members on Document.prototype; the engine's
+# per-object private records (patch 278)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 277)
+#
+# In a browser the document's only own property is location (unforgeable);
+# everything else is Document.prototype's (and Node's / EventTarget's).
+# Here document carried 136 own members, the bridge's internals among them
+# (__createElementNative, __getBody, _reg, __msCap, __msRegOnce, _listeners,
+# __ms_ready_fired, _elements, ...). hsw reads Object.getOwnPropertyNames
+# (document).
+#
+#  - macsurf_qjs.c: __vitaP(obj), installed first in
+#    macsurf_qjs_setup_globals, gives the engine a private record per object
+#    (a WeakMap; not enumerable); qjs_priv() is its C side. The document's
+#    native hooks are set on its record, and every engine script that used
+#    them (createElement / createTextNode / ... wrappers, the document event
+#    registry, DOMContentLoaded / load readiness) reaches them through
+#    __vitaP(document); the load path writes readyState there. The stub
+#    document's never-filled _elements map is gone.
+#  - vita_polyfill.js, last section: each public own member of document moves
+#    to Document.prototype -- a method as it is, a value as a read-only
+#    accessor over the document's record (domain settable, as in browsers),
+#    an accessor as it is -- on every pass (the bridge installs its members
+#    again when the real document arrives). A document it did not build reads
+#    undefined, as before (none inherits Document.prototype today: the
+#    scratch documents of createHTMLDocument / DOMParser are their own
+#    objects, and keep their own members).
+#
+# Not changed: scratch documents' layout; their querySelector does not see
+# nodes appended after creation (found here, older than this patch).
+#
+# Gate: testpages/pages/JS-document-shape.html (DOCSHAPE 6/6, Chromium 6/6;
+# the build before fails 1 and 2).
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+index c964d3261..97c8bb39f 100644
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1540,6 +1540,31 @@ static JSValue qjs_location_reload(JSContext *ctx, JSValueConst this_val,
+ 	return JS_UNDEFINED;
+ }
+ 
++/* VitaBrowser patch 278: the engine's own state about a page object --
++ * a document's native hooks, its event registry, ... -- lives in a record
++ * per object that only the engine can reach: __vitaP(obj) (a WeakMap in
++ * macsurf_qjs_setup_globals), not as the object's own properties a page
++ * sees. This is its C side; on failure, the object itself. */
++static JSValue qjs_priv(JSContext *ctx, JSValueConst obj)
++{
++	JSValue g = JS_GetGlobalObject(ctx);
++	JSValue f = JS_GetPropertyStr(ctx, g, "__vitaP");
++	JSValue r;
++
++	JS_FreeValue(ctx, g);
++	if (!JS_IsFunction(ctx, f)) {
++		JS_FreeValue(ctx, f);
++		return JS_DupValue(ctx, obj);
++	}
++	r = JS_Call(ctx, f, JS_UNDEFINED, 1, &obj);
++	JS_FreeValue(ctx, f);
++	if (JS_IsException(r)) {
++		JS_FreeValue(ctx, JS_GetException(ctx));
++		return JS_DupValue(ctx, obj);
++	}
++	return r;
++}
++
+ /* History API Phase B (Patch 136): evaluate history.__traverse(delta) in
+  * ctx. The JS shim keeps the pushState session entries; this returns true
+  * when one was shown (popstate already fired), false when the step leaves
+@@ -12260,6 +12285,8 @@ static void qjs_dom_install(JSContext *ctx)
+ {
+ 	JSValue global = JS_GetGlobalObject(ctx);
+ 	JSValue doc    = JS_GetPropertyStr(ctx, global, "document");
++	/* patch 278: the hooks below are the engine's, not the page's */
++	JSValue dpriv  = qjs_priv(ctx, doc);
+ 	dom_document *document = qjs_document_for_ctx(ctx);
+ 
+ 	/* fixes872 (#300) - before any element is wrapped in this realm. */
+@@ -12274,18 +12301,18 @@ static void qjs_dom_install(JSContext *ctx)
+ 		/* Real libdom-backed createElement (native fast path; JS wrapper
+ 		 * below adds a parentNode-tracking fallback for the pre-document
+ 		 * window). */
+-		qjs_set_func(ctx, doc, "__createElementNative",
++		qjs_set_func(ctx, dpriv, "__createElementNative",
+ 				qjs_create_element, 1);
+ 		/* fixes870 (#297) - createElementNS: Preact's only element factory. */
+-		qjs_set_func(ctx, doc, "__createElementNSNative",
++		qjs_set_func(ctx, dpriv, "__createElementNSNative",
+ 				qjs_create_element_ns, 3);
+ 		/* fixes846 (#167 S3) - real createTextNode/createDocumentFragment,
+ 		 * same native-fast-path/JS-fallback shape as createElement above. */
+-		qjs_set_func(ctx, doc, "__createTextNodeNative",
++		qjs_set_func(ctx, dpriv, "__createTextNodeNative",
+ 				qjs_create_text_node, 1);
+-		qjs_set_func(ctx, doc, "__createCommentNative",
++		qjs_set_func(ctx, dpriv, "__createCommentNative",
+ 				qjs_create_comment_node, 1);
+-		qjs_set_func(ctx, doc, "__createDocumentFragmentNative",
++		qjs_set_func(ctx, dpriv, "__createDocumentFragmentNative",
+ 				qjs_create_document_fragment, 0);
+ 		/* fixes879 - document.cookie as a REAL accessor pair over the
+ 		 * urldb jar, replacing the `document.cookie=''` data property
+@@ -12309,7 +12336,7 @@ static void qjs_dom_install(JSContext *ctx)
+ 		 * Two halves. First the registration hook the JS shims call, so
+ 		 * document.addEventListener / window.addEventListener reach
+ 		 * dom_event_target_add_event_listener. */
+-		qjs_set_func(ctx, doc, "__msRegDocEvent", qjs_doc_reg_event, 2);
++		qjs_set_func(ctx, dpriv, "__msRegDocEvent", qjs_doc_reg_event, 2);
+ 
+ 		/* Second: put the JS `document` object in the wrap table, keyed by
+ 		 * the document dom_node, so qjs_dom_listener_cb's qjs_wrap_lookup
+@@ -12345,10 +12372,10 @@ static void qjs_dom_install(JSContext *ctx)
+ 
+ 		/* Native section accessors used by the body/head/documentElement
+ 		 * getters installed in JS below. */
+-		qjs_set_func(ctx, doc, "__getDocumentElement",
++		qjs_set_func(ctx, dpriv, "__getDocumentElement",
+ 				qjs_get_document_element, 0);
+-		qjs_set_func(ctx, doc, "__getBody", qjs_get_body, 0);
+-		qjs_set_func(ctx, doc, "__getHead", qjs_get_head, 0);
++		qjs_set_func(ctx, dpriv, "__getBody", qjs_get_body, 0);
++		qjs_set_func(ctx, dpriv, "__getHead", qjs_get_head, 0);
+ 
+ 		/* Define body / head / documentElement as getters that return the
+ 		 * live libdom-wrapped element, falling back to a parentNode-tracking
+@@ -12452,7 +12479,7 @@ static void qjs_dom_install(JSContext *ctx)
+ 			"if(_cp&&_cp.prototype){try{Object.setPrototypeOf(el,_cp.prototype);}catch(e){}}}"
+ 			"return el;}"
+ 			"d.createElement=function(tag){"
+-			"var n=d.__createElementNative?d.__createElementNative(tag):null;"
++			"var n=__vitaP(d).__createElementNative?__vitaP(d).__createElementNative(tag):null;"
+ 			"if(n)return n;return mkfb(tag);};"
+ 			/* fixes870 (#297) - createElementNS, Preact's only element factory.
+ 			 * Same native-then-fallback shape as createElement above. `opt` is
+@@ -12461,28 +12488,28 @@ static void qjs_dom_install(JSContext *ctx)
+ 			 * object, so swallowing it here guarantees the native side can
+ 			 * never be handed an object it might try to read as a string. */
+ 			"d.createElementNS=function(ns,tag,opt){"
+-			"var n=d.__createElementNSNative?"
+-				"d.__createElementNSNative(ns,tag):null;"
++			"var n=__vitaP(d).__createElementNSNative?"
++				"__vitaP(d).__createElementNSNative(ns,tag):null;"
+ 			"if(n)return n;return mkfb(tag);};"
+-			"if(typeof d.createDocumentFragment!=='function'||!d.__hasFrag){"
+-			"d.__hasFrag=true;"
++			"if(typeof d.createDocumentFragment!=='function'||!__vitaP(d).__hasFrag){"
++			"__vitaP(d).__hasFrag=true;"
+ 			"d.createDocumentFragment=function(){"
+-			"var n=d.__createDocumentFragmentNative?"
+-			"d.__createDocumentFragmentNative():null;"
++			"var n=__vitaP(d).__createDocumentFragmentNative?"
++			"__vitaP(d).__createDocumentFragmentNative():null;"
+ 			"if(n)return n;return mkfb('#fragment');};"
+ 			"}"
+ 			"var _fbHtml=null,_fbBody=null,_fbHead=null;"
+ 			"Object.defineProperty(d,'documentElement',{configurable:true,"
+-			"get:function(){var n=d.__getDocumentElement();if(n)return n;"
++			"get:function(){var n=__vitaP(d).__getDocumentElement();if(n)return n;"
+ 			"if(!_fbHtml)_fbHtml=mkfb('html');return _fbHtml;}});"
+ 			"Object.defineProperty(d,'body',{configurable:true,"
+-			"get:function(){var n=d.__getBody();if(n)return n;"
++			"get:function(){var n=__vitaP(d).__getBody();if(n)return n;"
+ 			"if(!_fbBody){try{__msLife('document.body fell back to mkfb "
+ 			"(no real body yet)');}catch(e){}_fbBody=mkfb('body');"
+ 			"_fbBody.__msFallbackBody=1;}"
+ 			"return _fbBody;}});"
+ 			"Object.defineProperty(d,'head',{configurable:true,"
+-			"get:function(){var n=d.__getHead();if(n)return n;"
++			"get:function(){var n=__vitaP(d).__getHead();if(n)return n;"
+ 			"if(!_fbHead)_fbHead=mkfb('head');return _fbHead;}});"
+ 			/* fixes1180 (#267) - document.clientWidth/clientHeight.
+ 			 *
+@@ -12569,6 +12596,7 @@ static void qjs_dom_install(JSContext *ctx)
+ 				"<doc-proto>", JS_EVAL_TYPE_GLOBAL);
+ 		JS_FreeValue(ctx, r);
+ 	}
++	JS_FreeValue(ctx, dpriv);
+ 	JS_FreeValue(ctx, doc);
+ 	JS_FreeValue(ctx, global);
+ }
+@@ -13511,8 +13539,8 @@ static void register_browser_globals(JSContext *ctx)
+ 					"return document.implementation."
+ 					"createHTMLDocument('');}};"
+ 			"document.createTextNode=document.createTextNode||function(t){"
+-				"var n=document.__createTextNodeNative?"
+-					"document.__createTextNodeNative(String(t)):null;"
++				"var n=__vitaP(document).__createTextNodeNative?"
++					"__vitaP(document).__createTextNodeNative(String(t)):null;"
+ 				"if(n)return n;"
+ 				"return {nodeValue:String(t),textContent:String(t),"
+ 					"appendChild:function(){return null;},data:String(t)};};"
+@@ -13621,8 +13649,8 @@ static void register_browser_globals(JSContext *ctx)
+ 			 * before page scripts run; return null in the pre-document fallback
+ 			 * rather than falsely manufacturing the wrong node type. */
+ 			"document.createComment=function(t){"
+-				"return document.__createCommentNative?"
+-				"document.__createCommentNative(t):null;};"
++				"return __vitaP(document).__createCommentNative?"
++				"__vitaP(document).__createCommentNative(t):null;};"
+ 			/* fixes1010 - the same universals on `document`.
+ 			 *
+ 			 * jQuery's isAttached is ce.contains(e.ownerDocument, e), and
+@@ -13677,23 +13705,23 @@ static void register_browser_globals(JSContext *ctx)
+ 			 * listeners ran in that phase only -- document and window
+ 			 * bubble listeners fired while CAPTURING, before the
+ 			 * target, and never while bubbling. */
+-			"document._reg={};"
+-			"document.__msCap=function(opt){"
++			"__vitaP(document)._reg={};"
++			"__vitaP(document).__msCap=function(opt){"
+ 				"return opt===true||!!(opt&&typeof opt==='object'&&opt.capture);};"
+-			"document.__msRegOnce=function(t,opt){"
+-				"var k=t+(document.__msCap(opt)?'\001C':'\001B');"
+-				"if(document._reg[k])return;"
+-				"document._reg[k]=1;"
+-				"if(typeof document.__msRegDocEvent==='function'){"
+-					"try{document.__msRegDocEvent(t,opt);}catch(e){}}};"
++			"__vitaP(document).__msRegOnce=function(t,opt){"
++				"var k=t+(__vitaP(document).__msCap(opt)?'\001C':'\001B');"
++				"if(__vitaP(document)._reg[k])return;"
++				"__vitaP(document)._reg[k]=1;"
++				"if(typeof __vitaP(document).__msRegDocEvent==='function'){"
++					"try{__vitaP(document).__msRegDocEvent(t,opt);}catch(e){}}};"
+ 			"document.addEventListener=document.addEventListener||"
+ 				"function(t,fn,opt){"
+-					"if(!document._listeners)document._listeners={};"
+-					"if(!document._listeners[t])document._listeners[t]=[];"
+-					"if(!document._listenersC)document._listenersC={};"
+-					"if(!document._listenersC[t])document._listenersC[t]=[];"
+-					"document._listeners[t].push(fn);"
+-					"document._listenersC[t].push(document.__msCap(opt));"
++					"if(!__vitaP(document)._listeners)__vitaP(document)._listeners={};"
++					"if(!__vitaP(document)._listeners[t])__vitaP(document)._listeners[t]=[];"
++					"if(!__vitaP(document)._listenersC)__vitaP(document)._listenersC={};"
++					"if(!__vitaP(document)._listenersC[t])__vitaP(document)._listenersC[t]=[];"
++					"__vitaP(document)._listeners[t].push(fn);"
++					"__vitaP(document)._listenersC[t].push(__vitaP(document).__msCap(opt));"
+ 					/* fixes1249 (#167) - the real Facebook bundle has
+ 					 * AT LEAST 5-6 distinct DOMContentLoaded listener
+ 					 * registration sites (a messenger health tracker, a
+@@ -13719,12 +13747,12 @@ static void register_browser_globals(JSContext *ctx)
+ 							"__msLife('docevt reg DOMContentLoaded: '+"
+ 								"String(fn).slice(0,180));"
+ 					"}catch(e){}}"
+-					"document.__msRegOnce(t,opt);};"
++					"__vitaP(document).__msRegOnce(t,opt);};"
+ 			"document.removeEventListener=document.removeEventListener||"
+ 				"function(t,fn,opt){"
+-					"var L=document._listeners&&document._listeners[t];if(!L)return;"
+-					"var C=(document._listenersC&&document._listenersC[t])||[];"
+-					"var cap=document.__msCap(opt);"
++					"var L=__vitaP(document)._listeners&&__vitaP(document)._listeners[t];if(!L)return;"
++					"var C=(__vitaP(document)._listenersC&&__vitaP(document)._listenersC[t])||[];"
++					"var cap=__vitaP(document).__msCap(opt);"
+ 					"for(var i=0;i<L.length;i++)if(L[i]===fn&&!!C[i]===cap){"
+ 						"L.splice(i,1);C.splice(i,1);return;}};"
+ 			/* fixes1236 (#167) - had ZERO diagnostics and a fully silent
+@@ -13736,7 +13764,7 @@ static void register_browser_globals(JSContext *ctx)
+ 			"document.dispatchEvent=document.dispatchEvent||"
+ 				"function(ev){"
+ 					"var t=ev&&ev.type;"
+-					"var L=document._listeners&&document._listeners[t];"
++					"var L=__vitaP(document)._listeners&&__vitaP(document)._listeners[t];"
+ 					"var n=L?L.length:0;"
+ 					"if(t==='DOMContentLoaded'||t==='load'||"
+ 					   "t==='readystatechange'||t==='pageshow'){"
+@@ -13754,7 +13782,7 @@ static void register_browser_globals(JSContext *ctx)
+ 					 * capturing, the others while bubbling, all at the
+ 					 * target or for a direct call. */
+ 					"var ph=(ev&&ev.eventPhase)|0;"
+-					"var C=(document._listenersC&&document._listenersC[t])||[];"
++					"var C=(__vitaP(document)._listenersC&&__vitaP(document)._listenersC[t])||[];"
+ 					"if(L)L.slice().forEach(function(f,i){"
+ 					"if((ph===1&&!C[i])||(ph===3&&C[i]))return;"
+ 					"try{f.call(document,ev);}catch(e){"
+@@ -14040,8 +14068,8 @@ static void register_browser_globals(JSContext *ctx)
+ 						"String(fn).slice(0,180));"
+ 			"}catch(e){}}"
+ 			"if(typeof document!=='undefined'&&"
+-			   "typeof document.__msRegOnce==='function'){"
+-				"try{document.__msRegOnce(t,opt);}catch(e){}}};"
++			   "typeof __vitaP(document).__msRegOnce==='function'){"
++				"try{__vitaP(document).__msRegOnce(t,opt);}catch(e){}}};"
+ 		"this.removeEventListener=function(t,fn,opt){"
+ 			"var arr=this._winListeners[t];if(!arr)return;"
+ 			"var C=(this._winListenersC&&this._winListenersC[t])||[];"
+@@ -17093,6 +17121,12 @@ static void register_browser_globals(JSContext *ctx)
+ 
+ void macsurf_qjs_setup_globals(JSContext *qctx)
+ {
++	/* VitaBrowser patch 278: the engine's per-object private records
++	 * (qjs_priv), before anything is built */
++	macsurf_qjs__safe_eval(qctx,
++		"(function(g){if(g.__vitaP)return;var M=new WeakMap();"
++		"Object.defineProperty(g,'__vitaP',{value:function(o){"
++		"var r=M.get(o);if(r===undefined){r={};M.set(o,r);}return r;}});})(this);");
+ 	/* Install a minimal document object with the same shape as
+ 	 * the Duktape macsurf_js_dom.c provides, so page scripts that
+ 	 * call document.getElementById etc. get a no-op stub rather
+@@ -17102,8 +17136,7 @@ void macsurf_qjs_setup_globals(JSContext *qctx)
+ 		"(function(){"
+ 		"if(typeof document!=='undefined')return;"
+ 		"var doc={"
+-			"_elements:{},"
+-			"getElementById:function(id){return this._elements[id]||null;},"
++			"getElementById:function(id){return null;},"
+ 			"createElement:function(tag){return{tagName:tag.toUpperCase(),"
+ 				"children:[],style:{},className:'',"
+ 				"getAttribute:function(){return null;},"
+@@ -20837,9 +20870,9 @@ unsigned char js_fire_dom_ready(struct jsthread *thread, struct dom_document *do
+ 	static const char s_dom_ready_src[] =
+ 		"(function(){try{"
+ 		"if(typeof document==='undefined')return;"
+-		"if(document.__ms_ready_fired)return;"
+-		"document.__ms_ready_fired=true;"
+-		"document.readyState='interactive';"
++		"if(__vitaP(document).__ms_ready_fired)return;"
++		"__vitaP(document).__ms_ready_fired=true;"
++		"__vitaP(document).readyState='interactive';"
+ 		/* VitaBrowser: each readyState change fires readystatechange
+ 		 * first (HTML "update the current document readiness"). Google's
+ 		 * Wiz waits on it to finish building a controller whose optional
+@@ -20906,9 +20939,9 @@ unsigned char js_fire_window_load(struct jsthread *thread, struct dom_document *
+ 	static const char s_window_load_src[] =
+ 		"(function(){try{"
+ 		"if(typeof document==='undefined')return;"
+-		"if(document.__ms_load_fired)return;"
+-		"document.__ms_load_fired=true;"
+-		"document.readyState='complete';"
++		"if(__vitaP(document).__ms_load_fired)return;"
++		"__vitaP(document).__ms_load_fired=true;"
++		"__vitaP(document).readyState='complete';"
+ 		"try{document.dispatchEvent(new Event('readystatechange'));}catch(e){}"
+ 		"try{document.dispatchEvent(new Event('load'));}catch(e){}"
+ 		"try{if(typeof window!=='undefined')"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+index e88b4964f..bf74474d5 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -9783,5 +9783,62 @@
+ "\tfor (i = 0; i < names.length; i++) if (!known[names[i]]) remake(names[i]);\n"
+ "\tfor (i = 0; i < ORDER.length; i++) if (hasOwn.call(g, ORDER[i])) remake(ORDER[i]);\n"
+ "})();\n"
++"/* ---- document keeps its members on Document.prototype (patch 278) -------\n"
++" * In a browser the document has one own property, location (unforgeable);\n"
++" * everything else is an accessor or method of Document.prototype (and of\n"
++" * Node / EventTarget above it). Here document carried 136 own members, the\n"
++" * bridge's internals among them (__createElementNative, _reg, __msCap,\n"
++" * _listeners, ...; those now live in the engine's private record,\n"
++" * __vitaP(document), macsurf_qjs.c). Each public member moves to\n"
++" * Document.prototype -- a method as it is, a value as a read-only accessor\n"
++" * over the document's private record (where the engine itself writes\n"
++" * readyState as the page loads), an accessor as it is. A document this\n"
++" * did not build (none inherits Document.prototype today; the scratch\n"
++" * documents of createHTMLDocument and DOMParser are their own objects)\n"
++" * reads undefined, as it did, rather than this document's values. */\n"
++"(function () {\n"
++"\tvar d = g.document, P = g.Document && g.Document.prototype, rec = g.__vitaP;\n"
++"\tif (!d || !P || typeof rec !== 'function' || !P.isPrototypeOf(d)) return;\n"
++"\t/* again on each pass: the bridge installs its document members anew\n"
++"\t * when the real document arrives (and the polyfill runs again) */\n"
++"\tvar store = rec(d);\n"
++"\tvar mine = PRIV.docs || (PRIV.docs = new WeakSet());\n"
++"\tmine.add(d);\n"
++"\tvar KEEP = { location: 1 }, SETTABLE = { domain: 1 };\n"
++"\tObject.getOwnPropertyNames(d).forEach(function (k) {\n"
++"\t\tif (KEEP[k]) return;\n"
++"\t\tvar dsc;\n"
++"\t\ttry { dsc = Object.getOwnPropertyDescriptor(d, k); } catch (e) { return; }\n"
++"\t\tif (!dsc || !dsc.configurable) return;\n"
++"\t\tvar pd;\n"
++"\t\tif (k.charAt(0) === '_') {\n"
++"\t\t\t/* an internal the bridge did not route to the record itself */\n"
++"\t\t\tif ('value' in dsc) store[k] = dsc.value;\n"
++"\t\t\telse Object.defineProperty(store, k, dsc);\n"
++"\t\t\ttry { delete d[k]; } catch (e) { /* */ }\n"
++"\t\t\treturn;\n"
++"\t\t}\n"
++"\t\tif ('value' in dsc && typeof dsc.value === 'function') {\n"
++"\t\t\tpd = { value: dsc.value, writable: true, enumerable: true, configurable: true };\n"
++"\t\t} else if ('value' in dsc) {\n"
++"\t\t\tstore[k] = dsc.value;\n"
++"\t\t\tpd = { get: Object.getOwnPropertyDescriptor({ get [k]() {\n"
++"\t\t\t\treturn mine.has(this) ? rec(this)[k] : undefined; } }, k).get,\n"
++"\t\t\t\tset: SETTABLE[k] ? Object.getOwnPropertyDescriptor({ set [k](v) {\n"
++"\t\t\t\t\tif (mine.has(this)) rec(this)[k] = v; } }, k).set : undefined,\n"
++"\t\t\t\tenumerable: true, configurable: true };\n"
++"\t\t} else {\n"
++"\t\t\tvar gt = dsc.get, st = dsc.set;\n"
++"\t\t\tpd = { get: gt && Object.getOwnPropertyDescriptor({ get [k]() {\n"
++"\t\t\t\treturn mine.has(this) ? gt.call(this) : undefined; } }, k).get,\n"
++"\t\t\t\tset: st && Object.getOwnPropertyDescriptor({ set [k](v) {\n"
++"\t\t\t\t\tif (mine.has(this)) st.call(this, v);\n"
++"\t\t\t\t\telse Object.defineProperty(this, k, { value: v, writable: true, enumerable: true, configurable: true });\n"
++"\t\t\t\t} }, k).set,\n"
++"\t\t\t\tenumerable: true, configurable: true };\n"
++"\t\t}\n"
++"\t\ttry { Object.defineProperty(P, k, pd); delete d[k]; } catch (e) { /* */ }\n"
++"\t});\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+index 4486654c2..9955fadc3 100644
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -9782,4 +9782,61 @@ if (typeof g.PerformanceObserver === 'function' && !Array.isArray(g.PerformanceO
+ 	for (i = 0; i < names.length; i++) if (!known[names[i]]) remake(names[i]);
+ 	for (i = 0; i < ORDER.length; i++) if (hasOwn.call(g, ORDER[i])) remake(ORDER[i]);
+ })();
++/* ---- document keeps its members on Document.prototype (patch 278) -------
++ * In a browser the document has one own property, location (unforgeable);
++ * everything else is an accessor or method of Document.prototype (and of
++ * Node / EventTarget above it). Here document carried 136 own members, the
++ * bridge's internals among them (__createElementNative, _reg, __msCap,
++ * _listeners, ...; those now live in the engine's private record,
++ * __vitaP(document), macsurf_qjs.c). Each public member moves to
++ * Document.prototype -- a method as it is, a value as a read-only accessor
++ * over the document's private record (where the engine itself writes
++ * readyState as the page loads), an accessor as it is. A document this
++ * did not build (none inherits Document.prototype today; the scratch
++ * documents of createHTMLDocument and DOMParser are their own objects)
++ * reads undefined, as it did, rather than this document's values. */
++(function () {
++	var d = g.document, P = g.Document && g.Document.prototype, rec = g.__vitaP;
++	if (!d || !P || typeof rec !== 'function' || !P.isPrototypeOf(d)) return;
++	/* again on each pass: the bridge installs its document members anew
++	 * when the real document arrives (and the polyfill runs again) */
++	var store = rec(d);
++	var mine = PRIV.docs || (PRIV.docs = new WeakSet());
++	mine.add(d);
++	var KEEP = { location: 1 }, SETTABLE = { domain: 1 };
++	Object.getOwnPropertyNames(d).forEach(function (k) {
++		if (KEEP[k]) return;
++		var dsc;
++		try { dsc = Object.getOwnPropertyDescriptor(d, k); } catch (e) { return; }
++		if (!dsc || !dsc.configurable) return;
++		var pd;
++		if (k.charAt(0) === '_') {
++			/* an internal the bridge did not route to the record itself */
++			if ('value' in dsc) store[k] = dsc.value;
++			else Object.defineProperty(store, k, dsc);
++			try { delete d[k]; } catch (e) { /* */ }
++			return;
++		}
++		if ('value' in dsc && typeof dsc.value === 'function') {
++			pd = { value: dsc.value, writable: true, enumerable: true, configurable: true };
++		} else if ('value' in dsc) {
++			store[k] = dsc.value;
++			pd = { get: Object.getOwnPropertyDescriptor({ get [k]() {
++				return mine.has(this) ? rec(this)[k] : undefined; } }, k).get,
++				set: SETTABLE[k] ? Object.getOwnPropertyDescriptor({ set [k](v) {
++					if (mine.has(this)) rec(this)[k] = v; } }, k).set : undefined,
++				enumerable: true, configurable: true };
++		} else {
++			var gt = dsc.get, st = dsc.set;
++			pd = { get: gt && Object.getOwnPropertyDescriptor({ get [k]() {
++				return mine.has(this) ? gt.call(this) : undefined; } }, k).get,
++				set: st && Object.getOwnPropertyDescriptor({ set [k](v) {
++					if (mine.has(this)) st.call(this, v);
++					else Object.defineProperty(this, k, { value: v, writable: true, enumerable: true, configurable: true });
++				} }, k).set,
++				enumerable: true, configurable: true };
++		}
++		try { Object.defineProperty(P, k, pd); delete d[k]; } catch (e) { /* */ }
++	});
++})();
+ })(this);
