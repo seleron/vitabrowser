@@ -1,0 +1,137 @@
+# netsurf: a multipart file part typed as browsers type it; the
+# simulator can upload a file (patch 285)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 284)
+#
+# A file input's part in a multipart body: its filename (escaped by
+# libcurl as Chromium escapes it), its type and its bytes.
+#
+#  - the type: by the file's extension as Chromium types an upload, and
+#    application/octet-stream when unknown. The Vita frontend had no
+#    mimetype hook, so the default used its filetype(), whose fallback is
+#    text/plain (for showing a local file), and curl.c fell back to
+#    text/plain too (frontends/vita/fetch.c vita_fetch_mimetype;
+#    content/fetchers/curl.c).
+#  - the Vita has no file chooser: a file input stays empty there, and
+#    sends the empty file part browsers send (filename "",
+#    application/octet-stream) -- unchanged. The simulator's
+#    file_gadget_open (frontends/vita/window.c, VITA_HOST_SIM only) sets
+#    the file VITA_SIM_UPLOAD names when a file input is activated, so the
+#    gate can submit a real file.
+#
+# Gate: tools/run-vita-sim.sh "scriptless form submissions" -- the upload
+# case: a file named q"uote é.dat with CR LF, NUL and 0xFF bytes, tapped
+# and sent, "FORMCHECK upload ok a866dd8b3405" as Chromium given the same
+# file; with 283-284, all nine submissions as Chromium's. New bundled
+# pages: HTML-multipart-form.html, HTML-multipart-1252.html,
+# HTML-multipart-upload.html, JS-form-submitters.html (they need the gate
+# server's /form-check; over file:// they cannot report).
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 7754da8..902ebc1 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1212,7 +1212,9 @@ fetch_curl_postdata_convert(CURL *chandle,
+ 
+ 			mimetype = guit->fetch->mimetype(multipart->value);
+ 			if (mimetype == NULL) {
+-				mimetype=strdup("text/plain");
++				/* VitaBrowser patch 283: a type nobody knows is
++				 * octet-stream, as browsers send it */
++				mimetype=strdup("application/octet-stream");
+ 			}
+ 			if (mimetype == NULL) {
+ 				goto convert_failed;
+@@ -1311,7 +1313,7 @@ fetch_curl_postdata_convert(CURL *chandle,
+ 						    CURLFORM_FILE, control->rawfile,
+ 						    CURLFORM_FILENAME, leafname,
+ 						    CURLFORM_CONTENTTYPE,
+-						    (mimetype != 0 ? mimetype : "text/plain"),
++						    (mimetype != 0 ? mimetype : "application/octet-stream"),
+ 						    CURLFORM_END);
+ 				if (code != CURL_FORMADD_OK)
+ 					NSLOG(netsurf, INFO,
+diff --git a/frontends/vita/fetch.c b/frontends/vita/fetch.c
+index fdebd0a..41ce36c 100644
+--- a/frontends/vita/fetch.c
++++ b/frontends/vita/fetch.c
+@@ -71,6 +71,33 @@ static const char *vita_fetch_filetype(const char *unix_path)
+ 	return "text/plain";
+ }
+ 
++/* VitaBrowser patch 283: the type a file is uploaded as (a multipart
++ * form's file part), by its extension as Chromium types it; anything
++ * else is application/octet-stream. The default reused filetype(), whose
++ * fallback, text/plain, is for showing a local file. */
++static char *vita_fetch_mimetype(const char *unix_path)
++{
++	const char *dot = strrchr(unix_path, '.');
++	const char *slash = strrchr(unix_path, '/');
++	size_t i;
++
++	if (dot != NULL && (slash == NULL || dot > slash)) {
++		dot++;
++		if (strcasecmp(dot, "js") == 0)
++			return strdup("text/javascript");
++		if (strcasecmp(dot, "json") == 0)
++			return strdup("application/json");
++		if (strcasecmp(dot, "pdf") == 0)
++			return strdup("application/pdf");
++		for (i = 0; i < sizeof(vita_filetypes) / sizeof(vita_filetypes[0]);
++		     i++) {
++			if (strcasecmp(dot, vita_filetypes[i].ext) == 0)
++				return strdup(vita_filetypes[i].type);
++		}
++	}
++	return strdup("application/octet-stream");
++}
++
+ static nsurl *vita_get_resource_url(const char *path)
+ {
+ 	char buf[256];
+@@ -89,6 +116,7 @@ static nsurl *vita_get_resource_url(const char *path)
+ 
+ static struct gui_fetch_table fetch_table = {
+ 	.filetype = vita_fetch_filetype,
++	.mimetype = vita_fetch_mimetype,	/* patch 283 */
+ 	.get_resource_url = vita_get_resource_url,
+ };
+ 
+diff --git a/frontends/vita/window.c b/frontends/vita/window.c
+index a9b51c1..5776786 100644
+--- a/frontends/vita/window.c
++++ b/frontends/vita/window.c
+@@ -527,6 +527,26 @@ struct browser_window *vita_window_browser(struct gui_window *gw)
+ 	return (gw != NULL) ? gw->bw : NULL;
+ }
+ 
++/* VitaBrowser patch 283: a file input activated. The Vita has no file
++ * chooser, so it stays empty there (and its multipart part is the empty
++ * file part browsers send). The simulator takes the file named by
++ * VITA_SIM_UPLOAD, so the gate can submit a form with a real file. */
++static void vita_window_file_gadget_open(struct gui_window *gw,
++		struct hlcache_handle *hl, struct form_control *gadget)
++{
++	(void)hl;
++#ifdef VITA_HOST_SIM
++	{
++		const char *f = getenv("VITA_SIM_UPLOAD");
++		if (f != NULL && f[0] != '\0' && gw != NULL && gw->bw != NULL)
++			browser_window_set_gadget_filename(gw->bw, gadget, f);
++	}
++#else
++	(void)gw;
++	(void)gadget;
++#endif
++}
++
+ static struct gui_window_table window_table = {
+ 	.create = vita_window_create,
+ 	.destroy = vita_window_destroy,
+@@ -538,6 +558,7 @@ static struct gui_window_table window_table = {
+ 	.set_title = vita_window_set_title,
+ 	.set_url = vita_window_set_url,
+ 	.set_status = vita_window_set_status,
++	.file_gadget_open = vita_window_file_gadget_open,	/* patch 283 */
+ };
+ 
+ struct gui_window_table *vita_window_table = &window_table;

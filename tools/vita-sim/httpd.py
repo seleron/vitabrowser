@@ -156,6 +156,37 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if self.path.startswith("/form-check"):
+            # Patch 283: a form submission checked. Answers a page whose
+            # title is "FORMCHECK <case> ok <digest>" -- the body well
+            # formed (multipart: the boundary a valid token matching the
+            # Content-Type, every delimiter and header line CRLF, each part
+            # a form-data disposition with a quoted name, a file part's
+            # filename and type; Content-Length exact) and a digest of
+            # its entries, every byte except the boundary -- or
+            # "FORMCHECK <case> BAD <why>". The pages compare the digest
+            # with Chromium's for the same form; the page tells its parent
+            # (the form's target is a frame) with postMessage.
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length > 0 else b""
+            case = self.path.partition("case=")[2].split("&")[0] or "-"
+            verdict, listing = form_check(
+                self.headers.get("Content-Type", ""), body,
+                self.headers.get("Content-Length"),
+                self.headers.get("Transfer-Encoding"))
+            out = ("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                   "<title>FORMCHECK %s %s</title></head><body><pre>%s"
+                   "</pre><script>try { parent.postMessage(document.title,"
+                   " '*'); } catch (e) {}</script></body></html>"
+                   % (case, verdict, listing)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(out)
+            self.wfile.flush()
+            return
         if self.path == "/echo":
             # Patch 140: echo the request body back for fetch/XHR body tests.
             length = int(self.headers.get("Content-Length", 0))
@@ -172,6 +203,55 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             return
         self.send_response(404)
         self.end_headers()
+
+
+def form_check(ctype, body, clen, te):
+    """(verdict, listing) for a submitted form body: see do_POST"""
+    import hashlib
+    import html
+    import re
+    entries, why = [], None
+    if clen is None or te:
+        why = "no Content-Length"
+    elif ctype.startswith("multipart/form-data"):
+        m = re.search(r";\s*boundary=(\S+)$", ctype)
+        bd = m.group(1).strip('"').encode() if m else b""
+        if not re.fullmatch(rb"[0-9A-Za-z'()+_,\-./:=?]{1,70}", bd):
+            why = "boundary %r not a valid token" % bd
+        elif not body.startswith(b"--" + bd + b"\r\n"):
+            why = "body does not open with the boundary"
+        elif not body.endswith(b"\r\n--" + bd + b"--\r\n"):
+            why = "body does not close with the boundary"
+        else:
+            inner = body[len(bd) + 4:-(len(bd) + 8)]
+            for part in inner.split(b"\r\n--" + bd + b"\r\n"):
+                head, sep, value = part.partition(b"\r\n\r\n")
+                lines = head.split(b"\r\n")
+                if not sep or b"\n" in head.replace(b"\r\n", b""):
+                    why = "a part's headers are not CRLF lines"
+                    break
+                dm = re.fullmatch(rb'Content-Disposition: form-data; '
+                                  rb'name="([^"\r\n]*)"(; filename="([^"\r\n]*)")?',
+                                  lines[0])
+                if not dm:
+                    why = "a part's disposition: %r" % lines[0][:80]
+                    break
+                if dm.group(2) is not None and (
+                        len(lines) != 2 or not lines[1].startswith(b"Content-Type: ")):
+                    why = "a file part without its type"
+                    break
+                if dm.group(2) is None and len(lines) != 1:
+                    why = "a text part with extra headers"
+                    break
+                entries.append(lines + [value])
+    elif ctype.startswith("application/x-www-form-urlencoded"):
+        entries = [[p] for p in body.split(b"&")] if body else []
+    else:
+        why = "Content-Type %r" % ctype
+    digest = hashlib.sha256(repr(entries).encode()).hexdigest()[:12]
+    listing = html.escape("\n".join(" | ".join(repr(x)[2:-1] for x in e)
+                                     for e in entries))
+    return ("BAD %s" % why if why else "ok %s" % digest), listing
 
 
 class TLSThreadingServer(http.server.ThreadingHTTPServer):

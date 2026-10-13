@@ -1222,6 +1222,57 @@ grep -q 'dns: dead\.sim-hang -> FAILED' "$R/log.txt" || dbad=$((dbad + 1))
 grep -q 'page NET-dns-hang settled' "$R/log.txt" || dbad=$((dbad + 1))
 [ "$dbad" -eq 0 ] || fail "name lookup"
 
+# Patch 283: forms submitted by the engine's own form path -- tapped, as
+# without script (multipart, url-encoded, a windows-1252 page, a file
+# upload), and by script with each kind of submitter. One session taps
+# each Send button (the upload's file comes from VITA_SIM_UPLOAD: the Vita
+# has no file chooser, the simulator's file_gadget_open takes it); the
+# gate server's /form-check answers "FORMCHECK <case> ok <digest>" for a
+# well-formed body, the digest every entry byte for byte (not the
+# boundary). Each must be Chromium's for the same form (tools/vita-sim/
+# httpd.py; Chromium given the same file, 2026-10-13). Before 283:
+# multipart lines LF, names' line breaks %0A, _charset_ its own value, no
+# dirname entry, a disabled fieldset's control sent, a form="" control
+# missing, the first submit button sent with no submitter, an image
+# submitter abandoning the submission, windows-1252 "?" for the euro and
+# for what it lacks, an unknown file type sent as text/plain.
+echo "== scriptless form submissions =="
+FS="$OUT/forms"
+rm -rf "$FS"; mkdir -p "$FS/ux0:data/VitaBrowser"
+cp -r "$OUT/run/app0:" "$FS/"
+echo off > "$FS/ux0:data/VitaBrowser/netlog.cfg"
+FU="$FS/q\"uote é.dat"
+printf 'upload line 1\r\nline 2\n\000\001\376\377 end' > "$FU"
+FB="http://127.0.0.1:$HP"
+printf 'settle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-form.html\nsettle 3000\ntap 160 135\nsettle 3000\nnav %s/HTML-multipart-1252.html\nsettle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-upload.html\nsettle 3000\ntap 160 65\nsettle 1500\ntap 160 135\nsettle 3000\n' \
+	"$FB" "$FB" "$FB" > "$FS/script.txt"
+for c in img imgnoname nosub submit button; do
+	printf 'nav %s/JS-form-submitters.html?%s\nsettle 3000\n' "$FB" "$c" >> "$FS/script.txt"
+done
+echo quit >> "$FS/script.txt"
+python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+	--http "$HP" > "$OUT/httpd-forms.log" 2>&1 &
+HTTPD=$!
+sleep 1
+frc=0
+( cd "$FS" && VITA_SIM_UPLOAD="$FU" VITA_SIM_SCRIPT="$FS/script.txt" \
+	VITA_SIM_OUT="$FS" timeout 300 "$NS/nsvita-sim" \
+	"$FB/HTML-multipart-form.html" > "$FS/stdout.log" 2>&1 ) || frc=$?
+kill $HTTPD 2>/dev/null || true
+fgot=$(sed -n 's/.*gw title: \(FORMCHECK .*\)/\1/p' "$FS/ux0:data/VitaBrowser/log.txt" 2>/dev/null | uniq)
+fbad=
+for w in "multipart ok f3b471b28781" "urlencoded ok 7e9ed1917f53" \
+	 "w1252 ok 01804f0f31bf" "upload ok a866dd8b3405" \
+	 "img ok f147644a4326" "imgnoname ok 9663aca848e0" \
+	 "nosub ok 22de21b23e38" "submit ok 22de21b23e38" \
+	 "button ok 0ded7fa40b3c"; do
+	set -- $w
+	g=$(printf '%s\n' "$fgot" | grep "^FORMCHECK $1 " | tail -1)
+	echo "  $1: ${g:-no submission} (Chromium: FORMCHECK $w)"
+	[ "$g" = "FORMCHECK $w" ] || fbad="$fbad $1"
+done
+[ "$frc" -eq 0 ] && [ -z "$fbad" ] || fail "form submissions:$fbad (exit $frc)"
+
 # The controls, scripted (vita/interact.c, after pass N): taps, the
 # pointer, back / forward, drag scrolling, zoom, blocked hosts, a form
 # filled in, a typed URL, a URL pushed to the LAN listener, the cookie jar,
