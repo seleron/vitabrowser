@@ -338,6 +338,38 @@ layout (136 own members, Chromium 1; given to Chromium, it still passes)
 and values (clocks, memory sizes). What is left to examine: past 5418,
 and the parts of `n` no trace shows (hsw's own timing measurements).
 
+### Document, nodes, and inside the collector (2026-10-13, fourth round)
+
+**Document and nodes (278, 279).** Reflect.ownKeys(document) is
+['location'] and elements, text, comments and fragments have no own
+properties, as in Chromium; the bridge's internals live in per-object
+private records (__vitaP). With them the aligned trace no longer needs
+Chromium's document faked; it runs to the same walk end (now call 5013,
+the document walk being shorter).
+
+**Past the walk end.** The trace's next fork was the harness, not the
+engine: the simulator's stand-ins for Chromium's binding functions
+(__hswRec, __playwright__binding__) were plain values, so hsw walked one
+name further. They are functions named __hswStandIn now
+(tools/hcaptcha/data/harness-names.js; hsw-record.js recognises them).
+
+**Inside hsw's main collector call** (one import call that reads ~180
+descriptors: canvas, audio, navigator, window, document, Intl), compared
+with stock Chromium: operations on interface prototypes not enumerable
+(346 of 998) and some anonymous (Node.prototype.appendChild); window's
+attributes data properties where Chromium's are accessors; Intl objects
+untagged; document.location not enumerable; contentWindow on every
+element and iframe / img wrappers without their interface prototypes;
+computed and inline styles plain objects; localStorage not a Storage.
+All fixed in patch 280. These differences never fork the call sequence
+(they happen inside one import call), which is why the aligned trace did
+not show them -- the collector's notes have to be diffed directly
+(hsw-compare.py prints them when the calls align; for a run against stock
+Chromium, compare the call that reads getOwnPropertyNames(window)).
+
+After 280 the demo still refuses (797 bytes; the engine's request is 21.2
+KB, from ~23.5). Next: hsw's own timing measurements.
+
 ## How to measure again
 
 The scripts were scratch files; the method:

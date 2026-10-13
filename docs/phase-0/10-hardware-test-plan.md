@@ -3847,3 +3847,41 @@ three script-heavy sites from the usual list (Google, the Guardian,
 YouTube): every built-in method now goes through a stand-in, so watch
 for a site that worked in run 37 and now does not, and for slower
 script-heavy pages.
+
+### Patches 278-280 (2026-10-13): document, nodes and descriptors
+
+The hCaptcha record/compare's next findings (docs/wasm-hcaptcha-
+measurement.md, "fourth round"), fixed as standards bugs. The demo still
+refuses the engine after each.
+
+- **278: document's members on Document.prototype.** It had 136 own
+  properties (Chromium: location); the bridge's internals move to a
+  per-object private record, __vitaP(obj) / qjs_priv() in C, and the load
+  path writes readyState there.
+- **279: nodes have no own properties.** tagName / nodeName / nodeType
+  are C getters on Element.prototype / Node.prototype; __ptr is gone; the
+  listener / handler / style / classList / dataset caches go to the
+  private record; fragments use the prototypes' methods.
+- **280: descriptors as WebIDL / ECMAScript define them:** enumerable,
+  named operations; window's attributes as accessors; Intl tags;
+  document.location enumerable; contentWindow on HTMLIFrameElement.prototype
+  and iframe / img wrappers with their interfaces' prototypes (the name
+  table built "HTMLIframeElement"); CSSStyleDeclaration and Storage.
+
+Sim-verified: JS-document-shape (DOCSHAPE 6/6), JS-node-shape (NODESHAPE
+6/6), JS-descriptors (DESCRIPTORS 7/7), each Chromium-verified; full sim
+gate exit 0 after each (gate-278, gate-279b -- the first 279 gate failed
+JS-sanitize 5/7 on Attr fields assigned over the new getter-only nodeName,
+fixed before the commit -- gate-280); hsw replay identical in V8 and the
+engine.
+
+**On the device (run 38), in addition:** `JS-document-shape.html`,
+`JS-node-shape.html`, `JS-descriptors.html`: 6/6, 6/6, 7/7 expected. Then
+pages with iframes (an embedded video, a consent dialog) and pages that
+style elements from script, since element.style and iframes changed
+shape.
+
+Found on the way, older than these patches (not fixed): a capture
+listener on the event's target fires twice per event; a
+createHTMLDocument document's querySelector misses nodes appended after it
+was made.

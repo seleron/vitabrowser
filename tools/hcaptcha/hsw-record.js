@@ -31,7 +31,9 @@
    * QuickJS scanning 1.2 MB around each of ~17000 import calls would take
    * hours and the script budget -- so a light record is for comparing
    * with Chromium's (hsw-compare.py), not for replaying. */
-  var LIGHT = typeof __hswRec !== 'function';
+  /* (in the simulator harness-names.js puts stand-ins named __hswStandIn
+   * for Chromium's binding functions, so the two windows list alike) */
+  var LIGHT = typeof __hswRec !== 'function' || __hswRec.name === '__hswStandIn';
   var send = !LIGHT ? __hswRec : function (s) {
     var ls = s.split('\n'), t = ls.shift();
     ls.forEach(function (l) {

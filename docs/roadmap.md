@@ -134,9 +134,12 @@ on text inputs, buttons, selects, textareas (225).
    pass. *Patches 273-277:* key order and the native-function shape
    matched (window a Window, built-ins shaped, APIs on prototypes,
    Chromium's key order); the aligned trace now runs to call 5418 and the
-   demo still refuses. Left: document's own layout (and elements'), the
-   trace past 5418, hsw's timing (docs/wasm-hcaptcha-measurement.md,
-   "third round").
+   demo still refuses. *278-280:* document and nodes browser-shaped
+   (private records for the engine's internals), and the descriptors
+   hsw's collector reads inside one call (enumerable operations, window
+   accessors, Intl, iframe / img interfaces, CSSStyleDeclaration,
+   Storage); still refused. Next: hsw's own timing
+   (docs/wasm-hcaptcha-measurement.md, "fourth round").
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

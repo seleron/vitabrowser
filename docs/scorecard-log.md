@@ -4,6 +4,19 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patches 278-280 (r55-280-fresh, fresh reference)
+
+Document, nodes and descriptors browser-shaped (window attributes as
+accessors, style objects CSSStyleDeclarations, iframe / img with their
+interface prototypes) -- every page sees these, so scored against a fresh
+reference and compared with r54: mean **83.7** (r54 83.4); no site down
+by more than 0.3; Wikipedia +3.9 (Chrome's app banner gone again from the
+reference). One JS error more on Wikipedia, and not ours: the page drew
+Wikimedia's sampled network-pulse measurement in this run (42 requests to
+measure-esams.wikimedia.org, none in r52b / r54), whose promise rejects
+with undefined -- most likely waiting for resource-timing entries the
+engine does not record (a known gap). r55 is the baseline.
+
 ## 2026-10-13 — patches 273-277 (r54-277-fresh, fresh reference)
 
 The platform-shape batch (window a Window, built-ins shaped, APIs on
