@@ -126,8 +126,13 @@ on text inputs, buttons, selects, textareas (225).
    hCaptcha refuses us"). Traced call by call in both engines (patch
    268): same requests, same swallowed exceptions; the standards gaps
    it found are fixed (269-272) and the demo still refuses (gate
-   green; scorecard r52: no site moves but live content). Next, if
-   pursued: replay hsw's import results through wasm3 and V8.
+   green; scorecard r52: no site moves but live content). *Replayed*
+   (tools/hcaptcha/hsw-replay.js): the engine's wasm3 computes Chromium's
+   hsw run identically, and with the engine's whole request but `n`
+   transplanted Chromium still passes -- the refusal is in hsw's
+   fingerprint `n`; ten more surface differences given to Chromium all
+   pass. Next, if pursued: key order and the native-function shape
+   (docs/wasm-hcaptcha-measurement.md, "Record, replay").
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

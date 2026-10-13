@@ -223,7 +223,88 @@ bytes, `success: false` (getcaptcha body 23 KB, from 26). Nothing that
 can be given to Chromium makes it fail, so what is left is inside the
 computation: a record / replay of hsw's import results through wasm3 and
 V8 (the differential of `wasm-diff/` with the imports included), or
-QuickJS semantics hsw relies on. Not pursued further this round.
+QuickJS semantics hsw relies on. (Done the same day: the replay clears
+wasm3, see the next section.)
+
+### Record, replay, and where the refusal lives (2026-10-13, second round)
+
+Tools (`tools/hcaptcha/`): `hsw-record.js` records hsw in Chromium
+(`chrome-demo.py --record DIR`) or in the simulator (`VITA_SIM_INJECT`,
+then `sim-rec.py`): every call into the module, every import call with its
+arguments and answer, the bytes JS writes into its memory (Chromium only),
+and notes of what the glue probes (Reflect / Object reflection, own keys,
+the long JSON the page builds). `hsw-replay.js` replays a full record
+through any WebAssembly; `replay.sh` runs it in V8 and in the engine's own
+(wasm3 behind the polyfill, under ASan + UBSan). `hsw-compare.py` aligns
+two records call by call. hsw's control flow is deterministic given its
+import answers: two Chromium runs make the same 17580 calls in the same
+order.
+
+**1. wasm3 is cleared.** Chromium's real hsw run (543 calls into the
+module, 17037 import calls), replayed through the engine's WebAssembly,
+is identical to the byte -- every import argument, the bytes behind
+every (pointer, length) argument, every result, a hash of all of memory
+after every call -- under ASan + UBSan, sliced 13 times. Given the same
+inputs, the engine computes exactly what V8 computes. Everything that
+differs comes from the answers hsw's imports get: the browser.
+
+**2. The refusal is in `n`, nothing else in the request.** The getcaptcha
+body is the page's JSON request (`v, sitekey, host, hl, motionData, pdc,
+pem, n, e, c, ws, clientOptions`) encrypted by hsw; recorded in plain
+text before encryption, the engine's is 24.7 KB to Chromium's 41.8 KB:
+`n` (hsw's fingerprint and proof) 17.8 / 30.4 KB, motionData 5.4 / 9.9 KB,
+`pem` `{}` (no resource-timing entries) where Chromium has its
+api.hcaptcha.com connection timing. `chrome-demo.py --transplant` puts
+the engine's own motionData, pdc, pem, ws and clientOptions into
+Chromium's request before encryption: **challenge** (2 of 2). What makes
+the server refuse is inside `n`: hsw's reading of the browser.
+
+**3. Chromium, given each difference the aligned trace found, still
+passes** (each 2-3 runs; flags of `chrome-demo.py`):
+
+| given to Chromium | flag | answer |
+|---|---|---|
+| no resource-timing entries; the Vita's screen; ontouchstart; Resource Timing Level 3 attributes removed | `--mimic` | challenge |
+| the engine's 92 window names Chromium lacks (`__vita*`, `__ms*`, `_k`, DOMPurify, XF, HTML_Element, InternalError, ...) | `--add-globals` | challenge |
+| window's own `Symbol.toStringTag` "global" (`[object global]`) | `--global-tag` | challenge |
+| the engine's own-property layout: navigator 29 own keys (Chromium 0), document 139 (1), performance 17, history 13, screen 9, ... | `--own-layout` | challenge |
+| Object.keys(window) the engine's 145 names | `--enum-keys` | challenge |
+| canvas read-back blank | `--blank-canvas` | challenge |
+| no `Crypto.prototype.randomUUID` (hsw then skips a 1024-call setAttribute benchmark, as in the engine) | `--no-proto-uuid` | challenge |
+| all of the trace's differences together, window cut to the engine's names | (aligned run) | challenge |
+
+With all of them, Chromium and the engine make the same 4401 calls; the
+next fork comes from Object.keys(window) order (hsw picks a name by
+position; Chromium's unforgeable window properties cannot be reordered),
+so the trace stops being informative there, about halfway (the engine's
+run is ~8100 import calls, Chromium's ~9800).
+
+**Standards deviations found on the way** (none is the refusal; worth
+fixing as what they are, as 269-272 were): window's own
+`Symbol.toStringTag` "global"; the APIs of navigator, document, screen,
+performance, history, crypto are own properties of the instances, not
+of the prototypes (`Crypto.prototype.randomUUID` is undefined), with
+internals visible among them (`__vitaHonest`, `__vitaNav`,
+`__setUrlDisplay`, `_elements`, `__ptr`, `_L` on body); Object.keys(window)
+lists DOMPurify, XF, HTML_Element, setImmediate, console, CSS;
+built-in methods have a `prototype` property and accessors are
+anonymous (Chromium: no prototype, "get userAgent");
+`Function.prototype.fileName / lineNumber / columnNumber` (QuickJS's);
+`getEntriesByType('resource')` is always empty.
+
+**Simulator notes.** A script `VITA_SIM_INJECT` runs never gets its
+timers run (setTimeout / setInterval from the injected realm never fire;
+event-driven code works); the engine's console keeps a line under 2 KB
+with newlines made spaces, so the recorder writes one event per line and
+splits long ones.
+
+**Next, if pursued:** what hsw reads that differs and was never given to
+Chromium is now a short list of mechanisms rather than a guess: key
+order (window and the objects above), the native-function shape
+(prototype property, accessor names, `fileName`), and whatever lies
+past call 4401. The transplant can go one level deeper: hsw's own
+collected values are JSON-like before they are packed into `n`, so the
+same JSON hook may show them in plain text.
 
 ## How to measure again
 
