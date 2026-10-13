@@ -123,7 +123,10 @@ on text inputs, buttons, selects, textareas (225).
    interfaces this engine lacks, with its values or network stack, still
    passes, and the engine is refused under any user agent; hsw computes
    something different here (docs/wasm-hcaptcha-measurement.md, "Why
-   hCaptcha refuses us"). Next: trace hsw's import calls in both engines.
+   hCaptcha refuses us"). Traced call by call in both engines (patch
+   268): same requests, same swallowed exceptions; the standards gaps
+   it found are fixed (269-272) and the demo still refuses. Next, if
+   pursued: replay hsw's import results through wasm3 and V8.
 *Acceptance:* JS gates per item; claude.ai email login reaches "check your
 email".
 

@@ -1,0 +1,253 @@
+# netsurf: navigator.getBattery() from the Vita's battery (patch 272)
+# Generated 2026-10-13
+# Base: seleron/vitabrowser (patch stack through 271)
+#
+# The Battery Status API, backed by the hardware: frontends/vita
+# js_platform.c macsurf_battery() reads scePowerGetBatteryLifePercent,
+# scePowerIsBatteryCharging / IsPowerOnline and scePowerGetBatteryLifeTime
+# (minutes left); the bridge's __vitaBattery() hands them to the
+# polyfill's BatteryManager (an EventTarget): level, charging (or on
+# external power), dischargingTime from the minutes left, chargingTime 0
+# when full and Infinity otherwise (the Vita does not say). One manager
+# per page, read again every minute, with levelchange / chargingchange /
+# dischargingtimechange / chargingtimechange events and their on*
+# handlers. The simulator's host reports no battery: the spec's defaults
+# (charging, level 1, chargingTime 0, dischargingTime Infinity). Secure
+# contexts only, as in Chromium.
+#
+# Gate: testpages/pages/JS-device-honest.html check 6 (DEVICE 6/6 with
+# 271; Chromium 6/6). On the device: the level should match the Vita's
+# own battery indicator.
+diff --git a/content/handlers/javascript/quickjs/macos9.h b/content/handlers/javascript/quickjs/macos9.h
+--- a/content/handlers/javascript/quickjs/macos9.h
++++ b/content/handlers/javascript/quickjs/macos9.h
+@@ -161,6 +161,12 @@
+ /** window.close() in c's window: closes it when it is a popup. */
+ void macsurf_window_close_self(struct content *c);
+ 
++/** VitaBrowser patch 272: the battery, for navigator.getBattery(): level
++ * 0..1, whether it charges (or runs on external power), and the seconds
++ * of use left (negative when not known). Returns 0 when the platform has
++ * no battery information at all (the simulator), 1 otherwise. */
++int macsurf_battery(double *level, int *charging, double *discharging_s);
++
+ /** The directory localStorage files live in, ending in '/', or NULL when
+  * there is none. */
+ const char *macsurf_storage_dir(void);
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -1233,6 +1233,25 @@
+ 	return a;
+ }
+ 
++/* VitaBrowser patch 272: __vitaBattery() -> [level, charging,
++ * dischargingSeconds] from the platform (frontends/vita js_platform.c:
++ * scePower on the Vita), or null when it has no battery information. */
++static JSValue qjs_battery(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	double level = 1.0, dis = -1.0;
++	int charging = 1;
++	JSValue a;
++	(void)this_val; (void)argc; (void)argv;
++	if (!macsurf_battery(&level, &charging, &dis))
++		return JS_NULL;
++	a = JS_NewArray(ctx);
++	JS_SetPropertyUint32(ctx, a, 0, JS_NewFloat64(ctx, level));
++	JS_SetPropertyUint32(ctx, a, 1, JS_NewBool(ctx, charging != 0));
++	JS_SetPropertyUint32(ctx, a, 2, JS_NewFloat64(ctx, dis));
++	return a;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* canvas 2D measureText - real font metrics, not a fabricated width   */
+ /* ------------------------------------------------------------------ */
+@@ -13159,6 +13178,7 @@
+ 	/* --- monotonic clock for performance.now() --- */
+ 	qjs_set_func(ctx, global, "__macsurf_monotonic_ms", qjs_monotonic_ms, 0);
+ 	qjs_set_func(ctx, global, "__vitaJsHeap", qjs_js_heap, 0);
++	qjs_set_func(ctx, global, "__vitaBattery", qjs_battery, 0);
+ 	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
+ 	qjs_set_func(ctx, global, "__vitaSubmitForm", qjs_submit_form, 2); /* 263 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -9229,6 +9229,66 @@
+ 	define(n, '__vitaHonest', true);
+ })();
+ 
++/* ---- Battery Status: navigator.getBattery() (patch 272) -----------------
++ * The Vita runs on a battery and says how full it is (scePower): level,
++ * charging (or on external power), and the minutes of use left. One
++ * BatteryManager per page, read again every minute, with levelchange /
++ * chargingchange / dischargingtimechange / chargingtimechange events. A
++ * platform with no battery information (the simulator's host) gives the
++ * spec's defaults: charging, level 1, chargingTime 0, dischargingTime
++ * Infinity. Secure contexts only, as in Chromium. */
++(function () {
++	var n = g.navigator;
++	if (!n || isFn(n.getBattery) || !isFn(g.__vitaBattery) || g.isSecureContext === false) return;
++	function illegal() { throw new TypeError('Illegal constructor'); }
++	var ET = g.EventTarget;
++	var BM = function BatteryManager() { illegal(); };
++	if (isFn(ET)) Object.setPrototypeOf(BM.prototype, ET.prototype);
++	try { Object.defineProperty(BM.prototype, Symbol.toStringTag, { value: 'BatteryManager', configurable: true }); } catch (e) { /* */ }
++	define(g, 'BatteryManager', BM);
++	var cur = null, promise = null, mgr = null;
++	function read() {
++		var r = null;
++		try { r = g.__vitaBattery(); } catch (e) { /* */ }
++		if (!r) return { charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1 };
++		var full = r[0] >= 1;
++		return { charging: !!r[1], level: r[0],
++			chargingTime: r[1] ? (full ? 0 : Infinity) : Infinity,
++			dischargingTime: r[1] || !(r[2] > 0) ? Infinity : r[2] };
++	}
++	['charging', 'chargingTime', 'dischargingTime', 'level'].forEach(function (k) {
++		Object.defineProperty(BM.prototype, k, { get: function () {
++			if (this !== mgr) throw new TypeError('Illegal invocation');
++			return cur[k];
++		}, enumerable: true, configurable: true });
++	});
++	var EV = { charging: 'chargingchange', chargingTime: 'chargingtimechange',
++		dischargingTime: 'dischargingtimechange', level: 'levelchange' };
++	function poll() {
++		var nv = read(), old = cur;
++		cur = nv;
++		Object.keys(EV).forEach(function (k) {
++			if (old[k] === nv[k]) return;
++			var ev = new Event(EV[k]);
++			try { mgr.dispatchEvent(ev); } catch (e) { /* */ }
++			var h = mgr['on' + EV[k]];
++			if (isFn(h)) try { h.call(mgr, ev); } catch (e) { /* */ }
++		});
++	}
++	define(n, 'getBattery', function getBattery() {
++		if (!promise) {
++			mgr = isFn(ET) ? new ET() : {};
++			Object.setPrototypeOf(mgr, BM.prototype);
++			Object.keys(EV).forEach(function (k) { mgr['on' + EV[k]] = null; });
++			cur = read();
++			setInterval(poll, 60000);
++			promise = Promise.resolve(mgr);
++		}
++		return promise;
++	});
++	try { Object.defineProperty(n, 'getBattery', { enumerable: true }); } catch (e) { /* */ }
++})();
++
+ /* ---- the browser's functions look like a browser's (patch 269) ----------
+  * window's operations and interface objects are the browser's own: per
+  * WebIDL an operation is an enumerable data property whose function is
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -9230,6 +9230,66 @@
+ "\tdefine(n, '__vitaHonest', true);\n"
+ "})();\n"
+ "\n"
++"/* ---- Battery Status: navigator.getBattery() (patch 272) -----------------\n"
++" * The Vita runs on a battery and says how full it is (scePower): level,\n"
++" * charging (or on external power), and the minutes of use left. One\n"
++" * BatteryManager per page, read again every minute, with levelchange /\n"
++" * chargingchange / dischargingtimechange / chargingtimechange events. A\n"
++" * platform with no battery information (the simulator's host) gives the\n"
++" * spec's defaults: charging, level 1, chargingTime 0, dischargingTime\n"
++" * Infinity. Secure contexts only, as in Chromium. */\n"
++"(function () {\n"
++"\tvar n = g.navigator;\n"
++"\tif (!n || isFn(n.getBattery) || !isFn(g.__vitaBattery) || g.isSecureContext === false) return;\n"
++"\tfunction illegal() { throw new TypeError('Illegal constructor'); }\n"
++"\tvar ET = g.EventTarget;\n"
++"\tvar BM = function BatteryManager() { illegal(); };\n"
++"\tif (isFn(ET)) Object.setPrototypeOf(BM.prototype, ET.prototype);\n"
++"\ttry { Object.defineProperty(BM.prototype, Symbol.toStringTag, { value: 'BatteryManager', configurable: true }); } catch (e) { /* */ }\n"
++"\tdefine(g, 'BatteryManager', BM);\n"
++"\tvar cur = null, promise = null, mgr = null;\n"
++"\tfunction read() {\n"
++"\t\tvar r = null;\n"
++"\t\ttry { r = g.__vitaBattery(); } catch (e) { /* */ }\n"
++"\t\tif (!r) return { charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1 };\n"
++"\t\tvar full = r[0] >= 1;\n"
++"\t\treturn { charging: !!r[1], level: r[0],\n"
++"\t\t\tchargingTime: r[1] ? (full ? 0 : Infinity) : Infinity,\n"
++"\t\t\tdischargingTime: r[1] || !(r[2] > 0) ? Infinity : r[2] };\n"
++"\t}\n"
++"\t['charging', 'chargingTime', 'dischargingTime', 'level'].forEach(function (k) {\n"
++"\t\tObject.defineProperty(BM.prototype, k, { get: function () {\n"
++"\t\t\tif (this !== mgr) throw new TypeError('Illegal invocation');\n"
++"\t\t\treturn cur[k];\n"
++"\t\t}, enumerable: true, configurable: true });\n"
++"\t});\n"
++"\tvar EV = { charging: 'chargingchange', chargingTime: 'chargingtimechange',\n"
++"\t\tdischargingTime: 'dischargingtimechange', level: 'levelchange' };\n"
++"\tfunction poll() {\n"
++"\t\tvar nv = read(), old = cur;\n"
++"\t\tcur = nv;\n"
++"\t\tObject.keys(EV).forEach(function (k) {\n"
++"\t\t\tif (old[k] === nv[k]) return;\n"
++"\t\t\tvar ev = new Event(EV[k]);\n"
++"\t\t\ttry { mgr.dispatchEvent(ev); } catch (e) { /* */ }\n"
++"\t\t\tvar h = mgr['on' + EV[k]];\n"
++"\t\t\tif (isFn(h)) try { h.call(mgr, ev); } catch (e) { /* */ }\n"
++"\t\t});\n"
++"\t}\n"
++"\tdefine(n, 'getBattery', function getBattery() {\n"
++"\t\tif (!promise) {\n"
++"\t\t\tmgr = isFn(ET) ? new ET() : {};\n"
++"\t\t\tObject.setPrototypeOf(mgr, BM.prototype);\n"
++"\t\t\tObject.keys(EV).forEach(function (k) { mgr['on' + EV[k]] = null; });\n"
++"\t\t\tcur = read();\n"
++"\t\t\tsetInterval(poll, 60000);\n"
++"\t\t\tpromise = Promise.resolve(mgr);\n"
++"\t\t}\n"
++"\t\treturn promise;\n"
++"\t});\n"
++"\ttry { Object.defineProperty(n, 'getBattery', { enumerable: true }); } catch (e) { /* */ }\n"
++"})();\n"
++"\n"
+ "/* ---- the browser's functions look like a browser's (patch 269) ----------\n"
+ " * window's operations and interface objects are the browser's own: per\n"
+ " * WebIDL an operation is an enumerable data property whose function is\n"
+diff --git a/frontends/vita/js_platform.c b/frontends/vita/js_platform.c
+--- a/frontends/vita/js_platform.c
++++ b/frontends/vita/js_platform.c
+@@ -39,6 +39,9 @@
+ #include <psp2/common_dialog.h>
+ #include <psp2/message_dialog.h>
+ #include <psp2/kernel/threadmgr.h>
++#ifdef __vita__
++#include <psp2/power.h>
++#endif
+ #include <vita2d.h>
+ #endif
+ 
+@@ -417,6 +420,26 @@
+ }
+ 
+ /* exported interface documented in quickjs/macos9.h */
++int macsurf_battery(double *level, int *charging, double *discharging_s)
++{
++#ifdef __vita__
++	int pct = scePowerGetBatteryLifePercent();
++	int mins = scePowerGetBatteryLifeTime();
++
++	if (pct < 0)
++		return 0;
++	*level = (pct > 100 ? 100 : pct) / 100.0;
++	*charging = scePowerIsBatteryCharging() || scePowerIsPowerOnline();
++	*discharging_s = mins > 0 ? mins * 60.0 : -1.0;
++	return 1;
++#else
++	/* the simulator's host: no battery to speak of */
++	(void)level; (void)charging; (void)discharging_s;
++	return 0;
++#endif
++}
++
++/* exported interface documented in quickjs/macos9.h */
+ char *macsurf_window_location(struct content *c)
+ {
+ 	struct browser_window *bw;

@@ -3743,3 +3743,50 @@ row-gap, box-shadow, tab-size or aspect-ratio.
 
 (Device checks for these: run 37's list, above, items 2-3.)
 
+## Since run 37 — queued for run 38 (not built yet)
+
+### Patches 268-272 (2026-10-13): what the engine says about itself, honestly
+
+Came out of the hCaptcha question (docs/wasm-hcaptcha-measurement.md,
+"Why hCaptcha refuses us"): the engine is refused whatever it reports,
+and Chromium passes with every one of these differences given to it -- so
+none of them is the reason, and the demo still refuses the engine after
+them. They are fixed as the standards and honesty bugs they are.
+
+- **268: VITA_SIM_INJECT** (simulator only): a script evaluated in every
+  realm, cross-origin frames included -- the tool the trace was made with.
+- **269: built-ins look built-in.** The bridge's and the polyfill's
+  functions are compiled without source, so toString() gives
+  `function name() { [native code] }` (it gave our source text); window's
+  functions are named for their property with Chromium's WebIDL lengths
+  (matchMedia was anonymous, getComputedStyle "vgcs"), operations
+  enumerable and interface objects not, interface prototypes their
+  @@toStringTag; window.close / focus / blur exist everywhere (close()
+  closes only a window a script opened); the engine's helpers no longer
+  enumerate. A page's own functions keep their source.
+- **270: timers and User Timing.** performance.now() (and rAF / event
+  timestamps, timeOrigin) in 100 us steps, as High Resolution Time
+  requires (it was 0.1 us); performance.mark() / measure() record entries
+  (they did nothing), with PerformanceEntry / Mark / Measure /
+  ResourceTiming / Navigation; performance.memory from the script heap.
+- **271: the device, honestly.** screen is 960x544 (it said 1024x768),
+  pixelDepth 24, orientation landscape-primary (lock() not supported);
+  navigator.plugins / mimeTypes empty; permissions.query() says "denied"
+  for what the browser cannot grant (it said "prompt" for everything) and
+  "granted" for storage-access and local-network-access; clipboard
+  writes reject (they resolved with nothing copied). Not added on purpose:
+  mediaDevices, speechSynthesis, WebGL, AudioContext -- an empty stand-in
+  would make a feature test say the browser has them.
+- **272: navigator.getBattery()** from scePower: level, charging (or on
+  external power), dischargingTime from the minutes left, change events
+  (read every minute).
+
+Sim-verified: gate pages JS-builtins-native (BUILTIN 8/8), JS-perf-timing
+(PERFTIME 10/10), JS-device-honest (DEVICE 6/6), each Chromium-verified;
+full gate (see the commit).
+
+**On the device (run 38):** the autotest as usual, then open the bundled
+`file:///app0:/testpages/JS-device-honest.html` and `JS-perf-timing.html`:
+DEVICE 6/6 and PERFTIME 10/10 expected. Check 6 shows the battery the
+browser reads ("level 0.85, charging false, dischargingTime ..."): compare
+it with the Vita's own battery indicator, plugged in and unplugged.

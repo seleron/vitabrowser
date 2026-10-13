@@ -178,6 +178,53 @@ would not move the result (Chromium without them passes). The next
 measurement: trace hsw's import calls (name, arguments, result or
 exception) in both engines and compare them in order.
 
+### The trace, both engines (2026-10-13, patch 268)
+
+Patch 268 gives the simulator what Playwright's init scripts give
+Chromium: `VITA_SIM_INJECT=<file>` runs a script in every realm,
+cross-origin frames included. `tools/hcaptcha/hsw-trace.js` wraps hsw's
+188 imports, Reflect.has / Reflect.get (what its glue probes with),
+Function.prototype.apply (the glue's catch-all, so every exception it
+swallows is logged) and the getcaptcha XHR. Same hsw build both sides
+(checked by its hash; it rotates every few hours).
+
+- **Requests:** identical -- the same checksiteconfig answer (`"pass":
+  true`, features `enc_get_req`, `andint`), the same getcaptcha URL,
+  headers, withCredentials. The answer, decoded: `{"c": {"type": "hsw",
+  "req": ...}, "success": false, "error-codes": []}`.
+- **What hsw probes, in order:** the first difference is
+  `Reflect.has(window, "OfflineAudioContext")` (true / false); every
+  surface difference after it is one Chromium was shown to pass without.
+  Traced against a Chromium cut down to the engine's surface, the
+  remaining differences are values (webdriver, maxTouchPoints,
+  ontouchstart, nextHopProtocol "h2" / "http/1.1"), interface
+  @@toStringTag (`Request.prototype` was "Object"), and **the
+  native-function check:** hsw reads the descriptors of 44 window
+  functions and toString()s them -- here 24 gave their source text
+  (the bridge and the polyfill are JavaScript), several were anonymous
+  or named for a helper, and inside its frames 11 were accessors.
+- **Swallowed exceptions:** the same kinds both sides (Chromium 3,
+  engine 2: `chrome.loadTimes` on an undefined `chrome`, Reflect on a
+  non-object).
+- **Ruled out the same way, in Chromium:** source-text window functions
+  and accessor descriptors (both together), `performance.now()` with
+  sub-microsecond steps, `Date.now()` 2.3 s ahead of `timeOrigin +
+  now()` (the WSL clock steps; the Vita does not have them) -- challenge
+  every time. TextEncoder / TextDecoder (`encodeInto` included) agree
+  with Chromium on every case hsw's glue can hit.
+
+The standards deviations the trace found are fixed anyway, as what they
+are (patches 269-272: built-ins with [native code], names, WebIDL
+lengths and attributes; performance.now() coarsened to 100 us as High
+Resolution Time requires, User Timing, performance.memory; the screen
+the Vita has, no plugins, honest permission states, getBattery() from
+the hardware). **The demo still refuses the engine** after them: 797
+bytes, `success: false` (getcaptcha body 23 KB, from 26). Nothing that
+can be given to Chromium makes it fail, so what is left is inside the
+computation: a record / replay of hsw's import results through wasm3 and
+V8 (the differential of `wasm-diff/` with the imports included), or
+QuickJS semantics hsw relies on. Not pursued further this round.
+
 ## How to measure again
 
 The scripts were scratch files; the method:
