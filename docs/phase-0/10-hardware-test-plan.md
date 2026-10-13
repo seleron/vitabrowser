@@ -4239,8 +4239,9 @@ green.
 Found on the way, not fixed: libhubbub turns `&#13;` into LF; ~~a
 script's `textarea.value` is the value attribute (so a value set from
 script is not what is submitted)~~ **fixed in 286-287** (below);
-~~`form.elements.namedItem` is missing~~ **fixed in 288** (below); a
-form's `target` naming an iframe navigates the whole window; a parsed
+~~`form.elements.namedItem` is missing~~ **fixed in 288** (below); ~~a
+form's `target` naming an iframe navigates the whole window~~ **fixed in
+289** (below); a parsed
 iframe's `contentWindow.document` is undefined to its parent (still
 open: see 288).
 
@@ -4340,3 +4341,44 @@ full sim gate exit 0 (gate-288); Vita cross-build green.
 (no server needed). Then an older site that scripts its forms by name (a
 search or login form driven by `document.<form>.<field>`): report if it
 now works where it did not.
+
+### Patch 289 (2026-10-13): a form or link targeting an iframe loads in it
+
+The next item of 283's "found on the way" list. A target name is looked
+up among the page's browser windows, and an iframe had one only when it
+had a `src` and a box: a form or link whose target named an iframe with
+no `src` (before or after the form, or made by a script) or a
+`display:none` one found nothing, and its result replaced the whole
+page. In browsers every iframe is a browsing context with its name.
+
+- **289 (netsurf):** a named iframe without `src` gets its window -- in
+  its box, empty until something is sent there (it was a placeholder);
+  a script-made one too; and when no window has the name, the
+  requesting page's and its parents' `<iframe name=...>` elements are
+  asked, a `display:none` or not-yet-laid-out frame getting a box-less
+  window (244's kind). Nothing that was not loaded before is loaded:
+  the new windows stay empty until targeted, so 244's rule (blank and
+  same-origin script-made frames keep their in-page realm) holds.
+
+Found on the way, not fixed: a script's `a.click()` on a link does not
+follow it, with or without a target (the polyfill's `click()` activates
+submit buttons only).
+
+Sim-verified: JS-form-target.html (FORMTARGET 5/5: forms into an iframe
+with no `src`, `about:blank`, `display:none`, script-made, declared
+after the form; Chromium 5/5); the scriptless-forms gate section taps a
+Send button and a link into iframes (`FORMTARGET tap tapped,link`, as
+Chromium); the frame pages unchanged (XFRAME 9/9, XEARLY 3/3,
+FRAMELOCAL 6/6, REALM 11/11, XREALM 4/4); full sim gate exit 0
+(gate-289); Vita cross-build green.
+
+**On the device (run 39), in addition:** the bundled page needs the gate
+server to report form results, so open
+`file:///app0:/testpages/JS-form-target.html?tap` and tap both buttons
+(measured in the simulator over file://): **Send into the frame** must
+leave the page in place with an error page inside the first frame (no
+server: "not found"), not over the whole page; **Link into the hidden
+frame** must make the heading read `FORMTARGET tap: link`. The plain
+page (no `?tap`) stays at FORMTARGET 0/5 from the bundle (its results
+cannot report without the server) -- but must not be replaced by an
+error page.
