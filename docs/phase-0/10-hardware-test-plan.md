@@ -4236,7 +4236,8 @@ were checked against Chromium the same way. Full sim gate exit 0
 `x=0&y=0`, the image rule applied to it -- fixed); Vita cross-build
 green.
 
-Found on the way, not fixed: libhubbub turns `&#13;` into LF; ~~a
+Found on the way, not fixed: ~~libhubbub turns `&#13;` into LF~~
+**fixed in 290** (below); ~~a
 script's `textarea.value` is the value attribute (so a value set from
 script is not what is submitted)~~ **fixed in 286-287** (below);
 ~~`form.elements.namedItem` is missing~~ **fixed in 288** (below); ~~a
@@ -4382,3 +4383,30 @@ frame** must make the heading read `FORMTARGET tap: link`. The plain
 page (no `?tap`) stays at FORMTARGET 0/5 from the bundle (its results
 cannot report without the server) -- but must not be replaced by an
 error page.
+
+### Patch 290 (2026-10-13): numeric character references -- `&#13;` is CR
+
+The last parser item of 283's "found on the way" list. libhubbub fixed
+numeric references up with the 2010 draft's table: `&#13;` became LF --
+a value written `a&#13;&#10;b` held two line breaks, and the form sent
+them -- and the other controls (`&#1;`, `&#x7F;`...), the unassigned
+windows-1252 bytes (`&#x81;`...) and the noncharacters (`&#xFFFE;`...)
+became U+FFFD; U+10FFFF counted as out of range.
+
+- **290 (libhubbub): HTML's numeric character reference end state as it
+  is now** (checked against Chromium reference by reference): only NUL,
+  a surrogate or a number beyond U+10FFFF is U+FFFD; 0x80-0x9F take
+  windows-1252's character where it has one; anything else -- CR among
+  them -- is the code point it names. A textarea's text keeps the CR;
+  its value reads LF (its line breaks are normalised, 287), as in
+  browsers.
+
+Sim-verified: JS-charref.html (CHARREF 6/6, Chromium 6/6; 6/6 from the
+bundle over file://); HTML-multipart-form.html gained a field written
+`a&#13;&#10;b&#13;c`, and the scriptless-forms multipart digest
+(fcd2da030618) equals Chromium's -- the CR round-trips to the server;
+full sim gate exit 0 (gate-290); Vita cross-build green.
+
+**On the device (run 39), in addition:** the bundled
+`file:///app0:/testpages/JS-charref.html`: CHARREF 6/6 expected (no
+server needed).
