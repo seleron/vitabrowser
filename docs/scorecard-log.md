@@ -4,6 +4,19 @@ Each entry: what changed, the scorecard before and after (same Chrome
 reference, `--reuse-ref`), and the gaps it was chosen from. Method and
 targets: `roadmap.md`. Tool: `tools/scorecard/scorecard.py`.
 
+## 2026-10-13 — patches 283-285 (r58-285-fresh, fresh reference)
+
+Forms submitted by the engine's own path (entries, charsets, submitters,
+form="", file parts) -- nothing the scorecard's page loads exercise, so
+the check is that nothing moved. On r56's reference (r58-285, five hours
+old) the mean read 78.9: every drop was text recall on a live page (the
+news fronts, Hacker News, Stack Overflow's newest, Google), every static
+site identical -- the reference's age. Against a fresh one: mean
+**83.6** (r56 83.6), JS error counts unchanged on every site; Wikipedia
++2.8 (r57's donation appeal gone, so its visual is back), wpblog -1.3
+(its text, live), the Guardian and Stack Overflow -0.6 (visual), the rest
+within 0.5. **r58-285-fresh is the baseline.**
+
 ## 2026-10-13 — patch 282 (r57-282-fresh, fresh reference)
 
 Resource Timing: every page's fetches recorded, fetch() and XHR wrapped

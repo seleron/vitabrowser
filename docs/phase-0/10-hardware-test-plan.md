@@ -3566,6 +3566,10 @@ Sim-verified: JS-fetch-body checks 18-22, 22/22 over http and https
 exit 0 with no soft accepts; Vita cross-build green. No device check of
 its own.
 
+(The engine's own form path -- a `<form>` submitted without script --
+was brought in line in patches 283-285, queued for run 39 below:
+"Patches 283-285 (2026-10-13): forms submitted without script".)
+
 ## Run 36 — hand-off (2026-10-12 22:50; replaces untested run 35)
 
 **Superseded by run 37 (below) before it was tested.** Its checklist
@@ -4181,3 +4185,69 @@ entries" (no localhost server on the Vita). Anything else -- a check
 failing on "getEntriesByName gave 0 entries", or a crash -- is a fault.
 Watch memory on image-heavy pages: entries are kept per document (at
 most 250, 1024 in all) until the page is left.
+
+## Since run 38 — queued for run 39 (not built yet)
+
+### Patches 283-285 (2026-10-13): forms submitted without script
+
+The last gap after 257/258: a `<form>` submitted without script goes
+through the engine's own form path, which 257 (a script's FormData)
+never touched. Compared part by part with Chromium's body for the same
+forms, the multipart encoding itself (libcurl's: a random boundary,
+names and filenames escaped `"` CR LF as `%22 %0D %0A`) already matched;
+what differed was the list of entries, for every enctype:
+
+- **283 (netsurf): the entries as HTML builds them.** Line breaks in
+  names and values go as CR LF (a textarea's lines went as LF; a name's
+  break as `%0A`). A windows-1252 page's form is encoded in
+  windows-1252 (the euro is 0x80) and a character it lacks goes as
+  `&#N;` (it was `?`); `iso-8859-1`, `latin1` and `us-ascii` are its
+  labels. A hidden `_charset_` field sends the encoding's name.
+  `dirname` sends `ltr` / `rtl`. A control in a disabled fieldset, a
+  disabled option, a control with an empty name are not sent. Only the
+  submitter is sent: with none (`form.submit()`, `requestSubmit()`) the
+  first submit button was; Enter in a field now submits with the form's
+  default button. An image button pressed without a pointer sends
+  `name.x=0&name.y=0` -- it abandoned the whole submission. An unknown
+  element type in a form is skipped (it abandoned the submission too).
+- **284 (libdom): `form="id"`.** A control outside its form that names
+  it with the form attribute is submitted with it; one naming no form is
+  not submitted with its ancestor.
+- **285 (netsurf): the file part.** Typed by extension as Chromium types
+  an upload, `application/octet-stream` when unknown (it was
+  `text/plain`). The Vita has no file chooser, so a file input stays
+  empty there and sends the empty file part browsers send (filename `""`,
+  `application/octet-stream`); the simulator takes a file from
+  `VITA_SIM_UPLOAD` so the gate can send a real one.
+
+Sim-verified: a new gate section, "scriptless form submissions" -- one
+session taps each Send button of the new bundled pages
+(HTML-multipart-form: a multipart and an url-encoded form;
+HTML-multipart-1252; HTML-multipart-upload, with a file named
+`q"uote é.dat` holding CR LF, NUL and 0xFF bytes) and loads
+JS-form-submitters with each submitter (an image button, a nameless one,
+none, `form.submit()`, a second button). The gate server's `/form-check`
+checks the body (boundary a valid token matching the Content-Type,
+CRLF delimiters and headers, each part's disposition, a file part's
+type, Content-Length) and digests its entries; all nine digests equal
+Chromium's for the same forms and file. The url-encoded and GET bodies
+were checked against Chromium the same way. Full sim gate exit 0
+(gate-283b, after one failing run: a nameless plain submit button sent
+`x=0&y=0`, the image rule applied to it -- fixed); Vita cross-build
+green.
+
+Found on the way, not fixed: libhubbub turns `&#13;` into LF; a
+script's `textarea.value` is the value attribute (so a value set from
+script is not what is submitted); `form.elements.namedItem` is missing;
+a form's `target` naming an iframe navigates the whole window; a parsed
+iframe's `contentWindow.document` is undefined to its parent.
+
+**On the device (run 39):** the bundled HTML-multipart-* and
+JS-form-submitters pages post to the gate server, which the Vita does not
+have: from `file://` their Send leads to an error page, and they are not
+a device check. Instead: the autotest's form steps (interact 15-18: the
+IN-form submission must still read `via=form&q=hello+vita`, no extra
+button entry), a search from DuckDuckGo Lite and from Wikipedia's search
+box (both forms: results as before), and any form you use that has
+several submit buttons or an image button -- report if a site now gets
+the wrong button or none.
