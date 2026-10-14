@@ -1,0 +1,275 @@
+# netsurf: a form's named controls shadow its built-ins (patch 297)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 296)
+#
+# Patch 288's "not done", recorded in its Doc 10 entry: named access
+# on a form only reached names HTMLFormElement.prototype does not
+# have. The layer sits above the prototype, so a lookup for a name
+# the prototype owns -- submit, action, length, the classic
+# accidents a page ships when a field is named after one -- found
+# the built-in first, where a browser's [LegacyOverrideBuiltIns]
+# named-properties object sits between the instance and the
+# prototype and the control wins: <input name="submit"> leaves
+# form.submit the method here, and form.submit() from page code
+# then submits when the page meant to read its field (or throws on
+# the string it does get).
+#
+# The prototype's own members now answer through the named access.
+# Each own descriptor of HTMLFormElement.prototype is wrapped where
+# it sits -- a data property keeps its place and answers its value,
+# an accessor keeps a getter and setter of its own; the wrapped
+# getter asks the form's controls first, and the wrapped setter
+# swallows a write to a shadowed name (the control reads back, as
+# in browsers), keeps an unshadowed attribute's original setter,
+# and otherwise takes an own property on the form. The bridge puts
+# some of the form's own IDL attributes (action, method, target,
+# name) on the shared element prototype above the form's, so those
+# are wrapped where they live too; the form-only guard leaves every
+# other element's reads exactly as they were. A reentrancy guard
+# keeps the lookup's own reads (ownerDocument and friends, which
+# the control search itself needs) out of the wrapping.
+#
+# Measured while doing it, not fixed here (they are absences, not
+# shadowing): form.reset, form.enctype and form.encoding do not
+# exist in the bridge at all -- a control named reset "shadows" a
+# method that was never there. Controls named after the wider
+# HTMLElement members (id, title, ...) also still do not shadow;
+# the form's own interface is covered, the whole chain is not.
+#
+# Gate: testpages/pages/JS-form-shadow.html (FORMSHADOW 6/6 in the
+# simulator and in a reference browser -- Firefox/Camoufox, for
+# the reason patch 292's header gives). JS-form-named.html stays
+# FORMNAMED 7/7. Simulator only; the vita cross-build was not run
+# (no vitaSDK on this VM). Device expectation is in Doc 10.
+#
+# Decline conditions: if the bridge ever grows a real
+# named-properties object in C (a per-interface prototype between
+# instance and HTMLFormElement.prototype), this wrapping should be
+# deleted in its favour.
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10632,10 +10632,105 @@
+ 		try { Object.setPrototypeOf(P, px); } catch (e) { return; }
+ 		(PRIV.namedAbove || (PRIV.namedAbove = [])).push(px);
+ 	}
+-	if (FP) above(FP, function (form, k) {
+-		if (IDX.test(k)) return controls(form)[+k];
+-		return k === '' ? null : formNamed(form, k);
+-	});
++	/* VitaBrowser patch 297: named controls also shadow the form's
++	 * built-ins, as [LegacyOverrideBuiltIns] does in browsers -- an
++	 * <input name="submit"> makes form.submit the input, not the
++	 * method. Patch 288's layer sits above HTMLFormElement.prototype,
++	 * so it only ever sees a name the prototype does not have: a
++	 * control named submit / reset / action / length is found on
++	 * the prototype first and never shadows. The prototype's own
++	 * members therefore answer through the named access: each own
++	 * descriptor of HTMLFormElement.prototype is wrapped where it
++	 * sits -- a method stays a property of the prototype, an IDL
++	 * attribute keeps a getter and setter of its own -- and the
++	 * wrapped getter asks the form's controls first. Assignments
++	 * behave as in browsers: a shadowed name swallows the write (the
++	 * control still reads back), an unshadowed attribute keeps its
++	 * original setter, anything else takes an own property on the
++	 * form. The guard keeps the lookup's own reads -- ownerDocument
++	 * and friends, which the control search itself needs -- out of
++	 * the wrapping: a browser's internals never see the named
++	 * properties either. */
++	if (FP) {
++		var inNamed = false, wrapped = {};
++		function controlsFirst(form, k) {
++			if (inNamed) return undefined;
++			inNamed = true;
++			var v;
++			try {
++				v = IDX.test(k) ? controls(form)[+k] :
++					k === '' ? null : formNamed(form, k);
++			} catch (e) { v = undefined; }
++			inNamed = false;
++			return v === null ? undefined : v;
++		}
++		function wrapMember(P, k) {
++			var desc = GOPD(P, k);
++			if (!desc || !desc.configurable || wrapped[k]) return;
++			try {
++				if ('value' in desc) {
++					var val = desc.value;
++					D(P, k, { configurable: true,
++						enumerable: desc.enumerable,
++						get: GOPD({ get [k]() {
++							if (isA(this, FP)) {
++								var v = controlsFirst(this, k);
++								if (v !== undefined) return v;
++							}
++							return val;
++						} }, k).get,
++						set: function (v) {
++							if (isA(this, FP) &&
++							    controlsFirst(this, k) !== undefined)
++								return;
++							try {
++								D(this, k, { value: v, writable: true,
++									enumerable: true, configurable: true });
++							} catch (e) { /* */ }
++						} });
++				} else if (desc.get) {
++					var oget = desc.get, oset = desc.set;
++					D(P, k, { configurable: true,
++						enumerable: desc.enumerable,
++						get: GOPD({ get [k]() {
++							if (isA(this, FP)) {
++								var v = controlsFirst(this, k);
++								if (v !== undefined) return v;
++							}
++							return oget.call(this);
++						} }, k).get,
++						set: oset ? function (v) {
++							if (isA(this, FP) &&
++							    controlsFirst(this, k) !== undefined)
++								return;
++							oset.call(this, v);
++						} : undefined });
++				} else return;
++				wrapped[k] = true;
++			} catch (e) { /* */ }
++		}
++		Reflect.ownKeys(FP).forEach(function (k) {
++			if (typeof k === 'string') wrapMember(FP, k);
++		});
++		/* the bridge puts some of the form's own IDL attributes
++		 * (action, method, target, name) on the shared element
++		 * prototype above FP, not on FP: wrap those where they
++		 * live -- the isA guard keeps every other element's reads
++		 * exactly as they were */
++		['name', 'action', 'method', 'enctype', 'encoding', 'target',
++		 'autocomplete', 'noValidate', 'acceptCharset', 'rel',
++		 'relList', 'elements', 'length'].forEach(function (k) {
++			if (wrapped[k]) return;
++			for (var p = Object.getPrototypeOf(FP);
++			     p && p !== Object.prototype;
++			     p = Object.getPrototypeOf(p))
++				if (GOPD(p, k)) { wrapMember(p, k); break; }
++		});
++		above(FP, function (form, k) {
++			if (IDX.test(k)) return controls(form)[+k];
++			return k === '' ? null : formNamed(form, k);
++		});
++	}
+ 
+ 	/* document.forms, and the document's named access */
+ 	var DP = proto('Document');
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10633,10 +10633,105 @@
+ "\t\ttry { Object.setPrototypeOf(P, px); } catch (e) { return; }\n"
+ "\t\t(PRIV.namedAbove || (PRIV.namedAbove = [])).push(px);\n"
+ "\t}\n"
+-"\tif (FP) above(FP, function (form, k) {\n"
+-"\t\tif (IDX.test(k)) return controls(form)[+k];\n"
+-"\t\treturn k === '' ? null : formNamed(form, k);\n"
+-"\t});\n"
++"\t/* VitaBrowser patch 297: named controls also shadow the form's\n"
++"\t * built-ins, as [LegacyOverrideBuiltIns] does in browsers -- an\n"
++"\t * <input name=\"submit\"> makes form.submit the input, not the\n"
++"\t * method. Patch 288's layer sits above HTMLFormElement.prototype,\n"
++"\t * so it only ever sees a name the prototype does not have: a\n"
++"\t * control named submit / reset / action / length is found on\n"
++"\t * the prototype first and never shadows. The prototype's own\n"
++"\t * members therefore answer through the named access: each own\n"
++"\t * descriptor of HTMLFormElement.prototype is wrapped where it\n"
++"\t * sits -- a method stays a property of the prototype, an IDL\n"
++"\t * attribute keeps a getter and setter of its own -- and the\n"
++"\t * wrapped getter asks the form's controls first. Assignments\n"
++"\t * behave as in browsers: a shadowed name swallows the write (the\n"
++"\t * control still reads back), an unshadowed attribute keeps its\n"
++"\t * original setter, anything else takes an own property on the\n"
++"\t * form. The guard keeps the lookup's own reads -- ownerDocument\n"
++"\t * and friends, which the control search itself needs -- out of\n"
++"\t * the wrapping: a browser's internals never see the named\n"
++"\t * properties either. */\n"
++"\tif (FP) {\n"
++"\t\tvar inNamed = false, wrapped = {};\n"
++"\t\tfunction controlsFirst(form, k) {\n"
++"\t\t\tif (inNamed) return undefined;\n"
++"\t\t\tinNamed = true;\n"
++"\t\t\tvar v;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tv = IDX.test(k) ? controls(form)[+k] :\n"
++"\t\t\t\t\tk === '' ? null : formNamed(form, k);\n"
++"\t\t\t} catch (e) { v = undefined; }\n"
++"\t\t\tinNamed = false;\n"
++"\t\t\treturn v === null ? undefined : v;\n"
++"\t\t}\n"
++"\t\tfunction wrapMember(P, k) {\n"
++"\t\t\tvar desc = GOPD(P, k);\n"
++"\t\t\tif (!desc || !desc.configurable || wrapped[k]) return;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tif ('value' in desc) {\n"
++"\t\t\t\t\tvar val = desc.value;\n"
++"\t\t\t\t\tD(P, k, { configurable: true,\n"
++"\t\t\t\t\t\tenumerable: desc.enumerable,\n"
++"\t\t\t\t\t\tget: GOPD({ get [k]() {\n"
++"\t\t\t\t\t\t\tif (isA(this, FP)) {\n"
++"\t\t\t\t\t\t\t\tvar v = controlsFirst(this, k);\n"
++"\t\t\t\t\t\t\t\tif (v !== undefined) return v;\n"
++"\t\t\t\t\t\t\t}\n"
++"\t\t\t\t\t\t\treturn val;\n"
++"\t\t\t\t\t\t} }, k).get,\n"
++"\t\t\t\t\t\tset: function (v) {\n"
++"\t\t\t\t\t\t\tif (isA(this, FP) &&\n"
++"\t\t\t\t\t\t\t    controlsFirst(this, k) !== undefined)\n"
++"\t\t\t\t\t\t\t\treturn;\n"
++"\t\t\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\t\t\tD(this, k, { value: v, writable: true,\n"
++"\t\t\t\t\t\t\t\t\tenumerable: true, configurable: true });\n"
++"\t\t\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t\t\t} });\n"
++"\t\t\t\t} else if (desc.get) {\n"
++"\t\t\t\t\tvar oget = desc.get, oset = desc.set;\n"
++"\t\t\t\t\tD(P, k, { configurable: true,\n"
++"\t\t\t\t\t\tenumerable: desc.enumerable,\n"
++"\t\t\t\t\t\tget: GOPD({ get [k]() {\n"
++"\t\t\t\t\t\t\tif (isA(this, FP)) {\n"
++"\t\t\t\t\t\t\t\tvar v = controlsFirst(this, k);\n"
++"\t\t\t\t\t\t\t\tif (v !== undefined) return v;\n"
++"\t\t\t\t\t\t\t}\n"
++"\t\t\t\t\t\t\treturn oget.call(this);\n"
++"\t\t\t\t\t\t} }, k).get,\n"
++"\t\t\t\t\t\tset: oset ? function (v) {\n"
++"\t\t\t\t\t\t\tif (isA(this, FP) &&\n"
++"\t\t\t\t\t\t\t    controlsFirst(this, k) !== undefined)\n"
++"\t\t\t\t\t\t\t\treturn;\n"
++"\t\t\t\t\t\t\toset.call(this, v);\n"
++"\t\t\t\t\t\t} : undefined });\n"
++"\t\t\t\t} else return;\n"
++"\t\t\t\twrapped[k] = true;\n"
++"\t\t\t} catch (e) { /* */ }\n"
++"\t\t}\n"
++"\t\tReflect.ownKeys(FP).forEach(function (k) {\n"
++"\t\t\tif (typeof k === 'string') wrapMember(FP, k);\n"
++"\t\t});\n"
++"\t\t/* the bridge puts some of the form's own IDL attributes\n"
++"\t\t * (action, method, target, name) on the shared element\n"
++"\t\t * prototype above FP, not on FP: wrap those where they\n"
++"\t\t * live -- the isA guard keeps every other element's reads\n"
++"\t\t * exactly as they were */\n"
++"\t\t['name', 'action', 'method', 'enctype', 'encoding', 'target',\n"
++"\t\t 'autocomplete', 'noValidate', 'acceptCharset', 'rel',\n"
++"\t\t 'relList', 'elements', 'length'].forEach(function (k) {\n"
++"\t\t\tif (wrapped[k]) return;\n"
++"\t\t\tfor (var p = Object.getPrototypeOf(FP);\n"
++"\t\t\t     p && p !== Object.prototype;\n"
++"\t\t\t     p = Object.getPrototypeOf(p))\n"
++"\t\t\t\tif (GOPD(p, k)) { wrapMember(p, k); break; }\n"
++"\t\t});\n"
++"\t\tabove(FP, function (form, k) {\n"
++"\t\t\tif (IDX.test(k)) return controls(form)[+k];\n"
++"\t\t\treturn k === '' ? null : formNamed(form, k);\n"
++"\t\t});\n"
++"\t}\n"
+ "\n"
+ "\t/* document.forms, and the document's named access */\n"
+ "\tvar DP = proto('Document');\n"
