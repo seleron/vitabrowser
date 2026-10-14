@@ -4882,3 +4882,56 @@ minutes and finishes loading instead of hanging for good.
 NET-stall.html over the gate server is the check -- allow it
 ~130 s (the stall aborts at 120-135 s, then the drip script
 completes): converted, drip=1.
+
+### Patch 300 (2026-10-14): a `<title>` text change is not a repaint
+
+The 2026-10-14 performance profile found every large page
+paying two full reconverts before settling. The second one's
+batch always ended with a `document.title` write -- results
+pages and single-page apps write it constantly, and the shim
+writes it through the `<title>` element, marking the document
+TEXTCONTENT on `<title>`. The local rebuild path climbs from
+the changed node to the nearest element with a block box; from
+`<title>` the climb reaches the root block, and the block-change
+scan there declines -- it finds `<head>` itself boxless. The
+caller answers every decline with a full reconvert of the whole
+document: rebuild, relayout, repaint, to repaint nothing.
+
+- **300 (netsurf):** the local rebuild path answers a change
+  inside a `<title>` directly -- nothing rendered, nothing to
+  rebuild -- before the climb. The test is title, not head: the
+  ancestor walk stops (and the full path is kept) at a `<style>`
+  or at `<head>` itself, so a child-list change ON `<head>` (a
+  script inserting a `<style>`) and a `<style>`'s own text keep
+  declining into the full reconvert, as they must. A `<title>`
+  can contain neither: its content is text, and text in a title
+  paints nowhere.
+
+Benchmark (host simulator, relative timings): a throwaway page
+holding JS-dom-stall's 5000-paragraph document, whose only
+post-load step sets `document.title`. Before: three full
+reconverts totalling 1331 ms, the third being the title
+write's. After: two reconverts totalling 939 ms -- the title
+step's reconvert is gone, and the log shows the local path
+answering it ("LIFE rebuild local: title text, nothing
+rendered"). The five-page bench medians are unchanged within
+noise (domstall 1174 -> 1113/1140 in two runs): the suite
+pages' post-load reconvert is the whole result-writing batch
+declining together, a separate batching question.
+
+Sim-verified: full adapted gate exit 0 (gate-300-final;
+network mirror skipped as in every adapted run -- UDP
+sendto() is EPERM-blocked on this VM): clip modes 17
+identical / 0 differ / 1 time-varying, Vita's-pace pages 23
+identical / 0 differ, text batching 68 frames identical / 0
+differ, interaction pass 52/52. Fresh re-stage 388 applied /
+0 failed; html.c byte-identical to the tested tree. Vita
+cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** a page that rewrites
+its title after load (a search-results page setting
+document.title when the results land is the common case) no
+longer pays a full-document rebuild for the write. On a large
+document that rebuild was the dominant post-load stall in the
+simulator profile; expect the title write to be free and the
+page to settle one full rebuild sooner.
