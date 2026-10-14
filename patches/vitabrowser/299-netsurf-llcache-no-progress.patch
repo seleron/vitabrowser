@@ -1,0 +1,294 @@
+# netsurf: a no-progress bound for in-flight fetches (patch 299)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 298)
+#
+# The async fetcher had a connect timeout (30 s) and a low-speed
+# limit (1 byte/second averaged over 180 s), but no bound on how
+# long a fetch may go without progress -- and no bound at all on
+# the states the fetcher never reports on: a fetch queued behind a
+# host's connection limit, a resolution that never answers, a
+# callback that never fires. Anything waiting on such a fetch
+# waits forever. For a parser-blocking script that is the whole
+# document: measured in the simulator against an accept-and-hold
+# endpoint (the server takes the connection and never sends a
+# byte), the fetch started and the page had still not converted
+# when the run was stopped 89 seconds later -- nothing ahead of
+# it but curl's 180 s low-speed floor, and not even that for a
+# body that drips at or above 1 B/s for ever.
+#
+# llcache now keeps a per-fetch progress clock: set at fetch
+# start, restarted on every header and every data chunk. A
+# watchdog (the frontend scheduler llcache already uses, checked
+# every 15 s while any fetch is active) walks the cached and
+# uncached object lists; a fetch whose last progress is older
+# than the bound is aborted and its object completed with
+# LLCACHE_EVENT_ERROR / NSERROR_TIMEOUT -- the same completion a
+# failed fetch produces, so conversion and dependents proceed.
+# fetch_abort is silent (no terminal callback follows), so the
+# watchdog completes the object itself, as the redirect path
+# does. The abort is not retried like a fetcher-reported timeout:
+# the fetch already had the full bound without a sign of life,
+# and a silent retry would double the stall for the same answer.
+#
+# The bound is on NO PROGRESS, not on total time: a slow transfer
+# that keeps delivering bytes is never aborted by it. 120 s,
+# aligned with the blocking fetcher's BLOCKING_TIMEOUT_S -- the
+# value patches 199 and 200 anchored their give-up bounds to.
+# With the 15 s watchdog interval a stalled fetch is aborted
+# between 120 and 135 s after its last progress. Known
+# consequence, accepted: a stream that stays open but quiet for
+# 120 s (an idle EventSource, a long-polled fetch body) is
+# indistinguishable from a stall at this layer and is aborted
+# like one.
+#
+# Proof: tools/vita-sim/httpd.py gains /stall-js (accept and
+# hold, no bytes ever) and /drip-js (a complete script dripped
+# at 2 B/s), and testpages/pages/NET-stall.html blocks the parser
+# on the first, then the second. The page is not in the gate's
+# page list -- at the shipped bound it needs ~130 s of wall
+# time, past the gate's settle budget -- so, as patch 200 did,
+# the mechanism is proven on a throwaway build with the bound
+# compiled to 5 s (LLCACHE_FETCH_NOPROGRESS_S): the log shows
+# "No progress for 11 s, aborting fetch of .../stall-js" on the
+# watchdog's first tick past the bound, and the page converts
+# with NETSTALL drip=1 elapsed=19s -- the drip transfer, longer
+# than the bound in total, completed and ran because it kept
+# progressing. The full adapted simulator gate at the shipped
+# bound exits 0 with no spurious timeout (its network-mirror
+# section is skipped on this VM -- UDP sendto() is EPERM-blocked
+# -- as in every adapted run). Simulator only; the Vita
+# cross-build was not run (no vitaSDK on this VM). Device
+# expectation is in Doc 10.
+#
+# Decline conditions: none polite. A fetch that has shown no
+# sign of life for two minutes is not coming back; if a real
+# workload ever needs a longer leash, the bound is one define.
+#
+diff --git a/content/llcache.c b/content/llcache.c
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -130,6 +130,11 @@ typedef struct {
+ 
+ 	llcache_fetch_state state;	/**< Current state of object fetch */
+ 
++	/* VitaBrowser patch 299 - time of the last sign of life from
++	 * this fetch (start, a header, a data chunk). The watchdog
++	 * below aborts a fetch that shows none for the bound. */
++	time_t last_progress;
++
+ 	uint32_t redirect_count;	/**< Count of redirects followed */
+ 
+ 	uint32_t retries_remaining;     /**< Number of times to retry on timeout */
+@@ -302,6 +307,39 @@ static bool llcache_notify_in_progress = false;
+ /* forward referenced callback function */
+ static void llcache_fetch_callback(const fetch_msg *msg, void *p);
+ 
++/* VitaBrowser patch 299 - no-progress policy for in-flight fetches.
++ *
++ * The async fetcher sets a connect timeout and a low-speed limit
++ * (1 byte/second averaged over 180 s) but no bound on how long a
++ * fetch may go without progress, and none at all on states the
++ * fetcher never reports on (a queued fetch, a resolution that never
++ * answers, a callback that never fires). A parser-blocking script
++ * whose server accepts the connection and holds it therefore blocks
++ * the document's conversion indefinitely -- measured in the
++ * simulator with an accept-and-hold endpoint: the fetch started and
++ * the page had still not converted when the run was stopped 89 s
++ * later, with nothing ahead of it but the 180 s low-speed floor
++ * (and not even that for a body that drips at or above 1 B/s
++ * forever).
++ *
++ * The bound is on NO PROGRESS, not on total time: the clock
++ * restarts at fetch start and on every header and data message, so
++ * a slow transfer that keeps delivering bytes is never aborted by
++ * it. 120 s aligns with the blocking fetcher's BLOCKING_TIMEOUT_S
++ * -- the value patches 199 and 200 anchored their give-up bounds
++ * to. The watchdog runs every 15 s while any fetch is active, so a
++ * stalled fetch is aborted between 120 and 135 s after its last
++ * progress. Overridable at compile time for short-bound proof
++ * builds.
++ */
++#ifndef LLCACHE_FETCH_NOPROGRESS_S
++#define LLCACHE_FETCH_NOPROGRESS_S 120
++#endif
++#define LLCACHE_FETCH_WATCHDOG_MS 15000
++
++/* forward referenced watchdog arming (patch 299) */
++static void llcache_fetch_watchdog_arm(void);
++
+ /* forward referenced catch up function */
+ static void llcache_users_not_caught_up(void);
+ 
+@@ -1220,6 +1258,9 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 
+ 	/* Reset fetch state */
+ 	object->fetch.state = LLCACHE_FETCH_INIT;
++	/* VitaBrowser patch 299 - the no-progress clock starts here
++	 * (and restarts on every header / data message). */
++	object->fetch.last_progress = object->cache.req_time;
+ 
+ 	nslog_log(__FILE__, "", __LINE__, "Re-fetching %p", object);
+ 
+@@ -1242,6 +1283,12 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 	}
+ 	free(headers);
+ 
++	/* VitaBrowser patch 299 - keep the no-progress watchdog
++	 * running while this fetch is in flight. */
++	if (res == NSERROR_OK) {
++		llcache_fetch_watchdog_arm();
++	}
++
+ 	return res;
+ }
+ 
+@@ -3100,6 +3147,131 @@ static nserror llcache_fetch_ssl_error(llcache_object *object)
+ }
+ 
+ 
++/**
++ * VitaBrowser patch 299 - abort a fetch that has made no progress
++ * for the bound and complete its object with an error.
++ *
++ * fetch_abort() is silent -- the fetcher sends no terminal callback
++ * for an aborted fetch -- so, like the redirect path, this completes
++ * the object itself. Users get LLCACHE_EVENT_ERROR with
++ * NSERROR_TIMEOUT, and whatever was waiting on the object (the
++ * document's conversion, a dependent fetch) proceeds, exactly as
++ * for a fetch that failed on its own. Unlike a fetcher-reported
++ * timeout this is not retried: the fetch already had the full bound
++ * with no sign of life, and a silent retry would double the stall
++ * for the same answer.
++ *
++ * \param object  Object whose fetch stalled
++ * \return NSERROR_OK on success, appropriate error otherwise
++ */
++static nserror llcache_fetch_noprogress_abort(llcache_object *object)
++{
++	llcache_event event;
++
++	fetch_abort(object->fetch.fetch);
++	object->fetch.fetch = NULL;
++	object->fetch.state = LLCACHE_FETCH_COMPLETE;
++
++	/* Release candidate, if any */
++	if (object->candidate != NULL) {
++		object->candidate->candidate_count--;
++		object->candidate = NULL;
++	}
++
++	/* Invalidate cache control data */
++	llcache_invalidate_cache_control_data(object);
++
++	event.type = LLCACHE_EVENT_ERROR;
++	event.data.error.code = NSERROR_TIMEOUT;
++	event.data.error.msg = NULL;
++
++	return llcache_send_event_to_users(object, &event);
++}
++
++/** Whether the no-progress watchdog is currently scheduled. */
++static bool llcache_fetch_watchdog_armed = false;
++
++/**
++ * VitaBrowser patch 299 - one watchdog pass over an object list.
++ *
++ * \param list  Object list to walk (cached or uncached objects)
++ * \param now   Current time
++ * \return true if any fetch is still active on the list
++ */
++static bool llcache_fetch_watchdog_list(llcache_object *list, time_t now)
++{
++	llcache_object *object, *next;
++	bool any_active = false;
++
++	for (object = list; object != NULL; object = next) {
++		/* The abort below sends an event to the object's users;
++		 * capture the successor first, as llcache_persist's
++		 * walk does. (Object frees are deferred to the
++		 * quiescent drain in this codebase, so the captured
++		 * pointer stays valid for this callback.) */
++		next = object->next;
++
++		if (object->fetch.fetch == NULL ||
++		    object->fetch.state == LLCACHE_FETCH_COMPLETE) {
++			continue;
++		}
++
++		if (now - object->fetch.last_progress >=
++				LLCACHE_FETCH_NOPROGRESS_S) {
++			NSLOG(llcache, WARNING,
++			      "No progress for %lld s, aborting fetch of %s",
++			      (long long)(now - object->fetch.last_progress),
++			      nsurl_access(object->url));
++			(void)llcache_fetch_noprogress_abort(object);
++		} else {
++			any_active = true;
++		}
++	}
++
++	return any_active;
++}
++
++/**
++ * VitaBrowser patch 299 - no-progress watchdog. Walks every object
++ * with a fetch in flight; aborts the ones whose last progress is
++ * older than the bound, whatever state the fetch is in -- queued,
++ * connecting, awaiting headers, mid-body. Reschedules itself while
++ * any fetch remains active; llcache_fetch_watchdog_arm() restarts
++ * it when the next fetch starts.
++ */
++static void llcache_fetch_watchdog(void *p)
++{
++	bool any_active;
++
++	(void)p;
++	llcache_fetch_watchdog_armed = false;
++
++	if (llcache == NULL) {
++		return;
++	}
++
++	any_active = llcache_fetch_watchdog_list(
++			llcache->cached_objects, time(NULL));
++	any_active = llcache_fetch_watchdog_list(
++			llcache->uncached_objects, time(NULL)) || any_active;
++
++	if (any_active) {
++		llcache_fetch_watchdog_arm();
++	}
++}
++
++/* VitaBrowser patch 299 - schedule the watchdog if it is not
++ * already running. Called whenever a fetch starts. */
++static void llcache_fetch_watchdog_arm(void)
++{
++	if (!llcache_fetch_watchdog_armed && llcache != NULL) {
++		llcache_fetch_watchdog_armed = true;
++		guit->misc->schedule(LLCACHE_FETCH_WATCHDOG_MS,
++				llcache_fetch_watchdog, NULL);
++	}
++}
++
++
+ /**
+  * handle time out while trying to fetch.
+  *
+@@ -3463,6 +3635,8 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 		 * dropped - fired 10+ times per response, dominant log
+ 		 * volume contributor. */
+ 		object->fetch.state = LLCACHE_FETCH_HEADERS;
++		/* VitaBrowser patch 299 - a header is progress. */
++		object->fetch.last_progress = time(NULL);
+ 
+ 		error = llcache_fetch_process_header(object,
+ 				msg->data.header_or_data.buf,
+@@ -3497,6 +3671,8 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 	/* Normal 2xx state machine */
+ 	case FETCH_DATA:
+ 		/* Received some data. fixes97: per-chunk MS_LOG dropped. */
++		/* VitaBrowser patch 299 - a data chunk is progress. */
++		object->fetch.last_progress = time(NULL);
+ 		error = llcache_fetch_process_data(object,
+ 				msg->data.header_or_data.buf,
+ 				msg->data.header_or_data.len);

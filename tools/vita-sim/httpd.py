@@ -127,6 +127,40 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 pass
             return
+        if self.path == "/stall-js":
+            # Patch 299: accept and hold. Not one byte is ever sent --
+            # no headers, no body -- and the connection stays open.
+            # A parser-blocking script pointing here can only be
+            # unblocked by a client-side no-progress policy; httpd is
+            # a daemon killed at the end of the run, so this handler
+            # just parks.
+            try:
+                while True:
+                    time.sleep(1.0)
+            except Exception:
+                pass
+            return
+        if self.path == "/drip-js":
+            # Patch 299: slow but progressing. A complete, tiny script
+            # body dripped 4 bytes every 2 s (2 B/s -- above curl's
+            # 1 B/s low-speed floor, so only a policy that confuses
+            # slow with stalled would kill it). A no-PROGRESS policy
+            # must let it finish: window.__nsDrip is the receipt.
+            self.protocol_version = "HTTP/1.1"
+            self.close_connection = True
+            body = b"window.__nsDrip=1;\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.flush()
+            for i in range(0, len(body), 4):
+                self.wfile.write(body[i:i + 4])
+                self.wfile.flush()
+                if i + 4 < len(body):
+                    time.sleep(2.0)
+            return
         if self.path == "/slow-headers":
             # Patch 135: fetch() must resolve at the header block, not at
             # the first body byte. Send a complete header block, flush it,
