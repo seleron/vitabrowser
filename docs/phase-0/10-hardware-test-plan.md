@@ -4746,3 +4746,72 @@ from the symptom:
   had), a gate page that reads and writes a same-origin parsed
   frame's document from the parent, and the cross-origin side
   staying null (patch 294).
+
+### Patch 298 (2026-10-14): eventPhase, and the window steps of a document dispatch
+
+Patch 146's recorded follow-up, in two halves with one root -- the
+JS side of event dispatch never kept eventPhase. A fresh Event read
+eventPhase === undefined where a browser reads 0 (NONE), because
+the constructor never set it. And document.dispatchEvent was a shim
+that fired only the document's own listeners, phase-filtered by
+that undefined value: an event a page dispatched on the document
+never reached window -- no capture step on the way down, no bubble
+step on the way up, no true phases for the listeners it did reach,
+and currentTarget left pointing at the document afterwards. The
+native path was already right: an element dispatch goes through
+libdom, whose callback sets the true phase per visit and fans out
+to window at the document visit (patch 250).
+
+- **298 (netsurf):** the Event constructor sets eventPhase = 0,
+  and Event.prototype.stopPropagation records __msStopProp
+  (native dispatches shadow it with the C method the callback
+  installs, as before). The document shim tells its three callers
+  apart by the phase the event arrives with. A phase of 1-3 is the
+  native callback delivering a libdom dispatch: fire the
+  document's listeners only, exactly as it always has. The
+  engine's own lifecycle events -- js_fire_dom_ready and
+  js_fire_window_load, which dispatch window separately -- are
+  marked __msDocOnly by a new __msDocEv helper and get a
+  document-only step that now reports the at-target phase, 2.
+  Anything else at phase 0 is a page's direct call and runs the
+  path a document event really has: capture at window (1),
+  at-target at the document (2), bubble at window (3) when the
+  event bubbles -- window's own shim does the per-phase
+  filtering -- honouring stopPropagation and
+  stopImmediatePropagation between steps, and leaving the event
+  at rest (phase 0, no currentTarget). 'load' skips the window
+  steps: a document's window parent does not apply to it (patch
+  250's rule). The window shim treats a phase-0 arrival as a
+  dispatch at window (phase 2 while firing, rest state after);
+  its preset-phase calls are unchanged. After a native element
+  dispatch, qjs_el_dispatch_event_data resets the reused JS event
+  to phase 0 / currentTarget null, the state a browser leaves it
+  in -- and what keeps a re-dispatched event from looking like a
+  native delivery still in progress.
+
+Deliberately unchanged: document.dispatchEvent still returns
+true unconditionally (a browser returns false for a cancelled
+cancelable event). Not part of the recorded defect; the return
+contract is its own patch if it is ever wanted.
+
+Sim-verified: JS-event-phase.html (EVPHASE 9/9; reference browser
+9/9, Firefox/Camoufox as in patch 292's entry). Before the patch
+the simulator scored 2/9 -- phases undefined, no window steps,
+currentTarget left set -- and the two passes were the native
+element path and the DOMContentLoaded-fires-once guard, both of
+which stay passing; every listener sequence is byte-identical
+to the reference. JS-capture-target.html stays CAPTGT 7/7 and
+JS-event-order.html stays EVORDER 5/5. Full sim gate exit 0
+(gate-298-adapted; network mirror skipped as before, Vita's-pace
+pages 23 identical / 0 differ, interaction pass 52/52). Fresh
+re-stage 385 applied / 1 failed: the one failure is patch 22,
+whose change the pristine snapshot already carries (its target
+file comes out byte-identical either way); macsurf_qjs.c is
+byte-identical to the tested tree. Vita cross-build not run:
+no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** nothing new to tap by
+hand -- script-visible only, on pages that dispatch events on
+the document or read eventPhase outside a handler. The gate
+page over the gate server (JS-event-phase.html, EVPHASE 9/9)
+is the check.
