@@ -4613,3 +4613,43 @@ Vita cross-build not run: no vitaSDK on this machine.
 **On the device (run 39), in addition:** nothing new to tap --
 script-visible only. The gate page in the bundle
 (CSS-gcs-props.html, GCSPROPS 9/9) is the check.
+
+### Patch 296 (2026-10-14): a column flex container takes its item gap from row-gap
+
+Split from the item patch 295 shipped under, so each patch stays
+on one topic. The flex context resolved its two gaps once per
+container as main_gap = column-gap, cross_gap = row-gap, with a
+comment saying column-gap sizes the gap between items on the main
+axis -- only a row container's answer. The gap properties belong
+to the axis they separate: column-gap is the space between
+columns (between the items of a row container, and between the
+lines of a column one), row-gap the space between rows. In a
+column container the items stack in rows, so row-gap is the gap
+between items and column-gap the gap between lines; the context
+had them swapped, and a column container with row-gap: 14px and
+column-gap: 4px stepped its items by 14px where the reference
+steps 24px.
+
+- **296 (netsurf):** the context resolves both gaps to device
+  pixels and assigns them by direction -- horizontal: main =
+  column-gap, cross = row-gap (as before); vertical: main =
+  row-gap, cross = column-gap. Every consumer of the two fields
+  already works in axis-relative terms, so nothing else changes.
+
+Sim-verified: CSS-flex-gap.html (FLEXGAP 5/5; reference browser
+5/5, Firefox/Camoufox as in patch 292's entry), measuring item
+offsets in a row container (the control), a column container and
+a wrapped column container. Full sim gate exit 0
+(gate-296-adapted; network mirror skipped as before, clip modes
+17 identical / 0 differ / 1 time-varying, no section left without
+a summary). Fresh re-stage 384 applied / 0 failed, the changed
+file byte-identical; the restage's nsmonkey smoke build stops at
+its libcurl configuration step on this machine (patch 292's
+entry). Vita cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** a page with a vertical
+menu or card column laid out as a column flex with a row-gap --
+the stack's spacing should match what the same page shows in a
+desktop browser, where before it used the (usually smaller or
+unset) column-gap. The gate page in the bundle (CSS-flex-gap.html,
+FLEXGAP 5/5) is the check.
