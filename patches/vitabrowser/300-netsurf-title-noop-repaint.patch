@@ -1,0 +1,115 @@
+# netsurf: a <title> text change is not a repaint (patch 300)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 299)
+#
+# Writing document.title is something results pages and
+# single-page apps do constantly, and the QuickJS shim writes it
+# through the <title> element, so every write marked the document
+# TEXTCONTENT on <title> and asked for a reconvert. The local
+# rebuild path climbs from the changed node to the nearest
+# element with a block box; from <title> that climb reaches the
+# root block, and the block-change scan there declines -- it
+# finds <head> itself boxless ("new element is not a plain block,
+# list item or block of blocks"). The caller answers every
+# decline with a full reconvert of the whole document: rebuild,
+# relayout, repaint -- to repaint nothing, because a title's text
+# is rendered nowhere in the box tree.
+#
+# The local path now answers a change inside a <title> directly:
+# nothing rendered, nothing to rebuild, return before the climb.
+# The test is title, not head. The ancestor walk stops (and the
+# full path is kept) at a <style> or at <head> itself: a
+# child-list change ON <head> -- a script inserting a <style> --
+# and a <style>'s own text, which restyles the whole page, must
+# keep declining into the full reconvert, and they do. A <title>
+# can contain neither: its content is text, and text in a title
+# paints nowhere.
+#
+# Benchmark (host simulator, relative timings): a throwaway
+# page holding the same 5000-paragraph document as the
+# JS-dom-stall suite page, whose only post-load step sets
+# document.title. Before: three full reconverts totalling
+# 1331 ms, the third being the title write's. After: two
+# reconverts totalling 939 ms; the title step's reconvert is
+# gone and the log shows the local path answering it ("LIFE
+# rebuild local: title text, nothing rendered"). The remaining
+# two are the load itself. On the standard five-page bench the
+# medians are unchanged within noise (domstall 1174 -> ~1140 ms,
+# two runs 1113/1140): the suite pages' post-load reconvert is
+# the whole result-writing batch declining together, a separate
+# batching question, not this one.
+#
+# Proof and gate: the throwaway proof page above (deleted after
+# the runs; the 5000-paragraph document is JS-dom-stall's).
+# Full adapted simulator gate exit 0 (gate-300-final; network
+# mirror skipped as in every adapted run -- UDP sendto() is
+# EPERM-blocked on this VM): clip modes 17 identical / 0 differ
+# / 1 time-varying, Vita's-pace pages 23 identical / 0 differ,
+# text batching 68 frames identical / 0 differ, interaction
+# 52/52. Simulator only; the Vita cross-build was not run (no
+# vitaSDK on this VM). Device expectation is in Doc 10.
+#
+# Decline conditions: none new. Anything that is not a change
+# inside a <title> takes exactly the path it took before.
+#
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8833,6 +8833,57 @@
+ 		RL_NO("page has frames");
+ 	t0 = macos9_micros();
+ 
++	/* Patch 300 - a change to a <title> element's text names
++	 * content the box tree never renders: results pages and
++	 * single-page apps write document.title constantly, and the
++	 * shim writes it through the title element, so every write
++	 * marked the document TEXTCONTENT on <title>. The walk below
++	 * climbs from <title> to the root block and declines -- the
++	 * block-change scan there finds <head> itself boxless -- and
++	 * the caller answers the decline with a full reconvert of the
++	 * whole document, to repaint nothing. Measured on a 5000-
++	 * paragraph page whose only post-load step sets
++	 * document.title: one full reconvert (about 0.4 s of host sim
++	 * time) per write. Answer it here instead: there is nothing
++	 * to rebuild. The test is title, not head: a child-list
++	 * change ON <head> (a script inserting a <style>) must keep
++	 * the full path, and so must a <style>'s own text, which
++	 * restyles the page. A <title> can contain neither -- its
++	 * content is text, and text in a title paints nowhere. */
++	{
++		dom_node *qn = (dom_node *) vnode;	/* borrowed */
++		bool in_title = false, stop = false;
++
++		while (qn != NULL && !in_title && !stop) {
++			dom_string *nm = NULL;
++			dom_node *up = NULL;
++
++			if (dom_node_get_node_name(qn, &nm) == DOM_NO_ERR &&
++			    nm != NULL) {
++				if (strcasecmp(dom_string_data(nm), "title") == 0)
++					in_title = true;
++				else if (strcasecmp(dom_string_data(nm),
++						"style") == 0 ||
++					 strcasecmp(dom_string_data(nm),
++						"head") == 0)
++					stop = true;
++				dom_string_unref(nm);
++			}
++			if (dom_node_get_parent_node(qn, &up) != DOM_NO_ERR)
++				up = NULL;
++			if (qn != (dom_node *) vnode)
++				dom_node_unref(qn);
++			qn = up;
++		}
++		if (qn != NULL && qn != (dom_node *) vnode)
++			dom_node_unref(qn);
++		if (in_title) {
++			macsurf_debug_log_writef("LIFE rebuild local: "
++				"title text, nothing rendered");
++			return 0;
++		}
++	}
++
+ 	/* the nearest element with a block box: the one to rebuild */
+ 	n = vnode;
+ 	dom_node_ref(n);
