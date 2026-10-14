@@ -217,6 +217,7 @@ CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
 CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
 JS-event-order file:///app0:/testpages/JS-event-order.html
+JS-capture-target file:///app0:/testpages/JS-capture-target.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
 JS-module-http http://127.0.0.1:$HP/JS-module.html
@@ -590,6 +591,12 @@ eo=$(ls "$R"/*-JS-event-order.plot 2>/dev/null | head -1)
 eor=$(sed -n 's/.*STR \(EVORDER: [0-9]*\/[0-9]* passed\).*/\1/p' "$eo" 2>/dev/null | head -1)
 echo "  JS-event-order: ${eor:-no summary}"
 [ -n "$eo" ] && grep -o 'STR [0-9]* [^:]*: .*(want.*' "$eo" | sed 's/^STR /  /'
+# Capture listener on the event's own target (Patch 291): fires once at
+# AT_TARGET even when the target also carries a non-capture registration.
+ct=$(ls "$R"/*-JS-capture-target.plot 2>/dev/null | head -1)
+ctr=$(sed -n 's/.*STR \(CAPTGT: [0-9]*\/[0-9]* passed\).*/\1/p' "$ct" 2>/dev/null | head -1)
+echo "  JS-capture-target: ${ctr:-no summary}"
+[ -n "$ct" ] && grep -o 'STR [0-9]* [^:]*: .*(want.*' "$ct" | sed 's/^STR /  /'
 ig=$(ls "$R"/*-CSS-inline-grid.plot 2>/dev/null | head -1)
 igr=$(sed -n 's/.*STR \(INLINEGRID: [0-9]*\/[0-9]* passed\).*/\1/p' "$ig" 2>/dev/null | head -1)
 echo "  CSS-inline-grid: ${igr:-no summary}"
@@ -1173,7 +1180,7 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
-[ "$eor" = "EVORDER: 5/5 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
+[ "$eor" = "EVORDER: 5/5 passed" ] && [ "$ctr" = "CAPTGT: 7/7 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
 	[ "${op_ldbox:-0}" -ge 1 ] || fail "event order / inline-grid / group opacity"
 

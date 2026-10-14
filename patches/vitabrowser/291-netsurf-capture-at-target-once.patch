@@ -1,0 +1,173 @@
+# netsurf: a capture listener on the event's own target fires once, not
+# once per registration (patch 291)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 290)
+#
+# The bridge registers one libdom entry per (node, type, capture) and
+# fires the node's whole JS listener list from the one callback. On the
+# event's own target libdom invokes BOTH entries -- its dispatch filter's
+# at-target clause does not distinguish capture from non-capture -- so a
+# target carrying both kinds of registration ran its entire list twice:
+# the capture listener fired twice, and so did every bubble listener and
+# on* handler beside it (run 38 hand-off, older than those patches;
+# measured with the gate page below before the fix: capture+bubble on the
+# target gave [cap2 bub2 cap2 bub2], the same function under both flags
+# fired four times; capture-only and bubble-only targets were right).
+#
+# Capture registrations now get their own libdom listener object
+# (pw = (void *)1; non-capture keeps the shared one, pw = NULL). At
+# AT_TARGET the callback fires the list from the capture registration's
+# invocation and the non-capture invocation returns early when a capture
+# registration exists for the (node, type) -- qjs_reg_exists(), the
+# read-only twin of qjs_reg_seen. The registry mirrors libdom exactly:
+# every route funnels through qjs_dom_register_listener, and
+# removeEventListener deliberately leaves libdom registrations in place,
+# so an existing capture registration always means the capture entry is
+# invoked on that node. Ancestor visits are untouched (the two entries
+# invoke in different phases there), and a target with only a
+# non-capture registration fires as before.
+#
+# Gate: testpages/pages/JS-capture-target.html (CAPTGT 7/7, Chromium
+# 7/7); JS-event-order.html stays EVORDER 5/5. Simulator only; device
+# expectation for run 39: a click on an element that carries both a
+# capture and a bubble click listener runs each handler once.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4367,6 +4367,7 @@
+ /* fixes1008 - defined further down (next to qjs_dom_register_listener, which
+  * is what feeds them), used here at realm teardown. */
+ static void qjs_reg_clear(void);
++static int qjs_reg_exists(dom_node *node, const char *type, int capture);
+ static void qjs_evgate_reset(void);
+ 
+ static void qjs_wrap_drain(JSRuntime *rt)
+@@ -7894,6 +7895,15 @@
+  */
+ 
+ static dom_event_listener *g_qjs_dom_listener = NULL;
++/* VitaBrowser patch 291 - the CAPTURE twin of the shared listener above.
++ * Identical callback, but created with pw = (void *)1 so the callback can
++ * tell a capture registration's invocation from a non-capture one's. At
++ * AT_TARGET libdom invokes BOTH registrations on the target (its filter's
++ * third clause), and since the one callback fires the node's whole JS
++ * listener list, the list ran twice whenever a target carried both kinds
++ * of registration. The callback now lets only one of the two invocations
++ * fire at AT_TARGET (see qjs_dom_listener_cb). */
++static dom_event_listener *g_qjs_dom_listener_cap = NULL;
+ 
+ /* The callback needs a JSContext and only has the wrapper entry's runtime.
+  * Resolve it through the realm records rather than g_heap: with an iframe
+@@ -9316,7 +9326,6 @@
+ 	 * el.dispatchEvent does NOT reach here (it fires __msFireLocal
+ 	 * directly), so mid-burst dispatches are untouched. */
+ 	qjs_geom_settle_begin();
+-	(void)pw;
+ 	if (evt == NULL) return;
+ 	if (dom_event_get_current_target(evt, &ct) != DOM_NO_ERR) return;
+ 	if (ct == NULL) return;
+@@ -9358,6 +9367,42 @@
+ 		}
+ 	}
+ 
++	/* VitaBrowser patch 291 - AT_TARGET fires ONCE per node, not once
++	 * per libdom registration.
++	 *
++	 * libdom invokes every matching entry on the target itself: its
++	 * dispatch filter's third clause (target == current, phase
++	 * AT_TARGET) does not distinguish capture from non-capture entries,
++	 * per the DOM model where each registration is a distinct listener.
++	 * Here both entries are the SAME callback (pw apart), and the
++	 * callback fires the node's whole JS listener list -- capture,
++	 * bubble and on* handlers together, fixes1040 filtering by phase --
++	 * so a target with both registrations ran its entire list twice:
++	 * a capture listener on the target fired twice, and so did every
++	 * bubble listener beside it.
++	 *
++	 * Rule: at AT_TARGET the CAPTURE registration's invocation fires
++	 * the list; the non-capture invocation returns early when a
++	 * capture registration exists for this (node, type). pw tells the
++	 * invocations apart (patch 291's second listener object). When
++	 * only a non-capture registration exists it fires as before, and
++	 * ancestor visits are untouched -- capture and bubble entries
++	 * invoke in different phases there. removeEventListener leaves
++	 * libdom registrations in place (see qjs_el_remove_event_listener_
++	 * data), so "a capture registration exists" in the registry is
++	 * exactly "the capture entry will be invoked on this node". */
++	{
++		dom_event_flow_phase ph = 0;
++		if (pw == NULL &&
++		    dom_event_get_event_phase(evt, &ph) == DOM_NO_ERR &&
++		    ph == DOM_AT_TARGET &&
++		    qjs_reg_exists(node, dom_string_data(type_ds), 1)) {
++			macsurf_dom_string_unref(type_ds);
++			macsurf_dom_node_unref(node);
++			return;
++		}
++	}
++
+ 	/* fixes1008 (1d) - a REAL Event instance, not an ad-hoc object.
+ 	 *
+ 	 * This used to be a bare JS_NewObject with `type`, `target` and three
+@@ -9837,6 +9882,28 @@
+ 	return 0;
+ }
+ 
++/* VitaBrowser patch 291 - read-only twin of qjs_reg_seen: is this
++ * (node, type, capture) registered with libdom? Never inserts. The
++ * registry mirrors libdom's registrations exactly -- every route funnels
++ * through qjs_dom_register_listener, and removeEventListener deliberately
++ * leaves the libdom registration in place for the realm's lifetime -- so
++ * this answers "does a capture entry exist on this node for this type"
++ * for the AT_TARGET de-duplication in qjs_dom_listener_cb. */
++static int qjs_reg_exists(dom_node *node, const char *type, int capture)
++{
++	unsigned int h = (unsigned int)(((size_t)node >> 3) &
++			(QJS_REG_BUCKETS - 1));
++	struct qjs_reg_entry *e = s_reg_buckets[h];
++	while (e != NULL) {
++		if (e->node == node && e->capture == capture &&
++		    strcmp(e->type, type) == 0) {
++			return 1;
++		}
++		e = e->next;
++	}
++	return 0;
++}
++
+ /* Realm teardown: the nodes are going away, so the set must go with them or a
+  * recycled node address would look pre-registered and its listeners would
+  * never reach libdom. Called from qjs_wrap_drain. */
+@@ -9888,15 +9955,23 @@
+ 		macsurf_debug_log_writef("LIFE evreg %s cap=%d on %s",
+ 				type, capture, nb);
+ 	}
+-	if (g_qjs_dom_listener == NULL) {
+-		(void)dom_event_listener_create(qjs_dom_listener_cb, NULL,
+-				&g_qjs_dom_listener);
+-	}
+-	if (g_qjs_dom_listener == NULL) return;
+-	tds = qjs_make_domstr(type);
+-	if (tds == NULL) return;
+-	(void)dom_event_target_add_event_listener(node, tds,
+-			g_qjs_dom_listener, capture ? true : false);
++	/* VitaBrowser patch 291 - capture registrations get their own
++	 * listener object (pw = (void *)1) so the callback can tell the two
++	 * invocations apart at AT_TARGET; non-capture keeps the original
++	 * shared listener (pw = NULL). */
++	{
++		dom_event_listener **slot = capture ?
++				&g_qjs_dom_listener_cap : &g_qjs_dom_listener;
++		if (*slot == NULL) {
++			(void)dom_event_listener_create(qjs_dom_listener_cb,
++					capture ? (void *)(size_t)1 : NULL, slot);
++		}
++		if (*slot == NULL) return;
++		tds = qjs_make_domstr(type);
++		if (tds == NULL) return;
++		(void)dom_event_target_add_event_listener(node, tds,
++				*slot, capture ? true : false);
++	}
+ 	macsurf_dom_string_unref(tds);
+ }
+ 
