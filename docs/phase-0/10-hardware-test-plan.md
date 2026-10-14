@@ -4493,3 +4493,39 @@ JS-link-click.html: a script clicking a link should land on
 JS-link-click-b.html reporting LINKCLICK 5/5 -- and, by hand, a page
 whose script clicks a link (a download or "open" helper) now goes
 where a tap would.
+
+### Patch 293 (2026-10-14): a scratch document's querySelector finds what was appended to it
+
+Patch 279's "found on the way" item. A document from
+document.implementation.createHTMLDocument answered querySelector
+with null and querySelectorAll with [] -- not just for its own
+structure, but for nodes a script appended to it afterwards, which
+is the whole point of a scratch document: sanitizers and template
+code build a fragment in one and then query it. The two were stubs
+in the bridge's document.implementation stand-in and nothing ever
+replaced them; patch 246 gave the stand-ins a real
+getElementsByTagName (the DOMPurify fix) but left the query stubs
+in place.
+
+- **293 (netsurf):** the patch-246 "hat" the stand-in documents
+  wear now also answers querySelector / querySelectorAll, from the
+  document's own tree like its getElementsByTagName: the
+  documentElement's live query (it walks the tree as it is now, so
+  later appends are found), with the root itself counted when it
+  matches -- a real document's querySelectorAll('*') includes its
+  html element, an element's does not. DOMParser documents wear the
+  same hat and get the same answer.
+
+Sim-verified: JS-scratch-qsa.html (SCRATCHQSA 6/6; reference
+browser 6/6, Firefox/Camoufox as in patch 292's entry);
+JS-scratch-doc.html stays SCRATCHDOC 6/6. Full sim gate exit 0
+(gate-293-adapted; network mirror skipped as before, clip modes
+17 identical / 0 differ / 1 time-varying, no section left without a
+summary). Fresh re-stage 381 applied / 0 failed, both changed
+files byte-identical; the restage's nsmonkey smoke build stops at
+its libcurl configuration step on this machine (patch 292's entry).
+Vita cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** nothing new to tap --
+this is script-visible only. The gate page over the gate server
+(JS-scratch-qsa.html, SCRATCHQSA 6/6) is the check.
