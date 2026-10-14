@@ -4567,3 +4567,49 @@ script-visible only. The gate page over the gate server
 (JS-frame-xdoc.html, XDOC 4/4) is the check; sites that embed
 cross-origin frames (consent, video, sign-in) should behave as
 before, since their frame traffic is postMessage.
+
+### Patch 295 (2026-10-14): getComputedStyle answers border-radius, gaps, box-shadow, tab-size and aspect-ratio
+
+The native getComputedStyle answered only the properties on its
+list; border-radius, row-gap, column-gap, gap, box-shadow,
+tab-size and aspect-ratio were never among them, so the polyfill's
+wrapper filled them from its initial-value table -- or, for
+border-radius and tab-size, with '' -- whatever the style sheet
+said. Code that lays out from computed values (measured toolbars,
+gap-aware drawing, shadow-aware hit areas) read the initial values
+of a page that visibly had others. Recorded with the flex finding
+that became patch 296: the same census read row-gap "normal" on a
+container the sheet gave 7px.
+
+- **295 (netsurf):** the native answers all seven from the same
+  computed style it already reads, in the reference serialization:
+  a single radius as "12px" (a percentage stays "50%" -- the
+  cascade cannot resolve it); the gaps per axis, gap composed
+  row-then-column, "normal" when unset; box-shadow as the
+  colour-first list, inset last, "none" when there are none, from
+  libcss's full shadow list (a currentColor shadow takes the
+  element's colour); tab-size as its number (the accessor defaults
+  it to 8); aspect-ratio reduced ("16 / 9" -- the parser stores
+  thousandths, 16000 / 9000, so a fractional ratio survives),
+  "auto" when unset. The no-box cascade path (patch 235) answers
+  them too, since they are set in the same block.
+
+Sim-verified: CSS-gcs-props.html (GCSPROPS 9/9; reference browser
+9/9 with identical strings, Firefox/Camoufox as in patch 292's
+entry). The page's values come from a style sheet, not inline
+style -- the wrapper answers an inline value when the native one
+is missing, which would mask the miss -- and its checks run after
+load, when the elements have boxes: read at parse time, this
+engine's computed style has no cascade to answer from yet (the
+probe for this patch measured every property at its initial value
+then, colour included). Full sim gate exit 0 (gate-295-adapted;
+network mirror skipped as before, clip modes 17 identical / 0
+differ / 1 time-varying, no section left without a summary).
+Fresh re-stage 383 applied / 0 failed, the changed file
+byte-identical; the restage's nsmonkey smoke build stops at its
+libcurl configuration step on this machine (patch 292's entry).
+Vita cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** nothing new to tap --
+script-visible only. The gate page in the bundle
+(CSS-gcs-props.html, GCSPROPS 9/9) is the check.
