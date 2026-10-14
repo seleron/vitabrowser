@@ -268,6 +268,7 @@ NET-js-chardata http://127.0.0.1:$HP/JS-chardata.html
 NET-css-flex-header http://127.0.0.1:$HP/CSS-flex-header.html
 NET-css-account-bar http://127.0.0.1:$HP/CSS-account-bar.html
 NET-css-appearance http://127.0.0.1:$HP/CSS-appearance.html
+NET-css-gcs-props http://127.0.0.1:$HP/CSS-gcs-props.html
 NET-css-table-caption http://127.0.0.1:$HP/CSS-table-caption.html
 NET-js-inline-rect http://127.0.0.1:$HP/JS-inline-rect.html
 NET-html-hidden-details http://127.0.0.1:$HP/HTML-hidden-details.html
@@ -851,7 +852,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22" \
 	 "js-wasm WASM254 15" "js-frame-realm REALM 11" \
 	 "css-important-operands IMPORTANT264 3" \
-	 "css-style-edit STYLEEDIT 4" \
+	 "css-style-edit STYLEEDIT 4" "css-gcs-props GCSPROPS 9" \
 	 "js-xorigin-frame-early XEARLY 3" \
 	 "js-builtins-native BUILTIN 8" "js-perf-timing PERFTIME 10" \
 	 "js-device-honest DEVICE 6" "js-window-proto WINPROTO 6" \

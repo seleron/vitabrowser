@@ -1,0 +1,229 @@
+# netsurf: getComputedStyle answers border-radius, gaps, box-shadow,
+# tab-size and aspect-ratio (patch 295)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 294)
+#
+# The native getComputedStyle (macsurf_qjs.c) answered only the
+# properties on its list; border-radius, row-gap, column-gap, gap,
+# box-shadow, tab-size and aspect-ratio were never among them, so
+# the polyfill's wrapper filled them from its initial-value table --
+# or, for border-radius and tab-size, with '' -- whatever the style
+# sheet said. Code that lays out from computed values (measured
+# toolbars, gap-aware canvas drawing, shadow-aware hit areas) read
+# the initial values of a page that visibly had others.
+#
+# The native now answers all seven from the same computed style it
+# already reads, in the reference serialization: a single radius as
+# "12px" (a percentage stays "50%" -- the cascade cannot resolve
+# it); the gaps per axis, with gap composed row-then-column and
+# "normal" when unset; box-shadow as the colour-first list
+# ("rgb(10, 20, 30) 2px 3px 4px 5px", inset last, shadows in
+# order, "none" when there are none), from libcss's full shadow
+# list, a currentColor shadow taking the element's colour; tab-size
+# as its number (libcss's accessor already defaults it to 8);
+# aspect-ratio reduced ("16 / 9" -- the parser stores thousandths,
+# 16000 / 9000, so a fractional ratio survives) and "auto" when
+# unset. Because the values are set inside the same if (style)
+# block as the rest, the no-box cascade path (patch 235) answers
+# them too. Two small helpers carry the formatting: qjs_cs_len_str
+# (a length or percentage) and qjs_cs_colour_str (qjs_cs_colour's
+# formatting into a buffer, for colours composed into a list).
+#
+# Gate: testpages/pages/CSS-gcs-props.html (GCSPROPS 9/9 in the
+# simulator and in a reference browser -- Firefox/Camoufox, for the
+# reason patch 292's header gives -- with identical strings). The
+# values come from a style sheet, not inline style, on purpose: the
+# wrapper answers an inline value when the native one is missing,
+# which would mask the miss; and the checks run after load, when
+# the elements have boxes, since at parse time this engine's
+# computed style has no cascade to answer from yet (colour
+# included). Simulator only; the vita cross-build was not run (no
+# vitaSDK on this VM). Device expectation is in Doc 10.
+#
+# Decline conditions: none expected -- this is the native's own
+# property list growing, in place.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -9005,6 +9005,55 @@
+ 	JS_SetPropertyStr(ctx, o, name, JS_NewString(ctx, buf));
+ }
+ 
++/* patch 295: qjs_cs_colour's formatting into a caller buffer, for
++ * colours composed into a larger string (box-shadow's list). */
++static void qjs_cs_colour_str(css_color c, char *buf, size_t buflen)
++{
++	int a = (int)((c >> 24) & 0xff);
++	/* libcss packs colour as 0xAARRGGBB. */
++	if (a == 255) {
++		snprintf(buf, buflen, "rgb(%d, %d, %d)",
++			(int)((c >> 16) & 0xff), (int)((c >> 8) & 0xff),
++			(int)(c & 0xff));
++	} else {
++		int hundred = (a * 100 + 127) / 255;
++		char ab[8];
++
++		if ((hundred * 255 + 50) / 100 == a) {
++			if (hundred % 10 == 0)
++				snprintf(ab, sizeof ab, "%d.%d", hundred / 100,
++						(hundred / 10) % 10);
++			else
++				snprintf(ab, sizeof ab, "0.%02d", hundred);
++		} else {
++			snprintf(ab, sizeof ab, "0.%03d", (a * 1000 + 127) / 255);
++		}
++		if (a == 0)
++			strcpy(ab, "0");
++		snprintf(buf, buflen, "rgba(%d, %d, %d, %s)",
++			(int)((c >> 16) & 0xff), (int)((c >> 8) & 0xff),
++			(int)(c & 0xff), ab);
++	}
++}
++
++/* patch 295: a computed length as getComputedStyle prints it. A
++ * percentage stays a percentage (the cascade cannot resolve it);
++ * anything else is the cascade's length in px, the convention
++ * font-size above already follows. */
++static void qjs_cs_len_str(char *buf, size_t buflen, css_fixed len,
++		css_unit unit)
++{
++	if (unit == CSS_UNIT_PCT) {
++		double v = FIXTOFLT(len);
++		if (v == (double)(int)v)
++			snprintf(buf, buflen, "%d%%", (int)v);
++		else
++			snprintf(buf, buflen, "%g%%", v);
++	} else {
++		snprintf(buf, buflen, "%dpx", FIXTOINT(len));
++	}
++}
++
+ /* VitaBrowser patch 238: fill in a module's import.meta when QuickJS
+  * creates it (quickjs patch 06). url is the module's URL -- the name the
+  * loader resolved it to; an inline module, named "<document>#inline-
+@@ -9208,6 +9257,124 @@
+ 			JS_NewString(ctx,
+ 				css_computed_appearance(s) == CSS_APPEARANCE_NONE ?
+ 					"none" : "auto"));
++		/* VitaBrowser patch 295: five more properties scripts read.
++		 * border-radius, the gaps, box-shadow, tab-size and
++		 * aspect-ratio were never set here, so the polyfill's
++		 * wrapper answered them from its initial-value table (or,
++		 * for border-radius and tab-size, '') -- a stylesheet's
++		 * 12px radius and its shadow were invisible whatever it
++		 * said. */
++		{
++			css_fixed brl = 0;
++			css_unit bru = CSS_UNIT_PX;
++			if (css_computed_border_radius(s, &brl, &bru) ==
++					CSS_BORDER_RADIUS_SET) {
++				char brb[40];
++				qjs_cs_len_str(brb, sizeof brb, brl, bru);
++				JS_SetPropertyStr(ctx, out, "borderRadius",
++						JS_NewString(ctx, brb));
++			}
++		}
++		{
++			css_fixed rg = 0, cg = 0;
++			css_unit rgu = CSS_UNIT_PX, cgu = CSS_UNIT_PX;
++			char rgs[40], cgs[40], gg[96];
++			if (css_computed_row_gap(s, &rg, &rgu) ==
++					CSS_COLUMN_GAP_SET)
++				qjs_cs_len_str(rgs, sizeof rgs, rg, rgu);
++			else
++				strcpy(rgs, "normal");
++			if (css_computed_column_gap(s, &cg, &cgu) ==
++					CSS_COLUMN_GAP_SET)
++				qjs_cs_len_str(cgs, sizeof cgs, cg, cgu);
++			else
++				strcpy(cgs, "normal");
++			JS_SetPropertyStr(ctx, out, "rowGap",
++					JS_NewString(ctx, rgs));
++			JS_SetPropertyStr(ctx, out, "columnGap",
++					JS_NewString(ctx, cgs));
++			if (strcmp(rgs, cgs) == 0)
++				snprintf(gg, sizeof gg, "%s", rgs);
++			else
++				snprintf(gg, sizeof gg, "%s %s", rgs, cgs);
++			JS_SetPropertyStr(ctx, out, "gap",
++					JS_NewString(ctx, gg));
++		}
++		{
++			const int32_t *sh = css_computed_box_shadow_full(s);
++			if (sh == NULL) {
++				JS_SetPropertyStr(ctx, out, "boxShadow",
++						JS_NewString(ctx, "none"));
++			} else {
++				char sb[1024];
++				size_t off = 0;
++				int i2, n2 = sh[0];
++				css_color elc = 0;
++				css_computed_color(s, &elc);
++				sb[0] = '\0';
++				if (n2 > CSS_BOX_SHADOW_MAX)
++					n2 = CSS_BOX_SHADOW_MAX;
++				for (i2 = 0; i2 < n2; i2++) {
++					const int32_t *sf = sh + 1 +
++						i2 * CSS_BOX_SHADOW_FIELDS;
++					char cb2[48];
++					qjs_cs_colour_str((css_color)
++						((sf[4] &
++						  CSS_BOX_SHADOW_FLAG_CURRENT) ?
++							elc : (css_color)sf[5]),
++						cb2, sizeof cb2);
++					off += snprintf(sb + off,
++						sizeof sb - off,
++						"%s%s %dpx %dpx %dpx %dpx%s",
++						i2 ? ", " : "", cb2,
++						(int)sf[0], (int)sf[1],
++						(int)sf[2], (int)sf[3],
++						(sf[4] &
++						 CSS_BOX_SHADOW_FLAG_INSET) ?
++							" inset" : "");
++					if (off >= sizeof sb)
++						break;
++				}
++				JS_SetPropertyStr(ctx, out, "boxShadow",
++						JS_NewString(ctx, sb));
++			}
++		}
++		{
++			char tb[16];
++			snprintf(tb, sizeof tb, "%d",
++					(int)css_computed_tab_size(s));
++			JS_SetPropertyStr(ctx, out, "tabSize",
++					JS_NewString(ctx, tb));
++		}
++		{
++			int32_t arv = css_computed_aspect_ratio(s);
++			if (arv == 0) {
++				JS_SetPropertyStr(ctx, out, "aspectRatio",
++						JS_NewString(ctx, "auto"));
++			} else {
++				/* the parser stores thousandths (16 / 9
++				 * arrives as 16000 / 9000, so a fractional
++				 * ratio survives); browsers print the
++				 * reduced fraction */
++				char arb[32];
++				int an = (int)(arv >> 16), ad = (int)(arv & 0xffff);
++				int aa = an, ab2 = ad;
++				if (ad == 0)
++					ad = 1;
++				while (ab2 != 0) {
++					int t2 = aa % ab2;
++					aa = ab2;
++					ab2 = t2;
++				}
++				if (aa > 1) {
++					an /= aa;
++					ad /= aa;
++				}
++				snprintf(arb, sizeof arb, "%d / %d", an, ad);
++				JS_SetPropertyStr(ctx, out, "aspectRatio",
++						JS_NewString(ctx, arb));
++			}
++		}
+ 		/* Used width/height come from the BOX, not the cascade -- the
+ 		 * cascade may say `auto` while the box knows the resolved pixels,
+ 		 * and "used value" is what getComputedStyle is specified to give.
