@@ -4529,3 +4529,41 @@ Vita cross-build not run: no vitaSDK on this machine.
 **On the device (run 39), in addition:** nothing new to tap --
 this is script-visible only. The gate page over the gate server
 (JS-scratch-qsa.html, SCRATCHQSA 6/6) is the check.
+
+### Patch 294 (2026-10-14): a cross-origin frame's contentDocument is null
+
+A parsed iframe whose src is cross-origin answered contentDocument
+with patch 143's shim document: a writable stand-in DOM wearing the
+frame's label. Browsers give null -- the document inside a
+cross-origin frame is not the parent's to see. With the shim, a
+script could read and write a fake DOM for a document it has no
+right to, and the standard cross-origin test
+(frame.contentDocument === null), which a great deal of frame code
+branches on before falling back to postMessage, took the wrong
+path and talked to the shim instead.
+
+- **294 (netsurf):** the contentDocument getter answers null when
+  the frame's src is not same-origin with the page (the frame
+  code's own sameOrigin(): no src, a blank src and about:blank
+  count as same-origin). Same-origin and blank parsed frames keep
+  the shim -- their real document lives in the frame's own content
+  and script heap, and reaching it is item 7 below.
+  contentWindow is unchanged: its shim window is the postMessage
+  surface cross-origin frames are supposed to expose.
+
+Sim-verified: JS-frame-xdoc.html (XDOC 4/4; reference browser 4/4,
+Firefox/Camoufox as in patch 292's entry); JS-xorigin-frame.html
+stays XFRAME 9/9, JS-xorigin-frame-early.html XEARLY 3/3. Full sim
+gate exit 0 (gate-294-adapted; network mirror skipped as before,
+clip modes 17 identical / 0 differ / 1 time-varying, no section
+left without a summary). Fresh re-stage 382 applied / 0 failed,
+both changed files byte-identical; the restage's nsmonkey smoke
+build stops at its libcurl configuration step on this machine
+(patch 292's entry). Vita cross-build not run: no vitaSDK on this
+machine.
+
+**On the device (run 39), in addition:** nothing new to tap --
+script-visible only. The gate page over the gate server
+(JS-frame-xdoc.html, XDOC 4/4) is the check; sites that embed
+cross-origin frames (consent, video, sign-in) should behave as
+before, since their frame traffic is postMessage.
