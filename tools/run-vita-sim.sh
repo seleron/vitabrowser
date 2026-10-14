@@ -218,6 +218,7 @@ CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
 JS-event-order file:///app0:/testpages/JS-event-order.html
 JS-capture-target file:///app0:/testpages/JS-capture-target.html
+JS-event-phase file:///app0:/testpages/JS-event-phase.html
 JS-apis file:///app0:/testpages/JS-apis.html
 JS-module file:///app0:/testpages/JS-module.html
 JS-module-http http://127.0.0.1:$HP/JS-module.html
@@ -603,6 +604,14 @@ ct=$(ls "$R"/*-JS-capture-target.plot 2>/dev/null | head -1)
 ctr=$(sed -n 's/.*STR \(CAPTGT: [0-9]*\/[0-9]* passed\).*/\1/p' "$ct" 2>/dev/null | head -1)
 echo "  JS-capture-target: ${ctr:-no summary}"
 [ -n "$ct" ] && grep -o 'STR [0-9]* [^:]*: .*(want.*' "$ct" | sed 's/^STR /  /'
+# eventPhase and the window steps of a document dispatch (Patch 298):
+# a fresh event reads phase 0; document.dispatchEvent runs capture at
+# window, at-target at document, bubble at window, honouring
+# stopPropagation; the native element path is unchanged.
+ep=$(ls "$R"/*-JS-event-phase.plot 2>/dev/null | head -1)
+epr=$(sed -n 's/.*STR \(EVPHASE: [0-9]*\/[0-9]* passed\).*/\1/p' "$ep" 2>/dev/null | head -1)
+echo "  JS-event-phase: ${epr:-no summary}"
+[ -n "$ep" ] && grep -o 'STR [0-9]* [^:]*: .*(want.*' "$ep" | sed 's/^STR /  /'
 ig=$(ls "$R"/*-CSS-inline-grid.plot 2>/dev/null | head -1)
 igr=$(sed -n 's/.*STR \(INLINEGRID: [0-9]*\/[0-9]* passed\).*/\1/p' "$ig" 2>/dev/null | head -1)
 echo "  CSS-inline-grid: ${igr:-no summary}"
@@ -1190,7 +1199,7 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 [ "${rs_full:-1}" -eq 0 ] && [ "${rs_max:-99999}" -lt 16000 ] && \
 [ "$lzr" = "LAZYIMG: 4/4 passed" ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
-[ "$eor" = "EVORDER: 5/5 passed" ] && [ "$ctr" = "CAPTGT: 7/7 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
+[ "$eor" = "EVORDER: 5/5 passed" ] && [ "$ctr" = "CAPTGT: 7/7 passed" ] && [ "$epr" = "EVPHASE: 9/9 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
 	[ "${op_ldbox:-0}" -ge 1 ] || fail "event order / inline-grid / group opacity"
 

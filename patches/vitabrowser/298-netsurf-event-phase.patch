@@ -1,0 +1,273 @@
+# netsurf: eventPhase, and the window steps of a document dispatch (patch 298)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 297)
+#
+# The follow-up patch 146's Doc 10 entry recorded but did not fix.
+# Two defects, one root -- the JS side of event dispatch never kept
+# eventPhase:
+#
+# A fresh Event read eventPhase === undefined (the constructor never
+# set it), where a browser reads 0 (NONE). And document.dispatchEvent
+# was a shim that fired only the document's own listeners, filtered
+# by that undefined phase: an event a page dispatched on the document
+# never reached window at all -- no capture step on the way down, no
+# bubble step on the way up, no phases for the listeners it did reach,
+# and currentTarget left pointing at the document afterwards. The
+# native path was already right and stays right: an element dispatch
+# goes through libdom, whose callback sets the true phase per visit
+# and fans out to window at the document visit (patch 250).
+#
+# The constructor now sets eventPhase = 0, and the prototype's
+# stopPropagation records __msStopProp (native dispatches shadow it
+# with the C method the callback installs, as before). The document
+# shim tells its three callers apart by the phase the event arrives
+# with. A phase of 1-3 is the native callback delivering a libdom
+# dispatch: fire the document's listeners only, exactly as it always
+# has. The engine's own lifecycle events (js_fire_dom_ready /
+# js_fire_window_load, which dispatch window separately) are marked
+# __msDocOnly by a new __msDocEv helper and get a document-only step
+# that now reports the at-target phase, 2. Anything else at phase 0
+# is a page's direct call, and runs the path a document event really
+# has: capture at window (1), at-target at the document (2), bubble
+# at window (3) when the event bubbles -- window's own shim does the
+# per-phase filtering -- honouring stopPropagation and
+# stopImmediatePropagation between steps, and leaving the event at
+# rest (phase 0, no currentTarget). 'load' skips the window steps: a
+# document's window parent does not apply to it (patch 250's rule,
+# measured there). The window shim treats a phase-0 arrival as a
+# dispatch at window (phase 2 while firing, rest state after); its
+# preset-phase calls are unchanged. After a native element dispatch,
+# qjs_el_dispatch_event_data resets the reused JS event to phase 0 /
+# currentTarget null -- the state browsers leave it in, and what
+# keeps a re-dispatched event from looking like a native delivery
+# still in progress.
+#
+# Deliberately unchanged: document.dispatchEvent still returns true
+# unconditionally (a browser returns false for a cancelled cancelable
+# event). That was not part of the recorded defect; changing the
+# return contract is its own patch if it is ever wanted.
+#
+# Gate: testpages/pages/JS-event-phase.html (EVPHASE). Reference run
+# in Firefox/Camoufox (this VM's Chromium refuses loopback
+# navigations; see patch 292's header): 9/9. The simulator before
+# this patch: 2/9 -- phases undefined, no window steps, currentTarget
+# left set; the two passes were the native element path and the
+# DOMContentLoaded-fires-once guard, both of which had to stay
+# passing. After: EVPHASE 9/9, every listener sequence byte-identical
+# to the reference, CAPTGT 7/7 and EVORDER 5/5 held, and the full
+# adapted simulator gate exits 0 (its network-mirror section is
+# skipped on this VM -- UDP sendto() is EPERM-blocked -- as in every
+# adapted run). Simulator only; the Vita cross-build was not run (no
+# vitaSDK on this VM). Device expectation is in Doc 10.
+#
+# Decline conditions: if the bridge ever grows a real C-side
+# dispatchEvent for the document (libdom document events), the
+# shim's hand-walked path should be deleted in its favour; the
+# phase discrimination exists only because the native callback and
+# the shim share one entry point.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -10298,6 +10298,17 @@ static JSValue qjs_el_dispatch_event_data(JSContext *ctx,
+ 	(void)dom_event_target_dispatch_event(node, evt, &ok_flag);
+ 	g_qjs_in_dispatch = 0;
+ 
++	/* VitaBrowser patch 298 - leave the JS event at rest, as browsers
++	 * do (eventPhase NONE, no currentTarget). The listener callback
++	 * sets both per visit on this same object; without the reset a
++	 * later document.dispatchEvent of the same object would mistake
++	 * the stale phase for a native delivery in progress. */
++	if (JS_IsObject(argv[0])) {
++		JS_SetPropertyStr(ctx, argv[0], "eventPhase",
++				JS_NewInt32(ctx, 0));
++		JS_SetPropertyStr(ctx, argv[0], "currentTarget", JS_NULL);
++	}
++
+ 	g_synth_ev_stack = slot.prev;
+ 	dom_event_unref(evt);
+ 
+@@ -14244,12 +14255,21 @@ static void register_browser_globals(JSContext *ctx)
+ 			"this.cancelable=!!opts.cancelable;"
+ 			"this.composed=!!opts.composed;"
+ 			"this.defaultPrevented=false;"
++			/* VitaBrowser patch 298 - eventPhase exists from birth:
++			 * 0 (NONE) at rest, as in browsers. It used to be absent,
++			 * so ev.eventPhase read undefined outside a native
++			 * dispatch (and during a JS-shim one). */
++			"this.eventPhase=0;"
+ 			"this.target=null;this.currentTarget=null;"
+ 		"}"
+ 		"Event.NONE=0;Event.CAPTURING_PHASE=1;Event.AT_TARGET=2;Event.BUBBLING_PHASE=3;"
+ 		"Event.prototype.NONE=0;Event.prototype.CAPTURING_PHASE=1;Event.prototype.AT_TARGET=2;Event.prototype.BUBBLING_PHASE=3;"
+ 		"Event.prototype.preventDefault=function(){if(this.cancelable)this.defaultPrevented=true;};"
+-		"Event.prototype.stopPropagation=function(){};"
++		/* VitaBrowser patch 298 - the JS dispatch shims (document /
++		 * window) walk the path by hand and consult this flag between
++		 * steps; native dispatches shadow it with the C method the
++		 * listener callback installs on the event object. */
++		"Event.prototype.stopPropagation=function(){this.__msStopProp=true;};"
+ 		"Event.prototype.stopImmediatePropagation=function(){this.__msStopNow=true;};"
+ 		"Event.prototype.composedPath=function(){"
+ 			"var p=[];var n=this.target||this.srcElement;"
+@@ -14603,6 +14623,14 @@ static void register_browser_globals(JSContext *ctx)
+ 				"__vitaP(document)._reg[k]=1;"
+ 				"if(typeof __vitaP(document).__msRegDocEvent==='function'){"
+ 					"try{__vitaP(document).__msRegDocEvent(t,opt);}catch(e){}}};"
++			/* VitaBrowser patch 298 - the engine's own lifecycle
++			 * snippets (js_fire_dom_ready / js_fire_window_load) build
++			 * their document events through this helper; the marker
++			 * tells document.dispatchEvent to keep the step
++			 * document-only (the snippets dispatch window themselves),
++			 * instead of running its capture/bubble window steps. */
++			"__vitaP(document).__msDocEv=function(ty){"
++				"var e=new Event(ty);e.__msDocOnly=1;return e;};"
+ 			"document.addEventListener=document.addEventListener||"
+ 				"function(t,fn,opt){"
+ 					"if(!__vitaP(document)._listeners)__vitaP(document)._listeners={};"
+@@ -14659,26 +14687,77 @@ static void register_browser_globals(JSContext *ctx)
+ 					   "t==='readystatechange'||t==='pageshow'){"
+ 						"try{if(typeof __msLife==='function')"
+ 							"__msLife('docevt type='+t+' n='+n);}catch(_){}}"
++					"if(!ev)return true;"
+ 					/* VitaBrowser: over a snapshot, with this=document
+ 					 * and target set. A {once:true} listener removes
+ 					 * itself mid-dispatch; iterating the live array then
+ 					 * skipped the listener after it (Google's Wiz waits
+ 					 * for readystatechange that way, several at once). */
+-					"if(ev&&ev.target==null){try{ev.target=document;}catch(_){}}"
+-					"try{if(ev)ev.currentTarget=document;}catch(_){}"
+-					/* VitaBrowser: the phase libdom is in (the native
+-					 * listener callback sets it): capture listeners while
+-					 * capturing, the others while bubbling, all at the
+-					 * target or for a direct call. */
+-					"var ph=(ev&&ev.eventPhase)|0;"
++					"if(ev.target==null){try{ev.target=document;}catch(_){}}"
+ 					"var C=(__vitaP(document)._listenersC&&__vitaP(document)._listenersC[t])||[];"
+-					"if(L)L.slice().forEach(function(f,i){"
+-					"if((ph===1&&!C[i])||(ph===3&&C[i]))return;"
+-					"try{f.call(document,ev);}catch(e){"
+-						"try{if(typeof __msLife==='function')"
+-							"__msLife('docevt THREW type='+t+': '+"
+-								"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"
+-					"}});return true;};"
++					"function fireDoc(ph){"
++						"if(!L)return;"
++						"L.slice().forEach(function(f,i){"
++						"if((ph===1&&!C[i])||(ph===3&&C[i]))return;"
++						/* VitaBrowser patch 298 - the prototype's
++						 * stopImmediatePropagation sets __msStopNow;
++						 * it ends this node's list, as __msFireLocal's
++						 * does. */
++						"if(ev.__msStopNow)return;"
++						"try{f.call(document,ev);}catch(e){"
++							"try{if(typeof __msLife==='function')"
++								"__msLife('docevt THREW type='+t+': '+"
++									"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"
++						"}});}"
++					"var phIn=ev.eventPhase|0;"
++					/* VitaBrowser patch 298 - three ways in, kept apart
++					 * by the phase the event arrives with:
++					 * (a) phIn 1-3: the native listener callback is
++					 * delivering a libdom dispatch (it owns the path
++					 * and set the phase per visit, window fan-out
++					 * included) -- fire this node's listeners only,
++					 * exactly as this shim always has.
++					 * (b) __msDocOnly: the engine's own lifecycle fire
++					 * (js_fire_dom_ready / js_fire_window_load mark
++					 * their events); the caller dispatches window
++					 * separately, so this stays a document-only step
++					 * -- now with the at-target phase reported.
++					 * (c) phIn 0, unmarked: a page's direct call. Run
++					 * the path a document event actually has:
++					 * capture at window (1), at-target here (2),
++					 * bubble at window (3) when the event bubbles --
++					 * window's own shim does the per-phase filtering.
++					 * 'load' skips the window steps: a document's
++					 * window parent does not apply to it (patch 250).
++					 * stopPropagation / stopImmediatePropagation end
++					 * the path between steps. The event is left at
++					 * rest (phase 0, no currentTarget), as browsers
++					 * leave it. */
++					"if(phIn!==0){"
++						"try{ev.currentTarget=document;}catch(_){}"
++						"fireDoc(phIn);return true;}"
++					"if(ev.__msDocOnly){"
++						"try{ev.eventPhase=2;ev.currentTarget=document;}catch(_){}"
++						"fireDoc(2);"
++						"try{ev.eventPhase=0;ev.currentTarget=null;}catch(_){}"
++						"return true;}"
++					"ev.__msStopProp=false;ev.__msStopNow=false;"
++					"var W=(typeof window!=='undefined')?window:null;"
++					"var hasWin=!!(W&&typeof W.dispatchEvent==='function');"
++					"var stop=false;"
++					"if(hasWin&&t!=='load'){"
++						"try{ev.eventPhase=1;}catch(_){}"
++						"W.dispatchEvent(ev);"
++						"if(ev.__msStopProp||ev.__msStopNow)stop=true;}"
++					"if(!stop){"
++						"try{ev.eventPhase=2;ev.currentTarget=document;}catch(_){}"
++						"fireDoc(2);"
++						"if(ev.__msStopProp||ev.__msStopNow)stop=true;}"
++					"if(!stop&&ev.bubbles&&hasWin&&t!=='load'){"
++						"try{ev.eventPhase=3;}catch(_){}"
++						"W.dispatchEvent(ev);}"
++					"try{ev.eventPhase=0;ev.currentTarget=null;}catch(_){}"
++					"return true;};"
+ 		"}");
+ 
+ 	/* fixes879 - the "navigator extended shims" block that used to sit HERE was
+@@ -15006,6 +15085,15 @@ static void register_browser_globals(JSContext *ctx)
+ 			"if(ev&&ev.target==null){try{ev.target=W;}catch(_){}}"
+ 			/* VitaBrowser: phase-filtered, as document's */
+ 			"var ph=(ev&&ev.eventPhase)|0;"
++			/* VitaBrowser patch 298 - an event arriving at phase 0 is
++			 * being dispatched AT window (a direct call, the engine's
++			 * lifecycle fires, a document event's window step is
++			 * preset to 1/3 and the native callback presets 1-3): run
++			 * it as the at-target phase and leave it at rest, the
++			 * way browsers report it. Preset calls keep the caller's
++			 * phase and lifecycle. */
++			"var origin=(ph===0);"
++			"if(origin){ph=2;try{ev.eventPhase=2;}catch(_){}}"
+ 			"var C=(W._winListenersC&&W._winListenersC[t])||[];"
+ 			"try{if(ev)ev.currentTarget=W;}catch(_){}"
+ 			"if(arr)arr.slice().forEach(function(f,i){"
+@@ -15014,7 +15102,9 @@ static void register_browser_globals(JSContext *ctx)
+ 				"try{if(typeof __msLife==='function')"
+ 					"__msLife('winevt THREW type='+t+': '+"
+ 						"((e&&e.name)?(e.name+': '):'')+((e&&e.message)||e)+(e&&e.stack?(' STACK: '+e.stack):''));}catch(_){}"
+-			"}});return true;};"
++			"}});"
++			"if(origin){try{ev.eventPhase=0;ev.currentTarget=null;}catch(_){}}"
++			"return true;};"
+ 		/* fixes1011 - the REAL getComputedStyle. __gcsNative reads the
+ 		 * cascade + box (installed in qjs_dom_install); this wrapper adds
+ 		 * getPropertyValue with dash-to-camel mapping and falls back to the
+@@ -21767,8 +21857,11 @@ unsigned char js_fire_dom_ready(struct jsthread *thread, struct dom_document *do
+ 		 * Wiz waits on it to finish building a controller whose optional
+ 		 * children are absent while readyState is 'loading' -- without
+ 		 * it the sign-in form's buttons never got their controllers. */
+-		"try{document.dispatchEvent(new Event('readystatechange'));}catch(e){}"
+-		"try{document.dispatchEvent(new Event('DOMContentLoaded'));}catch(e){}"
++		/* VitaBrowser patch 298 - document events go through
++		 * __msDocEv so document.dispatchEvent keeps them
++		 * document-only (window is dispatched separately below). */
++		"try{document.dispatchEvent(__vitaP(document).__msDocEv('readystatechange'));}catch(e){}"
++		"try{document.dispatchEvent(__vitaP(document).__msDocEv('DOMContentLoaded'));}catch(e){}"
+ 		"try{if(typeof window!=='undefined')"
+ 		"window.dispatchEvent(new Event('DOMContentLoaded'));}catch(e){}"
+ 		"}catch(e){}})();";
+@@ -21831,8 +21924,10 @@ unsigned char js_fire_window_load(struct jsthread *thread, struct dom_document *
+ 		"if(__vitaP(document).__ms_load_fired)return;"
+ 		"__vitaP(document).__ms_load_fired=true;"
+ 		"__vitaP(document).readyState='complete';"
+-		"try{document.dispatchEvent(new Event('readystatechange'));}catch(e){}"
+-		"try{document.dispatchEvent(new Event('load'));}catch(e){}"
++		/* VitaBrowser patch 298 - as in s_dom_ready_src: __msDocEv
++		 * keeps these document-only; window load is fired below. */
++		"try{document.dispatchEvent(__vitaP(document).__msDocEv('readystatechange'));}catch(e){}"
++		"try{document.dispatchEvent(__vitaP(document).__msDocEv('load'));}catch(e){}"
+ 		"try{if(typeof window!=='undefined')"
+ 		"window.dispatchEvent(new Event('load'));}catch(e){}"
+ 		"}catch(e){}})();";

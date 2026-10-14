@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS event phase on document dispatch (script not run)</title>
+<!-- eventPhase and the window steps of a document dispatch (patch 298).
+     A fresh Event has no eventPhase at all in the bridge (the constructor
+     never sets it), and document.dispatchEvent is a JS shim that fires
+     only document's own listeners: it never sets a phase and never
+     reaches window, though a document event's propagation path is
+     window -> document -> window.
+     1: a fresh event reads eventPhase 0 (NONE), currentTarget null.
+     2: bubbling event on document: window capture (1), document
+        listeners at target (2, registration order), window bubble (3).
+     3: non-bubbling event on document: window capture and the target
+        step still run; the window bubble step does not.
+     4: stopPropagation in the window capture listener ends the path:
+        neither document nor window bubble listeners run.
+     5: after dispatch the event is back at rest: phase 0, no
+        currentTarget.
+     6: window.dispatchEvent is an at-target dispatch: both listener
+        kinds fire, phase 2, currentTarget window; rest state after.
+     7: an element dispatch (the native libdom path) still visits
+        window capture (1), document capture (1), document bubble (3),
+        window bubble (3), once each -- the layered path undisturbed.
+     8: the engine's own DOMContentLoaded still reaches a window
+        capture and a window bubble listener exactly once each.
+     9: 'load' is the exception to a document's window parent: a load
+        event dispatched on document does not visit window at all. -->
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 3px 0; padding: 2px 6px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+</style>
+</head>
+<body>
+<p id="sum" class="wait">EVPHASE: script did not run</p>
+<div id="t">target</div>
+<p id="r1" class="wait">1 fresh event: waiting</p>
+<p id="r2" class="wait">2 doc bubbling path: waiting</p>
+<p id="r3" class="wait">3 doc non-bubbling path: waiting</p>
+<p id="r4" class="wait">4 stopPropagation at window capture: waiting</p>
+<p id="r5" class="wait">5 rest state after dispatch: waiting</p>
+<p id="r6" class="wait">6 window dispatch at target: waiting</p>
+<p id="r7" class="wait">7 element dispatch path: waiting</p>
+<p id="r8" class="wait">8 DOMContentLoaded reaches window once: waiting</p>
+<p id="r9" class="wait">9 load exception: waiting</p>
+<script>
+(function () {
+	var N = 9, done = {};
+	function pass(n, ok, text) {
+		var p = document.getElementById('r' + n);
+		p.textContent = n + ' ' + text;
+		if (!ok) return;
+		done[n] = true;
+		p.className = 'pass';
+	}
+	function render() {
+		var k = 0, i;
+		for (i = 1; i <= N; i++) if (done[i]) k++;
+		document.getElementById('sum').textContent =
+			'EVPHASE: ' + k + '/' + N + ' passed';
+		document.title = 'JS event phase (' + k + '/' + N + ')';
+	}
+	document.getElementById('sum').textContent = 'EVPHASE: 0/' + N + ' passed';
+	function ct(e) {
+		if (e.currentTarget === window) return 'w';
+		if (e.currentTarget === document) return 'd';
+		return '?';
+	}
+	function rec(seq, tag) {
+		return function (e) { seq.push(tag + e.eventPhase + ct(e)); };
+	}
+
+	/* 8 is registered first: the engine fires DOMContentLoaded after
+	 * the parse, and these counters must already be in place. */
+	var dcl = { wc: 0, wb: 0, d: 0 };
+	window.addEventListener('DOMContentLoaded', function () { dcl.wc++; }, true);
+	window.addEventListener('DOMContentLoaded', function () { dcl.wb++; }, false);
+	document.addEventListener('DOMContentLoaded', function () { dcl.d++; }, false);
+
+	/* 1: a fresh event's rest state. */
+	var fresh = new Event('epz');
+	pass(1, fresh.eventPhase === 0 && fresh.currentTarget === null,
+		'fresh event: phase=' + fresh.eventPhase +
+		' ct=' + fresh.currentTarget);
+
+	/* 2 + 5: the full path of a bubbling document dispatch. */
+	var s2 = [];
+	window.addEventListener('epa', rec(s2, 'Wc'), true);
+	window.addEventListener('epa', rec(s2, 'Wb'), false);
+	document.addEventListener('epa', rec(s2, 'Dc'), true);
+	document.addEventListener('epa', rec(s2, 'Db'), false);
+	var ev2 = new Event('epa', { bubbles: true });
+	document.dispatchEvent(ev2);
+	pass(2, s2.join(' ') === 'Wc1w Dc2d Db2d Wb3w',
+		'doc bubbling path: [' + s2.join(' ') + ']');
+	pass(5, ev2.eventPhase === 0 && ev2.currentTarget === null,
+		'rest state after dispatch: phase=' + ev2.eventPhase +
+		' ct=' + ev2.currentTarget);
+
+	/* 3: no bubble step for a non-bubbling event. */
+	var s3 = [];
+	window.addEventListener('epb', rec(s3, 'Wc'), true);
+	window.addEventListener('epb', rec(s3, 'Wb'), false);
+	document.addEventListener('epb', rec(s3, 'Dc'), true);
+	document.addEventListener('epb', rec(s3, 'Db'), false);
+	document.dispatchEvent(new Event('epb'));
+	pass(3, s3.join(' ') === 'Wc1w Dc2d Db2d',
+		'doc non-bubbling path: [' + s3.join(' ') + ']');
+
+	/* 4: stopPropagation in the capture step ends the dispatch. */
+	var s4 = [];
+	window.addEventListener('epc', function (e) {
+		s4.push('Wc' + e.eventPhase + ct(e));
+		e.stopPropagation();
+	}, true);
+	window.addEventListener('epc', rec(s4, 'Wb'), false);
+	document.addEventListener('epc', rec(s4, 'Dc'), true);
+	document.addEventListener('epc', rec(s4, 'Db'), false);
+	document.dispatchEvent(new Event('epc', { bubbles: true }));
+	pass(4, s4.join(' ') === 'Wc1w',
+		'stopPropagation at window capture: [' + s4.join(' ') + ']');
+
+	/* 6: window as the dispatch target. */
+	var s6 = [];
+	window.addEventListener('epw', rec(s6, 'Wc'), true);
+	window.addEventListener('epw', rec(s6, 'Wb'), false);
+	var ev6 = new Event('epw');
+	window.dispatchEvent(ev6);
+	pass(6, s6.join(' ') === 'Wc2w Wb2w' &&
+		ev6.eventPhase === 0 && ev6.currentTarget === null,
+		'window dispatch at target: [' + s6.join(' ') + '] rest=' +
+		ev6.eventPhase + '/' + ev6.currentTarget);
+
+	/* 7: the native path from an element, undisturbed. */
+	var s7 = [], t = document.getElementById('t');
+	window.addEventListener('epe', rec(s7, 'Wc'), true);
+	window.addEventListener('epe', rec(s7, 'Wb'), false);
+	document.addEventListener('epe', rec(s7, 'Dc'), true);
+	document.addEventListener('epe', rec(s7, 'Db'), false);
+	t.dispatchEvent(new Event('epe', { bubbles: true }));
+	pass(7, s7.join(' ') === 'Wc1w Dc1d Db3d Wb3w',
+		'element dispatch path: [' + s7.join(' ') + ']');
+
+	/* 9: a load event dispatched on document skips window. */
+	var s9 = [];
+	window.addEventListener('load', rec(s9, 'Wc'), true);
+	document.addEventListener('load', rec(s9, 'Dd'), false);
+	document.dispatchEvent(new Event('load'));
+	pass(9, s9.join(' ') === 'Dd2d',
+		'load exception: [' + s9.join(' ') + ']');
+
+	/* 8 is settled once the lifecycle has run. */
+	setTimeout(function () {
+		pass(8, dcl.wc === 1 && dcl.wb === 1 && dcl.d === 1,
+			'DOMContentLoaded reaches window once: wc=' + dcl.wc +
+			' wb=' + dcl.wb + ' d=' + dcl.d);
+		render();
+	}, 800);
+	render();
+})();
+</script>
+</body>
+</html>
