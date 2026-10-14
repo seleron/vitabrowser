@@ -1,0 +1,288 @@
+# netsurf: a script's a.click() follows the link (patch 292)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 291)
+#
+# Found on the way in patch 289's Doc 10 entry: a script's click() on a
+# link did not follow it, with or without target. The polyfill's click()
+# dispatched the event and then activated submit buttons only, so the
+# common pattern of building a link and clicking it -- downloads,
+# router helpers, "open in new tab" shims -- silently went nowhere.
+#
+# The polyfill's click() now hands an anchor that carries an href to a
+# new native, __vitaFollowLink, after the dispatch (and only when the
+# dispatch was not default-prevented; the submitter path is unchanged
+# and returns first). The native is modelled on __vitaSubmitForm: it
+# keeps the element across the realm hop and does the navigation from a
+# scheduled callback, once the document is attached to a window. What
+# it does there mirrors what a real click does in
+# content/handlers/html/interaction.c's ACTION_NAVIGATE: the href is
+# resolved against the document base, a javascript: URL runs through
+# html_exec, a link the box model marked LINK_DOWNLOAD navigates with
+# BW_NAVIGATE_DOWNLOAD, and anything else navigates the window the
+# target names (browser_window_find_target: _blank, a frame's name,
+# _top/_parent) with BW_NAVIGATE_HISTORY. One deliberate difference
+# from interaction.c: html_download_suggest_name() is static there, so
+# a download reached from script keeps the URL's own file name instead
+# of a name the page suggests -- cosmetic only.
+#
+# Gate: testpages/pages/JS-link-click.html + JS-link-click-b.html
+# (LINKCLICK 5/5 in the simulator; the same pages in a reference
+# browser -- Firefox/Camoufox, because this VM's Chromium refuses
+# loopback navigations under its Local Network Access checks and all
+# non-loopback traffic is proxied -- also 5/5, ending on
+# JS-link-click-b.html?from=self). The checks: the script-clicked link
+# navigates this window; a link without href and a click whose
+# listener prevents the default do not navigate; a link with
+# target=<frame name> loads the destination in that frame. Simulator
+# only; the vita cross-build was not run (no vitaSDK on this VM).
+# Device expectation is in Doc 10.
+#
+# Decline conditions: if a future libdom lets the bridge dispatch a
+# click's default action itself, this should be removed in favour of
+# the native one; if link activation ever moves into the polyfill's
+# event path (a real "activation behaviour" step), the native should
+# be called from there instead.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -12852,6 +12852,153 @@
+ 	return JS_TRUE;
+ }
+ 
++/* VitaBrowser patch 292 - __vitaFollowLink(anchor): a script's
++ * a.click() follows the link, as a real click does. vita_polyfill.js's
++ * click() dispatched the event and then ran only a submit button's
++ * activation, so a script clicking a link went nowhere (patch 289's
++ * "found on the way, not fixed"). The follow mirrors
++ * html/interaction.c's ACTION_NAVIGATE: the same
++ * browser_window_find_target + browser_window_navigate pair, a
++ * javascript: URL executed in the page (ACTION_JS), and a download
++ * anchor navigating with BW_NAVIGATE_DOWNLOAD. The one piece not
++ * mirrored is html_download_suggest_name (static to interaction.c);
++ * the download falls back to the URL's own name. Like
++ * __vitaSubmitForm, it runs from the main loop, not in the script. */
++struct qjs_pending_link {
++	JSContext *ctx;
++	unsigned long gen;
++	struct content *content;
++	dom_node *anchor;
++	int tries;		/* passes waited for the page to be shown */
++};
++
++static void qjs_follow_link_cb(void *p)
++{
++	struct qjs_pending_link *pl = p;
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(pl->ctx);
++	html_content *html;
++	dom_string *name_ds = NULL, *href_ds = NULL, *target_ds = NULL;
++	nsurl *base, *abs = NULL;
++	char *href = NULL, *target = NULL;
++
++	if (owner == NULL || owner->content != pl->content ||
++	    qjs_ctx_gen(pl->ctx) != pl->gen || pl->content == NULL ||
++	    pl->content->handler == NULL ||
++	    pl->content->handler->type() != CONTENT_HTML) {
++		macsurf_debug_log_writef("LIFE js link: page gone, dropped");
++		goto out;
++	}
++	html = (html_content *)pl->content;
++	if (html->bw == NULL) {
++		if (++pl->tries <= 100) {
++			macos9_schedule(100, qjs_follow_link_cb, pl);
++			return;
++		}
++		macsurf_debug_log_writef("LIFE js link: page never shown, dropped");
++		goto out;
++	}
++	name_ds = qjs_make_domstr("href");
++	if (name_ds == NULL || macsurf_dom_element_get_attribute(
++			(dom_element *)pl->anchor, name_ds, &href_ds) !=
++			DOM_NO_ERR || href_ds == NULL) {
++		macsurf_debug_log_writef("LIFE js link: anchor has no href");
++		goto out;
++	}
++	href = strndup(dom_string_data(href_ds),
++			dom_string_length(href_ds));
++	if (href == NULL)
++		goto out;
++	{
++		dom_string *tn = qjs_make_domstr("target");
++		if (tn != NULL) {
++			if (macsurf_dom_element_get_attribute(
++					(dom_element *)pl->anchor, tn,
++					&target_ds) == DOM_NO_ERR &&
++					target_ds != NULL)
++				target = strndup(dom_string_data(target_ds),
++						dom_string_length(target_ds));
++			dom_string_unref(tn);
++		}
++	}
++	base = html->base_url != NULL ? html->base_url :
++			content_get_url(pl->content);
++	if (base == NULL || nsurl_join(base, href, &abs) != NSERROR_OK) {
++		macsurf_debug_log_writef("LIFE js link: bad href");
++		goto out;
++	}
++	{
++		lwc_string *scheme = nsurl_get_component(abs, NSURL_SCHEME);
++		if (scheme != NULL && lwc_string_length(scheme) == 10 &&
++		    strncasecmp(lwc_string_data(scheme), "javascript",
++				10) == 0) {
++			/* ACTION_JS: the URL's path is the script. */
++			lwc_string *path = nsurl_get_component(abs,
++					NSURL_PATH);
++			if (path != NULL) {
++				html_exec(pl->content, lwc_string_data(path),
++						lwc_string_length(path));
++				lwc_string_unref(path);
++			}
++			lwc_string_unref(scheme);
++			goto out;
++		}
++		if (scheme != NULL)
++			lwc_string_unref(scheme);
++	}
++	{
++		struct box *ab = box_for_node(pl->anchor);
++		nserror res;
++		if (ab != NULL && (ab->flags & LINK_DOWNLOAD) != 0) {
++			res = browser_window_navigate(html->bw, abs,
++					content_get_url(pl->content),
++					BW_NAVIGATE_DOWNLOAD, NULL, NULL, NULL);
++		} else {
++			res = browser_window_navigate(
++					browser_window_find_target(html->bw,
++							target, 0),
++					abs, content_get_url(pl->content),
++					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
++		}
++		macsurf_debug_log_writef("LIFE js link: navigate -> %d",
++				(int)res);
++	}
++out:
++	if (abs != NULL)
++		nsurl_unref(abs);
++	free(href);
++	free(target);
++	if (href_ds != NULL)
++		dom_string_unref(href_ds);
++	if (target_ds != NULL)
++		dom_string_unref(target_ds);
++	if (name_ds != NULL)
++		dom_string_unref(name_ds);
++	dom_node_unref(pl->anchor);
++	free(pl);
++}
++
++static JSValue qjs_follow_link(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	struct qjs_pending_link *pl;
++	dom_node *anchor;
++
++	(void)this_val;
++	if (argc < 1 || owner == NULL || owner->content == NULL ||
++	    (anchor = qjs_get_node(argv[0])) == NULL)
++		return JS_FALSE;
++	pl = calloc(1, sizeof(*pl));
++	if (pl == NULL)
++		return JS_FALSE;
++	pl->ctx = ctx;
++	pl->gen = qjs_ctx_gen(ctx);
++	pl->content = owner->content;
++	pl->anchor = dom_node_ref(anchor);
++	macos9_schedule(0, qjs_follow_link_cb, pl);
++	return JS_TRUE;
++}
++
+ static void qjs_dom_install(JSContext *ctx)
+ {
+ 	JSValue global = JS_GetGlobalObject(ctx);
+@@ -13780,6 +13927,7 @@
+ 	qjs_set_func(ctx, global, "__vitaBattery", qjs_battery, 0);
+ 	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
+ 	qjs_set_func(ctx, global, "__vitaSubmitForm", qjs_submit_form, 2); /* 263 */
++	qjs_set_func(ctx, global, "__vitaFollowLink", qjs_follow_link, 1); /* 292 */
+ 	qjs_set_func(ctx, global, "__vitaFormCtl", qjs_form_ctl, 2); /* 287 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+ 			qjs_canvas_measure_text_width, 2); /* fixes1245 */
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -5448,9 +5448,10 @@
+ 		}
+ 		if (typeof b.click === 'function') b.click();
+ 	};
+-	/* click(): the click event, then -- unless it was cancelled -- a
+-	 * submit button's activation behaviour, submitting its form through
+-	 * requestSubmit (so the form's submit event fires first). */
++	/* click(): the click event, then -- unless it was cancelled -- the
++	 * activation behaviour: a submit button submits its form through
++	 * requestSubmit (so the form's submit event fires first); a link
++	 * follows its href (patch 292, through __vitaFollowLink). */
+ 	(function () {
+ 		var o = d.createElement('button'), owner = null;
+ 		while (o && !owner) {
+@@ -5477,9 +5478,18 @@
+ 			try { ev = new g.MouseEvent('click', { bubbles: true, cancelable: true, view: g }); }
+ 			catch (e) { ev = new Event('click', { bubbles: true, cancelable: true }); }
+ 			var go = this.dispatchEvent ? this.dispatchEvent(ev) : true;
+-			if (go === false || ev.defaultPrevented || !isSubmitter(this)) return;
+-			f = formOf(this);
+-			if (f && isFn(f.requestSubmit)) f.requestSubmit(this);
++			if (go === false || ev.defaultPrevented) return;
++			if (isSubmitter(this)) {
++				f = formOf(this);
++				if (f && isFn(f.requestSubmit)) f.requestSubmit(this);
++				return;
++			}
++			/* VitaBrowser patch 292: a link's activation behaviour
++			 * -- follow it, as a real click does. An <a> without an
++			 * href attribute is not a link and does nothing. */
++			if (String(this.tagName || '').toUpperCase() === 'A' &&
++			    this.getAttribute && this.getAttribute('href') !== null &&
++			    isFn(g.__vitaFollowLink)) g.__vitaFollowLink(this);
+ 		});
+ 	})();
+ 	acc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -5449,9 +5449,10 @@
+ "\t\t}\n"
+ "\t\tif (typeof b.click === 'function') b.click();\n"
+ "\t};\n"
+-"\t/* click(): the click event, then -- unless it was cancelled -- a\n"
+-"\t * submit button's activation behaviour, submitting its form through\n"
+-"\t * requestSubmit (so the form's submit event fires first). */\n"
++"\t/* click(): the click event, then -- unless it was cancelled -- the\n"
++"\t * activation behaviour: a submit button submits its form through\n"
++"\t * requestSubmit (so the form's submit event fires first); a link\n"
++"\t * follows its href (patch 292, through __vitaFollowLink). */\n"
+ "\t(function () {\n"
+ "\t\tvar o = d.createElement('button'), owner = null;\n"
+ "\t\twhile (o && !owner) {\n"
+@@ -5478,9 +5479,18 @@
+ "\t\t\ttry { ev = new g.MouseEvent('click', { bubbles: true, cancelable: true, view: g }); }\n"
+ "\t\t\tcatch (e) { ev = new Event('click', { bubbles: true, cancelable: true }); }\n"
+ "\t\t\tvar go = this.dispatchEvent ? this.dispatchEvent(ev) : true;\n"
+-"\t\t\tif (go === false || ev.defaultPrevented || !isSubmitter(this)) return;\n"
+-"\t\t\tf = formOf(this);\n"
+-"\t\t\tif (f && isFn(f.requestSubmit)) f.requestSubmit(this);\n"
++"\t\t\tif (go === false || ev.defaultPrevented) return;\n"
++"\t\t\tif (isSubmitter(this)) {\n"
++"\t\t\t\tf = formOf(this);\n"
++"\t\t\t\tif (f && isFn(f.requestSubmit)) f.requestSubmit(this);\n"
++"\t\t\t\treturn;\n"
++"\t\t\t}\n"
++"\t\t\t/* VitaBrowser patch 292: a link's activation behaviour\n"
++"\t\t\t * -- follow it, as a real click does. An <a> without an\n"
++"\t\t\t * href attribute is not a link and does nothing. */\n"
++"\t\t\tif (String(this.tagName || '').toUpperCase() === 'A' &&\n"
++"\t\t\t    this.getAttribute && this.getAttribute('href') !== null &&\n"
++"\t\t\t    isFn(g.__vitaFollowLink)) g.__vitaFollowLink(this);\n"
+ "\t\t});\n"
+ "\t})();\n"
+ "\tacc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });\n"

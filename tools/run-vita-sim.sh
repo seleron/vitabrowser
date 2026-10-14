@@ -334,6 +334,7 @@ NET-js-resource-timing http://127.0.0.1:$HP/JS-resource-timing.html
 NET-js-form-values http://127.0.0.1:$HP/JS-form-values.html
 NET-js-form-named http://127.0.0.1:$HP/JS-form-named.html
 NET-js-form-target http://127.0.0.1:$HP/JS-form-target.html
+NET-js-link-click http://127.0.0.1:$HP/JS-link-click.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
@@ -856,7 +857,8 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-node-shape NODESHAPE 6" "js-descriptors DESCRIPTORS 7" \
 	 "js-timer-nesting TIMERNEST 4" "js-resource-timing RESTIMING 9" \
 	 "js-form-values FORMVAL 8" "js-form-named FORMNAMED 7" \
-	 "js-form-target FORMTARGET 5" "js-charref CHARREF 6"; do
+	 "js-form-target FORMTARGET 5" "js-charref CHARREF 6" \
+	 "js-link-click LINKCLICK 5"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
