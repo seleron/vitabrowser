@@ -1,0 +1,109 @@
+# netsurf: a scratch document's querySelector finds what was appended
+# to it (patch 293)
+# Generated 2026-10-14
+# Base: seleron/vitabrowser (patch stack through 292)
+#
+# Found on the way in patch 279 and recorded in its Doc 10 entry: a
+# document from document.implementation.createHTMLDocument answered
+# querySelector with null and querySelectorAll with [] -- not just for
+# its own structure, but for nodes a script appended to it afterwards,
+# which is the whole point of a scratch document (sanitizers and
+# template code build a fragment in one and then query it). The two
+# were stubs in the bridge's document.implementation stand-in and
+# nothing ever replaced them: patch 246 gave the stand-in documents a
+# real getElementsByTagName (the DOMPurify fix) but left the query
+# stubs in place.
+#
+# The patch-246 "hat" the stand-ins wear now also answers
+# querySelector / querySelectorAll, from the document's own tree like
+# its getElementsByTagName: the documentElement's live query (which
+# walks the tree as it is now, so later appends are found), with the
+# root itself counted when it matches -- a real document's
+# querySelectorAll('*') includes its html element, an element's does
+# not. DOMParser documents wear the same hat and get the same answer;
+# theirs now also comes from their own tree rather than the bridge's
+# per-document stub.
+#
+# Gate: testpages/pages/JS-scratch-qsa.html (SCRATCHQSA 6/6 in the
+# simulator and in a reference browser -- Firefox/Camoufox, for the
+# reason patch 292's header gives). The checks: a fresh scratch
+# document finds its own head and body; a node appended after
+# creation is found by class, by id and by a descendant selector; a
+# second append is counted too, so the answer is live, not a
+# snapshot; a DOMParser document answers querySelector as well.
+# JS-scratch-doc.html stays SCRATCHDOC 6/6. Simulator only; the vita
+# cross-build was not run (no vitaSDK on this VM). Device
+# expectation is in Doc 10.
+#
+# Decline conditions: when a scratch document becomes a real second
+# document (its own libdom tree the bridge queries natively), the
+# hat's answers should be deleted in favour of the native ones.
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -2653,6 +2653,30 @@
+ 		try {
+ 			PV(doc).__vbHat = true;
+ 			doc.getElementsByTagName = function (t) { return byTag(this, t); };
++			/* VitaBrowser patch 293: the createHTMLDocument stand-in
++			 * also wore stub querySelector / querySelectorAll that
++			 * answered null / [] forever (found on the way in patch
++			 * 279), so a node a script appended to its scratch
++			 * document could never be found again. Answer from the
++			 * document's own tree instead, like byTag above: the
++			 * root's live query, with the root itself counted when
++			 * it matches (a document's querySelectorAll('*') finds
++			 * its html too). DOMParser documents wear the same hat
++			 * and get the same answer. */
++			doc.querySelectorAll = function (s) {
++				var root = this.documentElement;
++				if (!root || typeof root.querySelectorAll !== 'function') return [];
++				var out = Array.prototype.slice.call(root.querySelectorAll(s));
++				try {
++					if (typeof root.matches === 'function' && root.matches(s))
++						out.unshift(root);
++				} catch (e) { /* */ }
++				return out;
++			};
++			doc.querySelector = function (s) {
++				var r = this.querySelectorAll(s);
++				return r.length ? r[0] : null;
++			};
+ 			if (typeof doc.getElementsByClassName !== 'function' ||
+ 			    !doc.documentElement)
+ 				doc.getElementsByClassName = function (c) {
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -2654,6 +2654,30 @@
+ "\t\ttry {\n"
+ "\t\t\tPV(doc).__vbHat = true;\n"
+ "\t\t\tdoc.getElementsByTagName = function (t) { return byTag(this, t); };\n"
++"\t\t\t/* VitaBrowser patch 293: the createHTMLDocument stand-in\n"
++"\t\t\t * also wore stub querySelector / querySelectorAll that\n"
++"\t\t\t * answered null / [] forever (found on the way in patch\n"
++"\t\t\t * 279), so a node a script appended to its scratch\n"
++"\t\t\t * document could never be found again. Answer from the\n"
++"\t\t\t * document's own tree instead, like byTag above: the\n"
++"\t\t\t * root's live query, with the root itself counted when\n"
++"\t\t\t * it matches (a document's querySelectorAll('*') finds\n"
++"\t\t\t * its html too). DOMParser documents wear the same hat\n"
++"\t\t\t * and get the same answer. */\n"
++"\t\t\tdoc.querySelectorAll = function (s) {\n"
++"\t\t\t\tvar root = this.documentElement;\n"
++"\t\t\t\tif (!root || typeof root.querySelectorAll !== 'function') return [];\n"
++"\t\t\t\tvar out = Array.prototype.slice.call(root.querySelectorAll(s));\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\tif (typeof root.matches === 'function' && root.matches(s))\n"
++"\t\t\t\t\t\tout.unshift(root);\n"
++"\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\treturn out;\n"
++"\t\t\t};\n"
++"\t\t\tdoc.querySelector = function (s) {\n"
++"\t\t\t\tvar r = this.querySelectorAll(s);\n"
++"\t\t\t\treturn r.length ? r[0] : null;\n"
++"\t\t\t};\n"
+ "\t\t\tif (typeof doc.getElementsByClassName !== 'function' ||\n"
+ "\t\t\t    !doc.documentElement)\n"
+ "\t\t\t\tdoc.getElementsByClassName = function (c) {\n"

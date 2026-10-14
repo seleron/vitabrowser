@@ -309,6 +309,7 @@ NET-js-attach-shadow http://127.0.0.1:$HP/JS-attach-shadow.html
 NET-css-late-link http://127.0.0.1:$HP/CSS-late-link.html
 NET-js-xorigin-frame http://127.0.0.1:$HP/JS-xorigin-frame.html
 NET-js-scratch-doc http://127.0.0.1:$HP/JS-scratch-doc.html
+NET-js-scratch-qsa http://127.0.0.1:$HP/JS-scratch-qsa.html
 NET-js-element-instanceof http://127.0.0.1:$HP/JS-element-instanceof.html
 NET-js-node-names http://127.0.0.1:$HP/JS-node-names.html
 NET-js-image-load http://127.0.0.1:$HP/JS-image-load.html
@@ -844,6 +845,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-template-text TPLTEXT 4" "js-selector-list-long LONGLIST 4" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
+	 "js-scratch-qsa SCRATCHQSA 6" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
 	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22" \
 	 "js-wasm WASM254 15" "js-frame-realm REALM 11" \
