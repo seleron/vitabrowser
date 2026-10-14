@@ -4653,3 +4653,96 @@ the stack's spacing should match what the same page shows in a
 desktop browser, where before it used the (usually smaller or
 unset) column-gap. The gate page in the bundle (CSS-flex-gap.html,
 FLEXGAP 5/5) is the check.
+
+### Patch 297 (2026-10-14): a form's named controls shadow its built-ins
+
+Patch 288's "not done". Named access on a form only reached names
+HTMLFormElement.prototype does not have: the layer sits above the
+prototype, so a lookup for a name the prototype owns -- submit,
+action, length, the classic accidents a page ships when a field
+is named after one -- found the built-in first. A browser's
+[LegacyOverrideBuiltIns] named-properties object sits between the
+instance and the prototype and the control wins: an
+<input name="submit"> left form.submit the method here, so page
+code reading its field submitted the form instead (or threw on
+what it got).
+
+- **297 (netsurf):** the prototype's own members answer through
+  the named access. Each own descriptor of
+  HTMLFormElement.prototype is wrapped where it sits -- a data
+  property keeps its place and answers its value, an accessor
+  keeps a getter and setter of its own -- and the wrapped getter
+  asks the form's controls first. The wrapped setter swallows a
+  write to a shadowed name (the control reads back, as in
+  browsers), keeps an unshadowed attribute's original setter, and
+  otherwise takes an own property on the form. The bridge puts
+  some of the form's own IDL attributes (action, method, target,
+  name) on the shared element prototype above the form's, so those
+  are wrapped where they live; a form-only guard leaves every
+  other element's reads exactly as they were, and a reentrancy
+  guard keeps the lookup's own reads (ownerDocument and friends,
+  which the control search itself needs) out of the wrapping.
+
+Measured while doing it, not fixed here (absences, not
+shadowing): form.reset, form.enctype and form.encoding do not
+exist in the bridge at all -- a control named reset "shadows" a
+method that was never there. Controls named after the wider
+HTMLElement members (id, title, ...) also still do not shadow;
+the form's own interface is covered, the whole chain is not.
+
+Sim-verified: JS-form-shadow.html (FORMSHADOW 6/6; reference
+browser 6/6, Firefox/Camoufox as in patch 292's entry);
+JS-form-named.html stays FORMNAMED 7/7, and the form and shape
+sections are unmoved (FORMVAL 8/8, FORMTARGET 5/5, DOCSHAPE 6/6,
+DESCRIPTORS 7/7, BSHAPE 8/8). Full sim gate exit 0
+(gate-297-adapted; network mirror skipped as before, clip modes
+17 identical / 0 differ / 1 time-varying, no section left without
+a summary). Fresh re-stage 385 applied / 0 failed, both changed
+files byte-identical; the restage's nsmonkey smoke build stops
+at its libcurl configuration step on this machine (patch 292's
+entry). Vita cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** nothing new to tap by
+hand -- script-visible only, on pages whose forms name fields
+submit / action / length and the like. The gate page over the
+gate server (JS-form-shadow.html, FORMSHADOW 6/6) is the check.
+
+### Item 7 (design note, 2026-10-14): a parsed frame's real document for the parent's realm
+
+The second half of patch 288's "not done", still open. A parsed
+iframe's document lives in the frame's own content, with its own
+QuickJS runtime; the parent realm sees a shim window (patch 143;
+postMessage works) and, since patch 294, a shim document for a
+same-origin frame or null for a cross-origin one. Giving the
+parent the REAL document is the remaining piece. What it takes,
+recorded now so the work can start from the design rather than
+from the symptom:
+
+- Only C can cross between runtimes -- a JSValue is
+  runtime-specific, and handing one across is the crash class the
+  cross-realm postMessage work (patch 244) was built to avoid.
+  The parent's handle on the frame's document must be a
+  marshalled object in the parent's realm: property reads and
+  method calls serialized through the bridge to the frame's
+  realm, in the shape of the existing message queue.
+- Lifetime is the crux. The frame's content can navigate or be
+  destroyed under the parent's handle. The handle needs the
+  owner/generation validation the realm-hop natives already use
+  (__vitaSubmitForm, patch 292's __vitaFollowLink), and returning
+  nodes needs the same answer for the child's libdom nodes: a
+  parent-realm wrapper around a child-owned node is a dangling
+  reference unless the child content is held alive by it, or the
+  node is copied.
+- The staged shape that fits the stack's grain: (1) the document
+  handle with scalar state (URL, title, readyState) and identity
+  (documentElement / body as marshalled node handles);
+  (2) queries (getElementById, querySelector) answered in the
+  child's realm, returning handles; (3) reads/writes on node
+  handles. A read-only snapshot (serializing the child's tree
+  into the parent's heap) is the cheap alternative and is wrong
+  for live access; a single shared runtime for all frames would
+  undo the isolation the frame work since patch 143 is built on.
+- Entry condition: its own design pass in the open (as patch 186
+  had), a gate page that reads and writes a same-origin parsed
+  frame's document from the parent, and the cross-origin side
+  staying null (patch 294).
