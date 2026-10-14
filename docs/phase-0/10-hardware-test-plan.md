@@ -4410,3 +4410,39 @@ full sim gate exit 0 (gate-290); Vita cross-build green.
 **On the device (run 39), in addition:** the bundled
 `file:///app0:/testpages/JS-charref.html`: CHARREF 6/6 expected (no
 server needed).
+
+### Patch 291 (2026-10-14): a capture listener on the event's own target fires once
+
+Patch 279's "found on the way" item, older than those patches. The
+bridge registers one libdom entry per (node, type, capture) and fires
+the node's whole JS listener list from the one callback; on the event's
+own target libdom invokes BOTH entries -- its dispatch filter's
+at-target clause does not distinguish capture from non-capture -- so a
+target carrying both kinds of registration ran its entire list twice:
+measured before the fix, capture+bubble on the target gave
+[cap2 bub2 cap2 bub2], and the same function registered under both
+flags fired four times. Capture-only and bubble-only targets were
+right.
+
+- **291 (netsurf):** capture registrations get their own libdom
+  listener object (pw = (void *)1; non-capture keeps the shared one).
+  At AT_TARGET the callback fires the list from the capture
+  registration's invocation, and the non-capture invocation returns
+  early when a capture registration exists for the (node, type).
+  Ancestor phases and non-capture-only targets are unchanged.
+
+Sim-verified: JS-capture-target.html (CAPTGT 7/7, Chromium 7/7);
+JS-event-order.html stays EVORDER 5/5. Full sim gate exit 0
+(gate-291-adapted): on this machine the gate ran through a locally
+adapted copy of tools/run-vita-sim.sh (kept outside the repo) with
+the network-mirror section skipped -- UDP sendto() is EPERM-blocked
+here, so no mirror data can exist and the committed script's mirror
+comparison otherwise stops every later section; all other sections
+executed (network pages, JS S3, forms, Vita-pace, the final assertion
+chain), verdicts as measured, and the pre-mirror sections match the
+pre-291 baseline (clip modes 17 identical, 0 differ, 1 time-varying).
+Fresh re-stage 379 applied / 0 failed, byte-identical. Vita
+cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39):** a click on an element that carries both a
+capture and a bubble click listener runs each handler once.
