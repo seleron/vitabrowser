@@ -4815,3 +4815,70 @@ hand -- script-visible only, on pages that dispatch events on
 the document or read eventPhase outside a handler. The gate
 page over the gate server (JS-event-phase.html, EVPHASE 9/9)
 is the check.
+
+### Patch 299 (2026-10-14): a no-progress bound for in-flight fetches
+
+The async fetcher had a connect timeout (30 s) and a low-speed
+limit (1 byte/second averaged over 180 s), but no bound on how
+long a fetch may go without progress -- and no bound at all on
+the states the fetcher never reports on: a fetch queued behind
+a host's connection limit, a resolution that never answers, a
+callback that never fires. Anything waiting on such a fetch
+waits forever. For a parser-blocking script that is the whole
+document. Measured in the simulator against an accept-and-hold
+endpoint (the server takes the connection and never sends a
+byte): the fetch started, and the page had still not converted
+when the run was stopped 89 seconds later -- nothing ahead of
+it but curl's 180 s low-speed floor, and not even that for a
+body that drips at or above 1 B/s for ever.
+
+- **299 (netsurf):** llcache keeps a per-fetch progress clock,
+  set at fetch start and restarted on every header and every
+  data chunk. A watchdog (the frontend scheduler llcache
+  already uses, checked every 15 s while any fetch is active)
+  walks the cached and uncached object lists; a fetch whose
+  last progress is older than the bound is aborted and its
+  object completed with LLCACHE_EVENT_ERROR / NSERROR_TIMEOUT
+  -- the same completion a failed fetch produces, so conversion
+  and dependents proceed. fetch_abort is silent (no terminal
+  callback follows), so the watchdog completes the object
+  itself, as the redirect path does. The abort is not retried
+  like a fetcher-reported timeout: the fetch already had the
+  full bound without a sign of life, and a silent retry would
+  double the stall for the same answer. The bound is on NO
+  PROGRESS, not on total time, and is 120 s -- aligned with the
+  blocking fetcher's BLOCKING_TIMEOUT_S, the value patches 199
+  and 200 anchored their give-up bounds to. With the 15 s
+  interval a stalled fetch is aborted 120-135 s after its last
+  progress.
+
+Known consequence, accepted: a stream that stays open but
+quiet for 120 s (an idle EventSource, a long-polled fetch
+body) is indistinguishable from a stall at this layer and is
+aborted like one.
+
+Sim-verified on a throwaway build with the bound compiled to
+5 s (the shipped-bound page needs ~130 s of wall time, past
+the gate's settle budget -- the proof pattern patch 200
+used): httpd.py gains /stall-js (accept and hold, no bytes
+ever) and /drip-js (a complete script dripped at 2 B/s), and
+NET-stall.html blocks the parser on the first, then the
+second. The log shows "No progress for 11 s, aborting fetch
+of .../stall-js" on the watchdog's first tick past the bound,
+and the page converts with NETSTALL drip=1 elapsed=19s --
+the drip transfer, longer than the bound in total, completed
+and ran because it kept progressing. Full sim gate exit 0 at
+the shipped bound (gate-299-adapted; network mirror skipped
+as before, clip modes 14 identical / 0 differ / 4
+time-varying, Vita's-pace pages 23 identical / 0 differ,
+interaction pass 52/52) -- no gate fetch tripped the watchdog.
+Fresh re-stage 386 applied / 1 failed (patch 22, as in patch
+298's entry); llcache.c byte-identical to the tested tree.
+Vita cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** a page whose server
+stalls a subresource now fails that subresource at about two
+minutes and finishes loading instead of hanging for good.
+NET-stall.html over the gate server is the check -- allow it
+~130 s (the stall aborts at 120-135 s, then the drip script
+completes): converted, drip=1.
