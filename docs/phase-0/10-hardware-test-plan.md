@@ -4446,3 +4446,50 @@ cross-build not run: no vitaSDK on this machine.
 
 **On the device (run 39):** a click on an element that carries both a
 capture and a bubble click listener runs each handler once.
+
+### Patch 292 (2026-10-14): a script's a.click() follows the link
+
+Patch 289's "found on the way" item. A script's click() on a link did
+not follow it, with or without target: the polyfill's click()
+dispatched the event and then activated submit buttons only, so the
+common pattern of building a link and clicking it (download helpers,
+router shims, "open the result" code) silently went nowhere, where a
+real tap on the same link navigates.
+
+- **292 (netsurf):** the polyfill's click() now hands an anchor that
+  carries an href to a new native, __vitaFollowLink, once the
+  dispatch returns (and only when it was not default-prevented; the
+  submitter path is unchanged and returns first). The native is
+  modelled on __vitaSubmitForm -- the element is kept across the
+  realm hop and the work happens in a scheduled callback once the
+  document has a window -- and mirrors interaction.c's ACTION_NAVIGATE:
+  the href resolved against the document base, a javascript: URL run
+  through html_exec, a LINK_DOWNLOAD link navigated with
+  BW_NAVIGATE_DOWNLOAD, anything else navigated in the window the
+  target names with BW_NAVIGATE_HISTORY. One deliberate difference:
+  interaction.c's html_download_suggest_name() is static there, so a
+  download reached from script keeps the URL's own file name instead
+  of a page-suggested one.
+
+Sim-verified: JS-link-click.html + JS-link-click-b.html over the gate
+server (LINKCLICK 5/5; the same pages in a reference browser 5/5,
+ending on JS-link-click-b.html?from=self -- Firefox/Camoufox, as this
+machine's Chromium refuses loopback navigations under its Local
+Network Access checks and every non-loopback address here is
+proxied). Full sim gate exit 0 (gate-292-adapted, the same locally
+adapted copy of tools/run-vita-sim.sh as patch 291's entry describes:
+network mirror skipped, UDP blocked here; all other sections
+executed, clip modes 17 identical / 0 differ / 1 time-varying, no
+section left without a summary). Fresh re-stage 380 applied / 0
+failed; the three changed files byte-identical between the gated tree
+and the fresh application. The restage's nsmonkey smoke build does
+not run on this machine (its pkg-config environment has no libcurl;
+it stops at the configuration stage, before any engine source) --
+the simulator build of the same tree is the compile evidence. Vita
+cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** over the gate server, open
+JS-link-click.html: a script clicking a link should land on
+JS-link-click-b.html reporting LINKCLICK 5/5 -- and, by hand, a page
+whose script clicks a link (a download or "open" helper) now goes
+where a tap would.
