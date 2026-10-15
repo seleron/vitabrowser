@@ -1,0 +1,290 @@
+# netsurf: a mutation batch keeps its precise marks (patch 301)
+# Generated 2026-10-15
+# Base: seleron/vitabrowser (patch stack through 300)
+#
+# The reconvert debounce batches the DOM mutations a script
+# makes before the next flush. The batch recorded its FIRST
+# mark precisely (node, kind, pre-change class) -- and a second
+# DISTINCT mark collapsed the whole slot to "multi": the node
+# was dropped, precision was gone, and the local rebuild path
+# refuses a multi slot on sight. The batch then took a full
+# reconvert of the whole document, however small its marks were.
+#
+# That is exactly the shape of a results page landing: two marks
+# per row (textContent, then className on the same node), a
+# summary line, a title. The 2026-10-14 profile measured every
+# large page paying TWO full reconverts before settling; the
+# second, post-first-content one (~450-560 ms of host sim time on
+# a 5000-paragraph document) was this collapse -- one batch of
+# small, individually answerable marks answered by rebuilding
+# everything.
+#
+# A slot now keeps up to 32 precise marks beyond the first,
+# recorded in order; a repeat of a recorded mark merges in place
+# (the first pre-change class is kept, as the primary mark's
+# always was), and references are held and released exactly as
+# the primary's are. try_local answers the marks in record
+# order. One mark that declines is deferred and retried once
+# after the rest: declines are non-destructive (the local paths
+# restore or never touch the tree on a decline), and a sibling's
+# rebuild can change the box state a later mark is checked
+# against, so a mark that declines in sequence may answer once
+# its siblings have settled -- the same answer the next flush
+# would have given it as a batch of one. Two declines end the
+# attempt at once: interacting declines are the structural cases
+# (patches 192/198) whose answer is the rebuild, not a retry.
+# Precision is still lost where it truly is: more than 32
+# distinct marks, or a mark that names no node, sends the slot
+# coarse (logged) and the batch takes the pre-301 full
+# reconvert. The bound is sized from the measured burst shape:
+# two marks per row, 32 marks cover a 16-row burst.
+#
+# Benchmark (host simulator, relative timings): on
+# JS-dom-stall's 5000-paragraph document the reconvert ledger
+# goes from two full reconverts totalling 856-970 ms to one --
+# the load rebuild -- at 375-379 ms; the post-load batch is
+# answered locally, mark by mark, with no coarse fallback in
+# the log. On the five-page bench, blockclass 1334 -> 1133/1134
+# ms (two runs) and text 341 -> 326/289; domstall's doc_after
+# is 1174 -> 1171/1083 -- its post-load batch overlapped the
+# page's own step schedule, so doc_after understates the saving
+# there and the reconvert ledger above is the direct measure;
+# fetch and module are within noise. Nothing else changes:
+# batches that declined before decline now, by the same routes.
+#
+# Proof and gate: full adapted simulator gate exit 0
+# (gate-301-final; network mirror skipped as in every adapted
+# run -- UDP sendto() is EPERM-blocked on this VM): clip modes
+# 17 identical / 0 differ / 1 time-varying, Vita's-pace pages
+# 23 identical / 0 differ, text batching 68 frames identical /
+# 0 differ, interaction 52/52. Simulator only; the Vita
+# cross-build was not run (no vitaSDK on this VM). Device
+# expectation is in Doc 10.
+#
+# Decline conditions: a coarse slot (overflow or a node-less
+# mark), two declining marks, and any mark kind the local path
+# does not know all take the full reconvert, exactly as a
+# pre-301 multi batch did.
+#
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -113,6 +113,15 @@
+  * dropping the work. */
+ #define RECONVERT_MAX_PENDING 8
+ 
++/* Patch 301 - precise marks kept per slot beyond the first. The
++ * bound is sized from the measured burst shape: a results/scoreboard
++ * write is two marks per row (textContent, then className on the
++ * same node), and the cosmetic debounce can let several rows --
++ * plus the steps that produced them -- accumulate before a flush.
++ * 32 marks cover a 16-row burst. Beyond it the slot goes coarse
++ * (logged) and the batch takes the pre-301 full reconvert. */
++#define RECONVERT_MAX_EXTRA 32
++
+ 
+ struct macos9_reconvert_pending {
+ 	struct content *c;
+@@ -137,6 +146,23 @@
+ 	 * burst a->b->c compares a against c. Freed when the slot is dropped
+ 	 * or cleared. */
+ 	char           *old_class;
++	/* Patch 301 - further precise marks (distinct node/kind) recorded
++	 * after the first, so a burst that touches several nodes -- the
++	 * common script render: text here, a class there -- can still be
++	 * answered locally, one mark at a time, instead of collapsing to
++	 * a full reconvert of the whole document. `coarse` is set only
++	 * when precision is truly lost: a mark that names no node, or
++	 * more distinct marks than the array holds. A coarse slot
++	 * behaves exactly as a pre-301 `multi` slot did. Node references
++	 * are held exactly as the primary's is, and released by the same
++	 * slot_drop_node path. */
++	struct macos9_reconvert_extra {
++		void *node;
++		int   kind;
++		char *old_class;
++	} extra[RECONVERT_MAX_EXTRA];
++	int             extra_n;
++	int             coarse;
+ };
+ 
+ /* fixes910 Phase 0 - implemented in content/handlers/html/html.c, where the real
+@@ -317,6 +343,17 @@
+ 	free(g_pending[i].old_class);
+ 	g_pending[i].old_class = NULL;
+ 	g_pending[i].kind = MACOS9_DOMMUT_UNKNOWN;
++	/* Patch 301 - the extra marks' references and class values die
++	 * with the primary's, on every path that drops precision. */
++	while (g_pending[i].extra_n > 0) {
++		int j = --g_pending[i].extra_n;
++		if (g_pending[i].extra[j].node != NULL) {
++			macsurf_reconvert_node_unref(g_pending[i].extra[j].node);
++			g_pending[i].extra[j].node = NULL;
++		}
++		free(g_pending[i].extra[j].old_class);
++		g_pending[i].extra[j].old_class = NULL;
++	}
+ }
+ 
+ /* fixes910 Phase 0 - clear a slot completely (content + node ref). */
+@@ -327,6 +364,7 @@
+ 	g_pending[i].c = NULL;
+ 	g_pending[i].token = 0;
+ 	g_pending[i].multi = 0;
++	g_pending[i].coarse = 0;
+ 	g_pending[i].kind_mask = 0;
+ 	ms_diag_batch_freeze(g_pending[i].batch_id);
+ 	g_pending[i].batch_id = 0;
+@@ -357,6 +395,7 @@
+ 				g_pending[i].token = macos9_content_token(c);
+ 				g_pending[i].kind = (node != NULL) ? kind : MACOS9_DOMMUT_UNKNOWN;
+ 				g_pending[i].multi = (node == NULL) ? 1 : 0;
++				g_pending[i].coarse = (node == NULL) ? 1 : 0;
+ 				g_pending[i].kind_mask = (kind >= 0 &&
+ 					kind < (int)(sizeof(unsigned long) * 8)) ? (1UL << kind) :
+ 					(1UL << MACOS9_DOMMUT_UNKNOWN);
+@@ -384,17 +423,50 @@
+ 
+ 			/* Merge this mutation into what the slot already holds.
+ 			 * Same node AND same kind = the same logical edit
+-			 * repeating (a textContent loop), so stay precise;
+-			 * anything else means we can no longer name one site. */
+-			if (g_pending[i].multi) {
+-				return;			/* already coarse */
++			 * repeating (a textContent loop), so stay precise. */
++			if (g_pending[i].coarse) {
++				return;		/* precision already lost */
+ 			}
+-			if (node == NULL || g_pending[i].node == NULL ||
+-			    g_pending[i].node != node ||
+-			    g_pending[i].kind != kind) {
+-				g_pending[i].multi = 1;
+-				macos9_reconvert_slot_drop_node(i);
++			if (node != NULL && g_pending[i].node != NULL &&
++			    g_pending[i].node == node &&
++			    g_pending[i].kind == kind) {
++				return;		/* the same mark repeating */
+ 			}
++			/* Patch 301 - a distinct mark no longer collapses the
++			 * slot on the spot: keep it as an extra precise mark
++			 * while it names a node and the array has room (a
++			 * repeat of an extra mark merges in place). The slot
++			 * goes coarse -- the pre-301 `multi` behaviour, node
++			 * references dropped -- only when a mark names no
++			 * node, or the array is full. `multi` is still set,
++			 * so every consumer that gates on "more than one
++			 * distinct mark" (the pump's action choice, the
++			 * cosmetic and style fast paths) behaves exactly as
++			 * before; only try_local's precision changes. */
++			if (node != NULL && g_pending[i].node != NULL) {
++				int j;
++				for (j = 0; j < g_pending[i].extra_n; j++) {
++					if (g_pending[i].extra[j].node == node &&
++					    g_pending[i].extra[j].kind == kind)
++						return;	/* already recorded */
++				}
++				if (g_pending[i].extra_n < RECONVERT_MAX_EXTRA) {
++					struct macos9_reconvert_extra *e =
++						&g_pending[i].extra[g_pending[i].extra_n++];
++					e->node = macsurf_reconvert_node_ref(node);
++					e->kind = kind;
++					e->old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
++						old_class != NULL) ? strdup(old_class) : NULL;
++					g_pending[i].multi = 1;
++					return;
++				}
++				macsurf_debug_log_writef(
++					"LIFE reconvert: batch coarse, more than %d distinct marks",
++					RECONVERT_MAX_EXTRA + 1);
++			}
++			g_pending[i].multi = 1;
++			g_pending[i].coarse = 1;
++			macos9_reconvert_slot_drop_node(i);
+ 			/* Patch 186 - same node and kind merging: the slot keeps
+ 			 * the FIRST mark's old_class. A later mark's value is
+ 			 * the intermediate state, not the pre-batch state. */
+@@ -417,6 +489,7 @@
+ 		kind < (int)(sizeof(unsigned long) * 8)) ? (1UL << kind) :
+ 		(1UL << MACOS9_DOMMUT_UNKNOWN);
+ 	g_pending[freeslot].multi = (node == NULL) ? 1 : 0;
++	g_pending[freeslot].coarse = (node == NULL) ? 1 : 0;
+ 	/* Patch 186 - copy the pre-mutation class value, if given. */
+ 	g_pending[freeslot].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
+ 		old_class != NULL) ? strdup(old_class) : NULL;
+@@ -715,21 +788,19 @@
+  * appended, inserted or removed, all on one element -- is first offered to
+  * html_reconvert_local, which rebuilds and lays out just the block that
+  * holds it. 1 = done (the slot is answered), 0 = do the full rebuild. */
+-static int macos9_reconvert_try_local(int i, struct content *c)
++static int macos9_reconvert_try_local_one(struct content *c, void *node,
++		int kind, const char *old_class)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
+ 	extern int html_reconvert_local_class(struct content *c, void *node,
+ 			const char *old_class);
+ 
+-	if (g_pending[i].multi || g_pending[i].node == NULL)
+-		return 0;
+ 	/* a class change on an inline-level element: its block (patch 173).
+ 	 * Patch 186 passes the pre-mutation class value for the precise
+ 	 * sibling check. */
+-	if (g_pending[i].kind == MACOS9_DOMMUT_SETATTR_CLASS)
+-		return html_reconvert_local_class(c, g_pending[i].node,
+-				g_pending[i].old_class) == 0;
+-	switch (g_pending[i].kind) {
++	if (kind == MACOS9_DOMMUT_SETATTR_CLASS)
++		return html_reconvert_local_class(c, node, old_class) == 0;
++	switch (kind) {
+ 	case MACOS9_DOMMUT_TEXTCONTENT:
+ 	case MACOS9_DOMMUT_INNERHTML:
+ 	case MACOS9_DOMMUT_APPENDCHILD:
+@@ -740,7 +811,48 @@
+ 	default:
+ 		return 0;
+ 	}
+-	return html_reconvert_local(c, g_pending[i].node) == 0;
++	return html_reconvert_local(c, node) == 0;
++}
++
++static int macos9_reconvert_try_local(int i, struct content *c)
++{
++	int j;
++	int deferred = -1;
++
++	if (g_pending[i].coarse || g_pending[i].node == NULL)
++		return 0;
++	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
++			g_pending[i].kind, g_pending[i].old_class))
++		return 0;
++	/* Patch 301 - answer the extra precise marks in the order they
++	 * were recorded. A mark that declines is DEFERRED, not failed:
++	 * a sibling's rebuild can invalidate the box state a later mark
++	 * is checked against, and a mark that declines in sequence may
++	 * answer once its siblings have settled -- the same answer the
++	 * next flush would have given it as a batch of one. Declines
++	 * are non-destructive (the local paths restore or never touch
++	 * the tree on a decline), so a second attempt is safe. One
++	 * deferred mark is retried after the rest; if it still
++	 * declines, the caller falls back to a full reconvert, exactly
++	 * as a single-mark batch would. If TWO marks decline, the
++	 * batch is left to the full reconvert at once: interacting
++	 * declines are the structural cases (patches 192/198) whose
++	 * answer is the rebuild, not a retry. */
++	for (j = 0; j < g_pending[i].extra_n; j++) {
++		if (macos9_reconvert_try_local_one(c, g_pending[i].extra[j].node,
++				g_pending[i].extra[j].kind,
++				g_pending[i].extra[j].old_class))
++			continue;
++		if (deferred >= 0)
++			return 0;
++		deferred = j;
++	}
++	if (deferred >= 0 &&
++	    !macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
++			g_pending[i].extra[deferred].kind,
++			g_pending[i].extra[deferred].old_class))
++		return 0;
++	return 1;
+ }
+ static void macos9_reconvert_schedule_pending(void);
+ 
