@@ -5038,3 +5038,66 @@ cross-build not run: no vitaSDK on this machine.
 **On the device (run 39), in addition:** JS-dispev-ret.html
 should read DISPRET 6/6. It is a pure API-correctness fix; no
 timing change is expected anywhere.
+
+### Patch 303 (2026-10-15): form.enctype / form.encoding and form.reset()
+
+The second forms remainder from the patch 146 review line.
+The bridge reflected a form's method and action, but
+enctype did not exist at all, and neither did reset() -- a
+framework reading the encoding to decide how to serialize,
+or calling form.reset() to clear a form, got undefined and
+silence.
+
+- **303 (netsurf):** enctype as the spec's LIMITED
+  reflection: the getter returns the attribute only when it
+  names one of the three submission encodings (matched ASCII
+  case-insensitively, returned lowercased) and the
+  missing/invalid-value default
+  application/x-www-form-urlencoded otherwise. (The generic
+  reflection would return '' for an absent attribute -- "no
+  encoding chosen", a different and wrong answer.) encoding
+  is the same accessor under its legacy name; patch 297's
+  named-access wrap already names both, so a control named
+  "enctype" still shadows the accessor. reset() fires a
+  bubbling, cancelable reset event and, unless it is
+  cancelled (the same dual test requestSubmit uses: dispatch
+  returning false, or defaultPrevented set), restores each
+  listed control from its default -- value from defaultValue,
+  checkedness from the checked attribute (no defaultChecked
+  exists here; the attribute is the established test, as in
+  :default), each option's selectedness from
+  defaultSelected.
+
+One honest bound, the engine's recorded value model (patch
+287): an input's value, a box's checkedness and an option's
+selectedness ARE their attributes in this engine, so those
+restores write back the model's own defaults. Where default
+and current genuinely diverge -- a textarea (patch 286) --
+the restore is the real thing, and the reset event itself
+is fully real everywhere: pages that confirm or revert on
+reset now get it, in order, with working cancellation.
+
+Proof: testpages/pages/JS-form-enctype-reset.html
+(standalone, not in the gate's page list, the NET-stall
+pattern) -- FORMENC 9/9 in the simulator: the default, a
+canonical read-back of a mixed-case valid value, the
+default again for an invalid value, the encoding alias both
+ways, a textarea restored by an uncancelled reset,
+checkedness and selectedness at their attribute defaults
+afterwards, the reset event observed bubbling and
+cancelable, and a cancelled reset leaving an edited
+textarea untouched.
+
+Sim-verified: full adapted gate exit 0 (gate-303-final;
+network mirror skipped as in every adapted run): clip modes
+17 identical / 0 differ / 1 time-varying, Vita's-pace pages
+23 identical / 0 differ, text batching 68 frames identical /
+0 differ, interaction pass 52/52; FORMVAL 8/8 and DOMSTALL
+8/8 held. Fresh re-stage 391 applied / 0 failed;
+vita_polyfill.js and vita_polyfill.inc byte-identical to
+the tested tree. Vita cross-build not run: no vitaSDK on
+this machine.
+
+**On the device (run 39), in addition:**
+JS-form-enctype-reset.html should read FORMENC 9/9. No
+timing change is expected anywhere.
