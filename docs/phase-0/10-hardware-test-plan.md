@@ -4988,3 +4988,53 @@ two. In the simulator that removed ~0.5 s of host time from a
 5000-paragraph page's post-load work; the device should feel
 it as the page becoming interactive one rebuild sooner after
 its content lands.
+
+### Patch 302 (2026-10-15): document.dispatchEvent reports cancellation
+
+The last open piece of the event work (the 298 remainder
+Yiğit approved with "do both"): dispatchEvent returns false
+when a cancelable event is cancelled, and the element path
+already honoured that -- but the document.dispatchEvent
+shim's page-direct path returned true unconditionally. A page
+could cancel an event at the document and never observe its
+own cancellation; a framework checking the return of a
+document-level dispatch read "not cancelled" for an event it
+had just cancelled.
+
+- **302 (netsurf):** of the shim's three return paths, only
+  the page-direct one changes -- it now returns
+  !(ev.cancelable && ev.defaultPrevented), read after the
+  whole path has run, so a cancellation at the document or in
+  either window step counts and a stopPropagation (not a
+  cancellation) does not. defaultPrevented is maintained by
+  the bridge's own Event shim, which sets it only on a
+  cancelable event. The other two paths keep returning true:
+  patch 146's native-delivery machinery and the engine's own
+  lifecycle fires discard the value.
+
+Proof: testpages/pages/JS-dispev-ret.html (standalone, not in
+the gate's page list, the NET-stall pattern) -- DISPRET 6/6 in
+the simulator: cancelled at the document false; uncancelled
+cancelable true; no listener true; preventDefault on a
+non-cancelable event true (and defaultPrevented stays false);
+cancelled in a window bubble listener false; stopPropagation
+alone true.
+
+Sim-verified: full adapted gate exit 0 on re-run
+(gate-302-rerun; network mirror skipped as in every adapted
+run): clip modes 17 identical / 0 differ / 1 time-varying,
+Vita's-pace pages 23 identical / 0 differ, text batching 68
+frames identical / 0 differ, interaction pass 52/52. The
+first run of the identical tree (gate-302-final) failed on
+three timing-sensitive sections at once -- the JS timer
+table, DOMSTALL 7/8, and frame diffs on the event-order /
+inline-grid / group-opacity pages -- a host-timing flake, not
+a code path this patch touches (it changes one return
+expression in a JS shim); the clean re-run is the verdict of
+record. Fresh re-stage 390 applied / 0 failed;
+macsurf_qjs.c byte-identical to the tested tree. Vita
+cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** JS-dispev-ret.html
+should read DISPRET 6/6. It is a pure API-correctness fix; no
+timing change is expected anywhere.
