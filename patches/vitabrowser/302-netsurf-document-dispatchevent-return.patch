@@ -1,0 +1,72 @@
+# netsurf: document.dispatchEvent reports cancellation (patch 302)
+# Generated 2026-10-15
+# Base: seleron/vitabrowser (patch stack through 301)
+#
+# dispatchEvent's contract: it returns false when a cancelable
+# event is cancelled -- when any listener on the path calls
+# preventDefault -- and true otherwise. The element path honours
+# it (the native libdom dispatch returns it and the bridge's
+# element dispatchEvent passes it through), but the
+# document.dispatchEvent shim's page-direct path returned true
+# unconditionally: a page could cancel an event at the document
+# and never observe its own cancellation, and a framework
+# checking the return of a document-level dispatch (a synthetic
+# submit, a custom lifecycle event) read "not cancelled" for an
+# event it had just cancelled.
+#
+# The shim has three return paths. Two are not a page's to
+# observe and keep returning true: the native-delivery path,
+# whose caller is patch 146's in-dispatch machinery and discards
+# the value, and the lifecycle-only path, whose callers are the
+# engine's own DOMContentLoaded / load / readystatechange /
+# pageshow fires. The third is the page-direct path -- a page
+# calling document.dispatchEvent itself -- and it now returns
+# the spec value: !(ev.cancelable && ev.defaultPrevented).
+# defaultPrevented is maintained by the bridge's own Event
+# shim (preventDefault sets it only on a cancelable event), and
+# it is read after the whole path has run, so a cancellation at
+# the document or in either window step counts, and a
+# stopPropagation -- which is not a cancellation -- does not.
+#
+# Proof: testpages/pages/JS-dispev-ret.html (standalone, not in
+# the gate's page list, the NET-stall pattern) -- DISPRET 6/6 in
+# the simulator: cancelled at the document returns false; an
+# uncancelled cancelable returns true; no listener returns true;
+# a preventDefault attempt on a non-cancelable event returns
+# true (and defaultPrevented stays false); a cancellation in a
+# window bubble listener returns false; stopPropagation alone
+# returns true. Gate numbers in Doc 10.
+#
+# Decline conditions: none -- no other path's behaviour
+# changes; window.dispatchEvent and the fake-element stub keep
+# their own semantics, as before.
+#
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -14678,6 +14678,16 @@
+ 			 * at least attempted one; document.dispatchEvent never did.
+ 			 * Same __msLife pattern: type=/n= scoped to lifecycle events to
+ 			 * bound log volume, THROW unscoped since it is inherently rare. */
++			/* VitaBrowser patch 302 - of the three paths in the
++			 * document.dispatchEvent shim below, only path (c) is a
++			 * page's direct call, and only its return value is one a
++			 * page can observe: it now reports cancellation like
++			 * every other dispatch in the bridge -- false when a
++			 * cancelable event was cancelled anywhere on the path
++			 * (the window steps included), true otherwise. Paths
++			 * (a) and (b) keep returning true: their callers are the
++			 * native dispatch machinery and the engine's own
++			 * lifecycle fires, which discard the value. */
+ 			"document.dispatchEvent=document.dispatchEvent||"
+ 				"function(ev){"
+ 					"var t=ev&&ev.type;"
+@@ -14757,7 +14767,7 @@
+ 						"try{ev.eventPhase=3;}catch(_){}"
+ 						"W.dispatchEvent(ev);}"
+ 					"try{ev.eventPhase=0;ev.currentTarget=null;}catch(_){}"
+-					"return true;};"
++					"return !(ev.cancelable&&ev.defaultPrevented);};"
+ 		"}");
+ 
+ 	/* fixes879 - the "navigator extended shims" block that used to sit HERE was
