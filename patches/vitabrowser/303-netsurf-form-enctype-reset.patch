@@ -1,0 +1,183 @@
+# netsurf: form.enctype / form.encoding and form.reset() (patch 303)
+# Generated 2026-10-15
+# Base: seleron/vitabrowser (patch stack through 302)
+#
+# Two long-missing pieces of the form surface (the forms
+# remainder from the patch 146 review line). The bridge
+# reflected a form's method and action, but enctype did not
+# exist at all, and neither did reset(): a framework reading
+# the encoding to decide how to serialize, or calling
+# form.reset() to clear a form, got undefined and silence.
+#
+# enctype is the spec's LIMITED reflection, not the plain kind
+# the generic mechanism would give: the getter returns the
+# attribute only when it names one of the three submission
+# encodings (application/x-www-form-urlencoded,
+# multipart/form-data, text/plain, matched ASCII
+# case-insensitively and returned lowercased), and the
+# missing/invalid-value default
+# application/x-www-form-urlencoded otherwise. The generic
+# reflection returns '' for an absent attribute, which a
+# framework reads as "no encoding chosen" -- a different answer
+# from the default, and the wrong one. encoding is the same
+# accessor under its legacy name. Patch 297's named-access wrap
+# list already names both, so a control named "enctype" still
+# shadows the accessor on the form, as it should.
+#
+# reset() follows the spec's shape on this engine's model:
+# fire a bubbling, cancelable reset event; if it is cancelled
+# (dispatch returns false or defaultPrevented is set -- the
+# same dual test requestSubmit uses), stop; otherwise restore
+# each listed control from its default -- value from
+# defaultValue, checkedness from the checked attribute (the
+# bridge has no defaultChecked; the attribute is the
+# established test, as in :default), and each option's
+# selectedness from defaultSelected. The caveat is the
+# engine's recorded value model (patch 287, Doc 10): an
+# input's value, a box's checkedness and an option's
+# selectedness ARE their attributes here, so those restores
+# write back the model's own defaults. Where default and
+# current genuinely diverge -- a textarea, whose value is
+# kept apart from its default text (patch 286) -- the restore
+# is the real thing, and the reset event itself is fully real
+# everywhere: pages that confirm or revert on reset now get
+# the event, in order, with working cancellation.
+#
+# Proof: testpages/pages/JS-form-enctype-reset.html
+# (standalone, not in the gate's page list, the NET-stall
+# pattern) -- FORMENC 9/9 in the simulator: the default, a
+# canonical read-back of a mixed-case valid value, the default
+# again for an invalid value, the encoding alias both ways, a
+# textarea restored to its default text by an uncancelled
+# reset, checkedness and selectedness at their attribute
+# defaults afterwards, the reset event observed bubbling and
+# cancelable, and a cancelled reset leaving an edited textarea
+# untouched. Gate numbers in Doc 10.
+#
+# Decline conditions: none -- both additions install only
+# where the bridge has no definition of their own (the
+# polyfill's acc/fn guards), and named controls keep
+# shadowing them per patch 297.
+#
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -5517,6 +5517,57 @@
+ 		});
+ 	})();
+ 	acc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });
++	/* VitaBrowser patch 303: form.enctype / form.encoding and
++	 * form.reset(). enctype is a limited reflection, not the plain
++	 * kind: the getter returns the attribute only when it names one
++	 * of the three submission encodings (ASCII case-insensitive),
++	 * and the missing/invalid-value default
++	 * application/x-www-form-urlencoded otherwise -- the generic
++	 * reflection would return '' for both cases, which a framework
++	 * reads as "no encoding chosen" and falls back differently.
++	 * encoding is the same accessor under its legacy name. */
++	acc(F, 'enctype', function () {
++		var v = this.getAttribute('enctype');
++		if (v !== null) {
++			v = String(v).toLowerCase();
++			if (v === 'application/x-www-form-urlencoded' ||
++			    v === 'multipart/form-data' || v === 'text/plain') return v;
++		}
++		return 'application/x-www-form-urlencoded';
++	}, function (v) { this.setAttribute('enctype', String(v)); });
++	acc(F, 'encoding', function () { return this.enctype; },
++		function (v) { this.enctype = v; });
++	/* form.reset(): fire the cancelable reset event; unless it is
++	 * cancelled, restore every listed control from its default --
++	 * value from defaultValue, checkedness from the checked
++	 * attribute (the bridge has no defaultChecked; the attribute
++	 * is the established test, as in :default), and each option's
++	 * selectedness from defaultSelected. In this engine's model
++	 * (patch 287, Doc 10) an input's value, a box's checkedness
++	 * and an option's selectedness ARE their attributes, so those
++	 * restores write back the model's own defaults; a textarea is
++	 * where default and current genuinely diverge (patch 286),
++	 * and there the restore is the real thing. */
++	fn(F, 'reset', function () {
++		var ev = new Event('reset', { bubbles: true, cancelable: true });
++		if (this.dispatchEvent(ev) === false || ev.defaultPrevented) return;
++		var els = this.elements;
++		for (var i = 0; i < els.length; i++) {
++			var el = els[i], tag = String(el.tagName || '').toUpperCase();
++			if (tag === 'INPUT' || tag === 'TEXTAREA') {
++				el.value = el.defaultValue;
++				if (tag === 'INPUT') {
++					var t = String(el.type || '').toLowerCase();
++					if (t === 'checkbox' || t === 'radio')
++						el.checked = el.hasAttribute('checked');
++				}
++			} else if (tag === 'SELECT') {
++				var opts = el.querySelectorAll('option');
++				for (var j = 0; j < opts.length; j++)
++					opts[j].selected = opts[j].defaultSelected;
++			}
++		}
++	});
+ 	/* text nodes */
+ 	acc(T, 'length', function () { return String(this.data || this.nodeValue || '').length; });
+ 	acc(T, 'wholeText', function () { return String(this.data || this.nodeValue || ''); });
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -5518,6 +5518,57 @@
+ "\t\t});\n"
+ "\t})();\n"
+ "\tacc(F, 'elements', function () { return this.querySelectorAll('input,select,textarea,button,fieldset,output,object'); });\n"
++"\t/* VitaBrowser patch 303: form.enctype / form.encoding and\n"
++"\t * form.reset(). enctype is a limited reflection, not the plain\n"
++"\t * kind: the getter returns the attribute only when it names one\n"
++"\t * of the three submission encodings (ASCII case-insensitive),\n"
++"\t * and the missing/invalid-value default\n"
++"\t * application/x-www-form-urlencoded otherwise -- the generic\n"
++"\t * reflection would return '' for both cases, which a framework\n"
++"\t * reads as \"no encoding chosen\" and falls back differently.\n"
++"\t * encoding is the same accessor under its legacy name. */\n"
++"\tacc(F, 'enctype', function () {\n"
++"\t\tvar v = this.getAttribute('enctype');\n"
++"\t\tif (v !== null) {\n"
++"\t\t\tv = String(v).toLowerCase();\n"
++"\t\t\tif (v === 'application/x-www-form-urlencoded' ||\n"
++"\t\t\t    v === 'multipart/form-data' || v === 'text/plain') return v;\n"
++"\t\t}\n"
++"\t\treturn 'application/x-www-form-urlencoded';\n"
++"\t}, function (v) { this.setAttribute('enctype', String(v)); });\n"
++"\tacc(F, 'encoding', function () { return this.enctype; },\n"
++"\t\tfunction (v) { this.enctype = v; });\n"
++"\t/* form.reset(): fire the cancelable reset event; unless it is\n"
++"\t * cancelled, restore every listed control from its default --\n"
++"\t * value from defaultValue, checkedness from the checked\n"
++"\t * attribute (the bridge has no defaultChecked; the attribute\n"
++"\t * is the established test, as in :default), and each option's\n"
++"\t * selectedness from defaultSelected. In this engine's model\n"
++"\t * (patch 287, Doc 10) an input's value, a box's checkedness\n"
++"\t * and an option's selectedness ARE their attributes, so those\n"
++"\t * restores write back the model's own defaults; a textarea is\n"
++"\t * where default and current genuinely diverge (patch 286),\n"
++"\t * and there the restore is the real thing. */\n"
++"\tfn(F, 'reset', function () {\n"
++"\t\tvar ev = new Event('reset', { bubbles: true, cancelable: true });\n"
++"\t\tif (this.dispatchEvent(ev) === false || ev.defaultPrevented) return;\n"
++"\t\tvar els = this.elements;\n"
++"\t\tfor (var i = 0; i < els.length; i++) {\n"
++"\t\t\tvar el = els[i], tag = String(el.tagName || '').toUpperCase();\n"
++"\t\t\tif (tag === 'INPUT' || tag === 'TEXTAREA') {\n"
++"\t\t\t\tel.value = el.defaultValue;\n"
++"\t\t\t\tif (tag === 'INPUT') {\n"
++"\t\t\t\t\tvar t = String(el.type || '').toLowerCase();\n"
++"\t\t\t\t\tif (t === 'checkbox' || t === 'radio')\n"
++"\t\t\t\t\t\tel.checked = el.hasAttribute('checked');\n"
++"\t\t\t\t}\n"
++"\t\t\t} else if (tag === 'SELECT') {\n"
++"\t\t\t\tvar opts = el.querySelectorAll('option');\n"
++"\t\t\t\tfor (var j = 0; j < opts.length; j++)\n"
++"\t\t\t\t\topts[j].selected = opts[j].defaultSelected;\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t});\n"
+ "\t/* text nodes */\n"
+ "\tacc(T, 'length', function () { return String(this.data || this.nodeValue || '').length; });\n"
+ "\tacc(T, 'wholeText', function () { return String(this.data || this.nodeValue || ''); });\n"
