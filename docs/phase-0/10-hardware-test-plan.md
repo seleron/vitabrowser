@@ -4935,3 +4935,56 @@ longer pays a full-document rebuild for the write. On a large
 document that rebuild was the dominant post-load stall in the
 simulator profile; expect the title write to be free and the
 page to settle one full rebuild sooner.
+
+### Patch 301 (2026-10-15): a mutation batch keeps its precise marks
+
+The second of the two full reconverts the 2026-10-14 profile
+found on every large page. The reconvert debounce recorded a
+batch's FIRST mark precisely (node, kind, pre-change class);
+a second DISTINCT mark collapsed the slot to "multi" -- the
+node was dropped, and the local rebuild path refuses a multi
+slot on sight. The batch took a full reconvert of the whole
+document, however small its marks were. A results page landing
+is exactly that shape: two marks per row (textContent, then
+className), a summary line, a title -- 18 small, individually
+answerable marks answered by rebuilding everything.
+
+- **301 (netsurf):** a slot keeps up to 32 precise marks
+  beyond the first, in record order (a repeat merges in place,
+  keeping the first pre-change class; references are held and
+  released as the primary's are). try_local answers them in
+  order. One declining mark is deferred and retried once after
+  the rest -- declines are non-destructive, and a sibling's
+  rebuild can change the box state a later mark is checked
+  against. Two declines end the attempt: interacting declines
+  are the structural cases (patches 192/198) whose answer is
+  the rebuild. Past 32 distinct marks, or a mark naming no
+  node, the slot goes coarse (logged) and the batch takes the
+  pre-301 full reconvert. 32 is sized from the measured burst:
+  two marks per row, a 16-row burst.
+
+Benchmark (host simulator, relative timings): on
+JS-dom-stall's 5000-paragraph document the reconvert ledger
+goes from two full reconverts totalling 856-970 ms to one --
+the load rebuild -- at 375-379 ms, with no coarse fallback in
+the log. Five-page bench: blockclass 1334 -> 1133/1134,
+text 341 -> 326/289, domstall doc_after 1174 -> 1171/1083
+(its post-load batch overlapped the page's own step schedule;
+the reconvert ledger is the direct measure), fetch and module
+within noise.
+
+Sim-verified: full adapted gate exit 0 (gate-301-final;
+network mirror skipped as in every adapted run): clip modes
+17 identical / 0 differ / 1 time-varying, Vita's-pace pages
+23 identical / 0 differ, text batching 68 frames identical /
+0 differ, interaction pass 52/52. Fresh re-stage 389 applied
+/ 0 failed; macos9_reconvert.c byte-identical to the tested
+tree. Vita cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** a page whose script
+renders its results in one burst (the scoreboard / results
+pattern) should now settle after ONE full rebuild instead of
+two. In the simulator that removed ~0.5 s of host time from a
+5000-paragraph page's post-load work; the device should feel
+it as the page becoming interactive one rebuild sooner after
+its content lands.
