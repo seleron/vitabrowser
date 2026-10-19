@@ -5457,3 +5457,42 @@ on this VM).
 instrumentation only -- no new page or count. The LIFE
 FULLCAUSE lines appear in the sim log only; they cost a few
 static counters and one log line per navigation.
+
+## Patch 309 (2026-10-19): precise-mark ring 32 -> 128 under a cost guard
+
+**What:** Doc-20 stage 1. The stage-0 census (patch 308) showed real
+batches wider than the 32-mark precise ring (over=1 on a 40-mark burst)
+with per-mark local answers (~0.9ms) far below a full reconvert's cost.
+Patch 309 raises the ring to 128 and adds a cost guard: marks are
+answered in order while cumulative local cost stays below the content's
+initial conversion cost; if the guard trips mid-batch, the rest takes
+one full reconvert. Per-mark semantics are unchanged from patch 301.
+
+**Proof (sim):** The 120-mark burst (60 rows x textContent+className) on
+the 200-paragraph BATCHBURST page trips the guard -- census shows
+`FULLCAUSE total=2 over=0 nonode=0 kind=0 local=1 two=0 guard=1`
+(the innerHTML batch's local full reconvert plus the burst's guard
+trip). Focused proof with a tight 12.5ms budget: 15 of 120 marks
+answered locally, then one full reconvert. The guard is a backstop,
+not a throttle.
+
+**Gate:** Full adapted gate exit 0. The BATCHBURST census assertion
+(total=2 guard=1) is the mechanism proof.
+
+**Pre-existing issues noted (not 309 regressions, affect 307 equally):**
+- The 5000-paragraph tree does not fully rebuild on reconvert (partial
+  box tree, ~128 boxes); DOM is correct, DOMSTALL 8/8 passes.
+- RECONVPHASE accumulators read sub-ms on real rebuilds; unusable as a
+  budget source (hence the initial-conversion budget, which errs
+  permissive).
+- First burst after an innerHTML reconvert doesn't record marks; the
+  gate page uses a priming burst.
+
+**On the device (run 39), in addition:** patch 309 changes reconvert
+behavior under wide mutation batches. The BATCHBURST page
+(testpages/pages/JS-batch-burst.html) exercises a 120-mark burst; on
+device the guard may or may not trip depending on the budget (initial
+conversion time). Either outcome is correct -- local answers where
+cheap, one full reconvert where the guard fires. Watch for: (1) the
+page's DOM correctness (textContent/className land), (2) no hangs or
+excessive reconverts under the burst.
