@@ -1,0 +1,761 @@
+# netsurf: a parsed frame's real document for the parent's realm (patch 304)
+# Generated 2026-10-19
+# Base: seleron/vitabrowser (patch stack through 303)
+#
+# Item 7, stage 1 (design: docs/phase-0/19). Since patch 143 the
+# parent realm saw a shim document for a parsed iframe -- a writable
+# stand-in whose queries reached nothing -- and since 294 a
+# cross-origin frame's contentDocument is null, as a browser's is.
+# The same-origin document was never the real one. Stage 1 of the
+# design's staged surface replaces the stand-in with a marshalled
+# handle over the frame's real document:
+#
+#   - __vitaFrameDocument(iframeElement) (macsurf_qjs.c) builds the
+#     handle in C. It carries a binding -- the child realm's jsheap
+#     pointer, the iframe element, the parent's document -- and the
+#     heap pointer is never dereferenced on trust: every read finds
+#     it in the live-heap list by pointer comparison, reads the
+#     child's CURRENT realm owner record, and confirms the element
+#     is still in the parent's document. A stale handle fails
+#     closed; nothing crosses realms but C state (doc 19,
+#     constraints 1 and 4).
+#   - The handle rebinds, as the design specifies: URL, title and
+#     readyState resolve the child's current content/document at
+#     read time. The scalars are engine C state -- the content's
+#     URL and status, the libdom tree's <title> text (the value the
+#     child's own document.title reads) -- so a read is answered
+#     synchronously, with no spin-wait on the child realm.
+#   - documentElement / body / head answer node handles capturing
+#     (binding, content, realm generation, node) with one ref on
+#     the node and one on the owner document, released only by the
+#     handle's finalizer. A frame navigation changes the content
+#     and generation, so pre-navigation handles go inert -- reads
+#     answer undefined, nothing dereferences the dead document,
+#     and a new document's nodes never alias through an old handle.
+#     Within one generation the document handle caches its roots,
+#     so body === body across reads. Stage 1 node handles expose
+#     identity only: tagName, nodeType.
+#   - Element removal is part of the lifetime spec: this engine
+#     keeps a removed frame's content alive until the parent goes,
+#     so the binding's attachment walk is what makes a removed
+#     frame's handles answer as a null document (scalars
+#     undefined, roots null), as the design requires.
+#   - The polyfill (vita_polyfill.js) routes contentDocument and
+#     the shim window's new document accessor through one
+#     per-element cached handle; the 294 cross-origin null and the
+#     143 shim fallback (while a frame has no live document yet)
+#     are unchanged, and script-made local frames keep their own
+#     realm window and document.
+#
+# Gate: testpages/pages/JS-frame-document.html (XDOC2 6/6 in the
+# simulator, over the gate server). In Firefox/Camoufox checks
+# 1-3 and 6 pass and the frame's navigation shows in fresh reads;
+# the captured handle's rebind, the node handles' inertness and
+# the removal answers are doc 19's specified handle semantics,
+# where a browser's captured Document stays with its old page.
+# JS-frame-xdoc.html stays XDOC 4/4 unmodified -- its same-origin
+# checks now answer through the real handle -- and
+# JS-xorigin-frame.html stays XFRAME 9/9. Simulator only; the
+# vita cross-build was not run (no vitaSDK on this VM). Device
+# expectation is in Doc 10.
+#
+# Decline conditions: stages 2 and 3 of doc 19 widen this handle
+# (queries answered in the child's realm, then node reads and
+# writes), each its own patch on this lifetime machinery.
+#
+
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -3421,6 +3421,504 @@
+ 	return JS_NULL;
+ }
+ 
++/* ======================================================================
++ * VitaBrowser patch 304 -- item 7, stage 1 (doc 19): a parsed frame's
++ * REAL document, answered in the parent's realm as a marshalled handle.
++ *
++ * Since patch 143 the parent realm saw a shim document for a parsed
++ * iframe; since 294 a cross-origin one answers null, as a browser's
++ * does. The same-origin document was never the real one: its queries
++ * reached a stand-in, not the frame's parsed tree. Stage 1 of doc 19's
++ * staged surface replaces the stand-in with a handle:
++ *
++ *   - __vitaFrameDocument(iframeElement) builds the handle in C. It
++ *     carries a binding -- the child realm's jsheap pointer, the
++ *     iframe element, the parent's document -- and the heap pointer
++ *     is NEVER dereferenced on trust: every read first finds it in
++ *     g_heap_list by pointer comparison (the qjs_thread_is_live_for_
++ *     dispatch discipline), then reads the child's CURRENT realm
++ *     owner record, and confirms the element is still in the
++ *     parent's document (a removed frame's content token is dead
++ *     even though this engine keeps the content itself alive until
++ *     the parent goes). A destroyed frame's heap is not in the
++ *     list, so a stale handle fails closed instead of dereferencing
++ *     freed state.
++ *   - The handle REBINDS, as a browser's document does: its scalar
++ *     getters (URL, title, readyState) resolve the child's current
++ *     content/document at read time, so a frame navigation is seen
++ *     through the same handle object. Stage 1's scalars are engine
++ *     C state -- the content's URL and status, the libdom tree's
++ *     <title> text -- so a read is answered synchronously from the
++ *     child's own state, with no spin-wait and no JSValue ever
++ *     crossing a runtime boundary (doc 19, constraint 1).
++ *   - documentElement / body / head answer NODE handles: parent-realm
++ *     objects capturing (child heap, content, realm generation, node)
++ *     under the owner/generation validation the realm-hop natives
++ *     already use (js_realm_valid_for_content's shape). A node handle
++ *     holds one ref on its node and one on the owner document (the
++ *     element wrapper's keepalive discipline), released only by its
++ *     finalizer. When the frame navigates, the generation and content
++ *     no longer match and the handle goes INERT -- reads answer
++ *     undefined, nothing dereferences the dead document, and a new
++ *     document's nodes can never alias through an old handle. Within
++ *     one generation the document handle caches its root handles, so
++ *     body === body across reads, as a browser's identity does.
++ *   - Stage 1 node handles expose identity only: tagName, nodeType.
++ *     Queries are stage 2; node reads/writes are stage 3 (doc 19).
++ * ====================================================================== */
++
++/* The binding a handle answers through: the child realm's heap, the
++ * iframe element in the parent's tree, and the parent's document.
++ * Element removal is part of the lifetime spec (doc 19): a frame's
++ * content token dies with its element, so every read also walks the
++ * element's parent chain -- still attached to the parent document,
++ * or the handle answers as a null document. (This engine keeps a
++ * removed frame's content alive until the parent goes, so liveness
++ * alone would keep answering for a frame the page no longer has.)
++ * The binding is shared by the document handle and the node handles
++ * it mints, and is C-refcounted; it holds one ref on the element and
++ * one on the parent document. */
++struct qjs_fbind {
++	struct jsheap *child;	/* compared against g_heap_list only */
++	dom_node *frame_el;	/* one ref held */
++	dom_node *parent_doc;	/* one ref held */
++	int refs;
++};
++
++struct qjs_fdoc_state {
++	struct qjs_fbind *bind;
++};
++
++struct qjs_fnode_state {
++	struct qjs_fbind *bind;
++	struct content *content;	/* captured; compared, never derefed */
++	unsigned long gen;		/* child realm generation at capture */
++	dom_node *node;			/* one ref held */
++	dom_node *owner_doc;		/* one ref held */
++};
++
++static JSClassID s_fdoc_class_id;
++static JSClassID s_fnode_class_id;
++
++static void qjs_fbind_unref(struct qjs_fbind *b)
++{
++	if (b == NULL || --b->refs > 0) return;
++	if (b->frame_el != NULL) macsurf_dom_node_unref(b->frame_el);
++	if (b->parent_doc != NULL) macsurf_dom_node_unref(b->parent_doc);
++	free(b);
++}
++
++static void qjs_fdoc_finalizer(JSRuntime *rt, JSValue val)
++{
++	struct qjs_fdoc_state *st =
++		(struct qjs_fdoc_state *)JS_GetOpaque(val, s_fdoc_class_id);
++	(void)rt;
++	if (st == NULL) return;
++	qjs_fbind_unref(st->bind);
++	free(st);
++}
++
++static void qjs_fnode_finalizer(JSRuntime *rt, JSValue val)
++{
++	struct qjs_fnode_state *st =
++		(struct qjs_fnode_state *)JS_GetOpaque(val, s_fnode_class_id);
++	(void)rt;
++	if (st == NULL) return;
++	/* Single release: this finalizer is the only place the handle's
++	 * refs are dropped. */
++	if (st->node != NULL) macsurf_dom_node_unref(st->node);
++	if (st->owner_doc != NULL) macsurf_dom_node_unref(st->owner_doc);
++	qjs_fbind_unref(st->bind);
++	free(st);
++}
++
++static JSClassDef s_fdoc_class = { "VitaFrameDocument", qjs_fdoc_finalizer };
++static JSClassDef s_fnode_class = { "VitaFrameNode", qjs_fnode_finalizer };
++
++/* The child heap is live iff it is in g_heap_list. Pointer comparison
++ * only: a destroyed heap's address is never dereferenced. */
++static int qjs_fdoc_heap_live(struct jsheap *child)
++{
++	struct jsheap *h;
++	if (child == NULL) return 0;
++	for (h = g_heap_list; h != NULL; h = h->next)
++		if (h == child) return 1;
++	return 0;
++}
++
++/* The frame element is still in the parent's document: doc 19's
++ * removal case. The walk is depth-capped; every ref it takes is
++ * dropped on the way out. */
++static int qjs_fbind_attached(struct qjs_fbind *b)
++{
++	dom_node *cur;
++	int attached = 0, depth = 0;
++	if (b == NULL || b->frame_el == NULL || b->parent_doc == NULL)
++		return 0;
++	cur = b->frame_el;
++	macsurf_dom_node_ref(cur);
++	while (cur != NULL && depth++ < 512) {
++		dom_node *parent = NULL;
++		if (cur == b->parent_doc) {
++			attached = 1;
++			break;
++		}
++		if (macsurf_dom_node_get_parent_node(cur, &parent) !=
++				DOM_NO_ERR)
++			parent = NULL;
++		macsurf_dom_node_unref(cur);
++		cur = parent;
++	}
++	if (cur != NULL) macsurf_dom_node_unref(cur);
++	return attached;
++}
++
++/* The child realm's current content/document/generation, or 0 when
++ * the frame is gone, detached, or has no live document yet. */
++static int qjs_fdoc_current(struct qjs_fbind *b, struct content **cp,
++		dom_document **dp, unsigned long *gp)
++{
++	struct qjs_realm_owner *o;
++	if (b == NULL || !qjs_fdoc_heap_live(b->child) ||
++	    b->child->ctx == NULL || !qjs_fbind_attached(b))
++		return 0;
++	o = qjs_owner_for_ctx(b->child->ctx);
++	if (o == NULL || o->content == NULL || o->document == NULL)
++		return 0;
++	if (cp != NULL) *cp = o->content;
++	if (dp != NULL) *dp = o->document;
++	if (gp != NULL) *gp = qjs_ctx_gen(b->child->ctx);
++	return 1;
++}
++
++static void qjs_fdoc_def_get(JSContext *ctx, JSValue obj, const char *name,
++		JSCFunction *fn)
++{
++	JSAtom atom = JS_NewAtom(ctx, name);
++	char gn[64];
++	snprintf(gn, sizeof gn, "get %s", name);
++	JS_DefinePropertyGetSet(ctx, obj, atom,
++			JS_NewCFunction(ctx, fn, gn, 0), JS_UNDEFINED,
++			JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
++	JS_FreeAtom(ctx, atom);
++}
++
++/* --- document handle scalar getters ---------------------------------- */
++
++static JSValue qjs_fdoc_get_url(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_fdoc_state *st =
++		(struct qjs_fdoc_state *)JS_GetOpaque(this_val, s_fdoc_class_id);
++	struct content *c = NULL;
++	struct nsurl *u;
++	(void)argc; (void)argv;
++	if (st == NULL || !qjs_fdoc_current(st->bind, &c, NULL, NULL))
++		return JS_UNDEFINED;	/* null document: fail closed */
++	u = content_get_url(c);
++	return JS_NewString(ctx, u != NULL ? nsurl_access(u) : "");
++}
++
++/* First <title> in document order, depth-first; consumes node's ref. */
++static dom_string *qjs_fdoc_title_walk(dom_node *node, int depth)
++{
++	dom_string *found = NULL;
++	dom_node_type type;
++	if (node == NULL || depth > 128) {
++		if (node != NULL) macsurf_dom_node_unref(node);
++		return NULL;
++	}
++	if (macsurf_dom_node_get_node_type(node, &type) == DOM_NO_ERR &&
++	    type == DOM_ELEMENT_NODE) {
++		dom_string *tag = NULL;
++		if (macsurf_dom_element_get_tag_name((dom_element *)node,
++				&tag) == DOM_NO_ERR && tag != NULL) {
++			if (strcasecmp(dom_string_data(tag), "title") == 0)
++				macsurf_dom_node_get_text_content(node, &found);
++			macsurf_dom_string_unref(tag);
++		}
++	}
++	if (found == NULL) {
++		dom_node *cur = NULL;
++		if (macsurf_dom_node_get_first_child(node, &cur) == DOM_NO_ERR) {
++			while (cur != NULL && found == NULL) {
++				dom_node *next = NULL;
++				macsurf_dom_node_get_next_sibling(cur, &next);
++				found = qjs_fdoc_title_walk(cur, depth + 1);
++				cur = next;	/* cur's ref consumed by the walk */
++			}
++			if (cur != NULL) macsurf_dom_node_unref(cur);
++		}
++	}
++	macsurf_dom_node_unref(node);
++	return found;
++}
++
++static JSValue qjs_fdoc_get_title(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_fdoc_state *st =
++		(struct qjs_fdoc_state *)JS_GetOpaque(this_val, s_fdoc_class_id);
++	dom_document *doc = NULL;
++	dom_string *t;
++	JSValue ret;
++	(void)argc; (void)argv;
++	if (st == NULL || !qjs_fdoc_current(st->bind, NULL, &doc, NULL))
++		return JS_UNDEFINED;
++	macsurf_dom_node_ref((dom_node *)doc);
++	t = qjs_fdoc_title_walk((dom_node *)doc, 0);
++	if (t == NULL) return JS_NewString(ctx, "");
++	ret = JS_NewString(ctx, dom_string_data(t));
++	macsurf_dom_string_unref(t);
++	return ret;
++}
++
++static JSValue qjs_fdoc_get_readystate(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_fdoc_state *st =
++		(struct qjs_fdoc_state *)JS_GetOpaque(this_val, s_fdoc_class_id);
++	struct content *c = NULL;
++	(void)argc; (void)argv;
++	if (st == NULL || !qjs_fdoc_current(st->bind, &c, NULL, NULL))
++		return JS_UNDEFINED;
++	/* The child's own readyState counts 'loading' -> 'interactive' at
++	 * DOM ready -> 'complete' at window load (fixes881); the content
++	 * status is the same ladder seen from the engine side. */
++	switch (c->status) {
++	case CONTENT_STATUS_DONE: return JS_NewString(ctx, "complete");
++	case CONTENT_STATUS_READY: return JS_NewString(ctx, "interactive");
++	default: return JS_NewString(ctx, "loading");
++	}
++}
++
++/* --- node handles ----------------------------------------------------- */
++
++static struct qjs_fnode_state *qjs_fnode_valid(JSValueConst v)
++{
++	struct qjs_fnode_state *st =
++		(struct qjs_fnode_state *)JS_GetOpaque(v, s_fnode_class_id);
++	struct content *c = NULL;
++	unsigned long gen = 0;
++	if (st == NULL || st->gen == 0) return NULL;
++	if (!qjs_fdoc_current(st->bind, &c, NULL, &gen)) return NULL;
++	if (c != st->content || gen != st->gen) return NULL;	/* navigated: inert */
++	return st;
++}
++
++static JSValue qjs_fnode_get_tagname(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	dom_string *tag = NULL;
++	JSValue ret;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	if (macsurf_dom_element_get_tag_name((dom_element *)st->node,
++			&tag) != DOM_NO_ERR || tag == NULL)
++		return JS_UNDEFINED;
++	ret = JS_NewString(ctx, dom_string_data(tag));
++	macsurf_dom_string_unref(tag);
++	return ret;
++}
++
++static JSValue qjs_fnode_get_nodetype(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	dom_node_type type;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	if (macsurf_dom_node_get_node_type(st->node, &type) != DOM_NO_ERR)
++		return JS_UNDEFINED;
++	return JS_NewInt32(ctx, (int32_t)type);
++}
++
++/* Wrap a child node as a node handle. Adopts node's ref. */
++static JSValue qjs_fnode_wrap(JSContext *ctx, struct qjs_fbind *bind,
++		struct content *content, unsigned long gen, dom_node *node,
++		dom_document *doc)
++{
++	JSValue obj = JS_NewObjectClass(ctx, (int)s_fnode_class_id);
++	struct qjs_fnode_state *st;
++	if (JS_IsException(obj)) {
++		macsurf_dom_node_unref(node);
++		return JS_NULL;
++	}
++	st = (struct qjs_fnode_state *)calloc(1, sizeof(*st));
++	if (st == NULL) {
++		macsurf_dom_node_unref(node);
++		JS_FreeValue(ctx, obj);
++		return JS_NULL;
++	}
++	st->bind = bind;
++	bind->refs++;
++	st->content = content;
++	st->gen = gen;
++	st->node = node;
++	st->owner_doc = (dom_node *)doc;
++	if (st->owner_doc != NULL) macsurf_dom_node_ref(st->owner_doc);
++	JS_SetOpaque(obj, st);
++	qjs_fdoc_def_get(ctx, obj, "tagName", qjs_fnode_get_tagname);
++	qjs_fdoc_def_get(ctx, obj, "nodeType", qjs_fnode_get_nodetype);
++	return obj;
++}
++
++/* First direct child element of `parent` with this tag, or NULL.
++ * Does not consume parent's ref; the result carries its own. */
++static dom_node *qjs_fdoc_child_element(dom_node *parent, const char *tag)
++{
++	dom_node *cur = NULL;
++	if (parent == NULL) return NULL;
++	if (macsurf_dom_node_get_first_child(parent, &cur) != DOM_NO_ERR)
++		return NULL;
++	while (cur != NULL) {
++		dom_node *next = NULL;
++		dom_node_type type;
++		macsurf_dom_node_get_next_sibling(cur, &next);
++		if (macsurf_dom_node_get_node_type(cur, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			dom_string *tn = NULL;
++			if (macsurf_dom_element_get_tag_name(
++					(dom_element *)cur, &tn) == DOM_NO_ERR &&
++			    tn != NULL) {
++				int match = strcasecmp(dom_string_data(tn),
++						tag) == 0;
++				macsurf_dom_string_unref(tn);
++				if (match) {
++					if (next != NULL)
++						macsurf_dom_node_unref(next);
++					return cur;
++				}
++			}
++		}
++		macsurf_dom_node_unref(cur);
++		cur = next;
++	}
++	return NULL;
++}
++
++/* documentElement (which==0) / head (1) / body (2) of the child's
++ * current document, identity-cached on the handle per generation. */
++static JSValue qjs_fdoc_root(JSContext *ctx, JSValueConst this_val, int which)
++{
++	struct qjs_fdoc_state *st =
++		(struct qjs_fdoc_state *)JS_GetOpaque(this_val, s_fdoc_class_id);
++	static const char *const cache_names[3] =
++		{ "__vitaFDE", "__vitaFHead", "__vitaFBody" };
++	struct content *content = NULL;
++	dom_document *doc = NULL;
++	unsigned long gen = 0;
++	dom_node *node = NULL;
++	JSValue cached, obj;
++	if (st == NULL || !qjs_fdoc_current(st->bind, &content, &doc, &gen))
++		return JS_NULL;	/* null document: roots are null */
++	cached = JS_GetPropertyStr(ctx, this_val, cache_names[which]);
++	if (JS_IsObject(cached)) {
++		struct qjs_fnode_state *cs =
++			(struct qjs_fnode_state *)JS_GetOpaque(cached,
++					s_fnode_class_id);
++		if (cs != NULL && cs->content == content && cs->gen == gen)
++			return cached;	/* same generation: identity holds */
++	}
++	JS_FreeValue(ctx, cached);
++	if (macsurf_dom_document_get_document_element(doc,
++			(dom_element **)&node) != DOM_NO_ERR || node == NULL)
++		return JS_NULL;
++	if (which != 0) {
++		dom_node *found = qjs_fdoc_child_element(node,
++				which == 1 ? "head" : "body");
++		macsurf_dom_node_unref(node);
++		node = found;
++		if (node == NULL) return JS_NULL;
++	}
++	obj = qjs_fnode_wrap(ctx, st->bind, content, gen, node, doc);
++	if (JS_IsObject(obj))
++		JS_SetPropertyStr(ctx, this_val, cache_names[which],
++				JS_DupValue(ctx, obj));
++	return obj;
++}
++
++static JSValue qjs_fdoc_get_de(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{ (void)argc; (void)argv; return qjs_fdoc_root(ctx, this_val, 0); }
++
++static JSValue qjs_fdoc_get_head(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{ (void)argc; (void)argv; return qjs_fdoc_root(ctx, this_val, 1); }
++
++static JSValue qjs_fdoc_get_body(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{ (void)argc; (void)argv; return qjs_fdoc_root(ctx, this_val, 2); }
++
++/* __vitaFrameDocument(iframeElement) -- the stage 1 document handle
++ * for a parsed frame's child realm, or null while the frame has no
++ * live document of its own (the polyfill then keeps the 143 shim).
++ * The same-origin decision stays in the polyfill (patch 294): this
++ * native only resolves the element's child window, exactly as
++ * __vitaIframeKey does, and never sees a cross-origin question. */
++static JSValue qjs_frame_document(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct content *c;
++	struct browser_window *bw;
++	dom_node *n;
++	int i;
++	(void)this_val;
++	if (argc < 1 || !JS_IsObject(argv[0]))
++		return JS_NULL;
++	n = qjs_get_node(argv[0]);
++	c = qjs_get_content_for_ctx(ctx);
++	if (n == NULL || c == NULL || c->handler == NULL ||
++	    c->handler->type() != CONTENT_HTML)
++		return JS_NULL;
++	bw = ((struct html_content *)c)->bw;
++	if (bw == NULL) return JS_NULL;
++	for (i = 0; i < bw->iframe_count; i++) {
++		struct browser_window *w = bw->iframes[i];
++		struct qjs_fbind *bind;
++		struct qjs_fdoc_state *st;
++		JSValue obj;
++		if (w == NULL || w->iframe_node != n || w->jsheap == NULL)
++			continue;
++		bind = (struct qjs_fbind *)calloc(1, sizeof(*bind));
++		if (bind == NULL) return JS_NULL;
++		bind->child = w->jsheap;
++		bind->frame_el = n;
++		macsurf_dom_node_ref(bind->frame_el);
++		bind->parent_doc = (dom_node *)qjs_document_for_ctx(ctx);
++		if (bind->parent_doc != NULL)
++			macsurf_dom_node_ref(bind->parent_doc);
++		bind->refs = 1;
++		if (!qjs_fdoc_current(bind, NULL, NULL, NULL)) {
++			qjs_fbind_unref(bind);
++			return JS_NULL;	/* no live child document yet */
++		}
++		obj = JS_NewObjectClass(ctx, (int)s_fdoc_class_id);
++		if (JS_IsException(obj)) {
++			qjs_fbind_unref(bind);
++			return JS_NULL;
++		}
++		st = (struct qjs_fdoc_state *)calloc(1, sizeof(*st));
++		if (st == NULL) {
++			qjs_fbind_unref(bind);
++			JS_FreeValue(ctx, obj);
++			return JS_NULL;
++		}
++		st->bind = bind;
++		JS_SetOpaque(obj, st);
++		qjs_fdoc_def_get(ctx, obj, "URL", qjs_fdoc_get_url);
++		qjs_fdoc_def_get(ctx, obj, "title", qjs_fdoc_get_title);
++		qjs_fdoc_def_get(ctx, obj, "readyState",
++				qjs_fdoc_get_readystate);
++		qjs_fdoc_def_get(ctx, obj, "documentElement", qjs_fdoc_get_de);
++		qjs_fdoc_def_get(ctx, obj, "head", qjs_fdoc_get_head);
++		qjs_fdoc_def_get(ctx, obj, "body", qjs_fdoc_get_body);
++		return obj;
++	}
++	return JS_NULL;
++}
++
+ /* VitaBrowser patch 246: the size of the iframe window this realm's page is
+  * shown in -- innerWidth/innerHeight inside a frame read the whole screen,
+  * so a frame measuring itself (a consent dialog, a captcha) was told
+@@ -11951,6 +12449,12 @@
+ 	JS_NewClass(rt, s_blob_class_id, &s_blob_class);
+ 	macsurf_canvas_init_class(rt);	/* patch 251 */
+ 	macsurf_wasm_init_class(rt);	/* patch 254 */
++	s_fdoc_class_id = 0;
++	JS_NewClassID(rt, &s_fdoc_class_id);
++	JS_NewClass(rt, s_fdoc_class_id, &s_fdoc_class);	/* patch 304 */
++	s_fnode_class_id = 0;
++	JS_NewClassID(rt, &s_fnode_class_id);
++	JS_NewClass(rt, s_fnode_class_id, &s_fnode_class);	/* patch 304 */
+ }
+ 
+ /* ====================================================================== */
+@@ -14106,6 +14610,7 @@
+ 	qjs_set_func(ctx, global, "__vitaNewRealm", qjs_new_realm, 0); /* 260 */
+ 	qjs_set_func(ctx, global, "__vitaSubmitForm", qjs_submit_form, 2); /* 263 */
+ 	qjs_set_func(ctx, global, "__vitaFollowLink", qjs_follow_link, 1); /* 292 */
++	qjs_set_func(ctx, global, "__vitaFrameDocument", qjs_frame_document, 1); /* 304 */
+ 	qjs_set_func(ctx, global, "__vitaFormCtl", qjs_form_ctl, 2); /* 287 */
+ 	qjs_set_func(ctx, global, "__canvasMeasureText",
+ 			qjs_canvas_measure_text_width, 2); /* fixes1245 */
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.js b/content/handlers/javascript/quickjs/vita_polyfill.js
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -7195,6 +7195,52 @@
+ 			} catch (e) { /* */ }
+ 			if (I && I !== Object.prototype) {
+ 				var winCache = new WeakMap();
++				/* VitaBrowser patch 304 (item 7, stage 1; doc 19):
++				 * a parsed same-origin frame's REAL document,
++				 * as the C bridge's marshalled handle (__vita
++				 * FrameDocument). One handle per element: the
++				 * handle itself rebinds when the frame
++				 * navigates, so it is cached for the element's
++				 * life and contentDocument / contentWindow.
++				 * document answer the identical object. Null
++				 * while the frame has no live document of its
++				 * own -- the caller then keeps the 143 shim. */
++				var docCache = new WeakMap();
++				function frameDoc(el) {
++					var h = null;
++					try { h = docCache.get(el); } catch (e) { /* */ }
++					if (h) return h;
++					if (typeof __vitaFrameDocument === 'function') {
++						try { h = __vitaFrameDocument(el); } catch (e) { h = null; }
++						if (h) {
++							try { docCache.set(el, h); } catch (e) { /* */ }
++							return h;
++						}
++					}
++					return null;
++				}
++				/* The shim window's document is the element's
++				 * document: the same decision contentDocument
++				 * makes (a local frame's own document, null
++				 * document cross-origin -- undefined here, the
++				 * property a cross-origin window does not
++				 * expose -- and the real handle same-origin). */
++				function bindWinDoc(w, el) {
++					if (!w || w.__vitaDocBound) return;
++					try {
++						Object.defineProperty(w, '__vitaDocBound', { value: true, configurable: true });
++						Object.defineProperty(w, 'document', {
++							enumerable: true, configurable: true,
++							get: function () {
++								try {
++									if (localFrame(el)) return inDoc(el) ? localWindow(el).document : null;
++									if (!sameOrigin(el)) return undefined;
++									return frameDoc(el) || shimDoc(labelOf(el));
++								} catch (e) { return undefined; }
++							}
++						});
++					} catch (e) { /* */ }
++				}
+ 				function labelOf(el) {
+ 					/* patch 244: the key its own window was linked
+ 					 * with, when it has one */
+@@ -7358,6 +7404,7 @@
+ 									w = makeShim(function () { return labelOf(self); });
+ 									winCache.set(this, w);
+ 								}
++								bindWinDoc(w, this);
+ 								return w;
+ 							} catch (e) { return null; }
+ 						}
+@@ -7382,7 +7429,17 @@
+ 								 * the shim; their real document is the
+ 								 * cross-heap work of Doc 10's item 7. */
+ 								if (!sameOrigin(this)) return null;
+-								return shimDoc(labelOf(this));
++								/* VitaBrowser patch 304 (item 7,
++								 * stage 1; doc 19): the same-
++								 * origin parsed frame's real
++								 * document, through the bridge's
++								 * marshalled handle; the shim
++								 * remains only while the frame
++								 * has no live document yet.
++								 * The cross-origin null above
++								 * is unchanged. */
++								var fh = frameDoc(this);
++								return fh || shimDoc(labelOf(this));
+ 							} catch (e) { return null; }
+ 						}
+ 					});
+diff --git a/content/handlers/javascript/quickjs/vita_polyfill.inc b/content/handlers/javascript/quickjs/vita_polyfill.inc
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -7196,6 +7196,52 @@
+ "\t\t\t} catch (e) { /* */ }\n"
+ "\t\t\tif (I && I !== Object.prototype) {\n"
+ "\t\t\t\tvar winCache = new WeakMap();\n"
++"\t\t\t\t/* VitaBrowser patch 304 (item 7, stage 1; doc 19):\n"
++"\t\t\t\t * a parsed same-origin frame's REAL document,\n"
++"\t\t\t\t * as the C bridge's marshalled handle (__vita\n"
++"\t\t\t\t * FrameDocument). One handle per element: the\n"
++"\t\t\t\t * handle itself rebinds when the frame\n"
++"\t\t\t\t * navigates, so it is cached for the element's\n"
++"\t\t\t\t * life and contentDocument / contentWindow.\n"
++"\t\t\t\t * document answer the identical object. Null\n"
++"\t\t\t\t * while the frame has no live document of its\n"
++"\t\t\t\t * own -- the caller then keeps the 143 shim. */\n"
++"\t\t\t\tvar docCache = new WeakMap();\n"
++"\t\t\t\tfunction frameDoc(el) {\n"
++"\t\t\t\t\tvar h = null;\n"
++"\t\t\t\t\ttry { h = docCache.get(el); } catch (e) { /* */ }\n"
++"\t\t\t\t\tif (h) return h;\n"
++"\t\t\t\t\tif (typeof __vitaFrameDocument === 'function') {\n"
++"\t\t\t\t\t\ttry { h = __vitaFrameDocument(el); } catch (e) { h = null; }\n"
++"\t\t\t\t\t\tif (h) {\n"
++"\t\t\t\t\t\t\ttry { docCache.set(el, h); } catch (e) { /* */ }\n"
++"\t\t\t\t\t\t\treturn h;\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t\treturn null;\n"
++"\t\t\t\t}\n"
++"\t\t\t\t/* The shim window's document is the element's\n"
++"\t\t\t\t * document: the same decision contentDocument\n"
++"\t\t\t\t * makes (a local frame's own document, null\n"
++"\t\t\t\t * document cross-origin -- undefined here, the\n"
++"\t\t\t\t * property a cross-origin window does not\n"
++"\t\t\t\t * expose -- and the real handle same-origin). */\n"
++"\t\t\t\tfunction bindWinDoc(w, el) {\n"
++"\t\t\t\t\tif (!w || w.__vitaDocBound) return;\n"
++"\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\tObject.defineProperty(w, '__vitaDocBound', { value: true, configurable: true });\n"
++"\t\t\t\t\t\tObject.defineProperty(w, 'document', {\n"
++"\t\t\t\t\t\t\tenumerable: true, configurable: true,\n"
++"\t\t\t\t\t\t\tget: function () {\n"
++"\t\t\t\t\t\t\t\ttry {\n"
++"\t\t\t\t\t\t\t\t\tif (localFrame(el)) return inDoc(el) ? localWindow(el).document : null;\n"
++"\t\t\t\t\t\t\t\t\tif (!sameOrigin(el)) return undefined;\n"
++"\t\t\t\t\t\t\t\t\treturn frameDoc(el) || shimDoc(labelOf(el));\n"
++"\t\t\t\t\t\t\t\t} catch (e) { return undefined; }\n"
++"\t\t\t\t\t\t\t}\n"
++"\t\t\t\t\t\t});\n"
++"\t\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\t}\n"
+ "\t\t\t\tfunction labelOf(el) {\n"
+ "\t\t\t\t\t/* patch 244: the key its own window was linked\n"
+ "\t\t\t\t\t * with, when it has one */\n"
+@@ -7359,6 +7405,7 @@
+ "\t\t\t\t\t\t\t\t\tw = makeShim(function () { return labelOf(self); });\n"
+ "\t\t\t\t\t\t\t\t\twinCache.set(this, w);\n"
+ "\t\t\t\t\t\t\t\t}\n"
++"\t\t\t\t\t\t\t\tbindWinDoc(w, this);\n"
+ "\t\t\t\t\t\t\t\treturn w;\n"
+ "\t\t\t\t\t\t\t} catch (e) { return null; }\n"
+ "\t\t\t\t\t\t}\n"
+@@ -7383,7 +7430,17 @@
+ "\t\t\t\t\t\t\t\t * the shim; their real document is the\n"
+ "\t\t\t\t\t\t\t\t * cross-heap work of Doc 10's item 7. */\n"
+ "\t\t\t\t\t\t\t\tif (!sameOrigin(this)) return null;\n"
+-"\t\t\t\t\t\t\t\treturn shimDoc(labelOf(this));\n"
++"\t\t\t\t\t\t\t\t/* VitaBrowser patch 304 (item 7,\n"
++"\t\t\t\t\t\t\t\t * stage 1; doc 19): the same-\n"
++"\t\t\t\t\t\t\t\t * origin parsed frame's real\n"
++"\t\t\t\t\t\t\t\t * document, through the bridge's\n"
++"\t\t\t\t\t\t\t\t * marshalled handle; the shim\n"
++"\t\t\t\t\t\t\t\t * remains only while the frame\n"
++"\t\t\t\t\t\t\t\t * has no live document yet.\n"
++"\t\t\t\t\t\t\t\t * The cross-origin null above\n"
++"\t\t\t\t\t\t\t\t * is unchanged. */\n"
++"\t\t\t\t\t\t\t\tvar fh = frameDoc(this);\n"
++"\t\t\t\t\t\t\t\treturn fh || shimDoc(labelOf(this));\n"
+ "\t\t\t\t\t\t\t} catch (e) { return null; }\n"
+ "\t\t\t\t\t\t}\n"
+ "\t\t\t\t\t});\n"

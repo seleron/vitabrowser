@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS frame document handle (script not run)</title>
+<!-- Patch 304 (item 7, stage 1; design: docs/phase-0/19): a parsed
+     same-origin iframe's contentWindow.document / contentDocument is
+     the frame's REAL document, reached through a marshalled handle --
+     patch 143's shim document answered in its place until now. The
+     checks, from doc 19's gate spec:
+       1. scalars cross: the parent reads URL / title / readyState
+          through the handle, equal to the child's own values -- the
+          title the child's SCRIPT set, not the parsed one;
+       2. identity: contentDocument === contentWindow.document, and
+          stable across reads;
+       3. roots: documentElement is the HTML element (tagName,
+          nodeType), body / head non-null, identical across reads;
+       4. lifetime: the frame navigates (same-origin, second page);
+          the document handle rebinds to the new page's scalars and
+          the pre-navigation node handles go inert (reads undefined,
+          no crash). Rebinding and inertness are doc 19's specified
+          handle semantics: a browser's captured Document reference
+          stays with the old page instead (the new page is reached
+          by re-reading contentWindow.document), and a browser
+          keeps a detached node readable. Reference check (Firefox):
+          checks 1-3 and 6 pass, and the frame does navigate --
+          fresh reads there show the second page's title/URL;
+       5. the frame element is removed: the held document handle
+          answers as a null document (scalars undefined, roots null);
+       6. a cross-origin parsed frame's contentDocument stays null
+          (patch 294).
+     One interval drives the whole flow from script start and writes
+     progress as it observes it, like the other timed gate pages: a
+     timer created after the frame's removal did not reliably run
+     again in this engine, and a quiet page is dumped by the
+     autotest before its later legs finish.
+     Over the gate server only (NET-js-frame-document): the
+     cross-origin child comes from the server's https port. -->
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+p { margin: 2px 0; }
+iframe { width: 300px; height: 40px; }
+</style>
+</head>
+<body>
+<div id="sum">XDOC2: 0/6 passed</div>
+<p id="r1" class="wait">1 waiting (the script never ran)</p>
+<p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+<p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+<p id="r6" class="wait">6 waiting</p>
+<iframe id="so" src="JS-frame-document-child.html"></iframe>
+<script>
+document.write('<iframe id="xo" src="https://127.0.0.1:' +
+	(Number(location.port || 80) + 1) +
+	'/JS-xorigin-frame-child.html"><\/iframe>');
+</script>
+<script>
+(function () {
+	var k = 0, N = 6, latest = null, phase = 0, docH = null,
+		oldBody = null, oldDE = null, ticks = 0, goneTries = 0,
+		expected2 = new URL('JS-frame-document-child2.html',
+			location.href).href;
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		if (!p || p.className === 'pass') return;
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'XDOC2: ' + k + '/' + N + ' passed';
+		document.title = 'JS frame document handle (' + k + '/' + N + ')';
+	}
+	function check(n, f, text) {
+		try { var r = f(); t(n, r === true, text + (r === true ? '' : ': ' + r)); }
+		catch (e) { t(n, false, text + ': ' + e); }
+	}
+	function fail(n, text) { t(n, false, text); }
+
+	window.addEventListener('message', function (e) {
+		var d = e.data || {};
+		if (d.xdoc2 === 'state') latest = d;
+	});
+
+	function phaseOne() {
+		var so = $('so'), d = null;
+		try { d = so.contentWindow.document; } catch (e) { /* */ }
+		docH = d;
+		check(1, function () {
+			if (!d) return 'no document';
+			if (d.title !== latest.title)
+				return 'title ' + d.title + ' != child ' + latest.title;
+			if (latest.title !== 'XDOC2 child one')
+				return 'child title not the script-set one: ' + latest.title;
+			if (d.URL !== latest.href)
+				return 'URL ' + d.URL + ' != child ' + latest.href;
+			if (d.readyState !== latest.readyState)
+				return 'readyState ' + d.readyState + ' != child ' + latest.readyState;
+			return true;
+		}, 'scalars cross: URL/title/readyState are the child\'s own');
+		check(2, function () {
+			if (!d) return 'no document';
+			if (so.contentDocument !== d) return 'contentDocument !== contentWindow.document';
+			if (so.contentDocument !== so.contentDocument) return 'contentDocument not stable';
+			return true;
+		}, 'one document, identical across accessors and reads');
+		check(3, function () {
+			if (!d) return 'no document';
+			var de = d.documentElement;
+			if (!de) return 'no documentElement';
+			if (de.tagName !== 'HTML') return 'documentElement tagName ' + de.tagName;
+			if (de.nodeType !== 1) return 'documentElement nodeType ' + de.nodeType;
+			if (d.documentElement !== de) return 'documentElement not identical';
+			if (!d.body) return 'no body';
+			if (d.body !== d.body) return 'body not identical across reads';
+			if (!d.head || d.head.tagName !== 'HEAD') return 'no head';
+			oldBody = d.body; oldDE = de;
+			return true;
+		}, 'roots: documentElement/body/head as node handles');
+		check(6, function () {
+			var xd = $('xo').contentDocument;
+			return xd === null || typeof xd;
+		}, 'a cross-origin frame\'s contentDocument stays null');
+		/* navigate the frame: the src set is the browser shape; the
+		 * child also navigates itself if asked (see the phase-1
+		 * leg) -- the lifetime machinery under test is the same */
+		try { so.src = 'JS-frame-document-child2.html'; } catch (e) { /* */ }
+		phase = 1;
+	}
+
+	function phaseTwo(u) {
+		check(4, function () {
+			if (u !== expected2)
+				return 'handle URL after navigation: ' + u;
+			var tb = oldBody && oldBody.tagName;
+			if (tb !== undefined) return 'old body handle not inert: tagName ' + tb;
+			var td = oldDE && oldDE.nodeType;
+			if (td !== undefined) return 'old documentElement handle not inert: nodeType ' + td;
+			return true;
+		}, 'lifetime: handle rebinds, pre-navigation node handles inert');
+		var so2 = $('so');
+		try { so2.parentNode.removeChild(so2); } catch (e) { /* */ }
+		phase = 2;
+	}
+
+	/* the one driver */
+	var driver = setInterval(function () {
+		ticks++;
+		if (phase === 0) {
+			if (latest && latest.iam === 'one' &&
+					latest.readyState === 'complete') {
+				phaseOne();
+			} else if (ticks % 4 === 0) {
+				$('r1').textContent = '1 waiting: child ' +
+					(latest ? latest.iam + '/' + latest.readyState
+						: 'silent') + ' (' + ticks + ')';
+			}
+		} else if (phase === 1) {
+			var tt = null, uu = null, rs = null;
+			try {
+				tt = docH && docH.title;
+				uu = docH && docH.URL;
+				rs = docH && docH.readyState;
+			} catch (e) { /* */ }
+			if (tt === 'XDOC2 child two' && rs === 'complete') {
+				phaseTwo(uu);
+			} else {
+				$('r4').textContent = '4 waiting: title=' + tt +
+					' readyState=' + rs + ' (' + ticks + ')';
+				/* if the src set did not navigate the frame,
+				 * ask the child to navigate itself */
+				if (ticks % 12 === 0) {
+					try { $('so').contentWindow.postMessage('navigate', '*'); } catch (e) { /* */ }
+				}
+			}
+		} else if (phase === 2) {
+			goneTries++;
+			var gone = false;
+			try {
+				gone = docH && docH.URL === undefined &&
+					docH.title === undefined &&
+					docH.documentElement === null;
+			} catch (e) { /* */ }
+			if (gone) {
+				t(5, true, 'removed frame: the held handle answers as a null document');
+				phase = 3;
+				clearInterval(driver);
+			} else if (goneTries >= 24) {
+				fail(5, 'removed frame: handle still answers URL ' +
+					(docH && docH.URL));
+				phase = 3;
+				clearInterval(driver);
+			} else {
+				$('r5').textContent = '5 waiting: URL=' +
+					(docH && docH.URL) + ' (' + goneTries + ')';
+			}
+		}
+	}, 250);
+
+	/* deadline: whatever never ran is a failure with its reason */
+	setTimeout(function () {
+		if (phase === 0) {
+			fail(1, 'child state never completed: ' +
+				(latest ? latest.iam + '/' + latest.readyState : 'no message'));
+			fail(2, 'not reached'); fail(3, 'not reached');
+			fail(4, 'not reached'); fail(5, 'not reached');
+		} else if (phase === 1) {
+			fail(4, 'handle never rebound to the second page: title ' +
+				(docH && docH.title) + ' readyState ' +
+				(docH && docH.readyState));
+			fail(5, 'not reached');
+		} else if (phase === 2) {
+			fail(5, 'removed frame: handle still answers URL ' +
+				(docH && docH.URL));
+		}
+		if (k < 6 && $('r6').className !== 'pass' &&
+				$('r6').textContent.match(/waiting/))
+			fail(6, 'cross-origin check not reached');
+		clearInterval(driver);
+	}, 30000);
+})();
+</script>
+</body>
+</html>
