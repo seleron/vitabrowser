@@ -5101,3 +5101,74 @@ this machine.
 **On the device (run 39), in addition:**
 JS-form-enctype-reset.html should read FORMENC 9/9. No
 timing change is expected anywhere.
+
+### Patch 304 (2026-10-19): a parsed frame's real document (item 7, stage 1)
+
+Item 7's first stage, per the design in doc 19. A parsed
+same-origin iframe's contentDocument / contentWindow.document
+was patch 143's shim -- a writable stand-in whose queries
+reached nothing. It is now the frame's real document, reached
+through a marshalled handle built in C
+(__vitaFrameDocument in macsurf_qjs.c):
+
+- The handle carries a binding -- the child realm's jsheap,
+  the iframe element, the parent's document. The heap pointer
+  is never dereferenced on trust: every read finds it in the
+  live-heap list by pointer comparison, reads the child's
+  current realm owner record, and confirms the element is
+  still in the parent's document. Only C state crosses
+  (doc 19, constraints 1 and 4); the frame keeps its own
+  runtime (constraint 2); the cross-origin null of patch 294
+  is untouched (constraint 3).
+- Scalars rebind at read time, as the design specifies:
+  URL and readyState from the child content's URL and status,
+  title from the child libdom tree's <title> text -- the value
+  the child's own document.title reads, so a title the child's
+  script sets is the title the parent reads.
+- documentElement / body / head answer node handles capturing
+  (binding, content, realm generation, node), one ref on the
+  node and one on the owner document, released only by the
+  handle's finalizer. Navigation changes content and
+  generation, so pre-navigation handles go inert (reads
+  undefined, no crash, no aliasing); within a generation the
+  roots are cached, so body === body. Stage 1 node handles
+  expose identity only: tagName, nodeType. Queries are
+  stage 2; node reads/writes are stage 3.
+- Removal: this engine keeps a removed frame's content alive
+  until the parent goes, so the binding's attachment walk is
+  what makes a removed frame's handles answer as a null
+  document (scalars undefined, roots null), as doc 19
+  specifies.
+
+Proof: testpages/pages/JS-frame-document.html (in the gate
+as NET-js-frame-document) -- XDOC2 6/6 in the simulator:
+scalars equal to the child's own posted values (title after
+the child's script changed it), document identity across
+both accessors, root handles' identity and tagName/nodeType,
+navigation rebind with pre-navigation handles inert, removal
+answers as a null document, cross-origin contentDocument
+null. One page-writing note: a single driver interval runs
+the flow -- a timer created after the frame's removal did
+not reliably run again here, and a quiet page is dumped by
+the autotest before its later legs finish. In
+Firefox/Camoufox checks 1-3 and 6 pass, and the frame's
+navigation shows in fresh reads; the captured handle's
+rebind, the inertness and the removal answers are doc 19's
+handle semantics, where a browser's captured Document stays
+with its old page.
+
+Sim-verified: full adapted gate exit 0 (gate-304-adapted;
+network mirror skipped as in every adapted run): XDOC2 6/6,
+XDOC 4/4 (unmodified -- its same-origin checks now answer
+through the real handle), XFRAME 9/9, Vita's-pace pages 23
+identical / 0 differ, text batching 68 frames identical /
+0 differ, interaction pass 52/52. Fresh re-stage 392
+applied / 0 failed; macsurf_qjs.c, vita_polyfill.js and
+vita_polyfill.inc byte-identical to the tested tree. Vita
+cross-build not run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:**
+JS-frame-document.html is in the gate's NET list, so the
+autotest covers it: it should read XDOC2 6/6. Frame-heavy
+pages (sign-in flows) are the ones whose scripts may now
+reach into same-origin frames; nothing else changes shape.
