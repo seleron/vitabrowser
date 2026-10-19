@@ -5304,3 +5304,86 @@ JS-frame-document.html should now read XDOC2 8/8. Pages
 whose scripts query into a same-origin frame's document
 (embed widgets, consent frames) now get real answers from
 the frame's live tree.
+
+### Patch 307 (2026-10-19): node reads/writes on a parsed frame's handles (item 7, stage 3)
+
+Item 7's third stage, per the design in doc 19 -- with it,
+the design's staged surface is complete. Patch 304's node
+handles exposed identity only and 306 added the document
+handle's queries; the handles now read and write:
+textContent and innerHTML (get/set), getAttribute /
+setAttribute, parentNode / firstChild / childNodes traversal
+as handles, and appendChild / removeChild taking handles of
+the same child document.
+
+- Each function is the realm's own entry point re-pointed at
+  the handle's node, with 304's validation in front of it:
+  an inert handle's reads answer undefined and its writes
+  are dropped, and a libdom exception drops the call instead
+  of throwing across the boundary. appendChild / removeChild
+  accept only a live handle of the same child document
+  (captured content and owner document equal); a node of
+  the parent's own document is not a handle and is dropped
+  -- cross-document adoption stays outside the design, and
+  parentDocument.appendChild(childHandle) stays the type
+  error it always was.
+- Writes perform the same libdom mutations the realm's
+  entry points perform -- the textContent empty-string rule
+  (fixes1031), the fragment-parser innerHTML with its
+  head-then-body descent (fixes846/1007) parsed against the
+  child's document, fixes926's attribute-kind classification
+  and 186/197's old-class mark -- and then take the same
+  dirty mark through the child realm's context, so the mark
+  lands on the child's content and the write flows through
+  the child's own mutation/reconvert machinery. No private
+  invalidation path.
+- Recorded remainder: the realm's entry points also queue a
+  MutationObserver record through the observing realm's
+  polyfill. Delivering that record for a parent-made write
+  would mean running child-realm JS from the parent's turn
+  -- the nested re-entry doc 19's first constraint forbids
+  -- so child-realm observers do not receive records for
+  parent-made writes. The writes are fully visible to the
+  child's own reads, which is what the gate proves. A
+  C-side queued delivery is a follow-up design question,
+  not part of the staged surface.
+
+Proof: testpages/pages/JS-frame-document.html extended in
+place -- XDOC2 10/10 in the simulator (the gate script's
+expectation rose 8 -> 10 with the page). Check 9 traverses
+through handles, sets textContent and an attribute on the
+child's #kid, sets innerHTML on its #box, removes a child
+and moves the box -- and passes only when the child's own
+script reports the written state from its own reads, which
+is what proves the writes landed in the child's real DOM.
+Check 10 is the discipline: a parent-document node passed
+to appendChild is dropped, and after the navigation the
+inert handle's writes drop without throwing while its
+stage 3 reads answer undefined. The page scored 5/10
+before the patch. In Firefox/Camoufox checks 1-3, 6, 7 and
+9 pass -- the read/write surface behaves as a browser's
+does; 4, 5, 8 and 10 are doc 19's handle semantics.
+JS-frame-xdoc.html stays XDOC 4/4 and JS-xorigin-frame.html
+stays XFRAME 9/9; the cross-origin null is untouched.
+
+Sim-verified: full adapted gate exit 0 (gate-307; network
+mirror skipped as in every adapted run): XDOC2 10/10, XDOC
+4/4, XFRAME 9/9, FRAMELOCAL 6/6, Vita's-pace pages 23
+identical / 0 differ, text batching 68 frames identical /
+0 differ, interaction pass 52/52. Fresh re-stage 395
+applied / 0 failed; macsurf_qjs.c byte-identical to the
+tested tree. Vita cross-build not run: no vitaSDK on this
+machine.
+
+Item 7 status: designed surface complete (doc 19, stages
+1-3, patches 304/306/307). Anything beyond it -- events
+crossing the boundary, contentWindow writes, cross-document
+adoption, MutationObserver records for parent-made writes
+-- is out of the design's scope and would need its own
+design pass.
+
+**On the device (run 39), in addition:** the bundled
+JS-frame-document.html should now read XDOC2 10/10. Pages
+whose scripts reach into a same-origin frame and write
+(embed widgets that fill in a frame's fields, consent
+frames) now act on the frame's real tree.
