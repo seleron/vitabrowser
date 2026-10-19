@@ -5412,3 +5412,48 @@ doc_after on the two JS-step-series bench pages read
 ~1800 ms all day (round 2: ~1120-1180) while engine phase
 totals stayed flat -- consistent with host timer pacing,
 flagged for re-check, not attributed to any patch.
+
+**Perf round 3 addendum (2026-10-19, leg 3):** the unexplained
+doc_after ~1800 ms on the two JS-step-series bench pages was
+attributed the next morning: a harness read race, not a
+regression. bench2.sh printed ~1760-1830 ms from a DIAG log the
+sim was still writing (the file grew 4,253,579 to 4,860,972
+bytes after extraction returned); the printed values exist in
+no finished log. Isolated boots with extraction waited to
+`exit: clean` (work/vita-sim-iso/, work/bench-iso.sh) showed
+the 303 tree and the 307 tree identical at domstall 1062 /
+blockclass 1167 -- the round-2 band. Write-up:
+work/perf-baseline-2026-10-14.md.
+
+**Patch 308 (netsurf: reconvert full-cause census; doc 20 stage
+0).** Instrumentation only -- zero behaviour change. Every
+batch full reconvert now names its cause in a LIFE FULLCAUSE
+line per navigation: over (the batch held more distinct marks
+than the precise ring, first cause wins), nonode (a mark named
+no node), kind (a mark kind the local answer does not handle),
+local (the primary node's subtree declined local reconvert),
+two (a second walker touched the node). The scheduled-callback
+and sync-flush paths share one classifier; batches the flush
+never takes (initial conversions, locally-answered batches)
+are not counted -- a fix found during proof, when the sync
+path briefly counted locally-answered batches as full
+reconverts; the census itself exposed the miscount. Proof on
+throwaway pages (deleted before commit): a 40-text-mark burst
+read over=1; a 3-setAttribute burst read kind=1 with all three
+attributes landed; a 5000-paragraph innerHTML batch read
+local=1; suite structural pages read two=1; nonode is
+code-reviewed, unobserved in the suite. The DOMSTALL and
+BLOCKCLASS bench pages show no FULLCAUSE lines -- zero batch
+full reconverts on them post-300/301. Full adapted gate exit
+0: EVPHASE 9/9, XFRAME 9/9, XDOC2 10/10, FSHADOW2 10/10,
+BLOCKCLASS 7/7, DOMSTALL 8/8, interaction pass 52/52. Fresh
+stage reapply: 396 patches applied, 0 failed, changed file
+byte-identical to the tested tree. This patch ships no perf
+change; it is the census doc 20's stage 1 builds on.
+Simulator only; the vita cross-build was not run (no vitaSDK
+on this VM).
+
+**On the device (run 39), in addition:** patch 308 is
+instrumentation only -- no new page or count. The LIFE
+FULLCAUSE lines appear in the sim log only; they cost a few
+static counters and one log line per navigation.
