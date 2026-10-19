@@ -5172,3 +5172,62 @@ JS-frame-document.html is in the gate's NET list, so the
 autotest covers it: it should read XDOC2 6/6. Frame-heavy
 pages (sign-in flows) are the ones whose scripts may now
 reach into same-origin frames; nothing else changes shape.
+
+### Patch 305 (2026-10-19): form named controls shadow the whole prototype chain
+
+Patch 297's remainder. Its wrapping covered the form's own
+interface plus a hand-listed set of IDL attributes, but a
+control named after a member inherited from HTMLElement,
+Element or Node -- id, title, children, focus, tagName,
+nodeType, className -- still did not shadow: form.id read the
+form's own id reflection and the control was reachable only
+through form.elements. Browsers apply
+[LegacyOverrideBuiltIns] to the whole chain.
+
+- The behavior was pinned against Firefox first: on a form
+  carrying those controls (one keyed by id as "dir"), every
+  read is the control; a form without collisions reads its
+  own values; and a write to a shadowed accessor still
+  reaches the built-in setter -- form.id = 'changed' sets
+  the form's id attribute -- while reads keep returning the
+  control.
+- The polyfill's named-access wrapping now walks every
+  prototype from HTMLFormElement.prototype up to (but not
+  including) Object.prototype and wraps each own member
+  where it lives, the lowest occurrence of a name deciding;
+  the hand-list is gone. The accessor setter no longer
+  swallows a write to a shadowed name, per the pin (297's
+  method-write behavior is unchanged). The form-only guard
+  is unchanged, so other elements are untouched.
+- Recorded remainders: Object.prototype members are not
+  wrapped (a control named toString keeps not shadowing --
+  the wrap would tax every object in the page), and a name
+  whose lowest member is not configurable cannot shadow.
+
+Proof: testpages/pages/JS-form-shadow-chain.html (in the
+gate as NET-js-form-shadow-chain) -- FSHADOW2 10/10 in the
+simulator and in Firefox/Camoufox; the page scored 1/10
+before the fix (only its no-collision check passed).
+JS-form-shadow.html stays FORMSHADOW 6/6 and
+JS-form-named.html stays FORMNAMED 7/7.
+
+Sim-verified: full adapted gate exit 0 (gate-305-rerun;
+network mirror skipped as in every adapted run). The first
+305 gate run failed its QuickJS engine probe 17/18 (the
+allocation check) under visible host load -- fib(25) at
+27 ms against its usual 15; jsprobe runs a bare QuickJS
+context and never loads the polyfill, and the identical
+tree's re-run passed 18/18 with fib back at 15 ms, so the
+failure is recorded as a host timing flake, as patch 302's
+was. Vita's-pace pages 23 identical / 0 differ, interaction
+pass 52/52. Fresh re-stage 393 applied / 0 failed;
+vita_polyfill.js and vita_polyfill.inc byte-identical to
+the tested tree. Vita cross-build not run: no vitaSDK on
+this machine.
+
+**On the device (run 39), in addition:**
+JS-form-shadow-chain.html is in the gate's NET list, so the
+autotest covers it: it should read FSHADOW2 10/10. Pages
+whose forms carry controls named like built-ins (id and
+title are the realistic accidents) now read those controls
+off the form, as in a browser.
