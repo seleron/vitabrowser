@@ -5387,3 +5387,28 @@ JS-frame-document.html should now read XDOC2 10/10. Pages
 whose scripts reach into a same-origin frame and write
 (embed widgets that fill in a frame's fields, consent
 frames) now act on the frame's real tree.
+
+**Perf round 3 (2026-10-19, no patch):** the reconvert
+build itself, profiled with throwaway sub-phase timers
+(reverted; tree verified byte-identical afterwards). On a
+5000-paragraph page the single remaining full reconvert is
+385-436 ms host, of which the build is 276-323 ms. Inside
+the build, style selection is 55-57% (~6.5 us per element:
+libcss select ~4.8 us + parent compose ~2.0 us), text
+construction ~12%, traversal + normalise ~23%, everything
+else ~9% combined (box allocation and property extraction
+are ~0.12 us per element -- already cheap). No patch
+ships: the sound levers are exhausted at this granularity.
+Compose-result sharing is unsound in the general case
+(selection resolves var() against a per-element
+custom-property environment), and match caching is a
+libcss-internals project. The next real lever is
+architectural -- avoiding the rebuild, not speeding it --
+and needs its own design pass. Full numbers and the
+rejected-lever analysis: the session perf file
+(perf-baseline-2026-10-14.md, round 3 section, work
+tree). One unexplained observation recorded there:
+doc_after on the two JS-step-series bench pages read
+~1800 ms all day (round 2: ~1120-1180) while engine phase
+totals stayed flat -- consistent with host timer pacing,
+flagged for re-check, not attributed to any patch.
