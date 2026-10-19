@@ -5231,3 +5231,76 @@ autotest covers it: it should read FSHADOW2 10/10. Pages
 whose forms carry controls named like built-ins (id and
 title are the realistic accidents) now read those controls
 off the form, as in a browser.
+
+### Patch 306 (2026-10-19): queries on a parsed frame's document handle (item 7, stage 2)
+
+Item 7's second stage, per the design in doc 19. Patch 304's
+document handle answered scalars and root node handles,
+identity only; a script's queries into the frame still
+reached nothing. The handle now answers getElementById,
+querySelector, querySelectorAll and getElementsByTagName:
+
+- Each native resolves the child's current content / document
+  / generation through 304's qjs_fdoc_current at call time and
+  answers from the child's own libdom tree -- the same C
+  state stage 1's scalars read -- so a navigated frame's
+  queries answer the new document, and on the null document
+  (frame removed, destroyed, or not yet loaded) single
+  lookups answer null and list lookups answer empty, never
+  a throw.
+- Selector evaluation is the bridge's own matcher
+  (qjs_sel_list_parse / qjs_sel_list_match, with
+  querySelector's single-id fast path) run over the child's
+  tree: a pure function of (selector, tree), so no child-realm
+  JS state is consulted and no JSValue crosses a runtime.
+  Matches are minted as 304 node handles capturing the query
+  call's (content, generation), so they share the roots'
+  lifetime discipline exactly -- live within the generation
+  that produced them, inert after it; a query cannot
+  resurrect or alias a stale document's nodes.
+- getElementsByTagName shares the list walk, mirroring the
+  realm's own document, whose getElementsByTagName IS
+  querySelectorAll(tag) (fixes873). Lists answer as plain
+  arrays of handles.
+
+Proof: testpages/pages/JS-frame-document.html extended in
+place -- XDOC2 8/8 in the simulator (the gate script's
+expectation rose 6 -> 8 with the page). Check 7 runs the four
+queries against the first child: getElementById finds the
+element the child created after load -- live access, not a
+snapshot -- the querySelectorAll('p') and
+getElementsByTagName('p') counts equal the child's own
+count, and misses answer null. Check 8 holds stage 1's
+lifetime semantics for query results: a pre-navigation query
+handle goes inert, fresh queries answer the second child's
+tree, and after the frame's removal the queries answer
+empty. The page scored 5/8 before the patch. In
+Firefox/Camoufox checks 1-3, 6 and 7 pass -- the query
+surface behaves as a browser's does; 4, 5 and 8 are doc 19's
+handle semantics, where a browser's captured Document stays
+with its old page. JS-frame-xdoc.html stays XDOC 4/4 and
+JS-xorigin-frame.html stays XFRAME 9/9; the cross-origin
+null is untouched.
+
+Sim-verified: full adapted gate exit 0 (gate-306-rerun2;
+network mirror skipped as in every adapted run): XDOC2 8/8,
+XDOC 4/4, XFRAME 9/9, Vita's-pace pages 23 identical /
+0 differ, text batching 68 frames identical / 0 differ,
+interaction pass 52/52. Two earlier runs of the same gate
+are recorded for honesty: gate-306 failed its reference-dump
+chain on the harness's stale XDOC2 6/6 expectation (the
+expectation update is part of this patch), and
+gate-306-rerun failed JS-frame-local's timer-chain check --
+300 links in 1530.1 ms against the page's 1500 ms
+wall-clock bound; the identical tree's next run measured
+1385.4 ms and passed everything, so that failure is
+recorded as a host timing flake, as patches 302's and 305's
+were. Fresh re-stage 394 applied / 0 failed; macsurf_qjs.c
+byte-identical to the tested tree. Vita cross-build not
+run: no vitaSDK on this machine.
+
+**On the device (run 39), in addition:** the bundled
+JS-frame-document.html should now read XDOC2 8/8. Pages
+whose scripts query into a same-origin frame's document
+(embed widgets, consent frames) now get real answers from
+the frame's live tree.
