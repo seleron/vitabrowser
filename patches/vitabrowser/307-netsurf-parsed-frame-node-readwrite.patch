@@ -1,0 +1,604 @@
+# netsurf: node reads/writes on a parsed frame's handles (patch 307)
+# Generated 2026-10-19
+# Base: seleron/vitabrowser (patch stack through 306)
+#
+# Item 7, stage 3 (design: docs/phase-0/19) -- the design's staged
+# surface is complete with this patch. Patch 304's node handles
+# exposed identity only; 306 added the document handle's queries.
+# Stage 3 gives the node handles their reads and writes:
+# textContent and innerHTML (get/set), getAttribute /
+# setAttribute, parentNode / firstChild / childNodes traversal
+# as handles, and appendChild / removeChild taking handles of
+# the same child document.
+#
+#   - Every function is the realm's own entry point
+#     (qjs_el_*_data) re-pointed at the handle's node, with patch
+#     304's validation in front of it: qjs_fnode_valid first, so
+#     an inert handle's reads answer undefined and its writes are
+#     dropped, and a libdom exception (a hierarchy error, a node
+#     that is not a child) drops the call instead of throwing
+#     across the boundary. Traversal mints handles by the same
+#     wrap as the roots and the query results; the parent of the
+#     root element is the document node itself, wrapped as a
+#     handle (nodeType 9), as a browser's parentNode answers
+#     the Document.
+#   - appendChild / removeChild accept only a live handle of
+#     the SAME child document (captured content and owner
+#     document equal; generation agreement is implied, both
+#     sides having matched the current generation). A node of
+#     the parent's own document is not a handle and is dropped
+#     -- adopting across documents is outside the design, as is
+#     parentDocument.appendChild(childHandle), which stays the
+#     type error it always was.
+#   - Writes perform the same libdom mutations the realm's
+#     entry points perform (the textContent empty-string rule,
+#     fixes1031; the fragment-parser innerHTML with its
+#     head-then-body descent, fixes846/1007, parsed against the
+#     CHILD's document; fixes926's attribute-kind classification
+#     and 186/197's old-class mark) and then take the same dirty
+#     mark through the CHILD realm's context, so the mark lands
+#     on the child's content and the write flows through the
+#     child's own mutation/reconvert machinery. The parent gets
+#     no private invalidation path (doc 19).
+#   - Recorded remainder: the realm's entry points also queue a
+#     MutationObserver record by calling the observing realm's
+#     polyfill queue (__msQueueMutation). Delivering that record
+#     for a parent-made write would mean running child-realm JS
+#     from the parent's turn -- the nested re-entry doc 19's
+#     first constraint forbids -- so child-realm observers do
+#     not receive records for parent-made writes. The writes
+#     themselves are fully visible to the child's own reads,
+#     which is what the gate proves. A C-side queued delivery is
+#     a follow-up design question, not part of the staged
+#     surface.
+#
+# Gate: testpages/pages/JS-frame-document.html extended in
+# place, XDOC2 8/8 -> 10/10 (the gate script's expectation
+# updated with it). Check 9 writes through handles -- traversal
+# first, then textContent and an attribute on the child's #kid,
+# innerHTML on its #box, a removeChild and an appendChild move
+# -- and passes only when the child's own script reports the
+# written state from its own reads: the write crossed. Check 10
+# is the discipline: a parent-document node passed to
+# appendChild is dropped, and after the frame navigates, the
+# inert handle's writes are dropped without throwing and its
+# stage 3 reads answer undefined. The page scored 5/10 before
+# this patch (check 9 missing its surface, the flow stalling
+# behind it). In Firefox/Camoufox checks 1-3, 6, 7 and 9 pass --
+# the read/write surface behaves as a browser's does; 4, 5, 8
+# and 10 are doc 19's handle semantics. JS-frame-xdoc.html
+# stays XDOC 4/4 and JS-xorigin-frame.html stays XFRAME 9/9;
+# the cross-origin null is untouched. With this patch, item
+# 7's designed surface (doc 19, stages 1-3) is complete.
+# Simulator only; the vita cross-build was not run (no
+# vitaSDK on this VM). Device expectation is in Doc 10.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -3485,6 +3485,32 @@
+  * matcher, no second walker. The natives live with the selector
+  * machinery below (struct qjs_sel_list's home); only their
+  * declarations and registration are here.
++ *
++ * Patch 307 -- stage 3: node handle reads and writes. On node
++ * handles: textContent and innerHTML (get/set), getAttribute /
++ * setAttribute, parentNode / firstChild / childNodes traversal
++ * as handles, and appendChild / removeChild taking handles of
++ * the same child document. Every operation validates the handle
++ * first (qjs_fnode_valid): an inert handle's reads answer
++ * undefined and its writes are dropped -- nothing dereferences
++ * the dead document, and a libdom exception (a hierarchy error,
++ * a foreign node) drops the call instead of throwing across the
++ * boundary. Writes are the realm's own write paths with the
++ * handle's node: the same libdom mutations the element entry
++ * points perform, then the same dirty mark
++ * (qjs_mark_dom_dirty against the CHILD realm's context, so the
++ * mark lands on the child's content) -- the write flows through
++ * the child's own mutation/reconvert machinery, with no private
++ * invalidation path (doc 19). One recorded remainder: the
++ * realm's entry points also queue a MutationObserver record by
++ * calling the observing realm's polyfill queue; delivering that
++ * record for a parent-made write would mean running child-realm
++ * JS from the parent's turn, which doc 19's no-nested-re-entry
++ * constraint forbids, so child-realm observers do not receive
++ * records for parent-made writes. A C-side queued delivery is a
++ * follow-up design question, not stage 3. The natives live with
++ * the mutation entry points below; only declarations and
++ * registration are here.
+  * ====================================================================== */
+ 
+ /* The binding a handle answers through: the child realm's heap, the
+@@ -3629,6 +3655,20 @@
+ 	JS_SetPropertyStr(ctx, obj, name, JS_NewCFunction(ctx, fn, name, len));
+ }
+ 
++static void qjs_fdoc_def_getset(JSContext *ctx, JSValue obj,
++		const char *name, JSCFunction *get, JSCFunction *set)
++{
++	JSAtom atom = JS_NewAtom(ctx, name);
++	char gn[64], sn[64];
++	snprintf(gn, sizeof gn, "get %s", name);
++	snprintf(sn, sizeof sn, "set %s", name);
++	JS_DefinePropertyGetSet(ctx, obj, atom,
++			JS_NewCFunction(ctx, get, gn, 0),
++			JS_NewCFunction(ctx, set, sn, 1),
++			JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
++	JS_FreeAtom(ctx, atom);
++}
++
+ /* --- document handle scalar getters ---------------------------------- */
+ 
+ static JSValue qjs_fdoc_get_url(JSContext *ctx, JSValueConst this_val,
+@@ -3760,6 +3800,31 @@
+ 	return JS_NewInt32(ctx, (int32_t)type);
+ }
+ 
++/* Stage 3 node-handle natives (patch 307): defined with the
++ * mutation entry points below, whose write paths they mirror. */
++static JSValue qjs_fnode_get_text_content(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_set_text_content(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_get_inner_html(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_set_inner_html(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_get_parent_node(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_get_first_child(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_get_child_nodes(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_get_attribute(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_set_attribute(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_append_child(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fnode_remove_child(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++
+ /* Wrap a child node as a node handle. Adopts node's ref. */
+ static JSValue qjs_fnode_wrap(JSContext *ctx, struct qjs_fbind *bind,
+ 		struct content *content, unsigned long gen, dom_node *node,
+@@ -3787,6 +3852,19 @@
+ 	JS_SetOpaque(obj, st);
+ 	qjs_fdoc_def_get(ctx, obj, "tagName", qjs_fnode_get_tagname);
+ 	qjs_fdoc_def_get(ctx, obj, "nodeType", qjs_fnode_get_nodetype);
++	qjs_fdoc_def_getset(ctx, obj, "textContent",
++			qjs_fnode_get_text_content,
++			qjs_fnode_set_text_content);
++	qjs_fdoc_def_getset(ctx, obj, "innerHTML",
++			qjs_fnode_get_inner_html,
++			qjs_fnode_set_inner_html);
++	qjs_fdoc_def_get(ctx, obj, "parentNode", qjs_fnode_get_parent_node);
++	qjs_fdoc_def_get(ctx, obj, "firstChild", qjs_fnode_get_first_child);
++	qjs_fdoc_def_get(ctx, obj, "childNodes", qjs_fnode_get_child_nodes);
++	qjs_fdoc_def_fn(ctx, obj, "getAttribute", qjs_fnode_get_attribute, 1);
++	qjs_fdoc_def_fn(ctx, obj, "setAttribute", qjs_fnode_set_attribute, 2);
++	qjs_fdoc_def_fn(ctx, obj, "appendChild", qjs_fnode_append_child, 1);
++	qjs_fdoc_def_fn(ctx, obj, "removeChild", qjs_fnode_remove_child, 1);
+ 	return obj;
+ }
+ 
+@@ -7273,6 +7351,420 @@
+ 	return JS_DupValue(ctx, argv[0]);
+ }
+ 
++/* ======================================================================
++ * VitaBrowser patch 307 -- item 7, stage 3 (doc 19): reads and
++ * writes on the parsed-frame node handles (the handles are patch
++ * 304's, above). Each function is the realm's own entry point
++ * (qjs_el_*_data) re-pointed at the handle's node, with patch
++ * 304's validation in front of it: qjs_fnode_valid first, so an
++ * inert handle reads undefined and drops writes, and the dirty
++ * mark goes through the CHILD realm's context, so the mark
++ * lands on the child's content and the child's own
++ * mutation/reconvert machinery consumes it. The one piece of
++ * the realm paths deliberately not mirrored is the
++ * MutationObserver record queue (a call into the observing
++ * realm's polyfill): see the patch header for why, and what the
++ * recorded remainder is.
++ * ====================================================================== */
++
++/* An argument that must be a live node handle of the same child
++ * document as `self`; NULL drops the call. Two handles are of
++ * the same document when their captured content and owner
++ * document agree -- the binding pointer itself may differ
++ * (contentDocument and contentWindow.document are minted
++ * through one polyfill cache, but the document test is the
++ * semantic one). Generation agreement is implied: qjs_fnode_valid
++ * has already matched each side against the CURRENT generation,
++ * so two valid handles are of the same generation by
++ * transitivity. */
++static struct qjs_fnode_state *qjs_fnode_arg_same_doc(JSValueConst v,
++		struct qjs_fnode_state *self)
++{
++	struct qjs_fnode_state *arg = qjs_fnode_valid(v);
++	if (arg == NULL || self == NULL) return NULL;
++	if (arg->content != self->content ||
++	    arg->owner_doc != self->owner_doc)
++		return NULL;
++	return arg;
++}
++
++static int qjs_fnode_is_element(struct qjs_fnode_state *st)
++{
++	dom_node_type type;
++	if (st == NULL) return 0;
++	if (macsurf_dom_node_get_node_type(st->node, &type) != DOM_NO_ERR)
++		return 0;
++	return type == DOM_ELEMENT_NODE;
++}
++
++static JSValue qjs_fnode_get_text_content(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	dom_string *ds = NULL;
++	JSValue ret;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	if (macsurf_dom_node_get_text_content(st->node, &ds) != DOM_NO_ERR
++	    || ds == NULL)
++		return JS_NewString(ctx, "");
++	ret = JS_NewString(ctx, dom_string_data(ds));
++	macsurf_dom_string_unref(ds);
++	return ret;
++}
++
++static JSValue qjs_fnode_set_text_content(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	const char *s;
++	dom_string *ds;
++	if (st == NULL || argc < 1) return JS_UNDEFINED; /* inert: dropped */
++	s = JS_ToCString(ctx, argv[0]);
++	if (s == NULL) return JS_UNDEFINED;
++	ds = qjs_make_domstr(s);
++	JS_FreeCString(ctx, s);
++	if (ds) {
++		if (dom_string_length(ds) == 0) {
++			/* fixes1031, as in qjs_el_set_text_content_data:
++			 * the empty string removes every child and adds
++			 * nothing (libdom would leave an empty text node). */
++			dom_node *ch = NULL;
++			if (macsurf_dom_node_get_first_child(st->node, &ch)
++					!= DOM_NO_ERR)
++				ch = NULL;
++			while (ch != NULL) {
++				dom_node *nx = NULL;
++				dom_node *removed = NULL;
++				if (macsurf_dom_node_get_next_sibling(ch, &nx)
++						!= DOM_NO_ERR)
++					nx = NULL;
++				if (macsurf_dom_node_remove_child(st->node,
++						ch, &removed) == DOM_NO_ERR &&
++				    removed != NULL)
++					macsurf_dom_node_unref(removed);
++				macsurf_dom_node_unref(ch);
++				ch = nx;
++			}
++		} else {
++			macsurf_dom_node_set_text_content(st->node, ds);
++		}
++		macsurf_dom_string_unref(ds);
++		qjs_mark_dom_dirty(st->bind->child->ctx, (void *)st->node,
++				MACOS9_DOMMUT_TEXTCONTENT);
++	}
++	return JS_UNDEFINED;
++}
++
++static JSValue qjs_fnode_get_inner_html(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	struct qjs_ih_buf b;
++	int r;
++	JSValue ret;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	memset(&b, 0, sizeof(b));
++	/* qjs_el_get_inner_html_data's serializer, on the handle's
++	 * node: descendants only, raw-text elements unescaped. */
++	if (qjs_fnode_is_element(st) &&
++	    qjs_ih_element_is_raw_text((dom_element *)st->node))
++		r = qjs_ih_serialize_raw_children(&b, st->node);
++	else
++		r = qjs_ih_serialize_children(&b, st->node);
++	if (r != 0 || b.data == NULL) {
++		if (b.data) free(b.data);
++		return JS_NewString(ctx, "");
++	}
++	ret = JS_NewStringLen(ctx, b.data, b.len);
++	free(b.data);
++	return ret;
++}
++
++static JSValue qjs_fnode_set_inner_html(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	dom_node *child, *next, *removed, *append_result;
++	dom_node *src_parent, *html_el, *body_el, *head_el;
++	dom_hubbub_parser_params params;
++	dom_hubbub_parser *parser = NULL;
++	dom_hubbub_error herr;
++	dom_document_fragment *frag = NULL;
++	const char *html_src;
++	size_t html_len = 0;
++
++	if (st == NULL || argc < 1 || !qjs_fnode_is_element(st))
++		return JS_UNDEFINED; /* inert or not an element: dropped */
++	html_src = JS_ToCStringLen(ctx, &html_len, argv[0]);
++	if (html_src == NULL) return JS_UNDEFINED;
++
++	/* qjs_el_set_inner_html_data's parse-and-move, with the
++	 * fragment parser created against the CHILD's document (the
++	 * handle's owner document), not the calling realm's. */
++	memset(&params, 0, sizeof(params));
++	params.enc = "UTF-8";
++	params.fix_enc = true;
++	params.enable_script = false;
++
++	herr = dom_hubbub_fragment_parser_create(&params,
++			(dom_document *)st->owner_doc, &parser, &frag);
++	if (herr != DOM_HUBBUB_OK || parser == NULL || frag == NULL) {
++		JS_FreeCString(ctx, html_src);
++		return JS_UNDEFINED;
++	}
++	dom_hubbub_parser_parse_chunk(parser,
++			(const uint8_t *) html_src, html_len);
++	dom_hubbub_parser_completed(parser);
++	dom_hubbub_parser_destroy(parser);
++	JS_FreeCString(ctx, html_src);
++
++	/* Clear existing children before inserting the parsed
++	 * content -- innerHTML= replaces, it does not append. */
++	child = NULL;
++	macsurf_dom_node_get_first_child(st->node, &child);
++	while (child != NULL) {
++		next = NULL;
++		macsurf_dom_node_get_next_sibling(child, &next);
++		removed = NULL;
++		macsurf_dom_node_remove_child(st->node, child, &removed);
++		if (removed != NULL) macsurf_dom_node_unref(removed);
++		macsurf_dom_node_unref(child);
++		child = next;
++	}
++
++	/* Descend fragment -> <html> -> <body> (fixes846): the
++	 * binding's fragment parser wraps the markup in an implied
++	 * document; take <head>'s children first (fixes1007), then
++	 * <body>'s, so source order survives. */
++	src_parent = (dom_node *) frag;
++	html_el = qjs_find_child_element_by_tag((dom_node *) frag, "html");
++	if (html_el != NULL) {
++		head_el = qjs_find_child_element_by_tag(html_el, "head");
++		if (head_el != NULL) {
++			child = NULL;
++			macsurf_dom_node_get_first_child(head_el, &child);
++			while (child != NULL) {
++				append_result = NULL;
++				macsurf_dom_node_append_child(st->node,
++						child, &append_result);
++				if (append_result != NULL)
++					macsurf_dom_node_unref(append_result);
++				macsurf_dom_node_unref(child);
++				child = NULL;
++				macsurf_dom_node_get_first_child(head_el,
++						&child);
++			}
++			macsurf_dom_node_unref(head_el);
++		}
++		body_el = qjs_find_child_element_by_tag(html_el, "body");
++		if (body_el != NULL) {
++			src_parent = body_el;
++		} else {
++			src_parent = html_el;
++		}
++	}
++
++	child = NULL;
++	macsurf_dom_node_get_first_child(src_parent, &child);
++	while (child != NULL) {
++		append_result = NULL;
++		macsurf_dom_node_append_child(st->node, child,
++				&append_result);
++		if (append_result != NULL)
++			macsurf_dom_node_unref(append_result);
++		macsurf_dom_node_unref(child);
++		child = NULL;
++		macsurf_dom_node_get_first_child(src_parent, &child);
++	}
++	if (html_el != NULL) macsurf_dom_node_unref(html_el);
++	if (src_parent != html_el && src_parent != (dom_node *) frag)
++		macsurf_dom_node_unref(src_parent);
++	macsurf_dom_node_unref((dom_node *) frag);
++
++	qjs_mark_dom_dirty(st->bind->child->ctx, (void *)st->node,
++			MACOS9_DOMMUT_INNERHTML);
++	return JS_UNDEFINED;
++}
++
++static JSValue qjs_fnode_get_parent_node(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	dom_node *parent = NULL;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	if (macsurf_dom_node_get_parent_node(st->node, &parent)
++			!= DOM_NO_ERR || parent == NULL)
++		return JS_NULL;
++	/* The parent of the root element is the document node
++	 * itself; it wraps as a handle like any other (nodeType 9,
++	 * no tagName), as a browser's parentNode answers the
++	 * Document. get_parent_node hands back a ref; the handle
++	 * adopts it. */
++	return qjs_fnode_wrap(ctx, st->bind, st->content, st->gen, parent,
++			(dom_document *)st->owner_doc);
++}
++
++static JSValue qjs_fnode_get_first_child(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	dom_node *child = NULL;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	if (macsurf_dom_node_get_first_child(st->node, &child)
++			!= DOM_NO_ERR || child == NULL)
++		return JS_NULL;
++	return qjs_fnode_wrap(ctx, st->bind, st->content, st->gen, child,
++			(dom_document *)st->owner_doc);
++}
++
++static JSValue qjs_fnode_get_child_nodes(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	JSValue arr;
++	dom_node *child = NULL;
++	int count = 0;
++	(void)argc; (void)argv;
++	if (st == NULL) return JS_UNDEFINED;
++	arr = JS_NewArray(ctx);
++	if (macsurf_dom_node_get_first_child(st->node, &child)
++			!= DOM_NO_ERR)
++		return arr;
++	while (child != NULL) {
++		dom_node *next = NULL;
++		macsurf_dom_node_get_next_sibling(child, &next);
++		/* the walk's ref passes to the handle */
++		JS_SetPropertyUint32(ctx, arr, (uint32_t)count++,
++				qjs_fnode_wrap(ctx, st->bind, st->content,
++						st->gen, child,
++						(dom_document *)st->owner_doc));
++		child = next;
++	}
++	return arr;
++}
++
++static JSValue qjs_fnode_get_attribute(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	const char *name_cstr;
++	dom_string *name_ds, *val_ds;
++	JSValue ret;
++	if (st == NULL) return JS_UNDEFINED;
++	if (argc < 1 || !qjs_fnode_is_element(st)) return JS_NULL;
++	name_cstr = JS_ToCString(ctx, argv[0]);
++	if (name_cstr == NULL) return JS_NULL;
++	name_ds = qjs_make_domstr(name_cstr);
++	JS_FreeCString(ctx, name_cstr);
++	if (name_ds == NULL) return JS_NULL;
++	val_ds = NULL;
++	if (macsurf_dom_element_get_attribute((dom_element *)st->node,
++			name_ds, &val_ds) != DOM_NO_ERR || val_ds == NULL) {
++		macsurf_dom_string_unref(name_ds);
++		return JS_NULL;
++	}
++	ret = JS_NewString(ctx, dom_string_data(val_ds));
++	macsurf_dom_string_unref(val_ds);
++	macsurf_dom_string_unref(name_ds);
++	return ret;
++}
++
++static JSValue qjs_fnode_set_attribute(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	const char *name_cstr, *val_cstr;
++	dom_string *name_ds, *val_ds, *old_ds;
++	int attr_kind;
++	if (st == NULL || argc < 2 || !qjs_fnode_is_element(st))
++		return JS_UNDEFINED; /* inert or not an element: dropped */
++	name_cstr = JS_ToCString(ctx, argv[0]);
++	val_cstr = JS_ToCString(ctx, argv[1]);
++	if (name_cstr == NULL || val_cstr == NULL) {
++		if (name_cstr) JS_FreeCString(ctx, name_cstr);
++		if (val_cstr) JS_FreeCString(ctx, val_cstr);
++		return JS_UNDEFINED;
++	}
++	name_ds = qjs_make_domstr(name_cstr);
++	val_ds = qjs_make_domstr(val_cstr);
++	old_ds = NULL;
++	/* fixes926's classification, as in qjs_el_setAttribute_data:
++	 * only class/style could ever be answered by a recascade. */
++	attr_kind = MACOS9_DOMMUT_SETATTRIBUTE;
++	if (strcmp(name_cstr, "class") == 0) {
++		attr_kind = MACOS9_DOMMUT_SETATTR_CLASS;
++	} else if (strcmp(name_cstr, "style") == 0) {
++		attr_kind = MACOS9_DOMMUT_SETATTR_STYLE;
++	}
++	if (name_ds && val_ds) {
++		dom_exception gerr = macsurf_dom_element_get_attribute(
++				(dom_element *)st->node, name_ds, &old_ds);
++		macsurf_dom_element_set_attribute(
++				(dom_element *)st->node, name_ds, val_ds);
++		/* Patch 186/197's class mark, through the child's
++		 * context: an absent attribute read back NULL with
++		 * DOM_NO_ERR is the empty old class set, not unknown. */
++		if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
++			qjs_mark_dom_dirty2(st->bind->child->ctx,
++					(void *)st->node, attr_kind,
++					old_ds != NULL ?
++						dom_string_data(old_ds) :
++						(gerr == DOM_NO_ERR ? "" : NULL));
++		else
++			qjs_mark_dom_dirty(st->bind->child->ctx,
++					(void *)st->node, attr_kind);
++	}
++	JS_FreeCString(ctx, name_cstr);
++	JS_FreeCString(ctx, val_cstr);
++	if (old_ds) macsurf_dom_string_unref(old_ds);
++	if (name_ds) macsurf_dom_string_unref(name_ds);
++	if (val_ds) macsurf_dom_string_unref(val_ds);
++	return JS_UNDEFINED;
++}
++
++static JSValue qjs_fnode_append_child(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	struct qjs_fnode_state *arg;
++	dom_node *result = NULL;
++	dom_exception exc;
++	if (st == NULL || argc < 1) return JS_UNDEFINED; /* dropped */
++	arg = qjs_fnode_arg_same_doc(argv[0], st);
++	if (arg == NULL) return JS_UNDEFINED; /* not a handle of this
++					       * document: dropped */
++	exc = macsurf_dom_node_append_child(st->node, arg->node, &result);
++	if (result) macsurf_dom_node_unref(result);
++	if (exc != DOM_NO_ERR) return JS_UNDEFINED; /* fail closed:
++					       * no throw across */
++	qjs_mark_dom_dirty(st->bind->child->ctx, (void *)st->node,
++			MACOS9_DOMMUT_APPENDCHILD);
++	return JS_DupValue(ctx, argv[0]);
++}
++
++static JSValue qjs_fnode_remove_child(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fnode_state *st = qjs_fnode_valid(this_val);
++	struct qjs_fnode_state *arg;
++	dom_node *result = NULL;
++	dom_exception exc;
++	if (st == NULL || argc < 1) return JS_UNDEFINED; /* dropped */
++	arg = qjs_fnode_arg_same_doc(argv[0], st);
++	if (arg == NULL) return JS_UNDEFINED;
++	exc = macsurf_dom_node_remove_child(st->node, arg->node, &result);
++	if (result) macsurf_dom_node_unref(result);
++	if (exc != DOM_NO_ERR) return JS_UNDEFINED; /* not a child, or
++					       * worse: fail closed */
++	qjs_mark_dom_dirty(st->bind->child->ctx, (void *)st->node,
++			MACOS9_DOMMUT_REMOVECHILD);
++	return JS_DupValue(ctx, argv[0]);
++}
++
+ /* ---- insertBefore ---- */
+ static JSValue qjs_el_insert_before_data(JSContext *ctx,
+ 		JSValueConst this_val, int argc, JSValueConst *argv,

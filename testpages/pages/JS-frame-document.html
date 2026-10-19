@@ -8,6 +8,7 @@
      the frame's REAL document, reached through a marshalled handle --
      patch 143's shim document answered in its place until now.
      Patch 306 adds stage 2: queries on the handle (checks 7-8).
+     Patch 307 adds stage 3: node reads/writes (checks 9-10).
      The checks, from doc 19's gate spec:
        1. scalars cross: the parent reads URL / title / readyState
           through the handle, equal to the child's own values -- the
@@ -48,6 +49,24 @@
           never a throw, never a stale node. Handle semantics as
           in check 4: a browser's captured document keeps answering
           for its old page, so this check is sim-only by design.
+       9. stage 3 reads/writes (patch 307): the parent traverses
+          through handles (parentNode / firstChild / childNodes),
+          sets textContent and an attribute on the child's #kid
+          handle, sets innerHTML on the child's #box handle,
+          removes a child and moves the box through appendChild /
+          removeChild with same-document handles -- and the
+          CHILD's own script then reports the written state from
+          its own reads (its text, its attribute, its child
+          count), which is what proves the writes landed in the
+          child's real DOM and not in a copy. A real browser
+          passes this check too.
+      10. stage 3 discipline (patch 307): appendChild with a node
+          of the PARENT's own document -- not a handle of the
+          child's -- is dropped (a browser would adopt the real
+          node; the handle surface takes handles only, doc 19);
+          and after the navigation, writes on the now-inert #kid
+          handle are dropped without throwing, while its stage 3
+          reads answer undefined. Sim-only, like checks 4/5/8.
      One interval drives the whole flow from script start and writes
      progress as it observes it, like the other timed gate pages: a
      timer created after the frame's removal did not reliably run
@@ -65,7 +84,7 @@ iframe { width: 300px; height: 40px; }
 </style>
 </head>
 <body>
-<div id="sum">XDOC2: 0/8 passed</div>
+<div id="sum">XDOC2: 0/10 passed</div>
 <p id="r1" class="wait">1 waiting (the script never ran)</p>
 <p id="r2" class="wait">2 waiting</p>
 <p id="r3" class="wait">3 waiting</p>
@@ -74,6 +93,8 @@ iframe { width: 300px; height: 40px; }
 <p id="r6" class="wait">6 waiting</p>
 <p id="r7" class="wait">7 waiting</p>
 <p id="r8" class="wait">8 waiting</p>
+<p id="r9" class="wait">9 waiting</p>
+<p id="r10" class="wait">10 waiting</p>
 <iframe id="so" src="JS-frame-document-child.html"></iframe>
 <script>
 document.write('<iframe id="xo" src="https://127.0.0.1:' +
@@ -82,9 +103,10 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 </script>
 <script>
 (function () {
-	var k = 0, N = 8, latest = null, phase = 0, docH = null,
+	var k = 0, N = 10, latest = null, phase = 0, docH = null,
 		oldBody = null, oldDE = null, ticks = 0, goneTries = 0,
-		qHandle = null, q8nav = null,
+		qHandle = null, q8nav = null, kidH = null, q10a = null,
+		s9a = null, latestObs = null, obsTries = 0,
 		expected2 = new URL('JS-frame-document-child2.html',
 			location.href).href;
 	function $(id) { return document.getElementById(id); }
@@ -103,10 +125,18 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 		catch (e) { t(n, false, text + ': ' + e); }
 	}
 	function fail(n, text) { t(n, false, text); }
+	/* like check(), but the verdict is returned (true or the
+	 * reason) instead of recorded -- for checks whose second leg
+	 * completes later (9's child confirmation) */
+	function attempt(f) {
+		try { var r = f(); return r === true ? true : 'failed: ' + r; }
+		catch (e) { return 'threw: ' + e; }
+	}
 
 	window.addEventListener('message', function (e) {
 		var d = e.data || {};
 		if (d.xdoc2 === 'state') latest = d;
+		if (d.xdoc2 === 'obs') latestObs = d;
 	});
 
 	function phaseOne() {
@@ -185,10 +215,58 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 			qHandle = late;
 			return true;
 		}, 'stage 2 queries reach the child\'s live tree');
-		/* navigate the frame: the src set is the browser shape; the
-		 * child also navigates itself if asked (see the phase-1
-		 * leg) -- the lifetime machinery under test is the same */
-		try { so.src = 'JS-frame-document-child2.html'; } catch (e) { /* */ }
+		/* stage 3, first leg (patch 307): writes and read-backs
+		 * through node handles; the child's own confirmation
+		 * completes check 9 in the driver's next phase */
+		s9a = attempt(function () {
+			if (!d) return 'no document';
+			kidH = d.getElementById('kid');
+			if (!kidH) return 'no kid handle';
+			if (typeof kidH.textContent !== 'string')
+				return 'no textContent on the handle';
+			/* traversal on the parsed tree, before any write */
+			if (!kidH.parentNode || kidH.parentNode.tagName !== 'BODY')
+				return 'kid parentNode ' + (kidH.parentNode && kidH.parentNode.tagName);
+			if (!kidH.firstChild || kidH.firstChild.nodeType !== 3)
+				return 'kid firstChild not its text node';
+			if (!kidH.childNodes || kidH.childNodes.length !== 1)
+				return 'kid childNodes length ' + (kidH.childNodes && kidH.childNodes.length);
+			if (!d.body.firstChild || d.body.firstChild.tagName !== 'P')
+				return 'body firstChild not the parsed P';
+			/* textContent write + parent-side read-back */
+			kidH.textContent = 'parent was here';
+			if (kidH.textContent !== 'parent was here')
+				return 'textContent read-back: ' + kidH.textContent;
+			/* attribute write + read-back; a miss answers null */
+			kidH.setAttribute('data-from', 'parent');
+			if (kidH.getAttribute('data-from') !== 'parent')
+				return 'getAttribute read-back: ' + kidH.getAttribute('data-from');
+			if (kidH.getAttribute('data-absent') !== null)
+				return 'getAttribute(absent) not null';
+			/* innerHTML write on the container + read-backs */
+			var boxH = d.getElementById('box');
+			if (!boxH) return 'no box handle';
+			boxH.innerHTML = '<span>a</span><span>b</span>';
+			if (!boxH.childNodes || boxH.childNodes.length !== 2)
+				return 'box childNodes after innerHTML: ' + (boxH.childNodes && boxH.childNodes.length);
+			if (boxH.innerHTML !== '<span>a</span><span>b</span>')
+				return 'box innerHTML read-back: ' + boxH.innerHTML;
+			if (!boxH.firstChild || boxH.firstChild.tagName !== 'SPAN')
+				return 'box firstChild not a SPAN handle';
+			/* removeChild takes a handle of the same document */
+			var sp = boxH.firstChild;
+			if (boxH.removeChild(sp) !== sp)
+				return 'removeChild did not return the removed handle';
+			if (boxH.childNodes.length !== 1)
+				return 'box childNodes after removeChild: ' + boxH.childNodes.length;
+			/* appendChild moves a same-document handle */
+			if (d.body.appendChild(boxH) !== boxH)
+				return 'appendChild did not return the moved handle';
+			return true;
+		});
+		if (s9a !== true) t(9, false, 'stage 3 writes: ' + s9a);
+		/* the frame navigates only once the child has confirmed
+		 * the writes from its own reads (driver, phase 1) */
 		phase = 1;
 	}
 
@@ -220,9 +298,41 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 				q8nav = 'fresh getElementsByTagName(p) on child two';
 			else q8nav = true;
 		} catch (e) { q8nav = 'fresh queries threw: ' + e; }
+		/* check 10, second leg: writes on the now-inert kid
+		 * handle are dropped without throwing; its stage 3
+		 * reads answer undefined */
+		try {
+			var it = kidH && kidH.textContent;
+			var ig = kidH && kidH.getAttribute('data-from');
+			if (kidH) {
+				kidH.textContent = 'too late';
+				kidH.setAttribute('data-late', 'x');
+				kidH.appendChild(kidH);
+			}
+			t(10, q10a === true && it === undefined && ig === undefined,
+				'stage 3 discipline: foreign nodes dropped, inert handles fail closed');
+		} catch (e) {
+			t(10, false, 'stage 3 discipline: an inert write threw: ' + e);
+		}
 		var so2 = $('so');
 		try { so2.parentNode.removeChild(so2); } catch (e) { /* */ }
-		phase = 2;
+		phase = 3;
+	}
+
+	/* check 10, first leg: appendChild with a node of the
+	 * PARENT's own document -- not a handle of the child's -- is
+	 * dropped. It runs only once check 9 is settled, because a
+	 * browser ADOPTS the node instead, which would change the
+	 * box's child count check 9's confirmation reads. */
+	function foreignLeg() {
+		try {
+			var boxH2 = docH && docH.getElementById('box');
+			if (!boxH2) { q10a = false; return; }
+			var before = boxH2.childNodes.length;
+			var fr = document.createElement('i');
+			q10a = boxH2.appendChild(fr) === undefined &&
+				boxH2.childNodes.length === before;
+		} catch (e) { q10a = false; }
 	}
 
 	/* check 8, second leg (after removal): queries on the held
@@ -261,6 +371,33 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 						: 'silent') + ' (' + ticks + ')';
 			}
 		} else if (phase === 1) {
+			/* stage 3 confirmation: the child's own reads must
+			 * show the written state before the frame navigates */
+			obsTries++;
+			var seen = latestObs && s9a === true &&
+				latestObs.kidText === 'parent was here' &&
+				latestObs.dataFrom === 'parent' &&
+				latestObs.boxKids === 1;
+			if (seen) {
+				t(9, true, 'stage 3 writes land in the child\'s tree, confirmed by the child');
+				foreignLeg();
+				try { $('so').src = 'JS-frame-document-child2.html'; } catch (e) { /* */ }
+				phase = 2;
+			} else if (obsTries >= 40) {
+				if (s9a === true)
+					fail(9, 'child never observed the writes: kid="' +
+						(latestObs && latestObs.kidText) + '" dataFrom=' +
+						(latestObs && latestObs.dataFrom) + ' boxKids=' +
+						(latestObs && latestObs.boxKids));
+				foreignLeg();
+				try { $('so').src = 'JS-frame-document-child2.html'; } catch (e) { /* */ }
+				phase = 2;
+			} else if (obsTries % 4 === 0 && s9a === true) {
+				$('r9').textContent = '9 waiting: child sees kid="' +
+					(latestObs && latestObs.kidText) + '" boxKids=' +
+					(latestObs && latestObs.boxKids) + ' (' + obsTries + ')';
+			}
+		} else if (phase === 2) {
 			var tt = null, uu = null, rs = null;
 			try {
 				tt = docH && docH.title;
@@ -278,7 +415,7 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 					try { $('so').contentWindow.postMessage('navigate', '*'); } catch (e) { /* */ }
 				}
 			}
-		} else if (phase === 2) {
+		} else if (phase === 3) {
 			goneTries++;
 			var gone = false;
 			try {
@@ -289,13 +426,13 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 			if (gone) {
 				t(5, true, 'removed frame: the held handle answers as a null document');
 				finishEight();
-				phase = 3;
+				phase = 4;
 				clearInterval(driver);
 			} else if (goneTries >= 24) {
 				fail(5, 'removed frame: handle still answers URL ' +
 					(docH && docH.URL));
 				t(8, false, 'stage 2 lifetime: frame never went null');
-				phase = 3;
+				phase = 4;
 				clearInterval(driver);
 			} else {
 				$('r5').textContent = '5 waiting: URL=' +
@@ -312,18 +449,30 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 			fail(2, 'not reached'); fail(3, 'not reached');
 			fail(4, 'not reached'); fail(5, 'not reached');
 			fail(7, 'not reached'); fail(8, 'not reached');
+			fail(9, 'not reached'); fail(10, 'not reached');
 		} else if (phase === 1) {
+			if (s9a === true)
+				fail(9, 'child never observed the writes: kid="' +
+					(latestObs && latestObs.kidText) + '" boxKids=' +
+					(latestObs && latestObs.boxKids));
+			fail(4, 'not reached'); fail(5, 'not reached');
+			fail(8, 'not reached'); fail(10, 'not reached');
+		} else if (phase === 2) {
 			fail(4, 'handle never rebound to the second page: title ' +
 				(docH && docH.title) + ' readyState ' +
 				(docH && docH.readyState));
 			fail(5, 'not reached');
 			if ($('r8').className !== 'pass')
 				fail(8, 'stage 2 lifetime: not reached');
-		} else if (phase === 2) {
+			if ($('r10').className !== 'pass')
+				fail(10, 'stage 3 discipline: not reached');
+		} else if (phase === 3) {
 			fail(5, 'removed frame: handle still answers URL ' +
 				(docH && docH.URL));
 			if ($('r8').className !== 'pass')
 				fail(8, 'stage 2 lifetime: removal leg not reached');
+			if ($('r10').className !== 'pass')
+				fail(10, 'stage 3 discipline: not reached');
 		}
 		if (k < N && $('r6').className !== 'pass' &&
 				$('r6').textContent.match(/waiting/))
