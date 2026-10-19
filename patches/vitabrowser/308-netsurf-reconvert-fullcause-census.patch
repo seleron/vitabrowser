@@ -1,0 +1,279 @@
+
+# netsurf: name the cause of every batch full reconvert (patch 308)
+# Generated 2026-10-19
+# Base: seleron/vitabrowser (patch stack through 307)
+#
+# Doc-20 stage 0. Instrumentation only -- zero behaviour change. The
+# reconvert flush paths (macos9_reconvert_cb and the sync
+# macos9_reconvert_flush_now) already know when a pending batch takes
+# a full reconvert, but nothing records WHY; this patch counts the
+# cause per navigation and prints it beside the INHERITEDCOLOR
+# summary, so stage 1's bound is sized from data instead of from the
+# bench pages' 18-mark show() bursts.
+#
+#   - macos9_reconvert_pending gains coarse_cause: 1 when a mark
+#     names no node, 2 when more distinct marks arrive than the
+#     extra ring holds (first cause wins; the slot already drops
+#     its references on going coarse).
+#   - macos9_reconvert_try_local names its own failure: kind (the
+#     mutation kind has no local answer, doc-20 T4), local (the
+#     local path declined, T6), two (two marks declined in
+#     sequence, T5 -- the defer-and-retry found a second).
+#     try_local_one classifies the single-mark decline; declines
+#     stay non-destructive, the counting reads only.
+#   - The flush sites count before clearing the slot, only when
+#     html_reconvert_content is actually taken (rc == 0); the
+#     busy/declined paths are not full reconverts and are not
+#     counted. Initial conversions are never counted -- the
+#     census is about batches, doc-20 T2-T7.
+#   - The line reads, e.g.:
+#     LIFE FULLCAUSE total=1 over=0 nonode=0 kind=0 local=0 two=1
+#     and is printed per navigation from macos9_reconvert_sync_reset,
+#     the same cadence as the other LIFE summaries.
+#
+# Overhead: one int per pending slot, six longs, one debug line per
+# navigation that had a batch full reconvert. No hot path changes.
+#
+# Gate: run-one.sh on JS-dom-stall.html (page passes, no batch full
+# reconverts -- the census correctly reports nothing), a throwaway
+# forced-full page (40-mark burst -> over=1; setAttribute burst ->
+# kind=1, page text correct after both full reconverts), and the
+# full adapted gate with all structural counts held.
+#
+# First datum from the instrumented gate: the suite's own pages take
+# batch full reconverts through two-in-sequence declines (two=1
+# lines across the CSS pages) -- the structural-interaction class
+# of patches 192/198 -- while over/nonode/kind stay 0 on the bench
+# pages, as expected post-301.
+#
+# Perf: instrumentation only; no before/after claimed.
+# No vitaSDK on this VM; the Vita cross-build does not run here.
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -163,6 +163,11 @@
+ 	} extra[RECONVERT_MAX_EXTRA];
+ 	int             extra_n;
+ 	int             coarse;
++	/* Patch 308 - why the slot went coarse: 0 not coarse, 1 a mark
++	 * named no node, 2 more distinct marks than the extra ring holds.
++	 * First cause wins; counted by the fullcause census (doc 20 T2/T3)
++	 * when the slot's batch takes a full reconvert. */
++	int             coarse_cause;
+ };
+ 
+ /* fixes910 Phase 0 - implemented in content/handlers/html/html.c, where the real
+@@ -365,6 +370,7 @@
+ 	g_pending[i].token = 0;
+ 	g_pending[i].multi = 0;
+ 	g_pending[i].coarse = 0;
++	g_pending[i].coarse_cause = 0;
+ 	g_pending[i].kind_mask = 0;
+ 	ms_diag_batch_freeze(g_pending[i].batch_id);
+ 	g_pending[i].batch_id = 0;
+@@ -396,6 +402,7 @@
+ 				g_pending[i].kind = (node != NULL) ? kind : MACOS9_DOMMUT_UNKNOWN;
+ 				g_pending[i].multi = (node == NULL) ? 1 : 0;
+ 				g_pending[i].coarse = (node == NULL) ? 1 : 0;
++				g_pending[i].coarse_cause = (node == NULL) ? 1 : 0;
+ 				g_pending[i].kind_mask = (kind >= 0 &&
+ 					kind < (int)(sizeof(unsigned long) * 8)) ? (1UL << kind) :
+ 					(1UL << MACOS9_DOMMUT_UNKNOWN);
+@@ -463,9 +470,14 @@
+ 				macsurf_debug_log_writef(
+ 					"LIFE reconvert: batch coarse, more than %d distinct marks",
+ 					RECONVERT_MAX_EXTRA + 1);
++				g_pending[i].coarse_cause = 2;
+ 			}
+ 			g_pending[i].multi = 1;
+ 			g_pending[i].coarse = 1;
++			/* Patch 308 - first cause wins: the overflow above already
++			 * set it; otherwise a no-node mark took the slot coarse. */
++			if (g_pending[i].coarse_cause == 0)
++				g_pending[i].coarse_cause = 1;
+ 			macos9_reconvert_slot_drop_node(i);
+ 			/* Patch 186 - same node and kind merging: the slot keeps
+ 			 * the FIRST mark's old_class. A later mark's value is
+@@ -490,6 +502,7 @@
+ 		(1UL << MACOS9_DOMMUT_UNKNOWN);
+ 	g_pending[freeslot].multi = (node == NULL) ? 1 : 0;
+ 	g_pending[freeslot].coarse = (node == NULL) ? 1 : 0;
++	g_pending[freeslot].coarse_cause = (node == NULL) ? 1 : 0;
+ 	/* Patch 186 - copy the pre-mutation class value, if given. */
+ 	g_pending[freeslot].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
+ 		old_class != NULL) ? strdup(old_class) : NULL;
+@@ -674,6 +687,52 @@
+  * ------------------------------------------------------------------ */
+ static long g_sync_flushes      = 0;	/* flushes actually run, this nav  */
+ static long g_sync_declined     = 0;	/* asked, refused (guard or budget) */
++
++/* Patch 308 - doc-20 stage 0: name the cause of every full reconvert
++ * that answers a pending batch. Initial conversions are NOT counted;
++ * only the html_reconvert_content calls the flush paths take with a
++ * batch outstanding. Counted until the JS navigation reset, printed
++ * beside the INHERITEDCOLOR summary. kind/local/two are distinguished
++ * inside try_local; coarse causes are recorded on the slot (T2/T3). */
++static long g_fc_total  = 0;	/* batch full reconverts taken */
++static long g_fc_over   = 0;	/* coarse: extra ring overflowed (T2) */
++static long g_fc_nonode = 0;	/* coarse: a mark named no node (T3) */
++static long g_fc_kind   = 0;	/* precise batch: unanswered kind (T4) */
++static long g_fc_local  = 0;	/* precise batch: local path declined (T6) */
++static long g_fc_two    = 0;	/* two marks declined in sequence (T5) */
++/* Last failure reason from macos9_reconvert_try_local, read by the
++ * flush site that just called it: 0 none / not consulted, 1 kind,
++ * 2 local-path decline, 3 two-in-sequence. */
++static int g_fc_reason = 0;
++/* Set by macos9_reconvert_try_local_one at its decline sites: 1 when
++ * the kind is not one the local machinery answers, 0 for a local-path
++ * decline. */
++static int g_one_fail_kind = 0;
++
++/* Patch 308 - doc-20 stage 0: name the cause of a batch's full
++ * reconvert. Called with the slot still intact, immediately after the
++ * flush site commits to html_reconvert_content and before it clears
++ * the slot. Coarse slots name their recorded cause (T2/T3); precise
++ * slots name try_local's last failure reason (T4/T5/T6). */
++static void
++macos9_reconvert_fullcause_count(int i)
++{
++	if (g_pending[i].coarse) {
++		if (g_pending[i].coarse_cause == 2)
++			g_fc_over++;
++		else
++			g_fc_nonode++;
++	} else {
++		switch (g_fc_reason) {
++		case 1: g_fc_kind++; break;
++		case 2: g_fc_local++; break;
++		case 3: g_fc_two++; break;
++		default:
++			break;
++		}
++	}
++	g_fc_total++;
++}
+ static long g_sync_us           = 0;	/* cumulative cost of the flushes   */
+ 
+ /* fixes1075 - WHY a flush was refused, because the first hardware log of
+@@ -754,6 +813,16 @@
+ 	g_inherited_color_attempt = 0;
+ 	g_inherited_color_commit = 0;
+ 	g_inherited_color_fallback = 0;
++	/* Patch 308 - doc-20 stage 0: name the full-reconvert causes seen
++	 * since the last navigation, beside the sync-reason counters. */
++	if (g_fc_total != 0) {
++		macsurf_debug_log_writef(
++			"LIFE FULLCAUSE total=%ld over=%ld nonode=%ld kind=%ld local=%ld two=%ld",
++			(long) g_fc_total, (long) g_fc_over, (long) g_fc_nonode,
++			(long) g_fc_kind, (long) g_fc_local, (long) g_fc_two);
++	}
++	g_fc_total = 0; g_fc_over = 0; g_fc_nonode = 0;
++	g_fc_kind = 0; g_fc_local = 0; g_fc_two = 0;
+ 	g_sync_flushes  = 0;
+ 	g_sync_declined = 0;
+ 	g_sync_us       = 0;
+@@ -797,7 +866,9 @@
+ 
+ 	/* a class change on an inline-level element: its block (patch 173).
+ 	 * Patch 186 passes the pre-mutation class value for the precise
+-	 * sibling check. */
++	 * sibling check. Patch 308 - reset the decline classifier; the
++	 * sites below set it before returning 0. */
++	g_one_fail_kind = 0;
+ 	if (kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 		return html_reconvert_local_class(c, node, old_class) == 0;
+ 	switch (kind) {
+@@ -809,6 +880,7 @@
+ 	case MACOS9_DOMMUT_CHARDATA:
+ 		break;
+ 	default:
++		g_one_fail_kind = 1;
+ 		return 0;
+ 	}
+ 	return html_reconvert_local(c, node) == 0;
+@@ -821,9 +893,12 @@
+ 
+ 	if (g_pending[i].coarse || g_pending[i].node == NULL)
+ 		return 0;
++	g_fc_reason = 0;
+ 	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
+-			g_pending[i].kind, g_pending[i].old_class))
++			g_pending[i].kind, g_pending[i].old_class)) {
++		g_fc_reason = g_one_fail_kind ? 1 : 2;
+ 		return 0;
++	}
+ 	/* Patch 301 - answer the extra precise marks in the order they
+ 	 * were recorded. A mark that declines is DEFERRED, not failed:
+ 	 * a sibling's rebuild can invalidate the box state a later mark
+@@ -843,15 +918,24 @@
+ 				g_pending[i].extra[j].kind,
+ 				g_pending[i].extra[j].old_class))
+ 			continue;
+-		if (deferred >= 0)
++		/* Patch 308 - name the decline for the fullcause census.
++		 * A mark that declines while another is deferred is the
++		 * two-in-sequence case (T5); a single failing mark is a
++		 * kind (T4) or local-path (T6) decline per the classifier
++		 * try_local_one sets. */
++		if (deferred >= 0) {
++			g_fc_reason = 3;
+ 			return 0;
++		}
+ 		deferred = j;
+ 	}
+ 	if (deferred >= 0 &&
+ 	    !macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
+ 			g_pending[i].extra[deferred].kind,
+-			g_pending[i].extra[deferred].old_class))
++			g_pending[i].extra[deferred].old_class)) {
++		g_fc_reason = g_one_fail_kind ? 1 : 2;
+ 		return 0;
++	}
+ 	return 1;
+ }
+ static void macos9_reconvert_schedule_pending(void);
+@@ -874,6 +958,8 @@
+ 	double t0;
+ 	int i;
+ 	int rc;
++	int slot;
++	int answered;
+ 
+ 	if (c == NULL)
+ 		return 0;
+@@ -958,14 +1044,24 @@
+ 	t0 = macos9_micros();
+ 	/* VitaBrowser: one text edit rebuilds just its block (WS-C) */
+ 	rc = -1;
++	/* Patch 308 - track which slot answered, for the fullcause
++	 * census below. Only a batch that actually takes the full
++	 * reconvert is counted, not one try_local answered. */
++	slot = -1;
++	answered = 0;
+ 	for (i = 0; i < RECONVERT_MAX_PENDING; i++)
+ 		if (g_pending[i].c == c) {
+-			if (macos9_reconvert_try_local(i, c))
++			slot = i;
++			if (macos9_reconvert_try_local(i, c)) {
+ 				rc = 0;
++				answered = 1;
++			}
+ 			break;
+ 		}
+ 	if (rc != 0)
+ 		rc = html_reconvert_content(c);	/* SYNCHRONOUS -- see fixes903 */
++	if (rc == 0 && slot >= 0 && !answered)
++		macos9_reconvert_fullcause_count(slot);
+ 	in_flush = 0;
+ 
+ 	if (rc != 0) {
+@@ -1235,6 +1331,9 @@
+ 			busy = 1;
+ 			continue;
+ 		}
++		/* Patch 308 - doc-20 stage 0: the slot goes full; name the
++		 * cause while the slot is still intact. */
++		macos9_reconvert_fullcause_count(i);
+ 		if (have_render_scope) ms_diag_render_leave(&render_scope,
+ 			MS_RRES_DONE, MS_SREASON_NONE);
+ 		macos9_reconvert_slot_clear(i);
