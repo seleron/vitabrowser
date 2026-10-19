@@ -1,0 +1,262 @@
+# netsurf: raise the precise-mark ring to 128 under a cost guard (patch 309)
+# Generated 2026-10-19
+# Base: seleron/vitabrowser (patch stack through 308)
+#
+# Doc-20 stage 1. The stage-0 census (patch 308) showed real batches wider
+# than the 32-mark precise ring (over=1 on a 40-mark burst) with per-mark
+# local answers far below a full reconvert's cost, so the old ceiling was
+# discarding wins. This patch raises the ring to 128 and adds a cost guard:
+# marks are answered in order while the cumulative local cost stays below
+# the content's initial conversion cost (the budget); if the guard trips
+# mid-batch, the rest takes one full reconvert.
+#
+# The guard can only move batches TOWARD the full reconvert, never away from
+# a safeguard: per-mark semantics are exactly patch 301's (same order, same
+# defer-and-retry, same two-decline rule), and marks already answered stand
+# (their local answers are complete; declines are non-destructive). The
+# budget is the initial conversion's measured microseconds, per content.
+# Reconverts do NOT refresh it: the RECONVPHASE accumulators are cumulative
+# per navigation and do not bracket the real build work (sub-ms on pages
+# whose rebuild is hundreds of ms), so a reconvert-derived sample would be
+# garbage. The initial conversion is a full build, strictly more expensive
+# than a reconvert, so the budget errs permissive -- the guard trips later,
+# never earlier, than a true reconvert-cost budget would.
+#
+# BSS cost: 8 slots x 128 x 24 bytes = 24,576 bytes (was 6,144).
+#
+# Proof: a 120-mark burst (60 rows x textContent+className, past the old
+# 32-mark ceiling) trips the guard on a 200-paragraph page -- the census
+# shows the guard firing (FULLCAUSE total=2 local=1 guard=1: the innerHTML
+# batch's local full reconvert plus the burst's guard trip). The guard
+# tripped correctly in focused proof with a tight budget (12.5ms): 15 of
+# 120 marks answered, then one full reconvert. On larger pages with bigger
+# budgets the burst is answered locally; the guard is a backstop for the
+# worst case, not a throttle on the win.
+#
+# The gate page JS-batch-burst.html (BATCHBURST) covers the guard leg --
+# the census asserts total=2 guard=1. The local-answer leg is proven by
+# the focused proof (120 marks answered locally when the budget allows)
+# and the stage-0 census.
+# < 1.48s budget), which is the correct behavior -- the guard bounds the
+# worst case instead of merely raising the ceiling.
+#
+# Pre-existing issues noted during proof (not caused by this patch):
+# - The 5000-paragraph tree does not fully rebuild on reconvert (partial
+#   box tree, ~128 boxes); the DOM is correct and DOMSTALL passes 8/8.
+#   Affects 307 and 309 equally.
+# - RECONVPHASE accumulators read sub-ms on real rebuilds; not usable as
+#   a budget source (hence the initial-conversion budget).
+#
+# Simulator only; the vita cross-build was not run (no vitaSDK on this VM).
+# Device expectation is in Doc 10.
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -90,6 +90,10 @@
+ double macos9_micros(void);
+ extern unsigned long macsurf_box_backlink_cleared;
+ extern int macsurf__cascade_probe_armed;
++
++/* Patch 309 - forward: per-content last-full-conversion cost, defined with
++ * the RECONVPHASE instrumentation below; seeded in html_box_convert_done. */
++static void html_note_full_us(struct content *c, double us);
+ extern const char *macsurf_talloc_free_ctx;
+ 
+ #include "macsurf_debug.h"
+@@ -427,6 +431,11 @@
+ 				"WORK pipeline: box+cascade DONE us=%ld boxes=%ld c=%p url=%s",
+ 				(long) elapsed_us, box_count, (void *) c,
+ 				nsurl_access(content_get_url((struct content *) c)));
++		/* Patch 309 - seed the stage-1 cost guard's budget (doc 20):
++		 * the initial conversion is the first full-conversion sample
++		 * for this content. html_note_full_us ignores us <= 0, so the
++		 * -1.0 "no start time" case needs no branch. */
++		html_note_full_us((struct content *) c, elapsed_us);
+ 		s_convert_start_us = 0.0;
+ 	}
+ 	macos9_html_reformat_seq = 0; /* fixes560: fresh reflow-storm count per load */
+@@ -3344,6 +3353,49 @@
+ static long g_reconv_ph_us[RECONV_PH_N];
+ static long g_reconv_ph_n = 0;
+ 
++/* Patch 309 - per-content last-full-conversion cost in microseconds: the
++ * doc-20 stage-1 cost guard's budget. Seeded by the initial conversion's
++ * measured build time (html_box_convert_done). Reconverts do NOT refresh
++ * it: the RECONVPHASE accumulators they would be read from are cumulative
++ * per navigation and do not bracket the real build work (they read sub-ms
++ * on pages whose rebuild is hundreds of ms), so a reconvert-derived sample
++ * would be garbage. The initial conversion is a full build of the same
++ * tree, strictly more expensive than a reconvert (it includes parse), so
++ * using it as the budget errs toward the permissive side -- the guard trips
++ * later, never earlier, than a true reconvert-cost budget would. */
++#define HTML_FULLUS_N 16
++static struct { struct content *c; double us; } g_html_fullus[HTML_FULLUS_N];
++
++static void html_note_full_us(struct content *c, double us)
++{
++	int i;
++
++	if (c == NULL || us <= 0.0)
++		return;
++	for (i = 0; i < HTML_FULLUS_N; i++) {
++		if (g_html_fullus[i].c == c) {
++			g_html_fullus[i].us = us;
++			return;
++		}
++	}
++	for (i = HTML_FULLUS_N - 1; i > 0; i--)
++		g_html_fullus[i] = g_html_fullus[i - 1];
++	g_html_fullus[0].c = c;
++	g_html_fullus[0].us = us;
++}
++
++/* Latest measured full-conversion cost for this content in microseconds,
++ * or 0.0 when the content has no completed conversion on record. */
++double html_content_full_us(struct content *c)
++{
++	int i;
++
++	for (i = 0; i < HTML_FULLUS_N; i++)
++		if (g_html_fullus[i].c == c)
++			return g_html_fullus[i].us;
++	return 0.0;
++}
++
+ static const char *g_reconv_ph_name[RECONV_PH_N] = {
+ 	"h1", "h3", "css", "pin", "build", "relink", "freeold", "reformat"
+ };
+diff --git a/content/handlers/javascript/quickjs/macos9_reconvert.c b/content/handlers/javascript/quickjs/macos9_reconvert.c
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -36,6 +36,10 @@
+ 
+ /* core re-convert trigger: 0 = NSERROR_OK (queued), non-zero = busy/skip. */
+ extern int html_reconvert_content(struct content *c);
++/* Patch 309 - this content's last measured full-conversion cost in
++ * microseconds (0.0 if none on record); the stage-1 cost guard's budget. */
++extern double html_content_full_us(struct content *c);
++extern double macos9_micros(void);
+ extern int macsurf_js_page_execution_active(void);
+ extern void macsurf_js_note_dom_mutation(void);
+ extern unsigned long macsurf_js_current_task_id(void);
+@@ -120,7 +124,13 @@
+  * plus the steps that produced them -- accumulate before a flush.
+  * 32 marks cover a 16-row burst. Beyond it the slot goes coarse
+  * (logged) and the batch takes the pre-301 full reconvert. */
+-#define RECONVERT_MAX_EXTRA 32
++/* Patch 309 (doc 20 stage 1) - the precise-mark ring grows from 32 to 128:
++ * the stage-0 census showed real batches wider than 32 (over=1 on a 40-mark
++ * burst) with per-mark local answers far below a full reconvert's cost, so
++ * the old ceiling was discarding wins. BSS cost: 8 slots x 128 x 24 bytes
++ * (void *node + int kind + char *old_class, padded) = 24,576 bytes. The
++ * cost guard below, not the ring size, is the soundness bound. */
++#define RECONVERT_MAX_EXTRA 128
+ 
+ 
+ struct macos9_reconvert_pending {
+@@ -700,9 +710,10 @@
+ static long g_fc_kind   = 0;	/* precise batch: unanswered kind (T4) */
+ static long g_fc_local  = 0;	/* precise batch: local path declined (T6) */
+ static long g_fc_two    = 0;	/* two marks declined in sequence (T5) */
++static long g_fc_guard  = 0;	/* patch 309: cost guard tripped mid-batch */
+ /* Last failure reason from macos9_reconvert_try_local, read by the
+  * flush site that just called it: 0 none / not consulted, 1 kind,
+- * 2 local-path decline, 3 two-in-sequence. */
++ * 2 local-path decline, 3 two-in-sequence, 4 cost-guard trip. */
+ static int g_fc_reason = 0;
+ /* Set by macos9_reconvert_try_local_one at its decline sites: 1 when
+  * the kind is not one the local machinery answers, 0 for a local-path
+@@ -727,6 +738,7 @@
+ 		case 1: g_fc_kind++; break;
+ 		case 2: g_fc_local++; break;
+ 		case 3: g_fc_two++; break;
++		case 4: g_fc_guard++; break; /* patch 309: cost-guard trip */
+ 		default:
+ 			break;
+ 		}
+@@ -817,12 +829,13 @@
+ 	 * since the last navigation, beside the sync-reason counters. */
+ 	if (g_fc_total != 0) {
+ 		macsurf_debug_log_writef(
+-			"LIFE FULLCAUSE total=%ld over=%ld nonode=%ld kind=%ld local=%ld two=%ld",
++			"LIFE FULLCAUSE total=%ld over=%ld nonode=%ld kind=%ld local=%ld two=%ld guard=%ld",
+ 			(long) g_fc_total, (long) g_fc_over, (long) g_fc_nonode,
+-			(long) g_fc_kind, (long) g_fc_local, (long) g_fc_two);
++			(long) g_fc_kind, (long) g_fc_local, (long) g_fc_two,
++			(long) g_fc_guard);
+ 	}
+ 	g_fc_total = 0; g_fc_over = 0; g_fc_nonode = 0;
+-	g_fc_kind = 0; g_fc_local = 0; g_fc_two = 0;
++	g_fc_kind = 0; g_fc_local = 0; g_fc_two = 0; g_fc_guard = 0;
+ 	g_sync_flushes  = 0;
+ 	g_sync_declined = 0;
+ 	g_sync_us       = 0;
+@@ -890,10 +903,29 @@
+ {
+ 	int j;
+ 	int deferred = -1;
++	/* Patch 309 - cost guard (doc 20 stage 1): the budget is this
++	 * content's initial conversion cost in microseconds. Marks are
++	 * answered in recorded order while the cumulative local cost
++	 * stays below it; the moment the batch has cost more than the
++	 * full conversion it avoids, the rest of the batch takes the
++	 * full reconvert. The guard can only move batches TOWARD the
++	 * full reconvert, never away from a safeguard: per-mark semantics
++	 * are exactly patch 301's, and marks already answered stand --
++	 * their local answers are complete, and local declines are
++	 * non-destructive, so the full reconvert sees a consistent tree. */
++	double budget;
++	double t0;
+ 
+ 	if (g_pending[i].coarse || g_pending[i].node == NULL)
+ 		return 0;
+ 	g_fc_reason = 0;
++	budget = html_content_full_us(c);
++	if (budget <= 0.0)
++		budget = 400000.0; /* no sample yet (backstop only: every
++				    * content seeds its real sample at
++				    * initial conversion): the round-3
++				    * 5000-paragraph full reconvert. */
++	t0 = macos9_micros();
+ 	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
+ 			g_pending[i].kind, g_pending[i].old_class)) {
+ 		g_fc_reason = g_one_fail_kind ? 1 : 2;
+@@ -914,6 +946,12 @@
+ 	 * declines are the structural cases (patches 192/198) whose
+ 	 * answer is the rebuild, not a retry. */
+ 	for (j = 0; j < g_pending[i].extra_n; j++) {
++		/* Patch 309 - the guard is checked before each further mark;
++		 * the primary's cost is already in the cumulative t0 above. */
++		if (macos9_micros() - t0 > budget) {
++			g_fc_reason = 4;
++			return 0;
++		}
+ 		if (macos9_reconvert_try_local_one(c, g_pending[i].extra[j].node,
+ 				g_pending[i].extra[j].kind,
+ 				g_pending[i].extra[j].old_class))
+@@ -929,12 +967,19 @@
+ 		}
+ 		deferred = j;
+ 	}
+-	if (deferred >= 0 &&
+-	    !macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
+-			g_pending[i].extra[deferred].kind,
+-			g_pending[i].extra[deferred].old_class)) {
+-		g_fc_reason = g_one_fail_kind ? 1 : 2;
+-		return 0;
++	if (deferred >= 0) {
++		/* Patch 309 - the retry is one more local answer; it counts
++		 * against the same budget. */
++		if (macos9_micros() - t0 > budget) {
++			g_fc_reason = 4;
++			return 0;
++		}
++		if (!macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
++				g_pending[i].extra[deferred].kind,
++				g_pending[i].extra[deferred].old_class)) {
++			g_fc_reason = g_one_fail_kind ? 1 : 2;
++			return 0;
++		}
+ 	}
+ 	return 1;
+ }
