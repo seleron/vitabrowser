@@ -6,8 +6,9 @@
 <!-- Patch 304 (item 7, stage 1; design: docs/phase-0/19): a parsed
      same-origin iframe's contentWindow.document / contentDocument is
      the frame's REAL document, reached through a marshalled handle --
-     patch 143's shim document answered in its place until now. The
-     checks, from doc 19's gate spec:
+     patch 143's shim document answered in its place until now.
+     Patch 306 adds stage 2: queries on the handle (checks 7-8).
+     The checks, from doc 19's gate spec:
        1. scalars cross: the parent reads URL / title / readyState
           through the handle, equal to the child's own values -- the
           title the child's SCRIPT set, not the parsed one;
@@ -29,6 +30,24 @@
           answers as a null document (scalars undefined, roots null);
        6. a cross-origin parsed frame's contentDocument stays null
           (patch 294).
+       7. stage 2 queries (patch 306): on the first child --
+          getElementById finds the element the child created AFTER
+          load (live tree, not a snapshot) and the parsed one, and
+          answers null for a missing id; querySelector returns the
+          first match and null for no match; querySelectorAll('p')
+          and getElementsByTagName('p') count exactly the child's
+          own <p> count, created ones included. A real browser
+          passes this check too (its frame document IS the real
+          document); it is the stage-2 surface itself under test.
+       8. stage 2 lifetime (patch 306): after the navigation, a
+          node handle a query returned goes inert like a root
+          handle; fresh queries answer the SECOND child's tree
+          (its single <p id="kid">); after the frame's removal,
+          queries on the held handle answer empty -- getElementById
+          and querySelector null, the list queries length 0 --
+          never a throw, never a stale node. Handle semantics as
+          in check 4: a browser's captured document keeps answering
+          for its old page, so this check is sim-only by design.
      One interval drives the whole flow from script start and writes
      progress as it observes it, like the other timed gate pages: a
      timer created after the frame's removal did not reliably run
@@ -46,13 +65,15 @@ iframe { width: 300px; height: 40px; }
 </style>
 </head>
 <body>
-<div id="sum">XDOC2: 0/6 passed</div>
+<div id="sum">XDOC2: 0/8 passed</div>
 <p id="r1" class="wait">1 waiting (the script never ran)</p>
 <p id="r2" class="wait">2 waiting</p>
 <p id="r3" class="wait">3 waiting</p>
 <p id="r4" class="wait">4 waiting</p>
 <p id="r5" class="wait">5 waiting</p>
 <p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
 <iframe id="so" src="JS-frame-document-child.html"></iframe>
 <script>
 document.write('<iframe id="xo" src="https://127.0.0.1:' +
@@ -61,8 +82,9 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 </script>
 <script>
 (function () {
-	var k = 0, N = 6, latest = null, phase = 0, docH = null,
+	var k = 0, N = 8, latest = null, phase = 0, docH = null,
 		oldBody = null, oldDE = null, ticks = 0, goneTries = 0,
+		qHandle = null, q8nav = null,
 		expected2 = new URL('JS-frame-document-child2.html',
 			location.href).href;
 	function $(id) { return document.getElementById(id); }
@@ -126,6 +148,43 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 			var xd = $('xo').contentDocument;
 			return xd === null || typeof xd;
 		}, 'a cross-origin frame\'s contentDocument stays null');
+		check(7, function () {
+			if (!d) return 'no document';
+			if (typeof d.getElementById !== 'function')
+				return 'no getElementById on the handle';
+			var late = d.getElementById('late');
+			if (!late) return 'getElementById(late) found nothing';
+			if (late.tagName !== 'P')
+				return 'late tagName ' + late.tagName;
+			if (late.nodeType !== 1)
+				return 'late nodeType ' + late.nodeType;
+			var kid = d.getElementById('kid');
+			if (!kid || kid.tagName !== 'P')
+				return 'getElementById(kid) wrong: ' + (kid && kid.tagName);
+			if (d.getElementById('no-such-id') !== null)
+				return 'getElementById(missing) not null';
+			var first = d.querySelector('p');
+			if (!first || first.tagName !== 'P')
+				return 'querySelector(p) wrong: ' + (first && first.tagName);
+			if (!d.querySelector('#kid'))
+				return 'querySelector(#kid) found nothing';
+			if (d.querySelector('.no-such-class') !== null)
+				return 'querySelector(no match) not null';
+			var all = d.querySelectorAll('p');
+			if (!all || all.length !== latest.pcount)
+				return 'querySelectorAll(p) length ' +
+					(all && all.length) + ' != child ' + latest.pcount;
+			if (!all[0] || all[0].tagName !== 'P')
+				return 'querySelectorAll(p)[0] not a P handle';
+			var byTag = d.getElementsByTagName('p');
+			if (!byTag || byTag.length !== latest.pcount)
+				return 'getElementsByTagName(p) length ' +
+					(byTag && byTag.length) + ' != child ' + latest.pcount;
+			if (d.getElementsByTagName('*').length < latest.pcount)
+				return 'getElementsByTagName(*) too short';
+			qHandle = late;
+			return true;
+		}, 'stage 2 queries reach the child\'s live tree');
 		/* navigate the frame: the src set is the browser shape; the
 		 * child also navigates itself if asked (see the phase-1
 		 * leg) -- the lifetime machinery under test is the same */
@@ -141,11 +200,51 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 			if (tb !== undefined) return 'old body handle not inert: tagName ' + tb;
 			var td = oldDE && oldDE.nodeType;
 			if (td !== undefined) return 'old documentElement handle not inert: nodeType ' + td;
+			var tq = qHandle && qHandle.tagName;
+			if (tq !== undefined) return 'pre-navigation query handle not inert: tagName ' + tq;
 			return true;
 		}, 'lifetime: handle rebinds, pre-navigation node handles inert');
+		/* check 8, first leg: fresh queries answer the second
+		 * child's tree (one <p id="kid">, no #late) */
+		try {
+			var nk = docH.getElementById('kid');
+			if (!nk || nk.tagName !== 'P')
+				q8nav = 'fresh getElementById(kid) on child two: ' +
+					(nk && nk.tagName);
+			else if (docH.getElementById('late') !== null)
+				q8nav = 'getElementById(late) answered on child two';
+			else if (docH.querySelectorAll('p').length !== 1)
+				q8nav = 'fresh querySelectorAll(p) on child two: ' +
+					docH.querySelectorAll('p').length;
+			else if (docH.getElementsByTagName('p').length !== 1)
+				q8nav = 'fresh getElementsByTagName(p) on child two';
+			else q8nav = true;
+		} catch (e) { q8nav = 'fresh queries threw: ' + e; }
 		var so2 = $('so');
 		try { so2.parentNode.removeChild(so2); } catch (e) { /* */ }
 		phase = 2;
+	}
+
+	/* check 8, second leg (after removal): queries on the held
+	 * handle answer empty -- singles null, lists length 0 */
+	function finishEight() {
+		if (q8nav !== true) {
+			t(8, false, 'stage 2 lifetime: ' + q8nav);
+			return;
+		}
+		try {
+			if (docH.getElementById('kid') !== null)
+				return t(8, false, 'stage 2 lifetime: removed frame getElementById not null');
+			if (docH.querySelector('p') !== null)
+				return t(8, false, 'stage 2 lifetime: removed frame querySelector not null');
+			if (docH.querySelectorAll('p').length !== 0)
+				return t(8, false, 'stage 2 lifetime: removed frame querySelectorAll not empty');
+			if (docH.getElementsByTagName('p').length !== 0)
+				return t(8, false, 'stage 2 lifetime: removed frame getElementsByTagName not empty');
+		} catch (e) {
+			return t(8, false, 'stage 2 lifetime: removed frame queries threw: ' + e);
+		}
+		t(8, true, 'stage 2 lifetime: query handles inert, queries rebind, removed frame answers empty');
 	}
 
 	/* the one driver */
@@ -153,7 +252,8 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 		ticks++;
 		if (phase === 0) {
 			if (latest && latest.iam === 'one' &&
-					latest.readyState === 'complete') {
+					latest.readyState === 'complete' &&
+					latest.stage2 === true) {
 				phaseOne();
 			} else if (ticks % 4 === 0) {
 				$('r1').textContent = '1 waiting: child ' +
@@ -188,11 +288,13 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 			} catch (e) { /* */ }
 			if (gone) {
 				t(5, true, 'removed frame: the held handle answers as a null document');
+				finishEight();
 				phase = 3;
 				clearInterval(driver);
 			} else if (goneTries >= 24) {
 				fail(5, 'removed frame: handle still answers URL ' +
 					(docH && docH.URL));
+				t(8, false, 'stage 2 lifetime: frame never went null');
 				phase = 3;
 				clearInterval(driver);
 			} else {
@@ -209,16 +311,21 @@ document.write('<iframe id="xo" src="https://127.0.0.1:' +
 				(latest ? latest.iam + '/' + latest.readyState : 'no message'));
 			fail(2, 'not reached'); fail(3, 'not reached');
 			fail(4, 'not reached'); fail(5, 'not reached');
+			fail(7, 'not reached'); fail(8, 'not reached');
 		} else if (phase === 1) {
 			fail(4, 'handle never rebound to the second page: title ' +
 				(docH && docH.title) + ' readyState ' +
 				(docH && docH.readyState));
 			fail(5, 'not reached');
+			if ($('r8').className !== 'pass')
+				fail(8, 'stage 2 lifetime: not reached');
 		} else if (phase === 2) {
 			fail(5, 'removed frame: handle still answers URL ' +
 				(docH && docH.URL));
+			if ($('r8').className !== 'pass')
+				fail(8, 'stage 2 lifetime: removal leg not reached');
 		}
-		if (k < 6 && $('r6').className !== 'pass' &&
+		if (k < N && $('r6').className !== 'pass' &&
 				$('r6').textContent.match(/waiting/))
 			fail(6, 'cross-origin check not reached');
 		clearInterval(driver);

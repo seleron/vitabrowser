@@ -1,0 +1,345 @@
+# netsurf: queries on a parsed frame's document handle (patch 306)
+# Generated 2026-10-19
+# Base: seleron/vitabrowser (patch stack through 305)
+#
+# Item 7, stage 2 (design: docs/phase-0/19). Patch 304 gave the
+# parent realm a marshalled handle over a same-origin parsed
+# frame's real document -- scalars and root node handles, identity
+# only. Stage 2 adds the queries the design stages second:
+# getElementById, querySelector, querySelectorAll and
+# getElementsByTagName on the document handle.
+#
+#   - Each native resolves the child's CURRENT content / document /
+#     generation through patch 304's qjs_fdoc_current at call time
+#     and answers from the child's own libdom tree -- the same C
+#     state stage 1's scalars read -- so a navigated frame's
+#     queries answer the new document, and on the null document
+#     (frame removed, destroyed, or not yet loaded) single lookups
+#     answer null and list lookups answer empty, never a throw
+#     (doc 19: "properties undefined, queries empty").
+#   - Selector evaluation is the bridge's own matcher
+#     (qjs_sel_list_parse / qjs_sel_list_match, querySelector's
+#     single-id fast path included) run over the child's tree. The
+#     matcher is a pure function of (selector, tree): no child-realm
+#     JS state is consulted, no JSValue crosses a runtime, and the
+#     parent never sees selector-engine state of the child's
+#     (there is none to see). The natives are defined with the
+#     selector machinery; only their declarations and registration
+#     live with the handle.
+#   - Matches are minted as patch 304 node handles capturing the
+#     query call's (content, generation), so they share the roots'
+#     lifetime discipline exactly: live within the generation that
+#     produced them, inert after it -- a query cannot resurrect or
+#     alias a stale document's nodes. Within a call, results are
+#     in document order, deduped by construction (one visit per
+#     node), as the realm's own querySelectorAll collects them.
+#   - getElementsByTagName shares the list walk, mirroring the
+#     realm's own document, whose getElementsByTagName IS
+#     querySelectorAll(tag) (fixes873): one matcher, no second
+#     walker. Lists answer as plain arrays of handles, as the
+#     realm's own list queries answer plain arrays.
+#
+# Gate: testpages/pages/JS-frame-document.html extended in place,
+# XDOC2 6/6 -> 8/8 (the gate script's expectation updated with
+# it): check 7 runs the four queries against the first child --
+# getElementById finds the element the child created AFTER load,
+# which is what proves live access rather than a snapshot -- and
+# check 8 holds stage 1's lifetime semantics for query results:
+# a pre-navigation query handle goes inert, fresh queries answer
+# the second child's tree, and after the frame's removal the
+# queries answer empty. The page scored 5/8 before this patch
+# (checks 7 and 8 missing their surface, and check 4's new
+# query-handle inertness leg with them). In Firefox/Camoufox
+# checks 1-3, 6 and 7 pass -- the query surface behaves as a
+# browser's does; 4, 5 and 8 are doc 19's handle semantics,
+# where a browser's captured Document stays with its old page.
+# JS-frame-xdoc.html stays XDOC 4/4 and JS-xorigin-frame.html
+# stays XFRAME 9/9; the cross-origin null is untouched.
+# Simulator only; the vita cross-build was not run (no vitaSDK
+# on this VM). Device expectation is in Doc 10.
+diff --git a/content/handlers/javascript/quickjs/macsurf_qjs.c b/content/handlers/javascript/quickjs/macsurf_qjs.c
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -3465,6 +3465,26 @@
+  *     body === body across reads, as a browser's identity does.
+  *   - Stage 1 node handles expose identity only: tagName, nodeType.
+  *     Queries are stage 2; node reads/writes are stage 3 (doc 19).
++ *
++ * Patch 306 -- stage 2: queries on the document handle.
++ * getElementById / querySelector / querySelectorAll /
++ * getElementsByTagName resolve the child's CURRENT tree through
++ * qjs_fdoc_current at call time and answer from it, so a navigated
++ * frame's queries answer the new document and a removed frame's
++ * answer empty (null / length 0) rather than throwing. Selector
++ * evaluation is the bridge's own matcher (qjs_sel_list_parse /
++ * qjs_sel_list_match) run over the child's libdom tree: the matcher
++ * is a pure function of (selector, tree), so no child-realm state
++ * is consulted and nothing crosses but C values (constraint 1).
++ * Matches are minted as node handles capturing (content,
++ * generation) at query time, so a query's handles go inert on
++ * navigation exactly like the roots -- a query cannot resurrect
++ * or alias a stale document's nodes. getElementsByTagName shares
++ * the list walk, mirroring the realm's own document, whose
++ * getElementsByTagName IS querySelectorAll(tag) (fixes873): one
++ * matcher, no second walker. The natives live with the selector
++ * machinery below (struct qjs_sel_list's home); only their
++ * declarations and registration are here.
+  * ====================================================================== */
+ 
+ /* The binding a handle answers through: the child realm's heap, the
+@@ -3603,6 +3623,12 @@
+ 	JS_FreeAtom(ctx, atom);
+ }
+ 
++static void qjs_fdoc_def_fn(JSContext *ctx, JSValue obj, const char *name,
++		JSCFunction *fn, int len)
++{
++	JS_SetPropertyStr(ctx, obj, name, JS_NewCFunction(ctx, fn, name, len));
++}
++
+ /* --- document handle scalar getters ---------------------------------- */
+ 
+ static JSValue qjs_fdoc_get_url(JSContext *ctx, JSValueConst this_val,
+@@ -3851,6 +3877,17 @@
+ 		int argc, JSValueConst *argv)
+ { (void)argc; (void)argv; return qjs_fdoc_root(ctx, this_val, 2); }
+ 
++/* Stage 2 query natives (patch 306): defined with the selector
++ * machinery below, where struct qjs_sel_list lives. */
++static JSValue qjs_fdoc_get_element_by_id(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fdoc_query_selector(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fdoc_query_selector_all(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue qjs_fdoc_get_elements_by_tag_name(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv);
++
+ /* __vitaFrameDocument(iframeElement) -- the stage 1 document handle
+  * for a parsed frame's child realm, or null while the frame has no
+  * live document of its own (the polyfill then keeps the 143 shim).
+@@ -3914,6 +3951,14 @@
+ 		qjs_fdoc_def_get(ctx, obj, "documentElement", qjs_fdoc_get_de);
+ 		qjs_fdoc_def_get(ctx, obj, "head", qjs_fdoc_get_head);
+ 		qjs_fdoc_def_get(ctx, obj, "body", qjs_fdoc_get_body);
++		qjs_fdoc_def_fn(ctx, obj, "getElementById",
++				qjs_fdoc_get_element_by_id, 1);
++		qjs_fdoc_def_fn(ctx, obj, "querySelector",
++				qjs_fdoc_query_selector, 1);
++		qjs_fdoc_def_fn(ctx, obj, "querySelectorAll",
++				qjs_fdoc_query_selector_all, 1);
++		qjs_fdoc_def_fn(ctx, obj, "getElementsByTagName",
++				qjs_fdoc_get_elements_by_tag_name, 1);
+ 		return obj;
+ 	}
+ 	return JS_NULL;
+@@ -12438,6 +12483,209 @@
+ 	}
+ }
+ 
++/* ======================================================================
++ * VitaBrowser patch 306 -- item 7, stage 2 (doc 19): queries on the
++ * parsed-frame document handle (the handle itself is patch 304's,
++ * above). Each native resolves the child's current content /
++ * document / generation through qjs_fdoc_current at call time, so
++ * the answers track the frame the parent actually has: after a
++ * navigation they answer the NEW document, and on the null
++ * document (frame removed, destroyed, or not yet loaded) single
++ * lookups answer null and list lookups answer empty -- doc 19's
++ * "properties undefined, queries empty", never a throw across the
++ * boundary. Matches are minted as patch 304 node handles capturing
++ * this call's (content, generation), so they share the roots'
++ * lifetime discipline exactly: live within the generation that
++ * produced them, inert after it, and never an alias into a stale
++ * document's tree.
++ * ====================================================================== */
++
++/* The handle's live query context; 0 = the null document. */
++static int qjs_fdoc_query_ctx(JSValueConst this_val,
++		struct qjs_fbind **bp, struct content **cp,
++		dom_document **dp, unsigned long *gp)
++{
++	struct qjs_fdoc_state *st =
++		(struct qjs_fdoc_state *)JS_GetOpaque(this_val,
++				s_fdoc_class_id);
++	if (st == NULL) return 0;
++	if (!qjs_fdoc_current(st->bind, cp, dp, gp)) return 0;
++	*bp = st->bind;
++	return 1;
++}
++
++static JSValue qjs_fdoc_get_element_by_id(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fbind *bind = NULL;
++	struct content *content = NULL;
++	dom_document *doc = NULL;
++	unsigned long gen = 0;
++	const char *id;
++	dom_string *id_ds;
++	dom_element *el = NULL;
++
++	if (argc < 1 || !qjs_fdoc_query_ctx(this_val, &bind, &content,
++			&doc, &gen))
++		return JS_NULL;
++	id = JS_ToCString(ctx, argv[0]);
++	if (id == NULL) return JS_NULL;
++	id_ds = qjs_make_domstr(id);
++	JS_FreeCString(ctx, id);
++	if (id_ds == NULL) return JS_NULL;
++	macsurf_dom_document_get_element_by_id(doc, id_ds, &el);
++	macsurf_dom_string_unref(id_ds);
++	if (el == NULL) return JS_NULL;
++	/* get_element_by_id hands back a ref; the handle adopts it. */
++	return qjs_fnode_wrap(ctx, bind, content, gen, (dom_node *)el, doc);
++}
++
++/* qjs_collect_by_sel_list with node-handle wrapping: every match in
++ * document order, each minted as a handle of this query's
++ * (content, generation). */
++static void qjs_fdoc_collect_by_sel_list(JSContext *ctx, dom_node *node,
++		const struct qjs_sel_list *sl, struct qjs_fbind *bind,
++		struct content *content, unsigned long gen,
++		dom_document *doc, JSValue arr, int *count)
++{
++	dom_node *child = NULL;
++	dom_node *next = NULL;
++
++	if (node == NULL) return;
++	if (qjs_sel_list_match(node, sl)) {
++		macsurf_dom_node_ref(node); /* the handle adopts the ref */
++		JS_SetPropertyUint32(ctx, arr, (uint32_t)(*count),
++				qjs_fnode_wrap(ctx, bind, content, gen,
++						node, doc));
++		(*count)++;
++	}
++	macsurf_dom_node_get_first_child(node, &child);
++	while (child != NULL) {
++		qjs_fdoc_collect_by_sel_list(ctx, child, sl, bind, content,
++				gen, doc, arr, count);
++		macsurf_dom_node_get_next_sibling(child, &next);
++		macsurf_dom_node_unref(child);
++		child = next;
++	}
++}
++
++/* The shared list walk behind querySelectorAll and
++ * getElementsByTagName: the realm's own document defines
++ * getElementsByTagName(t) AS querySelectorAll(t) (fixes873), and
++ * the handle mirrors it -- one matcher, no second walker. */
++static JSValue qjs_fdoc_query_list(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fbind *bind = NULL;
++	struct content *content = NULL;
++	dom_document *doc = NULL;
++	unsigned long gen = 0;
++	const char *sel;
++	JSValue arr;
++	int count = 0;
++
++	arr = JS_NewArray(ctx);
++	if (argc < 1 || !qjs_fdoc_query_ctx(this_val, &bind, &content,
++			&doc, &gen))
++		return arr; /* the null document's queries are empty */
++	sel = JS_ToCString(ctx, argv[0]);
++	if (sel == NULL) return arr;
++	{
++		struct qjs_sel_list s;
++		dom_element *root = NULL;
++
++		qjs_sel_list_parse(sel, &s);
++		if (s.approx) {
++			macsurf_debug_log_writef(
++				"WORK fdoc qsa: APPROX selector (unsupported "
++				"syntax ignored) sel=%s", sel);
++		}
++		JS_FreeCString(ctx, sel);
++		if (s.n == 0) return arr;
++		macsurf_dom_document_get_document_element(doc, &root);
++		if (root != NULL) {
++			qjs_fdoc_collect_by_sel_list(ctx, (dom_node *)root,
++					&s, bind, content, gen, doc, arr,
++					&count);
++			macsurf_dom_node_unref((dom_node *)root);
++		}
++	}
++	return arr;
++}
++
++static JSValue qjs_fdoc_query_selector_all(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	return qjs_fdoc_query_list(ctx, this_val, argc, argv);
++}
++
++static JSValue qjs_fdoc_get_elements_by_tag_name(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	return qjs_fdoc_query_list(ctx, this_val, argc, argv);
++}
++
++static JSValue qjs_fdoc_query_selector(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv)
++{
++	struct qjs_fbind *bind = NULL;
++	struct content *content = NULL;
++	dom_document *doc = NULL;
++	unsigned long gen = 0;
++	const char *sel;
++
++	if (argc < 1 || !qjs_fdoc_query_ctx(this_val, &bind, &content,
++			&doc, &gen))
++		return JS_NULL;
++	sel = JS_ToCString(ctx, argv[0]);
++	if (sel == NULL) return JS_NULL;
++	{
++		struct qjs_sel_list s;
++		dom_element *root = NULL;
++		dom_element *found = NULL;
++
++		qjs_sel_list_parse(sel, &s);
++		if (s.approx) {
++			macsurf_debug_log_writef(
++				"WORK fdoc qs: APPROX selector (unsupported "
++				"syntax ignored) sel=%s", sel);
++		}
++		JS_FreeCString(ctx, sel);
++		if (s.n == 0) return JS_NULL;
++
++		/* The single-id fast path, as in qjs_querySelector: it
++		 * applies only when the whole selector is one
++		 * id-bearing compound, and the result still runs the
++		 * full compound match before it is wrapped. */
++		if (s.n == 1 && s.alt[0].n == 1 &&
++		    s.alt[0].c[0].id[0] != '\0') {
++			dom_string *id_ds = qjs_make_domstr(s.alt[0].c[0].id);
++			dom_element *el = NULL;
++			if (id_ds == NULL) return JS_NULL;
++			macsurf_dom_document_get_element_by_id(doc,
++					id_ds, &el);
++			macsurf_dom_string_unref(id_ds);
++			if (el == NULL) return JS_NULL;
++			if (!qjs_compound_match((dom_node *)el,
++					&s.alt[0].c[0])) {
++				macsurf_dom_node_unref((dom_node *)el);
++				return JS_NULL;
++			}
++			return qjs_fnode_wrap(ctx, bind, content, gen,
++					(dom_node *)el, doc);
++		}
++
++		macsurf_dom_document_get_document_element(doc, &root);
++		if (root == NULL) return JS_NULL;
++		found = qjs_find_first_by_sel_list((dom_node *)root, &s);
++		macsurf_dom_node_unref((dom_node *)root);
++		if (found == NULL) return JS_NULL;
++		/* find_first hands back a ref; the handle adopts it. */
++		return qjs_fnode_wrap(ctx, bind, content, gen,
++				(dom_node *)found, doc);
++	}
++}
++
+ /* ---- Init class ID (call once at startup) ---- */
+ static void qjs_dom_init_class(JSRuntime *rt)
+ {

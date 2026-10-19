@@ -860,7 +860,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-template-text TPLTEXT 4" "js-selector-list-long LONGLIST 4" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
-	 "js-scratch-qsa SCRATCHQSA 6" "js-frame-xdoc XDOC 4" "js-frame-document XDOC2 6" \
+	 "js-scratch-qsa SCRATCHQSA 6" "js-frame-xdoc XDOC 4" "js-frame-document XDOC2 8" \
 	 "js-form-shadow FORMSHADOW 6" \
 	 "js-form-shadow-chain FSHADOW2 10" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
