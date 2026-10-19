@@ -1,0 +1,205 @@
+# Form named controls shadow the whole prototype chain
+#
+# Patch 297 made a form's named controls shadow the form's own
+# interface, as HTMLFormElement's [LegacyOverrideBuiltIns] does in
+# browsers, by wrapping HTMLFormElement.prototype's own members in
+# place and a hand-listed set of the form's IDL attributes that the
+# bridge keeps on the shared element prototype above it. The wider
+# chain was left unwrapped, so a control named after an HTMLElement,
+# Element or Node member -- id, title, children, focus, tagName,
+# nodeType, className -- did not shadow: form.id answered with the
+# form's own id reflection and the control was only reachable
+# through form.elements. Browsers shadow the whole chain.
+#
+# Pinned against Firefox before fixing (2026-10-19): on a form
+# carrying controls named id, title, children, focus, tagName,
+# nodeType and className, plus one with id "dir", every one of
+# those reads is the control, by name and by id; a form without
+# collisions reads its own values (id 'plain', title, tagName
+# 'FORM', nodeType 1); and a write to a shadowed accessor still
+# reaches the built-in setter -- form.id = 'changed' sets the
+# form's id attribute -- while reads keep returning the control.
+#
+# The wrapping therefore walks the whole chain: every own member
+# of every prototype from HTMLFormElement.prototype up to (but not
+# including) Object.prototype is wrapped where it sits, the lowest
+# occurrence of each name deciding (a member found lower is the one
+# reads resolve to, so a higher duplicate is never wrapped). The
+# hand-list is gone; the walk finds those members at their homes.
+# The accessor setter no longer swallows a write to a shadowed
+# name, matching the pin: writes reach the built-in, reads stay
+# control-first. (Patch 297's method writes are unchanged: a write
+# to a shadowed method name still does not stick, and its gate
+# check reads the control back.) The form-only guard is unchanged,
+# so every other element's reads and writes behave exactly as
+# before, and the reentrancy guard still keeps the control
+# search's own reads out of the wrapping.
+#
+# Deliberate remainders, recorded: Object.prototype's members are
+# not wrapped -- putting a wrapped getter in front of every object
+# in the page is too broad a hop for the sake of a control named
+# toString, which keeps not shadowing. A name whose lowest member
+# is not configurable cannot be wrapped and keeps not shadowing
+# (the wrap-in-place architecture's standing limit, as in 297).
+# Members defined on the chain after the polyfill's named-access
+# setup runs would not be wrapped either; none are today.
+#
+# Gate: testpages/pages/JS-form-shadow-chain.html (FSHADOW2 10/10
+# in the simulator and in a reference browser -- Firefox/Camoufox,
+# for the reason patch 292's header gives; the page scored 1/10
+# before the fix, only its no-collision check passing).
+# JS-form-shadow.html stays FORMSHADOW 6/6 and JS-form-named.html
+# stays FORMNAMED 7/7. Simulator only; the vita cross-build was
+# not run (no vitaSDK on this VM). Device expectation is in
+# Doc 10.
+#
+# Decline conditions: as patch 297's -- a real named-properties
+# object in the bridge replaces this wrapping wholesale.
+#--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10807,33 +10807,51 @@
+ 							}
+ 							return oget.call(this);
+ 						} }, k).get,
++						/* VitaBrowser patch 305: the setter no
++						 * longer swallows a write to a shadowed
++						 * name. Pinned against Firefox: the
++						 * write reaches the built-in setter
++						 * (form.id = 'x' changes the form's id
++						 * attribute) while reads keep returning
++						 * the control -- the named property
++						 * wins on reads, it does not write-
++						 * protect the built-in. */
+ 						set: oset ? function (v) {
+-							if (isA(this, FP) &&
+-							    controlsFirst(this, k) !== undefined)
+-								return;
+ 							oset.call(this, v);
+ 						} : undefined });
+ 				} else return;
+ 				wrapped[k] = true;
+ 			} catch (e) { /* */ }
+ 		}
+-		Reflect.ownKeys(FP).forEach(function (k) {
+-			if (typeof k === 'string') wrapMember(FP, k);
+-		});
+-		/* the bridge puts some of the form's own IDL attributes
+-		 * (action, method, target, name) on the shared element
+-		 * prototype above FP, not on FP: wrap those where they
+-		 * live -- the isA guard keeps every other element's reads
+-		 * exactly as they were */
+-		['name', 'action', 'method', 'enctype', 'encoding', 'target',
+-		 'autocomplete', 'noValidate', 'acceptCharset', 'rel',
+-		 'relList', 'elements', 'length'].forEach(function (k) {
+-			if (wrapped[k]) return;
+-			for (var p = Object.getPrototypeOf(FP);
+-			     p && p !== Object.prototype;
+-			     p = Object.getPrototypeOf(p))
+-				if (GOPD(p, k)) { wrapMember(p, k); break; }
+-		});
++		/* VitaBrowser patch 305: patch 297 wrapped the form's own
++		 * interface and a hand-listed set of IDL attributes living
++		 * on the shared prototype above it, but
++		 * [LegacyOverrideBuiltIns] shadows the WHOLE chain in
++		 * browsers -- a control named id, title, children, focus,
++		 * tagName or nodeType (HTMLElement / Element / Node
++		 * members) still read as the form's own values here.
++		 * Pinned against Firefox first: every one of those reads
++		 * as the control there, by name and by id. So wrap every
++		 * own member of every prototype from FP up to (but not
++		 * including) Object.prototype, the lowest occurrence of
++		 * each name deciding -- a member found lower is the one
++		 * reads resolve to, so a higher duplicate is never
++		 * wrapped. Object.prototype's members are deliberately
++		 * left alone: wrapping them would put a hop in front of
++		 * every object in the page, and a control named toString
++		 * keeps not shadowing (a recorded remainder, like 297's
++		 * scoping). A name whose lowest member is not
++		 * configurable cannot be wrapped and keeps not shadowing;
++		 * the isA guard keeps every other element's reads and
++		 * writes exactly as they were. */
++		var seen305 = {};
++		for (var chain = FP; chain && chain !== Object.prototype;
++		     chain = Object.getPrototypeOf(chain))
++			Reflect.ownKeys(chain).forEach(function (k) {
++				if (typeof k !== 'string' || seen305[k]) return;
++				seen305[k] = true;
++				wrapMember(chain, k);
++			});
+ 		above(FP, function (form, k) {
+ 			if (IDX.test(k)) return controls(form)[+k];
+ 			return k === '' ? null : formNamed(form, k);
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10808,33 +10808,51 @@
+ "\t\t\t\t\t\t\t}\n"
+ "\t\t\t\t\t\t\treturn oget.call(this);\n"
+ "\t\t\t\t\t\t} }, k).get,\n"
++"\t\t\t\t\t\t/* VitaBrowser patch 305: the setter no\n"
++"\t\t\t\t\t\t * longer swallows a write to a shadowed\n"
++"\t\t\t\t\t\t * name. Pinned against Firefox: the\n"
++"\t\t\t\t\t\t * write reaches the built-in setter\n"
++"\t\t\t\t\t\t * (form.id = 'x' changes the form's id\n"
++"\t\t\t\t\t\t * attribute) while reads keep returning\n"
++"\t\t\t\t\t\t * the control -- the named property\n"
++"\t\t\t\t\t\t * wins on reads, it does not write-\n"
++"\t\t\t\t\t\t * protect the built-in. */\n"
+ "\t\t\t\t\t\tset: oset ? function (v) {\n"
+-"\t\t\t\t\t\t\tif (isA(this, FP) &&\n"
+-"\t\t\t\t\t\t\t    controlsFirst(this, k) !== undefined)\n"
+-"\t\t\t\t\t\t\t\treturn;\n"
+ "\t\t\t\t\t\t\toset.call(this, v);\n"
+ "\t\t\t\t\t\t} : undefined });\n"
+ "\t\t\t\t} else return;\n"
+ "\t\t\t\twrapped[k] = true;\n"
+ "\t\t\t} catch (e) { /* */ }\n"
+ "\t\t}\n"
+-"\t\tReflect.ownKeys(FP).forEach(function (k) {\n"
+-"\t\t\tif (typeof k === 'string') wrapMember(FP, k);\n"
+-"\t\t});\n"
+-"\t\t/* the bridge puts some of the form's own IDL attributes\n"
+-"\t\t * (action, method, target, name) on the shared element\n"
+-"\t\t * prototype above FP, not on FP: wrap those where they\n"
+-"\t\t * live -- the isA guard keeps every other element's reads\n"
+-"\t\t * exactly as they were */\n"
+-"\t\t['name', 'action', 'method', 'enctype', 'encoding', 'target',\n"
+-"\t\t 'autocomplete', 'noValidate', 'acceptCharset', 'rel',\n"
+-"\t\t 'relList', 'elements', 'length'].forEach(function (k) {\n"
+-"\t\t\tif (wrapped[k]) return;\n"
+-"\t\t\tfor (var p = Object.getPrototypeOf(FP);\n"
+-"\t\t\t     p && p !== Object.prototype;\n"
+-"\t\t\t     p = Object.getPrototypeOf(p))\n"
+-"\t\t\t\tif (GOPD(p, k)) { wrapMember(p, k); break; }\n"
+-"\t\t});\n"
++"\t\t/* VitaBrowser patch 305: patch 297 wrapped the form's own\n"
++"\t\t * interface and a hand-listed set of IDL attributes living\n"
++"\t\t * on the shared prototype above it, but\n"
++"\t\t * [LegacyOverrideBuiltIns] shadows the WHOLE chain in\n"
++"\t\t * browsers -- a control named id, title, children, focus,\n"
++"\t\t * tagName or nodeType (HTMLElement / Element / Node\n"
++"\t\t * members) still read as the form's own values here.\n"
++"\t\t * Pinned against Firefox first: every one of those reads\n"
++"\t\t * as the control there, by name and by id. So wrap every\n"
++"\t\t * own member of every prototype from FP up to (but not\n"
++"\t\t * including) Object.prototype, the lowest occurrence of\n"
++"\t\t * each name deciding -- a member found lower is the one\n"
++"\t\t * reads resolve to, so a higher duplicate is never\n"
++"\t\t * wrapped. Object.prototype's members are deliberately\n"
++"\t\t * left alone: wrapping them would put a hop in front of\n"
++"\t\t * every object in the page, and a control named toString\n"
++"\t\t * keeps not shadowing (a recorded remainder, like 297's\n"
++"\t\t * scoping). A name whose lowest member is not\n"
++"\t\t * configurable cannot be wrapped and keeps not shadowing;\n"
++"\t\t * the isA guard keeps every other element's reads and\n"
++"\t\t * writes exactly as they were. */\n"
++"\t\tvar seen305 = {};\n"
++"\t\tfor (var chain = FP; chain && chain !== Object.prototype;\n"
++"\t\t     chain = Object.getPrototypeOf(chain))\n"
++"\t\t\tReflect.ownKeys(chain).forEach(function (k) {\n"
++"\t\t\t\tif (typeof k !== 'string' || seen305[k]) return;\n"
++"\t\t\t\tseen305[k] = true;\n"
++"\t\t\t\twrapMember(chain, k);\n"
++"\t\t\t});\n"
+ "\t\tabove(FP, function (form, k) {\n"
+ "\t\t\tif (IDX.test(k)) return controls(form)[+k];\n"
+ "\t\t\treturn k === '' ? null : formNamed(form, k);\n"

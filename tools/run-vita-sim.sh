@@ -316,6 +316,7 @@ NET-js-scratch-qsa http://127.0.0.1:$HP/JS-scratch-qsa.html
 NET-js-frame-xdoc http://127.0.0.1:$HP/JS-frame-xdoc.html
 NET-js-frame-document http://127.0.0.1:$HP/JS-frame-document.html
 NET-js-form-shadow http://127.0.0.1:$HP/JS-form-shadow.html
+NET-js-form-shadow-chain http://127.0.0.1:$HP/JS-form-shadow-chain.html
 NET-js-element-instanceof http://127.0.0.1:$HP/JS-element-instanceof.html
 NET-js-node-names http://127.0.0.1:$HP/JS-node-names.html
 NET-js-image-load http://127.0.0.1:$HP/JS-image-load.html
@@ -861,6 +862,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
 	 "js-scratch-qsa SCRATCHQSA 6" "js-frame-xdoc XDOC 4" "js-frame-document XDOC2 6" \
 	 "js-form-shadow FORMSHADOW 6" \
+	 "js-form-shadow-chain FSHADOW2 10" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \
 	 "js-image-load IMGLOAD 11" "js-canvas-2d CANVAS251 22" \
 	 "js-wasm WASM254 15" "js-frame-realm REALM 11" \
