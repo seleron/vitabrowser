@@ -5565,3 +5565,41 @@ plumbing only. Mutations should paint at least as promptly as before
 reconverts on pages with rapid timer-driven mutations (the floor still
 bounds them to ~1 per 600 ms).
 
+## Patch 313 (2026-10-20): attribute marks the local path can answer (doc 20 stage 2)
+
+**What:** The staged patch 310, landed with the two couplings its
+failed gates identified. Plain `setAttribute`/`removeAttribute` marks
+(no class/style) can now be answered by `html_reconvert_local` when
+the attribute cannot affect the rebuilt block's own style: no used
+stylesheet references the attribute name (`html_rl_sheet_refs_attr`
+scans used sheets' source for `[name...]` selectors and the
+value-dependent pseudo-classes), the attribute is not `id`, and it is
+not a presentational hint (or `href`) on a block box. Otherwise
+try_local declines by kind and the batch takes the full reconvert —
+before this patch every plain-attribute batch went full (or was
+dropped outright by the render decline).
+
+**The two couplings:** (1) the reconvert callback's render decline
+dropped pure-attribute batches before try_local ran, making the kind
+gate unreachable — it now consults the same sheet check and does not
+drop a batch whose attribute feeds style. (2) The patch-308 census
+prints at the next navigation reset, which split this page's causes
+across two gate windows during development; the flush site now also
+logs each committed full reconvert's cause synchronously
+(`LIFE BATCHCAUSE cause=...`), and the gate asserts on that. Batch
+separation (patch 312) is what keeps the gate page's attribute batch
+distinct from its load batch.
+
+**Gate page (new):** `JS-attr-local` — primes 10 divs by innerHTML
+(full reconvert, cause=local), then one timer task sets `data-x` on 9
+(local answers, no full reconvert) and `data-flag` on 1 (sheet has a
+`[data-flag]` rule: kind decline). Gate line: "JS-attr-local batch
+causes: kind=1 local=1".
+
+**Gate:** Full adapted gate exit 0.
+
+**On the device (run 39), in addition:** pages that set plain
+attributes from JS (frameworks toggling `data-*`, ARIA, `title`, ...)
+should repaint those elements without a full-page rebuild — visibly
+snappier attribute-driven updates; an attribute a stylesheet keys off
+must still update the element's style (the `[data-flag]` case).
