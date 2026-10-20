@@ -1,0 +1,692 @@
+# netsurf: answer non-class setAttribute/removeAttribute marks locally
+# when no stylesheet references the attribute (doc 20, stage 2 / T4)
+#
+# STATUS: SHELVED 2026-10-19/20 — implemented, builds clean, but NEVER
+# gate-verified (two unsuccessful gate runs, below). Nothing from this
+# patch is applied to the tree; it is not a regression risk to master.
+#
+# Design (doc 20 stage 2, first T4 kind by census order):
+# A SETATTRIBUTE / REMOVEATTRIBUTE mark for attribute `name` on a
+# BOX_BLOCK element is answered locally iff:
+#  - `name` is not `id` (always declines — id selectors are ubiquitous),
+#  - `name` is a presentational-hint attribute (21 names) or `href`,
+#    i.e. its only rendering effect is the element's own box paint, and
+#  - NO used stylesheet references `name`: html_rl_sheet_refs_attr scans
+#    all sheets textually for `[name]` in any selector position, plus the
+#    attribute-reading pseudo-classes (:link/:visited -> href,
+#    :enabled/:disabled -> disabled, :checked -> checked/selected).
+#    Backslash in a selector, an unreadable sheet, any doubt -> decline.
+# Equivalence argument: with no sheet selecting on `name` and no hint
+# effect beyond the element's own paint, style selection is unchanged and
+# the box-tree delta is exactly the element's own paint state — what the
+# full reconvert would have produced. Local answers are the same
+# per-mark semantics as patch 301 (order, defer-and-retry, two-decline).
+# Plumbing: attr_name rides the pending slot (+extras, freed in
+# slot_drop; merge identity includes name); macos9_js_mark_dom_dirty_attr
+# made public; try_local_one takes attr_name; 3 bridge call sites
+# (macsurf_qjs.c) updated to pass it.
+#
+# Gate page (preserved alongside as staging/310-attr-local.html, prefix
+# ATTRLCL): Phase A = 60 setAttribute on `data-x` (no sheet references
+# it) -> answered locally; Phase B = 1 setAttribute on `data-flag`
+# (a STATIC [data-flag] stylesheet rule) -> kind decline. The gate
+# asserted the cumulative LIFE FULLCAUSE line:
+#   total=2 over=0 nonode=0 kind=1 local=1 two=0 guard=0
+# (the page's own innerHTML batch accounts for local=1).
+# The adapted-script assertion (run-vita-sim-adapted.sh) was:
+#   acl=$(awk '/page [0-9]*\\\\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
+#   on && /page [0-9]*\\\\/[0-9]* [^ ]*: navigate/ {on=0}
+#   on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE FULLCAUSE' | tail -1)
+#   case "$acl" in *"total=2 over=0 nonode=0 kind=1 local=1 two=0 guard=0"*) ;;
+#   *) o2_bad="$o2_bad js-attr-local-census";; esac
+# with a NET-js-attr-local line in the page list. Re-add both with the page.
+#
+# Gate runs (both disclosed):
+#  1. FAILED: FULLCAUSE total=2 kind=0 local=1 two=1. Root cause was the
+#     PAGE, not the engine: Phase B's stylesheet was appended dynamically
+#     and the sheet was not registered when the scan ran. Fixed by moving
+#     the [data-flag] rule into static HTML.
+#  2. Never completed: stuck in the autotest phase >30 min, killed.
+#     Undiagnosed whether 310-related or a host issue.
+#
+# Blocker (PRE-EXISTING, not a 310 bug — the 307 tree behaves the same):
+# setAttribute marks recorded inside JS tasks (setTimeout callbacks) join
+# the lingering load batch and never get fresh batch separation; the
+# callback fires but the batch does not split. BATCHBURST (309) works only
+# because its textContent marks happen to align with flush windows. When
+# earlier batch marks decline first, the T4 kind census the ATTRLCL
+# assertion needs is unreachable on this page shape.
+#
+# Resume conditions (any one):
+#  - fix batch separation for marks recorded in JS tasks (batching
+#    infrastructure; judged out of leg scope 2026-10-19), or
+#  - find a page-driving pattern whose marks form fresh batches
+#    (a synchronous post-load burst was NOT tried), or
+#  - re-run on hardware, where flush pacing differs.
+# Then: re-apply this diff onto the stage309 tree (it applies against
+# upstream/netsurf paths), re-add the page + the adapted assertion, run
+# focused ATTRLCL, then the full adapted gate.
+#
+# Diff below: work/applytest (310 tree) vs work/stage309 (309 tree),
+# 2026-10-20. Debug instrumentation was removed before shelving.
+
+
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6629,6 +6629,258 @@
+ 	return false;
+ }
+ 
++/* ---- Patch 310 (doc 20 stage 2): the non-class attribute gate ----
++ *
++ * A SETATTRIBUTE / REMOVEATTRIBUTE mark names an attribute the local
++ * machinery never answered. The local path (html_reconvert_local_change)
++ * rebuilds the containing block's children from the DOM with fresh box
++ * construction and style selection, then re-lays out -- exactly what the
++ * full reconvert does to that subtree. So a non-class attribute change
++ * is answered locally iff NOTHING outside the rebuilt block can observe
++ * it. That is two checks:
++ *
++ * 1. No stylesheet can match on the attribute. Attribute selectors
++ *    ([name...], in any compound position, behind any namespace prefix,
++ *    inside :not()/:has()/:is()) and the attribute-reading pseudo-classes
++ *    this engine implements (:link/:visited read href, :enabled/:disabled
++ *    read disabled, :checked reads checked/selected; :lang() is stubbed
++ *    and never matches, scanned defensively anyway) are found by a
++ *    conservative textual scan in the html_rl_css_has_list_style_risk
++ *    idiom: comments and strings are skipped, and a backslash anywhere
++ *    else declines (it could be an escape hiding the name). The base,
++ *    quirks, adblock and user sheets are scanned too -- unlike the 186
++ *    cache, which starts at STYLESHEET_START: the base sheet carries
++ *    input[disabled], input[type=...], table[border] and a:link/:visited.
++ *    A sheet whose source cannot be read declines. `id` always declines:
++ *    `#` selectors are textually ambiguous with hex colours.
++ *    Anything the scan cannot prove absent is a decline, never a guess
++ *    (doc 20 constraint 1); over-declining only costs a full reconvert.
++ *
++ * 2. The element's own box, when it IS the rebuilt block, keeps its old
++ *    style: the rebuild re-cascades the block's children, not the block
++ *    itself. Presentational hints (hints.c -- keep the list below in sync
++ *    with it) map attributes onto the element's own style, and box->href
++ *    feeds the hover cursor, so a hinted attribute -- or href -- on a
++ *    block-level element declines. (Inline elements are rebuilt wholesale
++ *    as children of their block, so hints re-apply there.)
++ *
++ * Everything else an attribute change can do is reproduced by the local
++ * path by construction: box-construction reads (colspan/rowspan/src/
++ * value/...) are re-read from the DOM, paint-time reads (form control
++ * type, patch-218 numeric attributes) read the live DOM at repaint,
++ * interaction reads href/download live at click time, and custom
++ * elements' attributeChangedCallback runs synchronously inside
++ * setAttribute with its own marks (constraint 2: the DOM has committed).
++ */
++
++/* Presentational-hint attributes, from content/handlers/css/hints.c.
++ * Keep in sync with it: a new hinted attribute must be added here or a
++ * block-level change to it would keep a stale own-box style. */
++static const char *const html_rl_hint_attrs[] = {
++	"align", "background", "bgcolor", "border", "bordercolor",
++	"cellpadding", "cellspacing", "color", "cols", "height",
++	"hspace", "link", "nowrap", "rows", "size", "text", "type",
++	"valign", "vlink", "vspace", "width", NULL
++};
++
++/* Attribute-reading pseudo-classes, without the leading ':', per
++ * attribute name (see select.c node_is_link/node_is_disabled/
++ * node_is_checked; node_is_lang is stubbed). */
++static const char *const html_rl_pseudo_disabled[] =
++	{ "disabled", "enabled", NULL };
++static const char *const html_rl_pseudo_checked[] = { "checked", NULL };
++static const char *const html_rl_pseudo_href[] = { "link", "visited", NULL };
++static const char *const html_rl_pseudo_lang[] = { "lang(", NULL };
++static const char *const html_rl_pseudo_none[] = { NULL };
++
++static const char *const *html_rl_pseudos_for(const char *name)
++{
++	if (strcasecmp(name, "disabled") == 0)
++		return html_rl_pseudo_disabled;
++	if (strcasecmp(name, "checked") == 0 ||
++	    strcasecmp(name, "selected") == 0)
++		return html_rl_pseudo_checked;
++	if (strcasecmp(name, "href") == 0)
++		return html_rl_pseudo_href;
++	if (strcasecmp(name, "lang") == 0)
++		return html_rl_pseudo_lang;
++	return html_rl_pseudo_none;
++}
++
++static int html_rl310_cieq(const uint8_t *a, const char *b, size_t n)
++{
++	size_t k;
++	for (k = 0; k < n; k++) {
++		uint8_t ca = a[k], cb = (uint8_t)b[k];
++		if (ca >= 'A' && ca <= 'Z')
++			ca += (uint8_t)('a' - 'A');
++		if (cb >= 'A' && cb <= 'Z')
++			cb += (uint8_t)('a' - 'A');
++		if (ca != cb)
++			return 0;
++	}
++	return 1;
++}
++
++static int html_rl310_is_namech(uint8_t ch)
++{
++	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
++	    (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' ||
++	    ch >= 0x80;
++}
++
++static int html_rl310_is_ws(uint8_t ch)
++{
++	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
++	    ch == '\f';
++}
++
++/* True if one stylesheet's source can match on `name`. */
++static int html_rl_sheet_scan_attr(const uint8_t *st, size_t len,
++		const char *name, size_t namelen,
++		const char *const *pseudos)
++{
++	size_t i = 0;
++	int incomment = 0;
++	uint8_t quote = 0;
++	while (i < len) {
++		uint8_t ch = st[i];
++		if (incomment) {
++			if (ch == '*' && i + 1 < len && st[i + 1] == '/') {
++				incomment = 0;
++				i += 2;
++				continue;
++			}
++			i++;
++			continue;
++		}
++		if (quote != 0) {
++			if (ch == '\\' && i + 1 < len) {
++				i += 2;
++				continue;
++			}
++			if (ch == quote)
++				quote = 0;
++			i++;
++			continue;
++		}
++		if (ch == '/' && i + 1 < len && st[i + 1] == '*') {
++			incomment = 1;
++			i += 2;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			quote = ch;
++			i++;
++			continue;
++		}
++		/* An escape outside a string could hide the name inside
++		 * an identifier ([data-\78 ]): decline, don't guess. */
++		if (ch == '\\')
++			return 1;
++		if (ch == '[') {
++			size_t j = i + 1;
++			while (j < len && html_rl310_is_ws(st[j]))
++				j++;
++			/* namespace prefix: `*|` or `ident|` */
++			if (j < len && st[j] == '*') {
++				if (j + 1 < len && st[j + 1] == '|')
++					j += 2;
++			} else {
++				size_t k = j;
++				while (k < len && html_rl310_is_namech(st[k]))
++					k++;
++				if (k > j && k < len && st[k] == '|')
++					j = k + 1;
++			}
++			while (j < len && html_rl310_is_ws(st[j]))
++				j++;
++			if (j + namelen <= len &&
++			    html_rl310_cieq(st + j, name, namelen) &&
++			    (j + namelen == len ||
++			     !html_rl310_is_namech(st[j + namelen])))
++				return 1;
++			i++;
++			continue;
++		}
++		if (ch == ':') {
++			int p;
++			for (p = 0; pseudos[p] != NULL; p++) {
++				size_t tl = strlen(pseudos[p]);
++				if (i + 1 + tl <= len &&
++				    html_rl310_cieq(st + i + 1, pseudos[p],
++					    tl) &&
++				    (i + 1 + tl == len ||
++				     !html_rl310_is_namech(st[i + 1 + tl])))
++					return 1;
++			}
++			i++;
++			continue;
++		}
++		i++;
++	}
++	return 0;
++}
++
++/* True if any used stylesheet can match on attribute `name`. */
++static int html_rl_sheet_refs_attr(html_content *c, const char *name)
++{
++	unsigned int i;
++	size_t namelen = strlen(name);
++	const char *const *pseudos = html_rl_pseudos_for(name);
++	for (i = 0; i < c->stylesheet_count; i++) {
++		const uint8_t *data;
++		size_t size = 0;
++		if (c->stylesheets[i].sheet == NULL ||
++		    c->stylesheets[i].unused)
++			continue;
++		data = content_get_source_data(c->stylesheets[i].sheet,
++				&size);
++		/* A sheet we cannot read might reference it. */
++		if (data == NULL || size == 0)
++			return 1;
++		if (html_rl_sheet_scan_attr(data, size, name, namelen,
++				pseudos))
++			return 1;
++	}
++	return 0;
++}
++
++static int html_rl_attr_is_hinted(const char *name)
++{
++	const char *const *hp;
++	for (hp = html_rl_hint_attrs; *hp != NULL; hp++)
++		if (strcasecmp(name, *hp) == 0)
++			return 1;
++	return 0;
++}
++
++/* Patch 310 - may a SETATTRIBUTE / REMOVEATTRIBUTE mark for `attr_name`
++ * on `vnode` be answered by html_reconvert_local? 1 yes, 0 decline (the
++ * caller takes the full reconvert, exactly as before this patch). See
++ * the block comment above for the equivalence argument. */
++int html_rl_attr_local_ok(struct content *base_c, void *vnode,
++		const char *attr_name)
++{
++	html_content *c = (html_content *)base_c;
++	struct box *b;
++	if (c == NULL || vnode == NULL || attr_name == NULL ||
++	    attr_name[0] == '\0')
++		return 0;
++	/* `#` selectors are textually ambiguous with hex colours. */
++	if (strcasecmp(attr_name, "id") == 0)
++		return 0;
++	/* The element's own box is the rebuilt block: its own style is
++	 * not re-selected, so a hinted attribute -- or href, which feeds
++	 * the hover cursor via box->href -- would go stale. */
++	b = box_for_node((dom_node *)vnode);
++	if (b != NULL && b->type == BOX_BLOCK &&
++	    (html_rl_attr_is_hinted(attr_name) ||
++	     strcasecmp(attr_name, "href") == 0))
++		return 0;
++	return !html_rl_sheet_refs_attr(c, attr_name);
++}
++
+ /* Patch 192: true if a used document stylesheet uses sibling-position
+  * structural pseudo-classes or CSS counters, whose following-sibling
+  * styles the local block insert/remove path would leave stale. */
+
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -156,6 +156,9 @@
+ 	 * burst a->b->c compares a against c. Freed when the slot is dropped
+ 	 * or cleared. */
+ 	char           *old_class;
++	/* Patch 310 - the primary mark's attribute name for SETATTRIBUTE /
++	 * REMOVEATTRIBUTE (owned, NULL otherwise). See extra.attr_name. */
++	char           *attr_name;
+ 	/* Patch 301 - further precise marks (distinct node/kind) recorded
+ 	 * after the first, so a burst that touches several nodes -- the
+ 	 * common script render: text here, a class there -- can still be
+@@ -170,6 +173,12 @@
+ 		void *node;
+ 		int   kind;
+ 		char *old_class;
++		/* Patch 310 - the attribute name for SETATTRIBUTE /
++		 * REMOVEATTRIBUTE marks (owned, NULL otherwise), so the
++		 * local path can decide whether any sheet can match on
++		 * it. Distinct names are distinct marks for merging;
++		 * freed by the same slot_drop_node path as old_class. */
++		char *attr_name;
+ 	} extra[RECONVERT_MAX_EXTRA];
+ 	int             extra_n;
+ 	int             coarse;
+@@ -357,6 +366,10 @@
+ 	 * new generation, and a clear consumes the record. */
+ 	free(g_pending[i].old_class);
+ 	g_pending[i].old_class = NULL;
++	/* Patch 310 - the attribute name dies with the slot's precision,
++	 * exactly like old_class above. */
++	free(g_pending[i].attr_name);
++	g_pending[i].attr_name = NULL;
+ 	g_pending[i].kind = MACOS9_DOMMUT_UNKNOWN;
+ 	/* Patch 301 - the extra marks' references and class values die
+ 	 * with the primary's, on every path that drops precision. */
+@@ -368,6 +381,8 @@
+ 		}
+ 		free(g_pending[i].extra[j].old_class);
+ 		g_pending[i].extra[j].old_class = NULL;
++		free(g_pending[i].extra[j].attr_name);
++		g_pending[i].extra[j].attr_name = NULL;
+ 	}
+ }
+ 
+@@ -393,9 +408,34 @@
+  * a second DISTINCT mutation collapses the slot to `multi` and forgets the node,
+  * so a consumer can only ever be MORE conservative than the truth, never less.
+  * Behaviour is unchanged today - nothing reads these fields yet. */
++/* Patch 310 - attribute-name identity for mark merging. Two marks on
++ * the same node and kind but different attribute names are different
++ * marks (they must not merge: the local path decides per name). NULL
++ * is a name like any other; comparison is exact -- over-precision is
++ * safe, it only makes smaller batches. */
++static int
++macos9_reconvert_attr_same(const char *a, const char *b)
++{
++	if (a == NULL || b == NULL)
++		return a == b;
++	return strcmp(a, b) == 0;
++}
++
++/* Patch 310 - owned copy of an attribute mark's name, or NULL. Only
++ * SETATTRIBUTE / REMOVEATTRIBUTE marks carry one. */
++static char *
++macos9_reconvert_attr_dup(int kind, const char *attr_name)
++{
++	if ((kind == MACOS9_DOMMUT_SETATTRIBUTE ||
++	     kind == MACOS9_DOMMUT_REMOVEATTRIBUTE) &&
++	    attr_name != NULL && attr_name[0] != '\0')
++		return strdup(attr_name);
++	return NULL;
++}
++
+ static void
+-macos9_reconvert_pending_add2(struct content *c, void *node, int kind,
+-		const char *old_class)
++macos9_reconvert_pending_add3(struct content *c, void *node, int kind,
++		const char *old_class, const char *attr_name)
+ {
+ 	int i;
+ 	int freeslot = -1;
+@@ -420,6 +460,9 @@
+ 				/* Patch 186 - new generation, new old value. */
+ 				g_pending[i].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
+ 					old_class != NULL) ? strdup(old_class) : NULL;
++				/* Patch 310 - new generation, new attribute name. */
++				g_pending[i].attr_name =
++					macos9_reconvert_attr_dup(kind, attr_name);
+ 				memset(&prov, 0, sizeof(prov));
+ 				prov.nav = ms_diag_cur_nav();
+ 				html_content_get_diag_identity(c, &prov.doc, &prov.frame);
+@@ -440,13 +483,18 @@
+ 
+ 			/* Merge this mutation into what the slot already holds.
+ 			 * Same node AND same kind = the same logical edit
+-			 * repeating (a textContent loop), so stay precise. */
++			 * repeating (a textContent loop), so stay precise.
++			 * Patch 310 - for attribute marks the name joins the
++			 * identity: data-a then data-b on one node are two
++			 * marks, not one repeating. */
+ 			if (g_pending[i].coarse) {
+ 				return;		/* precision already lost */
+ 			}
+ 			if (node != NULL && g_pending[i].node != NULL &&
+ 			    g_pending[i].node == node &&
+-			    g_pending[i].kind == kind) {
++			    g_pending[i].kind == kind &&
++			    macos9_reconvert_attr_same(g_pending[i].attr_name,
++				    attr_name)) {
+ 				return;		/* the same mark repeating */
+ 			}
+ 			/* Patch 301 - a distinct mark no longer collapses the
+@@ -464,7 +512,10 @@
+ 				int j;
+ 				for (j = 0; j < g_pending[i].extra_n; j++) {
+ 					if (g_pending[i].extra[j].node == node &&
+-					    g_pending[i].extra[j].kind == kind)
++					    g_pending[i].extra[j].kind == kind &&
++					    macos9_reconvert_attr_same(
++						    g_pending[i].extra[j].attr_name,
++						    attr_name))
+ 						return;	/* already recorded */
+ 				}
+ 				if (g_pending[i].extra_n < RECONVERT_MAX_EXTRA) {
+@@ -474,6 +525,8 @@
+ 					e->kind = kind;
+ 					e->old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
+ 						old_class != NULL) ? strdup(old_class) : NULL;
++					e->attr_name = macos9_reconvert_attr_dup(kind,
++						attr_name);
+ 					g_pending[i].multi = 1;
+ 					return;
+ 				}
+@@ -516,6 +569,9 @@
+ 	/* Patch 186 - copy the pre-mutation class value, if given. */
+ 	g_pending[freeslot].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
+ 		old_class != NULL) ? strdup(old_class) : NULL;
++	/* Patch 310 - copy the attribute name, if an attribute mark. */
++	g_pending[freeslot].attr_name =
++		macos9_reconvert_attr_dup(kind, attr_name);
+ 	{
+ 		struct ms_diag_provenance prov;
+ 		memset(&prov, 0, sizeof(prov));
+@@ -871,11 +927,17 @@
+  * html_reconvert_local, which rebuilds and lays out just the block that
+  * holds it. 1 = done (the slot is answered), 0 = do the full rebuild. */
+ static int macos9_reconvert_try_local_one(struct content *c, void *node,
+-		int kind, const char *old_class)
++		int kind, const char *old_class, const char *attr_name)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
+ 	extern int html_reconvert_local_class(struct content *c, void *node,
+ 			const char *old_class);
++	/* Patch 310 (doc 20 stage 2) - the non-class attribute gate:
++	 * 1 while no sheet can match on the attribute and the element's
++	 * own box needs no attribute-fed style. html.c owns the check;
++	 * anything it refuses declines exactly as before. */
++	extern int html_rl_attr_local_ok(struct content *c, void *node,
++			const char *attr_name);
+ 
+ 	/* a class change on an inline-level element: its block (patch 173).
+ 	 * Patch 186 passes the pre-mutation class value for the precise
+@@ -892,6 +954,16 @@
+ 	case MACOS9_DOMMUT_INSERTBEFORE:
+ 	case MACOS9_DOMMUT_CHARDATA:
+ 		break;
++	case MACOS9_DOMMUT_SETATTRIBUTE:
++	case MACOS9_DOMMUT_REMOVEATTRIBUTE:
++		/* A sheet (or the element's own hinted box) can see the
++		 * attribute: only the full rebuild is sound, exactly as
++		 * before this patch. Otherwise the local path below. */
++		if (!html_rl_attr_local_ok(c, node, attr_name)) {
++			g_one_fail_kind = 1;
++			return 0;
++		}
++		break;
+ 	default:
+ 		g_one_fail_kind = 1;
+ 		return 0;
+@@ -927,7 +999,8 @@
+ 				    * 5000-paragraph full reconvert. */
+ 	t0 = macos9_micros();
+ 	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
+-			g_pending[i].kind, g_pending[i].old_class)) {
++			g_pending[i].kind, g_pending[i].old_class,
++			g_pending[i].attr_name)) {
+ 		g_fc_reason = g_one_fail_kind ? 1 : 2;
+ 		return 0;
+ 	}
+@@ -954,7 +1027,8 @@
+ 		}
+ 		if (macos9_reconvert_try_local_one(c, g_pending[i].extra[j].node,
+ 				g_pending[i].extra[j].kind,
+-				g_pending[i].extra[j].old_class))
++				g_pending[i].extra[j].old_class,
++				g_pending[i].extra[j].attr_name))
+ 			continue;
+ 		/* Patch 308 - name the decline for the fullcause census.
+ 		 * A mark that declines while another is deferred is the
+@@ -976,7 +1050,8 @@
+ 		}
+ 		if (!macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
+ 				g_pending[i].extra[deferred].kind,
+-				g_pending[i].extra[deferred].old_class)) {
++				g_pending[i].extra[deferred].old_class,
++				g_pending[i].extra[deferred].attr_name)) {
+ 			g_fc_reason = g_one_fail_kind ? 1 : 2;
+ 			return 0;
+ 		}
+@@ -1448,9 +1523,9 @@
+ 	macos9_js_mark_dom_dirty_node(c, NULL, MACOS9_DOMMUT_UNKNOWN);
+ }
+ 
+-void
+-macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
+-		const char *old_class)
++static void
++macos9_js_mark_dom_dirty_node3(struct content *c, void *node, int kind,
++		const char *old_class, const char *attr_name)
+ {
+ 	/* fixes489 - master switch. Still here as an emergency global
+ 	 * kill (macsurf_js_set_reconvert_enabled(0)); nothing currently calls
+@@ -1534,7 +1609,7 @@
+ 	if (g_first_mark_tick == 0)
+ 		g_first_mark_tick = (unsigned long) TickCount();
+ 
+-	macos9_reconvert_pending_add2(c, node, kind, old_class);
++	macos9_reconvert_pending_add3(c, node, kind, old_class, attr_name);
+ 	if (macsurf_js_page_execution_active())
+ 		macsurf_js_note_dom_mutation();
+ 	/* fixes1148 - DON'T reschedule if already queued.
+@@ -1557,6 +1632,23 @@
+ 		macos9_reconvert_schedule_pending();
+ }
+ 
++/* Patch 186 - variant carrying the pre-mutation class value. */
++void
++macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
++		const char *old_class)
++{
++	macos9_js_mark_dom_dirty_node3(c, node, kind, old_class, NULL);
++}
++
++/* Patch 310 - variant carrying the attribute name for SETATTRIBUTE /
++ * REMOVEATTRIBUTE marks. The name is copied; the caller keeps theirs. */
++void
++macos9_js_mark_dom_dirty_attr(struct content *c, void *node, int kind,
++		const char *attr_name)
++{
++	macos9_js_mark_dom_dirty_node3(c, node, kind, NULL, attr_name);
++}
++
+ /* Patch 186 - legacy entry point without the old class value. */
+ void
+ macos9_js_mark_dom_dirty_node(struct content *c, void *node, int kind)
+
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.h
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.h
+@@ -84,6 +84,14 @@
+ void macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
+ 		const char *old_class);
+ 
++/* Patch 310 - variant carrying the attribute NAME for SETATTRIBUTE /
++ * REMOVEATTRIBUTE marks (NULL or empty if unknown). Stored in the
++ * pending record so the local-rebuild path can decide whether any
++ * sheet can match on the attribute; the caller retains ownership, it
++ * is copied. Marks without a name decline exactly as before. */
++void macos9_js_mark_dom_dirty_attr(struct content *c, void *node, int kind,
++		const char *attr_name);
++
+ /* Legacy entry point  -  equivalent to _node(c, NULL, MACOS9_DOMMUT_UNKNOWN),
+  * i.e. "something changed, no idea what". Kept so any caller that cannot name
+  * the node still works, and always yields the full rebuild. */
+
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4825,8 +4825,8 @@
+ /* A DOM mutation belongs to the realm that invoked the binding.  Keeping the
+  * lookup in one helper prevents a future mutation surface from accidentally
+  * reviving a process-global reconvert target. */
+-static void qjs_mark_dom_dirty2(JSContext *ctx, void *node, int kind,
+-		const char *old_class)
++static void qjs_mark_dom_dirty3(JSContext *ctx, void *node, int kind,
++		const char *old_class, const char *attr_name)
+ {
+ 	struct content *content = qjs_get_content_for_ctx(ctx);
+ 	if (content == NULL)
+@@ -4849,7 +4849,16 @@
+ 		if (!in_doc)
+ 			return;
+ 	}
+-	macos9_js_mark_dom_dirty_node2(content, node, kind, old_class);
++	if (attr_name != NULL)
++		macos9_js_mark_dom_dirty_attr(content, node, kind, attr_name);
++	else
++		macos9_js_mark_dom_dirty_node2(content, node, kind, old_class);
++}
++
++static void qjs_mark_dom_dirty2(JSContext *ctx, void *node, int kind,
++		const char *old_class)
++{
++	qjs_mark_dom_dirty3(ctx, node, kind, old_class, NULL);
+ }
+ 
+ /* Patch 186 - legacy entry point without the old class value. */
+@@ -4858,6 +4867,15 @@
+ 	qjs_mark_dom_dirty2(ctx, node, kind, NULL);
+ }
+ 
++/* Patch 310 - attribute-name variant for SETATTRIBUTE / REMOVEATTRIBUTE
++ * marks (doc 20 stage 2). Goes through the same in-document check as
++ * the other variants; the name is copied by the reconvert layer. */
++static void qjs_mark_dom_dirty_attr(JSContext *ctx, void *node, int kind,
++		const char *attr_name)
++{
++	qjs_mark_dom_dirty3(ctx, node, kind, NULL, attr_name);
++}
++
+ /* ---- QuickJS class for element wrappers ---- */
+ static JSClassID s_el_class_id;
+ 
+@@ -6086,6 +6104,11 @@
+ 			qjs_mark_dom_dirty2(ctx, (void *) el, attr_kind,
+ 				old_ds != NULL ? dom_string_data(old_ds) :
+ 				(gerr == DOM_NO_ERR ? "" : NULL));
++		else if (attr_kind == MACOS9_DOMMUT_SETATTRIBUTE)
++			/* Patch 310 - carry the name for the local-answer
++			 * gate (doc 20 stage 2). */
++			qjs_mark_dom_dirty_attr(ctx, (void *) el, attr_kind,
++				name_cstr);
+ 		else
+ 			qjs_mark_dom_dirty(ctx, (void *) el, attr_kind);
+ 	}
+@@ -7714,6 +7737,10 @@
+ 					old_ds != NULL ?
+ 						dom_string_data(old_ds) :
+ 						(gerr == DOM_NO_ERR ? "" : NULL));
++		else if (attr_kind == MACOS9_DOMMUT_SETATTRIBUTE)
++			/* Patch 310 - as above, through the child realm. */
++			qjs_mark_dom_dirty_attr(st->bind->child->ctx,
++					(void *)st->node, attr_kind, name_cstr);
+ 		else
+ 			qjs_mark_dom_dirty(st->bind->child->ctx,
+ 					(void *)st->node, attr_kind);
+@@ -7861,6 +7888,11 @@
+ 			qjs_mark_dom_dirty2(ctx, (void *) el, rm_kind,
+ 				old_ds != NULL ? dom_string_data(old_ds) :
+ 				(gerr == DOM_NO_ERR ? "" : NULL));
++		else if (rm_kind == MACOS9_DOMMUT_REMOVEATTRIBUTE)
++			/* Patch 310 - carry the name for the local-answer
++			 * gate (doc 20 stage 2). */
++			qjs_mark_dom_dirty_attr(ctx, (void *) el, rm_kind,
++				name_cstr);
+ 		else
+ 			qjs_mark_dom_dirty(ctx, (void *) el, rm_kind);
+ 		macsurf_dom_string_unref(name_ds);
