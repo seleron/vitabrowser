@@ -5603,3 +5603,64 @@ attributes from JS (frameworks toggling `data-*`, ARIA, `title`, ...)
 should repaint those elements without a full-page rebuild — visibly
 snappier attribute-driven updates; an attribute a stylesheet keys off
 must still update the element's style (the `[data-flag]` case).
+
+## Patch 314 (2026-10-20): borders paint at the composed group opacity
+
+**What:** Patch 311's recorded remainder, border half. Two breaks
+kept borders solid at partial group opacity: `redraw_border.c`
+stamped the border plot styles' opacity from the border colour's
+alpha byte only (patch 100), never the composed group opacity; and
+the vita plotter honoured a style's opacity bucket only on the geom
+fill path, so border trapezoids (polygon op), dashed/dotted borders
+(line op) and rectangle outlines drew solid even when the style
+carried alpha. Now `html_redraw_border_plot` folds the composed
+group opacity (`html_redraw_group_opacity()`, the patch-149
+composition in redraw.c) into the border colour's alpha — colour
+alpha × group, the same product fills and text use — and the vita
+line/polygon/rectangle-outline paths draw at the style's bucket,
+tracing `OPAQUE <bucket>` only when non-solid (solid pages' dumps
+byte-identical; replay honours the LINE suffix). A side effect,
+intended: translucent border *colours* (patch 100) now blend on the
+line and polygon paths too, not only where a border happened to
+travel as a geom RECT fill.
+
+**Gate:** `CSS-opacity-group` gains four border boxes (solid,
+double, dashed, and an `rgba(0,0,0,0.5)` border, each inside and
+outside `opacity:.5`). Focused proof: border pixels 0 → 127 at
+half opacity on every path; the alpha border reads bucket 2 /
+pixel 127 standalone and bucket 1 / pixel 191 inside the group.
+Full adapted gate exit 0; the CSS-opacity line asserts half-border
+RECT 2/2, solid-border RECT 2, double-border POLYGON 8/16,
+dashed-border LINE 4/8, alpha-border OPAQUE 2/1 2/2. Restage: 401
+applied / 0 failed; all 6 changed files byte-identical.
+
+**Still open (recorded in the patch header):** images at partial
+opacity — not bounded. The bitmap plot op has no opacity channel,
+the composed group opacity never reaches the image content
+handlers, and vita2d has no tint-scale entry point in the stub/sim
+whose device-side existence could be verified. Needs an op-channel
+design first. The disc/arc ops and the SVG path filler also still
+draw solid regardless of style opacity (same class).
+
+**On the device (run 39), in addition:** elements at partial
+opacity (cards, overlays, faded panels) should show their borders
+faded with their contents, not full-strength; translucent border
+colours (thin `rgba(0,0,0,.1)` dividers) should blend on every
+border style, including dashed and double.
+
+## Gate script repair (2026-10-20, tools commit 5760198)
+
+The committed `tools/run-vita-sim.sh` was missing patch 309's
+`NET-js-batch-burst` nettest line and its census assertion — they
+existed only in the local adapted mirror, so the on-device gate did
+not check the burst census. Both are now ported (the batch-burst
+census asserts `total=2 over=0 nonode=0 kind=0 local=1 two=0
+guard=1`); a same-class sweep confirmed patch 313's attr-local line
+and census were already present in both scripts. Verified by a full
+adapted gate run (exit-clean; one earlier run missed the BLOCKSIB
+summary under concurrent host load and is disclosed in the session
+log — the clean re-run has BLOCKSIB 3/3).
+
+**Note on verification:** no vitaSDK on the build VM, so no Vita
+cross-build ran for patches 311–314 or this repair; device
+verification stays with run 39.
