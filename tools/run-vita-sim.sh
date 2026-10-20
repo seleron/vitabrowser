@@ -630,7 +630,21 @@ op_half_op2=$(grep -c 'STR HALFMARK OPAQUE 2$' "$op" 2>/dev/null || true)
 op_outer_op3=$(grep -c 'STR OUTERMARK OPAQUE 3$' "$op" 2>/dev/null || true)
 op_nested_op1=$(grep -c 'STR NESTEDMARK OPAQUE 1$' "$op" 2>/dev/null || true)
 op_shown_opaque=$(grep -c 'STR SHOWNMARK.*OPAQUE' "$op" 2>/dev/null || true)
-echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0)"
+# Patch 314: partial group opacity reaches borders -- RECT sides of the
+# 120-wide solid border (120x6 top/bottom, 6x32 sides) carry OPAQUE 2
+# inside .half and no token outside; the double border's 8 POLYGONs and
+# the dashed border's 4 LINEs likewise; the rgba(0,0,0,0.5) border is
+# OPAQUE 2 standalone (colour alpha) and OPAQUE 1 inside .half (folded).
+op_brect_h=$(awk '/PLOT RECT/ { if ($8 - $4 == 120 && $10 - $6 == 6 && /OPAQUE 2/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_brect_s=$(awk '/PLOT RECT/ { if ($8 - $4 == 6 && $10 - $6 == 32 && /OPAQUE 2/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_brect_ctl=$(awk '/PLOT RECT/ { if ($8 - $4 == 120 && $10 - $6 == 6 && !/OPAQUE/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_bdbl_op2=$(grep -c 'PLOT POLYGON.*OPAQUE 2' "$op" 2>/dev/null || true)
+op_bdbl_all=$(grep -c 'PLOT POLYGON' "$op" 2>/dev/null || true)
+op_bdash_op2=$(grep -c 'PLOT LINE.*OPAQUE 2' "$op" 2>/dev/null || true)
+op_bdash_all=$(grep -c 'PLOT LINE' "$op" 2>/dev/null || true)
+op_balpha_op2=$(awk '/PLOT RECT/ { if ($8 - $4 == 100 && $10 - $6 == 6 && /OPAQUE 2/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_balpha_op1=$(awk '/PLOT RECT/ { if ($8 - $4 == 100 && $10 - $6 == 6 && /OPAQUE 1/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0), half-border RECT ${op_brect_h:-?}/${op_brect_s:-?} (2/2), solid-border RECT ${op_brect_ctl:-?} (2), double-border POLYGON ${op_bdbl_op2:-?}/${op_bdbl_all:-?} (8/16), dashed-border LINE ${op_bdash_op2:-?}/${op_bdash_all:-?} (4/8), alpha-border OPAQUE 2/1 ${op_balpha_op2:-?}/${op_balpha_op1:-?} (2/2)"
 ifp=$(ls "$R"/*NET-js-interfaces.plot 2>/dev/null | head -1)
 ifr=$(sed -n 's/.*STR \(IFACES: [0-9]*\/[0-9]* passed\).*/\1/p' "$ifp" 2>/dev/null | head -1)
 echo "  JS-interfaces: ${ifr:-no summary}"
@@ -1242,7 +1256,12 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
 	[ "${op_ldbox:-0}" -ge 1 ] && [ "${op_half_op2:-0}" -eq 1 ] && \
 	[ "${op_outer_op3:-0}" -eq 1 ] && [ "${op_nested_op1:-0}" -eq 1 ] && \
-	[ "${op_shown_opaque:-1}" -eq 0 ] || fail "event order / inline-grid / group opacity"
+	[ "${op_shown_opaque:-1}" -eq 0 ] && \
+	[ "${op_brect_h:-0}" -eq 2 ] && [ "${op_brect_s:-0}" -eq 2 ] && \
+	[ "${op_brect_ctl:-0}" -eq 2 ] && \
+	[ "${op_bdbl_op2:-0}" -eq 8 ] && [ "${op_bdbl_all:-0}" -eq 16 ] && \
+	[ "${op_bdash_op2:-0}" -eq 4 ] && [ "${op_bdash_all:-0}" -eq 8 ] && \
+	[ "${op_balpha_op2:-0}" -eq 2 ] && [ "${op_balpha_op1:-0}" -eq 2 ] || fail "event order / inline-grid / group opacity"
 
 # Script-made frames (Patch 143) and timer chains (Patch 141): a same-
 # origin or blank frame a script makes fires load and has a same-realm

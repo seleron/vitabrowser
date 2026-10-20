@@ -1,0 +1,338 @@
+# netsurf: borders paint at the composed group opacity (patch 314)
+# Generated 2026-10-20
+# Base: seleron/vitabrowser (patch stack through 313)
+#
+# Doc 22 WS-A probe (a) / patch 311's recorded remainder: at partial
+# group opacity, background fills (patch 149) and text (patch 311)
+# faded, but borders painted solid -- an element at opacity .5 showed
+# a full-strength frame around faded contents. Two breaks caused it:
+# redraw_border.c set the border plot styles' opacity from the border
+# colour's alpha byte only (patch 100), never the composed group
+# opacity; and the vita plotter honoured a style's opacity bucket only
+# on the geom fill path, so border trapezoids (polygon op), dashed and
+# dotted borders (line op) and rectangle outlines drew solid even when
+# the style carried alpha.
+#
+#  - redraw.c exports html_redraw_group_opacity(), the composed
+#    g_group_opacity html_redraw_box maintains (the box's own opacity
+#    multiplied by its ancestors', patch 149 composition, including
+#    its dedup-by-shared-style semantics -- borders now match fills
+#    and text exactly).
+#  - html_redraw_border_plot folds that value into the border
+#    colour's alpha before the plot styles are stamped, so every
+#    border the core paints (block, inline, and fieldset borders all
+#    pass through it; every border style) composes colour alpha x
+#    group opacity. Folding ahead of the alpha == 0 early return also
+#    drops an opacity: 0 subtree's borders entirely, as its fills and
+#    text already vanish.
+#  - the vita plotter takes the style's opacity bucket on the paths
+#    borders travel: vita_plot_line_bucket() (the solid vita_plot_line
+#    keeps its signature for chrome/replay callers), the polygon op's
+#    fan fill and polyline stroke, and the rectangle op's outline
+#    rects (its geom fill already bucketed). LINE and POLYGON traces
+#    append " OPAQUE <bucket>" only when non-solid, so solid pages'
+#    dumps stay byte-identical; replay.c honours the LINE suffix the
+#    way patch 311 taught it for TEXT (POLYGON dumps are counts-only
+#    there and tolerate the suffix).
+#
+# Side effect, intended: a translucent border COLOUR (patch 100, e.g.
+# Tailwind's rgba(0,0,0,.1) dividers) previously blended only where
+# the border happened to travel as a geom RECT fill; it now blends on
+# the line and polygon paths too, as Firefox paints it.
+#
+# Proof (focused, sim): a 6px solid black border inside opacity:.5 --
+# pre-fix RECT sides carry no token and snapshot pixels read 0,0,0;
+# post-fix the sides carry OPAQUE 2 and read 127,127,127. Mixed-width
+# borders (RECT decomposition) and dashed borders (LINE OPAQUE 2)
+# read 127 on their strokes; a 9px double border paints 8 POLYGON
+# OPAQUE 2 and reads 127 on its bands (controls token-free, solid).
+# Composition: rgba(0,0,0,0.5) border standalone = OPAQUE 2 / pixel
+# 127; the same border inside opacity:.5 = OPAQUE 1 / pixel 191 --
+# colour alpha x group, exactly. Gate: CSS-opacity-group gains the
+# four border boxes; the gate script asserts the counts above.
+#
+# Scope notes (recorded, not changed here):
+#  - Images at partial opacity still paint opaque -- NOT bounded:
+#    the bitmap plot op carries no opacity channel (its flags encode
+#    blend mode only), the composed group opacity never reaches the
+#    four image content handlers or the background-image call site
+#    (they receive content + redraw_data, not the painting box), and
+#    vita2d offers no tint-scale entry point in the stub/sim for a
+#    texture drawn at alpha -- the device-side libvita2d entry cannot
+#    be verified without vitaSDK. Closing images needs an op-channel
+#    design first, like item 7 needed doc 19.
+#  - The disc/arc ops and the SVG path filler likewise still draw at
+#    VITA_BUCKET_SOLID regardless of the style's opacity (radio
+#    buttons, list discs, SVG icons inside a group) -- same class,
+#    recorded here rather than silently widening this patch.
+#
+# Simulator only; the vita cross-build was not run (no vitaSDK on
+# this VM). Device expectation is in Doc 10.
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -4845,6 +4845,16 @@
+ 	}
+ }
+ 
++/* VitaBrowser patch 314: the composed group opacity for the box whose
++ * subtree is being painted (its own opacity multiplied by its
++ * ancestors', composed by html_redraw_box below). Background fills and
++ * (patch 311) text read the statics directly inside this file;
++ * redraw_border.c folds this value into border alpha. */
++plot_style_fixed html_redraw_group_opacity(void)
++{
++	return g_group_opacity;
++}
++
+ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -28,6 +28,7 @@
+ 
+ #include "utils/errors.h"
+ #include "netsurf/types.h"
++#include "netsurf/plot_style.h"
+ #include "content/content_protected.h"
+ #include "content/handlers/css/utils.h"
+ 
+@@ -380,6 +381,10 @@
+ 		int p_width, int p_height, const struct rect *clip, float scale,
+ 		const struct redraw_context *ctx);
+ 
++/* VitaBrowser patch 314: composed group opacity of the box subtree
++ * currently being painted (in html/redraw.c). */
++plot_style_fixed html_redraw_group_opacity(void);
++
+ 
+ bool html_redraw_inline_borders(struct box *box, struct rect b,
+ 		const struct rect *clip, float scale, bool first, bool last,
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -210,6 +210,23 @@
+ 	alpha = html_redraw_border_cur_alpha;
+ 	html_redraw_border_cur_alpha = 255;
+ 
++	{
++		/* VitaBrowser patch 314: fold the composed group opacity
++		 * (the element's own opacity multiplied down the tree --
++		 * the same value background fills compose in redraw.c and
++		 * text composes since patch 311) into the border colour's
++		 * alpha, so a border inside an opacity group fades with
++		 * everything else the element paints instead of staying
++		 * solid. Folding before the alpha == 0 early return below
++		 * also drops borders of an opacity: 0 subtree entirely. */
++		plot_style_fixed group = html_redraw_group_opacity();
++
++		if (group < (plot_style_fixed)PLOT_STYLE_SCALE)
++			alpha = (unsigned int)(((uint64_t)alpha *
++						(unsigned int)group) /
++					PLOT_STYLE_SCALE);
++	}
++
+ 	if (c == NS_TRANSPARENT || alpha == 0) {
+ 		return res;
+ 	}
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -292,10 +292,17 @@
+ 	vita_plot_fan(xy, 4, vita_plot_rgba(c, bucket));
+ }
+ 
++/* VitaBrowser patch 314: the bucket-carrying line draw. Border lines
++ * (dashed/dotted styles, polygon strokes) arrive with the plot style's
++ * opacity -- the border colour's alpha folded with the composed group
++ * opacity in redraw_border.c -- and must blend like fills and text do.
++ * vita_plot_line below keeps the historical solid behaviour for its
++ * other callers (chrome, replay of untokenised dumps). */
+ /* exported interface documented in vita/plot.h */
+-void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c)
++void vita_plot_line_bucket(int x0, int y0, int x1, int y1, int width,
++			   colour c, int bucket)
+ {
+-	unsigned int rgba = vita_plot_rgba(c, VITA_BUCKET_SOLID);
++	unsigned int rgba = vita_plot_rgba(c, bucket);
+ 	int half;
+ 
+ 	if (vita_clip_empty)
+@@ -314,11 +321,11 @@
+ 	half = width / 2;
+ 	if (y0 == y1) {
+ 		vita_plot_fill_rect(min(x0, x1), y0 - half, max(x0, x1),
+-				    y0 - half + width, c, VITA_BUCKET_SOLID);
++				    y0 - half + width, c, bucket);
+ 	} else if (x0 == x1) {
+ 		vita_plot_fill_rect(x0 - half, min(y0, y1),
+ 				    x0 - half + width, max(y0, y1),
+-				    c, VITA_BUCKET_SOLID);
++				    c, bucket);
+ 	} else {
+ 		float dx = (float)(x1 - x0), dy = (float)(y1 - y0);
+ 		float len = sqrtf(dx * dx + dy * dy);
+@@ -332,6 +339,12 @@
+ 	}
+ }
+ 
++/* exported interface documented in vita/plot.h */
++void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c)
++{
++	vita_plot_line_bucket(x0, y0, x1, y1, width, c, VITA_BUCKET_SOLID);
++}
++
+ /** Draw a counted UTF-8 run in `style`, baseline at y. */
+ static void plot_text_styled(const struct vita_text_style *style, int x,
+ 			     int y, const char *text, size_t length,
+@@ -433,23 +446,33 @@
+ 	return NSERROR_OK;
+ }
+ 
+-/** Stroke a polyline given as float x,y pairs. */
+-static void stroke_polyline(const float *xy, unsigned int n, bool closed,
+-			    int width, colour c)
++/** Stroke a polyline given as float x,y pairs, at an opacity bucket. */
++static void stroke_polyline_bucket(const float *xy, unsigned int n,
++				   bool closed, int width, colour c,
++				   int bucket)
+ {
+ 	unsigned int i;
+ 
+ 	for (i = 0; i + 1 < n; i++) {
+-		vita_plot_line((int)xy[i * 2], (int)xy[i * 2 + 1],
+-			       (int)xy[i * 2 + 2], (int)xy[i * 2 + 3],
+-			       width, c);
++		vita_plot_line_bucket((int)xy[i * 2], (int)xy[i * 2 + 1],
++				      (int)xy[i * 2 + 2], (int)xy[i * 2 + 3],
++				      width, c, bucket);
+ 	}
+ 	if (closed && n > 2) {
+-		vita_plot_line((int)xy[(n - 1) * 2], (int)xy[(n - 1) * 2 + 1],
+-			       (int)xy[0], (int)xy[1], width, c);
++		vita_plot_line_bucket((int)xy[(n - 1) * 2],
++				      (int)xy[(n - 1) * 2 + 1],
++				      (int)xy[0], (int)xy[1], width, c,
++				      bucket);
+ 	}
+ }
+ 
++/** Stroke a polyline given as float x,y pairs. */
++static void stroke_polyline(const float *xy, unsigned int n, bool closed,
++			    int width, colour c)
++{
++	stroke_polyline_bucket(xy, n, closed, width, c, VITA_BUCKET_SOLID);
++}
++
+ static nserror
+ vita_plot_arc(const struct redraw_context *ctx,
+ 	      const plot_style_t *style,
+@@ -514,12 +537,23 @@
+ 		  const plot_style_t *style,
+ 		  const struct rect *line)
+ {
+-	trace("LINE X0 %d Y0 %d X1 %d Y1 %d",
+-	      line->x0, line->y0, line->x1, line->y1);
++	/* VitaBrowser patch 314: a line whose plot style carries opacity
++	 * (a border inside an opacity group, or a translucent border
++	 * colour) traces its bucket and blends; solid lines trace exactly
++	 * as before. */
++	int bucket = vita_geom_opacity_bucket(style);
++
++	if (bucket == VITA_BUCKET_SOLID)
++		trace("LINE X0 %d Y0 %d X1 %d Y1 %d",
++		      line->x0, line->y0, line->x1, line->y1);
++	else
++		trace("LINE X0 %d Y0 %d X1 %d Y1 %d OPAQUE %d",
++		      line->x0, line->y0, line->x1, line->y1, bucket);
+ 	if (style->stroke_type == PLOT_OP_TYPE_NONE)
+ 		return NSERROR_OK;
+-	vita_plot_line(line->x0, line->y0, line->x1, line->y1,
+-		       stroke_px(style), style->stroke_colour);
++	vita_plot_line_bucket(line->x0, line->y0, line->x1, line->y1,
++			      stroke_px(style), style->stroke_colour,
++			      bucket);
+ 	return NSERROR_OK;
+ }
+ 
+@@ -536,14 +570,18 @@
+ 		int w = stroke_px(style);
+ 		colour c = style->stroke_colour;
+ 		const struct rect *r = rect;
++		/* VitaBrowser patch 314: the outline takes the style's
++		 * opacity bucket like the geom fill above it does. */
++		int bucket = vita_geom_opacity_bucket(style);
++
+ 		vita_plot_fill_rect(r->x0, r->y0, r->x1, r->y0 + w, c,
+-				    VITA_BUCKET_SOLID);
++				    bucket);
+ 		vita_plot_fill_rect(r->x0, r->y1 - w, r->x1, r->y1, c,
+-				    VITA_BUCKET_SOLID);
++				    bucket);
+ 		vita_plot_fill_rect(r->x0, r->y0 + w, r->x0 + w, r->y1 - w, c,
+-				    VITA_BUCKET_SOLID);
++				    bucket);
+ 		vita_plot_fill_rect(r->x1 - w, r->y0 + w, r->x1, r->y1 - w, c,
+-				    VITA_BUCKET_SOLID);
++				    bucket);
+ 	}
+ 	return NSERROR_OK;
+ }
+@@ -556,8 +594,17 @@
+ {
+ 	float xy[64 * 2];
+ 	unsigned int i;
+-
+-	trace("POLYGON VERTICIES %u", n);
++	/* VitaBrowser patch 314: polygon fills and strokes (border
++	 * trapezoids, list markers) take the style's opacity bucket; the
++	 * trace carries it as an OPAQUE suffix only when non-solid, so
++	 * solid pages' dumps stay byte-identical (replay reads counts
++	 * only and tolerates the suffix). */
++	int bucket = vita_geom_opacity_bucket(style);
++
++	if (bucket == VITA_BUCKET_SOLID)
++		trace("POLYGON VERTICIES %u", n);
++	else
++		trace("POLYGON VERTICIES %u OPAQUE %d", n, bucket);
+ 	/* A fan is exact for convex polygons, which is what the core sends
+ 	 * (list bullets, form widgets). Longer ones are truncated. */
+ 	if (n > 64)
+@@ -566,10 +613,10 @@
+ 		xy[i] = (float)p[i];
+ 	if (style->fill_type != PLOT_OP_TYPE_NONE)
+ 		vita_plot_fan(xy, n, vita_plot_rgba(style->fill_colour,
+-						    VITA_BUCKET_SOLID));
++						    bucket));
+ 	if (style->stroke_type != PLOT_OP_TYPE_NONE)
+-		stroke_polyline(xy, n, true, stroke_px(style),
+-				style->stroke_colour);
++		stroke_polyline_bucket(xy, n, true, stroke_px(style),
++				       style->stroke_colour, bucket);
+ 	return NSERROR_OK;
+ }
+ 
+--- a/frontends/vita/plot.h
++++ b/frontends/vita/plot.h
+@@ -71,6 +71,10 @@
+ /** Draw a line of the given width in pixels. */
+ void vita_plot_line(int x0, int y0, int x1, int y1, int width, colour c);
+ 
++/** Draw a line at an opacity bucket (patch 314: border lines). */
++void vita_plot_line_bucket(int x0, int y0, int x1, int y1, int width,
++			   colour c, int bucket);
++
+ /** Draw `length` bytes of UTF-8 in regular sans at `px` pixels, baseline
+  * at y (the HUD, messages, stream replay). */
+ void vita_plot_text(int x, int y, const char *text, size_t length,
+--- a/frontends/vita/replay.c
++++ b/frontends/vita/replay.c
+@@ -95,7 +95,9 @@
+ 		}
+ 	} else if (sscanf(line, "LINE X0 %d Y0 %d X1 %d Y1 %d",
+ 			  &x0, &y0, &x1, &y1) == 4) {
+-		vita_plot_line(x0, y0, x1, y1, 1, 0x404040);
++		/* patch 314: honour the OPAQUE suffix like RECT/POLY. */
++		vita_plot_line_bucket(x0, y0, x1, y1, 1, 0x404040,
++				      parse_bucket(line));
+ 		stats->line++;
+ 	} else if (sscanf(line, "TEXT X %d Y %d STR ", &x0, &y0) == 2) {
+ 		const char *s = strstr(line, " STR ");
