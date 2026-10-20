@@ -622,7 +622,13 @@ op_shown=$(grep -c 'STR SHOWNMARK' "$op" 2>/dev/null || true)
 op_half=$(grep -c 'STR HALFMARK' "$op" 2>/dev/null || true)
 op_hidden=$(grep -c 'HIDDENSPANMARK\|HIDDENBLOCKMARK' "$op" 2>/dev/null || true)
 op_ldbox=$(awk '/PLOT RECT/ { if ($8 - $4 == 200 && $10 - $6 == 30) n++ } END { print n+0 }' "$op" 2>/dev/null)
-echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1)"
+# Patch 311: partial group opacity reaches text runs -- the plotter appends
+# the fixes49 OPAQUE bucket to non-solid TEXT lines (.5 -> 2, .25 -> 1).
+op_half_op2=$(grep -c 'STR HALFMARK OPAQUE 2$' "$op" 2>/dev/null || true)
+op_outer_op3=$(grep -c 'STR OUTERMARK OPAQUE 3$' "$op" 2>/dev/null || true)
+op_nested_op1=$(grep -c 'STR NESTEDMARK OPAQUE 1$' "$op" 2>/dev/null || true)
+op_shown_opaque=$(grep -c 'STR SHOWNMARK.*OPAQUE' "$op" 2>/dev/null || true)
+echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0)"
 ifp=$(ls "$R"/*NET-js-interfaces.plot 2>/dev/null | head -1)
 ifr=$(sed -n 's/.*STR \(IFACES: [0-9]*\/[0-9]* passed\).*/\1/p' "$ifp" 2>/dev/null | head -1)
 echo "  JS-interfaces: ${ifr:-no summary}"
@@ -1204,7 +1210,9 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 [ "$ifr" = "IFACES: 9/9 passed" ] && \
 [ "$eor" = "EVORDER: 5/5 passed" ] && [ "$ctr" = "CAPTGT: 7/7 passed" ] && [ "$epr" = "EVPHASE: 9/9 passed" ] && [ "$igr" = "INLINEGRID: 4/4 passed" ] && \
 	[ "${op_shown:-0}" -ge 1 ] && [ "${op_half:-0}" -ge 1 ] && [ "${op_hidden:-1}" -eq 0 ] && \
-	[ "${op_ldbox:-0}" -ge 1 ] || fail "event order / inline-grid / group opacity"
+	[ "${op_ldbox:-0}" -ge 1 ] && [ "${op_half_op2:-0}" -eq 1 ] && \
+	[ "${op_outer_op3:-0}" -eq 1 ] && [ "${op_nested_op1:-0}" -eq 1 ] && \
+	[ "${op_shown_opaque:-1}" -eq 0 ] || fail "event order / inline-grid / group opacity"
 
 # Script-made frames (Patch 143) and timer chains (Patch 141): a same-
 # origin or blank frame a script makes fires load and has a same-realm

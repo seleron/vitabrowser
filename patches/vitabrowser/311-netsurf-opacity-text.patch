@@ -1,0 +1,314 @@
+# netsurf: text paints at the composed group opacity (patch 311)
+# Generated 2026-10-20
+# Base: seleron/vitabrowser (patch stack through 309)
+#
+# WS-A probe (a), doc 22: Firefox paints <span style="opacity:0.5"> text at
+# 50%; VitaBrowser painted text/borders/images opaque at partial opacity.
+# The group-opacity machinery (patch 149) composed per-box opacity into
+# g_group_opacity but only background fills consumed it, so an inline at
+# opacity .5 painted its text at 100%. This patch threads the composed
+# group opacity into text runs:
+#  - plot_font_style_t gains an `opacity` field (plot_style_fixed,
+#    PLOT_STYLE_SCALE = full; 0 = unset/opaque, the plot_style_t fixes223
+#    convention). font_plot_style_from_css zeroes it; all positional
+#    initializers (box_textarea, form, plot_style.c, page-info) carry the
+#    new trailing field explicitly (-Werror=missing-field-initializers).
+#  - redraw paints text with g_group_opacity: text_redraw (all inline
+#    body text, incl. selection-highlight copies), the select-gadget
+#    text, and the overflow-ellipsis style (html_redraw_text_box).
+#  - the vita text plotter maps the font opacity to the fixes49 stipple
+#    bucket and draws the glyphs with that alpha (GXM/vitasim blend it);
+#    the trace TEXT line appends "OPAQUE <bucket>" for non-solid text so
+#    the gate can assert it (solid pages stay byte-identical).
+#  - replay.c's TEXT parser strips the trailing " OPAQUE <n>" token so
+#    replay draws the run, not the token.
+#
+# Proof (focused, nsmonkey-style trace via the sim): pre-fix the
+# CSS-opacity-group page's TEXT lines carry no OPAQUE token at all;
+# post-fix: HALFMARK OPAQUE 2 (.5 -> 35-60%), OUTERMARK OPAQUE 3 (.7 ->
+# 60-85%), NESTEDMARK OPAQUE 1 (.35 inside .7 = .245 -> 5-35%), SHOWNMARK
+# solid (no token). Pixel proof on the sim snapshot: darkest text pixel
+# SHOWNMARK 0, HALFMARK 127, OUTERMARK 64, NESTEDMARK 191 -- exactly the
+# bucket alphas (255/128/191/64) blended over white.
+#
+# Scope notes (recorded, not changed here):
+#  - Group composition dedups by shared computed style: two nested
+#    elements with the IDENTICAL style object (e.g. two .half divs)
+#    compose once (0.5, not 0.25). Pre-existing patch-149 semantics --
+#    background fills behave identically -- so text now MATCHES fills.
+#    Changing it would move fills too; a separate patch if wanted.
+#  - Borders and images at partial opacity still paint opaque (same
+#    doc-22 gap): borders would need the group factor multiplied into
+#    redraw_border.c's style opacity plus bucket plumbing in the vita
+#    line/polygon/rect-outline paths; images need an opacity channel on
+#    the bitmap plot op (tinted texture path). Both follow-ups.
+#
+# Simulator only; the vita cross-build was not run (no vitaSDK on this VM).
+# Device expectation is in Doc 10.
+--- a/include/netsurf/plot_style.h
++++ b/include/netsurf/plot_style.h
+@@ -198,6 +198,11 @@
+ 	 * macos9_font_split so soft-hyphen (U+00AD) break opportunities are
+ 	 * only taken when != CSS_HYPHENS_NONE. 0 (inherit) treated as manual. */
+ 	int hyphens;
++	/* patch 311: group opacity for the text run (plot_style_fixed,
++	 * PLOT_STYLE_SCALE = full). Set by the redraw from the composed
++	 * group opacity; 0 (unset) means opaque, the plot_style_t
++	 * convention (fixes223). Plotters map it to their opacity bucket. */
++	plot_style_fixed opacity;
+ } plot_font_style_t;
+ 
+ 
+--- a/content/handlers/html/font.c
++++ b/content/handlers/html/font.c
+@@ -188,4 +188,7 @@
+ 	fstyle->transform = 0;
+ 	fstyle->transform_b = 0;
+ 	fstyle->hyphens = 0;
++	/* patch 311: no group opacity here -- the redraw composes it
++	 * into the style at paint time. 0 = opaque, never stack garbage. */
++	fstyle->opacity = 0;
+ }
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -154,6 +154,9 @@
+  */
+ /* group opacity of the ancestors (defined with html_redraw_box) */
+ static plot_style_fixed g_group_parent;
++/* patch 311: composed group opacity for the current box's subtree
++ * (defined with html_redraw_box); text_redraw reads it. */
++static plot_style_fixed g_group_opacity;
+ 
+ static int32_t macsurf_anim_opacity_resolve_plot_fixed(int32_t packed)
+ {
+@@ -871,6 +874,11 @@
+ 	/* Need scaled text size to pass to plotters */
+ 	plot_fstyle.size *= scale;
+ 
++	/* patch 311: the text paints at the composed group opacity
++	 * (html_redraw_box). Text/borders/images at partial opacity
++	 * used to paint opaque; text now follows the group. */
++	plot_fstyle.opacity = g_group_opacity;
++
+ 	/* is this box part of a selection? */
+ 	if (!excluded && ctx->interactive == true) {
+ 		unsigned len = utf8_len + (space ? 1 : 0);
+@@ -1350,6 +1358,8 @@
+ 
+ 	font_plot_style_from_css(unit_len_ctx, box->style, &fstyle);
+ 	fstyle.background = background_colour;
++	/* patch 311: gadget text follows the group opacity too */
++	fstyle.opacity = g_group_opacity;
+ 
+ 	if (box->gadget->value) {
+ 		text = box->gadget->value;
+@@ -3813,6 +3823,10 @@
+ 
+ 	font_plot_style_from_css(&html->unit_len_ctx, box->style, &fstyle);
+ 	fstyle.background = current_background_color;
++	/* patch 311: the overflow ellipsis paints via this style
++	 * directly, so it takes the group opacity here (body text
++	 * takes it in text_redraw). */
++	fstyle.opacity = g_group_opacity;
+ 
+ 	/* #251: text-align:justify spreads leftover width across spaces by
+ 	 * adding a per-space delta (computed per justified line in
+@@ -4639,8 +4653,10 @@
+  * opacity into g_group_opacity for its subtree and skips a subtree whose
+  * composed opacity is 0; fills take the ancestors' factor
+  * (g_group_parent) times their own. A box sharing its style with the box
+- * that last composed (a block's own text) is not counted twice. Text,
+- * borders and images at partial opacity still paint opaque. */
++ * that last composed (a block's own text) is not counted twice. Patch
++ * 311: text runs take g_group_opacity into the font style, so partial
++ * group opacity reaches the text plotter (bucketed like fills). Borders
++ * and images at partial opacity still paint opaque. */
+ static plot_style_fixed g_group_opacity = (plot_style_fixed)PLOT_STYLE_SCALE;
+ static plot_style_fixed g_group_parent = (plot_style_fixed)PLOT_STYLE_SCALE;
+ static const css_computed_style *g_group_style = NULL;
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -330,7 +330,8 @@
+ 		0,   /* shadow_color */
+ 		0,   /* transform */
+ 		0,   /* transform_b */
+-		0   /* hyphens */
++		0,   /* hyphens */
++		0   /* opacity (patch 311) */
+ 	};
+ 	colour ta_background = NS_TRANSPARENT;
+ 	bool read_only = false;
+--- a/content/handlers/html/form.c
++++ b/content/handlers/html/form.c
+@@ -115,7 +115,8 @@
+ 	0,   /* shadow_color */
+ 	0,   /* transform */
+ 	0,   /* transform_b */
+-	0   /* hyphens */
++	0,   /* hyphens */
++	0   /* opacity (patch 311) */
+ };
+ 
+ 
+--- a/desktop/plot_style.c
++++ b/desktop/plot_style.c
+@@ -192,7 +192,8 @@
+         0,   /* shadow_color */
+         0,   /* transform */
+         0,   /* transform_b */
+-        0   /* hyphens */
++        0,   /* hyphens */
++        0   /* opacity (patch 311) */
+ };
+ plot_font_style_t const * const plot_fstyle_broken_object =
+                 &plot_fstyle_broken_object_static;
+@@ -392,6 +393,7 @@
+         0,   /* shadow_color */
+         0,   /* transform */
+         0,   /* transform_b */
+-        0   /* hyphens */
++        0,   /* hyphens */
++        0   /* opacity (patch 311) */
+ };
+ plot_font_style_t const * const plot_style_font = &plot_style_font_static;
+\ No newline at end of file
+--- a/desktop/page-info.c
++++ b/desktop/page-info.c
+@@ -45,7 +45,7 @@
+  * Plot style for heading font.
+  */
+ static plot_font_style_t pi__heading[PAGE_STATE__COUNT] = {
+-	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */ }
++	{ NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }, { NULL, PLOT_FONT_FAMILY_SANS_SERIF, 14 * PLOT_STYLE_SCALE, 400, FONTF_NONE, 0, 0, 0   /* letter_spacing */, 0   /* word_spacing */, 0   /* shadow_x */, 0   /* shadow_y */, 0   /* shadow_blur */, 0   /* shadow_color */, 0   /* transform */, 0   /* transform_b */, 0   /* hyphens */, 0   /* opacity (patch 311) */ }
+ };
+ 
+ /**
+@@ -61,7 +61,8 @@
+ 	0,   /* shadow_color */
+ 	0,   /* transform */
+ 	0,   /* transform_b */
+-	0   /* hyphens */
++	0,   /* hyphens */
++	0   /* opacity (patch 311) */
+ };
+ 
+ /**
+@@ -77,7 +78,8 @@
+ 	0,   /* shadow_color */
+ 	0,   /* transform */
+ 	0,   /* transform_b */
+-	0   /* hyphens */
++	0,   /* hyphens */
++	0   /* opacity (patch 311) */
+ };
+ 
+ /**
+@@ -93,7 +95,8 @@
+ 	0,   /* shadow_color */
+ 	0,   /* transform */
+ 	0,   /* transform_b */
+-	0   /* hyphens */
++	0,   /* hyphens */
++	0   /* opacity (patch 311) */
+ };
+ 
+ /**
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -334,7 +334,8 @@
+ 
+ /** Draw a counted UTF-8 run in `style`, baseline at y. */
+ static void plot_text_styled(const struct vita_text_style *style, int x,
+-			     int y, const char *text, size_t length, colour c)
++			     int y, const char *text, size_t length,
++			     colour c, int bucket)
+ {
+ 	int w, ascent, descent;
+ 
+@@ -350,7 +351,7 @@
+ 		return;
+ 	vita_plot_calls++;
+ 	vita_text_draw(style, x, y, text, length,
+-		       vita_plot_rgba(c, VITA_BUCKET_SOLID));
++		       vita_plot_rgba(c, bucket));
+ }
+ 
+ /* exported interface documented in vita/plot.h */
+@@ -360,7 +361,7 @@
+ 	struct vita_text_style style;
+ 
+ 	vita_text_style_default(&style, px);
+-	plot_text_styled(&style, x, y, text, length, c);
++	plot_text_styled(&style, x, y, text, length, c, VITA_BUCKET_SOLID);
+ }
+ 
+ /* ---- plot-stream dump (vita/diag.h) --------------------------------- */
+@@ -817,6 +818,24 @@
+ 	return NSERROR_OK;
+ }
+ 
++/* patch 311: map a plot_style_fixed opacity to the fixes49 stipple
++ * bucket, the same thresholds as vita_geom_opacity_bucket (which takes
++ * a plot_style_t; the font style carries the same fixed-point field). */
++static int vita_font_opacity_bucket(plot_style_fixed op)
++{
++	if (op == 0)
++		op = (plot_style_fixed)PLOT_STYLE_SCALE;
++	if (op < (plot_style_fixed)(PLOT_STYLE_SCALE / 20))
++		return 0;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 35) / 100))
++		return 1;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 60) / 100))
++		return 2;
++	if (op < (plot_style_fixed)((PLOT_STYLE_SCALE * 85) / 100))
++		return 3;
++	return VITA_BUCKET_SOLID;
++}
++
+ static nserror
+ vita_plot_text_op(const struct redraw_context *ctx,
+ 		  const struct plot_font_style *fstyle,
+@@ -826,10 +845,18 @@
+ 		  size_t length)
+ {
+ 	struct vita_text_style style;
++	int bucket = vita_font_opacity_bucket(fstyle->opacity);
+ 
+-	trace("TEXT X %d Y %d STR %.*s", x, y, (int)length, text);
++	/* The OPAQUE token is appended only for a non-solid bucket, so
++	 * streams of fully-opaque pages stay byte-identical. */
++	if (bucket == VITA_BUCKET_SOLID)
++		trace("TEXT X %d Y %d STR %.*s", x, y, (int)length, text);
++	else
++		trace("TEXT X %d Y %d STR %.*s OPAQUE %d",
++		      x, y, (int)length, text, bucket);
+ 	vita_text_style_from_plot(fstyle, &style);
+-	plot_text_styled(&style, x, y, text, length, fstyle->foreground);
++	plot_text_styled(&style, x, y, text, length, fstyle->foreground,
++			 bucket);
+ 	return NSERROR_OK;
+ }
+ 
+--- a/frontends/vita/replay.c
++++ b/frontends/vita/replay.c
+@@ -101,7 +101,20 @@
+ 		const char *s = strstr(line, " STR ");
+ 		size_t len;
+ 		s = (s != NULL) ? s + 5 : "";
++		/* patch 311: the plotter appends " OPAQUE <bucket>" for
++		 * non-solid text; strip it so replay draws the run, not
++		 * the token. (A run literally ending in " OPAQUE <n>"
++		 * loses the suffix in replay only -- diagnostic tool.) */
+ 		len = strcspn(s, "\r\n");
++		if (len > 10) {
++			const char *tail = s + len - 9;
++			if (tail[0] == ' ' && tail[1] == 'O' &&
++			    tail[2] == 'P' && tail[3] == 'A' &&
++			    tail[4] == 'Q' && tail[5] == 'U' &&
++			    tail[6] == 'E' && tail[7] == ' ' &&
++			    tail[8] >= '0' && tail[8] <= '9')
++				len -= 9;
++		}
+ 		vita_plot_text(x0, y0, s, len, 0x000000, REPLAY_TEXT_PX);
+ 		stats->text++;
+ 	} else if (sscanf(line, "DISC X %d Y %d RADIUS %d",
