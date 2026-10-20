@@ -5536,3 +5536,31 @@ dimmed against white (HALFMARK ~50%, OUTERMARK ~75% over the nested
 rule, NESTEDMARK ~25%). Simulator-only here (no vitaSDK on this VM);
 no Vita cross-build was run.
 
+## Patch 312 (2026-10-20): JS-task batch separation for reconvert marks
+
+**What:** Infrastructure. DOM mutation marks were consumed only by the
+debounced reconvert callback (400 ms base, doubling per cosmetic mark
+to a 6400 ms cap, plus floor/busy re-arms), so marks recorded inside a
+JS task (a setTimeout callback) joined whatever batch the callback had
+not yet consumed -- often the load batch. Per-batch semantics (patch
+301's local answers, patch 308's FULLCAUSE census) then mixed tasks'
+marks. `macos9_reconvert_js_task_complete_kind` (which already fires
+exactly when a task that recorded mutations pops) now also schedules
+the reconvert callback promptly, sealing the finished task's batch;
+the next task's marks start a fresh batch. Nothing else changes: the
+callback's floor, busy re-arm, and cosmetic-suppression guards still
+bound the rate, load-time batching is untouched (the hook stays quiet
+while page execution is active), and an already-queued callback is a
+no-op.
+
+**Proof (sim):** Scratch-tree focused runs show each task's marks
+flushing as their own batch; the BATCHBURST census is unchanged
+(total=2 local=1 guard=1), and no scratch-gate section regressed.
+
+**Gate:** Full adapted gate exit 0.
+
+**On the device (run 39), in addition:** no new page or count; this is
+plumbing only. Mutations should paint at least as promptly as before
+(task-end flush instead of debounced), never slower. Watch for excess
+reconverts on pages with rapid timer-driven mutations (the floor still
+bounds them to ~1 per 600 ms).
