@@ -1,0 +1,66 @@
+# netsurf: a mutating JS task seals its reconvert batch (patch 312)
+# Generated 2026-10-20
+# Base: seleron/vitabrowser (patch stack through 311)
+#
+# Batch separation (leg-4 diagnosis, leg-5 investigation): DOM marks
+# are collected in one pending slot per content and consumed only by
+# the debounced reconvert callback. The debounce is 400 ms at base and
+# doubles per cosmetic mark to a 6400 ms cap (fixes1024), and the
+# callback can re-arm further (floor, busy). Marks recorded inside a
+# JS task (a setTimeout callback, say) therefore join whatever batch
+# the callback has not yet consumed -- often the load batch -- instead
+# of forming a batch of their own. Per-batch semantics (patch 301's
+# local answers, patch 308's FULLCAUSE census) then mix the tasks'
+# marks: a kind-declining mark in a mixed batch trips the two-decline
+# rule (T5) instead of producing its own census (T4), which is what
+# shelved patch 310.
+#
+# Fix: macos9_reconvert_js_task_complete_kind already runs exactly
+# when a JS task that recorded mutations pops. It now also schedules
+# the reconvert callback immediately, sealing the finished task's
+# batch; the next task's marks start a fresh batch. Nothing else about
+# the flush changes: the callback's floor (36 ticks between reconvert
+# starts), busy re-arm, and cosmetic-suppression guards still bound
+# the rate, the task's own marks are consumed by the same try_local /
+# full-reconvert decision as before, and an already-queued callback
+# for the same batch is a harmless no-op (the first to fire consumes
+# the batch; the second finds no pending slots). Load-time batching is
+# unchanged (the hook stays quiet while page execution is active).
+#
+# Proof (focused, sim): on a page whose timers mutate in separate
+# tasks, each task's marks now flush as their own batch (the priming
+# task's marks no longer share a batch with the later task's marks);
+# the BATCHBURST census is unchanged (total=2 local=1 guard=1).
+# Full adapted gate exit 0.
+#
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -51,6 +51,14 @@
+ /* Debounce: fire this long after the last DOM mutation. ~24 ticks at 60Hz. */
+ #define RECONVERT_DEBOUNCE_MS	400
+ 
++/* Patch 312 - batch separation. A mutating JS task's end schedules the
++ * reconvert callback this promptly, so the next task's marks start a
++ * fresh batch instead of merging into this task's (up to 6400 ms of
++ * cosmetic escalation away). The callback's own floor, busy re-arm, and
++ * cosmetic-suppression guards still bound the rate; a second queued
++ * callback is a no-op (the first to fire consumes the batch). */
++#define RECONVERT_TASK_FLUSH_MS	0
++
+ /* fixes1024 - BACK OFF A COSMETIC TICKER.
+  *
+  * Hardware, hackaday, JS quiesced: NINE full box-tree reconverts of a
+@@ -1589,6 +1597,12 @@
+ 		g_consecutive_cosmetic = 0;
+ 		g_reconvert_debounce_ms = RECONVERT_DEBOUNCE_MS;
+ 	}
+-	if (!macsurf_js_page_execution_active())
++	if (!macsurf_js_page_execution_active()) {
+ 		macos9_reconvert_schedule_pending();
++		/* Patch 312 - a mutating task seals its batch: flush promptly
++		 * so the next task's marks do not merge into this batch. */
++		if (macos9_reconvert_pending_count() > 0)
++			(void) macos9_schedule(RECONVERT_TASK_FLUSH_MS,
++				macos9_reconvert_cb, NULL);
++	}
+ }
