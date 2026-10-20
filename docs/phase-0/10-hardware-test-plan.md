@@ -5686,3 +5686,27 @@ named — shadow-root-scoped sheets — cannot occur in this stack
 `@scope` in libcss); the design re-anchors confinement to
 id-anchored descendant sheets and carries the question to the
 owner as an open question in the doc.
+
+## Doc 24 (2026-10-20): bitmap opacity channel — design pass for images at group opacity
+
+Patch 314's recorded gap, designed: doc 24
+(`docs/phase-0/24-bitmap-opacity-channel-design.md`), design
+only — no patch, no gate change. The composed group opacity
+reaches the bitmap plot op as a byte in the op's own flags
+(bits 16–23, beside the blend-mode encoding; a masked 0 means
+"not supplied" → opaque, so every existing caller is
+unaffected), which is the one carrier that survives desktop
+knockout's queued-op replay verbatim. The background-image call
+site folds `html_redraw_group_opacity()` directly (same file);
+the four image content handlers (bmp, image, nssprite, rsvg)
+are fed by a new `content_redraw_data` field on the
+`background_blend_mode` precedent and fold it into the flags at
+their calls. The disc/arc ops and the SVG path filler need no
+channel — they already receive a plot style — and get per-op
+bucket adoption in the same stage. The sim-verifiable /
+device-dependent split is kept explicit: 1:1 tiles draw through
+the stub's existing tint-part entry (the text mechanism), while
+scaled tiles have no stub entry that scales and tints — the
+design recommends a CPU pre-multiply as the device-safe first
+path and carries the fork to the owner as an open question in
+the doc.
