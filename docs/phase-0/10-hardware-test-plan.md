@@ -5664,3 +5664,25 @@ log — the clean re-run has BLOCKSIB 3/3).
 **Note on verification:** no vitaSDK on the build VM, so no Vita
 cross-build ran for patches 311–314 or this repair; device
 verification stays with run 39.
+
+## Doc 23 (2026-10-20): stylesheet scoping — design pass for doc 20 stage 3
+
+Leg 6 assessed doc 20 stage 3 as not patch-sized; doc 23
+(`docs/phase-0/23-stylesheet-scoping-design.md`) is the design
+pass, design only — no patch, no gate change. The design: sheet
+identity carried on the reconvert mark from css.c's existing
+funnel (the patch 186/313 variant precedent; identity exists in
+`html_content.stylesheets[]` today and is discarded at the
+nodeless mark), a reach bound computed from BOTH versions of the
+changed sheet (id-anchored descendant selectors only; the
+outgoing sheet's anchors snapshotted before its handle is
+released), and a multi-root local rebuild by expanding the reach
+roots into precise marks under the existing batch machinery and
+patch 309's cost guard. Staged: census first, anchored reach
+second, match enumeration only if the census pays for it. One
+correction to the earlier record: the confined first case leg 6
+named — shadow-root-scoped sheets — cannot occur in this stack
+(no `attachShadow` in the bridge, no shadow roots in libdom, no
+`@scope` in libcss); the design re-anchors confinement to
+id-anchored descendant sheets and carries the question to the
+owner as an open question in the doc.
