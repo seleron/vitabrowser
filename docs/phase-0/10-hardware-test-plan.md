@@ -5564,3 +5564,4 @@ plumbing only. Mutations should paint at least as promptly as before
 (task-end flush instead of debounced), never slower. Watch for excess
 reconverts on pages with rapid timer-driven mutations (the floor still
 bounds them to ~1 per 600 ms).
+

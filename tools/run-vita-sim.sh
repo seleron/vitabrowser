@@ -248,6 +248,7 @@ NET-js-lazyimg http://127.0.0.1:$HP/JS-lazyimg.html
 NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html
 NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
+NET-js-attr-local http://127.0.0.1:$HP/JS-attr-local.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
 NET-js-abspos191 http://127.0.0.1:$HP/JS-abspos191.html
@@ -1087,6 +1088,20 @@ dsl=$(awk '/page [0-9]*\/[0-9]* NET-js-dom-stall: navigate/ {on=1; next}
 ds_local=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: rebuilt and laid out' || true)
 ds_blocks=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: blocks placed' || true)
 echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_blocks} block changes placed locally"
+# Patch 313: on the attr-local page, the load innerHTML batch commits a
+# local-cause full reconvert and the setAttribute batch (9 data-x
+# answered locally, 1 data-flag whose attribute a used sheet references)
+# commits a kind-cause full reconvert via try_local's kind gate.
+# BATCHCAUSE is logged synchronously at each flush, inside the page's
+# own window -- unlike the patch-308 census, which prints at the next
+# navigation reset and can split a page's causes across two windows.
+acl=$(awk '/page [0-9]*\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE BATCHCAUSE cause=' || true)
+acl_kind=$(printf '%s\n' "$acl" | grep -c 'cause=kind' || true)
+acl_local=$(printf '%s\n' "$acl" | grep -c 'cause=local' || true)
+echo "  JS-attr-local batch causes: kind=${acl_kind} local=${acl_local}"
+[ "$acl_kind" -ge 1 ] && [ "$acl_local" -ge 1 ] || o2_bad="$o2_bad js-attr-local-batchcause"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest

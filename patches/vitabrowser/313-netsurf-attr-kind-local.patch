@@ -1,76 +1,59 @@
-# netsurf: answer non-class setAttribute/removeAttribute marks locally
-# when no stylesheet references the attribute (doc 20, stage 2 / T4)
+# netsurf: setAttribute batches the local path can answer (patch 313)
+# Generated 2026-10-20
+# Base: seleron/vitabrowser (patch stack through 312)
 #
-# STATUS: SHELVED 2026-10-19/20 — implemented, builds clean, but NEVER
-# gate-verified (two unsuccessful gate runs, below). Nothing from this
-# patch is applied to the tree; it is not a regression risk to master.
+# Doc 20 stage 2 (was staged as patch 310; landed as 313 with the two
+# fixes its failed gates identified). DOM mutation marks for
+# SETATTRIBUTE / REMOVEATTRIBUTE on class/style already had local
+# answers; plain attributes did not, so every setAttribute batch fell
+# back to a full reconvert (or was dropped by the render decline).
+# This patch lets html_reconvert_local answer a plain-attribute mark
+# exactly when the attribute cannot affect the rebuilt block's own
+# style:
 #
-# Design (doc 20 stage 2, first T4 kind by census order):
-# A SETATTRIBUTE / REMOVEATTRIBUTE mark for attribute `name` on a
-# BOX_BLOCK element is answered locally iff:
-#  - `name` is not `id` (always declines — id selectors are ubiquitous),
-#  - `name` is a presentational-hint attribute (21 names) or `href`,
-#    i.e. its only rendering effect is the element's own box paint, and
-#  - NO used stylesheet references `name`: html_rl_sheet_refs_attr scans
-#    all sheets textually for `[name]` in any selector position, plus the
-#    attribute-reading pseudo-classes (:link/:visited -> href,
-#    :enabled/:disabled -> disabled, :checked -> checked/selected).
-#    Backslash in a selector, an unreadable sheet, any doubt -> decline.
-# Equivalence argument: with no sheet selecting on `name` and no hint
-# effect beyond the element's own paint, style selection is unchanged and
-# the box-tree delta is exactly the element's own paint state — what the
-# full reconvert would have produced. Local answers are the same
-# per-mark semantics as patch 301 (order, defer-and-retry, two-decline).
-# Plumbing: attr_name rides the pending slot (+extras, freed in
-# slot_drop; merge identity includes name); macos9_js_mark_dom_dirty_attr
-# made public; try_local_one takes attr_name; 3 bridge call sites
-# (macsurf_qjs.c) updated to pass it.
+#  - NO used stylesheet references the attribute name:
+#    html_rl_sheet_refs_attr scans the source text of every used sheet
+#    for attribute-selector spellings ([name], [name=, ~=, |=, ^=, $=,
+#    *=) and, for subject-position attributes (value/checked/selected/
+#    open/disabled/readonly/multiple), the pseudo-classes whose match
+#    depends on them (:checked, :disabled, ...). Unreadable sheets
+#    count as referencing (conservative). [id] is excluded from this
+#    reasoning in try_local_one ("id" declines unconditionally): a '#'
+#    selector is textually ambiguous with hex colours.
+#  - The element's own box is not a BOX_BLOCK whose presentational
+#    hint (or href, which feeds the hover cursor) the attribute feeds:
+#    those decline too (the local path rebuilds the block from the
+#    existing computed style, so a hinted attribute would go stale).
 #
-# Gate page (preserved alongside as staging/310-attr-local.html, prefix
-# ATTRLCL): Phase A = 60 setAttribute on `data-x` (no sheet references
-# it) -> answered locally; Phase B = 1 setAttribute on `data-flag`
-# (a STATIC [data-flag] stylesheet rule) -> kind decline. The gate
-# asserted the cumulative LIFE FULLCAUSE line:
-#   total=2 over=0 nonode=0 kind=1 local=1 two=0 guard=0
-# (the page's own innerHTML batch accounts for local=1).
-# The adapted-script assertion (run-vita-sim-adapted.sh) was:
-#   acl=$(awk '/page [0-9]*\\\\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
-#   on && /page [0-9]*\\\\/[0-9]* [^ ]*: navigate/ {on=0}
-#   on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE FULLCAUSE' | tail -1)
-#   case "$acl" in *"total=2 over=0 nonode=0 kind=1 local=1 two=0 guard=0"*) ;;
-#   *) o2_bad="$o2_bad js-attr-local-census";; esac
-# with a NET-js-attr-local line in the page list. Re-add both with the page.
+# Marks carry their attribute name (new attr_name plumbing on the mark
+# slot, its extras, and the coarse overflow slot). try_local_one
+# answers a plain-attribute mark only when html_rl_attr_local_ok
+# passes; on decline the batch takes the full reconvert, named cause
+# kind (T4 in the patch-308 census).
 #
-# Gate runs (both disclosed):
-#  1. FAILED: FULLCAUSE total=2 kind=0 local=1 two=1. Root cause was the
-#     PAGE, not the engine: Phase B's stylesheet was appended dynamically
-#     and the sheet was not registered when the scan ran. Fixed by moving
-#     the [data-flag] rule into static HTML.
-#  2. Never completed: stuck in the autotest phase >30 min, killed.
-#     Undiagnosed whether 310-related or a host issue.
+# Two couplings the staged version lacked, both found by its gates:
 #
-# Blocker (PRE-EXISTING, not a 310 bug — the 307 tree behaves the same):
-# setAttribute marks recorded inside JS tasks (setTimeout callbacks) join
-# the lingering load batch and never get fresh batch separation; the
-# callback fires but the batch does not split. BATCHBURST (309) works only
-# because its textContent marks happen to align with flush windows. When
-# earlier batch marks decline first, the T4 kind census the ATTRLCL
-# assertion needs is unreachable on this page shape.
+#  1. The reconvert callback's render decline dropped every
+#     non-structural batch before try_local ran, so the kind gate was
+#     unreachable for pure-attribute batches. The decline now consults
+#     html_rl_attr_local_ok for the batch's attribute marks: a batch
+#     containing an attribute that feeds style is not droppable.
+#  2. The patch-308 census prints at the next navigation reset, which
+#     can split one page's causes across two gate windows (a post-settle
+#     batch's census lands in the following page's window). The flush
+#     site now also logs each committed full reconvert's cause as it
+#     happens (LIFE BATCHCAUSE cause=kind|local|two|guard|over|
+#     nonode), synchronous and inside the page's own window; the gate
+#     asserts on that line. Batch separation (patch 312) is what keeps
+#     the gate page's attribute batch free of the load batch's marks.
 #
-# Resume conditions (any one):
-#  - fix batch separation for marks recorded in JS tasks (batching
-#    infrastructure; judged out of leg scope 2026-10-19), or
-#  - find a page-driving pattern whose marks form fresh batches
-#    (a synchronous post-load burst was NOT tried), or
-#  - re-run on hardware, where flush pacing differs.
-# Then: re-apply this diff onto the stage309 tree (it applies against
-# upstream/netsurf paths), re-add the page + the adapted assertion, run
-# focused ATTRLCL, then the full adapted gate.
+# Proof (focused + full gate): the JS-attr-local gate page primes 10
+# divs via innerHTML (full reconvert, cause=local), then one timer task
+# sets data-x on 9 (no sheet references it: local answers, no full
+# reconvert) and data-flag on 1 (a used sheet has a [data-flag] rule:
+# kind decline, full reconvert, cause=kind). Gate log: "JS-attr-local
+# batch causes: kind=1 local=1". Full adapted gate exit 0.
 #
-# Diff below: work/applytest (310 tree) vs work/stage309 (309 tree),
-# 2026-10-20. Debug instrumentation was removed before shelving.
-
-
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
 @@ -6629,6 +6629,258 @@
@@ -332,10 +315,9 @@
  /* Patch 192: true if a used document stylesheet uses sibling-position
   * structural pseudo-classes or CSS counters, whose following-sibling
   * styles the local block insert/remove path would leave stale. */
-
 --- a/content/handlers/javascript/quickjs/macos9_reconvert.c
 +++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
-@@ -156,6 +156,9 @@
+@@ -164,6 +164,9 @@
  	 * burst a->b->c compares a against c. Freed when the slot is dropped
  	 * or cleared. */
  	char           *old_class;
@@ -345,7 +327,7 @@
  	/* Patch 301 - further precise marks (distinct node/kind) recorded
  	 * after the first, so a burst that touches several nodes -- the
  	 * common script render: text here, a class there -- can still be
-@@ -170,6 +173,12 @@
+@@ -178,6 +181,12 @@
  		void *node;
  		int   kind;
  		char *old_class;
@@ -358,7 +340,7 @@
  	} extra[RECONVERT_MAX_EXTRA];
  	int             extra_n;
  	int             coarse;
-@@ -357,6 +366,10 @@
+@@ -365,6 +374,10 @@
  	 * new generation, and a clear consumes the record. */
  	free(g_pending[i].old_class);
  	g_pending[i].old_class = NULL;
@@ -369,7 +351,7 @@
  	g_pending[i].kind = MACOS9_DOMMUT_UNKNOWN;
  	/* Patch 301 - the extra marks' references and class values die
  	 * with the primary's, on every path that drops precision. */
-@@ -368,6 +381,8 @@
+@@ -376,6 +389,8 @@
  		}
  		free(g_pending[i].extra[j].old_class);
  		g_pending[i].extra[j].old_class = NULL;
@@ -378,7 +360,7 @@
  	}
  }
  
-@@ -393,9 +408,34 @@
+@@ -401,9 +416,34 @@
   * a second DISTINCT mutation collapses the slot to `multi` and forgets the node,
   * so a consumer can only ever be MORE conservative than the truth, never less.
   * Behaviour is unchanged today - nothing reads these fields yet. */
@@ -415,7 +397,7 @@
  {
  	int i;
  	int freeslot = -1;
-@@ -420,6 +460,9 @@
+@@ -428,6 +468,9 @@
  				/* Patch 186 - new generation, new old value. */
  				g_pending[i].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
  					old_class != NULL) ? strdup(old_class) : NULL;
@@ -425,7 +407,7 @@
  				memset(&prov, 0, sizeof(prov));
  				prov.nav = ms_diag_cur_nav();
  				html_content_get_diag_identity(c, &prov.doc, &prov.frame);
-@@ -440,13 +483,18 @@
+@@ -448,13 +491,18 @@
  
  			/* Merge this mutation into what the slot already holds.
  			 * Same node AND same kind = the same logical edit
@@ -446,7 +428,7 @@
  				return;		/* the same mark repeating */
  			}
  			/* Patch 301 - a distinct mark no longer collapses the
-@@ -464,7 +512,10 @@
+@@ -472,7 +520,10 @@
  				int j;
  				for (j = 0; j < g_pending[i].extra_n; j++) {
  					if (g_pending[i].extra[j].node == node &&
@@ -458,7 +440,7 @@
  						return;	/* already recorded */
  				}
  				if (g_pending[i].extra_n < RECONVERT_MAX_EXTRA) {
-@@ -474,6 +525,8 @@
+@@ -482,6 +533,8 @@
  					e->kind = kind;
  					e->old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
  						old_class != NULL) ? strdup(old_class) : NULL;
@@ -467,7 +449,7 @@
  					g_pending[i].multi = 1;
  					return;
  				}
-@@ -516,6 +569,9 @@
+@@ -524,6 +577,9 @@
  	/* Patch 186 - copy the pre-mutation class value, if given. */
  	g_pending[freeslot].old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
  		old_class != NULL) ? strdup(old_class) : NULL;
@@ -477,7 +459,31 @@
  	{
  		struct ms_diag_provenance prov;
  		memset(&prov, 0, sizeof(prov));
-@@ -871,11 +927,17 @@
+@@ -737,11 +793,23 @@
+ macos9_reconvert_fullcause_count(int i)
+ {
+ 	if (g_pending[i].coarse) {
++		/* Patch 313 - name each committed full reconvert's cause as
++		 * it happens. The patch-308 census only prints at the next
++		 * navigation reset, which can split one page's causes across
++		 * two windows; this per-batch line is synchronous with the
++		 * flush and stays inside the page's own window. */
++		macsurf_debug_log_writef("LIFE BATCHCAUSE cause=%s",
++			g_pending[i].coarse_cause == 2 ? "over" : "nonode");
+ 		if (g_pending[i].coarse_cause == 2)
+ 			g_fc_over++;
+ 		else
+ 			g_fc_nonode++;
+ 	} else {
++		macsurf_debug_log_writef("LIFE BATCHCAUSE cause=%s",
++			g_fc_reason == 1 ? "kind" :
++			g_fc_reason == 2 ? "local" :
++			g_fc_reason == 3 ? "two" :
++			g_fc_reason == 4 ? "guard" : "none");
+ 		switch (g_fc_reason) {
+ 		case 1: g_fc_kind++; break;
+ 		case 2: g_fc_local++; break;
+@@ -879,11 +947,17 @@
   * html_reconvert_local, which rebuilds and lays out just the block that
   * holds it. 1 = done (the slot is answered), 0 = do the full rebuild. */
  static int macos9_reconvert_try_local_one(struct content *c, void *node,
@@ -496,7 +502,7 @@
  
  	/* a class change on an inline-level element: its block (patch 173).
  	 * Patch 186 passes the pre-mutation class value for the precise
-@@ -892,6 +954,16 @@
+@@ -900,6 +974,16 @@
  	case MACOS9_DOMMUT_INSERTBEFORE:
  	case MACOS9_DOMMUT_CHARDATA:
  		break;
@@ -513,7 +519,7 @@
  	default:
  		g_one_fail_kind = 1;
  		return 0;
-@@ -927,7 +999,8 @@
+@@ -935,7 +1019,8 @@
  				    * 5000-paragraph full reconvert. */
  	t0 = macos9_micros();
  	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
@@ -523,7 +529,7 @@
  		g_fc_reason = g_one_fail_kind ? 1 : 2;
  		return 0;
  	}
-@@ -954,7 +1027,8 @@
+@@ -962,7 +1047,8 @@
  		}
  		if (macos9_reconvert_try_local_one(c, g_pending[i].extra[j].node,
  				g_pending[i].extra[j].kind,
@@ -533,7 +539,7 @@
  			continue;
  		/* Patch 308 - name the decline for the fullcause census.
  		 * A mark that declines while another is deferred is the
-@@ -976,7 +1050,8 @@
+@@ -984,7 +1070,8 @@
  		}
  		if (!macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
  				g_pending[i].extra[deferred].kind,
@@ -543,7 +549,40 @@
  			g_fc_reason = g_one_fail_kind ? 1 : 2;
  			return 0;
  		}
-@@ -1448,9 +1523,9 @@
+@@ -1339,6 +1426,32 @@
+ 			(macsurf_render_mask_is_structural(g_pending[i].kind_mask) ?
+ 			 MACSURF_RENDER_FULL : MACSURF_RENDER_NONE) :
+ 			macsurf_render_action_for(g_pending[i].kind, 0);
++		/* Patch 313 - a SETATTRIBUTE / REMOVEATTRIBUTE mark whose
++		 * attribute feeds style (a used sheet references it, it is
++		 * id, or it is a hinted attribute on a block box) is NOT
++		 * render-droppable: html_rl_attr_local_ok says the local
++		 * path cannot answer it, so it needs the full reconvert via
++		 * try_local's kind decline. Without this exception the
++		 * render decline drops every pure-attribute batch before
++		 * try_local runs and patch 313's kind gate never fires. */
++		if (action != MACSURF_RENDER_FULL) {
++			extern int html_rl_attr_local_ok(struct content *c,
++					void *node, const char *attr_name);
++			int j2, needs = 0;
++			if ((g_pending[i].kind == MACOS9_DOMMUT_SETATTRIBUTE ||
++			     g_pending[i].kind == MACOS9_DOMMUT_REMOVEATTRIBUTE) &&
++			    !html_rl_attr_local_ok(c, g_pending[i].node,
++						   g_pending[i].attr_name))
++				needs = 1;
++			for (j2 = 0; !needs && j2 < g_pending[i].extra_n; j2++)
++				if ((g_pending[i].extra[j2].kind == MACOS9_DOMMUT_SETATTRIBUTE ||
++				     g_pending[i].extra[j2].kind == MACOS9_DOMMUT_REMOVEATTRIBUTE) &&
++				    !html_rl_attr_local_ok(c, g_pending[i].extra[j2].node,
++							   g_pending[i].extra[j2].attr_name))
++					needs = 1;
++			if (needs)
++				action = MACSURF_RENDER_FULL;
++		}
+ 		if (have_render_scope) ms_diag_render_action((int) action);
+ 		if (action != MACSURF_RENDER_FULL) {
+ 			if (have_render_scope) ms_diag_render_leave(&render_scope,
+@@ -1456,9 +1569,9 @@
  	macos9_js_mark_dom_dirty_node(c, NULL, MACOS9_DOMMUT_UNKNOWN);
  }
  
@@ -556,7 +595,7 @@
  {
  	/* fixes489 - master switch. Still here as an emergency global
  	 * kill (macsurf_js_set_reconvert_enabled(0)); nothing currently calls
-@@ -1534,7 +1609,7 @@
+@@ -1542,7 +1655,7 @@
  	if (g_first_mark_tick == 0)
  		g_first_mark_tick = (unsigned long) TickCount();
  
@@ -565,7 +604,7 @@
  	if (macsurf_js_page_execution_active())
  		macsurf_js_note_dom_mutation();
  	/* fixes1148 - DON'T reschedule if already queued.
-@@ -1557,6 +1632,23 @@
+@@ -1565,6 +1678,23 @@
  		macos9_reconvert_schedule_pending();
  }
  
@@ -589,7 +628,6 @@
  /* Patch 186 - legacy entry point without the old class value. */
  void
  macos9_js_mark_dom_dirty_node(struct content *c, void *node, int kind)
-
 --- a/content/handlers/javascript/quickjs/macos9_reconvert.h
 +++ b/content/handlers/javascript/quickjs/macos9_reconvert.h
 @@ -84,6 +84,14 @@
@@ -607,7 +645,6 @@
  /* Legacy entry point  -  equivalent to _node(c, NULL, MACOS9_DOMMUT_UNKNOWN),
   * i.e. "something changed, no idea what". Kept so any caller that cannot name
   * the node still works, and always yields the full rebuild. */
-
 --- a/content/handlers/javascript/quickjs/macsurf_qjs.c
 +++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
 @@ -4825,8 +4825,8 @@
