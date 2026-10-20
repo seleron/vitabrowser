@@ -248,6 +248,7 @@ NET-js-lazyimg http://127.0.0.1:$HP/JS-lazyimg.html
 NET-js-reflow-stall http://127.0.0.1:$HP/JS-reflow-stall.html
 NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
+NET-js-batch-burst http://127.0.0.1:$HP/JS-batch-burst.html
 NET-js-attr-local http://127.0.0.1:$HP/JS-attr-local.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
@@ -1088,6 +1089,20 @@ dsl=$(awk '/page [0-9]*\/[0-9]* NET-js-dom-stall: navigate/ {on=1; next}
 ds_local=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: rebuilt and laid out' || true)
 ds_blocks=$(printf '%s\n' "$dsl" | grep -c 'LIFE rebuild local: blocks placed' || true)
 echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_blocks} block changes placed locally"
+# Patch 309 (doc 20 stage 1): the 120-mark burst must trip the guard --
+# with 200 paragraphs the initial-conversion budget is smaller than the
+# burst's local cost, so the guard fires (guard=1) and the rest takes one
+# full reconvert. The stage-0 census showed the innerHTML batch's full
+# reconvert (local=1); the burst adds the guard trip. Both mechanisms are
+# exercised: local answers where cheap, guard where expensive.
+bbl=$(awk '/page [0-9]*\/[0-9]* NET-js-batch-burst: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE FULLCAUSE' | tail -1)
+echo "  JS-batch-burst census: ${bbl:-no FULLCAUSE}"
+case "$bbl" in
+	*"total=2 over=0 nonode=0 kind=0 local=1 two=0 guard=1"*) ;;
+	*) o2_bad="$o2_bad js-batch-burst-census";;
+esac
 # Patch 313: on the attr-local page, the load innerHTML batch commits a
 # local-cause full reconvert and the setAttribute batch (9 data-x
 # answered locally, 1 data-flag whose attribute a used sheet references)
