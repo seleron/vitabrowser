@@ -5496,3 +5496,42 @@ conversion time). Either outcome is correct -- local answers where
 cheap, one full reconvert where the guard fires. Watch for: (1) the
 page's DOM correctness (textContent/className land), (2) no hangs or
 excessive reconverts under the burst.
+
+## Patch 311 (2026-10-20): text paints at the composed group opacity
+
+**What:** WS-A probe (a) from doc 22, bounded. Firefox paints
+`<span style="opacity:0.5">` text at 50%; VitaBrowser painted it opaque.
+The group-opacity machinery (patch 149) composed per-box opacity into
+`g_group_opacity` but only background fills consumed it. Patch 311
+threads the composed factor into text runs: `plot_font_style_t` gains a
+trailing `opacity` field (0 = unset/opaque), the redraw.c text paths
+(body text, select-gadget text, overflow ellipsis) set it from
+`g_group_opacity`, and the vita text plot maps it to the existing
+fixes49 opacity buckets. Solid pages' plot streams are byte-identical
+(the OPAQUE token is emitted only for non-solid buckets). Borders and
+images at partial opacity still paint opaque -- recorded as follow-ups,
+not regressions.
+
+**Proof (sim):** The CSS-opacity-group page carries HALFMARK
+(opacity .5), OUTERMARK (nested .7 over .5), NESTEDMARK (nested .5 over
+.7 -- style dedup composes once, 0.5 not 0.25, pre-existing 149
+semantics), and SHOWNMARK (solid). The plot shows `STR HALFMARK OPAQUE
+2` x1, `STR OUTERMARK OPAQUE 3` x1, `STR NESTEDMARK OPAQUE 1` x1, and no
+OPAQUE token on SHOWNMARK. Pixel proof on the sim snapshot: darkest
+text pixel SHOWNMARK 0, HALFMARK 127, OUTERMARK 64, NESTEDMARK 191 --
+exactly the bucket alphas (255/128/191/64) blended over white.
+
+**Gate:** Full adapted gate exit 0. Two early runs died on
+20-NET-https-local DIFFERS from 01-L1-layout-basics; root-caused to an
+orphaned httpd (from the first run) still holding :45281 and serving
+its in-memory OLD test-CA-signed leaf against the new run's bundle --
+environmental, not patch 311 (chain/files/library all verified
+standalone; a clean stage309 baseline run passes the same check with a
+fresh httpd). No timing flakes on the opacity assertions themselves.
+
+**On the device (run 39), in addition:** the CSS-opacity-group page
+(testpages/pages/CSS-opacity-group.html) now renders partially
+transparent text. On device: the marked lines should render visibly
+dimmed against white (HALFMARK ~50%, OUTERMARK ~75% over the nested
+rule, NESTEDMARK ~25%). Simulator-only here (no vitaSDK on this VM);
+no Vita cross-build was run.
