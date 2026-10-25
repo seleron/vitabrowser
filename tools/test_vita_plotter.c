@@ -732,7 +732,9 @@ static void test_backend(void)
 			}
 			snprintf(expect + n, sizeof(expect) - n,
 				 "PLOT TEXT X 5 Y 30 STR Hello\n"
-				 "PLOT POLYGON VERTICIES 3\n");
+				 /* patch 314: a polygon whose style is at
+				  * 40% opacity traces its bucket (2) */
+				 "PLOT POLYGON VERTICIES 3 OPAQUE 2\n");
 		}
 		CHECK(strcmp(dbuf, expect) == 0,
 		      "plot dump format:\n--- got\n%s--- expected\n%s", dbuf, expect);

@@ -383,10 +383,23 @@ void vita2d_draw_texture_tint_part(const vita2d_texture *t, float x, float y,
 				continue;
 			if (t->alpha8) {
 				cover = t->data[v * t->stride + u];
+				blend(first_px(x) + i, first_px(y) + j, color,
+				      cover);
 			} else {
-				cover = t->data[v * t->stride + u * 4 + 3];
+				/* An RGBA8 texture: libvita2d's tint shader
+				 * multiplies every channel, texel x tint
+				 * (patch 315 draws faded 1:1 bitmaps with a
+				 * white tint at the bucket alpha). */
+				const unsigned char *p =
+					t->data + v * t->stride + u * 4;
+				uint32_t m = 0;
+				int k;
+				for (k = 0; k < 4; k++)
+					m |= (uint32_t)((p[k] *
+						((color >> (8 * k)) & 0xff)) /
+						255) << (8 * k);
+				blend(first_px(x) + i, first_px(y) + j, m, 255);
 			}
-			blend(first_px(x) + i, first_px(y) + j, color, cover);
 		}
 }
 

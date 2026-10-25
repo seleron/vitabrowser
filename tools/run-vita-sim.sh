@@ -644,7 +644,38 @@ op_bdash_op2=$(grep -c 'PLOT LINE.*OPAQUE 2' "$op" 2>/dev/null || true)
 op_bdash_all=$(grep -c 'PLOT LINE' "$op" 2>/dev/null || true)
 op_balpha_op2=$(awk '/PLOT RECT/ { if ($8 - $4 == 100 && $10 - $6 == 6 && /OPAQUE 2/) n++ } END { print n+0 }' "$op" 2>/dev/null)
 op_balpha_op1=$(awk '/PLOT RECT/ { if ($8 - $4 == 100 && $10 - $6 == 6 && /OPAQUE 1/) n++ } END { print n+0 }' "$op" 2>/dev/null)
-echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0), half-border RECT ${op_brect_h:-?}/${op_brect_s:-?} (2/2), solid-border RECT ${op_brect_ctl:-?} (2), double-border POLYGON ${op_bdbl_op2:-?}/${op_bdbl_all:-?} (8/16), dashed-border LINE ${op_bdash_op2:-?}/${op_bdash_all:-?} (4/8), alpha-border OPAQUE 2/1 ${op_balpha_op2:-?}/${op_balpha_op1:-?} (2/2)"
+# Patch 315 (doc 24 stage 1): bitmaps carry the composed group opacity in
+# their flags -- the 20x20 no-repeat tile and the 16x16 tile repeated in
+# both axes (blend mode set too) inside .half trace OPAQUE 2 and draw 1:1
+# through the tint entry; the repeat control outside traces none. The
+# radio's 2 DISCs + 2 ARCs and the inline SVG's PATH inside .half carry
+# OPAQUE 2, the controls none. Pixels from the autotest snapshot: blue
+# tile 127,127,255; red tiles 255,127,127 (first tile and the last row
+# and column -- every tile faded); red control 255,0,0.
+op_bg1=$(grep -c 'PLOT BITMAP .* WIDTH 20 HEIGHT 20 OPAQUE 2$' "$op" 2>/dev/null || true)
+op_bgrep_op2=$(grep -c 'PLOT BITMAP .* WIDTH 16 HEIGHT 16 OPAQUE 2$' "$op" 2>/dev/null || true)
+op_bgrep_ctl=$(grep -c 'PLOT BITMAP .* WIDTH 16 HEIGHT 16$' "$op" 2>/dev/null || true)
+op_disc_op2=$(grep -c 'PLOT DISC .* OPAQUE 2$' "$op" 2>/dev/null || true)
+op_disc_all=$(grep -c 'PLOT DISC' "$op" 2>/dev/null || true)
+op_arc_op2=$(grep -c 'PLOT ARC .* OPAQUE 2$' "$op" 2>/dev/null || true)
+op_arc_all=$(grep -c 'PLOT ARC' "$op" 2>/dev/null || true)
+op_path_op2=$(grep -c 'PLOT PATH .* OPAQUE 2$' "$op" 2>/dev/null || true)
+op_path_all=$(grep -c 'PLOT PATH' "$op" 2>/dev/null || true)
+op_px=
+op_snap=$(ls "$OUT"/snaps/N-*-CSS-opacity.png 2>/dev/null | head -1)
+op_b20=$(grep -a -m1 -o 'PLOT BITMAP X [0-9]* Y [0-9]* WIDTH 20 HEIGHT 20 OPAQUE 2' "$op" 2>/dev/null || true)
+op_b16=$(grep -a -m1 -o 'PLOT BITMAP X [0-9]* Y [0-9]* WIDTH 16 HEIGHT 16 OPAQUE 2' "$op" 2>/dev/null || true)
+op_b16c=$(grep -a -m1 'PLOT BITMAP X [0-9]* Y [0-9]* WIDTH 16 HEIGHT 16$' "$op" 2>/dev/null | grep -o 'BITMAP X [0-9]* Y [0-9]*' || true)
+if [ -n "$op_snap" ] && [ -n "$op_b20" ] && [ -n "$op_b16" ] && [ -n "$op_b16c" ]; then
+	op_x20=$(echo "$op_b20" | awk '{print $4}'); op_y20=$(echo "$op_b20" | awk '{print $6}')
+	op_x16=$(echo "$op_b16" | awk '{print $4}'); op_y16=$(echo "$op_b16" | awk '{print $6}')
+	op_xc=$(echo "$op_b16c" | awk '{print $3}'); op_yc=$(echo "$op_b16c" | awk '{print $5}')
+	op_px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$op_snap" \
+		$((op_x20 + 10)),$((op_y20 + 10)) $((op_x16 + 8)),$((op_y16 + 8)) \
+		$((op_x16 + 60)),$((op_y16 + 28)) $((op_xc + 8)),$((op_yc + 8)) | \
+		awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0), half-border RECT ${op_brect_h:-?}/${op_brect_s:-?} (2/2), solid-border RECT ${op_brect_ctl:-?} (2), double-border POLYGON ${op_bdbl_op2:-?}/${op_bdbl_all:-?} (8/16), dashed-border LINE ${op_bdash_op2:-?}/${op_bdash_all:-?} (4/8), alpha-border OPAQUE 2/1 ${op_balpha_op2:-?}/${op_balpha_op1:-?} (2/2), bg-tile OPAQUE 2 ${op_bg1:-?} (1), bg-repeat OPAQUE 2/solid ${op_bgrep_op2:-?}/${op_bgrep_ctl:-?} (1/1), radio DISC ${op_disc_op2:-?}/${op_disc_all:-?} (2/4), radio ARC ${op_arc_op2:-?}/${op_arc_all:-?} (2/4), svg PATH ${op_path_op2:-?}/${op_path_all:-?} (1/2), image pixels ${op_px:-none} (127,127,255 255,127,127 255,127,127 255,0,0)"
 ifp=$(ls "$R"/*NET-js-interfaces.plot 2>/dev/null | head -1)
 ifr=$(sed -n 's/.*STR \(IFACES: [0-9]*\/[0-9]* passed\).*/\1/p' "$ifp" 2>/dev/null | head -1)
 echo "  JS-interfaces: ${ifr:-no summary}"
@@ -1261,7 +1292,12 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 	[ "${op_brect_ctl:-0}" -eq 2 ] && \
 	[ "${op_bdbl_op2:-0}" -eq 8 ] && [ "${op_bdbl_all:-0}" -eq 16 ] && \
 	[ "${op_bdash_op2:-0}" -eq 4 ] && [ "${op_bdash_all:-0}" -eq 8 ] && \
-	[ "${op_balpha_op2:-0}" -eq 2 ] && [ "${op_balpha_op1:-0}" -eq 2 ] || fail "event order / inline-grid / group opacity"
+	[ "${op_balpha_op2:-0}" -eq 2 ] && [ "${op_balpha_op1:-0}" -eq 2 ] && \
+	[ "${op_bg1:-0}" -eq 1 ] && [ "${op_bgrep_op2:-0}" -eq 1 ] && [ "${op_bgrep_ctl:-0}" -eq 1 ] && \
+	[ "${op_disc_op2:-0}" -eq 2 ] && [ "${op_disc_all:-0}" -eq 4 ] && \
+	[ "${op_arc_op2:-0}" -eq 2 ] && [ "${op_arc_all:-0}" -eq 4 ] && \
+	[ "${op_path_op2:-0}" -eq 1 ] && [ "${op_path_all:-0}" -eq 2 ] && \
+	[ "$op_px" = "127,127,255 255,127,127 255,127,127 255,0,0 " ] || fail "event order / inline-grid / group opacity"
 
 # Script-made frames (Patch 143) and timer chains (Patch 141): a same-
 # origin or blank frame a script makes fires load and has a same-realm

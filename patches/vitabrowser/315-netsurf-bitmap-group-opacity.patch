@@ -1,0 +1,601 @@
+# netsurf: bitmaps and the disc/arc/path ops paint at the composed group opacity (patch 315)
+# Generated 2026-10-25
+# Base: seleron/vitabrowser (patch stack through 314)
+#
+# Doc 24 stage 1 (the bitmap opacity channel). Patch 314 recorded the
+# remainder of patch 311's gap: at partial group opacity, fills, text
+# and borders faded but images, radio buttons and inline SVG painted
+# solid. The bitmap plot op had no opacity channel, and the disc, arc
+# and path ops ignored the opacity their plot style could carry.
+#
+#  - include/netsurf/plotters.h: BITMAPF_OPACITY(a), a byte in flag bits
+#    16-23 beside the blend-mode encoding (doc 24 shape (a)). A masked 0
+#    means "not supplied" = opaque, which is what every caller that never
+#    writes the field produces; folding sites write >= 1 for a real value.
+#    It rides in the op, so desktop knockout's queued replay keeps it.
+#  - Correction to doc 24's census: background images do NOT reach the
+#    plotter from redraw.c directly -- html_redraw_background and the
+#    inline-background path paint through content_redraw() and the image
+#    handler. So the carrier doc 24 scheduled for stage 2 is needed here:
+#    content_redraw_data gains `opacity` (a byte, 0 = solid). redraw.c
+#    fills it at both background sites from the new
+#    html_redraw_group_opacity_byte() (the patch-314 composed value,
+#    rounded, 0 when full so solid pages' flags are unchanged), and the
+#    four handlers that call the bitmap op (image.c -- png/jpeg/gif/ico/
+#    webp via image_bitmap_plot -- bmp.c, nssprite.c, rsvg.c) fold
+#    BITMAPF_OPACITY(data->opacity) beside their blend fold, so it
+#    composes with the REPEAT and blend bits. Every other constructor of
+#    the struct (content.c thumbnails, browser_window.c, print.c,
+#    treeview.c, and redraw.c's <img>/object data) sets opacity = 0:
+#    <img> at group opacity is doc 24 stage 2 and still paints solid.
+#    The two redraw.c sites that call the bitmap op directly fold the
+#    byte too: the background-clip:text image and a <canvas>.
+#  - frontends/vita/plot.c, bitmap op: bucket from the byte (the same
+#    thresholds as every other op). Bucket 0 skips the draw. A tile drawn
+#    1:1 (op size == texture size) at a partial bucket draws through
+#    vita2d_draw_texture_tint_part with a white tint at the bucket alpha
+#    -- the stub-declared entry the text atlas already uses; libvita2d's
+#    tint shader multiplies texel by tint. A SCALED tile still draws
+#    solid: no stub entry both scales and tints (doc 24's open fork: CPU
+#    pre-multiply vs a device-verified scale-tint entry -- the owner's
+#    call). The trace appends " OPAQUE <bucket>" only to a draw that is
+#    actually faded or skipped, so solid pages' dumps are byte-identical
+#    and a declined scaled fade reads as solid.
+#  - disc/arc/path: per-op adoption of vita_geom_opacity_bucket(style),
+#    exactly as patch 314 did for line/polygon/rectangle -- disc fill and
+#    stroke, arc stroke, the path filler's spans and strokes, with the
+#    OPAQUE trace suffix only when non-solid. Their callers passed shared
+#    static styles (radio) or a zeroed one (inline SVG), so the group
+#    opacity is folded in there: html_redraw_radio takes local copies of
+#    its four styles, vb_inline_svg_paint sets ps.opacity.
+#  - replay.c honours a BITMAP line's OPAQUE suffix like RECT/LINE.
+#
+# Simulator (tools/vita-sim/vitasim.c, same commit): its tint_part used
+# the tint colour as paint with texel alpha as coverage -- right for the
+# U8 text atlas, wrong for an RGBA texture (doc 24 assumed texel x tint).
+# RGBA textures now modulate every channel by the tint, as the libvita2d
+# shader does; the U8 path is unchanged (text pixels identical).
+#
+# Proof (focused, sim): inside opacity:.5 a 20x20 blue (0,0,255) no-repeat
+# tile reads 127,127,255; a 16x16 red tile repeated in both axes with
+# background-blend-mode set reads 255,127,127 in its first tile and its
+# last row/column; the same repeat outside the group reads 255,0,0 with
+# no token. A checked radio inside the group traces 2 DISC + 2 ARC
+# OPAQUE 2 (its centre dot 0 -> 117), the control none; an inline SVG
+# rect reads 127,127,255 vs 0,0,255 outside. Gate: CSS-opacity-group
+# gains the row; the gate script asserts the counts and the four pixels.
+#
+# Scope notes (recorded, not changed here):
+#  - Scaled bitmaps at partial opacity: solid, as above (doc 24 open
+#    question 1). <img> and other object contents: stage 2.
+#  - image_bitmap_plot's 1x1-bitmap shortcut plots a rectangle with a
+#    stack plot_style_t whose opacity/radius/shadow fields are never
+#    initialised (pre-existing): a 1x1 background inside a group cannot
+#    fade, and those fields are whatever the stack held. Not touched.
+#  - SVG image contents (content/handlers/image/svg.c) build their own
+#    path styles and do not fold the group opacity; checkbox gadgets
+#    (rect/line with static styles) likewise. Same class, next stage.
+#
+# Simulator only; the vita cross-build was not run for this patch.
+# Device expectation is in Doc 10.
+--- a/include/netsurf/plotters.h
++++ b/include/netsurf/plotters.h
+@@ -47,6 +47,19 @@
+ #define BITMAPF_BLEND_MASK (0x1fUL << BITMAPF_BLEND_SHIFT)
+ #define BITMAPF_BLEND_MODE(m) \
+ 	(((bitmap_flags_t)(m) & 0x1fUL) << BITMAPF_BLEND_SHIFT)
++/* VitaBrowser patch 315 (doc 24): the composed group opacity rides in
++ * bits 16-23 as a byte. A masked value of 0 means "not supplied" and the
++ * plotter draws opaque -- what every caller that never writes the field
++ * produces -- so folding sites write max(byte, 1) for a real value (a
++ * group opacity of 0 lands on 1, which quantises to "skip"). Frontends
++ * that do not know the bits ignore them. Carried in the op so desktop
++ * knockout's queued replay keeps it verbatim. */
++#define BITMAPF_OPACITY_SHIFT 16
++#define BITMAPF_OPACITY_MASK (0xffUL << BITMAPF_OPACITY_SHIFT)
++#define BITMAPF_OPACITY(a) \
++	(((bitmap_flags_t)(a) & 0xffUL) << BITMAPF_OPACITY_SHIFT)
++#define BITMAPF_OPACITY_BYTE(f) \
++	((unsigned int)(((f) & BITMAPF_OPACITY_MASK) >> BITMAPF_OPACITY_SHIFT))
+ 
+ enum path_command {
+ 	PLOTTER_PATH_MOVE,
+--- a/include/netsurf/content.h
++++ b/include/netsurf/content.h
+@@ -66,6 +66,11 @@
+ 
+ 	/** CSS background-blend-mode; zero and NORMAL both mean normal paint. */
+ 	unsigned char background_blend_mode;
++
++	/** VitaBrowser patch 315 (doc 24): composed group opacity of the
++	 *  painting box as a byte for BITMAPF_OPACITY(); 0 = not supplied
++	 *  (solid). Every constructor of this struct sets it explicitly. */
++	unsigned char opacity;
+ };
+ 
+ /**
+--- a/content/content.c
++++ b/content/content.c
+@@ -945,6 +945,7 @@
+ 	data.repeat_y = false;
+ 	data.nearest = false;  /* fixes829 (#256) */
+ 	data.background_blend_mode = 0;
++	data.opacity = 0;  /* patch 315: no group opacity (solid) */
+ 
+ 	/* Find the scale factor to use if the content has a width */
+ 	if (c->width) {
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -2954,6 +2954,7 @@
+ 	data.repeat_y = false;
+ 	data.nearest = false;  /* fixes829 (#256) */
+ 	data.background_blend_mode = 0;
++	data.opacity = 0;  /* patch 315: no group opacity (solid) */
+ 
+ 	content_clip = *clip;
+ 
+--- a/desktop/print.c
++++ b/desktop/print.c
+@@ -202,6 +202,7 @@
+ 	data.repeat_y = false;
+ 	data.nearest = false;  /* fixes829 (#256) */
+ 	data.background_blend_mode = 0;
++	data.opacity = 0;  /* patch 315: no group opacity (solid) */
+ 
+ 	html_redraw_printing = true;
+ 	html_redraw_printing_border = clip.y1;
+--- a/desktop/treeview.c
++++ b/desktop/treeview.c
+@@ -3038,6 +3038,7 @@
+ 	data.repeat_y = false;
+ 	data.nearest = false;  /* fixes829 (#256) */
+ 	data.background_blend_mode = 0;
++	data.opacity = 0;  /* patch 315: no group opacity (solid) */
+ 
+ 	if (tree->flags & TREEVIEW_SEARCHABLE) {
+ 		if (render_y < r.y1) {
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -385,6 +385,10 @@
+  * currently being painted (in html/redraw.c). */
+ plot_style_fixed html_redraw_group_opacity(void);
+ 
++/* VitaBrowser patch 315: the same as a BITMAPF_OPACITY() byte (0 when
++ * full, i.e. not supplied; >= 1 otherwise). */
++unsigned char html_redraw_group_opacity_byte(void);
++
+ 
+ bool html_redraw_inline_borders(struct box *box, struct rect b,
+ 		const struct rect *clip, float scale, bool first, bool last,
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1275,14 +1275,25 @@
+ 	nserror res;
+ 	/* #252: local copy of the selection-dot style for accent-color. */
+ 	plot_style_t blob_fill = *plot_style_fill_wblobc;
++	/* VitaBrowser patch 315: the radio's disc and arcs paint at the
++	 * composed group opacity (local copies of the shared styles). */
++	plot_style_t base = *plot_style_fill_wbasec;
++	plot_style_t dark = *plot_style_fill_darkwbasec;
++	plot_style_t light = *plot_style_fill_lightwbasec;
+ 
+ 	if (accent_set) {
+ 		blob_fill.fill_colour = accent_col;
+ 	}
++	if (g_group_opacity < (plot_style_fixed)PLOT_STYLE_SCALE) {
++		base.opacity = g_group_opacity;
++		dark.opacity = g_group_opacity;
++		light.opacity = g_group_opacity;
++		blob_fill.opacity = g_group_opacity;
++	}
+ 
+ 	/* plot background of radio button */
+ 	res = ctx->plot->disc(ctx,
+-			      plot_style_fill_wbasec,
++			      &base,
+ 			      x + width * 0.5,
+ 			      y + height * 0.5,
+ 			      width * 0.5 - 1);
+@@ -1292,7 +1303,7 @@
+ 
+ 	/* plot dark arc */
+ 	res = ctx->plot->arc(ctx,
+-			     plot_style_fill_darkwbasec,
++			     &dark,
+ 			     x + width * 0.5,
+ 			     y + height * 0.5,
+ 			     width * 0.5 - 1,
+@@ -1304,7 +1315,7 @@
+ 
+ 	/* plot light arc */
+ 	res = ctx->plot->arc(ctx,
+-			     plot_style_fill_lightwbasec,
++			     &light,
+ 			     x + width * 0.5,
+ 			     y + height * 0.5,
+ 			     width * 0.5 - 1,
+@@ -2524,6 +2535,9 @@
+ 						CSS_IMAGE_RENDERING_CRISP_EDGES));
+ 				bg_data.background_blend_mode = background->style != NULL ?
+ 					css_computed_background_blend_mode(background->style) : 0;
++				/* patch 315: background images fade with their
++				 * opacity group (doc 24 stage 1). */
++				bg_data.opacity = html_redraw_group_opacity_byte();
+ 
+ 				/* fixes1048 (#280) - the tile size was resolved up-front by
+ 				 * html_redraw_bg_tile_size (before background-position,
+@@ -3036,6 +3050,8 @@
+ 					CSS_IMAGE_RENDERING_CRISP_EDGES));
+ 			bg_data.background_blend_mode = box->style != NULL ?
+ 				css_computed_background_blend_mode(box->style) : 0;
++			/* patch 315: inline backgrounds fade likewise. */
++			bg_data.opacity = html_redraw_group_opacity_byte();
+ 
+ 			/* fixes828 (#255/#280): honour background-size on INLINE
+ 			 * backgrounds too. The block path (html_redraw_background)
+@@ -3785,6 +3801,11 @@
+ 			default:
+ 				break;
+ 			}
++			/* patch 315: the clipped (background-clip:text)
++			 * image carries the group opacity like the
++			 * handler-painted backgrounds do. */
++			bitmap_flags |= BITMAPF_OPACITY(
++					html_redraw_group_opacity_byte());
+ 		}
+ 	}
+ 
+@@ -4855,6 +4876,23 @@
+ 	return g_group_opacity;
+ }
+ 
++/* VitaBrowser patch 315 (doc 24): the composed group opacity as the
++ * BITMAPF_OPACITY() byte. Full opacity is "not supplied" (0), so solid
++ * pages' bitmap ops carry exactly the flags they did; a partial value
++ * is rounded to a byte and kept >= 1 (byte 0 would read as solid). */
++unsigned char html_redraw_group_opacity_byte(void)
++{
++	unsigned int b;
++
++	if (g_group_opacity >= (plot_style_fixed)PLOT_STYLE_SCALE)
++		return 0;
++	if (g_group_opacity <= 0)
++		return 1;
++	b = (unsigned int)(((int64_t)g_group_opacity * 255 +
++				PLOT_STYLE_SCALE / 2) / PLOT_STYLE_SCALE);
++	return (unsigned char)(b < 1 ? 1 : (b > 255 ? 255 : b));
++}
++
+ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -5891,6 +5929,9 @@
+ 			 css_computed_image_rendering(box->style) ==
+ 				CSS_IMAGE_RENDERING_CRISP_EDGES));
+ 		obj_data.background_blend_mode = 0;
++		/* patch 315: <img>/object group opacity is doc 24 stage 2;
++		 * until then objects paint solid, as before. */
++		obj_data.opacity = 0;
+ 
+ 		if (content_get_type(box->object) == CONTENT_HTML) {
+ 			obj_data.x /= scale;
+@@ -6039,7 +6080,11 @@
+ 		if (bitmap != NULL &&
+ 		    ctx->plot->bitmap(ctx, bitmap, x + padding_left, y + padding_top,
+ 				      width, height, current_background_color,
+-				      BITMAPF_NONE) != NSERROR_OK)
++				      /* patch 315: a canvas inside an
++				       * opacity group fades with it */
++				      BITMAPF_OPACITY(
++					html_redraw_group_opacity_byte()))
++				      != NSERROR_OK)
+ 			return false;
+ 	} else if (box->iframe) {
+ 		/* Offset is passed to browser window redraw unscaled */
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -462,6 +462,7 @@
+ 	struct svgtiny_diagram *d;
+ 	float transform[6];
+ 	unsigned int i;
++	plot_style_fixed group = html_redraw_group_opacity();	/* patch 315 */
+ 
+ 	if (box == NULL || box->node == NULL || width <= 0 || height <= 0 ||
+ 	    width > 4096 || height > 4096)
+@@ -504,6 +505,10 @@
+ 			ps.fill_type = PLOT_OP_TYPE_SOLID;
+ 			ps.fill_colour = BGR(d->shape[i].fill);
+ 		}
++		/* VitaBrowser patch 315: the shapes paint at the composed
++		 * group opacity (0 = unset = solid when the group is full). */
++		if (group < (plot_style_fixed)PLOT_STYLE_SCALE)
++			ps.opacity = group;
+ 		if (ctx->plot->path(ctx, &ps, d->shape[i].path,
+ 				d->shape[i].path_length, transform) !=
+ 				NSERROR_OK)
+--- a/content/handlers/image/image.c
++++ b/content/handlers/image/image.c
+@@ -169,6 +169,7 @@
+ 	if (data->repeat_y)
+ 		flags |= BITMAPF_REPEAT_Y;
+ 	flags |= BITMAPF_BLEND_MODE(data->background_blend_mode);
++	flags |= BITMAPF_OPACITY(data->opacity);	/* patch 315 (doc 24) */
+ 
+ 	return (ctx->plot->bitmap(ctx,
+ 				  bitmap,
+--- a/content/handlers/image/bmp.c
++++ b/content/handlers/image/bmp.c
+@@ -201,6 +201,7 @@
+ 	if (data->repeat_y)
+ 		flags |= BITMAPF_REPEAT_Y;
+ 	flags |= BITMAPF_BLEND_MODE(data->background_blend_mode);
++	flags |= BITMAPF_OPACITY(data->opacity);	/* patch 315 (doc 24) */
+ 
+ 	return (ctx->plot->bitmap(ctx,
+ 				  bmp->bitmap,
+--- a/content/handlers/image/nssprite.c
++++ b/content/handlers/image/nssprite.c
+@@ -201,6 +201,7 @@
+ 		flags |= BITMAPF_REPEAT_Y;
+ 	}
+ 	flags |= BITMAPF_BLEND_MODE(data->background_blend_mode);
++	flags |= BITMAPF_OPACITY(data->opacity);	/* patch 315 (doc 24) */
+ 
+ 	return (ctx->plot->bitmap(ctx,
+ 				  nssprite->bitmap,
+--- a/content/handlers/image/rsvg.c
++++ b/content/handlers/image/rsvg.c
+@@ -205,6 +205,7 @@
+ 	if (data->repeat_y)
+ 		flags |= BITMAPF_REPEAT_Y;
+ 	flags |= BITMAPF_BLEND_MODE(data->background_blend_mode);
++	flags |= BITMAPF_OPACITY(data->opacity);	/* patch 315 (doc 24) */
+ 
+ 	return (ctx->plot->bitmap(ctx,
+ 				  rsvgcontent->bitmap,
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -466,13 +466,6 @@
+ 	}
+ }
+ 
+-/** Stroke a polyline given as float x,y pairs. */
+-static void stroke_polyline(const float *xy, unsigned int n, bool closed,
+-			    int width, colour c)
+-{
+-	stroke_polyline_bucket(xy, n, closed, width, c, VITA_BUCKET_SOLID);
+-}
+-
+ static nserror
+ vita_plot_arc(const struct redraw_context *ctx,
+ 	      const plot_style_t *style,
+@@ -482,8 +475,17 @@
+ 	int segs, i;
+ 	float a1, a2;
+ 
+-	trace("ARC X %d Y %d RADIUS %d ANGLE1 %d ANGLE2 %d",
+-	      x, y, radius, angle1, angle2);
++	/* VitaBrowser patch 315: the arc strokes at its style's opacity
++	 * bucket (a radio's rims inside an opacity group); the trace
++	 * carries the bucket only when non-solid. */
++	int bucket = vita_geom_opacity_bucket(style);
++
++	if (bucket == VITA_BUCKET_SOLID)
++		trace("ARC X %d Y %d RADIUS %d ANGLE1 %d ANGLE2 %d",
++		      x, y, radius, angle1, angle2);
++	else
++		trace("ARC X %d Y %d RADIUS %d ANGLE1 %d ANGLE2 %d OPAQUE %d",
++		      x, y, radius, angle1, angle2, bucket);
+ 	/* Anticlockwise from angle1 to angle2, degrees from horizontal. */
+ 	while (angle2 < angle1)
+ 		angle2 += 360;
+@@ -498,8 +500,8 @@
+ 		xy[i * 2] = (float)x + (float)radius * cosf(a);
+ 		xy[i * 2 + 1] = (float)y - (float)radius * sinf(a);
+ 	}
+-	stroke_polyline(xy, (unsigned int)segs + 1, false, stroke_px(style),
+-			style->stroke_colour);
++	stroke_polyline_bucket(xy, (unsigned int)segs + 1, false,
++			       stroke_px(style), style->stroke_colour, bucket);
+ 	return NSERROR_OK;
+ }
+ 
+@@ -508,14 +510,21 @@
+ 	       const plot_style_t *style,
+ 	       int x, int y, int radius)
+ {
+-	trace("DISC X %d Y %d RADIUS %d", x, y, radius);
++	/* VitaBrowser patch 315: fill and stroke at the style's opacity
++	 * bucket, like the line/polygon/rectangle ops since patch 314. */
++	int bucket = vita_geom_opacity_bucket(style);
++
++	if (bucket == VITA_BUCKET_SOLID)
++		trace("DISC X %d Y %d RADIUS %d", x, y, radius);
++	else
++		trace("DISC X %d Y %d RADIUS %d OPAQUE %d", x, y, radius,
++		      bucket);
+ 	if (style->fill_type != PLOT_OP_TYPE_NONE &&
+ 	    clip_prepare(x - radius, y - radius, x + radius + 1,
+ 			 y + radius + 1)) {
+ 		vita_plot_calls++;
+ 		vita2d_draw_fill_circle((float)x, (float)y, (float)radius,
+-				vita_plot_rgba(style->fill_colour,
+-					       VITA_BUCKET_SOLID));
++				vita_plot_rgba(style->fill_colour, bucket));
+ 	}
+ 	if (style->stroke_type != PLOT_OP_TYPE_NONE) {
+ 		float xy[VITA_CIRCLE_SEGMENTS * 2];
+@@ -526,8 +535,9 @@
+ 			xy[i * 2] = (float)x + (float)radius * cosf(a);
+ 			xy[i * 2 + 1] = (float)y + (float)radius * sinf(a);
+ 		}
+-		stroke_polyline(xy, VITA_CIRCLE_SEGMENTS, true,
+-				stroke_px(style), style->stroke_colour);
++		stroke_polyline_bucket(xy, VITA_CIRCLE_SEGMENTS, true,
++				       stroke_px(style), style->stroke_colour,
++				       bucket);
+ 	}
+ 	return NSERROR_OK;
+ }
+@@ -642,12 +652,13 @@
+ 		y1[PATH_PENDING];
+ 	int n;
+ 	colour c;
++	int bucket;		/* patch 315: the path style's opacity */
+ };
+ 
+ static void span_flush_one(struct span_merge *m, int i)
+ {
+ 	vita_plot_fill_rect(m->x0[i], m->y0[i], m->x1[i], m->y1[i], m->c,
+-			    VITA_BUCKET_SOLID);
++			    m->bucket);
+ 	m->n--;
+ 	m->x0[i] = m->x0[m->n]; m->x1[i] = m->x1[m->n];
+ 	m->y0[i] = m->y0[m->n]; m->y1[i] = m->y1[m->n];
+@@ -734,10 +745,19 @@
+ 	unsigned int i = 0;
+ 	float cx = 0, cy = 0;
+ 	int k;
++	/* VitaBrowser patch 315: the filler's spans and the strokes take
++	 * the style's opacity bucket (an inline SVG inside an opacity
++	 * group); the trace carries it only when non-solid. */
++	int bucket = vita_geom_opacity_bucket(pstyle);
+ 
+ 	(void)ctx;
+-	trace("PATH VERTICIES %u WIDTH %f", n,
+-	      plot_style_fixed_to_float(pstyle->stroke_width));
++	if (bucket == VITA_BUCKET_SOLID)
++		trace("PATH VERTICIES %u WIDTH %f", n,
++		      plot_style_fixed_to_float(pstyle->stroke_width));
++	else
++		trace("PATH VERTICIES %u WIDTH %f OPAQUE %d", n,
++		      plot_style_fixed_to_float(pstyle->stroke_width),
++		      bucket);
+ 	memset(&pp, 0, sizeof(pp));
+ 	while (i < n) {
+ 		int cmd = (int)p[i];
+@@ -787,6 +807,7 @@
+ 		struct span_merge m;
+ 		m.n = 0;
+ 		m.c = pstyle->fill_colour;
++		m.bucket = bucket;
+ 		vita_plot_calls++;
+ 		(void)polyfill(pp.xy, pp.counts, pp.nsub, POLYFILL_NONZERO,
+ 			       vita_clip.x0, vita_clip.y0, vita_clip.x1,
+@@ -798,10 +819,10 @@
+ 		unsigned int at = 0;
+ 		for (k = 0; k < pp.nsub; k++) {
+ 			if (pp.counts[k] >= 2)
+-				stroke_polyline(pp.xy + at * 2,
++				stroke_polyline_bucket(pp.xy + at * 2,
+ 						(unsigned int)pp.counts[k],
+ 						pp.closed[k], stroke_px(pstyle),
+-						pstyle->stroke_colour);
++						pstyle->stroke_colour, bucket);
+ 			at += (unsigned int)pp.counts[k];
+ 		}
+ 	}
+@@ -811,6 +832,21 @@
+ 	return NSERROR_OK;
+ }
+ 
++static int vita_font_opacity_bucket(plot_style_fixed op);
++
++/* VitaBrowser patch 315 (doc 24): the bitmap op's opacity byte
++ * (BITMAPF_OPACITY, bits 16-23) to a bucket -- the same thresholds as
++ * every other op. A byte of 0 is "not supplied": solid. */
++static int vita_bitmap_opacity_bucket(bitmap_flags_t flags)
++{
++	unsigned int b = BITMAPF_OPACITY_BYTE(flags);
++
++	if (b == 0)
++		return VITA_BUCKET_SOLID;
++	return vita_font_opacity_bucket((plot_style_fixed)
++			(((unsigned int)PLOT_STYLE_SCALE * b) / 255));
++}
++
+ static nserror
+ vita_plot_bitmap(const struct redraw_context *ctx,
+ 		 struct bitmap *bitmap,
+@@ -823,15 +859,42 @@
+ 	vita2d_texture *tex;
+ 	float sx, sy;
+ 	int tx, ty, x_end, y_end;
+-
+-	trace("BITMAP X %d Y %d WIDTH %d HEIGHT %d", x, y, width, height);
++	int bucket = vita_bitmap_opacity_bucket(flags);
++	bool tint = false;
++	unsigned int tex_w = 0, tex_h = 0;
++
++	/* VitaBrowser patch 315 (doc 24 stage 1): a bitmap inside an
++	 * opacity group arrives with the composed opacity in its flags.
++	 * Bucket 0 skips the draw (an opacity:0 group leaks nothing). A
++	 * tile drawn 1:1 fades through vita2d_draw_texture_tint_part with
++	 * a white tint at the bucket alpha (texel x tint, the entry the
++	 * text atlas draws through); a scaled tile has no stub entry that
++	 * both scales and tints, so it still draws solid -- doc 24's open
++	 * fork (CPU pre-multiply vs a device-verified scale-tint entry).
++	 * The trace carries " OPAQUE <bucket>" only for a draw that is
++	 * actually faded (or skipped), so solid pages' dumps are
++	 * byte-identical and a declined scaled fade reads as solid. */
++	tex = vita_bitmap_texture(bitmap);
++	if (tex != NULL) {
++		tex_w = vita2d_texture_get_width(tex);
++		tex_h = vita2d_texture_get_height(tex);
++	}
++	if (bucket != VITA_BUCKET_SOLID &&
++	    (bucket == 0 || ((unsigned int)width == tex_w &&
++			     (unsigned int)height == tex_h)))
++		tint = true;
++	if (tint)
++		trace("BITMAP X %d Y %d WIDTH %d HEIGHT %d OPAQUE %d",
++		      x, y, width, height, bucket);
++	else
++		trace("BITMAP X %d Y %d WIDTH %d HEIGHT %d",
++		      x, y, width, height);
+ 	if (vita_clip_empty || width <= 0 || height <= 0)
+ 		return NSERROR_OK;
+-	tex = vita_bitmap_texture(bitmap);
+-	if (tex == NULL)
++	if (tex == NULL || (tint && bucket == 0))
+ 		return NSERROR_OK;
+-	sx = (float)width / (float)vita2d_texture_get_width(tex);
+-	sy = (float)height / (float)vita2d_texture_get_height(tex);
++	sx = (float)width / (float)tex_w;
++	sy = (float)height / (float)tex_h;
+ 
+ 	/* Tile across the clip rectangle on repeating axes; the GPU clip
+ 	 * trims the partial tiles at the edges. */
+@@ -858,8 +921,15 @@
+ 			if (!clip_prepare(tx, ty, tx + width, ty + height))
+ 				continue;
+ 			vita_plot_calls++;
+-			vita2d_draw_texture_scale(tex, (float)tx, (float)ty,
+-						  sx, sy);
++			if (tint)
++				vita2d_draw_texture_tint_part(tex, (float)tx,
++						(float)ty, 0.0f, 0.0f,
++						(float)tex_w, (float)tex_h,
++						vita_plot_rgba(0xffffff,
++							       bucket));
++			else
++				vita2d_draw_texture_scale(tex, (float)tx,
++						(float)ty, sx, sy);
+ 		}
+ 	}
+ 	return NSERROR_OK;
+--- a/frontends/vita/replay.c
++++ b/frontends/vita/replay.c
+@@ -127,9 +127,10 @@
+ 		stats->disc++;
+ 	} else if (sscanf(line, "BITMAP X %d Y %d WIDTH %d HEIGHT %d",
+ 			  &x0, &y0, &x1, &y1) == 4) {
+-		/* Image placeholder: the stream has no pixels. */
++		/* Image placeholder: the stream has no pixels. Patch 315:
++		 * honour the OPAQUE suffix like RECT/LINE. */
+ 		vita_plot_fill_rect(x0, y0, x0 + x1, y0 + y1, 0xc0c0c0,
+-				    VITA_BUCKET_SOLID);
++				    parse_bucket(line));
+ 		stats->bitmap++;
+ 	} else {
+ 		/* ARC, POLYGON VERTICIES, PATH: counts only, no geometry. */
