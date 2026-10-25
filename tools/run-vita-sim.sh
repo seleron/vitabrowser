@@ -250,6 +250,7 @@ NET-js-parse-tail http://127.0.0.1:$HP/JS-parse-tail.html
 NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
 NET-js-batch-burst http://127.0.0.1:$HP/JS-batch-burst.html
 NET-js-attr-local http://127.0.0.1:$HP/JS-attr-local.html
+NET-js-sheet-census http://127.0.0.1:$HP/JS-sheet-census.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
 NET-js-abspos191 http://127.0.0.1:$HP/JS-abspos191.html
@@ -1162,6 +1163,20 @@ acl_kind=$(printf '%s\n' "$acl" | grep -c 'cause=kind' || true)
 acl_local=$(printf '%s\n' "$acl" | grep -c 'cause=local' || true)
 echo "  JS-attr-local batch causes: kind=${acl_kind} local=${acl_local}"
 [ "$acl_kind" -ge 1 ] && [ "$acl_local" -ge 1 ] || o2_bad="$o2_bad js-attr-local-batchcause"
+# Patch 316 (doc 23 stage 1): the sheet census. Each committed full
+# reconvert of a nodeless batch logs which stylesheet entries marked it
+# ("LIFE SHEETCAUSE sheets=N", synchronous, inside the page's window).
+# The census page edits one <style> (a sheets=1 batch), then two in one
+# task (sheets=2), and checks both restyles landed.
+scc=$(awk '/page [0-9]*\/[0-9]* NET-js-sheet-census: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE SHEETCAUSE sheets=' || true)
+scc_one=$(printf '%s\n' "$scc" | grep -c 'sheets=1$' || true)
+scc_multi=$(printf '%s\n' "$scc" | grep -c 'sheets=[2-9]' || true)
+scp=$(ls "$R"/*NET-js-sheet-census.plot 2>/dev/null | head -1)
+scr=$(sed -n 's/.*STR \(SHEETCENSUS: [0-9]*\/[0-9]* passed\).*/\1/p' "$scp" 2>/dev/null | head -1)
+echo "  JS-sheet-census: ${scr:-no summary}; sheet causes single=${scc_one} multi=${scc_multi}"
+[ "$scr" = "SHEETCENSUS: 2/2 passed" ] && [ "$scc_one" -ge 1 ] && [ "$scc_multi" -ge 1 ] || o2_bad="$o2_bad js-sheet-census"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest
