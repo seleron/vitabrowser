@@ -318,6 +318,7 @@ NET-js-scratch-doc http://127.0.0.1:$HP/JS-scratch-doc.html
 NET-js-scratch-qsa http://127.0.0.1:$HP/JS-scratch-qsa.html
 NET-js-frame-xdoc http://127.0.0.1:$HP/JS-frame-xdoc.html
 NET-js-frame-document http://127.0.0.1:$HP/JS-frame-document.html
+NET-js-mo-delivery http://127.0.0.1:$HP/JS-mo-delivery.html
 NET-js-form-shadow http://127.0.0.1:$HP/JS-form-shadow.html
 NET-js-form-shadow-chain http://127.0.0.1:$HP/JS-form-shadow-chain.html
 NET-js-element-instanceof http://127.0.0.1:$HP/JS-element-instanceof.html
@@ -915,6 +916,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
 	 "js-scratch-qsa SCRATCHQSA 6" "js-frame-xdoc XDOC 4" "js-frame-document XDOC2 10" \
+	 "js-mo-delivery MODELIV 6" \
 	 "js-form-shadow FORMSHADOW 6" \
 	 "js-form-shadow-chain FSHADOW2 10" \
 	 "js-element-instanceof INSTOF 6" "js-node-names NODENAME 8" \

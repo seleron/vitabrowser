@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS MutationObserver delivery (script not run)</title>
+<!-- Patch 317 (doc 21): MutationObserver records are queued C-side (no
+     JS runs to queue one) and delivered by a task between page tasks.
+     1. delivery is async: no callback inside the mutating call;
+     2. attribute records carry attributeName and oldValue, and
+        attributeFilter filters;
+     3. characterData records carry the old text;
+     4. no nested delivery: a record queued BY a callback arrives in a
+        later callback invocation, never inside the running one;
+     5. a fragment's children are the record's addedNodes;
+     6. a write the PARENT makes through a frame handle (patch 307)
+        reaches the FRAME realm's own observer (failed before 317).
+     Chromium: 1-5 pass; 6 is the same shape as a parent writing into a
+     same-origin iframe's document, which Chromium also delivers. -->
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+p { margin: 0; padding: 1px 6px; font-size: 11px; }
+.wait { background: #fcc; } .pass { background: #cfc; } .fail { background: #f66; }
+#sum { font-size: 16px; font-weight: bold; }
+iframe { width: 300px; height: 40px; }
+</style>
+</head>
+<body>
+<p id="sum" class="wait">MODELIV: 0/6 passed</p>
+<div id="rows"></div>
+<div id="a"></div><div id="c"></div><div id="f"></div>
+<p id="tx">old text</p>
+<iframe id="fr" src="JS-mo-delivery-child.html"></iframe>
+<script>
+(function () {
+	var k = 0, N = 6, done = {};
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		if (done[n]) return;
+		done[n] = true;
+		var p = document.createElement('p');
+		p.className = ok ? 'pass' : 'fail';
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		$('rows').appendChild(p);
+		if (ok) k++;
+		$('sum').textContent = 'MODELIV: ' + k + '/' + N + ' passed';
+		$('sum').className = k === N ? 'pass' : 'wait';
+		document.title = 'JS MutationObserver delivery (' + k + '/' + N + ')';
+	}
+	/* 1 + 2: attributes, old values, filter */
+	var ra = [], rf = [];
+	new MutationObserver(function (ms) { for (var i = 0; i < ms.length; i++) ra.push(ms[i]); })
+		.observe($('a'), { attributes: true, attributeOldValue: true });
+	new MutationObserver(function (ms) { for (var i = 0; i < ms.length; i++) rf.push(ms[i]); })
+		.observe($('a'), { attributeFilter: ['y'] });
+	$('a').setAttribute('x', '1');
+	var syncCount = ra.length;
+	$('a').setAttribute('x', '2');
+	$('a').setAttribute('y', 'z');
+	/* 3: characterData */
+	var rc = [];
+	var txt = $('tx').firstChild;
+	new MutationObserver(function (ms) { for (var i = 0; i < ms.length; i++) rc.push(ms[i]); })
+		.observe(txt, { characterData: true, characterDataOldValue: true });
+	txt.data = 'new text';
+	/* 4: a callback's own mutation is delivered later, not nested */
+	var calls = 0, depth = 0, maxDepth = 0, lateSeen = false;
+	new MutationObserver(function (ms) {
+		depth++; calls++;
+		if (depth > maxDepth) maxDepth = depth;
+		for (var i = 0; i < ms.length; i++)
+			if (ms[i].addedNodes.length && ms[i].addedNodes[0].id === 'late') lateSeen = calls;
+		if (calls === 1) {
+			var late = document.createElement('i');
+			late.id = 'late';
+			$('c').appendChild(late);
+		}
+		depth--;
+	}).observe($('c'), { childList: true });
+	$('c').appendChild(document.createElement('b'));
+	/* 5: fragment children */
+	var rfr = [];
+	new MutationObserver(function (ms) { for (var i = 0; i < ms.length; i++) rfr.push(ms[i]); })
+		.observe($('f'), { childList: true });
+	var frag = document.createDocumentFragment();
+	frag.appendChild(document.createElement('u'));
+	frag.appendChild(document.createElement('u'));
+	$('f').appendChild(frag);
+
+	setTimeout(function () {
+		t(1, syncCount === 0 && ra.length > 0,
+			'delivery is async (in-call ' + syncCount + ', later ' + ra.length + ')');
+		var x1 = ra[0], x2 = ra[1];
+		t(2, ra.length === 3 && x1.attributeName === 'x' && x1.oldValue === null &&
+			x2.oldValue === '1' && rf.length === 1 && rf[0].attributeName === 'y',
+			'attribute records + oldValue + attributeFilter (' + ra.length + ',' +
+			(x2 && x2.oldValue) + ',' + rf.length + ')');
+		t(3, rc.length === 1 && rc[0].type === 'characterData' && rc[0].oldValue === 'old text',
+			'characterData record with old text (' + rc.length + ',' + (rc[0] && rc[0].oldValue) + ')');
+		t(5, rfr.length === 1 && rfr[0].addedNodes.length === 2,
+			'fragment children are addedNodes (' + (rfr[0] && rfr[0].addedNodes.length) + ')');
+	}, 800);
+	setTimeout(function () {
+		t(4, calls >= 2 && maxDepth === 1 && lateSeen >= 2,
+			'callback\'s own record delivered later, not nested (calls ' + calls +
+			', depth ' + maxDepth + ', late in call ' + lateSeen + ')');
+	}, 1600);
+	/* 6: the parent writes through frame handles; the frame's own
+	 * observer must see the records */
+	var wrote = false;
+	window.addEventListener('message', function (e) {
+		var m = e.data;
+		if (!m || m.modeliv !== 'child') return;
+		if (!wrote) {
+			wrote = true;
+			var d = $('fr').contentDocument;
+			var kid = d && d.getElementById('kid');
+			var mv = d && d.getElementById('mv');
+			if (!kid || !mv) { t(6, false, 'no frame handles'); return; }
+			kid.setAttribute('data-p', '1');
+			kid.appendChild(mv);
+			return;
+		}
+		if (m.attr === 'data-p' && m.added >= 1)
+			t(6, true, 'parent-made frame writes reach the frame\'s observer (calls ' + m.calls + ')');
+	});
+	setTimeout(function () {
+		t(6, false, 'parent-made frame writes reach the frame\'s observer (timed out)');
+	}, 6000);
+})();
+</script>
+</body>
+</html>

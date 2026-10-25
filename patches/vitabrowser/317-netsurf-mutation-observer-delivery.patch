@@ -1,0 +1,658 @@
+# netsurf: MutationObserver delivery -- a C record queue and a delivery task (patch 317)
+# Generated 2026-10-25
+# Base: seleron/vitabrowser (patch stack through 316)
+#
+# Doc 21 (MutationObserver delivery, the doc 19 no-nested-re-entry
+# constraint). Before this patch the records were queued by CALLING the
+# realm's JS (__msQueueMutation) from inside each mutating entry point,
+# and that JS armed a setTimeout(0) for delivery. The queue itself ran
+# JS, which is what kept patch 307's recorded remainder open: a write the
+# parent makes through a frame-document handle could not queue for the
+# frame's own observers without running child-realm JS in the parent's
+# turn, so frame observers never saw parent-made writes.
+#
+# Now, per doc 21:
+#  1. Queue, don't deliver. A record is a C struct -- destination realm
+#     (its JSContext), type, target and added/removed nodes
+#     as libdom references, attribute name and old value as copied
+#     strings. Queueing runs no JS in any realm. The realm entry points
+#     (appendChild/removeChild/insertBefore/setAttribute, and the
+#     polyfill's characterData setters through a native
+#     __msQueueMutation) queue into it, and so do patch 307's
+#     frame-handle writes (setAttribute, appendChild, removeChild), into
+#     the CHILD realm's queue. A realm is queued for only once it has
+#     called observe() (__msMutWatch, a flag on the realm's owner
+#     record -- not the heap: the polyfill's custom-elements code
+#     observes during the realm's build, before heap->ctx and its
+#     generation exist; a first version keyed on the heap missed it
+#     and CUSTOMEL fell to 5/7 in the gate), so pages without
+#     observers pay nothing.
+#  2./3. Delivery task. macsurf_qjs_pump_all drains the queue between
+#     page tasks, beside the cross-realm postMessage drain (the path doc
+#     21 names). Per realm, the records are built as JS objects inside that realm's own runtime,
+#     appended to its __msMutPending, and its __msDeliverMutations (the
+#     existing matcher, base or polyfill override) runs inside an
+#     INTERNAL_NOTIFICATION task scope. The queue is detached before
+#     delivery: records a callback queues go to a fresh queue and are
+#     delivered on a later pump, never nested in the running delivery.
+#  4. The delivery is a JS task, so a callback's own mutations reach the
+#     reconvert through the ordinary task-completion hook.
+# The JS __msQueueMutation and its setTimeout are removed; the reconvert
+# done hook (js_fire_mutation_batch) still calls __msDeliverMutations and
+# now finds nothing pending -- harmless, left as it was.
+#
+# Lifetimes: records hold node references and name their context, so
+# qjs_owner_unregister (which runs just before every JS_FreeContext of
+# a registered realm) purges them first -- a record never outlives its
+# realm, so a context address reused later cannot receive it. A purge
+# during a drain marks the drain's detached records dead instead. The
+# queue is bounded (8192 records, 4096 nodes a list);
+# overflow drops records and logs a count. qjs_wrap_any_node adopts a
+# reference, so each wrap is given its own.
+#
+# Proof (sim): new JS-mo-delivery (MODELIV 6/6): async delivery (no
+# callback in the mutating call), attribute records with oldValue and
+# attributeFilter, characterData with old text, a callback's own record
+# delivered in a later invocation (calls 2, max depth 1), a fragment's
+# children as addedNodes, and a parent-made write through frame handles
+# reaching the frame realm's observer. Disarm check: with the frame
+# queueing disabled, leg 6 times out (5/6). JS-mutation stays 7/7.
+#
+# Not changed (recorded): innerHTML / textContent setters queue no
+# childList records (realm or frame handle), as before; takeRecords()
+# still returns [] and records are still matched against observers at
+# delivery, not at queue time.
+#
+# Simulator only; the vita cross-build was not run for this patch.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -228,6 +228,12 @@
+ 	 * at the start of the navigation that made it); performance.now(),
+ 	 * animation frame and native event timestamps count from it */
+ 	double t_origin;
++	/* VitaBrowser patch 317 (doc 21): this realm has called
++	 * MutationObserver.observe() -- records are queued for it only
++	 * then. On the owner record because it exists from
++	 * JS_NewContextRaw on: the polyfill observes during the realm's
++	 * build, before heap->ctx and its generation are assigned. */
++	int mo_watch;
+ 	struct qjs_realm_owner *next;
+ };
+ 
+@@ -280,9 +286,14 @@
+ 	return 1;
+ }
+ 
++static void qjs_mo_purge_ctx(JSContext *ctx);	/* patch 317 */
++
+ static void qjs_owner_unregister(JSContext *ctx)
+ {
+ 	struct qjs_realm_owner **pp = &g_qjs_realm_owners;
++	/* patch 317: MutationObserver records name this context; they go
++	 * before it does (the owner is removed just before JS_FreeContext) */
++	qjs_mo_purge_ctx(ctx);
+ 	while (*pp != NULL) {
+ 		if ((*pp)->ctx == ctx) {
+ 			struct qjs_realm_owner *owner = *pp;
+@@ -7195,68 +7206,432 @@
+ 	return nodes;
+ }
+ 
+-static void qjs_queue_child_mutation(JSContext *ctx, const char *type,
+-		JSValueConst parent, JSValueConst added, JSValueConst removed)
++/* ======================================================================
++ * VitaBrowser patch 317 -- MutationObserver delivery (doc 21).
++ *
++ * Doc 19's first constraint: an observer callback never runs inside the
++ * call that mutated, and never in another realm's turn. Before this
++ * patch the records were queued by calling the realm's JS
++ * (__msQueueMutation) from inside the mutating entry point, and the
++ * delivery was a setTimeout armed there -- so the queue itself ran JS,
++ * and patch 307's parent-made writes into a frame's document could not
++ * queue for the frame's observers at all (it would have been the
++ * parent's turn running child-realm JS).
++ *
++ * Now (doc 21 steps 1-4):
++ *  1. Queue, don't deliver. A record is a C struct: the destination
++ *     realm (heap + context generation), the type, the target and the
++ *     added/removed nodes as libdom references, the attribute name and
++ *     old value as copied strings. Nothing runs in any realm to queue
++ *     one, so a write through a frame handle queues for the frame.
++ *     Only realms that called observe() are queued for.
++ *  2./3. Delivery task. macsurf_qjs_pump_all drains the queue between
++ *     page tasks (beside the cross-realm postMessage drain, the path
++ *     doc 21 names): per realm, the records are built as JS objects
++ *     inside that realm's own runtime and handed to its
++ *     __msDeliverMutations (the polyfill's matcher), inside a task
++ *     scope. The queue is detached before delivery, so records a
++ *     callback queues go to a fresh queue and are delivered on a later
++ *     pump -- never recursively in the same delivery.
++ *  4. The delivery is a JS task: a callback's own mutations reach the
++ *     reconvert through the ordinary task-completion hook.
++ * ====================================================================== */
++
++enum { QJS_MO_CHILD = 0, QJS_MO_ATTR = 1, QJS_MO_CDATA = 2 };
++
++struct qjs_mo_rec {
++	JSContext *ctx;		/* the destination realm; NULL: purged */
++	int type;
++	dom_node *target;
++	dom_node **added;
++	unsigned int nadded;
++	dom_node **removed;
++	unsigned int nremoved;
++	char *attr;
++	char *old;		/* NULL: oldValue null */
++	struct qjs_mo_rec *next;
++};
++
++static struct qjs_mo_rec *g_qjs_mo_head = NULL;
++/* the detached list a drain is delivering (a callback can free a
++ * realm mid-drain: its purge scrubs this list too) */
++static struct qjs_mo_rec *g_qjs_mo_draining = NULL;
++static struct qjs_mo_rec **g_qjs_mo_tail = &g_qjs_mo_head;
++static unsigned int g_qjs_mo_count = 0;
++static unsigned long g_qjs_mo_dropped = 0;
++/* A page that churns the DOM with an observer that never yields must
++ * not grow the queue without bound: past this, records are dropped
++ * (counted, logged once per drain). */
++#define QJS_MO_MAX_QUEUED 8192u
++#define QJS_MO_MAX_NODES 4096u
++
++static void qjs_mo_free(struct qjs_mo_rec *r)
+ {
+-	JSValue global;
+-	JSValue fn;
+-	JSValue args[4];
+-	JSValue result;
++	unsigned int i;
++	if (r->target != NULL) macsurf_dom_node_unref(r->target);
++	for (i = 0; i < r->nadded; i++) macsurf_dom_node_unref(r->added[i]);
++	for (i = 0; i < r->nremoved; i++)
++		macsurf_dom_node_unref(r->removed[i]);
++	free(r->added);
++	free(r->removed);
++	free(r->attr);
++	free(r->old);
++	free(r);
++}
+ 
+-	global = JS_GetGlobalObject(ctx);
+-	fn = JS_GetPropertyStr(ctx, global, "__msQueueMutation");
+-	if (!JS_IsFunction(ctx, fn)) {
+-		JS_FreeValue(ctx, fn);
+-		JS_FreeValue(ctx, global);
++static int qjs_mo_watching(JSContext *ctx)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	return owner != NULL && owner->mo_watch;
++}
++
++/* Collect the node(s) a JS value names, in the CALLING realm: a node
++ * wrapper, or an array / NodeList snapshot of wrappers (a fragment's
++ * children, taken before the insert moved them). Each is referenced. */
++static unsigned int qjs_mo_nodes(JSContext *ctx, JSValueConst v,
++		dom_node ***out)
++{
++	dom_node *one;
++	dom_node **list = NULL;
++	unsigned int n = 0;
++	int64_t len = 0, i;
++
++	*out = NULL;
++	if (JS_IsUndefined(v) || JS_IsNull(v)) return 0;
++	one = qjs_get_node(v);
++	if (one != NULL) {
++		list = (dom_node **)malloc(sizeof(*list));
++		if (list == NULL) return 0;
++		macsurf_dom_node_ref(one);
++		list[0] = one;
++		*out = list;
++		return 1;
++	}
++	if (!JS_IsObject(v)) return 0;
++	{
++		JSValue l = JS_GetPropertyStr(ctx, v, "length");
++		if (JS_IsException(l)) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			return 0;
++		}
++		if (JS_ToInt64(ctx, &len, l) < 0) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			len = 0;
++		}
++		JS_FreeValue(ctx, l);
++	}
++	if (len <= 0) return 0;
++	if (len > QJS_MO_MAX_NODES) len = QJS_MO_MAX_NODES;
++	list = (dom_node **)malloc((size_t)len * sizeof(*list));
++	if (list == NULL) return 0;
++	for (i = 0; i < len; i++) {
++		JSValue e = JS_GetPropertyUint32(ctx, v, (uint32_t)i);
++		dom_node *node;
++		if (JS_IsException(e)) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			continue;
++		}
++		node = qjs_get_node(e);
++		JS_FreeValue(ctx, e);
++		if (node == NULL) continue;
++		macsurf_dom_node_ref(node);
++		list[n++] = node;
++	}
++	if (n == 0) {
++		free(list);
++		list = NULL;
++	}
++	*out = list;
++	return n;
++}
++
++/* Append one record for the realm `ctx` (no JS runs). Takes ownership
++ * of the node lists (their references) on success and on failure. */
++static void qjs_mo_push(JSContext *ctx, int type, dom_node *target,
++		dom_node **added, unsigned int nadded,
++		dom_node **removed, unsigned int nremoved,
++		const char *attr, const char *old)
++{
++	struct qjs_mo_rec *r;
++
++	if (ctx == NULL || target == NULL ||
++	    g_qjs_mo_count >= QJS_MO_MAX_QUEUED ||
++	    (r = (struct qjs_mo_rec *)calloc(1, sizeof(*r))) == NULL) {
++		unsigned int i;
++		for (i = 0; i < nadded; i++) macsurf_dom_node_unref(added[i]);
++		for (i = 0; i < nremoved; i++)
++			macsurf_dom_node_unref(removed[i]);
++		free(added);
++		free(removed);
++		if (ctx != NULL && target != NULL) g_qjs_mo_dropped++;
+ 		return;
+ 	}
+-	args[0] = JS_NewString(ctx, type);
+-	args[1] = JS_DupValue(ctx, parent);
+-	args[2] = JS_DupValue(ctx, added);
+-	args[3] = JS_DupValue(ctx, removed);
+-	result = JS_Call(ctx, fn, global, 4, args);
+-	if (JS_IsException(result))
+-		JS_FreeValue(ctx, JS_GetException(ctx));
+-	JS_FreeValue(ctx, result);
+-	JS_FreeValue(ctx, args[0]);
+-	JS_FreeValue(ctx, args[1]);
+-	JS_FreeValue(ctx, args[2]);
+-	JS_FreeValue(ctx, args[3]);
+-	JS_FreeValue(ctx, fn);
++	r->ctx = ctx;
++	r->type = type;
++	macsurf_dom_node_ref(target);
++	r->target = target;
++	r->added = added;
++	r->nadded = nadded;
++	r->removed = removed;
++	r->nremoved = nremoved;
++	r->attr = attr != NULL ? strdup(attr) : NULL;
++	r->old = old != NULL ? strdup(old) : NULL;
++	*g_qjs_mo_tail = r;
++	g_qjs_mo_tail = &r->next;
++	g_qjs_mo_count++;
++}
++
++/* A realm is going away: drop its records (they name its context and
++ * hold references into its document). A drain in progress keeps its
++ * detached records, marked dead, and frees them itself. */
++static void qjs_mo_purge_ctx(JSContext *ctx)
++{
++	struct qjs_mo_rec **pp = &g_qjs_mo_head, *r;
++
++	for (r = g_qjs_mo_draining; r != NULL; r = r->next)
++		if (r->ctx == ctx) r->ctx = NULL;
++	g_qjs_mo_tail = &g_qjs_mo_head;
++	while ((r = *pp) != NULL) {
++		if (r->ctx == ctx) {
++			*pp = r->next;
++			g_qjs_mo_count--;
++			qjs_mo_free(r);
++			continue;
++		}
++		g_qjs_mo_tail = &r->next;
++		pp = &r->next;
++	}
++}
++
++static JSValue qjs_mo_node_array(JSContext *ctx, dom_node **nodes,
++		unsigned int n)
++{
++	JSValue a = JS_NewArray(ctx);
++	unsigned int i, k = 0;
++	if (JS_IsException(a)) return a;
++	for (i = 0; i < n; i++) {
++		JSValue w;
++		/* qjs_wrap_any_node adopts a reference: give it its own */
++		macsurf_dom_node_ref(nodes[i]);
++		w = qjs_wrap_any_node(ctx, nodes[i]);
++		if (JS_IsException(w)) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			continue;
++		}
++		if (JS_IsNull(w) || JS_IsUndefined(w)) continue;
++		JS_SetPropertyUint32(ctx, a, k++, w);
++	}
++	return a;
++}
++
++/* One realm's records, built inside its runtime and appended to its
++ * __msMutPending; 1 when anything was appended. */
++static int qjs_mo_build(JSContext *ctx, struct qjs_mo_rec *list)
++{
++	JSValue global = JS_GetGlobalObject(ctx);
++	JSValue pend = JS_GetPropertyStr(ctx, global, "__msMutPending");
++	struct qjs_mo_rec *r;
++	uint32_t at = 0;
++	int any = 0;
++
++	if (!JS_IsArray(pend)) {
++		JS_FreeValue(ctx, pend);
++		JS_FreeValue(ctx, global);
++		return 0;
++	}
++	{
++		JSValue l = JS_GetPropertyStr(ctx, pend, "length");
++		int64_t len = 0;
++		if (!JS_IsException(l) && JS_ToInt64(ctx, &len, l) == 0 &&
++		    len > 0)
++			at = (uint32_t)len;
++		JS_FreeValue(ctx, l);
++	}
++	for (r = list; r != NULL; r = r->next) {
++		JSValue o, t;
++		if (r->ctx != ctx) continue;
++		macsurf_dom_node_ref(r->target);	/* adopted by the wrap */
++		t = qjs_wrap_any_node(ctx, r->target);
++		if (JS_IsException(t)) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			continue;
++		}
++		if (JS_IsNull(t) || JS_IsUndefined(t)) continue;
++		o = JS_NewObject(ctx);
++		if (JS_IsException(o)) {
++			JS_FreeValue(ctx, JS_GetException(ctx));
++			JS_FreeValue(ctx, t);
++			continue;
++		}
++		JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx,
++				r->type == QJS_MO_ATTR ? "attributes" :
++				r->type == QJS_MO_CDATA ? "characterData" :
++				"childList"));
++		JS_SetPropertyStr(ctx, o, "target", t);
++		JS_SetPropertyStr(ctx, o, "addedNodes",
++				qjs_mo_node_array(ctx, r->added, r->nadded));
++		JS_SetPropertyStr(ctx, o, "removedNodes",
++				qjs_mo_node_array(ctx, r->removed, r->nremoved));
++		JS_SetPropertyStr(ctx, o, "previousSibling", JS_NULL);
++		JS_SetPropertyStr(ctx, o, "nextSibling", JS_NULL);
++		JS_SetPropertyStr(ctx, o, "attributeName",
++				r->attr != NULL ? JS_NewString(ctx, r->attr) :
++				JS_NULL);
++		JS_SetPropertyStr(ctx, o, "attributeNamespace", JS_NULL);
++		JS_SetPropertyStr(ctx, o, "oldValue",
++				r->old != NULL ? JS_NewString(ctx, r->old) :
++				JS_NULL);
++		JS_SetPropertyUint32(ctx, pend, at++, o);
++		any = 1;
++	}
++	JS_FreeValue(ctx, pend);
+ 	JS_FreeValue(ctx, global);
++	return any;
++}
++
++/* The delivery task(s): called from macsurf_qjs_pump_all, between page
++ * tasks. */
++static void qjs_mo_drain(void)
++{
++	struct qjs_mo_rec *list = g_qjs_mo_head, *r, *next;
++
++	if (list == NULL || g_qjs_mo_draining != NULL) return;
++	/* detach: records queued by a callback below form a fresh queue,
++	 * delivered on a later pump */
++	g_qjs_mo_head = NULL;
++	g_qjs_mo_tail = &g_qjs_mo_head;
++	g_qjs_mo_count = 0;
++	g_qjs_mo_draining = list;
++	if (g_qjs_mo_dropped != 0) {
++		macsurf_debug_log_writef("LIFE MUTOBS queue full: %lu records "
++				"dropped", g_qjs_mo_dropped);
++		g_qjs_mo_dropped = 0;
++	}
++	/* One delivery per realm with records, in queue order of first
++	 * record. A callback may free realms: their records are marked
++	 * dead by the purge (ctx NULL), so every ctx read here is live. */
++	for (r = list; r != NULL; r = r->next) {
++		JSContext *ctx = r->ctx;
++		struct qjs_mo_rec *q;
++		if (ctx == NULL) continue;
++		if (qjs_mo_build(ctx, r)) {
++			qjs_task_push(MACSURF_JS_TASK_INTERNAL_NOTIFICATION);
++			macsurf_qjs__safe_eval(ctx,
++				"(function(){try{"
++				"if(typeof __msDeliverMutations==='function')"
++				"__msDeliverMutations();"
++				"}catch(e){}})();");
++			qjs_task_pop();
++		}
++		/* this realm's records are delivered */
++		for (q = r; q != NULL; q = q->next)
++			if (q->ctx == ctx) q->ctx = NULL;
++	}
++	g_qjs_mo_draining = NULL;
++	for (r = list; r != NULL; r = next) {
++		next = r->next;
++		qjs_mo_free(r);
++	}
++}
++
++/* __msMutWatch(): MutationObserver.observe() was called in this realm. */
++static JSValue qjs_ms_mut_watch(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	struct qjs_realm_owner *owner = qjs_owner_for_ctx(ctx);
++	(void)this_val; (void)argc; (void)argv;
++	if (owner != NULL)
++		owner->mo_watch = 1;
++	return JS_UNDEFINED;
++}
++
++/* __msQueueMutation(type, target, added, removed, attr, oldValue): the
++ * polyfill's characterData setters (and anything else JS-side) queue
++ * through the same C queue; nothing is scheduled in JS. */
++static JSValue qjs_ms_queue_mutation(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	const char *type, *attr = NULL, *old = NULL;
++	dom_node *target;
++	dom_node **added = NULL, **removed = NULL;
++	unsigned int na = 0, nr = 0;
++	int kind;
++	(void)this_val;
++	if (!qjs_mo_watching(ctx) || argc < 2) return JS_UNDEFINED;
++	target = qjs_get_node(argv[1]);
++	if (target == NULL) return JS_UNDEFINED;
++	type = JS_ToCString(ctx, argv[0]);
++	if (type == NULL) {
++		JS_FreeValue(ctx, JS_GetException(ctx));
++		return JS_UNDEFINED;
++	}
++	kind = strcmp(type, "attributes") == 0 ? QJS_MO_ATTR :
++		strcmp(type, "characterData") == 0 ? QJS_MO_CDATA :
++		QJS_MO_CHILD;
++	JS_FreeCString(ctx, type);
++	if (argc > 2) na = qjs_mo_nodes(ctx, argv[2], &added);
++	if (argc > 3) nr = qjs_mo_nodes(ctx, argv[3], &removed);
++	if (argc > 4 && JS_IsString(argv[4])) attr = JS_ToCString(ctx, argv[4]);
++	if (argc > 5 && JS_IsString(argv[5])) old = JS_ToCString(ctx, argv[5]);
++	qjs_mo_push(ctx, kind, target, added, na, removed, nr, attr, old);
++	if (attr != NULL) JS_FreeCString(ctx, attr);
++	if (old != NULL) JS_FreeCString(ctx, old);
++	return JS_UNDEFINED;
++}
++
++static void qjs_queue_child_mutation(JSContext *ctx, const char *type,
++		JSValueConst parent, JSValueConst added, JSValueConst removed)
++{
++	/* patch 317: into the C queue (doc 21 step 1) -- no JS runs */
++	dom_node *target;
++	dom_node **a = NULL, **r = NULL;
++	unsigned int na, nr;
++
++	(void)type;
++	if (!qjs_mo_watching(ctx)) return;
++	target = qjs_get_node(parent);
++	if (target == NULL) return;
++	na = qjs_mo_nodes(ctx, added, &a);
++	nr = qjs_mo_nodes(ctx, removed, &r);
++	qjs_mo_push(ctx, QJS_MO_CHILD, target, a, na, r, nr, NULL, NULL);
+ }
+ 
+ static void qjs_queue_attribute_mutation(JSContext *ctx,
+ 		JSValueConst target, const char *name, const char *old_value)
+ {
+-	JSValue global;
+-	JSValue fn;
+-	JSValue args[6];
+-	JSValue result;
++	/* patch 317: into the C queue (doc 21 step 1) -- no JS runs */
++	dom_node *node;
+ 
+-	global = JS_GetGlobalObject(ctx);
+-	fn = JS_GetPropertyStr(ctx, global, "__msQueueMutation");
+-	if (!JS_IsFunction(ctx, fn)) {
+-		JS_FreeValue(ctx, fn);
+-		JS_FreeValue(ctx, global);
++	if (!qjs_mo_watching(ctx)) return;
++	node = qjs_get_node(target);
++	if (node == NULL) return;
++	qjs_mo_push(ctx, QJS_MO_ATTR, node, NULL, 0, NULL, 0, name,
++			old_value);
++}
++
++/* patch 317: a write made through a frame handle (patch 307) queues for
++ * the CHILD realm's observers -- C-side, so nothing runs in the child
++ * from the parent's turn; delivered on the child's own delivery task. */
++static void qjs_mo_queue_for_heap(struct jsheap *heap, int type,
++		dom_node *target, dom_node *added, dom_node *removed,
++		const char *attr, const char *old)
++{
++	dom_node **a = NULL, **r = NULL;
++	if (heap == NULL || heap->ctx == NULL || target == NULL ||
++	    !qjs_mo_watching(heap->ctx))
+ 		return;
++	if (added != NULL &&
++	    (a = (dom_node **)malloc(sizeof(*a))) != NULL) {
++		macsurf_dom_node_ref(added);
++		a[0] = added;
++	}
++	if (removed != NULL &&
++	    (r = (dom_node **)malloc(sizeof(*r))) != NULL) {
++		macsurf_dom_node_ref(removed);
++		r[0] = removed;
+ 	}
+-	args[0] = JS_NewString(ctx, "attributes");
+-	args[1] = JS_DupValue(ctx, target);
+-	args[2] = JS_UNDEFINED;
+-	args[3] = JS_UNDEFINED;
+-	args[4] = JS_NewString(ctx, name);
+-	args[5] = old_value ? JS_NewString(ctx, old_value) : JS_NULL;
+-	result = JS_Call(ctx, fn, global, 6, args);
+-	if (JS_IsException(result))
+-		JS_FreeValue(ctx, JS_GetException(ctx));
+-	JS_FreeValue(ctx, result);
+-	JS_FreeValue(ctx, args[0]);
+-	JS_FreeValue(ctx, args[1]);
+-	JS_FreeValue(ctx, args[4]);
+-	JS_FreeValue(ctx, args[5]);
+-	JS_FreeValue(ctx, fn);
+-	JS_FreeValue(ctx, global);
++	qjs_mo_push(heap->ctx, type, target, a, a != NULL ? 1 : 0,
++			r, r != NULL ? 1 : 0, attr, old);
+ }
+ 
+ static JSValue qjs_dom_mut_check(JSContext *ctx, const char *op,
+@@ -7731,6 +8106,10 @@
+ 		/* Patch 186/197's class mark, through the child's
+ 		 * context: an absent attribute read back NULL with
+ 		 * DOM_NO_ERR is the empty old class set, not unknown. */
++		/* patch 317: the child's observers get the record */
++		qjs_mo_queue_for_heap(st->bind->child, QJS_MO_ATTR,
++				st->node, NULL, NULL, name_cstr,
++				old_ds != NULL ? dom_string_data(old_ds) : NULL);
+ 		if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 			qjs_mark_dom_dirty2(st->bind->child->ctx,
+ 					(void *)st->node, attr_kind,
+@@ -7768,6 +8147,8 @@
+ 	if (result) macsurf_dom_node_unref(result);
+ 	if (exc != DOM_NO_ERR) return JS_UNDEFINED; /* fail closed:
+ 					       * no throw across */
++	qjs_mo_queue_for_heap(st->bind->child, QJS_MO_CHILD, st->node,
++			arg->node, NULL, NULL, NULL);	/* patch 317 */
+ 	qjs_mark_dom_dirty(st->bind->child->ctx, (void *)st->node,
+ 			MACOS9_DOMMUT_APPENDCHILD);
+ 	return JS_DupValue(ctx, argv[0]);
+@@ -7787,6 +8168,8 @@
+ 	if (result) macsurf_dom_node_unref(result);
+ 	if (exc != DOM_NO_ERR) return JS_UNDEFINED; /* not a child, or
+ 					       * worse: fail closed */
++	qjs_mo_queue_for_heap(st->bind->child, QJS_MO_CHILD, st->node,
++			NULL, arg->node, NULL, NULL);	/* patch 317 */
+ 	qjs_mark_dom_dirty(st->bind->child->ctx, (void *)st->node,
+ 			MACOS9_DOMMUT_REMOVECHILD);
+ 	return JS_DupValue(ctx, argv[0]);
+@@ -15398,6 +15781,9 @@
+ 	qjs_set_func(ctx, global, "__gcsNative", qjs_get_computed_style, 1);
+ 	qjs_set_func(ctx, global, "__attrNamesNative", qjs_attr_names_native, 1);
+ 	qjs_set_func(ctx, global, "__msLife",    qjs_ms_life, 1); /* fixes1015 */
++	/* patch 317 (doc 21): the C MutationObserver record queue */
++	qjs_set_func(ctx, global, "__msQueueMutation", qjs_ms_queue_mutation, 6);
++	qjs_set_func(ctx, global, "__msMutWatch", qjs_ms_mut_watch, 0);
+ 	qjs_set_func(ctx, global, "__msScript",  qjs_ms_current_script, 0); /* fixes1312 */
+ 	qjs_set_func(ctx, global, "__msRafFired", qjs_raf_fired, 0); /* fixes1236 */
+ 	/* localStorage persistence backend, consumed by the _Storage shim
+@@ -16144,6 +16530,8 @@
+ 			"try{__msLife('WANT MutationObserver.observe '"
+ 			"+((t.id||t.tagName)||'?')+' (real)');}catch(_){}"
+ 			"this._targets.push({node:t,opts:opts||{}});"
++			/* patch 317: the realm is now queued for (C side) */
++			"try{__msMutWatch();}catch(_){}"
+ 			"if(!globalThis.__msMutObservers)globalThis.__msMutObservers=[];"
+ 			"if(globalThis.__msMutObservers.indexOf(this)<0)"
+ 				"globalThis.__msMutObservers.push(this);"
+@@ -16161,18 +16549,10 @@
+ 		"};"
+ 		"MutationObserver.prototype.takeRecords=function(){return [];};"
+ 		"this.MutationObserver=MutationObserver;"
++		/* patch 317 (doc 21): __msQueueMutation is native now (the C
++		 * record queue); the pump's delivery task fills __msMutPending
++		 * in this realm and calls __msDeliverMutations. */
+ 		"globalThis.__msMutPending=[];globalThis.__msMutScheduled=false;"
+-		"globalThis.__msQueueMutation=function(type,target,added,removed,attr,oldValue){"
+-			"var a=Array.isArray(added)?added.slice():(added?[added]:[]);"
+-			"var r=Array.isArray(removed)?removed.slice():(removed?[removed]:[]);"
+-			"globalThis.__msMutPending.push({type:type,target:target,"
+-				"addedNodes:a,removedNodes:r,previousSibling:null,nextSibling:null,"
+-				"attributeName:attr||null,attributeNamespace:null,"
+-				"oldValue:oldValue===undefined?null:oldValue});"
+-			"if(globalThis.__msMutScheduled)return;"
+-			"globalThis.__msMutScheduled=true;"
+-			"setTimeout(function(){globalThis.__msDeliverMutations();},0);"
+-		"};"
+ 		"globalThis.__msDeliverMutations=function(){"
+ 			"var list=globalThis.__msMutObservers;"
+ 			"var pending=globalThis.__msMutPending.splice(0);"
+@@ -23576,6 +23956,9 @@
+ 	 * cadence timers run at (a queued message delivered on the next event
+ 	 * loop pass is spec-conformant -- postMessage is always async). */
+ 	qjs_xrealm_drain();
++	/* patch 317 (doc 21): MutationObserver delivery tasks, between page
++	 * tasks like postMessage */
++	qjs_mo_drain();
+ 	/* VitaBrowser: move non-blocking import() loads on (qjs_modload) */
+ 	qjs_modload_pump();
+ 	while (h != NULL) {
