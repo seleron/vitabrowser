@@ -5782,3 +5782,52 @@ faded squares come out white or solid-coloured instead of pale,
 the device tint semantics differ from the simulator's and that is
 the thing to report. Sites with faded image cards/overlays should
 show their background images faded with the rest of the card.
+
+## Patch 316 (2026-10-25): the stylesheet census (doc 23 stage 1, census only)
+
+**What:** Instrumentation only — no reconvert behaviour changes. A
+sheet change reaches the reconvert as a nodeless mark, so its batch
+goes coarse (cause `nonode`) and takes the full reconvert with no
+record of which sheet changed. css.c now attributes each of its two
+sheet-mark sites (a sheet finishing after layout; patch 266's
+mid-rebuild deferral) to the stylesheet entry that caused it, and
+when a coarse batch commits, the flush consumes that attribution:
+for `nonode` it logs `LIFE SHEETCAUSE sheets=N` beside BATCHCAUSE
+and counts single (1) / multi (>1) / unidentified (0 — a nodeless
+mark from a non-sheet caller). The navigation reset prints
+`LIFE SHEETCENSUS single= multi= unidentified=` on its own line, so
+the FULLCAUSE format the gate matches is unchanged.
+
+**Deviation from doc 23 piece A (recorded in the header):** identity
+is not carried on the mark (no `_dirty_sheet` variant, no per-entry
+modification counter). Batch-level attribution needs only the entry
+counters; the payload-carrying mark belongs with stage 2, the first
+stage that would read it.
+
+**First reading:** on JS-sheet-census, one `<style>` edit gives a
+`sheets=1` batch, and two edits in one task give one `sheets=2`
+batch (both DONEs land in the same debounce window). It also shows
+that **each sheet edit costs two full reconverts**: the task's own
+precise mark on the `<style>` text node is declined by the local
+path (`cause=local`, then `cause=two`), and then the sheet's nodeless
+batch follows. Stage 2 would have to answer the text-node mark too,
+not only the sheet batch. This goes to doc 23's open questions.
+
+**Gate:** new page `JS-sheet-census` (NET list, after
+JS-attr-local): SHEETCENSUS 2/2 restyle checks, plus the page
+window's SHEETCAUSE lines `sheets=1` ≥ 1 and `sheets≥2` ≥ 1.
+Full sim gate exit 0 (gate-316; interaction 52/52 at the Vita's
+pace, 23/23 pace-identical, 68/68 text frames). **Suite-wide
+census** (the autotest's netsurf.log): 9 nodeless batches, all
+attributed to sheets — single=8, multi=1, unidentified=0. On the
+gate suite, singleton windows dominate, which favours doc 23's
+singleton plumbing (open question 2). The suite is not a real-site
+sample, though, so the device or a scorecard run has to confirm it.
+
+**On the device (run 39), in addition:** JS-sheet-census.html should
+read SHEETCENSUS 2/2 (both boxes restyled after their `<style>`
+edits). netsurf.log should carry `LIFE SHEETCAUSE sheets=1` and
+`sheets=2` lines in that page's window. On real sites, the
+SHEETCENSUS summary lines are the data stage 2 is waiting for —
+worth collecting from any CSS-in-JS-heavy site (the Guardian,
+claude.ai).

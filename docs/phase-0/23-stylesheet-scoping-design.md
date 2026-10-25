@@ -306,3 +306,16 @@ and answering inside the burst.
    pairs instead, which is more pending-record state to bound.
    Flagged here so the choice is made on census data in the
    open, not silently inside a patch header.
+
+## Status (2026-10-25): stage 1 census landed as patch 316
+
+Census only: batch-level attribution through per-entry counters in
+css.c, with no identity on the mark (piece A's mark variant is
+deferred to stage 2). First readings: across the gate suite, 9
+nodeless batches, single=8 / multi=1 / unidentified=0. There is a
+new cost the design did not price: each `<style>` edit takes **two**
+full reconverts, because the edit's own precise mark on the style's
+text node is declined by the local path before the sheet's nodeless
+batch arrives. Stage 2 has to answer (or deliberately absorb) that
+text-node mark as well, or it saves at most half. Details are in
+doc 10's patch 316 entry.
