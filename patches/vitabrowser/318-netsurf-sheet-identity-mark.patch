@@ -1,0 +1,384 @@
+# netsurf: a sheet-change mark carries the sheet's identity (doc 23 piece A, patch 318)
+# Generated 2026-10-25
+# Base: seleron/vitabrowser (patch stack through 317)
+#
+# Doc 23 piece A ("sheet identity on the mark"), the piece patch 316's
+# census deferred. A sheet change reaches the reconvert as a nodeless
+# mark; nothing on it says which stylesheet changed, so no later stage
+# could answer the batch from that sheet. Behaviour is unchanged here:
+# identified batches still take the full reconvert, and the FULLCAUSE /
+# BATCHCAUSE / SHEETCAUSE formats the gate matches stay as they are.
+#
+#  - html.h: struct html_stylesheet gains mod_count, the per-entry
+#    modification counter (bumped at the top of
+#    html_css_process_modified_style, before the new sheet can finish
+#    and mark), and mark_pending (the entry held for patch 266's
+#    deferred refresh).
+#  - css.c: both sheet-mark sites go through html_css_mark_sheets(c, i).
+#    The settle window's set is the finishing entry, the entry held for
+#    the deferred refresh, and every entry still in flight (queued for
+#    re-processing, or its sheet still loading) -- that one will mark
+#    into the same window. A singleton set emits
+#    macos9_js_mark_dom_dirty_sheet(c, index, counter); anything else
+#    emits the nodeless mark as before. html_css_sheet_mark_current()
+#    answers whether an entry is still at the counter its mark carried.
+#    (Doc 23's "entries processed since the last mark" is read as
+#    "in flight": entries the initial parse processed bump the counter
+#    without ever marking, and counting them made every first
+#    post-layout mark multi.)
+#  - macos9_reconvert.c/.h: macos9_js_mark_dom_dirty_sheet records the
+#    nodeless mark exactly as macos9_js_mark_dom_dirty does, with the
+#    identity alongside. The slot folds every nodeless mark's identity
+#    (also into a slot already coarse): none / one entry (index + the
+#    FIRST mark's counter) / more than one, plus a flag for a nodeless
+#    mark without identity. At the commit of a nonode batch the flush
+#    logs "LIFE SHEETID single|stale idx= ctr=" (one entry; stale =
+#    re-processed before the flush, so an answer from that mark would
+#    use the wrong sheet pair), "LIFE SHEETID multi" or
+#    "LIFE SHEETID none", and the navigation reset prints
+#    "LIFE SHEETIDCENSUS single= stale= multi= none=".
+#
+# Proof (focused, sim, JS-sheet-census, now 3 steps): the one-<style>
+# edit logs SHEETID single idx=5 (agreeing with patch 316's sheets=1),
+# the two-<style> task logs SHEETID multi (sheets=2), and the new step
+# 3 -- one <style> edited twice 150 ms apart, the second edit landing
+# after the first's DONE but before its batch flushed -- logs SHEETID
+# stale, with the final style the second edit's (SHEETCENSUS 3/3). A
+# 40 ms gap coalesces the two edits into one process instead (one
+# DONE, counter current), as the doc's design expects.
+#
+# Not done (doc 23 pieces B/C, recorded): no reach analysis, no local
+# answer from an identified batch; the text-node mark each <style> edit
+# also produces (patch 316's finding) is untouched.
+#
+# Simulator only; the vita cross-build was not run for this patch.
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -66,6 +66,12 @@
+ 	 * marks came from, without carrying identity on the mark. */
+ 	unsigned int census_marks;
+ 	unsigned int census_closed;
++	/* VitaBrowser patch 318 (doc 23 piece A): bumped each time the
++	 * entry is (re)processed from its DOM node (the identity a sheet
++	 * mark carries is index + this counter); mark_pending holds the
++	 * entry for patch 266's deferred refresh mark. */
++	unsigned int mod_count;
++	bool mark_pending;
+ };
+ 
+ 
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -50,6 +50,9 @@
+ #ifdef WITH_QUICKJS
+ /* javascript/quickjs/macos9_reconvert.c: schedule a (debounced) rebuild */
+ extern void macos9_js_mark_dom_dirty(struct content *c);
++/* patch 318: the same, naming the one sheet entry it came from */
++extern void macos9_js_mark_dom_dirty_sheet(struct content *c, int index,
++		unsigned int counter);
+ #endif
+ 
+ /* VitaBrowser patch 316 (doc 23 stage 1): the sheet census. Every
+@@ -67,6 +70,56 @@
+ 		c->stylesheets[i].census_marks++;
+ }
+ 
++/* VitaBrowser patch 318 (doc 23 piece A): emit the sheet mark. The
++ * settle window's set of changing entries is the finishing entry `i`
++ * (or -1), any entry held for patch 266's deferred refresh, and every
++ * entry still in flight -- queued for re-processing or its sheet still
++ * loading -- since that one will mark into the same window. A singleton
++ * set carries its identity (index + modification counter) on the mark;
++ * anything else is the nodeless mark exactly as before. */
++#ifdef WITH_QUICKJS
++static void html_css_mark_sheets(html_content *c, int i)
++{
++	unsigned int j, n = 0;
++	int idx = -1;
++
++	for (j = 0; j != c->stylesheet_count; j++) {
++		struct html_stylesheet *s = &c->stylesheets[j];
++		bool loading = s->sheet != NULL &&
++			content_get_status(s->sheet) != CONTENT_STATUS_DONE &&
++			content_get_status(s->sheet) != CONTENT_STATUS_ERROR;
++		if ((int)j == i || s->mark_pending || s->modified ||
++		    ((int)j != i && loading)) {
++			n++;
++			idx = (int)j;
++		}
++		s->mark_pending = false;
++	}
++	if (n == 1)
++		macos9_js_mark_dom_dirty_sheet(&c->base, idx,
++				c->stylesheets[idx].mod_count);
++	else
++		macos9_js_mark_dom_dirty(&c->base);
++}
++#endif
++
++/* exported for javascript/quickjs/macos9_reconvert.c (patch 318): is the
++ * identified entry still at the counter its mark carried? (No: it was
++ * re-processed before the flush, and the batch's answer must not be
++ * computed from that mark.) */
++int html_css_sheet_mark_current(struct content *cc, int index,
++		unsigned int counter);
++int html_css_sheet_mark_current(struct content *cc, int index,
++		unsigned int counter)
++{
++	html_content *c = (html_content *)cc;
++
++	if (c == NULL || c->stylesheets == NULL || index < 0 ||
++	    (unsigned int)index >= c->stylesheet_count)
++		return 0;
++	return c->stylesheets[index].mod_count == counter;
++}
++
+ /* exported for javascript/quickjs/macos9_reconvert.c (patch 316) */
+ int html_css_census_batch_sheets(struct content *cc);
+ int html_css_census_batch_sheets(struct content *cc)
+@@ -152,7 +205,7 @@
+ 	}
+ 	html_css_refresh_selection_context(c);
+ #ifdef WITH_QUICKJS
+-	macos9_js_mark_dom_dirty(&c->base);
++	html_css_mark_sheets(c, -1);	/* patch 318 */
+ #endif
+ }
+ 
+@@ -261,7 +314,7 @@
+ 		html_css_refresh_selection_context(parent);
+ #ifdef WITH_QUICKJS
+ 		html_css_census_note(parent, i);	/* patch 316 */
+-		macos9_js_mark_dom_dirty(&parent->base);
++		html_css_mark_sheets(parent, (int)i);	/* patch 318 */
+ #endif
+ 	} else if ((event->type == CONTENT_MSG_DONE ||
+ 		    event->type == CONTENT_MSG_ERROR) &&
+@@ -269,6 +322,7 @@
+ 		   !parent->aborted) {
+ 		/* patch 266: mid-rebuild -- refresh once the tree is back */
+ 		html_css_census_note(parent, i);	/* patch 316 */
++		parent->stylesheets[i].mark_pending = true;	/* patch 318 */
+ 		guit->misc->schedule(50, html_css_deferred_refresh, parent);
+ 	}
+ 
+@@ -408,6 +462,8 @@
+ 	c->stylesheets[c->stylesheet_count].unused = false;
+ 	c->stylesheets[c->stylesheet_count].census_marks = 0;	/* patch 316 */
+ 	c->stylesheets[c->stylesheet_count].census_closed = 0;
++	c->stylesheets[c->stylesheet_count].mod_count = 0;	/* patch 318 */
++	c->stylesheets[c->stylesheet_count].mark_pending = false;
+ 	c->stylesheet_count++;
+ 
+ 	return c->stylesheets + (c->stylesheet_count - 1);
+@@ -420,6 +476,9 @@
+ 	hlcache_handle *sheet = NULL;
+ 	nserror error;
+ 
++	/* patch 318 (doc 23 piece A): every (re)process moves the entry's
++	 * counter, before the new sheet can finish and mark */
++	s->mod_count++;
+ 	error = html_stylesheet_from_domnode(c, s->node, &sheet);
+ 	if (error != NSERROR_OK) {
+ 		NSLOG(netsurf, INFO, "Failed to update sheet");
+@@ -633,6 +692,8 @@
+ 	htmlc->stylesheets[htmlc->stylesheet_count].unused = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].census_marks = 0;	/* patch 316 */
+ 	htmlc->stylesheets[htmlc->stylesheet_count].census_closed = 0;
++	htmlc->stylesheets[htmlc->stylesheet_count].mod_count = 0;	/* patch 318 */
++	htmlc->stylesheets[htmlc->stylesheet_count].mark_pending = false;
+ 
+ 	/* start fetch */
+ 	child.charset = htmlc->encoding;
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.h
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.h
+@@ -96,5 +96,12 @@
+  * i.e. "something changed, no idea what". Kept so any caller that cannot name
+  * the node still works, and always yields the full rebuild. */
+ void macos9_js_mark_dom_dirty(struct content *c);
++/* VitaBrowser patch 318 (doc 23 piece A): a sheet-change mark that
++ * names the one stylesheet entry it came from (its index in
++ * html_content.stylesheets[] and that entry's modification counter).
++ * It schedules exactly what macos9_js_mark_dom_dirty does -- a nodeless,
++ * coarse mark -- and records the identity on the batch. */
++void macos9_js_mark_dom_dirty_sheet(struct content *c, int index,
++		unsigned int counter);
+ 
+ #endif /* MACOS9_RECONVERT_H */
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -195,6 +195,16 @@
+ 	 * First cause wins; counted by the fullcause census (doc 20 T2/T3)
+ 	 * when the slot's batch takes a full reconvert. */
+ 	int             coarse_cause;
++	/* Patch 318 (doc 23 piece A) - sheet identity of the batch's
++	 * nodeless marks: sheet_state 0 none identified, 1 exactly one
++	 * entry (sheet_idx at modification counter sheet_ctr), 2 more
++	 * than one entry; sheet_unid set when a nodeless mark carried no
++	 * identity (another caller, or a multi-sheet settle window).
++	 * Recorded only: the batch still takes the full reconvert. */
++	int             sheet_state;
++	int             sheet_idx;
++	unsigned int    sheet_ctr;
++	int             sheet_unid;
+ };
+ 
+ /* fixes910 Phase 0 - implemented in content/handlers/html/html.c, where the real
+@@ -441,6 +451,41 @@
+ 	return NULL;
+ }
+ 
++/* Patch 318 - the identity of the nodeless mark being recorded right
++ * now (set by macos9_js_mark_dom_dirty_sheet around its call). */
++static struct {
++	int active;
++	int idx;
++	unsigned int ctr;
++} g_sheet_mark;
++
++/* Patch 318 - fold one nodeless mark's sheet identity into slot i.
++ * fresh: the slot was just (re)initialised. */
++static void
++macos9_reconvert_sheet_note(int i, int fresh)
++{
++	if (fresh) {
++		g_pending[i].sheet_state = 0;
++		g_pending[i].sheet_idx = -1;
++		g_pending[i].sheet_ctr = 0;
++		g_pending[i].sheet_unid = 0;
++	}
++	if (!g_sheet_mark.active) {
++		g_pending[i].sheet_unid = 1;
++		return;
++	}
++	if (g_pending[i].sheet_state == 0) {
++		g_pending[i].sheet_state = 1;
++		g_pending[i].sheet_idx = g_sheet_mark.idx;
++		/* first mark's counter: a later re-process of the same
++		 * entry makes it stale at the flush, by design */
++		g_pending[i].sheet_ctr = g_sheet_mark.ctr;
++	} else if (g_pending[i].sheet_state == 1 &&
++		   g_pending[i].sheet_idx != g_sheet_mark.idx) {
++		g_pending[i].sheet_state = 2;
++	}
++}
++
+ static void
+ macos9_reconvert_pending_add3(struct content *c, void *node, int kind,
+ 		const char *old_class, const char *attr_name)
+@@ -478,6 +523,12 @@
+ 				prov.task = ms_diag_cur_task();
+ 				g_pending[i].batch_id = ms_diag_batch_open(&prov);
+ 				ms_diag_batch_add(g_pending[i].batch_id, kind, prov.task);
++				/* Patch 318 - new generation, new identity */
++				g_pending[i].sheet_state = 0;
++				g_pending[i].sheet_idx = -1;
++				g_pending[i].sheet_unid = 0;
++				if (node == NULL)
++					macos9_reconvert_sheet_note(i, 1);
+ 				return;
+ 			}
+ 			ms_diag_batch_add(g_pending[i].batch_id, kind,
+@@ -488,6 +539,10 @@
+ 			g_pending[i].token = macos9_content_token(c);
+ 			if (kind >= 0 && kind < (int)(sizeof(unsigned long) * 8))
+ 				g_pending[i].kind_mask |= (1UL << kind);
++			/* Patch 318 - every nodeless mark folds its identity,
++			 * including into a slot already coarse */
++			if (node == NULL)
++				macos9_reconvert_sheet_note(i, 0);
+ 
+ 			/* Merge this mutation into what the slot already holds.
+ 			 * Same node AND same kind = the same logical edit
+@@ -580,6 +635,13 @@
+ 	/* Patch 310 - copy the attribute name, if an attribute mark. */
+ 	g_pending[freeslot].attr_name =
+ 		macos9_reconvert_attr_dup(kind, attr_name);
++	/* Patch 318 - a fresh slot's sheet identity */
++	g_pending[freeslot].sheet_state = 0;
++	g_pending[freeslot].sheet_idx = -1;
++	g_pending[freeslot].sheet_ctr = 0;
++	g_pending[freeslot].sheet_unid = 0;
++	if (node == NULL)
++		macos9_reconvert_sheet_note(freeslot, 1);
+ 	{
+ 		struct ms_diag_provenance prov;
+ 		memset(&prov, 0, sizeof(prov));
+@@ -781,6 +843,14 @@
+ static long g_fc_sheetn = 0;	/* two or more sheet entries */
+ static long g_fc_sheet0 = 0;	/* no sheet: another nodeless caller */
+ extern int html_css_census_batch_sheets(struct content *c);
++/* Patch 318 (doc 23 piece A): the same batches by the identity their
++ * marks carried. */
++static long g_id_single = 0;	/* one identified entry, counter current */
++static long g_id_stale  = 0;	/* one identified entry, re-processed since */
++static long g_id_multi  = 0;	/* more than one entry, or mixed */
++static long g_id_none   = 0;	/* no identified mark */
++extern int html_css_sheet_mark_current(struct content *c, int index,
++		unsigned int counter);
+ /* Last failure reason from macos9_reconvert_try_local, read by the
+  * flush site that just called it: 0 none / not consulted, 1 kind,
+  * 2 local-path decline, 3 two-in-sequence, 4 cost-guard trip. */
+@@ -818,6 +888,28 @@
+ 			/* patch 316: synchronous, beside BATCHCAUSE */
+ 			macsurf_debug_log_writef("LIFE SHEETCAUSE sheets=%d",
+ 				sheets);
++			/* patch 318: what the marks themselves said */
++			if (g_pending[i].sheet_state == 1 &&
++			    !g_pending[i].sheet_unid) {
++				int cur = html_css_sheet_mark_current(
++					g_pending[i].c, g_pending[i].sheet_idx,
++					g_pending[i].sheet_ctr);
++				macsurf_debug_log_writef(
++					"LIFE SHEETID %s idx=%d ctr=%u",
++					cur ? "single" : "stale",
++					g_pending[i].sheet_idx,
++					g_pending[i].sheet_ctr);
++				if (cur)
++					g_id_single++;
++				else
++					g_id_stale++;
++			} else if (g_pending[i].sheet_state != 0) {
++				macsurf_debug_log_writef("LIFE SHEETID multi");
++				g_id_multi++;
++			} else {
++				macsurf_debug_log_writef("LIFE SHEETID none");
++				g_id_none++;
++			}
+ 			if (sheets == 1)
+ 				g_fc_sheet1++;
+ 			else if (sheets > 1)
+@@ -940,6 +1032,13 @@
+ 			(long) g_fc_sheet0);
+ 	}
+ 	g_fc_sheet1 = 0; g_fc_sheetn = 0; g_fc_sheet0 = 0;
++	/* Patch 318 - the identity split, its own line */
++	if (g_id_single + g_id_stale + g_id_multi + g_id_none != 0) {
++		macsurf_debug_log_writef(
++			"LIFE SHEETIDCENSUS single=%ld stale=%ld multi=%ld none=%ld",
++			g_id_single, g_id_stale, g_id_multi, g_id_none);
++	}
++	g_id_single = 0; g_id_stale = 0; g_id_multi = 0; g_id_none = 0;
+ 	g_fc_total = 0; g_fc_over = 0; g_fc_nonode = 0;
+ 	g_fc_kind = 0; g_fc_local = 0; g_fc_two = 0; g_fc_guard = 0;
+ 	g_sync_flushes  = 0;
+@@ -1591,6 +1690,19 @@
+ 
+ /* Called from the JS DOM-mutation bindings on every successful mutation.
+  * schedule.c dedups identical (cb, param) so a burst collapses to one fire. */
++/* Patch 318 (doc 23 piece A) - the identified sheet mark: scheduled and
++ * recorded exactly as the nodeless mark below, plus the identity. */
++void
++macos9_js_mark_dom_dirty_sheet(struct content *c, int index,
++		unsigned int counter)
++{
++	g_sheet_mark.active = 1;
++	g_sheet_mark.idx = index;
++	g_sheet_mark.ctr = counter;
++	macos9_js_mark_dom_dirty_node(c, NULL, MACOS9_DOMMUT_UNKNOWN);
++	g_sheet_mark.active = 0;
++}
++
+ void
+ macos9_js_mark_dom_dirty(struct content *c)
+ {

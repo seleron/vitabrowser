@@ -1177,8 +1177,20 @@ scc_one=$(printf '%s\n' "$scc" | grep -c 'sheets=1$' || true)
 scc_multi=$(printf '%s\n' "$scc" | grep -c 'sheets=[2-9]' || true)
 scp=$(ls "$R"/*NET-js-sheet-census.plot 2>/dev/null | head -1)
 scr=$(sed -n 's/.*STR \(SHEETCENSUS: [0-9]*\/[0-9]* passed\).*/\1/p' "$scp" 2>/dev/null | head -1)
-echo "  JS-sheet-census: ${scr:-no summary}; sheet causes single=${scc_one} multi=${scc_multi}"
-[ "$scr" = "SHEETCENSUS: 2/2 passed" ] && [ "$scc_one" -ge 1 ] && [ "$scc_multi" -ge 1 ] || o2_bad="$o2_bad js-sheet-census"
+# Patch 318 (doc 23 piece A): the marks carry the sheet's identity --
+# the one-sheet edit's batch logs "SHEETID single", the two-sheet task's
+# "SHEETID multi", and step 3 (one <style> edited twice 150 ms apart,
+# the second before the first's batch flushed) "SHEETID stale": the
+# first mark's modification counter no longer matches at the flush.
+sci=$(awk '/page [0-9]*\/[0-9]* NET-js-sheet-census: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE SHEETID ' || true)
+sci_single=$(printf '%s\n' "$sci" | grep -c 'SHEETID single' || true)
+sci_multi=$(printf '%s\n' "$sci" | grep -c 'SHEETID multi' || true)
+sci_stale=$(printf '%s\n' "$sci" | grep -c 'SHEETID stale' || true)
+echo "  JS-sheet-census: ${scr:-no summary}; sheet causes single=${scc_one} multi=${scc_multi}; identity single=${sci_single} multi=${sci_multi} stale=${sci_stale}"
+[ "$scr" = "SHEETCENSUS: 3/3 passed" ] && [ "$scc_one" -ge 1 ] && [ "$scc_multi" -ge 1 ] && \
+	[ "$sci_single" -ge 1 ] && [ "$sci_multi" -ge 1 ] && [ "$sci_stale" -ge 1 ] || o2_bad="$o2_bad js-sheet-census"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest
