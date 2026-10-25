@@ -5889,3 +5889,51 @@ watch the DOM (framework devtools hooks, lazy-loaders, the
 Facebook checkpoint UI fixes1235 was for) should behave as
 before: delivery moved from a zero-delay timer to the pump's
 between-task drain, which is the same turn or sooner.
+
+## Patch 318 (2026-10-25): a sheet-change mark carries the sheet's identity (doc 23 piece A)
+
+**What:** Doc 23 piece A, the part patch 316's census deferred.
+css.c's two sheet-mark sites now go through
+`html_css_mark_sheets`. When exactly one stylesheet entry is
+changing in the settle window (the finishing entry, the one held for
+patch 266's deferred refresh, or any still queued or loading), the
+mark is `macos9_js_mark_dom_dirty_sheet(c, index, counter)`. The
+counter is a new per-entry modification count, bumped each time the
+entry is re-processed. Otherwise the mark is the plain nodeless one,
+as before. The reconvert slot folds each nodeless mark's identity,
+and at the commit of a nonode batch logs `LIFE SHEETID
+single|stale|multi|none`. "stale" means the one identified entry was
+re-processed before the flush, so its first mark's counter no longer
+matches. The navigation reset prints `LIFE SHEETIDCENSUS`.
+**Behaviour is unchanged:** identified batches still take the full
+reconvert, and the FULLCAUSE/BATCHCAUSE/SHEETCAUSE formats are as
+they were. Pieces B/C (reach analysis, local answer) are not
+started.
+
+**Reading of the design, recorded:** doc 23 says "entries processed
+since the last mark". This patch reads it as "in flight", because
+entries processed during the initial parse bump the counter without
+ever marking. Counting those made every first post-layout mark
+multi.
+
+**Gate:** JS-sheet-census gains step 3, which edits one `<style>`
+twice 150 ms apart: the second edit lands after the first's DONE but
+before its batch flushes. SHEETCENSUS 3/3, plus the page window's
+`SHEETID single` ≥ 1, `multi` ≥ 1 and `stale` ≥ 1. In focused
+runs, single/multi matched patch 316's sheets=1/2 every time, and
+stale reproduced on both runs. A 40 ms gap coalesces the two edits
+into one process instead (one DONE, counter current). Full sim gate exit 0 (gate-318): census page single=1 multi=1
+stale=1; STYLEEDIT 4/4, the batch-burst FULLCAUSE and attr-local
+causes unchanged; interaction 52/52 at the Vita's pace. **Suite-wide
+identity** (SHEETIDCENSUS): single=8, stale=1, multi=1, none=0.
+Every nodeless batch in the suite is a sheet batch, and 8 of 10
+name exactly one current sheet, which is the shape pieces B/C would
+answer.
+
+**On the device (run 39), in addition:** JS-sheet-census.html now
+reads SHEETCENSUS **3/3**. In netsurf.log that page's window should
+show `SHEETID single`, `multi` and `stale` lines. Stale depends on
+timing: on the device's slower pump it could instead read single or
+multi. That is not a failure if all three restyle checks pass;
+report what it reads. The SHEETIDCENSUS lines from real CSS-in-JS
+sites are the data pieces B/C need.

@@ -319,3 +319,14 @@ text node is declined by the local path before the sheet's nodeless
 batch arrives. Stage 2 has to answer (or deliberately absorb) that
 text-node mark as well, or it saves at most half. Details are in
 doc 10's patch 316 entry.
+
+## Status (2026-10-25, later): piece A landed as patch 318
+
+Sheet identity rides on the mark (`macos9_js_mark_dom_dirty_sheet`,
+index + per-entry modification counter), folded per batch and checked
+at the flush (single / stale / multi / none). Behaviour unchanged; the
+batches still take the full reconvert. One reading of the text above:
+"entries processed since the last mark" is implemented as "entries in
+flight" (queued or loading), because the initial parse processes
+entries without ever marking. Gate suite: single=8 stale=1 multi=1
+none=0. Pieces B (reach) and C (local answer) are not started.
