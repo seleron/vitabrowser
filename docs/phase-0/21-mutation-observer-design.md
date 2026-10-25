@@ -42,3 +42,15 @@ inside the mutating call.
 - Observing the frame document (doc 19 item 7): observers on the child
   document deliver on the child's task queue; cross-realm delivery follows
   the postMessage path, not a nested call.
+
+## Status (2026-10-25): implemented as patch 317
+
+Steps 1–4 landed: a C record queue that runs no JS to queue (libdom
+node references, keyed by the destination context), drained between
+page tasks next to the postMessage drain, with records built inside
+the destination realm and a detached queue so a callback's records
+arrive in a later delivery. The frame-document case in the non-goals
+now works as described there: parent-made writes through patch 307's
+handles queue for the child realm and are delivered on the child's
+own delivery task. Doc 10 records the gate (MODELIV 6/6) and the
+remaining gaps (innerHTML/textContent records, takeRecords).

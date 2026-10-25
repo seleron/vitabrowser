@@ -5831,3 +5831,61 @@ edits). netsurf.log should carry `LIFE SHEETCAUSE sheets=1` and
 SHEETCENSUS summary lines are the data stage 2 is waiting for —
 worth collecting from any CSS-in-JS-heavy site (the Guardian,
 claude.ai).
+
+## Patch 317 (2026-10-25): MutationObserver delivery — a C record queue and a delivery task (doc 21)
+
+**What:** Doc 21, implemented. Records used to be queued by calling
+the realm's own JS (`__msQueueMutation`) from inside each mutating
+entry point, and that JS armed a `setTimeout(0)` to deliver them. So
+queueing ran JS, and that is why patch 307's recorded remainder
+stayed open: frame observers never saw writes the parent made
+through frame-document handles. Now a record is a C struct (the
+destination realm's context, the type, libdom references for
+target/added/removed, copied strings for the attribute name and
+old value), and queueing one runs no JS in any
+realm. The realm entry points, the polyfill's characterData
+setters (through a native `__msQueueMutation`), and patch 307's
+frame-handle `setAttribute`/`appendChild`/`removeChild` all queue
+into it; the last of those queue for the **child** realm. A realm
+is queued for only after it calls `observe()`. `macsurf_qjs_pump_all`
+drains the queue between page tasks, beside the postMessage drain:
+for each realm with records it builds them inside that realm's
+runtime and runs the existing
+`__msDeliverMutations` matcher in a task scope. The queue is
+detached before delivery, so records a callback queues are
+delivered on a later pump, never nested in the running delivery.
+Records are purged in `qjs_owner_unregister`, which runs before
+every `JS_FreeContext` of a registered realm, so no record outlives
+its realm. The queue is bounded at 8192 records.
+
+**Gate:** new `JS-mo-delivery` (+ child frame), NET list after
+JS-frame-document, MODELIV 6/6: async delivery, attribute
+oldValue + attributeFilter, characterData old text, a callback's
+own record delivered later (calls 2, max depth 1), fragment
+children as addedNodes, and parent-made frame-handle writes
+reaching the frame's observer. Disarm check: with frame queueing
+off, leg 6 times out (5/6). JS-mutation stays 7/7. **First gate run failed (gate-317, exit 1):**
+CUSTOMEL fell to 5/7 (connectedCallback, innerHTML-made element).
+The polyfill's custom-elements code calls `observe()` while the
+realm is still being built, before `heap->ctx` and its generation
+are assigned, so a watch flag kept on the heap never armed. The
+flag now lives on the realm's owner record, which exists from
+`JS_NewContextRaw` on, and records are keyed by context.
+Re-run (gate-317b): full sim gate exit 0 — CUSTOMEL 7/7, MODELIV
+6/6, JS-mutation 7/7 over http and https, interaction 52/52 at the
+Vita's pace, 23/23 pace-identical, 68/68 text frames.
+
+**Still open (recorded in the header):** the innerHTML/textContent
+setters queue no childList records (realm or frame handle), as
+before; `takeRecords()` still returns `[]`; records are matched to
+observers at delivery, not at queue time.
+
+**On the device (run 39), in addition:** the bundled
+JS-mo-delivery.html reads **MODELIV 5/6** over file://. Leg 6
+fails with "no frame handles", because a file:// frame has no
+document (the same opaque-origin limit that makes the bundled
+XDOC2 read 1/10). Over http the gate reads 6/6. Pages that
+watch the DOM (framework devtools hooks, lazy-loaders, the
+Facebook checkpoint UI fixes1235 was for) should behave as
+before: delivery moved from a zero-delay timer to the pump's
+between-task drain, which is the same turn or sooner.
