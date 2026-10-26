@@ -220,6 +220,18 @@ struct vita2d_texture *vita_bitmap_texture(struct bitmap *b)
 {
 	return b ? b->tex : NULL;
 }
+/* Patch 319: the scaled faded path draws a pre-multiplied copy. Here the
+ * "copy" is a texture the test hands in (NULL = the copy is refused), and
+ * the alpha asked for is recorded. */
+static vita2d_texture *fade_tex;
+static unsigned int fade_alpha_asked;
+struct vita2d_texture *vita_bitmap_faded_texture(struct bitmap *b,
+						 unsigned int alpha)
+{
+	(void)b;
+	fade_alpha_asked = alpha;
+	return fade_tex;
+}
 
 /* ---------------------------------------------------------------------
  * harness
@@ -684,6 +696,32 @@ static void test_backend(void)
 		P->bitmap(&ctx, &bm, 30, 0, 20, 40, 0, BITMAPF_REPEAT_X);
 		CHECK(count_lines("tex ") == 6 && has_line("tex 10x20 -10 0 2 2"),
 		      "repeat-x tiles:\n%s", vlog);
+		/* Patch 319: scaled at a partial opacity (byte 128 = bucket
+		 * 2) draws the faded copy through the same scale entry; a
+		 * refused copy draws the source, solid; 1:1 never copies. */
+		full_clip();
+		fade_tex = vita2d_create_empty_texture(10, 21);
+		vlog_reset();
+		fade_alpha_asked = 0;
+		P->bitmap(&ctx, &bm, 100, 50, 20, 40, 0, BITMAPF_OPACITY(128));
+		CHECK(count_lines("tex ") == 1 && has_line("tex 10x21 100 50 2 2") &&
+		      fade_alpha_asked == 128, "scaled faded:\n%s", vlog);
+		vita2d_free_texture(fade_tex);
+		fade_tex = NULL;
+		vlog_reset();
+		P->bitmap(&ctx, &bm, 100, 50, 20, 40, 0, BITMAPF_OPACITY(128));
+		CHECK(count_lines("tex ") == 1 && has_line("tex 10x20 100 50 2 2"),
+		      "scaled fade refused -> solid:\n%s", vlog);
+		vlog_reset();
+		fade_alpha_asked = 0;
+		P->bitmap(&ctx, &bm, 100, 50, 10, 20, 0, BITMAPF_OPACITY(128));
+		CHECK(count_lines("tex ") == 0 && fade_alpha_asked == 0,
+		      "1:1 faded uses the tint entry:\n%s", vlog);
+		/* off-clip: no copy is made for a draw that cannot show */
+		r = (struct rect){ 0, 0, 50, 50 };
+		P->clip(&ctx, &r);
+		P->bitmap(&ctx, &bm, 100, 60, 20, 40, 0, BITMAPF_OPACITY(128));
+		CHECK(fade_alpha_asked == 0, "off-clip copy made");
 		vita2d_free_texture(bm.tex);
 	}
 

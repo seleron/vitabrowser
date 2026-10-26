@@ -214,6 +214,8 @@ CSS-spacing file:///app0:/testpages/CSS-spacing.html
 CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 CSS-inline-grid file:///app0:/testpages/CSS-inline-grid.html
 CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
+CSS-opacity-image file:///app0:/testpages/CSS-opacity-image.html
+IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
 JS-event-order file:///app0:/testpages/JS-event-order.html
@@ -678,6 +680,86 @@ if [ -n "$op_snap" ] && [ -n "$op_b20" ] && [ -n "$op_b16" ] && [ -n "$op_b16c" 
 		awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0), half-border RECT ${op_brect_h:-?}/${op_brect_s:-?} (2/2), solid-border RECT ${op_brect_ctl:-?} (2), double-border POLYGON ${op_bdbl_op2:-?}/${op_bdbl_all:-?} (8/16), dashed-border LINE ${op_bdash_op2:-?}/${op_bdash_all:-?} (4/8), alpha-border OPAQUE 2/1 ${op_balpha_op2:-?}/${op_balpha_op1:-?} (2/2), bg-tile OPAQUE 2 ${op_bg1:-?} (1), bg-repeat OPAQUE 2/solid ${op_bgrep_op2:-?}/${op_bgrep_ctl:-?} (1/1), radio DISC ${op_disc_op2:-?}/${op_disc_all:-?} (2/4), radio ARC ${op_arc_op2:-?}/${op_arc_all:-?} (2/4), svg PATH ${op_path_op2:-?}/${op_path_all:-?} (1/2), image pixels ${op_px:-none} (127,127,255 255,127,127 255,127,127 255,0,0)"
+# Patch 319 (doc 24 stage 2): <img> fades with its opacity group, per
+# image format the build decodes. CSS-opacity-image gives each blue
+# fixture its own intrinsic size (png 20, gif 22, svg 24, bmp 26, ico 28,
+# jpeg 30): at 1:1 inside .half each traces OPAQUE 2 (the tint entry), at
+# 2x (40/44/48/52/56/60) OPAQUE 2 through the pre-multiplied scaled path;
+# the SVG's PATHs likewise (2 faded + 1 solid control -- one PATH per
+# <img>: the svg.c reformat no longer stacks the shapes). Controls (png 20
+# and 40, jpeg 30) trace no token; the png inside opacity:0 (34) is not
+# plotted; a 1x1 png stretched to 30x10 inside .half is image.c's 1x1
+# RECT shortcut, OPAQUE 2 (control 32x10 solid); a background scaled
+# 20 -> 36 and a 16 -> 24 background repeated in x, both inside .half,
+# trace OPAQUE 2. Pixels from the autotest snapshot, at each leg's centre
+# (positions from the trace): faded blue 127,127,255 (jpeg 127,127,254),
+# solid 0,0,255 (jpeg 0,0,254), both background tiles 255,127,127, and
+# white where the opacity:0 png sits. The standalone image document
+# (IMG-standalone, opimg-20.png) must paint solid: one BITMAP 20x20, no
+# OPAQUE token anywhere, centre 0,0,255.
+echo "== image opacity (CSS-opacity-image, IMG-standalone) =="
+oi=$(ls "$R"/*-CSS-opacity-image.plot 2>/dev/null | head -1)
+oi_snap=$(ls "$OUT"/snaps/N-*-CSS-opacity-image.png 2>/dev/null | head -1)
+oi_bad=
+oi_n() { grep -c "$1" "$oi" 2>/dev/null || true; }
+# one count per leg: "WIDTHxHEIGHT/suffix want"
+for leg in 20/2/1 22/2/1 26/2/1 28/2/1 30/2/1 40/2/1 44/2/1 52/2/1 56/2/1 60/2/1 \
+	   36/2/1 24/2/1 20/s/1 40/s/1 30/s/1 34/a/0; do
+	w=${leg%%/*}; k=${leg#*/}; k=${k%/*}; want=${leg##*/}
+	case "$k" in
+		2) got=$(oi_n "PLOT BITMAP .* WIDTH $w HEIGHT $w OPAQUE 2\$") ;;
+		s) got=$(oi_n "PLOT BITMAP .* WIDTH $w HEIGHT $w\$") ;;
+		a) got=$(oi_n "PLOT BITMAP .* WIDTH $w HEIGHT $w") ;;
+	esac
+	[ "${got:-x}" = "$want" ] || oi_bad="$oi_bad bitmap$w/$k=${got:-none}"
+done
+oi_path2=$(oi_n 'PLOT PATH .* OPAQUE 2$'); oi_path=$(oi_n 'PLOT PATH')
+[ "$oi_path2" = 2 ] && [ "$oi_path" = 3 ] || oi_bad="$oi_bad path=$oi_path2/$oi_path"
+oi_r1=$(awk '/^PLOT RECT/ && $8 - $4 == 30 && $10 - $6 == 10 && / OPAQUE 2$/ { n++ } END { print n+0 }' "$oi" 2>/dev/null || true)
+oi_r1c=$(awk '/^PLOT RECT/ && $8 - $4 == 32 && $10 - $6 == 10 && !/OPAQUE/ { n++ } END { print n+0 }' "$oi" 2>/dev/null || true)
+[ "$oi_r1" = 1 ] && [ "$oi_r1c" = 1 ] || oi_bad="$oi_bad rect1x1=$oi_r1/$oi_r1c"
+# Sample points, in a fixed order: the faded legs, the solid controls,
+# the 1x1 pair, the background tiles, the opacity:0 spot.
+oi_pts=
+oi_c() {	# centre of the first BITMAP of size $1 with suffix $2 (+dx $3)
+	grep -a -m1 -E "^PLOT BITMAP X [0-9]+ Y [0-9]+ WIDTH $1 HEIGHT $1$2\$" "$oi" 2>/dev/null | \
+		awk -v dx="${3:-0}" '{ printf "%d,%d ", $4 + int($8 / 2) + dx, $6 + int($10 / 2) }'
+}
+oi_svg() {	# centre of the clip box before the Nth PATH with suffix $2
+	awk -v want="$1" -v suf="$2" '/^PLOT CLIP/ { cx = int(($4 + $8) / 2); cy = int(($6 + $10) / 2) }
+		/^PLOT PATH/ { s = ($0 ~ / OPAQUE 2$/) ? "2" : "s"; if (s == suf && ++n == want) { printf "%d,%d ", cx, cy; exit } }' "$oi" 2>/dev/null
+}
+if [ -n "$oi" ] && [ -n "$oi_snap" ]; then
+	for w in 20 22 26 28 30 40 44 52 56 60; do oi_pts="$oi_pts$(oi_c $w ' OPAQUE 2')"; done
+	oi_pts="$oi_pts$(oi_svg 1 2)$(oi_svg 2 2)"
+	for w in 20 40 30; do oi_pts="$oi_pts$(oi_c $w '')"; done
+	oi_pts="$oi_pts$(oi_svg 1 s)"
+	oi_pts="$oi_pts$(awk '/^PLOT RECT/ && $8 - $4 == 30 && $10 - $6 == 10 && / OPAQUE 2$/ { printf "%d,%d %d,%d ", ($4 + $8) / 2, ($6 + $10) / 2, $4 - 23, $6 + 17; exit }' "$oi")"
+	oi_pts="$oi_pts$(awk '/^PLOT RECT/ && $8 - $4 == 32 && $10 - $6 == 10 && !/OPAQUE/ { printf "%d,%d ", ($4 + $8) / 2, ($6 + $10) / 2; exit }' "$oi")"
+	oi_pts="$oi_pts$(oi_c 36 ' OPAQUE 2')$(oi_c 24 ' OPAQUE 2')$(oi_c 24 ' OPAQUE 2' 24)"
+	oi_px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$oi_snap" $oi_pts | \
+		awk '{printf "%s,%s,%s ", $2, $3, $4}' || true)
+fi
+# faded: png gif bmp ico jpeg (1:1), the same at 2x, svg 1:1 + 2x;
+# solid: png 20, png 40, jpeg, svg; 1x1 faded + the opacity:0 spot;
+# 1x1 control; background scaled, repeat tile 1, tile 2.
+oi_want="127,127,255 127,127,255 127,127,255 127,127,255 127,127,254 127,127,255 127,127,255 127,127,255 127,127,255 127,127,254 127,127,255 127,127,255 0,0,255 0,0,255 0,0,254 0,0,255 127,127,255 255,255,255 0,0,255 127,127,255 255,127,127 255,127,127 "
+[ "${oi_px:-none}" = "$oi_want" ] || oi_bad="$oi_bad pixels"
+echo "  CSS-opacity-image: counts ${oi_bad:+FAIL$oi_bad}${oi_bad:-ok} (16 bitmap legs, PATH ${oi_path2:-?}/${oi_path:-?} (2/3), 1x1 RECT ${oi_r1:-?}/${oi_r1c:-?} (1/1))"
+echo "  pixels ${oi_px:-none}"
+echo "  want   $oi_want"
+sa=$(ls "$R"/*-IMG-standalone.plot 2>/dev/null | head -1)
+sa_snap=$(ls "$OUT"/snaps/N-*-IMG-standalone.png 2>/dev/null | head -1)
+sa_bm=$(grep -c 'PLOT BITMAP .* WIDTH 20 HEIGHT 20$' "$sa" 2>/dev/null || true)
+sa_op=$(grep -c 'OPAQUE' "$sa" 2>/dev/null || true)
+sa_px=
+[ -n "$sa_snap" ] && sa_px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$sa_snap" \
+	$(grep -a -m1 -o 'PLOT BITMAP X [0-9]* Y [0-9]* WIDTH 20 HEIGHT 20$' "$sa" | awk '{ printf "%d,%d", $4 + 10, $6 + 10 }') | \
+	awk '{printf "%s,%s,%s", $2, $3, $4}' || true)
+echo "  IMG-standalone: BITMAP 20x20 solid ${sa_bm:-?} (1), OPAQUE tokens ${sa_op:-?} (0), centre ${sa_px:-none} (0,0,255)"
+[ -n "$oi" ] && [ -z "$oi_bad" ] && [ "${sa_bm:-0}" = 1 ] && [ "${sa_op:-1}" = 0 ] && \
+	[ "$sa_px" = "0,0,255" ] || fail "image opacity (doc 24 stage 2)"
+
 ifp=$(ls "$R"/*NET-js-interfaces.plot 2>/dev/null | head -1)
 ifr=$(sed -n 's/.*STR \(IFACES: [0-9]*\/[0-9]* passed\).*/\1/p' "$ifp" 2>/dev/null | head -1)
 echo "  JS-interfaces: ${ifr:-no summary}"

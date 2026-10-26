@@ -1,0 +1,403 @@
+# netsurf: <img> and object images paint at the composed group opacity; scaled faded bitmaps pre-multiply (patch 319)
+# Generated 2026-10-26
+# Base: seleron/vitabrowser (patch stack through 318)
+#
+# Doc 24 stage 2 (the image handlers). Patch 315 built the channel
+# (BITMAPF_OPACITY, flag bits 16-23), the content_redraw_data.opacity
+# carrier and the fold in all four handlers that call the bitmap op
+# (image.c, bmp.c, nssprite.c, rsvg.c) -- but only the background sites
+# filled the carrier, so an <img> inside an opacity group painted solid,
+# and a SCALED faded bitmap drew solid too (doc 24's open fork).
+#
+#  - redraw.c: the object paint site fills obj_data.opacity from
+#    html_redraw_group_opacity_byte() (0 when the group is full, so solid
+#    pages' flags are unchanged). Image handlers fold it already; HTML
+#    and text contents ignore the field. Every other content_redraw_data
+#    constructor (content.c thumbnails, browser_window.c -- a standalone
+#    image document --, print.c, treeview.c) still sets 0 (solid).
+#  - frontends/vita: a scaled tile at a partial bucket now draws a copy of
+#    its texture with every alpha byte scaled by the bucket alpha
+#    (vita_bitmap_faded_texture, bitmap.c) through the same
+#    vita2d_draw_texture_scale -- doc 24's recommended device-safe
+#    default: no stub entry both scales and tints, and the copy needs
+#    none. Straight alpha, so scaling the alpha byte is the whole fade:
+#    (a * A) / 255, the arithmetic the sim's tint_part uses for the 1:1
+#    path, so 1:1 and scaled fades read the same pixels. The copy comes
+#    from the texture pool and goes straight onto the dead list, so its
+#    memory is only reused after the frame the GPU is drawing retires
+#    (vita_bitmap_frame_retired) -- the GPU may still sample it this
+#    frame. A one-entry memo (source, alpha) copies once when the same
+#    image is drawn twice at one alpha in a frame; repeat tiles share the
+#    op's copy. No copy is made for a draw that cannot reach the clip. A
+#    refused allocation draws solid and is counted (log: "bitmaps: N
+#    faded copies (K KB), M refused" at load end, only when non-zero, so
+#    solid pages' logs are unchanged); the trace then reads solid too.
+#    The tint_part 1:1 path and bucket-0 skip are unchanged. Stage 3
+#    (a device-verified scale-tint entry) is NOT done here.
+#  - svg.c (the SVG image handler, NETSURF_USE_NSSVG -- the one this
+#    build compiles; rsvg and nssprite are not built for the Vita, their
+#    folds from 315 are compile-only here): (1) the redraw takes the
+#    opacity byte into its path and text styles; (2) its path style was
+#    a stack plot_style_t whose opacity/radius/shadow were never set --
+#    the vita path op reads opacity since 315 -- now zeroed; (3)
+#    svg_reformat re-parsed into the SAME diagram and svgtiny_parse
+#    APPENDS shapes, so an <img> laid out at a second size drew every
+#    shape twice (2 PATHs; invisible solid, a wrong-alpha double blend
+#    inside a group). It now parses into a fresh diagram on a size change
+#    (keeping the old one if none can be created).
+#  - image.c: image_bitmap_plot's 1x1 shortcut (a stretched 1x1 spacer
+#    or colour image becomes a RECT) zeroes its stack style (recorded as
+#    uninitialised at 315) and carries the opacity, so it fades too.
+#  - plotters.h: BITMAPF_OPACITY_FIXED(b), the byte as a plot_style_fixed
+#    for handlers that paint through style ops (0 stays 0 = solid; byte 1
+#    stays above 0 so it still quantises to "skip").
+#
+# Proof (focused, sim): CSS-opacity-image (new gate page) -- blue png,
+# gif, bmp, ico and jpeg <img> at 1:1 and at 2x inside opacity:.5 all
+# trace OPAQUE 2 and read 127,127,255 (jpeg 127,127,254: it decodes to
+# 0,0,254); the SVG <img> 1:1 and 2x trace PATH OPAQUE 2, one each;
+# controls read 0,0,255 with no token; a png in opacity:0 is not
+# plotted; a stretched 1x1 png traces RECT ... OPAQUE 2; a scaled and a
+# scaled+repeated background read faded (255,127,127 in both tiles). A
+# standalone image document traces one solid BITMAP and reads 0,0,255.
+# Host cost of one faded copy (memset + memcpy + alpha pass, -O2):
+# 0.26 ms at 640x480, 0.65 ms at 1024x768 (< 1 ns/px); paid only for a
+# scaled image inside a partial group, per redraw.
+#
+# Simulator only; the vita cross-build was not run for this patch.
+# Device expectation is in Doc 10.
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -5929,9 +5929,12 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			 css_computed_image_rendering(box->style) ==
+ 				CSS_IMAGE_RENDERING_CRISP_EDGES));
+ 		obj_data.background_blend_mode = 0;
+-		/* patch 315: <img>/object group opacity is doc 24 stage 2;
+-		 * until then objects paint solid, as before. */
+-		obj_data.opacity = 0;
++		/* patch 319 (doc 24 stage 2): an <img>/object paints at the
++		 * composed group opacity of its box, like the backgrounds
++		 * (patch 315). Image handlers fold it into the bitmap op;
++		 * HTML/text contents ignore the field. 0 when the group is
++		 * full, so solid pages' flags are unchanged. */
++		obj_data.opacity = html_redraw_group_opacity_byte();
+ 
+ 		if (content_get_type(box->object) == CONTENT_HTML) {
+ 			obj_data.x /= scale;
+--- a/content/handlers/image/image.c
++++ b/content/handlers/image/image.c
+@@ -18,6 +18,7 @@
+ 
+ #include <stdbool.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "utils/utils.h"
+ #include "utils/log.h"
+@@ -132,7 +133,14 @@ bool image_bitmap_plot(struct bitmap *bitmap,
+ 		if (height == 1) {
+ 			/* optimise 1x1 bitmap plot */
+ 			pixel = guit->bitmap->get_buffer(bitmap);
++			/* VitaBrowser patch 319: the style was a stack value
++			 * whose opacity/radius/shadow fields were never set
++			 * (plotters read them since fixes49/314); zero it, and
++			 * carry the group opacity so a faded 1x1 spacer/
++			 * colour <img> fades like the bitmap path. */
++			memset(&fill_style, 0, sizeof(fill_style));
+ 			fill_style.fill_colour = bitmap_pixel_to_colour(pixel);
++			fill_style.opacity = BITMAPF_OPACITY_FIXED(data->opacity);
+ 
+ 			if (guit->bitmap->get_opaque(bitmap) ||
+ 			    ((fill_style.fill_colour & 0xff000000) == 0xff000000)) {
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -137,6 +137,20 @@ static void svg_reformat(struct content *c, int width, int height)
+ 	if (width != svg->current_width || height != svg->current_height) {
+ 		source_data = content__get_source_data(c, &source_size);
+ 
++		/* VitaBrowser patch 319: svgtiny_parse APPENDS its shapes to
++		 * the diagram, so every reformat to a new size drew the image
++		 * once more on top of itself (an <img> laid out at two sizes
++		 * painted 2 PATHs per shape) -- invisible when solid, a
++		 * wrong-alpha double blend inside an opacity group. Parse
++		 * into a fresh diagram; keep the old one if none is free. */
++		if (svg->current_width != INT_MAX) {
++			struct svgtiny_diagram *fresh = svgtiny_create();
++			if (fresh != NULL) {
++				svgtiny_free(svg->diagram);
++				svg->diagram = fresh;
++			}
++		}
++
+ 		svgtiny_parse(svg->diagram,
+ 			      (const char *)source_data,
+ 			      source_size,
+@@ -166,7 +180,8 @@ svg_redraw_internal(svg_content *svg,
+ 		    const struct rect *clip,
+ 		    const struct redraw_context *ctx,
+ 		    float scale,
+-		    colour background_colour)
++		    colour background_colour,
++		    unsigned char opacity)
+ {
+ 	float transform[6];
+ 	struct svgtiny_diagram *diagram = svg->diagram;
+@@ -178,6 +193,15 @@ svg_redraw_internal(svg_content *svg,
+ 
+ 	assert(diagram);
+ 
++	/* VitaBrowser patch 319 (doc 24 stage 2): an SVG image (<img> or
++	 * background) paints at the composed group opacity it was given in
++	 * content_redraw_data. pstyle was a stack value whose opacity,
++	 * radius and shadow fields were never set -- the vita path op reads
++	 * the opacity since patch 315 -- so it is zeroed here. */
++	memset(&pstyle, 0, sizeof(pstyle));
++	pstyle.opacity = BITMAPF_OPACITY_FIXED(opacity);
++	fstyle.opacity = BITMAPF_OPACITY_FIXED(opacity);
++
+ 	transform[0] = (float) width / (float) svg->base.width;
+ 	transform[1] = 0;
+ 	transform[2] = 0;
+@@ -283,7 +307,8 @@ svg_redraw_tiled_internal(svg_content *svg,
+ 			if (!svg_redraw_internal(svg, x, y,
+ 						 data->width, data->height,
+ 						 clip, ctx, data->scale,
+-						 data->background_colour)) {
++						 data->background_colour,
++						 data->opacity)) {
+ 				return false;
+ 			}
+ 		}
+@@ -315,7 +340,8 @@ svg_redraw(struct content *c,
+ 		return svg_redraw_internal(svg, data->x, data->y,
+ 				data->width, data->height,
+ 				clip, ctx, data->scale,
+-				data->background_colour);
++				data->background_colour,
++				data->opacity);
+ 	}
+ 
+ 	return svg_redraw_tiled_internal(svg, data, clip, ctx);
+--- a/frontends/vita/bitmap.c
++++ b/frontends/vita/bitmap.c
+@@ -71,6 +71,15 @@ static struct texpool *pool;
+ static struct bitmap *dead;	/* destroyed, waiting for the GPU */
+ static unsigned int live_bitmaps, arena_failures;
+ 
++/* Patch 319: faded copies made this frame (see vita_bitmap_faded_texture)
++ * -- a one-entry memo, so a source drawn twice at one alpha in a frame is
++ * copied once -- and counters for the diag. */
++static const struct bitmap *fade_src;
++static unsigned int fade_alpha;
++static struct bitmap *fade_copy;
++static unsigned int fades_made, fades_declined;
++static unsigned long fade_bytes;
++
+ #ifdef VITA_HOST_SIM
+ /* The simulator's "GPU memory" is the heap; the pool logic is the same. */
+ static void *arena_get(void *ctx, size_t size, void **cookie)
+@@ -220,6 +229,8 @@ static void bitmap_destroy(void *bitmap)
+ /* exported interface documented in vita/bitmap.h */
+ void vita_bitmap_frame_retired(void)
+ {
++	fade_src = NULL;	/* the copy below is on the dead list */
++	fade_copy = NULL;
+ 	while (dead != NULL) {
+ 		struct bitmap *bm = dead;
+ 		dead = bm->next_dead;
+@@ -231,6 +242,60 @@ void vita_bitmap_frame_retired(void)
+ 		texpool_retire(pool);
+ }
+ 
++/* exported interface documented in vita/bitmap.h */
++struct vita2d_texture *vita_bitmap_faded_texture(struct bitmap *src,
++						 unsigned int alpha)
++{
++	struct bitmap *cp;
++	size_t stride;
++	int row, col;
++
++	if (src == NULL || src->pixels == NULL)
++		return NULL;
++	if (fade_copy != NULL && fade_src == src && fade_alpha == alpha)
++		return fade_copy->tex;
++	cp = bitmap_create(src->width, src->height, BITMAP_NONE);
++	if (cp == NULL) {
++		/* The caller draws solid; never a partial blend. */
++		if (fades_declined++ == 0)
++			vita_diag_log("bitmap: faded copy %dx%d refused "
++				      "(drawn solid)", src->width,
++				      src->height);
++		return NULL;
++	}
++	stride = (((size_t)src->width + 7) & ~(size_t)7) * 4;
++	memcpy(cp->pixels, src->pixels, stride * (size_t)src->height);
++	/* Straight alpha (see the top of this file): scaling the alpha byte
++	 * is the whole fade, texel x (white, alpha) as the tint shader and
++	 * the simulator's tint_part compute it -- so a scaled faded image
++	 * and a 1:1 one read the same pixels. */
++	for (row = 0; row < src->height; row++) {
++		unsigned char *p = (unsigned char *)cp->pixels +
++			(size_t)row * stride + 3;
++		for (col = 0; col < src->width; col++, p += 4)
++			*p = (unsigned char)((*p * alpha) / 255);
++	}
++	/* Destroyed at once: the memory stays put until the GPU has drawn
++	 * this frame (vita_bitmap_frame_retired), and nothing else holds
++	 * the copy. */
++	bitmap_destroy(cp);
++	fade_src = src;
++	fade_alpha = alpha;
++	fade_copy = cp;
++	fades_made++;
++	fade_bytes += stride * (size_t)src->height;
++	return cp->tex;
++}
++
++/* exported interface documented in vita/bitmap.h */
++void vita_bitmap_fade_stats(unsigned int *made, unsigned int *declined,
++			    unsigned int *kb)
++{
++	*made = fades_made;
++	*declined = fades_declined;
++	*kb = (unsigned int)(fade_bytes / 1024);
++}
++
+ /* exported interface documented in vita/bitmap.h */
+ void vita_bitmap_stats(unsigned int *live, unsigned int *arenas,
+ 		       unsigned int *used_kb, unsigned int *failures)
+--- a/frontends/vita/bitmap.h
++++ b/frontends/vita/bitmap.h
+@@ -39,6 +39,21 @@ struct vita2d_texture *vita_bitmap_texture(struct bitmap *bitmap);
+  */
+ void vita_bitmap_frame_retired(void);
+ 
++/**
++ * Patch 319 (doc 24 stage 2): a copy of the bitmap's texture with every
++ * texel's alpha scaled by alpha/255, for drawing a SCALED bitmap faded (no
++ * stub-declared vita2d entry both scales and tints). The copy lives until
++ * the frame in flight is retired, so draw it this frame only.
++ *
++ * \return the texture, or NULL if no copy could be made (draw solid)
++ */
++struct vita2d_texture *vita_bitmap_faded_texture(struct bitmap *bitmap,
++						 unsigned int alpha);
++
++/** Faded copies made, refused, and KB copied, since start. */
++void vita_bitmap_fade_stats(unsigned int *made, unsigned int *declined,
++			    unsigned int *kb);
++
+ /** Live bitmaps, texture arenas held, KB in use, allocations refused. */
+ void vita_bitmap_stats(unsigned int *live, unsigned int *arenas,
+ 		       unsigned int *used_kb, unsigned int *failures);
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -1346,6 +1346,14 @@ static void vita_run(struct browser_window *bw0)
+ 				vita_diag_log("bitmaps: %u live, %u KB in %u "
+ 					      "arenas, %u refused", bl, bkb,
+ 					      ba, bf);
++				/* patch 319: faded scaled copies, logged
++				 * only when a page made any, so solid
++				 * pages' logs are unchanged. */
++				vita_bitmap_fade_stats(&bl, &bf, &bkb);
++				if (bl != 0 || bf != 0)
++					vita_diag_log("bitmaps: %u faded "
++						      "copies (%u KB), %u "
++						      "refused", bl, bkb, bf);
+ 			}
+ 		}
+ 		/* A page may have set cookies: save the jar, at most every
+--- a/frontends/vita/plot.c
++++ b/frontends/vita/plot.c
+@@ -860,7 +860,7 @@ vita_plot_bitmap(const struct redraw_context *ctx,
+ 	float sx, sy;
+ 	int tx, ty, x_end, y_end;
+ 	int bucket = vita_bitmap_opacity_bucket(flags);
+-	bool tint = false;
++	bool tint = false, fade = false, draw;
+ 	unsigned int tex_w = 0, tex_h = 0;
+ 
+ 	/* VitaBrowser patch 315 (doc 24 stage 1): a bitmap inside an
+@@ -868,30 +868,53 @@ vita_plot_bitmap(const struct redraw_context *ctx,
+ 	 * Bucket 0 skips the draw (an opacity:0 group leaks nothing). A
+ 	 * tile drawn 1:1 fades through vita2d_draw_texture_tint_part with
+ 	 * a white tint at the bucket alpha (texel x tint, the entry the
+-	 * text atlas draws through); a scaled tile has no stub entry that
+-	 * both scales and tints, so it still draws solid -- doc 24's open
+-	 * fork (CPU pre-multiply vs a device-verified scale-tint entry).
++	 * text atlas draws through).
++	 * Patch 319 (doc 24 stage 2): a SCALED tile at a partial bucket
++	 * draws a copy with its alpha pre-multiplied by the bucket
++	 * (vita_bitmap_faded_texture) through the same
++	 * vita2d_draw_texture_scale -- no stub entry both scales and
++	 * tints, and the copy needs none (doc 24's device-safe default;
++	 * a scale-tint entry is stage 3, after a device check). The copy
++	 * is made only for a draw that can reach the clip, once per op.
+ 	 * The trace carries " OPAQUE <bucket>" only for a draw that is
+ 	 * actually faded (or skipped), so solid pages' dumps are
+-	 * byte-identical and a declined scaled fade reads as solid. */
++	 * byte-identical and a refused copy (drawn solid) reads as solid. */
+ 	tex = vita_bitmap_texture(bitmap);
+ 	if (tex != NULL) {
+ 		tex_w = vita2d_texture_get_width(tex);
+ 		tex_h = vita2d_texture_get_height(tex);
+ 	}
+-	if (bucket != VITA_BUCKET_SOLID &&
+-	    (bucket == 0 || ((unsigned int)width == tex_w &&
+-			     (unsigned int)height == tex_h)))
+-		tint = true;
+-	if (tint)
++	if (bucket != VITA_BUCKET_SOLID) {
++		if (bucket == 0 || ((unsigned int)width == tex_w &&
++				    (unsigned int)height == tex_h))
++			tint = true;
++		else
++			fade = true;
++	}
++	draw = !vita_clip_empty && width > 0 && height > 0 && tex != NULL &&
++		!(tint && bucket == 0);
++	/* A non-repeating axis that misses the clip draws nothing. */
++	if (draw && !(flags & BITMAPF_REPEAT_X) &&
++	    (x + width <= vita_clip.x0 || x >= vita_clip.x1))
++		draw = false;
++	if (draw && !(flags & BITMAPF_REPEAT_Y) &&
++	    (y + height <= vita_clip.y0 || y >= vita_clip.y1))
++		draw = false;
++	if (draw && fade) {
++		vita2d_texture *faded = vita_bitmap_faded_texture(bitmap,
++				vita_bucket_alpha[bucket]);
++		if (faded != NULL)
++			tex = faded;
++		else
++			fade = false;	/* refused: solid, counted */
++	}
++	if (tint || fade)
+ 		trace("BITMAP X %d Y %d WIDTH %d HEIGHT %d OPAQUE %d",
+ 		      x, y, width, height, bucket);
+ 	else
+ 		trace("BITMAP X %d Y %d WIDTH %d HEIGHT %d",
+ 		      x, y, width, height);
+-	if (vita_clip_empty || width <= 0 || height <= 0)
+-		return NSERROR_OK;
+-	if (tex == NULL || (tint && bucket == 0))
++	if (!draw)
+ 		return NSERROR_OK;
+ 	sx = (float)width / (float)tex_w;
+ 	sy = (float)height / (float)tex_h;
+--- a/include/netsurf/plotters.h
++++ b/include/netsurf/plotters.h
+@@ -60,6 +60,14 @@ typedef unsigned long bitmap_flags_t;
+ 	(((bitmap_flags_t)(a) & 0xffUL) << BITMAPF_OPACITY_SHIFT)
+ #define BITMAPF_OPACITY_BYTE(f) \
+ 	((unsigned int)(((f) & BITMAPF_OPACITY_MASK) >> BITMAPF_OPACITY_SHIFT))
++/* VitaBrowser patch 319 (doc 24 stage 2): a content_redraw_data opacity
++ * byte as a plot_style_t / plot_font_style_t opacity, for handlers that
++ * paint through style ops instead of the bitmap op (svg.c, image.c's 1x1
++ * shortcut). 0 stays 0 (unset = solid); byte 1 stays above 0 so it still
++ * quantises to "skip", as it does through the flags. */
++#define BITMAPF_OPACITY_FIXED(b) \
++	((b) == 0 ? (plot_style_fixed)0 : \
++	 (plot_style_fixed)(((int32_t)PLOT_STYLE_SCALE * (int32_t)(b) + 127) / 255))
+ 
+ enum path_command {
+ 	PLOTTER_PATH_MOVE,
