@@ -6006,9 +6006,11 @@ declaration in this engine, so no background paints. Separate
 of its own.
 
 **Still open:**
-- The gate should assert that IMG-svg/CSS-mask carry no OPAQUE token
-  (this would have caught the 315 skip). Not added in this commit, so
-  the gate that ran is the gate that is committed.
+- ~~The gate should assert that IMG-svg/CSS-mask carry no OPAQUE
+  token.~~ Added in a follow-up commit (gate-319b exit 0): IMG-svg
+  reads 6 paths with 0 tokens and CSS-mask 0 icon paths with a token.
+  Against gate 318's dumps the check fails (5/6 and 1), so it would
+  have caught the 315 skip that the paths-drawn count passed.
 - Checkbox gadgets don't fold the group opacity.
 - Stage 3 (scale-tint) needs a device check.
 - The vita cross-build was not run.

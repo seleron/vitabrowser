@@ -1570,15 +1570,21 @@ echo "  CSS-space: BRAVO at x $b1 / $b2, CHARLIE at x $c1 / $c2"
 # never appears.
 sv=$(ls "$R"/*-IMG-svg.plot 2>/dev/null | head -1)
 npath=$(grep -c '^PLOT PATH' "$sv" 2>/dev/null || true)
-echo "  IMG-svg: ${npath:-0} paths drawn$(grep -q LOGO-NOT-DRAWN "$sv" 2>/dev/null && echo ', ALT TEXT SHOWN')"
+# Neither SVG page sets opacity, so no path may carry an OPAQUE token: a
+# token here is a skipped or faded draw. Patch 315 let svg.c's
+# uninitialised path style through, and gate 318 traced IMG-svg's paths
+# OPAQUE 0 (not drawn) while the count above still read 5 (fixed in 319).
+npath_op=$(grep -c '^PLOT PATH .* OPAQUE' "$sv" 2>/dev/null || true)
+echo "  IMG-svg: ${npath:-0} paths drawn, ${npath_op:-?} with an OPAQUE token (0)$(grep -q LOGO-NOT-DRAWN "$sv" 2>/dev/null && echo ', ALT TEXT SHOWN')"
 # mask-image icons (patch 60): the two masked spans draw their SVG icon,
 # not a 24x24 block; only the two unmasked ones (-webkit-mask with a size,
 # which the background shorthand cannot take, and mask-image: none) do.
 mk=$(ls "$R"/*-CSS-mask.plot 2>/dev/null | head -1)
 # PLOT RECT X0 x0 Y0 y0 X1 x1 Y1 y1
 nblk=$(awk '/^PLOT RECT/ { if ($8 - $4 == 24 && $10 - $6 == 24) n++ } END { print n + 0 }' "$mk" 2>/dev/null)
-echo "  CSS-mask: $nblk solid 24x24 blocks (2 expected: the unmasked spans)"
-[ "$nblk" = 2 ] || fail "mask-image icons"
+mpath_op=$(grep -c '^PLOT PATH .* OPAQUE' "$mk" 2>/dev/null || true)
+echo "  CSS-mask: $nblk solid 24x24 blocks (2 expected: the unmasked spans), ${mpath_op:-?} icon paths with an OPAQUE token (0)"
+[ "$nblk" = 2 ] && [ "${mpath_op:-1}" = 0 ] || fail "mask-image icons"
 # background-size percentages (patches 89, 90): each of the five 300x200 boxes
 # with the 100x50 image draws its background at the sized tile; the
 # no-repeat boxes each emit one PLOT BITMAP of exactly that size.
@@ -1707,7 +1713,7 @@ done
 
 [ -n "$ext" ] && [ "$ext" -gt 1500 ] && [ -n "$b1" ] && [ "$b1" = "$b2" ] && \
 	[ -n "$c1" ] && [ "$c1" = "$c2" ] && [ "${npath:-0}" -ge 5 ] && \
-	! grep -q LOGO-NOT-DRAWN "$sv" || fail "real-site layout regressions"
+	[ "${npath_op:-1}" = 0 ] && ! grep -q LOGO-NOT-DRAWN "$sv" || fail "real-site layout regressions"
 
 # The network probe (frontends/vita/netprobe.c) before pass N: against the
 # local servers every step must succeed, with curl's own verdict logged.
