@@ -5937,3 +5937,95 @@ timing: on the device's slower pump it could instead read single or
 multi. That is not a failure if all three restyle checks pass;
 report what it reads. The SHEETIDCENSUS lines from real CSS-in-JS
 sites are the data pieces B/C need.
+
+## Patch 319 (2026-10-26): `<img>` paints at the composed group opacity; scaled faded bitmaps pre-multiply (doc 24 stage 2)
+
+**What:** Doc 24 stage 2. redraw.c's object site now fills the
+`content_redraw_data.opacity` carrier from patch 315, so an `<img>`
+inside an opacity group fades in every image format. Every other
+constructor stays at 0, so a standalone image document still paints
+solid. A **scaled** tile at a partial bucket draws a copy of its
+texture with the alpha bytes scaled by the bucket alpha
+(`vita_bitmap_faded_texture`), through the same
+`vita2d_draw_texture_scale`. This is doc 24's recommended
+device-safe default; stage 3 (a scale-tint entry) is not done. The
+copy comes from the texture pool and goes straight onto the dead
+list, so the memory is reused only after the frame the GPU is drawing
+retires. A one-entry memo copies once per (image, alpha) per frame,
+and no copy is made for a draw outside the clip. A refused copy draws
+solid and is logged ("bitmaps: N faded copies (K KB), M refused" at
+load end, only when non-zero). Host cost of one copy: 0.26 ms at
+640×480, 0.65 ms at 1024×768.
+
+**Fixed on the way:** these three are what made SVG images unreliable.
+- **svg.c's path style was never initialised** (a stack
+  `plot_style_t`). Since patch 315 the vita path op reads its
+  opacity, so SVG images picked up whatever the stack held. **In
+  gate 318, IMG-svg traced 5 PATHs `OPAQUE 0` and CSS-mask 1:
+  skipped.** The snapshot is missing the orange Y logo, the circle,
+  the triangle and the external-link icon. The gate did not notice,
+  because it counts the PATH lines and not their suffix. 319 zeroes
+  the style and folds the group opacity, and IMG-svg draws all four
+  again (snapshot checked).
+- **svg.c's reformat appended shapes:** `svgtiny_parse` adds to the
+  diagram, so an `<img>` laid out at a second size drew every shape
+  twice. It now parses into a fresh diagram.
+- **image.c's 1×1 shortcut** has the same uninitialised-style problem
+  (recorded at 315). It is now zeroed and fades.
+
+**Gate:** a new page, CSS-opacity-image (OPIMG), plus a standalone
+image document leg, IMG-standalone (`opimg-20.png`). Blue fixtures,
+one intrinsic size per format (png 20, gif 22, svg 24, bmp 26, ico
+28, jpeg 30):
+- 1:1 and 2× inside `.half`: OPAQUE 2, reading 127,127,255 (jpeg
+  127,127,254, since it decodes to 0,0,254). SVG PATH 2/3.
+- Controls read 0,0,255 with no token.
+- The opacity:0 png is not plotted, and its spot reads white.
+- The 1×1 RECT is OPAQUE 2 (1/1).
+- A scaled and a scaled+repeated background both read faded
+  (255,127,127 in both tiles).
+- The standalone image: one solid BITMAP, 0 OPAQUE tokens, 0,0,255.
+
+rsvg and nssprite are not built for the Vita, so they have no legs.
+test_vita_plotter gains 4 checks for the scaled faded path, its
+refused-copy fallback, 1:1 not copying, and no copy outside the clip.
+The renderer suite now reads 106/106 + 30/30.
+
+Full sim gate exit 0 (gate-319): the CSS-opacity checks for 311/314/315
+unchanged; interaction 52/52 at the Vita's pace; 23 bundled pages
+pace-identical; 68/68 text frames batched = unbatched. Dumps against
+gate 318, matched by name: 195 identical, 2 new. The 18 that differ:
+- IMG-svg and CSS-mask: the SVG fix above.
+- 16 NET-js-* timing pages (wasm, streaming, fetch, stall pages):
+  timing text. Their gate summaries pass as at 318.
+
+**Side finding (not fixed):** the `background:` shorthand with a `/
+size` part (`url(x) no-repeat 0 0 / 36px 36px`) drops the whole
+declaration in this engine, so no background paints. Separate
+`background-size` works. This is a libcss shorthand gap worth a patch
+of its own.
+
+**Still open:**
+- The gate should assert that IMG-svg/CSS-mask carry no OPAQUE token
+  (this would have caught the 315 skip). Not added in this commit, so
+  the gate that ran is the gate that is committed.
+- Checkbox gadgets don't fold the group opacity.
+- Stage 3 (scale-tint) needs a device check.
+- The vita cross-build was not run.
+
+**On the device (run 39), in addition:** run 39's queue (315–318)
+has the SVG skip bug, so **build run 39 with 319 included**. Without
+it, SVG images and icons can vanish at random on the device. Open
+the bundled CSS-opacity-image.html:
+- Rows 1 and 2 should be pale blue squares in every format, row 2
+  twice the size.
+- Row 3 is solid blue.
+- Row 4: a gap, a pale thin bar, a pale square and a pink strip.
+
+If row 2 is solid while row 1 is pale, the pre-multiplied copy is
+not taking effect. If row 2 flickers or shows another image's
+pixels, the copy's memory lifetime is wrong on the GPU; report
+either. Check that IMG-svg.html shows the orange Y logo, the circle,
+the triangle and the link icon. netsurf.log should carry "bitmaps: N
+faded copies" after that page loads; how long the page takes to
+settle is the first device reading of the copy cost.

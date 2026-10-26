@@ -301,3 +301,52 @@ retire it if the device check ever confirms the tint entry.
    second frontend is ever targeted at the same table, the
    choice is worth revisiting in the open rather than inside a
    patch.
+
+## Status (2026-10-25): stage 1 landed as patch 315
+
+Shape (a) as designed: `BITMAPF_OPACITY`, a byte in flag bits 16–23,
+where a masked 0 means not supplied (opaque). **Census correction:**
+background images do not reach the bitmap op from redraw.c. Both
+background paths paint through `content_redraw()` and the image
+handler, so the `content_redraw_data.opacity` carrier and the four
+handler folds landed in stage 1, with only the two background sites
+filling it. 1:1 tiles fade through `tint_part`, and bucket 0 skips.
+Scaled tiles stayed solid while open question 1 was undecided.
+Disc, arc and path adopt their style bucket. Details are in doc 10's
+patch 315 entry.
+
+## Status (2026-10-26): stage 2 landed as patch 319
+
+- **`<img>`/object:** redraw.c's object site fills the carrier from
+  the composed group opacity, so every image handler fades `<img>`
+  the way it fades backgrounds. The other constructors (the
+  standalone image document, thumbnails, print, treeview) stay at 0,
+  and the gate's IMG-standalone leg proves the standalone document
+  still paints solid.
+- **Open question 1, scaled path: pre-multiply, as recommended.**
+  A scaled tile at a partial bucket draws a pool copy of its texture
+  with the alpha bytes scaled (`vita_bitmap_faded_texture`), through
+  the stub's `vita2d_draw_texture_scale`. The copy goes onto the
+  bitmap dead list at once, so the GPU can sample it until the frame
+  retires; a refused copy draws solid and is counted. Host cost
+  is 0.26 ms per 640×480 copy, under 1 ns/px, paid only when a scaled
+  image sits inside a partial group. The device cost is unmeasured:
+  the source is GPU memory (CDRAM or uncached), and CPU reads from it
+  are the unknown. Stage 3, a scale-tint entry, is not started and
+  still needs a vitaSDK or hardware check first.
+- **Format families on the gate** (CSS-opacity-image, prefix OPIMG):
+  png, gif, jpeg, bmp, ico and SVG `<img>`, each at 1:1 and at 2×, plus
+  controls, opacity 0, the 1×1 shortcut, a scaled background and a
+  scaled repeated background. All are pixel-checked.
+- **Not on the gate:** rsvg and nssprite are not compiled for the
+  Vita, so their stage-1 folds are compile-only here.
+- **Found and fixed on the way, all in the same class:** svg.c's path
+  style was never initialised, so its opacity was stack garbage. In
+  gate 318 that skipped SVG images outright (IMG-svg traced its paths
+  `OPAQUE 0`). The
+  1×1 shortcut's style had the same problem (recorded at 315). And
+  svg.c's reformat appended a second copy of every shape whenever an
+  `<img>` was laid out at a new size, which double-blends inside a
+  group.
+- **Still open:** checkbox gadgets (rect/line with static styles) do
+  not fold the group opacity.
