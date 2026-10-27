@@ -1,0 +1,206 @@
+# netsurf: a box-less <style>'s own text edit is answered with no rebuild (patch 320)
+# Generated 2026-10-27
+# Base: seleron/vitabrowser (patch stack through 319)
+#
+# Doc 23 B0. A script that edits a <style>'s text (textContent,
+# innerHTML, a child appended / inserted / removed, a text node's data;
+# CSSOM insertRule / deleteRule write back through textContent) leaves a
+# precise mark on the <style> or its text node. The sheet change reaches
+# the reconvert on its own path (DOMSubtreeModified ->
+# html_css_update_style, processed from the scheduler after the task,
+# then a sheet mark when the new sheet is in). The precise mark was
+# declined by the local path, and its full reconvert ran first, against
+# the OLD sheet: every <style> edit cost two full reconverts, the first
+# rebuilding an identical tree (patch 316's census).
+#
+#  - html.c: html_rl_style_text_absorb(c, node) -- 1 when the node is an
+#    HTML-namespace (or null-namespace, as createElement makes it)
+#    <style>, or a text node directly in one, that has a stylesheet entry
+#    and no box, and no ancestor is an element whose rendering reads the
+#    DOM rather than boxes (svg, math, select, option, optgroup,
+#    datalist, textarea). A node under a box-less element has no box, so
+#    the edit can change no box; its only effect is through the sheet,
+#    which marks for itself. (box_construct.c skips <style> by tag name,
+#    so in this engine no <style> has a box; the box test stays as the
+#    stated guard.)
+#  - macos9_reconvert.c: try_local_one answers the six text kinds
+#    (TEXTCONTENT, INNERHTML, APPENDCHILD, REMOVECHILD, INSERTBEFORE,
+#    CHARDATA) with no rebuild when html_rl_style_text_absorb says so,
+#    logging "LIFE STYLETEXT absorbed kind=N"; the navigation reset prints
+#    "LIFE STYLETEXTCENSUS absorbed=N". An attribute change on a <style>
+#    (media, disabled) keeps the old path.
+#
+# Host A/B (same pages, absorb forced off vs on): JS-style-absorb 8 -> 4
+# full reconverts (4 local + 4 sheet -> 4 sheet), JS-sheet-census 6 -> 4,
+# CSS-style-edit 9 -> 8 (its others are its result rows' class changes).
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6881,6 +6881,118 @@ int html_rl_attr_local_ok(struct content *base_c, void *vnode,
+ 	return !html_rl_sheet_refs_attr(c, attr_name);
+ }
+ 
++/* Patch 320 (doc 23 B0): the companion text mark of a <style> edit.
++ * A script that edits a <style>'s text (textContent, innerHTML, a child
++ * appended / inserted / removed, a text node's data; CSSOM edits write
++ * back through textContent) leaves a precise mark on the <style> (or on
++ * its text node). The sheet change itself reaches the reconvert on its
++ * own path: DOMSubtreeModified -> html_css_update_style, re-processed
++ * from the scheduler after the task, then a sheet mark when the new
++ * sheet is in. The precise mark was declined by the local path and its
++ * full reconvert ran first -- against the OLD sheet, since processing
++ * had not run yet -- so every <style> edit cost two full reconverts,
++ * the first of them rebuilding an identical tree (patch 316's census).
++ *
++ * The mark may be answered with no rebuild when the <style> renders
++ * nothing: it has no box (the UA sheet's display:none; display:contents
++ * still makes a BOX_CONTENTS box, so a styled-visible <style> keeps the
++ * old path), a node under a box-less element has no box either, and so
++ * the edit can change no box. Its only effect is through the sheet,
++ * which marks for itself. Declined (1 = absorb, 0 = the old path):
++ * - a node that is not the <style> or a text node directly inside it;
++ * - a <style> not in the HTML (or null, as createElement makes it)
++ *   namespace, or with no stylesheet entry (html_css does not track it,
++ *   e.g. author CSS off);
++ * - a <style> under an element whose rendering reads descendant DOM
++ *   rather than boxes: inline <svg> (painted from the DOM at redraw)
++ *   and <math>, and the form controls whose gadgets take their text
++ *   from the DOM (select, option, optgroup, datalist, textarea). */
++int html_rl_style_text_absorb(struct content *base_c, void *vnode);
++int html_rl_style_text_absorb(struct content *base_c, void *vnode)
++{
++	static const char *const reads_dom[] = {
++		"svg", "math", "select", "option", "optgroup", "datalist",
++		"textarea", NULL
++	};
++	html_content *c = (html_content *)base_c;
++	dom_node *n = vnode;
++	dom_node *el = NULL;
++	dom_node *p, *next;
++	dom_node_type type;
++	dom_string *name = NULL;
++	dom_string *ns = NULL;
++	unsigned int i;
++	int ok = 0;
++
++	if (c == NULL || n == NULL || c->stylesheets == NULL)
++		return 0;
++	if (dom_node_get_node_type(n, &type) != DOM_NO_ERR)
++		return 0;
++	if (type == DOM_TEXT_NODE || type == DOM_CDATA_SECTION_NODE) {
++		if (dom_node_get_parent_node(n, &el) != DOM_NO_ERR)
++			return 0;
++	} else if (type == DOM_ELEMENT_NODE) {
++		el = dom_node_ref(n);
++	}
++	if (el == NULL)
++		return 0;
++
++	if (dom_node_get_node_type(el, &type) != DOM_NO_ERR ||
++	    type != DOM_ELEMENT_NODE ||
++	    dom_node_get_node_name(el, &name) != DOM_NO_ERR || name == NULL)
++		goto out;
++	if (!dom_string_caseless_lwc_isequal(name, corestring_lwc_style))
++		goto out;
++	if (dom_node_get_namespace(el, &ns) != DOM_NO_ERR)
++		goto out;
++	if (ns != NULL &&
++	    !dom_string_isequal(ns, dom_namespaces[DOM_NAMESPACE_HTML]))
++		goto out;
++	if (box_for_node(el) != NULL)
++		goto out;
++	for (i = 0; i != c->stylesheet_count; i++)
++		if (c->stylesheets[i].node == el)
++			break;
++	if (i == c->stylesheet_count)
++		goto out;
++
++	ok = 1;
++	if (dom_node_get_parent_node(el, &p) != DOM_NO_ERR)
++		p = NULL;
++	while (p != NULL && ok) {
++		if (dom_node_get_node_type(p, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			dom_string *pn = NULL;
++			if (dom_node_get_node_name(p, &pn) == DOM_NO_ERR &&
++			    pn != NULL) {
++				const char *s = dom_string_data(pn);
++				size_t len = dom_string_length(pn);
++				int k;
++				for (k = 0; reads_dom[k] != NULL; k++)
++					if (len == strlen(reads_dom[k]) &&
++					    strncasecmp(s, reads_dom[k],
++						    len) == 0)
++						ok = 0;
++				dom_string_unref(pn);
++			}
++		}
++		next = NULL;
++		if (dom_node_get_parent_node(p, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(p);
++		p = next;
++	}
++	if (p != NULL)
++		dom_node_unref(p);
++out:
++	if (ns != NULL)
++		dom_string_unref(ns);
++	if (name != NULL)
++		dom_string_unref(name);
++	dom_node_unref(el);
++	return ok;
++}
++
+ /* Patch 192: true if a used document stylesheet uses sibling-position
+  * structural pseudo-classes or CSS counters, whose following-sibling
+  * styles the local block insert/remove path would leave stale. */
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -849,6 +849,9 @@ static long g_id_single = 0;	/* one identified entry, counter current */
+ static long g_id_stale  = 0;	/* one identified entry, re-processed since */
+ static long g_id_multi  = 0;	/* more than one entry, or mixed */
+ static long g_id_none   = 0;	/* no identified mark */
++/* Patch 320 (doc 23 B0): companion text marks of <style> edits answered
++ * with no rebuild (html_rl_style_text_absorb). */
++static long g_style_absorbed = 0;
+ extern int html_css_sheet_mark_current(struct content *c, int index,
+ 		unsigned int counter);
+ /* Last failure reason from macos9_reconvert_try_local, read by the
+@@ -1039,6 +1042,11 @@ macos9_reconvert_sync_reset(void)
+ 			g_id_single, g_id_stale, g_id_multi, g_id_none);
+ 	}
+ 	g_id_single = 0; g_id_stale = 0; g_id_multi = 0; g_id_none = 0;
++	/* Patch 320 - absorbed companion marks, its own line */
++	if (g_style_absorbed != 0)
++		macsurf_debug_log_writef("LIFE STYLETEXTCENSUS absorbed=%ld",
++			g_style_absorbed);
++	g_style_absorbed = 0;
+ 	g_fc_total = 0; g_fc_over = 0; g_fc_nonode = 0;
+ 	g_fc_kind = 0; g_fc_local = 0; g_fc_two = 0; g_fc_guard = 0;
+ 	g_sync_flushes  = 0;
+@@ -1087,6 +1095,10 @@ static int macos9_reconvert_try_local_one(struct content *c, void *node,
+ 	 * anything it refuses declines exactly as before. */
+ 	extern int html_rl_attr_local_ok(struct content *c, void *node,
+ 			const char *attr_name);
++	/* Patch 320 (doc 23 B0) - 1 when the mark is a box-less <style>'s
++	 * own text edit: no box can change, and the sheet marks for itself
++	 * (html.c has the argument). */
++	extern int html_rl_style_text_absorb(struct content *c, void *node);
+ 
+ 	/* a class change on an inline-level element: its block (patch 173).
+ 	 * Patch 186 passes the pre-mutation class value for the precise
+@@ -1102,6 +1114,14 @@ static int macos9_reconvert_try_local_one(struct content *c, void *node,
+ 	case MACOS9_DOMMUT_REMOVECHILD:
+ 	case MACOS9_DOMMUT_INSERTBEFORE:
+ 	case MACOS9_DOMMUT_CHARDATA:
++		/* Patch 320 - answered with no rebuild; only these text
++		 * kinds (an attribute on a <style> keeps the old path) */
++		if (html_rl_style_text_absorb(c, node)) {
++			g_style_absorbed++;
++			macsurf_debug_log_writef(
++				"LIFE STYLETEXT absorbed kind=%d", kind);
++			return 1;
++		}
+ 		break;
+ 	case MACOS9_DOMMUT_SETATTRIBUTE:
+ 	case MACOS9_DOMMUT_REMOVEATTRIBUTE:

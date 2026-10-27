@@ -253,6 +253,7 @@ NET-js-dom-stall http://127.0.0.1:$HP/JS-dom-stall.html
 NET-js-batch-burst http://127.0.0.1:$HP/JS-batch-burst.html
 NET-js-attr-local http://127.0.0.1:$HP/JS-attr-local.html
 NET-js-sheet-census http://127.0.0.1:$HP/JS-sheet-census.html
+NET-js-style-absorb http://127.0.0.1:$HP/JS-style-absorb.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
 NET-js-abspos191 http://127.0.0.1:$HP/JS-abspos191.html
@@ -1257,7 +1258,12 @@ scc=$(awk '/page [0-9]*\/[0-9]* NET-js-sheet-census: navigate/ {on=1; next}
 	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE SHEETCAUSE sheets=' || true)
 scc_one=$(printf '%s\n' "$scc" | grep -c 'sheets=1$' || true)
 scc_multi=$(printf '%s\n' "$scc" | grep -c 'sheets=[2-9]' || true)
-scp=$(ls "$R"/*NET-js-sheet-census.plot 2>/dev/null | head -1)
+# Patch 320 gate fix: read the BOTTOM dump. The page is now taller than
+# the screen (7000 px spacer, like JS-attr-local), so the autotest takes
+# the bottom pass, whose 7 s settle window covers the 1500 ms legs (this
+# engine's JS timers run ~450 ms late; the top dump -- taken ~700 ms after
+# the first leg's repaint -- shows the initial state).
+scp=$(ls "$R"/*NET-js-sheet-census-bottom.plot 2>/dev/null | head -1)
 scr=$(sed -n 's/.*STR \(SHEETCENSUS: [0-9]*\/[0-9]* passed\).*/\1/p' "$scp" 2>/dev/null | head -1)
 # Patch 318 (doc 23 piece A): the marks carry the sheet's identity --
 # the one-sheet edit's batch logs "SHEETID single", the two-sheet task's
@@ -1273,6 +1279,27 @@ sci_stale=$(printf '%s\n' "$sci" | grep -c 'SHEETID stale' || true)
 echo "  JS-sheet-census: ${scr:-no summary}; sheet causes single=${scc_one} multi=${scc_multi}; identity single=${sci_single} multi=${sci_multi} stale=${sci_stale}"
 [ "$scr" = "SHEETCENSUS: 3/3 passed" ] && [ "$scc_one" -ge 1 ] && [ "$scc_multi" -ge 1 ] && \
 	[ "$sci_single" -ge 1 ] && [ "$sci_multi" -ge 1 ] && [ "$sci_stale" -ge 1 ] || o2_bad="$o2_bad js-sheet-census"
+# Patch 320 (doc 23 B0): a <style> edit's own precise mark is answered
+# with no rebuild while the <style> has no box, so each edit costs only
+# the sheet's batch. The page edits four sheets (textContent, CSSOM
+# insertRule, a text node's data, and one beside a paragraph edit in the
+# same task): all four restyle, the paragraph's new text is painted, at
+# least four marks are absorbed, and every full reconvert in the page's
+# window is a sheet batch (before 320: 4 local + 4 nonode).
+sab=$(awk '/page [0-9]*\/[0-9]* NET-js-style-absorb: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null || true)
+sab_abs=$(printf '%s\n' "$sab" | grep -a -c 'LIFE STYLETEXT absorbed' || true)
+sab_full=$(printf '%s\n' "$sab" | grep -a -c 'LIFE BATCHCAUSE cause=' || true)
+sab_sheet=$(printf '%s\n' "$sab" | grep -a -c 'LIFE BATCHCAUSE cause=nonode' || true)
+# Patch 320 gate fix: the BOTTOM dump (tall page, 7 s bottom-settle
+# window; see the sheet-census note above).
+sap=$(ls "$R"/*NET-js-style-absorb-bottom.plot 2>/dev/null | head -1)
+sar=$(sed -n 's/.*STR \(STYLEABS: [0-9]*\/[0-9]* passed\).*/\1/p' "$sap" 2>/dev/null | head -1)
+sam=$(grep -c 'STR MIXED-AFTER' "$sap" 2>/dev/null || true)
+echo "  JS-style-absorb: ${sar:-no summary}; absorbed=${sab_abs} full=${sab_full} (sheet batches ${sab_sheet}); paragraph painted=${sam:-0}"
+[ "$sar" = "STYLEABS: 4/4 passed" ] && [ "${sam:-0}" -ge 1 ] && [ "$sab_abs" -ge 4 ] && \
+	[ "$sab_full" -ge 1 ] && [ "$sab_full" -eq "$sab_sheet" ] || o2_bad="$o2_bad js-style-absorb"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest
