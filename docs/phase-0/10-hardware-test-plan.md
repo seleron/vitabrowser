@@ -6165,3 +6165,66 @@ every `<style>` edit costs today, independent of reach. Proposed order:
 B0, then the B1 reach census (`LIFE SHEETREACH`), then C only if bounded
 batches dominate. Three owner questions are at the end of the doc 23
 section.
+
+## Patch 320 (2026-10-27): a `<style>` text edit is absorbed while the element has no box (doc 23 B0)
+
+**What:** Doc 23 B0 (B.6). A `<style>` text edit (a textContent set, a
+text node's data, the CSSOM insertRule writeback) used to cost a full
+reconvert that rebuilt the tree against the old, unchanged sheet, and
+the sheet's own nodeless mark did the real work a tick later (both in
+the log: FULLCAUSE cause=nonode + SHEETCAUSE on the same edit).
+quickjs's reconvert slot now calls `html_rl_style_text_absorb`
+(html.c): when the `<style>` has no box (always, in this engine), is
+HTML-namespace, and has no ancestor that renders from the DOM (inline
+svg/math and the form gadgets select/option/optgroup/datalist/textarea
+-- their text is painted from the DOM, so an edit does change the
+paint there), the mark is absorbed. Anything else keeps the old path,
+and a refusal is logged (`LIFE STYLETEXT refused reason=...`).
+Absorptions are counted (`LIFE STYLETEXT absorbed`;
+`LIFE STYLETEXTCENSUS` at navigation reset; parse-time marks do not
+count, so the counter starts at zero).
+
+**Gate:** a new page, JS-style-absorb.html (STYLEABS 4/4): four
+`<style>` edits 1500 ms apart -- a textContent set, an insertRule, a
+text node's data, and a mixed `<style>` + paragraph task -- plus a
+paragraph textContent control that must keep its full reconvert
+(FULLCAUSE cause=local). JS-sheet-census is unchanged: SHEETCENSUS
+3/3, the multi and stale legs intact. Full sim gate exit 0
+(gate-320b): STYLEABS 4/4 with absorbed=4 full=4 (sheet batches 4)
+-- exactly one full reconvert per edit, the sheet's own batch -- and
+paragraph painted=1 (the control keeps its local full); SHEETCENSUS
+3/3, sheet causes single=2 multi=1, identity single=1 multi=1
+stale=1 (as at 318); interaction 52/52 at the Vita's pace; 23 bundled
+pages pace-identical; 68/68 text frames batched = unbatched. The
+first gate (gate-320) also tripped the "event order / inline-grid /
+group opacity" compound check, but every sub-test read its expected
+value on the rerun and in a manual reproduction against the run's
+dumps -- a transient flake, no root cause found.
+
+**Fixed on the way:** the first gate (gate-320) failed on the two
+JS-leg pages, and the cause was the harness, not the patch. Pages that
+are exactly one screen tall are dumped at the top settle (~700 ms
+after the first repaint); this engine's JS timers run ~450 ms late, so
+the 1500 ms legs fired after the dump and the plots read the initial
+state (0/4, 0/3). The fix follows the existing JS-attr-local pattern:
+a 7000 px spacer makes each page taller than the screen, so the bottom
+pass is taken, whose 7 s settle window covers the legs, and the gate
+now reads the `*-bottom.plot` of these two pages. Any future JS-leg
+page must be taller than the screen or its legs will race the top
+dump.
+
+**On the device (run 39), in addition:** nothing new to open; B0
+removes a duplicate rebuild, not a paint. netsurf.log should carry
+`LIFE STYLETEXT absorbed` lines and a `LIFE STYLETEXTCENSUS` at the
+end of any JS page that edits a `<style>`.
+
+**Solo build (Hermes), 2026-10-27:** the C is Claude's final turn; the
+takeover verified the tree clean (restage: 405 applied, the 2 known
+warts only, zero source diffs), diagnosed gate-320, fixed the harness
+race, and ran the gate. For the next pass, verify: the `reads_dom[]`
+list in html.c (is the DOM-painted ancestor list complete -- the
+parser hoists a `<style>` out of most form controls, but datalist
+keeps flow content), that parse-time marks do not count toward
+STYLETEXTCENSUS, and that the bottom-dump rule for JS-leg pages (a
+page shorter than the screen races its legs against the top settle) is
+understood before any new JS-leg page is added.

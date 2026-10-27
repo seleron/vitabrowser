@@ -615,3 +615,43 @@ against Chromium.
 3. **The changed-record cap** (proposed 64) and whether B1 should also
    log the changed-record count of batches it declines. That would show
    whether a hydration burst ever exceeds the cap.
+
+## Status (2026-10-27): piece B0 landed as patch 320
+
+The re-scope (any-compound anchoring, changed-rule bounding) was
+approved by the user 2026-10-27: "re-scope approved, land B0 first,
+cap 64 is fine". B0 landed as patch 320 (built solo by Hermes; Claude's
+final turn wrote the C, the takeover verified it clean), as designed
+in B.6, with two recorded deviations:
+
+- The absorb condition also refuses a `<style>` whose ancestor chain
+  renders from the DOM instead of boxes (inline `<svg>`, `<math>`, and
+  the form gadgets select/option/optgroup/datalist/textarea). Their
+  text is painted from the DOM, so an edit does change the paint there;
+  those marks keep the old path. See the `reads_dom[]` table in html.c.
+- The spec's "a visible `<style>` (display:block) still repaints its
+  text" is untestable in this engine: box building skips `<style>` by
+  tag name, so it can never have a box. The C-side box-existence guard
+  keeps the old path for any `<style>` that does get a box, and a
+  refused mark is logged (`LIFE STYLETEXT refused reason=...`).
+
+First reading: a `<style>` text edit now costs one full reconvert
+(the sheet's own nodeless batch) instead of two; the companion mark's
+own reconvert -- which rebuilt the tree against the old, unchanged
+sheet -- is absorbed and counted (`LIFE STYLETEXT absorbed`,
+`LIFE STYLETEXTCENSUS` at navigation reset; parse-time marks are not
+counted, so the counter starts at zero). The new gate page
+JS-style-absorb.html (STYLEABS 4/4) covers a textContent set, a CSSOM
+insertRule (its writeback goes through the text mark), a text node's
+data, and a mixed `<style>` + paragraph task. SHEETCENSUS is unchanged
+(3/3, the multi and stale legs intact).
+
+The first full gate (gate-320) failed, and the diagnosis was a harness
+timing race, not a patch regression: both JS-leg pages are exactly one
+screen tall, so the autotest dumped them at the top settle (~700 ms
+after the first repaint). This engine's JS timers run ~450 ms late, so
+the 1500 ms legs fired after the dump and the plots showed the initial
+state (0/4 and 0/3). The fix follows the existing JS-attr-local
+pattern: a 7000 px spacer makes each page taller than the screen, so
+the bottom pass is taken, whose 7 s settle window covers the legs; the
+gate now reads the `*-bottom.plot` of these two pages.
