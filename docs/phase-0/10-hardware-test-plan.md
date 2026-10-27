@@ -6228,3 +6228,52 @@ keeps flow content), that parse-time marks do not count toward
 STYLETEXTCENSUS, and that the bottom-dump rule for JS-leg pages (a
 page shorter than the screen races its legs against the top settle) is
 understood before any new JS-leg page is added.
+
+## Patch 321 (2026-10-27, in progress): the reach census of a sheet-identified reconvert (doc 23 B1)
+
+**What:** B1 (census only, no behaviour change). `css.c` carries the
+engine: each `html_stylesheet` keeps `reach_prev` / `reach_cur`
+record tables (`struct html_css_reach_table`); a `<style>` text edit
+(`html_css_process_modified_style`) captures prev (the old live table,
+or a scan of the old sheet source on first edit) and cur (a scan of
+the node's text) BEFORE the sheet is rebuilt from the new DOM.
+`html_css_sheet_reach_census(c, index, out)` diffs prev vs cur by
+longest common prefix/suffix (cap 64 changed records; over the cap →
+`reason=too-many`), walks the DOM from each changed record's anchors
+(B.1 rightmost-anchored-compound rule, ids raw-compared, classes via
+`dom_element_has_class`, a matched root skips its subtree), and
+admits roots statically (B.5: `html`/`body`/`li`, an `ol`/`ul`/`menu`
+parent, no box). `bounded` = the changed set is small enough to
+enumerate (≤64 records, all selectors anchored and plain, at least
+one root found, zero roots counts as bounded); otherwise `reason`
+names the first cause in priority order: no-source, too-many,
+at-rule, counter, nesting, escape, unanchored, admission.
+
+**Where it logs:** macos9_reconvert.c, beside the existing
+`LIFE SHEETID single` (patch 318): one `LIFE SHEETREACH bounded
+changed=%d anchors=%d roots=%d walked=%d` or `LIFE SHEETREACH
+unbounded reason=<name>` per event, and a `LIFE SHEETREACHCENSUS
+bounded=%ld unbounded=%ld at-rule=... counter=... nesting=...
+escape=... unanchored=... too-many=... admission=... no-source=...`
+summary at the navigation-reset flush (counters reset after).
+
+**State (Hermes solo build, 2026-10-27):** fully implemented in the
+applytest tree and both touched objects compile clean
+(`content_handlers_html_css.o`,
+`content_handlers_javascript_quickjs_macos9_reconvert.o`, zero new
+warnings). NOT yet gated: the SHEETSCOPE gate page, its
+`run-vita-sim.sh` registration, the full gate, and the patch file all
+remain (order in `~/vitabrowser-work/B1-handoff.md`).
+
+**Fork API notes found on the way (this libdom, not upstream):**
+`dom_string_size` does not exist — the byte-length API is
+`dom_string_byte_length`. `dom_node` is a complete-struct typedef, so
+a header prototype that must forward-declare uses `struct dom_node *`
+(css.h now does; html.h's style). No `dom_html_element_get_id` — an
+id read goes through `dom_element_get_attribute` with a
+process-lifetime interned `dom_string` "id". `c->document` is a
+`dom_document *` (cast to `dom_node *` for the walk). A bare `make`
+in the applytest tree reconfigures with defaults (Duktape, no
+libcss) and fails; the incremental objects build through
+`~/vitabrowser-work/incbuild.sh` (same env as the full
+`simbuild.sh`/`run-vita-sim.sh` recipe).

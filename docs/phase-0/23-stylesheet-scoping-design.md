@@ -655,3 +655,16 @@ state (0/4 and 0/3). The fix follows the existing JS-attr-local
 pattern: a 7000 px spacer makes each page taller than the screen, so
 the bottom pass is taken, whose 7 s settle window covers the legs; the
 gate now reads the `*-bottom.plot` of these two pages.
+
+## Status (2026-10-27, later): piece B1 implemented, not yet gated
+
+The B1 census engine (B.2 diff, B.3 capture, B.4 walk, B.5 admission,
+reason priority) is fully written into css.c and wired into
+macos9_reconvert.c (`LIFE SHEETREACH` per event beside `LIFE SHEETID`,
+`LIFE SHEETREACHCENSUS` at the flush). Both touched objects compile
+clean in the applytest tree (Hermes solo build). Remaining before this
+piece can be called landed: the SHEETSCOPE gate page, its
+`run-vita-sim.sh` registration, the full gate, and the 321 patch file
+(order in `~/vitabrowser-work/B1-handoff.md`). Census only — no
+behaviour change, so the existing 320 gate expectations are untouched
+by design.
