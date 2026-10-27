@@ -120,7 +120,7 @@ will differ in size and width**. Everything else should match. Answer:
 | 6 | PM-shadow | red box with a grey 8 px shadow on its right edge; blue box below it |
 | 7 | PM-animation | red vertical bar crossing a 50%-blue box (overlap purple); green box |
 | 8 | PM-macsurf-grid | 3×2 bordered cells C1…C6 |
-| 9 | PM-tagtype | a label, a select "optA", an input "hello" |
+| 9 | PM-tagtype | a label, a select (**blank** since patch 287: a `size=3` select with no `selected` option has no selected option, as in HTML; Chromium draws a list box, this engine a one-line gadget), an input "hello" |
 | 10 | PM-link | link text renders |
 | 11 | PM-shadow-clip | red and green boxes each with a full 10 px grey shadow; blue box's shadow cut at the bottom (right side showing is a known, separate bug) |
 | 12 | **VT-calibration** | see step 4a, the most important page |
@@ -4186,7 +4186,114 @@ failing on "getEntriesByName gave 0 entries", or a crash -- is a fault.
 Watch memory on image-heavy pages: entries are kept per document (at
 most 250, 1024 in all) until the page is left.
 
-## Since run 38 — queued for run 39 (not built yet)
+## Run 39 — hand-off (2026-10-27 14:45; replaces untested run 38)
+
+**Flash this build:** VitaBrowser.vpk `e147e12166d2`, VitaBrowser-ext.vpk
+`3cc11d39dcc3`, nsvita.elf `2d66a9a3f977` (patches through 319, built at
+973875c = origin/master). Full SHA256 of VitaBrowser.vpk:
+`e147e12166d2e43d1ef5ae4bd428b26a2722f54929a0588ee61c4e34766aa435`.
+Run 38 (`7a597a16f31c`) has no `results\`, so run 39 carries everything
+since run 27: **patches 168-319 + patches/quickjs/05-06 +
+patches/wasm3/01**, all unverified on hardware. It includes 319, which
+fixes the SVG skip that 315-318 alone would ship. Archive
+`<WORK>/vitabrowser-work/hwtest-2026-10-27-run39/` (SHA256SUMS, reference
+dumps, the reference run in `sim/`). Run 38's reference dumps are now
+`reference-dumps-run38\`. As for run 38, the VPKs and reference dumps are
+in `Desktop\VitaBrowser-hwtest\` (where `results\` lands), and the same
+plus nsvita.elf and SHA256SUMS are in `C:\Users\seleron\VitaBrowser-hwtest\`.
+Both were checked with `sha256sum -c`.
+
+Build: clean restage from 973875c on 2026-10-26 22:29 (404 applied + the
+two known collisions; backup `applytest-backup-pre-run39-20261026-2229.tar.gz`).
+Results: streams 4/4, renderer 106/106 + 30/30, full sim gate exit 0
+with no soft accepts (`gate-run39.log`). The gate included the
+CSS-opacity group/image legs, the IMG-svg/CSS-mask no-OPAQUE-token check
+(6 paths, 0 tokens; 0 icon paths with a token), and interaction 52/52
+also at the Vita's pace. The cross-build was interrupted by a WSL
+restart before it started compiling. It was rerun on 2026-10-27 from the
+same staged tree, green in 3m25s (`build-vita-run39.log`, no new
+warnings in 315-319's files). Both VPKs pass `unzip -t`, and the ELF
+carries the 316/318/319 log strings (`SHEETCENSUS`, `SHEETID`,
+`faded copies`).
+
+Reference autotest under device conditions (netlog off, `ux0:download` a
+file): interact **52/52**, js **18/18**, no `refused` bitmaps, 34 dumps.
+Against run 38's dumps, 28 are identical and 6 differ, all expected:
+- 07-PM-animation is time-varying.
+- 09-PM-tagtype's select is now blank (patch 287, see the page table above).
+- 19/20-NET-http(s)-example and their -bottom dumps: example.com's `s.js`
+  now injects `svg{opacity:.55}` and `p+p{opacity:.6}`, which this build
+  paints at group opacity (PATH `OPAQUE 2`, TEXT `OPAQUE 3`) where run 38
+  ignored it.
+
+**On the device:** start `receive-results.bat` first, then:
+
+1. **The autotest** (SELECT + SQUARE): every `.plot` SAME against
+   `reference-dumps\`. IN-history / IN-home-recent may differ in order,
+   07-PM-animation is time-varying, and the NET-*-example pages follow
+   the live example.com. Expect interact **52/52**, js **18/18**,
+   `bitmaps: ... 0 refused` after every page, and no crash.
+2. **Run 38's list, unchanged** (in its section above): the claude.ai
+   email sign-in, stackoverflow.com/questions, theguardian.com/uk, the
+   run-38 bundled pages (its table still holds for them), and
+   script-heavy sites.
+3. **Images at group opacity (315, 319) -- the main new device risk.**
+   Open `file:///app0:/testpages/CSS-opacity-image.html`:
+   - Rows 1-2 are pale blue in every format, with row 2 twice the size.
+   - Row 3 is solid blue.
+   - Row 4 shows a gap, a pale thin bar, a pale square and a pink strip.
+
+   netsurf.log should carry `bitmaps: 4 faded copies (9 KB), 0 refused`.
+   Report the page's settle time, which is the first device reading of
+   the copy cost. Then check CSS-opacity-group's last row (pale, not white
+   or solid; see patch 315's note) and IMG-svg (orange Y logo, circle,
+   triangle, link icon). A solid row 2, flicker or foreign pixels is the
+   report.
+4. **The new bundled pages**, opened as
+   `file:///app0:/testpages/<page>.html`. Measured in the simulator with
+   this build under device conditions (30 s settle; 29 pages, none
+   crashed). A value that differs on the Vita is worth reporting.
+
+| page | expected over file:// | note |
+|---|---|---|
+| CSS-flex-gap | FLEXGAP 5/5 | |
+| CSS-gcs-props | 9/9 | |
+| CSS-opacity-image | title "(OPIMG)", see step 3 | visual |
+| CSS-style-edit | 4/4 | |
+| JS-capture-target | 7/7 | each handler runs once |
+| JS-charref | CHARREF 6/6 | |
+| JS-dispev-ret | DISPRET 6 | |
+| JS-event-phase | EVPHASE 9/9 | |
+| JS-form-enctype-reset | FORMENC 9 | |
+| JS-form-named | FORMNAMED 7/7 | |
+| JS-form-shadow | 6/6 | |
+| JS-form-shadow-chain | 10/10 | |
+| JS-form-values | FORMVAL 8/8 | |
+| JS-link-click | lands on JS-link-click-b, LINKCLICK 5/5 | |
+| JS-scratch-qsa | SCRATCHQSA 6/6 | |
+| JS-sheet-census | SHEETCENSUS 3/3 | netsurf.log: `SHEETID single`/`multi` (+`stale`, timing-dependent) |
+| JS-mo-delivery | MODELIV **5/6** by design | 6 "no frame handles": file:// frames have no document |
+| JS-frame-xdoc | XDOC **3/4** by design | check 1 needs a parsed frame's document, which file:// frames lack; 4/4 over the gate server |
+| JS-frame-document | XDOC2 **1/10** by design | file:// frames have no document; 10/10 over http |
+| JS-form-target | FORMTARGET 0/5 plain; use `?tap` | tap both buttons, see patch 289's note |
+| JS-form-submitters, HTML-multipart-* | not a device check | they post to the gate server ("Not found") |
+| NET-stall | "converted drip=0" over file:// | the stall leg needs the gate server |
+| JS-attr-local, JS-batch-burst | no on-page summary | gate census pages; correct DOM, no hang |
+
+5. **Sites, by hand** (details in each patch's "On the device (run 39)"
+   note below):
+   - Forms (283-289, 297, 303, 305): DuckDuckGo Lite and Wikipedia search; any form with
+     several submit buttons or an image button; script-driven dropdowns
+     and counters.
+   - Pages that rewrite their title or render results in one burst
+     (300, 301, 309, 312): they should settle one full rebuild sooner.
+   - Attribute-driven updates (313): data-*/ARIA toggles should be
+     snappier.
+   - Faded cards and overlays (311, 314, 315): text, borders and images
+     should fade together.
+   - CSS-in-JS sites such as the Guardian and claude.ai: collect the
+     `SHEETCENSUS` / `SHEETIDCENSUS` lines from netsurf.log. They are the
+     data doc 23 pieces B/C wait on.
 
 ### Patches 283-285 (2026-10-13): forms submitted without script
 
