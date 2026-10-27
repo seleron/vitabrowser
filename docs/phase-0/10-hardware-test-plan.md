@@ -6138,3 +6138,30 @@ either. Check that IMG-svg.html shows the orange Y logo, the circle,
 the triangle and the link icon. netsurf.log should carry "bitmaps: N
 faded copies" after that page loads; how long the page takes to
 settle is the first device reading of the copy cost.
+
+## Doc 23 piece B (2026-10-27): design pass — reach from changed rules, anchored on any compound
+
+Design only, no patch; the full text is in doc 23's "Piece B design"
+section. The Guardian's and BBC's inline sheets (fetched 2026-10-27)
+have **0% id-anchored sheets or rules** but **95-100% class-anchored** rules
+under a corrected anchor rule. So piece B as first written (a whole
+sheet of id-anchored descendant chains) would never answer an edit on
+the pages it was designed for. The re-scoped piece B:
+- anchors on a class or id at the rightmost valid compound (the subject,
+  or any compound followed by a descendant/child step);
+- bounds only the rules that changed, by trimming the common prefix and
+  suffix of per-rule hashes, old ∪ new;
+- keeps a record table on each edited stylesheet entry and hands it on
+  from edit to edit;
+- resolves anchors in one walk with the matcher's own id/class
+  predicates (classes are case-insensitive in quirks mode);
+- adds unbounded causes (non-style at-rules, counters, since the
+  counter table is flat, nesting, escapes) and an admission contract
+  for piece C (`html`/`body`, list items, display changes).
+
+It also specifies **B0**: absorbing the companion text mark on an
+unboxed `<style>`, which removes the second of the two full reconverts
+every `<style>` edit costs today, independent of reach. Proposed order:
+B0, then the B1 reach census (`LIFE SHEETREACH`), then C only if bounded
+batches dominate. Three owner questions are at the end of the doc 23
+section.

@@ -330,3 +330,288 @@ batches still take the full reconvert. One reading of the text above:
 flight" (queued or loading), because the initial parse processes
 entries without ever marking. Gate suite: single=8 stale=1 multi=1
 none=0. Pieces B (reach) and C (local answer) are not started.
+
+## Piece B design (2026-10-27): reach from changed rules, anchored on any compound
+
+Design only: no implementation, no patch. This pass checked piece B
+(above) against real sheets and the code it has to fit, before any
+patch. Two of its premises do not hold. This section replaces piece B's
+definition, and it replaces the confined case of open question 1.
+
+### Evidence: the id-anchored confined case does not occur on real pages
+
+The inline `<style>` sheets of two CSS-in-JS front pages were fetched
+on 2026-10-27 (theguardian.com/uk 1.6 MB HTML, 20 sheets; bbc.co.uk/news
+0.9 MB, 4 sheets). Each style rule was classified textually. These are
+host Python measurements; the scanner was rough around parenthesised
+`@supports` preludes, which account for about 8 rules. In the `dcr` sheet, 3 of
+the 4 "unanchored" readings and all 8 at-rule/nesting readings are that
+artifact.
+
+| rule shape | Guardian, all sheets (1352 rules) | Guardian `dcr` sheet (764 KB, 1248) | BBC, all (1192) | BBC largest (1153) |
+|---|---|---|---|---|
+| every selector's **leftmost** compound has a plain `#id` | 0% | 0% | 0% | 0% |
+| a valid **class or id anchor** (rule below) | 95.4% | 99.0% | 96.7% | **100%** |
+| no valid anchor (bare tags, `:root`, `*[hidden]`, a reset list) | 1.6% | 1 rule | 0.9% | 0% |
+| at-rules (`@font-face`, `@keyframes`) | 2.7% | 0.3% | 2.3% | 0% |
+
+Piece B as written needs a whole sheet of id-anchored descendant
+chains. On these pages that never happens: no sheet qualifies and no
+edit would ever be answered locally. Two changes fix that, and each is
+needed on its own terms:
+
+1. **Anchor on classes as well as ids, at whichever compound is valid.**
+   CSS-in-JS emits hashed class selectors (`.dcr-1lp5d41`,
+   `.ssrcss-k49uhy-PromoContent`), and almost none carry an id.
+2. **Bound only the rules that changed, not the whole sheet.** Even
+   with class anchors, the Guardian's `dcr` sheet is unbounded as a
+   whole, because of a single rule (`.dcr-1lp5d41:focus~button`). A
+   hydration edit appends rules and leaves that one untouched.
+
+### B.1 Anchors (replaces "Anchored / Unbounded" above)
+
+A selector is a chain of compounds C0 c1 C1 ... cn Cn, where Cn is the
+subject. A compound Ck is a **valid anchor** when it carries a plain
+`#id` or `.class`: outside any functional pseudo, so `:is(.a)` and
+`:not(.a)` do not count. One of these must also hold:
+
+- Ck is the subject (k = n). Every element the selector matches
+  carries the token.
+- The combinator **immediately to Ck's right** (c(k+1)) is
+  descendant or child. The element matched at C(k+1) is then inside
+  Ck's element's subtree. Each later sibling step stays under a
+  parent that is already inside that subtree, and each later
+  descendant or child step goes further in. So every match lies in
+  the subtree of an element carrying the token, whatever c(k+2)..cn
+  are.
+
+The selector's anchor is the **rightmost** valid compound, which gives
+the tightest reach. Within one compound an id is preferred over a
+class. A selector with no valid anchor is unbounded. One unbounded
+selector in a rule's list makes that rule unbounded.
+
+This corrects two statements in piece B above:
+- "Every combinator in the selector is the descendant combinator" is
+  stricter than needed. A child combinator confines just as well, and
+  so does a sibling combinator to the right of a downward step:
+  `.Stack > * + *` is bounded by `.Stack`.
+- Only `#a ~ x` / `#a + x` (a sibling step directly right of the only
+  anchor) escape.
+
+What the Guardian and BBC sheets look like under this rule:
+- `html:not(.x) .dcr-a:focus` anchors at `.dcr-a` (the subject).
+- `#cb:checked~div .dcr-b` anchors at `.dcr-b`.
+- `.ssrcss-…-Stack >*+*` anchors at `.ssrcss-…-Stack`.
+
+### B.2 Changed rules, old ∪ new (replaces the whole-sheet bound)
+
+Both versions of the sheet are split into **records**. A record is one
+style rule, identified by the text of its enclosing group preludes, its
+selector text and its declaration block, with comments removed and
+whitespace runs collapsed. Each record is reduced to a 32-bit FNV-1a
+hash, the house hash already used by `html_rl_sib_sheet_for`. The
+changed set is found by trimming the longest common prefix and the
+longest common suffix of the two hash sequences. What is left in the
+middle of each version is the changed rules: the outgoing middle (old)
+and the incoming middle (new). The reach is the union of the anchors of
+every changed rule in both versions (constraint 4).
+
+**Why this is sound** (constraint 4, for rules rather than sheets):
+- Take an element that no changed rule matches in either version.
+  Every rule that matches it is a common record. Common records occur
+  in the same relative order in both versions, because prefix and
+  suffix trimming preserves order and the middle holds no common record
+  by construction.
+- Selectors in other sheets are unchanged.
+- So that element's matched declarations are the same, in the same
+  cascade order, under both selection contexts, and its cascaded style
+  is identical.
+- Inheritance only flows into a root's subtree, as piece B already
+  argued.
+- Hence no element outside the anchors' subtrees changes style.
+
+A middle that holds a rule and its moved copy is merely conservative:
+both copies count as changed.
+
+**The change is unbounded (full reconvert, cause counted) when:**
+- **Any changed record is not a plain style rule.** That covers
+  `@import`, `@namespace`, `@font-face`, `@keyframes`, `@property`,
+  `@counter-style`, `@page`, statement-form `@layer a, b;` (layer order
+  is document-wide, across sheets) and any unknown at-rule. All of
+  these reach elements by name, not by selector.
+- **A changed rule's declarations mention `counter-increment`,
+  `counter-reset`, `counter-set`, `counter(` or `counters(`.** This
+  engine keeps one flat counter table per box-construction pass
+  (box_construct.c, fixes134b), so a counter change inside a subtree
+  renumbers generated content after it, outside the subtree. This is
+  patch 192's token list, for the same reason.
+- **A changed rule contains a nested block** (CSS nesting, patch NEST211).
+  `&` placement can move the anchor, and v1 does not follow nesting.
+- **There is a backslash anywhere in a changed rule's prelude**, as in the
+  existing scan.
+- **A group prelude cannot be parsed**, or the sheet has no source data.
+- **More than a fixed number of changed records** (proposed 64, set from
+  the stage-B1 census): bookkeeping past that costs more than it saves.
+
+Rules that did not change are never classified. The Guardian's one
+sibling-escaping rule does not stop an edit that leaves it alone.
+
+### B.3 Snapshot: a record table per stylesheet entry, handed on edit to edit
+
+The outgoing version's source is released inside
+`html_css_process_modified_style` (the old handle dies at the swap). So
+the old side must be captured there, as piece B said. What is captured
+changes: a **record table**, not an anchor list. The table holds each
+record's hash and the offset of its anchor tokens in a pooled string
+block.
+
+- **Where it lives:** two owned pointers on `struct html_stylesheet`,
+  `reach_cur` (the table of the live version, when computed) and
+  `reach_prev` (the table of the version the boxes were built with).
+- **At process time:** `reach_prev` takes `reach_cur` when it exists.
+  Otherwise the outgoing source is scanned once, before the release.
+  `reach_cur` is then emptied, and the incoming version's table is
+  built lazily at the flush from the new handle's source (it is done by
+  then: the mark only fires when the sheet finishes).
+- **The handoff:** after a flush, the incoming table becomes the next
+  edit's `reach_prev` without a rescan. A sheet edited N times is
+  scanned N+1 times in all, once per version, never twice per version.
+  Sheets that are never edited are never scanned.
+- **Lifetime:** freed with the entry, and replaced at each process. A
+  stale mark (counter mismatch, patch 318) declines before the tables
+  are read, so a superseded pair is never used (unchanged rule).
+- **Bound:** two tables per edited sheet. The Guardian `dcr` sheet is
+  about 1250 records, roughly 10 KB of hashes and offsets plus about
+  12 KB of anchor tokens. That is small next to the 764 KB source that
+  libcss re-parses on every edit anyway.
+
+This replaces "ids only, freed when the mark it fed is consumed".
+Holding the old handle until the flush would avoid the scan, but it
+would also keep the old parsed libcss sheet (several times the source
+size) alive per in-flight mark, which is the wrong trade on the Vita.
+
+### B.4 Resolving anchors to roots at the flush
+
+The anchor tokens of the changed rules form a small set of ids and
+classes. They are resolved in **one document-order walk**, which is the
+walk piece C needs anyway:
+- **Same predicates as the matcher.** Ids are compared exactly, as
+  `node_has_id` does (case-sensitive even in quirks mode).
+  Classes go through `dom_element_has_class`, which is case-insensitive
+  whenever the document is not in no-quirks mode (libdom tests
+  `quirks_mode != NONE`). Re-implementing either comparison would let
+  the bound disagree with the matcher.
+- **Ancestor collapse in the same walk.** A matching element becomes a
+  root and its subtree is skipped.
+- **Several elements with one token are expected.** A class names many
+  elements, and libdom does not enforce id uniqueness. This is a union,
+  so piece B's "an id resolving to more than one element declines" is
+  dropped. The root count is bounded instead (patch 309's guard, in C).
+- **A token matching no element contributes no root.** If the batch
+  holds only this sheet mark, the DOM is the one the boxes were built
+  from, so no element carried the token under the old context either. If
+  the batch holds other marks, they keep their own rules (two-decline),
+  and an element whose class or id changed is rebuilt by its own
+  attribute mark (patch 313).
+
+### B.5 Root admission (the contract handed to piece C)
+
+These conditions turn a root's subtree rebuild into effects outside the
+subtree. If any one holds, the whole batch takes the full reconvert:
+- **The root is `<html>` or `<body>`.** Their background, overflow and
+  direction propagate to the canvas and viewport, and a full reconvert
+  costs the same anyway.
+- **The root is a list item, or the child of `ol`/`ul`/`menu`.** The
+  implicit list-item counter numbers following siblings during box
+  construction.
+- **The root's display is `contents` or `none` in either context, or
+  changes between `inline` and block level.** In those cases the root
+  has no box of its own to replace, or the parent's anonymous boxes
+  change. C checks the new computed display against the old box type.
+- **The root has no box while being displayed** (an unconverted
+  subtree).
+
+### B.6 The companion text mark (the second full reconvert per edit)
+
+Patch 316 found that each `<style>` text edit costs two full reconverts.
+The precise mark on the style's text node is declined by the local path,
+and then the sheet's own batch arrives.
+
+**Rule:** a precise mark is absorbed, meaning dropped and counted rather
+than declined, when all three hold:
+- Its node is a child of an HTML `<style>` element, or the mark is that
+  element's own child-list mark.
+- The `<style>` element has no box (`box_for_node` is NULL, which is
+  the UA sheet's `display:none`).
+- The mark is not a structural mark that moves the `<style>` itself.
+
+**Why it is sound:** a node under an unboxed element has no box, so
+rebuilding for it changes no box. The mark's only effect is through the
+sheet, which `DOMSubtreeModified` → `html_css_update_style` handles on
+its own path and marks separately. This does not depend on the sheet
+mark following. If the reparse fails, there is still nothing to rebuild.
+
+**What it is worth:** it saves one full reconvert per `<style>` edit
+(the first one, which today rebuilds against the old, unchanged sheet,
+so it is wasted outright). It is independent of reach and C. A `<style>`
+an author made visible (`style{display:block}`) has a box and keeps
+today's path.
+
+### Staging (replaces stage 2's single step)
+
+- **B0: absorb the companion text mark (B.6).** This is a behaviour
+  change with its own gate leg: STYLEEDIT 4/4 and SHEETCENSUS 3/3 hold,
+  and the census shows one full reconvert per edit instead of two. It
+  is the first host win on the doc 20 constraint 5 terms, measurable on
+  CSS-style-edit and JS-sheet-census.
+- **B1: reach census.** B.1 through B.4 and B.5's static checks, with
+  the full reconvert unchanged. Every single-identified current sheet
+  batch logs one of:
+  - `LIFE SHEETREACH bounded changed=K anchors=A roots=R walked=N`
+  - `LIFE SHEETREACH unbounded reason=<at-rule|counter|nesting|escape|unanchored|too-many|admission|no-source>`
+
+  These feed a `SHEETREACHCENSUS` beside `SHEETIDCENSUS`. Run on the
+  gate suite and on the scorecard's CSS-in-JS sites (the Guardian, BBC,
+  claude.ai) in the simulator, plus the run-40 device logs. **C is built
+  only if bounded batches dominate**, and C's guard budget is sized from
+  the R and N readings.
+- **C: multi-root rebuild,** unchanged from piece C above. It is fed by
+  B1's root set, with B.5 as its admission contract.
+
+### Gate page additions (extends the stage-2 spec above)
+
+These are SHEETSCOPE legs. Every leg also asserts final computed styles
+against Chromium.
+
+1. **Class-anchored append**, the CSS-in-JS shape: a script appends
+   `.k1 .x{color:...}` to a large `<style>` through `insertRule`. B1
+   logs `bounded changed=1`, and the roots are the `.k1` elements.
+2. **The subject is anchored behind a sibling step:**
+   `#cb:checked ~ div .y` is bounded at `.y`. `.y ~ button` is unbounded
+   (`reason=unanchored`).
+3. **Removal:** deleting an anchored rule includes its anchor (from the
+   old side) in the root set.
+4. **A common rule left alone:** a sheet holding one global
+   `body{...}` rule, plus an edit elsewhere, stays bounded.
+5. **Unbounded causes,** one leg each: an `@font-face` added, a
+   `counter-increment` rule, a nested rule, a statement `@layer`, and an
+   edit to the global `body{}` rule itself.
+6. **Quirks-mode class case:** in a document without a doctype,
+   `.Foo` anchors elements with `class="foo"` (matcher parity).
+7. **Admission:** a root that is an `li`, and a root that is `<body>`,
+   are bounded by B1 but declined by B.5.
+8. **B0:** a `<style>` text edit produces one full reconvert, not two.
+   A visible `<style>` (`display:block`) still repaints its text.
+
+### Open questions (for the owner)
+
+1. **Confirm the re-scope.** The confined case becomes "the changed
+   rules all have class or id anchors", not "the whole sheet is
+   id-anchored". The measurement above is the reason. The shadow-DOM
+   reservation in open question 1 above stands unchanged.
+2. **B0 first?** It is the cheapest win in this design, it needs no part
+   of reach, and it halves every `<style>` edit today. The
+   recommendation is to land it before B1.
+3. **The changed-record cap** (proposed 64) and whether B1 should also
+   log the changed-record count of batches it declines. That would show
+   whether a hydration burst ever exceeds the cap.
