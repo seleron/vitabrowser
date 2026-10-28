@@ -1,0 +1,127 @@
+# netsurf: the form named-access check is cached on libdom's tree generation (patch 324)
+# Generated 2026-10-28
+# Base: seleron/vitabrowser (patch stack through 323, with 324-libdom)
+#
+# After 323 the stackoverflow.com Cloudflare challenge still took ~9 s
+# against 5.25 s with no form shadowing. The remainder was 322's
+# anyNamed() -- getElementById, a native query of the nameable tags, a
+# getAttribute each -- reached through the form layer once per pending
+# record from the MutationObserver delivery loop (root.contains on an
+# observed form), repeating the same question between DOM changes.
+#
+#  - macsurf_qjs.c: __vitaDomGen() returns dom_tree_generation() (libdom,
+#    324-libdom). Like the other __vita* helpers it stays off the
+#    window's enumeration (patch 269).
+#  - vita_polyfill.js: anyNamed() keeps its answers per document (private
+#    data), keyed by tag list and name, and drops them when the
+#    generation moves. Without __vitaDomGen it computes every time, as
+#    before.
+#
+# Measured: stackoverflow.com/questions challenge cleared at 8.9-9.1 s
+# -> 5.5 / 5.8 / 5.5 s (no shadowing at all: 5.25 s). JS-form-walk-cost
+# gains leg 5 (after a cached miss, an attached control shadows at once,
+# a renamed one moves the shadow, a removed one reverts); with the
+# generation frozen the leg fails. FORMNAMED 7/7, FORMVAL 8/8,
+# FORMTARGET 5/5, DESCRIPTORS 7/7, NODESHAPE 6/6, BSHAPE 8/8,
+# APIPROTO 7/7, DOCSHAPE 6/6, WINORDER 5/5, WINPROTO 6/6.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4759,6 +4759,20 @@
+ 	s_rt_n = j;
+ }
+ 
++/* VitaBrowser patch 324: __vitaDomGen() -> libdom's tree generation, which
++ * moves on every attach, detach, replace and attribute change (any
++ * document, any realm). vita_polyfill.js keys its form named-access cache
++ * on it: an equal value means no element was added, removed or had an
++ * attribute changed since the cached answer was computed. */
++extern unsigned long dom_tree_generation(void);
++
++static JSValue qjs_dom_gen(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)this_val; (void)argc; (void)argv;
++	return JS_NewFloat64(ctx, (double)dom_tree_generation());
++}
++
+ /* __vitaResourceTake() -> this realm's entries finished since the last
+  * call: [[url, initiatorType, startTime, responseEnd, size, status, type,
+  * Timing-Allow-Origin or null], ...],
+@@ -15801,6 +15815,7 @@
+ 	qjs_set_func(ctx, global, "setTimeout",    qjs_settimeout,  2);
+ 	qjs_set_func(ctx, global, "__msRafTimeout", qjs_raf_timeout, 1);	/* patch 281 */
+ 	qjs_set_func(ctx, global, "__vitaResourceTake", qjs_rt_take, 0);	/* patch 282 */
++	qjs_set_func(ctx, global, "__vitaDomGen", qjs_dom_gen, 0);	/* patch 324 */
+ 	qjs_set_func(ctx, global, "setInterval",   qjs_setinterval, 2);
+ 	qjs_set_func(ctx, global, "clearTimeout",  qjs_cleartimeout, 1);
+ 	qjs_set_func(ctx, global, "clearInterval", qjs_cleartimeout, 1);
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10627,11 +10627,27 @@
+ 		inNamed = true;
+ 		try {
+ 			var doc = node.nodeType === 9 ? node : node.ownerDocument || d;
+-			if (doc.getElementById(n)) return true;
+-			var a = doc.querySelectorAll(tags);
+-			for (var i = 0; i < a.length; i++)
+-				if (a[i].getAttribute('name') === n) return true;
+-			return false;
++			/* patch 324: the answer holds until libdom's tree
++			 * generation moves (an attach, detach, replace or
++			 * attribute change anywhere), so repeated reads between
++			 * changes -- a MutationObserver delivery loop calling
++			 * root.contains on an observed form, per record -- are a
++			 * map hit, not a query */
++			var gen = typeof g.__vitaDomGen === 'function' ? g.__vitaDomGen() : null,
++				pv = gen !== null ? PV(doc) : null, memo = null, key = tags + '\n' + n, r = false;
++			if (pv) {
++				if (pv.namedGen !== gen) { pv.namedGen = gen; pv.namedMemo = new Map(); }
++				memo = pv.namedMemo;
++				if (memo.has(key)) return memo.get(key);
++			}
++			if (doc.getElementById(n)) r = true;
++			else {
++				var a = doc.querySelectorAll(tags);
++				for (var i = 0; i < a.length && !r; i++)
++					if (a[i].getAttribute('name') === n) r = true;
++			}
++			if (memo) memo.set(key, r);
++			return r;
+ 		} catch (e) {
+ 			return true;	/* unsure: take the full search */
+ 		} finally {
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10628,11 +10628,27 @@
+ "\t\tinNamed = true;\n"
+ "\t\ttry {\n"
+ "\t\t\tvar doc = node.nodeType === 9 ? node : node.ownerDocument || d;\n"
+-"\t\t\tif (doc.getElementById(n)) return true;\n"
+-"\t\t\tvar a = doc.querySelectorAll(tags);\n"
+-"\t\t\tfor (var i = 0; i < a.length; i++)\n"
+-"\t\t\t\tif (a[i].getAttribute('name') === n) return true;\n"
+-"\t\t\treturn false;\n"
++"\t\t\t/* patch 324: the answer holds until libdom's tree\n"
++"\t\t\t * generation moves (an attach, detach, replace or\n"
++"\t\t\t * attribute change anywhere), so repeated reads between\n"
++"\t\t\t * changes -- a MutationObserver delivery loop calling\n"
++"\t\t\t * root.contains on an observed form, per record -- are a\n"
++"\t\t\t * map hit, not a query */\n"
++"\t\t\tvar gen = typeof g.__vitaDomGen === 'function' ? g.__vitaDomGen() : null,\n"
++"\t\t\t\tpv = gen !== null ? PV(doc) : null, memo = null, key = tags + '\\n' + n, r = false;\n"
++"\t\t\tif (pv) {\n"
++"\t\t\t\tif (pv.namedGen !== gen) { pv.namedGen = gen; pv.namedMemo = new Map(); }\n"
++"\t\t\t\tmemo = pv.namedMemo;\n"
++"\t\t\t\tif (memo.has(key)) return memo.get(key);\n"
++"\t\t\t}\n"
++"\t\t\tif (doc.getElementById(n)) r = true;\n"
++"\t\t\telse {\n"
++"\t\t\t\tvar a = doc.querySelectorAll(tags);\n"
++"\t\t\t\tfor (var i = 0; i < a.length && !r; i++)\n"
++"\t\t\t\t\tif (a[i].getAttribute('name') === n) r = true;\n"
++"\t\t\t}\n"
++"\t\t\tif (memo) memo.set(key, r);\n"
++"\t\t\treturn r;\n"
+ "\t\t} catch (e) {\n"
+ "\t\t\treturn true;\t/* unsure: take the full search */\n"
+ "\t\t} finally {\n"

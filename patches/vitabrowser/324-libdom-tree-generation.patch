@@ -1,0 +1,114 @@
+# libdom: a process-wide tree generation number (patch 324)
+# Generated 2026-10-28
+# Base: seleron/vitabrowser (patch stack through 323)
+#
+# dom_tree_generation() returns a counter that moves on every change that
+# can alter which elements are in a tree or what their attributes are:
+# _dom_node_attach_range, _dom_node_detach_range and _dom_node_replace
+# (every insert / remove / replace funnels through them), and
+# __dom_dispatch_attr_modified_event (every attribute set, change and
+# removal; attributes set on a detached element are covered by its
+# attach). Callers cache answers computed from the tree and reuse them
+# while the value is unchanged; they compare for equality, so wrap-around
+# is harmless. Used by the bridge's form named-access check (the netsurf
+# half of patch 324, __vitaDomGen).
+#
+# A counter in the bridge's own mutation hook (macsurf_js_note_dom_mutation)
+# would not do: it sits on the reconvert-mark path, which some mutations
+# return before reaching, and it does not see parser-made changes.
+--- a/include/dom/core/node.h
++++ b/include/dom/core/node.h
+@@ -576,4 +576,9 @@
+ #define dom_node_get_user_data(n, k, r) dom_node_get_user_data( \
+ 		(dom_node *) (n), (k), (void **) (r))
+ 
++/* VitaBrowser patch 324: the process-wide tree generation -- it moves on
++ * every attach, detach, replace and attribute change; equal values mean
++ * no element was added, removed or had an attribute changed in between. */
++unsigned long dom_tree_generation(void);
++
+ #endif
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2145,6 +2145,25 @@
+  *
+  * The range is assumed to be a linked list of sibling nodes.
+  */
++/* VitaBrowser patch 324: a process-wide generation number that moves on
++ * every change that can alter which elements are in a tree or what their
++ * attributes are -- a node attached, detached or replaced, an attribute
++ * set, changed or removed (__dom_dispatch_attr_modified_event). Callers
++ * cache answers computed from the tree and reuse them while it is
++ * unchanged (the bridge's form named-access check). Wrap-around is
++ * harmless: a reader compares for equality with the value it cached. */
++static unsigned long dom_tree_gen = 1;
++
++unsigned long dom_tree_generation(void)
++{
++	return dom_tree_gen;
++}
++
++void _dom_tree_generation_bump(void)
++{
++	dom_tree_gen++;
++}
++
+ dom_exception _dom_node_attach_range(dom_node_internal *first, 
+ 		dom_node_internal *last,
+ 		dom_node_internal *parent, 
+@@ -2155,6 +2174,8 @@
+ 	bool success = true;
+ 	dom_node_internal *n;
+ 
++	_dom_tree_generation_bump();	/* patch 324 */
++
+ 	first->previous = previous;
+ 	last->next = next;
+ 
+@@ -2203,6 +2224,8 @@
+ 	dom_node_internal *n;
+ 	dom_exception err = DOM_NO_ERR;
+ 
++	_dom_tree_generation_bump();	/* patch 324 */
++
+ 	if (first->previous != NULL)
+ 		first->previous->next = last->next;
+ 	else
+@@ -2251,6 +2274,8 @@
+ 	dom_node_internal *first, *last;
+ 	dom_node_internal *n;
+ 
++	_dom_tree_generation_bump();	/* patch 324 */
++
+ 	if (replacement->type == DOM_DOCUMENT_FRAGMENT_NODE) {
+ 		first = replacement->first_child;
+ 		last = replacement->last_child;
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -306,4 +306,7 @@
+ 			(dom_mutation_type) (change), \
+ 			(bool *) (success))
+ 
++/* VitaBrowser patch 324: move the tree generation (node.c) */
++void _dom_tree_generation_bump(void);
++
+ #endif
+--- a/src/events/dispatch.c
++++ b/src/events/dispatch.c
+@@ -8,6 +8,7 @@
+ #include <assert.h>
+ 
+ #include "core/document.h"
++#include "core/node.h"
+ #include "events/dispatch.h"
+ #include "events/mutation_event.h"
+ 
+@@ -128,6 +129,8 @@
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 
++	_dom_tree_generation_bump();	/* patch 324 */
++
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
