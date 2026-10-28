@@ -668,3 +668,65 @@ piece can be called landed: the SHEETSCOPE gate page, its
 (order in `~/vitabrowser-work/B1-handoff.md`). Census only — no
 behaviour change, so the existing 320 gate expectations are untouched
 by design.
+
+## Status (2026-10-28): piece B1 landed as patch 321
+
+B1 is in, as specified (B.1 through B.4, plus B.5's static checks), and
+is census only. Each single-identified current sheet batch logs
+`LIFE SHEETREACH bounded changed=K anchors=A roots=R walked=N` or
+`LIFE SHEETREACH unbounded reason=<cause>`, and the navigation reset
+prints `LIFE SHEETREACHCENSUS bounded=.. unbounded=.. <cause>=..`. The
+full gate passed (gate321, exit 0), with STYLEABS 4/4 and SHEETCENSUS
+3/3 unchanged. Doc 10's patch 321 entry has the five defects that the
+review fixed in the solo-built engine before the gate.
+
+**Gate legs (SHEETSCOPE 5/5, SHEETSCOPE-UNB 5/5, SHEETSCOPE-Q 3/3).**
+Every leg of the gate-page spec above has a leg except B0's (already
+covered by 320's STYLEABS). Each one reads as specified:
+
+| leg | reads |
+|---|---|
+| 1 class-anchored insertRule append | `bounded changed=1 anchors=1 roots=3` |
+| 2 `#cb:checked ~ div .y` | `bounded changed=1 anchors=1 roots=2` |
+| 2 `.y3 ~ div` | `unbounded reason=unanchored` |
+| 3 removal | `bounded changed=1 anchors=1 roots=1` (anchor from the old side) |
+| 4 common `body{}` left alone | `bounded changed=2 anchors=1 roots=1` |
+| 5 `@font-face` / counter / nesting / statement `@layer` / the `body{}` rule itself | at-rule / counter / nesting / at-rule / unanchored |
+| 6 quirks `.Foo` vs `class="foo"` | `bounded changed=1 anchors=1 roots=1` |
+| 7 `<li>` root, `<body>` root | `unbounded reason=admission` (both) |
+
+Census lines: JS-sheet-scope `bounded=4 unbounded=1 unanchored=1`;
+JS-sheet-scope-unb `bounded=0 unbounded=5 at-rule=2 counter=1
+nesting=1 unanchored=1`; JS-sheet-scope-quirks `bounded=1 unbounded=2
+admission=2`. All three read `no-source=0`.
+
+**Deviations from the design, recorded:**
+- **Leg 1's roots are the `.x` elements, not the `.k1` elements** as
+  the gate-page spec says. B.1 takes the rightmost valid compound, and
+  in `.k1 .x` that is the subject, `.x`. The spec line contradicts B.1,
+  and the code follows B.1.
+- **The incoming table is built eagerly** at the processed edit, from
+  the `<style>`'s DOM text, not lazily at the flush (B.3). Each version
+  is still scanned once. The lazy build belongs with C.
+- **The legs are split across three pages** at 1200 ms per leg,
+  because the bottom-settle window holds about five legs.
+- **No legs exist for `escape`, `too-many` or `no-source`.** The gate
+  instead asserts `no-source=0` on all three pages. That catches a
+  first-edit capture that loses the old source, which the solo build
+  had.
+
+**Census over the whole gate suite (178 network pages):** 26 events,
+16 bounded and 10 unbounded. Outside SHEETSCOPE, the only unbounded
+events are CSS-late-link (`no-source`, a `<link>` sheet) and
+HTML-embed-placeholders (`too-many`: a YouTube iframe's `<style>`
+arriving whole into an entry with no prior sheet). The largest bounded
+reading was K=2, R=3, N=3066.
+
+**What decides C.** The gate pages are synthetic and do not count
+toward "bounded batches dominate". The deciding census is:
+- the scorecard's CSS-in-JS sites in the simulator (the Guardian, BBC,
+  claude.ai);
+- the next device run, whose logs carry `SHEETREACH` per event.
+
+C is built only if most of those real-site edits read bounded. Its
+guard budget is then sized from their R and N readings.

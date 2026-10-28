@@ -6277,3 +6277,73 @@ in the applytest tree reconfigures with defaults (Duktape, no
 libcss) and fails; the incremental objects build through
 `~/vitabrowser-work/incbuild.sh` (same env as the full
 `simbuild.sh`/`run-vita-sim.sh` recipe).
+
+## Patch 321 (2026-10-28): the sheet-reach census lands (doc 23 B1)
+
+**What:** this completes the in-progress entry above. B1 is census only,
+with no behaviour change: every sheet batch still takes the full
+reconvert. Each single-identified current sheet batch logs
+`LIFE SHEETREACH bounded changed=K anchors=A roots=R walked=N` or
+`LIFE SHEETREACH unbounded reason=<cause>`, and the navigation reset
+prints `LIFE SHEETREACHCENSUS`. The patch file is
+`321-netsurf-sheet-reach-census.patch` (html.h, css.h, css.c,
+macos9_reconvert.c).
+
+**Review before the gate (Claude takeover of the Hermes solo build).**
+The in-flight engine compiled clean but had never run. Reading it and
+then running it found five defects, all fixed before the patch was
+cut:
+- **Infinite loop in the DOM walk.** The child loop re-read
+  `dom_node_get_first_child` as its condition on every pass, so any
+  element with children walked forever. The walk is now iterative
+  (first child, next sibling, climb to the parent), which also keeps a
+  deep DOM off the Vita's C stack.
+- **Heap overflow.** `toks[ntok] = NULL` wrote one past a full token
+  array (a rule with exactly 4, 8, ... distinct anchors).
+- **First-edit capture always read no-source.** `content_get_source_data`
+  returns the data pointer, not an `nserror`. The `== NSERROR_OK` test
+  only passed for NULL, and the scanned pointer was never assigned, so
+  every first edit of a `<style>` would have logged `no-source`.
+- **NULL dereference (the gate's first run segfaulted on
+  JS-sheet-census).** A rule with an empty block, `.x {}`, normalised
+  to a NULL buffer, which the counter check passed to `strcasestr`.
+  `reach_norm_range` now always leaves a string (gate-321-segv log kept
+  as `~/vitabrowser-work/gate321-segv.log`).
+- **Double frees on out-of-memory**, in the two places that grow paired
+  arrays with consecutive `realloc`s. Smaller fixes: a missing
+  `dom_element` cast, a chain leak on the out-of-memory path, a
+  whitespace-only change to an existing include line reverted, and a
+  non-ASCII dash in a comment.
+
+**Gate pages (SHEETSCOPE, three pages, one `<style>` edit per leg).**
+The spec's legs did not fit one page's bottom-settle window, so they
+are split across three pages at 1200 ms per leg (7000 px spacer,
+bottom-plot reads, as at 320). Every leg also asserts its restyle.
+
+| page | legs | per-leg `SHEETREACH` (in order) |
+|---|---|---|
+| JS-sheet-scope | 5/5 | bounded K=1 A=1 R=3 (insertRule `.k1 .x`); bounded K=1 A=1 R=2 (`#cb:checked ~ div .y`); unanchored (`.y3 ~ div`); bounded K=1 A=1 R=1 (rule removed, anchor from the old side); bounded K=2 A=1 R=1 (common `body{}` left alone) |
+| JS-sheet-scope-unb | 5/5 | at-rule (`@font-face`); counter; nesting; at-rule (statement `@layer`); unanchored (the `body{}` rule itself) |
+| JS-sheet-scope-quirks | 3/3 | bounded K=1 A=1 R=1 (no doctype, `.Foo` matches `class="foo"`); admission (`<li>` root); admission (`<body>` root) |
+
+Each page's `SHEETREACHCENSUS` is printed at the next page's
+navigation reset, so the gate reads it from the following page's
+window. All three census lines read `no-source=0`.
+
+**Full gate: `gate321.log` exit 0.** SHEETSCOPE 5/5, 5/5, 3/3.
+SHEETCENSUS 3/3 (identity single=1 multi=1 stale=1, as at 318).
+STYLEABS 4/4 (absorbed=4 full=4, as at 320). Interaction 52/52, 23
+pages pace-identical, 68/68 batched frames identical.
+
+**The whole gate suite as census data (178 network pages):** 26 reach
+events, 16 bounded and 10 unbounded. The largest bounded event had
+K=2, R=3 and walked 3066 nodes (CSS-style-edit). Outside the
+SHEETSCOPE legs there are two unbounded events, both correct readings:
+- CSS-late-link: `no-source`, because a `<link>` sheet keeps no table.
+- HTML-embed-placeholders: `too-many`. Its YouTube iframe's `<style>`
+  arrives whole into an entry that had no sheet, so every record is
+  new.
+
+These are synthetic pages, so they do not decide piece C. That data
+comes from the scorecard's CSS-in-JS sites in the simulator (the
+Guardian, BBC, claude.ai) and from the next device run's logs.
