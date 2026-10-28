@@ -779,3 +779,15 @@ page loaded. Worth its own look before the next Guardian scorecard.
 named-access wrappers (patch 305) running the full control search on
 every generic member read of a `<form>`. The Guardian's title now
 appears at 4.1 s instead of 207 s.*
+
+## Status (2026-10-28, end of day): piece C still waits on the device census
+
+There is no device census yet. Run 40 (VPK `d2008e91051c`, patches
+through 324) carries the B1 census and was handed off at 20:25, but no
+results have arrived (doc 10, "Run 40 — results check"). The census
+lines are written only to the Vita's `netsurf.log`, so that file has to
+be fetched from the device (the `results\` receiver, or USB/FTP). The
+plot dumps cannot stand in for it. Until then, the real-site reading
+stands: the simulator census found 2 single-identified sheet batches
+across the Guardian, BBC and claude.ai, both bounded. That is too few
+to decide C, which stays on hold.

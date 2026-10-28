@@ -6568,3 +6568,23 @@ signal-cli daemon. A reference run must set `VITA_SIM_REMOTE_PORT`
      collect netsurf.log's `LIFE SHEETREACH`, `LIFE SHEETREACHCENSUS`,
      `LIFE SHEETIDCENSUS` and `LIFE SHEETCAUSE` lines. Doc 23 piece C
      is on hold until this data exists (its 2026-10-28 later status).
+
+## Run 40 — results check (2026-10-28 20:30): no device results yet
+
+A first check for run 40's results found none.
+- `Desktop\VitaBrowser-hwtest\` has no `results\` folder (where
+  `receive-results.bat` writes each launch) and no `netsurf.log`.
+- Nothing newer than the staging is anywhere on the Desktop,
+  `C:\Users\seleron\VitaBrowser-hwtest\`, Downloads or the work tree.
+- `reference-dumps\` (34 files, mtime 20:20:04) is **not** a device
+  dump. It is byte-for-byte identical to the simulator reference staged
+  at hand-off (`hwtest-2026-10-28-run40/reference-dumps`). Comparing it
+  against the reference would be a self-comparison and was not counted.
+
+Run 40 stays open (it is complete only when the user says so). When its
+results exist, they arrive as `results\net-<date>-<time>-<boot>\` from
+the receiver, or as a copy of the Vita's `ux0:data/VitaBrowser/` (USB or
+FTP). That copy must include **`netsurf.log`**: the piece-C census
+lines (`LIFE SHEETREACH`, `LIFE SHEETREACHCENSUS`, `LIFE SHEETIDCENSUS`,
+`LIFE SHEETCAUSE`) and the Guardian and Stack Overflow timings are
+written only there. The `.plot` dumps carry none of them.
