@@ -775,3 +775,7 @@ callback was a `Proxy` get / `Reflect.get` / `Array.prototype.every`
 chain calling `getAttribute` (`macsurf_qjs_run_timers`), so it is a
 script-cost problem, not census code. The scorecard run of the same
 page loaded. Worth its own look before the next Guardian scorecard.
+*Resolved by patch 322 (doc 10). The cost was the polyfill's form
+named-access wrappers (patch 305) running the full control search on
+every generic member read of a `<form>`. The Guardian's title now
+appears at 4.1 s instead of 207 s.*

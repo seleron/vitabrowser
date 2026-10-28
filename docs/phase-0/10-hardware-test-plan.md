@@ -6367,3 +6367,44 @@ hold C, and read the census from device run 40.
 A first scorecard attempt reported all three sites as crashes. That was
 not a crash: every sim exited rc=-2 (SIGINT) at the same 14.8 s wall
 time, a signal from outside the runs. An immediate rerun was clean.
+
+## Patch 322 (2026-10-28): form named access checks a name exists before searching
+
+**Symptom.** In the real-site census run, theguardian.com/uk took about
+130 s of CPU in one QuickJS timer callback before a document appeared
+(`run-live-sites.sh`). The scorecard's 30 s run only showed its title at
+207 s and still called the page "loaded". No scorecard had run since
+r58 (patches through 285, when the Guardian loaded in about 4.5 s).
+
+**Diagnosis.** A gdb helper walked QuickJS's frame chain
+(`rt->current_stack_frame`, the bytecode's `func_name` / `filename`
+atoms through `JS_AtomToCStringLen`). The Guardian bundle (`4501.client.web`)
+called a selector query. The polyfill's `jsQuery` walk read
+`firstChild` / `nodeType` / `getAttribute` on every element. On a
+`<form>`, each read went through patch 305's wrapper (`controlsFirst`)
+or 288's layer above HTMLFormElement into the full named-control search,
+which runs `querySelector('[form]')` (itself a JS walk of the whole
+document), an owner walk per control, and on a miss an owner walk per
+`<img>`. Patch 305 (2026-10-19) wraps every member of every prototype
+from HTMLFormElement up to Object.prototype, so these generic DOM reads
+are in the wrapped set.
+
+**Fix.** `anyNamed()`, an exact pre-check that uses native lookups only
+(`getElementById`, a plain-selector query of the nameable tags, one
+`getAttribute('name')` each), run under 297's `inNamed` guard. The
+first version of the fix recursed: its own `ownerDocument` and
+`getAttribute` reads on forms re-entered the wrappers. 305's FORMNAMED
+page caught that (0/7, stack overflow) before the gate.
+
+**Numbers.**
+- The Guardian in the simulator went from 137.9 s of CPU with no
+  document to 3.6 s, with the title at 4.1 s.
+- Scorecard r59-322 (r58 reference, 15 s): Guardian 35.6 → 63.6. The
+  rest of the gap to r58's 80.8 is text, because the reference's
+  headlines are two weeks old. BBC is 59.5 and claude.ai 73.0, both
+  unchanged.
+- The new page JS-form-walk-cost reads FORMWALK 3/3, with 20 attribute
+  queries in 304 ms. The pre-fix polyfill took 3695 ms and failed the
+  page.
+
+The full gate passed (`gate322.log`, exit 0).
