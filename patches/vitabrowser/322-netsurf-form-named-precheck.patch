@@ -1,0 +1,177 @@
+# netsurf: form named access -- an exact cheap pre-check before the control search (patch 322)
+# Generated 2026-10-28
+# Base: seleron/vitabrowser (patch stack through 321)
+#
+# Patch 305 made a form's named controls shadow the whole prototype
+# chain by wrapping every member of every prototype from
+# HTMLFormElement.prototype up to Object.prototype, in place -- so
+# Node.prototype.firstChild / nextSibling / parentNode / nodeType /
+# ownerDocument and Element.prototype.getAttribute are wrapped for every
+# node. On a non-form the wrapper is one isPrototypeOf. On a <form>
+# every such read ran the full named-control search: controls() opens
+# with querySelector('[form]') (an attribute selector, so the polyfill's
+# JS walk over the whole document), then each listed control's owner
+# walk, and on a miss formNamed scans every <img> with an owner walk
+# each. Any DOM walk that passes a form paid that per member read, and
+# the polyfill's own selector walk (jsQuery) reads several per element.
+# theguardian.com/uk spent ~130 s of CPU in one QuickJS timer callback
+# (a selector query from its client bundle) before a document appeared;
+# the scorecard's 30 s run showed its title at 207 s. The document's
+# named access (patch 288's layer above Document.prototype) had the same
+# shape: every unknown document.x read ran an attribute-selector query.
+#
+#  - vita_polyfill.js: anyNamed(node, tags, n) -- can any element carry
+#    the name n? getElementById(n), then a plain-selector query of the
+#    nameable tags (the native matcher) with one getAttribute('name')
+#    each. Exact: a name no element carries as id or name cannot shadow.
+#    It runs under patch 297's inNamed guard (its own ownerDocument and
+#    getAttribute reads on forms must not re-enter the lookups), and an
+#    exception answers "maybe" (the full search runs, as before).
+#  - controlsFirst (297/305's wrappers) and the layer above
+#    HTMLFormElement.prototype return at once when anyNamed says no;
+#    the layer above Document.prototype does the same for
+#    form/img/embed/object/iframe. Numeric indexes keep their path.
+#
+# Measured: theguardian.com/uk in the simulator (run-live-sites, 30 s):
+# 137.9 s user CPU, no document -> 3.6 s, document at 3.8 s. New gate page
+# JS-form-walk-cost (FORMWALK 3/3): 20 attribute queries over ~2000
+# elements with 3 forms and ~280 named images, 3695 ms before -> 286 ms;
+# JS-form-named (FORMNAMED 7/7, patches 288/297/305) unchanged.
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10607,6 +10607,38 @@
+ 		return r;
+ 	}
+ 	function named(el, n) { return el.id === n || el.getAttribute('name') === n; }
++	/* VitaBrowser patch 322: can ANY element of tags carry the name n?
++	 * An exact, cheap pre-check for the named lookups below, using only
++	 * native lookups: getElementById, and a plain-selector query (the
++	 * native matcher) with one attribute read per element. Patch 305
++	 * wraps every member of Node / Element / HTMLElement for forms, so
++	 * each firstChild / nodeType / getAttribute read on a form ran the
++	 * whole control search -- a full-document JS walk for '[form]', the
++	 * controls' owner walks, and an owner walk per <img> -- and any DOM
++	 * walk passing a form paid it per read (theguardian.com: ~130 s of
++	 * CPU in one timer before a document appeared). A name no element
++	 * carries cannot shadow, so those reads now return at once. */
++	function anyNamed(node, tags, n) {
++		if (!node || typeof n !== 'string' || n === '') return true;
++		/* its own reads (ownerDocument and getAttribute on a form, ...)
++		 * must not re-enter the named lookups: run under 297's guard,
++		 * as the search does */
++		var was = inNamed;
++		inNamed = true;
++		try {
++			var doc = node.nodeType === 9 ? node : node.ownerDocument || d;
++			if (doc.getElementById(n)) return true;
++			var a = doc.querySelectorAll(tags);
++			for (var i = 0; i < a.length; i++)
++				if (a[i].getAttribute('name') === n) return true;
++			return false;
++		} catch (e) {
++			return true;	/* unsure: take the full search */
++		} finally {
++			inNamed = was;
++		}
++	}
++	var NAMEABLE = LISTED + ',img';
+ 
+ 	/* a live list over a source of elements */
+ 	function live(P, src, extra) {
+@@ -10763,6 +10795,8 @@
+ 		var inNamed = false, wrapped = {};
+ 		function controlsFirst(form, k) {
+ 			if (inNamed) return undefined;
++			if (!IDX.test(k) && !anyNamed(form, NAMEABLE, k))
++				return undefined;	/* patch 322 */
+ 			inNamed = true;
+ 			var v;
+ 			try {
+@@ -10854,6 +10888,8 @@
+ 			});
+ 		above(FP, function (form, k) {
+ 			if (IDX.test(k)) return controls(form)[+k];
++			if (k !== '' && !anyNamed(form, NAMEABLE, k))
++				return null;	/* patch 322 */
+ 			return k === '' ? null : formNamed(form, k);
+ 		});
+ 	}
+@@ -10890,6 +10926,9 @@
+ 		if (HC && !GOPD(HC, 'namedItem')) { /* the bridge's HTMLCollection has its own */ }
+ 		above(DP, function (doc, k) {
+ 			if (k === '' || IDX.test(k)) return null;
++			/* patch 322: no element names k -- skip the attribute
++			 * query, which is a full-document JS walk */
++			if (!anyNamed(doc, 'form,img,embed,object,iframe', k)) return null;
+ 			var hits = [], all = doc.querySelectorAll('form[name],img[name],embed[name],object[name],iframe[name],object[id],img[id]');
+ 			for (var i = 0; i < all.length; i++) {
+ 				var e = all[i], t = e.nodeName;
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10608,6 +10608,38 @@
+ "\t\treturn r;\n"
+ "\t}\n"
+ "\tfunction named(el, n) { return el.id === n || el.getAttribute('name') === n; }\n"
++"\t/* VitaBrowser patch 322: can ANY element of tags carry the name n?\n"
++"\t * An exact, cheap pre-check for the named lookups below, using only\n"
++"\t * native lookups: getElementById, and a plain-selector query (the\n"
++"\t * native matcher) with one attribute read per element. Patch 305\n"
++"\t * wraps every member of Node / Element / HTMLElement for forms, so\n"
++"\t * each firstChild / nodeType / getAttribute read on a form ran the\n"
++"\t * whole control search -- a full-document JS walk for '[form]', the\n"
++"\t * controls' owner walks, and an owner walk per <img> -- and any DOM\n"
++"\t * walk passing a form paid it per read (theguardian.com: ~130 s of\n"
++"\t * CPU in one timer before a document appeared). A name no element\n"
++"\t * carries cannot shadow, so those reads now return at once. */\n"
++"\tfunction anyNamed(node, tags, n) {\n"
++"\t\tif (!node || typeof n !== 'string' || n === '') return true;\n"
++"\t\t/* its own reads (ownerDocument and getAttribute on a form, ...)\n"
++"\t\t * must not re-enter the named lookups: run under 297's guard,\n"
++"\t\t * as the search does */\n"
++"\t\tvar was = inNamed;\n"
++"\t\tinNamed = true;\n"
++"\t\ttry {\n"
++"\t\t\tvar doc = node.nodeType === 9 ? node : node.ownerDocument || d;\n"
++"\t\t\tif (doc.getElementById(n)) return true;\n"
++"\t\t\tvar a = doc.querySelectorAll(tags);\n"
++"\t\t\tfor (var i = 0; i < a.length; i++)\n"
++"\t\t\t\tif (a[i].getAttribute('name') === n) return true;\n"
++"\t\t\treturn false;\n"
++"\t\t} catch (e) {\n"
++"\t\t\treturn true;\t/* unsure: take the full search */\n"
++"\t\t} finally {\n"
++"\t\t\tinNamed = was;\n"
++"\t\t}\n"
++"\t}\n"
++"\tvar NAMEABLE = LISTED + ',img';\n"
+ "\n"
+ "\t/* a live list over a source of elements */\n"
+ "\tfunction live(P, src, extra) {\n"
+@@ -10764,6 +10796,8 @@
+ "\t\tvar inNamed = false, wrapped = {};\n"
+ "\t\tfunction controlsFirst(form, k) {\n"
+ "\t\t\tif (inNamed) return undefined;\n"
++"\t\t\tif (!IDX.test(k) && !anyNamed(form, NAMEABLE, k))\n"
++"\t\t\t\treturn undefined;\t/* patch 322 */\n"
+ "\t\t\tinNamed = true;\n"
+ "\t\t\tvar v;\n"
+ "\t\t\ttry {\n"
+@@ -10855,6 +10889,8 @@
+ "\t\t\t});\n"
+ "\t\tabove(FP, function (form, k) {\n"
+ "\t\t\tif (IDX.test(k)) return controls(form)[+k];\n"
++"\t\t\tif (k !== '' && !anyNamed(form, NAMEABLE, k))\n"
++"\t\t\t\treturn null;\t/* patch 322 */\n"
+ "\t\t\treturn k === '' ? null : formNamed(form, k);\n"
+ "\t\t});\n"
+ "\t}\n"
+@@ -10891,6 +10927,9 @@
+ "\t\tif (HC && !GOPD(HC, 'namedItem')) { /* the bridge's HTMLCollection has its own */ }\n"
+ "\t\tabove(DP, function (doc, k) {\n"
+ "\t\t\tif (k === '' || IDX.test(k)) return null;\n"
++"\t\t\t/* patch 322: no element names k -- skip the attribute\n"
++"\t\t\t * query, which is a full-document JS walk */\n"
++"\t\t\tif (!anyNamed(doc, 'form,img,embed,object,iframe', k)) return null;\n"
+ "\t\t\tvar hits = [], all = doc.querySelectorAll('form[name],img[name],embed[name],object[name],iframe[name],object[id],img[id]');\n"
+ "\t\t\tfor (var i = 0; i < all.length; i++) {\n"
+ "\t\t\t\tvar e = all[i], t = e.nodeName;\n"

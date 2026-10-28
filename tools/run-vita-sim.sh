@@ -351,6 +351,7 @@ NET-js-timer-nesting http://127.0.0.1:$HP/JS-timer-nesting.html
 NET-js-resource-timing http://127.0.0.1:$HP/JS-resource-timing.html
 NET-js-form-values http://127.0.0.1:$HP/JS-form-values.html
 NET-js-form-named http://127.0.0.1:$HP/JS-form-named.html
+NET-js-form-walk-cost http://127.0.0.1:$HP/JS-form-walk-cost.html
 NET-js-form-target http://127.0.0.1:$HP/JS-form-target.html
 NET-js-link-click http://127.0.0.1:$HP/JS-link-click.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
@@ -1347,6 +1348,20 @@ sr_check NET-js-sheet-scope-unb "SHEETSCOPE-UNB: 5/5 passed" \
 sr_check NET-js-sheet-scope-quirks "SHEETSCOPE-Q: 3/3 passed" \
 	"bounded changed=1 anchors=1 roots=1;unbounded reason=admission;unbounded reason=admission" \
 	"bounded=1 unbounded=2 at-rule=0 counter=0 nesting=0 escape=0 unanchored=0 too-many=0 admission=2 no-source=0"
+# Patch 322: a DOM walk past a <form> no longer runs the named-control
+# search per member read (patch 305 wraps Node / Element members for
+# forms; theguardian.com spent ~130 s of CPU in one timer). The page times
+# 20 attribute-selector queries (the polyfill's JS walk) over ~2000
+# elements with forms and named images -- ~3.7 s before 322, ~0.3 s after,
+# bound 1500 ms on the monotonic clock -- and keeps 305's semantics (a
+# control named firstChild still shadows; document named access). Bottom
+# dump: the summary sits below a 7000 px spacer, as on the 320 pages.
+fwp=$(ls "$R"/*NET-js-form-walk-cost-bottom.plot 2>/dev/null | head -1)
+fwr=$(sed -n 's/.*STR \(FORMWALK: [0-9]*\/[0-9]* passed\).*/\1/p' "$fwp" 2>/dev/null | head -1)
+fwt=$(sed -n 's/.*STR 1 attribute query x20 with forms present: \([0-9]*\) ms.*/\1/p' "$fwp" 2>/dev/null | head -1)
+echo "  JS-form-walk-cost: ${fwr:-no summary}; 20 queries ${fwt:-?} ms"
+[ -n "$fwp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$fwp" | sed 's/^STR /  /'
+[ "$fwr" = "FORMWALK: 3/3 passed" ] || o2_bad="$o2_bad js-form-walk-cost"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest
