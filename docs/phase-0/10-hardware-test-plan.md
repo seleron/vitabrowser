@@ -6446,3 +6446,35 @@ counter. `macsurf_js_note_dom_mutation` sits on the reconvert-mark path,
 which some mutations return before reaching, so it is not one.
 
 Full gate: `gate323.log`, exit 0.
+
+## Patch 324 (2026-10-28): the form named-access check is cached on a libdom tree generation
+
+This removes the remaining Stack Overflow challenge cost recorded under
+r59. Patch 322's `anyNamed()` was reached once per pending record from
+the MutationObserver delivery loop (`root.contains(...)` on an observed
+form), asking the same question between DOM changes.
+
+- **libdom** (`324-libdom-tree-generation.patch`): `dom_tree_generation()`
+  is a process-wide counter, bumped in `_dom_node_attach_range`,
+  `_dom_node_detach_range`, `_dom_node_replace` and
+  `__dom_dispatch_attr_modified_event`. Every change to which elements
+  are in a tree, or to what their attributes are, moves it.
+- **netsurf** (`324-netsurf-form-named-cache.patch`): `__vitaDomGen()`
+  exposes the counter. Like the other `__vita*` helpers it does not
+  enumerate. `anyNamed()` keeps its answers per document and drops
+  them when the generation moves.
+
+**Numbers.**
+- The Stack Overflow challenge now clears at 5.5 / 5.8 / 5.5 s (it
+  was 8.9–9.1 s after 323, and 5.25 s with no shadowing at all).
+- Scorecard against the r59 reference: Stack Overflow 83.0, Guardian
+  80.6.
+- JS-form-walk-cost leg 5 checks that after a cached miss, an attached
+  control shadows at once, a renamed one moves the shadow and a removed
+  one reverts it. Built with the generation frozen, the leg fails.
+- FORMWALK 5/5, with the 20 queries in 30 ms (304 ms at 322).
+
+Full gate: `gate324.log`, exit 0.
+
+**Device:** not cross-built yet. The next VPK carries the libdom change
+too, because `tools/build-vita.sh` builds libdom from the patch stack.
