@@ -6478,3 +6478,93 @@ Full gate: `gate324.log`, exit 0.
 
 **Device:** not cross-built yet. The next VPK carries the libdom change
 too, because `tools/build-vita.sh` builds libdom from the patch stack.
+
+## Run 40 — hand-off (2026-10-28 20:25; replaces untested run 39)
+
+**Flash this build:**
+- VitaBrowser.vpk `d2008e91051c`
+- VitaBrowser-ext.vpk `fc9d97e6c6f9`
+- nsvita.elf `9c50abf950b1`
+
+These are patches through 324, built at d8632fb = origin/master. Full
+SHA256 of VitaBrowser.vpk:
+`d2008e91051c76de228086673ba1f1024fa34418b8881d9f066863768dafcea0`.
+
+Run 39 (`e147e12166d2`) has no `results\`, so run 40 carries everything
+since run 27: **patches 168-324 + patches/quickjs/05-06 +
+patches/wasm3/01**, all unverified on hardware. New since run 39:
+- **320:** `<style>` text-edit absorb.
+- **321:** the sheet-reach census.
+- **322-324:** the form named-access fixes (Guardian timer stall,
+  Stack Overflow's Cloudflare challenge). 324 changes libdom as well.
+
+**Where the files are:**
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-10-28-run40/`
+  (SHA256SUMS, reference dumps, the reference run in `sim/`, and the
+  file:// page runs in `pages/`).
+- `Desktop\VitaBrowser-hwtest\`: the VPKs and new `reference-dumps\`.
+  Run 39's dumps are now `reference-dumps-run39\`.
+- `C:\Users\seleron\VitaBrowser-hwtest\`: the same, plus nsvita.elf and
+  SHA256SUMS.
+
+Before anything was overwritten, both folders' run-39 files were checked
+against run 39's archive. All copies were checked with `sha256sum -c`.
+
+**Build.** Applytest was verified equal to the committed stack (410
+applied + the two known collisions, no source differences) rather than
+restaged. The full sim gate passed at this tree (gate324, exit 0).
+- Renderer 106/106 + 30/30.
+- Streams 4/4 (on the host nsmonkey build).
+- Cross-build green in 4m05s (`build-vita-run40.log`), with no
+  warnings in 321-324's code.
+- Both VPKs pass `unzip -t`. The ELF carries `LIFE SHEETREACH`,
+  `LIFE SHEETREACHCENSUS` and the 322-324 polyfill (`anyNamed`,
+  `shadow323`, `__vitaDomGen`), and links `dom_tree_generation` from
+  the patched libdom.
+- The VPK bundles the four new gate pages.
+
+**Reference autotest under device conditions** (netlog off,
+`ux0:download` a file): interact **52/52**, js **18/18**, 34 dumps, no
+refused bitmaps. 32 of the 34 dumps are byte-identical to run 39's. The
+other two are IN-history and IN-home-recent, whose order varies.
+
+**Harness note:** on this machine, port 8080 is held by the Hermes
+signal-cli daemon. A reference run must set `VITA_SIM_REMOTE_PORT`
+(here 45180), as `run-vita-sim.sh` does. Without it, interact reads
+47/52: step 37's LAN-listener push goes to signal-cli, and steps 38 and
+40-42 fail with it.
+
+**On the device:** start `receive-results.bat` first, then:
+
+1. **The autotest** (SELECT + SQUARE): every `.plot` SAME against
+   `reference-dumps\`, except IN-history and IN-home-recent (order),
+   07-PM-animation (time-varying) and the NET-*-example pages (live
+   example.com). Expect interact **52/52**, js **18/18**, `bitmaps: ...
+   0 refused` after every page, and no crash.
+2. **Run 39's list, unchanged** (its section above): the
+   images-at-group-opacity page (CSS-opacity-image) and its settle
+   time, the new-pages table, and the sites by hand.
+3. **The new bundled pages**, opened as
+   `file:///app0:/testpages/<page>.html`. These were measured in the
+   simulator with this build over file:// (15 s settle).
+
+| page | expected | netsurf.log |
+|---|---|---|
+| JS-style-absorb | STYLEABS 4/4 | `LIFE STYLETEXT absorbed` x4 |
+| JS-sheet-scope | SHEETSCOPE 5/5 | 5 `LIFE SHEETREACH` lines: bounded, bounded, unbounded unanchored, bounded, bounded |
+| JS-sheet-scope-unb | SHEETSCOPE-UNB 5/5 | 5 unbounded: at-rule, counter, nesting, at-rule, unanchored |
+| JS-sheet-scope-quirks | SHEETSCOPE-Q 3/3 | bounded, then 2 x unbounded admission |
+| JS-form-walk-cost | FORMWALK 5/5 | leg 1 times 20 queries against a 1500 ms bound (30 ms in the sim). Report the number the page prints: it is the first device reading of the form-path cost, and the bound may be tight at the Vita's speed |
+
+4. **Sites, by hand. This is the main data this run is for:**
+   - **theguardian.com/uk:** the first document should arrive in
+     seconds, not minutes (322). Report the time to first paint.
+   - **stackoverflow.com/questions:** report how long the Cloudflare
+     "Just a moment..." page takes to clear (323-324). It is about
+     5.5 s in the simulator.
+   - **The B1 census from real browsing.** Browse CSS-in-JS sites
+     (the Guardian, BBC, claude.ai) and interact with them (open
+     menus, expand items, switch tabs), not only load them. Then
+     collect netsurf.log's `LIFE SHEETREACH`, `LIFE SHEETREACHCENSUS`,
+     `LIFE SHEETIDCENSUS` and `LIFE SHEETCAUSE` lines. Doc 23 piece C
+     is on hold until this data exists (its 2026-10-28 later status).
