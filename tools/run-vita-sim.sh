@@ -1356,12 +1356,14 @@ sr_check NET-js-sheet-scope-quirks "SHEETSCOPE-Q: 3/3 passed" \
 # bound 1500 ms on the monotonic clock -- and keeps 305's semantics (a
 # control named firstChild still shadows; document named access). Bottom
 # dump: the summary sits below a 7000 px spacer, as on the 320 pages.
+# Patch 323 adds leg 4: the members every node shares are not 305's form
+# wrappers (they moved into the form-only Proxy layer).
 fwp=$(ls "$R"/*NET-js-form-walk-cost-bottom.plot 2>/dev/null | head -1)
 fwr=$(sed -n 's/.*STR \(FORMWALK: [0-9]*\/[0-9]* passed\).*/\1/p' "$fwp" 2>/dev/null | head -1)
 fwt=$(sed -n 's/.*STR 1 attribute query x20 with forms present: \([0-9]*\) ms.*/\1/p' "$fwp" 2>/dev/null | head -1)
 echo "  JS-form-walk-cost: ${fwr:-no summary}; 20 queries ${fwt:-?} ms"
 [ -n "$fwp" ] && grep -o 'STR [0-9] [^"]*FAIL' "$fwp" | sed 's/^STR /  /'
-[ "$fwr" = "FORMWALK: 3/3 passed" ] || o2_bad="$o2_bad js-form-walk-cost"
+[ "$fwr" = "FORMWALK: 4/4 passed" ] || o2_bad="$o2_bad js-form-walk-cost"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest

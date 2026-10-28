@@ -1,0 +1,215 @@
+# netsurf: form named shadowing of inherited members moves into the form-only Proxy layer (patch 323)
+# Generated 2026-10-28
+# Base: seleron/vitabrowser (patch stack through 322)
+#
+# Patch 305 made a form's named controls shadow the whole prototype
+# chain ([LegacyOverrideBuiltIns]) by wrapping every member of every
+# prototype from HTMLFormElement.prototype up to Object.prototype IN
+# PLACE. Node.prototype / Element.prototype / HTMLElement.prototype /
+# EventTarget.prototype members are shared by every node, so every
+# node's firstChild, nodeType, getAttribute, contains, ... became a JS
+# getter or method wrapper plus an isPrototypeOf test, on every page.
+# The fresh scorecard r59 caught it: stackoverflow.com's Cloudflare
+# challenge needed ~23.5 s of CPU (5.25 s with the chain wrapping
+# disabled, same day), so the page cleared past the 15 s settle and
+# scored text 0 (85.8 -> 41.5).
+#
+#  - vita_polyfill.js: only HTMLFormElement.prototype's own members are
+#    wrapped in place (patch 297's rule). Names above it -- configurable
+#    members below Object.prototype, the lowest occurrence deciding, as
+#    305 chose them -- go into a null-prototype map. Patch 288's Proxy
+#    layer, which already sits between HTMLFormElement.prototype and
+#    its parent so that only a form's lookups pass through it, consults
+#    controlsFirst for those names in its get trap. A new set trap keeps
+#    297's write rule (a shadowed method name swallows the write) and
+#    305's (an accessor's write reaches its built-in setter, through
+#    Reflect.set). above() takes the map and lookup as optional
+#    arguments; the document's layer is unchanged.
+#  - Every non-form node's members are native again, and their
+#    descriptors are the bridge's own once more.
+#
+# Measured (simulator, run-live-sites, three runs each):
+# stackoverflow.com/questions challenge cleared at 23.3 / 23.7 / 24.4 s
+# -> 8.9 / 9.0 / 9.1 s. FORMNAMED 7/7, FORMVAL 8/8, FORMTARGET 5/5,
+# FORMWALK 3/3, DESCRIPTORS 7/7, NODESHAPE 6/6, BSHAPE 8/8, APIPROTO 7/7,
+# DOCSHAPE 6/6. Remaining cost against no shadowing (~3.8 s on that
+# challenge) is 322's anyNamed reached through the layer from the
+# MutationObserver delivery loop's root.contains on an observed form.
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -10757,18 +10757,40 @@
+ 		});
+ 	}
+ 	function isA(o, P) { try { return o !== P && P.isPrototypeOf(o); } catch (e) { return false; } }
+-	function above(P, lookup) {
++	/* shadow (patch 323, forms only): names found ABOVE P that P's
++	 * instances' named items still override -- a null-prototype map
++	 * { name: 'value' | 'accessor' } -- and first(obj, k), the
++	 * override or undefined.
++	 * Only P's instances look anything up through this layer, so every
++	 * other object keeps its native members untouched. */
++	function above(P, lookup, shadow, first) {
+ 		var parent = Object.getPrototypeOf(P);
+ 		if (!parent || PRIV.namedAbove && PRIV.namedAbove.indexOf(parent) >= 0) return;
+-		var px = new Proxy(parent, {
++		var h = {
+ 			get: function (t, k, r) {
+-				if (typeof k === 'string' && !(k in t) && isA(r, P)) {
+-					var v = lookup(r, k);
+-					if (v !== undefined && v !== null) return v;
++				if (typeof k === 'string' && isA(r, P)) {
++					var v;
++					if (!(k in t)) {
++						v = lookup(r, k);
++						if (v !== undefined && v !== null) return v;
++					} else if (shadow && shadow[k]) {
++						v = first(r, k);
++						if (v !== undefined) return v;
++					}
+ 				}
+ 				return Reflect.get(t, k, r);
+ 			}
+-		});
++		};
++		/* a shadowed method name swallows the write (patch 297's rule,
++		 * kept); an accessor's write reaches its built-in setter
++		 * (patch 305's), which Reflect.set does */
++		if (shadow) h.set = function (t, k, v, r) {
++			if (typeof k === 'string' && shadow[k] === 'value' &&
++			    isA(r, P) && first(r, k) !== undefined)
++				return true;
++			return Reflect.set(t, k, v, r);
++		};
++		var px = new Proxy(parent, h);
+ 		try { Object.setPrototypeOf(P, px); } catch (e) { return; }
+ 		(PRIV.namedAbove || (PRIV.namedAbove = [])).push(px);
+ 	}
+@@ -10878,20 +10900,36 @@
+ 		 * configurable cannot be wrapped and keeps not shadowing;
+ 		 * the isA guard keeps every other element's reads and
+ 		 * writes exactly as they were. */
+-		var seen305 = {};
++		/* VitaBrowser patch 323: only HTMLFormElement.prototype's own
++		 * members are wrapped in place. 305 wrapped every member of
++		 * HTMLElement / Element / Node / EventTarget where it sits, so
++		 * EVERY node's firstChild / nodeType / getAttribute / ... read
++		 * became a JS getter plus an isPrototypeOf, in every page: the
++		 * stackoverflow.com Cloudflare challenge went from ~5 s of CPU
++		 * to ~23.5 s (scorecard r59: past the settle, text score 0).
++		 * The names above FP shadow through patch 288's Proxy layer
++		 * instead, which sits between FP and its parent -- only a
++		 * form's lookups pass through it -- with the same rule:
++		 * configurable members below Object.prototype, the lowest
++		 * occurrence deciding, FP's own handled by the wrap. */
++		var seen305 = {}, shadow323 = Object.create(null);
+ 		for (var chain = FP; chain && chain !== Object.prototype;
+ 		     chain = Object.getPrototypeOf(chain))
+ 			Reflect.ownKeys(chain).forEach(function (k) {
+ 				if (typeof k !== 'string' || seen305[k]) return;
+ 				seen305[k] = true;
+-				wrapMember(chain, k);
++				if (chain === FP) { wrapMember(chain, k); return; }
++				var desc = GOPD(chain, k);
++				if (desc && desc.configurable &&
++				    ('value' in desc || desc.get))
++					shadow323[k] = 'value' in desc ? 'value' : 'accessor';
+ 			});
+ 		above(FP, function (form, k) {
+ 			if (IDX.test(k)) return controls(form)[+k];
+ 			if (k !== '' && !anyNamed(form, NAMEABLE, k))
+ 				return null;	/* patch 322 */
+ 			return k === '' ? null : formNamed(form, k);
+-		});
++		}, shadow323, controlsFirst);
+ 	}
+ 
+ 	/* document.forms, and the document's named access */
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -10758,18 +10758,40 @@
+ "\t\t});\n"
+ "\t}\n"
+ "\tfunction isA(o, P) { try { return o !== P && P.isPrototypeOf(o); } catch (e) { return false; } }\n"
+-"\tfunction above(P, lookup) {\n"
++"\t/* shadow (patch 323, forms only): names found ABOVE P that P's\n"
++"\t * instances' named items still override -- a null-prototype map\n"
++"\t * { name: 'value' | 'accessor' } -- and first(obj, k), the\n"
++"\t * override or undefined.\n"
++"\t * Only P's instances look anything up through this layer, so every\n"
++"\t * other object keeps its native members untouched. */\n"
++"\tfunction above(P, lookup, shadow, first) {\n"
+ "\t\tvar parent = Object.getPrototypeOf(P);\n"
+ "\t\tif (!parent || PRIV.namedAbove && PRIV.namedAbove.indexOf(parent) >= 0) return;\n"
+-"\t\tvar px = new Proxy(parent, {\n"
++"\t\tvar h = {\n"
+ "\t\t\tget: function (t, k, r) {\n"
+-"\t\t\t\tif (typeof k === 'string' && !(k in t) && isA(r, P)) {\n"
+-"\t\t\t\t\tvar v = lookup(r, k);\n"
+-"\t\t\t\t\tif (v !== undefined && v !== null) return v;\n"
++"\t\t\t\tif (typeof k === 'string' && isA(r, P)) {\n"
++"\t\t\t\t\tvar v;\n"
++"\t\t\t\t\tif (!(k in t)) {\n"
++"\t\t\t\t\t\tv = lookup(r, k);\n"
++"\t\t\t\t\t\tif (v !== undefined && v !== null) return v;\n"
++"\t\t\t\t\t} else if (shadow && shadow[k]) {\n"
++"\t\t\t\t\t\tv = first(r, k);\n"
++"\t\t\t\t\t\tif (v !== undefined) return v;\n"
++"\t\t\t\t\t}\n"
+ "\t\t\t\t}\n"
+ "\t\t\t\treturn Reflect.get(t, k, r);\n"
+ "\t\t\t}\n"
+-"\t\t});\n"
++"\t\t};\n"
++"\t\t/* a shadowed method name swallows the write (patch 297's rule,\n"
++"\t\t * kept); an accessor's write reaches its built-in setter\n"
++"\t\t * (patch 305's), which Reflect.set does */\n"
++"\t\tif (shadow) h.set = function (t, k, v, r) {\n"
++"\t\t\tif (typeof k === 'string' && shadow[k] === 'value' &&\n"
++"\t\t\t    isA(r, P) && first(r, k) !== undefined)\n"
++"\t\t\t\treturn true;\n"
++"\t\t\treturn Reflect.set(t, k, v, r);\n"
++"\t\t};\n"
++"\t\tvar px = new Proxy(parent, h);\n"
+ "\t\ttry { Object.setPrototypeOf(P, px); } catch (e) { return; }\n"
+ "\t\t(PRIV.namedAbove || (PRIV.namedAbove = [])).push(px);\n"
+ "\t}\n"
+@@ -10879,20 +10901,36 @@
+ "\t\t * configurable cannot be wrapped and keeps not shadowing;\n"
+ "\t\t * the isA guard keeps every other element's reads and\n"
+ "\t\t * writes exactly as they were. */\n"
+-"\t\tvar seen305 = {};\n"
++"\t\t/* VitaBrowser patch 323: only HTMLFormElement.prototype's own\n"
++"\t\t * members are wrapped in place. 305 wrapped every member of\n"
++"\t\t * HTMLElement / Element / Node / EventTarget where it sits, so\n"
++"\t\t * EVERY node's firstChild / nodeType / getAttribute / ... read\n"
++"\t\t * became a JS getter plus an isPrototypeOf, in every page: the\n"
++"\t\t * stackoverflow.com Cloudflare challenge went from ~5 s of CPU\n"
++"\t\t * to ~23.5 s (scorecard r59: past the settle, text score 0).\n"
++"\t\t * The names above FP shadow through patch 288's Proxy layer\n"
++"\t\t * instead, which sits between FP and its parent -- only a\n"
++"\t\t * form's lookups pass through it -- with the same rule:\n"
++"\t\t * configurable members below Object.prototype, the lowest\n"
++"\t\t * occurrence deciding, FP's own handled by the wrap. */\n"
++"\t\tvar seen305 = {}, shadow323 = Object.create(null);\n"
+ "\t\tfor (var chain = FP; chain && chain !== Object.prototype;\n"
+ "\t\t     chain = Object.getPrototypeOf(chain))\n"
+ "\t\t\tReflect.ownKeys(chain).forEach(function (k) {\n"
+ "\t\t\t\tif (typeof k !== 'string' || seen305[k]) return;\n"
+ "\t\t\t\tseen305[k] = true;\n"
+-"\t\t\t\twrapMember(chain, k);\n"
++"\t\t\t\tif (chain === FP) { wrapMember(chain, k); return; }\n"
++"\t\t\t\tvar desc = GOPD(chain, k);\n"
++"\t\t\t\tif (desc && desc.configurable &&\n"
++"\t\t\t\t    ('value' in desc || desc.get))\n"
++"\t\t\t\t\tshadow323[k] = 'value' in desc ? 'value' : 'accessor';\n"
+ "\t\t\t});\n"
+ "\t\tabove(FP, function (form, k) {\n"
+ "\t\t\tif (IDX.test(k)) return controls(form)[+k];\n"
+ "\t\t\tif (k !== '' && !anyNamed(form, NAMEABLE, k))\n"
+ "\t\t\t\treturn null;\t/* patch 322 */\n"
+ "\t\t\treturn k === '' ? null : formNamed(form, k);\n"
+-"\t\t});\n"
++"\t\t}, shadow323, controlsFirst);\n"
+ "\t}\n"
+ "\n"
+ "\t/* document.forms, and the document's named access */\n"
