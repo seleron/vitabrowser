@@ -6408,3 +6408,41 @@ page caught that (0/7, stack overflow) before the gate.
   page.
 
 The full gate passed (`gate322.log`, exit 0).
+
+## Scorecard r59 (2026-10-28): fresh reference, patches through 322, and patch 323
+
+This is the first fresh scorecard since r58 (patches through 285). The
+run is `scorecard.py --out score/r59-322-fresh --baseline
+score/r58-285-fresh/scores.json`, with a new Chromium reference and the
+default 15 s settle.
+
+**Mean 81.3 across 24 sites.** Every site that loads stayed within
+±2.2 of r58 except one:
+- **stackoverflow.com, 85.8 → 41.5 (text 0).** The page rendered
+  correctly, but Cloudflare's challenge only cleared at 24.3 s, past the
+  settle, so the text was taken from the challenge page.
+- Three repeat runs cleared at 23.3, 23.7 and 24.4 s, all CPU.
+- With patch 305's whole-chain wrapping disabled (same day, same
+  build), it cleared at 5.25 s.
+
+**Patch 323.** Patch 305 had wrapped the shared Node, Element,
+HTMLElement and EventTarget members in place, so every node's every
+read went through a JS wrapper. Patch 323 moves the shadowing of
+inherited names into patch 288's Proxy layer above
+HTMLFormElement.prototype, which only forms' lookups pass through.
+- The challenge now clears at 8.9 / 9.0 / 9.1 s.
+- Stack Overflow scores 84.1 against the r59 reference.
+- With that, the r59 mean is about 83.1.
+
+JS-form-walk-cost gains a structural leg 4. Calling Node's `firstChild`
+getter on a form must return its real first child, and `getAttribute`
+must be a plain method. The leg fails on 322.
+
+**Remaining:** about 3.8 s on that challenge compared with no shadowing.
+It is patch 322's `anyNamed`, reached through the form layer from the
+MutationObserver delivery loop's `root.contains(...)` on an observed
+form. A cache would remove it, but it needs a complete DOM-change
+counter. `macsurf_js_note_dom_mutation` sits on the reconvert-mark path,
+which some mutations return before reaching, so it is not one.
+
+Full gate: `gate323.log`, exit 0.
