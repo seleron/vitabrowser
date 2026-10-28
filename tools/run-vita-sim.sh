@@ -254,6 +254,9 @@ NET-js-batch-burst http://127.0.0.1:$HP/JS-batch-burst.html
 NET-js-attr-local http://127.0.0.1:$HP/JS-attr-local.html
 NET-js-sheet-census http://127.0.0.1:$HP/JS-sheet-census.html
 NET-js-style-absorb http://127.0.0.1:$HP/JS-style-absorb.html
+NET-js-sheet-scope http://127.0.0.1:$HP/JS-sheet-scope.html
+NET-js-sheet-scope-unb http://127.0.0.1:$HP/JS-sheet-scope-unb.html
+NET-js-sheet-scope-quirks http://127.0.0.1:$HP/JS-sheet-scope-quirks.html
 NET-js-cssom http://127.0.0.1:$HP/JS-cssom.html
 NET-js-cssom-190 http://127.0.0.1:$HP/JS-cssom-190.html
 NET-js-abspos191 http://127.0.0.1:$HP/JS-abspos191.html
@@ -1300,6 +1303,50 @@ sam=$(grep -c 'STR MIXED-AFTER' "$sap" 2>/dev/null || true)
 echo "  JS-style-absorb: ${sar:-no summary}; absorbed=${sab_abs} full=${sab_full} (sheet batches ${sab_sheet}); paragraph painted=${sam:-0}"
 [ "$sar" = "STYLEABS: 4/4 passed" ] && [ "${sam:-0}" -ge 1 ] && [ "$sab_abs" -ge 4 ] && \
 	[ "$sab_full" -ge 1 ] && [ "$sab_full" -eq "$sab_sheet" ] || o2_bad="$o2_bad js-style-absorb"
+# Patch 321 (doc 23 B1): the reach census, census only. Every
+# single-identified current sheet batch logs "LIFE SHEETREACH bounded
+# changed=K anchors=A roots=R walked=N" or "... unbounded reason=<cause>";
+# the navigation reset prints "LIFE SHEETREACHCENSUS". Three pages, one
+# <style> edit per leg, each leg also asserting its restyle (bottom dump,
+# 7000 px spacer as at 320). The per-leg lines must match in order (walked
+# is reported, not compared). A page's census line is printed at the NEXT
+# page's navigation reset, so it is read from the following page's window;
+# no-source=0 there means every first edit found the old sheet's source.
+sr_lines() {
+	awk -v p="$1" '$0 ~ "page [0-9]+/[0-9]+ " p ": navigate" {on=1; next}
+		on && /page [0-9]+\/[0-9]+ [^ ]*: navigate/ {on=0}
+		on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE SHEETREACH \(un\)\{0,1\}bounded' |
+		sed 's/.*LIFE SHEETREACH //; s/ walked=[0-9]*//' | paste -sd';' -
+}
+sr_walked() {
+	awk -v p="$1" '$0 ~ "page [0-9]+/[0-9]+ " p ": navigate" {on=1; next}
+		on && /page [0-9]+\/[0-9]+ [^ ]*: navigate/ {on=0}
+		on' "$R/netsurf.log" 2>/dev/null | sed -n 's/.*LIFE SHEETREACH bounded.* walked=\([0-9]*\).*/\1/p' | paste -sd',' -
+}
+sr_census() {
+	awk -v p="$1" '$0 ~ "page [0-9]+/[0-9]+ " p ": navigate" {st=1; next}
+		st == 1 && /page [0-9]+\/[0-9]+ [^ ]*: navigate/ {st=2; next}
+		st == 2 && /page [0-9]+\/[0-9]+ [^ ]*: navigate/ {exit}
+		st == 2 && /LIFE SHEETREACHCENSUS / {sub(/.*LIFE SHEETREACHCENSUS /, ""); print; exit}' \
+		"$R/netsurf.log" 2>/dev/null
+}
+sr_check() {	# page summary-expected lines-expected census-expected
+	srp=$(ls "$R"/*"$1"-bottom.plot 2>/dev/null | head -1)
+	srs=$(sed -n 's/.*STR \(SHEETSCOPE[-A-Z]*: [0-9]*\/[0-9]* passed\).*/\1/p' "$srp" 2>/dev/null | head -1)
+	srl=$(sr_lines "$1"); src=$(sr_census "$1")
+	echo "  ${1#NET-}: ${srs:-no summary}; reach: ${srl:-none} (walked $(sr_walked "$1"))"
+	echo "    census: ${src:-none}"
+	[ "$srs" = "$2" ] && [ "$srl" = "$3" ] && [ "$src" = "$4" ] || o2_bad="$o2_bad ${1#NET-}"
+}
+sr_check NET-js-sheet-scope "SHEETSCOPE: 5/5 passed" \
+	"bounded changed=1 anchors=1 roots=3;bounded changed=1 anchors=1 roots=2;unbounded reason=unanchored;bounded changed=1 anchors=1 roots=1;bounded changed=2 anchors=1 roots=1" \
+	"bounded=4 unbounded=1 at-rule=0 counter=0 nesting=0 escape=0 unanchored=1 too-many=0 admission=0 no-source=0"
+sr_check NET-js-sheet-scope-unb "SHEETSCOPE-UNB: 5/5 passed" \
+	"unbounded reason=at-rule;unbounded reason=counter;unbounded reason=nesting;unbounded reason=at-rule;unbounded reason=unanchored" \
+	"bounded=0 unbounded=5 at-rule=2 counter=1 nesting=1 escape=0 unanchored=1 too-many=0 admission=0 no-source=0"
+sr_check NET-js-sheet-scope-quirks "SHEETSCOPE-Q: 3/3 passed" \
+	"bounded changed=1 anchors=1 roots=1;unbounded reason=admission;unbounded reason=admission" \
+	"bounded=1 unbounded=2 at-rule=0 counter=0 nesting=0 escape=0 unanchored=0 too-many=0 admission=2 no-source=0"
 # Patch 188: step 7 is the span:empty{display:none} + comment-child probe
 # (use-after-free repro): the count went 7 -> 8.
 # GATE_TIMING_SOFT=1: REFLOW's check 3 is a wall-clock bound (longest

@@ -1,0 +1,1650 @@
+# netsurf: the sheet-reach census -- how far a <style> edit reaches (patch 321)
+# Generated 2026-10-28
+# Base: seleron/vitabrowser (patch stack through 320)
+#
+# Doc 23 piece B1. CENSUS ONLY: no behaviour change -- every sheet batch
+# still takes the full reconvert. Each single-identified current sheet
+# batch (patch 318's "SHEETID single") now also asks, of the one sheet
+# that changed, how much of the document the edit reached, and logs it.
+# The numbers are the gate for piece C (multi-root rebuild): C is built
+# only if bounded batches dominate on real sites.
+#
+#  - css.c: per <style> entry, two record tables (B.3): reach_prev (the
+#    version the boxes were built from) and reach_cur (the live version),
+#    captured in html_css_process_modified_style before the old handle is
+#    released. A record is one style rule (group at-rule preludes
+#    prefixed; other at-rules and at-statements one record each), hashed
+#    FNV-1a over its text with comments blanked and whitespace collapsed.
+#    The first edit of a <style> scans the outgoing sheet's source
+#    (content_get_source_data); later edits hand reach_cur on. The
+#    incoming table is built eagerly from the element's DOM text (B.3's
+#    lazy build-at-flush is left to C). <link> sheets keep no table.
+#  - html_css_sheet_reach_census(): the common prefix/suffix of the two
+#    hash sequences is trimmed; the middle (old + new) is the changed set
+#    K (B.2). Unbounded, first cause in this order: no table (no-source),
+#    K > 64 (too-many), a changed at-rule/statement (at-rule), counter
+#    keywords (counter), a nested block (nesting), a backslash in the
+#    prelude (escape), a selector with no anchor (unanchored). Otherwise
+#    the anchors (B.1: the rightmost compound with a plain #id/.class,
+#    outside functional pseudos, that is the subject or followed by a
+#    descendant/child step; id beats class) are resolved in one document
+#    walk (B.4: id exact, class through dom_element_has_class, a matched
+#    element's subtree skipped). No roots is bounded; a root that is
+#    <html>/<body>/<li>, a child of <ol>/<ul>/<menu>, or has no box is
+#    declined (B.5's static checks: admission).
+#  - macos9_reconvert.c: "LIFE SHEETREACH bounded changed=K anchors=A
+#    roots=R walked=N" or "LIFE SHEETREACH unbounded reason=<cause>" beside
+#    each "LIFE SHEETID single"; the navigation reset prints "LIFE
+#    SHEETREACHCENSUS bounded=.. unbounded=.. <cause>=.." (counters reset).
+#  - css.h is made self-contained (forward declarations, struct dom_node
+#    in the prototypes) so macos9_reconvert.c can include it.
+#
+# Host gate pages (SHEETSCOPE 5/5, SHEETSCOPE-UNB 5/5, SHEETSCOPE-Q 3/3):
+# class-anchored insertRule append, anchored behind a sibling step, a
+# sibling-escaping selector, a removed rule (anchor from the old side), a
+# common body{} rule left alone; @font-face, counter-increment, nesting,
+# statement @layer, the body{} rule itself; quirks .Foo vs class="foo",
+# an <li> root, a <body> root.
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -51,6 +51,7 @@
+ struct selection;
+ struct nsurl;
+ struct plot_font_style;
++struct html_css_reach_table;	/**< VitaBrowser patch 321 (doc 23 B1, css.h) */
+ 
+ /**
+  * Container for stylesheets used by an HTML document
+@@ -72,6 +73,14 @@
+ 	 * entry for patch 266's deferred refresh mark. */
+ 	unsigned int mod_count;
+ 	bool mark_pending;
++	/* VitaBrowser patch 321 (doc 23 B1): the reach record tables the
++	 * census (css.c) keeps per entry -- reach_prev the version the boxes
++	 * were last built from, reach_cur the live version, captured at each
++	 * processed edit (B.3's handoff). Inline <style> entries only (a
++	 * <link>'s next version is a fresh fetch, not DOM text); NULL is
++	 * "no table" (never captured, or not inline). Owned. */
++	struct html_css_reach_table *reach_prev;
++	struct html_css_reach_table *reach_cur;
+ };
+ 
+ 
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -24,6 +24,13 @@
+ #ifndef NETSURF_HTML_CSS_H
+ #define NETSURF_HTML_CSS_H
+ 
++/* Self-contained: the types below are used by the prototypes and the
++ * census API (patch 321); css.c gets them from its own includes. */
++struct content;
++struct dom_node;
++struct html_content;
++typedef struct css_select_ctx css_select_ctx;
++
+ /**
+  * Initialise html content css handling.
+  *
+@@ -84,7 +91,7 @@
+  * \param node the DOM link node to process. 
+  * \return true on success else false.
+  */
+-bool html_css_process_link(struct html_content *htmlc, dom_node *node);
++bool html_css_process_link(struct html_content *htmlc, struct dom_node *node);
+ 
+ /**
+  * process a css style dom node 
+@@ -93,7 +100,7 @@
+  * \param node the DOM node to process. 
+  * \return true on success else false.
+  */
+-bool html_css_process_style(struct html_content *htmlc, dom_node *node);
++bool html_css_process_style(struct html_content *htmlc, struct dom_node *node);
+ 
+ /**
+  * process a css style dom node update 
+@@ -102,7 +109,7 @@
+  * \param node the DOM node to process. 
+  * \return true on success else false.
+  */
+-bool html_css_update_style(struct html_content *htmlc, dom_node *node);
++bool html_css_update_style(struct html_content *htmlc, struct dom_node *node);
+ 
+ /**
+  * Walk the parsed DOM tree and discover every <style> and
+@@ -118,5 +125,52 @@
+  */
+ nserror html_css_discover_stylesheets(struct html_content *c);
+ 
++/* VitaBrowser patch 321 (doc 23 B1): the sheet-reach census. A
++ * single-identified current sheet batch asks, of the one sheet that
++ * changed, "how much of the document did this edit reach?" -- the
++ * census of doc 23 stage 1, the gate B1 logs, C decides. The record
++ * tables it diffs are defined in css.c and captured at each processed
++ * edit (the struct html_stylesheet reach_prev / reach_cur fields). */
++struct html_css_reach_table;
++struct html_css_reach_result {
++	/** 1 = the diff is small and every changed record's anchor
++	 * resolves to at least one root that passes B.5's static checks. */
++	int bounded;
++	/** The unbounded cause when !bounded (html_css_reach_reason). */
++	int reason;
++	/** K, the changed records (B.2's middle sum). */
++	unsigned int changed;
++	/** A, the distinct anchor tokens the changed records carry. */
++	unsigned int anchors;
++	/** R, the distinct element roots carrying a token (B.4). */
++	unsigned int roots;
++	/** N, the nodes walked to find them. */
++	unsigned int walked;
++};
++enum html_css_reach_reason {
++	HTML_CSS_REACH_OK = 0,
++	/** a changed record is an at-rule or a statement */
++	HTML_CSS_REACH_AT_RULE,
++	/** a changed record touches counters */
++	HTML_CSS_REACH_COUNTER,
++	/** a changed record has a nested rule */
++	HTML_CSS_REACH_NESTING,
++	/** a changed selector uses an escape */
++	HTML_CSS_REACH_ESCAPE,
++	/** a changed selector has no anchor */
++	HTML_CSS_REACH_UNANCHORED,
++	/** more changed records than the fixed cap */
++	HTML_CSS_REACH_TOO_MANY,
++	/** a root B.5's static checks decline */
++	HTML_CSS_REACH_ADMISSION,
++	/** a table is missing (no inline sheet, first edit) */
++	HTML_CSS_REACH_NO_SOURCE
++};
++/** Run the census for entry `index` of content `cc` into `out`. */
++void html_css_sheet_reach_census(struct content *cc, int index,
++		struct html_css_reach_result *out);
++/** The reason enum values as the log strings (SHEETREACH's reason=
++ * field and the SHEETREACHCENSUS reason counters). */
++const char *html_css_reach_reason_name(int reason);
+ 
+ #endif
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -42,6 +42,8 @@
+ 
+ #include "html/html.h"
+ #include "html/private.h"
++#include "html/box.h"
++#include "html/box_construct.h"	/* patch 321: B.5's box check */
+ 
+ /* VitaBrowser patch 282: Resource Timing (macsurf_frontend_stubs.c) */
+ void macsurf_rt_begin(void *parent, void *handle, const char *initiator);
+@@ -464,12 +466,19 @@
+ 	c->stylesheets[c->stylesheet_count].census_closed = 0;
+ 	c->stylesheets[c->stylesheet_count].mod_count = 0;	/* patch 318 */
+ 	c->stylesheets[c->stylesheet_count].mark_pending = false;
++	c->stylesheets[c->stylesheet_count].reach_prev = NULL;	/* 321 */
++	c->stylesheets[c->stylesheet_count].reach_cur = NULL;
+ 	c->stylesheet_count++;
+ 
+ 	return c->stylesheets + (c->stylesheet_count - 1);
+ }
+ 
+ 
++/* patch 321 (doc 23 B1, B.3): capture both versions' record tables at
++ * the processed edit (defined with the census below) */
++static void html_css_reach_capture(html_content *c,
++		struct html_stylesheet *s);
++
+ static bool
+ html_css_process_modified_style(html_content *c, struct html_stylesheet *s)
+ {
+@@ -479,6 +488,12 @@
+ 	/* patch 318 (doc 23 piece A): every (re)process moves the entry's
+ 	 * counter, before the new sheet can finish and mark */
+ 	s->mod_count++;
++
++	/* patch 321 (doc 23 B1, B.3): capture both versions' record
++	 * tables now -- the old sheet's source dies at the release below,
++	 * and the <style>'s DOM text is the new version's source. */
++	html_css_reach_capture(c, s);
++
+ 	error = html_stylesheet_from_domnode(c, s->node, &sheet);
+ 	if (error != NSERROR_OK) {
+ 		NSLOG(netsurf, INFO, "Failed to update sheet");
+@@ -694,6 +709,8 @@
+ 	htmlc->stylesheets[htmlc->stylesheet_count].census_closed = 0;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].mod_count = 0;	/* patch 318 */
+ 	htmlc->stylesheets[htmlc->stylesheet_count].mark_pending = false;
++	htmlc->stylesheets[htmlc->stylesheet_count].reach_prev = NULL;	/* 321 */
++	htmlc->stylesheets[htmlc->stylesheet_count].reach_cur = NULL;
+ 
+ 	/* start fetch */
+ 	child.charset = htmlc->encoding;
+@@ -759,6 +776,10 @@
+ }
+ 
+ 
++/* VitaBrowser patch 321 (doc 23 B1): the reach record table, freed with
++ * the stylesheet entry it belongs to (defined with the census below). */
++static void html_css_reach_table_free(struct html_css_reach_table *t);
++
+ /* exported function documented in html/css.h */
+ nserror html_css_free_stylesheets(html_content *html)
+ {
+@@ -768,6 +789,8 @@
+ 	guit->misc->schedule(-1, html_css_deferred_refresh, html);	/* 266 */
+ 
+ 	for (i = 0; i != html->stylesheet_count; i++) {
++		html_css_reach_table_free(html->stylesheets[i].reach_prev);
++		html_css_reach_table_free(html->stylesheets[i].reach_cur);
+ 		if (html->stylesheets[i].sheet != NULL) {
+ 			hlcache_handle_release(html->stylesheets[i].sheet);
+ 		}
+@@ -946,6 +969,1315 @@
+ 
+ 
+ /* exported function documented in html/css.h */
++/* =========================================================================
++ * VitaBrowser patch 321 (doc 23 B1): the sheet-reach census.
++ *
++ * B0 (patch 320) made a <style> text edit reach the reconvert as one sheet
++ * batch; A (patch 318) gave the mark the sheet's identity. B1 asks, of the
++ * single-identified CURRENT batch, "how much of the document did this edit
++ * reach?" and logs the answer -- it decides nothing yet: B1's census is the
++ * gate C decides (doc 23 piece C).
++ *
++ * Per sheet entry the handler keeps two record tables (B.3): reach_prev,
++ * the version the boxes were last built from, and reach_cur, the live
++ * version. A record is a style rule (selector list + block); a group
++ * at-rule (@media / @supports / @document / @layer with a block) recurses
++ * into its block with its prelude prefixed to each inner record's text;
++ * any other at-rule (@font-face, @keyframes, ...) is one record over its
++ * whole text, and an at-statement (@layer a, b; @import ...) is one
++ * record over its prelude. A record's identity is FNV-1a over its
++ * normalized text (comments blanked, whitespace runs collapsed) -- the
++ * same hash as html_rl_fnv1a.
++ *
++ * The diff (B.2) is the longest common prefix and suffix of the two
++ * record sequences; the middle, both sides, is the change. The census
++ * (html_css_sheet_reach_census, called from macos9_reconvert.c at the
++ * SHEETID single-identified current mark) logs bounded, or the first
++ * unbounded cause in priority order:
++ *   no table (a <link> sheet, or never captured)   no-source
++ *   K > 64 changed records                          too-many
++ *   a changed record is an at-rule / statement      at-rule
++ *   touches counters                                counter
++ *   has a nested rule                               nesting
++ *   a selector uses an escape                       escape
++ *   a selector has no anchor                        unanchored
++ *   the walk finds 0 roots                          bounded
++ *   a root is <html>/<body>, an <li>, a child of
++ *   <ol>/<ul>/<menu>, or has no box (B.5 static)    admission
++ *   otherwise                                       bounded
++ *
++ * B1 builds the incoming table EAGERLY at the processed edit (B.3's
++ * lazy build-at-flush is C's): the <style>'s DOM text is the new
++ * version's source -- html_stylesheet_from_domnode hands those same
++ * bytes to the fetcher -- so the scan count is the same (once per
++ * version) and the lifetime is simpler.
++ *
++ * A selector's anchor (B.1) is the rightmost compound carrying a plain
++ * #id or .class (outside (), [] and strings) that is the subject or
++ * followed by a descendant / child combinator; id beats class in one
++ * compound. The walk's class match is dom_element_has_class itself --
++ * the engine's matcher, quirks mode included; id is an exact compare.
++ */
++
++struct html_css_reach_record {
++	uint32_t hash;
++	int reason;
++	int ntok;
++	char **tok;
++};
++
++struct html_css_reach_table {
++	struct html_css_reach_record *rec;
++	int nrec;
++};
++
++#define HTML_CSS_REACH_MAX_CHANGED 64
++#define HTML_CSS_REACH_MAX_GROUP 32
++#define HTML_CSS_REACH_MAX_ROOTS 1024
++
++static uint32_t html_css_reach_fnv1a(const uint8_t *s, size_t len)
++{
++	uint32_t h = 2166136261u;
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		h ^= s[i];
++		h *= 16777619u;
++	}
++	return h;
++}
++
++static inline bool html_css_reach_ws(int c)
++{
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
++}
++
++static void html_css_reach_table_free(struct html_css_reach_table *t)
++{
++	int i;
++
++	if (t == NULL)
++		return;
++	for (i = 0; i < t->nrec; i++) {
++		int j;
++		for (j = 0; t->rec[i].tok != NULL && j < t->rec[i].ntok; j++)
++			free(t->rec[i].tok[j]);
++		free(t->rec[i].tok);
++	}
++	free(t->rec);
++	free(t);
++}
++
++/* A small growable buffer for normalized text. */
++struct reach_buf {
++	char *s;
++	size_t len;
++	size_t cap;
++};
++
++static bool reach_buf_put(struct reach_buf *b, const char *s, size_t n)
++{
++	if (b->len + n + 1 > b->cap) {
++		size_t nc = b->cap ? b->cap * 2 : 256;
++		char *ns;
++		while (nc < b->len + n + 1)
++			nc *= 2;
++		ns = realloc(b->s, nc);
++		if (ns == NULL)
++			return false;
++		b->s = ns;
++		b->cap = nc;
++	}
++	memcpy(b->s + b->len, s, n);
++	b->len += n;
++	b->s[b->len] = '\0';
++	return true;
++}
++
++/* Append src[a,e) to b normalized: whitespace runs to one space, no
++ * leading / trailing space. b->s is a string even when nothing was
++ * appended (an empty block, `.x {}`, reads as ""). */
++static bool reach_norm_range(struct reach_buf *b, const char *src,
++		size_t a, size_t e)
++{
++	bool pend = false;
++	size_t i;
++
++	for (i = a; i < e; i++) {
++		if (html_css_reach_ws((unsigned char)src[i])) {
++			pend = true;
++		} else {
++			if (pend && b->len > 0) {
++				if (!reach_buf_put(b, " ", 1))
++					return false;
++			}
++			pend = false;
++			if (!reach_buf_put(b, src + i, 1))
++				return false;
++		}
++	}
++	if (b->s == NULL)
++		return reach_buf_put(b, "", 0);
++	return true;
++}
++
++/* Blank C-style comments to single spaces (a comment between tokens
++ * must not glue them); the result is the parse source. */
++static char *reach_strip_comments(const char *src, size_t len)
++{
++	char *w = malloc(len + 1);
++	size_t i;
++
++	if (w == NULL)
++		return NULL;
++	i = 0;
++	while (i < len) {
++		if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {
++			size_t j = i + 2;
++			while (j < len && !(src[j] == '*' && j + 1 < len &&
++			       src[j + 1] == '/'))
++				j++;
++			while (i < j + 2 && i < len)
++				w[i++] = ' ';
++			if (j + 2 > len)
++				break;
++		} else {
++			w[i] = src[i];
++			i++;
++		}
++	}
++	w[len] = '\0';
++	return w;
++}
++
++static inline bool reach_ident_char(unsigned char c, bool start)
++{
++	if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
++		return true;
++	if (c >= '0' && c <= '9')
++		return !start;
++	return c == '_' || c == '-' || c == '\\' || c >= 0x80;
++}
++
++/* The first plain #id / .class of one compound, outside (), [] and
++ * strings; id beats class. malloc'd token KEEPS its leading delim ('#',
++ * '.' -> the class token is stored without it) so the walk can tell the
++ * kinds apart, NULL if the compound carries no plain anchor. */
++static char *reach_compound_token(const char *s, size_t len, bool *is_id)
++{
++	size_t i = 0;
++	int paren = 0, bracket = 0;
++	char strc = 0;
++	const char *id_at = NULL, *cls_at = NULL;
++	size_t id_len = 0, cls_len = 0;
++
++	while (i < len) {
++		char c = s[i];
++		if (strc != 0) {
++			if (c == strc)
++				strc = 0;
++			i++;
++			continue;
++		}
++		if (c == '"' || c == '\'') {
++			strc = c;
++			i++;
++			continue;
++		}
++		if (paren > 0) {
++			if (c == '(')
++				paren++;
++			else if (c == ')')
++				paren--;
++			i++;
++			continue;
++		}
++		if (c == '(') {
++			paren++;
++			i++;
++			continue;
++		}
++		if (bracket > 0) {
++			if (c == ']')
++				bracket--;
++			i++;
++			continue;
++		}
++		if (c == '[') {
++			bracket++;
++			i++;
++			continue;
++		}
++		if (c == '#' || c == '.') {
++			size_t j = i + 1;
++			if (j < len && reach_ident_char(s[j], true)) {
++				while (j < len && reach_ident_char(s[j], false))
++					j++;
++				if (c == '#' && id_at == NULL) {
++					id_at = s + i + 1;
++					id_len = j - i - 1;
++				} else if (c == '.' && cls_at == NULL) {
++					cls_at = s + i + 1;
++					cls_len = j - i - 1;
++				}
++			}
++			i = (j > i + 1) ? j : i + 1;
++			continue;
++		}
++		i++;
++	}
++	*is_id = (id_at != NULL);
++	if (id_at != NULL)
++		return strndup(id_at - 1, id_len + 1); /* keep the '#' */
++	if (cls_at != NULL)
++		return strndup(cls_at, cls_len);
++	return NULL;
++}
++
++/* B.1: the anchor token of one selector: the rightmost compound with a
++ * plain #id / .class that is the subject or followed by a descendant /
++ * child combinator (a sibling combinator to its right disqualifies). */
++static char *reach_selector_anchor(const char *sel, size_t len, bool *is_id)
++{
++	int *start = NULL, *cend = NULL, *comb = NULL;
++	int ncomp = 0, cap = 0;
++	int pend = 0;	/* 0 none (descendant), 1 child, 2 sibling */
++	size_t i = 0;
++	int k;
++
++	while (i < len && html_css_reach_ws((unsigned char)sel[i]))
++		i++;
++	while (i < len) {
++		/* scan the compound [i, j): to a top-level combinator,
++		 * whitespace, or the end */
++		size_t j = i;
++		int paren = 0, bracket = 0;
++		char strc = 0;
++		while (j < len) {
++			char c = sel[j];
++			if (strc != 0) {
++				if (c == strc)
++					strc = 0;
++				j++;
++				continue;
++			}
++			if (c == '"' || c == '\'') {
++				strc = c;
++				j++;
++				continue;
++			}
++			if (paren > 0) {
++				if (c == '(')
++					paren++;
++				else if (c == ')')
++					paren--;
++				j++;
++				continue;
++			}
++			if (c == '(') {
++				paren++;
++				j++;
++				continue;
++			}
++			if (bracket > 0) {
++				if (c == ']')
++					bracket--;
++				j++;
++				continue;
++			}
++			if (c == '[') {
++				bracket++;
++				j++;
++				continue;
++			}
++			if (c == '>' || c == '+' || c == '~' ||
++			    html_css_reach_ws((unsigned char)c))
++				break;
++			j++;
++		}
++		/* empty compound (stray combinator): consume it, else the
++		 * scan would not advance */
++		if (j == i) {
++			if (sel[i] == '>')
++				pend = 1;
++			else if (sel[i] == '+' || sel[i] == '~')
++				pend = 2;
++			i++;
++			continue;
++		}
++		/* the combinator after this compound, if any */
++		while (j < len && html_css_reach_ws((unsigned char)sel[j]))
++			j++;
++		{
++			int pc = pend;
++			pend = 0;
++			if (j < len && sel[j] == '>') {
++				j++;
++				pend = 1;
++				while (j < len &&
++				       html_css_reach_ws((unsigned char)sel[j]))
++					j++;
++			} else if (j < len && (sel[j] == '+' || sel[j] == '~')) {
++				j++;
++				pend = 2;
++				while (j < len &&
++				       html_css_reach_ws((unsigned char)sel[j]))
++					j++;
++			}
++			if (j > i && pc < 3) {
++				if (ncomp == cap) {
++					int nc = cap ? cap * 2 : 8;
++					int *ns;
++					ns = realloc(start, nc * sizeof(*ns));
++					if (ns != NULL) {
++						start = ns;
++						ns = realloc(cend, nc * sizeof(*ns));
++					}
++					if (ns != NULL) {
++						cend = ns;
++						ns = realloc(comb, nc * sizeof(*ns));
++					}
++					if (ns == NULL) {
++						free(start);
++						free(cend);
++						free(comb);
++						return NULL;
++					}
++					comb = ns;
++					cap = nc;
++				}
++				start[ncomp] = (int)i;
++				cend[ncomp] = (int)j;
++				comb[ncomp] = pc;
++				ncomp++;
++			}
++		}
++		i = j;
++	}
++	for (k = ncomp - 1; k >= 0; k--) {
++		bool ii;
++		char *t = reach_compound_token(sel + start[k],
++				cend[k] - start[k], &ii);
++		if (t == NULL)
++			continue;
++		if (k == ncomp - 1 || comb[k + 1] == 0 || comb[k + 1] == 1) {
++			*is_id = ii;
++			free(start);
++			free(cend);
++			free(comb);
++			return t;
++		}
++		free(t);
++	}
++	free(start);
++	free(cend);
++	free(comb);
++	return NULL;
++}
++
++struct reach_parser {
++	const char *s;
++	size_t len;
++	struct html_css_reach_table *t;
++	char **chain;
++	int nchain;
++	int chain_cap;
++	bool oom;
++};
++
++static bool reach_add_rec(struct reach_parser *p, uint32_t hash, int reason,
++		int ntok, char **tok)
++{
++	if (p->t->nrec % 64 == 0) {
++		struct html_css_reach_record *nr = realloc(p->t->rec,
++				sizeof(*nr) * (p->t->nrec + 64));
++		if (nr == NULL) {
++			p->oom = true;
++			return false;
++		}
++		p->t->rec = nr;
++	}
++	p->t->rec[p->t->nrec].hash = hash;
++	p->t->rec[p->t->nrec].reason = reason;
++	p->t->rec[p->t->nrec].ntok = ntok;
++	p->t->rec[p->t->nrec].tok = tok;
++	p->t->nrec++;
++	return true;
++}
++
++/* Hash the chain (the enclosing group preludes) + the normalized
++ * range [a,b). */
++static bool reach_hash_range(struct reach_parser *p, size_t a, size_t b,
++		uint32_t *h)
++{
++	struct reach_buf buf;
++	int ci;
++	bool ok = true;
++
++	memset(&buf, 0, sizeof(buf));
++	for (ci = 0; ci < p->nchain && ok; ci++) {
++		ok = reach_buf_put(&buf, p->chain[ci], strlen(p->chain[ci]));
++		ok = ok && reach_buf_put(&buf, " ", 1);
++	}
++	ok = ok && reach_norm_range(&buf, p->s, a, b);
++	if (ok)
++		*h = html_css_reach_fnv1a((const uint8_t *)buf.s, buf.len);
++	free(buf.s);
++	return ok;
++}
++
++/* One at-rule record over [a,b) (a,b the at-rule's full extent, or the
++ * statement's prelude up to its ';'). */
++static void reach_atrule_record(struct reach_parser *p, size_t a, size_t b)
++{
++	uint32_t h;
++	if (!reach_hash_range(p, a, b, &h)) {
++		p->oom = true;
++		return;
++	}
++	reach_add_rec(p, h, HTML_CSS_REACH_AT_RULE, 0, NULL);
++}
++
++/* One plain rule: prelude [sa, sb), block interior [ba, bb). */
++static void reach_plain_record(struct reach_parser *p, size_t sa, size_t sb,
++		size_t ba, size_t bb, size_t close)
++{
++	uint32_t h;
++	int reason = HTML_CSS_REACH_OK;
++	char **toks = NULL;
++	int ntok = 0, tcap = 0;
++	size_t m;
++	int paren, bracket;
++	char strc;
++
++	/* nesting: a '{' at depth 0 of the block interior */
++	reason = HTML_CSS_REACH_OK;
++	paren = bracket = 0;
++	strc = 0;
++	for (m = ba; m < bb; m++) {
++		char c = p->s[m];
++		if (strc != 0) {
++			if (c == strc)
++				strc = 0;
++			continue;
++		}
++		if (c == '"' || c == '\'') {
++			strc = c;
++			continue;
++		}
++		if (paren > 0) {
++			if (c == '(')
++				paren++;
++			else if (c == ')')
++				paren--;
++			continue;
++		}
++		if (c == '(') {
++			paren++;
++			continue;
++		}
++		if (bracket > 0) {
++			if (c == ']')
++				bracket--;
++			continue;
++		}
++		if (c == '[') {
++			bracket++;
++			continue;
++		}
++		if (c == '{') {
++			reason = HTML_CSS_REACH_NESTING;
++			break;
++		}
++	}
++
++	/* counters: the keywords, caseless, in the normalized block */
++	if (reason == HTML_CSS_REACH_OK) {
++		struct reach_buf nb;
++		size_t li;
++		memset(&nb, 0, sizeof(nb));
++		if (reach_norm_range(&nb, p->s, ba, bb)) {
++			for (li = 0; li < nb.len; li++)
++				nb.s[li] = (char)tolower((unsigned char)nb.s[li]);
++			if (strcasestr(nb.s, "counter-increment") != NULL ||
++			    strcasestr(nb.s, "counter-reset") != NULL ||
++			    strcasestr(nb.s, "counter-set") != NULL ||
++			    strcasestr(nb.s, "counter(") != NULL ||
++			    strcasestr(nb.s, "counters(") != NULL)
++				reason = HTML_CSS_REACH_COUNTER;
++		}
++		free(nb.s);
++	}
++
++	/* escape: a backslash in the raw prelude */
++	if (reason == HTML_CSS_REACH_OK) {
++		for (m = sa; m < sb; m++)
++			if (p->s[m] == '\\') {
++				reason = HTML_CSS_REACH_ESCAPE;
++				break;
++			}
++	}
++
++	/* anchors: each selector of the list, top-level commas */
++	if (reason == HTML_CSS_REACH_OK) {
++		struct reach_buf sb2;
++		size_t pos = 0;
++		bool unanch = false;
++		bool bad = false;
++		memset(&sb2, 0, sizeof(sb2));
++		bad = !reach_norm_range(&sb2, p->s, sa, sb);
++		while (!bad && !unanch) {
++			/* this selector ends at the next top-level ',' (a comma
++			 * inside (), [], strings does not split) or at the end */
++			size_t ce = 0;
++			paren = bracket = 0;
++			strc = 0;
++			for (m = pos; m < sb2.len; m++) {
++				char c = sb2.s[m];
++				if (strc != 0) {
++					if (c == strc)
++						strc = 0;
++					continue;
++				}
++				if (c == '"' || c == '\'') {
++					strc = c;
++					continue;
++				}
++				if (paren > 0) {
++					if (c == '(')
++						paren++;
++					else if (c == ')')
++						paren--;
++					continue;
++				}
++				if (c == '(') {
++					paren++;
++					continue;
++				}
++				if (bracket > 0) {
++					if (c == ']')
++						bracket--;
++					continue;
++				}
++				if (c == '[') {
++					bracket++;
++					continue;
++				}
++				if (c == ',') {
++					ce = m;
++					break;
++				}
++			}
++			if (ce == 0)
++				ce = sb2.len; /* no top-level comma: the last one */
++			{
++				bool ii;
++				char *t = reach_selector_anchor(
++						sb2.s + pos, ce - pos, &ii);
++				if (t == NULL) {
++					unanch = true;
++				} else {
++					int j;
++					bool seen = false;
++					for (j = 0; j < ntok; j++)
++						if (strcmp(toks[j], t) == 0) {
++							seen = true;
++							break;
++						}
++					if (!seen) {
++						if (ntok == tcap) {
++							int nt = tcap ? tcap * 2 : 4;
++							char **nt2 = realloc(
++									toks,
++									nt * sizeof(*nt2));
++							if (nt2 == NULL) {
++								bad = true;
++								break;
++							}
++							toks = nt2;
++							tcap = nt;
++						}
++						toks[ntok++] = t;
++					} else {
++						free(t);
++					}
++				}
++			}
++			if (ce == sb2.len)
++				break;
++			pos = ce + 1;
++		}
++		free(sb2.s);
++		if (bad) {
++			for (m = 0; m < (size_t)ntok; m++)
++				free(toks[m]);
++			free(toks);
++			p->oom = true;
++			return;
++		}
++		if (unanch) {
++			for (m = 0; m < (size_t)ntok; m++)
++				free(toks[m]);
++			free(toks);
++			reason = HTML_CSS_REACH_UNANCHORED;
++			toks = NULL;
++			ntok = 0;
++		}
++	}
++
++	if (!reach_hash_range(p, sa, close + 1, &h)) {
++		for (m = 0; m < (size_t)ntok; m++)
++			free(toks[m]);
++		free(toks);
++		p->oom = true;
++		return;
++	}
++	reach_add_rec(p, h, reason, ntok, toks);
++}
++
++static bool reach_is_group_name(const char *s, size_t a, size_t b)
++{
++	static const char *const grp[] = {
++		"media", "supports", "document", "layer"
++	};
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		size_t n = strlen(grp[i]);
++		if (b - a == n &&
++		    strncasecmp(s + a, grp[i], n) == 0)
++			return true;
++	}
++	return false;
++}
++
++/* Parse the block interior [a,b) into records; the enclosing group
++ * preludes are the chain (nchain of them). */
++static void reach_parse_block(struct reach_parser *p, size_t a, size_t b)
++{
++	size_t i = a;
++
++	while (i < b && !p->oom) {
++		while (i < b && html_css_reach_ws((unsigned char)p->s[i]))
++			i++;
++		if (i >= b)
++			break;
++		/* the prelude: to the first top-level ';', '{' or '}' */
++		size_t j = i;
++		int paren = 0, bracket = 0;
++		char strc = 0;
++		while (j < b) {
++			char c = p->s[j];
++			if (strc != 0) {
++				if (c == strc)
++					strc = 0;
++				j++;
++				continue;
++			}
++			if (c == '"' || c == '\'') {
++				strc = c;
++				j++;
++				continue;
++			}
++			if (paren > 0) {
++				if (c == '(')
++					paren++;
++				else if (c == ')')
++					paren--;
++				j++;
++				continue;
++			}
++			if (c == '(') {
++				paren++;
++				j++;
++				continue;
++			}
++			if (bracket > 0) {
++				if (c == ']')
++					bracket--;
++				j++;
++				continue;
++			}
++			if (c == '[') {
++				bracket++;
++				j++;
++				continue;
++			}
++			if (c == ';' || c == '{' || c == '}')
++				break;
++			j++;
++		}
++		if (j >= b)
++			break;
++		if (p->s[j] == ';') {
++			reach_atrule_record(p, i, j);
++			i = j + 1;
++			continue;
++		}
++		/* '{' at j: find the matching '}' */
++		{
++			int depth = 1;
++			size_t k = j + 1;
++			paren = bracket = 0;
++			strc = 0;
++			while (k < b && depth > 0) {
++				char c = p->s[k];
++				if (strc != 0) {
++					if (c == strc)
++						strc = 0;
++					k++;
++					continue;
++				}
++				if (c == '"' || c == '\'') {
++					strc = c;
++					k++;
++					continue;
++				}
++				if (paren > 0) {
++					if (c == '(')
++						paren++;
++					else if (c == ')')
++						paren--;
++					k++;
++					continue;
++				}
++				if (c == '(') {
++					paren++;
++					k++;
++					continue;
++				}
++				if (bracket > 0) {
++					if (c == ']')
++						bracket--;
++					k++;
++					continue;
++				}
++				if (c == '[') {
++					bracket++;
++					k++;
++					continue;
++				}
++				if (c == '{')
++					depth++;
++				else if (c == '}')
++					depth--;
++				k++;
++			}
++			if (depth != 0) {
++				/* unbalanced: stop parsing */
++				i = b;
++				break;
++			}
++			if (p->s[i] == '@') {
++				/* the at-rule name: to the first
++				 * whitespace / '(' / '{' after the '@' */
++				size_t nm = i + 1;
++				while (nm < j &&
++				       !html_css_reach_ws((unsigned char)p->s[nm]) &&
++				       p->s[nm] != '(' && p->s[nm] != '{')
++					nm++;
++				if (reach_is_group_name(p->s, i + 1, nm) &&
++				    p->nchain < HTML_CSS_REACH_MAX_GROUP) {
++					char *cp;
++					struct reach_buf cb;
++					memset(&cb, 0, sizeof(cb));
++					cp = NULL;
++					if (reach_norm_range(&cb, p->s, i, j)) {
++						cp = cb.s;
++						cb.s = NULL;
++					}
++					if (cp == NULL) {
++						free(cb.s);
++						p->oom = true;
++						break;
++					}
++					if (p->nchain == p->chain_cap) {
++						int nc = p->chain_cap ?
++								p->chain_cap * 2 : 4;
++						char **ncp = realloc(p->chain,
++								nc * sizeof(*ncp));
++						if (ncp == NULL) {
++							free(cp);
++							p->oom = true;
++							break;
++						}
++						p->chain = ncp;
++						p->chain_cap = nc;
++					}
++					p->chain[p->nchain] = cp;
++					p->nchain++;
++					reach_parse_block(p, j + 1, k - 1);
++					free(p->chain[p->nchain - 1]);
++					p->nchain--;
++				} else {
++					reach_atrule_record(p, i, k);
++				}
++			} else {
++				reach_plain_record(p, i, j, j + 1, k - 1, k - 1);
++			}
++			i = k;
++		}
++	}
++}
++
++/* Scan a sheet source into its record table (NULL on OOM). */
++static struct html_css_reach_table *html_css_reach_scan(const char *src,
++		size_t len)
++{
++	char *s;
++	struct reach_parser p;
++	struct html_css_reach_table *t;
++
++	t = calloc(1, sizeof(*t));
++	if (t == NULL)
++		return NULL;
++	s = reach_strip_comments(src, len);
++	if (s == NULL) {
++		free(t);
++		return NULL;
++	}
++	memset(&p, 0, sizeof(p));
++	p.s = s;
++	p.len = len;
++	p.t = t;
++	reach_parse_block(&p, 0, len);
++	free(s);
++	free(p.chain);
++	if (p.oom) {
++		html_css_reach_table_free(t);
++		return NULL;
++	}
++	return t;
++}
++
++/* B.3: capture both versions' tables at the processed edit. */
++static void html_css_reach_capture(html_content *c, struct html_stylesheet *s)
++{
++	struct html_css_reach_table *prev;
++	dom_string *text;
++	dom_exception exc;
++
++	if (s->node == NULL) {
++		/* a <link> sheet: its next version is a fresh fetch, not
++		 * DOM text; its census reports no-source. */
++		html_css_reach_table_free(s->reach_prev);
++		html_css_reach_table_free(s->reach_cur);
++		s->reach_prev = NULL;
++		s->reach_cur = NULL;
++		return;
++	}
++
++	/* the live table is the version the boxes were built from (it
++	 * was computed at the last processed edit); with no table yet
++	 * (the first edit of this <style>) the outgoing source is the
++	 * old sheet's -- read it now, the caller releases the handle
++	 * right after. */
++	prev = s->reach_cur;
++	s->reach_cur = NULL;
++	if (prev == NULL) {
++		const uint8_t *data = NULL;
++		size_t size = 0;
++		if (s->sheet != NULL)
++			data = content_get_source_data(s->sheet, &size);
++		if (data != NULL) {
++			prev = html_css_reach_scan((const char *)data, size);
++		} else if (s->sheet == NULL) {
++			/* never loaded: nothing was built from */
++			prev = html_css_reach_scan("", 0);
++		}
++	}
++	html_css_reach_table_free(s->reach_prev);
++	s->reach_prev = prev;
++
++	/* B1 builds the incoming table eagerly here (B.3's lazy
++	 * build-at-flush is C's): the DOM text is the new version's
++	 * source -- html_stylesheet_from_domnode hands those same bytes
++	 * to the fetcher -- so the scan count is the same (once per
++	 * version) and the lifetime is simpler. */
++	exc = dom_node_get_text_content(s->node, &text);
++	if (exc == DOM_NO_ERR) {
++		if (text != NULL) {
++			s->reach_cur = html_css_reach_scan(
++						dom_string_data(text),
++						dom_string_byte_length(text));
++		} else {
++			/* emptied: an empty sheet */
++			s->reach_cur = html_css_reach_scan("", 0);
++		}
++		dom_string_unref(text);
++	}
++	/* on error s->reach_cur stays NULL: the census reports
++	 * no-source */
++}
++
++/* B.4: the walk's state; the matched roots are recorded for B.5. */
++struct reach_walk {
++	char **tok; /* id tokens keep their '#', class tokens bare */
++	lwc_string **lwc;
++	int ntok;
++	unsigned long roots;
++	unsigned long walked;
++	dom_node *rlist[HTML_CSS_REACH_MAX_ROOTS];
++	int nrlist;
++};
++
++/* Lazily-created dom_string for the "id" attribute name (the census
++ * walk reads it through the generic attribute getter; this fork has
++ * no dom_html_element_get_id). Process-lifetime static: the census
++ * is a logger, this never gets freed. */
++static dom_string *reach_id_name(void)
++{
++	static dom_string *id_name = NULL;
++	if (id_name == NULL)
++		dom_string_create((const uint8_t *)"id", 2, &id_name);
++	return id_name;
++}
++
++/* Does element n carry one of the walk's tokens? */
++static bool reach_matches(dom_node *n, struct reach_walk *w)
++{
++	bool matched = false;
++	int t;
++	dom_string *id = NULL;
++
++	for (t = 0; t < w->ntok && !matched; t++) {
++		if (w->tok[t][0] == '#') {
++			if (id == NULL && reach_id_name() != NULL)
++				dom_element_get_attribute((dom_element *)n,
++						reach_id_name(), &id);
++			if (id != NULL) {
++				const char *d = dom_string_data(id);
++				size_t sz = dom_string_byte_length(id);
++				if (sz == strlen(w->tok[t] + 1) &&
++				    memcmp(d, w->tok[t] + 1, sz) == 0)
++					matched = true;
++			}
++		} else if (w->lwc[t] != NULL) {
++			dom_element_has_class((dom_element *)n, w->lwc[t],
++					&matched);
++		}
++	}
++	if (id != NULL)
++		dom_string_unref(id);
++	return matched;
++}
++
++/* B.4: the walk, in document order and without recursion (a deep DOM
++ * must not grow the C stack on the Vita). A matched element is a root
++ * and its subtree is skipped; the roots are recorded for B.5. Every
++ * node reference taken here is released before the next step. */
++static void reach_walk_tree(dom_node *root, struct reach_walk *w)
++{
++	dom_node *n = dom_node_ref(root);
++
++	while (n != NULL) {
++		dom_node_type type;
++		dom_node *next = NULL;
++		bool descend = true;
++
++		w->walked++;
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE && reach_matches(n, w)) {
++			if (w->nrlist < HTML_CSS_REACH_MAX_ROOTS)
++				w->rlist[w->nrlist++] = n;
++			w->roots++;
++			descend = false;
++		}
++		if (descend &&
++		    dom_node_get_first_child(n, &next) != DOM_NO_ERR)
++			next = NULL;
++		/* no child (or skipped): the next sibling of n or of the
++		 * nearest ancestor below root that has one */
++		while (next == NULL && n != root) {
++			dom_node *parent = NULL;
++			if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR)
++				next = NULL;
++			if (next != NULL)
++				break;
++			if (dom_node_get_parent_node(n, &parent) !=
++			    DOM_NO_ERR || parent == NULL)
++				break;
++			dom_node_unref(n);
++			n = parent;
++		}
++		dom_node_unref(n);
++		n = next;
++	}
++}
++
++/* B.5's static checks: the roots the census declines (1) -- <html>,
++ * <body>, <li>, a child of <ol>/<ul>/<menu>, a root with no box. The
++ * display-based checks are C's. */
++static bool reach_name_is(const dom_string *name, const char *s)
++{
++	size_t sz = dom_string_byte_length(name);
++	const char *d = dom_string_data(name);
++	size_t i;
++
++	if (sz != strlen(s))
++		return false;
++	for (i = 0; i < sz; i++) {
++		char a = (char)tolower((unsigned char)d[i]);
++		char b = (char)tolower((unsigned char)s[i]);
++		if (a != b)
++			return false;
++	}
++	return true;
++}
++
++static bool reach_root_admission(dom_node *n)
++{
++	dom_string *name;
++	bool r = false;
++	dom_node *parent;
++	static const char *const adm[] = { "html", "body", "li" };
++	static const char *const parents[] = { "ol", "ul", "menu" };
++	int i;
++
++	if (dom_node_get_node_name(n, &name) == DOM_NO_ERR && name != NULL) {
++		for (i = 0; i < 3; i++)
++			if (reach_name_is(name, adm[i]))
++				r = true;
++		dom_string_unref(name);
++	}
++	if (!r && dom_node_get_parent_node(n, &parent) == DOM_NO_ERR &&
++	    parent != NULL) {
++		if (dom_node_get_node_name(parent, &name) == DOM_NO_ERR && name != NULL) {
++			for (i = 0; i < 3; i++)
++				if (reach_name_is(name, parents[i]))
++					r = true;
++			dom_string_unref(name);
++		}
++		dom_node_unref(parent);
++	}
++	if (!r && box_for_node(n) == NULL)
++		r = true;
++	return r;
++}
++
++/* The census: exported, documented in html/css.h. */
++void html_css_sheet_reach_census(struct content *cc, int index,
++		struct html_css_reach_result *out)
++{
++	html_content *c = (html_content *)cc;
++	struct html_stylesheet *s;
++	const struct html_css_reach_table *o, *n;
++	int p, suf, omid, nmid;
++	unsigned int k;
++	int reason = HTML_CSS_REACH_OK;
++	int i;
++
++	memset(out, 0, sizeof(*out));
++	out->reason = HTML_CSS_REACH_NO_SOURCE;
++
++	if (c == NULL || c->stylesheets == NULL || index < 0 ||
++	    (size_t)index >= c->stylesheet_count)
++		return;
++	s = &c->stylesheets[index];
++	o = s->reach_prev;
++	n = s->reach_cur;
++	if (o == NULL || n == NULL)
++		return;
++
++	/* B.2: the longest common prefix and suffix; the middle, both
++	 * sides, is the change. */
++	p = 0;
++	while (p < o->nrec && p < n->nrec &&
++	       o->rec[p].hash == n->rec[p].hash)
++		p++;
++	suf = 0;
++	while (suf < o->nrec - p && suf < n->nrec - p &&
++	       o->rec[o->nrec - 1 - suf].hash ==
++	       n->rec[n->nrec - 1 - suf].hash)
++		suf++;
++	omid = o->nrec - p - suf;
++	nmid = n->nrec - p - suf;
++	k = (unsigned int)omid + (unsigned int)nmid;
++	out->changed = k;
++	if (k == 0) {
++		out->bounded = 1;
++		out->reason = HTML_CSS_REACH_OK;
++		return;
++	}
++	if (k > HTML_CSS_REACH_MAX_CHANGED) {
++		out->reason = HTML_CSS_REACH_TOO_MANY;
++		return;
++	}
++
++	/* the changed records' causes, in priority order */
++	{
++		static const int prio[] = {
++			HTML_CSS_REACH_AT_RULE,
++			HTML_CSS_REACH_COUNTER,
++			HTML_CSS_REACH_NESTING,
++			HTML_CSS_REACH_ESCAPE,
++			HTML_CSS_REACH_UNANCHORED
++		};
++		int pr;
++		for (pr = 0; pr < 5 && reason == HTML_CSS_REACH_OK; pr++) {
++			for (i = p; i < p + omid; i++)
++				if (o->rec[i].reason == prio[pr]) {
++					reason = prio[pr];
++					break;
++				}
++			for (i = p; i < p + nmid && reason == HTML_CSS_REACH_OK;
++			     i++)
++				if (n->rec[i].reason == prio[pr]) {
++					reason = prio[pr];
++					break;
++				}
++		}
++	}
++	if (reason != HTML_CSS_REACH_OK) {
++		out->reason = reason;
++		return;
++	}
++
++	/* the changed records' anchor tokens, distinct */
++	{
++		char **toks = NULL;
++		lwc_string **lwc = NULL;
++		int ntok = 0, tcap = 0;
++		int t;
++
++		for (i = p; i < p + omid; i++)
++			for (t = 0; t < o->rec[i].ntok; t++) {
++				int j, seen = 0;
++				for (j = 0; j < ntok; j++)
++					if (strcmp(toks[j], o->rec[i].tok[t]) == 0) {
++						seen = 1;
++						break;
++					}
++				if (seen)
++					continue;
++				if (ntok == tcap) {
++					int nt = tcap ? tcap * 2 : 4;
++					char **nt2;
++					lwc_string **nl2;
++					nt2 = realloc(toks, nt * sizeof(*nt2));
++					if (nt2 == NULL)
++						goto no_tokens;
++					toks = nt2;
++					nl2 = realloc(lwc, nt * sizeof(*nl2));
++					if (nl2 == NULL)
++						goto no_tokens;
++					lwc = nl2;
++					tcap = nt;
++				}
++				toks[ntok] = o->rec[i].tok[t];
++				lwc[ntok] = NULL;
++				ntok++;
++			}
++		for (i = p; i < p + nmid; i++)
++			for (t = 0; t < n->rec[i].ntok; t++) {
++				int j, seen = 0;
++				for (j = 0; j < ntok; j++)
++					if (strcmp(toks[j], n->rec[i].tok[t]) == 0) {
++						seen = 1;
++						break;
++					}
++				if (seen)
++					continue;
++				if (ntok == tcap) {
++					int nt = tcap ? tcap * 2 : 4;
++					char **nt2;
++					lwc_string **nl2;
++					nt2 = realloc(toks, nt * sizeof(*nt2));
++					if (nt2 == NULL)
++						goto no_tokens;
++					toks = nt2;
++					nl2 = realloc(lwc, nt * sizeof(*nl2));
++					if (nl2 == NULL)
++						goto no_tokens;
++					lwc = nl2;
++					tcap = nt;
++				}
++				toks[ntok] = n->rec[i].tok[t];
++				lwc[ntok] = NULL;
++				ntok++;
++			}
++		out->anchors = (unsigned int)ntok;
++		if (ntok == 0) {
++			out->reason = HTML_CSS_REACH_UNANCHORED;
++			goto no_tokens;
++		}
++		if (c->document == NULL)
++			goto no_tokens;
++
++		/* the walk (B.4): id tokens ('#x') compare raw, class
++		 * tokens (bare) go through dom_element_has_class */
++		{
++			struct reach_walk w;
++			bool ok = true;
++			memset(&w, 0, sizeof(w));
++			w.tok = toks;
++			w.lwc = lwc;
++			w.ntok = ntok;
++			for (t = 0; t < ntok && ok; t++)
++				if (toks[t][0] != '#')
++					ok = (lwc_intern_string(toks[t],
++							strlen(toks[t]),
++							&lwc[t]) ==
++					     lwc_error_ok);
++			if (!ok) {
++				for (t = 0; t < ntok; t++)
++					if (lwc[t] != NULL)
++						lwc_string_unref(lwc[t]);
++				goto no_tokens;
++			}
++			reach_walk_tree((dom_node *)c->document, &w);
++			out->roots = (unsigned int)w.roots;
++			out->walked = (unsigned int)w.walked;
++			if (w.roots == 0) {
++				out->bounded = 1;
++				out->reason = HTML_CSS_REACH_OK;
++				goto no_tokens;
++			}
++			/* B.5's static checks, per root */
++			for (t = 0; t < w.nrlist; t++) {
++				if (reach_root_admission(w.rlist[t])) {
++					out->reason = HTML_CSS_REACH_ADMISSION;
++					goto no_tokens;
++				}
++			}
++			out->bounded = 1;
++			out->reason = HTML_CSS_REACH_OK;
++		}
++no_tokens:
++		for (t = 0; t < ntok; t++)
++			if (lwc[t] != NULL)
++				lwc_string_unref(lwc[t]);
++		free(toks);
++		free(lwc);
++	}
++}
++
++/* The reason enum as the log strings (see html/css.h). */
++const char *html_css_reach_reason_name(int reason)
++{
++	switch (reason) {
++	case HTML_CSS_REACH_OK:
++		return "bounded";
++	case HTML_CSS_REACH_AT_RULE:
++		return "at-rule";
++	case HTML_CSS_REACH_TOO_MANY:
++		return "too-many";
++	case HTML_CSS_REACH_COUNTER:
++		return "counter";
++	case HTML_CSS_REACH_NESTING:
++		return "nesting";
++	case HTML_CSS_REACH_ESCAPE:
++		return "escape";
++	case HTML_CSS_REACH_UNANCHORED:
++		return "unanchored";
++	case HTML_CSS_REACH_ADMISSION:
++		return "admission";
++	case HTML_CSS_REACH_NO_SOURCE:
++		return "no-source";
++	}
++	return "unknown";
++}
++
+ nserror html_css_init(void)
+ {
+ 	nserror error;
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -33,6 +33,7 @@
+ #include "netsurf/content.h"		/* content_get_type, CONTENT_HTML */
+ #include "content/content_protected.h"	/* content_get_url                */
+ #include "utils/nsurl.h"		/* nsurl_get_component, NSURL_HOST */
++#include "content/handlers/html/css.h"	/* patch 321 B1: the reach census */
+ 
+ /* core re-convert trigger: 0 = NSERROR_OK (queued), non-zero = busy/skip. */
+ extern int html_reconvert_content(struct content *c);
+@@ -852,6 +853,12 @@
+ /* Patch 320 (doc 23 B0): companion text marks of <style> edits answered
+  * with no rebuild (html_rl_style_text_absorb). */
+ static long g_style_absorbed = 0;
++/* Patch 321 (doc 23 B1): the reach census of the single-identified
++ * current sheet batches (html_css_sheet_reach_census in css.c).
++ * Bounded: how small the edit's reach is; unbounded: the cause. */
++static long g_sr_bounded = 0;
++static long g_sr_unbounded = 0;
++static long g_sr_reasons[HTML_CSS_REACH_NO_SOURCE + 1];
+ extern int html_css_sheet_mark_current(struct content *c, int index,
+ 		unsigned int counter);
+ /* Last failure reason from macos9_reconvert_try_local, read by the
+@@ -906,6 +913,40 @@
+ 					g_id_single++;
+ 				else
+ 					g_id_stale++;
++				/* Patch 321 B1: the reach census --
++				 * census only, no behaviour
++				 * change. Bounded: how small
++				 * the edit's reach is;
++				 * unbounded: the cause. */
++				{
++					struct html_css_reach_result rr;
++					html_css_sheet_reach_census(
++						g_pending[i].c,
++						g_pending[i].sheet_idx,
++						&rr);
++					if (rr.bounded) {
++						g_sr_bounded++;
++						macsurf_debug_log_writef(
++							"LIFE SHEETREACH bounded "
++							"changed=%d anchors=%d "
++							"roots=%d walked=%d",
++							(int)rr.changed,
++							(int)rr.anchors,
++							(int)rr.roots,
++							(int)rr.walked);
++					} else {
++						g_sr_unbounded++;
++						if (rr.reason >= 0 &&
++						    rr.reason <=
++						    HTML_CSS_REACH_NO_SOURCE)
++							g_sr_reasons[rr.reason]++;
++						macsurf_debug_log_writef(
++							"LIFE SHEETREACH unbounded "
++							"reason=%s",
++							html_css_reach_reason_name(
++								rr.reason));
++					}
++				}
+ 			} else if (g_pending[i].sheet_state != 0) {
+ 				macsurf_debug_log_writef("LIFE SHEETID multi");
+ 				g_id_multi++;
+@@ -1047,6 +1088,28 @@
+ 		macsurf_debug_log_writef("LIFE STYLETEXTCENSUS absorbed=%ld",
+ 			g_style_absorbed);
+ 	g_style_absorbed = 0;
++	/* Patch 321 B1 - the reach census, its own line: bounded = the
++	 * edit's reach was small (per-event line above); unbounded = the
++	 * cause, by reason. */
++	if (g_sr_bounded + g_sr_unbounded != 0) {
++		macsurf_debug_log_writef(
++			"LIFE SHEETREACHCENSUS bounded=%ld unbounded=%ld "
++			"at-rule=%ld counter=%ld nesting=%ld escape=%ld "
++			"unanchored=%ld too-many=%ld admission=%ld "
++			"no-source=%ld",
++			(long)g_sr_bounded, (long)g_sr_unbounded,
++			(long)g_sr_reasons[HTML_CSS_REACH_AT_RULE],
++			(long)g_sr_reasons[HTML_CSS_REACH_COUNTER],
++			(long)g_sr_reasons[HTML_CSS_REACH_NESTING],
++			(long)g_sr_reasons[HTML_CSS_REACH_ESCAPE],
++			(long)g_sr_reasons[HTML_CSS_REACH_UNANCHORED],
++			(long)g_sr_reasons[HTML_CSS_REACH_TOO_MANY],
++			(long)g_sr_reasons[HTML_CSS_REACH_ADMISSION],
++			(long)g_sr_reasons[HTML_CSS_REACH_NO_SOURCE]);
++	}
++	g_sr_bounded = 0;
++	g_sr_unbounded = 0;
++	memset(g_sr_reasons, 0, sizeof(g_sr_reasons));
+ 	g_fc_total = 0; g_fc_over = 0; g_fc_nonode = 0;
+ 	g_fc_kind = 0; g_fc_local = 0; g_fc_two = 0; g_fc_guard = 0;
+ 	g_sync_flushes  = 0;
