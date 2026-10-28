@@ -6347,3 +6347,23 @@ SHEETSCOPE legs there are two unbounded events, both correct readings:
 These are synthetic pages, so they do not decide piece C. That data
 comes from the scorecard's CSS-in-JS sites in the simulator (the
 Guardian, BBC, claude.ai) and from the next device run's logs.
+
+## Real-site census for patch 321 (2026-10-28): Guardian, BBC, claude.ai
+
+`scorecard.py --only guardian,bbc,claude --settle 30000` (r58
+reference reused), output in `~/vitabrowser-work/score/census-321`.
+All three loaded (BBC 59.6, claude.ai 74.5, Guardian 35.6). The visual
+scores match r58. The news sites' text scores fell with the stale
+reference's headlines.
+
+The census found 2 single-identified sheet batches across the three
+sites, both on BBC and both bounded (K=1 A=1 R=15 N=1863; K=4 A=3 R=1
+N=1866). The Guardian had 1 sheet batch, with identity `none`.
+claude.ai had 5: 4 two-sheet `multi` batches and 1 `none`. Of the 23
+full reconverts across the three sites, C could have answered 2. Doc
+23's 2026-10-28 later status has the reading and the recommendation:
+hold C, and read the census from device run 40.
+
+A first scorecard attempt reported all three sites as crashes. That was
+not a crash: every sim exited rc=-2 (SIGINT) at the same 14.8 s wall
+time, a signal from outside the runs. An immediate rerun was clean.

@@ -730,3 +730,48 @@ toward "bounded batches dominate". The deciding census is:
 
 C is built only if most of those real-site edits read bounded. Its
 guard budget is then sized from their R and N readings.
+
+## Status (2026-10-28, later): the real-site census, and what it says about C
+
+The B1 census was run on the scorecard's three CSS-in-JS sites in the
+simulator: `tools/scorecard/scorecard.py --only guardian,bbc,claude
+--settle 30000`, reusing the r58 reference, output in
+`~/vitabrowser-work/score/census-321`. All three loaded. Their visual
+scores match r58 (BBC 0.734 vs 0.728, Guardian 0.515 vs 0.521,
+claude.ai 0.465 vs 0.465). The news sites' text scores fell only
+because the two-week-old reference has different headlines.
+
+| site | full reconverts | sheet batches (identity) | SHEETREACH |
+|---|---|---|---|
+| Guardian | 5 | 1 (none) | none |
+| BBC | 5 | 3 (2 single, 1 none) | 2 bounded: K=1 A=1 R=15 N=1863; K=4 A=3 R=1 N=1866 |
+| claude.ai `/login` | 13 | 5 (4 multi, 1 none) | none |
+
+**Reading.** On these pages, sheet edits are rare. All 8 single-sheet
+readings in this sample came from BBC, and both of BBC's single-sheet
+edits read bounded. But the sample is two events. Neither the Guardian
+nor claude.ai produced a single-identified sheet batch at all.
+claude.ai's sheet work arrives as two-sheet batches, which B1 does not
+classify and C as designed would decline (two-decline). The 2026-10-27
+design measurement predicted hydration appends to large class-anchored
+sheets. That does not show up within 30 s in this engine. The most C
+could remove here is 2 of 23 full reconverts, all on BBC.
+
+**Recommendation: do not build C yet.** "Bounded dominates" holds
+(2/2), but on too few events to size anything, and the payoff it could
+buy on these sites is about 10% of full reconverts. Next:
+- **Run 40 (device):** carry the census and read `SHEETREACH` and
+  `SHEETIDCENSUS` from real browsing. Interaction, not first load, is
+  where CSS-in-JS inserts rules.
+- **If multi-sheet batches dominate** there, as on claude.ai, the
+  question becomes whether C should take a batch of several identified
+  sheets (the union of their roots). That is a design change to piece
+  C's two-decline rule, and it is for the owner.
+
+**Side finding, outside B1.** Run alone through `run-live-sites.sh`
+(15 s minimum, no `VITA_CSSGAP`), the Guardian spent about 130 s of CPU
+in one QuickJS timer callback before a document appeared. In gdb, that
+callback was a `Proxy` get / `Reflect.get` / `Array.prototype.every`
+chain calling `getAttribute` (`macsurf_qjs_run_timers`), so it is a
+script-cost problem, not census code. The scorecard run of the same
+page loaded. Worth its own look before the next Guardian scorecard.
