@@ -350,3 +350,13 @@ patch 315 entry.
   group.
 - **Still open:** checkbox gadgets (rect/line with static styles) do
   not fold the group opacity.
+
+## Status (2026-10-29): checkbox gadgets landed as patch 325
+
+The last open item above is closed. `html_redraw_checkbox()` paints its
+base, bevel lines and tick from local style copies carrying the composed
+group opacity, like the radio. Gate: CSS-opacity-group's checkbox leg
+(RECT 1/1, LINE 6/12 at `OPAQUE 2`; without the patch 0/2 and 0/12).
+Stage 3 (a device-verified scale-tint entry to replace the pre-multiply
+path) is still unscheduled. It needs a vitaSDK or hardware check that
+this VM cannot do.

@@ -6588,3 +6588,38 @@ FTP). That copy must include **`netsurf.log`**: the piece-C census
 lines (`LIFE SHEETREACH`, `LIFE SHEETREACHCENSUS`, `LIFE SHEETIDCENSUS`,
 `LIFE SHEETCAUSE`) and the Guardian and Stack Overflow timings are
 written only there. The `.plot` dumps carry none of them.
+
+## Run 40 — plot-side check (2026-10-29 23:00): nothing from the device yet
+
+The overnight agenda asked for run 40's plot-side SAME check. It cannot run
+yet. The 34 `.plot` files in `Desktop\VitaBrowser-hwtest\reference-dumps\`
+are byte-identical to `hwtest-2026-10-28-run40/reference-dumps` (the staged
+simulator reference, mtime 10-28 20:20:04 = staging). No
+`results\net-*` folder exists for run 40. The device timings for the
+Guardian and Stack Overflow, the form-walk ms and the B1 census lines are
+also still open, because they are written only to the Vita's `netsurf.log`.
+Run 40 stays open. Piece C (doc 23) stays on hold for that log.
+
+## Patch 325 (2026-10-29): the checkbox paints at the composed group opacity (doc 24's last open item)
+
+Doc 24's 2026-10-26 status left one item open: checkbox gadgets. The
+scaled-image path the overnight agenda named (pre-multiply) already
+landed in 319.
+
+- **redraw.c `html_redraw_checkbox()`** drew its base fill, bevel lines
+  and tick from the shared static plot styles. It now takes local copies
+  of the base, dark and light styles beside the accent-color blob
+  copies. All five carry `g_group_opacity` when it is below full, as
+  `html_redraw_radio()` does since 315. The vita line and rectangle ops
+  already map a style's opacity to a bucket (314).
+- **Gate.** CSS-opacity-group gains a checked checkbox inside `.half` and
+  one outside. The faded checkbox traces its 13×13 base RECT and all six
+  LINEs (four bevel, two tick) with `OPAQUE 2`. The control traces none.
+  Result: RECT 1/1, LINE 6/12. Built without the patch, the leg reads
+  RECT 0/2, LINE 0/12. The dashed-border LINE count now takes only the
+  page's long lines (≥ 20 px).
+
+Full gate: `gate325.log`, exit 0 (interaction 52/52, 23 bundled pages
+identical at the Vita's pace).
+
+**Device:** sim-only until the next VPK.
