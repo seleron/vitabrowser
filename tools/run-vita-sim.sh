@@ -649,8 +649,17 @@ op_brect_s=$(awk '/PLOT RECT/ { if ($8 - $4 == 6 && $10 - $6 == 32 && /OPAQUE 2/
 op_brect_ctl=$(awk '/PLOT RECT/ { if ($8 - $4 == 120 && $10 - $6 == 6 && !/OPAQUE/) n++ } END { print n+0 }' "$op" 2>/dev/null)
 op_bdbl_op2=$(grep -c 'PLOT POLYGON.*OPAQUE 2' "$op" 2>/dev/null || true)
 op_bdbl_all=$(grep -c 'PLOT POLYGON' "$op" 2>/dev/null || true)
-op_bdash_op2=$(grep -c 'PLOT LINE.*OPAQUE 2' "$op" 2>/dev/null || true)
-op_bdash_all=$(grep -c 'PLOT LINE' "$op" 2>/dev/null || true)
+# Patch 325: the dashed border's LINEs are the page's long ones (>= 20 px);
+# the checkboxes' are 13 px or shorter.
+op_bdash_op2=$(awk '/PLOT LINE/ { dx = $8 - $4; dy = $10 - $6; if (dx < 0) dx = -dx; if (dy < 0) dy = -dy; if ((dx >= 20 || dy >= 20) && /OPAQUE 2$/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_bdash_all=$(awk '/PLOT LINE/ { dx = $8 - $4; dy = $10 - $6; if (dx < 0) dx = -dx; if (dy < 0) dy = -dy; if (dx >= 20 || dy >= 20) n++ } END { print n+0 }' "$op" 2>/dev/null)
+# Patch 325: the checked checkbox inside .half paints its 13x13 base RECT,
+# four bevel LINEs and two tick LINEs at OPAQUE 2; the control outside
+# paints the same seven ops with no token.
+op_cbrect_op2=$(awk '/PLOT RECT/ { if ($8 - $4 == 13 && $10 - $6 == 13 && /OPAQUE 2$/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_cbrect_ctl=$(awk '/PLOT RECT/ { if ($8 - $4 == 13 && $10 - $6 == 13 && !/OPAQUE/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_cbline_op2=$(awk '/PLOT LINE/ { dx = $8 - $4; dy = $10 - $6; if (dx < 0) dx = -dx; if (dy < 0) dy = -dy; if (dx < 20 && dy < 20 && /OPAQUE 2$/) n++ } END { print n+0 }' "$op" 2>/dev/null)
+op_cbline_all=$(awk '/PLOT LINE/ { dx = $8 - $4; dy = $10 - $6; if (dx < 0) dx = -dx; if (dy < 0) dy = -dy; if (dx < 20 && dy < 20) n++ } END { print n+0 }' "$op" 2>/dev/null)
 op_balpha_op2=$(awk '/PLOT RECT/ { if ($8 - $4 == 100 && $10 - $6 == 6 && /OPAQUE 2/) n++ } END { print n+0 }' "$op" 2>/dev/null)
 op_balpha_op1=$(awk '/PLOT RECT/ { if ($8 - $4 == 100 && $10 - $6 == 6 && /OPAQUE 1/) n++ } END { print n+0 }' "$op" 2>/dev/null)
 # Patch 315 (doc 24 stage 1): bitmaps carry the composed group opacity in
@@ -684,7 +693,7 @@ if [ -n "$op_snap" ] && [ -n "$op_b20" ] && [ -n "$op_b16" ] && [ -n "$op_b16c" 
 		$((op_x16 + 60)),$((op_y16 + 28)) $((op_xc + 8)),$((op_yc + 8)) | \
 		awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
-echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0), half-border RECT ${op_brect_h:-?}/${op_brect_s:-?} (2/2), solid-border RECT ${op_brect_ctl:-?} (2), double-border POLYGON ${op_bdbl_op2:-?}/${op_bdbl_all:-?} (8/16), dashed-border LINE ${op_bdash_op2:-?}/${op_bdash_all:-?} (4/8), alpha-border OPAQUE 2/1 ${op_balpha_op2:-?}/${op_balpha_op1:-?} (2/2), bg-tile OPAQUE 2 ${op_bg1:-?} (1), bg-repeat OPAQUE 2/solid ${op_bgrep_op2:-?}/${op_bgrep_ctl:-?} (1/1), radio DISC ${op_disc_op2:-?}/${op_disc_all:-?} (2/4), radio ARC ${op_arc_op2:-?}/${op_arc_all:-?} (2/4), svg PATH ${op_path_op2:-?}/${op_path_all:-?} (1/2), image pixels ${op_px:-none} (127,127,255 255,127,127 255,127,127 255,0,0)"
+echo "  CSS-opacity: shown ${op_shown:-0} (1), half ${op_half:-0} (1), hidden ${op_hidden:-?} (0), light-dark box fills ${op_ldbox:-0} (>=1), half-text OPAQUE 2 ${op_half_op2:-?} (1), outer-text OPAQUE 3 ${op_outer_op3:-?} (1), nested-text OPAQUE 1 ${op_nested_op1:-?} (1), shown-text solid ${op_shown_opaque:-?} (0), half-border RECT ${op_brect_h:-?}/${op_brect_s:-?} (2/2), solid-border RECT ${op_brect_ctl:-?} (2), double-border POLYGON ${op_bdbl_op2:-?}/${op_bdbl_all:-?} (8/16), dashed-border LINE ${op_bdash_op2:-?}/${op_bdash_all:-?} (4/8), alpha-border OPAQUE 2/1 ${op_balpha_op2:-?}/${op_balpha_op1:-?} (2/2), bg-tile OPAQUE 2 ${op_bg1:-?} (1), bg-repeat OPAQUE 2/solid ${op_bgrep_op2:-?}/${op_bgrep_ctl:-?} (1/1), radio DISC ${op_disc_op2:-?}/${op_disc_all:-?} (2/4), radio ARC ${op_arc_op2:-?}/${op_arc_all:-?} (2/4), checkbox RECT OPAQUE 2/solid ${op_cbrect_op2:-?}/${op_cbrect_ctl:-?} (1/1), checkbox LINE ${op_cbline_op2:-?}/${op_cbline_all:-?} (6/12), svg PATH ${op_path_op2:-?}/${op_path_all:-?} (1/2), image pixels ${op_px:-none} (127,127,255 255,127,127 255,127,127 255,0,0)"
 # Patch 319 (doc 24 stage 2): <img> fades with its opacity group, per
 # image format the build decodes. CSS-opacity-image gives each blue
 # fixture its own intrinsic size (png 20, gif 22, svg 24, bmp 26, ico 28,
@@ -1499,6 +1508,8 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 	[ "${op_bg1:-0}" -eq 1 ] && [ "${op_bgrep_op2:-0}" -eq 1 ] && [ "${op_bgrep_ctl:-0}" -eq 1 ] && \
 	[ "${op_disc_op2:-0}" -eq 2 ] && [ "${op_disc_all:-0}" -eq 4 ] && \
 	[ "${op_arc_op2:-0}" -eq 2 ] && [ "${op_arc_all:-0}" -eq 4 ] && \
+	[ "${op_cbrect_op2:-0}" -eq 1 ] && [ "${op_cbrect_ctl:-0}" -eq 1 ] && \
+	[ "${op_cbline_op2:-0}" -eq 6 ] && [ "${op_cbline_all:-0}" -eq 12 ] && \
 	[ "${op_path_op2:-0}" -eq 1 ] && [ "${op_path_all:-0}" -eq 2 ] && \
 	[ "$op_px" = "127,127,255 255,127,127 255,127,127 255,0,0 " ] || fail "event order / inline-grid / group opacity"
 
