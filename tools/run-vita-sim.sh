@@ -286,6 +286,7 @@ NET-js-inline-rect http://127.0.0.1:$HP/JS-inline-rect.html
 NET-html-hidden-details http://127.0.0.1:$HP/HTML-hidden-details.html
 NET-css-flow-root http://127.0.0.1:$HP/CSS-flow-root.html
 NET-css-grid-autofill http://127.0.0.1:$HP/CSS-grid-autofill.html
+NET-css-grid-named-var http://127.0.0.1:$HP/CSS-grid-named-var.html
 NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
 NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
@@ -998,6 +999,12 @@ c334p=$(ls "$R"/*NET-css-flex-item-width-contrib.plot 2>/dev/null | head -1)
 c334r=$(sed -n 's/.*STR \(FLEXCONTRIB334: [0-9]*\/[0-9]* passed\).*/\1/p' "$c334p" 2>/dev/null | head -1)
 echo "  css-flex-item-width-contrib: ${c334r:-no summary}"
 [ -n "$c334p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$c334p" | sed 's/^STR /  /'
+# Patch 336: grid line names are not tracks; var() in
+# grid-template-columns expands from this sheet (rem/em as 16px px).
+g336p=$(ls "$R"/*NET-css-grid-named-var.plot 2>/dev/null | head -1)
+g336r=$(sed -n 's/.*STR \(GRIDNAMES336: [0-9]*\/[0-9]* passed\).*/\1/p' "$g336p" 2>/dev/null | head -1)
+echo "  css-grid-named-var: ${g336r:-no summary}"
+[ -n "$g336p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$g336p" | sed 's/^STR /  /'
 # Patch 335: outlines honour their colour's alpha and the group opacity.
 # The five 200x20 boxes' 204x24 outline rects: the two transparent ones
 # draw nothing, the 50% one and the one inside opacity:.5 trace OPAQUE 2,
@@ -1542,6 +1549,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$f331r" = "FLEXAUTOMIN331: 5/5 passed" ] && \
 [ "$b333r" = "FLEXBLOCKIFY333: 6/6 passed" ] && \
 [ "$c334r" = "FLEXCONTRIB334: 5/5 passed" ] && \
+[ "$g336r" = "GRIDNAMES336: 4/4 passed" ] && \
 [ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \

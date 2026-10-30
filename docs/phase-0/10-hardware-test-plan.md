@@ -6895,3 +6895,33 @@ Consequence: no patch to write. The MDN layout is a genuine fit target for
 the grid rewrite (336 WIP, whose MDN reproduction already turns the TOC
 into a column), so it moves from "regression" to "rewrite acceptance
 page" below.
+
+## Patch 336 landed (2026-10-30 ~02:50): grid line names + var() in the -macsurf-grid rewrite
+
+`336-netsurf-grid-named-var.patch` (css_rewrite.c) closes the grid rewrite
+WIP. Four causes fixed, all in the text rewrite before libcss parses:
+
+1. `[line-name ...]` lists counted as tracks (each name a 1fr column).
+2. `var(--layout)` counted as one track; now expanded from the sheet's own
+   `--name:` definition (first one outside `@media print`), recursively
+   (4 levels), var() fallback when undefined.
+3. `minmax(<rem|em>, ...)` floors unrecognised (px only) -> 1fr; now 16px
+   root font.
+4. (found this session while bisection pointed at the site) bare rem/em
+   length tracks, e.g. the `2rem` gap track from `var(--gap)`, were emitted
+   verbatim and the -macsurf-grid grammar packed every non-fr dimension as
+   px: 2rem became a 2px column. Normalised to px at the same 16px root
+   font.
+
+Gate: CSS-grid-named-var (testpages/pages/, net page in run-vita-sim.sh,
+hard assert GRIDNAMES336 4/4): plain tracks, line names not tracks, var()
+with names + minmax(rem) + print override (gap exactly 32px), var()
+fallback. Sim 3/4 -> 4/4 with fix 4; Chromium 4/4 (page comment).
+Full sim gate with the new rewrite: all pages + clip modes pass; netlog
+mirror recheck 240 identical / 0 differ (one transient mirror-diff during
+the run was the receiver settling, verified clean after).
+
+MDN acceptance (live score, reuse-ref r61-335-fresh): 77.4 -> 79.5
+(visual 0.434 -> 0.488, text 1.0). The remaining gap to the stale 80.8
+baseline is the site reflow between the r59 and r61 reference captures,
+not the engine. Next full scorecard run (r62) should re-capture refs.
