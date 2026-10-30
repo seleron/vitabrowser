@@ -1,0 +1,193 @@
+# libcss: :not() takes a selector list (patch 328)
+# Generated 2026-10-29
+# Base: seleron/vitabrowser (patch stack through 327)
+#
+# libcss's :not() accepted one simple selector (CSS 3). A compound
+# (:not(.a.b)), a list (:not(.a, .b)) or a complex selector (:not(.a .b))
+# invalidated the rule. WordPress's navigation sheet resets the closed
+# menu container with
+# `.wp-block-navigation__responsive-container:not(.is-menu-open.is-menu-open){background-color:inherit!important}`.
+# That rule was dropped, so the global header's hover colour painted a
+# dark box over the whole wordpress.org navigation bar.
+#
+#  - parse/language.c parsePseudo(): parseNotSimple() probes for the old
+#    one-simple-selector form (it allocates nothing, so abandoning the
+#    probe is free), and that form keeps its existing detail. Anything
+#    else parses with parseSelectorArgList() into a SELLIST detail, as
+#    :is() does since patch 91, with negate set. match_detail() already
+#    inverts any negated detail, so matching needs no change. Specificity
+#    is the most specific argument's (Selectors 4), as for :is().
+#  - parseSelectorArgList() takes a forgiving flag. :is() and :where()
+#    stay forgiving. :not() is not, as in Chromium: one invalid
+#    alternative (a pseudo-element, anything this libcss lacks)
+#    invalidates the rule. An alternative using a pseudo-class this
+#    libcss parses but never matches (:has(), :host, :host-context(),
+#    also inside a nested :is()) is rejected too. Negated, it would match
+#    every element (fixes360b rejects them in the simple form for the
+#    same reason).
+#
+# Gate: CSS-not-list (NOTLIST328, 10 legs: compound, list, complex,
+# type+class, the WordPress !important case against a more specific
+# rule, :not(:is()), id specificity from a list argument, a
+# pseudo-element invalidating the rule, :not(:not())). Without this patch
+# it reads 1/10. Only the invalid-rule leg passes, because the old parser
+# dropped that rule too.
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -104,7 +104,7 @@
+ 		css_combinator *result);
+ static css_error parseSelectorArgList(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx, bool is_is,
+-		css_selector_sellist **result);
++		bool forgiving, css_selector_sellist **result);
+ static css_error parseSelector(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_selector **result);
+@@ -1360,6 +1360,68 @@
+ 	return CSS_OK;
+ }
+ 
++/**
++ * VitaBrowser patch 328: is the argument at *ctx one simple selector
++ * followed by ')' (the CSS 2/3 form of :not())? Probes only: the caller
++ * restores *ctx either way. Nothing is allocated (detail init takes no
++ * references), so abandoning the probe leaks nothing.
++ */
++static bool parseNotSimple(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx)
++{
++	const css_token *token = parserutils_vector_peek(vector, *ctx);
++	css_selector_detail det;
++	css_qname qname;
++
++	if (token == NULL)
++		return false;
++	if (token->type == CSS_TOKEN_IDENT || tokenIsChar(token, '*') ||
++			tokenIsChar(token, '|')) {
++		if (parseTypeSelector(c, vector, ctx, &qname) != CSS_OK)
++			return false;
++	} else if (parseSpecific(c, vector, ctx, true, &det) != CSS_OK) {
++		return false;
++	}
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	return token != NULL && tokenIsChar(token, ')');
++}
++
++/**
++ * VitaBrowser patch 328: does a selector (any compound of its chain, or an
++ * :is()/:where() list inside it) use a pseudo-class this libcss parses but
++ * never matches (:has(), :host, :host-context())? Negated by :not(), such a
++ * selector would match every element; fixes360b rejects them inside a
++ * simple :not() for the same reason.
++ */
++static bool selector_never_matches_part(css_language *c,
++		const css_selector *sel)
++{
++	const css_selector *s;
++	const css_selector_detail *d;
++	uint32_t i;
++
++	for (s = sel; s != NULL; s = s->combinator) {
++		for (d = &s->data; d != NULL; d = d->next ? d + 1 : NULL) {
++			if (d->type != CSS_SELECTOR_PSEUDO_CLASS)
++				continue;
++			if (d->value_type == CSS_SELECTOR_DETAIL_VALUE_SELLIST) {
++				for (i = 0; i < d->value.sellist->count; i++) {
++					if (selector_never_matches_part(c,
++						d->value.sellist->sel[i]))
++						return true;
++				}
++				continue;
++			}
++			if (d->qname.name == c->strings[HAS_FN] ||
++					d->qname.name == c->strings[HOST] ||
++					d->qname.name == c->strings[HOST_CONTEXT])
++				return true;
++		}
++	}
++	return false;
++}
++
+ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		int32_t *ctx, bool in_not, css_selector_detail *specific)
+ {
+@@ -1531,7 +1593,7 @@
+ 			css_selector_sellist *list = NULL;
+ 
+ 			error = parseSelectorArgList(c, vector, ctx,
+-					fun_type == IS_FN, &list);
++					fun_type == IS_FN, true, &list);
+ 			if (error != CSS_OK)
+ 				return error;
+ 
+@@ -1576,6 +1638,39 @@
+ 					detail_value, value_type,
+ 					false, specific);
+ 		} else if (fun_type == NOT) {
++			/* VitaBrowser patch 328: an argument that is not one
++			 * simple selector -- a compound (:not(.a.b)), a list
++			 * (:not(.a, .b)) or a complex selector (:not(.a .b))
++			 * -- is a selector list, matched like :is() and
++			 * negated (Selectors 4). It invalidated the rule, which
++			 * dropped e.g. WordPress's ":not(.is-menu-open.is-menu-
++			 * open){background-color:inherit!important}". The one-
++			 * simple-selector form keeps its own path below. */
++			int32_t arg_ctx = *ctx;
++
++			if (parseNotSimple(c, vector, ctx) == false) {
++				css_selector_sellist *list = NULL;
++
++				*ctx = arg_ctx;
++				error = parseSelectorArgList(c, vector, ctx,
++						true, false, &list);
++				if (error != CSS_OK)
++					return error;
++
++				qname.name = c->strings[IS_FN];
++				detail_value.sellist = list;
++				error = css__stylesheet_selector_detail_init(
++						c->sheet, CSS_SELECTOR_PSEUDO_CLASS,
++						&qname, detail_value,
++						CSS_SELECTOR_DETAIL_VALUE_SELLIST,
++						true, specific);
++				if (error != CSS_OK)
++					css__stylesheet_sellist_destroy(c->sheet,
++							list);
++				return error;
++			}
++			*ctx = arg_ctx;
++
+ 			/* type_selector | specific */
+ 			token = parserutils_vector_peek(vector, *ctx);
+ 			if (token == NULL)
+@@ -1980,7 +2075,7 @@
+  */
+ css_error parseSelectorArgList(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx, bool is_is,
+-		css_selector_sellist **result)
++		bool forgiving, css_selector_sellist **result)
+ {
+ 	parserutils_vector *alt = NULL;
+ 	css_selector_sellist *list;
+@@ -2044,6 +2139,20 @@
+ 					ok = false;
+ 			}
+ 
++			/* patch 328: :not()'s list is not forgiving -- one bad
++			 * alternative invalidates it, as in Chromium -- and an
++			 * alternative that can never match would turn the
++			 * negation into match-everything. */
++			if (!forgiving && ok && selector_never_matches_part(c, sel))
++				ok = false;
++			if (!forgiving && !ok) {
++				if (sel != NULL)
++					css__stylesheet_selector_destroy(
++							c->sheet, sel);
++				error = CSS_INVALID;
++				break;
++			}
++
+ 			if (ok && list->count == cap) {
+ 				css_selector_sellist *grown = realloc(list,
+ 						sizeof(*list) + (cap * 2 - 1) *
