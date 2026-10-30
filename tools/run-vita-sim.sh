@@ -216,6 +216,7 @@ CSS-inline-grid file:///app0:/testpages/CSS-inline-grid.html
 CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
 CSS-opacity-image file:///app0:/testpages/CSS-opacity-image.html
 CSS-isolation file:///app0:/testpages/CSS-isolation.html
+CSS-svg-viewbox file:///app0:/testpages/CSS-svg-viewbox.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
@@ -1053,6 +1054,16 @@ if [ -n "$i332s" ] && [ -n "$i332a" ] && [ -n "$i332b" ]; then
 		"$i332a" "$i332b" | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-isolation: isolated fill / control ${i332px:-none} (0,0,0 255,255,255)"
+# Patch 343: inline SVG viewBox applies (scaled, negative min-y, 960-unit
+# Material box). Fixed layout; snapshot pixels.
+v343s=$(ls "$OUT"/snaps/N-*-CSS-svg-viewbox.png 2>/dev/null | head -1)
+v343px=
+if [ -n "$v343s" ]; then
+	v343px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$v343s" \
+		36,66 12,42 24,106 24,170 24,140 | \
+		awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-svg-viewbox: ${v343px:-none} (255,0,0 238,238,238 255,0,0 255,0,0 238,238,238)"
 # Patch 221: the space after inline-blocks / replaced boxes.
 i221p=$(ls "$R"/*NET-css-inline-block-space.plot 2>/dev/null | head -1)
 i221r=$(sed -n 's/.*STR \(IBSPACE221: [0-9]*\/[0-9]* passed\).*/\1/p' "$i221p" 2>/dev/null | head -1)
@@ -1581,6 +1592,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$n341r" = "GRIDNEST341: 4/4 passed" ] && \
 [ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
+[ "$v343px" = "255,0,0 238,238,238 255,0,0 255,0,0 238,238,238 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
 [ "$r223r" = "RANGECOL223: 4/4 passed" ] && \

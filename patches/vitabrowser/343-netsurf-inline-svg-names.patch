@@ -1,0 +1,137 @@
+# netsurf: inline SVG serialized with SVG-cased names, so viewBox applies (patch 343)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 342)
+#
+# vb_inline_svg serializes the page's <svg> subtree for libsvgtiny. It
+# copied the names as the DOM hands them over: upper-case element names
+# and lower-case attributes (`viewbox`; the foreign-content case
+# adjustment does not reach the stored attribute). libsvgtiny is an XML
+# consumer and matches viewBox case-sensitively, so **no inline SVG's
+# viewBox ever applied**. A 24-unit icon on a 48px box drew at 24px in its
+# corner, and Material icons (`viewBox="0 -960 960 960"`) drew entirely
+# off-canvas. Google's trending arrows and search-bar icons and much of
+# YouTube's toolbar were blank. Shapes still drew at viewBox scale 1, which
+# is why logos sized to their viewBox looked right.
+#
+#  - vb_inline_svg.c sb_svg_name(): element names are lower-cased, and the
+#    HTML parsing spec's foreign-content camelCase table restores
+#    linearGradient, clipPath, feGaussianBlur and the rest. Attribute names
+#    likewise (viewBox, preserveAspectRatio, gradientUnits, ...). Used for
+#    the opening tag, the closing tag and every attribute.
+#
+# Gate: CSS-svg-viewbox (snapshot pixels, fixed layout): a scaled
+# 24-unit rect, a negative min-y and Material's 960-unit box read
+# 255,0,0 / 238,238,238 / 255,0,0 / 255,0,0 / 238,238,238, as in Chromium.
+# Before the patch the red points read the #eee background.
+# Known remaining: Google's search-bar icons now draw, but their paths fill
+# garbled (a separate path-fill issue).
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -36,6 +36,8 @@
+  * (a DOM change rebuilds the boxes, so stale entries are never hit).
+  */
+ 
++#include <ctype.h>
++#include <strings.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -154,6 +156,67 @@
+ 		z->nrefs++;
+ }
+ 
++/* VitaBrowser patch 343: SVG element and attribute names in their
++ * case-sensitive SVG spelling. The page's DOM hands this serializer HTML
++ * spellings -- upper-case element names, lower-case attributes
++ * ("viewbox") -- and libsvgtiny, an XML consumer, matches viewBox
++ * case-sensitively, so no inline SVG's viewBox applied: a 24-unit icon
++ * on a 48px box drew at 24px in its corner, and Material icons
++ * (viewBox="0 -960 960 960") drew off-canvas -- Google's search-bar
++ * icons, YouTube's toolbar. The camelCase lists are the HTML parsing
++ * spec's foreign-content tables. */
++static const char *const vb_svg_camel_elems[] = {
++	"altGlyph", "altGlyphDef", "altGlyphItem", "animateColor",
++	"animateMotion", "animateTransform", "clipPath", "feBlend",
++	"feColorMatrix", "feComponentTransfer", "feComposite",
++	"feConvolveMatrix", "feDiffuseLighting", "feDisplacementMap",
++	"feDistantLight", "feDropShadow", "feFlood", "feFuncA", "feFuncB",
++	"feFuncG", "feFuncR", "feGaussianBlur", "feImage", "feMerge",
++	"feMergeNode", "feMorphology", "feOffset", "fePointLight",
++	"feSpecularLighting", "feSpotLight", "feTile", "feTurbulence",
++	"foreignObject", "glyphRef", "linearGradient", "radialGradient",
++	"textPath", NULL
++};
++static const char *const vb_svg_camel_attrs[] = {
++	"attributeName", "attributeType", "baseFrequency", "baseProfile",
++	"calcMode", "clipPathUnits", "diffuseConstant", "edgeMode",
++	"filterUnits", "glyphRef", "gradientTransform", "gradientUnits",
++	"kernelMatrix", "kernelUnitLength", "keyPoints", "keySplines",
++	"keyTimes", "lengthAdjust", "limitingConeAngle", "markerHeight",
++	"markerUnits", "markerWidth", "maskContentUnits", "maskUnits",
++	"numOctaves", "pathLength", "patternContentUnits",
++	"patternTransform", "patternUnits", "pointsAtX", "pointsAtY",
++	"pointsAtZ", "preserveAlpha", "preserveAspectRatio",
++	"primitiveUnits", "refX", "refY", "repeatCount", "repeatDur",
++	"requiredExtensions", "requiredFeatures", "specularConstant",
++	"specularExponent", "spreadMethod", "startOffset", "stdDeviation",
++	"stitchTiles", "surfaceScale", "systemLanguage", "tableValues",
++	"targetX", "targetY", "textLength", "viewBox", "viewTarget",
++	"xChannelSelector", "yChannelSelector", "zoomAndPan", NULL
++};
++
++static void sb_svg_name(struct sbuf *out, const char *s, size_t n,
++		bool attr)
++{
++	const char *const *tab = attr ? vb_svg_camel_attrs : vb_svg_camel_elems;
++	char low[48];
++	size_t i;
++
++	if (n == 0 || n >= sizeof(low)) {
++		sb_add(out, s, n);
++		return;
++	}
++	for (i = 0; i < n; i++)
++		low[i] = (char)tolower((unsigned char)s[i]);
++	low[n] = '\0';
++	for (i = 0; tab[i] != NULL; i++)
++		if (strlen(tab[i]) == n && strcasecmp(tab[i], low) == 0) {
++			sb_add(out, tab[i], n);
++			return;
++		}
++	sb_add(out, low, n);
++}
++
+ static void ser_node(struct ser *z, dom_node *n, int depth, bool root);
+ 
+ static void ser_children(struct ser *z, dom_node *n, int depth)
+@@ -202,7 +265,8 @@
+ 		return;
+ 	}
+ 	sb_str(&z->out, "<");
+-	sb_add(&z->out, dom_string_data(name), dom_string_byte_length(name));
++	sb_svg_name(&z->out, dom_string_data(name),
++			dom_string_byte_length(name), false);	/* 343 */
+ 
+ 	if (dom_node_get_attributes(n, &attrs) == DOM_NO_ERR && attrs != NULL)
+ 		dom_namednodemap_get_length(attrs, &na);
+@@ -241,8 +305,8 @@
+ 				}
+ 			}
+ 			sb_str(&z->out, " ");
+-			sb_add(&z->out, dom_string_data(an),
+-			       dom_string_byte_length(an));
++			sb_svg_name(&z->out, dom_string_data(an),
++			       dom_string_byte_length(an), true);	/* 343 */
+ 			sb_str(&z->out, "=\"");
+ 			if (vn == 12 && strncasecmp(vp, "currentColor", 12) == 0)
+ 				sb_str(&z->out, z->color);
+@@ -297,7 +361,8 @@
+ 		}
+ 	}
+ 	sb_str(&z->out, "</");
+-	sb_add(&z->out, dom_string_data(name), dom_string_byte_length(name));
++	sb_svg_name(&z->out, dom_string_data(name),
++			dom_string_byte_length(name), false);	/* 343 */
+ 	sb_str(&z->out, ">");
+ 	dom_string_unref(name);
+ }
