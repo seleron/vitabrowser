@@ -1,0 +1,61 @@
+# netsurf: outlines honour their colour's alpha and the group opacity (patch 335)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 334)
+#
+# The outline painter (MacSurf fixes40) passed nscss_color_to_ns(ocol) to
+# the plotter, which drops the alpha, and never set the style's opacity.
+# Every outline drew opaque, a fully transparent one included. claude.ai
+# gives every link `outline: 2px solid hsla(var(--accent-100) / 0%)`, so
+# its full-width header link drew a blue frame across the page. Borders
+# have taken their colour alpha since patch 100 and the group opacity
+# since 314. Outlines now do the same.
+#
+#  - redraw.c: the outline colour's alpha, multiplied by the composed
+#    group opacity, becomes plot_style_outline.opacity. An alpha of 0
+#    skips the outline.
+#
+# Gate: CSS-outline-alpha. Of the five 200x20 boxes' 204x24 outline rects,
+# the two transparent ones (rgba(0,0,0,0), hsla(var() / 0%)) draw nothing,
+# the 50% one and an opaque one inside opacity: .5 trace OPAQUE 2, and the
+# opaque one traces no token: 3 rects, 2 at OPAQUE 2. Without the patch
+# there are 5 rects and no tokens. Chromium pixels agree (white, white,
+# 127, 0, 127).
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -5799,6 +5799,28 @@
+ 			plot_style_outline.stroke_width =
+ 					(owidth_px << PLOT_STYLE_RADIX);
+ 			plot_style_outline.stroke_colour = nscss_color_to_ns(ocol);
++			/* VitaBrowser patch 335: the outline colour's alpha (and
++			 * the composed group opacity), as borders take them
++			 * since patches 100/314. nscss_color_to_ns() drops the
++			 * alpha, so a transparent outline drew opaque:
++			 * claude.ai gives every link `outline: 2px solid
++			 * hsla(var(--accent-100) / 0%)`, and its header link
++			 * drew a blue frame across the page. */
++			{
++				unsigned int oalpha = (ocol >> 24) & 0xff;
++
++				if (g_group_opacity <
++						(plot_style_fixed)PLOT_STYLE_SCALE)
++					oalpha = (unsigned int)(((uint64_t)oalpha *
++						(unsigned int)g_group_opacity) /
++						PLOT_STYLE_SCALE);
++				if (oalpha == 0)
++					goto outline_done;
++				if (oalpha < 255)
++					plot_style_outline.opacity =
++						(plot_style_fixed)(oalpha *
++						PLOT_STYLE_SCALE / 255);
++			}
+ 			orect.x0 = (x - border_left - owidth_px) * scale;
+ 			orect.y0 = (y - border_top - owidth_px) * scale;
+ 			orect.x1 = (x + padding_width + border_right + owidth_px)
+@@ -5810,6 +5832,7 @@
+ 				return false;
+ 		}
+ 	}
++outline_done:
+ 
+ 	if (!html_redraw_multicol_rules(html, box, x, y, scale, &r, ctx))
+ 		return false;

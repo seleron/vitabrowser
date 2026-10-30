@@ -363,6 +363,7 @@ NET-css-font-size-calc http://127.0.0.1:$HP/CSS-font-size-calc.html
 NET-css-flex-auto-min-max http://127.0.0.1:$HP/CSS-flex-auto-min-max.html
 NET-css-flex-blockify http://127.0.0.1:$HP/CSS-flex-blockify.html
 NET-css-flex-item-width-contrib http://127.0.0.1:$HP/CSS-flex-item-width-contrib.html
+NET-css-outline-alpha http://127.0.0.1:$HP/CSS-outline-alpha.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -997,6 +998,14 @@ c334p=$(ls "$R"/*NET-css-flex-item-width-contrib.plot 2>/dev/null | head -1)
 c334r=$(sed -n 's/.*STR \(FLEXCONTRIB334: [0-9]*\/[0-9]* passed\).*/\1/p' "$c334p" 2>/dev/null | head -1)
 echo "  css-flex-item-width-contrib: ${c334r:-no summary}"
 [ -n "$c334p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$c334p" | sed 's/^STR /  /'
+# Patch 335: outlines honour their colour's alpha and the group opacity.
+# The five 200x20 boxes' 204x24 outline rects: the two transparent ones
+# draw nothing, the 50% one and the one inside opacity:.5 trace OPAQUE 2,
+# the opaque one no token (5 rects, no tokens, before the patch).
+o335p=$(ls "$R"/*NET-css-outline-alpha.plot 2>/dev/null | head -1)
+o335all=$(awk '/^PLOT RECT/ && $8 - $4 == 204 && $10 - $6 == 24 { n++ } END { print n + 0 }' "$o335p" 2>/dev/null)
+o335op2=$(awk '/^PLOT RECT/ && $8 - $4 == 204 && $10 - $6 == 24 && /OPAQUE 2$/ { n++ } END { print n + 0 }' "$o335p" 2>/dev/null)
+echo "  css-outline-alpha: outline rects ${o335all:-?} (3), OPAQUE 2 ${o335op2:-?} (2)"
 # Patch 332: isolation: isolate creates a stacking context. The z-index:-1
 # fill inside the isolated button paints black over its card; the control
 # (isolation: auto) is covered by its card (white, and culled from the
@@ -1533,6 +1542,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$f331r" = "FLEXAUTOMIN331: 5/5 passed" ] && \
 [ "$b333r" = "FLEXBLOCKIFY333: 6/6 passed" ] && \
 [ "$c334r" = "FLEXCONTRIB334: 5/5 passed" ] && \
+[ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
