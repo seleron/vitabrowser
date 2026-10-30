@@ -7398,3 +7398,16 @@ only the gate. A Chromium-checkable gate leg is not possible, because in
 Chrome those properties ARE own properties of the style object.
 
 Full gate (349 + 350): `gate349p.log`, exit 0.
+
+## State log 2026-10-30: r70 full fresh scorecard after 348-350 -- new baseline 84.4
+
+`score/r70-350` (fresh references, baseline r67b-audit 84.2): mean
+**84.4**. guardian is 80.8, confirming the 350 fix. The only drop larger
+than 1 is **wpblog −1.5 (81.0)**, and it is not a regression. The first
+screen is pixel-identical to r67b (visual 0.562 both). Text recall fell
+1.0 → 0.968 because a new comment thread appeared on the live page:
+Chrome's and the sim's text are both cut at the scorecard's 30,000
+characters, and the 13 missing words sit at the end of Chrome's window.
+Other moves are within the known noise: wikipedia +3.4 (carousel
+residual), hackernews +2.1 (live list), ddglite +1.1, claude +1.2. r70 is
+the baseline for the next units.
