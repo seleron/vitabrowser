@@ -219,6 +219,7 @@ CSS-isolation file:///app0:/testpages/CSS-isolation.html
 CSS-svg-viewbox file:///app0:/testpages/CSS-svg-viewbox.html
 CSS-svg-smooth-quad file:///app0:/testpages/CSS-svg-smooth-quad.html
 CSS-bg-layers-svg file:///app0:/testpages/CSS-bg-layers-svg.html
+CSS-svg-arc-flags file:///app0:/testpages/CSS-svg-arc-flags.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1123,6 +1124,14 @@ if [ -n "$b352s" ]; then
 		20,30 4,30 20,80 4,80 20,54 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-bg-layers-svg: ${b352px:-none} (153,153,153 255,255,255 153,153,153 255,255,255 255,255,255)"
+# Patch 354: SVG arc flags without separators (YouTube's icons).
+a354s=$(ls "$OUT"/snaps/N-*-CSS-svg-arc-flags.png 2>/dev/null | head -1)
+a354px=
+if [ -n "$a354s" ]; then
+	a354px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$a354s" \
+		24,64 24,51 4,44 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-svg-arc-flags: ${a354px:-none} (255,0,0 255,0,0 255,255,255)"
 # Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
 # same wave through the <img> path, no serializer rewrite.
 r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
@@ -1672,6 +1681,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$v343px" = "255,0,0 238,238,238 255,0,0 255,0,0 238,238,238 " ] && \
 [ "$q344px" = "255,0,0 238,238,238 255,0,0 " ] && \
 [ "$b352px" = "153,153,153 255,255,255 153,153,153 255,255,255 255,255,255 " ] && \
+[ "$a354px" = "255,0,0 255,0,0 255,255,255 " ] && \
 [ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \

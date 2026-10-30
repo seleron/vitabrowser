@@ -1,0 +1,71 @@
+# libsvgtiny: arc flags need no separator (patch 354)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 353)
+#
+# An elliptical arc's large-arc and sweep flags are single characters, '0'
+# or '1', and the SVG path grammar lets them run straight into the next
+# number. YouTube's icon paths are minified that way: `a9 9 0 105.641
+# 16.01` is rx 9, ry 9, rotation 0, flags 1 and 0, then x 5.641.
+# parse_path_parameters() read every parameter as a number, so "105.641"
+# became one value, the 7-number groups misaligned, and the whole path was
+# dropped. Every m.youtube.com icon (header search, compass, mic, the
+# bottom-bar Home / Shorts / You) was blank.
+#
+#  - svgtiny_path.c: parse_path_parameters() takes the command letter. For
+#    A/a, parameters 4 and 5 of each group of 7 are read as one '0' / '1'
+#    character. Anything else there ends the parameter list, as a bad
+#    number already did.
+#
+# Gate: CSS-svg-arc-flags (file:// snapshot: a circle drawn with `a8 8 0
+# 1016 0`, pixels as Chromium). Full fresh scorecard (r74-354 vs r73): all
+# YouTube icons draw. The sim's BBC and GitHub first screens are
+# pixel-identical to r73 (BBC's -2.2 is a new lead image in Chrome's
+# reference). Other moves are live content.
+--- a/src/svgtiny_path.c
++++ b/src/svgtiny_path.c
+@@ -1009,7 +1009,8 @@
+ static inline svgtiny_code
+ parse_path_parameters(const char **cursor,
+ 		      const char *textend,
+-		      struct internal_points *cmdp)
++		      struct internal_points *cmdp,
++		      char pathcmd)
+ {
+ 	const char *numend;
+ 	svgtiny_code res;
+@@ -1022,6 +1023,25 @@
+ 			return res;
+ 		}
+ 
++		/* VitaBrowser patch 354: an arc's large-arc and sweep flags
++		 * (parameters 4 and 5 of each group of 7) are single
++		 * characters, '0' or '1', and need no separator: YouTube's
++		 * icons write `a9 9 0 105.641 16.01` (flags 1 and 0, then x
++		 * 5.641). Read as numbers, "105.641" was one value, the
++		 * group misaligned and the whole path was dropped. */
++		if (pathcmd == 'A' && (cmdp->used % 7 == 3 ||
++				       cmdp->used % 7 == 4)) {
++			if (*cursor >= textend ||
++			    (**cursor != '0' && **cursor != '1')) {
++				res = svgtiny_SVG_ERROR;
++				break;
++			}
++			cmdp->p[cmdp->used++] = (float)(**cursor - '0');
++			(*cursor)++;
++			advance_comma_whitespace(cursor, textend);
++			continue;
++		}
++
+ 		numend = textend;
+ 		res = svgtiny_parse_number(*cursor,
+ 					   &numend,
+@@ -1123,7 +1143,8 @@
+ 			goto parse_path_data_error;
+ 		}
+ 
+-		res = parse_path_parameters(&cursor, textend, &pathstate.cmd);
++		res = parse_path_parameters(&cursor, textend, &pathstate.cmd,
++					    pathcmd);	/* 354 */
+ 		if (res != svgtiny_OK) {
+ 			goto parse_path_data_error;
+ 		}
