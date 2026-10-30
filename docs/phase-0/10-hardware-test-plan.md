@@ -7226,3 +7226,49 @@ same binary as r63):
 Follow-ups: make the BBC score deterministic (consent cookie or a longer
 settle for the reference and the sim alike); fix the crushed lead column
 (a layout bug, not yet reduced); restore HN's vote arrows.
+
+## Patch 347 (2026-10-30): BBC's crushed lead story -- seven grid and sizing causes
+
+The BBC lead story drew about 70px wide with one word per line, in every
+shot since at least r59, usually hidden under the consent overlay. I
+serialized the rendered DOM. styled-components inserts its rules through
+the CSSOM, so their text has to be inlined before serializing, or the
+copy is unstyled. Comparing the ancestor chain against Chromium reduced
+it to seven causes, each now a leg of CSS-grid-uniform-placement:
+
+1. `max-width: calc(100% - 32px)` resolved to **0** on any box. A
+   calc-family min/max-width went through `css_unit_len2device_px()`,
+   which has no reference width. It now resolves against the available
+   width (`css_unit_len2device_px_ref`).
+2. `repeat(24, 1fr)` became **5 columns**. The explicit track list is
+   rewritten in place (it must fit the declaration's own text) and caps
+   at 8 tracks. A uniform flexible repeat that cannot be carried whole
+   now uses the count form `-macsurf-grid: N`. The occupancy map widened
+   to 32 columns, and uniform spans use the exact share (floored columns
+   lost 11px over a 16-of-24 span).
+3. Grid items dropped their resolved min/max-width and their left
+   margin. BBC's page grid, an item of a one-column section grid, lost
+   `margin-inline: 16px` and its max-width.
+4. A count-form grid's min-content took its widest item. Grid 6.6 gives
+   an item spanning several flexible tracks no content-based minimum, so
+   the tracks are sized from single-span items only.
+5. In the intrinsic pass, `min-width: fit-content` acted as max-content.
+   It is min-content there (CSS Sizing 3); the used value clamps the
+   available width between the two.
+6. The `grid-column-end: span N` longhand was not understood.
+7. A `grid-row:` in its own @media block wiped an earlier
+   `grid-column:`, because placement is one packed property. libcss now
+   carries an axes mask and replaces only the axes a declaration sets.
+
+The serialized copy now matches Chromium's chain to 1px: headline L16
+W193 (Chromium 194), card grid W613, page grid L16 W928. Fresh
+scorecard on eight grid-heavy sites (`score/r65-347`, baseline r63):
+bbc 91.2, stackoverflow 89.0 (+1.4), mdn 83.0 (+0.2); github, guardian,
+rte, wpnews and wpblog flat. BBC's score still depends on the consent
+overlay flake.
+
+Follow-ups: grid placement in inline `style=""` attributes is still not
+rewritten (fixes817e, known); grid items' top margin is reserved in the
+row height but not applied to y.
+
+Full gate: `gate347.log`, exit 0.
