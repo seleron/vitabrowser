@@ -1,0 +1,113 @@
+# libcss: grid placement replaces only the axes a declaration sets (patch 347, with 347-netsurf)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 346)
+#
+# -macsurf-grid-col-span packs column start/span and row start/span into
+# one word, so the cascade winner replaced all four fields. BBC places its
+# card images with `grid-column: 17 / span 8` and `grid-row: 1 / span 3`
+# in separate @media blocks. The row rule came later and wiped the column
+# back to auto, span 1.
+#
+#  - p_macsurf_grid_col_span.c: an optional fifth field, the axes the
+#    declaration sets (bit 0 column, bit 1 row; absent = both, the old
+#    behaviour), stored as a second bytecode word.
+#  - s_macsurf_grid_col_span.c: replace only those axes' bytes (column
+#    in the low half, row in the high).
+#  - important.c: the property now has two operand words.
+--- a/src/parse/important.c
++++ b/src/parse/important.c
+@@ -491,7 +491,6 @@
+ 			case CSS_PROP_TEXT_DECORATION_THICKNESS:
+ 			case CSS_PROP_MACSURF_ANIMATION_OPACITY:
+ 			case CSS_PROP_MACSURF_ANIMATION_ROTATE:
+-			case CSS_PROP_MACSURF_GRID_COL_SPAN:
+ 			case CSS_PROP_MACSURF_GRID_FLOW:
+ 			case CSS_PROP_MACSURF_OBJECT_POSITION:
+ 				if (value == 0x0080)
+@@ -504,6 +503,11 @@
+ 					offset += 2; /* length + units */
+ 				break;
+ 
++			case CSS_PROP_MACSURF_GRID_COL_SPAN:
++				if (value == 0x0080)
++					offset += 2; /* packed + axes (347) */
++				break;
++
+ 			case CSS_PROP_MACSURF_DOTGRID:
+ 			case CSS_PROP_MACSURF_HSTRIPE_BG:
+ 				if (value == 0x0080)
+--- a/src/parse/properties/p_macsurf_grid_col_span.c
++++ b/src/parse/properties/p_macsurf_grid_col_span.c
+@@ -69,6 +69,7 @@
+ 	int32_t col_start;
+ 	int32_t row_start;
+ 	int32_t row_span;
++	int32_t axes;
+ 	int32_t packed;
+ 
+ 	token = parserutils_vector_peek(vector, *ctx);
+@@ -97,6 +98,13 @@
+ 	if (row_start < 0) row_start = 0;
+ 	row_span = macsurf_grid__read_int(vector, ctx);
+ 	if (row_span < 0) row_span = 0;
++	/* VitaBrowser patch 347: optional fifth field, the axes this
++	 * declaration sets (bit 0 column, bit 1 row; absent = both). A
++	 * `grid-row:` alone must not reset an earlier `grid-column:` --
++	 * BBC places its card images with the two in separate @media
++	 * blocks. */
++	axes = macsurf_grid__read_int(vector, ctx);
++	if (axes <= 0 || axes > 3) axes = 3;
+ 
+ 	if (col_span == 0 && col_start == 0 && row_start == 0 &&
+ 			row_span == 0) {
+@@ -118,7 +126,8 @@
+ 		return error;
+ 	}
+ 
+-	error = css__stylesheet_style_vappend(result, 1, (css_fixed)packed);
++	error = css__stylesheet_style_vappend(result, 2, (css_fixed)packed,
++			(css_fixed)axes);	/* 347: + axes word */
+ 	if (error != CSS_OK) {
+ 		*ctx = orig_ctx;
+ 		return error;
+--- a/src/select/properties/s_macsurf_grid_col_span.c
++++ b/src/select/properties/s_macsurf_grid_col_span.c
+@@ -29,6 +29,7 @@
+ 		css_style *style, css_select_state *state)
+ {
+ 	int32_t span = 0;
++	int32_t axes = 3;
+ 	bool is_set = false;
+ 
+ 	if (hasFlagValue(opv) == false) {
+@@ -41,13 +42,28 @@
+ 			 * clamp - the placement bits in the high bytes are
+ 			 * load-bearing now. */
+ 			if (span < 0) span = 0;
++			/* patch 347: the axes word */
++			axes = *((css_fixed *) style->bytecode);
++			advance_bytecode(style, sizeof(css_fixed));
++			if (axes <= 0 || axes > 3) axes = 3;
+ 		}
+ 	}
+ 
+ 	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
+ 			getFlagValue(opv))) {
+-		state->computed->i.macsurf_grid_col_span =
+-				is_set ? span : 0;
++		/* patch 347: replace only the axes this declaration
++		 * sets -- column in the low half, row in the high. */
++		uint32_t keep = 0;
++		uint32_t old = (uint32_t)
++				state->computed->i.macsurf_grid_col_span;
++
++		if (is_set && !(axes & 1))
++			keep |= 0x0000FFFFu;
++		if (is_set && !(axes & 2))
++			keep |= 0xFFFF0000u;
++		state->computed->i.macsurf_grid_col_span = is_set ?
++				(int32_t)((old & keep) |
++					((uint32_t)span & ~keep)) : 0;
+ 	}
+ 
+ 	return CSS_OK;
