@@ -6767,3 +6767,48 @@ was stopped to fold in 330.
 libcss from the patch stack, so 326-330 and 332-libcss (two new source
 files, p_isolation.c and s_isolation.c, in the libcss Makefiles) ride
 along automatically.
+
+## Patches 333-334 (2026-10-30): flex items blockify; a flex item's width counts toward its container
+
+Both were found on m.youtube.com, where the header logo drew as a ~10px
+red square.
+
+- **333, inline flex and grid items blockify**
+  (`333-netsurf-flex-inline-blockify.patch`). The box constructor
+  blockified inline-block, inline-flex and inline-grid children of flex
+  and grid containers, but not `display: inline`. YouTube's
+  `<ytm-home-logo>` (a custom element, inline by default) holds the logo
+  button. Split around its block-level content, it collapsed to 1px. The
+  same root cause ignored width and vertical margins on inline flex
+  items. It also lumped consecutive inline items (nav links) into one
+  anonymous item, so `gap` never separated them. CSS-flex-blockify reads
+  **0/6 before the patch**: link gaps, widths and margins all failed.
+  The parent node must own the flex box, because `containing_block`
+  skips inline ancestors and a span inside an inline em inside a flex
+  row must stay inline.
+- **334, the max-content contribution of a fixed-width flex item**
+  (`334-netsurf-flex-item-width-contrib.patch`). `layout_minmax_block()`
+  skips flex items in its "fixed width takes priority" step. Their
+  min-content must stay content-based for flex-shrink. That also dropped
+  the max side, so a 93px icon with no content contributed 0 and the
+  button around it sized to its padding. Only max moves now.
+
+Gate pages: CSS-flex-blockify (FLEXBLOCKIFY333 6/6, Chromium 6/6, 0/6
+without 333, 5/6 with 333 alone) and CSS-flex-item-width-contrib
+(FLEXCONTRIB334 5/5, Chromium 5/5, 1/5 without).
+
+**Scorecard (r59 reference):** youtube 77.1 → 77.4 (the logo draws
+93×20 at the right place), claude.ai 75.9 → 77.5, wpnews 85.2.
+
+**Finding, not fixed (owner's call):** YouTube's search bar is
+`rgba(0,0,0,.05)` on white. Chromium shows #f2f2f2, we draw #c0c0c0. The
+opacity buckets (doc 09: alpha 0/64/128/191/255, the contract shared with
+the monkey streams) put any alpha from 5% to 35% at 25%. Tailwind-style
+low-alpha fills (`bg-black/5`) are common, so this greys many surfaces.
+Drawing the exact alpha while keeping the bucket only for the trace token
+would leave every plot stream and gate count unchanged. It changes doc
+09's "opacity = bucket" contract, so it is left for a decision.
+
+Full gate: `gate333.log`, exit 0.
+
+**Device:** sim-only until the next VPK.
