@@ -222,6 +222,7 @@ CSS-bg-layers-svg file:///app0:/testpages/CSS-bg-layers-svg.html
 CSS-svg-arc-flags file:///app0:/testpages/CSS-svg-arc-flags.html
 CSS-img-webp file:///app0:/testpages/CSS-img-webp.html
 CSS-svg-fill-inherit file:///app0:/testpages/CSS-svg-fill-inherit.html
+CSS-svg-child-css file:///app0:/testpages/CSS-svg-child-css.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1150,6 +1151,14 @@ if [ -n "$f356s" ]; then
 		20,60 20,92 20,124 20,156 20,188 20,220 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-svg-fill-inherit: ${f356px:-none} (255,0,0 0,0,255 255,128,0 0,170,0 255,255,255 0,0,255)"
+# Patch 357: page CSS reaches inline SVG children.
+c357s=$(ls "$OUT"/snaps/N-*-CSS-svg-child-css.png 2>/dev/null | head -1)
+c357px=
+if [ -n "$c357s" ]; then
+	c357px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$c357s" \
+		20,60 20,92 20,124 20,156 20,188 20,220 20,252 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-svg-child-css: ${c357px:-none} (255,136,0 0,170,0 255,255,255 255,136,0 255,0,255 0,170,0 255,0,255)"
 # Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
 # same wave through the <img> path, no serializer rewrite.
 r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
@@ -1702,6 +1711,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$a354px" = "255,0,0 255,0,0 255,255,255 " ] && \
 [ "$w355px" = "255,0,0 0,0,255 " ] && \
 [ "$f356px" = "255,0,0 0,0,255 255,128,0 0,170,0 255,255,255 0,0,255 " ] && \
+[ "$c357px" = "255,136,0 0,170,0 255,255,255 255,136,0 255,0,255 0,170,0 255,0,255 " ] && \
 [ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \

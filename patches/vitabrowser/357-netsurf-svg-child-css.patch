@@ -1,0 +1,186 @@
+# netsurf: page CSS reaches inline SVG children (patch 357)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 356)
+#
+# The children of an inline <svg> have no boxes, so the page cascade never
+# reached them. Class rules on <path>/<g> (fill, display: none) and inline
+# style="fill:..." were ignored, and the serializer saw only attributes.
+#
+#  - vb_inline_svg.c: while serialising, each child element's style is
+#    selected with html_svg_get_style() against its parent's (the root
+#    starts from the <svg> box's style). A fill the page sets on the element
+#    (its computed fill differs from its parent's) is written as a fill
+#    attribute, replacing any fill attribute it has: author CSS beats SVG
+#    presentation attributes, as in browsers. currentColor resolves against
+#    the element's own colour. A child the page sets to display: none is
+#    dropped. Fills inherited from fill attributes on ancestors (<g
+#    fill=...>) are untouched; libsvgtiny inherits them.
+#
+# libcss computes no `stroke`, so stroke rules are still ignored.
+#
+# Gate: CSS-svg-child-css (file:// snapshot, seven rows, pixels exact as
+# Chromium: class fill; class currentColor under a coloured wrapper; class
+# display: none; class beats the fill attribute; a <g> class inherited; a
+# bare attribute kept; inline style). Full fresh scorecard (r77-357 vs
+# r75): mean 84.7 -> 85.1. The sim screens of mdn, youtube, claude and
+# guardian are pixel-identical. GitHub's 50-pixel diff is its live star
+# count; google's is 356's arrow icons; bbc and stackoverflow are live
+# content.
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -56,6 +56,7 @@
+ #include "html/private.h"
+ #include "html/box.h"
+ #include "html/vb_inline_svg.h"
++#include "html/box_construct.h"	/* patch 357: html_svg_get_style */
+ 
+ extern unsigned long macsurf_reconvert_seq;
+ 
+@@ -123,6 +124,9 @@
+ 	struct sbuf out;
+ 	char color[8];		/* "#rrggbb": what currentColor means */
+ 	char fill[8];		/* patch 356: the root's CSS fill, or "none" */
++	/* patch 357: the page cascade for the children */
++	const html_content *html;
++	const css_computed_style *style;	/* the current parent's */
+ 	char *refs[16];		/* ids that <use> elements point at */
+ 	float vb_w, vb_h;	/* the root's viewBox size, 0 if none */
+ 	int nrefs;
+@@ -367,6 +371,27 @@
+ 
+ static void ser_node(struct ser *z, dom_node *n, int depth, bool root);
+ 
++/* patch 357: an SVG paint value for a computed CSS fill; false for an
++ * unusable status */
++static bool css_fill_str(const css_computed_style *s, char out[8])
++{
++	css_color fc = 0, col = 0xff000000;
++	uint8_t ft = css_computed_fill(s, &fc);
++
++	if (ft == CSS_FILL_CURRENT_COLOR) {
++		css_computed_color(s, &col);
++		fc = col;
++	} else if (ft == CSS_FILL_NONE || (fc >> 24) == 0) {
++		strcpy(out, "none");
++		return true;
++	} else if (ft != CSS_FILL_COLOR) {
++		return false;
++	}
++	snprintf(out, 8, "#%02x%02x%02x", (unsigned int)((fc >> 16) & 0xff),
++		 (unsigned int)((fc >> 8) & 0xff), (unsigned int)(fc & 0xff));
++	return true;
++}
++
+ static void ser_children(struct ser *z, dom_node *n, int depth)
+ {
+ 	dom_node *c = NULL, *next;
+@@ -389,6 +414,10 @@
+ 	dom_namednodemap *attrs = NULL;
+ 	uint32_t i, na = 0;
+ 	bool has_fill = false, has_xmlns = false;
++	css_select_results *sel = NULL;			/* patch 357 */
++	const css_computed_style *saved = z->style, *own = NULL;
++	char css_fill[8];
++	bool css_fill_set = false;
+ 
+ 	if (depth > 64 || ++z->nodes > 20000 || z->out.oom)
+ 		return;
+@@ -412,6 +441,40 @@
+ 		dom_string_unref(name);
+ 		return;
+ 	}
++	/* VitaBrowser patch 357: the page's CSS for the SVG children. They
++	 * have no boxes, so nothing cascaded into them and class rules such
++	 * as MDN's `.logo__letter { fill: ... }` were ignored. Select each
++	 * child's style against its parent's: a fill the page sets (one that
++	 * differs from the parent's) becomes a fill attribute, unless the
++	 * element has its own, and display: none drops the element. */
++	if (!root && z->html != NULL && z->style != NULL) {
++		sel = html_svg_get_style(z->html, n, z->style, NULL, NULL);
++		if (sel != NULL && sel->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL) {
++			own = sel->styles[CSS_PSEUDO_ELEMENT_NONE];
++			if (css_computed_display(own, false) ==
++					CSS_DISPLAY_NONE) {
++				css_select_results_destroy(sel);
++				dom_string_unref(name);
++				return;
++			}
++		}
++	}
++	if (own != NULL) {
++		/* patch 357: a fill the page sets on this element (one that
++		 * differs from its parent's) -- author CSS beats the fill
++		 * attribute, as in browsers */
++		css_color a = 0, b = 0, ca = 0, cb = 0;
++		uint8_t fa = css_computed_fill(own, &a);
++		uint8_t fb = css_computed_fill(saved, &b);
++
++		if (fa == CSS_FILL_CURRENT_COLOR) {
++			css_computed_color(own, &ca);
++			if (fb == CSS_FILL_CURRENT_COLOR)
++				css_computed_color(saved, &cb);
++		}
++		css_fill_set = (fa != fb || a != b || ca != cb) &&
++				css_fill_str(own, css_fill);
++	}
+ 	sb_str(&z->out, "<");
+ 	sb_svg_name(&z->out, dom_string_data(name),
+ 			dom_string_byte_length(name), false);	/* 343 */
+@@ -430,8 +493,16 @@
+ 			const char *vp = av ? dom_string_data(av) : "";
+ 			size_t vn = av ? dom_string_byte_length(av) : 0;
+ 
+-			if (dstr_eq(an, "fill"))
++			if (dstr_eq(an, "fill")) {
+ 				has_fill = true;
++				if (css_fill_set) {	/* patch 357 */
++					dom_string_unref(an);
++					if (av != NULL)
++						dom_string_unref(av);
++					dom_node_unref(a);
++					continue;
++				}
++			}
+ 			if (dstr_eq(an, "xmlns"))
+ 				has_xmlns = true;
+ 			if (dstr_eq(an, "href") || dstr_eq(an, "xlink:href"))
+@@ -473,6 +544,11 @@
+ 	}
+ 	if (attrs != NULL)
+ 		dom_namednodemap_unref(attrs);
++	if (css_fill_set) {	/* patch 357 */
++		sb_str(&z->out, " fill=\"");
++		sb_str(&z->out, css_fill);
++		sb_str(&z->out, "\"");
++	}
+ 	if (root) {
+ 		if (!has_xmlns)
+ 			sb_str(&z->out, " xmlns=\"http://www.w3.org/2000/svg\""
+@@ -484,6 +560,8 @@
+ 		}
+ 	}
+ 	sb_str(&z->out, ">");
++	if (own != NULL)
++		z->style = own;		/* patch 357 */
+ 	ser_children(z, n, depth);
+ 	if (root && z->nrefs > 0) {
+ 		/* the <use> targets, which may live anywhere in the page */
+@@ -516,6 +594,9 @@
+ 			dom_string_byte_length(name), false);	/* 343 */
+ 	sb_str(&z->out, ">");
+ 	dom_string_unref(name);
++	z->style = saved;			/* patch 357 */
++	if (sel != NULL)
++		css_select_results_destroy(sel);
+ }
+ 
+ /* ---- the cache ---------------------------------------------------------- */
+@@ -586,6 +667,8 @@
+ 				 (unsigned int)((fc >> 8) & 0xff),
+ 				 (unsigned int)(fc & 0xff));
+ 	}
++	z.html = html;				/* patch 357 */
++	z.style = box->style;
+ 	ser_node(&z, box->node, 0, true);
+ 	for (i = 0; i < z.nrefs; i++)
+ 		free(z.refs[i]);
