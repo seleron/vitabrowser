@@ -7429,3 +7429,33 @@ down beyond ddglite's usual ±1.
 Gate: JS-style-setters (STYLESET351 6/6, Chromium 6/6).
 
 Full gate: `gate351.log`, exit 0.
+
+## Patch 352 (2026-10-30): HN's vote arrows -- layered backgrounds and SVG preserveAspectRatio
+
+Hacker News drew no ▲ arrows. There were two causes:
+
+1. **Layered backgrounds.** HN's rule is `background: url("triangle.svg"),
+   linear-gradient(transparent, transparent) no-repeat`. libcss drops a
+   comma-separated layer list whole, and the shorthand-gradient rewrite
+   (fixes318) then extracted the transparent gradient. The url() layer
+   was lost and nothing painted. A new same-size pass,
+   `macsurf__strip_background_layers()`, keeps only the top layer of
+   background, background-image and the per-layer longhands. It runs
+   before the gradient passes in both the stylesheet and inline paths.
+2. **SVG viewBox scaling (libsvgtiny, staged since 346).** triangle.svg
+   is 32x32 with `viewBox="0 0 32 16"`. libsvgtiny scaled each axis on
+   its own (1x2), which is `preserveAspectRatio="none"`; the default is
+   xMidYMid meet (one scale, centred). Only the triangle's tip showed.
+   preserveAspectRatio is now parsed (the nine alignments, meet/slice,
+   none) and applied.
+
+Gate: CSS-bg-layers-svg (file:// snapshot, five pixels as Chromium). In
+the reduction, the sim's triangles are row-for-row identical to
+Chromium's. Full fresh scorecard (`score/r72-352` vs r71, mean 84.7 →
+84.4): HN's arrows draw (visual 0.787 → 0.791). Every drop traces to live
+content or the known Wikipedia carousel (−3.7: Chrome's reference drew
+it). Pixel diffs of the static regions (headers, sidebars) are zero for
+github and bbc. For stackoverflow and guardian they fall only in the
+address bar and the live headline/question areas.
+
+Full gate: `gate352.log`, exit 0.
