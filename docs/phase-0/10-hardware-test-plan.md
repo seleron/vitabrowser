@@ -6828,3 +6828,35 @@ and an opaque one inside `opacity: .5` trace `OPAQUE 2`, and the opaque
 one traces no token: 3 rects, 2 at OPAQUE 2. Without the patch there
 are 5 rects and no tokens. Chromium's pixels agree (white, white, 127,
 0, 127). Full gate: `gate335.log`, exit 0.
+
+## Scorecard r61 (2026-10-30 ~01:45): fresh reference, patches through 335
+
+`score/r61-335-fresh`, a fresh Chromium reference, is the **new baseline:
+mean 84.3** (r59: 81.3). Against r59: wpnews +10.3 (85.1), hackernews +3.2,
+claude.ai +2.2 (77.6), wpblog +1.5, google +0.9, stackoverflow +43.3
+(patches 323-324). Reused-reference runs are unreliable for live-content
+sites. Against the 10-28 reference, google read text 0.45 because its
+trending list had changed.
+
+**Regression to investigate first: MDN 80.8 → 77.4** (visual 0.521 →
+0.434). The article now sits in a ~200px column with the table of
+contents over it. r59 showed the same overlap at full width. It is not
+reproduced by a hand-built copy of MDN's grid rules (that copy is full
+width, as before), so the cause is not bisected yet. The candidates
+touch grid placement: 328/329 (which `grid-area` rules now apply) and
+333 (grid items blockify).
+
+**Shelved, not committed:**
+- **@container → @media rewrite** (`~/vitabrowser-work/css_rewrite-336-shelved.c`,
+  page `CSS-container-query-336-shelved.html`, Chromium 6/6, sim 6/6). It
+  gave no measurable gain on the container-query sites (wpblog, wpnews,
+  github unchanged, claude.ai +0.1). wpblog's collapsed local nav is not
+  container-query driven. Its viewport approximation is a risk for
+  narrow components.
+- **Grid line names / var() / rem minmax in the -macsurf-grid rewrite**
+  (WIP `~/vitabrowser-work/css_rewrite-336grid-wip.c`, header
+  `hdr336.txt`, page `CSS-grid-named-var.html`, Chromium 4/4, sim 3/4). Line
+  names and the var() fallback work. The var() leg places the gap wrong
+  (2px instead of 32px, so `var(--gap)` inside the expanded list is not
+  emitted as a track). On the MDN reproduction the sidebar becomes a
+  column (479px), but the widths are not right yet.
