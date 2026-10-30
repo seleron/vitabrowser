@@ -7084,3 +7084,24 @@ drawn now. **Still open:** those search-bar icons (lens, mic, camera)
 fill garbled, a path-fill issue with Material's paths.
 
 Full gate: `gate343.log`, exit 0.
+
+## Patch 344 (2026-10-30): relative smooth quadratics in inline SVG
+
+Once 343 applied viewBoxes, Google's search-bar icons appeared but drew
+as scribbles. libsvgtiny adds the current point to a relative `t`'s
+reflected control point, which is already absolute, so each such curve
+overshoots. Material icons use `q…t` throughout. A standalone libsvgtiny
+test showed `M2 12q5 -10 10 0t10 0` reaching (28, 34.7) where the
+absolute `T` equivalent stays within (22, 18.7). libsvgtiny is a support
+library that this patch stack does not stage. Patching it would mean
+staging it in build-patched.sh and build-vita.sh, which is worth doing
+eventually. For now the inline-SVG serializer rewrites each relative
+`t` and `q` to absolute `T` / `Q`, tracking the current point through
+the path. libsvgtiny's relative `q` also stores its control point
+unoffset, so even an absolute T after it reflected wrongly. Google's mic
+icon now renders cleanly.
+
+Gate: CSS-svg-smooth-quad, snapshot pixels as in Chromium. Before the
+patch the dip of the test wave did not fill.
+
+Full gate: `gate344.log`, exit 0.
