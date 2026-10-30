@@ -6860,3 +6860,38 @@ touch grid placement: 328/329 (which `grid-area` rules now apply) and
   (2px instead of 32px, so `var(--gap)` inside the expanded list is not
   emitted as a track). On the MDN reproduction the sidebar becomes a
   column (479px), but the widths are not right yet.
+
+## MDN regression bisect (2026-10-30 ~02:15): 328/329/333 all exonerated
+
+Bisected the r61 MDN drop (80.8 → 77.4, visual 0.521 → 0.434) against the
+three candidate patches, each as a scratch build
+(`~/vitabrowser-work/bisect-mdn/`, scripts `bisect-mdn-setup.sh` /
+`bisect-mdn-sim.sh`): pristine upstream, full committed stack through 335,
+engine prefix rebuilt per variant; nsvita-sim relinked per variant; scored
+MDN live with `--reuse-ref score/r61-335-fresh` (the r61 Chromium side
+pinned).
+
+| variant | mdn score | visual | sim frame vs control |
+|---|---:|---:|---|
+| control (stack 335) | 77.4 | 0.434 | — |
+| no 333 (flex/grid inline blockify) | 77.4 | 0.434 | pixel-identical |
+| no 328+329 (:not() lists, var() cascade order) | 77.4 | 0.434 | pixel-identical (1 extra JS error, same render) |
+
+The control reproduced r61 exactly (77.4 / 0.434), so the pipeline is sound
+and none of the three candidates touches MDN's render at all.
+
+**Cause: the site changed, not the engine.** The Chromium reference
+screenshots of `developer.mozilla.org/en-US/docs/Web/HTML` differ between
+the r59 capture (10-28, `r59-322-fresh/ref/mdn.png`) and the r61 capture
+(10-30 01:45, `r61-335-fresh/ref/mdn.png`): mean abs pixel diff 9.15/255,
+13.7% of pixels moved by more than 16, 16px block means off by 7.8. MDN
+re-flowed the docs page in that window (the article column and TOC
+positions the r61 entry describes are the NEW layout). Against a moved
+target our score drops while the render is unchanged — the "regression" is
+a reference drift, exactly the live-content hazard the scorecard header
+warns about.
+
+Consequence: no patch to write. The MDN layout is a genuine fit target for
+the grid rewrite (336 WIP, whose MDN reproduction already turns the TOC
+into a column), so it moves from "regression" to "rewrite acceptance
+page" below.
