@@ -7002,3 +7002,51 @@ exposed the old fixes1309 saturation bug (339) and collapsed the grid.
 The 326 → 339 sequence is the cause. Reference drift is on top of it.
 
 Full gate: `gate337.log`, exit 0 (GRIDFR337 5/5, CALCNEG339 5/5, GRIDNAMES336 4/4, GRIDFILL206 8/8, interaction 52/52).
+
+## Patches 340-342 (2026-10-30): MDN's page grid, continued
+
+With 337-339 the page grid had its size, but it still laid out one
+column. Its tracks come from `var(--layout-1-sidebar-left)`, defined in
+another sheet.
+
+- **340, grid track var() across sheets**
+  (`340-netsurf-grid-var-crosssheet.patch` +
+  `340-libcss-macsurf-grid-raw-tracks.patch`). Sheets register their
+  top-level, non-print custom properties in a bounded process-wide table
+  that the 336 expansion consults. A trace showed that MDN's chunk sheet
+  was converted before styles-global, so the table alone is
+  order-dependent. When the text cannot be expanded, the declaration
+  becomes `-macsurf-grid: var(...)`: libcss substitutes it at cascade
+  time and `-macsurf-grid` parses the raw CSS track list (the dead
+  `css__parse_grid_template_columns`, now with rem/em at 16px and the
+  337 minmax kinds). **Fix to 336 (Hermes' solo patch):** it deleted the
+  emitter's `1fr` fallback, so `min-content` / `max-content` /
+  `fit-content` went to `-macsurf-grid` verbatim and ended the track
+  list (`max-content 1fr` became one column). It also read a block-local
+  buffer after its block ended. Both are fixed.
+- **341, `-macsurf-grid` never inherited**
+  (`341-libcss-macsurf-grid-no-inherit.patch`). NONE and INHERIT are both
+  0 in the 1-bit field, so compose gave every element without its own
+  grid its parent's. MDN's TOC list (`display: grid`, no template) spread
+  across the page columns, over the title. This was harmless while the
+  page grid had one track.
+- **342, grid padding** (`342-netsurf-grid-padding.patch`). Items ignored
+  the grid's padding. MDN sat 16px left of Chromium.
+
+Gate pages: CSS-grid-var-crosssheet (GRIDXSHEET340 4/4; 0/4 before, and
+legs 1-2 fail since 336) and CSS-grid-nested-padding (GRIDNEST341 4/4;
+before 341/342 the list went side by side and the padding offset was
+0/0). Both are 4/4 in Chromium.
+
+**MDN now lays out like Chromium:** the article starts at x=288 (exact; 656 wide
+against 641), the TOC entries are vertical, and the TOC sidebar is 256
+wide (exact) at x=16. Chromium has it at x=0, because MDN pulls it back
+with `margin-left: calc(var(--layout-side-padding-min) * -1)`, which is
+not applied here yet.
+**The scorecard reads lower, 82.4 against 84.7,** for the broken render
+in which the article ran full width with the TOC drawn over it. The
+visual metric (16px structure blocks) happened to favour full-width text
+lines over Chromium's article column. The layout is what the work is
+for, so this is recorded rather than optimised for.
+
+Full gate: `gate340.log`, exit 0 (GRIDXSHEET340 4/4, GRIDNEST341 4/4, GRIDFR337 5/5, GRIDNAMES336 4/4, GRIDFILL206 8/8, interaction 52/52).
