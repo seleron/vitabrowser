@@ -1,0 +1,224 @@
+# netsurf: grid fr sizing honours minmax floors; minmax(0, N) grows toward N (patch 337, with 337-libcss)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 336)
+#
+#  - layout_grid.c: a minmax(Npx, 1fr) track (fixes1214) was sized N PLUS
+#    its fr share, so MDN's 240px sidebar took 469px of 960. CSS Grid
+#    12.7.1: it is max(N, its share). A track whose floor exceeds its share
+#    is fixed at the floor and the remainder re-shared, until none does.
+#    The floors still stay reserved when auto tracks grow.
+#  - New track kind 9 (minmax(0, Npx), css_rewrite "mxN"): base 0, grows
+#    toward N with the free space left after fixed, auto and floor tracks,
+#    before fr tracks share the rest (12.6 "maximize tracks" before 12.7).
+#    MDN's article column is minmax(0, 48rem).
+#  - css_rewrite.c: minmax(0, <px|rem|em>) emits "mxN" (it was folded to
+#    1fr), and the emitter accepts the marker.
+#
+# repeat(auto-fill|auto-fit, minmax(N, 1fr)) uses the same track kind, so
+# its columns are now max(N, share) rather than N + share. GRIDFILL206
+# still passes 8/8.
+#
+# Gate: CSS-grid-fr-minmax (GRIDFR337 5/5, Chromium 5/5): minmax(100px,1fr)
+# 1fr = 300/300 (was 400/200), minmax(400px,1fr) 1fr = 400/200 (was
+# 500/100), minmax(0,300px) 1fr = 300/300, MDN's columns = 240/688 (was
+# 469/229), minmax(15rem,1fr) 1fr. CSS-grid-named-var leg 3 now reads
+# Chromium's 464.
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -437,6 +437,8 @@
+ #define MACSURF_GRID_TRACK_UNIT_AUTOFILL_FR 6
+ #define MACSURF_GRID_TRACK_UNIT_AUTOFIT_FR  7
+ #define MACSURF_GRID_TRACK_UNIT_AUTOFILL_PX 8
++/* patch 337: minmax(0, Npx) (css_rewrite "mxN"): base 0, grows toward N */
++#define MACSURF_GRID_TRACK_UNIT_MINMAX_ZERO_PX 9
+ 
+ /* fixes158: per-child placement scratch. The two-pass layout assigns
+  * (col, row, col_span, row_span) in pass 1 (placement + child layout
+@@ -684,6 +686,8 @@
+ 	if (grid_status == CSS_MACSURF_GRID_SET && raw_tracks != NULL &&
+ 			raw_tracks[0] != 0) {
+ 		int fixed_total = 0;
++		int mm_base_total = 0;	/* patch 337 */
++		int mx_limit[MACSURF_GRID_TRACK_MAX] = { 0 };	/* patch 337 */
+ 		int fr_total_q88 = 0;
+ 		int auto_total = 0;
+ 		int total_gap;
+@@ -811,9 +815,18 @@
+ 				if (value < 0) value = 0;
+ 				track_base[i] = value;
+ 				track_widths[i] = -256;
+-				fixed_total += value;
++				/* patch 337: the floor is not a fixed width;
++				 * it is honoured in the fr sizing below. Auto
++				 * tracks still leave room for it. */
++				mm_base_total += value;
+ 				fr_total_q88 += 256;
+ 				minmax_fr_tracks++;
++			} else if (unit ==
++					MACSURF_GRID_TRACK_UNIT_MINMAX_ZERO_PX) {
++				/* patch 337: sized after the fixed and auto
++				 * tracks, before the fr tracks */
++				mx_limit[i] = value > 0 ? value : 0;
++				track_widths[i] = 0;
+ 			}
+ 		}
+ 
+@@ -869,6 +882,7 @@
+ 				int avail = container_width -
+ 						col_gap * (n_tracks - 1);
+ 				int freesp = avail - fixed_total -
++						mm_base_total -
+ 						auto_min_total;
+ 				int grow_room = auto_max_total -
+ 						auto_min_total;
+@@ -906,18 +920,92 @@
+ 					fixed_total - auto_total;
+ 			if (remaining < 0) remaining = 0;
+ 
++			/* patch 337: minmax(0, N) tracks grow toward N with
++			 * the free space left after the fixed, auto and
++			 * minmax-floor tracks (CSS Grid 12.6 "maximize
++			 * tracks" runs before 12.7 "expand flexible
++			 * tracks"), equally, each capped at its N. */
++			{
++				int free_mx = remaining - mm_base_total;
++				int n_mx = 0, pass;
++
++				for (i = 0; i < n_tracks; i++)
++					if (mx_limit[i] > 0) n_mx++;
++				for (pass = 0; pass < n_tracks && n_mx > 0 &&
++						free_mx > 0; pass++) {
++					int share = free_mx / n_mx;
++					int capped = 0;
++					if (share < 1) break;
++					for (i = 0; i < n_tracks; i++) {
++						int g;
++						if (mx_limit[i] <= 0 ||
++							track_widths[i] >=
++								mx_limit[i])
++							continue;
++						g = mx_limit[i] - track_widths[i];
++						if (g > share) g = share;
++						track_widths[i] += g;
++						free_mx -= g;
++						remaining -= g;
++						if (track_widths[i] >= mx_limit[i])
++							capped++;
++					}
++					n_mx -= capped;
++				}
++				if (remaining < 0) remaining = 0;
++			}
++
+ 			if (fr_total_q88 > 0) {
+-				/* Distribute `remaining` across fr tracks
+-				 * proportionally to their Q8.8 ratio.
+-				 * frac = (track_q88 / fr_total_q88) */
++				/* VitaBrowser patch 337: CSS Grid 12.7.1, find
++				 * the size of an fr. A minmax(Npx, 1fr) track
++				 * is max(N, its share), not N + its share
++				 * (fixes1214 added them, so MDN's 240px sidebar
++				 * took 469px of 960). A track whose floor
++				 * exceeds its share is sized at the floor and
++				 * the rest re-shared, until none does. */
++				char inflex[MACSURF_GRID_TRACK_MAX];
++				long flex = fr_total_q88;
++				long left = remaining;
++				bool changed = true;
++
++				for (i = 0; i < n_tracks; i++)
++					inflex[i] = 0;
++				while (changed && flex > 0) {
++					changed = false;
++					for (i = 0; i < n_tracks; i++) {
++						long q88, share;
++						if (track_widths[i] >= 0 ||
++								inflex[i] ||
++								track_base[i] <= 0)
++							continue;
++						q88 = -track_widths[i];
++						share = left > 0 ?
++							(left * q88) / flex : 0;
++						if (track_base[i] > share) {
++							inflex[i] = 1;
++							left -= track_base[i];
++							flex -= q88;
++							changed = true;
++						}
++					}
++				}
+ 				for (i = 0; i < n_tracks; i++) {
+ 					if (track_widths[i] < 0) {
+ 						int q88 = -track_widths[i];
+-						int w = (int)(((long)remaining *
+-								(long)q88) /
+-								(long)fr_total_q88);
++						int w;
++
++						if (inflex[i]) {
++							track_widths[i] =
++								track_base[i];
++							continue;
++						}
++						w = (flex > 0 && left > 0) ?
++							(int)((left * (long)q88) /
++								flex) : 0;
++						if (w < track_base[i])
++							w = track_base[i];
+ 						if (w < 1) w = 1;
+-							track_widths[i] = track_base[i] + w;
++						track_widths[i] = w;
+ 					}
+ 				}
+ 			} else {
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -269,7 +269,8 @@
+ 		is_auto = true;
+ 	}
+ 	if (tok_len > 2 && (tok[0] == 'm' || tok[0] == 'M') &&
+-			(tok[1] == 'm' || tok[1] == 'M')) {
++			(tok[1] == 'm' || tok[1] == 'M' ||
++			 tok[1] == 'x' || tok[1] == 'X')) {	/* 337: mx */
+ 		is_minmax_marker = true;
+ 	}
+ 	/* patch 206: the auto-fill / auto-fit markers ("af100", "at100",
+@@ -662,6 +663,38 @@
+ 						n = macsurf__emit_one_track(out + pos,
+ 							cap - pos, marker, (size_t)n);
+ 					else n = -1;
++				} else if (floor_px == 0 && q < p && *q == ',') {
++					/* VitaBrowser patch 337: minmax(0, <length>)
++					 * -> "mxN": grows toward N with the free
++					 * space before fr tracks share the rest (MDN:
++					 * minmax(0, 48rem) is the article column). */
++					const char *v = q + 1;
++					int lim = 0, mult = 0;
++					while (v < p && (*v == ' ' || *v == '\t')) v++;
++					while (v < p && *v >= '0' && *v <= '9') {
++						if (lim < 100000)
++							lim = lim * 10 + (*v - '0');
++						v++;
++					}
++					if (lim > 0 && v + 1 < p &&
++							strncasecmp(v, "px", 2) == 0)
++						mult = 1;
++					else if (lim > 0 && v + 2 < p &&
++							strncasecmp(v, "rem", 3) == 0)
++						mult = 16;
++					else if (lim > 0 && v + 1 < p &&
++							strncasecmp(v, "em", 2) == 0)
++						mult = 16;
++					n = -1;
++					if (mult > 0) {
++						n = snprintf(marker, sizeof(marker),
++							"mx%d", lim * mult);
++						if (n > 0)
++							n = macsurf__emit_one_track(
++								out + pos, cap - pos,
++								marker, (size_t)n);
++						else n = -1;
++					}
+ 				} else n = -1;
+ 			} else n = -1;
+ 			if (n < 0)
