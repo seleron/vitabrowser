@@ -289,6 +289,8 @@ NET-css-grid-autofill http://127.0.0.1:$HP/CSS-grid-autofill.html
 NET-css-grid-named-var http://127.0.0.1:$HP/CSS-grid-named-var.html
 NET-css-grid-fr-minmax http://127.0.0.1:$HP/CSS-grid-fr-minmax.html
 NET-css-calc-negative http://127.0.0.1:$HP/CSS-calc-negative.html
+NET-css-grid-var-crosssheet http://127.0.0.1:$HP/CSS-grid-var-crosssheet.html
+NET-css-grid-nested-padding http://127.0.0.1:$HP/CSS-grid-nested-padding.html
 NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
 NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
@@ -1018,6 +1020,16 @@ c339p=$(ls "$R"/*NET-css-calc-negative.plot 2>/dev/null | head -1)
 c339r=$(sed -n 's/.*STR \(CALCNEG339: [0-9]*\/[0-9]* passed\).*/\1/p' "$c339p" 2>/dev/null | head -1)
 echo "  css-calc-negative: ${c339r:-no summary}"
 [ -n "$c339p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$c339p" | sed 's/^STR /  /'
+# Patch 340: grid track var() from another sheet; keyword tracks keep the
+# list. Patches 341/342: nested grids do not inherit tracks; grid padding.
+x340p=$(ls "$R"/*NET-css-grid-var-crosssheet.plot 2>/dev/null | head -1)
+x340r=$(sed -n 's/.*STR \(GRIDXSHEET340: [0-9]*\/[0-9]* passed\).*/\1/p' "$x340p" 2>/dev/null | head -1)
+echo "  css-grid-var-crosssheet: ${x340r:-no summary}"
+[ -n "$x340p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$x340p" | sed 's/^STR /  /'
+n341p=$(ls "$R"/*NET-css-grid-nested-padding.plot 2>/dev/null | head -1)
+n341r=$(sed -n 's/.*STR \(GRIDNEST341: [0-9]*\/[0-9]* passed\).*/\1/p' "$n341p" 2>/dev/null | head -1)
+echo "  css-grid-nested-padding: ${n341r:-no summary}"
+[ -n "$n341p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$n341p" | sed 's/^STR /  /'
 # Patch 335: outlines honour their colour's alpha and the group opacity.
 # The five 200x20 boxes' 204x24 outline rects: the two transparent ones
 # draw nothing, the 50% one and the one inside opacity:.5 trace OPAQUE 2,
@@ -1565,6 +1577,8 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$g336r" = "GRIDNAMES336: 4/4 passed" ] && \
 [ "$g337r" = "GRIDFR337: 5/5 passed" ] && \
 [ "$c339r" = "CALCNEG339: 5/5 passed" ] && \
+[ "$x340r" = "GRIDXSHEET340: 4/4 passed" ] && \
+[ "$n341r" = "GRIDNEST341: 4/4 passed" ] && \
 [ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
