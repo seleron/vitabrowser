@@ -19,6 +19,15 @@ Scores are only comparable run to run on the same machine and day (live
 sites change), so a run also writes the reference it used; --reuse-ref
 keeps Chrome's side fixed while the browser changes.
 
+A site's optional fourth sites.tsv column lists hosts (comma-separated,
+subdomains included) blocked on BOTH sides: the simulator's user
+blocklist.txt and a request abort in Chromium. It is for third-party
+overlays whose arrival races the screenshot or is sampled at random.
+BBC's consent dialog (cdn.privacy-mgmt.com) loaded in Chrome every time
+but in the simulator only sometimes, and its "Help us improve!" survey
+invite (edigitalsurvey.com) picks a random share of visits, so the same
+build scored anywhere from ~75 to ~90 run to run.
+
 Usage:
   tools/scorecard/scorecard.py --out DIR [--only a,b] [--reuse-ref DIR]
       [--jobs 4] [--settle 15000] [--baseline DIR/scores.json]
@@ -45,6 +54,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.environ.get("WORK", os.path.expanduser("<WORK>/vitabrowser-work"))
 SIM = os.path.join(WORK, "applytest/upstream/netsurf/nsvita-sim")
+BLOCK = {}	# site name -> hosts blocked on both sides (sites.tsv col 4)
 APP0 = os.path.join(WORK, "vita-sim/run/app0:")
 UA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like "
       "Gecko) Chrome/140.0.0.0 Mobile Safari/537.36")
@@ -192,6 +202,9 @@ def run_sim(outdir, name, url, slot, settle, timeout):
     shutil.copytree(APP0, os.path.join(d, "app0:"))
     with open(os.path.join(data, "netlog.cfg"), "w") as f:
         f.write("off\n")
+    if BLOCK.get(name):
+        with open(os.path.join(data, "blocklist.txt"), "w") as f:
+            f.write("".join(h + "\n" for h in BLOCK[name]))
     evaljs = os.path.join(d, "text.js")
     with open(evaljs, "w") as f:
         f.write(SIM_EVAL_JS)
@@ -271,6 +284,18 @@ def rescore_text(outdir, name):
 
 # ---- the Chrome side --------------------------------------------------
 
+def _blocker(hosts):
+    """A Playwright route handler aborting requests to hosts (and their
+    subdomains), as the simulator's blocklist matches them."""
+    def handle(route):
+        host = route.request.url.split("/")[2].split(":")[0].lower()
+        if any(host == h or host.endswith("." + h) for h in hosts):
+            route.abort()
+        else:
+            route.continue_()
+    return handle
+
+
 def run_chrome(refdir, sites, settle_ms):
     from playwright.sync_api import sync_playwright
     os.makedirs(refdir, exist_ok=True)
@@ -283,6 +308,8 @@ def run_chrome(refdir, sites, settle_ms):
             ctx.add_cookies([{"name": "SOCS", "value": "CAI", "domain": d,
                               "path": "/"} for d in (".google.com",
                                                      ".youtube.com")])
+            if BLOCK.get(name):
+                ctx.route("**/*", _blocker(BLOCK[name]))
             p = ctx.new_page()
             errors = []
             p.on("pageerror", lambda e: errors.append(str(e)[:160]))
@@ -363,8 +390,12 @@ def main():
     sites = []
     for line in open(a.sites):
         if line.strip() and not line.startswith("#"):
-            tier, name, url = line.split("\t")[:3]
+            cols = line.rstrip("\n").split("\t")
+            tier, name, url = cols[:3]
             sites.append((tier.strip(), name.strip(), url.strip()))
+            if len(cols) > 3 and cols[3].strip():
+                BLOCK[name.strip()] = [h.strip().lower() for h in
+                                       cols[3].split(",") if h.strip()]
     if a.only:
         keep = set(a.only.split(","))
         sites = [s for s in sites if s[1] in keep]
