@@ -7588,3 +7588,41 @@ fallback kept in 356. GitHub's only diff is its live star count; the
 rest is live content.
 
 Full gate: `gate357.log`, exit 0.
+
+## Patch 358 (2026-10-30): SVG stroke and stroke-width in CSS
+
+libcss had no `stroke` or `stroke-width`, so CSS strokes on inline SVG
+were dropped at parse time: outline icon kits' `stroke: currentColor` on
+the `<svg>`, and class rules on paths. libcss gains both properties
+(0x0ac / 0x0ad), wired like `isolation` in 332. `stroke` takes none,
+currentColor or a colour (inherited, initial none). `stroke-width`
+takes a length, or a bare number taken as user units/px (inherited,
+initial 1px).
+
+The netsurf half has two parts:
+- **css/hints.c:** stroke and stroke-width presentation attributes
+  become zero-specificity hints, as fill already was, so author CSS
+  outranks them in the cascade.
+- **vb_inline_svg.c:** the 357 per-element cascade covers stroke and
+  stroke-width. Where an element has the attribute, the computed value
+  (attribute and CSS already settled) replaces it. That closes the case
+  357 could not see: a class rule equal to the inherited value, such as
+  `stroke: none` against `stroke="#00f"`, or `fill: black`. Without the
+  attribute, values differing from the parent are written. The width is
+  printed with integers only (the Vita's newlib may lack float printf).
+
+**Build note:** new libcss source files and public-header entries
+need a clean netsurf build. Both build/Linux-vita* trees were moved
+aside (`~/vitabrowser-work/Linux-vita*.pre358`). Device build
+`build-vita-358.log` exit 0 (VPK 16.96 MB).
+
+Gate: CSS-svg-stroke (file:// snapshot, five pixels exact as Chromium).
+CSS-svg-child-css and CSS-svg-fill-inherit are unchanged. Full fresh
+scorecard (`score/r78-358` vs r77): mean **85.2**. wpnews' white stroked
+search icon now draws, about 8px left of Chromium's. Other diffs are
+live content.
+
+Noticed, not fixed: google.com's sim shows its footer links where
+Chromium has the search box (the search box is missing in the sim).
+
+Full gate: `gate358b.log`, exit 0. The first run (`gate358.log`, exit 1) failed only on JS-block-class-sibling, whose snapshot came before its script ran ("BLOCKSIB: script did not run"); it passes standalone three times and in the rerun, and never failed in gates 340-357. All SVG legs passed in both runs.
