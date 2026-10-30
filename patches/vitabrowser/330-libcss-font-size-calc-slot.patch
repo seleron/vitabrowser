@@ -1,0 +1,76 @@
+# libcss: a losing calc font-size leaves the winner's expression alone (patch 330)
+# Generated 2026-10-29
+# Base: seleron/vitabrowser (patch stack through 329)
+#
+# css__cascade_font_size() stored a calc()/min()/max()/clamp() value's
+# expression in the style's per-property calc slot before asking
+# css__outranks_existing() whether the declaration wins. The computed
+# font-size of the winner names the slot, not the expression, so a
+# losing calc font-size that cascaded after it replaced the winner's
+# expression. The helpers.c cascades for the other calc-capable
+# properties already set the slot only after winning (fixes1299).
+# font-size was the one left. On wordpress.org/news the release number
+# (`clamp(60px, 20vw - 96px, 160px)`, 96px) drew at 36px: h3's
+# `font-size: var(...)` = clamp(26px, 4vw, 36px) is replayed after the
+# cascade (patch 329), lost on specificity, and left its clamp in the
+# slot. The same happens without var(): an !important min() followed by
+# a more specific calc() rendered at the calc().
+#
+#  - select/properties/font_size.c: the expression and slot stay local,
+#    the unit is sniffed from the local expression, and the slot is
+#    written only when the declaration outranks.
+#
+# Gate: CSS-font-size-calc (FSCALC330, 3 legs: a specific clamp() against
+# a var() clamp(); !important min() against a later more specific calc();
+# a specific length control). Without this patch it reads 1/3.
+--- a/src/select/properties/font_size.c
++++ b/src/select/properties/font_size.c
+@@ -22,6 +22,13 @@
+ 	css_fixed size = 0;
+ 	uint32_t unit = UNIT_PX;
+ 	bool is_calc = false;
++	/* VitaBrowser patch 330: the calc expression and its slot are kept
++	 * local until the declaration wins, as the helpers.c cascades do
++	 * (fixes1299). Writing the slot first let a LOSING calc font-size
++	 * replace the winner's expression: the computed style still named
++	 * the slot, so the winner rendered at the loser's size. */
++	uint8_t calc_slot = 0;
++	lwc_string *calc_expr = NULL;
+ 
+ 	if (hasFlagValue(opv) == false) {
+ 		switch (getValue(opv)) {
+@@ -70,7 +77,6 @@
+ 			 * same per-property side-slot table the other
+ 			 * calc-capable properties use. */
+ 			uint32_t snum = 0;
+-			lwc_string *calc_expr = NULL;
+ 			uint8_t slot = css__calc_slot_for_prop(
+ 					getOpcode(opv));
+ 
+@@ -81,8 +87,7 @@
+ 			css__stylesheet_string_get(style->sheet, snum, &calc_expr);
+ 			if (calc_expr != NULL &&
+ 					slot < MACSURF_CALC_SLOT_COUNT) {
+-				css__calc_slot_set(state->computed, slot,
+-						calc_expr);
++				calc_slot = slot;
+ 				size = (css_fixed)slot;
+ 				is_calc = true;
+ 			}
+@@ -97,12 +102,14 @@
+ 	if (is_calc == false) {
+ 		unit = css__to_css_unit(unit);
+ 	} else {
+-		unit = css__calc_expr_unit(
+-				state->computed->macsurf_calc_expr[(uint8_t)size]);
++		unit = css__calc_expr_unit(calc_expr);
+ 	}
+ 
+ 	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
+ 			getFlagValue(opv))) {
++		if (is_calc)
++			css__calc_slot_set(state->computed, calc_slot,
++					calc_expr);
+ 		return set_font_size(state->computed, value, size, unit);
+ 	}
+ 
