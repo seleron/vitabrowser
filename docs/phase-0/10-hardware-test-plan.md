@@ -7050,3 +7050,37 @@ lines over Chromium's article column. The layout is what the work is
 for, so this is recorded rather than optimised for.
 
 Full gate: `gate340.log`, exit 0 (GRIDXSHEET340 4/4, GRIDNEST341 4/4, GRIDFR337 5/5, GRIDNAMES336 4/4, GRIDFILL206 8/8, interaction 52/52).
+
+## Scorecard r62 (2026-10-30): fresh reference, patches through 342
+
+`score/r62-342-fresh` is the new baseline, **mean 84.5** (r61: 84.3). MDN
++5.4 (82.8), stackoverflow +1.9, hackernews +0.9, bbc +0.5, cnnlite
++0.7. **Wikipedia −6.4 is not a regression.** Wikipedia's randomised
+CentralNotice gave the two engines different banners: Chromium a
+donation appeal, the simulator an app-install prompt. The article layout
+is unchanged.
+
+## Patch 343 (2026-10-30): inline SVG viewBox applies
+
+No inline SVG's viewBox had ever applied. `vb_inline_svg.c` serializes
+the `<svg>` subtree for libsvgtiny with the names the page DOM gives:
+`SVG`, `RECT`, `viewbox` (the foreign-content case adjustment does not
+reach the stored attribute). libsvgtiny, an XML consumer, matches
+`viewBox` case-sensitively. Shapes drew in viewBox units at scale 1:
+logos sized to their viewBox looked right, a 24-unit icon on a 48px box
+drew 24px in its corner, and Material icons (`viewBox="0 -960 960 960"`)
+drew entirely off-canvas. That left Google's trending arrows and
+search-bar icons and much of YouTube's toolbar blank. A standalone
+libsvgtiny test parsed both viewBox forms correctly, and a dump of the
+serialized markup showed the lower-case `viewbox`. The serializer now
+writes SVG spellings: element names lower-cased, and the HTML spec's
+camelCase tables for elements and attributes.
+
+Gate: CSS-svg-viewbox, a `file://` page with snapshot pixels: a scaled
+rect, a negative min-y and Material's 960-unit box all match Chromium.
+Before the patch they read background grey. Scorecard (r62 reference):
+google 79.5 → 79.7. The trending arrows and the search-bar icons are
+drawn now. **Still open:** those search-bar icons (lens, mic, camera)
+fill garbled, a path-fill issue with Material's paths.
+
+Full gate: `gate343.log`, exit 0.
