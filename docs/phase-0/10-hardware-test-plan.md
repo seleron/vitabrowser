@@ -6947,3 +6947,58 @@ BBC's front page is grid-heavy (50 `display:grid`, 43
 (no net/JS errors in out.log) and the gate pages all pass — BBC's grid is
 not covered by any gate page. Next: bisect 336's legs against the r62 BBC
 ref (bisect-mdn tree pattern) and fix without losing the MDN gain.
+
+## Patches 337-339 (2026-10-30): MDN's page grid, fr/minmax sizing and a libcss saturation bug
+
+After the restage through 336 (Hermes' solo commit 22470ab, gate-r62
+exit 0), developer.mozilla.org still drew its article in a ~200px column.
+With MDN's real stylesheets loaded locally, the page grid
+(`.layout__2-sidebars-inline`) was **0px wide** inside a 960px block.
+
+- **339, libcss saturating add/subtract**
+  (`339-libcss-fpmath-saturating.patch`). MDN pads that grid with
+  `max(1rem, calc(50vw - 720px + 1rem))`. A temporary trace in
+  `css_calculator_calculate` showed `-30px, 1rem, ADD → 2097151`. MacSurf's
+  fixes1309 computes `(int32_t)((uint32_t)ux >> 31) + INT_MAX`, which is
+  1 + INT_MAX for a negative x. That is signed overflow (undefined), and
+  GCC -O2 made the saturation test fire on ordinary mixed-sign sums. The
+  padding came out 21845px per side. Both functions now add/subtract in
+  int64 and clamp. fpmath.h is a public header that netsurf inlines, so
+  netsurf's objects must be rebuilt: an incremental sim build is not
+  enough. Margins with such sums (`calc(-30px + 1rem)`, now −14px) were
+  wrong the same way, which may well explain earlier unexplained
+  21845-class offsets on other sites.
+- **338, padding never negative**
+  (`338-netsurf-padding-nonnegative.patch`). A calc() padding below zero
+  was used as-is. CSS clamps it to 0.
+- **337, grid fr sizing** (`337-netsurf-grid-fr-minmax.patch` +
+  `337-libcss-grid-minmax-zero-marker.patch`). A `minmax(Npx, 1fr)` track
+  was N plus its share (fixes1214). It is now max(N, share), re-shared
+  per CSS Grid 12.7.1. `minmax(0, <length>)` gets its own track kind
+  (rewrite marker `mxN`, unit 9) that grows toward N before the fr
+  tracks share the rest (12.6 before 12.7). MDN's column list now
+  resolves to Chromium's 240 / 32 / 688 / 0. Auto-fill grids
+  (`repeat(auto-fill, minmax(N, 1fr))`) use the same kind and are now
+  max(N, share). GRIDFILL206 still passes 8/8.
+
+Gate pages: CSS-grid-fr-minmax (GRIDFR337 5/5) and CSS-calc-negative
+(CALCNEG339 5/5), both 5/5 in Chromium. Without-patch evidence comes from
+the measurements on this build line before each fix, not from a
+dedicated old-build run of these pages. Before 337, MDN's columns
+measured 469/229 and minmax(0, N) folded to 1fr. Before 339,
+`calc(-30px + 1rem)` measured 2097151 (21845px of padding). Before 338,
+`calc(-224px)` padding applied as −224.
+
+**Scorecard (r61 reference):** MDN 79.5 → **84.7** (visual 0.488 →
+0.617). The article is full width again. The table of contents still
+overlaps it, because the grid areas are not placed yet (next unit).
+
+**Correction to the solo bisect (184ddd2).** That bisect cleared
+328/329/333 and put the r59 → r61 MDN drop down to reference drift. Part
+of the drop was in fact an engine change. Before patch 326 the nested
+`calc()` inside MDN's `max()` did not parse, so the padding declaration
+was dropped (padding 0, a full-width page). 326 made it parse, which
+exposed the old fixes1309 saturation bug (339) and collapsed the grid.
+The 326 → 339 sequence is the cause. Reference drift is on top of it.
+
+Full gate: `gate337.log`, exit 0 (GRIDFR337 5/5, CALCNEG339 5/5, GRIDNAMES336 4/4, GRIDFILL206 8/8, interaction 52/52).
