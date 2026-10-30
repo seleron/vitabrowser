@@ -7510,3 +7510,31 @@ sim screens are pixel-identical to r73. BBC's −2.2 is a new lead image
 in Chrome's reference; other moves are live content.
 
 Full gate: `gate354.log`, exit 0.
+
+## Patch 355 (2026-10-30): WebP on the Vita -- BBC's lead images
+
+BBC's lead images drew as alt text in every sim run. bbc.com serves story
+images only as `.jpg.webp` (src and every srcset width), and WebP was off
+in the Vita frontend (`NETSURF_USE_WEBP := NO`: libwebp was not one of
+the vdpm packages the build used). vdpm does carry `libwebp`, so I
+installed it into ~/vitasdk (`VDPM_NONINTERACTIVE=1 vdpm install
+libwebp`) and turned WebP on. tools/build-vita.sh lists the package and
+refuses to start without `webp/decode.h`.
+
+**Build note:** flipping a NETSURF_USE_* option needs a clean netsurf
+build. image.c registers decoders under the define, and an incremental
+build keeps the stale object (the handler compiles but is never
+registered). I moved build/Linux-vita-sim and build/Linux-vita aside
+(kept as ~/vitabrowser-work/Linux-vita*.pre355).
+
+**Device build** (`build-vita-355.log`, exit 0): nsvita.elf links
+libwebp. The VPK is 16.95 MB, against 16.71 MB at run 40 with every
+patch since included. WebP decoding on the hardware is not yet tested;
+it belongs in the next device run's checklist (BBC's front page).
+
+Gate: CSS-img-webp (file:// snapshot of a 40x40 WebP, pixels exact as
+Chromium). Full fresh scorecard (`score/r75-355` vs r74): **bbc 82.2 →
+91.0** (visual 0.556 → 0.775), mean **84.7**. Other moves are live
+content.
+
+Full gate: `gate355.log`, exit 0.
