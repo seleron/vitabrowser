@@ -6623,3 +6623,147 @@ Full gate: `gate325.log`, exit 0 (interaction 52/52, 23 bundled pages
 identical at the Vita's pace).
 
 **Device:** sim-only until the next VPK.
+
+## Patches 326-330 (2026-10-29): five libcss fixes from wordpress.org/news
+
+wordpress.org/news was the weakest scored site in r59 (74.8, visual
+0.379). The causes were measured in the simulator against headless
+Chromium on a saved copy of the live page, using a probe script that
+logs bounding boxes and computed styles from both engines. All five are
+in libcss. Each has its own patch and its own gate page.
+
+- **326, math functions nest** (`326-libcss-calc-nesting.patch`).
+  WordPress's spacing preset is `clamp( 24px, calc( 100vw / 18 ), 80px )`.
+  A `calc()`/`min()`/`max()`/`clamp()` inside another math function is
+  a FUNCTION token, and `css__parse_calc_value()` rejected it, so the
+  whole declaration was dropped. A divisor followed by whitespace
+  (`calc( 100vw / 18 )`) also failed. Every gutter built on the preset
+  was 0. The nested function now parses into the same bytecode buffer
+  through `css__parse_calc_func_args()` (split out of
+  `css__parse_calc()`). The evaluator is a stack machine, so nesting
+  needs no evaluator change.
+- **327, exact viewport and absolute units**
+  (`327-libcss-exact-unit-scale.patch`). The len2px functions round
+  px-per-unit to a whole pixel before multiplying (upstream NetSurf). On
+  the Vita's 960×544 that made 1vw = 10px (100vw = 1000px), 1vh = 5px
+  and 1pt = 1px (45pt = 45px). Viewport units and in/cm/mm/q/pt/pc now
+  scale exactly. vw/vh/pt/pc/in compute length × size / divisor in one
+  step, because 9.6 is not exact in 22.10 fixed point. Font-relative
+  units keep the rounding.
+- **328, `:not()` takes a selector list**
+  (`328-libcss-not-selector-list.patch`). A compound, list or complex
+  argument invalidated the rule. WordPress resets the closed menu with
+  `:not(.is-menu-open.is-menu-open){background-color:inherit!important}`.
+  Dropped, it let the header's hover colour paint a dark box over the
+  navigation. The one-simple-selector form keeps its old path. Anything
+  else becomes a negated `:is()`-style SELLIST (patch 91). The list is
+  not forgiving, as in Chromium. A never-matching V1 pseudo (`:has()`,
+  `:host`) inside it invalidates the rule, because negated it would
+  match everything.
+- **329, var() declarations keep their cascade position**
+  (`329-libcss-var-cascade-order.patch`). Declarations using `var()` are
+  queued and replayed after the cascade (MacSurf fixes1268d). The
+  specificity tie-break (`>=`) assumed arrival in cascade order, so the
+  replay beat every later declaration of equal specificity.
+  WordPress's `padding: 0 0 var(--wp--custom--margin--vertical) 0`
+  survived its later `@media` reset to `padding-bottom: 0`, and the
+  navigation list grew 30px past the header. `prop_state` carries a
+  24-bit cascade position in its existing bitfield word (still 8
+  bytes). Declarations take base + 2w + 1 by bytecode word. A deferred
+  one takes base + 2·pos, between its neighbours. Ties go to the later
+  position, so cascades without var() are unchanged.
+- **330, a losing calc font-size keeps out of the winner's slot**
+  (`330-libcss-font-size-calc-slot.patch`). `css__cascade_font_size()`
+  wrote a calc value's expression into the style's calc slot before the
+  outrank check. The winner's computed font-size names the slot, so a
+  later losing calc rewrote the winner's size. "7.1.4"
+  (`clamp(60px, 20vw - 96px, 160px)`, 96px) drew at 36px, because h3's
+  var() clamp, replayed after the cascade, lost but kept its expression
+  in the slot. The helpers.c cascades already wrote the slot only on a
+  win (fixes1299). font-size was the one left. It also fails without
+  var(): `!important min()` followed by a more specific `calc()`.
+
+**Gate pages** (each Chromium-verified, each failing without its
+patch):
+
+| page | summary | without the patch |
+|---|---|---|
+| CSS-calc-nested | CALCNEST326 11/11 (legs 1-7 = 326, 8-11 = 327) | 1/11 (only 2.54cm, whose rounding happened to land on 96) |
+| CSS-not-list | NOTLIST328 10/10 | 1/10 (only the invalid-rule leg) |
+| CSS-var-order | VARORDER329 9/9 | 4/9 |
+| CSS-font-size-calc | FSCALC330 3/3 | 1/3 |
+
+**Scorecard, wpnews against the r59 reference:** 74.8 → 84.6 (text
+0.992, visual 0.379 → 0.624). The navigation bar, the gutters, the
+two-column split of the release hero and the size of "7.1.4" now match
+Chromium. Still different: the "Latest posts" column border (346px
+against 410px; patch 331 below) and the serif face (EB Garamond in
+Chromium, DejaVu Serif here, which wraps "Latest release").
+
+## Patch 331 (2026-10-30): flex automatic minimum capped by max-width; outer vs content-box limits
+
+The last wpnews layout difference after 326-330 was the "Latest posts"
+column (border at 346px, Chromium 410px). There were two flex bugs.
+
+- **The automatic minimum ignored max-width.** Flexbox 4.5 caps a flex
+  item's automatic minimum (min-content) by a definite max main size.
+  `layout_flex.c` applied min-content as a floor in three places: the
+  base size, the violation step (fixes614) and the used width
+  (fixes623). None was capped. The post list (`max-width: 75vw`, a
+  nowrap title line) kept its whole line. All three now cap it. An
+  explicit min-width still beats max-width.
+- **Outer target against content-box limits.**
+  `layout_flex__get_min_max_violations()` compared the outer target size
+  (the used width is target − delta) with content-box
+  `min_main`/`max_main`. The heading (min-width 358px border-box, 160px
+  padding, 53px margin) shrank to 295px. In a row, the limits now get
+  `delta_outer_main` added, as the hypothetical main size step already
+  did. Column containers keep the old comparison, which is not verified
+  there and is left for a later unit.
+
+Gate: CSS-flex-auto-min-max (FLEXAUTOMIN331 5/5, Chromium 5/5; the old
+build reads 1/4 on the first four legs). The wpnews reproduction (the
+real @media block plus vars) now matches Chromium: heading 358, list 720.
+
+## Patch 332 (2026-10-30): `isolation: isolate` creates a stacking context
+
+claude.ai's "Download" button is `relative isolate` with a black fill
+span `absolute -z-[1]`. libcss had no `isolation` property (cssgaps:
+claude, github, oldreddit). The netsurf stacking classifier listed it as
+not covered. The span was hoisted to the root's negative z phase and
+painted under the white card, giving white text on white. The grey
+"Continue with Google" fill was lost the same way.
+
+- **332-libcss**: the property (`CSS_PROP_ISOLATION` 0x0ab, keyword
+  `isolate`, 2 bits at `bits[15]` 28–29, not inherited, initial auto,
+  `css_computed_isolation()`). The p_/s_ files follow pointer-events.
+- **332-netsurf**: `html_redraw_box_classify()` treats `isolate` as a
+  zero-z stacking context, like `opacity < 1`.
+
+Gate: CSS-isolation. Snapshot pixels inside each fill, located from the
+text marks, read black for the isolated button and white for the
+`isolation: auto` control. Chromium gives the same. The plotter culls
+the fully covered control fill, so it is located from its text, not its
+rect.
+
+**Scorecard (r59 reference):** claude.ai 75.4 → 75.9. The Download
+button and the Google button fill are back, and the header logo has its
+padding. Still different: a "WebAssembly took 0.5 s" HUD toast (the
+hCaptcha wasm) is in the first-screen shot, a blue outline is drawn
+around the header, and corners are square (rounded boxes draw with
+square corners by design, doc 11). wpnews 85.1 (visual 0.636).
+
+**Gate for 326-332:** `gate326.log`, exit 0 (interaction 52/52, 23 bundled
+pages identical at the Vita's pace). Two earlier runs failed on test
+expectations, not rendering. `gate326-fail-iswhere.log`: CSS-is-where's
+197 block (`.n8:not(:where(.x))`) now matches, which is the specified
+result, where the expectation had encoded fixes360b's parse rejection.
+`gate326-fail-pace.log`: the pace check globs `[01]*.plot`, which
+caught the new file:// CSS-isolation page at list index 185. It now
+sits beside CSS-opacity-image. The first run (`gate326-aborted.log`)
+was stopped to fold in 330.
+
+**Device:** sim-only until the next VPK. `tools/build-vita.sh` builds
+libcss from the patch stack, so 326-330 and 332-libcss (two new source
+files, p_isolation.c and s_isolation.c, in the libcss Makefiles) ride
+along automatically.
