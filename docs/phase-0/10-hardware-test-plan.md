@@ -7299,3 +7299,37 @@ screens; the score now measures the page itself. Other sites have not
 been audited for similar overlays.
 
 Full gate: `gate348.log`, exit 0.
+
+## State log 2026-10-30: scorecard overlay audit (all sites)
+
+I looked for random overlays from both sides.
+
+**Chromium:** three fresh loads per site, recording any fixed or sticky
+element covering at least 12% of the screen and any consent or survey
+hosts. Consent UIs appeared on all three loads for cnnlite, rte and
+stackoverflow (OneTrust), guardian (Sourcepoint) and claude (its own
+cookie panel). None was random on the Chrome side.
+
+**Simulator:** two back-to-back fresh full runs (`score/r67a-audit`
+84.0, `r67b-audit` 84.2). Only three sites moved by 1.5 or more:
+
+- **wikipedia** 81.0 / 84.6. One sim run drew the CentralNotice
+  fundraising banner ("you only had a small chance of seeing our
+  message"), served from `meta.wikimedia.org` (`Special:BannerLoader`).
+  That host is not requested on a load without a banner, so it is now
+  blocked on both sides. Neither post-fix sim run fetched the banner
+  (`score/r68-wiki-det1..2`).
+  Still unhandled: mobile Wikipedia occasionally draws an image carousel
+  above the lead on the Chrome side (r68 det1 reference 84.3 vs det2
+  88.0). It is a first-party experiment, enrolled in no cookie,
+  localStorage key or distinct request that I could find (0 of 6 fresh
+  loads), so host blocking cannot reach it. It remains a known residual.
+- **hackernews** 90.0 / 87.2, and **stackoverflow** 84.8 / 87.0. Live
+  content drift in the text score (visual nearly identical). SO's
+  OneTrust panel appears in both sim runs, so it is deterministic.
+
+Every other site scored within 0.8 across the two runs, and 15 of the 21
+were identical. r67b (mean 84.2) is the new full baseline, the first
+taken with BBC's overlays blocked.
+
+Full gate: `gate349.log`, exit 0.
