@@ -215,6 +215,7 @@ CSS-overflow-x file:///app0:/testpages/CSS-overflow-x.html
 CSS-inline-grid file:///app0:/testpages/CSS-inline-grid.html
 CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
 CSS-opacity-image file:///app0:/testpages/CSS-opacity-image.html
+CSS-isolation file:///app0:/testpages/CSS-isolation.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
@@ -355,6 +356,11 @@ NET-js-form-walk-cost http://127.0.0.1:$HP/JS-form-walk-cost.html
 NET-js-form-target http://127.0.0.1:$HP/JS-form-target.html
 NET-js-link-click http://127.0.0.1:$HP/JS-link-click.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
+NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
+NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
+NET-css-var-order http://127.0.0.1:$HP/CSS-var-order.html
+NET-css-font-size-calc http://127.0.0.1:$HP/CSS-font-size-calc.html
+NET-css-flex-auto-min-max http://127.0.0.1:$HP/CSS-flex-auto-min-max.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -951,6 +957,49 @@ s220p=$(ls "$R"/*NET-css-letter-spacing.plot 2>/dev/null | head -1)
 s220r=$(sed -n 's/.*STR \(SPACING220: [0-9]*\/[0-9]* passed\).*/\1/p' "$s220p" 2>/dev/null | head -1)
 echo "  css-letter-spacing: ${s220r:-no summary}"
 [ -n "$s220p" ] && grep -o 'STR [0-9] [^"]*FAIL' "$s220p" | sed 's/^STR /  /'
+# Patches 326/327: math functions nest (clamp(24px, calc(100vw / 18),
+# 80px)), a divisor may be followed by whitespace, and viewport/absolute
+# units scale exactly (10vw = innerWidth/10, 45pt = 60px).
+c326p=$(ls "$R"/*NET-css-calc-nested.plot 2>/dev/null | head -1)
+c326r=$(sed -n 's/.*STR \(CALCNEST326: [0-9]*\/[0-9]* passed\).*/\1/p' "$c326p" 2>/dev/null | head -1)
+echo "  css-calc-nested: ${c326r:-no summary}"
+[ -n "$c326p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$c326p" | sed 's/^STR /  /'
+# Patch 328: :not() takes a selector list (compound, list, complex).
+n328p=$(ls "$R"/*NET-css-not-list.plot 2>/dev/null | head -1)
+n328r=$(sed -n 's/.*STR \(NOTLIST328: [0-9]*\/[0-9]* passed\).*/\1/p' "$n328p" 2>/dev/null | head -1)
+echo "  css-not-list: ${n328r:-no summary}"
+[ -n "$n328p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$n328p" | sed 's/^STR /  /'
+# Patch 329: a var() declaration competes at its own cascade position.
+v329p=$(ls "$R"/*NET-css-var-order.plot 2>/dev/null | head -1)
+v329r=$(sed -n 's/.*STR \(VARORDER329: [0-9]*\/[0-9]* passed\).*/\1/p' "$v329p" 2>/dev/null | head -1)
+echo "  css-var-order: ${v329r:-no summary}"
+[ -n "$v329p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$v329p" | sed 's/^STR /  /'
+# Patch 330: a calc font-size that loses the cascade leaves the winner's
+# calc expression alone.
+f330p=$(ls "$R"/*NET-css-font-size-calc.plot 2>/dev/null | head -1)
+f330r=$(sed -n 's/.*STR \(FSCALC330: [0-9]*\/[0-9]* passed\).*/\1/p' "$f330p" 2>/dev/null | head -1)
+echo "  css-font-size-calc: ${f330r:-no summary}"
+[ -n "$f330p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$f330p" | sed 's/^STR /  /'
+# Patch 331: a flex item's automatic minimum is capped by its max-width.
+f331p=$(ls "$R"/*NET-css-flex-auto-min-max.plot 2>/dev/null | head -1)
+f331r=$(sed -n 's/.*STR \(FLEXAUTOMIN331: [0-9]*\/[0-9]* passed\).*/\1/p' "$f331p" 2>/dev/null | head -1)
+echo "  css-flex-auto-min-max: ${f331r:-no summary}"
+[ -n "$f331p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$f331p" | sed 's/^STR /  /'
+# Patch 332: isolation: isolate creates a stacking context. The z-index:-1
+# fill inside the isolated button paints black over its card; the control
+# (isolation: auto) is covered by its card (white, and culled from the
+# plot), as in Chromium. Pixels from the snapshot, 18px left of and 20px
+# above each button's text mark (inside its fill).
+i332p=$(ls "$R"/*-CSS-isolation.plot 2>/dev/null | head -1)
+i332s=$(ls "$OUT"/snaps/N-*-CSS-isolation.png 2>/dev/null | head -1)
+i332a=$(grep -a -o 'PLOT TEXT X [0-9]* Y [0-9]* STR ISOMARK' "$i332p" 2>/dev/null | awk '{ print $4 - 18 "," $6 - 20; exit }')
+i332b=$(grep -a -o 'PLOT TEXT X [0-9]* Y [0-9]* STR CTLMARK' "$i332p" 2>/dev/null | awk '{ print $4 - 18 "," $6 - 20; exit }')
+i332px=
+if [ -n "$i332s" ] && [ -n "$i332a" ] && [ -n "$i332b" ]; then
+	i332px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$i332s" \
+		"$i332a" "$i332b" | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-isolation: isolated fill / control ${i332px:-none} (0,0,0 255,255,255)"
 # Patch 221: the space after inline-blocks / replaced boxes.
 i221p=$(ls "$R"/*NET-css-inline-block-space.plot 2>/dev/null | head -1)
 i221r=$(sed -n 's/.*STR \(IBSPACE221: [0-9]*\/[0-9]* passed\).*/\1/p' "$i221p" 2>/dev/null | head -1)
@@ -1465,6 +1514,12 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$p218r" = "PROGRESS218: 5/5 passed" ] && \
 [ "$e219r" = "EMBED219: 4/4 passed" ] && \
 [ "$s220r" = "SPACING220: 3/3 passed" ] && \
+[ "$c326r" = "CALCNEST326: 11/11 passed" ] && \
+[ "$n328r" = "NOTLIST328: 10/10 passed" ] && \
+[ "$v329r" = "VARORDER329: 9/9 passed" ] && \
+[ "$f330r" = "FSCALC330: 3/3 passed" ] && \
+[ "$f331r" = "FLEXAUTOMIN331: 5/5 passed" ] && \
+[ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
 [ "$r223r" = "RANGECOL223: 4/4 passed" ] && \
@@ -1705,11 +1760,12 @@ g320=$(awk '/^PLOT RECT/ && $8 - $4 == 320 && $10 - $6 > 1 && $10 - $6 < 20 { n+
 echo "  CSS-bgsizepct gradient: $g160 tile columns of 160, $g320 full-width stripes (2, 0 expected)"
 [ "$g160" = 2 ] && [ "$g320" = 0 ] || fail "background-size percentage gradient"
 # :is() / :where() (patch 91): each case that matches draws one 10px-high
-# block of its own width; 105 must not match, 197-199 must lose.
+# block of its own width; 105 must not match, 198-199 must lose; 197
+# (:not(:where())) matches since patch 328.
 iw=$(ls "$R"/*-CSS-iswhere.plot 2>/dev/null | head -1)
 iws=$(awk '/^PLOT RECT/ && $10 - $6 == 10 && $8 - $4 < 300 { print $8 - $4 }' "$iw" 2>/dev/null | sort -n | tr '\n' ' ')
-echo "  CSS-iswhere: block widths [$iws] (101 102 103 104 106 107 108 109 expected)"
-[ "$iws" = "101 102 103 104 106 107 108 109 " ] || fail ":is() / :where()"
+echo "  CSS-iswhere: block widths [$iws] (101 102 103 104 106 107 108 109 197 expected)"
+[ "$iws" = "101 102 103 104 106 107 108 109 197 " ] || fail ":is() / :where()"
 # CSS rewrite on a big sheet (patch 92): inset expands, and calc(1 * -1)
 # folds to an integer so flex order moves the 122-wide item first.
 bs=$(ls "$R"/*-CSS-bigsheet.plot 2>/dev/null | head -1)

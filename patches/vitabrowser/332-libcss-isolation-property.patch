@@ -1,0 +1,385 @@
+# libcss: the isolation property (patch 332, with 332-netsurf)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 331)
+#
+# isolation (CSS Compositing 1) was not a property, so `isolation:
+# isolate` was dropped (cssgaps: claude, github, oldreddit). Tailwind's
+# `isolate` class is how a button keeps its `-z-[1]` fill span above the
+# card it sits on (patch 332-netsurf).
+#
+#  - CSS_PROP_ISOLATION 0x0ab, enum css_isolation_e (inherit/auto/
+#    isolate), propstrings "isolation" (after transition-delay, LAST_PROP
+#    moves) and keyword "isolate" (after the deprecated colours).
+#  - parse: p_isolation.c (auto | isolate | inherit). select:
+#    s_isolation.c, not inherited, initial auto. The computed value is 2
+#    bits at bits[15] 28-29, free between hanging_punctuation and
+#    justify_items. css_computed_isolation() reads it.
+--- a/include/libcss/properties.h
++++ b/include/libcss/properties.h
+@@ -185,6 +185,7 @@
+ 	CSS_PROP_TRANSITION_DURATION            = 0x0a8,
+ 	CSS_PROP_TRANSITION_TIMING_FUNCTION     = 0x0a9,
+ 	CSS_PROP_TRANSITION_DELAY               = 0x0aa,
++	CSS_PROP_ISOLATION                      = 0x0ab, /* VitaBrowser 332 */
+ 	CSS_N_PROPERTIES
+ };
+ 
+@@ -1261,6 +1262,14 @@
+ 	CSS_TRANSITION_TIMING_FUNCTION_SET	= 0x1
+ };
+ 
++/* VitaBrowser patch 332: isolation (CSS Compositing 1). isolate creates a
++ * stacking context and nothing else. */
++enum css_isolation_e {
++	CSS_ISOLATION_INHERIT			= 0x0,
++	CSS_ISOLATION_AUTO			= 0x1,
++	CSS_ISOLATION_ISOLATE			= 0x2
++};
++
+ enum css_transition_delay_e {
+ 	CSS_TRANSITION_DELAY_INHERIT		= 0x0,
+ 	CSS_TRANSITION_DELAY_SET		= 0x1
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -574,6 +574,9 @@
+ uint8_t css_computed_justify_items(
+ 		const css_computed_style *style);   /* #279 */
+ 
++uint8_t css_computed_isolation(
++		const css_computed_style *style);   /* VitaBrowser 332 */
++
+ uint8_t css_computed_justify_self(
+ 		const css_computed_style *style);   /* #279 follow-up */
+ 
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -113,8 +113,9 @@
+ 	TRANSITION_DURATION,
+ 	TRANSITION_TIMING_FUNCTION,
+ 	TRANSITION_DELAY,
++	ISOLATION,		/* VitaBrowser 332 */
+ 
+-	LAST_PROP = TRANSITION_DELAY,
++	LAST_PROP = ISOLATION,
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+ 	NO_REPEAT, REPEAT_X, REPEAT_Y, REPEAT, HIDDEN, DOTTED, DASHED,
+@@ -228,6 +229,9 @@
+ 
+ 	LAST_DEPRECATEDCOLOUR = WINDOWTEXT,
+ 
++	/* VitaBrowser 332: keywords after the deprecated colours */
++	ISOLATE,
++
+ 	LAST_KNOWN
+ };
+ 
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -281,6 +281,7 @@
+ 	SMAP("transition-duration"),
+ 	SMAP("transition-timing-function"),
+ 	SMAP("transition-delay"),
++	SMAP("isolation"),	/* VitaBrowser 332 */
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+ 	SMAP("important"),
+@@ -800,7 +801,8 @@
+ 	SMAP("threedshadow"),
+ 	SMAP("window"),
+ 	SMAP("windowframe"),
+-	SMAP("windowtext")
++	SMAP("windowtext"),
++	SMAP("isolate")		/* VitaBrowser 332 */
+ };
+ 
+ 
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -210,7 +210,8 @@
+ 	css__parse_transition_property,
+ 	css__parse_transition_duration,
+ 	css__parse_transition_timing_function,
+-	css__parse_transition_delay
++	css__parse_transition_delay,
++	css__parse_isolation		/* VitaBrowser 332 */
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+@@ -382,6 +383,7 @@
+ 	[CSS_PROP_TRANSITION_DURATION]   = 0,
+ 	[CSS_PROP_TRANSITION_TIMING_FUNCTION] = 0,
+ 	[CSS_PROP_TRANSITION_DELAY]      = 0,
++	[CSS_PROP_ISOLATION]             = 0,
+ };
+ 
+ /*
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -743,4 +743,9 @@
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+ 
++/* VitaBrowser 332 */
++css_error css__parse_isolation(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++
+ #endif
+--- a/src/parse/properties/Makefile
++++ b/src/parse/properties/Makefile
+@@ -91,6 +91,7 @@
+ p_hanging_punctuation.c \
+ p_hyphens.c \
+ p_image_rendering.c \
++p_isolation.c \
+ p_justify_items.c \
+ p_justify_self.c \
+ p_macsurf_animation_opacity.c \
+--- /dev/null
++++ b/src/parse/properties/p_isolation.c
+@@ -0,0 +1,50 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++/**
++ * VitaBrowser patch 332: parse isolation: auto | isolate | inherit
++ */
++css_error css__parse_isolation(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	const css_token *token;
++	uint8_t flags = 0;
++	uint16_t value = 0;
++	bool match;
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL || token->type != CSS_TOKEN_IDENT)
++		return CSS_INVALID;
++
++	if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[INHERIT], &match) == lwc_error_ok) &&
++			match) {
++		flags = FLAG_INHERIT;
++	} else if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[AUTO], &match) == lwc_error_ok) &&
++			match) {
++		value = CSS_ISOLATION_AUTO;
++	} else if ((lwc_string_caseless_isequal(token->idata,
++			c->strings[ISOLATE], &match) == lwc_error_ok) &&
++			match) {
++		value = CSS_ISOLATION_ISOLATE;
++	} else {
++		return CSS_INVALID;
++	}
++	parserutils_vector_iterate(vector, ctx);
++
++	return css__stylesheet_style_appendOPV(result, CSS_PROP_ISOLATION,
++			flags, value);
++}
+--- a/src/select/dispatch.c
++++ b/src/select/dispatch.c
+@@ -717,5 +717,9 @@
+ 	{
+ 	        PROPERTY_FUNCS(transition_delay),
+ 	        0,
++	},
++	{
++	        PROPERTY_FUNCS(isolation),	/* VitaBrowser 332 */
++	        0,
+ 	}
+ 	};
+--- a/src/select/properties/properties.h
++++ b/src/select/properties/properties.h
+@@ -207,6 +207,7 @@
+ PROPERTY_FUNCS(transition_duration);
+ PROPERTY_FUNCS(transition_timing_function);
+ PROPERTY_FUNCS(transition_delay);
++PROPERTY_FUNCS(isolation);	/* VitaBrowser 332 */
+ 
+ #undef PROPERTY_FUNCS
+ 
+--- a/src/select/properties/Makefile
++++ b/src/select/properties/Makefile
+@@ -150,6 +150,7 @@
+ s_hanging_punctuation.c \
+ s_hyphens.c \
+ s_image_rendering.c \
++s_isolation.c \
+ s_justify_items.c \
+ s_justify_self.c \
+ s_macsurf_animation_opacity.c \
+--- /dev/null
++++ b/src/select/properties/s_isolation.c
+@@ -0,0 +1,82 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++/* VitaBrowser patch 332: isolation, not inherited, initial auto. */
++
++css_error css__cascade_isolation(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	uint16_t value = CSS_ISOLATION_INHERIT;
++
++	UNUSED(style);
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case CSS_ISOLATION_AUTO:
++			value = CSS_ISOLATION_AUTO;
++			break;
++		case CSS_ISOLATION_ISOLATE:
++			value = CSS_ISOLATION_ISOLATE;
++			break;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_isolation(state->computed, value);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_isolation_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_isolation(style, hint->status);
++}
++
++css_error css__initial_isolation(css_select_state *state)
++{
++	return set_isolation(state->computed, CSS_ISOLATION_AUTO);
++}
++
++css_error css__copy_isolation(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from == to)
++		return CSS_OK;
++
++	return set_isolation(to, get_isolation(from));
++}
++
++css_error css__compose_isolation(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	uint8_t type = get_isolation(child);
++
++	if (type == CSS_ISOLATION_INHERIT)
++		type = get_isolation(parent);
++
++	return set_isolation(result, type);
++}
++
++uint32_t destroy_isolation(void *bytecode)
++{
++	UNUSED(bytecode);
++
++	return 0;
++}
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -1115,6 +1115,12 @@
+ 	return get_justify_items(style);
+ }
+ 
++/* VitaBrowser 332 */
++uint8_t css_computed_isolation(const css_computed_style *style)
++{
++	return get_isolation(style);
++}
++
+ /* #279 follow-up */
+ uint8_t css_computed_justify_self(const css_computed_style *style)
+ {
+--- a/src/select/autogenerated_propget.h
++++ b/src/select/autogenerated_propget.h
+@@ -2306,6 +2306,23 @@
+ #undef JUSTIFY_ITEMS_SHIFT
+ #undef JUSTIFY_ITEMS_MASK
+ 
++/* VitaBrowser 332 isolation: bits[15] shift 28 (2 bits), free between
++ * hanging_punctuation and justify_items */
++#define ISOLATION_INDEX 15
++#define ISOLATION_SHIFT 28
++#define ISOLATION_MASK 0x30000000
++static inline uint8_t get_isolation(const css_computed_style *style)
++{
++	uint32_t bits = style->i.bits[ISOLATION_INDEX];
++	bits &= ISOLATION_MASK;
++	bits >>= ISOLATION_SHIFT;
++
++	return (bits & 0x3);
++}
++#undef ISOLATION_INDEX
++#undef ISOLATION_SHIFT
++#undef ISOLATION_MASK
++
+ #undef OBJECT_FIT_INDEX
+ #undef OBJECT_FIT_SHIFT
+ #undef OBJECT_FIT_MASK
+--- a/src/select/autogenerated_propset.h
++++ b/src/select/autogenerated_propset.h
+@@ -1826,6 +1826,23 @@
+ #undef JUSTIFY_ITEMS_SHIFT
+ #undef JUSTIFY_ITEMS_MASK
+ 
++/* VitaBrowser 332 isolation: bits[15] shift 28 (2 bits) */
++#define ISOLATION_INDEX 15
++#define ISOLATION_SHIFT 28
++#define ISOLATION_MASK 0x30000000
++static inline css_error set_isolation(css_computed_style *style, uint8_t type)
++{
++	uint32_t *bits = &style->i.bits[ISOLATION_INDEX];
++
++	*bits = (*bits & ~ISOLATION_MASK) |
++			(((uint32_t)type & 0x3) << ISOLATION_SHIFT);
++
++	return CSS_OK;
++}
++#undef ISOLATION_INDEX
++#undef ISOLATION_SHIFT
++#undef ISOLATION_MASK
++
+ #undef OBJECT_FIT_INDEX
+ #undef OBJECT_FIT_SHIFT
+ #undef OBJECT_FIT_MASK
+--- a/src/select/autogenerated_computed.h
++++ b/src/select/autogenerated_computed.h
+@@ -228,6 +228,7 @@
+  * macsurf_text_shadow (bits 1-0)
+  *
+  * 15 ...............EEPPPPWWWWXXOOORRA
++ * (VitaBrowser 332) isolation (bits 29-28);
+  * (fixes200)  pointer_events (bits 16-15);
+  * (fixes191g) macsurf_object_position (bits 14-11);
+  * (fixes136a) overflow_wrap (bits 10-9);
