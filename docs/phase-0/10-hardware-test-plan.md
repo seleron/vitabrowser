@@ -7105,3 +7105,36 @@ Gate: CSS-svg-smooth-quad, snapshot pixels as in Chromium. Before the
 patch the dip of the test wave did not fill.
 
 Full gate: `gate344.log`, exit 0.
+
+## Patch 345 (2026-10-30): explicit min-width turns off the flex automatic minimum
+
+Flexbox 4.5: the automatic minimum size (min-content) applies only when
+`min-width: auto`. `layout_flex.c` applied the min-content floor in three
+places (base size, violations, used width) whatever the item's min-width
+was, so `min-width: 0` -- the usual way to let a flex item shrink below its
+content -- did nothing. The fixes176 fallback separately replaced any
+definite `flex-basis: 0` with the item's intrinsic size, so `flex: 1 1 0`
+behaved like `flex: 1 1 auto`.
+
+GitHub's repo column is `flex: 1 1 0; width: 100%; min-width: 1px` with long
+nowrap file rows: it kept its whole min-content, filled the wrapping row,
+and the About sidebar wrapped below the file list.
+
+- 345-libcss: `css_computed_min_width_is_auto()` -- the raw answer,
+  mirroring the existing `css_computed_min_height_is_auto()`
+  (`css_computed_min_width()` turns auto into 0 unless the element itself
+  is a flex container, but the automatic minimum belongs to flex ITEMS).
+- 345-netsurf: `layout_flex.c` -- in a row, when min-width is explicit the
+  content minimum is not used as a floor (min_main carries the explicit
+  value); a definite zero basis stays 0 (AUTO bases, and a percentage basis
+  against an unknown container, still fall back); the min-width floors in
+  violations and used width are likewise skipped.
+
+Gate: CSS-flex-min-width-explicit (FLEXMINW345 3/3, Chromium 3/3): min-width
+1px and 0 share the line at 696, auto keeps the content minimum and wraps.
+Before the patch legs 1-2 wrapped.
+
+Scorecard (r62 reference): github 81.8 -> 83.8 -- the About sidebar sits
+beside the file list.
+
+Full gate: `gate345.log`, exit 0.
