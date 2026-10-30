@@ -26,7 +26,10 @@ overlays whose arrival races the screenshot or is sampled at random.
 BBC's consent dialog (cdn.privacy-mgmt.com) loaded in Chrome every time
 but in the simulator only sometimes, and its "Help us improve!" survey
 invite (edigitalsurvey.com) picks a random share of visits, so the same
-build scored anywhere from ~75 to ~90 run to run.
+build scored anywhere from ~75 to ~90 run to run. Wikipedia's fundraising
+banner (meta.wikimedia.org Special:BannerLoader) is likewise shown to a
+random share. Host blocking cannot reach first-party experiments; mobile
+Wikipedia's occasional image carousel (Chrome side) remains.
 
 Usage:
   tools/scorecard/scorecard.py --out DIR [--only a,b] [--reuse-ref DIR]
