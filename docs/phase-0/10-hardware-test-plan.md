@@ -6925,3 +6925,25 @@ MDN acceptance (live score, reuse-ref r61-335-fresh): 77.4 -> 79.5
 (visual 0.434 -> 0.488, text 1.0). The remaining gap to the stale 80.8
 baseline is the site reflow between the r59 and r61 reference captures,
 not the engine. Next full scorecard run (r62) should re-capture refs.
+
+## Scorecard r62 (2026-10-30 ~03:55, Hermes solo): full stack 336, refs re-fetched
+
+First full scorecard since r61, with re-fetched Chromium refs (the live
+sites moved). `scorecard.py --out score/r62-336-fresh --baseline
+score/r61-335-fresh`; refs captured 03:41Z, sim on the rebuilt applytest
+stack through 336 (gate-r62.log: full suite exit 0, 23/23 pace-identical,
+52/52 interaction).
+
+All-sites mean 83.8 (r61: 84.3). MDN 79.4 — the ~79.5 expected with 336
+(r61's 77.4 was against the stale r61 refs); the grid rewrite is working.
+Nearly every other site is flat (|Δ| ≤ 2.1).
+
+**BBC regression: 89.9 -> 75.2 (visual 0.635 -> 0.362).** Not site drift:
+r61-ref vs r62-ref visual 0.994 (the page barely moved in the two hours
+between captures) while sim r61 vs sim r62 is 0.478 (our render changed).
+BBC's front page is grid-heavy (50 `display:grid`, 43
+`grid-template-columns`, 28 `grid-template-rows` in the HTML), so patch
+336's -macsurf-grid rewrite is the prime suspect. The r62 sim run is clean
+(no net/JS errors in out.log) and the gate pages all pass — BBC's grid is
+not covered by any gate page. Next: bisect 336's legs against the r62 BBC
+ref (bisect-mdn tree pattern) and fix without losing the MDN gain.
