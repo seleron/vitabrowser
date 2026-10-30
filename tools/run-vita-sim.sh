@@ -300,6 +300,7 @@ NET-css-grid-uniform-placement http://127.0.0.1:$HP/CSS-grid-uniform-placement.h
 NET-css-grid-inline-placement http://127.0.0.1:$HP/CSS-grid-inline-placement.html
 NET-css-grid-item-offsets http://127.0.0.1:$HP/CSS-grid-item-offsets.html
 NET-js-style-setters http://127.0.0.1:$HP/JS-style-setters.html
+NET-js-empty-text-nodes http://127.0.0.1:$HP/JS-empty-text-nodes.html
 NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
 NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
@@ -1067,6 +1068,11 @@ s351p=$(ls "$R"/*NET-js-style-setters.plot 2>/dev/null | head -1)
 s351r=$(sed -n 's/.*STR \(STYLESET351: [0-9]*\/[0-9]* passed\).*/\1/p' "$s351p" 2>/dev/null | head -1)
 echo "  js-style-setters: ${s351r:-no summary}"
 [ -n "$s351p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$s351p" | sed 's/^STR /  /'
+# Patch 353: empty text nodes render nothing.
+e353p=$(ls "$R"/*NET-js-empty-text-nodes.plot 2>/dev/null | head -1)
+e353r=$(sed -n 's/.*STR \(EMPTYTXT353: [0-9]*\/[0-9]* passed\).*/\1/p' "$e353p" 2>/dev/null | head -1)
+echo "  js-empty-text-nodes: ${e353r:-no summary}"
+[ -n "$e353p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$e353p" | sed 's/^STR /  /'
 # Patch 335: outlines honour their colour's alpha and the group opacity.
 # The five 200x20 boxes' 204x24 outline rects: the two transparent ones
 # draw nothing, the 50% one and the one inside opacity:.5 trace OPAQUE 2,
@@ -1660,6 +1666,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$i348r" = "GRIDINL348: 8/8 passed" ] && \
 [ "$o349r" = "GRIDOFS349: 7/7 passed" ] && \
 [ "$s351r" = "STYLESET351: 6/6 passed" ] && \
+[ "$e353r" = "EMPTYTXT353: 7/7 passed" ] && \
 [ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$v343px" = "255,0,0 238,238,238 255,0,0 255,0,0 238,238,238 " ] && \
