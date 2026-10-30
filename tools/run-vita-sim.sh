@@ -361,6 +361,8 @@ NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
 NET-css-var-order http://127.0.0.1:$HP/CSS-var-order.html
 NET-css-font-size-calc http://127.0.0.1:$HP/CSS-font-size-calc.html
 NET-css-flex-auto-min-max http://127.0.0.1:$HP/CSS-flex-auto-min-max.html
+NET-css-flex-blockify http://127.0.0.1:$HP/CSS-flex-blockify.html
+NET-css-flex-item-width-contrib http://127.0.0.1:$HP/CSS-flex-item-width-contrib.html
 NET
 python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
 	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
@@ -985,6 +987,16 @@ f331p=$(ls "$R"/*NET-css-flex-auto-min-max.plot 2>/dev/null | head -1)
 f331r=$(sed -n 's/.*STR \(FLEXAUTOMIN331: [0-9]*\/[0-9]* passed\).*/\1/p' "$f331p" 2>/dev/null | head -1)
 echo "  css-flex-auto-min-max: ${f331r:-no summary}"
 [ -n "$f331p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$f331p" | sed 's/^STR /  /'
+# Patch 333: display:inline children of flex/grid containers blockify.
+b333p=$(ls "$R"/*NET-css-flex-blockify.plot 2>/dev/null | head -1)
+b333r=$(sed -n 's/.*STR \(FLEXBLOCKIFY333: [0-9]*\/[0-9]* passed\).*/\1/p' "$b333p" 2>/dev/null | head -1)
+echo "  css-flex-blockify: ${b333r:-no summary}"
+[ -n "$b333p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$b333p" | sed 's/^STR /  /'
+# Patch 334: a flex item's specified width is its max-content contribution.
+c334p=$(ls "$R"/*NET-css-flex-item-width-contrib.plot 2>/dev/null | head -1)
+c334r=$(sed -n 's/.*STR \(FLEXCONTRIB334: [0-9]*\/[0-9]* passed\).*/\1/p' "$c334p" 2>/dev/null | head -1)
+echo "  css-flex-item-width-contrib: ${c334r:-no summary}"
+[ -n "$c334p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$c334p" | sed 's/^STR /  /'
 # Patch 332: isolation: isolate creates a stacking context. The z-index:-1
 # fill inside the isolated button paints black over its card; the control
 # (isolation: auto) is covered by its card (white, and culled from the
@@ -1519,6 +1531,8 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$v329r" = "VARORDER329: 9/9 passed" ] && \
 [ "$f330r" = "FSCALC330: 3/3 passed" ] && \
 [ "$f331r" = "FLEXAUTOMIN331: 5/5 passed" ] && \
+[ "$b333r" = "FLEXBLOCKIFY333: 6/6 passed" ] && \
+[ "$c334r" = "FLEXCONTRIB334: 5/5 passed" ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
