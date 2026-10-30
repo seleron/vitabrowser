@@ -1,0 +1,215 @@
+# libcss: a var() declaration competes at its own cascade position (patch 329)
+# Generated 2026-10-29
+# Base: seleron/vitabrowser (patch stack through 328)
+#
+# A declaration whose value uses var() is queued in cascade_style() and
+# replayed after the whole cascade (MacSurf fixes1268d), with its rule's
+# specificity and origin restored. css__outranks_existing() breaks a
+# specificity tie with ">=", which is right only while declarations
+# arrive in cascade order. The replay arrives last, so it beat every
+# later declaration of equal specificity. wordpress.org's header sets
+# `padding: 0 0 var(--wp--custom--margin--vertical) 0` and zeroes
+# padding-bottom in a later @media rule. The navigation list kept 30px of
+# padding, the closed menu container grew to 95px and the bar's items
+# sat 15px above the header.
+#
+#  - select.h: prop_state gains a 24-bit `seq`, the cascade position of
+#    the declaration in force. It packs into the existing bitfield word,
+#    so the struct stays 8 bytes. The state gains current_seq/next_seq,
+#    and css_pending_var a seq.
+#  - select.c cascade_style(): a rule takes positions from next_seq. The
+#    declaration at bytecode word w gets base + 2w + 1. A deferred one
+#    that had pos words before it in its rule gets base + 2*pos, which
+#    falls between its source neighbours, so order inside one rule holds
+#    too. The replay restores the queued seq.
+#  - css__later_or_more_specific(): the specificity test of
+#    css__outranks_existing(). Higher specificity wins; on a tie the
+#    later position wins. Inline, every newcomer is later, so behaviour
+#    without var() is unchanged. set_hint() records seq 0 (hints precede
+#    every rule).
+#  - custom_properties.h / stylesheet.c: css_deferred_decl spends two of
+#    its pad bytes on `pos`, set when the carrier style merges into its
+#    rule (words already in the rule; saturates at 0xffff).
+#
+# Gate: CSS-var-order (VARORDER329, 9 legs: a later rule, a later @media
+# rule and a later shorthand beat a var() declaration; order inside one
+# rule both ways; higher specificity, !important and a later var() rule
+# still win). Without this patch it reads 4/9.
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -1973,6 +1973,7 @@
+ 	/* Keep selection state in sync with reality */
+ 	existing->set = 1;
+ 	existing->specificity = 0;
++	existing->seq = 0;	/* patch 329: before every rule */
+ 	existing->origin = CSS_ORIGIN_AUTHOR;
+ 	existing->important = 0;
+ 	existing->explicit_default = (hint->status == 0) ?
+@@ -3148,6 +3149,10 @@
+ 	css_style s = *style;
+ 	css_deferred_decl *dd;
+ 	css_error cperr;
++	/* patch 329: this rule's cascade positions. A declaration at
++	 * bytecode word w takes base + 2w + 1; a deferred one with pos
++	 * words before it takes base + 2pos, between its neighbours. */
++	uint32_t base = state->next_seq;
+ 
+ 	/* fixes1268b (#167) - this rule's own "--name" definitions join the
+ 	 * element's environment BEFORE anything else in the rule runs, so a
+@@ -3169,6 +3174,9 @@
+ 		css_error error;
+ 		css_code_t opv = *s.bytecode;
+ 
++		state->current_seq = base + 2 *
++				(uint32_t) (s.bytecode - style->bytecode) + 1;
++
+ 		advance_bytecode(&s, sizeof(opv));
+ 
+ 		op = getOpcode(opv);
+@@ -3177,6 +3185,7 @@
+ 		if (error != CSS_OK)
+ 			return error;
+ 	}
++	state->next_seq = base + 2 * style->used + 2;
+ 
+ 	/* fixes1268d (#167) - declarations that reference var() are QUEUED
+ 	 * here, not resolved here. A custom property defined by a rule that
+@@ -3212,6 +3221,7 @@
+ 		slot->specificity = state->current_specificity;
+ 		slot->origin = (uint8_t) state->current_origin;
+ 		slot->pseudo = (uint8_t) state->current_pseudo;
++		slot->seq = base + 2 * (uint32_t) dd->pos;
+ 	}
+ 
+ 	return CSS_OK;
+@@ -3240,6 +3250,7 @@
+ 		state->current_origin = (css_origin) p->origin;
+ 		state->current_pseudo = (css_pseudo_element) p->pseudo;
+ 		state->computed = p->computed;
++		state->current_seq = p->seq;
+ 
+ 		error = css__deferred_decl_resolve(p->dd, p->sheet, ctx,
+ 				state);
+@@ -3319,6 +3330,24 @@
+ 	return ctx->sheets[index].sheet;
+ }
+ 
++/**
++ * VitaBrowser patch 329: does the declaration being applied beat the one
++ * in \a existing on specificity, then cascade order? Inline, cascade
++ * order is processing order and every newcomer is later, so this is the
++ * old ">=" test. A queued var() declaration replays after the cascade
++ * with its own position restored, and loses a tie to anything after it.
++ */
++static inline bool css__later_or_more_specific(const css_select_state *state,
++		const prop_state *existing)
++{
++	uint32_t seq = (state->current_seq > 0xffffff) ?
++			0xffffff : state->current_seq;
++
++	if (state->current_specificity != existing->specificity)
++		return state->current_specificity > existing->specificity;
++	return seq >= existing->seq;
++}
++
+ bool css__outranks_existing(uint16_t op, bool important, css_select_state *state,
+ 		enum flag_value explicit_default)
+ {
+@@ -3381,8 +3410,8 @@
+ 			 * for UA stylesheets, when specificity is always
+ 			 * considered (as importance is meaningless) */
+ 			if (existing->origin == CSS_ORIGIN_UA) {
+-				if (state->current_specificity >=
+-						existing->specificity) {
++				if (css__later_or_more_specific(state,
++						existing)) {
+ 					outranks = true;
+ 				}
+ 			} else if (existing->important == 0 && important) {
+@@ -3392,8 +3421,8 @@
+ 				/* Old is more important than new */
+ 			} else {
+ 				/* Same importance, consider specificity */
+-				if (state->current_specificity >=
+-						existing->specificity) {
++				if (css__later_or_more_specific(state,
++						existing)) {
+ 					outranks = true;
+ 				}
+ 			}
+@@ -3416,6 +3445,8 @@
+ 		existing->origin = state->current_origin;
+ 		existing->important = important;
+ 		existing->explicit_default = explicit_default;
++		existing->seq = (state->current_seq > 0xffffff) ?
++				0xffffff : state->current_seq;
+ 	}
+ 
+ 	return outranks;
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -39,13 +39,15 @@
+ 	uint8_t origin;				/* Its sheet's origin */
+ 	uint8_t pseudo;				/* Pseudo element targeted */
+ 	uint8_t pad[2];
++	uint32_t seq;				/* patch 329: cascade position */
+ } css_pending_var;
+ 
+ typedef struct prop_state {
+ 	uint32_t specificity;                 /* Specificity of property in result */
+ 	unsigned int    set              : 1, /* Whether property is set in result */
+ 	                origin           : 2, /* Origin of property in result */
+-	                important        : 1; /* Importance of property in result */
++	                important        : 1, /* Importance of property in result */
++	                seq              : 24; /* patch 329: cascade position */
+ 	enum flag_value explicit_default : 3; /* Property is set to inherit */
+ } prop_state;
+ 
+@@ -159,6 +161,14 @@
+ 	 * its rule-scoped definitions. NULL until the first definition
+ 	 * arrives. New fields go at the END of this struct. */
+ 	struct css_cp_env *custom_env;
++
++	/* VitaBrowser patch 329: the cascade position of the declaration
++	 * being applied (current_seq) and the next free one (next_seq). A
++	 * queued var() declaration replays after the whole cascade; with
++	 * equal specificity it must still lose to a declaration that came
++	 * after it, which plain ">=" on specificity cannot tell. */
++	uint32_t current_seq;
++	uint32_t next_seq;
+ } css_select_state;
+ 
+ static inline void advance_bytecode(css_style *style, uint32_t n_bytes)
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -710,6 +710,17 @@
+ 	memcpy(target->bytecode + target->used, style->bytecode,
+ 			style->used * sizeof(css_code_t));
+ 
++	/* VitaBrowser patch 329: a deferred declaration remembers where it
++	 * sat among the rule's compiled declarations (the words before it),
++	 * so its replay competes at that position. */
++	{
++		css_deferred_decl *dd;
++		uint32_t pos = target->used + style->used;
++
++		for (dd = style->deferred; dd != NULL; dd = dd->next)
++			dd->pos = (pos > 0xffff) ? 0xffff : (uint16_t) pos;
++	}
++
+ 	target->used += style->used;
+ 
+ 	/* Move any deferred (var()) declarations from source to target,
+--- a/src/parse/custom_properties.h
++++ b/src/parse/custom_properties.h
+@@ -83,7 +83,9 @@
+ 				  *   (owned) */
+ 	uint32_t n_tokens;
+ 	uint8_t important;       /**< Non-zero => !important */
+-	uint8_t pad[3];
++	uint8_t pad;
++	uint16_t pos;            /**< patch 329: bytecode words before it
++				  *   in its rule (saturates) */
+ 	struct css_deferred_decl *next;
+ };
+ typedef struct css_deferred_decl css_deferred_decl;
