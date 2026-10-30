@@ -1,0 +1,288 @@
+# netsurf: CSS stroke on inline SVG; presentation attributes settle against CSS (patch 358, with 358-libcss)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 357, with 358-libcss)
+#
+#  - css/hints.c: the stroke and stroke-width presentation attributes
+#    become zero-specificity hints, as fill already was, so author CSS
+#    outranks them in the cascade (a class with stroke: none beats
+#    stroke="#00f").
+#  - vb_inline_svg.c: stroke and stroke-width join 357's per-element
+#    cascade. Where an element has the attribute (fill, stroke or
+#    stroke-width), the computed value -- attribute and CSS already settled
+#    -- is written in its place. Without one, a value differing from the
+#    parent's is written. The rest inherits. On the root a CSS stroke other
+#    than none, or a width other than 1, fills a missing attribute.
+#    stroke-width is written in user units: a CSS px inside an SVG is a
+#    user unit, scaled by the viewBox. It is printed with integers only
+#    (the Vita's newlib may lack float printf).
+#
+# Changing the libcss headers needs a clean netsurf build (build/Linux-vita
+# and build/Linux-vita-sim moved aside).
+#
+# Gate: CSS-svg-stroke (file:// snapshot, five pixels exact as Chromium:
+# class stroke + width; root stroke: currentColor; CSS width beats the
+# attribute; CSS stroke: none beats the attribute). CSS-svg-child-css and
+# CSS-svg-fill-inherit are unchanged. Full fresh scorecard (r78-358 vs
+# r77): mean 85.1 -> 85.2. wpnews' white stroked search icon now draws.
+# Other diffs are live content.
+--- a/content/handlers/css/hints.c
++++ b/content/handlers/css/hints.c
+@@ -1480,6 +1480,68 @@
+ 	dom_string_unref(value);
+ }
+ 
++/* VitaBrowser patch 358: the stroke and stroke-width presentation
++ * attributes, as fill above, so author CSS outranks them in the cascade
++ * (stroke: none on a class beats stroke="#00f"). */
++static dom_string *css_hint_svg_attr(dom_node *node, const char *attr)
++{
++	dom_string *name = NULL, *value = NULL;
++
++	if (dom_string_create((const uint8_t *)attr, strlen(attr), &name) !=
++			DOM_NO_ERR)
++		return NULL;
++	if (dom_element_get_attribute(node, name, &value) != DOM_NO_ERR)
++		value = NULL;
++	dom_string_unref(name);
++	return value;
++}
++
++static void css_hint_svg_stroke(dom_node *node)
++{
++	struct css_hint *hint = &hint_ctx.hints[hint_ctx.len];
++	dom_string *value = css_hint_svg_attr(node, "stroke");
++	const char *text;
++
++	if (value == NULL)
++		return;
++	text = (const char *)dom_string_data(value);
++	if (strcasecmp(text, "none") == 0) {
++		hint->prop = CSS_PROP_STROKE;
++		hint->status = CSS_STROKE_NONE;
++		css_hint_advance(&hint);
++	} else if (strcasecmp(text, "currentColor") == 0) {
++		hint->prop = CSS_PROP_STROKE;
++		hint->status = CSS_STROKE_CURRENT_COLOR;
++		css_hint_advance(&hint);
++	} else if (nscss_parse_colour(text, &hint->data.color)) {
++		hint->prop = CSS_PROP_STROKE;
++		hint->status = CSS_STROKE_COLOR;
++		css_hint_advance(&hint);
++	}
++	dom_string_unref(value);
++}
++
++static void css_hint_svg_stroke_width(dom_node *node)
++{
++	struct css_hint *hint = &hint_ctx.hints[hint_ctx.len];
++	dom_string *value = css_hint_svg_attr(node, "stroke-width");
++	css_fixed length;
++	css_unit unit;
++
++	if (value == NULL)
++		return;
++	/* a bare number is user units: parse_dimension gives it px */
++	if (parse_dimension((const char *)dom_string_data(value), false,
++			&length, &unit) && unit != CSS_UNIT_PCT && length >= 0) {
++		hint->prop = CSS_PROP_STROKE_WIDTH;
++		hint->status = CSS_STROKE_WIDTH_SET;
++		hint->data.length.value = length;
++		hint->data.length.unit = unit;
++		css_hint_advance(&hint);
++	}
++	dom_string_unref(value);
++}
++
+ static bool css_hint_is_svg_node(dom_node *node, const char *tname)
+ {
+ 	dom_string *ns = NULL;
+@@ -1810,6 +1872,8 @@
+ 	if (is_known == 0 && css_hint_is_svg_node(node, tname)) {
+ 		css_hint_color(pw, node);
+ 		css_hint_svg_fill(node);
++		css_hint_svg_stroke(node);		/* patch 358 */
++		css_hint_svg_stroke_width(node);	/* patch 358 */
+ 	}
+ 
+ 	if (is_known != 0) {
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -371,6 +371,45 @@
+ 
+ static void ser_node(struct ser *z, dom_node *n, int depth, bool root);
+ 
++/* patch 358: an SVG paint value for a computed CSS stroke; false for none
++ * or an unusable status (an absent stroke attribute already means none) */
++static bool css_stroke_str(const css_computed_style *s, char out[8],
++		bool *none)
++{
++	css_color sc = 0, col = 0xff000000;
++	uint8_t st = css_computed_stroke(s, &sc);
++
++	*none = false;
++	if (st == CSS_STROKE_CURRENT_COLOR) {
++		css_computed_color(s, &col);
++		sc = col;
++	} else if (st == CSS_STROKE_NONE || (sc >> 24) == 0) {
++		*none = true;
++		strcpy(out, "none");
++		return true;
++	} else if (st != CSS_STROKE_COLOR) {
++		return false;
++	}
++	snprintf(out, 8, "#%02x%02x%02x", (unsigned int)((sc >> 16) & 0xff),
++		 (unsigned int)((sc >> 8) & 0xff), (unsigned int)(sc & 0xff));
++	return true;
++}
++
++/* patch 358: stroke-width in user units -- a CSS px inside an SVG is a
++ * user unit, scaled by the viewBox like any other coordinate */
++static float css_stroke_width_uu(const struct ser *z,
++		const css_computed_style *s)
++{
++	css_fixed len = INTTOFIX(1);
++	css_unit unit = CSS_UNIT_PX;
++
++	css_computed_stroke_width(s, &len, &unit);
++	if (unit != CSS_UNIT_PX && z->html != NULL)
++		len = css_unit_len2device_px(s, &z->html->unit_len_ctx, len,
++				unit);
++	return FIXTOFLT(len);
++}
++
+ /* patch 357: an SVG paint value for a computed CSS fill; false for an
+  * unusable status */
+ static bool css_fill_str(const css_computed_style *s, char out[8])
+@@ -418,6 +457,11 @@
+ 	const css_computed_style *saved = z->style, *own = NULL;
+ 	char css_fill[8];
+ 	bool css_fill_set = false;
++	char css_stroke[8];			/* patch 358 */
++	bool attr_fill = false, attr_stroke = false, attr_sw = false;
++	bool css_stroke_set = false, css_sw_set = false, has_stroke = false;
++	bool has_sw = false;
++	float css_sw = 1;
+ 
+ 	if (depth > 64 || ++z->nodes > 20000 || z->out.oom)
+ 		return;
+@@ -460,6 +504,37 @@
+ 		}
+ 	}
+ 	if (own != NULL) {
++		/* patch 358: the presentation attributes enter the cascade
++		 * as hints (css/hints.c), so where the element has one the
++		 * computed value already settles attribute against CSS --
++		 * write it in the attribute's place. Without one, write only
++		 * what differs from the parent (the rest inherits). */
++		dom_string *k = NULL;
++		bool h = false;
++
++		if (dom_string_create((const uint8_t *)"fill", 4, &k) ==
++				DOM_NO_ERR) {
++			if (dom_element_has_attribute((dom_element *)n, k, &h) ==
++					DOM_NO_ERR)
++				attr_fill = h;
++			dom_string_unref(k);
++		}
++		if (dom_string_create((const uint8_t *)"stroke", 6, &k) ==
++				DOM_NO_ERR) {
++			if (dom_element_has_attribute((dom_element *)n, k, &h) ==
++					DOM_NO_ERR)
++				attr_stroke = h;
++			dom_string_unref(k);
++		}
++		if (dom_string_create((const uint8_t *)"stroke-width", 12,
++				&k) == DOM_NO_ERR) {
++			if (dom_element_has_attribute((dom_element *)n, k, &h) ==
++					DOM_NO_ERR)
++				attr_sw = h;
++			dom_string_unref(k);
++		}
++	}
++	if (own != NULL) {
+ 		/* patch 357: a fill the page sets on this element (one that
+ 		 * differs from its parent's) -- author CSS beats the fill
+ 		 * attribute, as in browsers */
+@@ -472,8 +547,33 @@
+ 			if (fb == CSS_FILL_CURRENT_COLOR)
+ 				css_computed_color(saved, &cb);
+ 		}
+-		css_fill_set = (fa != fb || a != b || ca != cb) &&
+-				css_fill_str(own, css_fill);
++		css_fill_set = (attr_fill || fa != fb || a != b || ca != cb) &&
++				css_fill_str(own, css_fill);	/* 358: attr_fill */
++	}
++	if (own != NULL || (root && z->style != NULL)) {
++		/* patch 358: stroke and stroke-width the page sets -- on a
++		 * child, one differing from its parent's; on the root, one
++		 * differing from the initial (none, 1) */
++		const css_computed_style *me = own != NULL ? own : z->style;
++		css_color a = 0, b = 0, ca = 0, cb = 0;
++		uint8_t sa = css_computed_stroke(me, &a);
++		uint8_t sb = own != NULL ? css_computed_stroke(saved, &b) :
++				CSS_STROKE_NONE;
++		bool none;
++
++		if (sa == CSS_STROKE_CURRENT_COLOR) {
++			css_computed_color(me, &ca);
++			if (own != NULL && sb == CSS_STROKE_CURRENT_COLOR)
++				css_computed_color(saved, &cb);
++		}
++		css_stroke_set = (attr_stroke || sa != sb || a != b ||
++				ca != cb) &&
++				css_stroke_str(me, css_stroke, &none) &&
++				!(none && own == NULL);
++		css_sw = css_stroke_width_uu(z, me);
++		css_sw_set = own != NULL ?
++				(attr_sw || css_sw != css_stroke_width_uu(z, saved)) :
++				css_sw != 1;
+ 	}
+ 	sb_str(&z->out, "<");
+ 	sb_svg_name(&z->out, dom_string_data(name),
+@@ -503,6 +603,22 @@
+ 					continue;
+ 				}
+ 			}
++			if (dstr_eq(an, "stroke") ||
++			    dstr_eq(an, "stroke-width")) {	/* patch 358 */
++				bool sw = dstr_eq(an, "stroke-width");
++				if (sw)
++					has_sw = true;
++				else
++					has_stroke = true;
++				if ((sw && css_sw_set && own != NULL) ||
++				    (!sw && css_stroke_set && own != NULL)) {
++					dom_string_unref(an);
++					if (av != NULL)
++						dom_string_unref(av);
++					dom_node_unref(a);
++					continue;
++				}
++			}
+ 			if (dstr_eq(an, "xmlns"))
+ 				has_xmlns = true;
+ 			if (dstr_eq(an, "href") || dstr_eq(an, "xlink:href"))
+@@ -549,6 +665,23 @@
+ 		sb_str(&z->out, css_fill);
+ 		sb_str(&z->out, "\"");
+ 	}
++	/* patch 358: on a child the page's value replaces the attribute
++	 * (skipped above); on the root it only fills a gap */
++	if (css_stroke_set && (own != NULL || !has_stroke)) {
++		sb_str(&z->out, " stroke=\"");
++		sb_str(&z->out, css_stroke);
++		sb_str(&z->out, "\"");
++	}
++	if (css_sw_set && (own != NULL || !has_sw)) {
++		/* integers only: the Vita's newlib may lack float printf */
++		char sw[32];
++		int c = (int)(css_sw * 100.0f + 0.5f);
++		if (c < 0)
++			c = 0;
++		snprintf(sw, sizeof(sw), " stroke-width=\"%d.%02d\"",
++			 c / 100, c % 100);
++		sb_str(&z->out, sw);
++	}
+ 	if (root) {
+ 		if (!has_xmlns)
+ 			sb_str(&z->out, " xmlns=\"http://www.w3.org/2000/svg\""
