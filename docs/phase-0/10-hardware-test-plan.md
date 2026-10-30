@@ -7357,3 +7357,44 @@ style names missing from that list (flexGrow, flexBasis, ...) have the
 same bug; a catch-all would need a Proxy on a hot object.
 
 Full gate: `gate348p.log`, exit 0.
+
+## Patch 349 (2026-10-30): grid items' margins, borders and alignment; the grid's own height
+
+A box's x/y is its padding edge everywhere in NetSurf, but grid
+placement left out the item's top margin and its top and left borders.
+Items with `margin-top` sat on the row's top edge, though the row
+reserved the margin, and bordered items pushed their borders above and
+left of their cells. Center/end alignment now uses the item's outer
+height. Found alongside: a grid's definite `height` was replaced by its
+rows' total, so a `height: 60px` grid shrank to its content. It now
+stands. Under the default align-content (normal/stretch), the free
+height is shared among auto rows; with flex-start it stays below them. A
+height smaller than the rows also stands.
+
+Gate: CSS-grid-item-offsets (GRIDOFS349 7/7, Chromium 7/7). All other
+grid and flex pages unchanged.
+
+## Patch 350 (2026-10-30): REGRESSION FIX for 348 -- theguardian.com read as empty
+
+A fresh scorecard after 349 showed **guardian 81.7 → 36.1** (text recall
+0.0). Its first screen was normal. Rebuilding without 349 changed
+nothing; reverting 348's `macsurf_qjs.c` half alone restored 81.0. In
+the sim, `document.body.innerText` threw **"InternalError: out of
+memory"** in the polyfill's text walk, and the `textContent` fallback
+failed with it. 348 had added 18 grid names to the element style
+object's per-instance setter list, about 36 more closures on every style
+object, and Guardian touches `.style` on enough elements to run the JS
+heap out. The gate has no page that big, which is how 348 passed it.
+
+The names now live once on `CSSStyleDeclaration.prototype` (which every
+style object gets, patch 280), going through the instance's own
+setProperty/getPropertyValue. The per-instance list is back to its
+pre-348 size. GRIDINL348 is still 8/8, and guardian is back at 80.9
+(text 0.995, twice).
+
+Lesson recorded: anything that grows per-element JS objects needs a
+heavy-page scorecard run (guardian is the canary) before commit, not
+only the gate. A Chromium-checkable gate leg is not possible, because in
+Chrome those properties ARE own properties of the style object.
+
+Full gate (349 + 350): `gate349p.log`, exit 0.
