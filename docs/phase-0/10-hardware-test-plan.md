@@ -7201,3 +7201,28 @@ claude.ai (77.6) notes for the next unit:
   live case for the open owner decision on low-alpha buckets.
 - The card corners are square under `border-radius: 32px 32px 28px 28px`
   (per-corner). Not yet tested in the sim.
+
+## State log 2026-10-30: r63 drops bisected — no regressions
+
+I re-ran a fresh scorecard for the four sites only (`score/r64-drops-a`,
+same binary as r63):
+
+- **cnnlite** 87.2 and **wpblog** 82.5 are back at r62 (87.9 / 82.5).
+  The r63 dips were noise.
+- **hackernews** 90.5 both times (r62 92.6). The layout matches r62's
+  shot. The text score (0.985 → 0.963) follows live drift between the
+  Chromium capture and the sim's fetch: items 13 and 14 were swapped and
+  the vote counts differed. One standing difference shows in r62 and r63
+  alike: the ▲ vote arrows are missing.
+- **bbc** swings between ~90 and ~75 on the same binary (r63 89.6, r64
+  75.5). The score depends on whether the third-party consent overlay
+  loads within the settle time. The reference always shows it, so a sim
+  run without it loses ~15 points. This is a scorecard flake, and it
+  also explains the earlier "336 regression" (89.9 → 75.2), not code.
+  Under the overlay is an older real bug: the lead story column is
+  crushed to ~70px with one word per line. It is in every shot back to
+  r59 (2026-10-28), so it predates tonight's patches.
+
+Follow-ups: make the BBC score deterministic (consent cookie or a longer
+settle for the reference and the sim alike); fix the crushed lead column
+(a layout bug, not yet reduced); restore HN's vote arrows.
