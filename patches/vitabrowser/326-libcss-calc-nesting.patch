@@ -1,0 +1,296 @@
+# libcss: math functions nest, and a divisor may be followed by whitespace (patch 326)
+# Generated 2026-10-29
+# Base: seleron/vitabrowser (patch stack through 325)
+#
+# wordpress.org/news (scorecard 74.8, the weakest scored site in r59) sets
+# its spacing preset to `clamp( 24px, calc( 100vw / 18 ), 80px )`. Every
+# padding and margin built on it parsed as invalid, so the page's columns
+# lost their gutters and the two-column split moved.
+#
+#  - parse/properties/utils.c css__parse_calc_value(): a calc(), min(),
+#    max() or clamp() inside an expression is a FUNCTION token, not a '('.
+#    It was rejected, and with it the whole declaration. Its arguments now
+#    parse into the same bytecode buffer through
+#    css__parse_calc_func_args(), split out of css__parse_calc(). The
+#    evaluator (select/calc.c) is a stack machine, so the nested function's
+#    terminal operator leaves one value for the outer expression.
+#  - css__parse_calc_product(): whitespace after a divisor is consumed,
+#    as css__parse_calc_value() does for every other operand.
+#    `calc( 100vw / 18 )` failed on the space before its ')'.
+#
+# Gate: CSS-calc-nested (CALCNEST326), legs 1-7 for this patch (the
+# clamp/calc nesting, the spaces, the var() chain, min(max(calc())),
+# calc(10px + min())). All fail without it.
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -2365,6 +2365,13 @@
+ 		parserutils_buffer *result);
+ 
+ static css_error
++css__parse_calc_func_args(css_language *c,
++		enum css_properties_e property,
++		const parserutils_vector *vector, int *ctx,
++		parserutils_buffer *result,
++		enum css_calc_func_e func);
++
++static css_error
+ css__parse_calc_number(
+ 		const parserutils_vector *vector, int *ctx,
+ 		parserutils_buffer *result)
+@@ -2421,6 +2428,29 @@
+ 		}
+ 		/* Consume the close-paren to complete this value */
+ 		parserutils_vector_iterate(vector, ctx);
++	} else if (css__calc_function(c, token) != CSS_CALC_FUNC_NONE) {
++		/* VitaBrowser patch 326: a nested calc()/min()/max()/clamp()
++		 * is a FUNCTION token, not a '(' -- clamp(24px, calc(100vw /
++		 * 18), 80px) was rejected whole. Its arguments go into the
++		 * same buffer: the evaluator is a stack machine, so the nested
++		 * function's terminal operator leaves one value for the outer
++		 * expression. */
++		enum css_calc_func_e func = css__calc_function(c, token);
++
++		parserutils_vector_iterate(vector, ctx);
++		consumeWhitespace(vector, ctx);
++		error = css__parse_calc_func_args(c, property, vector, ctx,
++				result, func);
++		if (error != CSS_OK) {
++			return error;
++		}
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (!tokenIsChar(token, ')')) {
++			return CSS_INVALID;
++		}
++		parserutils_vector_iterate(vector, ctx);
+ 	} else switch (token->type) {
+ 	case CSS_TOKEN_NUMBER:
+ 		error = css__parse_calc_number(vector, ctx, result);
+@@ -2519,6 +2549,11 @@
+ 					ctx, result);
+ 		} else {
+ 			error = css__parse_calc_number(vector, ctx, result);
++			/* patch 326: the divisor's trailing whitespace, as
++			 * css__parse_calc_value consumes it for every other
++			 * operand -- calc( 100vw / 18 ) failed on the space. */
++			if (error == CSS_OK)
++				consumeWhitespace(vector, ctx);
+ 		}
+ 		if (error != CSS_OK)
+ 			break;
+@@ -2645,62 +2680,33 @@
+ 	return css__parse_calc_sum(c, property, vector, ctx, result);
+ }
+ 
+-/* Documented in utils.h */
+-css_error css__parse_calc(css_language *c,
+-		const parserutils_vector *vector, int32_t *ctx,
+-		css_style *result,
+-		css_code_t OPV,
+-		uint32_t unit,
++/**
++ * Parse a math function's arguments (after its FUNCTION token, before its
++ * close paren) into the result buffer. Each variant leaves the expression
++ * ending with a terminal operator (CALC_MIN/CALC_MAX/CALC_CLAMP) whose
++ * value identifies which function produced it: the cascade sniffs that
++ * terminal operator to recover the css_unit for the computed style.
++ *
++ * VitaBrowser patch 326: split out of css__parse_calc so a nested math
++ * function (css__parse_calc_value) parses through the same code.
++ */
++static css_error
++css__parse_calc_func_args(css_language *c,
++		enum css_properties_e property,
++		const parserutils_vector *vector, int *ctx,
++		parserutils_buffer *result,
+ 		enum css_calc_func_e func)
+ {
+-	int32_t orig_ctx = *ctx;
+-	const css_token *token;
+ 	css_error error = CSS_OK;
+-	css_style *calc_style = NULL;
+-	parserutils_buffer *calc_buffer = NULL;
+-	lwc_string *calc_expr = NULL;
+-	uint32_t expr_index = 0;
+-	css_code_t finish = CALC_FINISH;
+-	enum css_properties_e property = getOpcode(OPV);
+-
+-	consumeWhitespace(vector, ctx);
+-
+-	token = parserutils_vector_peek(vector, *ctx);
+-	if (token == NULL) {
+-		*ctx = orig_ctx;
+-		return CSS_INVALID;
+-	}
+-
+-	if (parserutils_buffer_create(&calc_buffer) != PARSERUTILS_OK) {
+-		/* Since &calc_buffer is valid, the only error case is NONMEM */
+-		*ctx = orig_ctx;
+-		return CSS_NOMEM;
+-	}
+-
+-	error = css__stylesheet_style_create(c->sheet, &calc_style);
+-	if (error != CSS_OK)
+-		goto cleanup;
+-
+-	error = css__stylesheet_style_append(calc_style, OPV);
+-	if (error != CSS_OK)
+-		goto cleanup;
+-
+-	error = css__stylesheet_style_append(calc_style, (css_code_t) unit);
+-	if (error != CSS_OK)
+-		goto cleanup;
++	const css_token *token;
+ 
+-	/* Parse the argument list for the particular math function.  Each
+-	 * variant leaves the expression ending with a terminal operator
+-	 * (CALC_MIN/CALC_MAX/CALC_CLAMP) whose value identifies which
+-	 * function produced it: the cascade sniffs that terminal operator
+-	 * to recover the css_unit for the computed style. */
+ 	switch (func) {
+ 	case CSS_CALC_FUNC_CALC:
+ 		/* Exactly one sum:  calc(sum) */
+ 		error = css__parse_calc_sum(c, property, vector, ctx,
+-				calc_buffer);
++				result);
+ 		if (error != CSS_OK)
+-			goto cleanup;
++			return error;
+ 		break;
+ 
+ 	case CSS_CALC_FUNC_MIN: /* Fall through */
+@@ -2713,9 +2719,9 @@
+ 				CALC_MIN : CALC_MAX;
+ 
+ 		error = css__parse_calc_sum(c, property, vector, ctx,
+-				calc_buffer);
++				result);
+ 		if (error != CSS_OK)
+-			goto cleanup;
++			return error;
+ 
+ 		for (;;) {
+ 			consumeWhitespace(vector, ctx);
+@@ -2725,16 +2731,16 @@
+ 			}
+ 
+ 			error = css__parse_calc_comma_arg(c, property,
+-					vector, ctx, calc_buffer);
++					vector, ctx, result);
+ 			if (error != CSS_OK)
+-				goto cleanup;
++				return error;
+ 
+ 			error = css_error_from_parserutils_error(
+-				parserutils_buffer_append(calc_buffer,
++				parserutils_buffer_append(result,
+ 					(const uint8_t *)&func_op,
+ 					sizeof(func_op)));
+ 			if (error != CSS_OK)
+-				goto cleanup;
++				return error;
+ 		}
+ 		break;
+ 	}
+@@ -2746,34 +2752,90 @@
+ 		css_code_t func_op = CALC_CLAMP;
+ 
+ 		error = css__parse_calc_sum(c, property, vector, ctx,
+-				calc_buffer);
++				result);
+ 		if (error != CSS_OK)
+-			goto cleanup;
++			return error;
+ 
+ 		error = css__parse_calc_comma_arg(c, property, vector,
+-				ctx, calc_buffer);
++				ctx, result);
+ 		if (error != CSS_OK)
+-			goto cleanup;
++			return error;
+ 
+ 		error = css__parse_calc_comma_arg(c, property, vector,
+-				ctx, calc_buffer);
++				ctx, result);
+ 		if (error != CSS_OK)
+-			goto cleanup;
++			return error;
+ 
+ 		error = css_error_from_parserutils_error(
+-			parserutils_buffer_append(calc_buffer,
++			parserutils_buffer_append(result,
+ 				(const uint8_t *)&func_op,
+ 				sizeof(func_op)));
+ 		if (error != CSS_OK)
+-			goto cleanup;
++			return error;
+ 		break;
+ 	}
+ 
+ 	default:
+-		error = CSS_INVALID;
+-		goto cleanup;
++		return CSS_INVALID;
++	}
++
++	return CSS_OK;
++}
++
++/* Documented in utils.h */
++css_error css__parse_calc(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result,
++		css_code_t OPV,
++		uint32_t unit,
++		enum css_calc_func_e func)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	css_error error = CSS_OK;
++	css_style *calc_style = NULL;
++	parserutils_buffer *calc_buffer = NULL;
++	lwc_string *calc_expr = NULL;
++	uint32_t expr_index = 0;
++	css_code_t finish = CALC_FINISH;
++	enum css_properties_e property = getOpcode(OPV);
++
++	consumeWhitespace(vector, ctx);
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
+ 	}
+ 
++	if (parserutils_buffer_create(&calc_buffer) != PARSERUTILS_OK) {
++		/* Since &calc_buffer is valid, the only error case is NONMEM */
++		*ctx = orig_ctx;
++		return CSS_NOMEM;
++	}
++
++	error = css__stylesheet_style_create(c->sheet, &calc_style);
++	if (error != CSS_OK)
++		goto cleanup;
++
++	error = css__stylesheet_style_append(calc_style, OPV);
++	if (error != CSS_OK)
++		goto cleanup;
++
++	error = css__stylesheet_style_append(calc_style, (css_code_t) unit);
++	if (error != CSS_OK)
++		goto cleanup;
++
++	/* Parse the argument list for the particular math function.  Each
++	 * variant leaves the expression ending with a terminal operator
++	 * (CALC_MIN/CALC_MAX/CALC_CLAMP) whose value identifies which
++	 * function produced it: the cascade sniffs that terminal operator
++	 * to recover the css_unit for the computed style. */
++	error = css__parse_calc_func_args(c, property, vector, ctx,
++			calc_buffer, func);
++	if (error != CSS_OK)
++		goto cleanup;
++
+ 	consumeWhitespace(vector, ctx);
+ 	token = parserutils_vector_peek(vector, *ctx);
+ 	if (!tokenIsChar(token, ')')) {

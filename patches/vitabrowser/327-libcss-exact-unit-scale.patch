@@ -1,0 +1,148 @@
+# libcss: viewport and absolute units scale exactly (patch 327)
+# Generated 2026-10-29
+# Base: seleron/vitabrowser (patch stack through 326)
+#
+# css_unit_len2css_px(), css_unit_len2device_px() and the media-query
+# variant round px-per-unit to a whole pixel before multiplying by the
+# length (upstream NetSurf). For font-relative units at the usual integer
+# font sizes that is harmless. For viewport units it is not: on the Vita's
+# 960x544 viewport 1vw counted as 10px (100vw = 1000px), 1vh as 5px
+# (10vh = 50 rather than 54.4), and 1pt as 1px (45pt = 45px rather than
+# 60). calc() operands go through the same conversion, so
+# calc(100vw / 18) was 55.5 rather than 53.3.
+#
+#  - select/unit.c: css_unit__exact_scale() lists the viewport units
+#    (vh, vw, vi, vb, vmin, vmax) and the absolute units (in, cm, mm, q,
+#    pt, pc). Their lengths multiply by the unrounded px-per-unit in all
+#    three functions. Font-relative units (em, rem, ex, ch, lh) keep the
+#    rounding, which keeps this patch's reach to the units that were wrong.
+#
+# Gate: CSS-calc-nested legs 8-11 (10vw = innerWidth/10, 10vh =
+# innerHeight/10, 45pt = 60px, 2.54cm = 96px). The first three fail
+# without this patch.
+--- a/src/select/unit.c
++++ b/src/select/unit.c
+@@ -17,6 +17,38 @@
+ #include "macsurf_debug.h"
+ 
+ /**
++ * VitaBrowser patch 327: units whose px-per-unit is used unrounded.
++ *
++ * The len2px functions round px-per-unit to a whole pixel before
++ * multiplying, so 1vw on a 960px viewport counted as 10px (100vw = 1000),
++ * 1vh on 544 as 5px and 1pt as 1px (45pt = 45px, not 60). Viewport and
++ * absolute units scale exactly; font-relative units keep the rounding.
++ *
++ * \param[in] unit  Unit as specified (before viewport mapping).
++ * \return true when the length must be multiplied by the exact scale.
++ */
++static inline bool css_unit__exact_scale(const css_unit unit)
++{
++	switch (unit) {
++	case CSS_UNIT_VH:
++	case CSS_UNIT_VW:
++	case CSS_UNIT_VI:
++	case CSS_UNIT_VB:
++	case CSS_UNIT_VMIN:
++	case CSS_UNIT_VMAX:
++	case CSS_UNIT_IN:
++	case CSS_UNIT_CM:
++	case CSS_UNIT_MM:
++	case CSS_UNIT_Q:
++	case CSS_UNIT_PT:
++	case CSS_UNIT_PC:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/**
+  * Map viewport-relative length units to either vh or vw.
+  *
+  * Non-viewport-relative units are unchanged.
+@@ -58,6 +90,44 @@
+ }
+ 
+ /**
++ * VitaBrowser patch 327: length x px-per-unit for an exact-scale unit, in
++ * CSS pixels. Viewport and pt/pc/in lengths are computed as length x size
++ * / divisor in one step: 9.6 (1vw at 960) is not exact in 22.10 fixed
++ * point, and 10 x 9.5996 truncates to 95, not 96. Lengths too large for
++ * the one-step product fall back to length x the scale.
++ */
++static inline css_fixed css_unit__exact_len(const css_computed_style *style,
++		const css_fixed viewport_height, const css_fixed viewport_width,
++		const css_fixed length, const css_unit unit,
++		const css_fixed px_per_unit)
++{
++	css_fixed mag = (length < 0) ? -length : length;
++
++	switch (css_unit__map_viewport_units(style, viewport_height,
++			viewport_width, unit)) {
++	case CSS_UNIT_VW:
++		if (mag <= INTTOFIX(2000))
++			return FDIV(FMUL(length, viewport_width), F_100);
++		break;
++	case CSS_UNIT_VH:
++		if (mag <= INTTOFIX(2000))
++			return FDIV(FMUL(length, viewport_height), F_100);
++		break;
++	case CSS_UNIT_PT:
++		if (mag <= INTTOFIX(20000))
++			return FDIV(FMUL(length, F_96), F_72);
++		break;
++	case CSS_UNIT_PC:
++		return FMUL(length, INTTOFIX(16));
++	case CSS_UNIT_IN:
++		return FMUL(length, F_96);
++	default:
++		break;
++	}
++	return FMUL(length, px_per_unit);
++}
++
++/**
+  * Convert an absolute length to points (pt).
+  *
+  * \param[in] style            Style to get font-size from, or NULL.
+@@ -442,6 +512,12 @@
+ 		return px_per_unit;
+ 	}
+ 
++	if (css_unit__exact_scale(unit)) {
++		/* patch 327: no rounding of the scale (see above) */
++		return css_unit__exact_len(NULL, ctx->viewport_height,
++				ctx->viewport_width, length, unit, px_per_unit);
++	}
++
+ 	/* Ensure we round px_per_unit to the nearest whole number of pixels:
+ 	 * the use of FIXTOINT() below will truncate. */
+ 	px_per_unit += F_0_5;
+@@ -477,6 +553,12 @@
+ 		return px_per_unit;
+ 	}
+ 
++	if (css_unit__exact_scale(unit)) {
++		/* patch 327: no rounding of the scale (see above) */
++		return css_unit__exact_len(style, ctx->viewport_height,
++				ctx->viewport_width, length, unit, px_per_unit);
++	}
++
+ 	/* Ensure we round px_per_unit to the nearest whole number of pixels:
+ 	 * the use of FIXTOINT() below will truncate. */
+ 	px_per_unit += F_0_5;
+@@ -512,6 +594,13 @@
+ 		return css_unit_css2device_px(px_per_unit, ctx->device_dpi);
+ 	}
+ 
++	if (css_unit__exact_scale(unit)) {
++		/* patch 327: no rounding of the scale (see above) */
++		return css_unit_css2device_px(css_unit__exact_len(style,
++				ctx->viewport_height, ctx->viewport_width,
++				length, unit, px_per_unit), ctx->device_dpi);
++	}
++
+ 	px_per_unit = css_unit_css2device_px(px_per_unit, ctx->device_dpi);
+ 
+ 	/* Ensure we round px_per_unit to the nearest whole number of pixels:
