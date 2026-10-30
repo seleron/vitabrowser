@@ -1,0 +1,216 @@
+# netsurf: grid track var() from other sheets; restore the keyword-track fallback (patch 340)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 339)
+#
+#  - Cross-sheet var(). Patch 336 expands a var() in grid-template-columns
+#    from the same sheet only. MDN defines --layout-* in styles-global.css
+#    and lays out the page in a chunk sheet, so its page grid still fell
+#    back to one column. Every sheet the main rewrite sees now registers
+#    its top-level, non-print `--name: value` definitions in a bounded
+#    process-wide table (384 entries, value < 256 bytes, last definition
+#    wins), and a name not defined in the sheet itself is looked up there.
+#    It depends on order: a definition from a sheet converted later (or
+#    from a previous page) is what it is. It only serves this text-level
+#    grid compile, where the alternative is a single column.
+#  - A var() the rewrite still cannot expand (the defining sheet was not
+#    converted yet, so sheet order no longer matters) is kept: the
+#    declaration becomes `-macsurf-grid: var(...)` and libcss substitutes
+#    it at cascade time. 340-libcss lets -macsurf-grid parse the raw
+#    track list it then receives (line names, minmax(), repeat(), rem).
+#  - Fix in 336's emitter (macsurf__emit_one_track). 336 deleted the
+#    fallback that turns a non-value token into one 1fr track, so
+#    min-content / max-content / fit-content and other keyword tracks
+#    went to -macsurf-grid verbatim, and that parser ENDS the track list
+#    at an unknown ident (`max-content 1fr` became one column). Restored.
+#    The same hunk pointed tok_to_emit at a buffer declared in an inner
+#    block and read it after the block ended (undefined behaviour). The
+#    buffer now has function scope.
+#
+# Gate: CSS-grid-var-crosssheet (GRIDXSHEET340 4/4, Chromium 4/4): `max-content
+# 1fr` and `min-content 100px 1fr` keep their tracks (0/2 after 336), and
+# a var() defined in another <style> sheet resolves (200 / 32 gap /
+# 368). Without this patch it reads 0/4.
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -249,6 +249,7 @@
+ 	bool is_value = false;
+ 	bool is_auto = false;
+ 	bool is_minmax_marker = false;
++	char m[24];	/* patch 340: function scope (was a dangling block local) */
+ 
+ 	/* Detect if the token looks like a value (starts with digit, '.',
+ 	 * '+' or '-'). Anything else (auto, min-content, max-content,
+@@ -294,7 +295,6 @@
+ 			if ((ulen == 3 && strncasecmp(unit, "rem", 3) == 0) ||
+ 					(ulen == 2 && strncasecmp(unit, "em", 2) == 0)) {
+ 				long px = (long)(v * 16.0 + (v >= 0 ? 0.5 : -0.5));
+-				char m[24];
+ 				int n;
+ 				if (px < 0) px = 0;
+ 				if (px > 1000000) px = 1000000;
+@@ -307,6 +307,15 @@
+ 		}
+ 	}
+ 
++	/* patch 340: restore the fallback 336 dropped -- anything that is
++	 * not a value, `auto` or a marker (min-content, max-content,
++	 * fit-content, stray idents) is one 1fr track. Emitted verbatim,
++	 * the -macsurf-grid parser ended the whole track list at it. */
++	if (!is_value && !is_auto && !is_minmax_marker) {
++		tok_to_emit = fr_fallback;
++		emit_len = 3;
++	}
++
+ 	/* fixes275g: write value first; trailing space is optional. The
+ 	 * caller (emit_grid_tracks) trims any trailing space after the
+ 	 * last track anyway, so when we're short by exactly 1 byte we
+@@ -822,6 +831,102 @@
+ 	return false;
+ }
+ 
++/* VitaBrowser patch 340: custom-property definitions seen in other sheets.
++ *
++ * The var() expansion above only searches the sheet being rewritten, and
++ * real sites define their layout variables in one sheet and use them in
++ * another (MDN: --layout-* in styles-global.css, the page grid in a
++ * chunk sheet), so the grid still fell back to one track. Every sheet
++ * the rewrite sees registers its top-level, non-print `--name: value`
++ * definitions here (last definition wins; values over 255 bytes are
++ * skipped); a name not defined in the sheet itself is looked up here.
++ * Process-wide and order-dependent: a definition from a sheet converted
++ * later, or from a previous page, is what it is -- this only serves the
++ * text-level grid compile, where the alternative is a single column. */
++#define MACSURF_GTC_REG_MAX 384
++struct macsurf_gtc_reg {
++	char name[64];
++	char val[256];
++};
++static struct macsurf_gtc_reg macsurf__gtc_reg[MACSURF_GTC_REG_MAX];
++static int macsurf__gtc_reg_n;
++static int macsurf__gtc_reg_next;
++
++static void
++macsurf__gtc_register(const char *data, size_t size)
++{
++	size_t i;
++
++	for (i = 0; i + 3 < size; i++) {
++		size_t ns = i, ne, j, e;
++		int depth = 0, k;
++		size_t nlen, vlen;
++
++		if (data[i] != '-' || data[i + 1] != '-')
++			continue;
++		if (i > 0 && !(data[i - 1] == '{' || data[i - 1] == ';' ||
++				isspace((unsigned char)data[i - 1])))
++			continue;
++		ne = i + 2;
++		while (ne < size && (isalnum((unsigned char)data[ne]) ||
++				data[ne] == '-' || data[ne] == '_'))
++			ne++;
++		j = ne;
++		while (j < size && isspace((unsigned char)data[j]))
++			j++;
++		if (j >= size || data[j] != ':')
++			continue;
++		nlen = ne - ns;
++		for (e = j + 1; e < size; e++) {
++			if (data[e] == '(') depth++;
++			else if (data[e] == ')') depth--;
++			else if (depth <= 0 && (data[e] == ';' || data[e] == '}'))
++				break;
++		}
++		vlen = e - (j + 1);
++		i = e;
++		if (nlen >= 64 || vlen >= 256 || vlen == 0)
++			continue;
++		if (macsurf__gtc_in_print(data, ns))
++			continue;
++		for (k = 0; k < macsurf__gtc_reg_n; k++)
++			if (strlen(macsurf__gtc_reg[k].name) == nlen &&
++					memcmp(macsurf__gtc_reg[k].name,
++						data + ns, nlen) == 0)
++				break;
++		if (k == macsurf__gtc_reg_n) {
++			if (macsurf__gtc_reg_n < MACSURF_GTC_REG_MAX) {
++				k = macsurf__gtc_reg_n++;
++			} else {
++				k = macsurf__gtc_reg_next;
++				macsurf__gtc_reg_next = (macsurf__gtc_reg_next +
++						1) % MACSURF_GTC_REG_MAX;
++			}
++		}
++		memcpy(macsurf__gtc_reg[k].name, data + ns, nlen);
++		macsurf__gtc_reg[k].name[nlen] = '\0';
++		memcpy(macsurf__gtc_reg[k].val, data + j + 1, vlen);
++		macsurf__gtc_reg[k].val[vlen] = '\0';
++	}
++}
++
++static bool
++macsurf__gtc_reg_find(const char *name, size_t nlen, const char **vs,
++		const char **ve)
++{
++	int k;
++
++	for (k = 0; k < macsurf__gtc_reg_n; k++)
++		if (strlen(macsurf__gtc_reg[k].name) == nlen &&
++				memcmp(macsurf__gtc_reg[k].name, name,
++					nlen) == 0) {
++			*vs = macsurf__gtc_reg[k].val;
++			*ve = *vs + strlen(*vs);
++			return true;
++		}
++	return false;
++}
++
+ /* Expand var()s in [p, end) into buf; returns the length, or -1. */
+ static int
+ macsurf__gtc_expand(const char *data, size_t size, const char *p,
+@@ -855,7 +960,9 @@
+ 			if (close >= end || ne - ns < 3)
+ 				return -1;
+ 			if (macsurf__gtc_find_custom(data, size, ns,
+-					(size_t)(ne - ns), &vs, &ve))
++					(size_t)(ne - ns), &vs, &ve) ||
++			    macsurf__gtc_reg_find(ns, (size_t)(ne - ns),
++					&vs, &ve))	/* patch 340 */
+ 				r = macsurf__gtc_expand(data, size, vs, ve,
+ 						buf + n, cap - n, level + 1);
+ 			else if (fb != NULL)
+@@ -976,6 +1083,25 @@
+ 					if (xl > 0) {
+ 						vp = xbuf;
+ 						vend = xbuf + xl;
++					} else {
++						/* patch 340: not expandable from
++						 * the text (the definition lives in
++						 * a sheet not seen yet): keep the
++						 * var() for libcss to substitute at
++						 * cascade time; -macsurf-grid parses
++						 * the raw track list it gets. */
++						size_t vl = val_end - val_start;
++						size_t nn = prefix_len + vl;
++						if (nn <= total_replace) {
++							memmove(out + i + prefix_len,
++								out + val_start, vl);
++							memcpy(out + i, buf, prefix_len);
++							memset(out + i + nn, ' ',
++								total_replace - nn);
++							free(xbuf);
++							i = val_end;
++							continue;
++						}
+ 					}
+ 				}
+ 			}
+@@ -7488,6 +7614,9 @@
+ 	 * to do this via a new libcss property entry and destabilised
+ 	 * the cascade on CW8; rewriting the source text before libcss
+ 	 * sees it avoids touching libcss internals entirely. */
++	/* patch 340: remember this sheet's custom properties for var()
++	 * in later sheets' grid track lists */
++	macsurf__gtc_register(data, (size_t)size);
+ 	rewritten = macsurf__rewrite_grid_template_columns(data, (size_t)size);
+ 	rewritten_rows = NULL;
+ 	if (rewritten != NULL) {

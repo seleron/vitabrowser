@@ -1,0 +1,115 @@
+# libcss: -macsurf-grid parses a raw CSS track list (patch 340, with 340-netsurf)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 339)
+#
+# When css_rewrite cannot expand a var() in grid-template-columns, it now
+# emits `-macsurf-grid: var(...)` (340-netsurf), so at cascade time the
+# -macsurf-grid parser receives the substituted CSS track list (MDN:
+# `[full-start sidebar-start] minmax(15rem,1fr) [...] 2rem ...`).
+#
+#  - p_macsurf_grid.c: a value starting with '[' or a function token goes
+#    to css__parse_grid_template_columns() (until now dead code, declared
+#    in properties.h for this).
+#  - p_grid_template_columns.c, that raw parser: rem/em lengths at the
+#    16px root font (they were taken as px: 15rem became 15px).
+#    minmax(<length>, <fr>) packs the floor-plus-fr kind (5), and
+#    minmax(0, <length>) packs the grows-toward kind (9, patch 337).
+#    Before, minmax kept one bound as a plain track.
+--- a/src/parse/properties/p_grid_template_columns.c
++++ b/src/parse/properties/p_grid_template_columns.c
+@@ -67,6 +67,9 @@
+ #define MACSURF_GRID_TRACK_UNIT_FR      1
+ #define MACSURF_GRID_TRACK_UNIT_PX      2
+ #define MACSURF_GRID_TRACK_UNIT_PERCENT 3
++/* VitaBrowser patch 340: the -macsurf-grid kinds this parser now emits */
++#define MACSURF_GRID_TRACK_UNIT_MINMAX_FR      5
++#define MACSURF_GRID_TRACK_UNIT_MINMAX_ZERO_PX 9
+ #define MACSURF_GRID_TRACK_MAX          8
+ 
+ #define AUTO_FILL_FALLBACK_COLUMNS      3
+@@ -154,6 +157,9 @@
+ 		emit_track(tracks, n_tracks, MACSURF_GRID_TRACK_UNIT_FR, value);
+ 	} else {
+ 		int32_t px = (int32_t)(num >> 10);
++		/* patch 340: rem/em at the 16px root font the rewrite assumes */
++		if (lwc_eq_ci(unit_str, "rem") || lwc_eq_ci(unit_str, "em"))
++			px = (int32_t)((num * 16) >> 10);
+ 		if (px < 0) px = 0;
+ 		if (px > 0x0FFFFFFF) px = 0x0FFFFFFF;
+ 		value = px;
+@@ -328,6 +334,40 @@
+ 		parserutils_vector_iterate(vector, ctx);
+ 	}
+ 
++	/* patch 340: the -macsurf-grid minmax kinds. minmax(<length>, fr) is
++	 * a floor plus 1fr (fixes1214, sized max(floor, share) since 337);
++	 * minmax(0, <length>) grows toward the length (337). */
++	if (min_tok != NULL && max_tok != NULL &&
++			min_tok->type == CSS_TOKEN_DIMENSION &&
++			token_is_fr_track(max_tok) &&
++			max_tok->type == CSS_TOKEN_DIMENSION) {
++		int32_t t1[1];
++		int n1 = 0;
++		emit_dimension(min_tok, t1, &n1);
++		if (n1 == 1 && (((uint32_t)t1[0] >> 28) & 0xF) ==
++				MACSURF_GRID_TRACK_UNIT_PX) {
++			emit_track(tracks, n_tracks,
++					MACSURF_GRID_TRACK_UNIT_MINMAX_FR,
++					t1[0] & 0x0FFFFFFF);
++			return;
++		}
++	}
++	if (min_tok != NULL && max_tok != NULL &&
++			min_tok->type == CSS_TOKEN_NUMBER &&
++			max_tok->type == CSS_TOKEN_DIMENSION &&
++			!token_is_fr_track(max_tok)) {
++		int32_t t1[1];
++		int n1 = 0;
++		emit_dimension(max_tok, t1, &n1);
++		if (n1 == 1 && (((uint32_t)t1[0] >> 28) & 0xF) ==
++				MACSURF_GRID_TRACK_UNIT_PX) {
++			emit_track(tracks, n_tracks,
++					MACSURF_GRID_TRACK_UNIT_MINMAX_ZERO_PX,
++					t1[0] & 0x0FFFFFFF);
++			return;
++		}
++	}
++
+ 	if (max_tok != NULL && token_is_fr_track(max_tok)) {
+ 		if (max_tok->type == CSS_TOKEN_NUMBER) {
+ 			emit_number_as_fr(max_tok, tracks, n_tracks);
+--- a/src/parse/properties/p_macsurf_grid.c
++++ b/src/parse/properties/p_macsurf_grid.c
+@@ -141,6 +141,18 @@
+ 		return CSS_INVALID;
+ 	}
+ 
++	/* VitaBrowser patch 340: a raw CSS track list -- what a var() in
++	 * grid-template-columns expands to at cascade time when the css
++	 * rewrite could not expand it from the text (the definition is in
++	 * another sheet): line names, minmax(), repeat(). */
++	if ((token->type == CSS_TOKEN_CHAR && token->idata != NULL &&
++			lwc_string_length(token->idata) == 1 &&
++			lwc_string_data(token->idata)[0] == '[') ||
++			token->type == CSS_TOKEN_FUNCTION) {
++		return css__parse_grid_template_columns(c, vector, ctx,
++				result);
++	}
++
+ 	if (token->type == CSS_TOKEN_DIMENSION ||
+ 			token->type == CSS_TOKEN_PERCENTAGE) {
+ 		track_list_form = true;
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -120,6 +120,11 @@
+ css_error css__parse_macsurf_transform(css_language *c,
+                 const parserutils_vector *vector, int32_t *ctx,
+                 css_style *result);
++/* VitaBrowser patch 340: the raw grid track-list parser, used by
++ * -macsurf-grid for a var()-substituted list (not a property handler) */
++css_error css__parse_grid_template_columns(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
+ css_error css__parse_macsurf_grid(css_language *c,
+                 const parserutils_vector *vector, int32_t *ctx,
+                 css_style *result);
