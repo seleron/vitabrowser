@@ -7566,3 +7566,25 @@ Gate: CSS-svg-fill-inherit (file:// snapshot, six rows, pixels as
 Chromium).
 
 Full gate: `gate356.log`, exit 0.
+
+## Patch 357 (2026-10-30): page CSS reaches inline SVG children
+
+The children of an inline `<svg>` have no boxes, so the page cascade
+never reached them: class rules on `<path>`/`<g>` and inline
+`style="fill:…"` were ignored. The serializer now selects each child's
+style with `html_svg_get_style()` against its parent's, the same author
+cascade boxed elements get. A fill the page sets on an element (its
+computed fill differs from its parent's) is written as a fill attribute
+and replaces the element's own. Author CSS beats SVG presentation
+attributes, as in browsers. `currentColor` uses the element's own
+colour, and `display: none` drops the element. libcss computes no
+`stroke`, so stroke rules remain ignored.
+
+Gate: CSS-svg-child-css (file:// snapshot, seven rows, pixels exact as
+Chromium). Full fresh scorecard (`score/r77-357` vs r75): mean **85.1**
+(84.7). The mdn, youtube, claude and guardian screens are
+pixel-identical. MDN's logo was already the right blue through the
+fallback kept in 356. GitHub's only diff is its live star count; the
+rest is live content.
+
+Full gate: `gate357.log`, exit 0.
