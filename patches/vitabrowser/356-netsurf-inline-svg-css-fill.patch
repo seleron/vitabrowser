@@ -1,0 +1,75 @@
+# netsurf: inline SVG takes the CSS fill it inherits (patch 356)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 355)
+#
+# An inline <svg> with no fill attribute was given fill="<CSS color>", so a
+# wrapper's `fill: red` (or any explicit CSS fill) drew the icon in the
+# text colour. libcss computes `fill` (inherited), so vb_inline_svg now
+# reads it for the root:
+#
+#  - fill: none -> "none"; fill: currentColor -> the colour; an explicit
+#    colour -> that colour.
+#  - Opaque black, the initial value, cannot be told from an author's
+#    `fill: black`, so it keeps the text colour as before. Chromium would
+#    draw black, but page CSS does not reach the SVG children here. Those
+#    usually carry the real fill (MDN's logo letters, via a class, in the
+#    brand blue), and the text colour matches them far more often than
+#    black does. Defaulting to black turned MDN's logo black (scorecard
+#    r76), so it was withdrawn.
+#
+# Gate: CSS-svg-fill-inherit (file:// snapshot, six rows, pixels as
+# Chromium: wrapper red / currentColor / orange; the svg's own fill
+# attribute wins; fill: none draws nothing; a path's currentColor). Full
+# fresh scorecard (r76-356) plus a re-run of mdn and google on the final
+# rule: MDN pixel-identical to r75. Google's trending-arrow icons go from
+# pure blue to grey, as Chromium draws them. Everything else unchanged.
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -122,6 +122,7 @@
+ struct ser {
+ 	struct sbuf out;
+ 	char color[8];		/* "#rrggbb": what currentColor means */
++	char fill[8];		/* patch 356: the root's CSS fill, or "none" */
+ 	char *refs[16];		/* ids that <use> elements point at */
+ 	float vb_w, vb_h;	/* the root's viewBox size, 0 if none */
+ 	int nrefs;
+@@ -478,7 +479,7 @@
+ 			       " xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+ 		if (!has_fill) {
+ 			sb_str(&z->out, " fill=\"");
+-			sb_str(&z->out, z->color);
++			sb_str(&z->out, z->fill);	/* patch 356 */
+ 			sb_str(&z->out, "\"");
+ 		}
+ 	}
+@@ -561,6 +562,30 @@
+ 		 (unsigned int)((col >> 16) & 0xff),
+ 		 (unsigned int)((col >> 8) & 0xff),
+ 		 (unsigned int)(col & 0xff));
++	/* VitaBrowser patch 356: a root with no fill attribute takes the
++	 * CSS `fill` it inherits (libcss computes it), not `color`: a
++	 * wrapper's `fill: red` drew the icon in the text colour.
++	 * `fill: currentColor` -- what icon sets use -- gives the colour,
++	 * and `fill: none` nothing. Opaque black is the initial value and
++	 * cannot be told from an author's `fill: black`; there `color`
++	 * stays, as before. Chromium would draw black, but page CSS does not
++	 * reach the SVG children here, and those are what usually carry the
++	 * fill (MDN's logo letters: `.logo__letter` in the brand colour),
++	 * which the text colour matches far more often than black does. */
++	strcpy(z.fill, z.color);
++	if (box->style != NULL) {
++		css_color fc = 0xff000000;
++		uint8_t ft = css_computed_fill(box->style, &fc);
++
++		if (ft == CSS_FILL_NONE || (ft == CSS_FILL_COLOR &&
++				(fc >> 24) == 0))
++			strcpy(z.fill, "none");
++		else if (ft == CSS_FILL_COLOR && fc != 0xff000000)
++			snprintf(z.fill, sizeof(z.fill), "#%02x%02x%02x",
++				 (unsigned int)((fc >> 16) & 0xff),
++				 (unsigned int)((fc >> 8) & 0xff),
++				 (unsigned int)(fc & 0xff));
++	}
+ 	ser_node(&z, box->node, 0, true);
+ 	for (i = 0; i < z.nrefs; i++)
+ 		free(z.refs[i]);
