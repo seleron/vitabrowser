@@ -1,0 +1,127 @@
+# libsvgtiny: viewBox honours preserveAspectRatio (patch 352, with 352-netsurf)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 351)
+#
+# svgtiny_parse_viewbox() scaled x and y independently (viewport/viewBox
+# on each axis), which is preserveAspectRatio="none". The default is
+# xMidYMid meet: one scale, the smaller, with the viewBox centred.
+# news.ycombinator.com's triangle.svg (32x32, viewBox 0 0 32 16) was
+# stretched 1x2, so its vote arrow showed only the triangle's tip.
+#
+#  - svgtiny_parse.c: parse preserveAspectRatio (none; x{Min,Mid,Max}
+#    Y{Min,Mid,Max}; meet / slice; defer ignored) and apply a uniform scale
+#    with the alignment offset. A non-positive viewBox size keeps the old
+#    arithmetic.
+#  - svgtiny.c / svgtiny_internal.h / svgtiny_strings.h: read the
+#    attribute on <svg> and pass it in.
+--- a/src/svgtiny.c
++++ b/src/svgtiny.c
+@@ -989,11 +989,22 @@
+ 	}
+ 
+ 	if (view_box) {
++		/* patch 352: and its preserveAspectRatio */
++		dom_string *par = NULL;
++
++		exc = dom_element_get_attribute(svg,
++				state.interned_preserveAspectRatio, &par);
++		if (exc != DOM_NO_ERR)
++			par = NULL;
+ 		svgtiny_parse_viewbox(dom_string_data(view_box),
+ 				      dom_string_byte_length(view_box),
++				      par ? dom_string_data(par) : NULL,
++				      par ? dom_string_byte_length(par) : 0,
+ 				      state.viewport_width,
+ 				      state.viewport_height,
+ 				      &state.ctm);
++		if (par != NULL)
++			dom_string_unref(par);
+ 		dom_string_unref(view_box);
+ 	}
+ 
+--- a/src/svgtiny_internal.h
++++ b/src/svgtiny_internal.h
+@@ -113,7 +113,10 @@
+ 		struct svgtiny_transformation_matrix *tm);
+ svgtiny_code svgtiny_parse_color(const char *text, size_t textlen,
+ 		svgtiny_colour *c);
++/* VitaBrowser patch 352: par / parlen = the preserveAspectRatio
++ * attribute, NULL / 0 when absent (xMidYMid meet). */
+ svgtiny_code svgtiny_parse_viewbox(const char *text, size_t textlen,
++		const char *par, size_t parlen,
+ 		float viewport_width, float viewport_height,
+ 		struct svgtiny_transformation_matrix *tm);
+ svgtiny_code svgtiny_parse_none(const char *cursor, const char *textend);
+--- a/src/svgtiny_parse.c
++++ b/src/svgtiny_parse.c
+@@ -1442,6 +1442,8 @@
+ svgtiny_code
+ svgtiny_parse_viewbox(const char *text,
+ 		      size_t textlen,
++		      const char *par,
++		      size_t parlen,
+ 		      float viewport_width,
+ 		      float viewport_height,
+ 		      struct svgtiny_transformation_matrix *tm)
+@@ -1482,6 +1484,51 @@
+ 
+ 	tm->a = (float)viewport_width / paramv[2];
+ 	tm->d = (float)viewport_height / paramv[3];
++
++	/* VitaBrowser patch 352: preserveAspectRatio (SVG 1.1 7.8). The
++	 * default is xMidYMid meet: ONE scale, the smaller of the two, with
++	 * the viewBox centred in the viewport. The two independent scales
++	 * above are only `none`. HN's triangle.svg (32x32, viewBox 0 0 32
++	 * 16) was stretched 1x2, so its vote arrow showed only the tip. */
++	{
++		int ax = 1, ay = 1;	/* 0 min, 1 mid, 2 max */
++		bool none = false, slice = false;
++		const char *c = par, *e = par + parlen;
++
++		while (c != NULL && c < e) {
++			const char *w;
++			size_t n;
++
++			while (c < e && (*c == ' ' || *c == '\t' ||
++					*c == '\n' || *c == '\r' || *c == ','))
++				c++;
++			w = c;
++			while (c < e && !(*c == ' ' || *c == '\t' ||
++					*c == '\n' || *c == '\r' || *c == ','))
++				c++;
++			n = (size_t)(c - w);
++			if (n == 4 && strncmp(w, "none", 4) == 0) {
++				none = true;
++			} else if (n == 5 && strncmp(w, "slice", 5) == 0) {
++				slice = true;
++			} else if (n == 8 && w[0] == 'x' && w[4] == 'Y') {
++				ax = strncmp(w + 1, "Min", 3) == 0 ? 0 :
++					strncmp(w + 1, "Max", 3) == 0 ? 2 : 1;
++				ay = strncmp(w + 5, "Min", 3) == 0 ? 0 :
++					strncmp(w + 5, "Max", 3) == 0 ? 2 : 1;
++			}	/* "meet" and "defer" keep the defaults */
++		}
++		if (!none && paramv[2] > 0 && paramv[3] > 0) {
++			float s = slice ? (tm->a > tm->d ? tm->a : tm->d) :
++					(tm->a < tm->d ? tm->a : tm->d);
++			float fx = (float)viewport_width - paramv[2] * s;
++			float fy = (float)viewport_height - paramv[3] * s;
++
++			tm->a = tm->d = s;
++			tm->e += ax * fx / 2;
++			tm->f += ay * fy / 2;
++		}
++	}
+ 	tm->e += -paramv[0] * tm->a;
+ 	tm->f += -paramv[1] * tm->d;
+ 
+--- a/src/svgtiny_strings.h
++++ b/src/svgtiny_strings.h
+@@ -12,6 +12,7 @@
+ 
+ SVGTINY_STRING_ACTION(svg)
+ SVGTINY_STRING_ACTION(viewBox)
++SVGTINY_STRING_ACTION(preserveAspectRatio)
+ SVGTINY_STRING_ACTION(a)
+ SVGTINY_STRING_ACTION(d)
+ SVGTINY_STRING_ACTION(g)

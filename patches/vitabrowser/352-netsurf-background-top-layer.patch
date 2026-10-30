@@ -1,0 +1,160 @@
+# netsurf: layered backgrounds degrade to the top layer (patch 352, with 352-libsvgtiny)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 351, with 352-libsvgtiny)
+#
+# libcss takes one background layer and drops a comma-separated list whole.
+# fixes318/fixes266 then pick the first GRADIENT anywhere in the value,
+# not the top layer. HN's vote arrow is `background: url("triangle.svg"),
+# linear-gradient(transparent, transparent) no-repeat`: the url() layer
+# went and a transparent gradient painted, so there were no arrows.
+#
+#  - css_rewrite.c: macsurf__strip_background_layers() blanks everything
+#    after the first depth-0 comma in background, background-image and the
+#    per-layer longhands (repeat, position, size, attachment, origin,
+#    clip). It is a same-size pass that runs before the gradient passes in
+#    both the stylesheet and inline-style paths. The final layer's colour
+#    is lost, but the whole declaration was dropped before.
+#
+# Gate: CSS-bg-layers-svg snapshot (file://), five pixels as Chromium:
+# A (HN's rule) (20,30) #999 / (4,30) white; B (single layer) (20,80) #999
+# / (4,80) white / (20,54) white above the tip. Before: A painted nothing,
+# and B's 1x2 stretch put the tip at (20,54). Full fresh scorecard
+# (r72-352 vs r71): HN's arrows draw (visual 0.787 -> 0.791). Every drop
+# is live drift or the Wikipedia carousel residual: no site's static
+# regions changed.
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -3083,6 +3083,87 @@
+ 	return out;
+ }
+ 
++/* VitaBrowser patch 352: multiple backgrounds degrade to the TOP layer.
++ * libcss takes one background layer and drops any comma-separated list
++ * whole, and fixes318/fixes266 pick the first GRADIENT anywhere in the
++ * value -- not the top layer. HN's vote arrow is `background:
++ * url("triangle.svg"), linear-gradient(transparent, transparent)
++ * no-repeat`: the url layer was dropped and a transparent gradient
++ * painted, so no arrow. For background, background-image and the
++ * per-layer longhands, blank everything after the first depth-0 comma
++ * (same size, spaces). The final layer's colour is lost, but the whole
++ * declaration was dropped before. NULL when nothing changed. */
++static char *
++macsurf__strip_background_layers(const char *data, size_t in_size)
++{
++	static const char *const names[] = {
++		"background", "background-image", "background-repeat",
++		"background-position", "background-size",
++		"background-attachment", "background-origin",
++		"background-clip", NULL };
++	char *out;
++	size_t i = 0;
++	int changed = 0;
++
++	if (!macsurf__has_ci(data, in_size, "background") ||
++			memchr(data, ',', in_size) == NULL)
++		return NULL;
++	out = (char *)malloc(in_size + 1);
++	if (out == NULL)
++		return NULL;
++	memcpy(out, data, in_size);
++	out[in_size] = '\0';
++	while (i < in_size) {
++		size_t j = 0, k, comma = 0;
++		int n, depth = 0;
++		bool quote = false;
++		char q = 0;
++
++		for (n = 0; names[n] != NULL; n++) {
++			size_t l = strlen(names[n]);
++			if (macsurf__match_prop_name(data, in_size, i,
++					names[n], l)) {
++				j = i + l;
++				while (j < in_size && (data[j] == ' ' ||
++						data[j] == '\t' ||
++						data[j] == '\n' ||
++						data[j] == '\r')) j++;
++				if (j < in_size && data[j] == ':')
++					break;
++			}
++		}
++		if (names[n] == NULL) {
++			i++;
++			continue;
++		}
++		/* value: to the next depth-0 `;`, `}` or `!` */
++		for (k = j + 1; k < in_size; k++) {
++			char c = data[k];
++			if (quote) {
++				if (c == q) quote = false;
++				continue;
++			}
++			if (c == '"' || c == '\'') { quote = true; q = c; }
++			else if (c == '(') depth++;
++			else if (c == ')') { if (depth > 0) depth--; }
++			else if (depth == 0 && (c == ';' || c == '}' ||
++					c == '!')) break;
++			else if (depth == 0 && c == ',' && comma == 0)
++				comma = k;
++		}
++		if (comma != 0) {
++			memset(out + comma, ' ', k - comma);
++			changed++;
++		}
++		i = k;
++	}
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
+ static char *
+ macsurf__strip_stacked_gradients(const char *data, size_t in_size)
+ {
+@@ -6431,6 +6512,15 @@
+ 		src_size = cur_size;
+ 	}
+ 
++	/* patch 352: multiple backgrounds -> the top layer (same size) */
++	next = macsurf__strip_background_layers(src, src_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next;
++		cur_size = src_size;
++		src = (const char *)cur;
++	}
++
+ 	next = macsurf__rewrite_background_image_gradient(src, src_size,
+ 			&next_size);
+ 	if (next != NULL) {
+@@ -7565,6 +7655,7 @@
+ 	char *rewritten_hstripe = NULL;    /* fixes364 -macsurf-hstripe-bg emission */
+ 	char *rewritten_dotgrid = NULL;    /* fixes365c -macsurf-dotgrid emission */
+ 	char *rewritten_bg_short = NULL;   /* fixes318 background: shorthand gradient */
++	char *rewritten_bg_layers = NULL;  /* patch 352 top background layer */
+ 	size_t col_span_size = 0;
+ 	size_t text_shadow_size = 0;
+ 	size_t transform_size = 0;
+@@ -7914,6 +8005,13 @@
+ 		final_size = (unsigned int)lshort_size;
+ 	}
+ 
++	/* patch 352: multiple backgrounds -> the top layer, before the
++	 * gradient passes pick a layer of their own. */
++	rewritten_bg_layers = macsurf__strip_background_layers(final_data,
++			(size_t)final_size);
++	if (rewritten_bg_layers != NULL)
++		final_data = (const char *)rewritten_bg_layers;	/* same size */
++
+ 	/* fixes318 (#145) - background: shorthand → -macsurf-gradient:.
+ 	 * Runs BEFORE fixes266 so by the time fixes266's matcher inspects
+ 	 * the data, any shorthand-form gradient has already been extracted
+@@ -7988,6 +8086,7 @@
+ 	if (rewritten_hstripe != NULL) free(rewritten_hstripe); /* fixes364 */
+ 	if (rewritten_dotgrid != NULL) free(rewritten_dotgrid); /* fixes365c */
+ 	if (rewritten_bg_short != NULL) free(rewritten_bg_short); /* fixes318 */
++	if (rewritten_bg_layers != NULL) free(rewritten_bg_layers); /* 352 */
+ 
+ 	return result;
+ }
