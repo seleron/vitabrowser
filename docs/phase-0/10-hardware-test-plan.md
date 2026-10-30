@@ -7538,3 +7538,31 @@ Chromium). Full fresh scorecard (`score/r75-355` vs r74): **bbc 82.2 →
 content.
 
 Full gate: `gate355.log`, exit 0.
+
+## Patch 356 (2026-10-30): inline SVG takes the CSS fill it inherits
+
+An inline `<svg>` without a fill attribute was filled with the CSS
+`color`, so a wrapper's `fill: red` drew the icon in the text colour.
+libcss computes `fill` (inherited); vb_inline_svg now uses it for the
+root. `none` draws nothing, `currentColor` gives the colour, and an
+explicit colour gives itself.
+
+**A first version regressed MDN, and was changed before landing.** With
+no fill anywhere, Chromium draws the SVG initial, black, so the first
+version did too. The full scorecard (`score/r76-356`) showed MDN's logo
+turning black. Its letters take the brand blue from a class rule on the
+paths, and page CSS does not reach SVG children in this engine, so the
+old "text colour" fallback had been matching it. Opaque black, the
+initial, cannot be told from an explicit `fill: black`, so it now keeps
+the text colour. A re-run of mdn and google on the final rule: MDN
+pixel-identical to r75. Google's trending-arrow icons go from pure blue
+to grey, as Chromium draws them.
+
+Follow-up (not done): page CSS for SVG child elements (class selectors
+on `<path>` etc.) is the real gap behind the fallback. Doing it would
+need a style cascade for boxless elements.
+
+Gate: CSS-svg-fill-inherit (file:// snapshot, six rows, pixels as
+Chromium).
+
+Full gate: `gate356.log`, exit 0.
