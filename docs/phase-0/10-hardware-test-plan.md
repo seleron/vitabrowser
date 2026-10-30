@@ -7272,3 +7272,30 @@ rewritten (fixes817e, known); grid items' top margin is reserved in the
 row height but not applied to y.
 
 Full gate: `gate347.log`, exit 0.
+
+## State log 2026-10-30: BBC score made deterministic (scorecard per-site blocked hosts)
+
+The same build scored BBC anywhere from ~75 to ~91. Two random
+third-party overlays were racing the screenshot:
+
+- **Sourcepoint consent dialog** (`cdn.privacy-mgmt.com`). It loads in
+  Chrome every time but in the simulator only sometimes. Chrome's
+  reference always had it covering most of the page.
+- **"Help us improve!" survey invite** (`edigitalsurvey.com`, via
+  BBC's `edr.min.js`). It samples a random share of visits; the sim log
+  shows a `layershow` event when it appears.
+
+`sites.tsv` takes an optional fourth column of hosts blocked on **both**
+sides: the simulator's user `blocklist.txt` (suffix match, like the
+bundled list) and a Playwright route abort in Chromium. BBC lists both
+hosts. Over six fresh runs (`score/r66-bbc-det1..6`, reference retaken
+each time), the five runs without the survey all scored **84.2** (visual
+0.604). Before the survey host was blocked, one run drew the invite in
+the sim and scored 76.2.
+
+84.2 is the new BBC figure, and it is not comparable with earlier runs.
+Their ~90 came from the consent dialog covering both sides' first
+screens; the score now measures the page itself. Other sites have not
+been audited for similar overlays.
+
+Full gate: `gate348.log`, exit 0.
