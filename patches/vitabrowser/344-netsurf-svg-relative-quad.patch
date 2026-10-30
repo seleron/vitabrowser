@@ -1,0 +1,195 @@
+# netsurf: relative smooth quadratics in inline SVG paths (patch 344)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 343)
+#
+# libsvgtiny's generate_path_sbcurveto() computes a `t`'s reflected
+# control point as prev + (prev - quad), which is already absolute, and
+# for the relative form then adds prev again. Every relative `t` after a
+# curve overshoots. Material icons are written that way
+# ("q-50 0-85-35t-35-85"). Once 343 made their viewBox apply, Google's
+# search-bar lens, mic and camera drew as scribbles. A standalone
+# libsvgtiny test: `M2 12q5 -10 10 0t10 0` gave a bbox to (28, 34.7), its
+# absolute equivalent (22, 18.7). A relative `q` also stores its control
+# point unoffset, so even an absolute T after it reflects wrongly
+# (`q24 -24 48 0T96 24` reached y 56 in a 48-unit box).
+#
+# libsvgtiny is a support library this patch stack does not stage, so the
+# path is fixed on its way in.
+#
+#  - vb_inline_svg.c vb_path_fix_t(): a `d` value containing `t` is
+#    re-tokenised. The current point and subpath start are tracked
+#    through M/L/H/V/C/S/Q/T/A/Z in both cases, with implicit lineto after
+#    a moveto. Each relative `t` and `q` is re-emitted absolute (`T` /
+#    `Q`), and every other command as parsed. On any parse surprise the original
+#    text is used.
+#
+# Gate: CSS-svg-smooth-quad (snapshot pixels, fixed layout): the filled
+# dip of `M0 24q24 -24 48 0t48 0V48H0Z` reads red at (72,72), with the
+# background above it and red in the hump. Before the patch (72,72) read
+# background. Chromium agrees.
+--- a/content/handlers/html/vb_inline_svg.c
++++ b/content/handlers/html/vb_inline_svg.c
+@@ -156,6 +156,153 @@
+ 		z->nrefs++;
+ }
+ 
++/* VitaBrowser patch 344: libsvgtiny (generate_path_sbcurveto) adds the
++ * current point to a RELATIVE smooth quadratic's reflected control point,
++ * which is already absolute, so every `t` after a curve overshoots:
++ * Material icons ("q-50 0-85-35t-35-85") drew as scribbles (Google's
++ * search-bar lens, mic and camera). Its relative `q` stores its control
++ * point unoffset too, so even an absolute T after it reflects wrongly.
++ * libsvgtiny is a support library this patch stack does not stage, so the
++ * path is fixed on the way in: every relative `t` and `q` is re-emitted
++ * absolute (T / Q), tracking the current point through all commands;
++ * everything else is copied as parsed. On any parse surprise the original
++ * text is used. */
++static int vb_path_num(const char **pp, const char *e, double *v)
++{
++	const char *p = *pp;
++	char tmp[64];
++	size_t n = 0;
++	bool dot = false, ex = false;
++
++	while (p < e && (isspace((unsigned char)*p) || *p == ','))
++		p++;
++	if (p < e && (*p == '-' || *p == '+'))
++		tmp[n++] = *p++;
++	while (p < e && n < sizeof(tmp) - 1) {
++		if (isdigit((unsigned char)*p)) {
++			tmp[n++] = *p++;
++		} else if (*p == '.' && !dot && !ex) {
++			dot = true;
++			tmp[n++] = *p++;
++		} else if ((*p == 'e' || *p == 'E') && !ex && n > 0) {
++			ex = true;
++			tmp[n++] = *p++;
++			if (p < e && (*p == '-' || *p == '+'))
++				tmp[n++] = *p++;
++		} else {
++			break;
++		}
++	}
++	if (n == 0 || (n == 1 && (tmp[0] == '-' || tmp[0] == '+')))
++		return 0;
++	tmp[n] = '\0';
++	*v = strtod(tmp, NULL);
++	*pp = p;
++	return 1;
++}
++
++static bool vb_path_fix_t(struct sbuf *out, const char *d, size_t n)
++{
++	const char *p = d, *e = d + n;
++	double cx = 0, cy = 0, sx = 0, sy = 0;
++	char cmd = 0;
++	struct sbuf b;
++	char num[48];
++
++	memset(&b, 0, sizeof(b));
++	while (p < e) {
++		static const char *const cmds = "MmLlHhVvCcSsQqTtAaZz";
++		int np, k;
++		double v[7];
++		bool rel;
++		char uc;
++
++		while (p < e && (isspace((unsigned char)*p) || *p == ','))
++			p++;
++		if (p >= e)
++			break;
++		if (strchr(cmds, *p) != NULL && *p != '\0') {
++			cmd = *p++;
++		} else if (cmd == 0) {
++			goto fail;
++		} else if (cmd == 'M') {
++			cmd = 'L';	/* implicit lineto after moveto */
++		} else if (cmd == 'm') {
++			cmd = 'l';
++		}
++		rel = (cmd >= 'a' && cmd <= 'z');
++		uc = (char)toupper((unsigned char)cmd);
++		switch (uc) {
++		case 'Z': np = 0; break;
++		case 'H': case 'V': np = 1; break;
++		case 'M': case 'L': case 'T': np = 2; break;
++		case 'S': case 'Q': np = 4; break;
++		case 'C': np = 6; break;
++		case 'A': np = 7; break;
++		default: goto fail;
++		}
++		for (k = 0; k < np; k++)
++			if (!vb_path_num(&p, e, &v[k]))
++				goto fail;
++		if (cmd == 't') {
++			v[0] += cx;
++			v[1] += cy;
++			sb_str(&b, "T");
++		} else if (cmd == 'q') {
++			/* the relative q's control point is stored unoffset
++			 * too, and a following T reflects it */
++			v[0] += cx;
++			v[1] += cy;
++			v[2] += cx;
++			v[3] += cy;
++			sb_str(&b, "Q");
++		} else {
++			num[0] = cmd;
++			num[1] = '\0';
++			sb_str(&b, num);
++		}
++		for (k = 0; k < np; k++) {
++			snprintf(num, sizeof(num), k ? " %.9g" : "%.9g", v[k]);
++			sb_str(&b, num);
++		}
++		sb_str(&b, " ");
++		/* advance the current point */
++		switch (uc) {
++		case 'Z':
++			cx = sx;
++			cy = sy;
++			break;
++		case 'H':
++			cx = rel ? cx + v[0] : v[0];
++			break;
++		case 'V':
++			cy = rel ? cy + v[0] : v[0];
++			break;
++		default:
++			if (cmd == 't' || cmd == 'q') {	/* made absolute */
++				cx = v[np - 2];
++				cy = v[np - 1];
++			} else {
++				cx = rel ? cx + v[np - 2] : v[np - 2];
++				cy = rel ? cy + v[np - 1] : v[np - 1];
++			}
++			if (uc == 'M') {
++				sx = cx;
++				sy = cy;
++			}
++			break;
++		}
++	}
++	if (b.oom || b.s == NULL)
++		goto fail;
++	sb_add(out, b.s, b.n);
++	free(b.s);
++	return true;
++fail:
++	free(b.s);
++	return false;
++}
++
+ /* VitaBrowser patch 343: SVG element and attribute names in their
+  * case-sensitive SVG spelling. The page's DOM hands this serializer HTML
+  * spellings -- upper-case element names, lower-case attributes
+@@ -310,6 +457,9 @@
+ 			sb_str(&z->out, "=\"");
+ 			if (vn == 12 && strncasecmp(vp, "currentColor", 12) == 0)
+ 				sb_str(&z->out, z->color);
++			else if (dstr_eq(an, "d") && memchr(vp, 't', vn) != NULL &&
++					vb_path_fix_t(&z->out, vp, vn))
++				;	/* patch 344: relative t made absolute */
+ 			else
+ 				sb_esc(&z->out, vp, vn);
+ 			sb_str(&z->out, "\"");

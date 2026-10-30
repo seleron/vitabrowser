@@ -217,6 +217,7 @@ CSS-opacity file:///app0:/testpages/CSS-opacity-group.html
 CSS-opacity-image file:///app0:/testpages/CSS-opacity-image.html
 CSS-isolation file:///app0:/testpages/CSS-isolation.html
 CSS-svg-viewbox file:///app0:/testpages/CSS-svg-viewbox.html
+CSS-svg-smooth-quad file:///app0:/testpages/CSS-svg-smooth-quad.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
@@ -1064,6 +1065,14 @@ if [ -n "$v343s" ]; then
 		awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-svg-viewbox: ${v343px:-none} (255,0,0 238,238,238 255,0,0 255,0,0 238,238,238)"
+# Patch 344: relative t / q in inline SVG paths (libsvgtiny reflection).
+q344s=$(ls "$OUT"/snaps/N-*-CSS-svg-smooth-quad.png 2>/dev/null | head -1)
+q344px=
+if [ -n "$q344s" ]; then
+	q344px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$q344s" \
+		72,72 72,46 24,50 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-svg-smooth-quad: ${q344px:-none} (255,0,0 238,238,238 255,0,0)"
 # Patch 221: the space after inline-blocks / replaced boxes.
 i221p=$(ls "$R"/*NET-css-inline-block-space.plot 2>/dev/null | head -1)
 i221r=$(sed -n 's/.*STR \(IBSPACE221: [0-9]*\/[0-9]* passed\).*/\1/p' "$i221p" 2>/dev/null | head -1)
@@ -1593,6 +1602,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$v343px" = "255,0,0 238,238,238 255,0,0 255,0,0 238,238,238 " ] && \
+[ "$q344px" = "255,0,0 238,238,238 255,0,0 " ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
 [ "$r223r" = "RANGECOL223: 4/4 passed" ] && \
