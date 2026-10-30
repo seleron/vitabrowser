@@ -6812,3 +6812,19 @@ would leave every plot stream and gate count unchanged. It changes doc
 Full gate: `gate333.log`, exit 0.
 
 **Device:** sim-only until the next VPK.
+
+## Patch 335 (2026-10-30): outlines honour their colour's alpha
+
+claude.ai drew a blue frame across its header. Chromium computes every
+link's outline as `2px solid hsla(var(--accent-100) / 0%)`: present and
+fully transparent. The outline painter (MacSurf fixes40) dropped the
+colour's alpha and never set the style's opacity, so it drew opaque.
+Borders have taken colour alpha since patch 100 and group opacity since
+314. Outlines now do the same, and an alpha of 0 skips the outline.
+
+Gate: CSS-outline-alpha. Of the five boxes' 204×24 outline rects, the
+`rgba(0,0,0,0)` and `hsla(var() / 0%)` ones draw nothing, the 50% one
+and an opaque one inside `opacity: .5` trace `OPAQUE 2`, and the opaque
+one traces no token: 3 rects, 2 at OPAQUE 2. Without the patch there
+are 5 rects and no tokens. Chromium's pixels agree (white, white, 127,
+0, 127). Full gate: `gate335.log`, exit 0.
