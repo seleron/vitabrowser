@@ -7459,3 +7459,29 @@ github and bbc. For stackoverflow and guardian they fall only in the
 address bar and the live headline/question areas.
 
 Full gate: `gate352.log`, exit 0.
+
+## Patch 353 (2026-10-30): empty text nodes render nothing (YouTube's 75px offset)
+
+m.youtube.com drew ~75px too low (search box at y 290 vs 214). A
+serialized copy laid out correctly, so I probed the live page in the
+sim. The extra height came in 13px steps: the topbar's header at T13,
+an inline `ytm-tab-renderer` 13px tall, and a rich-grid div of H13
+(Chromium H0). The contents of each were **empty text nodes** (`""`),
+which YouTube's framework inserts as markers. NetSurf built a text box
+and a full line for each; browsers render nothing. Phantom line boxes of
+empty inline elements were already correct. `box_construct_text()` now
+returns with no box for zero-length data. Nodes filled later
+(data/appendData/nodeValue) still render.
+
+Also closed in passing: claude.ai's square card corners are by design
+(doc 11 -- the Vita draws square corners, and libcss keeps a single
+radius, so the per-corner forms compute to 0).
+
+Gate: JS-empty-text-nodes (EMPTYTXT353 7/7, Chromium 7/7). Full fresh
+scorecard (`score/r73-353` vs r72, mean 84.4): youtube 77.4 → **78.3**.
+hackernews −3.2, rte −2.2 and cnnlite −1.1 are live content: the same
+sim layout; HN's reference has a new story at #4 and rte reordered two
+cards. YouTube still lacks its icons, and its grey search box is the
+pending owner decision on low-alpha buckets.
+
+Full gate: `gate353.log`, exit 0.
