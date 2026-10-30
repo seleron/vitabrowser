@@ -296,6 +296,7 @@ NET-css-grid-var-crosssheet http://127.0.0.1:$HP/CSS-grid-var-crosssheet.html
 NET-css-grid-nested-padding http://127.0.0.1:$HP/CSS-grid-nested-padding.html
 NET-css-flex-min-width-explicit http://127.0.0.1:$HP/CSS-flex-min-width-explicit.html
 NET-css-grid-uniform-placement http://127.0.0.1:$HP/CSS-grid-uniform-placement.html
+NET-css-grid-inline-placement http://127.0.0.1:$HP/CSS-grid-inline-placement.html
 NET-css-viewport-units http://127.0.0.1:$HP/CSS-viewport-units.html
 NET-css-line-clamp http://127.0.0.1:$HP/CSS-line-clamp.html
 NET-css-ch-unit http://127.0.0.1:$HP/CSS-ch-unit.html
@@ -1047,6 +1048,11 @@ u347p=$(ls "$R"/*NET-css-grid-uniform-placement.plot 2>/dev/null | head -1)
 u347r=$(sed -n 's/.*STR \(GRIDUNI347: [0-9]*\/[0-9]* passed\).*/\1/p' "$u347p" 2>/dev/null | head -1)
 echo "  css-grid-uniform-placement: ${u347r:-no summary}"
 [ -n "$u347p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$u347p" | sed 's/^STR /  /'
+# Patch 348: grid placement in style="" and element.style.
+i348p=$(ls "$R"/*NET-css-grid-inline-placement.plot 2>/dev/null | head -1)
+i348r=$(sed -n 's/.*STR \(GRIDINL348: [0-9]*\/[0-9]* passed\).*/\1/p' "$i348p" 2>/dev/null | head -1)
+echo "  css-grid-inline-placement: ${i348r:-no summary}"
+[ -n "$i348p" ] && grep -o 'STR [0-9]* [^"]*FAIL' "$i348p" | sed 's/^STR /  /'
 # Patch 335: outlines honour their colour's alpha and the group opacity.
 # The five 200x20 boxes' 204x24 outline rects: the two transparent ones
 # draw nothing, the 50% one and the one inside opacity:.5 trace OPAQUE 2,
@@ -1628,6 +1634,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$n341r" = "GRIDNEST341: 4/4 passed" ] && \
 [ "$m345r" = "FLEXMINW345: 3/3 passed" ] && \
 [ "$u347r" = "GRIDUNI347: 9/9 passed" ] && \
+[ "$i348r" = "GRIDINL348: 8/8 passed" ] && \
 [ "${o335all:-0}" -eq 3 ] && [ "${o335op2:-0}" -eq 2 ] && \
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$v343px" = "255,0,0 238,238,238 255,0,0 255,0,0 238,238,238 " ] && \

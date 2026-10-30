@@ -1,0 +1,105 @@
+# netsurf: grid placement in style attributes and element.style (patch 348)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 347)
+#
+# Grid placement written inline never worked. The placement rewriter
+# (fixes158) works per {} block and emits the packed
+# -macsurf-grid-col-span at the block's `}`. An inline style has no
+# braces, so `style="grid-column: 1 / span 2"`, common in React and other
+# framework markup, stayed a raw declaration libcss drops, and the item
+# took one column. fixes817e/fixes831 noted the gap.
+#
+#  - css_rewrite.c: macsurf__rewrite_grid_placement_inline() wraps the
+#    attribute text in a block, runs the same placement rewriter and
+#    unwraps it. macsurf__rewrite_inline_style() runs it after the other
+#    grid passes. With 347's axes mask, an inline `grid-row:` keeps a
+#    class's `grid-column:`.
+#  - macsurf_qjs.c: the element.style object defines setters only for a
+#    fixed list of camelCase names, so `el.style.gridColumn = ...` made a
+#    plain JS property that never reached the style attribute. The grid
+#    placement and template names, gap/rowGap/columnGap, order, alignSelf,
+#    justifySelf and justifyItems join the list.
+#
+# Gate: CSS-grid-inline-placement (GRIDINL348 8/8, Chromium 8/8). Legs
+# 1-7 need an inline placement or the setter to take effect. Leg 8 guards
+# the other direction: an inline `grid-row:` must not wipe the class's
+# column.
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -1956,6 +1956,43 @@
+ }
+ 
+ 
++/* VitaBrowser patch 348: grid placement in a style="" attribute. The
++ * placement rewriter above works per brace block (it emits the packed
++ * declaration at the block's `}`), and an inline style has no braces, so
++ * `style="grid-column: 1 / span 2"` stayed a raw declaration libcss
++ * drops: the item took one column. Wrap the text in a block, rewrite,
++ * and unwrap. NULL when nothing changed (no grid- property at all). */
++static char *
++macsurf__rewrite_grid_placement_inline(const char *data, size_t in_size,
++		size_t *out_size_p)
++{
++	char *wrapped;
++	char *out;
++	size_t out_size = 0;
++
++	if (!macsurf__has_ci(data, in_size, "grid-"))
++		return NULL;
++	wrapped = (char *)malloc(in_size + 2);
++	if (wrapped == NULL)
++		return NULL;
++	wrapped[0] = '{';
++	memcpy(wrapped + 1, data, in_size);
++	wrapped[in_size + 1] = '}';
++	out = macsurf__rewrite_grid_placement(wrapped, in_size + 2, &out_size);
++	free(wrapped);
++	if (out == NULL)
++		return NULL;
++	if (out_size < 2 || out[0] != '{' || out[out_size - 1] != '}' ||
++			out_size == in_size + 2) {
++		free(out);	/* malformed, or no placement emitted */
++		return NULL;
++	}
++	memmove(out, out + 1, out_size - 2);
++	*out_size_p = out_size - 2;
++	return out;
++}
++
++
+ /* fixes175 - rewrite every author `text-shadow: VALUE` declaration to
+  * `-macsurf-text-shadow: VALUE` so the existing vendor parser
+  * (p_macsurf_text_shadow.c from fixes50) picks up standard CSS3
+@@ -6498,6 +6535,15 @@
+ 	if (next != NULL) {
+ 		if (cur != NULL) free(cur);
+ 		cur = next; cur_size = next_size;
++		src = (const char *)cur; src_size = cur_size;
++	}
++
++	/* patch 348: grid-column / grid-row / grid-area placement */
++	next = macsurf__rewrite_grid_placement_inline(src, src_size,
++			&next_size);
++	if (next != NULL) {
++		if (cur != NULL) free(cur);
++		cur = next; cur_size = next_size;
+ 		src = (const char *)cur; src_size = cur_size;
+ 	}
+ 
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -8804,7 +8804,13 @@
+ 		"'flexWrap','alignItems','justifyContent','transform','transition',"
+ 		"'animation','content','listStyle','tableLayout','borderCollapse',"
+ 		"'borderSpacing','captionSide','emptyCells','direction','float',"
+-		"'clear','columns','webkitAppearance'];"
++		"'clear','columns','webkitAppearance',"
++		/* patch 348: grid placement and templates -- `el.style.gridColumn =`
++		 * was a plain JS property, never reaching the style attribute. */
++		"'gridColumn','gridRow','gridArea','gridColumnStart','gridColumnEnd',"
++		"'gridRowStart','gridRowEnd','gridTemplateColumns','gridTemplateRows',"
++		"'gridTemplateAreas','gridAutoFlow','gap','rowGap','columnGap',"
++		"'order','alignSelf','justifySelf','justifyItems'];"
+ 		"var i;for(i=0;i<PS.length;i++)(function(p){"
+ 		"Object.defineProperty(sp,p,{"
+ 		"get:function(){return sc[p]||'';},"
