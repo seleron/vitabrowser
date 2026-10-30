@@ -1,0 +1,157 @@
+# netsurf: grid items -- margins, borders, outer-height alignment, the container's height (patch 349)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 348)
+#
+# A box's x/y is its padding edge everywhere in NetSurf (margin + border
+# in from the containing block). Grid placement left out the item's top
+# margin and its top and left borders. An item with margin-top sat on the
+# row's top edge, though the row height already reserved the margin, and
+# a bordered item pushed its border above and left of its cell. 347 added
+# the left margin.
+#
+#  - layout_grid.c: y adds the item's top margin and top border; x adds
+#    its left border.
+#  - layout_grid.c: center/end alignment uses the item's outer height
+#    (margins, borders, padding), not its content height.
+#  - layout_grid.c: a definite container `height` stands. It was replaced
+#    by the rows' total, so a `height: 60px` grid shrank to its content.
+#    Under the default align-content (normal/stretch), the free height is
+#    shared among auto rows; flex-start leaves it below them. A height
+#    smaller than the rows also stands (they overflow).
+#
+# Gate: CSS-grid-item-offsets (GRIDOFS349 7/7, Chromium 7/7).
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -1824,7 +1824,55 @@
+ 					 * the just-shifted tracks render OUTSIDE
+ 					 * the painted container. */
+ 					row_y = container_height;
++				} else {
++					/* VitaBrowser patch 349: the default
++					 * (normal/stretch) shares the free
++					 * height among auto rows; flex-start
++					 * leaves it below them. Either way the
++					 * CSS height stands -- it was replaced
++					 * by the rows' total, so a `height:
++					 * 60px` grid shrank to its content. */
++					int n_auto = 0, rr, yy = 0, add, rem;
++
++					for (rr = 0; rr <= max_row_used &&
++					     rr < MACSURF_GRID_ROWS_MAX; rr++)
++						if (!(has_row_tracks &&
++						      rr < n_row_tracks &&
++						      row_track_h[rr] > 0))
++							n_auto++;
++					if (ac != CSS_ALIGN_CONTENT_FLEX_START &&
++							n_auto > 0) {
++						int free_v = container_height -
++							row_y;
++						add = free_v / n_auto;
++						rem = free_v - add * n_auto;
++						for (rr = 0;
++						     rr <= max_row_used &&
++						     rr < MACSURF_GRID_ROWS_MAX;
++						     rr++) {
++							int h = row_max_h[rr];
++							if (has_row_tracks &&
++							    rr < n_row_tracks &&
++							    row_track_h[rr] > 0) {
++								h = row_track_h[rr];
++							} else {
++								h += add +
++								    (rem > 0 ? 1 : 0);
++								if (rem > 0)
++									rem--;
++								row_max_h[rr] = h;
++							}
++							row_y_arr[rr] = yy;
++							yy += h + row_gap;
++						}
++					}
++					row_y = container_height;
+ 				}
++			} else if (max_row_used >= 0 && grid->height > 0 &&
++					grid->height < row_y) {
++				/* patch 349: a definite height smaller than
++				 * the rows still stands; they overflow. */
++				row_y = grid->height;
+ 			}
+ 		}
+ 
+@@ -1852,6 +1900,7 @@
+ 				int x_pos;
+ 				int y_pos;
+ 				int cell_h;
++				int outer_h;	/* patch 349 */
+ 				int r;
+ 				int end_row;
+ 				uint8_t self_align;
+@@ -1878,6 +1927,9 @@
+ 				 * lost `margin-inline: 16px`. */
+ 				if (child->margin[LEFT] != AUTO)
+ 					x_pos += child->margin[LEFT];
++				/* patch 349: and its left border (x is the
++				 * padding edge, as y above) */
++				x_pos += child->border[LEFT].width;
+ 				child->x = x_pos;
+ 
+ 				/* #279 justify-items: position the item on the
+@@ -1936,6 +1988,20 @@
+ 				}
+ 
+ 				y_pos = row_y_arr[slot_row];
++				/* VitaBrowser patch 349: the item's outer
++				 * height. The row already reserves its margins
++				 * (child_total_h), but alignment compared the
++				 * content height and the box sat at the row's
++				 * top edge. */
++				outer_h = child->height +
++					child->padding[TOP] +
++					child->padding[BOTTOM] +
++					child->border[TOP].width +
++					child->border[BOTTOM].width +
++					(child->margin[TOP] != AUTO ?
++					 child->margin[TOP] : 0) +
++					(child->margin[BOTTOM] != AUTO ?
++					 child->margin[BOTTOM] : 0);
+ 
+ 				self_align = CSS_ALIGN_SELF_AUTO;
+ 				if (child->style != NULL) {
+@@ -1952,15 +2018,13 @@
+ 
+ 				switch (effective) {
+ 				case CSS_ALIGN_ITEMS_FLEX_END:
+-					if (cell_h > child->height) {
+-						y_pos += cell_h -
+-							 child->height;
++					if (cell_h > outer_h) {
++						y_pos += cell_h - outer_h;
+ 					}
+ 					break;
+ 				case CSS_ALIGN_ITEMS_CENTER:
+-					if (cell_h > child->height) {
+-						y_pos += (cell_h -
+-							 child->height) / 2;
++					if (cell_h > outer_h) {
++						y_pos += (cell_h - outer_h) / 2;
+ 					}
+ 					break;
+ 				case CSS_ALIGN_ITEMS_STRETCH:
+@@ -1971,7 +2035,16 @@
+ 					break;
+ 				}
+ 
+-				child->y = y_pos + grid->padding[TOP];	/* 342 */
++				/* 342: the grid's padding. 349: and, as
++				 * everywhere in NetSurf, a box's y is its
++				 * padding edge -- past its own top margin and
++				 * border. Items with margin-top sat on the
++				 * row's top edge, bordered ones poked their
++				 * border above it. */
++				child->y = y_pos + grid->padding[TOP] +
++					(child->margin[TOP] != AUTO ?
++					 child->margin[TOP] : 0) +
++					child->border[TOP].width;
+ 
+ 				slot_index++;
+ 				child = child->next;
