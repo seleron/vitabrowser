@@ -1,0 +1,120 @@
+# libcss: exact saturating add/subtract for css_fixed (patch 339)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 338)
+#
+# MacSurf's fixes1309 corrected upstream's sign-extending shift in
+# css_add_fixed/css_subtract_fixed to `(int32_t)((uint32_t)ux >> 31) +
+# INT_MAX`. For a negative x that is 1 + INT_MAX: signed overflow, which is
+# undefined. GCC -O2 used the freedom, and the saturation test fired on
+# ordinary mixed-sign sums: calc(-30px + 1rem) evaluated to INT_MAX
+# (2097151px as a length). On developer.mozilla.org the page padding
+# max(1rem, calc(50vw - 720px + 1rem)) became 21845px per side and the
+# whole page grid went 0px wide. Measured with a temporary trace in
+# css_calculator_calculate: `-30px, 1rem, ADD` -> 2097151.
+#
+#  - include/libcss/fpmath.h: both functions add or subtract in int64_t
+#    and clamp to the int32 range. That is exact for any operands and
+#    free of tricks. The CW8 int64 problem the header works around is
+#    multiply-by-constant only.
+#
+# fpmath.h is a public header that netsurf inlines, so the netsurf objects
+# must be rebuilt (build-patched.sh does; an incremental sim build may
+# not).
+#
+# Gate: CSS-calc-negative (CALCNEG339 5/5, Chromium 5/5): margin
+# calc(-30px + 1rem) = -14, MDN's padding expression = 16, calc(10px -
+# 20px + 1rem) = 6.
+#
+# Scorecard: MDN 79.5 -> 84.7 with 337-339 (r61 reference).
+--- a/include/libcss/fpmath.h
++++ b/include/libcss/fpmath.h
+@@ -22,64 +22,39 @@
+ /* type for fixed point numbers */
+ typedef int32_t css_fixed;
+ 
++/* VitaBrowser patch 339: saturating add/subtract in 64-bit arithmetic.
++ *
++ * fixes1309 replaced upstream's sign-extending shift with
++ * `(int32_t)((uint32_t)ux >> 31) + INT_MAX`, which for a negative x is
++ * 1 + INT_MAX: signed overflow, undefined behaviour. GCC -O2 used that
++ * freedom and the saturation test fired on ordinary mixed-sign sums, so
++ * calc(-30px + 1rem) evaluated to INT_MAX (2097151px once read as a
++ * length; 21845px of padding on screen) and developer.mozilla.org's
++ * page grid, padded with max(1rem, calc(50vw - 720px + 1rem)), went 0px
++ * wide. (`ux + uy` itself could overflow too.) A 64-bit intermediate is
++ * exact for any two int32 operands and needs no tricks; int64 add and
++ * subtract are fine on every target here, including CW8 (whose int64
++ * bug, below, is multiply-by-constant). */
+ static inline css_fixed
+ css_add_fixed(const css_fixed x, const css_fixed y) {
+-	int32_t ux = x;
+-	int32_t uy = y;
+-	int32_t res = ux + uy;
++	int64_t r = (int64_t)x + (int64_t)y;
+ 
+-	/* Calculate overflowed result. (Don't change the sign bit of ux)
+-	 *
+-	 * fixes1309 (#167, C0) - this branchless idiom needs ux>>31 to be
+-	 * an UNSIGNED (logical) shift, landing on 0 or 1 so the line below
+-	 * saturates to INT_MAX or INT_MIN respectively. `ux` is int32_t
+-	 * here, so `ux >> 31` on a negative operand is an ARITHMETIC
+-	 * (sign-extending) shift -- it lands on -1, not 1, making the
+-	 * saturation candidate INT_MAX-1 instead of INT_MIN. That flips
+-	 * the overflow test below into a false positive for a whole class
+-	 * of perfectly valid negative sums: confirmed directly,
+-	 * css_add_fixed(INTTOFIX(-609), INTTOFIX(0)) returned 2147483646
+-	 * instead of -623616 -- a real Facebook `margin-bottom:calc(-100vh
+-	 * + var(--header-height))` (real ~-609px) corrupted into +21845px,
+-	 * the exact hardware symptom this fix closes. Cast through
+-	 * uint32_t for the shift only; every other operation here still
+-	 * needs ux as signed for the XOR/OR overflow test that follows. */
+-	ux = (int32_t)((uint32_t)ux >> 31) + INT_MAX;
+-
+-	/* Force compiler to use cmovns instruction.
+-	 * Split to avoid CW8 internal compiler error on complex expression. */
+-	{
+-		int32_t temp_ice = (ux ^ uy) | ~(uy ^ res);
+-		if (temp_ice >= 0) {
+-			res = ux;
+-		}
+-	}
+-
+-	return res;
++	if (r > INT32_MAX)
++		return INT32_MAX;
++	if (r < INT32_MIN)
++		return INT32_MIN;
++	return (css_fixed)r;
+ }
+ 
+ static inline css_fixed
+ css_subtract_fixed(const css_fixed x, const css_fixed y) {
+-	int32_t ux = x;
+-	int32_t uy = y;
+-	int32_t res = ux - uy;
+-
+-	/* fixes1309 (#167, C0) - same unsigned-shift correction as
+-	 * css_add_fixed above, and the same class of bug: an
+-	 * ARITHMETIC shift here corrupts the INT_MIN saturation
+-	 * candidate for a negative x into INT_MAX-1, false-positiving
+-	 * the overflow test below on valid results. */
+-	ux = (int32_t)((uint32_t)ux >> 31) + INT_MAX;
+-
+-	/* Split to avoid CW8 internal compiler error. */
+-	{
+-		int32_t temp_ice = (ux ^ uy) & (ux ^ res);
+-		if (temp_ice < 0) {
+-			res = ux;
+-		}
+-	}
++	int64_t r = (int64_t)x - (int64_t)y;
+ 
+-	return res;
++	if (r > INT32_MAX)
++		return INT32_MAX;
++	if (r < INT32_MIN)
++		return INT32_MIN;
++	return (css_fixed)r;
+ }
+ 
+ #ifdef __MWERKS__
