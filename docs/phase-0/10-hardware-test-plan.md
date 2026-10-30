@@ -7182,3 +7182,22 @@ Scorecard google 54.8 -> 54.8 (identical to the r62-era run; the home
 page has no `<img>` SVGs and no relative q/t, so no 346 code path runs
 there -- the pixel diff vs the 18-day-old reference is trending-search
 drift).
+
+## State log 2026-10-30: r63 fresh scorecard (through patch 346)
+
+`score/r63-346-fresh`, fresh references, baseline r62-342-fresh. Mean
+**84.8** (r62 84.5) is the new baseline. github +2.0 (patch 345, About
+pane beside the file list), google +0.8, rte +1.0, wikipedia +6.4 (the
+r62 dip was the randomised campaign banner). The drops are hackernews
+-2.1, cnnlite -1.7, bbc -0.8 and wpblog -0.6. These are all live-content
+pages and none has been bisected yet; check them against a reused
+reference before treating them as regressions.
+
+claude.ai (77.6) notes for the next unit:
+- Its fonts are variable woff2 `@font-face` faces (anthropic-serif and
+  anthropic-sans), and web fonts are unsupported.
+- The Google button's fill is a child span at `rgba(0,0,0,0.05)`, drawn
+  at the 25% alpha bucket (#bfbfbf vs Chromium's ~#f2f2f2). This is a
+  live case for the open owner decision on low-alpha buckets.
+- The card corners are square under `border-radius: 32px 32px 28px 28px`
+  (per-corner). Not yet tested in the sim.
