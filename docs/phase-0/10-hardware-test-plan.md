@@ -7485,3 +7485,28 @@ cards. YouTube still lacks its icons, and its grey search box is the
 pending owner decision on low-alpha buckets.
 
 Full gate: `gate353.log`, exit 0.
+
+## Patch 354 (2026-10-30): YouTube's icons -- SVG arc flags without separators
+
+Every m.youtube.com icon was blank (header search, compass, mic, and the
+bottom-bar Home / Shorts / You). The icons are inline SVG with the right
+boxes; the paths drew nothing. YouTube minifies its path data so that an
+arc's flags run into the next number: `a9 9 0 105.641 16.01` is flags 1
+and 0, then x 5.641. The SVG grammar allows this, because the flags are
+single '0'/'1' characters. libsvgtiny parsed "105.641" as one number,
+the 7-parameter arc groups misaligned, and the path was dropped. The
+parser now reads arc parameters 4 and 5 as single flag characters. All
+YouTube icons draw (score 78.3 → 78.4: the icons are small).
+
+Found alongside, not fixed: the CSS `fill` inherited from a wrapper
+(`<div style="fill: red"><svg>...`) does not reach an inline SVG's
+unfilled paths; they draw black. YouTube's `fill: currentcolor` is near
+black, so it is invisible there. BBC's lead images never load in the
+sim (alt text only) -- separate, noted in the state file.
+
+Gate: CSS-svg-arc-flags (file:// snapshot, pixels as Chromium). Full
+fresh scorecard (`score/r74-354` vs r73, mean 84.3): the BBC and GitHub
+sim screens are pixel-identical to r73. BBC's −2.2 is a new lead image
+in Chrome's reference; other moves are live content.
+
+Full gate: `gate354.log`, exit 0.
