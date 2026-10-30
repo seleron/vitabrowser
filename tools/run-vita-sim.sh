@@ -220,6 +220,7 @@ CSS-svg-viewbox file:///app0:/testpages/CSS-svg-viewbox.html
 CSS-svg-smooth-quad file:///app0:/testpages/CSS-svg-smooth-quad.html
 CSS-bg-layers-svg file:///app0:/testpages/CSS-bg-layers-svg.html
 CSS-svg-arc-flags file:///app0:/testpages/CSS-svg-arc-flags.html
+CSS-img-webp file:///app0:/testpages/CSS-img-webp.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1132,6 +1133,14 @@ if [ -n "$a354s" ]; then
 		24,64 24,51 4,44 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-svg-arc-flags: ${a354px:-none} (255,0,0 255,0,0 255,255,255)"
+# Patch 355: WebP images decode (bbc.com story images).
+w355s=$(ls "$OUT"/snaps/N-*-CSS-img-webp.png 2>/dev/null | head -1)
+w355px=
+if [ -n "$w355s" ]; then
+	w355px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$w355s" \
+		10,60 30,60 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-img-webp: ${w355px:-none} (255,0,0 0,0,255)"
 # Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
 # same wave through the <img> path, no serializer rewrite.
 r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
@@ -1682,6 +1691,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$q344px" = "255,0,0 238,238,238 255,0,0 " ] && \
 [ "$b352px" = "153,153,153 255,255,255 153,153,153 255,255,255 255,255,255 " ] && \
 [ "$a354px" = "255,0,0 255,0,0 255,255,255 " ] && \
+[ "$w355px" = "255,0,0 0,0,255 " ] && \
 [ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \

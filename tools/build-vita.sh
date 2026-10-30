@@ -39,9 +39,9 @@
 #   -I compat ... decls.h       the same shim headers as the host build.
 #
 # Needs vdpm packages: expat (SVG), libvita2d (pulls freetype, libpng, libjpeg-turbo,
-# zlib, bzip2), libpcre2 and curl-mbedtls (pulls mbedtls, zstd). Install
-# without sudo:
-#   VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2 curl-mbedtls expat
+# zlib, bzip2), libpcre2, curl-mbedtls (pulls mbedtls, zstd) and libwebp
+# (patch 355: WebP images). Install without sudo:
+#   VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2 curl-mbedtls expat libwebp
 #
 # Usage: WORK=<WORK>/vitabrowser-work VITASDK=~/vitasdk tools/build-vita.sh
 set -e
@@ -72,6 +72,8 @@ GCC14="-Wno-error=implicit-function-declaration \
 	{ echo "no libvita2d: VDPM_NONINTERACTIVE=1 vdpm install libvita2d libpcre2"; exit 2; }
 [ -f "$VITASDK/arm-vita-eabi/include/pcre2posix.h" ] || \
 	{ echo "no libpcre2: VDPM_NONINTERACTIVE=1 vdpm install libpcre2"; exit 2; }
+[ -f "$VITASDK/arm-vita-eabi/include/webp/decode.h" ] || \
+	{ echo "no libwebp (patch 355): VDPM_NONINTERACTIVE=1 vdpm install libwebp"; exit 2; }
 grep -q 'mbedTLS\|mbedtls' "$VITASDK/arm-vita-eabi/lib/pkgconfig/libcurl.pc" 2>/dev/null || \
 	{ echo "no curl-mbedtls: VDPM_NONINTERACTIVE=1 vdpm install curl-mbedtls"; exit 2; }
 [ -f "$VITASDK/arm-vita-eabi/lib/libexpat.a" ] || \
