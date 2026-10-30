@@ -1,0 +1,56 @@
+# netsurf: display:inline children of flex and grid containers blockify (patch 333)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 332)
+#
+# CSS Display 3 2.7: a flex or grid item's display is blockified. The box
+# constructor blockified inline-block, inline-flex and inline-grid, but not
+# display:inline. A plain inline element that is a direct child of a flex
+# or grid container stayed BOX_INLINE inside an anonymous item. m.youtube's
+# <ytm-home-logo> (a custom element, inline by default) holds the logo
+# button: split around its block-level content, it collapsed to 1px and
+# the 93px logo drew 24px wide. The same root cause ignored width and
+# vertical margins on inline items, and it put consecutive inline items
+# (nav links) in one anonymous item, so `gap` never separated them.
+#
+#  - box_construct.c: BOX_INLINE becomes BOX_BLOCK when the containing
+#    block is a flex or grid container AND the element's parent node owns
+#    that box. containing_block skips inline ancestors, so without the
+#    parent check a span inside an inline em inside a flex row would be
+#    blockified too.
+#
+# Gate: CSS-flex-blockify (FLEXBLOCKIFY333, 6 legs: an inline item
+# holding a flex button, an inline item holding a block, link gaps, width
+# and vertical margin on an inline flex item, width on an inline grid
+# item). Chromium 6/6. Without this patch it reads 0/6.
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1511,6 +1511,29 @@
+ 				break;
+ 			}
+ 		}
++		/* VitaBrowser patch 333: display:inline blockifies too (CSS
++		 * Display 3 2.7) -- but only for a DIRECT child of the flex or
++		 * grid container: containing_block skips inline ancestors, so
++		 * a span inside an inline em inside a flex row also sees the
++		 * row. Unblockified, an inline item holding block-level content
++		 * (YouTube's <ytm-home-logo> around its logo button) split
++		 * around its blocks and collapsed to 1px, width and vertical
++		 * margins on inline items were ignored, and consecutive inline
++		 * items shared one anonymous item (no gap between links). */
++		if (box->type == BOX_INLINE &&
++		    (props.containing_block->type == BOX_FLEX ||
++		     props.containing_block->type == BOX_INLINE_FLEX ||
++		     props.containing_block->type == BOX_GRID ||
++		     props.containing_block->type == BOX_INLINE_GRID)) {
++			dom_node *pn = NULL;
++
++			if (dom_node_get_parent_node(ctx->n, &pn) ==
++					DOM_NO_ERR && pn != NULL) {
++				if (box_for_node(pn) == props.containing_block)
++					box->type = BOX_BLOCK;
++				dom_node_unref(pn);
++			}
++		}
+ 	}
+ 
+ 	if (convert_special_elements(ctx->n,
