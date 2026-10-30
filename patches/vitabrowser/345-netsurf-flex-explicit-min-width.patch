@@ -1,0 +1,86 @@
+# netsurf: an explicit min-width turns off a flex item's automatic minimum (patch 345, with 345-libcss)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 344, with 345-libcss)
+#
+# CSS Flexbox 4.5: the automatic minimum size (min-content) exists only
+# for `min-width: auto`. layout_flex.c applied the min-content floor in
+# three places (base size, violations, used width) whatever the item's
+# min-width was. `min-width: 0`, the usual way to let a flex item shrink
+# below its content, did nothing. GitHub's repo column is `flex: 1 1 0;
+# width: 100%; min-width: 1px` with long nowrap file rows: it kept its
+# whole min-content, filled the wrapping row, and the About sidebar
+# wrapped below the file list.
+#
+#  - layout_flex.c: in a row, when css_computed_min_width_is_auto()
+#    (345-libcss) is false, the content minimum is not used as a floor.
+#    min_main carries the explicit value as before.
+#  - The fixes176 fallback replaced any base size <= 0 with the item's
+#    intrinsic size, including a definite `flex-basis: 0`, so `flex: 1 1
+#    0` behaved like `flex: 1 1 auto`. A definite zero basis now stays 0.
+#    AUTO bases, and a percentage basis against an unknown container,
+#    still fall back.
+#
+# Gate: CSS-flex-min-width-explicit (FLEXMINW345 3/3, Chromium 3/3):
+# min-width 1px and 0 share the line (696 / pane at 696), and min-width
+# auto keeps the content minimum and wraps. Before the patch legs 1-2
+# wrapped.
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -603,6 +603,15 @@
+ 			content_min_width = spec_main_px;
+ 		}
+ 	}
++	/* VitaBrowser patch 345: the automatic minimum exists only for
++	 * min-width: auto. An explicit min-width -- even 0, the usual way
++	 * to let a flex item shrink below its content (GitHub's
++	 * `flex: 1 1 0; min-width: 1px` repo column) -- turns the
++	 * min-content floor off; min_main carries the explicit value. */
++	if (ctx->horizontal && b->style != NULL &&
++			!css_computed_min_width_is_auto(b->style)) {
++		content_min_width = 0;
++	}
+ 	/* VitaBrowser patch 331: ... and further clamped by a definite max
+ 	 * main size (Flexbox 4.5). The floor below compares outer sizes. */
+ 	if (ctx->horizontal && item->max_main > 0 &&
+@@ -701,7 +710,16 @@
+ 	 * real max-content intrinsic width; use it before the outer
+ 	 * delta is added. Only fires when the current base_size is
+ 	 * non-positive so the spec path is preserved when it works. */
+-	if (item->base_size == AUTO || item->base_size <= 0) {
++	/* VitaBrowser patch 345: a DEFINITE flex-basis of 0 (`flex: 1 1 0`)
++	 * is a real 0, not a missing size -- falling back to the intrinsic
++	 * size made it the item's whole max-content (GitHub's repo column
++	 * then filled its wrapping row). A percentage basis against an
++	 * unknown container still falls back. */
++	if ((item->base_size == AUTO || item->base_size <= 0) &&
++			!(item->basis == CSS_FLEX_BASIS_SET &&
++			  item->base_size == 0 &&
++			  (item->basis_unit != CSS_UNIT_PCT ||
++			   available_width > 0))) {
+ 		int intrinsic = flex_item_intrinsic_main_size(b,
+ 				ctx->horizontal);
+ 		if (intrinsic > 0) {
+@@ -1179,7 +1197,10 @@
+ 					item->min_main);
+ 		}
+ 
+-		if (target_main_size < item->box->min_width) {
++		if (target_main_size < item->box->min_width &&
++				!(ctx->horizontal && item->box->style != NULL &&
++				  !css_computed_min_width_is_auto(
++						item->box->style))) {	/* 345 */
+ 			/* fixes614 -- CSS Flexbox 4.5 automatic minimum size.
+ 			 * The content-based minimum (box->min_width, the item's
+ 			 * min-content width) must be capped by the item's
+@@ -1634,7 +1655,10 @@
+ 			}
+ 			b->width = tgt - delta;
+ 			if (b->min_width != AUTO && b->min_width > 0 &&
+-					b->min_width != UNKNOWN_WIDTH) {
++					b->min_width != UNKNOWN_WIDTH &&
++					!(ctx->horizontal && b->style != NULL &&
++					  !css_computed_min_width_is_auto(
++						b->style))) {	/* 345 */
+ 				floor_w = b->min_width - delta;
+ 				/* VitaBrowser patch 331: the automatic minimum
+ 				 * is capped by a definite max-width (Flexbox
