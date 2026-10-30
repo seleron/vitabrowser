@@ -1,0 +1,116 @@
+# netsurf: a flex item's automatic minimum is capped by its max-width (patch 331)
+# Generated 2026-10-30
+# Base: seleron/vitabrowser (patch stack through 330)
+#
+# CSS Flexbox 4.5: a flex item's automatic minimum size (min-width: auto)
+# is its content size suggestion (min-content), capped by its specified
+# size suggestion and further clamped by a definite max main size.
+# layout_flex__get_min_max_violations() applied the first cap (fixes614)
+# but not the max one. A nowrap item's whole line overrode its own
+# max-width, and the overflow squeezed its siblings. On wordpress.org/news
+# the post list (`max-width: 75vw`) kept its title line and pushed the
+# "Latest posts" heading below its min-width, so the column border sat at
+# 346px rather than 410px.
+#
+#  - layout_flex.c, the automatic minimum is capped by a definite
+#    max-width at all three places that apply it: the base-size floor
+#    (content_min_width), the violation step (auto_min) and the used-width
+#    floor (fixes623). An explicit min-width still beats max-width.
+#  - layout_flex__get_min_max_violations() compared an OUTER target main
+#    size (the used width is target - delta) with the content-box
+#    min_main/max_main. A padded item could shrink below its min-width,
+#    and a max-width allowed the padding through. In a row, the limits now
+#    get delta_outer_main added, as the hypothetical main size step
+#    already does. On wordpress.org the "Latest posts" heading (min-width
+#    358px border-box, 160px padding, 53px margin) shrank to 295px.
+#    Column containers keep the old comparison (not verified there).
+#
+# Gate: CSS-flex-auto-min-max (FLEXAUTOMIN331, 5 legs: max-width and a
+# vw max-width cap the automatic minimum; without max-width the line keeps
+# its min-content; min-width beats max-width; a padded, margined item keeps
+# its min-width). Without this patch it reads 1/4 of the first four.
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -603,6 +603,12 @@
+ 			content_min_width = spec_main_px;
+ 		}
+ 	}
++	/* VitaBrowser patch 331: ... and further clamped by a definite max
++	 * main size (Flexbox 4.5). The floor below compares outer sizes. */
++	if (ctx->horizontal && item->max_main > 0 &&
++			content_min_width > item->max_main + delta_outer_main) {
++		content_min_width = item->max_main + delta_outer_main;
++	}
+ 
+ 	if (item->basis == CSS_FLEX_BASIS_SET) {
+ 		if (item->basis_unit == CSS_UNIT_PCT) {
+@@ -1122,6 +1128,18 @@
+ 	for (i = line->first; i < item_count; i++) {
+ 		struct flex_item_data *item = &ctx->item.data[i];
+ 		int target_main_size = item->target_main_size;
++		/* VitaBrowser patch 331: target_main_size is an OUTER size
++		 * (the used width is target - delta), min_main/max_main are
++		 * content-box sizes: in a row, compare like with like, as the
++		 * hypothetical main size step does. Columns keep the old
++		 * comparison (unverified there). */
++		int delta = 0;
++
++		if (ctx->horizontal) {
++			delta = lh__delta_outer_main(ctx->flex, item->box);
++			if (delta < 0 || delta > FLEX_SAFE_MAX)
++				delta = 0;
++		}
+ 
+ 		NSLOG(flex, DEEPDEBUG, "item %p: target_main_size: %i",
+ 					item->box, target_main_size);
+@@ -1147,15 +1165,15 @@
+ #endif
+ 
+ 		if (item->max_main > 0 &&
+-		    target_main_size > item->max_main) {
+-			target_main_size = item->max_main;
++		    target_main_size > item->max_main + delta) {
++			target_main_size = item->max_main + delta;
+ 			item->max_violation = true;
+ 			NSLOG(flex, DEEPDEBUG, "Violation: max_main: %i",
+ 					item->max_main);
+ 		}
+ 
+-		if (target_main_size < item->min_main) {
+-			target_main_size = item->min_main;
++		if (target_main_size < item->min_main + delta) {
++			target_main_size = item->min_main + delta;
+ 			item->min_violation = true;
+ 			NSLOG(flex, DEEPDEBUG, "Violation: min_main: %i",
+ 					item->min_main);
+@@ -1182,6 +1200,15 @@
+ 					auto_min > item->base_size) {
+ 				auto_min = item->base_size;
+ 			}
++			/* VitaBrowser patch 331: Flexbox 4.5 -- the content
++			 * size suggestion is further clamped by a definite
++			 * max main size. Uncapped, a nowrap item's min-content
++			 * (a title line) overrode its own max-width:75vw and
++			 * squeezed its siblings (wordpress.org/news). */
++			if (ctx->horizontal && item->max_main > 0 &&
++					auto_min > item->max_main + delta) {
++				auto_min = item->max_main + delta;
++			}
+ 			if (target_main_size < auto_min) {
+ 				target_main_size = auto_min;
+ 				item->min_violation = true;
+@@ -1609,6 +1636,14 @@
+ 			if (b->min_width != AUTO && b->min_width > 0 &&
+ 					b->min_width != UNKNOWN_WIDTH) {
+ 				floor_w = b->min_width - delta;
++				/* VitaBrowser patch 331: the automatic minimum
++				 * is capped by a definite max-width (Flexbox
++				 * 4.5), as the base size and violation steps
++				 * now cap it. */
++				if (ctx->horizontal && item->max_main > 0 &&
++						floor_w > item->max_main) {
++					floor_w = item->max_main;
++				}
+ 				if (b->width < floor_w) {
+ 					b->width = floor_w;
+ 				}
