@@ -7333,3 +7333,27 @@ were identical. r67b (mean 84.2) is the new full baseline, the first
 taken with BBC's overlays blocked.
 
 Full gate: `gate349.log`, exit 0.
+
+## Patch 348 (2026-10-30): grid placement in style="" and element.style
+
+Inline grid placement never worked, the gap fixes817e/fixes831 noted.
+The placement rewriter emits its packed `-macsurf-grid-col-span` at a
+block's `}`, and an inline style has no braces. So `style="grid-column:
+1 / span 2"`, common in React and other framework markup, left the item
+in one column. The inline rewrite now wraps the attribute text in a
+block, runs the same rewriter and unwraps it. With 347's axes mask, an
+inline `grid-row:` keeps a class's `grid-column:`.
+
+Separately, `el.style.gridColumn = ...` was a plain JS property. The
+element style object defines setters only for a fixed list of camelCase
+names, and no grid names were on it. The grid placement and template
+names, the gaps, `order`, and the self/items alignments were added
+(`setProperty('grid-column', ...)` already worked).
+
+Gate: CSS-grid-inline-placement (GRIDINL348 8/8, Chromium 8/8). The
+CSSOM and shape pages are unchanged (JS-builtin-shape 8/8, JS-cssom 8/8,
+JS-cssom-190 2/2, document/node shape 6/6). Follow-up: other camelCase
+style names missing from that list (flexGrow, flexBasis, ...) have the
+same bug; a catch-all would need a Proxy on a hot object.
+
+Full gate: `gate348p.log`, exit 0.
