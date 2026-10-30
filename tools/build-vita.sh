@@ -102,9 +102,16 @@ if "$VITASDK/bin/arm-vita-eabi-nm" "$VP/lib/libparserutils.a" | grep -q " U icon
 fi
 
 echo "== support libraries (arm-vita-eabi) =="
+# libsvgtiny is staged (patch 346): the Vita build picks up the PATCHED
+# copy from $UP (the same one the host build uses).
 export CFLAGS="$GCC14"
 for l in $SUPPORT; do
-	( cd "$WORK/upstream/$l" && make install HOST=arm-vita-eabi PREFIX="$VP" \
+	if [ "$l" = libsvgtiny ]; then
+		src="$UP/$l"
+	else
+		src="$WORK/upstream/$l"
+	fi
+	( cd "$src" && make install HOST=arm-vita-eabi PREFIX="$VP" \
 	    PKG_CONFIG_PATH="$VP/lib/pkgconfig" \
 	    > "$WORK/applytest/vita-build-$l.log" 2>&1 ) \
 	  && echo "  $l ok" || { echo "  $l FAILED"; \

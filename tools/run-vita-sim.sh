@@ -218,6 +218,7 @@ CSS-opacity-image file:///app0:/testpages/CSS-opacity-image.html
 CSS-isolation file:///app0:/testpages/CSS-isolation.html
 CSS-svg-viewbox file:///app0:/testpages/CSS-svg-viewbox.html
 CSS-svg-smooth-quad file:///app0:/testpages/CSS-svg-smooth-quad.html
+CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
 CSS-intrinsic file:///app0:/testpages/CSS-intrinsic-width.html
@@ -1080,6 +1081,18 @@ if [ -n "$q344s" ]; then
 		72,72 72,46 24,50 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-svg-smooth-quad: ${q344px:-none} (255,0,0 238,238,238 255,0,0)"
+# Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
+# same wave through the <img> path, no serializer rewrite.
+r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
+r346px=
+if [ -n "$r346s" ]; then
+	r346px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$r346s" \
+		72,72 72,46 24,50 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+r346p=$(ls "$R"/*-CSS-svg-reltq.plot 2>/dev/null | head -1)
+r346n=$(grep -c '^PLOT PATH' "$r346p" 2>/dev/null || true)
+r346o=$(grep -c '^PLOT PATH .* OPAQUE' "$r346p" 2>/dev/null || true)
+echo "  css-svg-reltq: dip/hump/background ${r346px:-none} (255,0,0 238,238,238 255,0,0), ${r346n:-0} paths drawn (>=1), ${r346o:-0} OPAQUE (0)"
 # Patch 221: the space after inline-blocks / replaced boxes.
 i221p=$(ls "$R"/*NET-css-inline-block-space.plot 2>/dev/null | head -1)
 i221r=$(sed -n 's/.*STR \(IBSPACE221: [0-9]*\/[0-9]* passed\).*/\1/p' "$i221p" 2>/dev/null | head -1)
@@ -1611,6 +1624,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$i332px" = "0,0,0 255,255,255 " ] && \
 [ "$v343px" = "255,0,0 238,238,238 255,0,0 255,0,0 238,238,238 " ] && \
 [ "$q344px" = "255,0,0 238,238,238 255,0,0 " ] && \
+[ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
 [ "$r223r" = "RANGECOL223: 4/4 passed" ] && \

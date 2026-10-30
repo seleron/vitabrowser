@@ -96,7 +96,7 @@ for p in $(ls "$ROOT"/patches/vitabrowser/*.patch | sort -V); do
 	# were once named NN-vita-* / NN-xhr-*, and every restage dropped them
 	# silently (build-patched.sh shows only this script's last lines).
 	[ -d "$tree" ] || { echo "FAIL vitabrowser/$base: no '$lib' tree" \
-		"(name it NN-<libwapcaplet|libparserutils|libhubbub|libcss|libdom|netsurf>-what.patch)"; \
+		"(name it NN-<libwapcaplet|libparserutils|libhubbub|libcss|libdom|netsurf|libsvgtiny>-what.patch)"; \
 		bad=$((bad + 1)); continue; }
 	if apply_patch "$tree" -p1 "$p" > /tmp/patchlog.$$ 2>&1; then
 		ok=$((ok + 1))

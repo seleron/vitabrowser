@@ -48,7 +48,7 @@ SUPPORT="libnsutils libutf8proc libnsgif libnsbmp libnspsl libsvgtiny nsgenbind"
 # diffs MacSurf against their working files, and staging copies them. A tree
 # patched in place (doc 11 §37) regenerates a gutted stack and stages stale
 # files, silently. Refuse instead.
-for l in $LIBS netsurf; do
+for l in $LIBS netsurf libsvgtiny; do
 	if [ -n "$(git -C "$WORK/upstream/$l" status --porcelain 2>/dev/null)" ]; then
 		echo "build-patched.sh: $WORK/upstream/$l is not pristine" \
 		     "($(git -C "$WORK/upstream/$l" status --porcelain | wc -l) changed/untracked" \
@@ -71,7 +71,9 @@ fi
 echo "== staging clean upstream trees =="
 rm -rf "$WORK/applytest/upstream"
 mkdir -p "$WORK/applytest/upstream"
-for l in $LIBS netsurf; do
+# libsvgtiny is staged too (patch 346): its path bugs are fixed in the
+# staged copy, which is what the support build picks up below.
+for l in $LIBS netsurf libsvgtiny; do
 	cp -r "$WORK/upstream/$l" "$WORK/applytest/upstream/$l"
 	# The pristine trees are checked clean above; resetting the staged copy
 	# to HEAD as well is belt and braces (git apply, used by
@@ -117,9 +119,18 @@ for l in $LIBS; do
 done
 
 echo "== building support libraries =="
+# libsvgtiny is staged (patch 346): build the PATCHED copy, not the
+# pristine upstream tree.
 unset CFLAGS
 for l in $SUPPORT; do
-	( cd "$WORK/upstream/$l" && make install PREFIX="$P" >/dev/null 2>&1 ) || true
+	if [ "$l" = libsvgtiny ]; then
+		src="$WORK/applytest/upstream/$l"
+	else
+		src="$WORK/upstream/$l"
+	fi
+	( cd "$src" && make install PREFIX="$P" > "$WORK/applytest/build-$l.log" 2>&1 ) \
+		&& echo "  $l ok" || { echo "  $l FAILED"; \
+		   grep -m2 'error:' "$WORK/applytest/build-$l.log"; exit 1; }
 done
 
 echo "== building netsurf + nsmonkey =="
