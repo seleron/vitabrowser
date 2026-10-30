@@ -7411,3 +7411,21 @@ characters, and the 13 missing words sit at the end of Chrome's window.
 Other moves are within the known noise: wikipedia +3.4 (carousel
 residual), hackernews +2.1 (live list), ddglite +1.1, claude +1.2. r70 is
 the baseline for the next units.
+
+## Patch 351 (2026-10-30): element.style setters for every supported property
+
+element.style defined camelCase setters only for a fixed list, plus the
+grid names from 348/350. `el.style.flexGrow = 1`, `.textTransform`,
+`.letterSpacing` and the rest were plain JS properties that never
+reached the style attribute. The remaining 46 names of CSS.supports'
+list now join 350's shared accessors on CSSStyleDeclaration.prototype.
+They are defined once, so they cost nothing per element, and because
+they come from CSS.supports, feature detection stays consistent with
+what the engine claims. Following the rule from 348, a full fresh
+scorecard ran before the gate (`score/r71-351` vs r70): mean 84.4 →
+**84.7**, guardian unchanged at 80.8, rte +2.0, cnnlite +1.3, nothing
+down beyond ddglite's usual ±1.
+
+Gate: JS-style-setters (STYLESET351 6/6, Chromium 6/6).
+
+Full gate: `gate351.log`, exit 0.
