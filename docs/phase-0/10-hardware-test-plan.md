@@ -8272,3 +8272,95 @@ whose node has left the document.
 
 Left of WS-C's script-change list: a class change on a `<td>`'s own box,
 with whole-table scope.
+
+## Patch 369 (2026-11-01): a class change on a table cell's own box rebuilds its table alone
+
+The last WS-C script change still on the full rebuild: a class change on
+a `<td>`'s own box. Re-measured on the 2500-paragraph sim page
+(`ST-367.html`, `setTimeout(0)` heartbeat, median of 3, host sim): 98 ms
+with the current tree, 93-94 ms with the 368 binary ("class change on an
+element with a non-inline, non-block box").
+
+**Scope, worked out first.** A cell's box carries what table
+normalisation and the table layout work out from every cell: its start
+column, its used borders in `border-collapse` (from its neighbours,
+table.c), and the table's column types (from every cell's style,
+computed at layout time, layout.c 488). Restyling the cell alone would
+leave its neighbours' shared borders and the column types stale. The
+whole table is the honest invalidation scope -- and still far less than
+the page.
+
+The change:
+- html.c: `html_rl_table_restyle()` climbs cell -> row -> row group ->
+  table, requiring a real `<table>` element whose box sits in a block or
+  a cell (nested tables included). It takes the table's box out, resets
+  the cascade over the table's subtree, builds the `<table>` element
+  again, puts the new box back where the old one was, normalises it as a
+  full build normalises a table child, and lays the page out once
+  ("table restyled, full layout (a cell's own class)"). A failure
+  part-way leaves the full reconvert to rebuild from the DOM, as the
+  block restyle (174) does.
+- Declined: a table holding objects, controls, frames or list markers
+  (they would need unwinding); a page whose CSS mentions counters (a
+  class on the cell could change a counter read outside the table).
+- `:has()` is not a reach out of the table in this engine: libcss parses
+  it and never matches it (patch 328, `selector_never_matches_part`), so
+  a full build applies no such rule either. A first cut declined on it
+  through patch 186's scan, which only sees `:has()` inside
+  sibling-combinator rules; dropped, with a comment that this must
+  decline on `:has()` if its matching is ever added.
+- box_normalise.c/h: `box_normalise_table_ext()`, an export of the static
+  `box_normalise_table`.
+
+Result: **94 -> 17 ms**.
+
+Gate: JS-table-cell-class runs nine steps 250 ms apart:
+- a width class on a cell (its column widens);
+- a thick border in border-collapse (the neighbours' shared borders);
+- a header's font size;
+- a colspan cell's padding;
+- a class removed;
+- a cell of a nested table;
+- a class that a `td.hl + td` sibling selector reads;
+- `::before` content -- not drawn on cells by a full build either, an
+  existing limitation;
+- a cell of a border-spacing table.
+
+It renders row for row as CSS-table-cell-class-ref, the same steps run
+while the page parses. Every intermediate state was checked the same way
+against a parse-time build (0 rows each). So were three variants
+(scratch): a page with `div:has(td.hl)` (restyled locally, 0 rows), one
+with counters, and a table holding an image (both decline, 0 rows). The
+engine log shows 20 cell class changes restyled with their table across
+the whole gate, 5 or more required -- JS-remove-controls' two cell steps
+now take this path too, still 0 rows; the 368 binary prints none. Full
+gate `gate369.log`, exit 0 (all 364-368 fast-path checks unchanged).
+Seen, not new: CSS-sibling-class prints "no summary" in every gate back
+to at least gate340 (an informational line), its precise-decline count
+moving 2-3 between runs.
+
+Scorecard r94: 21 sites against `r79-360`, 369 and the 368 binary back to
+back (`score/r94-369`, `score/r94-pre369`): **74.65 vs 74.64**. The path
+fired 0 times in the site loads; the movers are live text (hackernews
++0.1, stackoverflow +0.2). No crash and no Cloudflare interstitial.
+
+**WS-C's script-change list is exhausted.** Every item measured in 364
+and since now costs 17-23 ms on the 2500-paragraph page, against
+88-290 ms before:
+
+| change | before | now | patch |
+|---|---|---|---|
+| a block holding an image / a control inserted | 228 / 287 ms | 22 ms | 364 |
+| a float inserted among blocks | 220-270 ms (and misplaced) | 21 ms | 365 |
+| a table cell's text | 270 ms | 23 ms | 366 |
+| content beside a float in a cell | 91-97 ms | 18 ms | 367 |
+| a block holding a control removed | 88-106 ms | 18 ms | 368 |
+| a class on a cell's own box | 93-98 ms | 17 ms | 369 |
+
+None of these fired in a scorecard page load (r89-r94): they are
+interaction-time costs. What still takes the full rebuild, by decline
+reason, is in the census method of 362/364 (`BATCHCAUSE` and
+`rebuild local: declined (...)` in the scorecard sims'
+netsurf.log). The next unit should be picked from a fresh measured batch
+of that census -- the r88 census put `<head>`/`<script>` churn on top,
+shelved as 362 -- or from another workstream.
