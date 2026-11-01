@@ -7857,3 +7857,78 @@ to parse those pseudo-classes). An appended unrendered element changes
 no sibling-combinator match for rendered elements (it is the rightmost
 sibling), so that part is free. This overlaps doc 23's rule-diff
 design; settle it there first.
+
+## Patch 363 (2026-11-01): rounded corners -- four corner radii in libcss, drawn rounded
+
+Briefed as "shorthand expansion" with three recorded leads (`background:`
+with `/ size`, `gap: calc()`, 2-value logical shorthands). None appears
+in the r86-361 census any more. The shorthand-family gap that does --
+the corner-radius longhands, dropped as unknown properties on 17 of 21
+sites (claude 83 declarations, oldreddit 56, youtube 51, github 33) --
+turned out to be invisible on its own: **the Vita had never drawn a
+rounded corner.** `plot_style.border_radius` was set in redraw.c and
+read by no plotter, so even `border-radius: 20px` and `50%` drew square
+(earlier entries called this "by design"; it was the standing
+limitation, not a decision). With the owner's go-ahead the unit took
+rounded corners end to end.
+
+**libcss.** `border-{top,bottom}-{left,right}-radius` (0x0ae-0x0b1):
+`<length-percentage>{1,2}`, not inherited, initial 0, stored per corner
+as horizontal and vertical length + unit beside 358's stroke fields;
+`css_computed_border_corner_radius()` reads one. `border-radius` is now
+their shorthand (`{1,4} [ / {1,4} ]`, filled out as margin's is; it used
+to keep one length and drop any second value as junk).
+`css_computed_border_radius()` reads the top-left corner for older
+callers. Aliases: `-webkit-border-radius`, `-moz-border-radius`,
+`-webkit-border-{corner}-radius`, and the logical corners
+(`border-start-start-radius` ...) placed as horizontal-tb
+left-to-right. `var()` comes through the existing deferral. Not
+covered: `calc()` in a corner (about 6 declarations in the census).
+
+**Drawing (redraw.c, redraw_border.c).** The four corners resolve to
+device px (a percentage of the border box's width or height) and shrink
+together where they overlap (CSS backgrounds 5.5). A box's own solid
+background colour fills a rounded path; a border whose drawn sides are
+all solid and one colour is one ring (two subpaths, the inner one wound
+the other way), with the colour's alpha and the group opacity folded as
+the square painter folds them. Both go through `ctx->plot->path`, so the
+Vita fills them with the antialiased filler of patch 359 and its
+frame-pool fallback. A border of mixed colours or styles keeps the
+square painter, and so does that box's background, so a square border
+never shows rounded wedges inside it. getComputedStyle answers the four
+corners (`"H"` or `"H V"`) and `borderRadius` as their shorthand, and
+CSS.supports knows the corner and logical names.
+
+Still square: background images and gradients, inline boxes'
+backgrounds, box-shadow, and overflow clipping of children (an `<img>`
+with `border-radius: 50%` stays a square photo), and mixed borders.
+**Device cost not yet measured**: one path per rounded box per frame;
+watch frame times on claude.ai / youtube in the next run.
+
+**Build note:** libcss's public headers changed (`CSS_N_PROPERTIES`),
+so netsurf needs a clean build: both build trees were moved aside
+(`~/vitabrowser-work/Linux-vita.pre363`, `Linux-vita-sim.pre363`).
+libcss was rebuilt and installed into `applytest/prefix` by hand
+(`make install` in the staged tree, the CFLAGS of build-patched.sh),
+since build-patched.sh re-stages and would wipe the work tree.
+
+Gate: CSS-border-radius (file:// snapshot, 13 pixels: a uniform radius,
+`20px 20px 0 0`, a solid ring, a mixed border kept square, logical
+corners, a translucent ring). Before the patch every corner pixel read
+the box colour. Two older checks encoded square drawing and now read
+the rounded form: CSS-shadow's b2 (a 50% border on a rounded box) is one
+ring path at bucket 2 with no square bands, and CSS-spacing's
+radius+bottom box (patch 107) is counted by its 11x36 path clip. The
+first two runs failed on exactly those (`gate363.log`, `gate363b.log`);
+full gate `gate363c.log`, exit 0.
+
+Scorecard: all 21 sites against the `r79-360` reference, 363 and the
+pre-363 binary back to back (`score/r88-363`, `score/r88-pre363`): mean
+**74.40 vs 74.39**, visual mean 0.5657 in both -- the scorecard's
+downscaled visual comparison does not see corner shapes. The parse
+census shows the change: dropped radius declarations **317 -> 3**.
+guardian read 36.3 once (an empty innerText dump; reruns 66.0 / 66.0
+against 66.6 / 66.6). Its consent dialog sits 8 px left in some runs:
+a pre-existing timing race in the Sourcepoint iframe (the pre-361 binary
+shifts in 2 of 4 runs too), not this patch. github's Done s is bimodal
+(9 or 13 s) across every binary since r85.
