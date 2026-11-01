@@ -101,6 +101,12 @@ void *vita2d_pool_memalign(unsigned int size, unsigned int align)
 	return pool + at;
 }
 void vita2d_pool_reset(void) { pool_used = 0; }
+/* Patch 359: the pool this test has is far below the path plotter's
+ * reserve, so antialiased path edges take their pool-short fallback. */
+unsigned int vita2d_pool_free_space(void)
+{
+	return (unsigned int)(sizeof(pool) - pool_used);
+}
 void vita2d_draw_line(float x0, float y0, float x1, float y1, unsigned int c)
 {
 	vlogf("line %g %g %g %g #%08x", x0, y0, x1, y1, c);

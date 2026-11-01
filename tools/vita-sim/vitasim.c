@@ -90,7 +90,15 @@ static unsigned char pool[8 << 20];
 static size_t pool_used;
 
 int vita2d_init(void) { return 0; }
-int vita2d_init_advanced(unsigned int size) { (void)size; return 0; }
+/* Patch 359: the size the frontend asked for (VITA_FRAME_POOL), so
+ * vita2d_pool_free_space() answers as the device's pool would. */
+static size_t pool_limit = sizeof(pool);
+int vita2d_init_advanced(unsigned int size)
+{
+	if (size > 0 && size < sizeof(pool))
+		pool_limit = size;
+	return 0;
+}
 int vita2d_fini(void) { return 0; }
 void vita2d_wait_rendering_done(void) { }
 void vita2d_set_vblank_wait(int e) { (void)e; }
@@ -127,6 +135,11 @@ void *vita2d_pool_memalign(unsigned int size, unsigned int align)
 	return pool + at;
 }
 void vita2d_pool_reset(void) { pool_used = 0; }
+unsigned int vita2d_pool_free_space(void)
+{
+	return pool_used >= pool_limit ? 0 :
+		(unsigned int)(pool_limit - pool_used);
+}
 
 void vita2d_draw_rectangle(float x, float y, float w, float h, unsigned int c)
 {
@@ -229,22 +242,36 @@ static void fill_triangle(const vita2d_color_vertex *a,
 			  const vita2d_color_vertex *c)
 {
 	float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
-	int minx = first_px(fminf(a->x, fminf(b->x, c->x)));
-	int maxx = first_px(fmaxf(a->x, fmaxf(b->x, c->x)));
-	int miny = first_px(fminf(a->y, fminf(b->y, c->y)));
-	int maxy = first_px(fmaxf(a->y, fmaxf(b->y, c->y)));
-	int i, j;
+	int minx, maxx, miny, maxy, i, j, bc, ca, ab;
 
 	if (area == 0)
 		return;
+	/* Patch 359: the GPU's top-left rule, as textured_triangle has it.
+	 * Every edge used to be inclusive, so a pixel centre on an edge two
+	 * triangles share was blended by both: a translucent 1x1 quad (the
+	 * antialiased path edges) has its centre on its own diagonal and came
+	 * out at double alpha. The Vita draws it once. */
+	if (area < 0) {
+		const vita2d_color_vertex *tmp = b;
+		b = c;
+		c = tmp;
+	}
+	minx = first_px(fminf(a->x, fminf(b->x, c->x)));
+	maxx = first_px(fmaxf(a->x, fmaxf(b->x, c->x)));
+	miny = first_px(fminf(a->y, fminf(b->y, c->y)));
+	maxy = first_px(fmaxf(a->y, fmaxf(b->y, c->y)));
+	bc = top_left(b->x, b->y, c->x, c->y);
+	ca = top_left(c->x, c->y, a->x, a->y);
+	ab = top_left(a->x, a->y, b->x, b->y);
 	for (j = miny; j < maxy; j++) {
 		for (i = minx; i < maxx; i++) {
 			float px = i + 0.5f, py = j + 0.5f;
 			float w0 = edge(b->x, b->y, c->x, c->y, px, py);
 			float w1 = edge(c->x, c->y, a->x, a->y, px, py);
 			float w2 = edge(a->x, a->y, b->x, b->y, px, py);
-			if (area < 0) { w0 = -w0; w1 = -w1; w2 = -w2; }
-			if (w0 >= 0 && w1 >= 0 && w2 >= 0)
+			if ((w0 > 0 || (w0 == 0 && bc)) &&
+			    (w1 > 0 || (w1 == 0 && ca)) &&
+			    (w2 > 0 || (w2 == 0 && ab)))
 				blend(i, j, a->color, 255);
 		}
 	}

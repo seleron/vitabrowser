@@ -1,0 +1,462 @@
+# netsurf: antialiased SVG path fills (patch 359)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 358)
+#
+# Path fills were centre-sampled: a pixel drew if its centre was inside
+# the shape. Thin shapes -- a 1.5px icon ring, a diagonal at a shallow
+# angle -- broke into pixel crumbs, and a 1px bar straddling two columns
+# came out one column solid and one empty. Browsers antialias; the Vita
+# can (text and rectangles already do).
+#
+#  - pathfill.c/h: polyfill_aa(), the coverage form of polyfill(). Same
+#    shape, rule and clip, but each row reports how much of every pixel
+#    the shape covers (0..255 per pixel). Coverage is sampled on
+#    POLYFILL_AA_SS=4 sub-scanlines per row, each crossing exactly in x
+#    (the canvas rasteriser's method). Rows are reported top to bottom,
+#    trimmed to their covered pixels.
+#  - plot.c: path fills now use polyfill_aa(). Fully covered runs go
+#    through the existing span merger; partial-coverage edge pixels are
+#    batched into ONE triangle-list draw per path, the fill colour at
+#    that pixel's share of its alpha. Vertices come from vita2d's
+#    per-frame pool (VITA_FRAME_POOL, 4 MB), shared with text and
+#    rectangles: a path whose edge pixels would leave less than 1 MiB of
+#    the pool, that has more than 4096 edge quads, or whose pool
+#    allocation fails, falls back to the old centre-sampled look (solid
+#    where at least half covered). An allocation failure part-way keeps
+#    the rows already made, so no pixel blends twice.
+#  - tools: vita2d_pool_free_space() in the sim and plotter stub (the
+#    pool answers as the device's 4 MB would, at the size the frontend
+#    asked for). Gate line: CSS-svg-aa (file:// snapshot -- a half-
+#    covered diagonal pixel and a 1px bar straddling two columns read
+#    127 grey, as background and inline SVG).
+#
+# The sim's fill_triangle also got the GPU's top-left rule (it used to
+# include every edge, so a pixel centre on an edge two triangles share
+# blended twice -- a translucent 1x1 quad, the AA edge, came out at
+# double alpha).
+#
+# Gate: CSS-svg-aa pixels exact (0,0,0 255,255,255 127,127,127 x5);
+# full gate359d exit 0. Scorecard: r84-359-freshref (guardian, bbc,
+# hackernews, stackoverflow, rte, fresh Chrome ref at the same time):
+# 86.9 vs 87.0 baseline -- no regression. The r81-359 run's 75.7 mean
+# is stale-reference drift (ref 20 h old: live news/forum content moved,
+# one guardian sim flake with an empty innerText dump), not a code
+# change: the five sites recover to baseline on the fresh ref.
+--- a/frontends/vita/pathfill.h	2026-11-01 00:26:34.308717788 +0000
++++ b/frontends/vita/pathfill.h	2026-10-31 02:54:45.355243548 +0000
+@@ -54,4 +54,29 @@
+              int cx0, int cy0, int cx1, int cy1,
+              polyfill_span_fn fn, void *ctx);
+ 
++/* VitaBrowser patch 359: receives one row's coverage: cov[i] is the
++ * share of pixel (x0 + i, y) inside the shape, 0 (none) .. 255 (all).
++ * x0 < x1; cov[0] and cov[x1 - x0 - 1] are non-zero. */
++typedef void (*polyfill_cov_fn)(void *ctx, int y, int x0, int x1,
++                                const unsigned char *cov);
++
++/*
++ * The antialiased form of polyfill(): same shape, rule and clip, but
++ * each row reports how much of every pixel the shape covers rather
++ * than which pixel centres it holds. Coverage is sampled on
++ * POLYFILL_AA_SS sub-scanlines per row, each crossing exactly in x
++ * (the canvas rasteriser's method, quickjs/macsurf_canvas.c raster()).
++ * Rows are reported top to bottom, each once at most, trimmed to its
++ * covered pixels.
++ *
++ * Returns 0 on success, -1 if memory ran out (nothing more is
++ * reported after that).
++ */
++#define POLYFILL_AA_SS 4
++
++int polyfill_aa(const float *xy, const int *counts, int nsub,
++                enum polyfill_rule rule,
++                int cx0, int cy0, int cx1, int cy1,
++                polyfill_cov_fn fn, void *ctx);
++
+ #endif /* POLYFILL_H */
+--- a/frontends/vita/pathfill.c	2026-11-01 00:26:34.308689205 +0000
++++ b/frontends/vita/pathfill.c	2026-10-31 03:25:22.744856915 +0000
+@@ -21,12 +21,14 @@
+  * Vita frontend: scanline polygon filler for SVG paths (vita/pathfill.h).
+  * Written by the local pi agent from work order T3 (host-tested against a
+  * brute-force winding reference: 18 checks incl. 2000 fuzzed shapes, under
+- * ASan/UBSan) and reviewed.
++ * ASan/UBSan) and reviewed. Patch 359 adds polyfill_aa(), the
++ * antialiased (coverage) form, after the canvas rasteriser.
+  */
+ 
+ #include "vita/pathfill.h"
+ #include <stdlib.h>
+ #include <math.h>
++#include <string.h>
+ 
+ #define MAX_POINTS 1000000
+ 
+@@ -169,3 +171,194 @@
+     free(cross);
+     return 0;
+ }
++
++/* ---- VitaBrowser patch 359: antialiased coverage --------------------- */
++
++typedef struct {
++    float x0, y0, y1, dxdy;   /* top point, bottom y, slope */
++    int   dir;                /* +1 downward edge, -1 upward */
++} AaEdge;
++
++typedef struct {
++    float x;
++    int   dir;
++} AaCross;
++
++static int cmp_aa_edge(const void *a, const void *b)
++{
++    const AaEdge *ea = (const AaEdge *)a;
++    const AaEdge *eb = (const AaEdge *)b;
++    if (ea->y0 < eb->y0) return -1;
++    if (ea->y0 > eb->y0) return 1;
++    return 0;
++}
++
++/* Add weight w to every pixel of [xa, xb), partial pixels pro rata. */
++static void aa_span(float *acc, int width, float xa, float xb, float w)
++{
++    if (xa < 0) xa = 0;
++    if (xb > (float)width) xb = (float)width;
++    if (!(xb > xa))             /* NaN too */
++        return;
++    int ia = (int)xa, ib = (int)xb;
++    if (ia == ib) {
++        acc[ia] += (xb - xa) * w;
++        return;
++    }
++    acc[ia] += ((float)(ia + 1) - xa) * w;
++    for (int i = ia + 1; i < ib; i++)
++        acc[i] += w;
++    if (ib < width)
++        acc[ib] += (xb - (float)ib) * w;
++}
++
++static float aa_clamp(float v)
++{
++    if (v < -1e6f) return -1e6f;    /* keep the int conversions defined */
++    if (v > 1e6f) return 1e6f;
++    return v;
++}
++
++int polyfill_aa(const float *xy, const int *counts, int nsub,
++                enum polyfill_rule rule,
++                int cx0, int cy0, int cx1, int cy1,
++                polyfill_cov_fn fn, void *ctx)
++{
++    if (nsub <= 0 || cx0 >= cx1 || cy0 >= cy1)
++        return 0;
++
++    long total = 0;
++    for (int i = 0; i < nsub; i++) {
++        if (counts[i] < 0) return 0;
++        total += counts[i];
++    }
++    if (total > MAX_POINTS)
++        return -1;
++
++    size_t cap = (size_t)(total > 0 ? total : 1);
++    AaEdge  *e = malloc(cap * sizeof(AaEdge));
++    AaCross *cr = malloc((cap + 1) * sizeof(AaCross));
++    int     *act = malloc((cap + 1) * sizeof(int));
++    float   *acc = NULL;
++    unsigned char *cov = NULL;
++    int rc = -1;
++    if (!e || !cr || !act)
++        goto out;
++
++    int ne = 0;
++    float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f;
++    const float *p = xy;
++    for (int i = 0; i < nsub; i++) {
++        int n = counts[i];
++        if (n < 3) { p += n * 2; continue; }
++        int ok = 1;
++        for (int k = 0; k < n; k++) {
++            if (!is_finite(p[k*2]) || !is_finite(p[k*2+1])) { ok = 0; break; }
++        }
++        if (!ok) { p += n * 2; continue; }
++        for (int k = 0; k < n; k++) {
++            float xa = aa_clamp(p[k*2]), ya = aa_clamp(p[k*2+1]);
++            float xb = aa_clamp(p[((k+1)%n)*2]);
++            float yb = aa_clamp(p[((k+1)%n)*2+1]);
++            /* Every point widens the box, a horizontal edge's too: a
++             * corner reached only by one would be cut off. */
++            if (xa < minx) minx = xa;
++            if (xa > maxx) maxx = xa;
++            if (ya < miny) miny = ya;
++            if (ya > maxy) maxy = ya;
++            if (ya == yb) continue;
++            AaEdge *ed = &e[ne++];
++            if (ya < yb) {
++                ed->x0 = xa; ed->y0 = ya; ed->y1 = yb; ed->dir = 1;
++            } else {
++                ed->x0 = xb; ed->y0 = yb; ed->y1 = ya; ed->dir = -1;
++            }
++            ed->dxdy = (xb - xa) / (yb - ya);
++        }
++        p += n * 2;
++    }
++    rc = 0;
++    if (ne == 0)
++        goto out;
++
++    int bx0 = (int)floorf(minx), bx1 = (int)ceilf(maxx);
++    int by0 = (int)floorf(miny), by1 = (int)ceilf(maxy);
++    if (bx0 < cx0) bx0 = cx0;
++    if (bx1 > cx1) bx1 = cx1;
++    if (by0 < cy0) by0 = cy0;
++    if (by1 > cy1) by1 = cy1;
++    if (bx1 <= bx0 || by1 <= by0)
++        goto out;
++
++    int width = bx1 - bx0;
++    acc = malloc(sizeof(float) * (size_t)(width + 2));
++    cov = malloc((size_t)width + 1);
++    if (!acc || !cov) {
++        rc = -1;
++        goto out;
++    }
++    qsort(e, (size_t)ne, sizeof(AaEdge), cmp_aa_edge);
++
++    /* Edges entirely above the first row never become active. */
++    int next = 0, nact = 0;
++    for (int y = by0; y < by1; y++) {
++        int lo = width, hi = -1;
++        memset(acc, 0, sizeof(float) * (size_t)(width + 2));
++        for (int s = 0; s < POLYFILL_AA_SS; s++) {
++            float sy = (float)y + ((float)s + 0.5f) / POLYFILL_AA_SS;
++            int nc = 0, k = 0;
++            while (next < ne && e[next].y0 <= sy)
++                act[nact++] = next++;
++            for (int j = 0; j < nact; j++)
++                if (e[act[j]].y1 > sy)
++                    act[k++] = act[j];
++            nact = k;
++            for (int j = 0; j < nact; j++) {
++                const AaEdge *ed = &e[act[j]];
++                AaCross c;
++                c.x = ed->x0 + (sy - ed->y0) * ed->dxdy - (float)bx0;
++                c.dir = ed->dir;
++                int m;
++                for (m = nc; m > 0 && cr[m - 1].x > c.x; m--)
++                    cr[m] = cr[m - 1];
++                cr[m] = c;
++                nc++;
++            }
++            int wind = 0;
++            float start = 0;
++            for (int j = 0; j < nc; j++) {
++                int before = wind;
++                wind += cr[j].dir;
++                int in0 = (rule == POLYFILL_NONZERO) ? (before != 0)
++                                                     : (before & 1);
++                int in1 = (rule == POLYFILL_NONZERO) ? (wind != 0)
++                                                     : (wind & 1);
++                if (!in0 && in1)
++                    start = cr[j].x;
++                else if (in0 && !in1)
++                    aa_span(acc, width, start, cr[j].x,
++                            1.0f / POLYFILL_AA_SS);
++            }
++        }
++        for (int i = 0; i < width; i++) {
++            float a = acc[i];
++            int c = a >= 1.0f ? 255 : (a <= 0.0f ? 0 :
++                                       (int)(a * 255.0f + 0.5f));
++            cov[i] = (unsigned char)c;
++            if (c != 0) {
++                if (i < lo) lo = i;
++                hi = i;
++            }
++        }
++        if (hi >= lo)
++            fn(ctx, y, bx0 + lo, bx0 + hi + 1, cov + lo);
++    }
++
++out:
++    free(e);
++    free(cr);
++    free(act);
++    free(acc);
++    free(cov);
++    return rc;
++}
+--- a/frontends/vita/plot.c	2026-11-01 00:26:39.865018157 +0000
++++ b/frontends/vita/plot.c	2026-10-31 02:55:30.440003125 +0000
+@@ -37,6 +37,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <limits.h>
+ #include <string.h>
+ #include <math.h>
+ 
+@@ -686,6 +687,128 @@
+ 	m->n++;
+ }
+ 
++/* VitaBrowser patch 359: path fills are antialiased. polyfill_aa()
++ * reports each pixel's coverage; fully covered runs go through the span
++ * merger above as before, and the edge pixels -- partial coverage, the
++ * fill colour at that share of its alpha -- are batched into ONE
++ * triangle-list draw per path. Thin shapes (a 1.5px icon ring) no longer
++ * break into pixel crumbs where the old centre-sampling missed them.
++ *
++ * The vertices come from vita2d's per-frame pool (VITA_FRAME_POOL, 4 MB),
++ * which text and every rectangle share. A path whose edge pixels would
++ * leave less than PATH_AA_RESERVE of it, or that has more than
++ * PATH_AA_MAX_QUADS of them, draws its edge pixels the old way instead:
++ * solid where at least half covered. */
++
++#define PATH_AA_MAX_QUADS 4096
++#define PATH_AA_RESERVE (1024 * 1024)
++
++struct path_aa {
++	struct span_merge *m;
++	int *q;			/* x, y, w, coverage per edge run */
++	unsigned int nq, capq;
++	bool overflow;		/* too many: draw the old way */
++	bool any;		/* a row was reported */
++};
++
++static void path_aa_cov(void *ctx, int y, int x0, int x1,
++			const unsigned char *cov)
++{
++	struct path_aa *aa = ctx;
++	int i = 0, w = x1 - x0;
++
++	aa->any = true;
++	while (i < w) {
++		int j = i + 1;
++		unsigned char c = cov[i];
++
++		while (j < w && cov[j] == c)
++			j++;
++		if (c == 255) {
++			span_cb(aa->m, y, x0 + i, x0 + j);
++		} else if (c != 0) {
++			if (aa->nq == aa->capq && !aa->overflow) {
++				unsigned int cq = aa->capq ? aa->capq * 2 : 64;
++				int *nq = NULL;
++				if (cq <= PATH_AA_MAX_QUADS)
++					nq = realloc(aa->q, cq * 4 * sizeof(int));
++				if (nq == NULL) {
++					aa->overflow = true;
++				} else {
++					aa->q = nq;
++					aa->capq = cq;
++				}
++			}
++			if (aa->overflow) {
++				if (c >= 128)
++					span_cb(aa->m, y, x0 + i, x0 + j);
++			} else {
++				int *r = aa->q + aa->nq * 4;
++				r[0] = x0 + i; r[1] = y; r[2] = j - i; r[3] = c;
++				aa->nq++;
++			}
++		}
++		i = j;
++	}
++}
++
++/** Draw the batched edge runs of one path: one triangle list. */
++static void path_aa_flush(struct path_aa *aa, colour c, int bucket)
++{
++	unsigned int amax = vita_bucket_alpha[bucket], i, n = 0;
++	size_t need = (size_t)aa->nq * 6 * sizeof(vita2d_color_vertex);
++	vita2d_color_vertex *v = NULL;
++	int bx0 = INT_MAX, by0 = INT_MAX, bx1 = INT_MIN, by1 = INT_MIN;
++
++	if (aa->nq == 0)
++		return;
++	if (vita2d_pool_free_space() >= need + PATH_AA_RESERVE)
++		v = vita2d_pool_memalign((unsigned int)need,
++					 sizeof(vita2d_color_vertex));
++	if (v == NULL) {
++		/* The pool is short: the old centre-sampled look. */
++		for (i = 0; i < aa->nq; i++) {
++			const int *r = aa->q + i * 4;
++			if (r[3] >= 128)
++				vita_plot_fill_rect(r[0], r[1], r[0] + r[2],
++						    r[1] + 1, c, bucket);
++		}
++		return;
++	}
++	for (i = 0; i < aa->nq; i++) {
++		const int *r = aa->q + i * 4;
++		unsigned int a = ((unsigned int)r[3] * amax + 127) / 255;
++		unsigned int rgba = (c & 0xffffff) | (a << 24);
++		float x0 = (float)r[0], y0 = (float)r[1];
++		float x1 = x0 + (float)r[2], y1 = y0 + 1.0f;
++		vita2d_color_vertex *t = v + n * 6;
++
++		if (a == 0)
++			continue;
++		t[0].x = x0; t[0].y = y0;
++		t[1].x = x1; t[1].y = y0;
++		t[2].x = x0; t[2].y = y1;
++		t[3].x = x1; t[3].y = y0;
++		t[4].x = x1; t[4].y = y1;
++		t[5].x = x0; t[5].y = y1;
++		for (int k = 0; k < 6; k++) {
++			t[k].z = 0.5f;
++			t[k].color = rgba;
++		}
++		if (r[0] < bx0) bx0 = r[0];
++		if (r[1] < by0) by0 = r[1];
++		if (r[0] + r[2] > bx1) bx1 = r[0] + r[2];
++		if (r[1] + 1 > by1) by1 = r[1] + 1;
++		n++;
++	}
++	/* polyfill_aa reported inside the clip only: no stencil is needed,
++	 * clip_prepare just turns off a live one for another rectangle. */
++	if (n == 0 || !clip_prepare(bx0, by0, bx1, by1))
++		return;
++	vita_plot_calls++;
++	vita2d_draw_array(SCE_GXM_PRIMITIVE_TRIANGLES, v, n * 6);
++}
++
+ struct path_pts {
+ 	float *xy;		/* all subpaths' points */
+ 	int *counts;		/* points per subpath */
+@@ -805,15 +928,30 @@
+ 	if (pstyle->fill_type != PLOT_OP_TYPE_NONE && pp.n >= 3 &&
+ 	    !vita_clip_empty) {
+ 		struct span_merge m;
++		struct path_aa aa;
+ 		m.n = 0;
+ 		m.c = pstyle->fill_colour;
+ 		m.bucket = bucket;
++		memset(&aa, 0, sizeof(aa));
++		aa.m = &m;
+ 		vita_plot_calls++;
+-		(void)polyfill(pp.xy, pp.counts, pp.nsub, POLYFILL_NONZERO,
+-			       vita_clip.x0, vita_clip.y0, vita_clip.x1,
+-			       vita_clip.y1, span_cb, &m);
++		if (bucket > 0 &&
++		    polyfill_aa(pp.xy, pp.counts, pp.nsub, POLYFILL_NONZERO,
++				vita_clip.x0, vita_clip.y0, vita_clip.x1,
++				vita_clip.y1, path_aa_cov, &aa) != 0 &&
++		    !aa.any) {
++			/* No memory to start with: the aliased filler. (Out
++			 * of memory part-way keeps the rows already made, so
++			 * no pixel is blended twice.) */
++			(void)polyfill(pp.xy, pp.counts, pp.nsub,
++				       POLYFILL_NONZERO, vita_clip.x0,
++				       vita_clip.y0, vita_clip.x1,
++				       vita_clip.y1, span_cb, &m);
++		}
+ 		while (m.n > 0)
+ 			span_flush_one(&m, 0);
++		path_aa_flush(&aa, pstyle->fill_colour, bucket);
++		free(aa.q);
+ 	}
+ 	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
+ 		unsigned int at = 0;
