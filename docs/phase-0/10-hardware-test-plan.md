@@ -7932,3 +7932,65 @@ against 66.6 / 66.6). Its consent dialog sits 8 px left in some runs:
 a pre-existing timing race in the Sourcepoint iframe (the pre-361 binary
 shifts in 2 of 4 runs too), not this patch. github's Done s is bimodal
 (9 or 13 s) across every binary since r85.
+
+## Patch 364 (2026-11-01): a block with images or form controls a script inserts is built alone
+
+WS-C's remaining script-change items, measured before choosing. On a
+2500-paragraph sim page (the house stall method: a `setTimeout(0)`
+heartbeat records the longest main-loop gap around each change; median
+of 3, host sim):
+
+| change | gap | path |
+|---|---|---|
+| a plain `<p>` inserted | 7-8 ms | placed locally (166) |
+| an `<li>` appended to a 2500-item list | 23 ms | built alone, page laid out once (176) |
+| a `<p>` holding an `<img>` | **228 ms** | full rebuild |
+| a `<p>` holding an `<input>` | **287 ms** | full rebuild |
+| a floated `<div>` among blocks | 250 ms | full rebuild (once floats are among the children) |
+| a table cell's text | 266 ms | full rebuild ("nearest box is not a block") |
+
+Local list placement (numbering and through-collapsing done locally)
+would save about 16 ms a change; images and controls cost about 250.
+None of these shapes occurs in the scorecard's page loads: the r88 census
+of "new element is not a plain block" declines on 8 sites is all
+`<head>` / `<script>` churn, the 362 territory left shelved. They are
+interaction cases -- a feed inserting a card with a picture, a form
+growing a field.
+
+The change (html.c): a new block may now hold `img`, `input`, `button`,
+`select` / `option` / `optgroup`, `textarea`, `label` and `form`, and a
+new top-level `<form>` counts as a block. Not iframe, object or embed
+(frames and plugins), and not fieldset (its legend painter). Such a block
+takes html_rl_block_change's built-alone path -- box_build_element
+fetches the image and the forms code makes each gadget, as a full build
+does -- and the page is laid out once; the image's later arrival reflows
+through 163's incremental path. Removing a block that holds objects or
+controls still takes the full rebuild.
+
+Result: **228 -> 22 ms** (image), **287 -> 22 ms** (input); floats and
+tables unchanged.
+
+Gate: JS-block-oc-insert (OCINS 7/7, over the gate server): the image
+loads at 20 px and moves the next paragraph down; the input takes a
+value and belongs to its new form, which lists 3 elements; the select
+reads its selected option; the button is laid out; the form block sits
+between its neighbours. Plus an engine-log check that both inserts were
+built alone (2 or more "full layout (new block holds images or form
+controls)"). Its screenshot is pixel-identical to the full rebuild's
+(only the HUD's cpu readout differs). Full gate `gate364.log`, exit 0
+(LISTNEST 7/7, DOMSTALL 8/8 unchanged).
+
+Found on the way, separate gaps: `control.form` answers a fresh wrapper,
+so `input.form === formElement` is false on every build (the id matches),
+and `button.form` is undefined.
+
+Scorecard: 21 sites against the `r79-360` reference, 364 and the 363
+binary back to back (`score/r89-364`, `score/r89-pre364`): **74.34 vs
+74.39**. The new path fired 0 times in those loads, so the code they ran
+was identical; guardian's visual delta (0.544 vs 0.527) is the
+Sourcepoint dialog timing race recorded under 363, stackoverflow's is
+live text. No Cloudflare interstitials in either arm.
+
+Next candidates by cost: floats among blocks (250 ms) and table-cell
+text (266 ms) -- both need local placement that respects the float
+context or the table's column widths.
