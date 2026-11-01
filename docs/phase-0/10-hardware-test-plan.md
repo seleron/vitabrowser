@@ -7626,3 +7626,47 @@ Noticed, not fixed: google.com's sim shows its footer links where
 Chromium has the search box (the search box is missing in the sim).
 
 Full gate: `gate358b.log`, exit 0. The first run (`gate358.log`, exit 1) failed only on JS-block-class-sibling, whose snapshot came before its script ran ("BLOCKSIB: script did not run"); it passes standalone three times and in the rerun, and never failed in gates 340-357. All SVG legs passed in both runs.
+
+## Patch 359 (2026-11-01): antialiased SVG path fills
+
+Path fills were centre-sampled: a pixel drew if its centre was inside
+the shape. Thin shapes -- a 1.5px icon ring, a shallow diagonal --
+broke into pixel crumbs, and a 1px bar straddling two columns came out
+one column solid and one empty. Browsers antialias, and the Vita can:
+text and rectangles already do.
+
+pathfill.c/h gains `polyfill_aa()`, the coverage form of polyfill():
+same shape, rule and clip, but each row reports how much of every pixel
+the shape covers (0..255). Coverage is sampled on 4 sub-scanlines per
+row, each crossing exactly in x -- the canvas rasteriser's method
+(quickjs/macsurf_canvas.c `raster()`). Rows are reported top to bottom,
+trimmed to their covered pixels.
+
+plot.c path fills use it: fully covered runs go through the existing
+span merger, partial-coverage edge pixels are batched into ONE
+triangle-list draw per path, the fill colour at that pixel's share of
+its alpha. Vertices come from vita2d's per-frame pool (VITA_FRAME_POOL,
+4 MB), which text and every rectangle share. A path whose edge pixels
+would leave less than 1 MiB of the pool, that has more than 4096 edge
+quads, or whose allocation fails, draws the old centre-sampled way
+instead (solid where at least half covered). An allocation failure
+part-way keeps the rows already made, so no pixel blends twice.
+
+The sim's `fill_triangle` also got the GPU's top-left rule. Every edge
+had been inclusive, so a pixel centre on an edge two triangles share
+was blended by both: a translucent 1x1 quad -- the antialiased edge --
+came out at double alpha. The Vita draws it once.
+
+Gate: CSS-svg-aa (file:// snapshot, a half-covered diagonal pixel and a
+1px bar straddling two columns read 127 grey, as background and
+inline). Full gate `gate359d.log`, exit 0.
+
+Scorecard: `r84-359-freshref` (guardian, bbc, hackernews, stackoverflow,
+rte with a fresh Chrome reference at the same time): 86.9 vs the 87.0
+baseline -- no regression. The first full run (r81-359, mean 75.7)
+scored against a reference 20 hours old: the news, forum and search
+tiers are live content, so the text and visual columns moved, and one
+guardian sim run flaked (its innerText dump was empty). All five sites
+recover to baseline on the fresh reference; the live-stable tiers
+(static, wiki, wordpress, jquery, docs, spa) were already identical in
+r81-359.
