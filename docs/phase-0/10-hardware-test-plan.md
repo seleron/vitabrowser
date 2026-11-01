@@ -8135,3 +8135,65 @@ With 364-366, the WS-C script-change items measured in 364 all cost
 21-23 ms on the 2500-paragraph page, against 220-290 ms before. Left: a
 class change on a cell or flex/grid item's own box, content beside a
 float in a cell, and removal of a block holding objects or controls.
+
+## Patch 367 (2026-11-01): a table cell holding floats is rebuilt alone too
+
+366 left three WS-C script changes on the full box-tree rebuild. I
+re-measured them on a 2500-paragraph sim page (the house stall method:
+a `setTimeout(0)` heartbeat, the longest main-loop gap around each
+change, median of 3, host sim; `ST-367.html` in the probe directory):
+
+| change | gap | path |
+|---|---|---|
+| a class change on a `<td>`'s own box | 96-98 ms | full rebuild ("class change on an element with a non-inline, non-block box") |
+| a class change on a flex item's own box | 4 ms | already local (block restyle) |
+| content next to a float inside a cell | 91-97 ms | full rebuild ("block is not one line container of plain content") |
+| removing a `<p>` holding an `<img>` | 7-8 ms | already local |
+| removing a `<p>` holding an `<input>` | 94-106 ms | full rebuild ("removed block holds objects or controls") |
+
+The three left cost the same, so I took the cheapest to do right. A
+control's removal would have to unwind its gadget and form registration,
+and a cell's own class change would have to rebuild the cell's box
+inside table-row normalisation. The float only had to get past one test.
+
+The change (html.c): the inline path refused any block with a float
+list. A table cell may now have one: after a cell's rebuild the page is
+laid out whole (366), and layout_block_context makes the cell's float
+list again. The list is cleared as the old floats are freed; a failed
+rebuild keeps both. A float wraps its element's box, so an image or
+control can sit below the line's top level. For a cell with floats, the
+old-content object test therefore looks through the whole subtree. A
+cell's new content may hold blocks (a floated `<div>`), checked with the
+block-or-inline tag walk; a full build normalises the cell the same way.
+The log reads "rebuilt, full layout (a table cell with floats)". A
+floated image still takes the full rebuild (an object).
+
+Result: **91 -> 18 ms**.
+
+Gate: JS-table-cell-float runs eight steps 250 ms apart:
+- text beside a right float;
+- innerHTML bringing a float into a cell that had none;
+- text wrapping beside a floated div in a fixed-width cell;
+- a floated div replacing a cell's content;
+- text between a left and a right float;
+- text beside a floated image (the full rebuild);
+- a span's class beside a float;
+- text shrinking beside a float.
+
+It renders row for row as CSS-table-cell-float-ref, the same steps run
+while the page parses. Every intermediate state was checked the same way
+against a parse-time build (scratch pages): 0 rows each. The engine log
+shows 7 cell-with-float rebuilds, 5 or more required; the 366 baseline
+prints none. Full gate `gate367.log`, exit 0 (JS-table-cell-text 0 rows
+with 14 cell rebuilds, floats 0/0, OCINS 7/7, LISTNEST 7/7, SIBINS 4/4,
+DOMSTALL 8/8).
+
+Scorecard r92: 21 sites against `r79-360`, 367 and the 366 binary back to
+back (`score/r92-367`, `score/r92-pre367`): **74.54 vs 74.59**. Neither
+cell path fired in the site loads, so they ran identical code. The movers
+are guardian's visual (the Sourcepoint dialog race), stackoverflow's text
+(live) and wpnews +0.1. No crash -- wpblog included -- and no Cloudflare
+interstitial in either arm.
+
+Left of WS-C's script-change list: a class change on a cell's own box
+(96 ms) and removing a block that holds a form control (94-106 ms).
