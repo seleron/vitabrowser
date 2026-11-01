@@ -234,6 +234,8 @@ JS-float-insert-one file:///app0:/testpages/JS-float-insert-one.html
 CSS-float-insert-one-ref file:///app0:/testpages/CSS-float-insert-one-ref.html
 JS-table-cell-text file:///app0:/testpages/JS-table-cell-text.html
 CSS-table-cell-text-ref file:///app0:/testpages/CSS-table-cell-text-ref.html
+JS-table-cell-float file:///app0:/testpages/JS-table-cell-float.html
+CSS-table-cell-float-ref file:///app0:/testpages/CSS-table-cell-float-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1448,6 +1450,12 @@ tcr=$(fl_rows JS-table-cell-text CSS-table-cell-text-ref)
 tcl=$(grep -c 'LIFE rebuild local: rebuilt, full layout (a table cell)' "$R/netsurf.log" || true)
 echo "  JS-table-cell-text: rows differing from the parse-time build $tcr (0); ${tcl} cell changes rebuilt alone (5 or more)"
 [ "$tcr" = 0 ] && [ "${tcl:-0}" -ge 5 ] || fail "table cell text rebuilt alone"
+# Patch 367: the same for a cell holding floats (before: a full rebuild,
+# its float list made it "not one line container of plain content").
+tfr=$(fl_rows JS-table-cell-float CSS-table-cell-float-ref)
+tfl=$(grep -c 'LIFE rebuild local: rebuilt, full layout (a table cell with floats)' "$R/netsurf.log" || true)
+echo "  JS-table-cell-float: rows differing from the parse-time build $tfr (0); ${tfl} cell-with-float changes rebuilt alone (5 or more)"
+[ "$tfr" = 0 ] && [ "${tfl:-0}" -ge 5 ] || fail "table cell with floats rebuilt alone"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path

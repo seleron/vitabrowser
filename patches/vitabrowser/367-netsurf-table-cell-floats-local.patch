@@ -1,0 +1,104 @@
+# netsurf: a table cell holding floats is rebuilt alone too (patch 367)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 366)
+#
+# 366 left three WS-C script changes on the full rebuild. Re-measured on
+# a 2500-paragraph sim page (longest main-loop gap, median of 3): a class
+# change on a cell's own box 96-98 ms; content next to a float inside a
+# cell 91-97 ms; removing a block holding a form control 94-106 ms
+# (removing one holding an image is already local, 7-8 ms; a flex item's
+# class change is already local, 4 ms). All three cost the same, so the
+# cheapest to do right: the float.
+#
+#  - html.c: a cell whose content holds floats is rebuilt alone. The
+#    inline path's "one line container of plain content" test let no
+#    block with a float list through; a table cell may now have one --
+#    366 lays the page out whole after a cell's rebuild, and
+#    layout_block_context makes the cell's float list again. The list is
+#    cleared as the old floats are freed (a failed rebuild keeps both).
+#    A float wraps its element's box, so the old-content object test
+#    looks through the whole subtree for a cell with floats; and a cell's
+#    new content may hold blocks too (a floated <div>), checked with the
+#    block-or-inline tag walk. Logged "full layout (a table cell with
+#    floats)". A floated image still takes the full rebuild.
+#
+# Result: 91 -> 18 ms. Eight steps (text beside left/right floats, a
+# float arriving through innerHTML, a floated div replacing content, text
+# wrapping beside a float, a floated image, a span's class) render row
+# for row as a parse-time build of the same DOM, at every step.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9465,6 +9465,7 @@
+ 	unsigned int objects_before, old_flags;
+ 	int old_x, old_y, old_h, delta = 0;
+ 	bool local;
++	bool cell_floats = false;	/* patch 367 */
+ 	double t0, t1;
+ 	static unsigned long done_n, relaid_n;
+ 
+@@ -9607,7 +9608,12 @@
+ 	/* a block of inline content: one inline container, nothing generated,
+ 	 * no objects or controls, now or after the change */
+ 	if (block->object != NULL || block->gadget != NULL ||
+-	    block->list_marker != NULL || block->float_children != NULL ||
++	    block->list_marker != NULL ||
++	    /* Patch 367: a table cell's floats are fine -- the page is
++	     * laid out whole after a cell's rebuild (366), and that layout
++	     * makes the cell's float list again */
++	    (block->float_children != NULL &&
++	     block->type != BOX_TABLE_CELL) ||
+ 	    block->iframe != NULL || block->styles == NULL ||
+ 	    block->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE] != NULL ||
+ 	    block->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL ||
+@@ -9616,7 +9622,12 @@
+ 		dom_node_unref(element);
+ 		RL_NO("block is not one line container of plain content");
+ 	}
+-	if (!html_rl_inline_subtree(element)) {
++	/* Patch 367: a cell may hold blocks too (a floated <div>): the
++	 * rebuilt content is normalised as a full build normalises a cell,
++	 * and the page laid out whole after it */
++	if (block->type == BOX_TABLE_CELL ?
++	    !html_rl_subtree_tags(element, true) :
++	    !html_rl_inline_subtree(element)) {
+ 		dom_node_unref(element);
+ 		RL_NO("new content is not plain inline elements");
+ 	}
+@@ -9625,6 +9636,13 @@
+ 			dom_node_unref(element);
+ 			RL_NO("old content has an object or control");
+ 		}
++	/* Patch 367: a float wraps its element's box, so an image or a
++	 * control can sit below the line's top level: look all the way */
++	if (block->float_children != NULL &&
++	    html_rl_subtree_objects(old_ic->children)) {
++		dom_node_unref(element);
++		RL_NO("old content has an object or control");
++	}
+ 
+ 	/* build the block's children again */
+ 	old_x = old_ic->x;
+@@ -9672,6 +9690,12 @@
+ 		return -1;
+ 	}
+ 	dom_node_unref(element);
++	/* Patch 367: the cell's float list holds the old floats being freed
++	 * here; the layout below builds it again (layout_block_context) */
++	if (block->type == BOX_TABLE_CELL && block->float_children != NULL) {
++		cell_floats = true;
++		block->float_children = NULL;
++	}
+ 	box_free(old_ic);	/* backlinks only where they are still its */
+ 
+ 	/* lay out just the new lines if we can, else the page (the tree is
+@@ -9684,7 +9708,8 @@
+ 		/* Patch 366: the cell's width and its row's height are the
+ 		 * table's to work out from every cell */
+ 		macsurf_debug_log_writef("LIFE rebuild local: rebuilt, full "
+-			"layout (a table cell)");
++			"layout (a table cell%s)",
++			cell_floats ? " with floats" : "");
+ 		content__reformat(base_c, false, base_c->available_width,
+ 				base_c->available_height);
+ 		done_n++;
