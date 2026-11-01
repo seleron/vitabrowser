@@ -227,6 +227,7 @@ CSS-svg-stroke file:///app0:/testpages/CSS-svg-stroke.html
 CSS-svg-aa file:///app0:/testpages/CSS-svg-aa.html
 CSS-flex-column-automin file:///app0:/testpages/CSS-flex-column-automin.html
 JS-style-invalid file:///app0:/testpages/JS-style-invalid.html
+CSS-border-radius file:///app0:/testpages/CSS-border-radius.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1202,6 +1203,17 @@ if [ -n "$s361s" ]; then
 		150,50 300,50 150,70 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  js-style-invalid: ${s361px:-none} (0,170,0 255,255,255 0,170,0)"
+# Patch 363: rounded corners -- the four corners (shorthand, longhands,
+# logical names), a solid one-colour border as a ring, a mixed border and
+# its background kept square, a translucent ring.
+r363s=$(ls "$OUT"/snaps/N-*-CSS-border-radius.png 2>/dev/null | head -1)
+r363px=
+if [ -n "$r363s" ]; then
+	r363px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$r363s" \
+		12,42 60,70 122,42 122,97 232,42 280,41 280,70 342,42 346,46 \
+		452,42 547,42 562,42 610,41 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-border-radius: ${r363px:-none} (255,255,255 0,170,0 255,255,255 0,170,0 255,255,255 0,0,255 0,170,0 0,0,255 0,170,0 255,255,255 0,170,0 255,255,255 127,127,255)"
 # Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
 # same wave through the <img> path, no serializer rewrite.
 r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
@@ -1759,6 +1771,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$a359px" = "0,0,0 255,255,255 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 " ] && \
 [ "$f360px" = "0,0,255 0,170,0 0,170,0 255,0,0 0,170,0 " ] && \
 [ "$s361px" = "0,170,0 255,255,255 0,170,0 " ] && \
+[ "$r363px" = "255,255,255 0,170,0 255,255,255 0,170,0 255,255,255 0,0,255 0,170,0 0,0,255 0,170,0 255,255,255 0,170,0 255,255,255 127,127,255 " ] && \
 [ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \
@@ -2026,13 +2039,17 @@ bxplot=$(ls "$R"/*-CSS-shadow.plot 2>/dev/null | head -1)
 bxs1=$(rects "$bxplot" 222 1); bxs2=$(rects "$bxplot" 239 3); bxs3=$(rects "$bxplot" 244 2)
 bxs4=$(rects "$bxplot" 255 1 2); bxs5=$(awk '/^PLOT RECT/ && $8 - $4 == 266 && $10 - $6 <= 2 { n++ } END { print n + 0 }' "$bxplot" 2>/dev/null)
 bxb1=$(rects "$bxplot" 277 1); bxb2=$(rects "$bxplot" 288 1 2)
+# patch 363: b2's rounded border is one ring path at bucket 2, not bands
+bxb2r=$(grep -c '^PLOT PATH VERTICIES [0-9]* WIDTH [0-9.]* OPAQUE 2$' "$bxplot" 2>/dev/null || true)
 echo "  CSS-shadow: ring $bxs1, spread $bxs2, list+initial $bxs3, hsl(from) ring $bxs4 (2 each); invalid $bxs5 (0)"
 # (MacSurf's old rounded-box frame was a stroke, and the plot stream records
-# fills only, so its absence is not checkable here; bxb2 proves rounded
-# boxes now reach the border painter.)
-echo "  CSS-shadow borders: 0.5px $bxb1 (2), rounded 50% $bxb2 (2)"
+# fills only, so its absence is not checkable here. Patch 363: a rounded
+# box's solid one-colour border is one ring path -- bxb2r -- and the square
+# bands bxb2 are gone.)
+echo "  CSS-shadow borders: 0.5px $bxb1 (2), rounded 50% ring paths $bxb2r (1), square bands $bxb2 (0)"
 [ "$bxs1" = 2 ] && [ "$bxs2" = 2 ] && [ "$bxs3" = 2 ] && [ "$bxs4" = 2 ] && [ "$bxs5" = 0 ] &&
-	[ "$bxb1" = 2 ] && [ "$bxb2" = 2 ] || fail "box-shadow / borders"
+	[ "$bxb1" = 2 ] && [ "$bxb2r" = 1 ] && [ "$bxb2" = 0 ] ||
+	fail "box-shadow / borders"
 # Modern colour syntax and at-rules (patches 94, 95, 98, 99): each block
 # drawn once, at the expected opacity bucket.
 clplot=$(ls "$R"/*-CSS-color.plot 2>/dev/null | head -1)
@@ -2061,7 +2078,15 @@ SPEOF
 spbx=$(( ${spd1:-0} - ${spc1:-0} )); spby=$(( ${spd2:-0} - ${spc2:-0} ))
 echo "  CSS-spacing: gap $spgap (51); :host var $(rects "$spplot" 120 11) (1); iOS @supports $(rects "$spplot" 133 11)/$(rects "$spplot" 333 11) (1/0)"
 echo "  CSS-spacing: inline calc heights [$sph ] ([ 2 4 6 8 10 ]); button child at +$spbx,+$spby (80|81,15)"
-echo "  CSS-spacing: abs in flex $(rects "$spplot" 170 50) (1); radius+bottom $(rects "$spplot" 11 36) (1); @media $(rects "$spplot" 188 11)/$(rects "$spplot" 88 11) (1/0)"
+# Patch 363: a rounded box (107's radius+bottom one) is drawn as a path,
+# clipped to its border box: count it by that clip.
+rpaths() {
+	awk -v w="$2" -v h="$3" '/^PLOT CLIP/ { cw = $8 - $4; ch = $10 - $6 }
+		/^PLOT PATH/ && cw == w && ch == h { n++ }
+		END { print n + 0 }' "$1" 2>/dev/null
+}
+sprb=$(( $(rects "$spplot" 11 36) + $(rpaths "$spplot" 11 36) ))
+echo "  CSS-spacing: abs in flex $(rects "$spplot" 170 50) (1); radius+bottom $sprb (1); @media $(rects "$spplot" 188 11)/$(rects "$spplot" 88 11) (1/0)"
 # Round 10: range-syntax media queries -- (width>=350px) and the double
 # range apply at the 960-wide viewport, (width>=961px) must not.
 echo "  CSS-spacing: range media $(rects "$spplot" 251 11)/$(rects "$spplot" 253 11) (1/1); width>=961px $(rects "$spplot" 252 11) (0)"
@@ -2069,7 +2094,7 @@ echo "  CSS-spacing: range media $(rects "$spplot" 251 11)/$(rects "$spplot" 253
 	[ "$(rects "$spplot" 133 11)" = 1 ] && [ "$(rects "$spplot" 333 11)" = 0 ] &&
 	[ "$sph" = " 2 4 6 8 10" ] && { [ "$spbx" = 80 ] || [ "$spbx" = 81 ]; } &&
 	[ "$spby" = 15 ] && [ "$(rects "$spplot" 170 50)" = 1 ] &&
-	[ "$(rects "$spplot" 11 36)" = 1 ] && [ "$(rects "$spplot" 188 11)" = 1 ] &&
+	[ "$sprb" = 1 ] && [ "$(rects "$spplot" 188 11)" = 1 ] &&
 	[ "$(rects "$spplot" 88 11)" = 0 ] &&
 	[ "$(rects "$spplot" 251 11)" = 1 ] && [ "$(rects "$spplot" 253 11)" = 1 ] &&
 	[ "$(rects "$spplot" 252 11)" = 0 ] || fail "spacing / calc / layout"

@@ -1,0 +1,887 @@
+# libcss: four corner radii; border-radius as their shorthand (patch 363, with 363-netsurf)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 361)
+#
+# border-radius was one length for all four corners; any second value
+# dropped the declaration as junk, and the corner longhands were unknown
+# properties. The r86 scorecard census dropped corner-radius declarations
+# on 17 of 21 sites (claude 83, oldreddit 56, youtube 51, github 33).
+#
+#  - CSS_PROP_BORDER_{TOP_LEFT,TOP_RIGHT,BOTTOM_RIGHT,BOTTOM_LEFT}_RADIUS
+#    (0x0ae-0x0b1): <length-percentage>{1,2} (horizontal, vertical), not
+#    inherited, initial 0. Stored beside 358's stroke fields (status, h
+#    length + unit, v length + unit per corner); read with
+#    css_computed_border_corner_radius(style, corner, ...). A percentage
+#    is of the border box's width (h) or height (v).
+#  - border-radius is now their shorthand: <lp>{1,4} [ / <lp>{1,4} ],
+#    each list filled out as margin's is; inherit / initial / unset set
+#    all four. css_computed_border_radius() reads the top-left corner, so
+#    older callers keep working.
+#  - Aliases (alias_props): -webkit-border-radius, -moz-border-radius,
+#    -webkit-border-{corner}-radius, and the logical corners
+#    border-{start,end}-{start,end}-radius as horizontal-tb left-to-right
+#    places them. var() works through the existing deferral.
+#  - Wiring as for 358: property enum, opcodes, important.c (4 operands),
+#    property strings, parse/dispatch tables, Makefiles,
+#    p_border_corner_radius.c, s_border_corner_radius.c.
+#
+# Not covered: calc() in a corner (about 6 declarations in the census;
+# the declaration is still dropped), and the -moz-border-radius-topleft
+# style corner names.
+#
+--- a/include/libcss/properties.h
++++ b/include/libcss/properties.h
+@@ -188,6 +188,11 @@
+ 	CSS_PROP_ISOLATION                      = 0x0ab, /* VitaBrowser 332 */
+ 	CSS_PROP_STROKE                         = 0x0ac, /* VitaBrowser 358 */
+ 	CSS_PROP_STROKE_WIDTH                   = 0x0ad, /* VitaBrowser 358 */
++	/* VitaBrowser 363: the four corners border-radius sets */
++	CSS_PROP_BORDER_TOP_LEFT_RADIUS         = 0x0ae,
++	CSS_PROP_BORDER_TOP_RIGHT_RADIUS        = 0x0af,
++	CSS_PROP_BORDER_BOTTOM_RIGHT_RADIUS     = 0x0b0,
++	CSS_PROP_BORDER_BOTTOM_LEFT_RADIUS      = 0x0b1,
+ 	CSS_N_PROPERTIES
+ };
+ 
+@@ -196,6 +201,21 @@
+ 	CSS_BORDER_RADIUS_SET			= 0x1
+ };
+ 
++/* VitaBrowser 363: one corner's radius (horizontal, vertical). Not
++ * inherited; initial 0. */
++enum css_border_corner_radius_e {
++	CSS_BORDER_CORNER_RADIUS_INHERIT	= 0x0,
++	CSS_BORDER_CORNER_RADIUS_SET		= 0x1
++};
++
++/* VitaBrowser 363: corner index for css_computed_border_corner_radius */
++enum css_border_corner_e {
++	CSS_CORNER_TOP_LEFT			= 0,
++	CSS_CORNER_TOP_RIGHT			= 1,
++	CSS_CORNER_BOTTOM_RIGHT			= 2,
++	CSS_CORNER_BOTTOM_LEFT			= 3
++};
++
+ enum css_box_shadow_e {
+ 	CSS_BOX_SHADOW_INHERIT			= 0x0,
+ 	CSS_BOX_SHADOW_NONE			= 0x1,
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -258,6 +258,13 @@
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+ 
++/* VitaBrowser 363: one corner's radius, horizontal (h) and vertical (v);
++ * a percentage is of the border box's width (h) or height (v). Returns
++ * CSS_BORDER_CORNER_RADIUS_SET always (initial 0px 0px). */
++uint8_t css_computed_border_corner_radius(
++		const css_computed_style *style, int corner,
++		css_fixed *h, css_unit *hu, css_fixed *v, css_unit *vu);
++
+ uint8_t css_computed_box_shadow(
+ 		const css_computed_style *style,
+ 		int32_t *integer);
+--- a/src/bytecode/opcodes.h
++++ b/src/bytecode/opcodes.h
+@@ -972,6 +972,12 @@
+ 	STROKE_WIDTH_SET           = 0x0080
+ };
+ 
++/* VitaBrowser 363: a corner radius: OPV, h length, h unit, v length,
++ * v unit */
++enum op_border_corner_radius {
++	BORDER_CORNER_RADIUS_SET   = 0x0080
++};
++
+ /* SVG fill V1 OPV values. */
+ enum op_fill {
+ 	FILL_NONE                  = 0x0000,
+--- a/src/parse/important.c
++++ b/src/parse/important.c
+@@ -218,6 +218,15 @@
+ 					offset += 2; /* length + unit */
+ 				break;
+ 
++			/* VitaBrowser 363 */
++			case CSS_PROP_BORDER_TOP_LEFT_RADIUS:
++			case CSS_PROP_BORDER_TOP_RIGHT_RADIUS:
++			case CSS_PROP_BORDER_BOTTOM_RIGHT_RADIUS:
++			case CSS_PROP_BORDER_BOTTOM_LEFT_RADIUS:
++				if (value == BORDER_CORNER_RADIUS_SET)
++					offset += 4; /* h, unit, v, unit */
++				break;
++
+ 			case CSS_PROP_TRANSITION_PROPERTY:
+ 				if (value == CSS_TRANSITION_PROPERTY_SET)
+ 					offset += 1 + bytecode[offset] * 3;
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -116,8 +116,12 @@
+ 	ISOLATION,		/* VitaBrowser 332 */
+ 	STROKE,			/* VitaBrowser 358 */
+ 	STROKE_WIDTH,		/* VitaBrowser 358 */
++	BORDER_TOP_LEFT_RADIUS,	/* VitaBrowser 363 */
++	BORDER_TOP_RIGHT_RADIUS,
++	BORDER_BOTTOM_RIGHT_RADIUS,
++	BORDER_BOTTOM_LEFT_RADIUS,
+ 
+-	LAST_PROP = STROKE_WIDTH,
++	LAST_PROP = BORDER_BOTTOM_LEFT_RADIUS,
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+ 	NO_REPEAT, REPEAT_X, REPEAT_Y, REPEAT, HIDDEN, DOTTED, DASHED,
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -284,6 +284,10 @@
+ 	SMAP("isolation"),	/* VitaBrowser 332 */
+ 	SMAP("stroke"),		/* VitaBrowser 358 */
+ 	SMAP("stroke-width"),	/* VitaBrowser 358 */
++	SMAP("border-top-left-radius"),		/* VitaBrowser 363 */
++	SMAP("border-top-right-radius"),
++	SMAP("border-bottom-right-radius"),
++	SMAP("border-bottom-left-radius"),
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+ 	SMAP("important"),
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -213,7 +213,11 @@
+ 	css__parse_transition_delay,
+ 	css__parse_isolation,		/* VitaBrowser 332 */
+ 	css__parse_stroke,		/* VitaBrowser 358 */
+-	css__parse_stroke_width		/* VitaBrowser 358 */
++	css__parse_stroke_width,	/* VitaBrowser 358 */
++	css__parse_border_top_left_radius,	/* VitaBrowser 363 */
++	css__parse_border_top_right_radius,
++	css__parse_border_bottom_right_radius,
++	css__parse_border_bottom_left_radius
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+@@ -388,6 +392,10 @@
+ 	[CSS_PROP_ISOLATION]             = 0,
+ 	[CSS_PROP_STROKE]                = 0,
+ 	[CSS_PROP_STROKE_WIDTH]          = UNIT_LENGTH,	/* 358 */
++	[CSS_PROP_BORDER_TOP_LEFT_RADIUS]     = UNIT_LENGTH | UNIT_PCT, /* 363 */
++	[CSS_PROP_BORDER_TOP_RIGHT_RADIUS]    = UNIT_LENGTH | UNIT_PCT,
++	[CSS_PROP_BORDER_BOTTOM_RIGHT_RADIUS] = UNIT_LENGTH | UNIT_PCT,
++	[CSS_PROP_BORDER_BOTTOM_LEFT_RADIUS]  = UNIT_LENGTH | UNIT_PCT,
+ };
+ 
+ /*
+@@ -423,6 +431,18 @@
+ 	{ "mask", BACKGROUND, false },
+ 	{ "-webkit-mask", BACKGROUND, false },
+ 	{ "-webkit-appearance", APPEARANCE, false },
++	/* VitaBrowser 363: the prefixed radius names, and the logical
++	 * corners as horizontal-tb, left-to-right sets them */
++	{ "-webkit-border-radius", BORDER_RADIUS, false },
++	{ "-moz-border-radius", BORDER_RADIUS, false },
++	{ "-webkit-border-top-left-radius", BORDER_TOP_LEFT_RADIUS, false },
++	{ "-webkit-border-top-right-radius", BORDER_TOP_RIGHT_RADIUS, false },
++	{ "-webkit-border-bottom-right-radius", BORDER_BOTTOM_RIGHT_RADIUS, false },
++	{ "-webkit-border-bottom-left-radius", BORDER_BOTTOM_LEFT_RADIUS, false },
++	{ "border-start-start-radius", BORDER_TOP_LEFT_RADIUS, false },
++	{ "border-start-end-radius", BORDER_TOP_RIGHT_RADIUS, false },
++	{ "border-end-end-radius", BORDER_BOTTOM_RIGHT_RADIUS, false },
++	{ "border-end-start-radius", BORDER_BOTTOM_LEFT_RADIUS, false },
+ };
+ 
+ int css__property_id(css_language *c, lwc_string *name, bool *mask_image)
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -760,5 +760,23 @@
+ css_error css__parse_stroke_width(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
++/* VitaBrowser 363 */
++css_error css__parse_corner_radius_one(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_fixed *length, uint32_t *unit);
++css_error css__corner_radius_append(css_style *result, int prop,
++		css_fixed h, uint32_t hu, css_fixed v, uint32_t vu);
++css_error css__parse_border_top_left_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_top_right_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_bottom_right_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_bottom_left_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
+ 
+ #endif
+--- a/src/parse/properties/Makefile
++++ b/src/parse/properties/Makefile
+@@ -94,6 +94,7 @@
+ p_isolation.c \
+ p_stroke.c \
+ p_stroke_width.c \
++p_border_corner_radius.c \
+ p_justify_items.c \
+ p_justify_self.c \
+ p_macsurf_animation_opacity.c \
+--- a/src/parse/properties/p_border_radius.c
++++ b/src/parse/properties/p_border_radius.c
+@@ -16,6 +16,12 @@
+ /**
+  * Parse border-radius
+  *
++ * VitaBrowser patch 363: a shorthand for the four corners (it was one
++ * length for all four, and any second value dropped the declaration):
++ *   <length-percentage>{1,4} [ / <length-percentage>{1,4} ]?
++ * horizontal radii then vertical ones, each list filled out as margin's
++ * is (top-left, top-right, bottom-right, bottom-left).
++ *
+  * \param c	  Parsing context
+  * \param vector  Vector of tokens to process
+  * \param ctx	  Pointer to vector iteration context
+@@ -31,67 +37,94 @@
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result)
+ {
++	static const int props[4] = {
++		CSS_PROP_BORDER_TOP_LEFT_RADIUS,
++		CSS_PROP_BORDER_TOP_RIGHT_RADIUS,
++		CSS_PROP_BORDER_BOTTOM_RIGHT_RADIUS,
++		CSS_PROP_BORDER_BOTTOM_LEFT_RADIUS
++	};
+ 	int32_t orig_ctx = *ctx;
+-	css_error error;
++	css_error error = CSS_OK;
+ 	const css_token *token;
+-	css_fixed length = 0;
+-	uint32_t unit = 0;
+ 	enum flag_value flag_value;
++	css_fixed len[2][4];
++	uint32_t unit[2][4];
++	int n[2] = { 0, 0 };
++	int axis, i;
+ 
+-	/* length? | IDENT(inherit) */
+ 	token = parserutils_vector_peek(vector, *ctx);
+-	if (token == NULL) {
+-		*ctx = orig_ctx;
++	if (token == NULL)
+ 		return CSS_INVALID;
+-	}
+ 
+ 	flag_value = get_css_flag_value(c, token);
+-
+ 	if (flag_value != FLAG_VALUE__NONE) {
+-		parserutils_vector_iterate(vector, ctx);
+-		/* inherit */
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_BORDER_RADIUS);
+-	} else {
+-		error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
+-				&length, &unit);
+-		if (error != CSS_OK) {
+-			*ctx = orig_ctx;
+-			return error;
+-		}
++		for (i = 0; i < 4 && error == CSS_OK; i++)
++			error = css_stylesheet_style_flag_value(result,
++					flag_value, props[i]);
++		if (error == CSS_OK)
++			parserutils_vector_iterate(vector, ctx);
++		return error;
++	}
+ 
+-		if (unit & UNIT_ANGLE || unit & UNIT_TIME ||
+-				unit & UNIT_FREQ) {
++	for (axis = 0; axis < 2; axis++) {
++		while (n[axis] < 4) {
++			consumeWhitespace(vector, ctx);
++			token = parserutils_vector_peek(vector, *ctx);
++			if (token == NULL || (token->type != CSS_TOKEN_DIMENSION &&
++					token->type != CSS_TOKEN_NUMBER &&
++					token->type != CSS_TOKEN_PERCENTAGE))
++				break;
++			error = css__parse_corner_radius_one(c, vector, ctx,
++					&len[axis][n[axis]],
++					&unit[axis][n[axis]]);
++			if (error != CSS_OK) {
++				*ctx = orig_ctx;
++				return error;
++			}
++			n[axis]++;
++		}
++		if (n[axis] == 0) {
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
++		if (axis == 1)
++			break;
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL || !tokenIsChar(token, '/'))
++			break;
++		parserutils_vector_iterate(vector, ctx);
++	}
+ 
+-		/* Lengths must not be negative */
+-		if (length < 0) {
+-			*ctx = orig_ctx;
+-			return CSS_INVALID;
++	for (axis = 0; axis < 2; axis++) {
++		if (n[axis] == 0) {
++			/* no "/": the vertical radii are the horizontal ones */
++			memcpy(len[1], len[0], sizeof(len[0]));
++			memcpy(unit[1], unit[0], sizeof(unit[0]));
++			continue;
++		}
++		/* 1 value: all four; 2: TL+BR, TR+BL; 3: TL, TR+BL, BR */
++		if (n[axis] < 2) {
++			len[axis][1] = len[axis][0];
++			unit[axis][1] = unit[axis][0];
+ 		}
++		if (n[axis] < 3) {
++			len[axis][2] = len[axis][0];
++			unit[axis][2] = unit[axis][0];
++		}
++		if (n[axis] < 4) {
++			len[axis][3] = len[axis][1];
++			unit[axis][3] = unit[axis][1];
++		}
++	}
+ 
+-		error = css__stylesheet_style_appendOPV(result,
+-		                                       CSS_PROP_BORDER_RADIUS,
+-		                                       0,
+-		                                       0x0080); /* BORDER_RADIUS_SET */
++	for (i = 0; i < 4; i++) {
++		error = css__corner_radius_append(result, props[i],
++				len[0][i], unit[0][i], len[1][i], unit[1][i]);
+ 		if (error != CSS_OK) {
+ 			*ctx = orig_ctx;
+ 			return error;
+ 		}
+-
+-		error = css__stylesheet_style_vappend(result,
+-						     2,
+-						     length,
+-						     unit);
+-
+-	}
+-
+-	if (error != CSS_OK) {
+-		*ctx = orig_ctx;
+-		return error;
+ 	}
+-
+ 	return CSS_OK;
+ }
+--- a/src/select/dispatch.c
++++ b/src/select/dispatch.c
+@@ -729,5 +729,21 @@
+ 	{
+ 	        PROPERTY_FUNCS(stroke_width),	/* VitaBrowser 358 */
+ 	        1,
++	},
++	{
++	        PROPERTY_FUNCS(border_top_left_radius),	/* VitaBrowser 363 */
++	        0,
++	},
++	{
++	        PROPERTY_FUNCS(border_top_right_radius),
++	        0,
++	},
++	{
++	        PROPERTY_FUNCS(border_bottom_right_radius),
++	        0,
++	},
++	{
++	        PROPERTY_FUNCS(border_bottom_left_radius),
++	        0,
+ 	}
+ 	};
+--- a/src/select/properties/properties.h
++++ b/src/select/properties/properties.h
+@@ -210,6 +210,10 @@
+ PROPERTY_FUNCS(isolation);	/* VitaBrowser 332 */
+ PROPERTY_FUNCS(stroke);		/* VitaBrowser 358 */
+ PROPERTY_FUNCS(stroke_width);	/* VitaBrowser 358 */
++PROPERTY_FUNCS(border_top_left_radius);		/* VitaBrowser 363 */
++PROPERTY_FUNCS(border_top_right_radius);
++PROPERTY_FUNCS(border_bottom_right_radius);
++PROPERTY_FUNCS(border_bottom_left_radius);
+ 
+ #undef PROPERTY_FUNCS
+ 
+--- a/src/select/properties/Makefile
++++ b/src/select/properties/Makefile
+@@ -153,6 +153,7 @@
+ s_isolation.c \
+ s_stroke.c \
+ s_stroke_width.c \
++s_border_corner_radius.c \
+ s_justify_items.c \
+ s_justify_self.c \
+ s_macsurf_animation_opacity.c \
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -571,9 +571,40 @@
+ 	return get_border_left_width(style, length, unit);
+ }
+ 
++/* VitaBrowser 363: one corner; an unset corner is 0 */
++uint8_t css_computed_border_corner_radius(
++		const css_computed_style *style, int corner,
++		css_fixed *h, css_unit *hu, css_fixed *v, css_unit *vu)
++{
++	if (corner < 0 || corner > 3 ||
++	    style->i.corner_radius_status[corner] !=
++			CSS_BORDER_CORNER_RADIUS_SET) {
++		*h = *v = 0;
++		*hu = *vu = CSS_UNIT_PX;
++		return CSS_BORDER_CORNER_RADIUS_SET;
++	}
++	*h = style->i.corner_radius_h[corner];
++	*hu = (css_unit)style->i.corner_radius_hu[corner];
++	*v = style->i.corner_radius_v[corner];
++	*vu = (css_unit)style->i.corner_radius_vu[corner];
++	return CSS_BORDER_CORNER_RADIUS_SET;
++}
++
+ uint8_t css_computed_border_radius(const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit)
+ {
++	/* VitaBrowser 363: border-radius is a shorthand now; the old
++	 * single value reads as the top-left corner's horizontal radius */
++	css_fixed v;
++	css_unit vu;
++
++	if (style->i.corner_radius_status[CSS_CORNER_TOP_LEFT] ==
++			CSS_BORDER_CORNER_RADIUS_SET) {
++		(void) css_computed_border_corner_radius(style,
++				CSS_CORNER_TOP_LEFT, length, unit, &v, &vu);
++		return (*length > 0) ? CSS_BORDER_RADIUS_SET :
++				CSS_BORDER_RADIUS_INHERIT;
++	}
+ 	return get_border_radius(style, length, unit);
+ }
+ 
+--- a/src/select/autogenerated_computed.h
++++ b/src/select/autogenerated_computed.h
+@@ -490,6 +490,13 @@
+ 	int32_t stroke_width_status;
+ 	css_fixed stroke_width;
+ 	int32_t stroke_width_unit;
++	/* VitaBrowser 363: the four corner radii (TL, TR, BR, BL), the same
++	 * way: status, horizontal and vertical length + unit */
++	int32_t corner_radius_status[4];
++	css_fixed corner_radius_h[4];
++	int32_t corner_radius_hu[4];
++	css_fixed corner_radius_v[4];
++	int32_t corner_radius_vu[4];
+ };
+ 
+ struct css_computed_style {
+--- /dev/null
++++ b/src/parse/properties/p_border_corner_radius.c
+@@ -0,0 +1,144 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ */
++
++/* VitaBrowser patch 363: the four corner radii.
++ *
++ *   border-top-left-radius etc.:  <length-percentage>{1,2}
++ *   border-radius (p_border_radius.c):
++ *       <length-percentage>{1,4} [ / <length-percentage>{1,4} ]?
++ *
++ * Each corner is stored as OPV + horizontal length, unit + vertical
++ * length, unit (the vertical one equal to the horizontal when not
++ * given). The logical corners (border-start-start-radius ...) and the
++ * -webkit- names are aliases (properties.c alias_props). */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++/* One radius: a non-negative length or percentage. */
++css_error css__parse_corner_radius_one(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_fixed *length, uint32_t *unit)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	css_error error;
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL || (token->type != CSS_TOKEN_DIMENSION &&
++			token->type != CSS_TOKEN_NUMBER &&
++			token->type != CSS_TOKEN_PERCENTAGE))
++		return CSS_INVALID;
++
++	error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++			length, unit);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++	if ((*unit & UNIT_ANGLE) || (*unit & UNIT_TIME) ||
++			(*unit & UNIT_FREQ) || *length < 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++	return CSS_OK;
++}
++
++css_error css__corner_radius_append(css_style *result, int prop,
++		css_fixed h, uint32_t hu, css_fixed v, uint32_t vu)
++{
++	css_error error;
++
++	error = css__stylesheet_style_appendOPV(result, prop, 0,
++			BORDER_CORNER_RADIUS_SET);
++	if (error != CSS_OK)
++		return error;
++	return css__stylesheet_style_vappend(result, 4, h, hu, v, vu);
++}
++
++static css_error parse_corner(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result, int prop)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	enum flag_value flag_value;
++	css_fixed h = 0, v = 0;
++	uint32_t hu = UNIT_PX, vu = UNIT_PX;
++	css_error error;
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL)
++		return CSS_INVALID;
++
++	flag_value = get_css_flag_value(c, token);
++	if (flag_value != FLAG_VALUE__NONE) {
++		parserutils_vector_iterate(vector, ctx);
++		return css_stylesheet_style_flag_value(result, flag_value,
++				prop);
++	}
++
++	error = css__parse_corner_radius_one(c, vector, ctx, &h, &hu);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++	v = h;
++	vu = hu;
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token != NULL && (token->type == CSS_TOKEN_DIMENSION ||
++			token->type == CSS_TOKEN_NUMBER ||
++			token->type == CSS_TOKEN_PERCENTAGE)) {
++		error = css__parse_corner_radius_one(c, vector, ctx, &v, &vu);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++	}
++
++	error = css__corner_radius_append(result, prop, h, hu, v, vu);
++	if (error != CSS_OK)
++		*ctx = orig_ctx;
++	return error;
++}
++
++css_error css__parse_border_top_left_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	return parse_corner(c, vector, ctx, result,
++			CSS_PROP_BORDER_TOP_LEFT_RADIUS);
++}
++
++css_error css__parse_border_top_right_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	return parse_corner(c, vector, ctx, result,
++			CSS_PROP_BORDER_TOP_RIGHT_RADIUS);
++}
++
++css_error css__parse_border_bottom_right_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	return parse_corner(c, vector, ctx, result,
++			CSS_PROP_BORDER_BOTTOM_RIGHT_RADIUS);
++}
++
++css_error css__parse_border_bottom_left_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	return parse_corner(c, vector, ctx, result,
++			CSS_PROP_BORDER_BOTTOM_LEFT_RADIUS);
++}
+--- /dev/null
++++ b/src/select/properties/s_border_corner_radius.c
+@@ -0,0 +1,254 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ */
++
++/* VitaBrowser patch 363: the four corner radii (p_border_corner_radius.c).
++ * Not inherited; initial 0. Stored beside 358's stroke fields: status,
++ * horizontal and vertical length + unit per corner. */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "select/helpers.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++static css_error cascade_corner(int k, uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	int32_t status = CSS_BORDER_CORNER_RADIUS_INHERIT;
++	css_fixed h = 0, v = 0;
++	uint32_t hu = UNIT_PX, vu = UNIT_PX;
++
++	if (hasFlagValue(opv) == false &&
++			getValue(opv) == BORDER_CORNER_RADIUS_SET) {
++		status = CSS_BORDER_CORNER_RADIUS_SET;
++		h = *((css_fixed *) style->bytecode);
++		advance_bytecode(style, sizeof(h));
++		hu = *((uint32_t *) style->bytecode);
++		advance_bytecode(style, sizeof(hu));
++		v = *((css_fixed *) style->bytecode);
++		advance_bytecode(style, sizeof(v));
++		vu = *((uint32_t *) style->bytecode);
++		advance_bytecode(style, sizeof(vu));
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		state->computed->i.corner_radius_status[k] = status;
++		state->computed->i.corner_radius_h[k] = h;
++		state->computed->i.corner_radius_hu[k] =
++				(int32_t)css__to_css_unit(hu);
++		state->computed->i.corner_radius_v[k] = v;
++		state->computed->i.corner_radius_vu[k] =
++				(int32_t)css__to_css_unit(vu);
++	}
++	return CSS_OK;
++}
++
++static void set_corner(css_computed_style *s, int k, int32_t status,
++		css_fixed h, int32_t hu, css_fixed v, int32_t vu)
++{
++	s->i.corner_radius_status[k] = status;
++	s->i.corner_radius_h[k] = h;
++	s->i.corner_radius_hu[k] = hu;
++	s->i.corner_radius_v[k] = v;
++	s->i.corner_radius_vu[k] = vu;
++}
++
++static void copy_corner(int k, const css_computed_style *from,
++		css_computed_style *to)
++{
++	set_corner(to, k, from->i.corner_radius_status[k],
++			from->i.corner_radius_h[k], from->i.corner_radius_hu[k],
++			from->i.corner_radius_v[k], from->i.corner_radius_vu[k]);
++}
++
++css_error css__cascade_border_top_left_radius(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return cascade_corner(0, opv, style, state);
++}
++
++css_error css__set_border_top_left_radius_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	set_corner(style, 0, hint->status, hint->data.length.value,
++			(int32_t)hint->data.length.unit,
++			hint->data.length.value,
++			(int32_t)hint->data.length.unit);
++	return CSS_OK;
++}
++
++css_error css__initial_border_top_left_radius(css_select_state *state)
++{
++	set_corner(state->computed, 0, CSS_BORDER_CORNER_RADIUS_SET,
++			0, CSS_UNIT_PX, 0, CSS_UNIT_PX);
++	return CSS_OK;
++}
++
++css_error css__copy_border_top_left_radius(const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from != to)
++		copy_corner(0, from, to);
++	return CSS_OK;
++}
++
++css_error css__compose_border_top_left_radius(const css_computed_style *parent,
++		const css_computed_style *child, css_computed_style *result)
++{
++	copy_corner(0, child->i.corner_radius_status[0] ==
++			CSS_BORDER_CORNER_RADIUS_INHERIT ? parent : child,
++			result);
++	return CSS_OK;
++}
++
++uint32_t destroy_border_top_left_radius(void *bytecode)
++{
++	(void)bytecode;
++	return 0;
++}
++
++css_error css__cascade_border_top_right_radius(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return cascade_corner(1, opv, style, state);
++}
++
++css_error css__set_border_top_right_radius_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	set_corner(style, 1, hint->status, hint->data.length.value,
++			(int32_t)hint->data.length.unit,
++			hint->data.length.value,
++			(int32_t)hint->data.length.unit);
++	return CSS_OK;
++}
++
++css_error css__initial_border_top_right_radius(css_select_state *state)
++{
++	set_corner(state->computed, 1, CSS_BORDER_CORNER_RADIUS_SET,
++			0, CSS_UNIT_PX, 0, CSS_UNIT_PX);
++	return CSS_OK;
++}
++
++css_error css__copy_border_top_right_radius(const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from != to)
++		copy_corner(1, from, to);
++	return CSS_OK;
++}
++
++css_error css__compose_border_top_right_radius(const css_computed_style *parent,
++		const css_computed_style *child, css_computed_style *result)
++{
++	copy_corner(1, child->i.corner_radius_status[1] ==
++			CSS_BORDER_CORNER_RADIUS_INHERIT ? parent : child,
++			result);
++	return CSS_OK;
++}
++
++uint32_t destroy_border_top_right_radius(void *bytecode)
++{
++	(void)bytecode;
++	return 0;
++}
++
++css_error css__cascade_border_bottom_right_radius(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return cascade_corner(2, opv, style, state);
++}
++
++css_error css__set_border_bottom_right_radius_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	set_corner(style, 2, hint->status, hint->data.length.value,
++			(int32_t)hint->data.length.unit,
++			hint->data.length.value,
++			(int32_t)hint->data.length.unit);
++	return CSS_OK;
++}
++
++css_error css__initial_border_bottom_right_radius(css_select_state *state)
++{
++	set_corner(state->computed, 2, CSS_BORDER_CORNER_RADIUS_SET,
++			0, CSS_UNIT_PX, 0, CSS_UNIT_PX);
++	return CSS_OK;
++}
++
++css_error css__copy_border_bottom_right_radius(const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from != to)
++		copy_corner(2, from, to);
++	return CSS_OK;
++}
++
++css_error css__compose_border_bottom_right_radius(const css_computed_style *parent,
++		const css_computed_style *child, css_computed_style *result)
++{
++	copy_corner(2, child->i.corner_radius_status[2] ==
++			CSS_BORDER_CORNER_RADIUS_INHERIT ? parent : child,
++			result);
++	return CSS_OK;
++}
++
++uint32_t destroy_border_bottom_right_radius(void *bytecode)
++{
++	(void)bytecode;
++	return 0;
++}
++
++css_error css__cascade_border_bottom_left_radius(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return cascade_corner(3, opv, style, state);
++}
++
++css_error css__set_border_bottom_left_radius_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	set_corner(style, 3, hint->status, hint->data.length.value,
++			(int32_t)hint->data.length.unit,
++			hint->data.length.value,
++			(int32_t)hint->data.length.unit);
++	return CSS_OK;
++}
++
++css_error css__initial_border_bottom_left_radius(css_select_state *state)
++{
++	set_corner(state->computed, 3, CSS_BORDER_CORNER_RADIUS_SET,
++			0, CSS_UNIT_PX, 0, CSS_UNIT_PX);
++	return CSS_OK;
++}
++
++css_error css__copy_border_bottom_left_radius(const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from != to)
++		copy_corner(3, from, to);
++	return CSS_OK;
++}
++
++css_error css__compose_border_bottom_left_radius(const css_computed_style *parent,
++		const css_computed_style *child, css_computed_style *result)
++{
++	copy_corner(3, child->i.corner_radius_status[3] ==
++			CSS_BORDER_CORNER_RADIUS_INHERIT ? parent : child,
++			result);
++	return CSS_OK;
++}
++
++uint32_t destroy_border_bottom_left_radius(void *bytecode)
++{
++	(void)bytecode;
++	return 0;
++}

@@ -1,0 +1,455 @@
+# netsurf: rounded corners drawn (patch 363, with 363-libcss)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 361)
+#
+# The Vita never drew border-radius: plot_style.border_radius was set and
+# no plotter read it, so every box was square (doc 11 recorded it as the
+# Vita's limitation). Pills, cards, avatars' backgrounds and rounded
+# buttons now draw rounded, through the antialiased path filler (359).
+#
+#  - redraw_border.c: html_redraw_corner_radii() resolves the four corners
+#    to device px (percentages of the border box) and shrinks overlapping
+#    radii together (CSS backgrounds 5.5); html_redraw_rounded_shape()
+#    emits a rounded rectangle -- or a ring, the inner one wound the
+#    other way -- as a flattened path (<= 16 segments a corner) through
+#    ctx->plot->path; html_redraw_borders_rounded() draws a border whose
+#    drawn sides are all solid and one colour as one ring, with the
+#    colour's alpha and the group opacity folded as the square painter
+#    does (html_redraw_border_can_round() is the test).
+#  - redraw.c: a box's own solid background colour (not the canvas
+#    propagated from root/body, no macsurf transform, background-clip
+#    border-box) with any corner radius fills the rounded shape; a box
+#    whose border cannot be rounded keeps a square background too, so a
+#    square border never shows corner wedges. The ring is tried before
+#    html_redraw_borders().
+#  - getComputedStyle answers the four corners (borderTopLeftRadius ...,
+#    "H" or "H V") and borderRadius as their shorthand; CSS.supports
+#    knows the corner and logical names (vita_polyfill.js / .inc).
+#
+# Still square: background images and gradients, inline boxes'
+# backgrounds, box-shadow, overflow clipping of children (an <img> with
+# border-radius: 50% stays a square photo), and borders of mixed colour
+# or style. Device cost: one path per rounded box, the 359 frame-pool
+# budget falls back to centre-sampled fills; not yet measured on the Vita.
+#
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -381,6 +381,32 @@
+ 		int p_width, int p_height, const struct rect *clip, float scale,
+ 		const struct redraw_context *ctx);
+ 
++/* VitaBrowser patch 363: rounded corners (html/redraw_border.c).
++ * The box's four corner radii in device px (TL, TR, BR, BL), a
++ * percentage of the border box bw x bh, overlap-scaled as CSS says;
++ * false when all are zero. */
++bool html_redraw_corner_radii(const struct box *box,
++		const css_unit_ctx *unit_len_ctx, float scale, float bw,
++		float bh, float rx[4], float ry[4]);
++/* Fill a rounded rectangle, or with inner != NULL the ring between it
++ * and an inner one (inner = x0 y0 x1 y1, radii irx/iry). */
++nserror html_redraw_rounded_shape(const struct redraw_context *ctx,
++		const plot_style_t *style, const struct rect *clip,
++		const float outer[4], const float rx[4], const float ry[4],
++		const float *inner, const float *irx, const float *iry);
++/* True when the box's border can be drawn rounded: no side draws, or
++ * every side that does is solid and one colour (*colour, *any). A box
++ * whose border cannot keeps a square background too. */
++bool html_redraw_border_can_round(const struct box *box, css_color *colour,
++		bool *any);
++/* The border of a rounded box as one ring, when every drawn side is
++ * solid and one colour; false (nothing drawn) otherwise. */
++bool html_redraw_borders_rounded(struct box *box, int x_parent,
++		int y_parent, int p_width, int p_height,
++		const struct rect *clip, float scale,
++		const css_unit_ctx *unit_len_ctx,
++		const struct redraw_context *ctx);
++
+ /* VitaBrowser patch 314: composed group opacity of the box subtree
+  * currently being painted (in html/redraw.c). */
+ plot_style_fixed html_redraw_group_opacity(void);
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -2434,6 +2434,41 @@
+ 				 * helper so gradient backgrounds repeat at
+ 				 * the requested tile size when bg-size is set
+ 				 * to a specific px value. */
++				/* VitaBrowser patch 363: a box's own solid
++				 * background with border-radius is a rounded
++				 * shape (the border box's, clipped by r) */
++				float rr_out[4], rr_x[4], rr_y[4];
++				bool rr = false;
++
++				if (background == box && box->style != NULL &&
++				    pstyle_fill_bg.fill_type ==
++						PLOT_OP_TYPE_SOLID &&
++				    pstyle_fill_bg.transform == 0 &&
++				    css_computed_background_clip(box->style) ==
++						CSS_BACKGROUND_CLIP_BORDER_BOX &&
++				    html_redraw_border_can_round(box, NULL,
++						NULL)) {
++					rr_out[0] = x - box->border[LEFT].width *
++							scale;
++					rr_out[1] = y - box->border[TOP].width *
++							scale;
++					rr_out[2] = x + (box->padding[LEFT] +
++						box->width + box->padding[RIGHT] +
++						box->border[RIGHT].width) * scale;
++					rr_out[3] = y + (box->padding[TOP] +
++						box->height + box->padding[BOTTOM] +
++						box->border[BOTTOM].width) * scale;
++					rr = html_redraw_corner_radii(box,
++						unit_len_ctx, scale,
++						rr_out[2] - rr_out[0],
++						rr_out[3] - rr_out[1],
++						rr_x, rr_y);
++				}
++				if (rr)
++					res = html_redraw_rounded_shape(ctx,
++						&pstyle_fill_bg, &r, rr_out,
++						rr_x, rr_y, NULL, NULL, NULL);
++				else
+ 				res = html_redraw_paint_gradient_tiled(ctx,
+ 						&pstyle_fill_bg, &r,
+ 						background ? background->style : NULL);
+@@ -5598,6 +5633,10 @@
+ 					y_parent, padding_width,
+ 					padding_height, &r, scale, ctx))
+ 				return false;
++		} else if (html_redraw_borders_rounded(box, x_parent,
++				y_parent, padding_width, padding_height, &r,
++				scale, &html->unit_len_ctx, ctx)) {
++			/* VitaBrowser patch 363: drawn as one rounded ring */
+ 		} else if (!html_redraw_borders(box, x_parent, y_parent,
+ 				padding_width, padding_height, &r,
+ 				scale, ctx))
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -24,6 +24,8 @@
+ 
+ #include <stdbool.h>
+ #include <stdlib.h>
++#include <string.h>
++#include <math.h>
+ 
+ #include "utils/utils.h"
+ #include "utils/log.h"
+@@ -1078,3 +1080,238 @@
+ 
+ 	return true;
+ }
++
++
++/* ---- VitaBrowser patch 363: rounded corners --------------------------
++ *
++ * border-radius was parsed (one length, patch 107) and never drawn: the
++ * Vita painted every box square. libcss now keeps four corners (each a
++ * horizontal and a vertical radius); here they become device pixels and
++ * a path: the background fill (redraw.c) and a solid one-colour border
++ * draw through the path plotter, which antialiases (patch 359). Mixed
++ * border colours or styles keep the square painter; images, shadows and
++ * overflow clipping stay square. */
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++#define HTML_RR_SEG_MAX 16
++#define HTML_RR_FLOATS (2 * (4 * (HTML_RR_SEG_MAX + 1) * 3 + 1))
++
++bool html_redraw_corner_radii(const struct box *box,
++		const css_unit_ctx *unit_len_ctx, float scale, float bw,
++		float bh, float rx[4], float ry[4])
++{
++	float f = 1.0f;
++	bool any = false;
++	int k;
++
++	if (box == NULL || box->style == NULL || bw <= 0 || bh <= 0)
++		return false;
++	for (k = 0; k < 4; k++) {
++		css_fixed h = 0, v = 0;
++		css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++
++		css_computed_border_corner_radius(box->style, k,
++				&h, &hu, &v, &vu);
++		rx[k] = (hu == CSS_UNIT_PCT) ? FIXTOFLT(h) * bw / 100.0f :
++			FIXTOFLT(css_unit_len2device_px(box->style,
++					unit_len_ctx, h, hu)) * scale;
++		ry[k] = (vu == CSS_UNIT_PCT) ? FIXTOFLT(v) * bh / 100.0f :
++			FIXTOFLT(css_unit_len2device_px(box->style,
++					unit_len_ctx, v, vu)) * scale;
++		if (rx[k] < 0.5f || ry[k] < 0.5f)
++			rx[k] = ry[k] = 0;
++		else
++			any = true;
++	}
++	if (!any)
++		return false;
++	/* CSS backgrounds 5.5: radii that overlap on a side shrink
++	 * together */
++#define HTML_RR_FIT(len, a, b) \
++	if ((a) + (b) > (len) && (len) / ((a) + (b)) < f) \
++		f = (len) / ((a) + (b))
++	HTML_RR_FIT(bw, rx[0], rx[1]);
++	HTML_RR_FIT(bw, rx[3], rx[2]);
++	HTML_RR_FIT(bh, ry[0], ry[3]);
++	HTML_RR_FIT(bh, ry[1], ry[2]);
++#undef HTML_RR_FIT
++	if (f < 1.0f)
++		for (k = 0; k < 4; k++) {
++			rx[k] *= f;
++			ry[k] *= f;
++		}
++	return true;
++}
++
++/* Append one rounded rectangle as a closed subpath: corners clockwise
++ * from the top left, or anticlockwise (the ring's hole). */
++static unsigned int html_rr_subpath(float *p, unsigned int n,
++		const float r[4], const float rx[4], const float ry[4],
++		bool anticlockwise)
++{
++	/* each corner's centre and start angle (y down, so increasing
++	 * angle runs clockwise on screen) */
++	float cx[4], cy[4], a0[4];
++	float pts[4 * (HTML_RR_SEG_MAX + 1)][2];
++	unsigned int np = 0, i;
++	int k, s;
++
++	cx[0] = r[0] + rx[0]; cy[0] = r[1] + ry[0]; a0[0] = (float)M_PI;
++	cx[1] = r[2] - rx[1]; cy[1] = r[1] + ry[1]; a0[1] = 1.5f * (float)M_PI;
++	cx[2] = r[2] - rx[2]; cy[2] = r[3] - ry[2]; a0[2] = 0;
++	cx[3] = r[0] + rx[3]; cy[3] = r[3] - ry[3]; a0[3] = 0.5f * (float)M_PI;
++	for (k = 0; k < 4; k++) {
++		int segs;
++		float m = rx[k] > ry[k] ? rx[k] : ry[k];
++
++		if (rx[k] <= 0 || ry[k] <= 0) {
++			/* a square corner */
++			pts[np][0] = (k == 0 || k == 3) ? r[0] : r[2];
++			pts[np][1] = (k == 0 || k == 1) ? r[1] : r[3];
++			np++;
++			continue;
++		}
++		segs = (int)(m / 2.0f) + 2;
++		if (segs > HTML_RR_SEG_MAX)
++			segs = HTML_RR_SEG_MAX;
++		for (s = 0; s <= segs; s++) {
++			float a = a0[k] + 0.5f * (float)M_PI * s / segs;
++			pts[np][0] = cx[k] + rx[k] * cosf(a);
++			pts[np][1] = cy[k] + ry[k] * sinf(a);
++			np++;
++		}
++	}
++	for (i = 0; i < np; i++) {
++		unsigned int j = anticlockwise ? np - 1 - i : i;
++		p[n++] = (float)(i == 0 ? PLOTTER_PATH_MOVE :
++				PLOTTER_PATH_LINE);
++		p[n++] = pts[j][0];
++		p[n++] = pts[j][1];
++	}
++	p[n++] = (float)PLOTTER_PATH_CLOSE;
++	return n;
++}
++
++nserror html_redraw_rounded_shape(const struct redraw_context *ctx,
++		const plot_style_t *style, const struct rect *clip,
++		const float outer[4], const float rx[4], const float ry[4],
++		const float *inner, const float *irx, const float *iry)
++{
++	static const float identity[6] = { 1, 0, 0, 1, 0, 0 };
++	float p[HTML_RR_FLOATS];
++	unsigned int n;
++	plot_style_t st = *style;
++	nserror res;
++
++	if (ctx->plot->path == NULL)
++		return NSERROR_NOT_IMPLEMENTED;
++	n = html_rr_subpath(p, 0, outer, rx, ry, false);
++	if (inner != NULL && inner[2] > inner[0] && inner[3] > inner[1])
++		n = html_rr_subpath(p, n, inner, irx, iry, true);
++	st.stroke_type = PLOT_OP_TYPE_NONE;
++	st.fill_type = PLOT_OP_TYPE_SOLID;
++	res = ctx->plot->clip(ctx, clip);
++	if (res != NSERROR_OK)
++		return res;
++	return ctx->plot->path(ctx, &st, p, n, identity);
++}
++
++bool html_redraw_border_can_round(const struct box *box, css_color *colour,
++		bool *any)
++{
++	static const unsigned int sides[4] = { TOP, RIGHT, BOTTOM, LEFT };
++	bool have = false;
++	css_color col = 0;
++	int k;
++
++	for (k = 0; k < 4; k++) {
++		const struct box_border *b = &box->border[sides[k]];
++
++		if (b->width == 0 || b->style == CSS_BORDER_STYLE_NONE ||
++		    b->style == CSS_BORDER_STYLE_HIDDEN ||
++		    nscss_color_is_transparent(b->c))
++			continue;
++		if (b->style != CSS_BORDER_STYLE_SOLID ||
++		    (have && b->c != col))
++			return false;
++		col = b->c;
++		have = true;
++	}
++	if (colour != NULL)
++		*colour = col;
++	if (any != NULL)
++		*any = have;
++	return true;
++}
++
++bool html_redraw_borders_rounded(struct box *box, int x_parent,
++		int y_parent, int p_width, int p_height,
++		const struct rect *clip, float scale,
++		const css_unit_ctx *unit_len_ctx,
++		const struct redraw_context *ctx)
++{
++	static const unsigned int sides[4] = { TOP, RIGHT, BOTTOM, LEFT };
++	float bw[4], outer[4], inner[4], rx[4], ry[4], irx[4], iry[4];
++	css_color col = 0;
++	bool have = false;
++	plot_style_t st;
++	unsigned int alpha;
++	plot_style_fixed group;
++	float x, y;
++	int k;
++
++	if (box->style == NULL ||
++	    !html_redraw_border_can_round(box, &col, &have) || !have)
++		return false;
++	/* the band each side draws (a hidden side draws none) */
++	for (k = 0; k < 4; k++) {
++		const struct box_border *b = &box->border[sides[k]];
++
++		bw[k] = (b->width == 0 || b->style == CSS_BORDER_STYLE_NONE ||
++			 b->style == CSS_BORDER_STYLE_HIDDEN ||
++			 nscss_color_is_transparent(b->c)) ? 0 :
++			b->width * scale;
++	}
++
++	x = (x_parent + box->x) * scale;
++	y = (y_parent + box->y) * scale;
++	outer[0] = x - box->border[LEFT].width * scale;
++	outer[1] = y - box->border[TOP].width * scale;
++	outer[2] = x + p_width + box->border[RIGHT].width * scale;
++	outer[3] = y + p_height + box->border[BOTTOM].width * scale;
++	if (!html_redraw_corner_radii(box, unit_len_ctx, scale,
++			outer[2] - outer[0], outer[3] - outer[1], rx, ry))
++		return false;
++
++	/* the hole: the padding box, its radii less the border widths */
++	inner[0] = outer[0] + bw[3];
++	inner[1] = outer[1] + bw[0];
++	inner[2] = outer[2] - bw[1];
++	inner[3] = outer[3] - bw[2];
++	irx[0] = rx[0] - bw[3]; iry[0] = ry[0] - bw[0];
++	irx[1] = rx[1] - bw[1]; iry[1] = ry[1] - bw[0];
++	irx[2] = rx[2] - bw[1]; iry[2] = ry[2] - bw[2];
++	irx[3] = rx[3] - bw[3]; iry[3] = ry[3] - bw[2];
++	for (k = 0; k < 4; k++)
++		if (irx[k] <= 0 || iry[k] <= 0)
++			irx[k] = iry[k] = 0;
++
++	/* the colour's alpha, folded with the group opacity, as
++	 * html_redraw_border_plot does (0 = opaque for the plotters) */
++	alpha = (col >> 24) & 0xff;
++	group = html_redraw_group_opacity();
++	if (group < (plot_style_fixed)PLOT_STYLE_SCALE)
++		alpha = (unsigned int)(((uint64_t)alpha *
++				(unsigned int)group) / PLOT_STYLE_SCALE);
++	if (alpha == 0)
++		return true;	/* nothing to draw, and nothing square */
++	memset(&st, 0, sizeof(st));
++	st.fill_type = PLOT_OP_TYPE_SOLID;
++	st.fill_colour = nscss_color_to_ns(col);
++	st.opacity = alpha >= 255 ? 0 :
++		(plot_style_fixed)(alpha * PLOT_STYLE_SCALE / 255);
++	return html_redraw_rounded_shape(ctx, &st, clip, outer, rx, ry,
++			inner, irx, iry) == NSERROR_OK;
++}
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -10796,16 +10796,44 @@
+ 		 * for border-radius and tab-size, '') -- a stylesheet's
+ 		 * 12px radius and its shadow were invisible whatever it
+ 		 * said. */
++		/* VitaBrowser patch 363: the four corners, each "H" or
++		 * "H V" as Chromium writes them, and borderRadius as the
++		 * shorthand of the four (one value when they agree). */
+ 		{
+-			css_fixed brl = 0;
+-			css_unit bru = CSS_UNIT_PX;
+-			if (css_computed_border_radius(s, &brl, &bru) ==
+-					CSS_BORDER_RADIUS_SET) {
+-				char brb[40];
+-				qjs_cs_len_str(brb, sizeof brb, brl, bru);
+-				JS_SetPropertyStr(ctx, out, "borderRadius",
+-						JS_NewString(ctx, brb));
++			static const char *const cn[4] = {
++				"borderTopLeftRadius", "borderTopRightRadius",
++				"borderBottomRightRadius",
++				"borderBottomLeftRadius"
++			};
++			char cv[4][84], all[360];
++			int k;
++
++			for (k = 0; k < 4; k++) {
++				css_fixed h = 0, v = 0;
++				css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++				char hb[40], vb[40];
++
++				css_computed_border_corner_radius(s, k,
++						&h, &hu, &v, &vu);
++				qjs_cs_len_str(hb, sizeof hb, h, hu);
++				qjs_cs_len_str(vb, sizeof vb, v, vu);
++				if (strcmp(hb, vb) == 0)
++					snprintf(cv[k], sizeof cv[k], "%s", hb);
++				else
++					snprintf(cv[k], sizeof cv[k], "%s %s",
++							hb, vb);
++				JS_SetPropertyStr(ctx, out, cn[k],
++						JS_NewString(ctx, cv[k]));
+ 			}
++			if (strcmp(cv[0], cv[1]) == 0 &&
++			    strcmp(cv[0], cv[2]) == 0 &&
++			    strcmp(cv[0], cv[3]) == 0)
++				snprintf(all, sizeof all, "%s", cv[0]);
++			else
++				snprintf(all, sizeof all, "%s %s %s %s",
++						cv[0], cv[1], cv[2], cv[3]);
++			JS_SetPropertyStr(ctx, out, "borderRadius",
++					JS_NewString(ctx, all));
+ 		}
+ 		{
+ 			css_fixed rg = 0, cg = 0;
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6813,7 +6813,9 @@
+ (function () {
+ 	var props = ('align-content align-items align-self animation aspect-ratio background background-attachment ' +
+ 		'background-clip background-color background-image background-origin background-position background-repeat ' +
+-		'background-size border border-bottom border-collapse border-color border-left border-radius border-right ' +
++		'background-size border border-bottom border-bottom-left-radius border-bottom-right-radius border-collapse border-color ' +
++		'border-end-end-radius border-end-start-radius border-left border-radius border-right border-start-end-radius ' +
++		'border-start-start-radius border-top-left-radius border-top-right-radius ' +
+ 		'border-spacing border-style border-top border-width bottom box-shadow box-sizing caption-side clear clip ' +
+ 		'color column-count column-gap columns content counter-increment counter-reset cursor direction display ' +
+ 		'empty-cells fill flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap float font ' +
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6814,7 +6814,9 @@
+ "(function () {\n"
+ "\tvar props = ('align-content align-items align-self animation aspect-ratio background background-attachment ' +\n"
+ "\t\t'background-clip background-color background-image background-origin background-position background-repeat ' +\n"
+-"\t\t'background-size border border-bottom border-collapse border-color border-left border-radius border-right ' +\n"
++"\t\t'background-size border border-bottom border-bottom-left-radius border-bottom-right-radius border-collapse border-color ' +\n"
++"\t\t'border-end-end-radius border-end-start-radius border-left border-radius border-right border-start-end-radius ' +\n"
++"\t\t'border-start-start-radius border-top-left-radius border-top-right-radius ' +\n"
+ "\t\t'border-spacing border-style border-top border-width bottom box-shadow box-sizing caption-side clear clip ' +\n"
+ "\t\t'color column-count column-gap columns content counter-increment counter-reset cursor direction display ' +\n"
+ "\t\t'empty-cells fill flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap float font ' +\n"
