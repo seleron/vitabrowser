@@ -7802,3 +7802,58 @@ are live content: hackernews +0.3, wpnews +0.1, stackoverflow 64.8 vs
 65.6, rerun interleaved at 65.4 / 64.1 (361) vs 65.3 / 18.5 (360, which
 caught a challenge page); its text recall swings 0.50-0.53 run to run in
 both arms.
+
+## Unit 362 (2026-11-01): script changes around flex containers -- SHELVED, census recorded
+
+Not landed. The change was correct on its test page but fired **zero
+times** on the 21 scorecard sites, so it is shelved rather than forced.
+Diff, test page and notes: `~/vitabrowser-work/wip-362-flex-unrendered-20261101/`.
+
+**What the census found** (r85-360 / r86-361 sim logs, all 21 sites).
+Full reconverts are expensive in box building, not layout:
+stackoverflow spent 866 ms of host time in 7 of them, of which build was
+843 ms and reformat 15 ms (github 1.16 s in 4, claude 0.89 s). By cause
+(`BATCHCAUSE`): local-path declines 53, nodeless/sheet 39, unhandled kind
+20, over 3. A trace of the local declines' mutated node, kind and
+appended child showed the shape behind stackoverflow's 7: `appendChild`
+on `<head>` (a Cloudflare challenge `<script>`), on `<html>`, and on a
+`display: flex` `<body>` (a `<script>`, a `<form>`, a 1x1 tracking
+`<img>`, an ad `div#pb-anchor--wrapper`); guardian's was an
+`insertBefore` on `<body>` among style/link/script. Loader scripts,
+mostly. The roadmap's WS-C list is out of date: its sibling-combinator
+item was closed by patch 186.
+
+**What was built (shelved):**
+- A change on `<head>` answered with no rebuild when no sheet has
+  `:has()` (head's children have no boxes, and a `<style>`/`<link>`
+  marks its own sheet -- verified: appended ones still apply).
+- A child-list change on a flex or grid container routed to
+  `html_rl_block_change` (new items built alone, the page laid out once;
+  flex, grid and table child boxes accepted).
+- Children that never have a box (head, script, style, link, meta,
+  title, base, template) no longer counted as "new elements"; a change
+  touching only those answered with no rebuild.
+On its test page (`JS-flex-body-append.html`, kept in the WIP dir) the
+three full reconverts became none, pixels identical, sheets applied.
+
+**Why it does not fire on real pages:** "only an unrendered child
+changed" cannot be proved safe with the engine's present selector
+analysis. The removed node is gone by flush time, and an appended
+`<script>` really does restyle siblings in Chromium through structural
+selectors (the previous last child stops matching `:last-child`). The
+page-wide test (`html_rl_css_has_list_style_risk`: any `:first-child`,
+`:last-child`, `:nth-*`, counters) and patch 186's parser, which marks a
+sheet conservative (state 2) when a left compound carries a
+pseudo-class, are true on essentially every real site: 22 of r87-362's
+declines were the new "unrendered child changed; page CSS has sibling or
+structural selectors", and the head path never qualified.
+
+**Next step, if resumed:** per-element structural analysis -- know the
+mutation was an append (pass the kind), take the appended node as the
+parent's last child, and match the compound around each
+`:last-child` / `:only-child` / `:nth-last-*` / `:has()` against the one
+sibling whose position changed (patch 186's compound matcher, extended
+to parse those pseudo-classes). An appended unrendered element changes
+no sibling-combinator match for rendered elements (it is the rightmost
+sibling), so that part is free. This overlaps doc 23's rule-diff
+design; settle it there first.
