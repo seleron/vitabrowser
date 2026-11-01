@@ -225,6 +225,7 @@ CSS-svg-fill-inherit file:///app0:/testpages/CSS-svg-fill-inherit.html
 CSS-svg-child-css file:///app0:/testpages/CSS-svg-child-css.html
 CSS-svg-stroke file:///app0:/testpages/CSS-svg-stroke.html
 CSS-svg-aa file:///app0:/testpages/CSS-svg-aa.html
+CSS-flex-column-automin file:///app0:/testpages/CSS-flex-column-automin.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1179,6 +1180,17 @@ if [ -n "$a359s" ]; then
 		5,75 35,45 10,50 60,60 61,60 10,98 60,108 61,108 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-svg-aa: ${a359px:-none} (0,0,0 255,255,255 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127)"
+# Patch 360: a column flex container counts its `flex: 1` item's content
+# (the automatic minimum), so the footer after it stays below (google.com's
+# search form was under its footer); getComputedStyle().flexGrow answers
+# instead of overflowing the stack.
+f360s=$(ls "$OUT"/snaps/N-*-CSS-flex-column-automin.png 2>/dev/null | head -1)
+f360px=
+if [ -n "$f360s" ]; then
+	f360px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$f360s" \
+		10,50 10,70 10,150 10,170 10,190 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  css-flex-column-automin: ${f360px:-none} (0,0,255 0,170,0 0,170,0 255,0,0 0,170,0)"
 # Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
 # same wave through the <img> path, no serializer rewrite.
 r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
@@ -1734,6 +1746,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$c357px" = "255,136,0 0,170,0 255,255,255 255,136,0 255,0,255 0,170,0 255,0,255 " ] && \
 [ "$s358px" = "255,0,0 255,255,255 0,170,0 0,0,255 255,255,255 " ] && \
 [ "$a359px" = "0,0,0 255,255,255 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 " ] && \
+[ "$f360px" = "0,0,255 0,170,0 0,170,0 255,0,0 0,170,0 " ] && \
 [ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \

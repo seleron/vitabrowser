@@ -1,0 +1,152 @@
+# netsurf: flex column automatic minimum; getComputedStyle recursion (patch 360)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 359)
+#
+# google.com's search box was missing in the sim: its footer (DIV.fbar)
+# painted over the search form. Google's page is #gb-main {display: flex;
+# flex-direction: column; min-height: 100%} holding a header and a
+# `flex: 1` middle (#n0tgWb), then the footer. The column came out as
+# tall as its header (139px) while the middle laid out 681px tall inside
+# it, so the in-flow footer after it landed at y=129, on the form.
+#
+#  - layout_flex.c: an item's hypothetical main size is now clamped by
+#    the AUTOMATIC minimum too (Flexbox 9.2 step 3E, 4.5): a column item
+#    with min-height auto and overflow visible is never shorter than its
+#    content. Only the free-space pass applied it, and an auto-height
+#    column sums the hypothetical sizes for its own height, so a
+#    `flex: 1` item (libcss stores the shorthand's basis as 0px) counted
+#    as 0. base_size, which the free space is measured from, is
+#    untouched.
+#  - layout_flex.c: a PERCENTAGE flex-basis in a column resolves against
+#    the container's main size (its height), and against an indefinite
+#    one is `content` (Flexbox 7.2.3). It resolved against
+#    available_width -- the cross size.
+#  - macsurf_qjs.c / vita_polyfill.js(.inc): getComputedStyle reads OWN
+#    properties only. The computed-style object inherits
+#    CSSStyleDeclaration.prototype (patch 280), whose patch-351 accessors
+#    call this.getPropertyValue -- the wrapper, which read the accessor
+#    again -- so any property __gcsNative did not answer (flexGrow, ...)
+#    recursed until "Maximum call stack size exceeded", on every page.
+#    The polyfill's read() now falls to its INITIAL table as designed.
+#
+# Not the cause, for the record: google's inline script sets
+# #gb-main.style.minHeight = a.scrollHeight + "px" during parse, before
+# the element has a box, and the engine answers undefined there by
+# design (fixes1087), so the inline style reads "min-height:undefinedpx".
+# libcss drops the declaration; the overlap reproduces with no script.
+# Before this patch the footer's JS geometry (offsetTop and
+# getBoundingClientRect, read 15 s in) said 764 while the frame painted
+# it at 129 -- the paint matched the 139px column, so paint was right.
+# Why the JS read differed was not traced (764 = the document's 820px
+# scrollHeight minus the footer's 56px); with this patch both say 764.
+#
+# Gate: CSS-flex-column-automin (file:// snapshot: head, middle twice,
+# footer below the middle, getComputedStyle row green); full gate360b
+# exit 0. Scorecard, all 21 sites against the r79-360 reference, this
+# patch and the pre-360 binary run back to back (r85-360 / r85-pre360):
+# mean 74.30 vs 74.30 -- no regression (claude's one "Just a moment..."
+# Cloudflare interstitial in r85-360 rerun: 77.0, as before). google
+# 53.6 vs 53.9: the search box now shows where Chromium has it, but the
+# visual column compares against a day-old reference and text recall
+# was already counting the footer, so the score does not see the fix.
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -620,7 +620,18 @@
+ 	}
+ 
+ 	if (item->basis == CSS_FLEX_BASIS_SET) {
+-		if (item->basis_unit == CSS_UNIT_PCT) {
++		if (item->basis_unit == CSS_UNIT_PCT && !ctx->horizontal) {
++			/* VitaBrowser patch 360: a percentage basis is of the
++			 * container's MAIN size -- a column's height, not
++			 * available_width -- and against an indefinite one it
++			 * is `content` (Flexbox 7.2.3). Google's #gb-main
++			 * column gave its `flex: 1` (0%) middle a basis of 0,
++			 * so the column stayed header-tall and the footer
++			 * after it painted over the search form. */
++			item->base_size = (ctx->available_main == AUTO) ? AUTO :
++					FPCT_OF_INT_TOINT(item->basis_length,
++						ctx->available_main);
++		} else if (item->basis_unit == CSS_UNIT_PCT) {
+ 			item->base_size = FPCT_OF_INT_TOINT(
+ 					item->basis_length,
+ 					available_width);
+@@ -754,6 +765,29 @@
+ 		item->main_size = item->min_main + delta_outer_main;
+ 	}
+ 
++	/* VitaBrowser patch 360: the hypothetical main size is clamped by
++	 * the AUTOMATIC minimum too (Flexbox 9.2 step 3E, 4.5): a column
++	 * item with min-height auto and overflow visible is never shorter
++	 * than its content. Only the free-space pass applied it, and an
++	 * auto-height column sums these hypothetical sizes for its own
++	 * height -- so Google's #gb-main stayed as tall as its header, its
++	 * `flex: 1` middle (basis 0) overflowed it, and the footer after
++	 * it painted over the search form. base_size (what the free space
++	 * is measured from) is untouched. */
++	if (!ctx->horizontal && item->content_main > item->main_size &&
++			b->style != NULL &&
++			css_computed_min_height_is_auto(b->style) &&
++			css_computed_overflow_y(b->style) ==
++				CSS_OVERFLOW_VISIBLE) {
++		int auto_min = item->content_main;
++
++		if (item->max_main > 0 &&
++				auto_min > item->max_main + delta_outer_main)
++			auto_min = item->max_main + delta_outer_main;
++		if (item->main_size < auto_min)
++			item->main_size = auto_min;
++	}
++
+ 	NSLOG(flex, DEEPDEBUG, "flex-item box: %p: base_size: %i, main_size %i",
+ 			b, item->base_size, item->main_size);
+ 
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -16834,7 +16834,15 @@
+ 			"o.getPropertyValue=function(p){"
+ 				"var k=String(p).replace(/-([a-z])/g,function(m,x){"
+ 					"return x.toUpperCase();});"
+-				"if(o[k]!==undefined&&typeof o[k]!=='function')return ''+o[k];"
++				/* VitaBrowser patch 360: OWN properties only. o
++				 * inherits CSSStyleDeclaration.prototype (patch 280),
++				 * whose patch-351 accessors call
++				 * this.getPropertyValue -- this function -- so any
++				 * property __gcsNative did not answer (flexGrow...)
++				 * recursed until the stack overflowed. */
++				"if(Object.prototype.hasOwnProperty.call(o,k)&&"
++					"o[k]!==undefined&&typeof o[k]!=='function')"
++					"return ''+o[k];"
+ 				"if(inl&&inl.getPropertyValue)return inl.getPropertyValue(p);"
+ 				"return '';};"
+ 			"o.setProperty=function(p,v){if(inl&&inl.setProperty)"
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6911,7 +6911,11 @@
+ 		if (g.CSSStyleDeclaration && Object.getPrototypeOf(base) === Object.prototype)
+ 			try { Object.setPrototypeOf(base, g.CSSStyleDeclaration.prototype); } catch (e) { /* */ }
+ 		function read(k) {
+-			var v = base[k];
++			/* patch 360: own properties only -- an inherited one is a
++			 * patch-351 CSSStyleDeclaration accessor, which calls
++			 * getPropertyValue, which reads here: a property the native
++			 * side did not answer recursed to a stack overflow */
++			var v = Object.prototype.hasOwnProperty.call(base, k) ? base[k] : undefined;
+ 			if (v !== undefined && v !== null && typeof v !== 'function') return String(v);
+ 			if (inl && typeof inl[k] === 'string' && inl[k] !== '') return inl[k];
+ 			return INITIAL[k] !== undefined ? INITIAL[k] : '';
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6912,7 +6912,11 @@
+ "\t\tif (g.CSSStyleDeclaration && Object.getPrototypeOf(base) === Object.prototype)\n"
+ "\t\t\ttry { Object.setPrototypeOf(base, g.CSSStyleDeclaration.prototype); } catch (e) { /* */ }\n"
+ "\t\tfunction read(k) {\n"
+-"\t\t\tvar v = base[k];\n"
++"\t\t\t/* patch 360: own properties only -- an inherited one is a\n"
++"\t\t\t * patch-351 CSSStyleDeclaration accessor, which calls\n"
++"\t\t\t * getPropertyValue, which reads here: a property the native\n"
++"\t\t\t * side did not answer recursed to a stack overflow */\n"
++"\t\t\tvar v = Object.prototype.hasOwnProperty.call(base, k) ? base[k] : undefined;\n"
+ "\t\t\tif (v !== undefined && v !== null && typeof v !== 'function') return String(v);\n"
+ "\t\t\tif (inl && typeof inl[k] === 'string' && inl[k] !== '') return inl[k];\n"
+ "\t\t\treturn INITIAL[k] !== undefined ? INITIAL[k] : '';\n"
