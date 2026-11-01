@@ -8077,3 +8077,61 @@ reproduce in 4 runs under gdb (`~/opt/gdb/gdb.sh`), so there is no
 backtrace yet. Next: run it under ASAN or catch a core in a loop.
 
 Next by cost (364's table): text changes in a table cell, 266 ms.
+
+## Patch 366 (2026-11-01): a table cell's content a script changes is rebuilt alone
+
+The last of 364's cost table: a script changing a table cell's text cost
+**270 ms** median (243-305) on the 2500-paragraph sim page -- a full
+box-tree rebuild. The local walk climbs from the change to the nearest
+element with a block box; a `<td>`'s box is TABLE_CELL, so it declined
+("nearest box is not a block").
+
+The change (html.c): a TABLE_CELL box now ends the walk as a block does.
+A full build normalises a cell with box_normalise_block too, so its
+content is rebuilt alone. Text, innerHTML with inline markup, a text
+node's data, and a class change on an inline element inside go through
+the inline path (165). A cell holding blocks (a `<p>` added or removed)
+goes through html_rl_block_change. Either way the page is then laid out
+once ("rebuilt, full layout (a table cell)" / "blocks in a table cell"):
+a cell's width and its row's height come from every cell in the table,
+and the table layout works them out. The local line relayout is never
+used for a cell (its own "ancestor not a plain block" refusal would
+have caught it; the explicit test names the reason in the log). Still
+the full rebuild: a class change on the cell itself (its own box
+restyles), and a cell with a float (its content is not one line
+container).
+
+Result: **270 -> 23 ms** median; float, image and control inserts
+unchanged at 21-23 ms.
+
+Gate: JS-table-cell-text runs ten steps 250 ms apart on three bordered
+tables, so every column width and row height shows in the pixels:
+- a narrow column's cell grows (3 -> 3000) and a wide one shrinks;
+- a header grows, and a colspan cell outgrows both its columns;
+- innerHTML with `<b>`/`<i>`, and a text node's data;
+- a `<p>` appended to, then removed from, a cell holding blocks;
+- a span's class change in a cell (20 px font);
+- text beside a float in a cell (the full rebuild).
+
+It renders row for row as CSS-table-cell-text-ref, the same steps run
+while the page parses (a full build), and the engine log shows the cell
+path: 13 cell changes across the whole gate, 5 or more required. Every
+one of the ten intermediate states was checked the same way against a
+parse-time build (scratch pages): 0 differing rows each. Full gate
+`gate366.log`, exit 0 (OCINS 7/7, LISTNEST 7/7, floats 0/0, SIBINS 4/4,
+DOMSTALL 8/8 unchanged).
+
+Scorecard r91: 21 sites against `r79-360`, 366 and the 365 binary back to
+back (`score/r91-366`, `score/r91-pre366`): **74.51 vs 74.58**. The cell
+path fired 0 times in the site loads, so the code they ran was identical.
+The sites' 5 remaining "nearest box is not a block" declines are
+flex/grid/inline-block boxes, the same in both arms. guardian's visual
+(0.531 vs 0.548) is the Sourcepoint dialog race, and stackoverflow's text
+(0.517 vs 0.527) is live content. The wpblog intermittent segfault (logged
+under 365) did not recur in either arm, and no Cloudflare interstitial
+appeared on any site.
+
+With 364-366, the WS-C script-change items measured in 364 all cost
+21-23 ms on the 2500-paragraph page, against 220-290 ms before. Left: a
+class change on a cell or flex/grid item's own box, content beside a
+float in a cell, and removal of a block holding objects or controls.
