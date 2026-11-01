@@ -7747,3 +7747,58 @@ a day-old reference (live trending list) and text recall already counted
 the footer's text, so the score does not register the fix. The
 absolute means are below r84's 86.9 because the r79-360 reference is a
 day old; the A/B pair is what compares.
+
+## Patch 361 (2026-11-01): inline style object reads the attribute, ignores garbage writes
+
+Picked over the WS-C remainder on evidence: the r85-360 scorecard runs
+logged only 52 local-rebuild declines across all 21 sites (1-13 a
+page), spread over 11 reasons, and the "sibling combinators" item on
+the roadmap list was already closed by patch 186's per-selector check.
+The style setter residual from patch 360, probed, was worse than logged
+and sits under fixes1087's whole "answer undefined before layout" policy.
+
+`el.style` (the el-helpers style object, macsurf_qjs.c) had two faults:
+- **It read only what a script had set.** Values authored in the style
+  attribute read `''`: `style="display:none"` answered `''` to
+  `el.style.display`, so the usual toggle
+  (`display === 'none' ? '' : 'none'`) hid an already hidden menu again.
+  Reads now parse the live attribute (quote- and paren-aware, the last
+  declaration wins, custom properties keep their case). That also feeds
+  getComputedStyle's inline fallback: an inline `flex-direction: column`
+  now reads `column` (a stylesheet one still reads the INITIAL `row`).
+- **A write removed the old declaration and stored any value.**
+  fixes1087 answers `undefined` for a size measured before layout,
+  expecting the page's `el.style.width = w + "px"` write-back to be a
+  no-op, as in Chromium, which rejects the value. Here it deleted an
+  authored `width:200px` and stored `width:undefinedpx`, which libcss
+  drops, so the block went full width (probe: 960px instead of 200px,
+  for `undefined + "px"`, `NaN + "px"` and `setProperty`). A value
+  holding NaN, undefined, null, Infinity or `[object X]`, bare or with a
+  unit, is now ignored and the old value kept. Exempt: `--custom`
+  properties and those taking custom idents or strings (font-family,
+  font, content, quotes, grid-area/row/column/template-areas,
+  animation*, transition*, counter-*, list-style*, will-change,
+  view-transition-name): `font-family: undefined` is kept, as Chromium
+  keeps it. `null` and `''` still remove. The cssText setter drops only
+  such declarations.
+
+Also: setProperty honours `important`, getPropertyPriority exists, and
+removeProperty returns the old value. The attribute keeps its
+serialization (`name:value;name:value`). Not covered: shorthands do not
+expand (`style.marginTop` of an authored `margin: 5px` reads `''`), and
+values Chromium rejects for other reasons (an unknown keyword) are still
+stored; libcss drops them at render, as before.
+
+Gate: JS-style-invalid (file:// snapshot: an authored `width:200px`
+survives `undefined + "px"` and `setProperty(NaN + "px")`, and an
+authored `display:none` is toggled shown). Before the patch the row
+read green at x=300 (full width) and the toggled row stayed white. Full
+gate `gate361.log`, exit 0.
+
+Scorecard: all 21 sites against the `r79-360` reference, this patch and
+the patch-360 binary run back to back (`score/r86-361`,
+`score/r86-pre361`): mean **74.54 vs 74.56**, no regression. The movers
+are live content: hackernews +0.3, wpnews +0.1, stackoverflow 64.8 vs
+65.6, rerun interleaved at 65.4 / 64.1 (361) vs 65.3 / 18.5 (360, which
+caught a challenge page); its text recall swings 0.50-0.53 run to run in
+both arms.
