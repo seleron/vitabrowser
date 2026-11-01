@@ -8364,3 +8364,110 @@ reason, is in the census method of 362/364 (`BATCHCAUSE` and
 netsurf.log). The next unit should be picked from a fresh measured batch
 of that census -- the r88 census put `<head>`/`<script>` churn on top,
 shelved as 362 -- or from another workstream.
+
+## Patch 370 (2026-11-01): census of full-rebuild causes; a style attribute change restyles locally
+
+**The census.** I took it from the r94 scorecard sims (369 binary, 21
+sites): every `BATCHCAUSE` (a committed full reconvert), the local-path
+decline just before each `local` one, and each site's mean reconvert
+cost (`RECONVPHASE total / n`; there is no per-reconvert timing line, so
+cost per cause is an estimate):
+
+| cause | batches | est. host ms | top sites |
+|---|---|---|---|
+| nonode (sheet / nodeless marks) | 34 | ~2050 | youtube, claude, github, google |
+| local: block is not one line container | 9 | ~1030 | stackoverflow, youtube |
+| kind (mutation kinds refused outright) | 22 | ~950 | claude, rte |
+| local: nearest box is not a block | 5 | ~490 | stackoverflow |
+| over | 3 | ~385 | guardian, rte, wikipedia |
+| local: page has frames | 2 | ~280 | guardian, rte |
+| local: new element is not a plain block | 17 | ~280 | claude, bbc, cnnlite |
+
+nonode is doc 23's territory (parked on the owner's run-40 census). A
+temporary trace split the next two:
+- "not one line container": stackoverflow's and guardian's are
+  `<html>`/`<head>`/`<body>` changes (362, parked); the rest are blocks
+  with ::before/::after (youtube, wpblog, github), content arriving in
+  empty blocks (github, google, wikipedia), and oldreddit's ten-box
+  block.
+- kind: **10 of 14 were inline style attribute changes** (kind 10,
+  SETATTR_STYLE) on rte (5), stackoverflow, wpblog, cnnlite, google and
+  youtube -- always a full rebuild, the local path never even tried.
+  The other 4 were attribute writes (`name`, `href`, `data-*`,
+  `aria-expanded`) that patch 310's gate refused because a sheet selects
+  on them.
+
+Pick: the style attribute, the first single unparked cause that fires on
+real page loads.
+
+**The change.**
+- macos9_reconvert.c: a SETATTR_STYLE mark goes to
+  `html_reconvert_local_style()` instead of the "kind" refusal.
+- html.c: `html_reconvert_local_style()` treats the change as a class
+  change: the element's own box selected afresh by the class paths. Those
+  are the inline content of its block (165/173), a block restyle (174), or
+  a cell's table (369). An element with no box before (display: none) is
+  met by its parent's rebuild as a new one. The current class is passed
+  as the "old" one, so patch 186's sibling check sees no class change.
+- Declined only when a **sibling** selector can test the attribute: a
+  left compound of `+`/`~` with `[style...]` in the patch-186 cache, or a
+  sheet that scan gave up on (state 2) whose text selects on `style` at
+  all (patch 310's scan). A `[style]` selector on the element or a
+  descendant is covered by the rebuild, and `:has()` never matches in this
+  libcss (patch 328).
+- Getting there took two rounds. A first cut declined on any sheet that
+  mentions `[style]` (patch 310's whole-sheet scan): r95, 8 of 10 real
+  style changes declined. A second declined on any state-2 sheet: r95b, 14
+  declined, 0 routed -- most real sheets are state 2 (a pseudo-class in a
+  sibling rule's left compound). The combination above is the narrowest
+  sound one.
+- html.c, `html_rl_block_restyle` (174), which class changes share: a
+  flex or grid item, and a block whose siblings include flex, grid or
+  table boxes or float carriers, are restyled too, and the page is then
+  laid out whole. Only the local placement needed plain blocks.
+
+**Result** on the 2500-paragraph sim page (`ST-370.html`, median of 3):
+a span's colour **97 -> 8 ms**; a paragraph's margin **91 -> 7 ms**; a
+cell's background **94 -> 17 ms**; a flex item's flex-grow **94 -> 17
+ms**. Full rebuilds on that page: 13 -> 1.
+
+Gate: JS-style-attr runs eleven steps 250 ms apart:
+- an inline span's colour, and a block's margin;
+- a block hidden, then shown;
+- an inline span made a block;
+- `setAttribute('style')` on a block;
+- a table cell's background, and a flex item's flex-grow;
+- a span made position:absolute;
+- body's background (still the full rebuild);
+- a class-hidden span shown by its style.
+
+It renders row for row as CSS-style-attr-ref, the same steps run while
+the page parses. Every intermediate state was checked the same way, on
+it and on four `[style]` sheet shapes (scratch pages): `[style]` on self
+and descendants (routed); `[style]` in a sibling rule (declined); a
+state-2 sheet with a `[style]` sibling rule (declined); a state-2 sheet
+without one (routed). That is 0 differing rows in 55 states. The engine
+log shows 35 style changes taken locally across the gate, 8 or more
+required; the 369 binary prints none. Full gate `gate370c.log`, exit 0
+(BLOCKCLASS 7/7 with 136 local restyles, BLOCKSIB 3/3, and all 364-369
+checks; `gate370.log` and `gate370b.log` passed on the earlier cuts).
+
+Scorecard r95c: 21 sites against `r79-360`, 370 and the 369 binary back
+to back (`score/r95c-370`, `score/r95c-pre370`): **74.83 vs 74.81**.
+On the sites, 8 style changes were routed locally (rte 6, cnnlite,
+google) and 3 declined for `[style]` sibling rules (stackoverflow,
+wpblog, youtube). But **all 8 then declined downstream** -- rte's on
+"page has frames", cnnlite's on "restyled block holds objects, controls
+or floats", google's on "nearest box is not a block" -- so in this load
+census no full rebuild was saved yet. Total full rebuilds read 112 vs
+116, within run-to-run batching noise (per site equal or +-1, google
++2). The measured win is interaction-time, where scripts write styles
+constantly (menus, toggles, animation by script). The guardian visual
+(0.529 vs 0.547) is the Sourcepoint dialog race; no crash and no
+Cloudflare interstitial.
+
+Next by this census: **"page has frames"** now gates rte's six style
+changes plus its own batches (rte, guardian). The local path refuses
+every change on a page with an iframe. After it: the ::before/::after
+and empty-block shapes of "not one line container", and attribute
+writes refused because a sheet selects on them.
