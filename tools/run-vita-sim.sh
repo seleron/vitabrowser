@@ -240,6 +240,8 @@ JS-remove-controls file:///app0:/testpages/JS-remove-controls.html
 CSS-remove-controls-ref file:///app0:/testpages/CSS-remove-controls-ref.html
 JS-table-cell-class file:///app0:/testpages/JS-table-cell-class.html
 CSS-table-cell-class-ref file:///app0:/testpages/CSS-table-cell-class-ref.html
+JS-style-attr file:///app0:/testpages/JS-style-attr.html
+CSS-style-attr-ref file:///app0:/testpages/CSS-style-attr-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1475,6 +1477,13 @@ tkr=$(fl_rows JS-table-cell-class CSS-table-cell-class-ref)
 tkl=$(grep -c "LIFE rebuild local: table restyled, full layout (a cell's own class)" "$R/netsurf.log" || true)
 echo "  JS-table-cell-class: rows differing from the parse-time build $tkr (0); ${tkl} cell class changes restyled with their table (5 or more)"
 [ "$tkr" = 0 ] && [ "${tkl:-0}" -ge 5 ] || fail "cell class changes restyle the table"
+# Patch 370: a style attribute change restyles locally, as a class change
+# (before: always a full rebuild); the eleven-step page renders row for
+# row as the same steps run at parse time.
+sar=$(fl_rows JS-style-attr CSS-style-attr-ref)
+sal=$(grep -c "LIFE rebuild local: style attribute change, as a class change" "$R/netsurf.log" || true)
+echo "  JS-style-attr: rows differing from the parse-time build $sar (0); ${sal} style attribute changes taken locally (8 or more)"
+[ "$sar" = 0 ] && [ "${sal:-0}" -ge 8 ] || fail "style attribute changes taken locally"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path

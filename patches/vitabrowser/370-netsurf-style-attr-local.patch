@@ -1,0 +1,215 @@
+# netsurf: a style attribute change restyles locally, as a class change (patch 370)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 369)
+#
+# A fresh census of full-rebuild causes (r94, 21 sites; estimated cost =
+# each site's mean reconvert time per batch) put nodeless/sheet batches
+# first (doc 23, parked) and, unparked, the mutation kinds the local path
+# refuses outright; a temporary trace split those: 10 of 14 were inline
+# style attribute changes (el.style.x = ..., setAttribute('style')), on
+# rte, stackoverflow, wpblog, cnnlite, google and youtube. Every one was a
+# full box-tree rebuild: 89-109 ms on a 2500-paragraph sim page.
+#
+#  - macos9_reconvert.c: a SETATTR_STYLE mark goes to
+#    html_reconvert_local_style() instead of the "kind" refusal.
+#  - html.c: html_reconvert_local_style() treats the change as a class
+#    change -- the element's own box selected afresh by the class paths:
+#    the inline content of its block (165/173), a block restyle (174), a
+#    cell's table (369); an element with no box before (display: none) is
+#    met by its parent's rebuild as a new one. The current class is passed
+#    as the "old" one, so patch 186's sibling check sees no class change.
+#    Declined only when a sibling selector can test the attribute: a
+#    left compound of + / ~ with [style...] in the patch-186 cache, or a
+#    sheet that scan gave up on (state 2) whose text selects on style at
+#    all (patch 310's scan). A [style] selector on the element or a
+#    descendant is covered by the rebuild; :has() never matches here (328).
+#  - html.c, html_rl_block_restyle (174, shared with class changes): a flex
+#    or grid item, and a block whose siblings include flex, grid or table
+#    boxes or float carriers, are restyled too, the page then laid out
+#    whole -- the local placement was what needed plain blocks.
+#
+# Result on the sim page: a span's colour 97 -> 8 ms, a paragraph's margin
+# 91 -> 7 ms, a cell's background 94 -> 17 ms, a flex item's flex-grow
+# 94 -> 17 ms. Eleven steps, and four sheet shapes ([style] on self and
+# descendants; [style] in a sibling rule; a state-2 sheet with and without
+# [style]), render row for row as a parse-time build at every step.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9493,11 +9493,30 @@
+ 
+ #define RL_RNO(w) do { macsurf_debug_log_writef( \
+ 		"LIFE rebuild local: declined (%s)", (w)); return -1; } while (0)
+-	if (pbox == NULL || pbox->type != BOX_BLOCK)
++	/* Patch 370: a flex or grid item, and a block among flex, grid or
++	 * table boxes or floats, are restyled the same way; only the local
++	 * placement below needs plain blocks, so the page is laid out whole
++	 * for them instead */
++	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
++			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID))
+ 		RL_RNO("restyled block's parent is not a block");
+-	for (b = pbox->children; b != NULL; b = b->next)
+-		if (b->type != BOX_BLOCK || b->node == NULL)
+-			RL_RNO("restyled block's parent holds more than blocks");
++	if (pbox->type != BOX_BLOCK) {
++		full = true;
++		why = "a flex or grid item";
++	}
++	for (b = pbox->children; b != NULL; b = b->next) {
++		if (b->type == BOX_BLOCK && b->node != NULL)
++			continue;
++		if ((b->node != NULL && (b->type == BOX_FLEX ||
++		     b->type == BOX_GRID || b->type == BOX_TABLE)) ||
++		    html_rl_float_carrier(b)) {
++			full = true;
++			why = why != NULL ? why :
++				"flex, grid, table or float siblings";
++			continue;
++		}
++		RL_RNO("restyled block's parent holds more than blocks");
++	}
+ 	if (ob->object != NULL || ob->gadget != NULL || ob->iframe != NULL ||
+ 	    ob->list_marker != NULL || ob->float_children != NULL ||
+ 	    html_rl_subtree_referenced(ob->children))
+@@ -9522,9 +9541,10 @@
+ 	html_rl_unlink(ob);
+ 	box_free(ob);
+ 	html_rl_invalidate(pbox);
+-	if (layout_relayout_block(c, pbox, prev, NULL, nx, &rb, &delta)) {
++	if (!full && layout_relayout_block(c, pbox, prev, NULL, nx, &rb,
++			&delta)) {
+ 		total += delta;
+-	} else {
++	} else if (!full) {
+ 		full = true;
+ 		why = layout_relayout_why;
+ 	}
+@@ -9623,6 +9643,106 @@
+ 	return html_reconvert_local_change(base_c, vnode, true, old_class);
+ }
+ 
++/* Patch 370: a change to an element's style attribute. Like a class
++ * change, it restyles the element's own box -- and the class paths are
++ * exactly the ones that select an element's style afresh: the inline
++ * content of its block rebuilt (165/173), a block restyled (174), a
++ * cell's table rebuilt (369); an element with no box (display: none
++ * before) is found by its parent's rebuild as a new one. Declined when
++ * a sibling selector can match on the attribute (below): the change
++ * could then restyle a sibling the rebuild does not reach. The class has
++ * not changed, so patch 186's sibling check gets the current value as
++ * the old one and finds no difference (NULL would decline it). */
++/* Patch 370: could a style attribute change restyle something the
++ * rebuild does not? The rebuild selects the element and everything under
++ * it afresh, so a [style...] selector matching the element or a
++ * descendant is covered; :has() never matches in this libcss (patch 328).
++ * What is left is a sibling combinator whose left compound tests the
++ * attribute (`[style*="display: none"] + p`): the patch-186 cache holds
++ * every such compound. A sheet that scan gave up on (state 2) is a
++ * risk only if it can select on the attribute at all (patch 310's
++ * textual scan). */
++static bool html_rl_cp_tests_attr(const struct html_rl_sib_compound *cp,
++		const char *name)
++{
++	int i;
++
++	for (i = 0; i < cp->nattrs; i++)
++		if (cp->attrs[i].name != NULL &&
++		    strcmp(cp->attrs[i].name, name) == 0)
++			return true;
++	return false;
++}
++
++static bool html_rl_style_sibling_risk(html_content *c)
++{
++	unsigned int si;
++	int k;
++
++	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
++		struct html_rl_sib_sheet *sh;
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		sh = html_rl_sib_sheet_for(c->stylesheets[si].sheet);
++		if (sh == NULL)
++			continue;
++		if (sh->state == 2) {
++			/* the scan gave up on this sheet's sibling rules (a
++			 * pseudo-class in a left compound, say): it is a risk
++			 * only if the sheet can select on the attribute at all
++			 * (patch 310's scan) */
++			const uint8_t *data;
++			size_t size = 0;
++			data = content_get_source_data(
++					c->stylesheets[si].sheet, &size);
++			if (data == NULL || size == 0 ||
++			    html_rl_sheet_scan_attr(data, size, "style", 5,
++					html_rl_pseudos_for("style")))
++				return true;
++			continue;
++		}
++		for (k = 0; k < sh->nlefts; k++)
++			if (html_rl_cp_tests_attr(&sh->lefts[k], "style"))
++				return true;
++		for (k = 0; k < sh->nrules; k++)
++			if (html_rl_cp_tests_attr(&sh->rules[k].l, "style"))
++				return true;
++	}
++	return false;
++}
++
++int html_reconvert_local_style(struct content *base_c, void *vnode);
++int html_reconvert_local_style(struct content *base_c, void *vnode)
++{
++	html_content *c = (html_content *)base_c;
++	dom_string *cls = NULL;
++	char *cs;
++	int r;
++
++	if (c == NULL || vnode == NULL)
++		return -1;
++	if (html_rl_style_sibling_risk(c)) {
++		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
++			"sibling selector can match on the style attribute)");
++		return -1;
++	}
++	if (dom_element_get_attribute((dom_node *)vnode, corestring_dom_class,
++			&cls) != DOM_NO_ERR)
++		return -1;
++	cs = cls != NULL ? strndup(dom_string_data(cls),
++			dom_string_byte_length(cls)) : strdup("");
++	if (cls != NULL)
++		dom_string_unref(cls);
++	if (cs == NULL)
++		return -1;
++	macsurf_debug_log_writef("LIFE rebuild local: style attribute "
++		"change, as a class change");
++	r = html_reconvert_local_change(base_c, vnode, true, cs);
++	free(cs);
++	return r;
++}
++
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+ 		bool class_change, const char *old_class)
+ {
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1152,6 +1152,7 @@
+ 	extern int html_reconvert_local(struct content *c, void *node);
+ 	extern int html_reconvert_local_class(struct content *c, void *node,
+ 			const char *old_class);
++	extern int html_reconvert_local_style(struct content *c, void *node);
+ 	/* Patch 310 (doc 20 stage 2) - the non-class attribute gate:
+ 	 * 1 while no sheet can match on the attribute and the element's
+ 	 * own box needs no attribute-fed style. html.c owns the check;
+@@ -1170,6 +1171,11 @@
+ 	g_one_fail_kind = 0;
+ 	if (kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 		return html_reconvert_local_class(c, node, old_class) == 0;
++	/* Patch 370: a style attribute change (el.style.x = ..., a style
++	 * setAttribute) restyles the element's own box, as a class change
++	 * does: the same local paths, unless a sheet selects on [style] */
++	if (kind == MACOS9_DOMMUT_SETATTR_STYLE)
++		return html_reconvert_local_style(c, node) == 0;
+ 	switch (kind) {
+ 	case MACOS9_DOMMUT_TEXTCONTENT:
+ 	case MACOS9_DOMMUT_INNERHTML:
