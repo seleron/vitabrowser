@@ -379,6 +379,7 @@ NET-js-form-named http://127.0.0.1:$HP/JS-form-named.html
 NET-js-form-walk-cost http://127.0.0.1:$HP/JS-form-walk-cost.html
 NET-js-form-target http://127.0.0.1:$HP/JS-form-target.html
 NET-js-link-click http://127.0.0.1:$HP/JS-link-click.html
+NET-js-block-oc-insert http://127.0.0.1:$HP/JS-block-oc-insert.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -1305,7 +1306,7 @@ for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-timer-nesting TIMERNEST 4" "js-resource-timing RESTIMING 9" \
 	 "js-form-values FORMVAL 8" "js-form-named FORMNAMED 7" \
 	 "js-form-target FORMTARGET 5" "js-charref CHARREF 6" \
-	 "js-link-click LINKCLICK 5"; do
+	 "js-link-click LINKCLICK 5" "js-block-oc-insert OCINS 7"; do
 	set -- $g
 	gp=$(ls "$R"/*NET-$1.plot 2>/dev/null | head -1)
 	gr=$(sed -n "s/.*STR \($2: [0-9]*\/[0-9]* passed\).*/\1/p" "$gp" 2>/dev/null | head -1)
@@ -1407,6 +1408,12 @@ lnp=$(ls "$R"/*NET-js-list-nested-stall*.plot 2>/dev/null)
 lnr=$(sed -n 's/.*STR \(LISTNEST: [0-9]*\/[0-9]* passed\).*/\1/p' $lnp 2>/dev/null | head -1)
 lnl=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (a list item or nested blocks)' "$R/netsurf.log" || true)
 echo "  JS-list-nested-stall: ${lnr:-no summary}; ${lnl} list/nested changes built alone"
+# Patch 364: a block holding images or form controls a script inserts is
+# built alone and the page laid out once (JS-block-oc-insert's two
+# inserts); before, each was a full box-tree rebuild.
+ocl=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (new block holds images or form controls)' "$R/netsurf.log" || true)
+echo "  JS-block-oc-insert: ${ocl} image/control blocks built alone (2 or more)"
+[ "${ocl:-0}" -ge 2 ] || fail "image/control blocks built alone"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path

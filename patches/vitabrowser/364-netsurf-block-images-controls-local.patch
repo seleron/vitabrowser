@@ -1,0 +1,128 @@
+# netsurf: a block with images or form controls a script inserts is built alone (patch 364)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 363)
+#
+# WS-C, script-driven DOM changes. Measured on a 2500-paragraph sim page
+# (longest main-loop gap, median of 3, host sim): a plain <p> inserted
+# 7-8 ms (local placement, 166); a list item 23 ms (built alone, page laid
+# out once, 176); a <p> holding an <img> 228 ms and one holding an
+# <input> 287 ms -- full box-tree rebuilds, declined with "new element is
+# not a plain block, list item or block of blocks". A float among blocks
+# 250 ms and a table cell's text 266 ms are the same order, but need new
+# placement; local list placement would save ~16 ms. So: images and
+# form controls, insertion.
+#
+#  - html.c: html_rl_oc_tag() names what a new block may now hold: img,
+#    input, button, select / option / optgroup, textarea, label, form (not
+#    iframe / object / embed, not fieldset and its legend painter); a new
+#    top-level <form> counts as a block. Such a block takes
+#    html_rl_block_change's built-alone path (box_build_element fetches
+#    the image and the forms code makes each gadget, as a full build
+#    does) and the page is laid out once ("full layout (new block holds
+#    images or form controls)"). A later image arrival reflows through
+#    163's incremental path. Removing a block that holds objects or
+#    controls still takes the full rebuild (its fetches and gadgets would
+#    need unwinding).
+#
+# Result: 228 -> 22 ms (image), 287 -> 22 ms (input). JS-block-oc-insert's
+# screenshot is pixel-identical to the full rebuild's (the HUD's cpu
+# readout aside).
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6289,6 +6289,47 @@
+ static bool html_rl_block_tag(dom_node *n);
+ static bool html_rl_list_tag(dom_node *n);
+ 
++/* Patch 364: images and form controls a new block may hold. The block is
++ * built alone (box_build_element fetches the image, the forms code makes
++ * the control's gadget, as in a full build) and the page laid out whole.
++ * Not iframe/object/embed (frames and plugins), not fieldset (its legend
++ * painter). */
++static bool html_rl_oc_tag(dom_node *n)
++{
++	static const char *const ok[] = {
++		"img", "input", "button", "select", "option", "optgroup",
++		"textarea", "label", "form", NULL
++	};
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; ok[i] != NULL && !found; i++)
++		if (strcasecmp(dom_string_data(name), ok[i]) == 0)
++			found = true;
++	dom_string_unref(name);
++	return found;
++}
++
++/* Patch 364: a <form> is a block too (UA display: block) */
++static bool html_rl_is_form(dom_node *n)
++{
++	dom_string *name = NULL;
++	bool is;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	is = strcasecmp(dom_string_data(name), "form") == 0;
++	dom_string_unref(name);
++	return is;
++}
++
++/* Patch 364: set around html_rl_subtree_tags() to admit html_rl_oc_tag
++ * elements as well */
++static bool html_rl_tags_oc = false;
++
+ /* are all of element's descendant elements plain inline ones -- or, with
+  * blocks_too, plain inline, block or list ones (patch 176)? */
+ static bool html_rl_subtree_tags(dom_node *element, bool blocks_too)
+@@ -6309,7 +6350,8 @@
+ 		if (type == DOM_ELEMENT_NODE) {
+ 			if (!html_rl_inline_tag(n) &&
+ 			    !(blocks_too && (html_rl_block_tag(n) ||
+-					     html_rl_list_tag(n)))) {
++					     html_rl_list_tag(n))) &&
++			    !(html_rl_tags_oc && html_rl_oc_tag(n))) {
+ 				dom_node_unref(n);
+ 				return false;
+ 			}
+@@ -7091,8 +7133,22 @@
+ 			if (b == NULL) {
+ 				bool plain = html_rl_block_tag(n) &&
+ 					html_rl_inline_subtree(n);
++				bool oc = false;
++				if (nadd < HTML_RL_MAX_CHANGES && !plain &&
++				    !((html_rl_block_tag(n) ||
++				       html_rl_list_tag(n)) &&
++				      html_rl_subtree_tags(n, true)) &&
++				    (html_rl_block_tag(n) ||
++				     html_rl_list_tag(n) ||
++				     html_rl_is_form(n))) {
++					/* Patch 364: a block holding images
++					 * or form controls */
++					html_rl_tags_oc = true;
++					oc = html_rl_subtree_tags(n, true);
++					html_rl_tags_oc = false;
++				}
+ 				if (nadd == HTML_RL_MAX_CHANGES ||
+-				    (!plain &&
++				    (!plain && !oc &&
+ 				     !((html_rl_block_tag(n) ||
+ 					html_rl_list_tag(n)) &&
+ 				       html_rl_subtree_tags(n, true)))) {
+@@ -7101,7 +7157,12 @@
+ 						"block, list item or block of "
+ 						"blocks");
+ 				}
+-				if (!plain) {
++				if (oc) {
++					full = true;
++					why = why != NULL ? why :
++						"new block holds images or "
++						"form controls";
++				} else if (!plain) {
+ 					/* built alone, laid out whole */
+ 					full = true;
+ 					why = why != NULL ? why :
