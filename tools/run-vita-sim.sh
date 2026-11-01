@@ -232,6 +232,8 @@ JS-float-insert file:///app0:/testpages/JS-float-insert.html
 CSS-float-insert-ref file:///app0:/testpages/CSS-float-insert-ref.html
 JS-float-insert-one file:///app0:/testpages/JS-float-insert-one.html
 CSS-float-insert-one-ref file:///app0:/testpages/CSS-float-insert-one-ref.html
+JS-table-cell-text file:///app0:/testpages/JS-table-cell-text.html
+CSS-table-cell-text-ref file:///app0:/testpages/CSS-table-cell-text-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1438,6 +1440,14 @@ fll=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed)
 echo "  JS-float-insert: rows differing from the static page: one $flr1 (0), eight $flr8 (0); ${fll} float changes built alone (4 or more)"
 [ "$flr1" = 0 ] && [ "$flr8" = 0 ] && [ "${fll:-0}" -ge 4 ] ||
 	fail "script floats placed as the static page"
+# Patch 366: a script changing a table cell's text rebuilds the cell's
+# content and lays the page out once (before: a full box-tree rebuild).
+# The ten-step page renders row for row as the same steps run at parse
+# time, and the engine log shows the cell path.
+tcr=$(fl_rows JS-table-cell-text CSS-table-cell-text-ref)
+tcl=$(grep -c 'LIFE rebuild local: rebuilt, full layout (a table cell)' "$R/netsurf.log" || true)
+echo "  JS-table-cell-text: rows differing from the parse-time build $tcr (0); ${tcl} cell changes rebuilt alone (5 or more)"
+[ "$tcr" = 0 ] && [ "${tcl:-0}" -ge 5 ] || fail "table cell text rebuilt alone"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path

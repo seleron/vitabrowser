@@ -1,0 +1,77 @@
+# netsurf: a table cell's content a script changes is rebuilt alone (patch 366)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 365)
+#
+# A script changing the text of a table cell was a full box-tree rebuild:
+# the walk up from the change to the nearest element with a block box met
+# the cell's TABLE_CELL box and declined ("nearest box is not a block"),
+# 243-305 ms on a 2500-paragraph page.
+#
+#  - html.c: a TABLE_CELL box ends the walk as a block does (a full build
+#    normalises a cell with box_normalise_block too), so the cell's
+#    content is rebuilt alone through the inline path (165) -- text,
+#    innerHTML with inline markup, a text node's data, a class change on
+#    an inline element in it -- or, for a cell holding blocks, through
+#    html_rl_block_change. Either way the page is then laid out once
+#    ("rebuilt, full layout (a table cell)" / "blocks in a table cell"):
+#    a cell's width and its row's height come from every cell, and the
+#    table layout works them out; no local line relayout for a cell. A
+#    class change on the cell itself still takes the full rebuild, as
+#    does a cell with a float (its content is not one line container).
+#
+# Result: 270 -> 23 ms (median, 2500-paragraph page). Ten steps on three
+# tables (cells growing and shrinking their columns, a header, a colspan
+# cell outgrowing its columns, inline markup, a text node, blocks in a
+# cell added and removed, a span's class, text beside a float) each render
+# row for row as a parse-time build of the same DOM.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7142,6 +7142,13 @@
+ #define RL_BNO(w) do { macsurf_debug_log_writef( \
+ 		"LIFE rebuild local: declined (%s)", (w)); goto decline; } while (0)
+ 
++	/* Patch 366: blocks in a table cell: the table lays the cell out
++	 * (its width, its row's height), so the page is laid out whole */
++	if (pbox->type == BOX_TABLE_CELL) {
++		full = true;
++		why = "blocks in a table cell";
++	}
++
+ 	/* the boxes: blocks only; which ones lost their element */
+ 	for (b = pbox->children; b != NULL; b = b->next) {
+ 		dom_node *parent = NULL;
+@@ -9558,6 +9565,16 @@
+ 				element = n;
+ 				break;
+ 			}
++			/* Patch 366: a table cell holds its content as a block
++			 * does (box_normalise_block normalises it): rebuild the
++			 * cell's content, then lay the page out once, so the
++			 * table's column widths and row heights come from the
++			 * table layout itself. (A class change on the cell
++			 * itself restyles its box: not here, see above.) */
++			if (b != NULL && b->type == BOX_TABLE_CELL) {
++				element = n;
++				break;
++			}
+ 			if (b != NULL && b->type != BOX_INLINE) {
+ 				dom_node_unref(n);	/* a table cell, ... */
+ 				RL_NO("nearest box is not a block");
+@@ -9663,6 +9680,16 @@
+ 		b->max_width = UNKNOWN_MAX_WIDTH;
+ 	new_ic = block->children;
+ 	local = false;
++	if (block->type == BOX_TABLE_CELL) {
++		/* Patch 366: the cell's width and its row's height are the
++		 * table's to work out from every cell */
++		macsurf_debug_log_writef("LIFE rebuild local: rebuilt, full "
++			"layout (a table cell)");
++		content__reformat(base_c, false, base_c->available_width,
++				base_c->available_height);
++		done_n++;
++		return 0;
++	}
+ 	if (new_ic != NULL && new_ic->next == NULL &&
+ 	    new_ic->type == BOX_INLINE_CONTAINER) {
+ 		new_ic->x = old_x;
