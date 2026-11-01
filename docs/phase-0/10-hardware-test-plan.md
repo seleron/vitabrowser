@@ -8197,3 +8197,78 @@ interstitial in either arm.
 
 Left of WS-C's script-change list: a class change on a cell's own box
 (96 ms) and removing a block that holds a form control (94-106 ms).
+
+## Patch 368 (2026-11-01): a block holding form controls a script removes is unlinked locally
+
+The two WS-C script changes 367 left on the full rebuild, re-measured on
+the 2500-paragraph sim page (`ST-367.html`, `setTimeout(0)` heartbeat,
+median of 3, host sim):
+
+| change | 367 binary | 368 |
+|---|---|---|
+| a class change on a `<td>`'s own box | 92-97 ms (full rebuild) | 95 ms (unchanged) |
+| removing a `<p>` holding an `<input>` | 88-93 ms (full rebuild) | **18 ms** |
+
+**Why the removal, not the cell.** A cell's own class change has to
+restyle the cell box, and that box carries what table normalisation
+worked out: its start column, and in `border-collapse` mode its used
+borders, which come from its neighbours (table.c 262-267, 404-448). The
+table's column types come from every cell's style too. So the honest
+invalidation scope is the whole table: re-normalise it and recompute the
+column types -- and a table holding images or controls would need those
+unwound as well. The removal only had to let go of its controls.
+
+The change (html.c): a removed block may hold form controls. Objects
+and frames still take the full rebuild ("removed block holds objects or
+frames"). Before the block is freed, `html_rl_release_box()` walks its
+subtree: focus held by a control in it goes back to the page, and an
+open select menu of one is dropped. Both are raw pointers into what is
+about to be freed. box_free then frees each control, and
+form_free_control takes it out of its form, so form.elements shrinks as
+it does in a browser. A field put back later keeps its value, which
+lives in the DOM; the new control reads it. Logged "removed block's
+controls released".
+
+Gate: JS-remove-controls runs eight steps 250 ms apart:
+- an input given a value, then its block removed;
+- a select's block removed;
+- the input's block put back (value `typed` kept);
+- a textarea's block removed;
+- a block with a control outside any form removed;
+- a class change on a table cell's own box (the full rebuild -- covered
+  for correctness);
+- a radio group's block removed;
+- the cell's class moved to the next cell.
+
+It renders row for row as CSS-remove-controls-ref, the same steps run
+while the page parses. Every intermediate state was checked the same way
+against a parse-time build, in the 368 and the 367 binaries alike: 0
+rows each, with identical form.elements counts (4, 3, 3, 3, 1, 1) and the
+typed value. The first removal shares its batch with a `.value` write on
+another node, so it takes the full rebuild. The engine log shows 4
+control blocks removed locally (3 or more required); the 367 binary
+prints none. Full gate `gate368.log`, exit 0 (FORMVAL 8/8, FORMNAMED 7/7,
+FORMSHADOW 6/6, OCINS 7/7, LISTNEST 7/7 -- now 10 of its changes built
+alone, as its control-block removals no longer fall back -- floats 0/0,
+table cells 0 and 0 rows, SIBINS 4/4, DOMSTALL 8/8).
+
+Scorecard r93: 21 sites against `r79-360`, 368 and the 367 binary back to
+back (`score/r93-368`, `score/r93-pre368`): **74.61 vs 74.59**. The path
+fired 0 times in the site loads, and the 367 arm never hit the old
+decline there, so the code they ran was identical. The movers are live
+text: bbc +0.1, stackoverflow +0.3. No crash and no Cloudflare
+interstitial.
+
+Separate bug, logged and not fixed: a **full reconvert keeps a
+form-owned control alive with `control->box` pointing into the freed
+tree** (box_talloc_destructor frees only orphan controls, fixes1076). For
+an element removed from the document, the pointer is never rebuilt.
+`form_radio_set` redraws every selected radio of the group through it
+(`html__redraw_a_box(radio->html, control->box)`), so selecting a radio
+after another radio of its group was removed by a full reconvert reads
+freed memory. The local path no longer keeps such controls. The fix
+belongs where a full reconvert frees the old tree: drop the controls
+whose node has left the document.
+
+Left of WS-C's script-change list: a class change on a `<td>`'s own box,
+with whole-table scope.
