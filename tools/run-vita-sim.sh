@@ -226,6 +226,7 @@ CSS-svg-child-css file:///app0:/testpages/CSS-svg-child-css.html
 CSS-svg-stroke file:///app0:/testpages/CSS-svg-stroke.html
 CSS-svg-aa file:///app0:/testpages/CSS-svg-aa.html
 CSS-flex-column-automin file:///app0:/testpages/CSS-flex-column-automin.html
+JS-style-invalid file:///app0:/testpages/JS-style-invalid.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1191,6 +1192,16 @@ if [ -n "$f360s" ]; then
 		10,50 10,70 10,150 10,170 10,190 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
 fi
 echo "  css-flex-column-automin: ${f360px:-none} (0,0,255 0,170,0 0,170,0 255,0,0 0,170,0)"
+# Patch 361: el.style ignores a NaN/undefined write-back (an authored
+# width:200px stays 200px wide) and reads the authored style attribute
+# (style="display:none" reads 'none', so the toggle shows it).
+s361s=$(ls "$OUT"/snaps/N-*-JS-style-invalid.png 2>/dev/null | head -1)
+s361px=
+if [ -n "$s361s" ]; then
+	s361px=$(python3 "$ROOT/tools/vita-sim/png-pixel.py" "$s361s" \
+		150,50 300,50 150,70 | awk '{printf "%s,%s,%s ", $2, $3, $4}')
+fi
+echo "  js-style-invalid: ${s361px:-none} (0,170,0 255,255,255 0,170,0)"
 # Patch 346: libsvgtiny staged, its relative t / q fixed at source -- the
 # same wave through the <img> path, no serializer rewrite.
 r346s=$(ls "$OUT"/snaps/N-*-CSS-svg-reltq.png 2>/dev/null | head -1)
@@ -1747,6 +1758,7 @@ soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] &
 [ "$s358px" = "255,0,0 255,255,255 0,170,0 0,0,255 255,255,255 " ] && \
 [ "$a359px" = "0,0,0 255,255,255 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 127,127,127 " ] && \
 [ "$f360px" = "0,0,255 0,170,0 0,170,0 255,0,0 0,170,0 " ] && \
+[ "$s361px" = "0,170,0 255,255,255 0,170,0 " ] && \
 [ "$r346px" = "255,0,0 238,238,238 255,0,0 " ] && [ "${r346n:-0}" -ge 1 ] && [ "${r346o:-0}" -eq 0 ] && \
 [ "$i221r" = "IBSPACE221: 5/5 passed" ] && \
 [ "$f222r" = "FIELDSET222: 5/5 passed" ] && \

@@ -1,0 +1,120 @@
+# netsurf: inline style object reads the attribute, ignores garbage writes (patch 361)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 360)
+#
+# el.style (the el-helpers style object in macsurf_qjs.c) had two faults,
+# both against what Chromium does:
+#
+#  - It read only what a script had set. Values authored in the style
+#    attribute read '' -- style="display:none" answered '' to
+#    el.style.display, so the usual toggle
+#    `el.style.display = el.style.display === 'none' ? '' : 'none'`
+#    hid an already hidden menu again. Reads now parse the LIVE
+#    attribute (quote- and paren-aware, the last declaration wins,
+#    custom properties keep their case), which also feeds
+#    getComputedStyle's inline fallback.
+#  - A write removed the old declaration and stored any value. JS
+#    arithmetic garbage -- `w + "px"` with w undefined -- is what fixes1087
+#    deliberately produces for a size measured before layout, expecting a
+#    no-op; here it deleted an authored width:200px and stored
+#    width:undefinedpx, which libcss drops, so the block went full width.
+#    A value holding NaN, undefined, null, Infinity or [object X], bare or
+#    with a unit, is now ignored and the old value kept. Exempt: --custom
+#    properties and those taking custom idents or strings (font-family,
+#    font, content, quotes, grid-area/row/column/template-areas,
+#    animation*, transition*, counter-*, list-style*, will-change,
+#    view-transition-name). null and '' still remove, as in browsers. The
+#    cssText setter drops only such declarations.
+#
+# Also: setProperty honours "important" and getPropertyPriority exists;
+# removeProperty returns the old value. The attribute keeps its
+# serialization (name:value;name:value). Not covered: shorthands do not
+# expand (style.marginTop of an authored `margin: 5px` reads ''), and
+# values Chromium rejects for other reasons (an unknown keyword) are still
+# stored -- libcss drops them at render as before.
+#
+# Gate: JS-style-invalid (file:// snapshot: authored width:200px survives
+# an undefined/NaN write-back; an authored display:none is toggled
+# shown); full gate361 exit 0. Scorecard, all 21 sites against the
+# r79-360 reference, this patch and the patch-360 binary back to back
+# (r86-361 / r86-pre361): mean 74.54 vs 74.56 -- no regression. The
+# movers are live content: stackoverflow 64.8 vs 65.6 reran interleaved
+# at 65.4 / 64.1 (361) vs 65.3 / 18.5 (360, a challenge page), text
+# recall 0.50-0.53 either way.
+#
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -8806,22 +8806,55 @@
+ 		"return true;}"
+ 		"var mk=function(){"
+ 		"var el=this;"
+-		"var sc={};"
+ 		"/* fixes1196 - vendor-prefix-aware name mapping: "
+ 		"cc(webkitAppearance) is -webkit-appearance (leading dash); "
+ 		"gu(-webkit-appearance) is webkitAppearance (lowercase w). */"
+ 		"function cc(n){return n.replace(/([A-Z])/g,'-$1').toLowerCase().replace(/^(webkit|moz|ms)-/,'-$1-');}"
+ 		"function gu(n){return String(n).replace(/^-(webkit|moz|ms)-/,'$1-').replace(/-([a-z])/g,function(m,c){return c.toUpperCase();});}"
++		/* VitaBrowser patch 361: the style object reads the LIVE style
++		 * attribute (it read only what a script had set: an authored
++		 * style="display:none" answered '' and toggles inverted), and a
++		 * write whose value is JS arithmetic garbage -- NaN, undefined,
++		 * null, Infinity, [object X], bare or with a unit -- is ignored
++		 * and the old value kept, as Chromium's parser rejects it. It
++		 * deleted the old declaration and stored one libcss drops, so a
++		 * width:200px block measured before layout (fixes1087's
++		 * undefined) and written back went full width. Properties that
++		 * take custom idents or strings keep such words. */
++		"function nm(p){p=String(p);return p.slice(0,2)==='--'?p:cc(p);}"
++		"function dl(s){var o=[],c='',q='',d=0,i,h,k,n,v,m;s=String(s||'');"
++		"for(i=0;i<=s.length;i++){h=i<s.length?s.charAt(i):';';"
++		"if(q){c+=h;if(h===q)q='';continue;}"
++		"if(h==='\"'||h===\"'\"){q=h;c+=h;continue;}"
++		"if(h==='(')d++;else if(h===')'&&d>0)d--;"
++		"if(h===';'&&!d){k=c.indexOf(':');if(k>0){n=c.slice(0,k).trim();v=c.slice(k+1).trim();"
++		"m=/\\s*!\\s*important\\s*$/i.exec(v);if(m)v=v.slice(0,m.index).trim();"
++		"if(n.slice(0,2)!=='--')n=n.toLowerCase();if(n)o.push([n,v,!!m]);}"
++		"c='';continue;}"
++		"c+=h;}return o;}"
++		"function gv(n){var l=dl(el.getAttribute('style')),i,r='';"
++		"for(i=0;i<l.length;i++)if(l[i][0]===n)r=l[i][1];return r;}"
++		"var IDP=/^(--|font-family$|font$|content$|quotes$|grid-area$|grid-row|grid-column|grid-template-areas$|animation|transition|counter-|list-style|will-change$|view-transition-name$)/;"
++		"function bad(n,v){if(IDP.test(n))return false;"
++		"return /(?:^|[\\s,(\\/])[-+]?(?:NaN|undefined|null|Infinity|\\[object(?: [A-Za-z]+)?\\])[a-zA-Z%]*(?=$|[\\s,)\\/])/.test(v);}"
+ 		"var sp={setProperty:function(p,v,pri){"
++		"var n=nm(p);"
++		"if(v!==null&&v!==undefined)v=String(v);"
++		"if(v!==null&&v!==undefined&&v!==''&&bad(n,v))return;"
+ 		"var s=el.getAttribute('style')||'';"
+-		"var re=new RegExp('(?:^|;)\\\\s*'+cc(p)+'\\\\s*:[^;]*','g');"
++		"var re=new RegExp('(?:^|;)\\\\s*'+n.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')+'\\\\s*:[^;]*','g');"
+ 		"s=s.replace(re,'').replace(/;+/g,';').replace(/^;|;$/g,'').trim();"
+-		"if(v!==null&&v!=='')s=s+(s?';':'')+cc(p)+':'+v;"
+-		"el.setAttribute('style',s);sc[p]=v||'';},"
+-		"removeProperty:function(p){this.setProperty(p,'');},"
+-		"getPropertyValue:function(p){return sc[gu(p)]||sc[p]||'';},"
++		"if(v!==null&&v!==undefined&&v!=='')s=s+(s?';':'')+n+':'+v+"
++			"(String(pri||'').toLowerCase()==='important'?' !important':'');"
++		"el.setAttribute('style',s);},"
++		"removeProperty:function(p){var o=this.getPropertyValue(p);this.setProperty(p,'');return o;},"
++		"getPropertyValue:function(p){return gv(nm(p));},"
++		"getPropertyPriority:function(p){var l=dl(el.getAttribute('style')),i,n=nm(p),r='';"
++		"for(i=0;i<l.length;i++)if(l[i][0]===n)r=l[i][2]?'important':'';return r;},"
+ 		"get cssText(){return el.getAttribute('style')||'';},"
+-		"set cssText(v){el.setAttribute('style',v);}};"
++		"set cssText(v){var l=dl(v),i,k=[],x=false;"
++		"for(i=0;i<l.length;i++){if(bad(l[i][0],l[i][1]))x=true;else k.push(l[i]);}"
++		"el.setAttribute('style',x?k.map(function(e){return e[0]+':'+e[1]+(e[2]?' !important':'');}).join(';'):String(v==null?'':v));}};"
+ 		"var PS=['display','visibility','opacity','position','overflow',"
+ 		"'overflowX','overflowY','width','height','minWidth','maxWidth',"
+ 		"'minHeight','maxHeight','top','left','right','bottom','margin',"
+@@ -8841,8 +8874,8 @@
+ 		"'clear','columns','webkitAppearance'];"
+ 		"var i;for(i=0;i<PS.length;i++)(function(p){"
+ 		"Object.defineProperty(sp,p,{"
+-		"get:function(){return sc[p]||'';},"
+-		"set:function(v){sc[p]=v;sp.setProperty(p,v);},"
++		"get:function(){return sp.getPropertyValue(p);},"
++		"set:function(v){sp.setProperty(p,v);},"
+ 		"configurable:true,enumerable:true});})(PS[i]);"
+ 		"return sp;};"
+ 		"Object.defineProperty(P,'style',{get:function(){"
