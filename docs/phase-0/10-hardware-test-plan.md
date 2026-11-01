@@ -8471,3 +8471,24 @@ changes plus its own batches (rte, guardian). The local path refuses
 every change on a page with an iframe. After it: the ::before/::after
 and empty-block shapes of "not one line container", and attribute
 writes refused because a sheet selects on them.
+
+## Morning loop close (2026-11-01 10:00Z): user stop
+
+- Window: kickoff `10f9cb8` (patch 359) at 00:50Z, stop 10:00Z ("Stop at
+  10AM"). 20 commits `8cf9fd2..6aaa44c`: patches 360-370 landed plus
+  state logs; unit 362 shelved (flex/unrendered script change fired 0x
+  on 21 sites, census recorded).
+- Scorecard: r85 (360) 74.30 -> r95c (370) 74.83 (pre 74.81); every gate
+  exit 0 (gate360b .. gate370c). Best morning gain: 366 (cell content
+  270->23 ms), 368/369 (91->17 ms), 370 (style attr 89-109 -> 7-17 ms).
+- Session at stop: Claude in the 370 wrap-up (patch regen); box empty;
+  all of 370's work committed and pushed (f2bbafe + 6aaa44c), 0 unpushed.
+- Disarmed by the 10:00Z finalizer: watchdog `3c85827d538b` and heartbeat
+  `90f0bdd3da46` paused; nothing steers the session after 10:00Z.
+- Next (from the 370 census, in order): "page has frames" -- it now
+  gates rte's six style changes plus rte/guardian's own batches; then
+  the ::before/::after and empty-block shapes of "not one line
+  container"; then attribute writes refused because a sheet selects on
+  them. Parked: nodeless/sheet batches (doc 23). Unfixed and logged:
+  full-reconvert keeps a removed field's control alive (368 entry),
+  wpblog intermittent segfault (365 entry).
