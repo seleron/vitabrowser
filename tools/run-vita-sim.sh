@@ -228,6 +228,10 @@ CSS-svg-aa file:///app0:/testpages/CSS-svg-aa.html
 CSS-flex-column-automin file:///app0:/testpages/CSS-flex-column-automin.html
 JS-style-invalid file:///app0:/testpages/JS-style-invalid.html
 CSS-border-radius file:///app0:/testpages/CSS-border-radius.html
+JS-float-insert file:///app0:/testpages/JS-float-insert.html
+CSS-float-insert-ref file:///app0:/testpages/CSS-float-insert-ref.html
+JS-float-insert-one file:///app0:/testpages/JS-float-insert-one.html
+CSS-float-insert-one-ref file:///app0:/testpages/CSS-float-insert-one-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1414,6 +1418,26 @@ echo "  JS-list-nested-stall: ${lnr:-no summary}; ${lnl} list/nested changes bui
 ocl=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (new block holds images or form controls)' "$R/netsurf.log" || true)
 echo "  JS-block-oc-insert: ${ocl} image/control blocks built alone (2 or more)"
 [ "${ocl:-0}" -ge 2 ] || fail "image/control blocks built alone"
+# Patch 365: floats a script inserts or removes among blocks are placed
+# where the DOM has them (built alone, page laid out once). Each page
+# must render as the same final DOM written statically, row for row (one
+# insert: before, the float drew below the last block; eight inserts,
+# moves and a removal), and the engine log must show the float path.
+fl_rows() {
+	fa=$(ls "$OUT"/snaps/N-*-"$1".png 2>/dev/null | head -1)
+	fb=$(ls "$OUT"/snaps/N-*-"$2".png 2>/dev/null | head -1)
+	if [ -n "$fa" ] && [ -n "$fb" ]; then
+		python3 "$ROOT/tools/vita-sim/png-rows-diff.py" "$fa" "$fb"
+	else
+		echo missing
+	fi
+}
+flr1=$(fl_rows JS-float-insert-one CSS-float-insert-one-ref)
+flr8=$(fl_rows JS-float-insert CSS-float-insert-ref)
+fll=$(grep -c 'LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (\(a float\|floats\) among the blocks)' "$R/netsurf.log" || true)
+echo "  JS-float-insert: rows differing from the static page: one $flr1 (0), eight $flr8 (0); ${fll} float changes built alone (4 or more)"
+[ "$flr1" = 0 ] && [ "$flr8" = 0 ] && [ "${fll:-0}" -ge 4 ] ||
+	fail "script floats placed as the static page"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path

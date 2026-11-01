@@ -1,0 +1,305 @@
+# netsurf: floats a script inserts or removes among blocks placed locally (patch 365)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 364)
+#
+# A float between blocks is an anonymous inline container (a "float
+# carrier") holding a float box that wraps the element's box
+# (box_construct.c). The local block path (166/176) knew nothing of that:
+#  - in a container holding only blocks, a script-inserted float WAS
+#    built locally, but box_construct puts its carrier at the END of the
+#    parent, and the path laid the page out with it there: the float drew
+#    below the last block (one insert: 120 rows off the static render;
+#    "full layout (new block not in its parent)") -- a correctness bug;
+#  - once a carrier was among the children, every later insert or
+#    removal there was a full box-tree rebuild ("parent holds more than
+#    blocks"): 220-270 ms on a 2500-paragraph page.
+#
+#  - html.c: html_rl_float_carrier() recognises a carrier (only float
+#    boxes, each wrapping one element box). html_rl_block_change accepts
+#    carriers among the children (a float whose element left is
+#    removed, its carrier freed when emptied) and a float's element box
+#    under them; a new float is taken out of wherever the builder put it
+#    and placed in DOM order -- after the previous sibling's float in its
+#    carrier, first in the carrier of the floats after it, or in a new
+#    carrier after the previous sibling's box. The "after" search climbs
+#    from a sibling's box to its box under the parent
+#    (html_rl_top_under), so a block inserted after a float lands after
+#    the carrier, not before it. Floats present: the page is laid out
+#    once ("full layout (a float among the blocks)" / "(floats among the
+#    blocks)"). A container whose first child is a carrier now reaches
+#    the block path too. The sibling-combinator check reads a removed
+#    float's element and floats' elements as neighbours
+#    (html_rl_removed_nodes; a carrier has no node).
+#
+# Result: 220 -> 21 ms (median, 2500-paragraph page), and the float in
+# its place. Gate: JS-float-insert-one and JS-float-insert (eight
+# inserts, moves and a removal) render row for row as the same DOM
+# written statically; every intermediate state of the eight was checked
+# the same way against a parse-time build (0 rows each).
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7067,6 +7067,62 @@
+ /* A script inserted and/or removed blocks among parent's block children:
+  * build (or unlink) just those and place them (layout_relayout_block).
+  * 0 done, -1 declined (nothing changed). */
++/* Patch 365: a float between blocks is an anonymous inline container
++ * holding float boxes (no node), each wrapping its element's box
++ * (box_construct.c). True for such a "float carrier": nothing else in
++ * it, so it can be edited float by float. */
++static bool html_rl_float_carrier(const struct box *b)
++{
++	const struct box *f;
++
++	if (b->type != BOX_INLINE_CONTAINER || b->node != NULL ||
++	    b->children == NULL)
++		return false;
++	for (f = b->children; f != NULL; f = f->next)
++		if ((f->type != BOX_FLOAT_LEFT && f->type != BOX_FLOAT_RIGHT) ||
++		    f->node != NULL || f->children == NULL ||
++		    f->children->next != NULL ||
++		    f->children->node == NULL)
++			return false;
++	return true;
++}
++
++/* Patch 365: the element of a removed box and its element neighbours
++ * as they were: a float box stands for its element, and a float carrier
++ * beside it for the nearest float's element (the carrier has no node). */
++static dom_node *html_rl_edge_elem(struct box *b, bool last)
++{
++	if (b == NULL)
++		return NULL;
++	if (html_rl_float_carrier(b))
++		b = last ? b->last : b->children;
++	if (b->type == BOX_FLOAT_LEFT || b->type == BOX_FLOAT_RIGHT)
++		b = b->children;
++	return b != NULL ? b->node : NULL;
++}
++
++static void html_rl_removed_nodes(struct box *r, dom_node **e,
++		dom_node **prev, dom_node **next)
++{
++	bool f = r->type == BOX_FLOAT_LEFT || r->type == BOX_FLOAT_RIGHT;
++	struct box *top = (f && r->parent != NULL) ? r->parent : r;
++
++	*e = html_rl_edge_elem(r, false);
++	*prev = (f && r->prev != NULL) ? html_rl_edge_elem(r->prev, true) :
++			html_rl_edge_elem(top->prev, true);
++	*next = (f && r->next != NULL) ? html_rl_edge_elem(r->next, false) :
++			html_rl_edge_elem(top->next, false);
++}
++
++/* Patch 365: the box among pbox's children that holds b (b itself, or
++ * the float carrier its float sits in); NULL if b is not under pbox */
++static struct box *html_rl_top_under(struct box *b, const struct box *pbox)
++{
++	while (b != NULL && b->parent != pbox)
++		b = b->parent;
++	return b;
++}
++
+ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		struct box *pbox, double t0)
+ {
+@@ -7089,6 +7145,33 @@
+ 	/* the boxes: blocks only; which ones lost their element */
+ 	for (b = pbox->children; b != NULL; b = b->next) {
+ 		dom_node *parent = NULL;
++		if (html_rl_float_carrier(b)) {
++			/* Patch 365: floats among the blocks: tracked like
++			 * blocks (a float whose element left is removed),
++			 * and the page is laid out whole */
++			struct box *f;
++			full = true;
++			why = why != NULL ? why : "floats among the blocks";
++			for (f = b->children; f != NULL; f = f->next) {
++				struct box *e = f->children;
++				parent = NULL;
++				if (dom_node_get_parent_node(e->node, &parent) !=
++						DOM_NO_ERR)
++					RL_BNO("dom error");
++				if (parent != NULL)
++					dom_node_unref(parent);
++				if (parent == pnode)
++					continue;
++				if (nrem == HTML_RL_MAX_CHANGES ||
++				    html_rl_subtree_objects(e->children) ||
++				    e->object != NULL || e->gadget != NULL ||
++				    e->iframe != NULL)
++					RL_BNO("removed float holds objects or "
++						"controls");
++				removed[nrem++] = f;
++			}
++			continue;
++		}
+ 		if (b->type != BOX_BLOCK || b->node == NULL)
+ 			RL_BNO("parent holds more than blocks");
+ 		if (dom_node_get_parent_node(b->node, &parent) != DOM_NO_ERR)
+@@ -7170,7 +7253,15 @@
+ 				}
+ 				added[nadd++] = n;
+ 				dom_node_ref(n);
+-			} else if (b->parent != pbox) {
++			} else if (b->parent != pbox &&
++				   !(b->parent != NULL &&
++				     (b->parent->type == BOX_FLOAT_LEFT ||
++				      b->parent->type == BOX_FLOAT_RIGHT) &&
++				     b->parent->parent != NULL &&
++				     b->parent->parent->parent == pbox &&
++				     html_rl_float_carrier(b->parent->parent))) {
++				/* (patch 365: a float's element box sits in
++				 * its float, in a carrier under pbox) */
+ 				dom_node_unref(n);
+ 				RL_BNO("an element moved in from elsewhere");
+ 			}
+@@ -7214,8 +7305,17 @@
+ 			removed[i]->border[BOTTOM].width;
+ 		rb.margin_top = removed[i]->margin[TOP];
+ 		rb.margin_bottom = removed[i]->margin[BOTTOM];
+-		html_rl_unlink(removed[i]);
+-		box_free(removed[i]);
++		{
++			/* patch 365: a float leaves its carrier, which goes
++			 * too when it is left empty */
++			struct box *rp = removed[i]->parent;
++			html_rl_unlink(removed[i]);
++			box_free(removed[i]);
++			if (rp != NULL && rp != pbox && rp->children == NULL) {
++				html_rl_unlink(rp);
++				box_free(rp);
++			}
++		}
+ 		html_rl_invalidate(pbox);
+ 		if (!full && layout_relayout_block(c, pbox, prev, NULL, nx,
+ 				&rb, &delta)) {
+@@ -7229,7 +7329,7 @@
+ 
+ 	/* then the new blocks, in document order */
+ 	for (i = 0; i < nadd; i++) {
+-		struct box *nb, *after = NULL;
++		struct box *nb, *after = NULL, *flt, *aftel;
+ 		dom_node *sib = NULL, *prevsib = NULL;
+ 		unsigned int objects_before = c->num_objects;
+ 
+@@ -7251,7 +7351,30 @@
+ 			dom_node_unref(added[i]);
+ 			continue;
+ 		}
+-		/* after the box of the nearest earlier element with one */
++		/* Patch 365: a float is built into an inline container at
++		 * the END of pbox (box_construct appends one, or reuses a
++		 * last one): take its float box out, to place in DOM order
++		 * below. It used to stay there and draw after the last
++		 * block. */
++		flt = NULL;
++		if (nb->parent != NULL && (nb->parent->type == BOX_FLOAT_LEFT ||
++		    nb->parent->type == BOX_FLOAT_RIGHT) &&
++		    nb->parent->parent != NULL &&
++		    nb->parent->parent->type == BOX_INLINE_CONTAINER &&
++		    nb->parent->parent->node == NULL &&
++		    nb->parent->parent->parent == pbox) {
++			struct box *ic0 = nb->parent->parent;
++			flt = nb->parent;
++			html_rl_unlink(flt);
++			if (ic0->children == NULL) {
++				html_rl_unlink(ic0);
++				box_free(ic0);
++			}
++		}
++		/* after the box of the nearest earlier element with one --
++		 * patch 365: the box under pbox that holds it (a float's
++		 * carrier), so nothing lands before an earlier float */
++		aftel = NULL;
+ 		sib = added[i];
+ 		dom_node_ref(sib);
+ 		while (after == NULL) {
+@@ -7262,11 +7385,58 @@
+ 			dom_node_unref(sib);
+ 			sib = prevsib;
+ 			b = box_for_node(sib);
+-			if (b != NULL && b->parent == pbox && b != nb)
+-				after = b;
++			if (b != NULL && b != nb) {
++				struct box *top = html_rl_top_under(b, pbox);
++				if (top != NULL && top != nb) {
++					after = top;
++					aftel = b;
++				}
++			}
+ 		}
+ 		dom_node_unref(sib);
+ 		dom_node_unref(added[i]);
++		if (flt != NULL) {
++			struct box *nx = after != NULL ? after->next :
++					pbox->children;
++			if (after != NULL && html_rl_float_carrier(after) &&
++			    aftel != NULL && aftel->parent != NULL &&
++			    aftel->parent->parent == after) {
++				/* right after the earlier sibling's float */
++				html_rl_link_after(after, aftel->parent, flt);
++			} else if (nx != NULL && html_rl_float_carrier(nx)) {
++				/* first in the carrier of the floats after it */
++				html_rl_link_after(nx, NULL, flt);
++			} else {
++				struct box *ic = box_create(NULL, NULL, false,
++						NULL, NULL, NULL, NULL, c->bctx);
++				if (ic == NULL) {
++					box_free(flt);
++					for (i++; i < nadd; i++)
++						dom_node_unref(added[i]);
++					macsurf_debug_log_writef("LIFE rebuild "
++						"local: no memory for a float's "
++						"container, full reconvert");
++					return -1;
++				}
++				ic->type = BOX_INLINE_CONTAINER;
++				html_rl_link_after(pbox, after, ic);
++				html_rl_link_after(ic, NULL, flt);
++			}
++			if (!box_normalise_block(nb, c->layout, c)) {
++				full = true;
++				why = why != NULL ? why : "normalise failed";
++				continue;
++			}
++			if (c->num_objects != objects_before) {
++				full = true;
++				why = why != NULL ? why :
++					"new block fetches objects";
++			}
++			html_rl_invalidate(flt);
++			full = true;
++			why = why != NULL ? why : "a float among the blocks";
++			continue;
++		}
+ 		if (nb->parent != pbox) {
+ 			full = true;		/* built somewhere unexpected */
+ 			why = why != NULL ? why : "new block not in its parent";
+@@ -9058,11 +9228,10 @@
+ 				dom_node_unref(next);
+ 		}
+ 		for (i = 0; i < nrem && !risk; i++) {
+-			dom_node *e = removed[i]->node;
+-			dom_node *prev = removed[i]->prev != NULL ?
+-					removed[i]->prev->node : NULL;
+-			dom_node *next = removed[i]->next != NULL ?
+-					removed[i]->next->node : NULL;
++			dom_node *e, *prev, *next;
++			/* patch 365: a float's element, and floats' elements
++			 * as neighbours (a carrier has no node) */
++			html_rl_removed_nodes(removed[i], &e, &prev, &next);
+ 			if (e == NULL)
+ 				return true;
+ 			risk = html_rl_sib_remove_risky(e, prev, next, sh);
+@@ -9408,7 +9577,10 @@
+ 
+ 	/* blocks inserted or removed among blocks (a paragraph added to a
+ 	 * list of paragraphs) */
+-	if (old_ic != NULL && old_ic->type == BOX_BLOCK &&
++	if (old_ic != NULL && (old_ic->type == BOX_BLOCK ||
++	    /* patch 365: a float carrier first (a float before the
++	     * first block) */
++	    html_rl_float_carrier(old_ic)) &&
+ 	    block->object == NULL && block->gadget == NULL) {
+ 		int r = html_rl_block_change(c, element, block, t0);
+ 		dom_node_unref(element);
