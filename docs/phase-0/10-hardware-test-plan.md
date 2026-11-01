@@ -7994,3 +7994,86 @@ live text. No Cloudflare interstitials in either arm.
 Next candidates by cost: floats among blocks (250 ms) and table-cell
 text (266 ms) -- both need local placement that respects the float
 context or the table's column widths.
+
+## Patch 365 (2026-11-01): floats a script inserts or removes among blocks placed locally
+
+Started as the cheaper of 364's two next candidates (a float inserted
+among blocks, 250 ms). Checked first, and it was also a **correctness
+bug**: in NetSurf's box tree a float between blocks is an anonymous
+inline container (here, a "float carrier") holding a float box that
+wraps the element's box. box_construct builds a new float's carrier at
+the END of its parent. The local block path (166/176) did not know that:
+
+- In a container that holds only blocks, a script-inserted float was
+  built locally ("full layout (new block not in its parent)") and left
+  there, so it drew **below the last block**. One insert rendered 120
+  pixel rows off the same DOM written statically. (Inserted straight into
+  `<body>` it never got that far: the body's `<script>` counts as an
+  unplain new element -- the 362 territory -- and the full rebuild drew
+  it right.)
+- Once a carrier was among a container's children, every later insert or
+  removal there declined ("parent holds more than blocks"): a full
+  box-tree rebuild, 220-270 ms on a 2500-paragraph page.
+
+The change (html.c):
+- `html_rl_float_carrier()` recognises a carrier: an anonymous inline
+  container whose children are all float boxes, each wrapping exactly one
+  element box.
+- html_rl_block_change accepts carriers among the children. A float whose
+  element is no longer in the parent is removed, and its carrier is freed
+  when emptied. An existing float's element box under a carrier is not
+  "an element moved in from elsewhere".
+- A new float is taken out of wherever the builder put it and placed in
+  DOM order: right after the previous sibling's float in that carrier;
+  else first in the carrier of the floats that follow; else in a new
+  carrier after the previous sibling's box.
+- The "after" search now climbs from a sibling's box to its box under
+  the parent (`html_rl_top_under`). Before, a plain block inserted after
+  a float skipped the float's carrier and could land before it.
+- A container whose first child is a carrier now reaches the block path
+  too, so a float before the first block is not a full rebuild.
+- The sibling-combinator check (patch 198) reads a removed float as its
+  element, and floats' elements as neighbours
+  (`html_rl_removed_nodes`); a carrier has no node, which read as "risk".
+- Whenever floats are present, the page is laid out once ("full layout
+  (a float among the blocks)" / "(floats among the blocks)"). Placing
+  locally around floats would need the float context of every following
+  line; laying out once is the 364-class cost.
+
+Result: **220 -> 21 ms** median for a float inserted on the
+2500-paragraph page (all three reps local; before, the first was
+misplaced and the next two full rebuilds). Images, controls and list
+items unchanged at 21-22 ms.
+
+Gate: two pages render row for row as the same final DOM written
+statically (`tools/vita-sim/png-rows-diff.py`, rows 20-520):
+JS-float-insert-one (one float between two blocks; 120 rows before this
+patch, 0 after) and JS-float-insert (eight steps: a left and a right
+float, a second float joining a carrier, a block after floats, a float
+before the first block, a float before an existing float, a removal).
+Plus an engine-log check: 7 float changes built alone (4 or more
+required). Every intermediate state of the eight steps was also checked
+against a parse-time build of the same DOM (scratch pages): 0 differing
+rows each. Full gate `gate365.log`, exit 0 (LISTNEST 7/7, LISTSTRUCT
+6/6, SIBINS 4/4, DOMSTALL 8/8 unchanged).
+
+Scorecard: 21 sites against `r79-360`, 365 and the 364 binary back to
+back (`score/r90-365`, `score/r90-pre365`). The float path fired 0 times
+in the site loads, so both arms ran the same layout code there. The raw
+means (74.30 vs 68.08) hold three outliers, each rerun:
+- the baseline's claude read a Cloudflare "Just a moment..." page (rerun
+  77.0);
+- 365's claude visual read 0.489 once (reruns 0.518 / 0.518, its value in
+  every run since r86);
+- the baseline's wpblog **crashed** (see below; rerun 71.3).
+With the reruns: **74.36 vs 74.39**.
+
+Separate bug, logged and not fixed: **wpblog (make.wordpress.org/core)
+segfaults intermittently** in the sim, in the 364 and 365 binaries alike
+(rc -11; 1 of 3 runs each in `score/r90-wp-pre1..3` / `r90-wp-post1..3`,
+plus `r90-pre365`). It never crashed in any earlier scorecard (r1-r89),
+so it is probably today's live content reaching a latent bug. It did not
+reproduce in 4 runs under gdb (`~/opt/gdb/gdb.sh`), so there is no
+backtrace yet. Next: run it under ASAN or catch a core in a loop.
+
+Next by cost (364's table): text changes in a table cell, 266 ms.
