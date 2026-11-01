@@ -1,0 +1,107 @@
+# netsurf: a block holding form controls a script removes is unlinked locally (patch 368)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 367)
+#
+# The two WS-C script changes 367 left on the full rebuild, re-measured on
+# a 2500-paragraph sim page (median of 3): a class change on a <td>'s own
+# box 92-97 ms; removing a <p> holding an <input> 88-93 ms. The cell is the
+# wider job -- in border-collapse a cell's used borders come from its
+# neighbours and the table's column types from every cell, set during
+# table normalisation (table.c), so its honest scope is the whole table.
+# The removal only needed its controls let go of. That one.
+#
+#  - html.c: a removed block may hold form controls (objects and frames
+#    still take the full rebuild: "removed block holds objects or
+#    frames"). Before the block is freed, html_rl_release_box() walks its
+#    subtree: focus held by a control in it goes back to the page, and an
+#    open select menu of one is dropped. box_free then frees each control,
+#    and form_free_control takes it out of its form -- form.elements
+#    shrinks, as in a browser. (A full reconvert keeps a form-owned
+#    control alive with a box pointer into the freed tree; logged in doc
+#    10 as a separate bug.) A re-inserted field keeps its value: it lives
+#    in the DOM, and the new control reads it. Logged "removed block's
+#    controls released".
+#
+# Result: 91 -> 18 ms. Eight steps (input, select, textarea and radio-group
+# blocks removed, an input's block put back, a control outside any form,
+# a table cell's own class twice) render row for row as a parse-time build
+# of the same DOM at every step, with the same form.elements count and
+# the same typed value.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6501,6 +6501,47 @@
+ 	return false;
+ }
+ 
++/* Patch 368: does a box subtree hold an object or a frame (what a removed
++ * block must not take with it -- a form control it may)? */
++static bool html_rl_subtree_objects_or_frames(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->object != NULL || b->iframe != NULL)
++			return true;
++		if (html_rl_subtree_objects_or_frames(b->children))
++			return true;
++	}
++	return false;
++}
++
++/* Patch 368: a removed block's form controls are freed with its boxes
++ * (box_free -> form_free_control, which also takes each out of its
++ * form, as a browser's form.elements does). Before that, nothing may
++ * still point at them: the focus (a caret in a removed field goes back
++ * to the page) and an open select's menu. True if it held a control. */
++static bool html_rl_release_box(html_content *c, struct box *b)
++{
++	bool any = false;
++	struct box *ch;
++
++	if (b->gadget != NULL) {
++		any = true;
++		if ((c->focus_type == HTML_FOCUS_TEXTAREA &&
++		     c->focus_owner.textarea == b) ||
++		    (c->focus_type == HTML_FOCUS_CONTENT &&
++		     c->focus_owner.content == b)) {
++			c->focus_type = HTML_FOCUS_SELF;
++			c->focus_owner.self = true;
++		}
++		if (c->visible_select_menu == b->gadget)
++			c->visible_select_menu = NULL;
++	}
++	for (ch = b->children; ch != NULL; ch = ch->next)
++		if (html_rl_release_box(c, ch))
++			any = true;
++	return any;
++}
++
+ /* does a box subtree hold anything that others point at (an object's
+  * entry, a form control, a frame)? */
+ static bool html_rl_subtree_referenced(struct box *b)
+@@ -7186,11 +7227,11 @@
+ 		if (parent != NULL)
+ 			dom_node_unref(parent);
+ 		if (parent != pnode) {
++			/* patch 368: form controls may go (released below) */
+ 			if (nrem == HTML_RL_MAX_CHANGES ||
+-			    html_rl_subtree_objects(b->children) ||
+-			    b->object != NULL || b->gadget != NULL ||
+-			    b->iframe != NULL)
+-				RL_BNO("removed block holds objects or controls");
++			    html_rl_subtree_objects_or_frames(b->children) ||
++			    b->object != NULL || b->iframe != NULL)
++				RL_BNO("removed block holds objects or frames");
+ 			/* a list item, or a block of blocks: the page is laid
+ 			 * out whole afterwards (markers renumbered, margins
+ 			 * collapsed through the nesting) */
+@@ -7316,6 +7357,10 @@
+ 			/* patch 365: a float leaves its carrier, which goes
+ 			 * too when it is left empty */
+ 			struct box *rp = removed[i]->parent;
++			/* patch 368: nothing may point at its controls */
++			if (html_rl_release_box(c, removed[i]))
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"removed block's controls released");
+ 			html_rl_unlink(removed[i]);
+ 			box_free(removed[i]);
+ 			if (rp != NULL && rp != pbox && rp->children == NULL) {

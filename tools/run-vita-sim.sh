@@ -236,6 +236,8 @@ JS-table-cell-text file:///app0:/testpages/JS-table-cell-text.html
 CSS-table-cell-text-ref file:///app0:/testpages/CSS-table-cell-text-ref.html
 JS-table-cell-float file:///app0:/testpages/JS-table-cell-float.html
 CSS-table-cell-float-ref file:///app0:/testpages/CSS-table-cell-float-ref.html
+JS-remove-controls file:///app0:/testpages/JS-remove-controls.html
+CSS-remove-controls-ref file:///app0:/testpages/CSS-remove-controls-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1456,6 +1458,14 @@ tfr=$(fl_rows JS-table-cell-float CSS-table-cell-float-ref)
 tfl=$(grep -c 'LIFE rebuild local: rebuilt, full layout (a table cell with floats)' "$R/netsurf.log" || true)
 echo "  JS-table-cell-float: rows differing from the parse-time build $tfr (0); ${tfl} cell-with-float changes rebuilt alone (5 or more)"
 [ "$tfr" = 0 ] && [ "${tfl:-0}" -ge 5 ] || fail "table cell with floats rebuilt alone"
+# Patch 368: a block holding form controls a script removes is unlinked
+# locally, its controls released (before: a full rebuild). The page also
+# changes a table cell's own class (still the full rebuild) and renders
+# row for row as the same steps run at parse time.
+rcr=$(fl_rows JS-remove-controls CSS-remove-controls-ref)
+rcl=$(grep -c "LIFE rebuild local: removed block's controls released" "$R/netsurf.log" || true)
+echo "  JS-remove-controls: rows differing from the parse-time build $rcr (0); ${rcl} control blocks removed locally (3 or more)"
+[ "$rcr" = 0 ] && [ "${rcl:-0}" -ge 3 ] || fail "control blocks removed locally"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path
