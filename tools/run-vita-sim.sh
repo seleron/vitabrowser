@@ -238,6 +238,8 @@ JS-table-cell-float file:///app0:/testpages/JS-table-cell-float.html
 CSS-table-cell-float-ref file:///app0:/testpages/CSS-table-cell-float-ref.html
 JS-remove-controls file:///app0:/testpages/JS-remove-controls.html
 CSS-remove-controls-ref file:///app0:/testpages/CSS-remove-controls-ref.html
+JS-table-cell-class file:///app0:/testpages/JS-table-cell-class.html
+CSS-table-cell-class-ref file:///app0:/testpages/CSS-table-cell-class-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1466,6 +1468,13 @@ rcr=$(fl_rows JS-remove-controls CSS-remove-controls-ref)
 rcl=$(grep -c "LIFE rebuild local: removed block's controls released" "$R/netsurf.log" || true)
 echo "  JS-remove-controls: rows differing from the parse-time build $rcr (0); ${rcl} control blocks removed locally (3 or more)"
 [ "$rcr" = 0 ] && [ "${rcl:-0}" -ge 3 ] || fail "control blocks removed locally"
+# Patch 369: a class change on a table cell's own box builds the cell's
+# table again (before: a full rebuild); the nine-step page renders row for
+# row as the same steps run at parse time.
+tkr=$(fl_rows JS-table-cell-class CSS-table-cell-class-ref)
+tkl=$(grep -c "LIFE rebuild local: table restyled, full layout (a cell's own class)" "$R/netsurf.log" || true)
+echo "  JS-table-cell-class: rows differing from the parse-time build $tkr (0); ${tkl} cell class changes restyled with their table (5 or more)"
+[ "$tkr" = 0 ] && [ "${tkl:-0}" -ge 5 ] || fail "cell class changes restyle the table"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path

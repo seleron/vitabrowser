@@ -1,0 +1,204 @@
+# netsurf: a class change on a table cell's own box rebuilds its table alone (patch 369)
+# Generated 2026-11-01
+# Base: seleron/vitabrowser (patch stack through 368)
+#
+# The last WS-C script change on the full rebuild: a class change on a
+# <td>'s own box ("class change on an element with a non-inline,
+# non-block box"), 93-98 ms on a 2500-paragraph sim page. A cell's box
+# carries what the table works out from every cell -- its start column
+# and, in border-collapse, its used borders from its neighbours (table
+# normalisation, table.c) -- and the column types come from every cell's
+# style. So the scope is the table.
+#
+#  - html.c: html_rl_table_restyle() takes the cell's table box out (a
+#    real <table> whose box sits in a block or a cell), cascades the
+#    table's subtree afresh, builds the <table> element again, puts its
+#    box back where the old one was, normalises it as a full build does,
+#    and lays the page out once -- which makes the column types again
+#    (layout.c). Declined: a table holding objects, controls, frames or
+#    list markers; a page whose CSS mentions counters (a class could
+#    change one read outside the table). :has() is not a reach out: this
+#    libcss parses it and never matches it (patch 328). Logged "table
+#    restyled, full layout (a cell's own class)".
+#  - box_normalise.c/h: box_normalise_table_ext(), the static
+#    box_normalise_table for one table.
+#
+# Result: 94 -> 17 ms. Nine steps (a width class, a thick collapsed
+# border, a header's font, a colspan cell's padding, a class removed, a
+# nested table's cell, a class a td.hl + td selector reads, ::before, a
+# border-spacing table) render row for row as a parse-time build of the
+# same DOM at every step; :has(), counter and image variants likewise.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9353,6 +9353,130 @@
+  * it was -- patch 166's removal then insertion, laid out with the block
+  * layout's own margin arithmetic. 0 done, -1 declined (nothing changed)
+  * or failed (the full reconvert rebuilds from the DOM). */
++/* ---- a cell's own class (patch 369) ---------------------------------
++ *
++ * A class change on a table cell's own box restyles that box, and a cell's
++ * box carries what table normalisation and the table layout work out from
++ * every cell: its start column, its collapsed borders (from its
++ * neighbours, table.c), the table's column types. So the scope is the
++ * table: it is built again whole, with a fresh cascade, and put back where
++ * it was; the page is then laid out once (which makes the column types
++ * again, layout.c). Outside the table a class could reach through a
++ * counter it changes -- a counter in the page's CSS declines, as does a
++ * table holding objects, controls, frames or list markers -- or through
++ * :has() on an ancestor, but this libcss parses :has() and never matches
++ * it (patch 328, selector_never_matches_part), so a full build applies no
++ * such rule either. If :has() matching is ever added, this must decline
++ * on it. */
++
++/* does a used author sheet mention a counter at all (conservative: the
++ * raw source, comments included)? */
++static bool html_rl_page_counters(html_content *c)
++{
++	unsigned int si;
++
++	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
++		const uint8_t *data;
++		size_t size = 0, i;
++
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		data = content_get_source_data(c->stylesheets[si].sheet, &size);
++		if (data == NULL)
++			continue;
++		for (i = 0; i + 8 <= size; i++)
++			if (strncasecmp((const char *) data + i, "counter-",
++					8) == 0)
++				return true;
++	}
++	return false;
++}
++
++static int html_rl_table_restyle(html_content *c, struct box *cell,
++		double t0)
++{
++	struct content *base_c = &c->base;
++	struct box *row = cell->parent;
++	struct box *grp = row != NULL ? row->parent : NULL;
++	struct box *tb = grp != NULL ? grp->parent : NULL;
++	struct box *pbox, *prev, *nb;
++	dom_node *el;
++	unsigned int objects_before;
++	static unsigned long table_n;
++
++#define RL_TNO(w) do { macsurf_debug_log_writef( \
++		"LIFE rebuild local: declined (%s)", (w)); return -1; } while (0)
++	if (row == NULL || row->type != BOX_TABLE_ROW ||
++	    grp == NULL || grp->type != BOX_TABLE_ROW_GROUP ||
++	    tb == NULL || tb->type != BOX_TABLE || tb->node == NULL)
++		RL_TNO("restyled cell's table is not a plain table");
++	pbox = tb->parent;
++	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
++			     pbox->type != BOX_TABLE_CELL))
++		RL_TNO("restyled cell's table is not in a block");
++	if (tb->object != NULL || tb->gadget != NULL || tb->iframe != NULL ||
++	    tb->list_marker != NULL ||
++	    html_rl_subtree_referenced(tb->children))
++		RL_TNO("restyled cell's table holds objects, controls or "
++			"frames");
++	if (html_rl_page_counters(c))
++		RL_TNO("a cell's class could reach outside its table "
++			"(counters)");
++
++	/* out with the old table, in with the new, cascaded afresh, where
++	 * the old one was */
++	el = tb->node;
++	dom_node_ref(el);
++	prev = tb->prev;
++	html_rl_unlink(tb);
++	box_free(tb);
++	html_rl_invalidate(pbox);
++	objects_before = c->num_objects;
++	(void) html_reconvert_reset_node_data_walk(el, 0);
++	if (!box_build_element(c, el)) {
++		nb = box_for_node(el);
++		if (nb != NULL) {
++			html_rl_unlink(nb);
++			box_free(nb);
++		}
++		dom_node_unref(el);
++		macsurf_debug_log_writef("LIFE rebuild local: restyled table "
++			"failed to build, full reconvert");
++		return -1;
++	}
++	nb = box_for_node(el);
++	dom_node_unref(el);
++	if (nb == NULL || nb->type != BOX_TABLE || nb->parent != pbox) {
++		if (nb != NULL) {
++			html_rl_unlink(nb);
++			box_free(nb);
++		}
++		macsurf_debug_log_writef("LIFE rebuild local: restyled table "
++			"is no longer a table here, full reconvert");
++		return -1;
++	}
++	html_rl_unlink(nb);
++	html_rl_link_after(pbox, prev, nb);
++	if (!box_normalise_table_ext(nb, c->layout, c) ||
++	    c->num_objects != objects_before) {
++		/* the tree is whole, but not as a full build makes it: the
++		 * full reconvert starts from the DOM */
++		macsurf_debug_log_writef("LIFE rebuild local: restyled table "
++			"did not normalise, full reconvert");
++		return -1;
++	}
++	html_rl_invalidate(nb);
++	table_n++;
++	macsurf_debug_log_writef("LIFE rebuild local: table restyled, full "
++		"layout (a cell's own class) in %ld us (%lu so far)",
++		(long)(macos9_micros() - t0), table_n);
++	content__reformat(base_c, false, base_c->available_width,
++			base_c->available_height);
++	return 0;
++#undef RL_TNO
++}
++
+ static int html_rl_block_restyle(html_content *c, dom_node *el,
+ 		struct box *ob, double t0, const char *old_class)
+ {
+@@ -9601,6 +9725,13 @@
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
++			if (class_change && n == vnode && b != NULL &&
++			    b->type == BOX_TABLE_CELL) {
++				/* a cell's own box: its table (patch 369) */
++				int r = html_rl_table_restyle(c, b, t0);
++				dom_node_unref(n);
++				return r;
++			}
+ 			if (class_change && n == vnode && b != NULL &&
+ 			    b->type != BOX_INLINE) {
+ 				dom_node_unref(n);
+--- a/content/handlers/html/box_normalise.c
++++ b/content/handlers/html/box_normalise.c
+@@ -1286,3 +1286,12 @@
+ 
+ 	return true;
+ }
++
++/* VitaBrowser patch 369: normalise one table on its own -- html.c builds a
++ * table again when a cell's own class changes (whole-table scope), and its
++ * new box needs exactly what box_normalise_block does for a table child. */
++bool box_normalise_table_ext(struct box *table, const struct box *root,
++		html_content *c)
++{
++	return box_normalise_table(table, root, c);
++}
+--- a/content/handlers/html/box_normalise.h
++++ b/content/handlers/html/box_normalise.h
+@@ -63,4 +63,8 @@
+  */
+ bool box_normalise_block(struct box *block, const struct box *root, struct html_content *c);
+ 
++/* VitaBrowser patch 369: one table, as box_normalise_block normalises a
++ * table child */
++bool box_normalise_table_ext(struct box *table, const struct box *root, struct html_content *c);
++
+ #endif
