@@ -7670,3 +7670,80 @@ guardian sim run flaked (its innerText dump was empty). All five sites
 recover to baseline on the fresh reference; the live-stable tiers
 (static, wiki, wordpress, jquery, docs, spa) were already identical in
 r81-359.
+
+## Patch 360 (2026-11-01): flex column automatic minimum; getComputedStyle recursion
+
+Closes the 358 note: google.com's sim showed its footer links where
+Chromium has the search box. The search box was there, under the footer.
+Google's page is `#gb-main {display: flex; flex-direction: column;
+min-height: 100%}` holding a header and a `flex: 1` middle (`#n0tgWb`),
+then the in-flow footer `DIV.fbar`. The column came out as tall as its
+header (139px) while the middle laid out 681px tall inside it, so the
+footer after it painted at y=129, on the form at y=160.
+
+**Unit 360 was first briefed as zero-height inputs. That was stale:**
+probed in 12 layouts (inline, block, flex, textarea, password, search),
+an auto-height input is 24px on the current tree, and google's search
+textarea measured 520x24 before and after. The intrinsic-size change
+(10em x 1.5em in obj_w/obj_h) made every input 30px (Chromium ~21) and
+did not touch google; it is shelved, not landed, in
+`~/vitabrowser-work/wip-360-input-intrinsic-20261101/`, with the note
+that `layout_get_object_dimensions` ratio-scales an AUTO axis, so a
+gadget there needs a no-ratio branch (`width: 300px` gave 45px tall).
+
+The fixes, in layout_flex.c:
+- An item's hypothetical main size is now clamped by the automatic
+  minimum too (Flexbox 9.2 step 3E, 4.5): a column item with min-height
+  auto and overflow visible is never shorter than its content. Only the
+  free-space pass applied it, and an auto-height column sums the
+  hypothetical sizes for its own height, so a `flex: 1` item (libcss
+  stores the shorthand's basis as 0px, not the spec's 0%) counted as 0.
+  base_size, which the free space is measured from, is untouched.
+- A percentage flex-basis in a column resolves against the container's
+  height, or is `content` when that is indefinite (Flexbox 7.2.3). It
+  resolved against available_width, the cross size.
+
+And in the JS bridge: getComputedStyle reads OWN properties only
+(macsurf_qjs.c's wrapper, vita_polyfill.js `read()`). The computed style
+inherits CSSStyleDeclaration.prototype (patch 280), whose patch-351
+accessors call `this.getPropertyValue` -- the wrapper, which read the
+accessor again. Any property `__gcsNative` did not answer (flexGrow...)
+recursed to "Maximum call stack size exceeded", on every page; it showed
+up as probe scripts dying on google.
+
+What was traced and ruled out:
+- `min-height:undefinedpx` on #gb-main is google's inline script
+  (`a.style.minHeight = a.scrollHeight + "px"`, right after the footer)
+  reading scrollHeight before #gb-main has a box; the engine answers
+  undefined there by design (fixes1087). libcss drops the declaration,
+  and the overlap reproduces with no script at all. Still true, not
+  fixed: our style setter stores the invalid value (Chromium ignores
+  it), so getComputedStyle echoes `undefinedpx` from the inline style.
+- Before this patch the footer's JS geometry (offsetTop and
+  getBoundingClientRect, read 15 s in) said 764 while the frame painted
+  it at 129. Paint matched the 139px column, so paint was the
+  authoritative one. Why the JS read differed was not traced (764 = the
+  document's 820px scrollHeight minus the footer's 56px); with this
+  patch both say 764 and the frame agrees.
+- Still wrong, separate: computed `flexDirection` answers the INITIAL
+  `row` for a column (the native side does not supply it).
+
+Gate: CSS-flex-column-automin (file:// snapshot: blue head, green middle
+at y 70 and 150, red footer at 170 below it, and a row the page's
+script turns green when `getComputedStyle(el).flexGrow` answers). Before
+the patch the footer read red at y 70, over the middle. Full gate
+`gate360b.log`, exit 0 (`gate360.log`, before the gate line was added,
+also exit 0).
+
+Scorecard: all 21 sites against the `r79-360` reference, this patch and
+the pre-360 binary run back to back (`score/r85-360`,
+`score/r85-pre360`): mean **74.30 vs 74.30**, no regression; moves are
+within +-0.4 (hackernews, stackoverflow, wpnews, google). claude read
+"blocked" once in r85-360 -- a Cloudflare "Just a moment..."
+interstitial -- and scored 77.0, as before, on rerun
+(`score/r85-360-claude`). google 53.6 vs 53.9: the frame now has the
+search box where Chromium does, but the visual column compares against
+a day-old reference (live trending list) and text recall already counted
+the footer's text, so the score does not register the fix. The
+absolute means are below r84's 86.9 because the r79-360 reference is a
+day old; the A/B pair is what compares.
