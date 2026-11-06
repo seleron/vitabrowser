@@ -8903,3 +8903,104 @@ saves full rebuilds on real page loads:
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 375 (2026-11-06): local rebuilds carry objects over to the new boxes
+
+**Why.** 374 made every local rebuild decline when an object entry (an
+`<img>`, or a CSS background image) points into the subtree it would
+free, because the entry's load callback and the full reconvert's relink
+read `o->box`. By the r99 census that decline stopped rte's backgrounded
+slick tracks and the "holds objects" restyles (youtube 6, rte 5, wpblog
+3).
+
+**How.** The full reconvert already solves this for the whole tree:
+`html_reconvert_relink_objects` sends each entry to `box_for_node` of
+its old box's node, dedupes, and retires the rest. Running it on the
+live tree was rejected. For every entry it re-resolves the box,
+invalidates `max_width` up the parent chain, unlinks CLONE siblings, and
+retires entries whose box has no node (generated-content images and
+markers that still exist). So the patch scopes it to the subtree a
+restyle rebuilds:
+- The flex/grid restyle (372), the block restyle (174 and 373's route)
+  and the cell's table restyle (369) keep the old subtree **alive**
+  across the build: unlinked, with its node backlinks cleared
+  (`html_rl_clear_backlinks`). They used to free it first.
+- This also makes **html_fetch_object's fixes977 adoption sound**. While
+  building, it moves an entry of the same element and URL to the new box,
+  and to check the element it reads the *old* box's node, which the local
+  paths had already freed. A trace on JS-bg-objects showed the adoption
+  had moved every background entry before the relink ran (0 left under
+  the old track).
+- `html_rl_relink_subtree()`, after the build, handles each entry still
+  under the old subtree:
+  - it goes to its element's new box, and if loaded is attached there as
+    object or background, with the box's ancestors re-measured;
+  - or it is retired: the element has no box now (display:none), or a
+    duplicate the build made wins (the loaded one is kept, as the full
+    relink dedupes);
+  - retired entries go through `html_object_free_objects`, and then the
+    old subtree is freed. Entries elsewhere are not touched.
+- Given up after the build, the old subtree is left for the full
+  reconvert, whose relink reads those boxes. 374's `html_rl_drop_new`
+  still decides what happens to the new one.
+- Still declined: an `<object>` or `<embed>` (CONTENT_ANY; the full
+  relink drops those too), controls, frames. The line path and block
+  removals keep 374's decline.
+
+**Result** on `ST-375.html` (2500 paragraphs, a track of 30 slides each
+with an image and a background image, median of 3): the track's style
+**109 -> 20 ms**. A backgrounded paragraph's class costs 18 ms. On 374
+it read 4 ms, but that was the fixes1135 class-drop of the 372 entry
+again: a class change after three full style rebuilds ran no rebuild at
+all.
+
+**Gate.** JS-objects-relink runs five steps 600 ms apart:
+- a track whose slides have images and backgrounds, its style (2
+  entries re-pointed, 2 duplicates retired);
+- a backgrounded paragraph's class (adopted during the build);
+- a cell's class in a table holding an image (re-pointed);
+- a flex with an image hidden (its entry retired), then shown.
+
+It renders row for row as its parse-time reference: **0 rows**, every
+image drawn. On the 374 binary it is also 0 rows, all taken by full
+rebuilds. 4 changes are rebuilt locally on the page, and 7 rebuilds
+re-point objects across the gate. Two earlier checks changed meaning:
+- JS-flex-restyle's image-holding flex is now restyled alone ("objects
+  carried over", 7);
+- JS-bg-objects' backgrounded track is now local (0 object declines),
+  while its backgrounded line still declines.
+
+Full gate `gate375.log`, exit 0, first run, with every 364-374 check
+unchanged. Restage from pristine: 468 applied plus the 2 known
+collisions, html.c byte-identical.
+
+**Found, pre-existing, unchanged: an `<object>` in a flex is lost after
+any full rebuild.** The full reconvert's relink retires every
+non-CONTENT_IMAGE entry, so after the first full rebuild the element has
+no entry, and the first draft of the test page differed in its 20 rows
+on both 374 and 375. It is not in the gate. A future unit should carry
+`<object>`/`<embed>` entries over, or refetch them, in the full
+reconvert.
+
+**Scorecard r100**: 21 sites against `r79-360`, the 375 and 374 binaries
+run back to back (`score/r100-375`, `score/r100-pre375`): **71.64 vs
+71.56**. No crash; per site equal within live noise (claude +1.2,
+cnnlite +0.7, stackoverflow -0.4).
+
+**Load-time census.**
+- Object declines: rte 5 -> 2, youtube 6 -> 2, wpblog 3 -> 0.
+- rte: local rebuilds 1 -> 4, with 1 rebuild re-pointing objects.
+- Full rebuilds per site are unchanged within batching noise.
+
+**Next**, by the r100 census:
+1. **rte's "restyled element is not a plain block of text" (7).** The
+   block restyle only takes text blocks (`html_rl_inline_subtree`). A
+   block holding images and child blocks could take the subtree rebuild
+   of 372/375 with a full layout.
+2. **youtube's "parent holds more than blocks" (5)**, and its "flex holds
+   controls or frames" (3).
+3. **The fixes1135 class-drop** (372 entry), a correctness bug, seen
+   again here.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
