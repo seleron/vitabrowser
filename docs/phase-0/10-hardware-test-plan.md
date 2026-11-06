@@ -9004,3 +9004,83 @@ cnnlite +0.7, stackoverflow -0.4).
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 376 (2026-11-06): a block holding more than text restyles its subtree alone
+
+**The shape.** The r100 census's top local decline on rte was "restyled
+element is not a plain block of text" (7). A temporary trace (tag,
+class, the subtree's blocks, floats, markers and objects) showed all
+seven were slick slides: `div.slick-slide` blocks of 2-17 nested blocks,
+one holding an image, directly in rte's flex track, with no floats and
+no list markers. The block restyle (174) takes only text blocks
+(`html_rl_block_tag` + `html_rl_inline_subtree`) because of its local
+placement; anything else was a full box-tree rebuild.
+
+**The change** (html.c):
+- `html_rl_block_restyle` hands a block that holds more than text to
+  372's container rebuild (`html_rl_flex_restyle`, now with an
+  `is_block` mode for its log line). The block is built whole and
+  cascaded afresh, its objects are carried over (375), and the page is
+  laid out whole. It is routed before the sibling-structure check, which
+  only the local placement needs, so its siblings may be anything. That
+  path's own checks still apply: controls, frames, sibling selectors,
+  counting, `<object>`/`<embed>`.
+- Declined:
+  - an own list marker, or a list marker below it (its items'
+    numbering);
+  - a float below it (`html_rl_subtree_floats`). A float inside a block
+    that does not contain its floats is listed in an *ancestor's* float
+    list, which the rebuild would leave pointing at the freed box.
+
+**Result** on `ST-376.html` (2500 paragraphs, median of 3, host sim):
+
+| change | 375 | 376 |
+|---|---|---|
+| a slide's class (nested blocks + an image, in a flex track) | 105 ms | 16 ms |
+| a section's style (heading, paragraphs, an image) | 102 ms | 16 ms |
+
+**Gate.** JS-block-subtree runs seven steps 600 ms apart:
+- local: a slide's class and a slide's style in a flex track; a section's
+  style; a figure's class; a container whose class shows a hidden panel
+  through a descendant rule;
+- full: a list (its markers); a block holding a float.
+
+It renders row for row as its parse-time reference: **0 rows**. On the
+375 binary it is also 0 rows, taken by six full rebuilds. 5 subtrees
+were restyled locally, with 4 floats/markers declines.
+
+`gate376` failed on exactly one pinned value: **JS-batch-burst's census**.
+- Its 200-paragraph `innerHTML` load batch, which fills an empty
+  `#big`, was a full rebuild (`total=2 ... local=1 ... guard=1`). It is
+  now built locally: 373's empty-block route reaches 376's subtree
+  rebuild because `#big` now holds blocks.
+- The page's own DOM check reads **BATCHBURST 3/3** on both the 375 and
+  376 binaries, read by an injected `console.log`, since the result lines
+  sit below the screen in the dump.
+- The expectation is now `total=1 ... local=0 ... guard=1`, with a
+  comment.
+
+`gate376b.log`: exit 0. Restage from pristine: 469 applied plus the 2
+known collisions, html.c byte-identical.
+
+**Scorecard r101**: 21 sites against `r79-360`, the 376 and 375 binaries
+run back to back (`score/r101-376`, `score/r101-pre376`): **72.80 vs
+72.85**. No crash; per site equal within live noise (stackoverflow -0.6,
+wpblog -0.3, hackernews -0.1).
+
+**Load-time census.**
+- rte: **62** slide restyles were taken locally. The 375 binary attempted
+  7 and declined them all. That gap suggests most of rte's later slide
+  changes never reached the local path on 375, consistent with the
+  fixes1135 class-drop (372 entry), but that is not proven here.
+- rte's full rebuilds went 10 -> 8, and across all 21 sites 116 -> 113.
+
+**Next**, by the r101 census:
+1. **youtube's "parent holds more than blocks" (5)**: block insertion and
+   removal among mixed siblings.
+2. **The fixes1135 class-drop** (372 entry), a correctness bug, now with
+   rte as a likely real-site case.
+3. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
