@@ -258,6 +258,10 @@ JS-block-subtree file:///app0:/testpages/JS-block-subtree.html
 CSS-block-subtree-ref file:///app0:/testpages/CSS-block-subtree-ref.html
 JS-mixed-siblings file:///app0:/testpages/JS-mixed-siblings.html
 CSS-mixed-siblings-ref file:///app0:/testpages/CSS-mixed-siblings-ref.html
+JS-late-append file:///app0:/testpages/JS-late-append.html
+CSS-late-append-ref file:///app0:/testpages/CSS-late-append-ref.html
+JS-late-append-struct file:///app0:/testpages/JS-late-append-struct.html
+CSS-late-append-struct-ref file:///app0:/testpages/CSS-late-append-struct-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1600,6 +1604,22 @@ echo "  JS-mixed-siblings: rows differing from the parse-time build $k377r (0); 
 [ "$k377r" = 0 ] && [ "${k377l:-0}" -ge 5 ] && [ "${k377s:-0}" -ge 1 ] &&
 	[ "${k377j:-0}" -ge 1 ] && [ "${k377e:-0}" -ge 1 ] && [ "${k377f:-0}" -ge 1 ] ||
 	fail "block changes among mixed siblings"
+# Patch 378: a child-list change that adds or removes no element with a
+# box (a <script> appended to <body> or <html>) needs no rebuild, and an
+# <iframe> or <img> appended at the end is built alone (before: full
+# rebuilds, "new element is not a plain block"). Both pages render row for
+# row as the same steps at parse time; a <script> that takes a <p>'s
+# :first-child keeps the full rebuild, as does an <iframe> mid-page.
+k378r=$(fl_rows JS-late-append CSS-late-append-ref)
+k378s=$(fl_rows JS-late-append-struct CSS-late-append-struct-ref)
+k378n=$(grep -c "LIFE rebuild local: child list changed only in elements with no box" "$R/netsurf.log" || true)
+k378a=$(grep -c "LIFE rebuild local: an iframe or image appended at the end, built alone" "$R/netsurf.log" || true)
+k378g=$(awk '/ page [0-9]+\/[0-9]+ JS-late-append-struct: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: declined (structural selectors or counters in page CSS)" || true)
+echo "  JS-late-append: rows differing from the parse-time build $k378r (0), :first-child page $k378s (0); ${k378n} child-list changes needing no rebuild (2 or more); ${k378a} iframes/images appended alone (2 or more); :first-child guard ${k378g} (1 or more)"
+[ "$k378r" = 0 ] && [ "$k378s" = 0 ] && [ "${k378n:-0}" -ge 2 ] &&
+	[ "${k378a:-0}" -ge 2 ] && [ "${k378g:-0}" -ge 1 ] ||
+	fail "late appends and boxless child-list changes"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

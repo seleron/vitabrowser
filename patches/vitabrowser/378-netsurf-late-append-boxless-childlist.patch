@@ -1,0 +1,250 @@
+# netsurf: boxless child-list changes need no rebuild; late iframes and images built alone (patch 378)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 377)
+#
+# The r102 census: "new element is not a plain block, list item or block
+# of blocks" (youtube 7, guardian 1). A temporary trace (the element, its
+# parent, its descendants' tags) found two shapes:
+#   - <head> in <html> (youtube 2, claude, bbc, cnnlite): a script changed
+#     <html>'s child list -- typically a <script> appended to it (unit
+#     362's shape) -- and the walk read the box-less <head> as new;
+#   - <iframe> in <body> (youtube 4, guardian 2, cnnlite 1): ad and
+#     tracker frames appended by script.
+#
+#  - <head> joins 377's never-boxed tags.
+#  - html_reconvert_local_childlist(): appendChild / insertBefore /
+#    removeChild marks (macos9_reconvert.c) tell the local answer that the
+#    node is the parent whose children changed. html_rl_block_change then
+#    answers a change on that parent that added or removed no element
+#    with a box with no rebuild -- the box tree already matches -- unless
+#    structural pseudo-classes or counters are in page CSS (192: a
+#    <script> before a <p> takes its :first-child) or a sibling rule can
+#    see the skipped elements (198). Removed box-less elements are not
+#    known there; only a tag-only sibling rule naming one could see it go.
+#  - An <iframe> or <img> appended at the end (no later sibling with a box,
+#    no later text) is built alone wherever box_construct puts it -- an
+#    inline one at the end of the parent's last line, which is its place
+#    exactly then -- and the page laid out whole. A frame gets its record
+#    and its late load as in a full build (patch 244). Mid-page ones still
+#    take the full rebuild.
+#
+# Result on a 2500-paragraph sim page: a <script> appended to <html>
+# 105 -> 4 ms; an <iframe> appended to <body> 103 -> 30 ms; a pixel <img>
+# 105 -> 16 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7450,7 +7450,7 @@
+ {
+ 	static const char *const tags[] = {
+ 		"script", "style", "link", "meta", "template", "title",
+-		"base", "noscript", NULL
++		"base", "noscript", "head", NULL	/* head: patch 378 */
+ 	};
+ 	dom_string *name = NULL;
+ 	bool found = false;
+@@ -7524,6 +7524,61 @@
+ 	return top;
+ }
+ 
++/* Patch 378: the parent of the child-list change being answered
++ * (appendChild / insertBefore / removeChild mark it), else NULL -- set by
++ * html_reconvert_local_childlist for the length of one local answer. */
++static dom_node *html_rl_childlist_parent;
++
++/* Patch 378: elements a script appends at the end of a parent that this
++ * path builds on their own wherever they are inline-level: box_construct
++ * puts a new inline box at the end of the parent's last line (or a new
++ * one), which is its place exactly when no later sibling has a box.
++ * youtube's, guardian's and cnnlite's ad and tracker <iframe>s, tracking
++ * pixel <img>s. */
++static bool html_rl_late_tag(dom_node *n)
++{
++	static const char *const tags[] = { "iframe", "img", NULL };
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; tags[i] != NULL && !found; i++)
++		if (dom_string_byte_length(name) == strlen(tags[i]) &&
++		    strncasecmp(dom_string_data(name), tags[i],
++				strlen(tags[i])) == 0)
++			found = true;
++	dom_string_unref(name);
++	return found;
++}
++
++/* Patch 378: does any later sibling of n have a box, or is it text that
++ * is not white space? */
++static bool html_rl_boxed_after(dom_node *n)
++{
++	dom_node *s = n, *t;
++	bool after = false;
++
++	dom_node_ref(s);
++	while (!after) {
++		dom_node_type type;
++		t = NULL;
++		if (dom_node_get_next_sibling(s, &t) != DOM_NO_ERR || t == NULL)
++			break;
++		dom_node_unref(s);
++		s = t;
++		if (dom_node_get_node_type(s, &type) != DOM_NO_ERR)
++			after = true;
++		else if (type == DOM_ELEMENT_NODE)
++			after = box_for_node(s) != NULL;
++		else if (type == DOM_TEXT_NODE)
++			after = !html_rl_text_is_space(s);
++	}
++	dom_node_unref(s);
++	return after;
++}
++
+ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		struct box *pbox, double t0)
+ {
+@@ -7532,7 +7587,9 @@
+ 	struct content *base_c = &c->base;
+ 	struct box *removed[HTML_RL_MAX_CHANGES];
+ 	dom_node *added[HTML_RL_MAX_CHANGES];
+-	unsigned int nrem = 0, nadd = 0, i, local_n = 0;
++	dom_node *skipped[HTML_RL_MAX_CHANGES];	/* patch 378 */
++	unsigned int nrem = 0, nadd = 0, i, local_n = 0, nskip = 0;
++	bool skip_over = false;
+ 	struct box *b, *layout;
+ 	dom_node *n = NULL, *next;
+ 	bool full = false;
+@@ -7664,7 +7721,14 @@
+ 		if (type == DOM_ELEMENT_NODE) {
+ 			b = box_for_node(n);
+ 			if (b == NULL && html_rl_never_boxed(n)) {
+-				/* patch 377: a <script> etc. -- no box, ever */
++				/* patch 377: a <script> etc. -- no box, ever;
++				 * patch 378: kept for the no-op's check */
++				if (nskip < HTML_RL_MAX_CHANGES) {
++					skipped[nskip++] = n;
++					dom_node_ref(n);
++				} else {
++					skip_over = true;
++				}
+ 				goto next_node;
+ 			}
+ 			if (b == NULL) {
+@@ -7684,6 +7748,24 @@
+ 					oc = html_rl_subtree_tags(n, true);
+ 					html_rl_tags_oc = false;
+ 				}
++				/* Patch 378: an <iframe> or <img> appended at
++				 * the end of the parent (no later sibling has a
++				 * box) is built alone wherever it lands (an
++				 * inline one at the end of the last line), the
++				 * page laid out whole; a frame gets its record
++				 * and its late load as in a full build (244) */
++				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
++				    html_rl_late_tag(n) && !html_rl_boxed_after(n)) {
++					full = true;
++					why = why != NULL ? why :
++						"an iframe or image appended";
++					added[nadd++] = n;
++					dom_node_ref(n);
++					macsurf_debug_log_writef("LIFE rebuild "
++						"local: an iframe or image appended "
++						"at the end, built alone");
++					goto next_node;
++				}
+ 				if (nadd == HTML_RL_MAX_CHANGES ||
+ 				    (!plain && !oc &&
+ 				     !((html_rl_block_tag(n) ||
+@@ -7744,8 +7826,36 @@
+ 		dom_node_unref(n);
+ 		n = next;
+ 	}
++	/* Patch 378: a child-list change on this very parent that added or
++	 * removed no element with a box (a <script> appended to <html> or
++	 * <body>, a <link> or <style> element moved -- its sheet marks for
++	 * itself): the box tree already matches. Answered with no rebuild,
++	 * unless the elements can still move a selector: structural
++	 * pseudo-classes or counters (192: a <script> before a <p> takes its
++	 * :first-child), or a sibling rule that sees the skipped elements
++	 * (198). Removed boxless elements are not known here; only a rule
++	 * with a tag-only left compound naming them could see one go. */
++	if (nadd == 0 && nrem == 0 && pnode == html_rl_childlist_parent &&
++	    !skip_over) {
++		if (html_rl_block_list_style_risk(c))
++			RL_BNO("structural selectors or counters in page CSS");
++		if (html_rl_block_sibling_risk(c, pnode, skipped, nskip,
++				NULL, 0))
++			RL_BNO("sibling combinator may see an element with no "
++				"box");
++		for (i = 0; i < nskip; i++)
++			dom_node_unref(skipped[i]);
++		macsurf_debug_log_writef("LIFE rebuild local: child list "
++			"changed only in elements with no box (%u), nothing to "
++			"rebuild", nskip);
++		return 0;
++	}
+ 	if (nadd == 0 && nrem == 0)
+ 		RL_BNO("no inserted or removed block found");
++	/* patch 378: the skipped elements served the no-op only */
++	for (i = 0; i < nskip; i++)
++		dom_node_unref(skipped[i]);
++	nskip = 0;
+ 
+ 	/* Patch 192: structural pseudo-classes (:nth-child() etc.) and CSS
+ 	 * counters make following siblings' styles and generated-content
+@@ -7982,6 +8092,8 @@
+ decline:
+ 	for (i = 0; i < nadd; i++)
+ 		dom_node_unref(added[i]);
++	for (i = 0; i < nskip; i++)
++		dom_node_unref(skipped[i]);
+ 	return -1;
+ #undef RL_BNO
+ }
+@@ -10282,6 +10394,20 @@
+ 	return html_reconvert_local_change(base_c, vnode, false, NULL);
+ }
+ 
++/* Patch 378: a child-list change (appendChild, insertBefore,
++ * removeChild) on vnode -- the same local answer, told that vnode is the
++ * parent whose children changed (html_rl_block_change's no-op) */
++int html_reconvert_local_childlist(struct content *base_c, void *vnode);
++int html_reconvert_local_childlist(struct content *base_c, void *vnode)
++{
++	int r;
++
++	html_rl_childlist_parent = (dom_node *) vnode;
++	r = html_reconvert_local_change(base_c, vnode, false, NULL);
++	html_rl_childlist_parent = NULL;
++	return r;
++}
++
+ /* A class change (patch 173). One on an inline-level element is rebuilt
+  * like a text change: the block holding it gets its inline content built
+  * again, which cascades the element and everything in the block afresh.
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1150,6 +1150,10 @@
+ 		int kind, const char *old_class, const char *attr_name)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
++	/* Patch 378 - a child-list mark: the same answer, told the node is
++	 * the parent whose children changed */
++	extern int html_reconvert_local_childlist(struct content *c,
++			void *node);
+ 	extern int html_reconvert_local_class(struct content *c, void *node,
+ 			const char *old_class);
+ 	extern int html_reconvert_local_style(struct content *c, void *node);
+@@ -1206,6 +1210,10 @@
+ 		g_one_fail_kind = 1;
+ 		return 0;
+ 	}
++	if (kind == MACOS9_DOMMUT_APPENDCHILD ||
++	    kind == MACOS9_DOMMUT_INSERTBEFORE ||
++	    kind == MACOS9_DOMMUT_REMOVECHILD)
++		return html_reconvert_local_childlist(c, node) == 0;
+ 	return html_reconvert_local(c, node) == 0;
+ }
+ 
