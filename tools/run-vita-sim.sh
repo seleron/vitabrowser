@@ -266,6 +266,8 @@ JS-struct-scoped file:///app0:/testpages/JS-struct-scoped.html
 CSS-struct-scoped-ref file:///app0:/testpages/CSS-struct-scoped-ref.html
 JS-struct-dir file:///app0:/testpages/JS-struct-dir.html
 CSS-struct-dir-ref file:///app0:/testpages/CSS-struct-dir-ref.html
+JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
+CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1653,6 +1655,20 @@ k380w=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural range
 echo "  JS-struct-dir: rows differing from the parse-time build $k380r (0); ${k380l} changes local on the page (5 or more); declines: positional ${k380p} (2 or more), whole range ${k380w} (1 or more)"
 [ "$k380r" = 0 ] && [ "${k380l:-0}" -ge 5 ] && [ "${k380p:-0}" -ge 2 ] &&
 	[ "${k380w:-0}" -ge 1 ] || fail "structural check by direction"
+# Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
+# sibling rule's left compound), changes at the parent's tail -- appends
+# with only box-less tags after them, removals of the last -- skip the
+# sibling-combinator check (nothing boxed follows); :empty still counts.
+# Renders row for row as the same steps at parse time; four changes take
+# the tail path, a first insertion and an :empty fill decline.
+k381r=$(fl_rows JS-sib-tail CSS-sib-tail-ref)
+k381seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-tail: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k381t=$(printf '%s\n' "$k381seg" | grep -c "LIFE rebuild local: sibling check at the tail" || true)
+k381l=$(printf '%s\n' "$k381seg" | grep -c "LIFE rebuild local: blocks rebuilt\|LIFE rebuild local: child list changed only" || true)
+k381d=$(printf '%s\n' "$k381seg" | grep -c "declined (sibling combinator may restyle on insert/remove)\|declined (a sibling rule tests :empty)" || true)
+echo "  JS-sib-tail: rows differing from the parse-time build $k381r (0); ${k381t} tail checks (3 or more), ${k381l} changes local (4 or more), ${k381d} declines (2 or more)"
+[ "$k381r" = 0 ] && [ "${k381t:-0}" -ge 3 ] && [ "${k381l:-0}" -ge 4 ] &&
+	[ "${k381d:-0}" -ge 2 ] || fail "sibling check at the tail"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

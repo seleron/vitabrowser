@@ -1,0 +1,253 @@
+# netsurf: the sibling-combinator check skipped at the parent's tail (patch 381)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 380)
+#
+# A fresh census of youtube's full rebuilds (r105, 380 binary): its four
+# <iframe> batches -- the iframe now built alone (378) and past the
+# structural check (380) -- declined on patch 198's "sibling combinator
+# may restyle on insert/remove": youtube's sheets are in patch 186's
+# conservative state (a pseudo-class in a sibling rule's left compound),
+# for which html_rl_block_sibling_risk declines every change outright.
+#
+# A + / ~ rule restyles the element AFTER its left compound's element. A
+# change at the parent's tail -- elements appended with nothing after them
+# but tags that never have a box, the last block removed, a box-less
+# removal whose recorded place (380) is the end -- moves no existing
+# sibling's match; the moved elements are built afresh.
+#  - html_rl_block_sibling_risk gains a tail mode: no per-element
+#    combinator analysis, no conservative-sheet decline. The parent's
+#    :empty flipping still counts (a conservative sheet declines on a
+#    flip: its :empty list cannot be trusted). :has() is not checked: this
+#    libcss parses it and never matches it (patch 328,
+#    selector_never_matches_part), as patch 369 relies on; if :has()
+#    matching is ever added, this must decline on it (youtube's sheets
+#    name :has()).
+#  - html_rl_block_change uses it for a child-list mark on this parent
+#    whose added elements are followed only by box-less tags
+#    (html_rl_at_tail) and whose removed blocks were the last; the 378
+#    no-op for an appendChild (the node went last) or a removal placed at
+#    the end. html_reconvert_local_childlist now also carries whether the
+#    mark was an appendChild (macos9_reconvert.c).
+#
+# Result on a 2500-paragraph sim page with a conservative sibling sheet:
+# an <iframe> appended to <body> 123 -> 32 ms; a block appended to a list
+# 117 -> 26 ms. On youtube the four iframe blocks are built locally.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7959,7 +7959,7 @@
+ /* Patch 198 (below, after the patch-186 sheet machinery it uses). */
+ static bool html_rl_block_sibling_risk(html_content *c, dom_node *pnode,
+ 		dom_node **added, unsigned int nadd,
+-		struct box **removed, unsigned int nrem);
++		struct box **removed, unsigned int nrem, bool tail);
+ 
+ 
+ /* A script inserted and/or removed blocks among parent's block children:
+@@ -8170,6 +8170,8 @@
+ /* Patch 380: for a removal, whether its position is known, and where: the
+  * removed child's next element sibling at removal time (NULL: the last) */
+ static bool html_rl_childlist_rm_known;
++/* Patch 381: the change was an appendChild (the node went last) */
++static bool html_rl_childlist_append;
+ static dom_node *html_rl_childlist_rm_next;
+ 
+ /* Patch 378: elements a script appends at the end of a parent that this
+@@ -8222,6 +8224,31 @@
+ 	return after;
+ }
+ 
++/* Patch 381: does nothing but elements that never have a box follow n? */
++static bool html_rl_at_tail(dom_node *n)
++{
++	dom_node *s = n, *t;
++	bool tail = true;
++
++	dom_node_ref(s);
++	while (tail) {
++		dom_node_type type;
++		t = NULL;
++		if (dom_node_get_next_sibling(s, &t) != DOM_NO_ERR || t == NULL)
++			break;
++		dom_node_unref(s);
++		s = t;
++		if (dom_node_get_node_type(s, &type) != DOM_NO_ERR)
++			tail = false;
++		else if (type == DOM_ELEMENT_NODE && !html_rl_never_boxed(s))
++			tail = false;
++		else if (type == DOM_TEXT_NODE && !html_rl_text_is_space(s))
++			tail = false;
++	}
++	dom_node_unref(s);
++	return tail;
++}
++
+ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		struct box *pbox, double t0)
+ {
+@@ -8231,6 +8258,7 @@
+ 	struct box *removed[HTML_RL_MAX_CHANGES];
+ 	dom_node *added[HTML_RL_MAX_CHANGES];
+ 	dom_node *skipped[HTML_RL_MAX_CHANGES];	/* patch 378 */
++	bool sib_tail = false;			/* patch 381 */
+ 	unsigned int nrem = 0, nadd = 0, i, local_n = 0, nskip = 0;
+ 	bool skip_over = false;
+ 	struct box *b, *layout;
+@@ -8503,8 +8531,19 @@
+ 				"structural check: %s", swhy ? swhy : "?");
+ 			RL_BNO("structural selectors or counters in page CSS");
+ 		}
+-		if (html_rl_block_sibling_risk(c, pnode, skipped, nskip,
+-				NULL, 0))
++		/* patch 381: an appended element went last; a removal whose
++		 * recorded place is the end left nothing after it -- the
++		 * tail mode counts one element in or out (the skipped list
++		 * holds every box-less child, not just the moved one) */
++		bool ntail = html_rl_childlist_append ||
++			(html_rl_childlist_removal &&
++			 html_rl_childlist_rm_known &&
++			 html_rl_childlist_rm_next == NULL);
++		if (ntail ? html_rl_block_sibling_risk(c, pnode, skipped,
++				html_rl_childlist_removal ? 0 : 1, NULL,
++				html_rl_childlist_removal ? 1 : 0, true) :
++		    html_rl_block_sibling_risk(c, pnode, skipped, nskip,
++				NULL, 0, false))
+ 			RL_BNO("sibling combinator may see an element with no "
+ 				"box");
+ 		for (i = 0; i < nskip; i++)
+@@ -8583,8 +8622,29 @@
+ 	 * stale-styles issue. The check is per element: an insert whose
+ 	 * element does not move any sibling's match stays on the local
+ 	 * path. Decline before touching any box. */
++	/* Patch 381: every change at the parent's tail (a child-list mark on
++	 * it: the added elements followed only by tags that never have a
++	 * box, the removed blocks the last ones, a box-less removal placed
++	 * at the end) -- see html_rl_block_sibling_risk's tail mode */
++	{
++		bool tail = pnode == html_rl_childlist_parent &&
++			(!html_rl_childlist_removal ||
++			 (html_rl_childlist_rm_known &&
++			  html_rl_childlist_rm_next == NULL));
++		for (i = 0; i < nadd && tail; i++)
++			tail = html_rl_at_tail(added[i]);
++		for (i = 0; i < nrem && tail; i++) {
++			dom_node *re = NULL, *rp = NULL, *rn = NULL;
++			html_rl_removed_nodes(removed[i], &re, &rp, &rn);
++			tail = rn == NULL && removed[i]->next == NULL;
++		}
++		if (tail)
++			macsurf_debug_log_writef("LIFE rebuild local: sibling "
++				"check at the tail");
++		sib_tail = tail;
++	}
+ 	if (html_rl_block_sibling_risk(c, pnode, added, nadd,
+-			removed, nrem))
++			removed, nrem, sib_tail))
+ 		RL_BNO("sibling combinator may restyle on insert/remove");
+ 
+ 	/* removals first */
+@@ -10509,7 +10569,7 @@
+  * their local rebuilds). Conservative on any doubt. */
+ static bool html_rl_block_sibling_risk(html_content *c, dom_node *pnode,
+ 		dom_node **added, unsigned int nadd,
+-		struct box **removed, unsigned int nrem)
++		struct box **removed, unsigned int nrem, bool tail)
+ {
+ 	unsigned int i, si;
+ 	int k;
+@@ -10523,6 +10583,49 @@
+ 		sh = html_rl_sib_sheet_for(c->stylesheets[si].sheet);
+ 		if (sh == NULL)
+ 			continue;
++		/* Patch 381: every change at the parent's tail -- elements
++		 * appended with nothing after them but tags that never have a
++		 * box, removals of the last -- cannot move a + / ~ match of
++		 * an existing sibling: a sibling combinator restyles the
++		 * element AFTER its left one, and nothing (boxed) follows.
++		 * The moved elements are built afresh. Left: the parent's
++		 * :empty flipping. :has() is not: this libcss parses it and
++		 * never matches it (patch 328, selector_never_matches_part),
++		 * so no :has() rule applies before or after -- as patch 369's
++		 * table restyle relies on. If :has() matching is ever added,
++		 * this must decline on it (youtube's sheets name :has()). */
++		if (tail) {
++			if (nadd > 0 || nrem > 0) {
++				unsigned int nel = 0;
++				dom_node *ch = NULL;
++				if (dom_node_get_first_child(pnode, &ch) ==
++						DOM_NO_ERR) {
++					while (ch != NULL) {
++						dom_node_type type;
++						dom_node *nx = NULL;
++						if (dom_node_get_node_type(ch,
++							&type) == DOM_NO_ERR &&
++						    type == DOM_ELEMENT_NODE)
++							nel++;
++						dom_node_get_next_sibling(ch,
++							&nx);
++						dom_node_unref(ch);
++						ch = nx;
++					}
++				}
++				if ((nel == 0) != (nel + nrem - nadd == 0)) {
++					/* :empty flipped: a conservative sheet
++					 * cannot say which rules see it */
++					if (sh->state == 2)
++						return true;
++					for (k = 0; k < sh->nempty; k++)
++						if (html_rl_sib_match_static(
++							pnode, &sh->empty_cp[k]))
++							return true;
++				}
++			}
++			continue;
++		}
+ 		if (sh->state == 2)
+ 			/* Patch 186 conservative sheet: cannot prove
+ 			 * safety. */
+@@ -11110,12 +11213,13 @@
+  * removeChild) on vnode -- the same local answer, told that vnode is the
+  * parent whose children changed (html_rl_block_change's no-op) */
+ int html_reconvert_local_childlist(struct content *base_c, void *vnode,
+-		int removal, int rm_known, void *rm_next);
++		int removal, int rm_known, void *rm_next, int append);
+ int html_reconvert_local_childlist(struct content *base_c, void *vnode,
+-		int removal, int rm_known, void *rm_next)
++		int removal, int rm_known, void *rm_next, int append)
+ {
+ 	int r;
+ 
++	html_rl_childlist_append = append != 0;	/* patch 381 */
+ 	html_rl_childlist_parent = (dom_node *) vnode;
+ 	html_rl_childlist_removal = removal != 0;	/* patch 380 */
+ 	html_rl_childlist_rm_known = removal != 0 && rm_known != 0;
+@@ -11125,6 +11229,7 @@
+ 	html_rl_childlist_removal = false;
+ 	html_rl_childlist_rm_known = false;
+ 	html_rl_childlist_rm_next = NULL;
++	html_rl_childlist_append = false;
+ 	return r;
+ }
+ 
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1225,7 +1225,8 @@
+ 	/* Patch 378 - a child-list mark: the same answer, told the node is
+ 	 * the parent whose children changed */
+ 	extern int html_reconvert_local_childlist(struct content *c,
+-			void *node, int removal, int rm_known, void *rm_next);
++			void *node, int removal, int rm_known, void *rm_next,
++			int append);
+ 	extern int html_reconvert_local_class(struct content *c, void *node,
+ 			const char *old_class);
+ 	extern int html_reconvert_local_style(struct content *c, void *node);
+@@ -1288,7 +1289,8 @@
+ 		/* patch 380: whether it removed a child */
+ 		return html_reconvert_local_childlist(c, node,
+ 			kind == MACOS9_DOMMUT_REMOVECHILD,
+-			rm_state == 1, rm_next) == 0;	/* patch 380 */
++			rm_state == 1, rm_next,		/* patch 380 */
++			kind == MACOS9_DOMMUT_APPENDCHILD) == 0;	/* 381 */
+ 	return html_reconvert_local(c, node) == 0;
+ }
+ 
