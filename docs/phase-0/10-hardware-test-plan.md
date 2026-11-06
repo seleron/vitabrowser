@@ -8787,3 +8787,119 @@ expanding panels).
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 374 (2026-11-06): counters across a local build; never free a box an object points at
+
+**Counters.** Box construction numbers CSS counters in one flat table per
+build pass (fixes134b), so a subtree built alone counts from an empty
+table. 369's table restyle declined on any `counter-` in page CSS, and
+372/373 on any shown counter. By the r98 census those guards were what
+stopped rte's carousel tracks and wpblog's and github's changes. The
+line path (165) never checked at all.
+
+A local build only goes wrong when the rebuilt subtree itself takes part
+in counting. So:
+- box_construct.c: every touch of the table (a reset, an increment, a
+  `counter()` shown) marks the counting element's **parent** box
+  `VB_COUNTS` (box.h, bit 22), and sets `box_counters_touched()`. It has
+  to be the parent: the element being built is attached to its box only
+  after its counters and its ::before run. A first cut marked
+  `box_for_node(n)` and a trace showed it found a box there: **the
+  replaced tree's box**, which in a local build is already freed.
+- html.c, `html_rl_box_counts()`: a box takes part in counting if it or
+  any box below it is `VB_COUNTS`, or if its own style or its
+  ::before/::after style resets, increments or shows a counter.
+- Every local builder declines such a subtree before freeing it, and
+  hands a build that touched counters to the full reconvert: the block
+  restyle (174, and 373's route), the flex restyle (372), the table
+  restyle (369, whose `html_rl_page_counters` goes) and the line path.
+  373's `html_rl_page_counter_shown` goes too.
+- Found on the way: **a display:none element counts nothing in this
+  engine** (no `counter_mark` reached for one). The first gate page
+  assumed otherwise; the code was right and the test was wrong.
+
+**Objects: a latent use-after-free, made reachable.** The first r99
+scorecard crashed rte (2 of 2, never before). Its backtrace:
+`box_for_node(0x800ffffffff) <- html_reconvert_relink_objects <-
+html_reconvert_done`, in a full reconvert that a `getComputedStyle`
+flush started. Every fetched object keeps `o->box`, which its load
+callback and the relink read. That includes an `<img>`, and also a CSS
+background image, whose `box->background` is set only once it arrives.
+**No local path ever checked backgrounds**, so freeing such a box left
+the entry dangling. That has been latent since patch 165, and rarely
+fatal while the freed talloc memory went unused. The 373 binary shows
+it on the new gate page: it rebuilt a track of backgrounded slides,
+rebuilt a line holding a backgrounded span and removed a backgrounded
+block, all locally (0 rows, no crash, by luck). rte's slick slides have
+background images, and once 374 let their 75-335-box track take the
+flex rebuild, the memory got reused.
+- `html_rl_objects_point_into()`: walk each object entry's box up its
+  parents to the subtree about to be freed. Those boxes are still alive
+  at that point. The line path, the block/flex/table restyles and removed
+  blocks and floats now decline on it.
+- Clearing `o->box` instead was rejected: the object callback
+  dereferences the box unguarded on its `CONTENT_MSG_LOADING` path.
+- `html_rl_drop_new()`: a builder that gives up after its build fetched
+  objects keeps the new boxes for the full reconvert instead of freeing
+  them, since the new entries point at them. The line path then keeps
+  its new children and frees the old line.
+
+**Result** on `ST-374.html` (2500 paragraphs, an `h2::before` counter
+shown, median of 3, host sim):
+
+| change | 373 | 374 |
+|---|---|---|
+| a flex track's style | 108 ms | 19 ms |
+| text under ::before | 104 ms | 19 ms |
+| a table cell's class | 107 ms | 18 ms |
+
+**Gate.**
+- JS-counters-local runs nine steps 600 ms apart:
+  - local: a plain paragraph's text, a flex track's style, a ::before
+    block's text, content in an empty div, a cell's class;
+  - full: a flex holding an item that increments the counter, a
+    numbered heading's text, a paragraph whose span shows the counter,
+    a paragraph holding a span that increments it.
+- JS-bg-objects:
+  - full: a track of backgrounded slides, a line with a backgrounded
+    span, a removed backgrounded block;
+  - local: a plain paragraph and a plain track.
+- Both render row for row as their parse-time references (**0 rows,
+  0 rows**). Every counting decline kind (block 5, line 2, flex 2) and
+  both background declines are seen, and no page-wide counter decline
+  remains.
+
+Full gate `gate374e.log`, exit 0, with every 364-373 check unchanged.
+The earlier runs failed on the test, not the engine:
+- `gate374` and `gate374b`: the new page's steps were 250 ms apart, so
+  a full rebuild's 400 ms debounce swallowed the next step's mark and
+  some declines never got a local attempt;
+- `gate374c`: my check's variable `ctr` clashed with CAPTGT's later
+  check of the same name. `fail` exits at the first failure, so that
+  check had never run after mine before.
+
+Restage from pristine: 467 applied plus the 2 known collisions, the
+four changed files byte-identical.
+
+**Scorecard r99**: 21 sites against `r79-360`, the fixed 374 and 373
+binaries run back to back (`score/r99-374`, `score/r99-pre374`):
+**71.71 vs 71.65**. No crash; per site equal within live noise (claude
++1.2). The crashing run is kept as `score/r99a-*` (66.93 vs 71.57).
+
+**Load-time census.** This is the first unit in the 370-374 run that
+saves full rebuilds on real page loads:
+- rte: 1 local rebuild (a slick track); its 3 counter declines are gone,
+  and 2 tracks now decline on background objects;
+- wpblog: 5 local rebuilds, its counter declines gone;
+- github: one batch fewer.
+
+**Next**, by this census:
+1. **Objects in rebuilt subtrees.** Re-point the entries of the freed
+   subtree at the new boxes for the same nodes, as the full reconvert's
+   relink does, instead of declining. That covers rte's backgrounded
+   tracks and the "holds objects" declines (youtube 3, rte 1).
+2. **youtube's "parent holds more than blocks" (5).**
+3. **The fixes1135 class-drop** (372 entry), a correctness bug.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
