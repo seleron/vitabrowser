@@ -1,0 +1,179 @@
+# netsurf: a flex or grid container's own class or style restyles it alone (patch 372)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 371)
+#
+# The r96 census, after 371 cleared "page has frames": rte's five style
+# changes declined on "class change on an element with a non-inline,
+# non-block box". A temporary trace showed all five were slick carousel
+# tracks -- <div class="slick-track" style="opacity:1;width:59616px;
+# transform:translate(...)">, BOX_FLEX in a block, 75-335 boxes, 4 of 5
+# with no object -- whose style slick writes on every slide. Each write
+# was a full box-tree rebuild: 107 ms on a 2500-paragraph sim page.
+#
+#  - html.c: html_rl_flex_restyle(). A class or style change on an
+#    element whose own box is BOX_FLEX or BOX_GRID builds the container
+#    again on its own, as patch 369 builds a cell's table: the old box
+#    freed, box_build_element cascading the container and its items
+#    afresh from the DOM (descendant selectors and inheritance reach the
+#    items), the new box linked where the old one was, normalised, and the
+#    page laid out whole. display:none is a removal; a container that
+#    became a block is normalised as one.
+#  - Declined: a container holding objects, controls or frames (others
+#    point at those boxes; HTML_RL_FRAME of 371); one not directly in a
+#    block, cell, flex or grid box (a float's or an inline's); a sibling
+#    selector the class can move (patch 186); counters in page CSS. One
+#    that became inline-level (inline-flex) after the build is handed to
+#    the full reconvert, as 369 does.
+#  - box_normalise.c/h: box_normalise_flex_ext(), box_normalise_flex for
+#    one container (as 369's box_normalise_table_ext).
+#
+# Result on the sim page: the track's style 107 -> 19 ms; a flex class
+# 107 -> 19 ms; a grid class 18 ms.
+#
+--- a/content/handlers/html/box_normalise.c
++++ b/content/handlers/html/box_normalise.c
+@@ -1287,6 +1287,15 @@
+ 	return true;
+ }
+ 
++/* VitaBrowser patch 372: normalise one flex or grid container on its own
++ * -- html.c builds one again when its own class or style changes, and its
++ * new box needs what box_normalise_block does for a flex or grid child. */
++bool box_normalise_flex_ext(struct box *flex, const struct box *root,
++		html_content *c)
++{
++	return box_normalise_flex(flex, root, c);
++}
++
+ /* VitaBrowser patch 369: normalise one table on its own -- html.c builds a
+  * table again when a cell's own class changes (whole-table scope), and its
+  * new box needs exactly what box_normalise_block does for a table child. */
+--- a/content/handlers/html/box_normalise.h
++++ b/content/handlers/html/box_normalise.h
+@@ -67,4 +67,8 @@
+  * table child */
+ bool box_normalise_table_ext(struct box *table, const struct box *root, struct html_content *c);
+ 
++/* VitaBrowser patch 372: one flex or grid container, as box_normalise_block
++ * normalises a flex or grid child */
++bool box_normalise_flex_ext(struct box *flex, const struct box *root, struct html_content *c);
++
+ #endif
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9499,6 +9499,99 @@
+ #undef RL_TNO
+ }
+ 
++/* Patch 372: a class or style change on a flex or grid container's own
++ * box. The r96 census: rte's carousel (slick) writes the style of its
++ * track, a flex container of 75-335 boxes, on every slide, and each
++ * write was a full box-tree rebuild ("class change on an element with a
++ * non-inline, non-block box"). Its items' styles may depend on it
++ * (descendant selectors, inheritance) and the container's layout is the
++ * items' layout, so the whole container is built again -- cascaded
++ * afresh from the DOM, as the cell's table of patch 369 -- and the page
++ * laid out whole. Declined: a container holding objects, controls or
++ * frames (others point at those boxes); one not directly in a block,
++ * cell, flex or grid box (a float's, an inline's); a sibling selector
++ * the class can move (patch 186); counters in page CSS. */
++static int html_rl_flex_restyle(html_content *c, dom_node *el,
++		struct box *ob, double t0, const char *old_class)
++{
++	struct content *base_c = &c->base;
++	struct box *pbox = ob->parent, *prev, *nb;
++	unsigned int objects_before;
++	bool ok;
++	static unsigned long flex_n;
++
++#define RL_FNO(w) do { macsurf_debug_log_writef( \
++		"LIFE rebuild local: declined (%s)", (w)); return -1; } while (0)
++	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
++			     pbox->type != BOX_TABLE_CELL &&
++			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID))
++		RL_FNO("restyled flex or grid box is not in a block");
++	if (ob->object != NULL || ob->gadget != NULL || HTML_RL_FRAME(ob) ||
++	    html_rl_subtree_objects(ob->children))
++		RL_FNO("restyled flex or grid box holds objects, controls or "
++			"frames");
++	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
++		RL_FNO("class change may move a sibling selector");
++	if (html_rl_page_counters(c))
++		RL_FNO("a class could reach outside its flex or grid box "
++			"(counters)");
++
++	/* out with the old box, in with the new, where the old one was */
++	dom_node_ref(el);
++	prev = ob->prev;
++	html_rl_unlink(ob);
++	box_free(ob);
++	html_rl_invalidate(pbox);
++	objects_before = c->num_objects;
++	(void) html_reconvert_reset_node_data_walk(el, 0);
++	if (!box_build_element(c, el)) {
++		nb = box_for_node(el);
++		if (nb != NULL) {
++			html_rl_unlink(nb);
++			box_free(nb);
++		}
++		dom_node_unref(el);
++		macsurf_debug_log_writef("LIFE rebuild local: restyled flex "
++			"or grid box failed to build, full reconvert");
++		return -1;
++	}
++	nb = box_for_node(el);
++	dom_node_unref(el);
++	if (nb != NULL) {		/* else display: none -- a removal */
++		if (nb->parent != pbox || (nb->type != BOX_FLEX &&
++		    nb->type != BOX_GRID && nb->type != BOX_BLOCK)) {
++			html_rl_unlink(nb);
++			box_free(nb);
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"flex or grid box is no longer a block-level "
++				"box here, full reconvert");
++			return -1;
++		}
++		html_rl_unlink(nb);
++		html_rl_link_after(pbox, prev, nb);
++		ok = nb->type == BOX_BLOCK ?
++			box_normalise_block(nb, c->layout, c) :
++			box_normalise_flex_ext(nb, c->layout, c);
++		if (!ok || c->num_objects != objects_before) {
++			/* the tree is whole, but not as a full build makes
++			 * it: the full reconvert starts from the DOM */
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"flex or grid box did not normalise, full "
++				"reconvert");
++			return -1;
++		}
++		html_rl_invalidate(nb);
++	}
++	flex_n++;
++	macsurf_debug_log_writef("LIFE rebuild local: flex or grid box "
++		"restyled, full layout (its own class or style) in %ld us "
++		"(%lu so far)", (long)(macos9_micros() - t0), flex_n);
++	content__reformat(base_c, false, base_c->available_width,
++			base_c->available_height);
++	return 0;
++#undef RL_FNO
++}
++
+ static int html_rl_block_restyle(html_content *c, dom_node *el,
+ 		struct box *ob, double t0, const char *old_class)
+ {
+@@ -9880,6 +9973,15 @@
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
++			if (class_change && n == vnode && b != NULL &&
++			    (b->type == BOX_FLEX || b->type == BOX_GRID)) {
++				/* a flex or grid container's own box: the
++				 * container (patch 372) */
++				int r = html_rl_flex_restyle(c, n, b, t0,
++					old_class);
++				dom_node_unref(n);
++				return r;
++			}
+ 			if (class_change && n == vnode && b != NULL &&
+ 			    b->type != BOX_INLINE) {
+ 				dom_node_unref(n);

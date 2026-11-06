@@ -242,6 +242,8 @@ JS-table-cell-class file:///app0:/testpages/JS-table-cell-class.html
 CSS-table-cell-class-ref file:///app0:/testpages/CSS-table-cell-class-ref.html
 JS-style-attr file:///app0:/testpages/JS-style-attr.html
 CSS-style-attr-ref file:///app0:/testpages/CSS-style-attr-ref.html
+JS-flex-restyle file:///app0:/testpages/JS-flex-restyle.html
+CSS-flex-restyle-ref file:///app0:/testpages/CSS-flex-restyle-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1486,6 +1488,18 @@ sar=$(fl_rows JS-style-attr CSS-style-attr-ref)
 sal=$(grep -c "LIFE rebuild local: style attribute change, as a class change" "$R/netsurf.log" || true)
 echo "  JS-style-attr: rows differing from the parse-time build $sar (0); ${sal} style attribute changes taken locally (8 or more)"
 [ "$sar" = 0 ] && [ "${sal:-0}" -ge 8 ] || fail "style attribute changes taken locally"
+# Patch 372: a class or style change on a flex or grid container's own
+# box builds the container again on its own and lays the page out whole
+# (before: a full rebuild). The twelve-step page renders row for row as
+# the same steps run at parse time; a container holding an image, one made
+# inline-flex, and a class a sibling rule sees still take the full rebuild.
+fxr=$(fl_rows JS-flex-restyle CSS-flex-restyle-ref)
+fxl=$(grep -c "LIFE rebuild local: flex or grid box restyled, full layout" "$R/netsurf.log" || true)
+fxo=$(grep -c "LIFE rebuild local: declined (restyled flex or grid box holds objects, controls or frames)" "$R/netsurf.log" || true)
+fxi=$(grep -c "LIFE rebuild local: restyled flex or grid box is no longer a block-level box here" "$R/netsurf.log" || true)
+echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fxl} flex/grid containers restyled alone (8 or more); declined: holding an image ${fxo} (1 or more), made inline ${fxi} (1 or more)"
+[ "$fxr" = 0 ] && [ "${fxl:-0}" -ge 8 ] && [ "${fxo:-0}" -ge 1 ] &&
+	[ "${fxi:-0}" -ge 1 ] || fail "flex and grid containers restyled alone"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and
