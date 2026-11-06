@@ -8492,3 +8492,112 @@ writes refused because a sheet selects on them.
   them. Parked: nodeless/sheet batches (doc 23). Unfixed and logged:
   full-reconvert keeps a removed field's control alive (368 entry),
   wpblog intermittent segfault (365 entry).
+
+## Patch 371 (2026-11-06): a page with frames takes the local rebuild paths
+
+**Why frames were refused.** Patch 165's local path, and the late-object
+relayout of WS-C item 2B, declined any change once `c->iframe` held a
+record ("page has frames"), with no reason written down. Reading the
+frame code gives two real needs; neither is page-wide:
+- **A frame's box must never be freed by a local rebuild.** Its record
+  (`c->iframe`, walked by `browser_window_recalculate_iframes` on every
+  reformat, `cur->box->node`) and its window (`window->box`) point at
+  it. The local paths already declined on `b->iframe`, but that is the
+  window, linked only once one is made. A record can have none, for a
+  while or for good: a same-origin frame a script made
+  (`browser_window_iframe_is_new` is false for it), or frames past
+  `SCRIPT_FRAMES_MAX`. Freeing such a box leaves the record dangling.
+- **A moved frame needs its window placed at its box.** The full
+  layout's descendant pass does that (`layout.c`,
+  `browser_window_set_position`). The window's x/y is where its page's
+  repaints, caret and drags go. This was already safe:
+  `layout_relayout_core` declines when a frame follows the change
+  (`lr_subtree_unsafe`, "positioned box or iframe after it"), and the
+  page is then laid out whole. A first cut also placed windows again
+  in `html_relayout_notify`. gate371 showed that never fired, because
+  the relayout guard got there first, so I took it out.
+
+**The change** (html.c only):
+- The `c->iframe != NULL` refusal is gone, in `html_reconvert_local_change`
+  and in `html_relayout_object_local`.
+- `HTML_RL_FRAME(b)` is a window or the `IFRAME` box flag, which
+  `box_iframe` sets on every box it makes a record for. It replaces
+  `b->iframe` in every check that guards a free: the subtree helpers,
+  removed blocks and floats, the restyled block or table, and the
+  rebuilt block.
+- The line path's old-content test now also looks below the line's top
+  level (`html_rl_subtree_frames`). That covers a frame inside an
+  inline-block whose removal left the new content plain.
+- No local path builds a frame: none of the new-content tag lists
+  includes iframe.
+
+**Gate.** JS-frames-local (over the gate server, child page
+JS-frames-local-child.html) runs eleven steps 250 ms apart:
+- above the frame: a paragraph's text, a paragraph's class, a
+  paragraph hidden by its style, a block inserted into a div and one
+  removed;
+- below the frame: a span's colour;
+- a block holding a script-made frame appended (full rebuild), then a
+  paragraph's text changed with it present;
+- that block removed, then an inline-block holding a frame removed from
+  its line;
+- the class put back.
+
+It renders row for row as CSS-frames-local-ref, which runs the same
+steps while the page parses: **0 rows**. On that page 8 changes were
+rebuilt locally (7 or more required). The 370 binary refuses all of
+them, "page has frames". Both frame removals still take the full
+rebuild ("removed block holds objects or frames", "old content has a
+frame"), and no "page has frames" line is printed. The first gate
+(`gate371.log`) failed only on the window-placement count described
+above. Full gate `gate371b.log`, exit 0: JS-style-attr 0 rows with 39
+local changes, BLOCKCLASS 7/7, BLOCKSIB 3/3, JS-table-cell-class 0
+rows, and every 364-370 check. A body-level insert still declines,
+because `<script>` is a boxless child of body (unit 362's shelved
+shape). That is why the test inserts into a div.
+
+**Scorecard r96**: 21 sites against `r79-360`, the 371 and 370 binaries
+run back to back (`score/r96-371`, `score/r96-pre371`, 370 binary
+`applytest/nsvita-sim.pre371`). The means read **72.93 vs 68.34**, but
+the gap is noise:
+- the 370 arm's wpblog crashed (the intermittent segfault in the 365
+  entry);
+- its guardian text read 0.0. A rerun of guardian and wpblog on both
+  binaries (`score/r96b-*`) gives guardian 36.6 with err 2 on **both**
+  and wpblog 68.2 on both.
+
+The other sites are equal to within live-text noise (claude +1.2,
+ddglite +1.1, stackoverflow +0.3, hackernews -0.1). Both arms sit about
+2 below r95c because the live sites drifted from the old reference
+(cnnlite text 0.927 -> 0.46 in both arms, bbc, wpblog, wpnews). No
+Cloudflare interstitial.
+
+**Load-time census.** "page has frames" fell from **8 to 0** (rte 7,
+guardian 1), but nothing was saved at load time yet, because the same
+changes are now declined by the next check:
+- rte's six style changes become **5 x "class change on an element with
+  a non-inline, non-block box"** (their own box is an inline-block,
+  flex or table kind), plus one "restyled block holds objects, controls
+  or floats" and one "restyled block's parent is not a block";
+- guardian's becomes "parent holds more than blocks".
+
+Full rebuilds per site are unchanged (rte 11, guardian 5-6). As with
+370, the measured win is at interaction time, on pages with ads,
+embeds and consent frames.
+
+Not done: the Vita cross-build (no vitaSDK on this machine, as before).
+No sudo needed. `tools/regen-patches.sh` was run; it rewrites only the
+MacSurf whole-library diffs in `$WORK/patches`. Patch 371 was cut by
+hand from the 370-state `html.c`, and applying it to that file gives a
+byte-identical copy of the staged tree's.
+
+Next, by this census:
+- **a style or class change on an element whose own box is not inline
+  or block** (rte x5): an inline-block or flex container restyled as a
+  block restyle with a full layout, as 370 did for flex items;
+- the ::before/::after and empty-block shapes of "not one line
+  container";
+- attribute writes refused because a sheet selects on them.
+
+Parked: nodeless/sheet batches (doc 23), body/head churn with boxless
+children (362).
