@@ -264,6 +264,8 @@ JS-late-append-struct file:///app0:/testpages/JS-late-append-struct.html
 CSS-late-append-struct-ref file:///app0:/testpages/CSS-late-append-struct-ref.html
 JS-struct-scoped file:///app0:/testpages/JS-struct-scoped.html
 CSS-struct-scoped-ref file:///app0:/testpages/CSS-struct-scoped-ref.html
+JS-struct-dir file:///app0:/testpages/JS-struct-dir.html
+CSS-struct-dir-ref file:///app0:/testpages/CSS-struct-dir-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1636,6 +1638,21 @@ k379c=$(printf '%s\n' "$k379seg" | grep -c "declined (a removed block takes part
 echo "  JS-struct-scoped: rows differing from the parse-time build $k379r (0); ${k379l} changes local on the page (3 or more); structural rule matches ${k379s} (2 or more); counting ${k379c} (2 or more)"
 [ "$k379r" = 0 ] && [ "${k379l:-0}" -ge 3 ] && [ "${k379s:-0}" -ge 2 ] &&
 	[ "${k379c:-0}" -ge 2 ] || fail "structural check scoped to the parent"
+# Patch 380: a structural rule counting earlier siblings flips only after
+# a change, one counting later siblings only before it, and :first-child /
+# :last-child only for the child that is or was first or last. youtube's
+# shape: a bare :first-child rule with <iframe>s and <script>s appended at
+# the end. Renders row for row as the same steps at parse time; four
+# changes local, three declined (two positional, a <script> removal
+# whole).
+k380r=$(fl_rows JS-struct-dir CSS-struct-dir-ref)
+k380seg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-dir: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k380l=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: blocks rebuilt\|LIFE rebuild local: blocks placed\|LIFE rebuild local: child list changed only" || true)
+k380p=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural range positional" || true)
+k380w=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural range whole" || true)
+echo "  JS-struct-dir: rows differing from the parse-time build $k380r (0); ${k380l} changes local on the page (5 or more); declines: positional ${k380p} (2 or more), whole range ${k380w} (1 or more)"
+[ "$k380r" = 0 ] && [ "${k380l:-0}" -ge 5 ] && [ "${k380p:-0}" -ge 2 ] &&
+	[ "${k380w:-0}" -ge 1 ] || fail "structural check by direction"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

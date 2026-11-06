@@ -1,0 +1,819 @@
+# netsurf: the structural check by direction and position (patch 380)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 379)
+#
+# The r104 census: 379's scoped check found real matches -- youtube 6,
+# guardian 1. A temporary trace: youtube's is a bare :first-child rule
+# matching <body>'s first child (div.bdcvod) while <iframe>s are appended
+# at the end of <body>; guardian's a div:first-child on <body>'s first div
+# while a <script> is appended. A child inserted or removed at the end
+# cannot change which child is first.
+#
+#  - Each structural compound knows what its pseudo-class depends on:
+#    being the first (:first-child, :first-of-type), being the last
+#    (:last-child, :last-of-type), the count of earlier siblings
+#    (:nth-child, :nth-of-type), of later ones (:nth-last-*), or both
+#    (:only-*).
+#  - html_rl_block_struct_risk, given where the change sits among the
+#    parent's element children (the inserted elements, or a removed
+#    block's element neighbour -- the end if none), tests only the
+#    children such a rule can flip: the child that is or was the first
+#    (of its type) when the change reaches the start; the last when it
+#    reaches the end; those after the change for an earlier-count rule;
+#    those before it for a later-count one. The moved elements themselves
+#    are built afresh.
+#  - Positions are used only for a child-list mark on this very parent.
+#    A removal's place: removeChild (macsurf_qjs.c) now records the
+#    removed child's next element sibling (NULL: it was the last) and
+#    marks through macos9_js_mark_dom_dirty_removal; the mark slot holds it
+#    as a node reference (rm_next / rm_state, primary and extra marks,
+#    released with the slot's other references), and a second removal
+#    from the same parent in the batch makes it unknown. youtube removes a
+#    box-less <script> from <body> in the same batch as it appends an
+#    <iframe>: without the place, that removal took the whole range and
+#    declined the batch. Unknown places (other removal paths, two
+#    removals), a removed block beside an inline container, and any other
+#    mark take the whole range, as 379.
+#  - The first / last rules are exact: the first child flips if it is
+#    first now and something removed preceded it, or it was first and new
+#    elements precede it now; the last, the mirror. *-of-type ones keep
+#    the range test.
+#  - A structural pseudo-class inside :not() / :is() / :where() /
+#    :matches() is bounded by the OUTER compound (its tag, id, classes),
+#    which keeps the element; 379 made every such one unbounded. The
+#    compound scan backwards now steps over balanced (...) groups:
+#    .x:not(.y):not(:last-of-type) is one compound, not
+#    :not(:last-of-type). youtube's remaining decline was such a rule.
+#
+# Result on a 2500-paragraph sim page with a bare :first-child rule: an
+# <iframe> appended to <body> 170 -> 32 ms; a <script> 167 -> 4 ms. On
+# youtube the structural declines fall 5 -> 1.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6872,6 +6872,12 @@
+ 	int ncl;
+ 	bool of_type;
+ 	bool unbounded;
++	/* patch 380: what the pseudo-class depends on --
++	 * 0 being the first (:first-child, :first-of-type),
++	 * 1 being the last (:last-child, :last-of-type),
++	 * 2 the count of earlier siblings (:nth-child, :nth-of-type),
++	 * 3 the count of later ones (:nth-last-*), 4 both (:only-*) */
++	int dir;
+ };
+ #define HTML_RL_STRUCT_CACHE_N 32
+ #define HTML_RL_STRUCT_CP_MAX 512
+@@ -7024,6 +7030,83 @@
+ 		c == '}' || c == ';' || c == '(' || c == ')';
+ }
+ 
++/* Patch 380: the start of the compound that ends before s[a] -- back to a
++ * boundary, over balanced (...) groups of functional pseudo-classes
++ * (.x:not(.y):last-child is one compound: the plain backward scan stopped
++ * at its ')' and kept only :last-child, unbounded) */
++static size_t html_rl_struct_back(const uint8_t *s, size_t a)
++{
++	while (a > 0) {
++		uint8_t c = s[a - 1];
++		if (c == ')') {
++			int depth = 0;
++			size_t j = a - 1;
++			for (;;) {
++				if (s[j] == ')')
++					depth++;
++				else if (s[j] == '(' && --depth == 0)
++					break;
++				if (j == 0)
++					return a;	/* unbalanced: stop here */
++				j--;
++			}
++			a = j;	/* at the '(' -- go on past the name */
++			continue;
++		}
++		if (html_rl_struct_boundary(c))
++			break;
++		a--;
++	}
++	return a;
++}
++
++/* Patch 380: a structural pseudo-class as the argument of a functional
++ * one -- open is the '(' -- bounded by the OUTER compound when the
++ * function keeps its element (:not, :is, :where, :matches, :-webkit-any);
++ * else unbounded. The parser skips the parenthesised part. */
++static void html_rl_struct_outer_cp(const uint8_t *s, size_t len, size_t open,
++		struct html_rl_struct_cp *cp)
++{
++	static const char *const keep[] = {
++		"not", "is", "where", "matches", "-webkit-any", "-moz-any", NULL
++	};
++	size_t ne = open, ns = open, a, b;
++	int depth = 0, i;
++	bool ok = false;
++
++	while (ns > 0 && html_rl_struct_ident_ch(s[ns - 1]))
++		ns--;
++	if (ns == 0 || s[ns - 1] != ':' || ns == ne) {
++		cp->unbounded = true;
++		return;
++	}
++	for (i = 0; keep[i] != NULL && !ok; i++)
++		if (ne - ns == strlen(keep[i]) &&
++		    strncasecmp((const char *)s + ns, keep[i], ne - ns) == 0)
++			ok = true;
++	if (!ok) {
++		cp->unbounded = true;
++		return;
++	}
++	/* the outer compound: back from the ':' to a boundary, forward past
++	 * the matching ')' to one */
++	a = html_rl_struct_back(s, ns - 1);
++	for (b = open; b < len; b++) {
++		if (s[b] == '(')
++			depth++;
++		else if (s[b] == ')' && --depth == 0)
++			break;
++	}
++	if (b >= len) {
++		cp->unbounded = true;
++		return;
++	}
++	b++;
++	while (b < len && !html_rl_struct_boundary(s[b]))
++		b++;
++	html_rl_struct_parse_cp(s, a, b, cp);
++}
++
+ /* collect a sheet's structural compounds and counter use (the raw-source
+  * scanner of patch 192's html_rl_css_has_list_style_risk, which this
+  * replaces: comments and strings skipped, tokens at identifier
+@@ -7094,10 +7177,10 @@
+ 				e->counters = true;
+ 				break;
+ 			}
+-			/* the compound around the pseudo-class */
+-			a = i;
+-			while (a > 0 && !html_rl_struct_boundary(s[a - 1]))
+-				a--;
++			/* the compound around the pseudo-class (patch 380:
++			 * over balanced functional groups) */
++			a = (i > 0 && s[i - 1] == '(') ? i :
++				html_rl_struct_back(s, i);
+ 			b = i + tl;
+ 			if (b < len && s[b] == '(') {
+ 				int depth = 0;
+@@ -7124,9 +7207,19 @@
+ 					memset(&n[e->ncps], 0, sizeof(*n));
+ 					n[e->ncps].of_type =
+ 						strstr(toks[k], "of-type") != NULL;
+-					/* inside a functional pseudo: unbounded */
++					n[e->ncps].dir =
++						strstr(toks[k], "only") ? 4 :
++						strstr(toks[k], "nth-last") ? 3 :
++						strstr(toks[k], "nth") ? 2 :
++						strstr(toks[k], "last") ? 1 : 0;
++					/* inside a functional pseudo: patch 380 --
++					 * :not() / :is() / :where() keep the outer
++					 * compound's element, so its tag, id and
++					 * classes still bound it; :has() and others
++					 * stay unbounded */
+ 					if (a > 0 && s[a - 1] == '(')
+-						n[e->ncps].unbounded = true;
++						html_rl_struct_outer_cp(s, len, a - 1,
++							&n[e->ncps]);
+ 					else
+ 						html_rl_struct_parse_cp(s, a, b,
+ 							&n[e->ncps]);
+@@ -7251,7 +7344,8 @@
+  * moved[0..nmoved) went in or out? */
+ static bool html_rl_block_struct_risk(html_content *c, dom_node *pnode,
+ 		char **moved, unsigned int nmoved, bool counters_matter,
+-		const char **why)
++		const char **why, dom_node **present, unsigned int npresent,
++		dom_node **gaps, unsigned int ngaps, bool positional)
+ {
+ 	struct html_rl_struct_sheet *sh[64];
+ 	struct html_rl_struct_el *els = NULL;
+@@ -7259,6 +7353,18 @@
+ 	bool any = false, risk = false;
+ 	dom_node *ch = NULL, *nx;
+ 	int q;
++	/* Patch 380: where the change sits among the parent's element
++	 * children. A rule counting EARLIER siblings can flip only for a
++	 * child after the change, one counting LATER siblings only for a
++	 * child before it. fstart: the first child an earlier-counting
++	 * rule can reach; bend: the last child a later-counting one can.
++	 * The moved (present) elements themselves are built afresh. */
++	long fstart = 0, bend = 0x7fffffff;
++	unsigned int found = 0;
++	bool gap_end = false;
++	bool *is_present = NULL;
++	long gidx[2 * HTML_RL_MAX_CHANGES];	/* each gap's child index */
++	unsigned int ngi = 0;
+ 
+ 	*why = NULL;
+ 	for (si = STYLESHEET_START; si < c->stylesheet_count && nsh < 64;
+@@ -7285,6 +7391,13 @@
+ 	}
+ 	if (!any)
+ 		return false;
++	if (positional) {
++		fstart = 0x7fffffff;
++		bend = -1;
++		for (m = 0; m < ngaps; m++)
++			if (gaps[m] == NULL)
++				gap_end = true;	/* removed at the end */
++	}
+ 	/* the parent's children, read once */
+ 	if (dom_node_get_first_child(pnode, &ch) != DOM_NO_ERR)
+ 		ch = NULL;
+@@ -7307,6 +7420,37 @@
+ 				break;
+ 			}
+ 			els = ne;
++			if (positional) {
++				bool *np = realloc(is_present,
++						(nel + 1) * sizeof(bool));
++				if (np == NULL) {
++					*why = "no memory";
++					risk = true;
++					dom_node_unref(ch);
++					break;
++				}
++				is_present = np;
++				is_present[nel] = false;
++				for (m = 0; m < npresent; m++)
++					if (present[m] == ch) {
++						is_present[nel] = true;
++						found++;
++						if ((long)nel + 1 < fstart)
++							fstart = (long)nel + 1;
++						if ((long)nel - 1 > bend)
++							bend = (long)nel - 1;
++					}
++				for (m = 0; m < ngaps; m++)
++					if (gaps[m] == ch) {
++						found++;
++						if (ngi < 2 * HTML_RL_MAX_CHANGES)
++							gidx[ngi++] = (long)nel;
++						if ((long)nel < fstart)
++							fstart = (long)nel;
++						if ((long)nel - 1 > bend)
++							bend = (long)nel - 1;
++					}
++			}
+ 			els[nel].tag = html_rl_struct_tag(ch);
+ 			els[nel].id = html_rl_struct_attr(ch, corestring_dom_id);
+ 			els[nel].cls = html_rl_struct_attr(ch,
+@@ -7319,6 +7463,20 @@
+ 		dom_node_unref(ch);
+ 		ch = nx;
+ 	}
++	if (positional && !risk) {
++		unsigned int need = npresent;
++		for (m = 0; m < ngaps; m++)
++			if (gaps[m] != NULL)
++				need++;
++		if (gap_end && (long)nel - 1 > bend)
++			bend = (long)nel - 1;
++		if (found < need) {
++			/* a moved element not among the children: the whole
++			 * range, as patch 379 */
++			fstart = 0;
++			bend = 0x7fffffff;
++		}
++	}
+ 	for (si = 0; si < nsh && !risk; si++) {
+ 		if (sh[si]->overflow && nel > 0) {
+ 			*why = "a sheet of too many structural rules";
+@@ -7336,12 +7494,86 @@
+ 				if (!same)
+ 					continue;
+ 			}
+-			for (k = 0; k < nel && !risk; k++)
++			/* first / last: only the child that is or was the
++			 * first or last (of the type) can flip, and only if
++			 * the change reaches it */
++			long f0 = -1, l0 = -1;
++			if (positional && (cp->dir == 0 || cp->dir == 1)) {
++				for (k = 0; k < nel; k++) {
++					if (is_present[k] || (cp->of_type &&
++					    cp->tag != NULL && (els[k].tag == NULL ||
++					    strcmp(els[k].tag, cp->tag) != 0)))
++						continue;
++					if (f0 < 0)
++						f0 = (long)k;
++					l0 = (long)k;
++				}
++			}
++			for (k = 0; k < nel && !risk; k++) {
++				if (positional) {
++					bool hit, g0 = false, gb = false, ga = false;
++					unsigned int gq;
++					if (is_present[k])
++						continue;
++					/* gaps: at the very start; at or before f0;
++					 * after l0 (the end counts) */
++					for (gq = 0; gq < ngi; gq++) {
++						if (gidx[gq] == 0)
++							g0 = true;
++						if (gidx[gq] <= f0)
++							gb = true;
++						if (gidx[gq] > l0)
++							ga = true;
++					}
++					if (gap_end)
++						ga = true;
++					switch (cp->dir) {
++					case 0:
++						/* the first child flips if: it is first
++						 * now and something removed preceded it;
++						 * or it was first and new ones precede it
++						 * now (nothing removed did before) */
++						if (cp->of_type)
++							hit = (long)k == f0 &&
++								fstart <= f0;
++						else
++							hit = ((long)k == 0 && g0) ||
++								((long)k == f0 && f0 > 0 &&
++								 !gb);
++						break;
++					case 1:
++						/* the mirror: last now and something
++						 * removed followed it; or it was last and
++						 * new ones follow it now */
++						if (cp->of_type)
++							hit = (long)k == l0 &&
++								bend >= l0;
++						else
++							hit = ((long)k == (long)nel - 1 &&
++								gap_end) ||
++								((long)k == l0 &&
++								 l0 < (long)nel - 1 && !ga);
++						break;
++					case 2:
++						hit = (long)k >= fstart;
++						break;
++					case 3:
++						hit = (long)k <= bend;
++						break;
++					default:
++						hit = (long)k >= fstart ||
++							(long)k <= bend;
++						break;
++					}
++					if (!hit)
++						continue;
++				}
+ 				if (html_rl_struct_cp_matches(cp, &els[k])) {
+ 					*why = "a structural rule matches a "
+ 						"sibling";
+ 					risk = true;
+ 				}
++			}
+ 		}
+ 	}
+ 	for (k = 0; k < nel; k++) {
+@@ -7350,6 +7582,11 @@
+ 		free(els[k].cls);
+ 	}
+ 	free(els);
++	free(is_present);
++	if (risk)
++		macsurf_debug_log_writef("LIFE rebuild local: structural "
++			"range %s: from %ld forward, to %ld back",
++			positional ? "positional" : "whole", fstart, bend);
+ 	return risk;
+ }
+ 
+@@ -7926,6 +8163,14 @@
+  * (appendChild / insertBefore / removeChild mark it), else NULL -- set by
+  * html_reconvert_local_childlist for the length of one local answer. */
+ static dom_node *html_rl_childlist_parent;
++/* Patch 380: that change removed a child (removeChild): a removed
++ * element with no box leaves no position, so the structural check takes
++ * the whole range for it */
++static bool html_rl_childlist_removal;
++/* Patch 380: for a removal, whether its position is known, and where: the
++ * removed child's next element sibling at removal time (NULL: the last) */
++static bool html_rl_childlist_rm_known;
++static dom_node *html_rl_childlist_rm_next;
+ 
+ /* Patch 378: elements a script appends at the end of a parent that this
+  * path builds on their own wherever they are inline-level: box_construct
+@@ -8242,8 +8487,15 @@
+ 		bool srisk;
+ 		for (i = 0; i < nskip; i++)
+ 			tags[i] = html_rl_struct_tag(skipped[i]);
++		/* patch 380: positions known unless it was a removal (the
++		 * removed element with no box is gone without a trace) */
++		/* a removal: at its recorded place (patch 380), if known */
+ 		srisk = html_rl_block_struct_risk(c, pnode, tags, nskip, false,
+-				&swhy);
++				&swhy, skipped, nskip,
++				&html_rl_childlist_rm_next,
++				html_rl_childlist_removal ? 1 : 0,
++				!html_rl_childlist_removal ||
++				html_rl_childlist_rm_known);
+ 		for (i = 0; i < nskip; i++)
+ 			free(tags[i]);
+ 		if (srisk) {
+@@ -8280,18 +8532,38 @@
+ 	 * declines here, a new one that counts after its build */
+ 	{
+ 		char *tags[2 * HTML_RL_MAX_CHANGES];
+-		unsigned int nt = 0;
++		dom_node *gaps[HTML_RL_MAX_CHANGES];
++		unsigned int nt = 0, ng = 0;
+ 		const char *swhy = NULL;
+-		bool srisk;
++		bool srisk, positional;
++		/* patch 380: positions are known for a child-list mark on this
++		 * parent: an insertion (the added elements), or a removal of a
++		 * block with a box (where its element-neighbour is, or the
++		 * end) -- not for other marks, nor a removed block beside an
++		 * inline container (no element neighbour to place it by) */
++		positional = pnode == html_rl_childlist_parent &&
++			(!html_rl_childlist_removal ||
++			 html_rl_childlist_rm_known);
+ 		for (i = 0; i < nadd; i++)
+ 			tags[nt++] = html_rl_struct_tag(added[i]);
+ 		for (i = 0; i < nrem; i++) {
+ 			dom_node *re = NULL, *rp = NULL, *rn = NULL;
+ 			html_rl_removed_nodes(removed[i], &re, &rp, &rn);
+ 			tags[nt++] = html_rl_struct_tag(re);
++			if (rn == NULL && removed[i]->next != NULL)
++				positional = false;
++			gaps[ng++] = rn;
++		}
++		/* the recorded place of this mark's removal (patch 380) --
++		 * a removed element with no box is located only by it */
++		if (html_rl_childlist_rm_known) {
++			if (ng < HTML_RL_MAX_CHANGES)
++				gaps[ng++] = html_rl_childlist_rm_next;
++			else
++				positional = false;
+ 		}
+ 		srisk = html_rl_block_struct_risk(c, pnode, tags, nt, false,
+-				&swhy);
++				&swhy, added, nadd, gaps, ng, positional);
+ 		for (i = 0; i < nt; i++)
+ 			free(tags[i]);
+ 		if (srisk) {
+@@ -10837,14 +11109,22 @@
+ /* Patch 378: a child-list change (appendChild, insertBefore,
+  * removeChild) on vnode -- the same local answer, told that vnode is the
+  * parent whose children changed (html_rl_block_change's no-op) */
+-int html_reconvert_local_childlist(struct content *base_c, void *vnode);
+-int html_reconvert_local_childlist(struct content *base_c, void *vnode)
++int html_reconvert_local_childlist(struct content *base_c, void *vnode,
++		int removal, int rm_known, void *rm_next);
++int html_reconvert_local_childlist(struct content *base_c, void *vnode,
++		int removal, int rm_known, void *rm_next)
+ {
+ 	int r;
+ 
+ 	html_rl_childlist_parent = (dom_node *) vnode;
++	html_rl_childlist_removal = removal != 0;	/* patch 380 */
++	html_rl_childlist_rm_known = removal != 0 && rm_known != 0;
++	html_rl_childlist_rm_next = (dom_node *) rm_next;
+ 	r = html_reconvert_local_change(base_c, vnode, false, NULL);
+ 	html_rl_childlist_parent = NULL;
++	html_rl_childlist_removal = false;
++	html_rl_childlist_rm_known = false;
++	html_rl_childlist_rm_next = NULL;
+ 	return r;
+ }
+ 
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -168,6 +168,13 @@
+ 	/* Patch 310 - the primary mark's attribute name for SETATTRIBUTE /
+ 	 * REMOVEATTRIBUTE (owned, NULL otherwise). See extra.attr_name. */
+ 	char           *attr_name;
++	/* Patch 380 - a REMOVECHILD mark's position: rm_state 1 = known
++	 * (rm_next: the removed child's next element sibling at removal
++	 * time, a held reference, NULL = it was the last), 2 = unknown (a
++	 * removal path that did not say, or more than one removal from this
++	 * parent in the batch), 0 = not a removal */
++	void           *rm_next;
++	int             rm_state;
+ 	/* Patch 301 - further precise marks (distinct node/kind) recorded
+ 	 * after the first, so a burst that touches several nodes -- the
+ 	 * common script render: text here, a class there -- can still be
+@@ -188,6 +195,9 @@
+ 		 * it. Distinct names are distinct marks for merging;
+ 		 * freed by the same slot_drop_node path as old_class. */
+ 		char *attr_name;
++		/* Patch 380 - as the primary's rm_next / rm_state */
++		void *rm_next;
++		int   rm_state;
+ 	} extra[RECONVERT_MAX_EXTRA];
+ 	int             extra_n;
+ 	int             coarse;
+@@ -389,6 +399,12 @@
+ 	 * exactly like old_class above. */
+ 	free(g_pending[i].attr_name);
+ 	g_pending[i].attr_name = NULL;
++	/* Patch 380 - the removal position dies with the precision */
++	if (g_pending[i].rm_next != NULL) {
++		macsurf_reconvert_node_unref(g_pending[i].rm_next);
++		g_pending[i].rm_next = NULL;
++	}
++	g_pending[i].rm_state = 0;
+ 	g_pending[i].kind = MACOS9_DOMMUT_UNKNOWN;
+ 	/* Patch 301 - the extra marks' references and class values die
+ 	 * with the primary's, on every path that drops precision. */
+@@ -402,6 +418,13 @@
+ 		g_pending[i].extra[j].old_class = NULL;
+ 		free(g_pending[i].extra[j].attr_name);
+ 		g_pending[i].extra[j].attr_name = NULL;
++		/* Patch 380 */
++		if (g_pending[i].extra[j].rm_next != NULL) {
++			macsurf_reconvert_node_unref(
++				g_pending[i].extra[j].rm_next);
++			g_pending[i].extra[j].rm_next = NULL;
++		}
++		g_pending[i].extra[j].rm_state = 0;
+ 	}
+ }
+ 
+@@ -487,6 +510,34 @@
+ 	}
+ }
+ 
++/* Patch 380 - the position of the removal being marked, set only around
++ * macos9_js_mark_dom_dirty_removal's call (the one path that knows it) */
++static int g_rm_pos_known;
++static void *g_rm_pos_next;
++
++static void macos9_reconvert_rm_set(void **next, int *state, int kind)
++{
++	if (kind != MACOS9_DOMMUT_REMOVECHILD) {
++		*next = NULL;
++		*state = 0;
++		return;
++	}
++	*state = g_rm_pos_known ? 1 : 2;
++	*next = (g_rm_pos_known && g_rm_pos_next != NULL) ?
++		macsurf_reconvert_node_ref(g_rm_pos_next) : NULL;
++}
++
++/* a second removal from the same parent: where is no longer one place */
++static void macos9_reconvert_rm_unknown(void **next, int *state)
++{
++	if (*next != NULL) {
++		macsurf_reconvert_node_unref(*next);
++		*next = NULL;
++	}
++	if (*state != 0)
++		*state = 2;
++}
++
+ static void
+ macos9_reconvert_pending_add3(struct content *c, void *node, int kind,
+ 		const char *old_class, const char *attr_name)
+@@ -517,6 +568,9 @@
+ 				/* Patch 310 - new generation, new attribute name. */
+ 				g_pending[i].attr_name =
+ 					macos9_reconvert_attr_dup(kind, attr_name);
++				/* Patch 380 */
++				macos9_reconvert_rm_set(&g_pending[i].rm_next,
++					&g_pending[i].rm_state, kind);
+ 				memset(&prov, 0, sizeof(prov));
+ 				prov.nav = ms_diag_cur_nav();
+ 				html_content_get_diag_identity(c, &prov.doc, &prov.frame);
+@@ -559,6 +613,11 @@
+ 			    g_pending[i].kind == kind &&
+ 			    macos9_reconvert_attr_same(g_pending[i].attr_name,
+ 				    attr_name)) {
++				/* Patch 380 - a second removal: no one place */
++				if (kind == MACOS9_DOMMUT_REMOVECHILD)
++					macos9_reconvert_rm_unknown(
++						&g_pending[i].rm_next,
++						&g_pending[i].rm_state);
+ 				return;		/* the same mark repeating */
+ 			}
+ 			/* Patch 301 - a distinct mark no longer collapses the
+@@ -579,8 +638,14 @@
+ 					    g_pending[i].extra[j].kind == kind &&
+ 					    macos9_reconvert_attr_same(
+ 						    g_pending[i].extra[j].attr_name,
+-						    attr_name))
++						    attr_name)) {
++						/* Patch 380 */
++						if (kind == MACOS9_DOMMUT_REMOVECHILD)
++							macos9_reconvert_rm_unknown(
++							    &g_pending[i].extra[j].rm_next,
++							    &g_pending[i].extra[j].rm_state);
+ 						return;	/* already recorded */
++					}
+ 				}
+ 				if (g_pending[i].extra_n < RECONVERT_MAX_EXTRA) {
+ 					struct macos9_reconvert_extra *e =
+@@ -591,6 +656,9 @@
+ 						old_class != NULL) ? strdup(old_class) : NULL;
+ 					e->attr_name = macos9_reconvert_attr_dup(kind,
+ 						attr_name);
++					/* Patch 380 */
++					macos9_reconvert_rm_set(&e->rm_next,
++						&e->rm_state, kind);
+ 					g_pending[i].multi = 1;
+ 					return;
+ 				}
+@@ -636,6 +704,9 @@
+ 	/* Patch 310 - copy the attribute name, if an attribute mark. */
+ 	g_pending[freeslot].attr_name =
+ 		macos9_reconvert_attr_dup(kind, attr_name);
++	/* Patch 380 */
++	macos9_reconvert_rm_set(&g_pending[freeslot].rm_next,
++		&g_pending[freeslot].rm_state, kind);
+ 	/* Patch 318 - a fresh slot's sheet identity */
+ 	g_pending[freeslot].sheet_state = 0;
+ 	g_pending[freeslot].sheet_idx = -1;
+@@ -1147,13 +1218,14 @@
+  * html_reconvert_local, which rebuilds and lays out just the block that
+  * holds it. 1 = done (the slot is answered), 0 = do the full rebuild. */
+ static int macos9_reconvert_try_local_one(struct content *c, void *node,
+-		int kind, const char *old_class, const char *attr_name)
++		int kind, const char *old_class, const char *attr_name,
++		int rm_state, void *rm_next)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
+ 	/* Patch 378 - a child-list mark: the same answer, told the node is
+ 	 * the parent whose children changed */
+ 	extern int html_reconvert_local_childlist(struct content *c,
+-			void *node);
++			void *node, int removal, int rm_known, void *rm_next);
+ 	extern int html_reconvert_local_class(struct content *c, void *node,
+ 			const char *old_class);
+ 	extern int html_reconvert_local_style(struct content *c, void *node);
+@@ -1213,7 +1285,10 @@
+ 	if (kind == MACOS9_DOMMUT_APPENDCHILD ||
+ 	    kind == MACOS9_DOMMUT_INSERTBEFORE ||
+ 	    kind == MACOS9_DOMMUT_REMOVECHILD)
+-		return html_reconvert_local_childlist(c, node) == 0;
++		/* patch 380: whether it removed a child */
++		return html_reconvert_local_childlist(c, node,
++			kind == MACOS9_DOMMUT_REMOVECHILD,
++			rm_state == 1, rm_next) == 0;	/* patch 380 */
+ 	return html_reconvert_local(c, node) == 0;
+ }
+ 
+@@ -1246,7 +1321,8 @@
+ 	t0 = macos9_micros();
+ 	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
+ 			g_pending[i].kind, g_pending[i].old_class,
+-			g_pending[i].attr_name)) {
++			g_pending[i].attr_name, g_pending[i].rm_state,
++			g_pending[i].rm_next)) {
+ 		g_fc_reason = g_one_fail_kind ? 1 : 2;
+ 		return 0;
+ 	}
+@@ -1274,7 +1350,9 @@
+ 		if (macos9_reconvert_try_local_one(c, g_pending[i].extra[j].node,
+ 				g_pending[i].extra[j].kind,
+ 				g_pending[i].extra[j].old_class,
+-				g_pending[i].extra[j].attr_name))
++				g_pending[i].extra[j].attr_name,
++				g_pending[i].extra[j].rm_state,
++				g_pending[i].extra[j].rm_next))
+ 			continue;
+ 		/* Patch 308 - name the decline for the fullcause census.
+ 		 * A mark that declines while another is deferred is the
+@@ -1297,7 +1375,9 @@
+ 		if (!macos9_reconvert_try_local_one(c, g_pending[i].extra[deferred].node,
+ 				g_pending[i].extra[deferred].kind,
+ 				g_pending[i].extra[deferred].old_class,
+-				g_pending[i].extra[deferred].attr_name)) {
++				g_pending[i].extra[deferred].attr_name,
++				g_pending[i].extra[deferred].rm_state,
++				g_pending[i].extra[deferred].rm_next)) {
+ 			g_fc_reason = g_one_fail_kind ? 1 : 2;
+ 			return 0;
+ 		}
+@@ -1917,6 +1997,19 @@
+ 		macos9_reconvert_schedule_pending();
+ }
+ 
++/* Patch 380 - a removeChild mark that knows where the child was: next is
++ * its next element sibling at removal time (NULL: it was the last) */
++void
++macos9_js_mark_dom_dirty_removal(struct content *c, void *node, void *next)
++{
++	g_rm_pos_known = 1;
++	g_rm_pos_next = next;
++	macos9_js_mark_dom_dirty_node3(c, node, MACOS9_DOMMUT_REMOVECHILD,
++			NULL, NULL);
++	g_rm_pos_known = 0;
++	g_rm_pos_next = NULL;
++}
++
+ /* Patch 186 - variant carrying the pre-mutation class value. */
+ void
+ macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.h
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.h
+@@ -81,6 +81,10 @@
+  * pending record so the local-rebuild path can compare the class set before
+  * and after the change without trusting live DOM. The caller retains
+  * ownership of old_class; it is copied. */
++/* Patch 380 - a removeChild mark that knows where the removed child was
++ * (its next element sibling, NULL if it was the last) */
++void macos9_js_mark_dom_dirty_removal(struct content *c, void *node,
++		void *next);
+ void macos9_js_mark_dom_dirty_node2(struct content *c, void *node, int kind,
+ 		const char *old_class);
+ 
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4886,6 +4886,30 @@
+ 	qjs_mark_dom_dirty3(ctx, node, kind, old_class, NULL);
+ }
+ 
++/* Patch 380 - removeChild's mark with where the child was. The parent's
++ * in-document check is qjs_mark_dom_dirty3's. */
++static void qjs_mark_dom_dirty_removal(JSContext *ctx, void *node,
++		void *next)
++{
++	struct content *content = qjs_get_content_for_ctx(ctx);
++	struct dom_document *doc = NULL;
++	bool in_doc = true;
++
++	if (content == NULL || node == NULL)
++		return;
++	if (dom_node_get_owner_document((dom_node *) node, &doc) ==
++			DOM_NO_ERR && doc != NULL) {
++		if ((void *) doc != node &&
++		    dom_node_contains((dom_node *) doc, (dom_node *) node,
++				&in_doc) != DOM_NO_ERR)
++			in_doc = true;
++		dom_node_unref(doc);
++	}
++	if (!in_doc)
++		return;
++	macos9_js_mark_dom_dirty_removal(content, node, next);
++}
++
+ /* Patch 186 - legacy entry point without the old class value. */
+ static void qjs_mark_dom_dirty(JSContext *ctx, void *node, int kind)
+ {
+@@ -7727,6 +7751,7 @@
+ 	dom_element *el;
+ 	dom_element *child_el;
+ 	dom_node *result = NULL;
++	dom_node *rm_next_el = NULL;	/* patch 380 */
+ 	dom_exception exc;
+ 	JSValue err;
+ 	(void)this_val; (void)magic;
+@@ -7740,6 +7765,24 @@
+ 	}
+ 	qjs_dom_mut_trace("remove", ctx, this_val, argv[0], JS_NULL,
+ 			(dom_node *)el, (dom_node *)child_el, NULL);
++	/* Patch 380 - where the child is: its next element sibling (the
++	 * structural check needs the position; NULL = the last) */
++	{
++		dom_node *sib = NULL, *t;
++		dom_node_type st;
++		if (dom_node_get_next_sibling((dom_node *)child_el, &sib) !=
++				DOM_NO_ERR)
++			sib = NULL;
++		while (sib != NULL && (dom_node_get_node_type(sib, &st) !=
++				DOM_NO_ERR || st != DOM_ELEMENT_NODE)) {
++			t = NULL;
++			if (dom_node_get_next_sibling(sib, &t) != DOM_NO_ERR)
++				t = NULL;
++			dom_node_unref(sib);
++			sib = t;
++		}
++		rm_next_el = sib;
++	}
+ 	exc = macsurf_dom_node_remove_child((dom_node *)el, (dom_node *)child_el,
+ 			&result);
+ 	if (result) macsurf_dom_node_unref(result);
+@@ -7749,7 +7792,11 @@
+ 	 * inside a mutation handler fails just as silently. */
+ 	err = qjs_dom_mut_check(ctx, "removeChild", exc, (dom_node *)el,
+ 			(dom_node *)child_el);
+-	if (JS_IsException(err)) return err;
++	if (JS_IsException(err)) {
++		if (rm_next_el != NULL)	/* patch 380 */
++			dom_node_unref(rm_next_el);
++		return err;
++	}
+ 	qjs_queue_child_mutation(ctx, "childList", this_val, JS_UNDEFINED,
+ 			argv[0]);
+ 	if (g_rm_audit_budget > 0) {	/* fixes1015/1029 */
+@@ -7759,7 +7806,10 @@
+ 		qjs_node_brief((dom_node *)el, pb, (int)sizeof pb);
+ 		macsurf_debug_log_writef("LIFE rm %s -> %s", pb, cb);
+ 	}
+-	qjs_mark_dom_dirty(ctx, (void *) el, MACOS9_DOMMUT_REMOVECHILD);
++	/* Patch 380 - the mark carries where the child was */
++	qjs_mark_dom_dirty_removal(ctx, (void *) el, (void *) rm_next_el);
++	if (rm_next_el != NULL)
++		dom_node_unref(rm_next_el);
+ 	return JS_DupValue(ctx, argv[0]);
+ }
+ 
