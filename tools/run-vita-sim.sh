@@ -268,6 +268,8 @@ JS-struct-dir file:///app0:/testpages/JS-struct-dir.html
 CSS-struct-dir-ref file:///app0:/testpages/CSS-struct-dir-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
+JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
+CSS-flex-buttons-ref file:///app0:/testpages/CSS-flex-buttons-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1669,6 +1671,18 @@ k381d=$(printf '%s\n' "$k381seg" | grep -c "declined (sibling combinator may res
 echo "  JS-sib-tail: rows differing from the parse-time build $k381r (0); ${k381t} tail checks (3 or more), ${k381l} changes local (4 or more), ${k381d} declines (2 or more)"
 [ "$k381r" = 0 ] && [ "${k381t:-0}" -ge 3 ] && [ "${k381l:-0}" -ge 4 ] &&
 	[ "${k381d:-0}" -ge 2 ] || fail "sibling check at the tail"
+# Patch 382: a flex container (or a block holding more than text) whose
+# subtree holds buttons is rebuilt alone, its controls handed to the new
+# boxes (box construction finds them by element). Renders row for row as
+# the same steps at parse time; the rebuilt button still clicks; a flex
+# holding a typed text field keeps the full rebuild.
+k382r=$(fl_rows JS-flex-buttons CSS-flex-buttons-ref)
+k382seg=$(awk '/ page [0-9]+\/[0-9]+ JS-flex-buttons: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k382h=$(printf '%s\n' "$k382seg" | grep -c "LIFE rebuild local: restyled box's controls handed to the new boxes" || true)
+k382d=$(printf '%s\n' "$k382seg" | grep -c "LIFE rebuild local: declined (restyled flex or grid box holds controls or frames)" || true)
+echo "  JS-flex-buttons: rows differing from the parse-time build $k382r (0); ${k382h} rebuilds handing controls over (2 or more); stateful-control declines ${k382d} (1 or more)"
+[ "$k382r" = 0 ] && [ "${k382h:-0}" -ge 2 ] && [ "${k382d:-0}" -ge 1 ] ||
+	fail "buttons handed to rebuilt boxes"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

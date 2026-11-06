@@ -1,0 +1,127 @@
+# netsurf: a subtree rebuild carries its buttons over (patch 382)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 381)
+#
+# The r106 census: youtube's "restyled flex or grid box holds controls or
+# frames" (4). A temporary trace: toolbars -- a flex holding two <button>s
+# (three times) and one holding a submit button; no focus, no open menu.
+# (rte's one is a frame: still declined.)
+#
+#  - The container rebuild of 372/376 may hold buttons (<button>, submit,
+#    reset): controls with no state but focus. Others -- typed text, a
+#    checked box, a chosen option, a picked file -- and frames still
+#    decline (html_rl_subtree_stateful).
+#  - Box construction finds a control by its element
+#    (html_forms_get_control_for_node: the existing one, else a new one)
+#    and points it at the NEW box. A first cut released the old boxes'
+#    buttons after the build, as 368 releases a removed block's, and
+#    box_free freed the very controls the new boxes now held: the rebuilt
+#    buttons read garbage. html_rl_detach_controls() instead lets go of
+#    them BEFORE the build -- focus and an open select menu back to the
+#    page, box->gadget and gadget->box cleared -- so the build attaches
+#    each to its new box, a failed build's new boxes own them (and the
+#    full reconvert makes them again), and the old boxes free none. A
+#    control whose element gets no new box (display:none) waits, box-less,
+#    in its form for the next build.
+#
+# Result on a 2500-paragraph sim page: a flex toolbar of two <button>s and
+# a submit, its style, 107 -> 16 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6598,6 +6598,61 @@
+ 	return false;
+ }
+ 
++/* Patch 382: a subtree's frames, or controls with state a rebuild would
++ * lose (typed text, a checked box, a chosen option, a picked file). A
++ * button -- <button>, submit, reset -- has none but focus, which
++ * html_rl_release_box hands back: it is released with the old boxes and
++ * made again by the build, as 364 builds and 368 releases controls. */
++static bool html_rl_subtree_stateful(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (HTML_RL_FRAME(b))
++			return true;
++		if (b->gadget != NULL &&
++		    b->gadget->type != GADGET_BUTTON &&
++		    b->gadget->type != GADGET_SUBMIT &&
++		    b->gadget->type != GADGET_RESET)
++			return true;
++		if (html_rl_subtree_stateful(b->children))
++			return true;
++	}
++	return false;
++}
++
++/* Patch 382: before a subtree is built again, its boxes let go of their
++ * controls. Box construction finds a control by its element
++ * (html_forms_get_control_for_node: the existing one, or a new one) and
++ * points it at the NEW box, so an old box still holding it would free it
++ * (box_free -> form_free_control) under the new one -- the first cut did,
++ * and the rebuilt buttons read garbage. Focus and an open select menu go
++ * back to the page first, as 368's html_rl_release_box does. A control
++ * whose element gets no new box (display:none) waits, box-less, in its
++ * form for the next build. */
++static unsigned int html_rl_detach_controls(html_content *c, struct box *b)
++{
++	unsigned int n = 0;
++
++	for (; b != NULL; b = b->next) {
++		if (b->gadget != NULL) {
++			if ((c->focus_type == HTML_FOCUS_TEXTAREA &&
++			     c->focus_owner.textarea == b) ||
++			    (c->focus_type == HTML_FOCUS_CONTENT &&
++			     c->focus_owner.content == b)) {
++				c->focus_type = HTML_FOCUS_SELF;
++				c->focus_owner.self = true;
++			}
++			if (c->visible_select_menu == b->gadget)
++				c->visible_select_menu = NULL;
++			if (b->gadget->box == b)
++				b->gadget->box = NULL;
++			b->gadget = NULL;
++			n++;
++		}
++		n += html_rl_detach_controls(c, b->children);
++	}
++	return n;
++}
++
+ /* Patch 375: the object entries of a subtree a local rebuild replaced,
+  * moved to the new boxes -- html_reconvert_relink_objects (the full
+  * reconvert's) for the entries under old_root only. The old subtree is
+@@ -10948,9 +11003,10 @@
+ 			     pbox->type != BOX_TABLE_CELL &&
+ 			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID))
+ 		RL_FNO("restyled flex or grid box is not in a block");
+-	/* patch 375: objects are carried over (html_rl_relink_subtree) */
++	/* patch 375: objects are carried over (html_rl_relink_subtree);
++	 * patch 382: buttons too, released and made again */
+ 	if (ob->gadget != NULL || HTML_RL_FRAME(ob) ||
+-	    html_rl_subtree_controls_frames(ob->children))
++	    html_rl_subtree_stateful(ob->children))
+ 		RL_FNO("restyled flex or grid box holds controls or frames");
+ 	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
+ 		RL_FNO("class change may move a sibling selector");
+@@ -10968,6 +11024,10 @@
+ 	prev = ob->prev;
+ 	html_rl_unlink(ob);
+ 	html_rl_clear_backlinks(ob);
++	/* patch 382: its buttons go to the new boxes */
++	if (html_rl_detach_controls(c, ob->children) > 0)
++		macsurf_debug_log_writef("LIFE rebuild local: restyled box's "
++			"controls handed to the new boxes");
+ 	html_rl_invalidate(pbox);
+ 	objects_before = c->num_objects;
+ 	(void) html_reconvert_reset_node_data_walk(el, 0);
+@@ -11008,7 +11068,8 @@
+ 		html_rl_invalidate(nb);
+ 	}
+ 	/* patch 375: the old boxes' objects to the new ones, then the old
+-	 * boxes go (the page is laid out whole below: new images sized) */
++	 * boxes go (the page is laid out whole below: new images sized;
++	 * patch 382: they hold no controls any more) */
+ 	html_rl_relink_subtree(c, ob);
+ 	box_free(ob);
+ 	flex_n++;
