@@ -9654,3 +9654,94 @@ JS-block-class-sibling's 700 ms settle-edge flake.
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 383 (2026-11-06): <head> child-list changes and inert attributes need no rebuild
+
+**The shape.** By the r106 census youtube had 3 "no inserted or removed
+block found". A temporary trace (the mark's kind and node, the parent
+block, its children) found two kinds:
+- `insertBefore` / `removeChild` / `appendChild` marks **naming `<head>`**
+  (youtube, bbc, claude, page after page). `<head>` has no box, so the
+  walk climbed to `<html>`, found none of its boxed children changed, and
+  declined into a full rebuild. This is unit 362's shelved head no-op.
+- a `SETATTRIBUTE` on claude's `<body>` that patch 310's gate had let
+  through. `<body>` is a block of blocks with no line to rebuild, so it
+  declined the same way.
+
+**The change** (html.c, macos9_reconvert.c):
+- **`<head>`:** `html_reconvert_local_change` answers a child-list mark on
+  `<head>` itself with no rebuild, checked early like 300's `<title>`.
+  - `<head>` and everything in it have no box.
+  - No selector reaches from it into `<body>`: its children are siblings
+    only of each other, and `:has()` never matches in this libcss (patch
+    328).
+  - A sheet that arrives marks for itself (`html_css_process_style` /
+    `_link` -> `html_css_mark_sheets` -> a sheet mark), as patch 320
+    relies on. The gate checks that a `<style>` appended to `<head>`
+    still turns its paragraph red.
+  - A **removed** `<style>` or `<link>` keeps applying. The stylesheet
+    list is collected when the content is created, added to on insertion,
+    and never re-collected or pruned, by a full rebuild either. That is a
+    pre-existing gap, and the full rebuild this replaces changed nothing
+    there.
+- **Attributes:** SETATTRIBUTE and REMOVEATTRIBUTE marks now carry their
+  attribute name to `html_reconvert_local_attr`. `html_rl_block_change`
+  answers one with no rebuild when all of these hold:
+  - it is on the block itself, and no box was added or removed;
+  - the block is a plain `BOX_BLOCK` whose box holds no object, control,
+    frame or list marker;
+  - the attribute has no effect except through CSS
+    (`html_rl_attr_inert`: `data-*`, `aria-*`, `role`, `tabindex`,
+    microdata and the like). Not `title`, which the builder copies for
+    the tooltip, and not list, table, link, media or form attributes
+    (`start`, `colspan`, `href`, `src`, `value`...), which the builder or
+    layout read directly. 310's gate has already ruled CSS out, the UA
+    sheets included (`[hidden]`, `:lang()`, `:dir()`).
+
+**Result** on `ST-383.html` (2500 paragraphs, median of 3): a `<script>`
+appended to `<head>` **103 -> 4 ms**.
+
+**Gate.** JS-head-attr runs six steps 600 ms apart:
+- `<head>`: a `<script>` appended, a `<meta>` inserted, a `<script>`
+  removed, and a `<style>` appended that turns a paragraph red;
+- attributes: `data-state` on `<body>`, and `aria-label` on a div of
+  blocks.
+
+It renders row for row as its parse-time reference: **0 rows**. On the
+382 binary it is also 0 rows, taken by full rebuilds. 4 `<head>` changes
+and 2 inert attributes needed no rebuild. JS-style-absorb (patch 320's
+sheet page) stays STYLEABS 4/4.
+- `gate383` failed on the **page's own timing**. Its no-op steps repaint
+  nothing, so it settled before its last two steps, and the autotest
+  moved on; their two no-ops were logged in the reference page's segment.
+  Each step now also writes a visible step count.
+- `gate383b`: exit 0.
+- Restage from pristine: 476 applied plus the 2 known collisions, both
+  changed files byte-identical.
+
+**Found, pre-existing:** a script setting an `<ol>`'s `start` does not
+renumber it, full rebuild or not. The first draft of the gate page
+differed in the list numbers (rows 96-121) on both 382 and 383. List
+numbering reads `start` when the list is first built. The step is out of
+the gate.
+
+**Scorecard r108**: 21 sites against `r79-360`, the 383 and 382 binaries
+run back to back (`score/r108-383`, `score/r108-pre383`): **73.01 vs
+73.00**. No crash; per site within live noise.
+
+**Load-time census.** This is the largest load-time saving of the
+371-383 run: full rebuilds across the 21 sites **110 -> 98**. 21
+`<head>` changes and 3 attribute changes needed no rebuild. youtube went
+**18 -> 14**, bbc **6 -> 4**, guardian **6 -> 4**.
+
+**Next:**
+1. **Sheet and nodeless batches (doc 23)**: now the largest share of
+   youtube's remaining full rebuilds.
+2. **The fixes1135 class-drop** (372 entry), a correctness bug.
+3. **`<object>`/`<embed>` lost after a full rebuild** (375 entry), and
+   **stylesheet removal never taking effect** (above).
+4. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes; no-op
+   gate pages must keep repainting until their last step.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
