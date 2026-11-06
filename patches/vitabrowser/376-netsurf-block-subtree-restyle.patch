@@ -1,0 +1,111 @@
+# netsurf: a block holding more than text restyles its subtree alone (patch 376)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 375)
+#
+# The r100 census's top local decline on rte: "restyled element is not a
+# plain block of text" (7). A temporary trace: all seven were slick slides,
+# div.slick-slide blocks of 2-17 nested blocks (one with an image) directly
+# in rte's flex track, no floats, no list markers. The block restyle (174)
+# takes only text blocks (html_rl_block_tag + html_rl_inline_subtree), for
+# its local placement; anything else was a full box-tree rebuild.
+#
+#  - html_rl_block_restyle: a block that holds more than text is handed to
+#    the container rebuild of 372 (html_rl_flex_restyle, now with an
+#    is_block mode for its log line): built again whole, cascaded afresh,
+#    its objects carried over (375), the page laid out whole -- so it is
+#    routed before the sibling-structure check the local placement needs,
+#    and its siblings may be anything. That path's own checks stand
+#    (controls, frames, sibling selectors, counting, <object>/<embed>).
+#  - Declined: an own list marker, a list marker below it (the items'
+#    numbering), a float below it (html_rl_subtree_floats: a float inside a
+#    block that does not contain its floats is listed in an ANCESTOR's
+#    float list, which the rebuild would leave pointing at the freed box).
+#
+# Result on a 2500-paragraph sim page: a slide's class (nested blocks and
+# an image, in a flex track) 105 -> 16 ms; a section's style (heading,
+# paragraphs, an image) 102 -> 16 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6571,6 +6571,20 @@
+ 	return false;
+ }
+ 
++/* Patch 376: a float in a subtree. A float inside a block that does not
++ * contain its floats sits in an ANCESTOR's float list, which a subtree
++ * rebuild would leave pointing at the freed box. */
++static bool html_rl_subtree_floats(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->type == BOX_FLOAT_LEFT || b->type == BOX_FLOAT_RIGHT)
++			return true;
++		if (html_rl_subtree_floats(b->children))
++			return true;
++	}
++	return false;
++}
++
+ /* Patch 375: list markers in a subtree (369 kept the table restyle off
+  * them; objects are carried over now, markers still are not) */
+ static bool html_rl_subtree_markers(struct box *b)
+@@ -9783,7 +9797,8 @@
+  * cell, flex or grid box (a float's, an inline's); a sibling selector
+  * the class can move (patch 186); counters in page CSS. */
+ static int html_rl_flex_restyle(html_content *c, dom_node *el,
+-		struct box *ob, double t0, const char *old_class)
++		struct box *ob, double t0, const char *old_class,
++		bool is_block)
+ {
+ 	struct content *base_c = &c->base;
+ 	struct box *pbox = ob->parent, *prev, *nb;
+@@ -9861,9 +9876,16 @@
+ 	html_rl_relink_subtree(c, ob);
+ 	box_free(ob);
+ 	flex_n++;
+-	macsurf_debug_log_writef("LIFE rebuild local: flex or grid box "
+-		"restyled, full layout (its own class or style) in %ld us "
+-		"(%lu so far)", (long)(macos9_micros() - t0), flex_n);
++	if (is_block)		/* patch 376 */
++		macsurf_debug_log_writef("LIFE rebuild local: block subtree "
++			"restyled, full layout (not a plain block of text) in "
++			"%ld us (%lu so far)", (long)(macos9_micros() - t0),
++			flex_n);
++	else
++		macsurf_debug_log_writef("LIFE rebuild local: flex or grid "
++			"box restyled, full layout (its own class or style) in "
++			"%ld us (%lu so far)", (long)(macos9_micros() - t0),
++			flex_n);
+ 	content__reformat(base_c, false, base_c->available_width,
+ 			base_c->available_height);
+ 	return 0;
+@@ -9897,6 +9919,21 @@
+ 		full = true;
+ 		why = "a flex or grid item";
+ 	}
++	if (!html_rl_block_tag(el) || !html_rl_inline_subtree(el)) {
++		/* Patch 376: a block that holds more than text -- child
++		 * blocks, images (rte's slick slides: div.slick-slide, 2-17
++		 * nested blocks, in its flex track) -- is built again whole,
++		 * as a flex or grid container is (372): cascaded afresh, its
++		 * objects carried over (375), the page laid out whole, so its
++		 * siblings may be anything. Not one holding a float (an
++		 * ancestor's float list may hold it) or a list marker (its
++		 * item's numbering). */
++		if (ob->list_marker != NULL ||
++		    html_rl_subtree_floats(ob->children) ||
++		    html_rl_subtree_markers(ob->children))
++			RL_RNO("restyled block holds floats or list markers");
++		return html_rl_flex_restyle(c, el, ob, t0, old_class, true);
++	}
+ 	for (b = pbox->children; b != NULL; b = b->next) {
+ 		if (b->type == BOX_BLOCK && b->node != NULL)
+ 			continue;
+@@ -10345,7 +10382,7 @@
+ 				/* a flex or grid container's own box: the
+ 				 * container (patch 372) */
+ 				int r = html_rl_flex_restyle(c, n, b, t0,
+-					old_class);
++					old_class, false);
+ 				dom_node_unref(n);
+ 				return r;
+ 			}

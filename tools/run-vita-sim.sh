@@ -254,6 +254,8 @@ JS-bg-objects file:///app0:/testpages/JS-bg-objects.html
 CSS-bg-objects-ref file:///app0:/testpages/CSS-bg-objects-ref.html
 JS-objects-relink file:///app0:/testpages/JS-objects-relink.html
 CSS-objects-relink-ref file:///app0:/testpages/CSS-objects-relink-ref.html
+JS-block-subtree file:///app0:/testpages/JS-block-subtree.html
+CSS-block-subtree-ref file:///app0:/testpages/CSS-block-subtree-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1567,6 +1569,18 @@ k375o=$(grep -c "LIFE rebuild local: objects re-pointed [1-9]" "$R/netsurf.log" 
 echo "  JS-objects-relink: rows differing from the parse-time build $k375r (0); ${k375l} changes rebuilt locally on the page (4 or more); ${k375o} rebuilds re-pointed objects (2 or more)"
 [ "$k375r" = 0 ] && [ "${k375l:-0}" -ge 4 ] && [ "${k375o:-0}" -ge 2 ] ||
 	fail "objects carried over by local rebuilds"
+# Patch 376: a class or style change on a block holding more than text
+# (child blocks, images) builds the block again whole and lays the page
+# out once (before: "restyled element is not a plain block of text", a
+# full rebuild). The page renders row for row as the same steps at parse
+# time; a list and a block holding a float keep the full rebuild.
+k376r=$(fl_rows JS-block-subtree CSS-block-subtree-ref)
+k376l=$(awk '/ page [0-9]+\/[0-9]+ JS-block-subtree: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: block subtree restyled" || true)
+k376d=$(grep -c "LIFE rebuild local: declined (restyled block holds floats or list markers)" "$R/netsurf.log" || true)
+echo "  JS-block-subtree: rows differing from the parse-time build $k376r (0); ${k376l} block subtrees restyled on the page (5 or more); floats/markers declines ${k376d} (2 or more)"
+[ "$k376r" = 0 ] && [ "${k376l:-0}" -ge 5 ] && [ "${k376d:-0}" -ge 2 ] ||
+	fail "non-plain blocks restyled alone"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and
@@ -1691,12 +1705,16 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 # full reconvert. The stage-0 census showed the innerHTML batch's full
 # reconvert (local=1); the burst adds the guard trip. Both mechanisms are
 # exercised: local answers where cheap, guard where expensive.
+# Patch 376: the innerHTML batch (200 paragraphs into the empty #big) is
+# now built locally -- 373's empty-block route meets 376's subtree rebuild
+# -- so the guard trip is the only full reconvert left (total=1, local=0);
+# the page still reads back BATCHBURST 3/3 from its own DOM.
 bbl=$(awk '/page [0-9]*\/[0-9]* NET-js-batch-burst: navigate/ {on=1; next}
 	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
 	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE FULLCAUSE' | tail -1)
 echo "  JS-batch-burst census: ${bbl:-no FULLCAUSE}"
 case "$bbl" in
-	*"total=2 over=0 nonode=0 kind=0 local=1 two=0 guard=1"*) ;;
+	*"total=1 over=0 nonode=0 kind=0 local=0 two=0 guard=1"*) ;;
 	*) o2_bad="$o2_bad js-batch-burst-census";;
 esac
 # Patch 313: on the attr-local page, the load innerHTML batch commits a
