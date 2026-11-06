@@ -9571,3 +9571,86 @@ their live swings across r96-r106.
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 382 (2026-11-06): a subtree rebuild carries its buttons over
+
+**The shape.** By the r106 census, youtube had 4 "restyled flex or grid
+box holds controls or frames". A temporary trace (box count, control
+types, frames, focus, open menu) showed **button toolbars**:
+`div.JYXaTc`, a flex holding two `<button>`s (`GADGET_BUTTON`, three
+times), and `div.r7fnGb`, one holding a submit button. Nothing was focused
+and no menu was open. rte's one is an iframe (a video modal container),
+which stays declined: carrying frames over would mean relinking windows
+and records (371).
+
+**The change** (html.c):
+- The container rebuild of 372/376 may hold **buttons** (`<button>`,
+  submit, reset), which keep no state but focus.
+  `html_rl_subtree_stateful` still declines frames and stateful controls
+  (typed text, a checked box, a chosen option, a picked file).
+- **A use-after-free caught before the gate.** Box construction finds a
+  control by its element (`html_forms_get_control_for_node`: the
+  existing one, else a new one) and points it at the *new* box. A first
+  cut released the old boxes' buttons after the build, as 368 releases a
+  removed block's, and `box_free` then freed (`form_free_control`) the
+  very controls the new boxes held. A trace of the second rebuild read
+  the rebuilt buttons' types as garbage (-70422312...).
+- `html_rl_detach_controls()` now lets go of the controls **before** the
+  build:
+  - focus and an open select menu go back to the page;
+  - `box->gadget` and `gadget->box` are cleared;
+  - so the build attaches each control to its new box, and the old boxes
+    free none;
+  - a failed build's new boxes own the controls, and the full reconvert
+    makes them again (construction creates them on demand);
+  - a control whose element gets no new box (`display:none`) waits,
+    box-less, in its form.
+  - The same trace on the fixed code read valid types (11/8/9) with
+    `gadget->box` pointing back at the new box.
+- `form.elements` comes from the DOM in the polyfill (`querySelectorAll`),
+  so its order is unaffected. The engine's own submission includes only
+  the activated submit button.
+
+**Result** on `ST-382.html` (2500 paragraphs, median of 3): a flex
+toolbar of two `<button>`s and a submit, its style, **107 -> 16 ms**.
+
+**Gate.** JS-flex-buttons runs a form whose flex toolbar holds a
+`<button>`, a submit and a reset, four steps 600 ms apart:
+- local: the toolbar's style, twice (its rebuilt buttons rebuilt again);
+  a click on the rebuilt `<button>`, whose handler writes a line;
+- declined: a flex holding a typed text field.
+
+It renders row for row as its parse-time reference: **0 rows**, with 2
+rebuilds handing controls over and 1 stateful-control decline.
+JS-remove-controls (368) is unchanged, with 0 rows and 4 removals.
+`gate382` failed only on **TIMERNEST** (a 4 ms clamped timer gap read
+3.3 ms against a 3.5 ms threshold, the same signature as gate379b).
+`gate382b` on the same binary: exit 0, TIMERNEST 4/4. Restage from
+pristine: 475 applied plus the 2 known collisions, html.c byte-identical.
+
+**Scorecard r107**: 21 sites against `r79-360`, the 382 and 381 binaries
+run back to back (`score/r107-382`, `score/r107-pre382`): **73.00 vs
+73.00**. No crash; per site within live noise.
+
+**Load-time census.**
+- youtube: control declines **4 -> 0**, 5 toolbars rebuilt locally with
+  their controls handed over, and full rebuilds 20 vs 18.
+- rte: its one frame decline stays, as intended.
+- All sites: 114 vs 112, within noise.
+
+**Gate hygiene note.** TIMERNEST has now failed in 2 of the last 8 gates
+(379b, 382), both with the 10th clamped gap at 3.3 ms. Its 3.5 ms
+threshold sits close to the sim's timer granularity under WSL. It is
+worth widening, in a gate-only change, together with
+JS-block-class-sibling's 700 ms settle-edge flake.
+
+**Next** (youtube's remaining full rebuilds, by the r106 census):
+1. **"no inserted or removed block found" (3)**: what those marks are.
+2. **Sheet and nodeless batches (4, doc 23)**, and the "kind" refusal
+   (1).
+3. **The fixes1135 class-drop** (372 entry), a correctness bug.
+4. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+5. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
