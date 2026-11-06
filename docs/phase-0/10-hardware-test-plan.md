@@ -9183,3 +9183,94 @@ run back to back (`score/r102-377`, `score/r102-pre377`): **71.52 vs
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 378 (2026-11-06): boxless child-list changes need no rebuild; late iframes and images built alone
+
+**The shapes.** By the r102 census, "new element is not a plain block,
+list item or block of blocks" was youtube 7 and guardian 1. A temporary
+trace (the element, its parent and its descendants' tags) found two
+shapes:
+- **`<head>` read as new in `<html>`** (youtube 2, claude, bbc,
+  cnnlite 2). A script changed `<html>`'s child list, typically a
+  `<script>` appended to it (unit 362's shape), and the walk read the
+  box-less `<head>` as a new element.
+- **`<iframe>` appended to `<body>`** (youtube 4, guardian 2, cnnlite
+  1): ad and tracker frames.
+
+**The change** (html.c, macos9_reconvert.c):
+- `<head>` joins 377's never-boxed tags.
+- `html_reconvert_local_childlist()`: appendChild, insertBefore and
+  removeChild marks now tell the local answer that the node is the
+  parent whose children changed. A change on that parent that adds or
+  removes no element with a box is answered **with no rebuild**, because
+  the box tree already matches. Two guards keep the full rebuild:
+  - 192's structural/counter check (a `<script>` inserted before a `<p>`
+    takes its `:first-child`);
+  - 198's sibling check, run with the skipped elements as the added ones.
+  - Removed box-less elements are not known there; only a sibling rule
+    whose left compound names one by tag alone could see one go.
+- An **`<iframe>` or `<img>` appended at the end** (no later sibling with
+  a box, no later text) is built alone wherever `box_construct` puts it,
+  and the page is laid out whole. An inline one goes at the end of the
+  parent's last line, which is its place exactly when nothing boxed
+  follows. A frame gets its record and its late load as in a full build
+  (patch 244). One inserted mid-page still takes the full rebuild.
+
+**Result** on `ST-378.html` (2500 paragraphs, median of 3):
+
+| change | 377 | 378 |
+|---|---|---|
+| a `<script>` appended to `<html>` | 105 ms | 4 ms |
+| an `<iframe>` appended to `<body>` | 103 ms | 30 ms |
+| a 1x1 `<img>` appended to `<body>` | 105 ms | 16 ms |
+
+**Gate.**
+- JS-late-append:
+  - no rebuild: a `<script>` appended to `<body>`, and one to `<html>`;
+  - built alone: a named `<iframe>` and an `<img>` appended at the end;
+  - full: an `<iframe>` inserted before a block.
+- JS-late-append-struct: a `p:first-child` rule, and a `<script>`
+  inserted before the first `<p>`, where the no-op must decline.
+- Both render row for row as their parse-time references (0 rows, 0
+  rows). Across the gate: 39 child-list changes answered with no
+  rebuild, 5 late appends, and the `:first-child` guard seen.
+- The frames are **named with no src** (patch 289: a record and a window
+  that load nothing). A first draft used a src, and the page differed in
+  its 60 frame rows on both 377 and 378: a script-made same-origin frame
+  is not loaded as a parsed one is (patch 143), which is pre-existing.
+
+`gate378` failed on one line, **"JS-block-class-sibling: no summary"**:
+the page was dumped before its own `show()` ran. That is a pre-existing
+timing flake. Its steps check 600 ms after each change and step again
+100 ms later, exactly the 700 ms quiet window that ends a page, and
+`gate358` failed the same way before `gate358b` passed (1 in 38 gate
+logs here). The page passes 3/3 on both binaries standalone, and
+`gate378b` on the same binary: **exit 0**. Restage from pristine: 471
+applied plus the 2 known collisions, both changed files byte-identical.
+
+**Scorecard r103**: 21 sites against `r79-360`, the 378 and 377 binaries
+run back to back (`score/r103-378`, `score/r103-pre378`): **72.81 vs
+72.71**. No crash; per site equal within live noise (claude +1.2,
+guardian +0.9).
+
+**Load-time census.**
+- "new element is not a plain block": youtube 7 -> 0, claude 3 -> 0,
+  bbc 2 -> 0, cnnlite 3 -> 0 (guardian 1 stays).
+- **8 late appends built alone** (youtube 4, cnnlite 4).
+- The no-op mostly meets its guards on real sites, as it should: youtube
+  "structural selectors or counters in page CSS" (5), claude "sibling
+  combinator may see an element with no box" (2). Across the sites it
+  answered 1 change.
+- Full rebuilds read 113 vs 117, within batching noise.
+
+**Next**, by the r103 census:
+1. **youtube's no-op guard (5).** A structural-selector check scoped to
+   the parent's children (does any `:first-child`/`:nth-*` rule match a
+   child of this parent?) instead of page-wide.
+2. **The fixes1135 class-drop** (372 entry), a correctness bug.
+3. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+4. **JS-block-class-sibling's flake.** Space its steps off the 700 ms
+   settle window (gate hygiene).
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
