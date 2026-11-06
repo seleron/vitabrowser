@@ -1,0 +1,548 @@
+# netsurf: counters across a local build (patch 374)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 373)
+#
+# Box construction numbers CSS counters in one flat table per build pass
+# (fixes134b), so a subtree built alone counts from an empty table. 369's
+# table restyle declined on any "counter-" in page CSS, and 372/373 on any
+# counter() shown -- which, by the r98 census, is now what stops rte's
+# carousel tracks and wpblog's and github's changes. The line path (165)
+# never checked: a span::before showing counter() inside a paragraph read
+# from an empty table after the paragraph's text changed.
+#
+# A local build only goes wrong when the rebuilt subtree itself takes part
+# in counting. So:
+#  - box_construct.c: every touch of the counter table (a reset, an
+#    increment, a counter() shown) marks the counting element's parent box
+#    VB_COUNTS (box.h, bit 22) and sets a flag box_counters_touched()
+#    reads. The mark goes on the parent: the element being built has no
+#    box_for_node of its own yet -- the one it returns there is the
+#    replaced tree's, in a local build already freed. (A display:none
+#    element counts nothing in this engine.)
+#  - html.c, html_rl_box_counts(): an element box takes part in counting
+#    if it or a box below it is VB_COUNTS, or its own style or its
+#    ::before / ::after's style resets or increments a counter, or a
+#    pseudo-element of it shows one.
+#  - Each local builder declines a subtree that takes part in counting,
+#    before freeing it, and hands a build that touched counters to the
+#    full reconvert: the block restyle (174, and 373's route), 372's flex
+#    restyle, 369's table restyle (html_rl_page_counters goes) and the
+#    line path. html_rl_page_counter_shown (373) goes.
+#
+#  - Objects (found by the r99 scorecard: rte crashed, 2 of 2, once its
+#    carousel tracks reached the flex rebuild). Every fetched object --
+#    an <img>, and also a CSS background image, whose box->background is
+#    set only when it arrives -- keeps o->box, which its load callback and
+#    the full reconvert's html_reconvert_relink_objects read. No local
+#    path ever checked for backgrounds: freeing such a box left the entry
+#    dangling (a latent use-after-free since patch 165, rarely fatal while
+#    the freed memory went unused). html_rl_objects_point_into() walks
+#    each entry's box up to the subtree about to be freed; the line path,
+#    the block, flex and table restyles, and removed blocks and floats
+#    decline on it. html_rl_drop_new(): a build that gave up after it
+#    fetched objects keeps its new boxes for the full reconvert instead of
+#    freeing them (the entries point at them); the line path then keeps
+#    its new children and frees the old line.
+#
+# Result on a 2500-paragraph sim page that shows a counter (median of 3):
+# a flex track's style 108 -> 19 ms; text under ::before 104 -> 19 ms; a
+# table cell's class 107 -> 18 ms.
+#
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -110,6 +110,10 @@
+ 					 * positioned box whose height comes
+ 					 * from top + bottom: percentage
+ 					 * heights inside resolve against it */
++	VB_COUNTS = 1 << 22,	/* patch 374: a child element of this box
++				 * (or one of its pseudo-elements) reset,
++				 * incremented or showed a counter while the
++				 * box tree was built */
+ 	LINK_DOWNLOAD = 1 << 15	/* fixes1063 (#114): enclosing <a> has `download`;
+ 				 * propagates with href so an inline TEXT box,
+ 				 * which carries no DOM node of its own, still
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -164,6 +164,14 @@
+  */
+ bool box_build_element(struct html_content *c, struct dom_node *element);
+ 
++/* VitaBrowser patch 374: counters across a local build. Construction
++ * numbers counters in one flat table per build pass (fixes134b), so a
++ * subtree built alone starts from an empty table. box_counters_touched()
++ * is true when a build since box_counters_touched_reset() reset,
++ * incremented or showed a counter: html.c then takes the full rebuild. */
++void box_counters_touched_reset(void);
++bool box_counters_touched(void);
++
+ /**
+  * Extract a URL from a relative link, handling junk like whitespace and
+  * attempting to read a real URL from "javascript:" links.
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -519,6 +519,51 @@
+  * cross-object equivalence so pointer equality isn't required.
+  */
+ 
++/* VitaBrowser patch 374: a build touched the counter table (see
++ * box_construct.h), and which boxes hold the elements that did. The
++ * element being built is attached to its box only after its counters and
++ * its ::before run, so the mark goes on the nearest ancestor that has a
++ * box (its parent, in this pass). */
++static bool box_counters_were_touched;
++
++void box_counters_touched_reset(void)
++{
++	box_counters_were_touched = false;
++}
++
++bool box_counters_touched(void)
++{
++	return box_counters_were_touched;
++}
++
++static void counter_mark(struct box_construct_ctx *ctx)
++{
++	dom_node *n = NULL, *up;
++	struct box *b = NULL;
++
++	box_counters_were_touched = true;
++	/* from the PARENT: the node being built has no box of its own yet,
++	 * and box_for_node on it can return its box from the tree this one
++	 * replaces -- in a local build already freed */
++	if (ctx->n == NULL ||
++	    dom_node_get_parent_node(ctx->n, &n) != DOM_NO_ERR)
++		return;
++	while (n != NULL) {
++		b = box_for_node(n);
++		if (b != NULL)
++			break;
++		up = NULL;
++		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR)
++			up = NULL;
++		dom_node_unref(n);
++		n = up;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	if (b != NULL)
++		b->flags |= VB_COUNTS;
++}
++
+ static struct macsurf_counter_entry *
+ counter_lookup_or_create(struct box_construct_ctx *ctx, lwc_string *name)
+ {
+@@ -526,6 +571,7 @@
+ 	bool same;
+ 
+ 	if (name == NULL) return NULL;
++	counter_mark(ctx);	/* patch 374 */
+ 
+ 	for (e = ctx->counters; e != NULL; e = e->next) {
+ 		if (lwc_string_isequal(e->name, name, &same) ==
+@@ -595,6 +641,7 @@
+ 	bool same;
+ 
+ 	if (name == NULL) return 0;
++	counter_mark(ctx);	/* patch 374 */
+ 
+ 	for (e = ctx->counters; e != NULL; e = e->next) {
+ 		if (lwc_string_isequal(e->name, name, &same) ==
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6510,6 +6510,29 @@
+ 	return false;
+ }
+ 
++/* Patch 374: does any entry of the page's object list point at a box in
++ * the subtree under top (top included)? Each fetched object -- an <img>,
++ * but also a CSS background image (box->background is set only once it
++ * arrives), a list-style image -- keeps o->box, which its load callback
++ * and the full reconvert's html_reconvert_relink_objects read
++ * (o->box->node). Freeing such a box leaves the entry dangling: rte's
++ * carousel slides (background images) crashed the relink once 374 let
++ * their track take a local rebuild. The boxes are still alive here; each
++ * entry's box is walked up to the root. */
++static bool html_rl_objects_point_into(html_content *c, struct box *top)
++{
++	struct content_html_object *o;
++	struct box *b;
++
++	if (top == NULL)
++		return false;
++	for (o = c->object_list; o != NULL; o = o->next)
++		for (b = o->box; b != NULL; b = b->parent)
++			if (b == top)
++				return true;
++	return false;
++}
++
+ /* like html_rl_subtree_referenced, but a list marker is no reason: the
+  * full layout that follows numbers the markers again (patch 176) */
+ static bool html_rl_subtree_objects(struct box *b)
+@@ -7235,7 +7258,9 @@
+ 				if (nrem == HTML_RL_MAX_CHANGES ||
+ 				    html_rl_subtree_objects(e->children) ||
+ 				    e->object != NULL || e->gadget != NULL ||
+-				    HTML_RL_FRAME(e))
++				    HTML_RL_FRAME(e) ||
++				    /* patch 374: a background too */
++				    html_rl_objects_point_into(c, f))
+ 					RL_BNO("removed float holds objects or "
+ 						"controls");
+ 				removed[nrem++] = f;
+@@ -7252,7 +7277,9 @@
+ 			/* patch 368: form controls may go (released below) */
+ 			if (nrem == HTML_RL_MAX_CHANGES ||
+ 			    html_rl_subtree_objects_or_frames(b->children) ||
+-			    b->object != NULL || HTML_RL_FRAME(b))
++			    b->object != NULL || HTML_RL_FRAME(b) ||
++			    /* patch 374: a background too */
++			    html_rl_objects_point_into(c, b))
+ 				RL_BNO("removed block holds objects or frames");
+ 			/* a list item, or a block of blocks: the page is laid
+ 			 * out whole afterwards (markers renumbered, margins
+@@ -9391,61 +9418,106 @@
+  * such rule either. If :has() matching is ever added, this must decline
+  * on it. */
+ 
+-/* does a used author sheet mention a counter at all (conservative: the
+- * raw source, comments included)? */
+-static bool html_rl_page_counters(html_content *c)
++/* Patch 374: counters across a local build. Box construction numbers
++ * counters in one flat table per build pass (fixes134b), so a subtree
++ * built alone counts from an empty table, and a subtree whose counting
++ * is taken away or changed moves every number after it. Neither can
++ * happen when the subtree takes no part in counting: no element in it
++ * reset, incremented or showed a counter when the tree was built (the
++ * builder marks the counting element's parent box VB_COUNTS; a
++ * display:none element counts nothing here), and the build that
++ * replaces it touches no counter (box_counters_touched). The element's
++ * own counting marks its parent, outside the subtree: its own and its
++ * pseudo-elements' styles are read here instead. */
++static bool html_rl_style_counts(const css_computed_style *st)
+ {
+-	unsigned int si;
++	const css_computed_counter *arr = NULL;
+ 
+-	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
+-		const uint8_t *data;
+-		size_t size = 0, i;
+-
+-		if (c->stylesheets[si].sheet == NULL ||
+-		    c->stylesheets[si].unused)
+-			continue;
+-		data = content_get_source_data(c->stylesheets[si].sheet, &size);
+-		if (data == NULL)
+-			continue;
+-		for (i = 0; i + 8 <= size; i++)
+-			if (strncasecmp((const char *) data + i, "counter-",
+-					8) == 0)
+-				return true;
+-	}
++	if (st == NULL)
++		return false;
++	if (css_computed_counter_reset(st, &arr) ==
++			CSS_COUNTER_RESET_NAMED && arr != NULL &&
++	    arr->name != NULL)
++		return true;
++	arr = NULL;
++	if (css_computed_counter_increment(st, &arr) ==
++			CSS_COUNTER_INCREMENT_NAMED && arr != NULL &&
++	    arr->name != NULL)
++		return true;
+ 	return false;
+ }
+ 
+-/* Patch 373: does any sheet show a counter (counter() / counters() in a
+- * content value)? Box construction numbers those in one flat table per
+- * build pass, so a subtree built alone would count from zero; without
+- * one, counter-reset and counter-increment change nothing on screen --
+- * html_rl_page_counters' "counter-" match is broader than these
+- * rebuilds need (rte: counter-reset in its sheets, no counter() shown). */
+-static bool html_rl_page_counter_shown(html_content *c)
++/* a pseudo-element showing a counter (content: counter(x) / counters()) */
++static bool html_rl_style_shows_counter(const css_computed_style *st)
+ {
+-	unsigned int si;
++	const css_computed_content_item *it = NULL;
++	int i;
+ 
+-	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
+-		const uint8_t *data;
+-		size_t size = 0, i;
++	if (st == NULL || css_computed_content(st, &it) != CSS_CONTENT_SET ||
++	    it == NULL)
++		return false;
++	for (i = 0; it[i].type != CSS_COMPUTED_CONTENT_NONE; i++)
++		if (it[i].type == CSS_COMPUTED_CONTENT_COUNTER ||
++		    it[i].type == CSS_COMPUTED_CONTENT_COUNTERS)
++			return true;
++	return false;
++}
+ 
+-		if (c->stylesheets[si].sheet == NULL ||
+-		    c->stylesheets[si].unused)
+-			continue;
+-		data = content_get_source_data(c->stylesheets[si].sheet, &size);
+-		if (data == NULL)
+-			continue;
+-		for (i = 0; i + 8 <= size; i++)
+-			if (strncasecmp((const char *) data + i, "counter",
+-					7) == 0 &&
+-			    (data[i + 7] == '(' ||
+-			     (data[i + 7] == 's' && i + 9 <= size &&
+-			      data[i + 8] == '(')))
+-				return true;
++static bool html_rl_subtree_counts(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->flags & VB_COUNTS)
++			return true;
++		if (html_rl_subtree_counts(b->children))
++			return true;
+ 	}
+ 	return false;
+ }
+ 
++/* does the element box b, rebuilt with its subtree, take part in
++ * counting? (its own counting, what below it counted, its ::before /
++ * ::after's own counting; a pseudo-element showing a counter marked b) */
++static bool html_rl_box_counts(struct box *b)
++{
++	if (b->flags & VB_COUNTS)
++		return true;
++	if (b->style != NULL && html_rl_style_counts(b->style))
++		return true;
++	if (b->styles != NULL &&
++	    (html_rl_style_counts(
++			b->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]) ||
++	     html_rl_style_counts(
++			b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]) ||
++	     html_rl_style_shows_counter(
++			b->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]) ||
++	     html_rl_style_shows_counter(
++			b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER])))
++		return true;
++	return html_rl_subtree_counts(b->children);
++}
++
++/* Patch 374: a local builder giving up after box_build_element ran. Its
++ * new box can be freed only if the build fetched no object: each object
++ * fetched is an entry in c->object_list pointing at a box of the new
++ * subtree, and the full reconvert that follows re-links every entry
++ * through its box (html_reconvert_relink_objects) -- rte's carousel track
++ * crashed there once 374 let it reach the build. Otherwise the new box
++ * stays where the build put it: the tree is whole, and the full reconvert
++ * rebuilds it from the DOM, as a failed normalise already leaves it. */
++static void html_rl_drop_new(html_content *c, struct box *nb,
++		unsigned int objects_before)
++{
++	if (nb == NULL)
++		return;
++	if (c->num_objects != objects_before) {
++		macsurf_debug_log_writef("LIFE rebuild local: the new boxes "
++			"fetched objects, kept for the full reconvert");
++		return;
++	}
++	html_rl_unlink(nb);
++	box_free(nb);
++}
++
+ static int html_rl_table_restyle(html_content *c, struct box *cell,
+ 		double t0)
+ {
+@@ -9473,9 +9545,11 @@
+ 	    html_rl_subtree_referenced(tb->children))
+ 		RL_TNO("restyled cell's table holds objects, controls or "
+ 			"frames");
+-	if (html_rl_page_counters(c))
+-		RL_TNO("a cell's class could reach outside its table "
+-			"(counters)");
++	/* patch 374: the table's own counting, not the page's */
++	if (html_rl_box_counts(tb))
++		RL_TNO("the restyled table takes part in counting");
++	if (html_rl_objects_point_into(c, tb))	/* patch 374 */
++		RL_TNO("an object (a background) is in the restyled table");
+ 
+ 	/* out with the old table, in with the new, cascaded afresh, where
+ 	 * the old one was */
+@@ -9487,24 +9561,20 @@
+ 	html_rl_invalidate(pbox);
+ 	objects_before = c->num_objects;
+ 	(void) html_reconvert_reset_node_data_walk(el, 0);
+-	if (!box_build_element(c, el)) {
++	box_counters_touched_reset();	/* patch 374 */
++	if (!box_build_element(c, el) || box_counters_touched()) {
+ 		nb = box_for_node(el);
+-		if (nb != NULL) {
+-			html_rl_unlink(nb);
+-			box_free(nb);
+-		}
++		html_rl_drop_new(c, nb, objects_before);	/* patch 374 */
+ 		dom_node_unref(el);
+ 		macsurf_debug_log_writef("LIFE rebuild local: restyled table "
+-			"failed to build, full reconvert");
++			"failed to build%s, full reconvert",
++			box_counters_touched() ? " (it counts)" : "");
+ 		return -1;
+ 	}
+ 	nb = box_for_node(el);
+ 	dom_node_unref(el);
+ 	if (nb == NULL || nb->type != BOX_TABLE || nb->parent != pbox) {
+-		if (nb != NULL) {
+-			html_rl_unlink(nb);
+-			box_free(nb);
+-		}
++		html_rl_drop_new(c, nb, objects_before);	/* patch 374 */
+ 		macsurf_debug_log_writef("LIFE rebuild local: restyled table "
+ 			"is no longer a table here, full reconvert");
+ 		return -1;
+@@ -9563,8 +9633,11 @@
+ 			"frames");
+ 	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
+ 		RL_FNO("class change may move a sibling selector");
+-	if (html_rl_page_counter_shown(c))	/* patch 373: shown ones */
+-		RL_FNO("a counter shown in page CSS");
++	if (html_rl_box_counts(ob))		/* patch 374 */
++		RL_FNO("the restyled flex or grid box takes part in counting");
++	if (html_rl_objects_point_into(c, ob))	/* patch 374 */
++		RL_FNO("an object (a background) is in the restyled flex or "
++			"grid box");
+ 
+ 	/* out with the old box, in with the new, where the old one was */
+ 	dom_node_ref(el);
+@@ -9574,15 +9647,14 @@
+ 	html_rl_invalidate(pbox);
+ 	objects_before = c->num_objects;
+ 	(void) html_reconvert_reset_node_data_walk(el, 0);
+-	if (!box_build_element(c, el)) {
++	box_counters_touched_reset();	/* patch 374 */
++	if (!box_build_element(c, el) || box_counters_touched()) {
+ 		nb = box_for_node(el);
+-		if (nb != NULL) {
+-			html_rl_unlink(nb);
+-			box_free(nb);
+-		}
++		html_rl_drop_new(c, nb, objects_before);	/* patch 374 */
+ 		dom_node_unref(el);
+ 		macsurf_debug_log_writef("LIFE rebuild local: restyled flex "
+-			"or grid box failed to build, full reconvert");
++			"or grid box failed to build%s, full reconvert",
++			box_counters_touched() ? " (it counts)" : "");
+ 		return -1;
+ 	}
+ 	nb = box_for_node(el);
+@@ -9590,8 +9662,7 @@
+ 	if (nb != NULL) {		/* else display: none -- a removal */
+ 		if (nb->parent != pbox || (nb->type != BOX_FLEX &&
+ 		    nb->type != BOX_GRID && nb->type != BOX_BLOCK)) {
+-			html_rl_unlink(nb);
+-			box_free(nb);
++			html_rl_drop_new(c, nb, objects_before);	/* 374 */
+ 			macsurf_debug_log_writef("LIFE rebuild local: restyled "
+ 				"flex or grid box is no longer a block-level "
+ 				"box here, full reconvert");
+@@ -9666,6 +9737,10 @@
+ 	    ob->list_marker != NULL || ob->float_children != NULL ||
+ 	    html_rl_subtree_referenced(ob->children))
+ 		RL_RNO("restyled block holds objects, controls or floats");
++	if (html_rl_box_counts(ob))		/* patch 374 */
++		RL_RNO("the restyled block takes part in counting");
++	if (html_rl_objects_point_into(c, ob))	/* patch 374 */
++		RL_RNO("an object (a background) is in the restyled block");
+ 	if (!html_rl_block_tag(el) || !html_rl_inline_subtree(el))
+ 		RL_RNO("restyled element is not a plain block of text");
+ 	/* a class on this block could restyle its following siblings, but
+@@ -9697,22 +9772,20 @@
+ 	/* in with the new, cascaded afresh, where the old one was */
+ 	objects_before = c->num_objects;
+ 	(void) html_reconvert_reset_node_data_walk(el, 0);
+-	if (!box_build_element(c, el)) {
++	box_counters_touched_reset();	/* patch 374 */
++	if (!box_build_element(c, el) || box_counters_touched()) {
+ 		nb = box_for_node(el);
+-		if (nb != NULL) {
+-			html_rl_unlink(nb);
+-			box_free(nb);
+-		}
++		html_rl_drop_new(c, nb, objects_before);	/* patch 374 */
+ 		macsurf_debug_log_writef("LIFE rebuild local: restyled block "
+-			"failed to build, full reconvert");
++			"failed to build%s, full reconvert",
++			box_counters_touched() ? " (it counts)" : "");
+ 		return -1;
+ 	}
+ 	nb = box_for_node(el);
+ 	if (nb != NULL) {		/* else display: none -- a removal */
+ 		if (nb->parent != pbox || nb->type != BOX_BLOCK) {
+ 			/* no longer a block here: the full rebuild */
+-			html_rl_unlink(nb);
+-			box_free(nb);
++			html_rl_drop_new(c, nb, objects_before);	/* 374 */
+ 			macsurf_debug_log_writef("LIFE rebuild local: restyled "
+ 				"element is no longer a block, full reconvert");
+ 			return -1;
+@@ -10155,12 +10228,9 @@
+ 		char *cs;
+ 		int r;
+ 
+-		/* box construction numbers counter() in one flat table per
+-		 * build pass: a block built alone would count from zero */
+-		if (gen && html_rl_page_counter_shown(c)) {
+-			dom_node_unref(element);
+-			RL_NO("a counter shown in page CSS");
+-		}
++		/* counters: the block restyle declines a block that takes
++		 * part in counting (patch 374) */
++		(void) gen;
+ 		if ((old_ic == NULL || html_rl_node_empty(element)) &&
+ 		    html_rl_empty_sibling_risk(c)) {
+ 			dom_node_unref(element);
+@@ -10206,6 +10276,19 @@
+ 		dom_node_unref(element);
+ 		RL_NO("block is not one line container of plain content");
+ 	}
++	/* Patch 374: the line's elements took part in counting (their
++	 * counting marked the block VB_COUNTS): rebuilt alone they would
++	 * count from zero -- this path never checked (an inline
++	 * span::before showing a counter() read 1 after any text change) */
++	if ((block->flags & VB_COUNTS) ||
++	    html_rl_subtree_counts(old_ic->children)) {
++		dom_node_unref(element);
++		RL_NO("the line takes part in counting");
++	}
++	if (html_rl_objects_point_into(c, old_ic)) {	/* patch 374 */
++		dom_node_unref(element);
++		RL_NO("an object (a background) is in the line");
++	}
+ 	/* Patch 373: a line emptied flips the block's :empty -- a sibling
+ 	 * rule can see that */
+ 	if (html_rl_node_empty(element) && html_rl_empty_sibling_risk(c)) {
+@@ -10270,9 +10353,26 @@
+ 	 * "if (box_for_node(n) != NULL) box_construct_element_after(...)"
+ 	 * runs on OLD detached boxes for nodes that get no new box. */
+ 	html_rl_clear_backlinks(old_ic);
++	box_counters_touched_reset();	/* patch 374 */
+ 	if (!box_rebuild_children(c, element) ||
++	    box_counters_touched() ||
+ 	    !box_normalise_block(block, c->layout, c) ||
+ 	    c->num_objects != objects_before) {
++		if (c->num_objects != objects_before) {
++			/* Patch 374: the new children fetched objects, whose
++			 * entries point at them (html_rl_drop_new): they stay,
++			 * the old line goes (it held none -- checked above),
++			 * and the full reconvert takes it from here */
++			dom_node_unref(element);
++			/* as below: a cell's float list holds the old floats */
++			if (block->type == BOX_TABLE_CELL)
++				block->float_children = NULL;
++			box_free(old_ic);
++			macsurf_debug_log_writef("LIFE rebuild local: the new "
++				"boxes fetched objects, kept for the full "
++				"reconvert");
++			return -1;
++		}
+ 		/* back to the old boxes; the full reconvert takes it from
+ 		 * here */
+ 		for (b = block->children; b != NULL; b = next) {

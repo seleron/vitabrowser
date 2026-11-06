@@ -248,6 +248,10 @@ JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
 CSS-gen-empty-sib-ref file:///app0:/testpages/CSS-gen-empty-sib-ref.html
+JS-counters-local file:///app0:/testpages/JS-counters-local.html
+CSS-counters-local-ref file:///app0:/testpages/CSS-counters-local-ref.html
+JS-bg-objects file:///app0:/testpages/JS-bg-objects.html
+CSS-bg-objects-ref file:///app0:/testpages/CSS-bg-objects-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1508,16 +1512,46 @@ echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fx
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render
 # row for row as the same steps at parse time; a sibling rule testing
-# :empty and a counter shown in page CSS keep the full rebuild.
+# :empty and a counting block (patch 374: its own ::before increments a
+# counter) keep the full rebuild.
 ger=$(fl_rows JS-gen-empty CSS-gen-empty-ref)
 ges=$(fl_rows JS-gen-empty-sib CSS-gen-empty-sib-ref)
 gel=$(grep -c "LIFE rebuild local: \(a block with generated content\|content in an empty block\), the block built again" "$R/netsurf.log" || true)
 gee=$(grep -c "LIFE rebuild local: declined (a sibling rule tests :empty)" "$R/netsurf.log" || true)
-gec=$(grep -c "LIFE rebuild local: declined (a counter shown in page CSS)" "$R/netsurf.log" || true)
-echo "  JS-gen-empty: rows differing from the parse-time build $ger (0), sibling/counter page $ges (0); ${gel} blocks built again (8 or more); declined: :empty sibling rule ${gee} (1 or more), counter shown ${gec} (1 or more)"
+gec=$(grep -c "LIFE rebuild local: declined (the restyled block takes part in counting)" "$R/netsurf.log" || true)
+echo "  JS-gen-empty: rows differing from the parse-time build $ger (0), sibling/counter page $ges (0); ${gel} blocks built again (8 or more); declined: :empty sibling rule ${gee} (1 or more), counting block ${gec} (1 or more)"
 [ "$ger" = 0 ] && [ "$ges" = 0 ] && [ "${gel:-0}" -ge 8 ] &&
 	[ "${gee:-0}" -ge 1 ] && [ "${gec:-0}" -ge 1 ] ||
 	fail "generated-content and empty blocks built again"
+# Patch 374: on a page that shows a counter, local builds go on unless
+# the rebuilt subtree takes part in counting (before: 369/372/373
+# declined on any counter in page CSS, and the line path never checked).
+# The nine-step page renders row for row as the same steps at parse time;
+# its five non-counting changes are taken locally, a numbered heading, a
+# line holding a span that shows or increments the counter, and a flex
+# holding a counting item keep the full rebuild.
+k374r=$(fl_rows JS-counters-local CSS-counters-local-ref)
+k374l=$(awk '/ page [0-9]+\/[0-9]+ JS-counters-local: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: \(rebuilt and laid out\|flex or grid box restyled\|table restyled\|.*the block built again\)" || true)
+k374b=$(grep -c "LIFE rebuild local: declined (the restyled block takes part in counting)" "$R/netsurf.log" || true)
+k374n=$(grep -c "LIFE rebuild local: declined (the line takes part in counting)" "$R/netsurf.log" || true)
+k374f=$(grep -c "LIFE rebuild local: declined (the restyled flex or grid box takes part in counting)" "$R/netsurf.log" || true)
+k374o=$(grep -c "LIFE rebuild local: declined (a counter shown in page CSS)\|could reach outside its \(table\|flex\)" "$R/netsurf.log" || true)
+echo "  JS-counters-local: rows differing from the parse-time build $k374r (0); ${k374l} changes built locally on the page (5 or more); counting declines: block ${k374b}, line ${k374n}, flex ${k374f} (1 or more each); page-wide counter declines ${k374o} (0)"
+[ "$k374r" = 0 ] && [ "${k374l:-0}" -ge 5 ] && [ "${k374b:-0}" -ge 1 ] &&
+	[ "${k374n:-0}" -ge 1 ] && [ "${k374f:-0}" -ge 1 ] && [ "${k374o:-0}" = 0 ] ||
+	fail "counters across a local build"
+# Patch 374, objects: a local rebuild never frees a box an object entry
+# points at (a CSS background image too: the entry's load callback and the
+# full reconvert's relink read o->box -- rte crashed there). The page
+# renders row for row as the same steps at parse time; the backgrounded
+# track and line decline, the plain ones stay local.
+k374bgr=$(fl_rows JS-bg-objects CSS-bg-objects-ref)
+k374bgf=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the restyled flex or grid box)" "$R/netsurf.log" || true)
+k374bgl=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the line)" "$R/netsurf.log" || true)
+echo "  JS-bg-objects: rows differing from the parse-time build $k374bgr (0); declined: backgrounded flex ${k374bgf}, backgrounded line ${k374bgl} (1 or more each)"
+[ "$k374bgr" = 0 ] && [ "${k374bgf:-0}" -ge 1 ] && [ "${k374bgl:-0}" -ge 1 ] ||
+	fail "local rebuilds keep the boxes objects point at"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and
