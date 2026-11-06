@@ -244,6 +244,10 @@ JS-style-attr file:///app0:/testpages/JS-style-attr.html
 CSS-style-attr-ref file:///app0:/testpages/CSS-style-attr-ref.html
 JS-flex-restyle file:///app0:/testpages/JS-flex-restyle.html
 CSS-flex-restyle-ref file:///app0:/testpages/CSS-flex-restyle-ref.html
+JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
+CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
+JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
+CSS-gen-empty-sib-ref file:///app0:/testpages/CSS-gen-empty-sib-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1500,6 +1504,20 @@ fxi=$(grep -c "LIFE rebuild local: restyled flex or grid box is no longer a bloc
 echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fxl} flex/grid containers restyled alone (8 or more); declined: holding an image ${fxo} (1 or more), made inline ${fxi} (1 or more)"
 [ "$fxr" = 0 ] && [ "${fxl:-0}" -ge 8 ] && [ "${fxo:-0}" -ge 1 ] &&
 	[ "${fxi:-0}" -ge 1 ] || fail "flex and grid containers restyled alone"
+# Patch 373: a change in a block with ::before/::after, or content
+# arriving in an empty block, builds the block again on its own (before:
+# a full rebuild, "block is not one line container"). Both pages render
+# row for row as the same steps at parse time; a sibling rule testing
+# :empty and a counter shown in page CSS keep the full rebuild.
+ger=$(fl_rows JS-gen-empty CSS-gen-empty-ref)
+ges=$(fl_rows JS-gen-empty-sib CSS-gen-empty-sib-ref)
+gel=$(grep -c "LIFE rebuild local: \(a block with generated content\|content in an empty block\), the block built again" "$R/netsurf.log" || true)
+gee=$(grep -c "LIFE rebuild local: declined (a sibling rule tests :empty)" "$R/netsurf.log" || true)
+gec=$(grep -c "LIFE rebuild local: declined (a counter shown in page CSS)" "$R/netsurf.log" || true)
+echo "  JS-gen-empty: rows differing from the parse-time build $ger (0), sibling/counter page $ges (0); ${gel} blocks built again (8 or more); declined: :empty sibling rule ${gee} (1 or more), counter shown ${gec} (1 or more)"
+[ "$ger" = 0 ] && [ "$ges" = 0 ] && [ "${gel:-0}" -ge 8 ] &&
+	[ "${gee:-0}" -ge 1 ] && [ "${gec:-0}" -ge 1 ] ||
+	fail "generated-content and empty blocks built again"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

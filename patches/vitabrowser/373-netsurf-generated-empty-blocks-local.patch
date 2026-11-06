@@ -1,0 +1,240 @@
+# netsurf: blocks with generated content, and empty blocks, built again alone (patch 373)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 372)
+#
+# The 370 census's second unparked cause, "block is not one line container
+# of plain content", has two shapes this patch takes: a change inside a
+# block with ::before / ::after (youtube, wpblog, github) -- rebuilding its
+# children alone would lose the generated boxes -- and content arriving in
+# an empty block (github, google, wikipedia), which has no line to
+# rebuild. Both were full box-tree rebuilds: 104-109 ms on a
+# 2500-paragraph sim page.
+#
+#  - html.c, html_reconvert_local_change: such a block is built again
+#    whole, as a restyle of its own box (html_rl_block_restyle, patch
+#    174; the current class as the "old" one, so no class changed):
+#    box_build_element makes its generated content and its new children,
+#    cascaded afresh; placed locally among plain blocks, else the page
+#    laid out whole.
+#  - Declined: a counter shown in page CSS when the block has generated
+#    content (box construction numbers counter() in one flat table per
+#    build pass); a sibling rule whose left compound tests :empty when
+#    the block was or becomes empty (html_rl_empty_sibling_risk: patch
+#    198's compounds, a state-2 sheet searched as text). The line path
+#    gets the same :empty check when it empties a block (it had none).
+#  - The counters guard of 372's flex restyle, and of the generated
+#    content above, is html_rl_page_counter_shown(): counter( or
+#    counters( in a sheet. 369's "counter-" match declined rte's slick
+#    tracks for a counter-reset nothing displays.
+#
+# Result on the sim page (median of 3): text under ::before 109 -> 18 ms;
+# content into an empty div 104 -> 18 ms; a flex track's style on a page
+# with counter-reset 107 -> 19 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9415,6 +9415,37 @@
+ 	return false;
+ }
+ 
++/* Patch 373: does any sheet show a counter (counter() / counters() in a
++ * content value)? Box construction numbers those in one flat table per
++ * build pass, so a subtree built alone would count from zero; without
++ * one, counter-reset and counter-increment change nothing on screen --
++ * html_rl_page_counters' "counter-" match is broader than these
++ * rebuilds need (rte: counter-reset in its sheets, no counter() shown). */
++static bool html_rl_page_counter_shown(html_content *c)
++{
++	unsigned int si;
++
++	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
++		const uint8_t *data;
++		size_t size = 0, i;
++
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		data = content_get_source_data(c->stylesheets[si].sheet, &size);
++		if (data == NULL)
++			continue;
++		for (i = 0; i + 8 <= size; i++)
++			if (strncasecmp((const char *) data + i, "counter",
++					7) == 0 &&
++			    (data[i + 7] == '(' ||
++			     (data[i + 7] == 's' && i + 9 <= size &&
++			      data[i + 8] == '(')))
++				return true;
++	}
++	return false;
++}
++
+ static int html_rl_table_restyle(html_content *c, struct box *cell,
+ 		double t0)
+ {
+@@ -9532,9 +9563,8 @@
+ 			"frames");
+ 	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
+ 		RL_FNO("class change may move a sibling selector");
+-	if (html_rl_page_counters(c))
+-		RL_FNO("a class could reach outside its flex or grid box "
+-			"(counters)");
++	if (html_rl_page_counter_shown(c))	/* patch 373: shown ones */
++		RL_FNO("a counter shown in page CSS");
+ 
+ 	/* out with the old box, in with the new, where the old one was */
+ 	dom_node_ref(el);
+@@ -9827,6 +9857,81 @@
+ 	return false;
+ }
+ 
++/* Patch 373: can a sibling rule see the change's block go empty or stop
++ * being empty? :empty on the block itself is cascaded again by its
++ * rebuild, and no ancestor of it can be empty; what reaches outside is a
++ * + / ~ rule whose left compound has :empty (patch 198 keeps those
++ * compounds; a sheet the patch-186 scan gave up on is searched as text). */
++static bool html_rl_empty_sibling_risk(html_content *c)
++{
++	unsigned int si;
++	int k;
++
++	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
++		struct html_rl_sib_sheet *sh;
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		sh = html_rl_sib_sheet_for(c->stylesheets[si].sheet);
++		if (sh == NULL)
++			continue;
++		if (sh->state == 2) {
++			const uint8_t *data;
++			size_t size = 0, i;
++			data = content_get_source_data(
++					c->stylesheets[si].sheet, &size);
++			if (data == NULL || size == 0)
++				return true;
++			for (i = 0; i + 6 <= size; i++)
++				if (strncasecmp((const char *) data + i,
++						":empty", 6) == 0)
++					return true;
++			continue;
++		}
++		for (k = 0; k < sh->nlefts; k++)
++			if (sh->lefts[k].has_empty)
++				return true;
++		for (k = 0; k < sh->nrules; k++)
++			if (sh->rules[k].l.has_empty)
++				return true;
++	}
++	return false;
++}
++
++/* Patch 373: does the element have no element and no text child now (as
++ * :empty sees it: comments do not count)? */
++static bool html_rl_node_empty(dom_node *el)
++{
++	dom_node *ch = NULL, *nx;
++	bool empty = true;
++
++	if (dom_node_get_first_child(el, &ch) != DOM_NO_ERR)
++		return false;
++	while (ch != NULL && empty) {
++		dom_node_type type;
++		if (dom_node_get_node_type(ch, &type) != DOM_NO_ERR ||
++		    type == DOM_ELEMENT_NODE)
++			empty = false;
++		else if (type == DOM_TEXT_NODE ||
++			 type == DOM_CDATA_SECTION_NODE) {
++			dom_string *d = NULL;
++			if (dom_characterdata_get_data(ch, &d) != DOM_NO_ERR ||
++			    (d != NULL && dom_string_byte_length(d) > 0))
++				empty = false;
++			if (d != NULL)
++				dom_string_unref(d);
++		}
++		nx = NULL;
++		if (dom_node_get_next_sibling(ch, &nx) != DOM_NO_ERR)
++			nx = NULL;
++		dom_node_unref(ch);
++		ch = nx;
++	}
++	if (ch != NULL)
++		dom_node_unref(ch);
++	return empty;
++}
++
+ int html_reconvert_local_style(struct content *base_c, void *vnode);
+ int html_reconvert_local_style(struct content *base_c, void *vnode)
+ {
+@@ -10031,6 +10136,59 @@
+ 		return r;
+ 	}
+ 
++	/* Patch 373: a block with generated content (::before / ::after), or
++	 * one that was empty (content arriving): rebuilding its children
++	 * alone (below) would lose the generated boxes, and there is no line
++	 * to rebuild. Build the whole block again instead, as a restyle of
++	 * its own box does (patch 174): box_build_element makes its
++	 * generated content and its new children, cascaded afresh. */
++	if (block->type == BOX_BLOCK && block->styles != NULL &&
++	    block->object == NULL && block->gadget == NULL &&
++	    !HTML_RL_FRAME(block) &&
++	    (old_ic == NULL ||
++	     block->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE] != NULL ||
++	     block->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL)) {
++		bool gen = block->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE] !=
++				NULL ||
++			block->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL;
++		dom_string *cls = NULL;
++		char *cs;
++		int r;
++
++		/* box construction numbers counter() in one flat table per
++		 * build pass: a block built alone would count from zero */
++		if (gen && html_rl_page_counter_shown(c)) {
++			dom_node_unref(element);
++			RL_NO("a counter shown in page CSS");
++		}
++		if ((old_ic == NULL || html_rl_node_empty(element)) &&
++		    html_rl_empty_sibling_risk(c)) {
++			dom_node_unref(element);
++			RL_NO("a sibling rule tests :empty");
++		}
++		if (dom_element_get_attribute(element, corestring_dom_class,
++				&cls) != DOM_NO_ERR) {
++			dom_node_unref(element);
++			RL_NO("dom error");
++		}
++		cs = cls != NULL ? strndup(dom_string_data(cls),
++				dom_string_byte_length(cls)) : strdup("");
++		if (cls != NULL)
++			dom_string_unref(cls);
++		if (cs == NULL) {
++			dom_node_unref(element);
++			return -1;
++		}
++		macsurf_debug_log_writef("LIFE rebuild local: %s, the block "
++			"built again", old_ic == NULL ? "content in an empty "
++			"block" : "a block with generated content");
++		/* the current class as the "old" one: no class changed */
++		r = html_rl_block_restyle(c, element, block, t0, cs);
++		free(cs);
++		dom_node_unref(element);
++		return r;
++	}
++
+ 	/* a block of inline content: one inline container, nothing generated,
+ 	 * no objects or controls, now or after the change */
+ 	if (block->object != NULL || block->gadget != NULL ||
+@@ -10048,6 +10206,12 @@
+ 		dom_node_unref(element);
+ 		RL_NO("block is not one line container of plain content");
+ 	}
++	/* Patch 373: a line emptied flips the block's :empty -- a sibling
++	 * rule can see that */
++	if (html_rl_node_empty(element) && html_rl_empty_sibling_risk(c)) {
++		dom_node_unref(element);
++		RL_NO("a sibling rule tests :empty");
++	}
+ 	/* Patch 367: a cell may hold blocks too (a floated <div>): the
+ 	 * rebuilt content is normalised as a full build normalises a cell,
+ 	 * and the page laid out whole after it */
