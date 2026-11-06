@@ -9475,3 +9475,99 @@ style rule really can flip the new last child. Full rebuilds read 115 vs
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 381 (2026-11-06): the sibling-combinator check skipped at the parent's tail
+
+**The census** (youtube's 20 full rebuilds on the r105 sim, 380 binary,
+each batch with the local answers and declines that led to it):
+- 4 nodeless or sheet batches (doc 23, parked);
+- 1 "kind" refusal, and 3 class or style declines on sibling rules or
+  `[style]`;
+- 4 flex containers holding controls or frames;
+- 3 "no inserted or removed block found";
+- 1 real structural match;
+- **the four `<iframe>` batches.** Their iframe is now built alone (378)
+  and passes the structural check (380), but each batch then declined on
+  patch 198's **"sibling combinator may restyle on insert/remove"**.
+
+youtube's sheets are in patch 186's conservative state 2 (a pseudo-class
+in a sibling rule's left compound), and for such a sheet
+`html_rl_block_sibling_risk` declined every insertion and removal before
+looking at where it was.
+
+**The argument.** A `+`/`~` rule restyles the element *after* its left
+compound's element. A change at the parent's tail moves no existing
+sibling's match, and the moved elements are built afresh. "At the tail"
+means elements appended with nothing after them but tags that never have
+a box, the last block removed, or a box-less removal whose recorded place
+(380) is the end.
+
+**The change** (html.c, macos9_reconvert.c):
+- `html_rl_block_sibling_risk` gains a **tail mode**: no per-element
+  combinator analysis and no conservative-sheet decline.
+  - The parent's `:empty` flipping still counts. A conservative sheet
+    declines on a flip, because its `:empty` list cannot be trusted.
+  - `:has()` is not checked. This libcss parses it and **never matches
+    it**: `selector_never_matches_part` in `src/parse/language.c` (patch
+    328) treats `:has()`, `:host` and `:host-context()` as never
+    matching, and rejects them inside a simple `:not()`. Patch 369's
+    table restyle relies on the same thing. If `:has()` matching is ever
+    added, this must decline on it. A first cut still declined
+    conservative sheets whose text names `:has(`, and youtube's do, so
+    nothing moved until that check went.
+- `html_rl_block_change` uses tail mode for a child-list mark on this
+  parent whose added elements are followed only by box-less tags
+  (`html_rl_at_tail`) and whose removed blocks were the last. The 378
+  no-op uses it for an appendChild (the node went last) or a removal
+  placed at the end; the skipped list holds every box-less child, so it
+  counts one element in or out for the `:empty` test.
+  `html_reconvert_local_childlist` now also carries whether the mark was
+  an appendChild.
+
+**Result** on `ST-381.html` (2500 paragraphs, a conservative sibling
+sheet, median of 3): an `<iframe>` appended to `<body>` **123 -> 32 ms**;
+a block appended to a list **117 -> 26 ms**.
+
+**Gate.** JS-sib-tail runs on a conservative sheet (`.a:hover + .b`) that
+also has `.n + .n`, `.slot:empty + p` and a `:has()` rule, six steps
+600 ms apart:
+- local: an `<iframe>` and a `<script>` appended to `<body>`; a `.n`
+  appended to the list; its last `.n` removed;
+- declined: a `.n` inserted first (not the tail); content appended into
+  the empty `.slot` (its `:empty` flips; 373's guard declines it first).
+
+It renders row for row as its parse-time reference: **0 rows**. On the
+380 binary it is also 0 rows, with all six steps declined. Across the page
+there were 3 tail checks, 4 local changes and 2 declines.
+JS-block-sibling-insert, 198's own page, stays **SIBINS 4/4** with 5
+sibling declines, so the non-tail path is intact. `gate381.log`, exit 0,
+first run; Vita pace 23 identical, 0 differ. Restage from pristine: 474
+applied plus the 2 known collisions, both changed files byte-identical.
+
+**Scorecard r106**: 21 sites against `r79-360`, the 381 and 380 binaries
+run back to back (`score/r106-381`, `score/r106-pre381`): **72.71 vs
+72.79**. No crash. stackoverflow (-2.0) and claude (+1.2) are within
+their live swings across r96-r106.
+
+**Load-time census.**
+- youtube: sibling declines **4 -> 0**; its four iframe blocks are built
+  locally; full rebuilds 23 vs 20.
+- The iframe batches still end in a full rebuild:
+  - one trips patch 309's **cost guard**;
+  - in three, a later mark finds a **second** `<iframe>` appended after
+    the first. The first then stops being the last of its type, and an
+    unbounded `:not(:last-of-type)`-style rule (its outer part sits across
+    a descendant combinator the scan does not analyse) really could match
+    it. That decline is correct.
+- All sites: full rebuilds 117 vs 119, within noise.
+
+**Next:**
+1. **youtube's flex containers holding controls or frames (4)**: carry
+   form controls over in a rebuilt subtree (like 375's objects).
+2. **"no inserted or removed block found" (youtube 3)**: what those marks
+   are.
+3. **The fixes1135 class-drop** (372 entry), a correctness bug.
+4. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
