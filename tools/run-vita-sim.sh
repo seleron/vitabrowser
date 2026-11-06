@@ -262,6 +262,8 @@ JS-late-append file:///app0:/testpages/JS-late-append.html
 CSS-late-append-ref file:///app0:/testpages/CSS-late-append-ref.html
 JS-late-append-struct file:///app0:/testpages/JS-late-append-struct.html
 CSS-late-append-struct-ref file:///app0:/testpages/CSS-late-append-struct-ref.html
+JS-struct-scoped file:///app0:/testpages/JS-struct-scoped.html
+CSS-struct-scoped-ref file:///app0:/testpages/CSS-struct-scoped-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1620,6 +1622,20 @@ echo "  JS-late-append: rows differing from the parse-time build $k378r (0), :fi
 [ "$k378r" = 0 ] && [ "$k378s" = 0 ] && [ "${k378n:-0}" -ge 2 ] &&
 	[ "${k378a:-0}" -ge 2 ] && [ "${k378g:-0}" -ge 1 ] ||
 	fail "late appends and boxless child-list changes"
+# Patch 379: the structural/counter check is scoped to the parent's
+# children (before: page-wide, patch 192). On a page with :nth-child,
+# :first-of-type, :first-child and counters, a block into an unreached box,
+# a <script> and a <div> among first-of-type paragraphs stay local; an
+# <li> into the striped list, a <p> among the paragraphs and the counting
+# headings decline. Renders row for row as the same steps at parse time.
+k379r=$(fl_rows JS-struct-scoped CSS-struct-scoped-ref)
+k379seg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-scoped: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k379l=$(printf '%s\n' "$k379seg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: child list changed only" || true)
+k379s=$(printf '%s\n' "$k379seg" | grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
+k379c=$(printf '%s\n' "$k379seg" | grep -c "declined (a removed block takes part in counting)\|building a new block takes part in counting" || true)
+echo "  JS-struct-scoped: rows differing from the parse-time build $k379r (0); ${k379l} changes local on the page (3 or more); structural rule matches ${k379s} (2 or more); counting ${k379c} (2 or more)"
+[ "$k379r" = 0 ] && [ "${k379l:-0}" -ge 3 ] && [ "${k379s:-0}" -ge 2 ] &&
+	[ "${k379c:-0}" -ge 2 ] || fail "structural check scoped to the parent"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and
@@ -1644,7 +1660,8 @@ echo "  JS-frames-local: rows differing from the parse-time build $frr (0); ${fr
 # item's marker box is freed.
 lsp=$(ls "$R"/*NET-js-list-structural*.plot 2>/dev/null)
 lsr=$(sed -n 's/.*STR \(LISTSTRUCT: [0-9]*\/[0-9]* passed\).*/\1/p' $lsp 2>/dev/null | head -1)
-lsd=$(grep -c 'LIFE rebuild local: declined (structural selectors or counters in page CSS)' "$R/netsurf.log" || true)
+# patch 379: the counter cases decline as the counting subtrees they are
+lsd=$(grep -c 'LIFE rebuild local: declined (structural selectors or counters in page CSS)\|LIFE rebuild local: declined (a removed block takes part in counting)\|LIFE rebuild local: building a new block takes part in counting' "$R/netsurf.log" || true)
 lsm=$(grep -c 'box_free: freed list marker' "$R/netsurf.log" || true)
 echo "  JS-list-structural: ${lsr:-no summary}; ${lsd} structural/counter declines, ${lsm} markers freed"
 [ -n "$lsp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lsp | sort -u | sed 's/^STR /  /'
@@ -2413,12 +2430,14 @@ mkdir -p "$S2/snaps"
 	> "$S2/stdout.log" 2>&1 ) || fail "slow autotest run"
 kill $HTTPD 2>/dev/null || true
 same=0; bad=0
-for f in "$R"/[01]*.plot; do
+for f in "$R"/[01][0-9]-*.plot; do
 	n=${f##*/}
 	case "$n" in 07-PM-animation*) continue ;; esac
 	# [01]* meant the bundled pages (01-19) until the network list ran
 	# past page 99: 100-* and up are network pages this run never
-	# loads (it has only NET-http-local).
+	# loads (it has only NET-http-local). Patch 379: the gate's own
+	# pages ran past 99 too (JS-popup became 100-), so the glob takes
+	# two-digit pages only -- the 01-19 this run loads.
 	case "$n" in
 	*-NET-*) [ -f "$S2/ux0:data/VitaBrowser/$n" ] || continue ;;
 	esac

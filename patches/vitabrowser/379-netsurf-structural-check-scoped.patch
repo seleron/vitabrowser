@@ -1,0 +1,669 @@
+# netsurf: the structural/counter check scoped to the parent (patch 379)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 378)
+#
+# Patch 192 declined every local block insertion and removal -- and 378's
+# no-op -- on a page whose CSS has a structural pseudo-class (:first-child,
+# :nth-*, :last-*, :only-*, *-of-type) or a counter anywhere: by the r103
+# census, youtube's five no-op answers all met it.
+#
+# Inserting or removing a child moves the child index of the parent's
+# children only. html_rl_block_struct_risk() therefore asks:
+#  - per sheet (cached as patch 186 caches its sibling rules: handle,
+#    source pointer, size, FNV-1a hash), the compound around each
+#    structural pseudo-class -- its tag, id and classes; attributes and
+#    other pseudo-classes ignored (a broader match: safe); one that does
+#    not parse simply (quotes, escapes, a namespace, one inside a
+#    functional pseudo such as :not(:first-child)) is unbounded;
+#  - per change, whether one can match a child element of THIS parent --
+#    an *-of-type one only when a moved element has its tag. Over 1000
+#    children, or 512 compounds in a sheet: risk, as before.
+#  - counters apart: 378's no-op ignores them (an element with no box
+#    counts nothing); a block insertion or removal declines when a removed
+#    box takes part in counting (374's html_rl_box_counts) and hands a new
+#    block whose build touched counters to the full reconvert (its failure
+#    path now through 374's html_rl_drop_new).
+# html_rl_block_list_style_risk and html_rl_css_has_list_style_risk go.
+#
+# Result on a 2500-paragraph sim page with :nth-child and :first-child
+# rules elsewhere: a block inserted into a box 109 -> 7 ms; a <script>
+# appended to <body> 107 -> 4 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6844,18 +6844,192 @@
+ 
+ #define HTML_RL_MAX_CHANGES 16
+ 
+-/* Patch 192: does a stylesheet's source use sibling-position structural
+- * pseudo-classes (:nth-child() etc.) or CSS counters? Inserting or removing
+- * a block/list item shifts every following sibling's child index and
+- * counter values, but the local path never recascades them (and the forced
+- * full layout doesn't re-run style selection either), so their styles and
+- * ::before/::after counter text would go stale. Scan the raw source,
+- * skipping comments and strings; conservative (a match in a dead rule still
+- * declines) but precise enough that ordinary pages never hit it.
+- * Case-insensitive; tokens must sit at identifier boundaries. CSS escapes
+- * inside the token itself (e.g. :\6e th-child) are not recognised -- the
+- * same limitation as the patch-186 scanner. */
+-static bool html_rl_css_has_list_style_risk(const uint8_t *s, size_t len)
++/* ---- Patch 379: the structural check, scoped to the parent ----------
++ *
++ * Patch 192 declined every block insert or removal -- and 378's no-op --
++ * on a page whose CSS has a structural pseudo-class or a counter anywhere
++ * (youtube: always). Inserting or removing a child moves the child index
++ * of the PARENT'S CHILDREN only, so a rule X:first-child (or :nth-*,
++ * :last-*, :only-*) can flip only for a child of that parent matching X,
++ * and an X:*-of-type rule only for a child of an inserted or removed
++ * element's tag. Each sheet's structural compounds are collected once
++ * (cached as patch 186 caches its sibling rules: handle, source pointer,
++ * size and an FNV-1a hash), as their tag, id and classes; attributes and
++ * other pseudo-classes in them are ignored (a broader match: safe). A
++ * compound that does not parse simply -- quotes, escapes, a namespace,
++ * one inside a functional pseudo (:not(:first-child)) -- is unbounded:
++ * it matches any child. Counters are reported apart (the caller decides:
++ * an element with no box counts nothing). */
++static uint32_t html_rl_fnv1a(const uint8_t *s, size_t len);
++static bool html_rl_box_counts(struct box *b);
++static void html_rl_drop_new(html_content *c, struct box *nb,
++		unsigned int objects_before);
++
++struct html_rl_struct_cp {
++	char *tag;		/* lowercased, or NULL */
++	char *id;		/* or NULL */
++	char **classes;
++	int ncl;
++	bool of_type;
++	bool unbounded;
++};
++#define HTML_RL_STRUCT_CACHE_N 32
++#define HTML_RL_STRUCT_CP_MAX 512
++struct html_rl_struct_sheet {
++	struct hlcache_handle *sheet;
++	const uint8_t *data;
++	size_t size;
++	uint32_t hash;
++	bool counters;
++	bool overflow;		/* too many compounds: every child risks */
++	struct html_rl_struct_cp *cps;
++	int ncps;
++};
++static struct html_rl_struct_sheet html_rl_struct_cache[HTML_RL_STRUCT_CACHE_N];
++static unsigned int html_rl_struct_cache_next;
++
++static bool html_rl_struct_ident_ch(uint8_t c)
++{
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++		(c >= '0' && c <= '9') || c == '-' || c == '_' || c >= 0x80;
++}
++
++static char *html_rl_struct_dup_lower(const uint8_t *s, size_t n)
++{
++	char *d = malloc(n + 1);
++	size_t i;
++
++	if (d == NULL)
++		return NULL;
++	for (i = 0; i < n; i++)
++		d[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) :
++			(char)s[i];
++	d[n] = 0;
++	return d;
++}
++
++static void html_rl_struct_cp_free(struct html_rl_struct_cp *cp)
++{
++	int i;
++
++	free(cp->tag);
++	free(cp->id);
++	for (i = 0; i < cp->ncl; i++)
++		free(cp->classes[i]);
++	free(cp->classes);
++	memset(cp, 0, sizeof(*cp));
++}
++
++static void html_rl_struct_sheet_free(struct html_rl_struct_sheet *e)
++{
++	int k;
++
++	for (k = 0; k < e->ncps; k++)
++		html_rl_struct_cp_free(&e->cps[k]);
++	free(e->cps);
++	memset(e, 0, sizeof(*e));
++}
++
++/* parse the compound s[a, b) into cp (tag, id, classes); unbounded if it
++ * does not parse simply */
++static void html_rl_struct_parse_cp(const uint8_t *s, size_t a, size_t b,
++		struct html_rl_struct_cp *cp)
++{
++	size_t i = a, j;
++
++	for (j = a; j < b; j++)
++		if (s[j] == '"' || s[j] == '\'' || s[j] == '\\' || s[j] == '|') {
++			cp->unbounded = true;
++			return;
++		}
++	if (i < b && s[i] == '*') {
++		i++;
++	} else if (i < b && html_rl_struct_ident_ch(s[i]) &&
++		   !(s[i] >= '0' && s[i] <= '9')) {
++		j = i;
++		while (j < b && html_rl_struct_ident_ch(s[j]))
++			j++;
++		cp->tag = html_rl_struct_dup_lower(s + i, j - i);
++		i = j;
++	}
++	while (i < b) {
++		uint8_t c = s[i];
++		if (c == '#' || c == '.') {
++			char *v;
++			j = ++i;
++			while (j < b && html_rl_struct_ident_ch(s[j]))
++				j++;
++			if (j == i) {
++				cp->unbounded = true;
++				return;
++			}
++			v = html_rl_struct_dup_lower(s + i, j - i);
++			if (v == NULL) {
++				cp->unbounded = true;
++				return;
++			}
++			if (c == '#') {
++				free(cp->id);
++				cp->id = v;
++			} else {
++				char **nc = realloc(cp->classes,
++					(cp->ncl + 1) * sizeof(char *));
++				if (nc == NULL) {
++					free(v);
++					cp->unbounded = true;
++					return;
++				}
++				cp->classes = nc;
++				cp->classes[cp->ncl++] = v;
++			}
++			i = j;
++		} else if (c == '[') {
++			while (i < b && s[i] != ']')
++				i++;
++			if (i >= b) {
++				cp->unbounded = true;
++				return;
++			}
++			i++;
++		} else if (c == ':') {
++			while (i < b && s[i] == ':')
++				i++;
++			while (i < b && html_rl_struct_ident_ch(s[i]))
++				i++;
++			if (i < b && s[i] == '(') {
++				int depth = 0;
++				for (; i < b; i++) {
++					if (s[i] == '(')
++						depth++;
++					else if (s[i] == ')' && --depth == 0)
++						break;
++				}
++				if (i >= b) {
++					cp->unbounded = true;
++					return;
++				}
++				i++;
++			}
++		} else {
++			cp->unbounded = true;
++			return;
++		}
++	}
++}
++
++static bool html_rl_struct_boundary(uint8_t c)
++{
++	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' ||
++		c == '>' || c == '+' || c == '~' || c == ',' || c == '{' ||
++		c == '}' || c == ';' || c == '(' || c == ')';
++}
++
++/* collect a sheet's structural compounds and counter use (the raw-source
++ * scanner of patch 192's html_rl_css_has_list_style_risk, which this
++ * replaces: comments and strings skipped, tokens at identifier
++ * boundaries, case-insensitive; escapes in a token not recognised) */
++static void html_rl_struct_scan(const uint8_t *s, size_t len,
++		struct html_rl_struct_sheet *e)
+ {
+ 	static const char *const toks[] = {
+ 		":first-child", ":last-child",
+@@ -6899,41 +7073,286 @@
+ 			continue;
+ 		}
+ 		for (k = 0; toks[k] != NULL; k++) {
+-			size_t tl = strlen(toks[k]);
+-			size_t j;
++			size_t tl = strlen(toks[k]), j, a, b;
+ 			if (i + tl > len)
+ 				continue;
+ 			for (j = 0; j < tl; j++) {
+-				uint8_t a = s[i + j], b = (uint8_t)toks[k][j];
+-				if (a >= 'A' && a <= 'Z')
+-					a += (uint8_t)('a' - 'A');
+-				if (a != b)
++				uint8_t x = s[i + j], y = (uint8_t)toks[k][j];
++				if (x >= 'A' && x <= 'Z')
++					x += (uint8_t)('a' - 'A');
++				if (x != y)
+ 					break;
+ 			}
+ 			if (j != tl)
+ 				continue;
+-			if (i > 0 && toks[k][0] != ':') {
+-				uint8_t p = s[i - 1];
+-				if ((p >= 'a' && p <= 'z') ||
+-				    (p >= 'A' && p <= 'Z') ||
+-				    (p >= '0' && p <= '9') ||
+-				    p == '_' || p == '-' || p >= 0x80)
+-					continue;
++			if (i > 0 && toks[k][0] != ':' &&
++			    html_rl_struct_ident_ch(s[i - 1]))
++				continue;
++			if (i + tl < len && html_rl_struct_ident_ch(s[i + tl]))
++				continue;
++			if (toks[k][0] != ':') {
++				e->counters = true;
++				break;
+ 			}
+-			if (i + tl < len) {
+-				uint8_t f = s[i + tl];
+-				if ((f >= 'a' && f <= 'z') ||
+-				    (f >= 'A' && f <= 'Z') ||
+-				    (f >= '0' && f <= '9') ||
+-				    f == '_' || f == '-' || f >= 0x80)
+-					continue;
++			/* the compound around the pseudo-class */
++			a = i;
++			while (a > 0 && !html_rl_struct_boundary(s[a - 1]))
++				a--;
++			b = i + tl;
++			if (b < len && s[b] == '(') {
++				int depth = 0;
++				for (; b < len; b++) {
++					if (s[b] == '(')
++						depth++;
++					else if (s[b] == ')' && --depth == 0)
++						break;
++				}
++				if (b < len)
++					b++;
+ 			}
+-			return true;
++			while (b < len && !html_rl_struct_boundary(s[b]))
++				b++;
++			if (e->ncps >= HTML_RL_STRUCT_CP_MAX) {
++				e->overflow = true;
++			} else {
++				struct html_rl_struct_cp *n = realloc(e->cps,
++					(e->ncps + 1) * sizeof(*n));
++				if (n == NULL) {
++					e->overflow = true;
++				} else {
++					e->cps = n;
++					memset(&n[e->ncps], 0, sizeof(*n));
++					n[e->ncps].of_type =
++						strstr(toks[k], "of-type") != NULL;
++					/* inside a functional pseudo: unbounded */
++					if (a > 0 && s[a - 1] == '(')
++						n[e->ncps].unbounded = true;
++					else
++						html_rl_struct_parse_cp(s, a, b,
++							&n[e->ncps]);
++					e->ncps++;
++				}
++			}
++			i = b > i ? b - 1 : i;
++			break;
++		}
++	}
++}
++
++static struct html_rl_struct_sheet *html_rl_struct_sheet_for(
++		struct hlcache_handle *sheet)
++{
++	const uint8_t *data;
++	size_t size = 0;
++	uint32_t hash;
++	unsigned int k;
++	struct html_rl_struct_sheet *e = NULL;
++
++	data = content_get_source_data(sheet, &size);
++	if (data == NULL || size == 0)
++		return NULL;
++	hash = html_rl_fnv1a(data, size);
++	for (k = 0; k < HTML_RL_STRUCT_CACHE_N; k++)
++		if (html_rl_struct_cache[k].sheet == sheet) {
++			e = &html_rl_struct_cache[k];
++			break;
+ 		}
++	if (e == NULL) {
++		e = &html_rl_struct_cache[html_rl_struct_cache_next];
++		html_rl_struct_cache_next = (html_rl_struct_cache_next + 1) %
++			HTML_RL_STRUCT_CACHE_N;
++	} else if (e->data == data && e->size == size && e->hash == hash) {
++		return e;
++	}
++	html_rl_struct_sheet_free(e);
++	e->sheet = sheet;
++	e->data = data;
++	e->size = size;
++	e->hash = hash;
++	html_rl_struct_scan(data, size, e);
++	return e;
++}
++
++/* one child element as the compounds see it */
++struct html_rl_struct_el {
++	char *tag;
++	char *id;
++	char *cls;	/* lowercased, space separated */
++};
++
++static bool html_rl_struct_has_class(const char *list, const char *c)
++{
++	size_t n = strlen(c);
++	const char *p = list;
++
++	while (p != NULL && *p != 0) {
++		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
++		       *p == '\f')
++			p++;
++		if (strncmp(p, c, n) == 0 &&
++		    (p[n] == 0 || p[n] == ' ' || p[n] == '\t' ||
++		     p[n] == '\n' || p[n] == '\r' || p[n] == '\f'))
++			return true;
++		while (*p != 0 && *p != ' ' && *p != '\t' && *p != '\n' &&
++		       *p != '\r' && *p != '\f')
++			p++;
+ 	}
+ 	return false;
+ }
+ 
++static bool html_rl_struct_cp_matches(const struct html_rl_struct_cp *cp,
++		const struct html_rl_struct_el *e)
++{
++	int i;
++
++	if (cp->unbounded)
++		return true;
++	if (cp->tag != NULL && (e->tag == NULL || strcmp(cp->tag, e->tag) != 0))
++		return false;
++	if (cp->id != NULL && (e->id == NULL || strcmp(cp->id, e->id) != 0))
++		return false;
++	for (i = 0; i < cp->ncl; i++)
++		if (e->cls == NULL || !html_rl_struct_has_class(e->cls,
++				cp->classes[i]))
++			return false;
++	return true;
++}
++
++static char *html_rl_struct_attr(dom_node *n, dom_string *name)
++{
++	dom_string *v = NULL;
++	char *r = NULL;
++
++	if (dom_element_get_attribute((dom_element *)n, name, &v) ==
++			DOM_NO_ERR && v != NULL) {
++		r = html_rl_struct_dup_lower((const uint8_t *)dom_string_data(v),
++				dom_string_byte_length(v));
++		dom_string_unref(v);
++	}
++	return r;
++}
++
++static char *html_rl_struct_tag(dom_node *n)
++{
++	dom_string *v = NULL;
++	char *r = NULL;
++
++	if (n != NULL && dom_node_get_node_name(n, &v) == DOM_NO_ERR &&
++	    v != NULL) {
++		r = html_rl_struct_dup_lower((const uint8_t *)dom_string_data(v),
++				dom_string_byte_length(v));
++		dom_string_unref(v);
++	}
++	return r;
++}
++
++/* Patch 379: can a structural rule (or, with counters_matter, a counter)
++ * in page CSS restyle a child of pnode now that the elements of tags
++ * moved[0..nmoved) went in or out? */
++static bool html_rl_block_struct_risk(html_content *c, dom_node *pnode,
++		char **moved, unsigned int nmoved, bool counters_matter,
++		const char **why)
++{
++	struct html_rl_struct_sheet *sh[64];
++	struct html_rl_struct_el *els = NULL;
++	unsigned int nsh = 0, si, nel = 0, k, m;
++	bool any = false, risk = false;
++	dom_node *ch = NULL, *nx;
++	int q;
++
++	*why = NULL;
++	for (si = STYLESHEET_START; si < c->stylesheet_count && nsh < 64;
++	     si++) {
++		struct html_rl_struct_sheet *e;
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		e = html_rl_struct_sheet_for(c->stylesheets[si].sheet);
++		if (e == NULL)
++			continue;
++		if (counters_matter && e->counters) {
++			*why = "counters in page CSS";
++			return true;
++		}
++		if (e->ncps > 0 || e->overflow) {
++			sh[nsh++] = e;
++			any = true;
++		}
++	}
++	if (si < c->stylesheet_count) {
++		*why = "too many sheets";
++		return true;
++	}
++	if (!any)
++		return false;
++	/* the parent's children, read once */
++	if (dom_node_get_first_child(pnode, &ch) != DOM_NO_ERR)
++		ch = NULL;
++	while (ch != NULL) {
++		dom_node_type type;
++		if (dom_node_get_node_type(ch, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			struct html_rl_struct_el *ne;
++			if (nel >= 1000) {
++				*why = "a parent of over 1000 children";
++				risk = true;
++				dom_node_unref(ch);
++				break;
++			}
++			ne = realloc(els, (nel + 1) * sizeof(*ne));
++			if (ne == NULL) {
++				*why = "no memory";
++				risk = true;
++				dom_node_unref(ch);
++				break;
++			}
++			els = ne;
++			els[nel].tag = html_rl_struct_tag(ch);
++			els[nel].id = html_rl_struct_attr(ch, corestring_dom_id);
++			els[nel].cls = html_rl_struct_attr(ch,
++					corestring_dom_class);
++			nel++;
++		}
++		nx = NULL;
++		if (dom_node_get_next_sibling(ch, &nx) != DOM_NO_ERR)
++			nx = NULL;
++		dom_node_unref(ch);
++		ch = nx;
++	}
++	for (si = 0; si < nsh && !risk; si++) {
++		if (sh[si]->overflow && nel > 0) {
++			*why = "a sheet of too many structural rules";
++			risk = true;
++			break;
++		}
++		for (q = 0; q < sh[si]->ncps && !risk; q++) {
++			const struct html_rl_struct_cp *cp = &sh[si]->cps[q];
++			if (cp->of_type && cp->tag != NULL) {
++				/* only the moved elements' own type */
++				bool same = false;
++				for (m = 0; m < nmoved && !same; m++)
++					same = moved[m] != NULL &&
++						strcmp(moved[m], cp->tag) == 0;
++				if (!same)
++					continue;
++			}
++			for (k = 0; k < nel && !risk; k++)
++				if (html_rl_struct_cp_matches(cp, &els[k])) {
++					*why = "a structural rule matches a "
++						"sibling";
++					risk = true;
++				}
++		}
++	}
++	for (k = 0; k < nel; k++) {
++		free(els[k].tag);
++		free(els[k].id);
++		free(els[k].cls);
++	}
++	free(els);
++	return risk;
++}
++
+ /* ---- Patch 310 (doc 20 stage 2): the non-class attribute gate ----
+  *
+  * A SETATTRIBUTE / REMOVEATTRIBUTE mark names an attribute the local
+@@ -7298,34 +7717,13 @@
+ 	return ok;
+ }
+ 
+-/* Patch 192: true if a used document stylesheet uses sibling-position
+- * structural pseudo-classes or CSS counters, whose following-sibling
+- * styles the local block insert/remove path would leave stale. */
++/* Patch 192's page-wide structural/counter check is replaced by patch
++ * 379's html_rl_block_struct_risk (scoped to the parent). */
+ /* Patch 198 (below, after the patch-186 sheet machinery it uses). */
+ static bool html_rl_block_sibling_risk(html_content *c, dom_node *pnode,
+ 		dom_node **added, unsigned int nadd,
+ 		struct box **removed, unsigned int nrem);
+ 
+-static bool html_rl_block_list_style_risk(html_content *c)
+-{
+-	unsigned int i;
+-
+-	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
+-		const uint8_t *data;
+-		size_t size = 0;
+-
+-		if (c->stylesheets[i].sheet == NULL ||
+-		    c->stylesheets[i].unused)
+-			continue;
+-		data = content_get_source_data(c->stylesheets[i].sheet,
+-				&size);
+-		if (data == NULL || size == 0)
+-			continue;
+-		if (html_rl_css_has_list_style_risk(data, size))
+-			return true;
+-	}
+-	return false;
+-}
+ 
+ /* A script inserted and/or removed blocks among parent's block children:
+  * build (or unlink) just those and place them (layout_relayout_block).
+@@ -7837,8 +8235,22 @@
+ 	 * with a tag-only left compound naming them could see one go. */
+ 	if (nadd == 0 && nrem == 0 && pnode == html_rl_childlist_parent &&
+ 	    !skip_over) {
+-		if (html_rl_block_list_style_risk(c))
++		/* patch 379: scoped to this parent's children; counters do
++		 * not matter (an element with no box counts nothing) */
++		char *tags[HTML_RL_MAX_CHANGES];
++		const char *swhy = NULL;
++		bool srisk;
++		for (i = 0; i < nskip; i++)
++			tags[i] = html_rl_struct_tag(skipped[i]);
++		srisk = html_rl_block_struct_risk(c, pnode, tags, nskip, false,
++				&swhy);
++		for (i = 0; i < nskip; i++)
++			free(tags[i]);
++		if (srisk) {
++			macsurf_debug_log_writef("LIFE rebuild local: "
++				"structural check: %s", swhy ? swhy : "?");
+ 			RL_BNO("structural selectors or counters in page CSS");
++		}
+ 		if (html_rl_block_sibling_risk(c, pnode, skipped, nskip,
+ 				NULL, 0))
+ 			RL_BNO("sibling combinator may see an element with no "
+@@ -7863,8 +8275,35 @@
+ 	 * recascades them (and the forced full layout doesn't re-run style
+ 	 * selection), so decline and let the full reconversion rebuild
+ 	 * styles from the DOM. */
+-	if (html_rl_block_list_style_risk(c))
+-		RL_BNO("structural selectors or counters in page CSS");
++	/* Patch 379: scoped to this parent's children and the moved
++	 * elements' tags; counters apart -- a removed box that counts
++	 * declines here, a new one that counts after its build */
++	{
++		char *tags[2 * HTML_RL_MAX_CHANGES];
++		unsigned int nt = 0;
++		const char *swhy = NULL;
++		bool srisk;
++		for (i = 0; i < nadd; i++)
++			tags[nt++] = html_rl_struct_tag(added[i]);
++		for (i = 0; i < nrem; i++) {
++			dom_node *re = NULL, *rp = NULL, *rn = NULL;
++			html_rl_removed_nodes(removed[i], &re, &rp, &rn);
++			tags[nt++] = html_rl_struct_tag(re);
++		}
++		srisk = html_rl_block_struct_risk(c, pnode, tags, nt, false,
++				&swhy);
++		for (i = 0; i < nt; i++)
++			free(tags[i]);
++		if (srisk) {
++			macsurf_debug_log_writef("LIFE rebuild local: "
++				"structural check: %s", swhy ? swhy : "?");
++			RL_BNO("structural selectors or counters in page CSS");
++		}
++		for (i = 0; i < nrem; i++)
++			if (html_rl_box_counts(removed[i]))
++				RL_BNO("a removed block takes part in "
++					"counting");
++	}
+ 
+ 	/* Patch 198: sibling combinators (+ / ~), :empty and :has() can
+ 	 * restyle a following sibling, the parent or an ancestor when a
+@@ -7920,16 +8359,17 @@
+ 		unsigned int objects_before = c->num_objects;
+ 
+ 		(void) html_reconvert_reset_node_data_walk(added[i], 0);
+-		if (!box_build_element(c, added[i])) {
++		box_counters_touched_reset();	/* patch 379 */
++		if (!box_build_element(c, added[i]) || box_counters_touched()) {
++			bool counts = box_counters_touched();
+ 			nb = box_for_node(added[i]);
+-			if (nb != NULL) {
+-				html_rl_unlink(nb);
+-				box_free(nb);
+-			}
++			/* patch 379: kept if it fetched objects (374) */
++			html_rl_drop_new(c, nb, objects_before);
+ 			for (; i < nadd; i++)
+ 				dom_node_unref(added[i]);
+ 			macsurf_debug_log_writef("LIFE rebuild local: "
+-				"building a new block failed, full reconvert");
++				"building a new block %s, full reconvert",
++				counts ? "takes part in counting" : "failed");
+ 			return -1;	/* the full rebuild starts from the DOM */
+ 		}
+ 		nb = box_for_node(added[i]);
