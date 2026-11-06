@@ -9084,3 +9084,102 @@ wpblog -0.3, hackernews -0.1).
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 377 (2026-11-06): blocks inserted or removed among mixed siblings, locally
+
+**The shape.** The r101 census had youtube's "parent holds more than
+blocks" (5). A temporary trace (the parent, its children's box types,
+and the contents of any anonymous inline container) showed two cases:
+- youtube's `<body>` holds a block, a flex `<div>` (`BOX_FLEX`) and an
+  anonymous line of inline content: a hidden 0x0 `<iframe>`;
+- guardian's `<body>` (2) holds a line of 18 `<gu-island>` custom
+  elements among its blocks.
+
+`html_rl_block_change`, the insert/remove path, took only parents of
+blocks and float carriers. It was also entered only when the parent's
+*first* child was a block, so a `<body>` starting with a table went to
+the line path and declined there.
+
+**The change** (html.c):
+- Flex, grid and table element boxes are tracked like blocks: one whose
+  element left is a removal, with the same object and frame checks. The
+  page is then laid out whole.
+- An anonymous inline container among the blocks stays as it is, as long
+  as every element it holds is still in the parent
+  (`html_rl_ic_intact`). Text directly in the parent still declines on
+  its own. The DOM walk accepts an inline element whose box sits in such
+  a container.
+- Declined:
+  - a new block whose element neighbours share one line container (it
+    would split the line: a full build makes two);
+  - a removal that leaves two line containers side by side (a full build
+    makes them one line);
+  - an element gone from a line container.
+- Elements that never have a box (`script`, `style`, `link`, `meta`,
+  `template`, `title`, `base`, `noscript`) are skipped in the DOM walk.
+  Before, a `<script>` in `<body>` read as a new block, which was unit
+  362's shape.
+- The path is entered when the block holds any block-level child
+  (`html_rl_has_block_child`), not only when a block comes first.
+- `html_rl_normalise_new`: a new box is normalised by its type (see
+  below).
+
+**gate377 aborted** (exit 134) with `box_normalise_block` asserting that
+the block is a `BOX_BLOCK`, `BOX_INLINE_BLOCK` or `BOX_TABLE_CELL`.
+JS-objects-relink's display:flex `<div>`, hidden and then shown, now
+reached this path (the widened dispatch read it as a new block), and its
+new box is a `BOX_FLEX`. The bug was latent before, for any
+display:flex `<div>` inserted among plain blocks: the "plain block" test
+checks only tags. The fix:
+- normalise a new box by its type: flex/grid via
+  `box_normalise_flex_ext`, table via `box_normalise_table_ext`;
+- if it does not normalise, hand over to the full reconvert with the
+  tree whole. The old code carried on and laid out an unnormalised box;
+- lay the page out whole for a non-block new box.
+
+JS-mixed-siblings gained a display:flex insert, and the gate requires it
+("new box normalised as a flex or grid", 2).
+
+**Result** on `ST-377.html` (2500 paragraphs; `<body>` holds tables, a
+flex and a line of inline content; median of 3): a block inserted into
+`<body>` or removed from it, **103 -> 15 ms**.
+
+**Gate.** JS-mixed-siblings runs nine steps in `<body>`, with its
+`<script>` present, 600 ms apart:
+- local: a paragraph appended; a block inserted before the flex; a block
+  removed; the flex removed; a block inserted after a line of inline
+  content; a display:flex `<div>` inserted;
+- declined: a block between two spans of one line (split); a block
+  between two lines removed (join); an inline `<span>` removed (lost).
+
+It renders row for row as its parse-time reference: **0 rows**. On the
+376 binary it is also 0 rows, all steps declined "parent holds more than
+blocks". 6 block changes were placed locally, with every decline seen.
+`gate377b.log`, exit 0, with every 364-376 check unchanged. Restage
+from pristine: 470 applied plus the 2 known collisions, html.c
+byte-identical.
+
+**Scorecard r102**: 21 sites against `r79-360`, the 377 and 376 binaries
+run back to back (`score/r102-377`, `score/r102-pre377`): **71.52 vs
+71.54**. No crash; per site equal within live noise.
+
+**Load-time census.**
+- "parent holds more than blocks" went from **5 to 0** on youtube and
+  **2 to 0** on guardian, but those changes now decline downstream,
+  mostly at "new element is not a plain block, list item or block of
+  blocks" (youtube 4 -> 7): the elements inserted are complex.
+- Total full rebuilds read 121 vs 114. That is claude's run-to-run
+  batching noise: claude's full rebuilds range from 5 to 13 across
+  r96-r102 on adjacent binaries, in both directions (r96 13 vs 5, r101
+  5 vs 8). google moves between 11 and 14, oldreddit between 7 and 10,
+  and youtube went 22 -> 21.
+
+**Next**, by the r102 census:
+1. **"new element is not a plain block, list item or block of blocks"**
+   (youtube 7, guardian 1): inserted elements of arbitrary shape. They
+   could take the subtree build of 376 with a full layout.
+2. **The fixes1135 class-drop** (372 entry), a correctness bug.
+3. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
