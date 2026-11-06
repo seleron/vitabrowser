@@ -9274,3 +9274,102 @@ guardian +0.9).
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 379 (2026-11-06): the structural/counter check scoped to the parent
+
+**Why.** Patch 192 (`html_rl_block_list_style_risk`) declined every
+local block insertion and removal, and 378's no-op, on any page whose
+CSS has a structural pseudo-class (`:first-child`, `:nth-*`, `:last-*`,
+`:only-*`, `*-of-type`) or a counter anywhere. By the r103 census,
+youtube's five no-op answers all met it.
+
+**The argument.** Inserting or removing a child moves the child index
+of the parent's children only. So a rule `X:first-child` can flip only
+for a child of that parent matching `X`. An `X:*-of-type` rule can flip
+only when an element of `X`'s tag was inserted or removed. Counters can
+be moved only by an element that counts.
+
+**The change** (html.c):
+- `html_rl_block_struct_risk()` keeps a per-sheet cache, as patch 186
+  caches its sibling rules (handle, source pointer, size, FNV-1a hash).
+  For each structural pseudo-class it records the surrounding compound:
+  - its tag, id and classes;
+  - attributes and other pseudo-classes are ignored, which makes the
+    match broader, so it stays safe;
+  - one that does not parse simply (quotes, escapes, a namespace, one
+    inside a functional pseudo such as `:not(:first-child)`) counts as
+    unbounded and matches any child.
+- Per change, the parent's child elements are read once (tag, id,
+  classes) and tested against the compounds. An `*-of-type` compound
+  counts only when a moved element has its tag. Over 1000 children or
+  512 compounds in a sheet, it reports a risk, as before.
+- Counters are handled apart:
+  - 378's no-op ignores them, because an element with no box counts
+    nothing;
+  - a block insertion or removal declines when a removed box takes part
+    in counting (374's `html_rl_box_counts`);
+  - a new block whose build touched counters goes to the full
+    reconvert, through 374's `html_rl_drop_new`.
+- 192's `html_rl_block_list_style_risk` and
+  `html_rl_css_has_list_style_risk` go.
+
+**Result** on `ST-379.html` (2500 paragraphs, with `:nth-child` and
+`:first-child` rules elsewhere on the page; median of 3):
+
+| change | 378 | 379 |
+|---|---|---|
+| a block inserted into a box | 109 ms | 7 ms |
+| a `<script>` appended to `<body>` | 107 ms | 4 ms |
+
+**Gate.** JS-struct-scoped runs on a page with `:nth-child`,
+`:first-of-type`, `:first-child` and counters, seven steps 600 ms apart:
+- local: a block into a box no rule reaches; a `<script>` appended to
+  `<body>` (no rebuild); a `<div>` among `p:first-of-type` paragraphs;
+- declined: an `<li>` into the striped list and a `<p>` among the
+  paragraphs (a structural rule matches); a counting heading removed, and
+  one inserted (counting).
+
+It renders row for row as its parse-time reference: **0 rows**. On the
+378 binary it is also 0 rows, with all eight answers page-wide declines.
+JS-list-structural (192's own page) stays LISTSTRUCT 6/6. Its decline
+count now also accepts the scoped counting reasons.
+
+Two runs failed on the gate, not the engine:
+- `gate379` failed on the **Vita-pace section**. Its glob `[01]*` meant
+  bundled pages 01-19, but the gate's own pages passed 99 this week
+  (JS-popup became `100-`), and the slow run never loads those. The glob
+  is now `[01][0-9]-*`.
+- `gate379b` failed on a **TIMERNEST timing flake**: the last clamped
+  timer gap read 3.3 ms against a 3.5 ms threshold. That test passed 65
+  times in the gate logs before.
+
+`gate379c.log`: exit 0, including Vita pace with 23 identical and 0
+differ. Restage from pristine: 472 applied plus the 2 known collisions,
+html.c byte-identical.
+
+**Scorecard r104**: 21 sites against `r79-360`, the 379 and 378 binaries
+run back to back (`score/r104-379`, `score/r104-pre379`): **70.86 vs
+72.83**. The gap is one wpblog blank load (28.4: text 0.0, visual 0.336).
+On rerun, wpblog read 68.2 on all three 379 runs, and the 378 binary
+**crashed** once of three. That is the known intermittent wpblog
+instability (365 entry), seen on both. The other sites are equal within
+live noise.
+
+**Load-time census.** The scoped check finds **real matches** on the
+sites that met 192 before: youtube 6 and guardian 1, "a structural rule
+matches a sibling" (a rule there does reach the parent's children). So no
+load-time rebuild is saved on these 21 sites; full rebuilds 107 vs 116 are
+within noise. The win is at interaction time, on pages whose structural
+rules sit elsewhere.
+
+**Next:**
+1. **youtube's real matches.** Which compound matches `<body>`'s
+   children; an `:nth-*` that cannot change for an appended last child
+   (`:first-child`, `:nth-child(an+b)` of earlier siblings) could be
+   exempted for appends at the end.
+2. **The fixes1135 class-drop** (372 entry), a correctness bug.
+3. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+4. **Gate hygiene**: JS-block-class-sibling and TIMERNEST timing flakes.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
