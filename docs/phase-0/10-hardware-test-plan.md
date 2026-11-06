@@ -8692,3 +8692,98 @@ none were saved yet: three tracks now decline on "counters in page CSS"
 (373): the counters guard only needs to fire when a sheet displays a
 counter (`counter(` / `counters(`); then the shapes of "not one line
 container".
+
+## Patch 373 (2026-11-06): blocks with generated content, and empty blocks, built again alone
+
+**The shapes.** "block is not one line container of plain content", the
+370 census's second unparked cause, has two shapes this patch takes:
+- **A change in a block with ::before / ::after** (youtube, wpblog,
+  github). The line path rebuilds only the element's children
+  (`box_rebuild_children`), so the generated boxes would be lost.
+- **Content arriving in an empty block** (github, google, wikipedia).
+  There is no line to rebuild.
+
+Both were full box-tree rebuilds: 104-109 ms on the 2500-paragraph sim
+page.
+
+**The change** (html.c):
+- `html_reconvert_local_change`: such a block is built again whole, as
+  a restyle of its own box (`html_rl_block_restyle`, patch 174), with
+  the current class passed as the old one so no class has changed.
+  `box_build_element` makes the generated content and the new children,
+  cascaded afresh. The block is placed locally among plain blocks, else
+  the page is laid out whole. The log line is "a block with generated
+  content / content in an empty block, the block built again".
+- Declined:
+  - **a counter shown in page CSS**, when the block has generated
+    content: box construction numbers `counter()` in one flat table per
+    build pass, so a block built alone would count from zero;
+  - **a sibling rule whose left compound tests `:empty`**, when the
+    block was or becomes empty (`html_rl_empty_sibling_risk`: patch
+    198's compounds, and a state-2 sheet searched as text). The block's
+    own `:empty` is cascaded again by its rebuild, and no ancestor can
+    be empty. The line path gets the same check when it empties a
+    block; it had none before (a pre-existing gap, closed).
+- `html_rl_page_counter_shown()` (`counter(` / `counters(` in a sheet)
+  replaces 369's `counter-` match in 372's flex restyle and in the
+  generated-content route. Without a shown counter, `counter-reset` and
+  `counter-increment` change nothing on screen. 369's table restyle and
+  192's list check keep their broader scan.
+
+**Result** on `ST-373.html` (2500 paragraphs, median of 3, host sim):
+
+| change | 372 | 373 |
+|---|---|---|
+| text under ::before | 109 ms | 18 ms |
+| content into an empty div | 104 ms | 18 ms |
+| a flex track's style on a `counter-reset` page | 107 ms | 19 ms |
+
+**Gate.** JS-gen-empty runs nine steps 250 ms apart:
+- text under ::before, and text under ::after;
+- a span's class in a ::before block;
+- content arriving in an empty div, and text in an empty paragraph;
+- an empty div styled by `:empty` filled (its own `:empty` cascaded
+  again);
+- a ::before block emptied (its generated content stays);
+- a paragraph emptied, then filled again.
+
+JS-gen-empty-sib is a `.slot:empty + p` rule plus an `h3::before`
+counter: both changes decline. Each renders row for row as its
+parse-time reference: **0 rows and 0 rows**. On the 372 binary both are
+also 0 rows, taken by full rebuilds. Across the gate 29 blocks were
+built again (other gate pages with ::before now take the route too, and
+their own row checks still pass), with 1 `:empty` decline and 3 counter
+declines. Full gate `gate373.log`, exit 0: JS-flex-restyle, JS-style-attr
+and JS-frames-local all unchanged. Restage from pristine: 466 applied
+plus the 2 known collisions, files byte-identical.
+
+**Scorecard r98**: 21 sites against `r79-360`, the 373 and 372 binaries
+run back to back (`score/r98-373`, `score/r98-pre373`): **71.61 vs
+71.58**. No crash; per site equal within live noise (ddglite +1.0,
+hackernews -0.5, stackoverflow +0.2).
+
+**Load-time census.** "not one line container" fell to 0 on youtube (2),
+wpblog (1) and wikipedia (1), but only youtube saved a full rebuild (1).
+The others now decline on real guards:
+- **rte's** tracks (3), **wpblog** (2) and **github** (1): "a counter
+  shown in page CSS". These sites do display a counter, so the
+  narrowing of the guard is right but does not reach them.
+- **wikipedia**: a `:empty` sibling rule.
+
+Full rebuilds per site are unchanged within batching noise. As with
+370-372, the win is at interaction time (carousels, live tickers,
+expanding panels).
+
+**Next**, by this census:
+1. **Counters done right.** Keep the page's counter values across a
+   local build (snapshot the flat table at the block's position, or
+   recompute from the previous sibling's state). This decides rte,
+   wpblog and github.
+2. **youtube's "parent holds more than blocks" (5)**: block restyle or
+   change in a parent mixing blocks with inline containers.
+3. **Objects in rebuilt subtrees** (youtube 3, rte 1): re-link the
+   `content_html_object` entries instead of declining.
+4. **The fixes1135 class-drop** (372 entry), a correctness bug.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
