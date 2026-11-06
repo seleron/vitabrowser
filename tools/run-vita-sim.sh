@@ -256,6 +256,8 @@ JS-objects-relink file:///app0:/testpages/JS-objects-relink.html
 CSS-objects-relink-ref file:///app0:/testpages/CSS-objects-relink-ref.html
 JS-block-subtree file:///app0:/testpages/JS-block-subtree.html
 CSS-block-subtree-ref file:///app0:/testpages/CSS-block-subtree-ref.html
+JS-mixed-siblings file:///app0:/testpages/JS-mixed-siblings.html
+CSS-mixed-siblings-ref file:///app0:/testpages/CSS-mixed-siblings-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1581,6 +1583,23 @@ k376d=$(grep -c "LIFE rebuild local: declined (restyled block holds floats or li
 echo "  JS-block-subtree: rows differing from the parse-time build $k376r (0); ${k376l} block subtrees restyled on the page (5 or more); floats/markers declines ${k376d} (2 or more)"
 [ "$k376r" = 0 ] && [ "${k376l:-0}" -ge 5 ] && [ "${k376d:-0}" -ge 2 ] ||
 	fail "non-plain blocks restyled alone"
+# Patch 377: blocks inserted into or removed from a parent that also
+# holds flex/grid/table boxes, inline content or a <script> are placed
+# locally and the page laid out whole (before: "parent holds more than
+# blocks", a full rebuild). The page renders row for row as the same steps
+# at parse time; a block that would split a line, a removal that would
+# join two lines and a removed inline element keep the full rebuild.
+k377r=$(fl_rows JS-mixed-siblings CSS-mixed-siblings-ref)
+k377l=$(awk '/ page [0-9]+\/[0-9]+ JS-mixed-siblings: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (\(flex, grid or table\|inline content\) among the blocks)" || true)
+k377s=$(grep -c "LIFE rebuild local: declined (new block would split a line)" "$R/netsurf.log" || true)
+k377j=$(grep -c "LIFE rebuild local: declined (removal would join two lines)" "$R/netsurf.log" || true)
+k377e=$(grep -c "LIFE rebuild local: declined (inline content among the blocks lost an element)" "$R/netsurf.log" || true)
+k377f=$(grep -c "LIFE rebuild local: new box normalised as a \(flex or grid\|table\)" "$R/netsurf.log" || true)
+echo "  JS-mixed-siblings: rows differing from the parse-time build $k377r (0); ${k377l} block changes placed among mixed siblings (5 or more); declined: split ${k377s}, join ${k377j}, inline element lost ${k377e} (1 or more each); new flex boxes ${k377f} (1 or more)"
+[ "$k377r" = 0 ] && [ "${k377l:-0}" -ge 5 ] && [ "${k377s:-0}" -ge 1 ] &&
+	[ "${k377j:-0}" -ge 1 ] && [ "${k377e:-0}" -ge 1 ] && [ "${k377f:-0}" -ge 1 ] ||
+	fail "block changes among mixed siblings"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

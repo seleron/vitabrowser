@@ -1,0 +1,346 @@
+# netsurf: blocks inserted or removed among mixed siblings, locally (patch 377)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 376)
+#
+# The r101 census: youtube's "parent holds more than blocks" (5). A
+# temporary trace: youtube's <body> holds a block, a flex <div> and a line
+# of inline content (a hidden 0x0 <iframe>); guardian's <body> a line of
+# <gu-island> custom elements among its blocks. html_rl_block_change (the
+# insert/remove path) took only parents of blocks and float carriers, and
+# was entered only when the FIRST child was a block -- a <body> that starts
+# with a table went to the line path and declined there.
+#
+#  - Flex, grid and table element boxes among the blocks are tracked like
+#    blocks (one whose element left is a removal, with the same
+#    object/frame checks), and the page is laid out whole.
+#  - An anonymous inline container among the blocks stays as it is if
+#    every element it holds is still in the parent (html_rl_ic_intact;
+#    text directly in the parent declines on its own), page laid out
+#    whole; the DOM walk accepts an inline element whose box is in one.
+#  - Declined: a new block whose element neighbours are in the same line
+#    container (it would split the line: a full build makes two); a
+#    removal that leaves two line containers side by side (a full build
+#    makes one line of them); an element gone from a line container.
+#  - Elements that never have a box (script, style, link, meta, template,
+#    title, base, noscript) are skipped in the DOM walk: a <script> in
+#    <body> read as a new block (unit 362's shape).
+#  - The path is entered when the block holds any block-level child
+#    (html_rl_has_block_child), not only a block first.
+#  - A new box is normalised by its type (html_rl_normalise_new): a new
+#    element can be a flex, grid or table box by its CSS, and
+#    box_normalise_block asserted on one (gate377 aborted: a shown
+#    display:flex <div> among <body>'s mixed children; latent before, for
+#    a display:flex <div> inserted among plain blocks). Not normalised ->
+#    the full reconvert (the tree is whole), where the old code laid out
+#    an unnormalised box; a non-block new box -> the page laid out whole.
+#
+# Result on a 2500-paragraph sim page whose <body> holds tables, a flex and
+# a line of inline content: a block inserted into it, or removed,
+# 103 -> 15 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7379,6 +7379,120 @@
+ 
+ /* Patch 365: the box among pbox's children that holds b (b itself, or
+  * the float carrier its float sits in); NULL if b is not under pbox */
++/* Patch 377: does a box hold a block-level child (a block, a flex, grid
++ * or table element box, a float carrier)? Not a box of one line. */
++static bool html_rl_has_block_child(struct box *block)
++{
++	struct box *b;
++
++	for (b = block->children; b != NULL; b = b->next)
++		if (b->type == BOX_BLOCK || html_rl_float_carrier(b) ||
++		    ((b->type == BOX_FLEX || b->type == BOX_GRID ||
++		      b->type == BOX_TABLE) && b->node != NULL))
++			return true;
++	return false;
++}
++
++/* Patch 377: an anonymous inline container (inline content directly in a
++ * parent of blocks: youtube's hidden <iframe> in <body>, guardian's
++ * <gu-island>s) */
++static bool html_rl_anon_ic(const struct box *b)
++{
++	return b != NULL && b->type == BOX_INLINE_CONTAINER && b->node == NULL;
++}
++
++/* Patch 377: is every element an inline container holds still inside
++ * pnode (none removed: its box would stay behind)? Text inside them is an
++ * element's (text directly in pnode declines on its own below). */
++static bool html_rl_ic_intact(struct box *ic, dom_node *pnode)
++{
++	struct box *k = ic->children;
++
++	while (k != NULL) {
++		if (k->node != NULL) {
++			dom_node *n = k->node, *up;
++			bool in = false;
++			dom_node_ref(n);
++			while (n != NULL) {
++				up = NULL;
++				if (dom_node_get_parent_node(n, &up) !=
++						DOM_NO_ERR)
++					up = NULL;
++				dom_node_unref(n);
++				n = up;
++				if (n == pnode) {
++					in = true;
++					break;
++				}
++			}
++			if (n != NULL)
++				dom_node_unref(n);
++			if (!in)
++				return false;
++		}
++		/* next in document order, inside ic */
++		if (k->children != NULL) {
++			k = k->children;
++			continue;
++		}
++		while (k != ic && k->next == NULL)
++			k = k->parent;
++		if (k == ic)
++			break;
++		k = k->next;
++	}
++	return true;
++}
++
++/* Patch 377: elements that never have a box (362's shape: a <script> in
++ * <body> read as a block "added" with no box) */
++static bool html_rl_never_boxed(dom_node *n)
++{
++	static const char *const tags[] = {
++		"script", "style", "link", "meta", "template", "title",
++		"base", "noscript", NULL
++	};
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; tags[i] != NULL && !found; i++)
++		if (dom_string_byte_length(name) == strlen(tags[i]) &&
++		    strncasecmp(dom_string_data(name), tags[i],
++				strlen(tags[i])) == 0)
++			found = true;
++	dom_string_unref(name);
++	return found;
++}
++
++/* Patch 377: normalise a new box as box_normalise_block would as its
++ * child -- a new element can be a flex, grid or table box by its CSS (a
++ * <div class="track">), and box_normalise_block asserts on those (gate377:
++ * a shown display:flex <div> among <body>'s mixed children). False: not
++ * normalised, or a type this path does not place. */
++static bool html_rl_normalise_new(struct box *nb, html_content *c)
++{
++	switch (nb->type) {
++	case BOX_BLOCK:
++	case BOX_INLINE_BLOCK:
++	case BOX_TABLE_CELL:
++		return box_normalise_block(nb, c->layout, c);
++	case BOX_FLEX:
++	case BOX_GRID:
++		macsurf_debug_log_writef("LIFE rebuild local: new box "
++			"normalised as a flex or grid");
++		return box_normalise_flex_ext(nb, c->layout, c);
++	case BOX_TABLE:
++		macsurf_debug_log_writef("LIFE rebuild local: new box "
++			"normalised as a table");
++		return box_normalise_table_ext(nb, c->layout, c);
++	default:
++		return false;
++	}
++}
++
+ static struct box *html_rl_top_under(struct box *b, const struct box *pbox)
+ {
+ 	while (b != NULL && b->parent != pbox)
+@@ -7386,6 +7500,30 @@
+ 	return b;
+ }
+ 
++/* Patch 377: the box under pbox holding the nearest element sibling of n
++ * (forward or back) that has a box, or NULL */
++static struct box *html_rl_sib_top(dom_node *n, const struct box *pbox,
++		bool forward)
++{
++	dom_node *s = n, *t;
++	struct box *top = NULL;
++
++	dom_node_ref(s);
++	while (top == NULL) {
++		t = NULL;
++		if ((forward ? dom_node_get_next_sibling(s, &t) :
++			       dom_node_get_previous_sibling(s, &t)) !=
++				DOM_NO_ERR || t == NULL)
++			break;
++		dom_node_unref(s);
++		s = t;
++		if (box_for_node(s) != NULL)
++			top = html_rl_top_under(box_for_node(s), pbox);
++	}
++	dom_node_unref(s);
++	return top;
++}
++
+ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		struct box *pbox, double t0)
+ {
+@@ -7444,7 +7582,27 @@
+ 			}
+ 			continue;
+ 		}
+-		if (b->type != BOX_BLOCK || b->node == NULL)
++		/* Patch 377: inline content among the blocks stays as it is
++		 * (the page is laid out whole), unless an element it holds
++		 * left */
++		if (html_rl_anon_ic(b)) {
++			if (!html_rl_ic_intact(b, pnode))
++				RL_BNO("inline content among the blocks lost "
++					"an element");
++			full = true;
++			why = why != NULL ? why :
++				"inline content among the blocks";
++			continue;
++		}
++		/* Patch 377: flex, grid and table boxes are tracked like
++		 * blocks (one whose element left is removed), and the page
++		 * is laid out whole */
++		if ((b->type == BOX_FLEX || b->type == BOX_GRID ||
++		     b->type == BOX_TABLE) && b->node != NULL) {
++			full = true;
++			why = why != NULL ? why :
++				"flex, grid or table among the blocks";
++		} else if (b->type != BOX_BLOCK || b->node == NULL)
+ 			RL_BNO("parent holds more than blocks");
+ 		if (dom_node_get_parent_node(b->node, &parent) != DOM_NO_ERR)
+ 			RL_BNO("dom error");
+@@ -7472,6 +7630,24 @@
+ 			removed[nrem++] = b;
+ 		}
+ 	}
++	/* Patch 377: a removal that leaves two runs of inline content side
++	 * by side: a full build makes them one line container (one line),
++	 * this path would keep two */
++	{
++		struct box *prevk = NULL;
++		for (b = pbox->children; b != NULL; b = b->next) {
++			unsigned int k;
++			bool gone = false;
++			for (k = 0; k < nrem; k++)
++				if (removed[k] == b)
++					gone = true;
++			if (gone)
++				continue;
++			if (html_rl_anon_ic(b) && html_rl_anon_ic(prevk))
++				RL_BNO("removal would join two lines");
++			prevk = b;
++		}
++	}
+ 	/* the elements: new ones have no box yet */
+ 	if (dom_node_get_first_child(pnode, &n) != DOM_NO_ERR)
+ 		RL_BNO("dom error");
+@@ -7487,6 +7663,10 @@
+ 		}
+ 		if (type == DOM_ELEMENT_NODE) {
+ 			b = box_for_node(n);
++			if (b == NULL && html_rl_never_boxed(n)) {
++				/* patch 377: a <script> etc. -- no box, ever */
++				goto next_node;
++			}
+ 			if (b == NULL) {
+ 				bool plain = html_rl_block_tag(n) &&
+ 					html_rl_inline_subtree(n);
+@@ -7525,9 +7705,26 @@
+ 					why = why != NULL ? why :
+ 						"a list item or nested blocks";
+ 				}
++				/* Patch 377: a block between two pieces of one
++				 * line of inline content splits that line --
++				 * a full build makes two line containers */
++				{
++					struct box *bt = html_rl_sib_top(n, pbox,
++						false);
++					if (html_rl_anon_ic(bt) && bt ==
++					    html_rl_sib_top(n, pbox, true)) {
++						dom_node_unref(n);
++						RL_BNO("new block would split a "
++							"line");
++					}
++				}
+ 				added[nadd++] = n;
+ 				dom_node_ref(n);
+ 			} else if (b->parent != pbox &&
++				   /* patch 377: inline content among the
++				    * blocks */
++				   !(html_rl_anon_ic(b->parent) &&
++				     b->parent->parent == pbox) &&
+ 				   !(b->parent != NULL &&
+ 				     (b->parent->type == BOX_FLOAT_LEFT ||
+ 				      b->parent->type == BOX_FLOAT_RIGHT) &&
+@@ -7540,6 +7737,7 @@
+ 				RL_BNO("an element moved in from elsewhere");
+ 			}
+ 		}
++next_node:
+ 		next = NULL;
+ 		if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR)
+ 			next = NULL;
+@@ -7700,10 +7898,13 @@
+ 				html_rl_link_after(pbox, after, ic);
+ 				html_rl_link_after(ic, NULL, flt);
+ 			}
+-			if (!box_normalise_block(nb, c->layout, c)) {
+-				full = true;
+-				why = why != NULL ? why : "normalise failed";
+-				continue;
++			if (!html_rl_normalise_new(nb, c)) {	/* 377 */
++				for (i++; i < nadd; i++)
++					dom_node_unref(added[i]);
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"new box did not normalise (type %d), "
++					"full reconvert", (int)nb->type);
++				return -1;	/* the tree is whole */
+ 			}
+ 			if (c->num_objects != objects_before) {
+ 				full = true;
+@@ -7722,10 +7923,18 @@
+ 		}
+ 		html_rl_unlink(nb);
+ 		html_rl_link_after(pbox, after, nb);
+-		if (!box_normalise_block(nb, c->layout, c)) {
++		if (!html_rl_normalise_new(nb, c)) {	/* patch 377 */
++			for (i++; i < nadd; i++)
++				dom_node_unref(added[i]);
++			macsurf_debug_log_writef("LIFE rebuild local: new box "
++				"did not normalise (type %d), full reconvert",
++				(int)nb->type);
++			return -1;	/* the tree is whole */
++		}
++		if (nb->type != BOX_BLOCK) {	/* patch 377: placed whole */
+ 			full = true;
+-			why = why != NULL ? why : "normalise failed";
+-			continue;
++			why = why != NULL ? why :
++				"new box is a flex, grid or table";
+ 		}
+ 		if (c->num_objects != objects_before) {
+ 			full = true;
+@@ -10428,7 +10637,10 @@
+ 	if (old_ic != NULL && (old_ic->type == BOX_BLOCK ||
+ 	    /* patch 365: a float carrier first (a float before the
+ 	     * first block) */
+-	    html_rl_float_carrier(old_ic)) &&
++	    html_rl_float_carrier(old_ic) ||
++	    /* patch 377: any block-level child (a table or a line of
++	     * inline content first, as in many a <body>) */
++	    html_rl_has_block_child(block)) &&
+ 	    block->object == NULL && block->gadget == NULL) {
+ 		int r = html_rl_block_change(c, element, block, t0);
+ 		dom_node_unref(element);
