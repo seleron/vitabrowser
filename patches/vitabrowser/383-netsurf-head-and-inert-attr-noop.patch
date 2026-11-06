@@ -1,0 +1,182 @@
+# netsurf: <head> child-list changes and inert attributes need no rebuild (patch 383)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 382)
+#
+# The r106 census: youtube's "no inserted or removed block found" (3). A
+# temporary trace (the mark's kind and node, the parent block and its
+# children): insertBefore / removeChild / appendChild marks naming <head>
+# -- youtube, bbc, claude, page after page -- and a SETATTRIBUTE on
+# claude's <body> that patch 310's gate let through. <head> has no box, so
+# the walk climbed to <html>, found no boxed child changed, and declined
+# into a full rebuild (unit 362's shelved head no-op shape).
+#
+#  - html_reconvert_local_change: a child-list mark on <head> itself
+#    renders nothing -- <head> and all it holds have no box, no selector
+#    reaches from it into <body> (its children are siblings only of each
+#    other; :has() never matches here, patch 328). A sheet that arrives
+#    marks for itself (html_css_process_style / _link -> a sheet mark),
+#    as patch 320 relies on: the gate checks a <style> appended to <head>
+#    still applies. A <style> or <link> REMOVED keeps applying -- the
+#    stylesheet list is never re-collected, by a full rebuild either
+#    (pre-existing; nothing changes there).
+#  - html_reconvert_local_attr(): SETATTRIBUTE / REMOVEATTRIBUTE marks
+#    (macos9_reconvert.c) carry the attribute's name. html_rl_block_change
+#    answers one on the block itself with no rebuild when no box was
+#    added or removed, the block is a plain BOX_BLOCK whose box holds no
+#    object, control, frame or list marker, and the attribute has no
+#    effect but through CSS (html_rl_attr_inert: data-*, aria-*, role,
+#    tabindex, microdata...; not title, which the builder copies for the
+#    tooltip, nor list, table, link, media or form attributes) -- 310's
+#    gate has already ruled CSS out, the UA sheets included.
+#
+# Result on a 2500-paragraph sim page: a <script> appended to <head>
+# 103 -> 4 ms.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8227,6 +8227,10 @@
+ static bool html_rl_childlist_rm_known;
+ /* Patch 381: the change was an appendChild (the node went last) */
+ static bool html_rl_childlist_append;
++/* Patch 383: the element of the attribute mark being answered (a
++ * SETATTRIBUTE / REMOVEATTRIBUTE that patch 310's gate let through), else
++ * NULL */
++static dom_node *html_rl_attr_mark_node;
+ static dom_node *html_rl_childlist_rm_next;
+ 
+ /* Patch 378: elements a script appends at the end of a parent that this
+@@ -8608,6 +8612,25 @@
+ 			"rebuild", nskip);
+ 		return 0;
+ 	}
++	/* Patch 383: an attribute that patch 310's gate let through, on
++	 * this block itself, no box added or removed: no sheet can match on
++	 * it, it is not a hint, and the block's own box holds no object,
++	 * control, frame or list marker an attribute could feed (src,
++	 * value, data), and the attribute is one with no effect but
++	 * through CSS (html_rl_attr_inert: data-*, aria-*, role...) --
++	 * nothing to rebuild (claude: body attributes). The
++	 * line path answers such a mark by rebuilding the line; a block of
++	 * blocks has none, and declined below into a full rebuild. */
++	if (nadd == 0 && nrem == 0 && pnode == html_rl_attr_mark_node &&
++	    pbox->type == BOX_BLOCK &&
++	    pbox->object == NULL && pbox->gadget == NULL &&
++	    !HTML_RL_FRAME(pbox) && pbox->list_marker == NULL) {
++		for (i = 0; i < nskip; i++)
++			dom_node_unref(skipped[i]);
++		macsurf_debug_log_writef("LIFE rebuild local: attribute on a "
++			"block of blocks, nothing to rebuild");
++		return 0;
++	}
+ 	if (nadd == 0 && nrem == 0)
+ 		RL_BNO("no inserted or removed block found");
+ 	/* patch 378: the skipped elements served the no-op only */
+@@ -11270,6 +11293,51 @@
+ 	return html_reconvert_local_change(base_c, vnode, false, NULL);
+ }
+ 
++/* Patch 383: an attribute mark that patch 310's gate let through (no
++ * sheet, the UA's included, can match on the attribute; not a hint or
++ * href on a block's own box) -- the same local answer, told so */
++/* Patch 383: attributes with no effect on rendering but through CSS
++ * (which patch 310's gate has ruled out): data-*, aria-*, and the
++ * attributes of scripting, accessibility and microdata. Not title (the
++ * box builder copies it for the tooltip), nor list, table, link, media
++ * or form attributes (start, colspan, href, src, value...), which the
++ * builder or layout read directly. */
++static bool html_rl_attr_inert(const char *name)
++{
++	static const char *const ok[] = {
++		"role", "tabindex", "translate", "spellcheck", "draggable",
++		"nonce", "slot", "itemprop", "itemscope", "itemtype",
++		"itemid", "itemref", "autocapitalize", "enterkeyhint",
++		"inputmode", "accesskey", "part", "exportparts",
++		"popover", "inert", NULL
++	};
++	int i;
++
++	if (name == NULL)
++		return false;
++	if (strncasecmp(name, "data-", 5) == 0 ||
++	    strncasecmp(name, "aria-", 5) == 0)
++		return true;
++	for (i = 0; ok[i] != NULL; i++)
++		if (strcasecmp(name, ok[i]) == 0)
++			return true;
++	return false;
++}
++
++int html_reconvert_local_attr(struct content *base_c, void *vnode,
++		const char *attr_name);
++int html_reconvert_local_attr(struct content *base_c, void *vnode,
++		const char *attr_name)
++{
++	int r;
++
++	html_rl_attr_mark_node = html_rl_attr_inert(attr_name) ?
++		(dom_node *) vnode : NULL;
++	r = html_reconvert_local_change(base_c, vnode, false, NULL);
++	html_rl_attr_mark_node = NULL;
++	return r;
++}
++
+ /* Patch 378: a child-list change (appendChild, insertBefore,
+  * removeChild) on vnode -- the same local answer, told that vnode is the
+  * parent whose children changed (html_rl_block_change's no-op) */
+@@ -11572,6 +11640,34 @@
+ 			return 0;
+ 		}
+ 	}
++
++	/* Patch 383: a child-list change on <head> (a <script>, <link>,
++	 * <style> or <meta> inserted, moved or removed: youtube, bbc and
++	 * claude do it on every page) renders nothing. <head> and all it
++	 * holds have no box; no selector reaches from it into <body> (its
++	 * children are siblings only of each other, and :has() never
++	 * matches in this libcss, patch 328). A sheet that arrives marks
++	 * for itself (html_css_process_style / _link -> a sheet mark), as
++	 * patch 320 relies on. A <style> or <link> REMOVED keeps applying
++	 * -- the stylesheet list is never re-collected, by a full rebuild
++	 * either (pre-existing; the full rebuild this replaces changed
++	 * nothing there). The walk below climbed to <html> and declined
++	 * ("no inserted or removed block found") into a full rebuild:
++	 * unit 362's head no-op, shelved behind checks since narrowed. */
++	if ((dom_node *) vnode == html_rl_childlist_parent) {
++		dom_string *nm = NULL;
++		bool head = false;
++		if (dom_node_get_node_name((dom_node *) vnode, &nm) ==
++				DOM_NO_ERR && nm != NULL) {
++			head = strcasecmp(dom_string_data(nm), "head") == 0;
++			dom_string_unref(nm);
++		}
++		if (head && box_for_node((dom_node *) vnode) == NULL) {
++			macsurf_debug_log_writef("LIFE rebuild local: <head>'s "
++				"children changed, nothing rendered");
++			return 0;
++		}
++	}
+ 
+ 	/* the nearest element with a block box: the one to rebuild */
+ 	n = vnode;
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1222,6 +1222,9 @@
+ 		int rm_state, void *rm_next)
+ {
+ 	extern int html_reconvert_local(struct content *c, void *node);
++	/* Patch 383 - an attribute mark 310's gate let through */
++	extern int html_reconvert_local_attr(struct content *c, void *node,
++			const char *attr_name);
+ 	/* Patch 378 - a child-list mark: the same answer, told the node is
+ 	 * the parent whose children changed */
+ 	extern int html_reconvert_local_childlist(struct content *c,
+@@ -1291,6 +1294,9 @@
+ 			kind == MACOS9_DOMMUT_REMOVECHILD,
+ 			rm_state == 1, rm_next,		/* patch 380 */
+ 			kind == MACOS9_DOMMUT_APPENDCHILD) == 0;	/* 381 */
++	if (kind == MACOS9_DOMMUT_SETATTRIBUTE ||	/* patch 383 */
++	    kind == MACOS9_DOMMUT_REMOVEATTRIBUTE)
++		return html_reconvert_local_attr(c, node, attr_name) == 0;
+ 	return html_reconvert_local(c, node) == 0;
+ }
+ 

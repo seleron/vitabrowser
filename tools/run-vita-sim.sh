@@ -270,6 +270,8 @@ JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
 CSS-flex-buttons-ref file:///app0:/testpages/CSS-flex-buttons-ref.html
+JS-head-attr file:///app0:/testpages/JS-head-attr.html
+CSS-head-attr-ref file:///app0:/testpages/CSS-head-attr-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1683,6 +1685,17 @@ k382d=$(printf '%s\n' "$k382seg" | grep -c "LIFE rebuild local: declined (restyl
 echo "  JS-flex-buttons: rows differing from the parse-time build $k382r (0); ${k382h} rebuilds handing controls over (2 or more); stateful-control declines ${k382d} (1 or more)"
 [ "$k382r" = 0 ] && [ "${k382h:-0}" -ge 2 ] && [ "${k382d:-0}" -ge 1 ] ||
 	fail "buttons handed to rebuilt boxes"
+# Patch 383: a child-list change on <head> needs no rebuild (a sheet that
+# arrives marks for itself), nor an inert attribute (data-*, aria-*,
+# role...) on a block of blocks. Renders row for row as the same steps at
+# parse time -- the <style> appended to <head> still applies.
+k383r=$(fl_rows JS-head-attr CSS-head-attr-ref)
+k383seg=$(awk '/ page [0-9]+\/[0-9]+ JS-head-attr: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k383h=$(printf '%s\n' "$k383seg" | grep -c "LIFE rebuild local: <head>'s children changed, nothing rendered" || true)
+k383a=$(printf '%s\n' "$k383seg" | grep -c "LIFE rebuild local: attribute on a block of blocks, nothing to rebuild" || true)
+echo "  JS-head-attr: rows differing from the parse-time build $k383r (0); ${k383h} <head> changes needing no rebuild (3 or more); ${k383a} inert attributes (2 or more)"
+[ "$k383r" = 0 ] && [ "${k383h:-0}" -ge 3 ] && [ "${k383a:-0}" -ge 2 ] ||
+	fail "head changes and inert attributes need no rebuild"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and
