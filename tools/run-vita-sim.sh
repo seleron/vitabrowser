@@ -252,6 +252,8 @@ JS-counters-local file:///app0:/testpages/JS-counters-local.html
 CSS-counters-local-ref file:///app0:/testpages/CSS-counters-local-ref.html
 JS-bg-objects file:///app0:/testpages/JS-bg-objects.html
 CSS-bg-objects-ref file:///app0:/testpages/CSS-bg-objects-ref.html
+JS-objects-relink file:///app0:/testpages/JS-objects-relink.html
+CSS-objects-relink-ref file:///app0:/testpages/CSS-objects-relink-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1499,13 +1501,14 @@ echo "  JS-style-attr: rows differing from the parse-time build $sar (0); ${sal}
 # Patch 372: a class or style change on a flex or grid container's own
 # box builds the container again on its own and lays the page out whole
 # (before: a full rebuild). The twelve-step page renders row for row as
-# the same steps run at parse time; a container holding an image, one made
-# inline-flex, and a class a sibling rule sees still take the full rebuild.
+# the same steps run at parse time; one made inline-flex and a class a
+# sibling rule sees still take the full rebuild. Patch 375: a container
+# holding an image is restyled alone too, its object entry carried over.
 fxr=$(fl_rows JS-flex-restyle CSS-flex-restyle-ref)
 fxl=$(grep -c "LIFE rebuild local: flex or grid box restyled, full layout" "$R/netsurf.log" || true)
-fxo=$(grep -c "LIFE rebuild local: declined (restyled flex or grid box holds objects, controls or frames)" "$R/netsurf.log" || true)
+fxo=$(grep -c "LIFE rebuild local: objects re-pointed [1-9]" "$R/netsurf.log" || true)
 fxi=$(grep -c "LIFE rebuild local: restyled flex or grid box is no longer a block-level box here" "$R/netsurf.log" || true)
-echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fxl} flex/grid containers restyled alone (8 or more); declined: holding an image ${fxo} (1 or more), made inline ${fxi} (1 or more)"
+echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fxl} flex/grid containers restyled alone (8 or more); objects carried over ${fxo} (1 or more); declined: made inline ${fxi} (1 or more)"
 [ "$fxr" = 0 ] && [ "${fxl:-0}" -ge 8 ] && [ "${fxo:-0}" -ge 1 ] &&
 	[ "${fxi:-0}" -ge 1 ] || fail "flex and grid containers restyled alone"
 # Patch 373: a change in a block with ::before/::after, or content
@@ -1545,13 +1548,25 @@ echo "  JS-counters-local: rows differing from the parse-time build $k374r (0); 
 # points at (a CSS background image too: the entry's load callback and the
 # full reconvert's relink read o->box -- rte crashed there). The page
 # renders row for row as the same steps at parse time; the backgrounded
-# track and line decline, the plain ones stay local.
+# line declines, the plain ones stay local. Patch 375: the backgrounded
+# track is restyled alone, its entries moved to the new boxes.
 k374bgr=$(fl_rows JS-bg-objects CSS-bg-objects-ref)
-k374bgf=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the restyled flex or grid box)" "$R/netsurf.log" || true)
+k374bgf=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the restyled flex or grid box)\|declined (restyled flex or grid box holds objects" "$R/netsurf.log" || true)
 k374bgl=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the line)" "$R/netsurf.log" || true)
-echo "  JS-bg-objects: rows differing from the parse-time build $k374bgr (0); declined: backgrounded flex ${k374bgf}, backgrounded line ${k374bgl} (1 or more each)"
-[ "$k374bgr" = 0 ] && [ "${k374bgf:-0}" -ge 1 ] && [ "${k374bgl:-0}" -ge 1 ] ||
+echo "  JS-bg-objects: rows differing from the parse-time build $k374bgr (0); flex declines on objects ${k374bgf} (0, patch 375); backgrounded line declined ${k374bgl} (1 or more)"
+[ "$k374bgr" = 0 ] && [ "${k374bgf:-0}" = 0 ] && [ "${k374bgl:-0}" -ge 1 ] ||
 	fail "local rebuilds keep the boxes objects point at"
+# Patch 375: a restyled flex, block or table holding images or background
+# images is rebuilt alone, its object entries moved to the new boxes
+# (before: declined). The page renders row for row as the same steps at
+# parse time -- every image still drawn -- with four changes local.
+k375r=$(fl_rows JS-objects-relink CSS-objects-relink-ref)
+k375l=$(awk '/ page [0-9]+\/[0-9]+ JS-objects-relink: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: \(flex or grid box restyled\|block restyled\|table restyled\)" || true)
+k375o=$(grep -c "LIFE rebuild local: objects re-pointed [1-9]" "$R/netsurf.log" || true)
+echo "  JS-objects-relink: rows differing from the parse-time build $k375r (0); ${k375l} changes rebuilt locally on the page (4 or more); ${k375o} rebuilds re-pointed objects (2 or more)"
+[ "$k375r" = 0 ] && [ "${k375l:-0}" -ge 4 ] && [ "${k375o:-0}" -ge 2 ] ||
+	fail "objects carried over by local rebuilds"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and
