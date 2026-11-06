@@ -9373,3 +9373,105 @@ rules sit elsewhere.
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Patch 380 (2026-11-06): the structural check by direction and position
+
+**The real matches.** 379's scoped check left youtube with 6 structural
+declines and guardian with 1. Temporary traces (the compound, the child it
+matched, the mark kind, where the change sat) found:
+- **guardian**: `div:first-child` on `<body>`'s first `<div>`, while a
+  `<script>` was appended.
+- **youtube, first pass**: a bare `:first-child` on `<body>`'s first child
+  (`div.bdcvod`), while `<iframe>`s were appended at the end of `<body>`.
+  An append at the end cannot change which child is first.
+- **youtube, once direction was in**: the same batches still declined.
+  The trace showed a `removeChild` of a box-less element (an injected
+  `<script>`) from `<body>` in the batch that appends the iframe, and a
+  removal with no known place takes the whole range. Then a
+  `:last-of-type` compound matched the earlier iframe: the token sat
+  inside `.x:not(.y):not(:last-of-type)`, and 379 made every token inside
+  parentheses unbounded.
+
+**The change.**
+- html.c: each structural compound records what it depends on:
+  - being the first (`:first-child`, `:first-of-type`);
+  - being the last (`:last-child`, `:last-of-type`);
+  - the count of earlier siblings (`:nth-child`, `:nth-of-type`);
+  - the count of later ones (`:nth-last-*`);
+  - both (`:only-*`).
+- `html_rl_block_struct_risk` is given where the change sits among the
+  parent's element children: the inserted elements, and each removal's
+  element neighbour (or the end). It tests only the children such a rule
+  can flip:
+  - the first child, if it is first now and something removed preceded
+    it, or it was first and new elements precede it now;
+  - the last child, the mirror;
+  - `:nth-*` by range (after the change for earlier counts, before it
+    for later ones);
+  - `*-of-type` by range and the moved tags.
+  - The moved elements themselves are built afresh.
+- **A removal's place:** `removeChild` (macsurf_qjs.c) records the
+  removed child's next element sibling at removal time (NULL: it was the
+  last) and marks through a new `macos9_js_mark_dom_dirty_removal`. The
+  mark slot holds it as a node reference (`rm_next` / `rm_state`, for
+  primary and extra marks, released with the slot's other references).
+  A second removal from the same parent in the batch makes the place
+  unknown. `html_reconvert_local_childlist` carries it to the check.
+  Unknown places take the whole range, as 379: other removal paths, two
+  removals, a removed block beside an inline container, and any other
+  mark kind.
+- **Compounds inside `:not()` / `:is()` / `:where()` / `:matches()` /
+  `:-webkit-any()`** are bounded by the *outer* compound, which keeps
+  the element (its tag, id and classes). `:has()` and other functions stay
+  unbounded. The backward compound scan now steps over balanced `(...)`
+  groups, so `.x:not(.y):not(:last-of-type)` is one compound rather than
+  `:not(:last-of-type)`.
+
+**Result** on `ST-380.html` (2500 paragraphs plus a bare `:first-child`
+rule, median of 3): an `<iframe>` appended to `<body>` **170 -> 32 ms**;
+a `<script>` appended **167 -> 4 ms**. With such a rule even the full
+rebuild is costlier.
+
+**Gate.** JS-struct-dir runs on a page with a bare `:first-child`,
+`p:last-child`, `li:nth-child(odd)` and `.tab:not(.x):not(:last-of-type)`,
+ten steps 600 ms apart:
+- local: two `<iframe>`s appended to `<body>` (the second makes the first
+  no longer last of its type, but the only `*-of-type` rule is bounded by
+  `.tab`); a `<script>` appended (no rebuild); an `<li>` appended; the
+  last `<li>` removed; one `<script>` removed (placed by its sibling: no
+  rebuild);
+- declined: a `<div>` inserted first in a box (the old first child flips);
+  two `<script>`s removed in one go (the place is unknown: whole range); a
+  `<p>` appended after a `p:last-child` (the old last flips).
+
+It renders row for row as its parse-time reference: **0 rows**. On the
+379 binary it is also 0 rows, with all ten steps declined page-wide. 6
+changes are local on the page, with 2 positional and 1 whole-range
+declines. A first gate380 passed on the draft (first/last as a plain
+range); the refinements followed the youtube traces, and `gate380b`
+passed on the final code: exit 0, every earlier check unchanged, Vita
+pace 23 identical and 0 differ. Restage from pristine: 473 applied plus
+the 2 known collisions, the four changed files byte-identical.
+
+**Scorecard r105** (final binary): 21 sites against `r79-360`, the 380
+and 379 binaries run back to back (`score/r105-380`, `score/r105-pre380`;
+the draft's run is kept as `score/r105a-*`): **72.74 vs 72.86**. No
+crash; ddglite (74.8 vs 76.0, its usual swing) and stackoverflow (-1.1)
+are live noise.
+
+**Load-time census.** Structural declines across the 21 sites fell
+**7 -> 3**: youtube **5 -> 1**, and guardian stays at 0 (it had 1 on 379).
+youtube's last one is a removal at the end where a `:not(:last-child)`-
+style rule really can flip the new last child. Full rebuilds read 115 vs
+122, within noise: youtube's iframe batches still meet other declines.
+
+**Next:**
+1. **What else stops youtube's iframe batches** (its full rebuilds stay
+   at 20-21), by a fresh census.
+2. **The fixes1135 class-drop** (372 entry), a correctness bug.
+3. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+4. **Gate hygiene**: the JS-block-class-sibling and TIMERNEST timing
+   flakes.
+
+Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
+needed.
