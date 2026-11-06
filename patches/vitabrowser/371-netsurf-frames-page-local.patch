@@ -1,0 +1,185 @@
+# netsurf: a page with frames takes the local rebuild paths (patch 371)
+# Generated 2026-11-06
+# Base: seleron/vitabrowser (patch stack through 370)
+#
+# The patch-370 census (r95c, 21 sites): after 370 routed style attribute
+# changes locally, every one of rte's six then declined on "page has
+# frames", and rte's and guardian's own batches did too. The local path
+# (html_reconvert_local_change, patch 165) and the late-object relayout
+# (html_relayout_object_local, WS-C item 2B) refused any change on a page
+# holding a single iframe record. Two things a frame needs are real; the
+# rest of the page is not theirs:
+#
+#  1. Nothing may free a frame's box. Its record (c->iframe, which
+#     browser_window_recalculate_iframes walks -- cur->box->node -- on
+#     every reformat) and its window (window->box) point at it. The local
+#     paths already declined on b->iframe (the window), but a record can
+#     have no window yet or ever: a same-origin frame a script made,
+#     frames past SCRIPT_FRAMES_MAX. box_iframe marks each box it makes a
+#     record for IFRAME, so the checks now test HTML_RL_FRAME (window or
+#     flag), and the line path's old-content test looks below the line's
+#     top level too (a frame in an inline-block whose removal left the
+#     new content plain). No local path builds a frame: the new-content
+#     tag lists hold no iframe.
+#  2. Nothing may move a frame's box without the full layout's
+#     descendant pass, which places its window at it (layout.c,
+#     browser_window_set_position). Already so: layout_relayout_core
+#     declines on a frame after the change (lr_subtree_unsafe, "positioned
+#     box or iframe after it") and the page is laid out whole -- the box
+#     tree is still rebuilt locally, the bulk of a full reconvert's cost
+#     (unit 362's measurement). A frame's own box is never laid out by a
+#     local path.
+#
+# Gate: JS-frames-local (eleven steps above and below a frame; a
+# script-made frame appended, then removed; a frame removed inside an
+# inline-block) renders row for row as CSS-frames-local-ref, the same
+# steps at parse time; 7 or more of its changes rebuilt locally, the two
+# frame removals still the full rebuild, and no "page has frames" line.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -6204,7 +6204,9 @@
+ 	if (htmlc->layout == NULL || htmlc->reflowing ||
+ 	    !htmlc->had_initial_layout || htmlc->aborted ||
+ 	    c->status != CONTENT_STATUS_DONE || c->locked ||
+-	    htmlc->iframe != NULL || htmlc->late_reflow_pending)
++	    htmlc->late_reflow_pending)	/* patch 371: not frames --
++			 * layout_relayout_core never moves a frame's box
++			 * (lr_subtree_unsafe), the full layout places it */
+ 		return false;
+ 	t0 = macos9_micros();
+ 	if (!layout_relayout_object(htmlc, box, &delta)) {
+@@ -6488,12 +6490,32 @@
+ 	return found;
+ }
+ 
++/* Patch 371: an iframe's box. b->iframe is its window, linked only once
++ * the window is made -- a record (c->iframe, which the window code walks
++ * on every reformat) also points at boxes with no window yet or ever (a
++ * same-origin frame a script made, frames past SCRIPT_FRAMES_MAX).
++ * box_iframe marks every box it makes a record for IFRAME: a box either
++ * way must never be freed by a local rebuild. */
++#define HTML_RL_FRAME(b) ((b)->iframe != NULL || ((b)->flags & IFRAME) != 0)
++
++/* Patch 371: does a box subtree hold an iframe's box? */
++static bool html_rl_subtree_frames(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (HTML_RL_FRAME(b))
++			return true;
++		if (html_rl_subtree_frames(b->children))
++			return true;
++	}
++	return false;
++}
++
+ /* like html_rl_subtree_referenced, but a list marker is no reason: the
+  * full layout that follows numbers the markers again (patch 176) */
+ static bool html_rl_subtree_objects(struct box *b)
+ {
+ 	for (; b != NULL; b = b->next) {
+-		if (b->object != NULL || b->gadget != NULL || b->iframe != NULL)
++		if (b->object != NULL || b->gadget != NULL || HTML_RL_FRAME(b))
+ 			return true;
+ 		if (html_rl_subtree_objects(b->children))
+ 			return true;
+@@ -6506,7 +6528,7 @@
+ static bool html_rl_subtree_objects_or_frames(struct box *b)
+ {
+ 	for (; b != NULL; b = b->next) {
+-		if (b->object != NULL || b->iframe != NULL)
++		if (b->object != NULL || HTML_RL_FRAME(b))
+ 			return true;
+ 		if (html_rl_subtree_objects_or_frames(b->children))
+ 			return true;
+@@ -6548,7 +6570,7 @@
+ {
+ 	for (; b != NULL; b = b->next) {
+ 		if (b->object != NULL || b->gadget != NULL ||
+-		    b->iframe != NULL || b->list_marker != NULL)
++		    HTML_RL_FRAME(b) || b->list_marker != NULL)
+ 			return true;
+ 		if (html_rl_subtree_referenced(b->children))
+ 			return true;
+@@ -7213,7 +7235,7 @@
+ 				if (nrem == HTML_RL_MAX_CHANGES ||
+ 				    html_rl_subtree_objects(e->children) ||
+ 				    e->object != NULL || e->gadget != NULL ||
+-				    e->iframe != NULL)
++				    HTML_RL_FRAME(e))
+ 					RL_BNO("removed float holds objects or "
+ 						"controls");
+ 				removed[nrem++] = f;
+@@ -7230,7 +7252,7 @@
+ 			/* patch 368: form controls may go (released below) */
+ 			if (nrem == HTML_RL_MAX_CHANGES ||
+ 			    html_rl_subtree_objects_or_frames(b->children) ||
+-			    b->object != NULL || b->iframe != NULL)
++			    b->object != NULL || HTML_RL_FRAME(b))
+ 				RL_BNO("removed block holds objects or frames");
+ 			/* a list item, or a block of blocks: the page is laid
+ 			 * out whole afterwards (markers renumbered, margins
+@@ -9415,7 +9437,7 @@
+ 	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
+ 			     pbox->type != BOX_TABLE_CELL))
+ 		RL_TNO("restyled cell's table is not in a block");
+-	if (tb->object != NULL || tb->gadget != NULL || tb->iframe != NULL ||
++	if (tb->object != NULL || tb->gadget != NULL || HTML_RL_FRAME(tb) ||
+ 	    tb->list_marker != NULL ||
+ 	    html_rl_subtree_referenced(tb->children))
+ 		RL_TNO("restyled cell's table holds objects, controls or "
+@@ -9517,7 +9539,7 @@
+ 		}
+ 		RL_RNO("restyled block's parent holds more than blocks");
+ 	}
+-	if (ob->object != NULL || ob->gadget != NULL || ob->iframe != NULL ||
++	if (ob->object != NULL || ob->gadget != NULL || HTML_RL_FRAME(ob) ||
+ 	    ob->list_marker != NULL || ob->float_children != NULL ||
+ 	    html_rl_subtree_referenced(ob->children))
+ 		RL_RNO("restyled block holds objects, controls or floats");
+@@ -9772,8 +9794,14 @@
+ 		RL_NO("not loaded");
+ 	if (base_c->textsearch.context != NULL)
+ 		RL_NO("find in page is open");
+-	if (c->iframe != NULL)
+-		RL_NO("page has frames");
++	/* Patch 371: frames on the page are no reason by themselves (it was
++	 * every change on a page with one iframe: rte, guardian). What a
++	 * frame needs is kept below: no rebuild frees a frame's box (the
++	 * checks test HTML_RL_FRAME), none builds one (the new-content tag
++	 * lists hold no iframe), and none moves one without the full layout
++	 * that places its window (layout.c, lr_subtree_unsafe: a frame after
++	 * the change makes the relayout decline, and the page is laid out
++	 * whole). */
+ 	t0 = macos9_micros();
+ 
+ 	/* Patch 300 - a change to a <title> element's text names
+@@ -9910,7 +9938,7 @@
+ 	     * makes the cell's float list again */
+ 	    (block->float_children != NULL &&
+ 	     block->type != BOX_TABLE_CELL) ||
+-	    block->iframe != NULL || block->styles == NULL ||
++	    HTML_RL_FRAME(block) || block->styles == NULL ||
+ 	    block->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE] != NULL ||
+ 	    block->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL ||
+ 	    old_ic == NULL || old_ic->next != NULL ||
+@@ -9928,10 +9956,18 @@
+ 		RL_NO("new content is not plain inline elements");
+ 	}
+ 	for (b = old_ic->children; b != NULL; b = b->next)
+-		if (b->object != NULL || b->gadget != NULL || b->iframe != NULL) {
++		if (b->object != NULL || b->gadget != NULL || HTML_RL_FRAME(b)) {
+ 			dom_node_unref(element);
+ 			RL_NO("old content has an object or control");
+ 		}
++	/* Patch 371: a frame anywhere in the old line -- in an inline-block
++	 * too, below the line's top level -- stays: its record and its
++	 * window point at its box (a script that removed the <iframe> left
++	 * the new content plain) */
++	if (html_rl_subtree_frames(old_ic->children)) {
++		dom_node_unref(element);
++		RL_NO("old content has a frame");
++	}
+ 	/* Patch 367: a float wraps its element's box, so an image or a
+ 	 * control can sit below the line's top level: look all the way */
+ 	if (block->float_children != NULL &&

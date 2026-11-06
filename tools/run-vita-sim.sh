@@ -394,6 +394,8 @@ NET-js-form-walk-cost http://127.0.0.1:$HP/JS-form-walk-cost.html
 NET-js-form-target http://127.0.0.1:$HP/JS-form-target.html
 NET-js-link-click http://127.0.0.1:$HP/JS-link-click.html
 NET-js-block-oc-insert http://127.0.0.1:$HP/JS-block-oc-insert.html
+NET-js-frames-local http://127.0.0.1:$HP/JS-frames-local.html
+NET-css-frames-local-ref http://127.0.0.1:$HP/CSS-frames-local-ref.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -1484,6 +1486,23 @@ sar=$(fl_rows JS-style-attr CSS-style-attr-ref)
 sal=$(grep -c "LIFE rebuild local: style attribute change, as a class change" "$R/netsurf.log" || true)
 echo "  JS-style-attr: rows differing from the parse-time build $sar (0); ${sal} style attribute changes taken locally (8 or more)"
 [ "$sar" = 0 ] && [ "${sal:-0}" -ge 8 ] || fail "style attribute changes taken locally"
+# Patch 371: a page with frames takes the local paths too (before: every
+# change refused, "page has frames"). Its eleven steps render row for row
+# as the same steps run at parse time; on that page the changes above and
+# below the frame are rebuilt locally (laid out whole: a frame after the
+# change keeps the relayout from moving it); a removed frame -- in a
+# removed block, or below a line's top level in an inline-block -- still
+# takes the full rebuild.
+frr=$(fl_rows NET-js-frames-local NET-css-frames-local-ref)
+frl=$(awk '/ page [0-9]+\/[0-9]+ NET-js-frames-local: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: \(rebuilt\|block restyled\|blocks rebuilt\)" || true)
+frd=$(grep -c "LIFE rebuild local: declined (old content has a frame)" "$R/netsurf.log" || true)
+frb=$(grep -c "LIFE rebuild local: declined (removed block holds objects or frames)" "$R/netsurf.log" || true)
+frn=$(grep -c "LIFE rebuild local: declined (page has frames)" "$R/netsurf.log" || true)
+echo "  JS-frames-local: rows differing from the parse-time build $frr (0); ${frl} changes rebuilt locally on the page (7 or more); frame declines: in a line ${frd} (1 or more), in a removed block ${frb} (1 or more); 'page has frames' ${frn} (0)"
+[ "$frr" = 0 ] && [ "${frl:-0}" -ge 7 ] && [ "${frd:-0}" -ge 1 ] &&
+	[ "${frb:-0}" -ge 1 ] && [ "${frn:-0}" = 0 ] ||
+	fail "changes on a page with frames taken locally"
 [ -n "$lnp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $lnp | sort -u | sed 's/^STR /  /'
 # Structural/counter lists (Patch 192): inserting/removing a list item on a
 # page whose CSS uses :nth-child() or CSS counters declines the local path
