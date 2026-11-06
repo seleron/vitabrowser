@@ -8601,3 +8601,94 @@ Next, by this census:
 
 Parked: nodeless/sheet batches (doc 23), body/head churn with boxless
 children (362).
+
+## Patch 372 (2026-11-06): a flex or grid container's own class or style restyles it alone
+
+**The census shape.** After 371, rte's five style changes declined on
+"class change on an element with a non-inline, non-block box". A
+temporary trace (the box type, the element and the size of its subtree)
+showed all five were slick carousel tracks:
+`<div class="slick-track" style="opacity:1;width:59616px;transform:translate(0px, 0px)">`,
+each a `BOX_FLEX` in a block, with 75-335 boxes. Four of the five hold
+no object; one holds 17 images. Slick writes that style on every slide,
+and each write was a full box-tree rebuild.
+
+**The change.**
+- html.c, `html_rl_flex_restyle()`: a class or style change on an
+  element whose own box is `BOX_FLEX` or `BOX_GRID` builds the
+  container again on its own, the way 369 builds a cell's table. The
+  old box is freed, and `box_build_element` cascades the container and
+  its items afresh from the DOM, so descendant selectors and
+  inheritance reach the items. The new box is linked where the old one
+  was and normalised, and the page is laid out whole.
+- Outcomes: `display:none` is a removal; a container made a block is
+  normalised as a block; one made inline-level (inline-flex) after the
+  build goes to the full reconvert.
+- Declined:
+  - the container holds objects, controls or frames (`HTML_RL_FRAME`
+    of 371);
+  - it is not directly in a block, cell, flex or grid box;
+  - a sibling selector the class can move (patch 186);
+  - counters in page CSS (369's scan).
+- box_normalise.c/h: `box_normalise_flex_ext()`.
+
+**Result** on `ST-372.html` (2500 paragraphs plus a 30-slide track,
+median of 3, host sim):
+
+| change | before | 372 |
+|---|---|---|
+| the track's style, as slick writes it | 107 ms | 19 ms |
+| a flex container's class (alone) | 107 ms | 19 ms |
+| a grid container's class | (see below) | 18 ms |
+
+**Found on the way (pre-existing, unfixed): class changes dropped with
+no rebuild.** On the 371 binary, after three full style rebuilds in a
+row, the page's later flex-class and grid-class changes ran no rebuild
+at all (4 ms, no LIFE or batch line). Measured alone, the same flex
+class change costs 107 ms. The likeliest cause is the fixes1135
+cosmetic-churn cap in macos9_reconvert.c
+(`RECONVERT_COSMETIC_MAX_CONSECUTIVE 2`). Its comment says "the styles
+were already applied by the JS setAttribute", which holds for neither a
+class change nor a style change that needs a box rebuild, so the render
+goes stale. Its "cosmetic-suppress" log line never appeared, so the
+cause is not proven. 372 makes it fire less often, since flex/grid
+changes are no longer full rebuilds, but the cap is still there. It
+needs its own unit.
+
+**Gate.** JS-flex-restyle runs twelve steps 250 ms apart:
+- the track: its style as slick writes it, its class (restyling its
+  items through a descendant selector), hidden and shown, its direction;
+- a grid's class;
+- a flex in a table cell, and a flex nested in a flex;
+- a flex holding an image (declined);
+- a flex made a block, and one made inline-flex (full reconvert);
+- a class a sibling rule can see (declined).
+
+It renders row for row as CSS-flex-restyle-ref, the same steps run at
+parse time: **0 rows**. On the 371 binary the same pair is also 0 rows,
+taken by full rebuilds. Across the gate 13 containers were restyled
+alone (8 or more required), with both declines and the inline hand-off
+seen. Full gate `gate372.log`, exit 0: JS-style-attr 0 rows with 52
+local changes, JS-frames-local 0 rows, BLOCKCLASS 7/7, BLOCKSIB 3/3,
+JS-table-cell-class 0 rows. Restage from pristine: 465 applied plus the
+2 known collisions, and the three changed files are byte-identical.
+
+**Scorecard r97**: 21 sites against `r79-360`, the 372 and 371 binaries
+run back to back (`score/r97-372`, `score/r97-pre372`). The means read
+**68.36 vs 71.57**, and the whole gap is one wpblog crash in the 372
+arm (0.0 vs 68.7):
+- no 372 path ran on wpblog: its one 372 decision was a decline, taken
+  before any box was freed, and the crash is in object free/load;
+- wpblog then loaded on 3 of 3 reruns on each binary;
+- r96 had the same crash in the 370 arm.
+
+So it is the intermittent wpblog segfault of the 365 entry, now seen
+in 2 of 4 arms. The other sites are equal within live noise (claude
++1.2, ddglite +0.1, hackernews +0.2, stackoverflow -0.2).
+
+**Load-time census.** rte's non-inline declines fell from 4 to 0, but
+none were saved yet: three tracks now decline on "counters in page CSS"
+(rte's sheets mention `counter-`) and one on "holds objects". Next
+(373): the counters guard only needs to fire when a sheet displays a
+counter (`counter(` / `counters(`); then the shapes of "not one line
+container".
