@@ -9789,3 +9789,73 @@ design, recorded in doc 23 as the next step there and not started.
 
 No code changed; the temporary census build was reverted (`css.c` is
 back to 383's). No sudo needed.
+
+## Patch 385 (2026-11-07): fixes1135's cosmetic cap defers class churn instead of dropping it
+
+**The bug.** This is the "fixes1135 class-drop" logged since 372. After
+two class-only full rebuilds in a row, fixes1135 cleared the next single
+class mark's slot without rebuilding. Its premise was that "the styles
+were already applied by the JS setAttribute". That does not hold in this
+engine: style is computed when boxes are built, so the change stayed
+unrendered until some other change came. Two things hid it:
+- its log line starts "LIFE reconvert", a prefix `diag.c` drops as noise
+  (`engine_noise[]`, which also hides `html_reconvert_content rc=`);
+- it ran **before** `try_local`, so even a class change the local paths
+  answer in a few ms was dropped.
+
+**Why the cap stays.** Patch 312's task flush fires the reconvert
+callback about 16 ms after every mutating task. That overrides
+fixes1024's escalating debounce (400 -> 6400 ms). The probe showed the
+callback 16 ms after marks while the debounce read 6400. Without the
+cap, a carousel's timer churn would cost a full rebuild a tick (the 0.6
+s FLOOR aside).
+
+**The change** (macos9_reconvert.c):
+- The check moves after `try_local`, just before the full reconvert.
+- Past the cap, a class-only full rebuild (still single class marks only,
+  as fixes1135) waits until `RECONVERT_COSMETIC_DEFER_MS` after the last
+  full rebuild. That is fixes1024's 6400 ms ceiling.
+- Its slot **stays pending** and the callback re-arms for the window:
+  - the page always converges;
+  - later marks join the batch (a multi-mark batch runs at once, as
+    before);
+  - the autotest's settle waits for it (`page_reconvert_pending`).
+- Logged as `LIFE cosmetic rebuild deferred N ms`, outside the noise
+  prefix.
+
+**Repro and gate** (JS-class-churn / CSS-class-churn-ref). The span's
+class changes first (local), then `#a` goes `on`, off, `on`, 600 ms
+apart, under a `.on + p` rule:
+- **383:** the third full rebuild is dropped. 14 rows are stale: the
+  paragraph stays black although `#a` ends `.on`.
+- **385:** deferred 5.8 s, rebuilt, **0 rows**.
+- `gate385`: exit 0 on the first run. NET-css-sibling-class also defers
+  twice and converges, and now settles in 5.6 s. BLOCKSIB counts 18
+  sibling declines instead of 7, because changes that used to be dropped
+  now reach `try_local`.
+- Restage from pristine: 477 applied plus the 2 known collisions,
+  byte-identical.
+
+**Scorecard r109**: 21 sites against `r79-360`, the 385 and 383 binaries
+run back to back: **72.83 vs 72.90**. No crash. The gap is ddglite, where
+DuckDuckGo served its anomaly page to the 385 arm (title " DuckDuckGo ",
+`assets/anomaly` fetched; 0 rebuilds on both arms). No real-site load
+reached the cap (0 deferrals on both arms), so this fix changes
+interaction (carousels, tabs, timers), not first load.
+
+**Probe notes:**
+- Ending the repro on a value the page already showed hides the drop
+  (383 dropped two changes and landed back on what it had drawn). The
+  gate page ends on a changed state.
+- More class marks during a deferral make the batch multi-mark, and it
+  runs at the next task flush.
+
+**Next:**
+1. **`<object>`/`<embed>` lost after a full rebuild** (375 entry).
+2. **Stylesheet removal never taking effect** (383 entry).
+3. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+4. **The diag.c noise list** also hides `html_reconvert_content rc=`, the
+   one line naming every full rebuild's start. BATCHCAUSE covers the
+   count, but a rate-capped allowance would help triage.
+
+No sudo needed. The Vita cross-build was not run (no vitaSDK here).
