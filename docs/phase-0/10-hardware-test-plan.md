@@ -10842,3 +10842,113 @@ No sudo. The Vita cross-build was not run (no vitaSDK here).
 2. github's remaining MO time (0.15 s host) and the 0.7 s of public
    selector calls are fine on the host; re-measure on the device before
    tuning further.
+
+## Run 42 — hand-off (2026-11-07 15:45; replaces runs 40 and 41, both untested)
+
+**Flash this build:**
+- VitaBrowser.vpk `5c388575b60e`
+- VitaBrowser-ext.vpk `5cf099746bac`
+- nsvita.elf `b4c7dbb2e694`
+
+Patches through 402, built at 96fa534 = origin/master. Full SHA256 of
+VitaBrowser.vpk:
+`5c388575b60e2e4066a4f577d87385f20fa490627f414bce8e77a95d0b80fffa`.
+
+**What it replaces.** Run 40 (`d2008e91051c`, patches through 324) has
+no `results\`. **Run 41** is an undocumented build of 2026-11-01 11:27:
+VPKs in the Desktop folder, archive `hwtest-2026-11-01-run41`, no notes,
+no doc 10 entry, no results. So run 42 carries everything since run 27
+unverified on hardware, and everything since run 40 (patches 325-402)
+for the first time. The reason for this run:
+- **395** (wpblog segfault, doc 10 entry above): a full reconvert forced
+  from script could leave an iframe window pointing at a freed box; and
+  `html_destroy` freed form controls before the box tree, so **leaving
+  any page with a form control read freed memory**. In ASan the second
+  fired at the first navigation away from a form page (unit 398). On the
+  device that is possible heap corruption on every form submission.
+- **396**: a removed `<style>` with a pending text update crashed
+  (old.reddit.com, developer.mozilla.org: 4/4 in the sim).
+- **402**: github.com spent 5.7 s (host) in one JS task in the selector
+  engine. On the Vita that cannot finish inside the 8000 ms script
+  deadline, so github's scripts were cut off. Now 42 ms on the host.
+- Also new since run 40: 363 rounded corners, 364-383 local rebuilds
+  (images/controls, floats, table cells, frames, flex/grid, counters,
+  objects, buttons, structural checks), 385 cosmetic cap, 386
+  `<object>` kept through full rebuilds, 387-389 stylesheet removal,
+  plus the grid/SVG/CSS patches 325-361.
+
+Engine-side assurance from this machine (units 397-401): every C library
+the simulator builds from source is ASan-clean over the 21 scorecard
+sites and the gate's whole interaction.
+
+**Where the files are:**
+- Archive: `<WORK>/vitabrowser-work/hwtest-2026-11-07-run42/`
+  (SHA256SUMS, VPKs, ELF, `reference-dumps/`, the reference run in
+  `sim/`, file:// page runs in `pages/`).
+- `Desktop\VitaBrowser-hwtest\`: the VPKs, `SHA256SUMS-run42.txt`,
+  new `reference-dumps\`. Run 41's dumps stay in `reference-dumps-run41\`
+  (the old `reference-dumps\` was a byte-identical duplicate, moved to
+  `reference-dumps-run41-dup-*`).
+- `C:\Users\seleron\VitaBrowser-hwtest\`: the same plus nsvita.elf and
+  SHA256SUMS. Run 40's dumps were moved to `reference-dumps-run40\`.
+
+Before anything was replaced, the Desktop files were checked against
+run 41's archive and the `C:\Users` files against run 40's (`sha256sum -c`
+OK, `diff -r` of the dumps clean). The new copies were checked the same
+way.
+
+**Build.** applytest is the tree restaged for patch 402 (485 applied +
+the two known collisions). gate402 passed at it (exit 0, SELECTORS
+89/89).
+- Renderer 106/106 + 30/30.
+- Streams 4/4.
+- Cross-build green in 198 s (`build-vita-run42.log`, 0 warnings).
+- Both VPKs pass `unzip -t`. The ELF carries 395's log line (`is not in
+  the parent's tree`) and 402's polyfill (`seedGroups`). The VPK bundles
+  378 test pages, including the 89-case JS-selectors.
+- Correction to the entries since 386: "no vitaSDK here" was wrong.
+  `~/vitasdk` is installed and `tools/build-vita.sh` defaults to it.
+
+**Reference autotest under device conditions** (netlog off,
+`ux0:download` a file, `VITA_SIM_REMOTE_PORT` set because signal-cli
+holds :8080): interact **52/52**, js **18/18**, 34 dumps, every
+`bitmaps:` line 0 refused. Against run 40's dumps: 27 of 34 identical.
+The other 7: IN-history and IN-home-recent (order), the two
+NET-*-example pages (live example.com), and three expected rendering
+changes since run 40. 02-L2-macsurf-css and IN-settings draw rounded
+corners as PATH where run 40 drew RECT (363); 08-PM-macsurf-grid has
+one RECT fewer (the 336-349 grid work). (Run 41's dumps were taken with
+the gate's full network list, so they do not compare.)
+
+**On the device:** start `receive-results.bat` first, then:
+
+1. **The autotest** (SELECT + SQUARE): every `.plot` SAME against
+   `reference-dumps\`, except IN-history and IN-home-recent (order),
+   07-PM-animation (time-varying) and the NET-*-example pages (live
+   example.com). Expect interact **52/52**, js **18/18**, `bitmaps: ...
+   0 refused` after every page, and no crash.
+2. **`file:///app0:/testpages/JS-selectors.html`**: title **JS selectors
+   (89/89)** (402's engine, including four github-shaped lists).
+3. **Leaving form pages (395).** Each of these used to read freed memory:
+   - Open JS-selectors.html (it has a `<form>`), then a bookmark, then
+     back, then forward. Do this 5 times.
+   - **lite.duckduckgo.com**: search, then search again from the
+     results page, then back twice. Do this 3 times.
+   - Any login or search form on a site you use: submit it, then
+     navigate on.
+   Expect no crash and no freeze. Report any that happen, with
+   netsurf.log.
+4. **github.com/netsurf-browser/netsurf (402).** Report the time to
+   "Done", whether the file list and the README render, and how many
+   `DEADLINE hit` lines netsurf.log has (expect none; before 402 the
+   selector-engine task would have hit the 8000 ms deadline).
+5. **make.wordpress.org/core (395, the original crash).** Load it, wait
+   30 s, scroll to the bottom. Expect no crash. netsurf.log may show `iframe
+   window ...: box ... is not in the parent's tree` (the guard firing,
+   which is fine).
+6. **old.reddit.com and developer.mozilla.org (396):** both load without
+   crashing.
+7. **Still open from run 40** (never answered): the Guardian's time to
+   first paint, Stack Overflow's Cloudflare clear time, and the
+   `LIFE SHEETREACH*` / `SHEETIDCENSUS` / `SHEETCAUSE` lines from real
+   browsing of CSS-in-JS sites (doc 23 piece C waits on these).
