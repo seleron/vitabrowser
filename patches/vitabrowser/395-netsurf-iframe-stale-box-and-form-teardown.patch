@@ -1,0 +1,134 @@
+# netsurf: two use-after-frees ASan found on make.wordpress.org/core (patch 395)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 391)
+#
+# The 365 entry's "wpblog intermittent segfault rc -11, no gdb repro".
+# Under an ASan sim (the 386 recipe) it reproduces on every load, and it
+# is two bugs:
+#
+#  1. desktop/frames.c -- an iframe window's box freed by a full reconvert.
+#     browser_window_recalculate_iframes (fixes905/patch 244) re-links each
+#     window to its box when the PARENT reformats. A full reconvert forced
+#     by script (getComputedStyle -> qjs_geometry_flush ->
+#     macos9_reconvert_flush_now -> html_reconvert) frees the old tree
+#     first, and a background reformat of the CHILD scheduled earlier can
+#     run before the parent's: content__reformat -> browser_window_update ->
+#     browser_window_invalidate_iframe -> html_redraw_a_box -> box_coords on
+#     the freed box. On wpblog: a script-made videopress iframe.
+#     New browser_window_iframe_box_live(): the window's box must be one of
+#     the parent's current iframe records (pointer compare, never read
+#     through); otherwise it is set NULL until the next re-link. Used by
+#     browser_window_invalidate_iframe and the iframe scrollbar callback.
+#     Logged "iframe window %p: box %p is not in the parent's tree".
+#
+#  2. content/handlers/html/html.c -- html_destroy freed the forms (and so
+#     every form-owned control) BEFORE html_free_layout, and
+#     box_talloc_destructor reads b->gadget->form to free orphan controls:
+#     every box with a form control read freed memory at every content
+#     destroy -- any page with a <form> control, on navigation away or exit
+#     (ASan: a one-button form page). Forms are now destroyed after the
+#     layout, the order html_reconvert_free_old already uses.
+#
+--- a/desktop/frames.c	2026-11-07 10:04:16.738131358 +0000
++++ b/desktop/frames.c	2026-11-07 10:10:25.885797347 +0000
+@@ -58,6 +58,40 @@
+ 
+ 
+ /**
++ * Patch 395: is an iframe window's box still in its parent's box tree?
++ *
++ * The re-link in browser_window_recalculate_iframes runs when the PARENT
++ * reformats. A full reconvert frees the old tree before that -- and when
++ * script forces it (getComputedStyle's geometry flush), the CHILD's own
++ * reformat can be broadcast first: browser_window_update ->
++ * browser_window_invalidate_iframe -> html_redraw_a_box -> box_coords on a
++ * freed box (ASan, make.wordpress.org/core: the 365 entry's intermittent
++ * rc -11). The parent's iframe records always name boxes of its current
++ * tree (the full reconvert drops the old list, the build makes the new
++ * one), so the window's box is matched against them by pointer only --
++ * never read through. A box not found is dropped (NULL); the parent's
++ * next re-link sets the right one.
++ */
++static bool browser_window_iframe_box_live(struct browser_window *bw)
++{
++	struct content_html_iframe *cur;
++
++	if (bw->box == NULL)
++		return false;
++	if (bw->parent != NULL && bw->parent->current_content != NULL &&
++	    content_get_type(bw->parent->current_content) == CONTENT_HTML) {
++		for (cur = html_get_iframe(bw->parent->current_content);
++		     cur != NULL; cur = cur->next)
++			if (cur->box == bw->box)
++				return true;
++	}
++	NSLOG(netsurf, INFO, "iframe window %p: box %p is not in the parent's "
++	      "tree, dropped until the re-link", bw, bw->box);
++	bw->box = NULL;
++	return false;
++}
++
++/**
+  * Callback for (i)frame scrollbars.
+  */
+ void browser_window_scroll_callback(void *client_data,
+@@ -68,8 +102,9 @@
+ 	switch(scrollbar_data->msg) {
+ 	case SCROLLBAR_MSG_MOVED:
+ 		if (bw->browser_window_type == BROWSER_WINDOW_IFRAME) {
+-			/* patch 244: an iframe window can be without a box */
+-			if (bw->box != NULL)
++			/* patch 244: an iframe window can be without a box;
++			 * patch 395: or hold one a full reconvert freed */
++			if (browser_window_iframe_box_live(bw))
+ 				html_redraw_a_box(bw->parent->current_content,
+ 						  bw->box);
+ 		} else {
+@@ -204,6 +239,10 @@
+ 			bw->parent->current_content == NULL) {
+ 		return NSERROR_OK;
+ 	}
++	/* patch 395: a box a full reconvert freed before the parent's
++	 * re-link ran is never read */
++	if (!browser_window_iframe_box_live(bw))
++		return NSERROR_OK;
+ 	html_redraw_a_box(bw->parent->current_content, bw->box);
+ 	return NSERROR_OK;
+ }
+--- a/content/handlers/html/html.c	2026-11-07 10:07:39.473619515 +0000
++++ b/content/handlers/html/html.c	2026-11-07 10:10:25.887280085 +0000
+@@ -12131,12 +12131,13 @@
+ 
+ 	selection_destroy(html->sel);
+ 
+-	/* Destroy forms */
+-	for (f = html->forms; f != NULL; f = g) {
+-		g = f->prev;
+-
+-		form_free(f);
+-	}
++	/* patch 395: the forms are destroyed AFTER the layout (below).
++	 * box_talloc_destructor reads b->gadget->form to free orphan controls,
++	 * so freeing the form-owned controls first made every box with one read
++	 * freed memory as html_free_layout ran -- on every page with a <form>
++	 * control, at every content destroy (ASan: a one-button form page). The
++	 * full reconvert already frees in this order (html_reconvert_free_old:
++	 * old tree, then old forms). */
+ 
+ 	imagemap_destroy(html);
+ 
+@@ -12224,6 +12225,14 @@
+ 
+ 	/* free layout */
+ 	html_free_layout(html);
++
++	/* Destroy forms (patch 395: after the layout, see above) */
++	for (f = html->forms; f != NULL; f = g) {
++		g = f->prev;
++
++		form_free(f);
++	}
++	html->forms = NULL;
+ }
+ 
+ 
