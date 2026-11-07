@@ -10484,3 +10484,47 @@ sudo. The Vita cross-build was not run (no vitaSDK here).
    drop with 2. Fold it into the next hand-off.
 2. ASan-sweep the other 20 scorecard sites with the same loop. Two runs
    of one site found two bugs; the rest have never had an ASan load.
+
+## Unit 397 (2026-11-07): ASan sweep of the scorecard sites -- clean; the ASan loop becomes two tools
+
+**395's "Next" #2.** Two ASan loads found three crash bugs (395 a/b, 396),
+so every scorecard site got ASan loads on the landed stack (395+396):
+**20 sites x 3 loads = 60 loads, 0 ASan errors** (wpblog was already
+8/8 clean in the 395 entry). Each load is a scorecard load: same
+directory, blocklist, settle 15000, then `quit`, so the full
+`netsurf_exit` teardown runs (confirmed "Exited successfully" in every
+log). Every page reached Done with its real title and ran its scripts:
+bbc 76, guardian 87, stackoverflow 72, youtube 65, claude 32, oldreddit
+28 (the "Welcome to Reddit" wall), google 23. The ASan binary was built
+from sources compared file-by-file with applytest (0 diffs).
+
+**What this covers and what it does not:** instrumented netsurf code
+(content/, desktop/, frontends/vita, utils/) through load, script, local
+and full rebuilds, and teardown. It does **not** cover libcss / libdom /
+libhubbub / QuickJS / curl (the prefix libraries are not instrumented),
+user interaction (no taps, scrolling, or form input; the gate's
+interaction pass is not run under ASan), or the bundled test pages.
+
+**The loop as tools** (the regression check the 395 entry names):
+- `tools/build-asan-sim.sh <dest>`: copies applytest's netsurf to
+  `<dest>` and builds an ASan nsvita-sim with run-vita-sim.sh's flags
+  plus `-fsanitize=address` (applytest untouched; needs a prior gate run
+  for the overlay and libvitasim.a).
+- `tools/scorecard/asan_sweep.py <asan-sim> <out> [--runs N] [--jobs N]
+  [--only a,b] [--skip a,b]`: scorecard loads with the binary swapped.
+  Prints each load's first ASan frame, and exits 1 if any load has one.
+- Checked both ways: the 395+396 build, wpblog + example, exit 0. The
+  saved unfixed ASan binary, wpblog, exit 1 with
+  `heap-use-after-free in box_coords (box_inspect.c:571)`, the 395
+  bug.
+
+Tools only, no engine or gate change: the tree is the one gate396 passed
+(exit 0). No sudo.
+
+**Next:**
+1. ASan the interaction paths: the gate's bundled pages + interaction
+   pass against an ASan binary (run-vita-sim.sh builds its own, so it
+   needs a binary override).
+2. Instrument the prefix libraries (libdom / libcss) for a sweep, since
+   the engine's DOM and cascade live there.
+3. Device run: do form-page nav-away crashes drop with 395b?
