@@ -1,0 +1,238 @@
+# netsurf: querySelectorAll's JS path tries a candidate only against its own seed's selectors (patch 402)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 396)
+#
+# github.com spent 5.7 s (host sim; far past the Vita's 8000 ms script
+# deadline) in ONE MutationObserver delivery. Its selector-observer's
+# SelectorSet.queryAll joins every registered selector into one
+# querySelectorAll ("a, b, [attr], ..."); a few use attributes or
+# pseudo-classes, so the whole list fails plain() and goes to jsQuery,
+# which took one native candidate query per selector's seed (the subject's
+# tag/#id/.classes; '*' for attribute-only ones) and tried EVERY candidate
+# against the WHOLE list: seeds x candidates x selectors. Measured: 2.4
+# million String.replace calls, 99% compoundOk's class normalisation.
+#
+#  - seedGroups(list): selectors grouped by identical seed. A seed is a
+#    necessary condition of its selector's subject, so every element a
+#    selector matches is among its seed's candidates: a candidate is tried
+#    only against its group (complexOk per selector), each distinct seed
+#    queried once. Same results; pseudo-element subjects still never match.
+#  - compoundOk: within one jsQuery (ctx.cls), a node's class string is
+#    normalised once, not per selector tried on it. matches()/closest()
+#    pass no cache and behave as before.
+#
+# github: slowest MO delivery 5667 -> 42 ms, all MO callbacks 6.7 s ->
+# 0.15 s. Results checked on github itself: 348 long-list queries compared
+# against a brute-force el.matches(list) walk, 0 differ (both binaries).
+# Gate: JS-selectors gains four multi-seed lists (Chromium's output), 89.
+#
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js	2026-11-07 14:39:23.726042036 +0000
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js	2026-11-07 14:46:39.917392111 +0000
+@@ -4932,7 +4932,13 @@
+ 		if (cp.tag && lname(n) !== cp.tag) return false;
+ 		if (cp.id !== null && n.getAttribute('id') !== cp.id) return false;
+ 		if (cp.cls.length) {
+-			var c = ' ' + String(n.getAttribute('class') || '').replace(/\s+/g, ' ') + ' ';
++			/* 402: one query (jsQuery's ctx.cls) normalises a node's
++			 * class string once, not once per selector tried on it */
++			var c = ctx && ctx.cls ? ctx.cls.get(n) : undefined;
++			if (c === undefined) {
++				c = ' ' + String(n.getAttribute('class') || '').replace(/\s+/g, ' ') + ' ';
++				if (ctx && ctx.cls) ctx.cls.set(n, c);
++			}
+ 			for (var i = 0; i < cp.cls.length; i++) if (c.indexOf(' ' + cp.cls[i] + ' ') < 0) return false;
+ 		}
+ 		for (var j = 0; j < cp.attrs.length; j++) if (!attrOk(n, cp.attrs[j])) return false;
+@@ -5050,16 +5056,31 @@
+ 		return /^[\sA-Za-z0-9_\-#.,>+~*]*$/.test(sel) && !/(^|[,>+~\s])[+~>]|[+~>]\s*($|,)/.test(sel.trim());
+ 	}
+ 	/* the rightmost compound's tag/#id/.class part, for native candidates */
+-	function seed(list) {
+-		var out = [];
++	function seedOf(cp) {
++		var s = cp.tag || '*';
++		if (cp.id !== null && /^[A-Za-z_][\w-]*$/.test(cp.id)) s += '#' + cp.id;
++		for (var k = 0; k < cp.cls.length; k++) if (/^[A-Za-z_][\w-]*$/.test(cp.cls[k])) s += '.' + cp.cls[k];
++		return s;
++	}
++	/* 402: the list's selectors grouped by seed. A seed is a necessary
++	 * condition of its selector's subject (the rightmost compound's tag,
++	 * #id and .classes), so every element a selector matches is among its
++	 * seed's candidates: a candidate need only be tried against the
++	 * selectors of its own group. (Was: every candidate of every seed
++	 * against the whole list -- github's SelectorSet joins every
++	 * registered selector into one querySelectorAll, ~2.4 million class
++	 * tests and 5.7 s in one MutationObserver delivery.) Pseudo-element
++	 * subjects never match and get no group. */
++	function seedGroups(list) {
++		var groups = [], at = {};
+ 		for (var i = 0; i < list.length; i++) {
+-			var cp = list[i].parts[list[i].parts.length - 1], s = cp.tag || '*';
++			var cp = list[i].parts[list[i].parts.length - 1], s;
+ 			if (cp.pel) continue;
+-			if (cp.id !== null && /^[A-Za-z_][\w-]*$/.test(cp.id)) s += '#' + cp.id;
+-			for (var k = 0; k < cp.cls.length; k++) if (/^[A-Za-z_][\w-]*$/.test(cp.cls[k])) s += '.' + cp.cls[k];
+-			out.push(s);
++			s = seedOf(cp);
++			if (!Object.prototype.hasOwnProperty.call(at, s)) { at[s] = groups.length; groups.push({ seed: s, sels: [] }); }
++			groups[at[s]].sels.push(list[i]);
+ 		}
+-		return out;
++		return groups;
+ 	}
+ 	function listOf(a) {
+ 		try { Object.defineProperty(a, 'item', { value: function (i) { return this[i] || null; }, configurable: true }); } catch (e) { /* */ }
+@@ -5107,8 +5128,9 @@
+ 		return inOrder(root, set);
+ 	}
+ 	function jsQuery(root, sel, first, nat) {
+-		var list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;
+-		if (!seeds.length) return first ? null : listOf([]);
++		var list = parse(sel), groups = seedGroups(list), out = [], all = [], seen = new Set(), i, j, k;
++		var ctx = { scope: root.nodeType === 1 ? root : null, cls: new Map() };
++		if (!groups.length) return first ? null : listOf([]);
+ 		/* 193: :scope matches the scoping element itself, but each()
+ 		 * never yields the root for element roots. Test it explicitly;
+ 		 * it precedes all descendants in document order. */
+@@ -5117,24 +5139,27 @@
+ 			all.push(root);
+ 			seen.add(root);
+ 		}
+-		for (i = 0; i < seeds.length; i++) {
+-			var cand = null;
+-			try { cand = nat ? nat.call(root, seeds[i]) : null; } catch (e) { cand = null; }
++		for (i = 0; i < groups.length; i++) {
++			var cand = null, sels = groups[i].sels;
++			try { cand = nat ? nat.call(root, groups[i].seed) : null; } catch (e) { cand = null; }
+ 			if (!cand) {
+ 				cand = [];
+ 				each(root, function (m) { cand.push(m); return false; });
+ 			}
+ 			for (k = 0; k < cand.length; k++) {
+ 				var m = cand[k];
+-				if (seeds.length > 1 && seen.has(m)) continue;
+-				if (matchList(m, list, ctx)) {
+-					if (first && seeds.length === 1) return m;
+-					all.push(m);
+-					seen.add(m);
++				if (groups.length > 1 && seen.has(m)) continue;
++				for (j = 0; j < sels.length; j++) {
++					if (complexOk(m, sels[j].parts, sels[j].parts.length - 1, ctx)) {
++						if (first && groups.length === 1) return m;
++						all.push(m);
++						seen.add(m);
++						break;
++					}
+ 				}
+ 			}
+ 		}
+-		out = seeds.length > 1 ? inOrder(root, seen) : all;
++		out = groups.length > 1 ? inOrder(root, seen) : all;
+ 		if (first) return out[0] || null;
+ 		return listOf(out);
+ 	}
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc	2026-11-07 14:39:23.727440421 +0000
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc	2026-11-07 14:46:39.917698268 +0000
+@@ -4933,7 +4933,13 @@
+ "\t\tif (cp.tag && lname(n) !== cp.tag) return false;\n"
+ "\t\tif (cp.id !== null && n.getAttribute('id') !== cp.id) return false;\n"
+ "\t\tif (cp.cls.length) {\n"
+-"\t\t\tvar c = ' ' + String(n.getAttribute('class') || '').replace(/\\s+/g, ' ') + ' ';\n"
++"\t\t\t/* 402: one query (jsQuery's ctx.cls) normalises a node's\n"
++"\t\t\t * class string once, not once per selector tried on it */\n"
++"\t\t\tvar c = ctx && ctx.cls ? ctx.cls.get(n) : undefined;\n"
++"\t\t\tif (c === undefined) {\n"
++"\t\t\t\tc = ' ' + String(n.getAttribute('class') || '').replace(/\\s+/g, ' ') + ' ';\n"
++"\t\t\t\tif (ctx && ctx.cls) ctx.cls.set(n, c);\n"
++"\t\t\t}\n"
+ "\t\t\tfor (var i = 0; i < cp.cls.length; i++) if (c.indexOf(' ' + cp.cls[i] + ' ') < 0) return false;\n"
+ "\t\t}\n"
+ "\t\tfor (var j = 0; j < cp.attrs.length; j++) if (!attrOk(n, cp.attrs[j])) return false;\n"
+@@ -5051,16 +5057,31 @@
+ "\t\treturn /^[\\sA-Za-z0-9_\\-#.,>+~*]*$/.test(sel) && !/(^|[,>+~\\s])[+~>]|[+~>]\\s*($|,)/.test(sel.trim());\n"
+ "\t}\n"
+ "\t/* the rightmost compound's tag/#id/.class part, for native candidates */\n"
+-"\tfunction seed(list) {\n"
+-"\t\tvar out = [];\n"
++"\tfunction seedOf(cp) {\n"
++"\t\tvar s = cp.tag || '*';\n"
++"\t\tif (cp.id !== null && /^[A-Za-z_][\\w-]*$/.test(cp.id)) s += '#' + cp.id;\n"
++"\t\tfor (var k = 0; k < cp.cls.length; k++) if (/^[A-Za-z_][\\w-]*$/.test(cp.cls[k])) s += '.' + cp.cls[k];\n"
++"\t\treturn s;\n"
++"\t}\n"
++"\t/* 402: the list's selectors grouped by seed. A seed is a necessary\n"
++"\t * condition of its selector's subject (the rightmost compound's tag,\n"
++"\t * #id and .classes), so every element a selector matches is among its\n"
++"\t * seed's candidates: a candidate need only be tried against the\n"
++"\t * selectors of its own group. (Was: every candidate of every seed\n"
++"\t * against the whole list -- github's SelectorSet joins every\n"
++"\t * registered selector into one querySelectorAll, ~2.4 million class\n"
++"\t * tests and 5.7 s in one MutationObserver delivery.) Pseudo-element\n"
++"\t * subjects never match and get no group. */\n"
++"\tfunction seedGroups(list) {\n"
++"\t\tvar groups = [], at = {};\n"
+ "\t\tfor (var i = 0; i < list.length; i++) {\n"
+-"\t\t\tvar cp = list[i].parts[list[i].parts.length - 1], s = cp.tag || '*';\n"
++"\t\t\tvar cp = list[i].parts[list[i].parts.length - 1], s;\n"
+ "\t\t\tif (cp.pel) continue;\n"
+-"\t\t\tif (cp.id !== null && /^[A-Za-z_][\\w-]*$/.test(cp.id)) s += '#' + cp.id;\n"
+-"\t\t\tfor (var k = 0; k < cp.cls.length; k++) if (/^[A-Za-z_][\\w-]*$/.test(cp.cls[k])) s += '.' + cp.cls[k];\n"
+-"\t\t\tout.push(s);\n"
++"\t\t\ts = seedOf(cp);\n"
++"\t\t\tif (!Object.prototype.hasOwnProperty.call(at, s)) { at[s] = groups.length; groups.push({ seed: s, sels: [] }); }\n"
++"\t\t\tgroups[at[s]].sels.push(list[i]);\n"
+ "\t\t}\n"
+-"\t\treturn out;\n"
++"\t\treturn groups;\n"
+ "\t}\n"
+ "\tfunction listOf(a) {\n"
+ "\t\ttry { Object.defineProperty(a, 'item', { value: function (i) { return this[i] || null; }, configurable: true }); } catch (e) { /* */ }\n"
+@@ -5108,8 +5129,9 @@
+ "\t\treturn inOrder(root, set);\n"
+ "\t}\n"
+ "\tfunction jsQuery(root, sel, first, nat) {\n"
+-"\t\tvar list = parse(sel), seeds = seed(list), ctx = { scope: root.nodeType === 1 ? root : null }, out = [], all = [], seen = new Set(), i, k;\n"
+-"\t\tif (!seeds.length) return first ? null : listOf([]);\n"
++"\t\tvar list = parse(sel), groups = seedGroups(list), out = [], all = [], seen = new Set(), i, j, k;\n"
++"\t\tvar ctx = { scope: root.nodeType === 1 ? root : null, cls: new Map() };\n"
++"\t\tif (!groups.length) return first ? null : listOf([]);\n"
+ "\t\t/* 193: :scope matches the scoping element itself, but each()\n"
+ "\t\t * never yields the root for element roots. Test it explicitly;\n"
+ "\t\t * it precedes all descendants in document order. */\n"
+@@ -5118,24 +5140,27 @@
+ "\t\t\tall.push(root);\n"
+ "\t\t\tseen.add(root);\n"
+ "\t\t}\n"
+-"\t\tfor (i = 0; i < seeds.length; i++) {\n"
+-"\t\t\tvar cand = null;\n"
+-"\t\t\ttry { cand = nat ? nat.call(root, seeds[i]) : null; } catch (e) { cand = null; }\n"
++"\t\tfor (i = 0; i < groups.length; i++) {\n"
++"\t\t\tvar cand = null, sels = groups[i].sels;\n"
++"\t\t\ttry { cand = nat ? nat.call(root, groups[i].seed) : null; } catch (e) { cand = null; }\n"
+ "\t\t\tif (!cand) {\n"
+ "\t\t\t\tcand = [];\n"
+ "\t\t\t\teach(root, function (m) { cand.push(m); return false; });\n"
+ "\t\t\t}\n"
+ "\t\t\tfor (k = 0; k < cand.length; k++) {\n"
+ "\t\t\t\tvar m = cand[k];\n"
+-"\t\t\t\tif (seeds.length > 1 && seen.has(m)) continue;\n"
+-"\t\t\t\tif (matchList(m, list, ctx)) {\n"
+-"\t\t\t\t\tif (first && seeds.length === 1) return m;\n"
+-"\t\t\t\t\tall.push(m);\n"
+-"\t\t\t\t\tseen.add(m);\n"
++"\t\t\t\tif (groups.length > 1 && seen.has(m)) continue;\n"
++"\t\t\t\tfor (j = 0; j < sels.length; j++) {\n"
++"\t\t\t\t\tif (complexOk(m, sels[j].parts, sels[j].parts.length - 1, ctx)) {\n"
++"\t\t\t\t\t\tif (first && groups.length === 1) return m;\n"
++"\t\t\t\t\t\tall.push(m);\n"
++"\t\t\t\t\t\tseen.add(m);\n"
++"\t\t\t\t\t\tbreak;\n"
++"\t\t\t\t\t}\n"
+ "\t\t\t\t}\n"
+ "\t\t\t}\n"
+ "\t\t}\n"
+-"\t\tout = seeds.length > 1 ? inOrder(root, seen) : all;\n"
++"\t\tout = groups.length > 1 ? inOrder(root, seen) : all;\n"
+ "\t\tif (first) return out[0] || null;\n"
+ "\t\treturn listOf(out);\n"
+ "\t}\n"

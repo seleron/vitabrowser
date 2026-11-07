@@ -1852,7 +1852,7 @@ echo "  JS-appearance196: ${a96r:-no summary}"
 slp=$(ls "$R"/*NET-js-selectors*.plot 2>/dev/null)
 slr=$(sed -n 's/.*STR \(SELECTORS: [0-9]*\/[0-9]* passed\).*/\1/p' $slp 2>/dev/null | head -1)
 echo "  JS-selectors: ${slr:-no summary}"
-[ "$slr" = "SELECTORS: 85/85 passed" ] || { [ -n "$slp" ] && grep -aho 'STR [^"]*(want[^"]*' $slp | head -3 | sed 's/^STR /  /'; }
+[ "$slr" = "SELECTORS: 89/89 passed" ] || { [ -n "$slp" ] && grep -aho 'STR [^"]*(want[^"]*' $slp | head -3 | sed 's/^STR /  /'; }
 # Character data (Patch 179): a detached text node's data set no longer
 # crashes libdom; CharacterData edits; characterData mutation records.
 cdp=$(ls "$R"/*NET-js-chardata*.plot 2>/dev/null)
@@ -2196,7 +2196,7 @@ soft_pass "$lnr" "LISTNEST: 7/7 passed" "$lnp" 7 && [ "${lnl:-0}" -ge 6 ] && \
 [ "$smr" = "STRMAX194: 4/4 passed" ] && \
 [ "$f95r" = "FLEX195: 4/4 passed" ] && \
 [ "$a96r" = "APPEAR196: 22/22 passed" ] && \
-[ "$slr" = "SELECTORS: 85/85 passed" ] && \
+[ "$slr" = "SELECTORS: 89/89 passed" ] && \
 [ "$abr" = "ACCTBAR: 5/5 passed" ] && \
 [ "$appr" = "APPEAR: 6/6 passed" ] && \
 [ "$cdr" = "CHARDATA: 5/5 passed" ] && \
