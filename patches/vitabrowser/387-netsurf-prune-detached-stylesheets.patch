@@ -1,0 +1,190 @@
+# netsurf: a removed <style>/<link> stops cascading (patch 387)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 386)
+#
+# The unit 383 entry ("the <head> no-op") observed the persistence
+# without fixing it: the stylesheet list in struct html_content is
+# collected when the content is created and added to on insertion,
+# and it is never re-collected nor pruned -- even by a full rebuild.
+# html_css_process_style/_link appends an entry per element; nothing
+# removes the entry when the element leaves the DOM, so a deleted
+# <style>/<link> kept cascading through every later rebuild, local or
+# full, until the document was replaced.
+#
+# The fix: html_css_prune_detached_sheets() (css.c) walks the array
+# and, for every entry with a live node, follows the parent chain.
+# Attached = the chain reaches the document (the only node with a
+# NULL parent); removed = the chain is cut at the removal point.
+# Detached entries are marked unused -- the slot layout is fixed
+# (the 316/318 sheet census references index + mod_count), so "dead"
+# is the unused flag html_css_new_selection_context already skips --
+# and their sheet handle, reach tables and node ref are released,
+# mirroring html_css_free_stylesheets() for one entry. The
+# selection-context refresh is folded in so the caller makes one
+# call. node == NULL entries (UA sheet, pre-387 link entries) are
+# left alone: no evidence they are gone.
+#
+# Two call sites (html.c):
+# - html_reconvert: up front, after the quiesce guard. The full
+#   rebuild's fresh cascade is then built from the pruned list.
+# - html_reconvert_local_change: up front, before the local rebuild.
+#   Anything detached declines the local path (RL_NO) into the full
+#   reconvert, whose own prune rebuilds the tree without the sheet.
+#
+# Log lines: WORK reconvert: pruned N detached sheet(s) /
+# LIFE rebuild local: declined (detached stylesheet pruned).
+#
+# Gate: the whole unit gate is green (all suites at their baselines;
+# see the 387 state-log entry). ASan was not re-run in this session.
+diff -ruN a/content/handlers/html/css.c b/content/handlers/html/css.c
+--- a/content/handlers/html/css.c	2026-11-07 03:04:57.276766760 +0000
++++ b/content/handlers/html/css.c	2026-11-07 03:04:57.278096522 +0000
+@@ -803,6 +803,85 @@
+ 	return NSERROR_OK;
+ }
+ 
++/* VitaBrowser unit 387: the stylesheet list is append-only --
++ * html_css_process_style/_link add entries on insertion and NOTHING
++ * removes them when the element leaves the DOM, so a deleted
++ * <style>/<link> kept cascading through every rebuild (the unit 383
++ * head no-op even documents the persistence). Prune the entries whose
++ * element is no longer connected to this document: mark them unused
++ * (the slot layout is fixed -- the 316/318 census references
++ * index + mod_count -- so "dead" is the unused flag
++ * html_css_new_selection_context already skips), release the sheet
++ * handle and the reach table, and unref the node. The selection-context
++ * refresh is folded in here so callers make one call.
++ *
++ * Entries with node == NULL (the base/UA sheet, and link entries
++ * created before this patch) are left alone: there is no evidence
++ * they are gone.
++ *
++ * \param c The html content
++ * \return The number of sheets marked unused (0 = nothing to do)
++ */
++int html_css_prune_detached_sheets(html_content *c)
++{
++	unsigned int i;
++	int n = 0;
++
++	if (c == NULL || c->stylesheets == NULL || c->document == NULL)
++		return 0;
++
++	for (i = STYLESHEET_START; i != c->stylesheet_count; i++) {
++		struct html_stylesheet *hsheet = &c->stylesheets[i];
++		dom_node *walk;
++		bool attached = true;
++
++		if (hsheet->unused || hsheet->node == NULL)
++			continue;
++
++		/* Walk the parent chain: attached iff it reaches the
++		 * document (the only node whose parent is NULL). A
++		 * removed node's chain is cut at the removal point, so
++		 * the walk stops early with a live parent. */
++		walk = hsheet->node;
++		attached = false;
++		while (walk != NULL) {
++			dom_node *up = NULL;
++			dom_node *next;
++			if (dom_node_get_parent_node(walk, &up) != DOM_NO_ERR)
++				break;
++			next = up;
++			if (up == NULL) {
++				attached = true;
++				break;
++			}
++			dom_node_unref(up);
++			walk = next;
++		}
++		if (attached)
++			continue;
++
++		/* The element that brought this sheet into the document
++		 * has left it: drop the sheet from the cascade, mirroring
++		 * html_css_free_stylesheets() for the one entry. */
++		hsheet->unused = true;
++		if (hsheet->sheet != NULL)
++			hlcache_handle_release(hsheet->sheet);
++		hsheet->sheet = NULL;
++		html_css_reach_table_free(hsheet->reach_prev);
++		html_css_reach_table_free(hsheet->reach_cur);
++		hsheet->reach_prev = NULL;
++		hsheet->reach_cur = NULL;
++		dom_node_unref(hsheet->node);
++		hsheet->node = NULL;
++		n++;
++	}
++
++	if (n > 0)
++		html_css_refresh_selection_context(c);
++
++	return n;
++}
++
+ 
+ /* exported function documented in html/css.h */
+ nserror html_css_quirks_stylesheets(html_content *c)
+diff -ruN a/content/handlers/html/css.h b/content/handlers/html/css.h
+--- a/content/handlers/html/css.h	2026-11-07 03:04:57.279544285 +0000
++++ b/content/handlers/html/css.h	2026-11-07 03:04:57.280781864 +0000
+@@ -53,6 +53,17 @@
+ nserror html_css_new_selection_context(struct html_content *c, css_select_ctx **select_ctx);
+ 
+ /**
++ * Prune stylesheets whose <style>/<link> element has been removed from
++ * the DOM (unit 387): the list is append-only, so without this a
++ * deleted element's rules keep cascading. Marks the entries unused,
++ * releases their sheet handles and refreshes the selection context.
++ *
++ * \param c The html content to prune.
++ * \return The number of sheets marked unused (0 = nothing to do).
++ */
++int html_css_prune_detached_sheets(struct html_content *c);
++
++/**
+  * Initialise core stylesheets for a content
+  *
+  * \param c content structure to update
+diff -ruN a/content/handlers/html/html.c b/content/handlers/html/html.c
+--- a/content/handlers/html/html.c	2026-11-07 03:04:57.282709091 +0000
++++ b/content/handlers/html/html.c	2026-11-07 03:04:57.284201225 +0000
+@@ -4921,6 +4921,19 @@
+ 		return NSERROR_NEED_DATA;
+ 	}
+ 
++	/* Unit 387 - prune stylesheets whose element left the DOM. The
++	 * list is append-only, so a removed <style>/<link> kept cascading
++	 * through EVERY rebuild, including this one (unit 383). Prune +
++	 * select-ctx refresh live in the css layer; when nothing detached
++	 * this is a short parent-chain scan and a no-op. */
++	{
++		int pruned = html_css_prune_detached_sheets(c);
++		if (pruned > 0)
++			macsurf_debug_log_writef(
++				"WORK reconvert: pruned %d detached sheet(s)",
++				pruned);
++	}
++
+ 	{
+ 		macsurf_reconvert_seq++;
+ 		macsurf_debug_log_writef(
+@@ -11610,6 +11623,18 @@
+ 		RL_NO("not loaded");
+ 	if (base_c->textsearch.context != NULL)
+ 		RL_NO("find in page is open");
++	/* Unit 387 - a <style>/<link> that left the DOM (anywhere, not
++	 * just <head>) leaves a live entry in the append-only stylesheet
++	 * list: the local rebuild below would succeed and repaint against
++	 * the stale cascade (unit 383's persistence). Prune up front;
++	 * anything detached declines into the full reconvert, whose own
++	 * prune + select-context refresh rebuilds the tree without the
++	 * dead sheet. */
++	{
++		int pruned = html_css_prune_detached_sheets(c);
++		if (pruned > 0)
++			RL_NO("detached stylesheet pruned");
++	}
+ 	/* Patch 371: frames on the page are no reason by themselves (it was
+ 	 * every change on a page with one iframe: rte, guardian). What a
+ 	 * frame needs is kept below: no rebuild frees a frame's box (the
