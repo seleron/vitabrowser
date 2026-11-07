@@ -10528,3 +10528,53 @@ Tools only, no engine or gate change: the tree is the one gate396 passed
 2. Instrument the prefix libraries (libdom / libcss) for a sweep, since
    the engine's DOM and cascade live there.
 3. Device run: do form-page nav-away crashes drop with 395b?
+
+## Unit 398 (2026-11-07): the gate's interaction runs under ASan -- clean; tools/asan-autotest.sh
+
+**397's "Next" #1.** The scorecard sweep loads pages but never taps,
+scrolls or types. The gate's interaction lives in three simulator runs,
+and each now ran against an ASan binary of the landed stack (395+396,
+`tools/build-asan-sim.sh`):
+
+| run | what it drives | ASan | result |
+|---|---|---|---|
+| main autotest | every bundled + network page (251 network lines, 319 dumps) and the interaction pass: taps, pointer, back/forward, drag scroll, zoom, blocked hosts, a form filled in, typed URL, LAN push, cookies, home, download | clean, rc 0 | interaction **52/52**, 319/319 dumps |
+| scriptless form submissions | multipart / urlencoded / windows-1252 / file upload / image + named/unnamed submitters / button / values, tapped Send into an iframe target | clean, rc 0 | **10/10** FORMCHECK as Chromium; FORMTARGET `tap tapped,link` |
+| Vita's pace (40 ms/frame, text unbatched) | the autotest again at the device's frame pace, so different event timing | clean, rc 0 | interaction **52/52**, JS-window 4 of 4 |
+
+296 of the 319 main-run dumps are byte-identical to the gate's. The 23
+that differ are timing pages (streaming, fetch-stream/headers, stall
+pages, timer nesting, wasm, history/home-recent timestamps). Every one
+that carries a summary reads the same pass count as the gate. REFLOW's
+top dump was taken before the slower ASan run settled, and its bottom
+dump reads 3/3.
+
+**Negative check, and what it adds to the 395 entry:** the forms run on
+the saved **unfixed** ASan binary stops with 395b's
+`heap-use-after-free in box_talloc_destructor` (`html_destroy` ->
+`html_free_layout`) at the **first navigation away from a form page**,
+after 3 of 10 submissions. So 395b was reachable in ordinary browsing
+(submit a form, the result page replaces it), not only at exit.
+
+**tools/asan-autotest.sh** `<asan-sim> <dir> [main|forms|slow]`: the
+three runs above, reusing the last gate run's app0: bundle, network page
+list (ports moved to 45480+) and TLS certs. Exits 1 on an ASan error, a
+crash, or any count short of the gate's. The form script mirrors
+run-vita-sim.sh's "scriptless form submissions" block (the tool's header
+says so). A change to that block must be copied into the tool.
+Checked both ways: unfixed binary, `forms`, exit 1; fixed binary, all
+three, exit 0 (main 52/52 + 319 dumps, forms 10/10, slow 52/52, "ASan autotest: clean").
+
+Tools only, no engine or gate change: the tree is the one gate396 passed.
+No sudo.
+
+**Coverage after 397-398:** netsurf's own code is ASan-clean over 21
+real sites (load, scripts, teardown) and all of the gate's interaction.
+Still uninstrumented: libdom / libcss / libhubbub / QuickJS / curl.
+
+**Next:**
+1. Instrument libdom + libcss (prefix rebuild with `-fsanitize=address`
+   into a scratch prefix, link the ASan sim against it) and rerun both
+   sweeps.
+2. Device run: 395b was reachable on every form submission, so check
+   whether form-page crashes drop.
