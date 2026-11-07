@@ -10360,3 +10360,127 @@ No engine change, so no scorecard. No sudo.
 
 **Next:** unchanged from 393. (1) wpblog intermittent segfault rc -11,
 no gdb repro (365 entry), the only remaining UNFIXED item.
+
+## Patches 395-396 (2026-11-07): the wpblog segfault is two use-after-frees (an iframe window's freed box; forms freed before the layout at every content destroy), and a 387-389 regression crashed oldreddit/mdn
+
+**The 365 entry's open item** ("wpblog intermittent segfault rc -11, no
+gdb repro"; crashed in r90, r96, r97, t370, and once in the r104
+reruns). Every crash came 5.8-10 s into the load, while the page
+settled. The engine log is buffered, so its tail always stops in a
+burst of `data:image/svg+xml` object fetches/frees, short of the real
+crash point. That is the "object free/load" reading in the 372 entry.
+It is not where the crash happens.
+
+**Found with the 386 ASan recipe** (copy the applytest netsurf tree to
+scratch, relink with `-fsanitize=address -fno-omit-frame-pointer -g`,
+plus `-Wno-error=` for the stringop/array-bounds warnings ASan
+triggers). A loop reuses `scorecard.run_sim` with the binary swapped
+(the same per-site directory, script, and settle 15000).
+make.wordpress.org/core reproduces on **every** ASan load (12/12),
+not 1 in 3:
+
+1. **heap-use-after-free in box_coords**, from
+   `content__reformat` (scheduled) -> `browser_window_update` ->
+   `browser_window_invalidate_iframe` -> `html_redraw_a_box`. Freed by
+   `html_reconvert_free_old` in a full reconvert forced from script
+   (`qjs_get_computed_style` -> `qjs_geometry_flush` ->
+   `macos9_reconvert_flush_now` -> `html_reconvert`). The re-link of
+   iframe windows to their boxes (fixes905 / patch 244,
+   `browser_window_recalculate_iframes`) runs when the PARENT
+   reformats. A background reformat of the CHILD, scheduled before the
+   flush (`browser_window_reformat(window, true, ...)` from the previous
+   re-link), can run first, and then it reads `bw->box` from the freed
+   tree. On wpblog the window is a script-made videopress iframe.
+2. With 1 fixed, the loads run the full settle and ASan stops at exit:
+   **heap-use-after-free in box_talloc_destructor** (box_manipulate.c,
+   `b->gadget->form`), from `html_destroy` -> `html_free_layout`, the
+   gadget freed by `form_free` earlier in the same `html_destroy`.
+   `html_destroy` freed the forms (and so every form-owned control)
+   before the layout, and the destructor's orphan-control check reads
+   each box's gadget. This is **not wpblog-specific**: a one-line
+   `<form><button>` page reproduces it under ASan at exit. It fires at
+   **every content destroy of every page with a form control**
+   (navigation away included). A read of freed memory that picks up a
+   zeroed `form` field would `form_free_control` freed memory, which
+   is heap corruption on the device. The full reconvert already frees in
+   the right order (`html_reconvert_free_old`: old tree, then old
+   forms). Only `html_destroy` had it backwards.
+
+**The change** (patch 395):
+- `desktop/frames.c`: new `browser_window_iframe_box_live()`. The
+  window's box must be one of the parent's current iframe records,
+  checked by pointer compare and never read through. The full reconvert
+  drops the old record list, and the build makes the new one, so the
+  records always name boxes of the live tree. A box that is not found
+  is set NULL (logged "iframe window %p: box %p is not in the parent's
+  tree, dropped until the re-link"), and the parent's next re-link
+  sets the right one (`window->box != cur->box`). Used by
+  `browser_window_invalidate_iframe` and the iframe scrollbar callback,
+  the two places that read `bw->box` outside the re-link.
+- `content/handlers/html/html.c`, `html_destroy`: forms are destroyed
+  after `html_free_layout`, and `html->forms` is set NULL.
+
+**Verified under ASan** (fixed binary, same loop): wpblog **8/8 clean**,
+against 12/12 ASan errors before. The form page is clean. The new log
+line fires exactly once per wpblog load (8/8): that is the race the
+segfault needed, now caught.
+
+**Not done:** no deterministic gate page for the iframe race. A local
+attempt (resize iframe A, remove a block holding iframe B, which is a
+known full-rebuild decline, then a geometry read, 12 rounds) got only 2
+full reconverts, and the unfixed ASan binary stayed clean on it. The
+wpblog trigger is a chain of declined local rebuilds around a
+script-made cross-origin frame. A UAF read does not crash the plain
+gate binary anyway, so the regression check for both bugs is the ASan
+loop above, with the wpblog URL and the one-button form page.
+
+**Patch 396 (same unit): a pruned `<style>` with a pending text update
+(a 387-389 regression).** The first 395 scorecard (r112, the 395 and
+pre-395 binaries back to back) showed **old.reddit.com and
+developer.mozilla.org crashing in both arms**. r111 (387 binary) had no
+crash, so the cause is in 388-391. ASan on oldreddit: SEGV, NULL in
+`dom_node_get_text_content` <- `html_stylesheet_from_domnode` <-
+`html_css_process_modified_style` <- `html_css_process_modified_styles`
+(scheduled). A script changes a `<style>`'s text (`modified = true`,
+pass scheduled at 0), then the element leaves the document. The 387
+prune drops the entry (`unused`, node unref'd and set NULL) but kept
+the mark, and the pass re-read a NULL node. Fix: the prune clears
+`modified`, and the pass unmarks and skips an entry that is unused or
+has no node. Plain sim, 4 loads each: **oldreddit 4/4 crash -> 0/4,
+mdn 4/4 crash -> 0/4** (395 binary vs 395+396). ASan oldreddit 3/3
+clean. mdn's stack was not captured: ASan loads of mdn were clean,
+and gdb (with and without address randomization) never crashed, the
+same "no gdb repro" signature as wpblog. The attribution rests on the
+4/4 -> 0/4 swing. r112's one **github** crash (395 arm only) did not
+reproduce: 4/4 plain loads on 395, 4/4 on 396, 2/2 under ASan, all
+clean. It is logged, not attributed.
+
+**Restage from pristine:** 484 applied plus the 2 known collisions;
+frames.c, html.c and css.c byte-identical to the tested tree.
+
+**Gates:** gate395 (395 alone) and gate396 (395+396) both exit 0. gate396: 251/251 pages, interaction 52/52 (full pass
+and at the Vita's pace), TIMERNEST 4/4, Vita's-pace 23/23 identical +
+68 text frames identical, vita-test.bin byte-identical, netlog mirror 322
+identical 0 differ.
+
+**Scorecard r113**: 21 sites against `r79-360`, the 396 (395+396) and
+pre-395 binaries back to back (`score/r113-396`, `score/r113-pre395`):
+**71.55 vs 66.54**. The whole gap is the two 387-389 crashes: mdn 83.0
+vs crash, and oldreddit loads (scored 20.8 "blocked": Reddit served its
+"Welcome to Reddit" wall, a live-site state) vs crash. Every other site
+is within live noise (ddglite +1.2, hackernews +0.4, stackoverflow
+-0.2). wpblog 68.2 in both, no crash in either. A crash-free wpblog
+in one A/B proves nothing about an intermittent bug; the ASan loop is
+the evidence.
+(r112, the first 395 A/B before 396 existed: 63.52 vs 66.66. 395 arm:
+oldreddit, mdn, github crash; pre arm: oldreddit, mdn crash.)
+
+Binaries: `applytest/nsvita-sim.395` (395 only), `.396` (395+396), `.pre395` (391 stack). No
+sudo. The Vita cross-build was not run (no vitaSDK here).
+
+**Next:**
+1. A device run would show whether nav-away crashes on form pages
+   (fixes907's "TALLOC-INFO free-layout during=content-destroy" family)
+   drop with 2. Fold it into the next hand-off.
+2. ASan-sweep the other 20 scorecard sites with the same loop. Two runs
+   of one site found two bugs; the rest have never had an ASan load.
