@@ -10578,3 +10578,50 @@ Still uninstrumented: libdom / libcss / libhubbub / QuickJS / curl.
    sweeps.
 2. Device run: 395b was reachable on every form submission, so check
    whether form-page crashes drop.
+
+## Unit 399 (2026-11-07): the engine libraries under ASan too -- both sweeps clean; build-asan-sim.sh --libs
+
+**398's "Next" #1.** The 397/398 sweeps instrumented netsurf's own code
+only. The DOM, the cascade and the HTML parser live in the prefix
+libraries. `tools/build-asan-sim.sh --libs <dest>` now also rebuilds
+**libwapcaplet, libparserutils, libhubbub, libcss and libdom** with
+`-fsanitize=address -fno-omit-frame-pointer -g`, plus the sim's
+`WITHOUT_ICONV_FILTER` libparserutils overlay. It builds them from
+applytest's staged (patched) trees into `<dest>/prefix` and
+`<dest>/overlay` (a copy of applytest's prefix, its .pc files repointed),
+and links the ASan sim against them. `ASAN_OPTIONS=detect_leaks=0`
+during the build, because libcss/libhubbub run their generators built
+with the same flags. Two minutes on this machine. Each library .a is
+checked for `__asan_report` before the link.
+
+**Linked, not just built:** ASan checks in the final binary,
+`--libs` vs the netsurf-only build: `css_select_style` 876 vs 1,
+`dom_string_create` 12 vs 0, `hubbub_parser_parse_chunk` 10 vs 0,
+`parserutils_inputstream_create` 41 vs 0, `lwc__intern` 21. The default
+mode was rebuilt after the change: `css_select_style` 0, `html_destroy`
+55, a sweep load clean.
+
+**Results with the libraries instrumented** (stack 395+396):
+- `asan_sweep.py`, all 21 scorecard sites x 3: **63/63 loads clean**.
+- `asan-autotest.sh`: main **52/52** with 319/319 dumps, forms **10/10**
+  as Chromium + target `tap tapped,link`, Vita's pace **52/52** +
+  JS-window 4/4. **"ASan autotest: clean"**.
+
+**Coverage now:** netsurf + the five engine libraries are ASan-clean over
+21 real sites (load, script, local/full rebuilds, teardown) and all of
+the gate's interaction. Still uninstrumented: QuickJS (`host-quickjs`),
+curl + mbedTLS, FreeType, and the support libraries (libnsgif, libnsbmp,
+libsvgtiny, libnspsl, libnsutils, libutf8proc). Also not covered: a
+sanitizer for uninitialised reads (MSan needs every library rebuilt with
+clang, including libc++-free C deps; not attempted) and leak checking
+(off throughout: the engine frees lazily at exit by design, see the
+`Remaining lwc strings` dump).
+
+Tools only, no engine or gate change: the tree is the one gate396 passed.
+No sudo.
+
+**Next:**
+1. QuickJS under ASan: it holds every script, and wasm3 sits inside it.
+   Rebuild `host-quickjs` with ASan into the dest dir, then the same two
+   sweeps.
+2. Device run with 395 (form submissions, nav-away from form pages).
