@@ -10751,3 +10751,94 @@ No sudo.
 1. **github's selector-engine task** (400 entry: 5.7 s host in
    `matchList`; on the Vita it cannot finish inside 8000 ms).
 2. Device run with 395 (form submissions, nav-away from form pages).
+
+## Patch 402 (2026-11-07): github's 5.7 s MutationObserver delivery -- querySelectorAll's JS path tries a candidate only against its own seed's selectors
+
+**401's "Next" #1** (the 400 entry: github spends 5.7 s in one JS task;
+the Vita's 8000 ms script deadline cannot cover it on a CPU many times
+slower than the host). Measured on the plain 396 sim, github load:
+
+1. **Not the public selector calls.** A sim inject (`VITA_SIM_INJECT`)
+   wrapping `matches` / `closest` / `querySelector(All)` on every
+   prototype in the chain counted 0.7 s in total (JS path 84 ms). Two
+   inject pitfalls cost a round each and are worth knowing: the polyfill
+   runs twice per realm and re-installs its method wrappers over an
+   inject's, and **timers an inject creates never fire**. A wrapper
+   installed from inside a MutationObserver callback (the inject's MO
+   wrapper does work) stays in place.
+2. **One MutationObserver delivery: 5.7 s.** Triggered by 2 attribute
+   records on a DIV; its callback source reads `[native code]`. DOM
+   mutators, custom-element callbacks and getComputedStyle inside it:
+   milliseconds.
+3. **sprof** (tools/vita-sim/sprof.c) over the slow window (3.2-8.8 s,
+   1401 samples): 99% `JS_CallInternal` under `qjs_mo_drain` (65%), and
+   **43% in `js_string_replace`**, mostly regex replaces.
+4. **JS stacks from inside `String.prototype.replace`** (every 2000th of
+   **2.4 million** calls, `Error.stackTraceLimit` raised): 99% from
+   `compoundOk`'s class normalisation <- `complexOk` <- `matchList` <-
+   `jsQuery` <- `querySelectorAll` <- github's `pb-*.js` (the
+   **SelectorSet** behind selector-observer: `queryAll` runs
+   `querySelectorAll(this.selectors.join(", "))`, every registered
+   selector in one list) <- `deliver` (our MO delivery).
+
+**Why that list is slow.** A few of the joined selectors carry
+attributes or pseudo-classes, so `plain()` fails and the whole list goes
+to `jsQuery`. jsQuery took one native candidate query per selector's seed
+(the subject's tag/#id/.classes; `*` for attribute-only selectors, i.e.
+every element) and tried **every candidate against the whole list**:
+seeds x candidates x selectors.
+
+**The change** (vita_polyfill.js + regenerated .inc):
+- `seedGroups(list)`: selectors grouped by identical seed. A seed is a
+  necessary condition of its selector's subject, so every element a
+  selector matches is among its seed's candidates. Each distinct seed is
+  queried once, and its candidates are tried only against that group's
+  selectors (`complexOk` per selector). Results are the same by
+  construction. Pseudo-element subjects still get no group (they never
+  match). Multi-group results are merged in document order as before;
+  `querySelector`'s early return now needs a single group.
+- `compoundOk`: within one jsQuery (`ctx.cls`, a Map), a node's class
+  string is normalised once, not once per selector. `matches()` /
+  `closest()` pass no cache and behave exactly as before.
+
+**Measured (github, 2 runs each, MO-timing inject only):** slowest MO
+delivery **5667 / 5614 ms -> 42 / 41 ms**; all MO callbacks **6.7 s ->
+0.15 s**. The page still loads (title, 0 deadline hits).
+
+**Same results, checked on github itself:** an inject compares every
+`querySelector(All)` call with 3+ alternatives against a brute-force walk
+(`getElementsByTagName('*')` filtered by `el.matches(list)`, which goes
+through the unchanged `matchList`): **348 long-list queries, 0 differ**,
+on both the 402 and the 396 binary (70510 selector calls each).
+
+**Gate page:** JS-selectors gains four multi-seed lists, github-shaped:
+`*` seeds (`[attr]`, `:checked`), two selectors sharing a seed,
+overlaps, a pseudo-element alternative, and a first match that is not the
+first-listed selector's. Expected output is Chromium's
+(chromium_headless_shell-1234 `--dump-dom`; its first 84 lines equal the
+existing pasted list, and it scores the page 89/89). Gate check 85 -> 89.
+
+**Restage from pristine:** 485 applied plus the 2 known collisions;
+vita_polyfill.js and vita_polyfill.inc byte-identical to the tested tree.
+
+**Gate (gate402, exit 0):** JS-selectors **89/89**, 251/251 pages,
+interaction 52/52 (full pass and at the Vita's pace), TIMERNEST 4/4,
+Vita's-pace 23/23 identical + 68 text frames identical, vita-test.bin
+byte-identical, netlog mirror 322 identical 0 differ.
+
+**Scorecard r114**: 21 sites against `r79-360`, the 402 and 396 binaries
+back to back (`score/r114-402`, `score/r114-396`): **71.64 vs 71.64**.
+Per site the only differences are guardian -0.7 and claude +1.2 (claude
+flips between 75.8 and 77.0 run to run). The win is not visible here: on
+the host, 5.7 s fits inside the 8000 ms deadline either way. github's
+log shows it independently: the script watchdog's heartbeats (one per
+2 s inside a single long JS task) drop from 7 to 3.
+
+No sudo. The Vita cross-build was not run (no vitaSDK here).
+
+**Next:**
+1. Device run: patches 395 (form pages) + 402 (github within the
+   deadline) in one hand-off.
+2. github's remaining MO time (0.15 s host) and the 0.7 s of public
+   selector calls are fine on the host; re-measure on the device before
+   tuning further.
