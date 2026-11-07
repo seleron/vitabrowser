@@ -10189,3 +10189,48 @@ so no scorecard.
    `html_reconvert_content rc=` (385 entry).
 
 No sudo needed. The Vita cross-build was not run (no vitaSDK here).
+## Unit 391 (2026-11-07): the diag.c noise filter gets a rate-capped allowance for the two full-rebuild triage lines
+
+**390's "Next" #2, done (diag.c only, no engine change).** Two lines
+that name what matters when a full rebuild goes wrong sat under
+diag.c's noise prefixes, so a rebuild storm was invisible in exactly
+the run it would have explained:
+- `LIFE reconvert: html_reconvert_content rc=` (macos9_reconvert.c,
+  after every `html_reconvert_content` call) is the one line naming
+  every full rebuild's start -- the 385 entry found it hidden there
+  when fixes1135's class-drop escaped every log;
+- `LIFE objects relinked` (html.c, the relink's own line, 386 entry).
+
+**The change** (netsurf/frontends/vita/diag.c):
+- `engine_is_noise` now checks a small allowance list **before** the
+  noise list. Each allowed line passes while its per-boot count is
+  below the cap (`ENGINE_NOISE_ALLOW 32`); the line that crosses it
+  logs one summary --
+  `MS diag: more '<prefix>' lines suppressed (showing the first 32,
+  this boot)` -- and the rest are dropped.
+- `"LIFE objects relinked"` leaves `engine_noise[]` (it is now
+  allowed); the `"LIFE reconvert"` prefix stays, so the
+  start/done/depth lines under it are dropped as before.
+- The counters are per boot, like the engine log itself: the process
+  is fresh on every boot, so the statics start at zero.
+- Cap calibration from run 18's autotest log (64k lines): 18 rc=
+  lines, 72 `LIFE reconvert` lines total, 9576 pure-noise prefix
+  lines.
+
+**Gate (exit 0):** this run's own autotest exercised the cap: 33
+full-rebuild start lines -> 32 shown + the one summary line at the
+crossing; 26 relink lines, all under cap. Everything else at
+baseline -- bundled pages 23/23 at the Vita's pace, text batched vs
+unbatched 68 frames identical, interaction 52/52, vita-test.bin
+byte-identical, QuickJS probe 18/18.
+
+No per-element JS objects grew, so no scorecard. No sudo needed. The
+Vita cross-build was not run (no vitaSDK here).
+
+**Next:**
+1. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes (385's
+   #3, deferred twice).
+2. The UNFIXED list is unchanged (full reconvert keeps a removed
+   field's form control alive, fixes107 area; wpblog intermittent
+   segfault rc -11, no gdb repro).
+
