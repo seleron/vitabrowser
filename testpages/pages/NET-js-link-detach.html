@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS link detach</title>
+<style>
+/* Patch 389: the prune 387/388 built cannot see a <link>'s entry --
+ * html_css_process_link created it with node == NULL, so a removed
+ * <link> kept cascading through every rebuild. 389 gives the link
+ * entry its element (like the <style> entry) and checks the sheet's
+ * content object before releasing: a finished sheet is released at
+ * the prune; a sheet removed mid-flight keeps its handle in the slot
+ * for the fetch's callback (whose lookup-by-handle would trip its
+ * assert on a NULLed slot). The page proves both: #b1's sheet has
+ * settled when its <link> leaves (pruned, released); #b2's /slow/
+ * sheet (1 s) is removed BEFORE it lands (pruned, handle kept, lands
+ * into a dead slot). The <head> removals are no-ops (383), so the
+ * class toggle on #trig (a sibling rule watches #watch) forces the
+ * rebuild whose up-front prune must drop both entries. Steps
+ * (500 ms apart): insert A, settle, settle, verify b1 red + remove
+ * A, insert B, remove B in flight + toggle, toggle back + verify b2
+ * blue, verify both blue. A failed check leaves FAIL in the tick
+ * line and the settled frame stops matching CSS-link-detach-ref. */
+body { margin: 0; padding-top: 30px; font-family: sans-serif; font-size: 14px; background: #fff; }
+p, div { margin: 4px 10px; }
+.box { width: 120px; height: 60px; background: #00c; }
+.on + p { color: #c00; }
+</style>
+</head>
+<body>
+<div id="b1" class="box">b1: blue at rest, red while its link lives</div>
+<div id="b2" class="box">b2: blue at rest, red while its link lives</div>
+<p id="trig">A paragraph whose class a sibling rule watches.</p>
+<p id="watch">Red while the paragraph before it is .on (it ends without).</p>
+<p id="sum">LINKDETACH: 0/3 passed</p>
+<p id="tick">step 0</p>
+<p>Last paragraph.</p>
+<script>
+(function () {
+	function $(id) { return document.getElementById(id); }
+	function bg(id) { return String(getComputedStyle($(id)).backgroundColor).replace(/\s+/g, ''); }
+	var RED = 'rgb(255,0,0)', BLUE = 'rgb(0,0,204)';
+	var k = 0, N = 3;
+	function link(href) {
+		var l = document.createElement('link');
+		l.rel = 'stylesheet';
+		l.href = href;
+		document.head.appendChild(l);
+		return l;
+	}
+	function t(ok) {
+		$('tick').textContent = 'step ' + (k + 1) + (ok ? '' : ' FAIL');
+		if (ok) {
+			k++;
+			$('sum').textContent = 'LINKDETACH: ' + k + '/' + N + ' passed';
+			document.title = 'JS link detach (' + k + '/' + N + ')';
+		}
+	}
+	var la, lb;
+	/* Each op runs in order (500 ms apart); only ops with chk count
+	 * toward the summary. A check failing leaves FAIL in the tick
+	 * line and freezes the sum below 3/3. */
+	var ops = [
+		{ f: function () { la = link('/slow/js-link-detach-a.css'); } },
+		{ f: function () {} },
+		{ f: function () {} },
+		{ f: function () { var ok = bg('b1') === RED; if (la) la.parentNode.removeChild(la); return ok; }, chk: 1 },
+		{ f: function () { lb = link('/slow/js-link-detach-b.css'); } },
+		{ f: function () { if (lb) lb.parentNode.removeChild(lb); $('trig').className = 'on'; } },
+		{ f: function () { var ok = bg('b2') === BLUE; $('trig').className = ''; return ok; }, chk: 1 },
+		{ f: function () { return bg('b1') === BLUE && bg('b2') === BLUE; }, chk: 1 }
+	];
+	var m = 0;
+	window.addEventListener('load', function () { setTimeout(function () { (function next() { if (m < ops.length) { var op = ops[m]; var ok = op.f(); if (op.chk) t(ok); $('tick').textContent = 'step ' + (m + 1); m++; if (m < ops.length) setTimeout(next, 500); } })(); }, 500); });
+})();
+</script>
+</body>
+</html>

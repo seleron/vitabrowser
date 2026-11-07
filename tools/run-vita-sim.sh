@@ -278,6 +278,8 @@ JS-object-rebuild file:///app0:/testpages/JS-object-rebuild.html
 CSS-object-rebuild-ref file:///app0:/testpages/CSS-object-rebuild-ref.html
 JS-style-detach file:///app0:/testpages/JS-style-detach.html
 CSS-style-detach-ref file:///app0:/testpages/CSS-style-detach-ref.html
+NET-js-link-detach http://127.0.0.1:$HP/NET-js-link-detach.html
+CSS-link-detach-ref file:///app0:/testpages/CSS-link-detach-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1742,6 +1744,24 @@ k388p=$(printf '%s\n' "$k388seg" | grep -c "WORK reconvert: pruned" || true)
 echo "  JS-style-detach: rows differing from the static final state $k388r (0); ${k388d} local rebuilds declined on a pruned sheet (2 or more); full-reconvert prunes $k388p"
 [ "$k388r" = 0 ] && [ "${k388d:-0}" -ge 2 ] ||
 fail "a removed <style> stops cascading"
+# Patch 389: a <link> that leaves the DOM stops cascading too. The
+# 387/388 prune could not see a link's entry (created with node ==
+# NULL), so a removed <link> kept cascading through every rebuild.
+# 389 gives the entry its element and checks the sheet's content
+# object: a settled sheet is released at the prune; a sheet removed
+# mid-flight keeps its handle in the slot for the fetch's callback
+# (whose lookup-by-handle would trip its assert on a NULLed slot).
+# The page removes #b1's settled sheet and #b2's /slow/ sheet before
+# it lands; the class toggle forces the rebuild whose up-front prune
+# drops both. Final state vs the static reference, row for row.
+k389r=$(fl_rows NET-js-link-detach CSS-link-detach-ref)
+k389seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-link-detach: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k389d=$(printf '%s\n' "$k389seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)" || true)
+k389p=$(printf '%s\n' "$k389seg" | grep -c "WORK reconvert: pruned" || true)
+k389s=$(sed -n 's/.*STR \(LINKDETACH: [0-9]*\/[0-9]* passed\).*/\1/p' "$(ls "$R"/*NET-js-link-detach*.plot 2>/dev/null | head -1)" 2>/dev/null | head -1)
+echo "  NET-js-link-detach: rows differing from the static final state $k389r (0); ${k389d} local rebuilds declined on a pruned sheet (1 or more); full-reconvert prunes $k389p; ${k389s:-no summary}"
+[ "$k389r" = 0 ] && [ "${k389d:-0}" -ge 1 ] && [ "$k389s" = "LINKDETACH: 3/3 passed" ] ||
+fail "a removed <link> stops cascading"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

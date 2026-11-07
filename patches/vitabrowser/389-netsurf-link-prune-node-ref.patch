@@ -1,0 +1,143 @@
+# netsurf: the <link> sheet entry keeps its element, so the prune can
+# see it (patch 389)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 388)
+#
+# 387/388 gave html_content a prune walk (html_css_prune_detached_sheets)
+# that drops a stylesheet entry when the element that created it has
+# left the DOM. It works for <style> (whose entry stores the element)
+# but never for <link>: html_css_process_link created its entry with
+# node == NULL, and the walk leaves node == NULL entries alone -- "no
+# evidence they are gone". So a <link> removed mid-life kept cascading
+# through every rebuild, indefinitely: the exact persistence 387 was
+# meant to end, one tag short of fixed. The 387/388 gates could not
+# see it (their pages removed <style> elements only).
+#
+# The fix (css.c), in two parts:
+#
+# 1. html_css_process_link now dom_node_refs the <link> element into
+#    the entry (as html_css_process_style does at line 461). The
+#    entry->node ref is released in the no_memory path (the slot was
+#    never committed when the fetch fails) and in
+#    html_css_free_stylesheets (the existing free loop, which already
+#    handles node != NULL for the <style> entries).
+#
+# 2. The prune checks the sheet's content object before releasing.
+#    A sheet that has FINISHED (CONTENT_STATUS_DONE) is released and
+#    NULLed as before. A sheet still in flight (LOADING) is left in
+#    the slot: its fetch's own reference keeps the content object
+#    alive to html_convert_css_callback, whose lookup-by-handle
+#    (assert(i != stylesheet_count)) would miss a NULLed slot -- and
+#    in a build without asserts would write past the array. The
+#    unused flag already dropped the sheet from the cascade, so the
+#    late arrival paints nothing; the callback's DONE path finishes
+#    the bookkeeping (active--, selection-context refresh skips
+#    unused entries) and its ERROR path releases the handle.
+#
+# Invariant, stated at the callback's assert: a pruned entry's handle
+# is NULL iff its content object is DONE, and a DONE object's callback
+# has already run (content completion is synchronous in this event
+# loop). So the lookup always finds a live handle.
+#
+# In-sim test (NET-js-link-detach + CSS-link-detach-ref): #b1's sheet
+# is fetched through /slow/ (1 s), settles, its <link> is removed
+# (status DONE at prune -> released); #b2's /slow/ sheet is removed
+# BEFORE it lands (LOADING at prune -> handle kept, lands into a dead
+# slot). The <head> removals are no-ops (383), so a class toggle on
+# the watched paragraph forces the rebuild whose up-front prune drops
+# both entries; the local path declines, the full reconvert prunes 2.
+# Final state row-for-row vs the static reference; the page's tick
+# line must read step 8 with all three checks passed.
+diff -ruN a/content/handlers/html/css.c b/content/handlers/html/css.c
+--- a/content/handlers/html/css.c	2026-11-07 04:41:27.662589793 +0000
++++ b/content/handlers/html/css.c	2026-11-07 04:48:55.680938349 +0000
+@@ -273,6 +273,11 @@
+ 			break;
+ 	}
+ 
++	/* Unit 389 keeps this true for a pruned in-flight sheet: the
++	 * prune leaves the handle in the slot (the content object is
++	 * not DONE), so this lookup finds it and the DONE/ERROR path
++	 * below finishes the teardown. A DONE sheet was released at
++	 * the prune, and its callback already ran. */
+ 	assert(i != parent->stylesheet_count);
+ 
+ 	switch (event->type) {
+@@ -627,6 +632,7 @@
+ 	dom_string *rel, *type_attr, *media, *href;
+ 	struct html_stylesheet *stylesheets;
+ 	nsurl *joined;
++	dom_node *nref;
+ 	dom_exception exc;
+ 	nserror ns_error;
+ 	hlcache_child_context child;
+@@ -702,7 +708,13 @@
+ 	}
+ 
+ 	htmlc->stylesheets = stylesheets;
+-	htmlc->stylesheets[htmlc->stylesheet_count].node = NULL;
++	/* Unit 389: keep the element that brought this sheet into the
++	 * document -- the <style> entry has always done this (the
++	 * html_create_style_element line), the link entry never did. Without
++	 * a node the 387/388 prune walk cannot see the sheet, so a <link>
++	 * removed mid-life kept cascading through every rebuild. */
++	nref = dom_node_ref(node);
++	htmlc->stylesheets[htmlc->stylesheet_count].node = nref;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].modified = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].unused = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].census_marks = 0;	/* patch 316 */
+@@ -724,8 +736,13 @@
+ 
+ 	nsurl_unref(joined);
+ 
+-	if (ns_error != NSERROR_OK)
++	if (ns_error != NSERROR_OK) {
++		/* The slot was never committed (the count below did not
++		 * move): take back the node reference stored in it. */
++		if (nref != NULL)
++			dom_node_unref(nref);
+ 		goto no_memory;
++	}
+ 
+ 	macsurf_rt_begin(&htmlc->base,	/* patch 282 */
+ 			htmlc->stylesheets[htmlc->stylesheet_count].sheet, "link");
+@@ -815,9 +832,9 @@
+  * handle and the reach table, and unref the node. The selection-context
+  * refresh is folded in here so callers make one call.
+  *
+- * Entries with node == NULL (the base/UA sheet, and link entries
+- * created before this patch) are left alone: there is no evidence
+- * they are gone.
++ * Entries with node == NULL (only base/UA sheets since unit 389 --
++ * the link entry keeps its element now) are left alone: there is no
++ * evidence they are gone.
+  *
+  * \param c The html content
+  * \return The number of sheets marked unused (0 = nothing to do)
+@@ -867,11 +884,22 @@
+ 
+ 		/* The element that brought this sheet into the document
+ 		 * has left it: drop the sheet from the cascade, mirroring
+-		 * html_css_free_stylesheets() for the one entry. */
++		 * html_css_free_stylesheets() for the one entry. Unit 389:
++		 * the content object's status decides the release -- a
++		 * finished sheet is released now; a sheet still in flight
++		 * keeps its handle in the slot (the fetch's own reference
++		 * keeps the content alive to the html_convert_css_callback,
++		 * whose lookup-by-handle would miss a NULLed slot and trip
++		 * its assert). The unused flag already dropped it from the
++		 * cascade; the callback's DONE/ERROR path finishes the
++		 * teardown, releasing on error. */
+ 		hsheet->unused = true;
+-		if (hsheet->sheet != NULL)
+-			hlcache_handle_release(hsheet->sheet);
+-		hsheet->sheet = NULL;
++		if (hsheet->sheet != NULL) {
++			if (content_get_status(hsheet->sheet) == CONTENT_STATUS_DONE) {
++				hlcache_handle_release(hsheet->sheet);
++				hsheet->sheet = NULL;
++			}
++		}
+ 		html_css_reach_table_free(hsheet->reach_prev);
+ 		html_css_reach_table_free(hsheet->reach_cur);
+ 		hsheet->reach_prev = NULL;

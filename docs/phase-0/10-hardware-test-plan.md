@@ -10065,3 +10065,75 @@ node and stay until the document is replaced (387 entry, unchanged).
    likely, a content-object check, not a node check.
 
 No sudo needed. The Vita cross-build was not run (no vitaSDK here).
+
+## Patch 389 (2026-11-07): the `<link>` sheet entry keeps its element, so the prune can see it
+
+**388's "Next" #3, done.** The 387/388 prune walk drops a stylesheet
+entry when the element that created it leaves the DOM -- but
+`html_css_process_link` had always created its entry with
+`node == NULL`, and the walk leaves `node == NULL` entries alone
+("no evidence they are gone"). So a `<link>` removed mid-life kept
+cascading through every rebuild, indefinitely: the exact persistence
+387 was meant to end, one tag short of fixed. The 387/388 gates could
+not see it (their pages removed `<style>` elements only).
+
+**The fix (css.c), in two parts.** (1) `html_css_process_link`
+now `dom_node_ref`s the `<link>` element into the entry, as
+`html_css_process_style` always did; the no_memory path unrefs it
+when the fetch fails before the slot is committed, and
+`html_css_free_stylesheets` releases it as for `<style>` entries.
+(2) The prune checks the sheet's content object before releasing:
+`CONTENT_STATUS_DONE` releases and NULLs the handle as before; a
+sheet still in flight (LOADING) keeps its handle in the slot --
+the fetch's own reference keeps the content alive to
+`html_convert_css_callback`, whose lookup-by-handle would miss a
+NULLed slot and trip its assert (and write past the array in a
+build without asserts). The `unused` flag already dropped the sheet
+from the cascade, so the late arrival paints nothing; the callback's
+DONE path finishes the bookkeeping (its ERROR path releases).
+Invariant, stated at the callback's assert: a pruned entry's handle
+is NULL iff its content object is DONE, and a DONE object's
+callback has already run (content completion is synchronous in this
+event loop).
+
+In-sim test (`NET-js-link-detach` + static
+`CSS-link-detach-ref`): `#b1`'s sheet is fetched through `/slow/`
+(1 s), settles, its `<link>` is removed (DONE at prune -> released,
+and b1 was verified red while the sheet lived); `#b2`'s `/slow/`
+sheet is removed BEFORE it lands (LOADING at prune -> handle kept,
+lands into the dead slot -- no assert, paints nothing). The
+`<head>` removals are no-ops (383), so class toggles on the watched
+paragraph force the rebuilds whose up-front prunes drop the
+detached entries. Sequence in the log: b1 red at check 1 -> the
+deferred DONE notification for A's sheet triggers a local rebuild,
+whose up-front prune drops A (the first `declined (detached
+stylesheet pruned)`, full reconvert) -> B's removal + toggle prunes
+B in flight (second decline, full reconvert) -> b2 blue at check 2
+(after B lands into the dead slot) -> both blue at check 3. Final
+state row for row vs the static reference.
+
+**Gate (this unit, exit 0):** `NET-js-link-detach: rows differing
+from the static final state 0 (0); 2 local rebuilds declined on a
+pruned sheet (1 or more); full-reconvert prunes 0; LINKDETACH: 3/3
+passed`. (Full-reconvert prunes 0: the local path prunes first, as
+in 388.) Everything else at baseline -- autotest 267 pages, CSS
+suites, text batched vs unbatched 68 frames identical, Vita's-pace
+23/23 and 52/52.
+
+**Left as is:** a link entry pruned while in flight stays in the
+slot (unused, handle in place) until the fetch settles and the
+callback releases it -- one short-lived slot, needed for the
+callback's lookup. The prune still runs on every full reconvert and
+every local rebuild (a short parent-chain scan per live entry; a
+no-op when nothing detached). No per-element JS objects grew, so no
+scorecard.
+
+**Next:**
+1. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+2. **The diag.c noise list** hides the relink line and
+   `html_reconvert_content rc=` (385 entry).
+3. `<link rel=preload as=stylesheet>`: a preload that becomes a
+   stylesheet after the page is DONE -- does it cascade, and can it
+   be pruned? (No such page in the gate set yet.)
+
+No sudo needed. The Vita cross-build was not run (no vitaSDK here).
