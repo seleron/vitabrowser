@@ -10323,3 +10323,40 @@ netlog mirror 322 identical 0 differ. No engine change, so no scorecard.
    only remaining UNFIXED item.
 2. If Claude's /login recovers (pane shows a working prompt, not the
    "Not logged in" banner), resume hybrid: feed the next unit prompt.
+
+## Unit 394 (2026-11-07): the gate names a failed page check instead of blaming "event order / inline-grid / group opacity" -- harness only
+
+**What happened (gate382 re-examined; no engine change).** A stale work
+order, written after gate382 (2026-11-06 22:30, EXIT 1), asked for
+fixes to "event order", "inline-grid" and "group opacity", which were
+the names on gate382's `FAILED:` line. None of the three had failed.
+In gate382.log every check in that group reads its expected value
+(EVORDER 5/5, CAPTGT 7/7, EVPHASE 9/9, INLINEGRID 4/4, every CSS-opacity
+count and pixel matches). The real failure was **TIMERNEST 2/4** (clamped
+gaps 3.3/3.4 ms against the then 3.5 ms floor). That is the timing
+flake 392 already widened. gate382b passed 22:49 on the same binary,
+and 382 landed as 122cc1c. So the work order was already done. The only
+thing left to fix was the misleading label.
+
+**Why the label lied.** `run-vita-sim.sh` collects the per-page checks
+(the TIMERNEST/RESTIMING/... table, form-submit, canvas, the sheet
+census, FORMWALK, ...) into `$o2_bad`. `[ -z "$o2_bad" ]` was only one
+link of the long `&&` chain that ends in
+`|| fail "event order / inline-grid / group opacity"`, so any page-check
+miss was reported under the chain's last group name. This is the same
+signature gate-320 recorded (patch 320 entry) as "a transient flake, no
+root cause found". It was most likely a page check too.
+
+**Fix.** Right before that chain:
+`[ -z "$o2_bad" ] || fail "page checks:$o2_bad"`. A page-check miss now
+prints, for example, `FAILED: page checks: js-timer-nesting`. The old
+`[ -z "$o2_bad" ]` link stays in the chain (now always true there,
+harmless). A standalone test with `o2_bad=" js-timer-nesting"` under
+`set -e` prints exactly that line and exits 1.
+
+No engine change, so no scorecard. No sudo.
+
+**Gate (this unit, exit 0):** gate394: 251/251 pages, interaction 52/52 (full pass and at the Vita's pace), TIMERNEST 4/4, CLASSSTALL 7/7, Vita's-pace 23/23 identical + 68 text frames identical, vita-test.bin byte-identical, netlog mirror 322 identical 0 differ. The new line is silent on a passing run, as expected.
+
+**Next:** unchanged from 393. (1) wpblog intermittent segfault rc -11,
+no gdb repro (365 entry), the only remaining UNFIXED item.

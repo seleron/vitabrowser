@@ -2112,6 +2112,12 @@ if [ "$rs_ok" = no ] && [ "${GATE_TIMING_SOFT:-0}" = 1 ] && \
 	rs_ok=soft
 	echo "  REFLOW: only the timing check (3) failed -- accepted, GATE_TIMING_SOFT=1"
 fi
+# The page checks collected in o2_bad are one link of the compound chain
+# below, whose fail label names only its last group -- so a TIMERNEST miss
+# read "event order / inline-grid / group opacity" (gate-320, gate382).
+# Fail on them first, by name.
+[ -z "$o2_bad" ] || fail "page checks:$o2_bad"
+
 soft_pass "$dsr" "DOMSTALL: 8/8 passed" "$dsp" 8 && [ "${ds_local:-0}" -ge 3 ] && \
 [ "${ds_blocks:-0}" -ge 3 ] && \
 [ "$ptr" = "PARSETAIL: 2/2 passed" ] && \
