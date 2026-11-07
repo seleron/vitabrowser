@@ -280,6 +280,8 @@ JS-style-detach file:///app0:/testpages/JS-style-detach.html
 CSS-style-detach-ref file:///app0:/testpages/CSS-style-detach-ref.html
 NET-js-link-detach http://127.0.0.1:$HP/NET-js-link-detach.html
 CSS-link-detach-ref file:///app0:/testpages/CSS-link-detach-ref.html
+NET-js-link-preload http://127.0.0.1:$HP/NET-js-link-preload.html
+CSS-link-preload-ref file:///app0:/testpages/CSS-link-preload-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1762,6 +1764,23 @@ k389s=$(sed -n 's/.*STR \(LINKDETACH: [0-9]*\/[0-9]* passed\).*/\1/p' "$(ls "$R"
 echo "  NET-js-link-detach: rows differing from the static final state $k389r (0); ${k389d} local rebuilds declined on a pruned sheet (1 or more); full-reconvert prunes $k389p; ${k389s:-no summary}"
 [ "$k389r" = 0 ] && [ "${k389d:-0}" -ge 1 ] && [ "$k389s" = "LINKDETACH: 3/3 passed" ] ||
 fail "a removed <link> stops cascading"
+# Unit 390: census -- a <link rel=preload as=stylesheet> never cascades:
+# the rel check in html_css_process_link (strcasestr(rel, "stylesheet"))
+# returns before any fetch, so no sheet entry exists and the 387/388/389
+# prune has nothing to see. A real stylesheet with the same URL takes the
+# normal path: it cascades after the page is DONE, and once it leaves the
+# DOM the prune drops it. b1 stays blue through the whole preload phase,
+# goes red only while the real sheet lives, blue again after its removal
+# (the class toggle forces the rebuild whose up-front prune drops it).
+# Final state vs the static reference, row for row.
+k390r=$(fl_rows NET-js-link-preload CSS-link-preload-ref)
+k390seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-link-preload: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k390d=$(printf '%s\n' "$k390seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)" || true)
+k390p=$(printf '%s\n' "$k390seg" | grep -c "WORK reconvert: pruned" || true)
+k390s=$(sed -n 's/.*STR \(LINKPRELOAD: [0-9]*\/[0-9]* passed\).*/\1/p' "$(ls "$R"/*NET-js-link-preload*.plot 2>/dev/null | head -1)" 2>/dev/null | head -1)
+echo "  NET-js-link-preload: rows differing from the static final state $k390r (0); ${k390d} local rebuilds declined on a pruned sheet (1 or more); full-reconvert prunes $k390p; ${k390s:-no summary}"
+[ "$k390r" = 0 ] && [ "${k390d:-0}" -ge 1 ] && [ "$k390s" = "LINKPRELOAD: 3/3 passed" ] ||
+fail "a preload never cascades; the same-URL stylesheet does, and prunes"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

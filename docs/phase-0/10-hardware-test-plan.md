@@ -10132,8 +10132,60 @@ scorecard.
 1. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
 2. **The diag.c noise list** hides the relink line and
    `html_reconvert_content rc=` (385 entry).
-3. `<link rel=preload as=stylesheet>`: a preload that becomes a
-   stylesheet after the page is DONE -- does it cascade, and can it
-   be pruned? (No such page in the gate set yet.)
+
+No sudo needed. The Vita cross-build was not run (no vitaSDK here).
+
+## Unit 390 (2026-11-07): `<link rel=preload as=stylesheet>` -- a census: it never cascades, so there is nothing to prune
+
+**389's "Next" #3, done (census, no engine change).** A preload
+with `as=stylesheet` never becomes a cascading stylesheet in this
+engine: `html_css_process_link` gates on
+`strcasestr(rel, "stylesheet")`, and `rel="preload"` misses that
+check and returns before any fetch. No fetch, no sheet entry, no
+cascade -- which is what the spec asks (a preload is a fetch
+optimization, not a style source) -- and consequently there is
+nothing for the 387/388/389 prune walk to see: no `node == NULL`
+entry left behind, no element-backed entry outliving the `<link>`.
+The second half of the question -- a stylesheet that becomes
+active *after* the page is DONE -- works and prunes cleanly: a
+real `<link rel=stylesheet>` with the preloaded URL takes the
+normal 389 path (entry refs the element, fetch settles, cascade
+runs), and when it leaves the DOM the up-front prune of a rebuild
+drops it.
+
+In-sim test (`NET-js-link-preload` + static
+`CSS-link-preload-ref`): `#b1` (blue at rest) is watched through
+three phases. (1) The preload is inserted (through `/slow/`, 1 s);
+after settling well past the fetch time, b1 is checked -- it is
+still blue: the preload did NOT cascade (a bug would have turned
+it red by then). (2) The real stylesheet with the same URL is
+inserted; after settling, b1 is red: the stylesheet cascades
+after DONE. (3) The real `<link>` is removed and the class toggle
+on `#trig` forces the rebuild (the `<head>` removal is a no-op,
+383) whose up-front prune drops the settled sheet: b1 is blue
+again. Sequence in the log: `1 LIFE rebuild local: declined
+(detached stylesheet pruned)`; the settled frame is row for row
+the static reference.
+
+**Gate (this unit, exit 0):** `NET-js-link-preload: rows
+differing from the static final state 0 (0); 1 local rebuilds
+declined on a pruned sheet (1 or more); full-reconvert prunes 0;
+LINKPRELOAD: 3/3 passed`. (Full-reconvert prunes 0: the local
+path prunes first, as in 389.) Everything else at baseline --
+autotest 269 pages, text batched vs unbatched 68 frames
+identical, Vita's-pace 23/23 and 52/52.
+
+The one deliberate non-feature: preloads are not fetched, so the
+optimization of warming the cache for a later same-URL
+stylesheet is not implemented (the fetch would keep the page
+active and would have to dedupe against the later real sheet --
+a feature decision, not a bug). No per-element JS objects grew,
+so no scorecard.
+
+**Next:**
+1. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes
+   (389's #1, deferred).
+2. **The diag.c noise list** hides the relink line and
+   `html_reconvert_content rc=` (385 entry).
 
 No sudo needed. The Vita cross-build was not run (no vitaSDK here).
