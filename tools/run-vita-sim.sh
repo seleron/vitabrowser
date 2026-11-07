@@ -28,8 +28,11 @@ fail() { echo "  FAILED: $*"; exit 1; }
 # that stops early (a crash, a failed check) must not leave them behind, or
 # the next run's frontend finds a stale receiver on its port and mirrors
 # to it instead.
-HTTPD=; RX=
-trap 'kill $HTTPD $RX 2>/dev/null || true' EXIT
+HTTPD=; RX=; BG_JOBS=
+# Unit 403: the background runs (bg_forms, bg_slow below) record their
+# httpd and simulator PIDs in $OUT/*.pids; a gate that stops early takes
+# them down too.
+trap 'kill $HTTPD $RX $BG_JOBS $(cat "$OUT"/*.pids 2>/dev/null) 2>/dev/null || true' EXIT
 # The Vita's LAN listener (vita/remote.c) takes 8080 on the device; here
 # that port may be taken, so the simulator's listener moves.
 export VITA_SIM_REMOTE_PORT="${REMOTE_PORT:-45180}"
@@ -173,6 +176,95 @@ hrc=0
 hft=$(sed -n 's/.*gw title: \(HISTFIRST .*\)/\1/p' "$HF/ux0:data/VitaBrowser/log.txt" 2>/dev/null | tail -1)
 echo "  JS-history-first: exit $hrc, title ${hft:-none} (Chromium: HISTFIRST 1)"
 [ "$hrc" -eq 0 ] && [ "$hft" = "HISTFIRST 1" ] || fail "history.length on a window's first page"
+
+# Unit 403 (gate efficiency): the scriptless form submissions and the
+# Vita's-pace autotest share nothing with the main autotest while they run
+# (own directories, own httpd and LAN-listener ports; their checks read the
+# main run's dumps only after both finish), so they start here and are
+# waited for at their own sections. GATE_SERIAL=1 runs them in place, one
+# after another, as before. HP is the main run's httpd port (set below).
+HP="${HTTPD_PORT:-45280}"
+# The background runs' TCP ports sit BELOW Linux's ephemeral range
+# (32768-60999 here): a listener inside it can lose its port to any
+# outgoing connection that happens to be using it as a local port at that
+# moment (the frontend's listener has SO_REUSEADDR, which covers TIME_WAIT,
+# not live sockets). Seen: "remote: cannot listen on :45182, errno 98" and
+# the slow run's interaction 45/52. The main run's 45180/45280-45282 carry
+# the same small, pre-existing exposure.
+SLOW_HP="${SLOW_HTTPD_PORT:-31290}"; SLOW_REMOTE="${SLOW_REMOTE_PORT:-31182}"
+FORMS_HP="${FORMS_HTTPD_PORT:-31300}"; FORMS_REMOTE="${FORMS_REMOTE_PORT:-31183}"
+# bind_note DIR: say so when a run's LAN listener could not bind (its
+# remote-control steps then fail and the summary alone does not say why)
+bind_note() {
+	grep -h "remote: cannot listen" "$1/ux0:data/VitaBrowser/log.txt" 2>/dev/null | \
+		sed 's/^\[[^]]*\] /  LISTENER: /' || true
+}
+# bg_forms: the scriptless form submissions' run (checked at its section).
+# Own httpd port and LAN-listener port: it may run beside the main autotest
+# (unit 403).
+bg_forms() {
+	FS="$OUT/forms"
+	rm -rf "$FS"; mkdir -p "$FS/ux0:data/VitaBrowser"
+	cp -r "$OUT/run/app0:" "$FS/"
+	echo off > "$FS/ux0:data/VitaBrowser/netlog.cfg"
+	FU="$FS/q\"uote é.dat"
+	printf 'upload line 1\r\nline 2\n\000\001\376\377 end' > "$FU"
+	FB="http://127.0.0.1:$FORMS_HP"
+	printf 'settle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-form.html\nsettle 3000\ntap 160 135\nsettle 3000\nnav %s/HTML-multipart-1252.html\nsettle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-upload.html\nsettle 3000\ntap 160 65\nsettle 1500\ntap 160 135\nsettle 3000\n' \
+		"$FB" "$FB" "$FB" > "$FS/script.txt"
+	for c in img imgnoname nosub submit button values; do
+		printf 'nav %s/JS-form-submitters.html?%s\nsettle 3000\n' "$FB" "$c" >> "$FS/script.txt"
+	done
+	# Patch 289: a tapped Send button and a tapped link whose target is an
+	# iframe (one with no src, one display:none) load there; the page stays
+	# and its title lists what arrived (was: the result replaced the page)
+	printf 'nav %s/JS-form-target.html?tap\nsettle 3000\ntap 160 65\nsettle 2000\ntap 160 135\nsettle 3000\n' "$FB" >> "$FS/script.txt"
+	echo quit >> "$FS/script.txt"
+	python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+		--http "$FORMS_HP" > "$OUT/httpd-forms.log" 2>&1 &
+	echo $! > "$OUT/forms.pids"
+	sleep 1
+	( cd "$FS" && VITA_SIM_UPLOAD="$FU" VITA_SIM_SCRIPT="$FS/script.txt" \
+		VITA_SIM_OUT="$FS" VITA_SIM_REMOTE_PORT=$FORMS_REMOTE \
+		exec timeout 300 "$NS/nsvita-sim" \
+		"$FB/HTML-multipart-form.html" > "$FS/stdout.log" 2>&1 ) &
+	echo $! >> "$OUT/forms.pids"
+	f_rc=0; wait $! || f_rc=$?
+	kill $(head -1 "$OUT/forms.pids") 2>/dev/null || true
+	rm -f "$OUT/forms.pids"
+	echo $f_rc > "$FS/rc"
+}
+# bg_slow: the Vita's-pace autotest's run (checked at its section). Own
+# httpd port and LAN-listener port; its dumps are compared with the main
+# run's only after both finish (unit 403).
+bg_slow() {
+	S2="$OUT/slow"
+	rm -rf "$S2"; mkdir -p "$S2/ux0:data/VitaBrowser"
+	cp -r "$OUT/run/app0:" "$S2/"
+	echo off > "$S2/ux0:data/VitaBrowser/netlog.cfg"
+	python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+		--http "$SLOW_HP" > "$OUT/httpd-slow.log" 2>&1 &
+	echo $! > "$OUT/slow.pids"
+	echo "NET-http-local http://127.0.0.1:$SLOW_HP/L1-layout-basics.html" \
+		> "$S2/ux0:data/VitaBrowser/nettest.txt"
+	mkdir -p "$S2/snaps"
+	( cd "$S2" && VITA_SIM_SLOW_MS=40 VITA_SIM_TEXT_UNBATCHED=1 VITA_SIM_AUTOTEST=1 \
+		VITA_SIM_SNAP="$S2/snaps" VITA_SIM_REMOTE_PORT=$SLOW_REMOTE \
+		exec timeout 1200 "$NS/nsvita-sim" > "$S2/stdout.log" 2>&1 ) &
+	echo $! >> "$OUT/slow.pids"
+	s_rc=0; wait $! || s_rc=$?
+	kill $(head -1 "$OUT/slow.pids") 2>/dev/null || true
+	rm -f "$OUT/slow.pids"
+	echo $s_rc > "$S2/rc"
+}
+
+FORMS_JOB=; SLOW_JOB=
+if [ "${GATE_SERIAL:-0}" != 1 ]; then
+	bg_forms > "$OUT/bg-forms.log" 2>&1 & FORMS_JOB=$!
+	bg_slow > "$OUT/bg-slow.log" 2>&1 & SLOW_JOB=$!
+	BG_JOBS="$FORMS_JOB $SLOW_JOB"
+	echo "  (forms + Vita's-pace runs started in the background: jobs $BG_JOBS)"
+fi
 
 echo "== autotest run (reference dumps) =="
 rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference" "$OUT/snaps" "$OUT/net"
@@ -446,24 +538,65 @@ NET-css-flex-blockify http://127.0.0.1:$HP/CSS-flex-blockify.html
 NET-css-flex-item-width-contrib http://127.0.0.1:$HP/CSS-flex-item-width-contrib.html
 NET-css-outline-alpha http://127.0.0.1:$HP/CSS-outline-alpha.html
 NET
-python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
-	--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
-	--https-bad $((HP + 2)) "$T/rogue.pem" "$T/rogue.key" \
-	> "$OUT/httpd.log" 2>&1 &
-HTTPD=$!
-# The receiver starts LATE, as it did not start at all in hardware run 6:
-# 15 s into the autotest, with log lines and dumps already sent to nobody.
-# When it answers the next hello, the frontend re-sends this launch's files
-# (vita/diag.c catch_up), so the mirror must still come out complete.
-( sleep "${NETLOG_LATE:-15}"; exec python3 "$ROOT/tools/vita-netlog.py" \
-	--port "$NETLOG_PORT" --bind 127.0.0.1 --out "$OUT/net" --quiet \
-	--exit-when-done --timeout 1000 ) > "$OUT/netlog-receiver.log" 2>&1 &
-RX=$!
-( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
-	VITA_SETTLE_EXTRA_MS="${VITA_SETTLE_EXTRA_MS:-7000}" \
-	timeout 900 "$NS/nsvita-sim" )
-wait $RX || true
-kill $HTTPD 2>/dev/null || true
+# Unit 403: GATE_REUSE_AUTOTEST=1 skips this run when every input is what
+# the last PASSING gate's run had (autotest_key: the simulator binary, the
+# app0: bundle, the network page list, the two helper servers, the settle
+# knobs and this block itself), and restores that run's output instead --
+# every check below still evaluates it. Off by default: a plain gate always
+# runs it. A fresh run is cached only when the whole gate exits 0 (at the
+# end), so a flaky failure is never frozen in. The bundle's ca-bundle.pem is
+# Mozilla's plus this run's freshly made test CA, so it is keyed by the
+# Mozilla file instead.
+autotest_key() {
+	{ sha256sum "$NS/nsvita-sim" | cut -c1-64
+	  ( cd "$OUT/run/app0:" && find . -type f ! -path ./res/ca-bundle.pem | LC_ALL=C sort | \
+	    while IFS= read -r f; do sha256sum "$f"; done )
+	  sha256sum "$WORK/certs/ca-bundle.pem" "$ROOT/tools/vita-sim/httpd.py" \
+		"$ROOT/tools/vita-netlog.py" | cut -c1-64
+	  cat "$OUT/run/ux0:data/VitaBrowser/nettest.txt" "$OUT/run/ux0:data/VitaBrowser/netlog.cfg"
+	  echo "${VITA_SETTLE_EXTRA_MS:-7000} ${NETLOG_LATE:-15} $VITA_SIM_REMOTE_PORT"
+	  sed -n '/^# AUTOTEST RUN BEGIN/,/^# AUTOTEST RUN END/p' "$0"
+	} | sha256sum | cut -c1-16
+}
+AC="$OUT/autotest-cache"; AKEY=; AFRESH=
+[ "${GATE_REUSE_AUTOTEST:-0}" = 1 ] && AKEY=$(autotest_key)
+if [ -n "$AKEY" ] && [ -f "$AC/$AKEY/ok" ]; then
+	echo "  autotest: inputs unchanged (key $AKEY), reusing the last passing gate's run (GATE_REUSE_AUTOTEST=1)"
+	rm -rf "$OUT/run/ux0:data/VitaBrowser" "$OUT/snaps" "$OUT/net"
+	cp -r "$AC/$AKEY/VitaBrowser" "$OUT/run/ux0:data/VitaBrowser"
+	cp -r "$AC/$AKEY/snaps" "$OUT/snaps"
+	cp -r "$AC/$AKEY/net" "$OUT/net"
+	cp "$AC/$AKEY/httpd.log" "$AC/$AKEY/netlog-receiver.log" "$OUT/"
+else
+# AUTOTEST RUN BEGIN
+	python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
+		--http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
+		--https-bad $((HP + 2)) "$T/rogue.pem" "$T/rogue.key" \
+		> "$OUT/httpd.log" 2>&1 &
+	HTTPD=$!
+	# The receiver starts LATE, as it did not start at all in hardware run 6:
+	# 15 s into the autotest, with log lines and dumps already sent to nobody.
+	# When it answers the next hello, the frontend re-sends this launch's files
+	# (vita/diag.c catch_up), so the mirror must still come out complete.
+	( sleep "${NETLOG_LATE:-15}"; exec python3 "$ROOT/tools/vita-netlog.py" \
+		--port "$NETLOG_PORT" --bind 127.0.0.1 --out "$OUT/net" --quiet \
+		--exit-when-done --timeout 1000 ) > "$OUT/netlog-receiver.log" 2>&1 &
+	RX=$!
+	( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
+		VITA_SETTLE_EXTRA_MS="${VITA_SETTLE_EXTRA_MS:-7000}" \
+		timeout 900 "$NS/nsvita-sim" )
+	wait $RX || true
+	kill $HTTPD 2>/dev/null || true
+# AUTOTEST RUN END
+	if [ -n "$AKEY" ]; then
+		# staged now (later sections read but do not write these); moved
+		# into the cache only if the gate passes
+		rm -rf "$OUT/autotest-fresh"; mkdir -p "$OUT/autotest-fresh"
+		cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/snaps" "$OUT/net" \
+			"$OUT/httpd.log" "$OUT/netlog-receiver.log" "$OUT/autotest-fresh/"
+		AFRESH=1
+	fi
+fi
 cp -r "$OUT/run/ux0:data/VitaBrowser" "$OUT/reference"
 rm -f "$OUT/reference/netlog.cfg" "$OUT/reference/nettest.txt"
 # Every nettest.txt line must reach the autotest: past the frontend's
@@ -2292,32 +2425,10 @@ grep -q 'page NET-dns-hang settled' "$R/log.txt" || dbad=$((dbad + 1))
 # an option selected -- is what is sent; a drop-down with two options
 # marked sends the last (it sent both).
 echo "== scriptless form submissions =="
-FS="$OUT/forms"
-rm -rf "$FS"; mkdir -p "$FS/ux0:data/VitaBrowser"
-cp -r "$OUT/run/app0:" "$FS/"
-echo off > "$FS/ux0:data/VitaBrowser/netlog.cfg"
-FU="$FS/q\"uote é.dat"
-printf 'upload line 1\r\nline 2\n\000\001\376\377 end' > "$FU"
-FB="http://127.0.0.1:$HP"
-printf 'settle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-form.html\nsettle 3000\ntap 160 135\nsettle 3000\nnav %s/HTML-multipart-1252.html\nsettle 3000\ntap 160 65\nsettle 3000\nnav %s/HTML-multipart-upload.html\nsettle 3000\ntap 160 65\nsettle 1500\ntap 160 135\nsettle 3000\n' \
-	"$FB" "$FB" "$FB" > "$FS/script.txt"
-for c in img imgnoname nosub submit button values; do
-	printf 'nav %s/JS-form-submitters.html?%s\nsettle 3000\n' "$FB" "$c" >> "$FS/script.txt"
-done
-# Patch 289: a tapped Send button and a tapped link whose target is an
-# iframe (one with no src, one display:none) load there; the page stays
-# and its title lists what arrived (was: the result replaced the page)
-printf 'nav %s/JS-form-target.html?tap\nsettle 3000\ntap 160 65\nsettle 2000\ntap 160 135\nsettle 3000\n' "$FB" >> "$FS/script.txt"
-echo quit >> "$FS/script.txt"
-python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
-	--http "$HP" > "$OUT/httpd-forms.log" 2>&1 &
-HTTPD=$!
-sleep 1
-frc=0
-( cd "$FS" && VITA_SIM_UPLOAD="$FU" VITA_SIM_SCRIPT="$FS/script.txt" \
-	VITA_SIM_OUT="$FS" timeout 300 "$NS/nsvita-sim" \
-	"$FB/HTML-multipart-form.html" > "$FS/stdout.log" 2>&1 ) || frc=$?
-kill $HTTPD 2>/dev/null || true
+if [ "${GATE_SERIAL:-0}" = 1 ]; then bg_forms; else wait $FORMS_JOB || true; fi
+FS="$OUT/forms"; FU="$FS/q\"uote é.dat"
+frc=$(cat "$FS/rc" 2>/dev/null || echo 99)
+bind_note "$FS"
 fgot=$(sed -n 's/.*gw title: \(FORMCHECK .*\)/\1/p' "$FS/ux0:data/VitaBrowser/log.txt" 2>/dev/null | uniq)
 fbad=
 for w in "multipart ok fcd2da030618" "urlencoded ok 7e9ed1917f53" \
@@ -2566,20 +2677,10 @@ grep -q 'js: probe took .*: \([0-9]*\)/\1 checks' "$R/log.txt" && \
 # (VITA_SIM_TEXT_UNBATCHED), so its frames must match the batched run's
 # pixel for pixel: the check that caught batching drawing a "9" as an "A".
 echo "== at the Vita's pace (VITA_SIM_SLOW_MS=40), text unbatched =="
+if [ "${GATE_SERIAL:-0}" = 1 ]; then bg_slow; else wait $SLOW_JOB || true; fi
 S2="$OUT/slow"
-rm -rf "$S2"; mkdir -p "$S2/ux0:data/VitaBrowser"
-cp -r "$OUT/run/app0:" "$S2/"
-echo off > "$S2/ux0:data/VitaBrowser/netlog.cfg"
-python3 "$ROOT/tools/vita-sim/httpd.py" --dir "$ROOT/testpages/pages" \
-	--http "$HP" > "$OUT/httpd-slow.log" 2>&1 &
-HTTPD=$!
-echo "NET-http-local http://127.0.0.1:$HP/L1-layout-basics.html" \
-	> "$S2/ux0:data/VitaBrowser/nettest.txt"
-mkdir -p "$S2/snaps"
-( cd "$S2" && VITA_SIM_SLOW_MS=40 VITA_SIM_TEXT_UNBATCHED=1 VITA_SIM_AUTOTEST=1 \
-	VITA_SIM_SNAP="$S2/snaps" timeout 1200 "$NS/nsvita-sim" \
-	> "$S2/stdout.log" 2>&1 ) || fail "slow autotest run"
-kill $HTTPD 2>/dev/null || true
+bind_note "$S2"
+[ "$(cat "$S2/rc" 2>/dev/null || echo 99)" = 0 ] || fail "slow autotest run (exit $(cat "$S2/rc" 2>/dev/null || echo none))"
 same=0; bad=0
 for f in "$R"/[01][0-9]-*.plot; do
 	n=${f##*/}
@@ -2611,3 +2712,12 @@ isum_slow=$(sed -n 's/.*interact: \([0-9]*\/[0-9]*\) passed.*/\1/p' "$S2/ux0:dat
 echo "  interaction pass at the Vita's pace: ${isum_slow:-no summary} passed"
 [ "$bad" -eq 0 ] && [ "$same" -gt 0 ] && [ "$jsw_slow" -ge 4 ] && \
 	[ -n "$isum_slow" ] && [ "${isum_slow%/*}" = "${isum_slow#*/}" ] || fail "at the Vita's pace"
+
+# Unit 403: every check passed. A fresh main autotest run made under
+# GATE_REUSE_AUTOTEST=1 becomes the one cached run (the latest only).
+if [ -n "$AFRESH" ]; then
+	rm -rf "$AC"; mkdir -p "$AC"
+	mv "$OUT/autotest-fresh" "$AC/$AKEY"
+	: > "$AC/$AKEY/ok"
+	echo "  autotest output cached for GATE_REUSE_AUTOTEST=1 (key $AKEY)"
+fi

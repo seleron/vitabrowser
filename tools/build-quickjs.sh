@@ -33,8 +33,27 @@ W="$WORK/wasm3/source"
 M3SRCS="m3_bind m3_code m3_compile m3_core m3_emit m3_env m3_exec m3_function
 m3_info m3_module m3_optimize m3_parse"
 
+# Unit 403: a build is skipped when its inputs are what built the library
+# already there -- every source and header it reads, the compiler's version
+# line, the flags and this script (stamp beside the library). The gate runs
+# this on every pass; the compile was 23 s of each.
+# stamp_of CC FLAGS DIR... -> one line
+stamp_of() {
+	cc="$1"; fl="$2"; shift 2
+	{ "$cc" --version 2>/dev/null | head -1; echo "$fl"; cat "$0"
+	  for d in "$@"; do find "$d" -maxdepth 1 -type f \( -name '*.c' -o -name '*.h' \) | LC_ALL=C sort | xargs cat; done
+	} | sha256sum | cut -c1-16
+}
+# fresh LIB STAMPFILE STAMP -> 0 when LIB exists and STAMPFILE holds STAMP
+fresh() { [ -f "$1" ] && [ -f "$2" ] && [ "$(cat "$2")" = "$3" ]; }
+
 # build_m3 CC AR PREFIX
 build_m3() {
+	st=$(stamp_of "$1" "-O3 -g -std=gnu11 -fwrapv -Wno-unused-function" "$W")
+	if fresh "$3/lib/libm3.a" "$3/lib/.libm3.stamp" "$st"; then
+		echo "  $3/lib/libm3.a: inputs unchanged (stamp $st), not rebuilt"
+		return 0
+	fi
 	obj="$3/obj-wasm3"
 	rm -rf "$obj" "$3/include/wasm3"; mkdir -p "$obj" "$3/lib" "$3/include/wasm3"
 	for f in $M3SRCS; do
@@ -46,11 +65,17 @@ build_m3() {
 	$2 rcs "$3/lib/libm3.a" "$obj"/*.o
 	cp "$W"/*.h "$3/include/wasm3/"
 	cp "$WORK/wasm3/LICENSE" "$3/include/wasm3/LICENSE-wasm3"
+	echo "$st" > "$3/lib/.libm3.stamp"
 	echo "  $3/lib/libm3.a ($(du -k "$3/lib/libm3.a" | cut -f1) KiB)"
 }
 
 # build CC AR PREFIX EXTRA_CFLAGS
 build() {
+	st=$(stamp_of "$1" "-O2 -g -D_GNU_SOURCE -include pthread.h $4" "$Q")
+	if fresh "$3/lib/libquickjs.a" "$3/lib/.libquickjs.stamp" "$st"; then
+		echo "  $3/lib/libquickjs.a: inputs unchanged (stamp $st), not rebuilt"
+		return 0
+	fi
 	obj="$3/obj-quickjs"
 	rm -rf "$obj"; mkdir -p "$obj" "$3/lib" "$3/include/quickjs"
 	for f in $SRCS; do
@@ -62,6 +87,7 @@ build() {
 	$2 rcs "$3/lib/libquickjs.a" "$obj"/*.o
 	cp "$Q/quickjs.h" "$3/include/quickjs/"
 	cp "$Q/LICENSE" "$3/include/quickjs/LICENSE-QuickJS"
+	echo "$st" > "$3/lib/.libquickjs.stamp"
 	echo "  $3/lib/libquickjs.a ($(du -k "$3/lib/libquickjs.a" | cut -f1) KiB)"
 }
 

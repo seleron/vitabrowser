@@ -10952,3 +10952,95 @@ the gate's full network list, so they do not compare.)
    first paint, Stack Overflow's Cloudflare clear time, and the
    `LIFE SHEETREACH*` / `SHEETIDCENSUS` / `SHEETCAUSE` lines from real
    browsing of CSS-in-JS sites (doc 23 piece C waits on these).
+
+## Unit 403 (2026-11-07): gate efficiency -- 1182 s -> ~927 s by default, ~250 s on an unchanged binary; verdicts unchanged
+
+**Context.** No hardware tests are available for now (owner away):
+development continues sim-only, and run 42 stays handed off, untested.
+This unit is the queued gate-efficiency task. The rule is zero coverage
+loss: every check still runs, and on the same data.
+
+**Profile** (baseline gate on 2b5c559, every output line timestamped,
+`gate-base-ts.log`): **1182 s, exit 0**.
+
+| stage | s | share |
+|---|---|---|
+| QuickJS host build (recompiled every run) | 23 | 2% |
+| stand-in SDK, overlay, sim build (incremental make + relink), bundle, certs | 7 | 1% |
+| 18-page screenshot pass + history-first | 24 | 2% |
+| **main autotest** (251 network lines, 319 dumps, interaction pass) | **882** | **75%** |
+| every check over its dumps | ~10 | 1% |
+| scriptless form submissions | 55 | 5% |
+| **Vita's-pace autotest** | **182** | **15%** |
+
+The checks are cheap; the simulator runs are the cost.
+
+**What changed** (tools only, no engine change):
+1. **The form-submission and Vita's-pace runs start beside the main
+   autotest** (`bg_forms` / `bg_slow` in run-vita-sim.sh). They share
+   nothing with it while running: own run directories, own httpd and
+   LAN-listener ports. Their checks, which read the main run's dumps, run
+   unchanged at their own sections after a `wait`. Each job records its
+   exit code in `<dir>/rc` and its httpd/simulator PIDs in `$OUT/*.pids`.
+   The EXIT trap kills them, so a gate that fails early leaves nothing
+   behind. `GATE_SERIAL=1` runs them in place, one after another, as
+   before.
+2. **The QuickJS/wasm3 host build is skipped when its inputs are
+   unchanged** (tools/build-quickjs.sh). The stamp beside each library is
+   a hash of every .c/.h it reads, the compiler's version line, the flags
+   and the script. 21.7 s -> 0.05 s. A stale stamp rebuilds that library
+   only, byte-identical.
+3. **`GATE_REUSE_AUTOTEST=1`** (opt-in; off by default). When every input
+   to the main autotest matches what the **last passing** gate's run had,
+   that run is skipped and its output restored, and every check still
+   evaluates it. The key (`autotest_key`) hashes the simulator binary,
+   the app0: bundle, the network page list, httpd.py, vita-netlog.py, the
+   settle knobs and the run block itself. The bundle's ca-bundle.pem holds
+   each run's freshly made test CA, so it is keyed by the Mozilla file
+   instead. A fresh run is cached only when the whole gate exits 0 (the
+   last lines of the script), so a flaky failure is never frozen in. One
+   entry is kept, ~35 MB. The main use: re-gating tools-, doc- or
+   check-only changes.
+
+**Not done, and why:**
+- Skipping the sim relink saves ~4 s, because make is already
+  incremental. Not worth the risk.
+- Sharding the main autotest would be the big win, but its pages share
+  state (cookies, history, storage, one netlog stream, the interaction
+  pass's history order), so it would change what is tested.
+
+**Found on the way: listener ports inside the ephemeral range.** The
+first cache-hit gate failed "at the Vita's pace", interaction 45/52:
+`remote: cannot listen on :45182, errno 98`. Linux's ephemeral range here
+is 32768-60999. Every gate TCP port sat inside it, so a listener could
+lose its port to any outgoing connection using that number as its local
+port at that moment (the frontend's listener sets SO_REUSEADDR, which
+covers TIME_WAIT, not live sockets). The background runs now use ports
+below the range (slow 31290/31182, forms 31300/31183; overridable). A
+failed bind now prints `LISTENER: remote: cannot listen ...` at the run's
+section instead of only a short count. The main run's 45180/45280-45282
+keep their small, pre-existing exposure.
+
+**Measured** (each a full gate on this tree):
+
+| run | wall | result |
+|---|---|---|
+| baseline (before) | 1182 s | exit 0 |
+| default, parallel | **927 s** (-22%) | exit 0 |
+| `GATE_REUSE_AUTOTEST=1`, fresh (fills the cache) | 932 s | exit 0 |
+| `GATE_REUSE_AUTOTEST=1`, cache hit (before the port fix) | 252 s | exit 1 (ephemeral port, above) |
+| `GATE_REUSE_AUTOTEST=1`, cache hit, after the port fix | **211 s** | exit 0 |
+| the same again | **210 s** | exit 0 |
+| default, parallel, after the port fix | **931 s** | exit 0 |
+| `GATE_SERIAL=1` | 1170 s | exit 0 |
+
+**Verdicts unchanged.** Every result line ("passed", "identical/differ",
+"ok", "byte-identical", EXIT) of the baseline, parallel and serial gates:
+195 lines each, **identical**. The cache-filling run differs only in
+FORMWALK's timing reading (30 vs 29 ms, 5/5 both). The runs on the final script (parallel 931 s, both cache hits) differ from the baseline in that one timing reading only (28/29/29 ms). The cache hits print `autotest: inputs unchanged (key 191cb6c6e5864027), reusing the last passing gate's run`. The final script's gates (parallel, cache hit x2) are this unit's gate: exit 0.
+
+No sudo.
+
+**Next:** units from the census. Patches are through 402; the open
+items are in the 395-402 "Next" lists (device-dependent ones wait for
+hardware).
