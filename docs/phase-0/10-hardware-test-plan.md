@@ -10684,3 +10684,70 @@ No sudo.
    querySelectorAll), then index by id/class/tag before `complexOk`, or
    route simple selectors to libcss/libdom's native matching.
 2. Device run with 395 (form submissions, nav-away from form pages).
+
+## Unit 401 (2026-11-07): curl, mbedTLS, FreeType and the image/SVG/support libraries under ASan -- everything built from source is clean
+
+**400's coverage list, finished.** `tools/build-asan-sim.sh` gains three
+flags and a shorthand:
+- `--net`: mbedTLS 3.6.5 + curl 8.22.0 from `tools/build-host-curl.sh`'s
+  cached, checksummed tarballs in `$WORK/src`, with the same
+  `config.py` threading settings and cmake options, plus
+  `-DCMAKE_C_FLAGS=<ASan>`, into `<dest>/host-curl`. It refuses if
+  host-curl's version differs from the one it builds.
+- `--freetype`: FreeType 2.14.3, `build-host-freetype.sh`'s configure
+  line plus ASan, into `<dest>/host-freetype`.
+- `--support`: libnsutils, libutf8proc, libnsgif, libnsbmp, libnspsl and
+  the staged (patched, 346) libsvgtiny, built as `build-patched.sh` builds
+  them (no compat header), plus ASan, into `<dest>/prefix`.
+- `--all` = `--libs --js --net --freetype --support`. Under 4 minutes.
+  Every archive is checked for `__asan_report` before the link, and the
+  link puts each instrumented prefix's `-L` ahead of pkg-config's. The
+  script was rewritten around a shared prefix copy, and default mode was
+  re-checked after it (`html_destroy` 55 checks; `css_select_style`,
+  `Curl_cookie_add`, `FT_Load_Glyph`, `JS_CallInternal` 0; a sweep load
+  clean).
+
+**Linked, not just built** (`__asan_report` sites, `--all` vs the
+400 build): `Curl_cookie_add` 217 vs 0, `mbedtls_ssl_read_record` 261
+vs 0, `mbedtls_internal_sha256_process` 67, `FT_Load_Glyph` 120 vs 0,
+`FT_Outline_Decompose` 58, `bmp_decode` 118, `svgtiny_parse` 158,
+`nsgif_frame_decode` 6, `nspsl_getpublicsuffix` 19,
+`utf8proc_decompose_char` 15.
+
+**Results, `--all`** (stack 395+396):
+- `asan_sweep.py`, 21 sites x 3: **63/63 clean**. The new libraries
+  were exercised: 6186 https fetches through curl/mbedTLS, 716
+  SVG/GIF/BMP resources through the decoders, and every page's text
+  through FreeType. Script counts match the plain build (youtube
+  65/65/66, claude 31, wpblog 145, bbc 76, rte 45, wikipedia 14). The
+  only deadline hits are github's selector-engine task (400 entry). The
+  "Could not resolve" lines are ad/tracker hosts (doubleclick,
+  scorecardresearch, bbc's edigitalsurvey frame), and every load reached
+  its page.
+- `asan-autotest.sh`: main **52/52** + 319/319 dumps (incl. the https
+  good/rogue-certificate pages), forms **10/10** + target, Vita's pace
+  **52/52** + JS-window 4/4. 0 deadline hits. **"ASan autotest: clean"**.
+
+**Coverage, final:** every line of C the simulator links that this repo
+builds from source is ASan-clean over 21 real sites and the whole gate
+interaction: netsurf, libwapcaplet, libparserutils, libhubbub, libcss,
+libdom, libnsutils, libutf8proc, libnsgif, libnsbmp, libnspsl,
+libsvgtiny, QuickJS-ng, wasm3, mbedTLS, curl, FreeType. **Not covered:**
+the system shared libraries the sim loads (libjpeg, libpng, libwebp,
+zlib, expat, pcre2; ASan still checks their memcpy/strlen-style calls
+through its interceptors, but not their internals), the stand-in SDK
+(vitasim.c), uninitialised reads (MSan) and leaks.
+
+Also checked (standing rule): `asan-autotest.sh`'s form script still
+matches run-vita-sim.sh's "scriptless form submissions" block. Same
+navigation/tap sequence, the same six submitter cases, the same ten
+FORMCHECK hashes and FORMTARGET expectation. The tool folds `quit` into
+its last printf.
+
+Tools only, no engine or gate change: the tree is the one gate396 passed.
+No sudo.
+
+**Next:**
+1. **github's selector-engine task** (400 entry: 5.7 s host in
+   `matchList`; on the Vita it cannot finish inside 8000 ms).
+2. Device run with 395 (form submissions, nav-away from form pages).
