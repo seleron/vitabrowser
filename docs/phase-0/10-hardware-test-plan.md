@@ -10625,3 +10625,62 @@ No sudo.
    Rebuild `host-quickjs` with ASan into the dest dir, then the same two
    sweeps.
 2. Device run with 395 (form submissions, nav-away from form pages).
+
+## Unit 400 (2026-11-07): QuickJS-ng and wasm3 under ASan too -- clean; and github's 5.7 s selector-engine task
+
+**399's "Next" #1.** `tools/build-asan-sim.sh --js` compiles QuickJS-ng
+(quickjs, libregexp, libunicode, dtoa) and wasm3 the way
+`tools/build-quickjs.sh` does (same sources in `$WORK/quickjs` /
+`$WORK/wasm3`, same flags: -O2 / -O3 -fwrapv) plus ASan, into
+`<dest>/quickjs`, and links the sim against it (`VITA_SIM_QUICKJS`).
+Combined with `--libs`, a 3-minute build. Linked checks: `JS_CallInternal`
+2597 `__asan_report` sites, `js_function_apply` 10, wasm3's `m3_Call`
+26, `css_select_style` 387, `html_destroy` 55.
+
+**The deadline under ASan.** The instrumented interpreter is several
+times slower. The first sweep at the stock per-script deadline
+(`MACSURF_JS_TIMEOUT_MS` 8000) had "DEADLINE hit" aborts on rte,
+wpblog and wikipedia, so parts of those scripts never ran and went
+unchecked. `--js` now builds with `-DMACSURF_JS_TIMEOUT_MS=32000`
+(`ASAN_JS_TIMEOUT_MS`; the define is `#ifndef` in macsurf_qjs.c). That
+is an ASan-build-only knob; the engine's 8000 is unchanged.
+(The same first sweep also had a DNS blip: youtube-0 and claude-0 read
+"Could not resolve hostname". Runs 1-2 of each loaded normally.)
+
+**Results, everything instrumented** (netsurf + 5 engine libraries +
+QuickJS + wasm3; stack 395+396):
+- `asan_sweep.py`, 21 sites x 3, deadline 32000: **63/63 clean**.
+  Script counts are the plain build's (youtube 66/64/66, claude 31,
+  rte 45, wpblog 144-145, wikipedia 14, stackoverflow 71, guardian 87).
+  The only remaining deadline hit is github (below).
+- `asan-autotest.sh` (stock deadline; 0 deadline hits in it): main
+  **52/52** + 319/319 dumps, forms **10/10** + target, Vita's pace
+  **52/52** + JS-window 4/4. Includes the wasm page (WASM254 15/15):
+  wasm3's tail-call interpreter survives ASan at -O3.
+
+**Found on the way: github spends 5.7 s in one JS task, in our selector
+engine.** Every ASan github load (libs-only and full) aborts at the
+deadline, even at 32000, in `matchList` (`<vita_polyfill>:4959`): the
+polyfill's querySelector/matches engine (`complexOk` walks ancestors per
+candidate). The plain build never hits the deadline. But its log shows
+one task from 3.18 s to 8.9 s (heartbeats at 3, 5, 7 s) right after
+`dom_to_box`, starting at a `MutationObserver.observe(html)`. That is
+**5.7 s on this host**. The Vita's CPU is many times slower, so on the
+device this task cannot finish inside 8000 ms: github's script there is
+almost certainly cut off. Not fixed here; it is the next unit.
+
+**Coverage now:** netsurf, libwapcaplet, libparserutils, libhubbub,
+libcss, libdom, QuickJS-ng and wasm3 are ASan-clean over 21 real sites
+and all of the gate's interaction. Still uninstrumented: curl + mbedTLS,
+FreeType, the image/SVG support libraries. Uninitialised reads (MSan)
+and leaks are out of scope (399 entry).
+
+Tools only, no engine or gate change: the tree is the one gate396 passed.
+No sudo.
+
+**Next:**
+1. **github's selector-engine task** (5.7 s host): profile which
+   selector(s) and DOM size (sprof / a per-call timer in the polyfill's
+   querySelectorAll), then index by id/class/tag before `complexOk`, or
+   route simple selectors to libcss/libdom's native matching.
+2. Device run with 395 (form submissions, nav-away from form pages).
