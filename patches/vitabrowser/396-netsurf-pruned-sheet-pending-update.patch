@@ -1,0 +1,45 @@
+# netsurf: a pruned <style> with a pending text update crashed (patch 396)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 395)
+#
+# Regression from 387-389 (prune on detach). A <style> whose text a
+# script changes is marked (html_css_update_style: s->modified = true,
+# html_css_process_modified_styles scheduled at 0). If the element leaves
+# the document before that runs, html_css_prune_detached_sheets drops the
+# entry (unused = true, node unref'd and set NULL) but left the mark, so
+# the scheduled pass called html_stylesheet_from_domnode(c, NULL, ...) ->
+# dom_node_get_text_content(NULL): SEGV (ASan, old.reddit.com). Plain sim:
+# old.reddit.com and developer.mozilla.org crash 4/4 with the 395 binary,
+# 0/4 with this patch (scorecard r112: both crashed in both arms).
+#
+#  - prune: clears hsheet->modified with the node.
+#  - html_css_process_modified_styles: a marked entry that is unused or
+#    has no node is unmarked and skipped (covers a mark set between).
+#
+--- a/content/handlers/html/css.c	2026-11-07 10:36:31.963816237 +0000
++++ b/content/handlers/html/css.c	2026-11-07 10:42:23.517886629 +0000
+@@ -552,6 +552,14 @@
+ 	bool all_done = true;
+ 
+ 	for (i = 0, s = c->stylesheets; i != c->stylesheet_count; i++, s++) {
++		/* patch 396: an entry the 387 prune dropped (its <style>
++		 * left the document after a text change marked it, before
++		 * this ran) has no node to re-read: nothing to update.
++		 * old.reddit.com, NULL in dom_node_get_text_content. */
++		if (s->modified && (s->unused || s->node == NULL)) {
++			s->modified = false;
++			continue;
++		}
+ 		if (c->stylesheets[i].modified) {
+ 			all_done &= html_css_process_modified_style(c, s);
+ 		}
+@@ -906,6 +914,9 @@
+ 		hsheet->reach_cur = NULL;
+ 		dom_node_unref(hsheet->node);
+ 		hsheet->node = NULL;
++		/* patch 396: a pending text-change update has nothing
++		 * left to read (html_css_process_modified_styles) */
++		hsheet->modified = false;
+ 		n++;
+ 	}
+ 
