@@ -272,6 +272,8 @@ JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
 CSS-flex-buttons-ref file:///app0:/testpages/CSS-flex-buttons-ref.html
 JS-head-attr file:///app0:/testpages/JS-head-attr.html
 CSS-head-attr-ref file:///app0:/testpages/CSS-head-attr-ref.html
+JS-class-churn file:///app0:/testpages/JS-class-churn.html
+CSS-class-churn-ref file:///app0:/testpages/CSS-class-churn-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1696,6 +1698,18 @@ k383a=$(printf '%s\n' "$k383seg" | grep -c "LIFE rebuild local: attribute on a b
 echo "  JS-head-attr: rows differing from the parse-time build $k383r (0); ${k383h} <head> changes needing no rebuild (3 or more); ${k383a} inert attributes (2 or more)"
 [ "$k383r" = 0 ] && [ "${k383h:-0}" -ge 3 ] && [ "${k383a:-0}" -ge 2 ] ||
 	fail "head changes and inert attributes need no rebuild"
+# Patch 385: fixes1135's cap defers class churn instead of dropping it.
+# Four class changes 600 ms apart: the span's is local, the paragraph's
+# three are full rebuilds and the third is past the cap. Before 385 it
+# was dropped (14 stale rows); now it waits for its window and the page
+# renders row for row as the same changes at parse time.
+k385r=$(fl_rows JS-class-churn CSS-class-churn-ref)
+k385seg=$(awk '/ page [0-9]+\/[0-9]+ JS-class-churn: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k385d=$(printf '%s\n' "$k385seg" | grep -c "LIFE cosmetic rebuild deferred" || true)
+k385l=$(printf '%s\n' "$k385seg" | grep -c "LIFE rebuild local: rebuilt and laid out" || true)
+echo "  JS-class-churn: rows differing from the parse-time build $k385r (0); ${k385d} class rebuilds deferred past the cap (1 or more); ${k385l} answered locally (1 or more)"
+[ "$k385r" = 0 ] && [ "${k385d:-0}" -ge 1 ] && [ "${k385l:-0}" -ge 1 ] ||
+	fail "class churn past the cap is deferred, not dropped"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

@@ -1,0 +1,220 @@
+# netsurf: fixes1135's cosmetic cap defers class churn instead of dropping it (patch 385)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 383)
+#
+# The "fixes1135 class-drop" logged since 372. After two class-only full
+# rebuilds in a row, fixes1135 cleared the next single class mark's slot
+# unrebuilt ("the styles were already applied by the JS setAttribute").
+# Not so in this engine: style is computed when boxes are built, so the
+# change stayed unrendered until some other change came. Its log line
+# never appeared because diag.c drops every "LIFE reconvert" line as
+# noise, and it ran BEFORE try_local, so even a change the local paths
+# answer in a few ms was dropped.
+#
+# The cap still matters: patch 312's task flush fires the callback ~16 ms
+# after every mutating task, which overrides fixes1024's escalating
+# debounce, so a carousel's timer churn would otherwise cost a full
+# rebuild per tick (the FLOOR aside).
+#
+#  - macos9_reconvert_cb: the check moves after try_local, just before
+#    the full reconvert. Past the cap (still single class marks only, as
+#    fixes1135), a class-only full rebuild waits until
+#    RECONVERT_COSMETIC_DEFER_MS (= fixes1024's 6400 ms ceiling) after
+#    the last full rebuild. Its slot stays pending and the callback is
+#    re-armed for the window, so the page always converges, later marks
+#    join the same batch (a multi-mark batch runs as before), and the
+#    autotest's settle (page_reconvert_pending) waits for it.
+#  - The log line is "LIFE cosmetic rebuild deferred %lu ms", outside the
+#    noise prefix. macos9_reconvert_census_structural() replaces the two
+#    copies of the census scan.
+#
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-07 00:29:15.176573172 +0000
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-07 00:29:15.180804860 +0000
+@@ -237,6 +237,9 @@
+  * structural mutation (append/remove/innerHTML/textContent) resets the
+  * counter. Reset per navigation. */
+ #define RECONVERT_COSMETIC_MAX_CONSECUTIVE 2
++/* Patch 385 - past the cap, a class-only full rebuild waits this long
++ * after the last full rebuild (fixes1024's own debounce ceiling) */
++#define RECONVERT_COSMETIC_DEFER_MS RECONVERT_DEBOUNCE_MAX_MS
+ static int g_consecutive_cosmetic = 0;
+ 
+ static int macos9_reconvert_kind_is_cosmetic(int kind)
+@@ -1392,6 +1395,22 @@
+ 	}
+ 	return 1;
+ }
++/* fixes1135 / patch 385 - does the batch's census hold any kind other
++ * than a class or style change? */
++static int macos9_reconvert_census_structural(void)
++{
++	int k;
++
++	for (k = 0; k <= MACOS9_DOMMUT_SETATTR_STYLE; k++) {
++		if (k == MACOS9_DOMMUT_SETATTR_CLASS ||
++		    k == MACOS9_DOMMUT_SETATTR_STYLE)
++			continue;
++		if (g_mut_counts[k] > 0)
++			return 1;
++	}
++	return 0;
++}
++
+ static void macos9_reconvert_schedule_pending(void);
+ 
+ static void
+@@ -1575,6 +1594,7 @@
+ 	int i;
+ 	int busy = 0;
+ 	int did_one = 0;
++	unsigned long defer_ms = 0;	/* patch 385 */
+ 	enum macsurf_render_action action;
+ 	struct ms_diag_provenance prov;
+ 	struct ms_diag_render_scope render_scope;
+@@ -1642,54 +1662,6 @@
+ 			continue;
+ 		}
+ 
+-		/* fixes1135 - cosmetic-only batch: if we have already run
+-		 * MAX_CONSECUTIVE cosmetic rebuilds in a row without a
+-		 * structural mutation, suppress this one. The timer-driven
+-		 * style churn (slick autoplay, CSS animation polyfills)
+-		 * produces infinite O(document) rebuilds that cost ~1.5s
+-		 * each. The page still renders correctly - the styles were
+-		 * already applied by the JS setAttribute, and the next
+-		 * structural mutation forces a real rebuild. */
+-		{
+-			int cosm;
+-			int any_structural = 0;
+-			for (cosm = 0;
+-			     cosm <= MACOS9_DOMMUT_SETATTR_STYLE; cosm++) {
+-				if (cosm == MACOS9_DOMMUT_SETATTR_CLASS ||
+-				    cosm == MACOS9_DOMMUT_SETATTR_STYLE)
+-					continue;
+-				if (g_mut_counts[cosm] > 0) {
+-					any_structural = 1;
+-					break;
+-				}
+-			}
+-			/* A style edit has a correctness path: either the existing
+-			 * single-box paint path, the inherited-colour transaction, or
+-			 * a real fallback reconvert.  Never suppress it merely because
+-			 * two earlier cosmetic batches ran: a multi-style batch can
+-			 * contain geometry (for example parent colour plus child width).
+-			 * Keep the animation-churn cap for the unsupported precise class
+-			 * case only. */
+-			if (!any_structural &&
+-			    g_pending[i].multi == 0 &&
+-			    g_pending[i].kind == MACOS9_DOMMUT_SETATTR_CLASS &&
+-			    g_consecutive_cosmetic >=
+-			    RECONVERT_COSMETIC_MAX_CONSECUTIVE) {
+-				macsurf_debug_log_writef(
+-					"LIFE reconvert cosmetic-suppress "
+-					"consec=%d cap=%d",
+-					g_consecutive_cosmetic,
+-					RECONVERT_COSMETIC_MAX_CONSECUTIVE);
+-				if (have_render_scope) ms_diag_render_leave(&render_scope,
+-					MS_RRES_COSMETIC_SUPPRESSED, MS_SREASON_NONE);
+-				macos9_reconvert_slot_clear(i);
+-				memset(g_mut_counts, 0,
+-					sizeof(g_mut_counts));
+-				g_mut_total = 0;
+-				continue;
+-			}
+-		}
+-
+ 		if (g_pending[i].multi == 0 && g_pending[i].kind == MACOS9_DOMMUT_SETATTR_STYLE && g_pending[i].node != NULL) {
+ 			if (c->status == CONTENT_STATUS_READY || c->status == CONTENT_STATUS_DONE) {
+ 				g_style_fast_attempt++;
+@@ -1798,6 +1770,49 @@
+ 			macos9_reconvert_census_dump();
+ 			continue;
+ 		}
++		/* Patch 385 - fixes1135's cap, as a deferral. The cap stays:
++		 * patch 312's task flush fires this callback ~16 ms after
++		 * every mutating task, which overrides fixes1024's escalating
++		 * debounce, so a carousel's class churn would otherwise cost a
++		 * full rebuild per timer tick. But fixes1135 DROPPED the batch
++		 * ("the styles were already applied by the JS setAttribute"):
++		 * not so here -- style is computed when boxes are built, so a
++		 * dropped class change stayed stale until some other change
++		 * came. Now the batch waits: once the cap is reached, a
++		 * class-only full rebuild runs no sooner than
++		 * RECONVERT_COSMETIC_DEFER_MS after the last full rebuild, and
++		 * its slot stays pending, so the page always converges and
++		 * later marks join the same rebuild. It runs after try_local,
++		 * so a change answered locally is never held, and its log line
++		 * is not under diag.c's "LIFE reconvert" noise prefix, which
++		 * hid fixes1135 from every log. */
++		{
++			unsigned long defer_ticks = (unsigned long)
++				RECONVERT_COSMETIC_DEFER_MS * 60UL / 1000UL;
++			unsigned long since = now - g_last_reconvert_tick;
++
++			if (g_pending[i].multi == 0 &&
++			    g_pending[i].kind == MACOS9_DOMMUT_SETATTR_CLASS &&
++			    !macos9_reconvert_census_structural() &&
++			    g_consecutive_cosmetic >=
++			    RECONVERT_COSMETIC_MAX_CONSECUTIVE &&
++			    g_last_reconvert_tick != 0 &&
++			    since < defer_ticks) {
++				unsigned long left_ms = (defer_ticks - since) *
++					1000UL / 60UL + 1UL;
++				macsurf_debug_log_writef(
++					"LIFE cosmetic rebuild deferred %lu ms "
++					"(class-only full rebuild %d in a row)",
++					left_ms, g_consecutive_cosmetic + 1);
++				if (have_render_scope) ms_diag_render_leave(
++					&render_scope,
++					MS_RRES_COSMETIC_SUPPRESSED,
++					MS_SREASON_NONE);
++				if (defer_ms == 0 || left_ms < defer_ms)
++					defer_ms = left_ms;
++				continue;
++			}
++		}
+ 		rc = html_reconvert_content(c);	/* 0 = queued, !=0 = busy */
+ 		macsurf_debug_log_writef(
+ 			"LIFE reconvert: html_reconvert_content rc=%d c=%p", rc,
+@@ -1820,24 +1835,10 @@
+ 		did_one = 1;
+ 
+ 		/* fixes1135 - track consecutive cosmetic-only reconverts. */
+-		{
+-			int cosm;
+-			int any_structural = 0;
+-			for (cosm = 0;
+-			     cosm <= MACOS9_DOMMUT_SETATTR_STYLE; cosm++) {
+-				if (cosm == MACOS9_DOMMUT_SETATTR_CLASS ||
+-				    cosm == MACOS9_DOMMUT_SETATTR_STYLE)
+-					continue;
+-				if (g_mut_counts[cosm] > 0) {
+-					any_structural = 1;
+-					break;
+-				}
+-			}
+-			if (!any_structural)
+-				g_consecutive_cosmetic++;
+-			else
+-				g_consecutive_cosmetic = 0;
+-		}
++		if (!macos9_reconvert_census_structural())
++			g_consecutive_cosmetic++;
++		else
++			g_consecutive_cosmetic = 0;
+ 
+ 		/* fixes925 - dump the census for the batch this reconvert answers.
+ 		 * fixes1158 - AFTER both fixes1135 readers: the dump zeroes
+@@ -1863,6 +1864,12 @@
+ 	if (busy) {
+ 		(void) macos9_schedule(RECONVERT_DEBOUNCE_MS,
+ 				macos9_reconvert_cb, p);
++	} else if (defer_ms != 0) {
++		/* Patch 385 - a deferred cosmetic batch: its slot is still
++		 * pending; come back when its window opens. A mutating task
++		 * meanwhile (patch 312) may pull this forward, which just
++		 * defers again. The batch clock keeps running. */
++		(void) macos9_schedule((int) defer_ms, macos9_reconvert_cb, p);
+ 	} else {
+ 		/* R1.4 - batch consumed: the work ran (did_one), or the table
+ 		 * drained without it (a sync flush answered the marks, or every
