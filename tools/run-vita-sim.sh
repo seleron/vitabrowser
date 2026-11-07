@@ -274,6 +274,8 @@ JS-head-attr file:///app0:/testpages/JS-head-attr.html
 CSS-head-attr-ref file:///app0:/testpages/CSS-head-attr-ref.html
 JS-class-churn file:///app0:/testpages/JS-class-churn.html
 CSS-class-churn-ref file:///app0:/testpages/CSS-class-churn-ref.html
+JS-object-rebuild file:///app0:/testpages/JS-object-rebuild.html
+CSS-object-rebuild-ref file:///app0:/testpages/CSS-object-rebuild-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1710,6 +1712,16 @@ k385l=$(printf '%s\n' "$k385seg" | grep -c "LIFE rebuild local: rebuilt and laid
 echo "  JS-class-churn: rows differing from the parse-time build $k385r (0); ${k385d} class rebuilds deferred past the cap (1 or more); ${k385l} answered locally (1 or more)"
 [ "$k385r" = 0 ] && [ "${k385d:-0}" -ge 1 ] && [ "${k385l:-0}" -ge 1 ] ||
 	fail "class churn past the cap is deferred, not dropped"
+# Patch 386: <object>/<embed> survive a full rebuild. Three full
+# rebuilds (one after an <object>'s block is removed) against a STATIC
+# reference of the final state. Before 386 every object drew blank
+# (180 rows); the relink retired the new tree's own entries.
+k386r=$(fl_rows JS-object-rebuild CSS-object-rebuild-ref)
+k386seg=$(awk '/ page [0-9]+\/[0-9]+ JS-object-rebuild: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k386k=$(printf '%s\n' "$k386seg" | grep -c "LIFE full rebuild kept [0-9]* new object/embed entries" || true)
+echo "  JS-object-rebuild: rows differing from the static final state $k386r (0); ${k386k} full rebuilds keeping the new tree's objects (2 or more)"
+[ "$k386r" = 0 ] && [ "${k386k:-0}" -ge 2 ] ||
+	fail "objects and embeds survive a full rebuild"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

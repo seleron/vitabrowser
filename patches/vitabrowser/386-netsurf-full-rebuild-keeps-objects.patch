@@ -1,0 +1,101 @@
+# netsurf: <object> and <embed> survive a full rebuild (patch 386)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 385)
+#
+# The 375 entry's "<object> lost after a full rebuild" -- not only in a
+# flex: every <object> and <embed> drew blank after any full reconvert
+# (a static page draws them; the same page after one sibling-declined
+# class change does not; the engine log freed 6 entries for 3 elements).
+#
+# html_reconvert_relink_objects retires every non-CONTENT_IMAGE entry,
+# because an <object>/<embed> entry's object_params are talloc'd against
+# the OLD bctx. But box construction has just made the NEW tree's own
+# entries (box_object / box_embed -> html_fetch_object, prepended to the
+# same list), and the branch retired those too -- before looking at which
+# tree an entry belongs to. Images escape: their branch re-resolves the
+# box, and fixes977 adopts the old entry anyway.
+#
+#  - struct content_html_object: reconvert_old, set on every entry when
+#    the full reconvert sets the old tree aside (beside
+#    g_reconvert_old_layout), cleared on the kept list after the relink.
+#  - html_reconvert_relink_objects: a non-image entry WITHOUT the mark is
+#    the new tree's: kept as is. Old ones retire as before. Not by
+#    box_for_node(node) == o->box: a removed element's node can still
+#    name its old box, which would keep an entry pointing into the tree
+#    about to be freed. Logged "LIFE full rebuild kept N new
+#    object/embed entries" (the relink's own line is under diag.c's
+#    noise prefix).
+#
+--- a/content/handlers/html/html.h	2026-11-07 01:13:35.151795549 +0000
++++ b/content/handlers/html/html.h	2026-11-07 01:13:35.153257275 +0000
+@@ -203,6 +203,10 @@
+ 	 * had no element yet -- a cached image finishes inside box
+ 	 * construction; its event is resolved when the box has one */
+ 	int img_settle;
++	/** VitaBrowser patch 386: set on every entry when a full reconvert
++	 * sets the old box tree aside; an entry without it at the relink was
++	 * made by the new tree's construction */
++	bool reconvert_old;
+ };
+ 
+ 
+--- a/content/handlers/html/html.c	2026-11-07 01:13:35.150391556 +0000
++++ b/content/handlers/html/html.c	2026-11-07 01:13:35.153084464 +0000
+@@ -3674,6 +3674,7 @@
+ 	int rt_nobox = 0, rt_nonode = 0, rt_unresolved = 0;
+ 	int rt_dedup = 0;   /* fixes973b - duplicate display slot collapsed */
+ 	int kept_nobox = 0; /* fixes976 - box-less entries CARRIED, not retired */
++	int kept_new = 0;   /* patch 386 - the new tree's own non-image entries */
+ 
+ 	if (c == NULL) {
+ 		return;
+@@ -3703,6 +3704,23 @@
+ 		 * -- and retiring it was the single largest class of the disappear
+ 		 * bug (background=70 of 101 on hackaday). It now falls through to
+ 		 * box re-resolution and attaches to newbox->background. */
++		/* Patch 386 - an <object>/<embed> entry the NEW tree's
++		 * construction just made (box_object / box_embed fetched it
++		 * for its new box, whose object_params are in the new bctx)
++		 * is not the old tree's: keep it. Retiring it too -- as this
++		 * branch did -- left every <object> and <embed> blank after
++		 * any full rebuild (the 375 entry's "lost after a full
++		 * rebuild"). Told apart by the mark set when the old tree was
++		 * set aside, not by box_for_node: a removed element's node can
++		 * still name its old box. */
++		if (g_object_relink_enabled != 0 &&
++		    o->permitted_types != CONTENT_IMAGE &&
++		    !o->reconvert_old) {
++			kept_new++;
++			o->next = keep; keep = o; n_keep++;
++			o = next;
++			continue;
++		}
+ 		if (g_object_relink_enabled == 0 ||
+ 		    o->permitted_types != CONTENT_IMAGE) {
+ 			if (g_object_relink_enabled == 0) rt_disabled++;
+@@ -3921,6 +3939,11 @@
+ 	(void) html_object_free_objects(c);
+ 	c->object_list = keep;
+ 	c->num_objects = n_keep;
++	for (o = keep; o != NULL; o = o->next)
++		o->reconvert_old = false;	/* patch 386 */
++	if (kept_new != 0)
++		macsurf_debug_log_writef("LIFE full rebuild kept %d new "
++				"object/embed entries", kept_new);
+ 
+ 	if (relinked || inflight || retired) {
+ 		/* fixes928 - the why= partition sums to retired= by construction.
+@@ -5024,6 +5047,13 @@
+ 	g_reconvert_old_layout = c->layout;
+ 	g_reconvert_old_iframe = c->iframe;
+ 	g_reconvert_old_forms = c->forms;
++	/* Patch 386 - mark the entries that point into the old tree, so
++	 * the relink can tell the new tree's own entries from them. */
++	{
++		struct content_html_object *ob;
++		for (ob = c->object_list; ob != NULL; ob = ob->next)
++			ob->reconvert_old = true;
++	}
+ 	c->bctx = NULL;
+ 	c->layout = NULL;
+ 	c->forms = NULL;
