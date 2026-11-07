@@ -9859,3 +9859,71 @@ interaction (carousels, tabs, timers), not first load.
    count, but a rate-capped allowance would help triage.
 
 No sudo needed. The Vita cross-build was not run (no vitaSDK here).
+
+## Patch 386 (2026-11-07): <object> and <embed> survive a full rebuild
+
+**The bug** was wider than the 375 entry's "an `<object>` in a flex is
+lost after a full rebuild". **Every** `<object>` and `<embed>` drew
+blank after any full reconvert, in a block too:
+- a static page draws them;
+- the same page after one sibling-declined class change does not;
+- the engine log freed 6 entries for 3 elements at that rebuild.
+
+**The cause.** `html_reconvert_relink_objects` retires every
+non-`CONTENT_IMAGE` entry, because an `<object>`/`<embed>` entry's
+`object_params` are talloc'd against the old bctx. But box construction
+has just made the **new** tree's own entries (`box_object` /
+`box_embed` -> `html_fetch_object`, prepended to the same list). The
+branch retired those too, before looking at which tree an entry belongs
+to. Images escape: their branch re-resolves the box, and fixes977 adopts
+the old entry anyway.
+
+**The change** (html.c, html.h):
+- `struct content_html_object` gains `reconvert_old`.
+  - It is set on every entry when the full reconvert sets the old tree
+    aside (beside `g_reconvert_old_layout`).
+  - It is cleared on the kept list after the relink.
+- In the relink, a non-image entry **without** the mark is the new
+  tree's, and is kept as is. The old tree's entries retire as before.
+- The test is deliberately not `box_for_node(node) == o->box`. A removed
+  element's node can still name its old box, and that test would keep an
+  entry pointing into the tree about to be freed.
+- Logged as `LIFE full rebuild kept N new object/embed entries`. The
+  relink's own line is under diag.c's noise prefix (see 385).
+
+**Gate** (JS-object-rebuild / CSS-object-rebuild-ref). The page has
+objects in a flex and in a block, plus an embed. Three steps, each a
+full rebuild: `#a .on`, an `<object>`'s block removed, `#a` back to no
+class. It is compared against a **static** reference of the final
+state; a parse-time script takes the same full rebuild, which is why
+375's first draft read blank against blank.
+- **385:** 180 rows differ, every object blank.
+- **386:** **0 rows**, 3 keeps.
+- **ASan.** I built an ASan sim in a scratch copy of the tree:
+  `-fsanitize=address` on the engine objects, `detect_leaks=0`. It ran
+  clean on JS-object-rebuild (including the rebuild after the removal),
+  the probe page and JS-objects-relink.
+- `gate386`: exit 0 on the first run. 375's JS-objects-relink and
+  JS-bg-objects checks are unchanged.
+- Restage from pristine: 478 applied plus the 2 known collisions, both
+  changed files byte-identical.
+
+**Scorecard r110**: 21 sites against `r79-360`, the 386 and 385 binaries
+run back to back: **72.93 vs 72.92**. No crash. No site has an
+`<object>` or `<embed>` that goes through a full rebuild (0 keeps), so
+the fix matters for pages with plugin-style embeds (SVG/PNG `<object>`,
+`<embed>`), not for the scorecard's set.
+
+**Left as is:** `html_reconvert_has_droppable_inflight` still defers a
+full reconvert while any fetch is active and the page holds an
+`<object>`/`<embed>` with a handle. It mirrors the old-entry drop, which
+still applies, so it stays correct. It is conservative, and that is
+pre-existing.
+
+**Next:**
+1. **Stylesheet removal never taking effect** (383 entry).
+2. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+3. **The diag.c noise list** hides the relink line and
+   `html_reconvert_content rc=` (385 entry).
+
+No sudo needed. The Vita cross-build was not run (no vitaSDK here).
