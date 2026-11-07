@@ -9927,3 +9927,78 @@ pre-existing.
    `html_reconvert_content rc=` (385 entry).
 
 No sudo needed. The Vita cross-build was not run (no vitaSDK here).
+
+## Patch 387 (2026-11-07): a removed <style>/<link> stops cascading
+
+**The bug** (unit 387, the 383 entry's open item). The stylesheet
+list in `struct html_content` is collected when the content is
+created and added to on insertion, and it is **never re-collected
+nor pruned -- even by a full rebuild**. `html_css_process_style` /
+`_link` append one entry per element; nothing removes the entry when
+the element leaves the DOM. A deleted `<style>`/`<link>` kept
+cascading through every later rebuild, local or full, until the
+document was replaced. The 383 head no-op observed exactly this
+persistence.
+
+**The cause.** Append-only by construction: the array's slot layout
+is load-bearing (the 316/318 sheet census references
+`index + mod_count`), and no code path ever looked at whether an
+entry's element was still in the document.
+
+**The change** (css.c, css.h, html.c):
+- `html_css_prune_detached_sheets(c)` (css.c): walks the array; for
+  every entry with a live node it follows the parent chain. Attached
+  = the chain reaches the document (the only node with a NULL
+  parent); removed = the chain is cut at the removal point. Detached
+  entries are marked `unused` (the flag `html_css_new_selection_context`
+  already skips), and their sheet handle, reach tables and node ref
+  are released -- mirroring `html_css_free_stylesheets()` for one
+  entry. The selection-context refresh is folded in so the caller
+  makes one call. `node == NULL` entries (UA sheet, pre-387 link
+  entries) are left alone: no evidence they are gone.
+- `html_reconvert` (html.c): prunes up front, after the quiesce
+  guard -- the full rebuild's fresh cascade is built from the pruned
+  list.
+- `html_reconvert_local_change` (html.c): prunes up front, before the
+  local rebuild. Anything detached declines the local path
+  (`RL_NO`) into the full reconvert, whose own prune rebuilds the
+  tree without the dead sheet.
+- Log lines: `WORK reconvert: pruned N detached sheet(s)` /
+  `LIFE rebuild local: declined (detached stylesheet pruned)`.
+
+**Gate.** `tools/run-vita-sim.sh` exit 0: all suites at baseline
+(sheet suites SHEETCENSUS 3/3, SHEETSCOPE 5/5, STYLEABS 4/4;
+JS-style-attr 84 local; interaction 52/52; Vita-pace 23 identical).
+First gate run failed on two -Werrors in this patch (a typedef
+visible only through private.h in css.h, and a `dom_document *` vs
+`dom_node *` compare); both fixed -- the parent-chain walk now ends
+at the document by the NULL-parent test alone, no opaque pointer
+compared. Restage from pristine: 478 applied + this patch =
+applytest byte-identical on all three files (dry-run clean).
+
+**Scorecard r111**: 21 sites, the saved runs of the same day against
+the `r79-360` reference (386 binary 01:36, 385 binary 01:38, 387
+binary 03:08): **73.8 vs 74.2 vs 74.1**. Per site: every
+static/doc/wiki site identical to two decimals; the deltas are the
+live news/forum pages (bbc -2.7, hackernews -1.3, cnnlite -0.8,
+stackoverflow -0.6, guardian -0.2). No crash, no systematic cascade
+shift -- expected: the change only alters rendering when a
+`<style>`/`<link>` is removed *during* a page's lifetime, and the
+scorecard set loads its documents once.
+
+**Left as is:** pruning runs on every full reconvert and every local
+rebuild (a short parent-chain scan per live entry; a no-op when
+nothing detached). Entries created pre-387 for `<link>` elements that
+were removed while the content was loading carry no node and stay
+until the document is replaced -- the 316/318 census treats them as
+it treats any unprunable entry.
+
+**Next:**
+1. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+2. **The diag.c noise list** hides the relink line and
+   `html_reconvert_content rc=` (385 entry).
+3. An in-sim test for 387 itself: a page that inserts and then
+   removes a `<style>`, asserted by pixels (no gate page exercises
+   removal-during-lifetime yet).
+
+No sudo needed. The Vita cross-build was not run (no vitaSDK here).
