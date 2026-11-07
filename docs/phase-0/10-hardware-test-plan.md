@@ -10234,3 +10234,40 @@ Vita cross-build was not run (no vitaSDK here).
    field's form control alive, fixes107 area; wpblog intermittent
    segfault rc -11, no gdb repro).
 
+## Unit 392 (2026-11-07): the gate's two timing flakes get wider margins (TIMERNEST's floor, BLOCKSIB's chain) -- test pages only
+
+**391's "Next" #1 (gate hygiene, 385's #3, deferred twice); no engine
+change.** Two gate flakes whose signatures the logs had already pinned:
+
+- **TIMERNEST** had failed twice with the same reading (gate379b, gate382):
+  a clamped gap of 3.3 ms against the 3.5 ms floor. The sim's clamped timers
+  under WSL land at 3.3-4.2 ms while its unclamped ones land at 0-0.2 ms
+  (391 run: 3.9 4.0 4.2 3.7 vs 0.2 0 0 0 0 0; 392 run: 3.8 4.1 4.2 3.7 vs
+  0.1 0 0 0 0.1 0). The 3.5 ms floor sat inside that band. The three
+  clamped-gap checks (tests 1, 2, 4) now use a 3.0 ms floor -- 0.3 ms clear
+  of the observed clamped minimum, the unclamped maximum an order of
+  magnitude away. The unclamped check (< 4 ms) is unchanged.
+- **BLOCKSIB's settle edge** (gate358: one bottom dump read "script did not
+  run"). The page's timer chain ran 2600 ms after load and each step's
+  600 + 100 = 700 ms span sat exactly on the frontend's settle constant
+  (VITA_SETTLE_MS), so a slow WSL pass could settle the page on the edge of
+  a step. The chain is now 100 + 3 * (400 + 60) = 1480 ms after load: the
+  step spans (460 ms) are off the 700 ms edge and the whole script finishes
+  well inside the gate's settle windows. The assertions are unchanged.
+
+**Gate (this unit, exit 0):** TIMERNEST 4/4 (clamped gaps 3.8 4.1 4.2 3.7,
+unclamped <= 0.1), BLOCKSIB 3/3 with 22 sibling declines across the suite
+(the 390/391 baseline; the 4 in older logs predates the newer class-churn
+pages). Everything else at baseline: bundled pages 23/23 at the Vita's pace,
+text batched vs unbatched 68 frames identical, interaction 52/52,
+vita-test.bin byte-identical, QuickJS probe 18/18.
+
+No engine change, no per-element JS objects grew, so no scorecard. No sudo
+needed. The Vita cross-build was not run (no vitaSDK here).
+
+**Next:**
+1. The UNFIXED list (full reconvert keeps a removed field's form control
+   alive, fixes107 area, doc 10 368 entry; wpblog intermittent segfault
+   rc -11, no gdb repro, 365 entry).
+2. If Claude's /login recovers (pane shows a working prompt, not the
+   "Not logged in" banner), resume hybrid: feed the next unit prompt.
