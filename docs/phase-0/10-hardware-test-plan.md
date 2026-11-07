@@ -9745,3 +9745,47 @@ run back to back (`score/r108-383`, `score/r108-pre383`): **73.01 vs
 
 Not done: the Vita cross-build (no vitaSDK on this machine). No sudo
 needed.
+
+## Unit 384 (2026-11-07): sheet and nodeless batches -- census, shelved (doc 23)
+
+**Doc-only; no patch.** After 371-383, sheet and nodeless batches are
+the largest remaining full-rebuild cause on real-site loads: 28 of 73
+across ten sites in the r108 sims. This unit took a fresh census of them
+against doc 23's piece C (answering a sheet change by rebuilding only
+the subtrees its changed rules can reach).
+
+**The census**, with the full table in doc 23's 2026-11-07 status:
+- Sheet batches split into:
+  - single-identified edits (youtube 5, google 3, rte, stackoverflow,
+    cnnlite);
+  - multi-sheet windows (google 4, github 3, bbc 2, rte 2, wikipedia 1);
+  - unidentified ones.
+- Of the single ones, B1's reach is almost all unbounded: too-many 4,
+  at-rule 2, unanchored 2, no-source 2. Just one is bounded (google,
+  roots=1).
+- A temporary build with B1's 64-record cap lifted turned every
+  too-many into **at-rule**. The large CSS-in-JS sheets carry `@media`,
+  `@keyframes` and `@font-face` rules in their changed range. No batch
+  became bounded with roots, and none reached zero roots (the "rules
+  match nothing" case).
+
+**Decision: shelved.** Piece C would answer at most one batch here.
+These batches are new sheets arriving after first layout, which by
+construction reach the whole document. Patch 383 already made the
+`<head>` insertion of such a `<style>` need no rebuild, so the sheet's
+own mark is now the only full rebuild it costs. Taking them needs a
+cheaper whole-document path, a **re-cascade in place** that keeps the
+box tree unless a box-shaping property changed. That is a large new
+design, recorded in doc 23 as the next step there and not started.
+
+**Next** (the remaining non-sheet causes and the open bugs):
+1. **The fixes1135 class-drop** (372 entry), a correctness bug: class
+   changes after a run of full style rebuilds run no rebuild at all.
+2. **`<object>`/`<embed>` lost after a full rebuild** (375 entry), and
+   **stylesheet removal never taking effect** (383 entry).
+3. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+4. **Doc 23's re-cascade in place**, if the owner wants the sheet
+   batches taken on: a design first.
+
+No code changed; the temporary census build was reverted (`css.c` is
+back to 383's). No sudo needed.

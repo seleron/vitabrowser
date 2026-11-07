@@ -791,3 +791,71 @@ plot dumps cannot stand in for it. Until then, the real-site reading
 stands: the simulator census found 2 single-identified sheet batches
 across the Guardian, BBC and claude.ai, both bounded. That is too few
 to decide C, which stays on hold.
+
+## Status (2026-11-07): unit 384's fresh census -- piece C would not pay; shelved
+
+After patches 371-383 took most other full-rebuild causes off the
+scorecard's real-site loads, **sheet and nodeless batches are the
+largest remaining cause**: 28 of 73 full rebuilds across ten sites in
+the r108 sims (383 binary). So the question of piece C came back, this
+time with the owner's go-ahead to work on it.
+
+**The census** (r108-383 sims; the patch-318 identity lines and the
+patch-321 reach lines, per site):
+
+| site | sheet batches | identity single / multi / none | B1 reach of the single ones |
+|---|---|---|---|
+| youtube | 5 | 10 / 0 / 0 | too-many 3, unanchored 1, no-source 1 |
+| google | 8 | 6 / 4 / 1 | bounded (roots=1) 1, at-rule 1, unanchored 1 |
+| github | 4 | 0 / 3 / 1 | -- |
+| rte | 3 | 2 / 2 / 0 | at-rule 1 |
+| bbc | 2 | 0 / 2 / 0 | -- |
+| wikipedia | 2 | 0 / 1 / 1 | -- |
+| stackoverflow | 2 | 2 / 0 / 1 | no-source 1 |
+| cnnlite | 1 | 2 / 0 / 0 | too-many 1 |
+| claude | 1 | 0 / 0 / 1 | -- |
+
+(The identity counts are per mark, so they can exceed the batch count.)
+
+**The cap was not what blocked them.** B1 gives up above 64 changed
+rule records ("too-many"). A temporary build with that cap lifted
+(`HTML_CSS_REACH_MAX_CHANGED` 100000; youtube, cnnlite, google, rte,
+stackoverflow) turned every "too-many" into **at-rule**: the large
+injected sheets carry `@media`, `@keyframes` and `@font-face` rules in
+their changed range. The other reasons stayed (admission, unanchored,
+no-source). With the cap lifted, **no sheet batch on these sites is
+bounded with roots, and none reaches zero roots**, the "rules matching
+nothing" case that would need no rebuild at all.
+
+**Decision: piece C stays unbuilt (shelved, as unit 362 was).** Its
+bounded subtree rebuild would answer at most one batch in this sample:
+google's bounded-with-one-root edit. The machinery it would need now
+exists, in the subtree rebuild of 372/376 with objects carried over
+(375) and controls detached (382), so building C is no longer the
+obstacle. The sheets are. What these batches are is new sheets arriving
+after first layout:
+- CSS-in-JS injecting `<style>` elements (google: dozens at once; github
+  and youtube in groups);
+- linked sheets finishing load.
+
+Their changes reach the whole document by construction. Patch 383 made
+the `<head>` child-list mark of such an insertion need no rebuild, so
+the sheet's own mark is now the only full rebuild it costs.
+
+**What would take them** is not a narrower rebuild but a cheaper whole
+one: **re-cascading every box's style in place**, reselecting with the
+new sheet set and keeping the box tree. The tree would be rebuilt only
+where a box-shaping property changed: `display`, `float`, `position`,
+`content` on generated content, list markers, `white-space` or
+`text-transform` on text. That is a different and much larger design: style
+ownership, generated-content boxes, inline-container structure and
+text boxes all depend on the computed style at build time. It is
+recorded here as the next step for this doc, not started.
+
+Smaller, measurable refinements, if C is ever revisited:
+- `@media` blocks whose query cannot match the Vita (the viewport is
+  960 px) can never apply. They could be dropped from the reach scan
+  instead of making a sheet unbounded.
+- Multi-sheet batches (12 here) would need the union of several sheets'
+  roots, which is the two-decline design change noted at the 2026-10-28
+  census.
