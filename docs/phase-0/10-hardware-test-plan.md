@@ -8259,7 +8259,8 @@ decline there, so the code they ran was identical. The movers are live
 text: bbc +0.1, stackoverflow +0.3. No crash and no Cloudflare
 interstitial.
 
-Separate bug, logged and not fixed: a **full reconvert keeps a
+Separate bug, logged on 2026-11-01 and on 2026-11-07 verified NOT to
+reproduce on the current stack (Unit 393): a **full reconvert keeps a
 form-owned control alive with `control->box` pointing into the freed
 tree** (box_talloc_destructor frees only orphan controls, fixes1076). For
 an element removed from the document, the pointer is never rebuilt.
@@ -8268,7 +8269,12 @@ an element removed from the document, the pointer is never rebuilt.
 after another radio of its group was removed by a full reconvert reads
 freed memory. The local path no longer keeps such controls. The fix
 belongs where a full reconvert frees the old tree: drop the controls
-whose node has left the document.
+whose node has left the document. -- Unit 393 closed it: a full reconvert
+detaches every old control's box pointer before the old tree is set
+aside (html_reconvert_detach_forms) and frees the whole old form
+registry on success (html_reconvert_free_old -> form_free ->
+form_free_control), so no form-owned control survives a reconvert with a
+live box pointer; ASan host-sim, both repro shapes, zero reports.
 
 Left of WS-C's script-change list: a class change on a `<td>`'s own box,
 with whole-table scope.
@@ -10266,8 +10272,50 @@ No engine change, no per-element JS objects grew, so no scorecard. No sudo
 needed. The Vita cross-build was not run (no vitaSDK here).
 
 **Next:**
-1. The UNFIXED list (full reconvert keeps a removed field's form control
-   alive, fixes107 area, doc 10 368 entry; wpblog intermittent segfault
-   rc -11, no gdb repro, 365 entry).
+1. wpblog intermittent segfault rc -11, no gdb repro (365 entry) -- the
+   only remaining UNFIXED item (the 368 entry closed by Unit 393).
+2. If Claude's /login recovers (pane shows a working prompt, not the
+   "Not logged in" banner), resume hybrid: feed the next unit prompt.
+
+## Unit 393 (2026-11-07): the 368 entry (stale form control after a full reconvert) -- ASan verification: not reproducible on the current stack
+
+**392's "Next" #1, closed as no-op (no engine change).** The 368 entry
+claimed a full reconvert keeps a form-owned control alive with
+`control->box` pointing into the freed tree, and that `form_radio_set`
+reads that pointer when a surviving group member is selected. The premise
+is false on the current stack: a full reconvert detaches every old
+control's box pointer BEFORE the old tree is set aside
+(`html_reconvert_detach_forms`, H3) and frees the whole old form registry
+on success (`html_reconvert_free_old` -> `html_reconvert_free_forms` ->
+`form_free` -> `form_free_control` per control). No form-owned control
+therefore survives a reconvert with a live box pointer -- the orphan
+controls already go with their boxes in `box_talloc_destructor`
+(fixes1076), and the form-owned ones go with the old forms. That ordering
+has been in the reconvert machinery since the 13.
+
+**ASan host-sim repro.** Fresh build of the current staged tree
+(`-fsanitize=address -O1 -g`, no SVG, host deps reused). Two pages, both
+in `testpages/pages/`: `JS-fullreconvert-radio.html` -- remove radio r1
+of a group in its own batch, then a class change on the table cell (369
+declines: the table holds controls, so the full reconvert) -- and
+`JS-fullreconvert-radio-batched.html`, the faithful original 368
+trigger: the removal and a `.value` write on a separate node in ONE JS
+batch, so the batch takes the full rebuild. Both runs: the page reports
+r3's tap point in its title, the gate taps the surviving radio,
+`form_radio_set` redraws the group. **Result: zero ASan reports in both
+shapes.** The batched run's log shows exactly what the entry feared being
+handled: four `form_free_control` lines (the whole old registry, the
+removed radio among them) and a reconvert pagemap without the removed
+radio. The taps are pixel-verified (the radio's fill dot appears only in
+the final frame), so the redraw path really ran. No dangling read.
+
+No engine change, so no scorecard (nothing rebuilt). No sudo. The Vita
+cross-build was not run (no vitaSDK here).
+
+**Gate (this unit, exit 0):** [pending this commit's run]
+
+**Next:**
+1. wpblog intermittent segfault rc -11, no gdb repro (365 entry) -- the
+   only remaining UNFIXED item.
 2. If Claude's /login recovers (pane shows a working prompt, not the
    "Not logged in" banner), resume hybrid: feed the next unit prompt.
