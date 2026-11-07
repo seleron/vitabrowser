@@ -10312,7 +10312,11 @@ the final frame), so the redraw path really ran. No dangling read.
 No engine change, so no scorecard (nothing rebuilt). No sudo. The Vita
 cross-build was not run (no vitaSDK here).
 
-**Gate (this unit, exit 0):** [pending this commit's run]
+**Gate (this unit, exit 0):** 251/251 pages, interaction 52/52 (full pass
+and at the Vita's pace), TIMERNEST 4/4, the 369 page's class-stall 7/7
+(5 local relayouts, 0 full fallbacks), Vita's-pace 23/23 identical + 68
+text frames identical, QuickJS probe 18/18, vita-test.bin byte-identical,
+netlog mirror 322 identical 0 differ. No engine change, so no scorecard.
 
 **Next:**
 1. wpblog intermittent segfault rc -11, no gdb repro (365 entry) -- the
