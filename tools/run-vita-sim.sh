@@ -276,6 +276,8 @@ JS-class-churn file:///app0:/testpages/JS-class-churn.html
 CSS-class-churn-ref file:///app0:/testpages/CSS-class-churn-ref.html
 JS-object-rebuild file:///app0:/testpages/JS-object-rebuild.html
 CSS-object-rebuild-ref file:///app0:/testpages/CSS-object-rebuild-ref.html
+JS-style-detach file:///app0:/testpages/JS-style-detach.html
+CSS-style-detach-ref file:///app0:/testpages/CSS-style-detach-ref.html
 CSS-svg-reltq file:///app0:/testpages/CSS-svg-reltq.html
 IMG-standalone file:///app0:/testpages/opimg-20.png
 CSS-census file:///app0:/testpages/CSS-census.html
@@ -1722,6 +1724,24 @@ k386k=$(printf '%s\n' "$k386seg" | grep -c "LIFE full rebuild kept [0-9]* new ob
 echo "  JS-object-rebuild: rows differing from the static final state $k386r (0); ${k386k} full rebuilds keeping the new tree's objects (2 or more)"
 [ "$k386r" = 0 ] && [ "${k386k:-0}" -ge 2 ] ||
 	fail "objects and embeds survive a full rebuild"
+# Patch 388: the in-sim test 387's entry asked for -- a <style> that
+# leaves the DOM during the page's lifetime stops cascading. The page
+# inserts and removes two sheets (parse-time #sA, script-inserted
+# #sB); each removal is a <head> no-op (383), so a class toggle on
+# the watched paragraph forces the rebuild whose up-front prune must
+# drop the detached entry -- the local path declines, the full
+# reconvert paints without the sheet. Final state vs the static
+# reference, row for row; the declines must be in the page's log.
+# (The 387 walk read a removed node's cut chain as attached -- 388
+# ends it on the document's type; without that fix both boxes stay
+# red and the rows differ.)
+k388r=$(fl_rows JS-style-detach CSS-style-detach-ref)
+k388seg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-detach: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k388d=$(printf '%s\n' "$k388seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)" || true)
+k388p=$(printf '%s\n' "$k388seg" | grep -c "WORK reconvert: pruned" || true)
+echo "  JS-style-detach: rows differing from the static final state $k388r (0); ${k388d} local rebuilds declined on a pruned sheet (2 or more); full-reconvert prunes $k388p"
+[ "$k388r" = 0 ] && [ "${k388d:-0}" -ge 2 ] ||
+fail "a removed <style> stops cascading"
 # Patch 371: a page with frames takes the local paths too (before: every
 # change refused, "page has frames"). Its eleven steps render row for row
 # as the same steps run at parse time; on that page the changes above and

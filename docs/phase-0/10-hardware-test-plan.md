@@ -10002,3 +10002,66 @@ it treats any unprunable entry.
    removal-during-lifetime yet).
 
 No sudo needed. The Vita cross-build was not run (no vitaSDK here).
+
+## Patch 388 (2026-11-07): the prune walk ends on the document's type, not on a NULL parent
+
+**The in-sim test 387's "Next" asked for exposed a defect in the
+387 prune itself.** New gate page `JS-style-detach`: two sheets --
+parse-time `#sA` (b1, b2 red) and a script-inserted `#sB` (b3, b4
+red) -- each removed during the page's lifetime; a class toggle on
+the watched paragraph forces the rebuild whose up-front prune must
+drop the detached entry. Static reference
+`CSS-style-detach-ref.html` (final state: b1, b2 blue; b3, b4 red;
+tick 6).
+
+The first run settled with the tick at step 2 -- both boxes b1 and
+b3 red, the sheets still cascading after removal. Diagnosis: libdom's
+`_dom_node_detach` sets a removed node's `parent` to NULL, and the
+387 walk's terminal test ("a NULL parent means the document") read
+the removed node's own cut chain as attached. Every sheet looked
+attached, `html_css_prune_detached_sheets()` pruned nothing, and the
+persistence 387 was meant to end (a removed sheet cascading through
+every rebuild, 383) lived on. 387's gate could not see it -- no gate
+page removes a sheet during its lifetime -- and the scorecard set
+loads its documents once.
+
+**The fix (css.c):** when the walk reaches a node whose parent is
+NULL, the sheet is attached only if that node *is* the document --
+`dom_node_get_node_type() == DOM_DOCUMENT_NODE`, no opaque pointer
+compared (the 387 build refused one as -Werror). A removed node is
+an element: the walk ends there, `attached = false`, the entry is
+pruned as 387 intended. Ancestor removal is covered by the same
+test: a chain cut at a removed ancestor ends on an element, not on
+the document.
+
+Log lines: unchanged -- the 387 lines now actually print. In-sim
+sequence: `LIFE rebuild local: <head>'s children changed, nothing
+rendered` (sB in, the 383 no-op) -> `BATCHCAUSE cause=nonode` (sB
+arrives) -> `LIFE rebuild local: declined (detached stylesheet
+pruned)` (sA out) -> local `cause=local` reconvert paints b1 blue ->
+`declined (detached stylesheet pruned)` (sB out) -> b3 blue. Note
+the full-reconvert prune line did not fire: the local path prunes
+first, so the reconvert finds a clean list.
+
+**Gate (this unit, exit 0):** `JS-style-detach: rows differing from
+the static final state 0 (0); 2 local rebuilds declined on a pruned
+sheet (2 or more)`; everything else at baseline -- autotest 265
+pages, CSS suites, text batched vs unbatched 68 frames identical,
+Vita's-pace 23/23 and 52/52.
+
+**Left as is:** the prune still runs on every full reconvert and
+every local rebuild (a short parent-chain scan per live entry; a
+no-op when nothing detached). Entries created pre-387 for
+`<link>` elements removed while their content was loading carry no
+node and stay until the document is replaced (387 entry, unchanged).
+
+**Next:**
+1. **Gate hygiene**: the TIMERNEST and BLOCKSIB timing flakes.
+2. **The diag.c noise list** hides the relink line and
+   `html_reconvert_content rc=` (385 entry).
+3. Removal of a `<link rel=stylesheet>` whose *content* has already
+   loaded and cascaded -- the detached-entry path that has no node
+   (pre-387 entries) is not pruned yet; needs a test page and,
+   likely, a content-object check, not a node check.
+
+No sudo needed. The Vita cross-build was not run (no vitaSDK here).

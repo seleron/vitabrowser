@@ -1,0 +1,67 @@
+# netsurf: the prune walk ends on the document's type, not on a NULL
+# parent (patch 388)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 387)
+#
+# This unit's in-sim test (JS-style-detach, the 387 entry's
+# "inserts and then removes a <style>, asserted by pixels") exposed
+# a defect in the 387 prune: a removed node's parent is NULL
+# (libdom's _dom_node_detach), and the walk's terminal test -- "a
+# NULL parent means the document" -- read the removed node's own cut
+# chain as attached. Every sheet therefore looked attached, and
+# html_css_prune_detached_sheets() never pruned: a removed
+# <style>/<link> kept cascading through every rebuild, exactly the
+# unit 383 persistence 387 was meant to end. 387's gate could not
+# see it (no gate page removed a sheet during its lifetime) and the
+# scorecard set loads its documents once, so nothing moved.
+#
+# The fix (css.c): when the walk reaches a node whose parent is
+# NULL, it is attached only if that node is the document -- the
+# DOM_DOCUMENT_NODE type test, no pointer compared (the 387 build
+# refused the opaque dom_document * comparison as a -Werror). A
+# removed node is an element: the walk ends there, attached = false,
+# and the entry is pruned as 387 intended. Ancestor removal is
+# covered too: a chain cut at a removed ancestor ends on an element,
+# not on the document.
+#
+# Log lines: unchanged -- the 387 lines now actually print:
+# WORK reconvert: pruned N detached sheet(s) /
+# LIFE rebuild local: declined (detached stylesheet pruned).
+#
+# Gate: JS-style-detach (two sheets -- one parse-time, one inserted
+# -- each removed; a class toggle on the watched paragraph forces
+# the rebuild whose up-front prune must drop the detached entry)
+--- a/content/handlers/html/css.c	2026-11-07 03:49:11.177443886 +0000
++++ b/content/handlers/html/css.c	2026-11-07 03:49:11.177443886 +0000
+@@ -839,9 +839,11 @@
+ 			continue;
+ 
+ 		/* Walk the parent chain: attached iff it reaches the
+-		 * document (the only node whose parent is NULL). A
+-		 * removed node's chain is cut at the removal point, so
+-		 * the walk stops early with a live parent. */
++		 * document. Unit 388: a NULL parent is not proof on
++		 * its own -- a removed node's parent is NULL too (the
++		 * chain is cut there), and 387's test counted that as
++		 * the document, so nothing was ever pruned. End the
++		 * walk on the document's type. */
+ 		walk = hsheet->node;
+ 		attached = false;
+ 		while (walk != NULL) {
+@@ -849,11 +851,14 @@
+ 			dom_node *next;
+ 			if (dom_node_get_parent_node(walk, &up) != DOM_NO_ERR)
+ 				break;
+-			next = up;
+ 			if (up == NULL) {
+-				attached = true;
++				dom_node_type type;
++				attached = dom_node_get_node_type(walk, &type) ==
++					DOM_NO_ERR &&
++					type == DOM_DOCUMENT_NODE;
+ 				break;
+ 			}
++			next = up;
+ 			dom_node_unref(up);
+ 			walk = next;
+ 		}
