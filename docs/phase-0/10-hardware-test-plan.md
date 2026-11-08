@@ -12067,3 +12067,99 @@ No sudo.
 2. "restyled block holds floats or list markers" (archwiki, cnnlite,
    google, stackoverflow).
 3. Committing layout-only re-cascades in place (415's next step).
+
+## Patch 417 (2026-11-08): attributes a sheet can select on are re-selected as a class change; inline `<svg>` is a replaced leaf for the local paths
+
+**Two pieces, one patch.** On its own, the inline-SVG piece frees about
+one decline. A probe (scratch only) of the "new element" declines left
+after 416 found:
+- claude's 5: a `<div>` holding a nested `<html>` element (an innerHTML
+  quirk);
+- cnnlite: a `<fieldset>` (OneTrust; excluded for its legend painter);
+- youtube: a `<video>`;
+- bbc: an SVG.
+
+"Restyled block holds floats or list markers" (6) was mostly list items
+with markers (archwiki's and google's `<li>`), which the counter guard
+(374) declines anyway, and one float (cnnlite). So the bigger piece is the
+census's **`kind` batches** (14 in r129), probed across ten sites.
+
+**What the kind batches were.** An attribute change that a used sheet can
+select on went straight to the full rebuild (310/313's kind gate):
+- `data-theme` / `data-*-theme` / `data-cjk-order` on `<html>`;
+- `aria-expanded`, `disabled`, `tabindex`, `title`, `href`;
+- `name` on an `<input>`;
+- google's `eid` / `data-fbar` / `jsaction`;
+- an `ng-app-id` on a `<style>`, `data-loaded` on a `<script>`.
+
+**The change** (html.c, macos9_reconvert.c):
+- **`html_reconvert_local_attr_restyle`**: such an attribute is answered
+  as 370 answers `style`. The element and its subtree are re-selected
+  through the class-change paths (`html_rl_style_as_class` set, so 414's
+  no-op cannot take it). Exceptions:
+  - a sibling selector that can match on the attribute declines. 409's
+    selector scan is generalised from `[style` to any name
+    (`html_rl_attr_sel_risk`, `html_rl_attr_sib_scan`,
+    `html_rl_attr_sibling_risk`; the style wrappers stay);
+  - not `id`, since `#id` is not found by the attribute scans;
+  - an element construction never boxes (415's list: style, meta, link,
+    title, base, head) renders nothing;
+  - a change on `<html>` still meets the root's decline.
+- `try_local_one` calls it where it used to decline with the kind
+  classifier. Its declines are local declines now.
+- **Inline `<svg>`** (a replaced box whose children are never converted,
+  fixes195) joins 364's replaced-child list and 407's leaf tags. The
+  subtree walks never descend into it.
+
+**Sites** (scratch build, the ten with kind batches): **kind 12 -> 0**;
+google re-selects 10 attribute changes, rte 67, stackoverflow 4,
+youtube 4.
+
+**Gate.**
+- New pair **JS-attr-restyle / CSS-attr-restyle-ref**. `data-state` on a
+  wrapper opens a hidden panel (a **geometric** proof: the plot dumps do
+  not record colour), `aria-pressed` on a span and `data-x` on a div:
+  **3 re-selected**. `data-ng-app-id` on a `<style>`: **renders nothing**.
+  `data-y` with `[data-y] + p` in the sheet: **declined** (1). An `id`
+  change keeps its decline: **2 full rebuilds** on the page. Rows 0.
+- Two expectations changed with the behaviour:
+  - JS-attr-local's `data-flag` (313's kind case) is now re-selected:
+    kind 0, local 1;
+  - JS-sheet-census's step 3 relied on its arming attribute
+    (`data-arm`, which the sheet names) being a kind full rebuild that
+    held the first edit's batch past the second edit. Now each edit gets
+    its own batch: identities single ctr=3 then single ctr=4, instead of
+    one "stale". The check accepts either shape; its own SHEETCENSUS 3/3
+    passes.
+- **gate417b exit 0** (gate417 failed only on those two).
+
+**Restage from pristine:** 499 applied plus the 2 known collisions, both
+files byte-identical. **gate417c (restaged): exit 0**.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean** (345
+page dumps).
+
+**Scorecard r130**: 21 sites against `r79-360`, the 417 and 416 binaries
+back to back: **73.05 vs 72.93**. claude (77.0/75.8) and ddglite
+(77.0/76.0) are the known flippers. No crash.
+
+**Census, back to back, said plainly:**
+- **BATCHCAUSE 88 vs 86: flat.** claude 8 vs 5 is its usual swing.
+- `kind` **12 -> 0**, but those batches now end at local declines (local
+  38 -> 53).
+- The attribute marks themselves: **21 more re-selected locally** (102
+  vs 81, the count including 370's style lines), 6 rendering nothing, and
+  **9 declined on a real sibling selector for the attribute**.
+- Root (`<html>`) attribute changes keep their decline.
+
+Like 415, the gain is in what is answered and what the census now names,
+not yet the total.
+
+No sudo.
+
+**Next:**
+1. claude's nested-`<html>` innerHTML quirk (5 declines a load).
+2. Root (`<html>`) changes with named classes or attributes: a root
+   restyle in place (the dry run: youtube's is layout-only).
+3. List items with markers: rebuild an `<li>` when its marker's number
+   cannot change (bullets).
