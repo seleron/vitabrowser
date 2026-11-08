@@ -11859,3 +11859,118 @@ No sudo.
 wikipedia/archwiki/jquery): a root restyle in place rather than a full
 rebuild; sibling rules behind `:where()`/`:is()` (wpblog); the
 boxed flex-item insert.
+
+## Patch 415 (2026-11-08): sheet changes measured, then made precise: a sheet mark no longer makes its batch coarse, and a sheet change that re-cascades to the same styles rebuilds nothing
+
+**Why this unit.** In r127 the largest cause is the coarse `nonode`
+batch (32-34): a stylesheet arrived or changed after first layout. Unit
+384 shelved it: piece C's reach is almost never bounded, and taking these
+"needs a cheaper whole-document path, a re-cascade in place ... a design
+first". The named-token `<html>` class changes left after 414
+(wikipedia, archwiki: `client-js`) need the same path. So this unit
+measured first.
+
+**The measurement (scratch build only, never in applytest).** At every
+full rebuild on the 21 scorecard sites, a dry run re-cascaded the whole
+document with a fresh selection context. It compared each element's new
+own, `::before` and `::after` style with its box's, and checked box-less
+elements against construction's own rules. It classified every element
+as same, paint-only, layout-only or box-shaping (display, float,
+position, white-space, text-transform, list markers, background-image,
+counters, generated content, a box-less element that would get a box).
+- **Of 21 sheet batches whose sheets had settled, 19 changed NO
+  element's style**: archwiki, bbc 2, cnnlite, github, google 3, mdn,
+  oldreddit, rte 2, stackoverflow 2, wikipedia 2, youtube 3. The other
+  two (claude) changed only layout properties. **None changed box
+  structure.** 14 more flushed while a sheet was still loading. Their
+  full rebuild cascades against the old context (the refresh waits for
+  every sheet to settle), so it cannot apply the new sheet either.
+- Root class changes: jquery and wpnews unchanged, youtube 4 layout-only,
+  wikipedia (280 box-shaping) and archwiki (270 boxes appear) really
+  structural.
+- **Two bugs in the first dry run, both lessons for the real code:**
+  - **six crashes** (bbc, oldreddit, stackoverflow, google, youtube,
+    github): `html_css_new_selection_context` asserts in
+    `nscss_get_stylesheet` on a sheet handle still loading. Only settled
+    sheets are safe (`html_css_sheets_settled`'s rule).
+  - false "box-less element shown" for elements construction never
+    boxes: SVG internals, `<link>`/`<meta>` in body, hidden inputs. A
+    "shown before?" check with `c->select_ctx` did not work, because the
+    context is refreshed at the sheet's DONE, **before** its mark, so at
+    flush it is already the new one.
+
+**The first cut answered almost nothing.** It answered coarse batches
+holding only sheet marks. A `SHEETMIX` census showed **25 of 26** sheet
+batches also carried real DOM marks (class changes 8, appends 6,
+attribute changes 7, ...), which coarsening had been throwing away.
+
+**The change** (html.c, css.c, macos9_reconvert.c):
+- Every sheet mark is known. The multi-sheet settle window's mark goes
+  through a new `macos9_js_mark_dom_dirty_sheets`.
+- A sheet mark **sets the slot's `sheets` flag instead of making it
+  coarse**. `multi` stays set, so the single-mark fast paths (style,
+  inherited colour, cosmetic deferral) never take the slot. A sheet-only
+  slot adopts the first node mark as its primary.
+- `try_local` answers the precise marks as always, so new elements are
+  built against the settled context. It then calls
+  **`html_rl_sheet_batch_noop`**:
+  - settled sheets and no detached sheet to prune;
+  - the whole document re-cascaded with a fresh context, stopping at the
+    first element whose own, `::before` or `::after` style differs, or a
+    box-less element that would get a box (construction's tag skips and
+    hidden inputs mirrored; children of replaced boxes and select/textarea
+    gadgets not walked);
+  - on success the fresh context replaces `c->select_ctx` and the page is
+    redrawn (a new `@font-face` is looked up at paint).
+- Its decline is fullcause reason 5. It is logged as the census's
+  `nonode` with the sheet census lines (316/318/321) as before, so those
+  gate pages read the same.
+
+**Gate.**
+- New pair **JS-sheet-noop / CSS-sheet-noop-ref**. A sheet matching
+  nothing, alone and beside a paragraph's new text: **2 restyle nothing**.
+  A class change with the sheet that styles it in one task, and a sheet
+  restyling the paragraphs: **2 declines** (full rebuild). Rows 0.
+- gate415's first run failed only on this page's expectation. The class
+  change was checked while its sheet was still pending (414 skips pending
+  sheets), so it was called a no-op. The re-cascade then caught the
+  restyled block and took the full rebuild. That is the safety net
+  working, and the page now expects it.
+- The 316-321 sheet pages and JS-style-absorb pass unchanged.
+  **gate415b exit 0**; restaged **gate415c exit 0**, 3 files
+  byte-identical.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean** (340
+page dumps).
+
+**Scorecard r128**: 21 sites against `r79-360`, the 415 and 414 binaries
+back to back: **72.95 vs 73.05**. guardian and stackoverflow 0.8 lower
+reran equal in both arms twice (63.2/63.2, 64.6/64.6, 64.3/64.2): noise.
+guardian's jump to about 63 from 36 in earlier runs is the live site (it
+reads 63 on 414 too). No crash.
+
+**Census, back to back, said plainly:**
+- **BATCHCAUSE total 82 vs 84: flat.**
+- `nonode` **26 -> 3**: the sheet-batch cause is nearly gone.
+- Its batches now show their real causes: local 30 -> 39, two 15 -> 21,
+  kind 7 -> 13.
+- 3 sheet batches answered outright (stackoverflow 2, one more).
+- **45 more marks answered locally** (152 vs 107).
+
+The gain is the census becoming actionable: the 20-odd precise declines
+the coarse bucket hid are now the next units' targets, and each one fixed
+lets its sheet batch finish locally too. The cost to watch: a batch that
+answers some marks locally and then declines pays both (bounded by 309's
+guard, the full conversion's own cost).
+
+No sudo.
+
+**Next:**
+1. The precise declines now on top: "new element is not a plain block"
+   (claude's spinner SVG, google's span, wpblog's comment, youtube's
+   player).
+2. Committing re-cascade results in place for layout-only changes
+   (claude's sheets, youtube's root class), then the named-token
+   `<html>` changes.
+3. Sheet batches flushed while a sheet is still loading (14): defer them
+   to the settle instead of a full rebuild that cannot apply the sheet.
