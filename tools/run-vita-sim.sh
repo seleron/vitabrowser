@@ -380,6 +380,8 @@ JS-inline-mid file:///app0:/testpages/JS-inline-mid.html
 CSS-inline-mid-ref file:///app0:/testpages/CSS-inline-mid-ref.html
 JS-attr-restyle file:///app0:/testpages/JS-attr-restyle.html
 CSS-attr-restyle-ref file:///app0:/testpages/CSS-attr-restyle-ref.html
+JS-domparser-svg file:///app0:/testpages/JS-domparser-svg.html
+CSS-domparser-svg-ref file:///app0:/testpages/CSS-domparser-svg-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1957,6 +1959,17 @@ k417d=$(printf '%s\n' "$k417seg" | grep -c "declined (a sibling selector can mat
 k417f=$(printf '%s\n' "$k417seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-attr-restyle: rows $k417r (0), re-selected ${k417a} (3 or more), renders nothing ${k417n} (1), sibling decline ${k417d} (1), full rebuilds ${k417f} (2)"
 [ "$k417r" = 0 ] && [ "${k417a:-0}" -ge 3 ] && [ "${k417n:-0}" -eq 1 ] && [ "${k417d:-0}" -eq 1 ] && [ "${k417f:-0}" -eq 2 ] || fail "attributes a sheet can see"
+# Patch 418: DOMParser's image/svg+xml document element is the <svg> (a
+# text/html one keeps <html>); appended between blocks it is placed
+# locally (417's replaced leaf), no full rebuild.
+k418r=$(fl_rows JS-domparser-svg CSS-domparser-svg-ref)
+k418p=$(ls "$R"/*-JS-domparser-svg.plot 2>/dev/null | head -1)
+k418s=$(sed -n 's/.*STR \(DOMPARSER: [0-9]*\/[0-9]* passed\).*/\1/p' "$k418p" 2>/dev/null | head -1)
+k418seg=$(awk '/ page [0-9]+\/[0-9]+ JS-domparser-svg: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k418l=$(printf '%s\n' "$k418seg" | grep -c "a leaf element inserted between blocks, built alone" || true)
+k418f=$(printf '%s\n' "$k418seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-domparser-svg: ${k418s:-no summary}; rows $k418r (0), svg placed locally ${k418l} (1), full rebuilds ${k418f} (0)"
+[ "$k418s" = "DOMPARSER: 3/3 passed" ] && [ "$k418r" = 0 ] && [ "${k418l:-0}" -ge 1 ] && [ "${k418f:-1}" -eq 0 ] || fail "DOMParser svg document element"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
