@@ -1,0 +1,413 @@
+# netsurf: a structural match restyles only the matching siblings when that is enough (patch 405)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 404)
+#
+# Patch 404 answered a structural match on a child-list change by
+# rebuilding the parent's subtree; on the 21 sites that converted almost
+# nothing: the matches are mostly on <body> (youtube appends <iframe>s
+# there), whose subtree holds frames and controls, which the container
+# rebuild declines ("holds controls or frames" 8 of 10 in r115). And only
+# one child flips there: the old last child, when something is appended
+# after it.
+#
+#  - html_rl_struct_scan: each structural compound records sib_after --
+#    a sibling combinator (+ ~) follows it (for one inside :not()/:is()/...,
+#    the OUTER compound, past the group; nested deeper, unknown: set): then
+#    a flip restyles another element than the matching one.
+#  - html_rl_block_struct_risk: optional hits/nhits/narrow -- every child
+#    a structural rule matches is collected (referenced, at most 8);
+#    narrow when each matching compound is bounded and has no sibling
+#    combinator after it, no sheet overflowed, nothing ran out.
+#  - html_rl_block_change: narrow -> the blocks are placed as usual and
+#    the matching siblings restyled alone at the success exits
+#    (html_rl_struct_hits_finish), or in place of patch 378's no-op; each
+#    by the container rebuild of 372/376 (its guards unchanged). A matching
+#    child with no box, or not a block-level box of the parent, declines
+#    into the full rebuild. Not narrow -> 404's parent-subtree route. The
+#    references are released on every exit.
+# Logged "LIFE rebuild local: structural change: N matching sibling(s)
+# restyled alone in N us (M so far)".
+#
+# Measured: a 500-row feed with .row:last-child, 10 appends -- 404's parent
+# subtree 12.7 ms per append (median), this 1.66 ms. On the 21 scorecard
+# sites it converts nothing: youtube's matches are unbounded bare
+# :last-child compounds on the previous <iframe> (a frame's box is not
+# rebuilt), so the census needs an in-place restyle there.
+#
+--- a/content/handlers/html/html.c	2026-11-08 00:37:16.972813776 +0000
++++ b/content/handlers/html/html.c	2026-11-08 01:55:37.473412182 +0000
+@@ -6976,6 +6976,11 @@
+ 	 * 2 the count of earlier siblings (:nth-child, :nth-of-type),
+ 	 * 3 the count of later ones (:nth-last-*), 4 both (:only-*) */
+ 	int dir;
++	/* patch 405: a sibling combinator (+ ~) follows the compound (for
++	 * one inside :not()/:is()/..., the outer compound; nested deeper
++	 * than one group, unknown: set): a flip restyles another element
++	 * than the matching one */
++	bool sib_after;
+ };
+ #define HTML_RL_STRUCT_CACHE_N 32
+ #define HTML_RL_STRUCT_CP_MAX 512
+@@ -7321,6 +7326,58 @@
+ 					else
+ 						html_rl_struct_parse_cp(s, a, b,
+ 							&n[e->ncps]);
++					{	/* patch 405 */
++						size_t q = b;
++						bool unknown = false;
++						if (a > 0 && s[a - 1] == '(') {
++							/* inside a functional pseudo
++							 * (youtube: .tab:not(.x):not(
++							 * :last-of-type)): what follows
++							 * the OUTER compound -- past the
++							 * group's ')' and the rest of it,
++							 * over balanced groups. Another
++							 * ')' first: nested deeper, not
++							 * seen here. */
++							int depth = 0;
++							for (q = a - 1; q < len; q++) {
++								if (s[q] == '(')
++									depth++;
++								else if (s[q] == ')' &&
++									 --depth == 0)
++									break;
++							}
++							if (q < len)
++								q++;
++							while (q < len) {
++								if (s[q] == '(') {
++									depth = 0;
++									for (; q < len; q++) {
++										if (s[q] == '(')
++											depth++;
++										else if (s[q] == ')' &&
++											 --depth == 0)
++											break;
++									}
++									if (q < len)
++										q++;
++									continue;
++								}
++								if (html_rl_struct_boundary(
++										s[q]))
++									break;
++								q++;
++							}
++							if (q >= len || s[q] == ')')
++								unknown = true;
++						}
++						while (q < len && (s[q] == ' ' ||
++						    s[q] == '\t' || s[q] == '\n' ||
++						    s[q] == '\r' || s[q] == '\f'))
++							q++;
++						n[e->ncps].sib_after = unknown ||
++							(q < len && (s[q] == '+' ||
++							 s[q] == '~'));
++					}
+ 					e->ncps++;
+ 				}
+ 			}
+@@ -7369,6 +7426,7 @@
+ 	char *tag;
+ 	char *id;
+ 	char *cls;	/* lowercased, space separated */
++	dom_node *node;	/* patch 405: the child (no ref: in the tree) */
+ };
+ 
+ static bool html_rl_struct_has_class(const char *list, const char *c)
+@@ -7440,15 +7498,27 @@
+ /* Patch 379: can a structural rule (or, with counters_matter, a counter)
+  * in page CSS restyle a child of pnode now that the elements of tags
+  * moved[0..nmoved) went in or out? */
++/* Patch 405: with hits non-NULL, every child a structural rule matches
++ * is collected (referenced, at most HTML_RL_STRUCT_HITS_MAX) and
++ * *narrow says whether restyling exactly those is enough: each matching
++ * compound bounded and followed by no sibling combinator, no sheet over
++ * its compound limit, the list not overflowed. */
++#define HTML_RL_STRUCT_HITS_MAX 8
+ static bool html_rl_block_struct_risk(html_content *c, dom_node *pnode,
+ 		char **moved, unsigned int nmoved, bool counters_matter,
+ 		const char **why, dom_node **present, unsigned int npresent,
+-		dom_node **gaps, unsigned int ngaps, bool positional)
++		dom_node **gaps, unsigned int ngaps, bool positional,
++		dom_node **hits, unsigned int *nhits, bool *narrow)
+ {
+ 	struct html_rl_struct_sheet *sh[64];
+ 	struct html_rl_struct_el *els = NULL;
+ 	unsigned int nsh = 0, si, nel = 0, k, m;
+ 	bool any = false, risk = false;
++	bool collect = hits != NULL;	/* patch 405 */
++	if (collect) {
++		*nhits = 0;
++		*narrow = true;
++	}
+ 	dom_node *ch = NULL, *nx;
+ 	int q;
+ 	/* Patch 380: where the change sits among the parent's element
+@@ -7507,6 +7577,8 @@
+ 			if (nel >= 1000) {
+ 				*why = "a parent of over 1000 children";
+ 				risk = true;
++				if (collect)	/* patch 405 */
++					*narrow = false;
+ 				dom_node_unref(ch);
+ 				break;
+ 			}
+@@ -7514,6 +7586,8 @@
+ 			if (ne == NULL) {
+ 				*why = "no memory";
+ 				risk = true;
++				if (collect)	/* patch 405 */
++					*narrow = false;
+ 				dom_node_unref(ch);
+ 				break;
+ 			}
+@@ -7524,6 +7598,8 @@
+ 				if (np == NULL) {
+ 					*why = "no memory";
+ 					risk = true;
++					if (collect)	/* patch 405 */
++						*narrow = false;
+ 					dom_node_unref(ch);
+ 					break;
+ 				}
+@@ -7549,6 +7625,7 @@
+ 							bend = (long)nel - 1;
+ 					}
+ 			}
++			els[nel].node = ch;	/* patch 405 */
+ 			els[nel].tag = html_rl_struct_tag(ch);
+ 			els[nel].id = html_rl_struct_attr(ch, corestring_dom_id);
+ 			els[nel].cls = html_rl_struct_attr(ch,
+@@ -7575,13 +7652,15 @@
+ 			bend = 0x7fffffff;
+ 		}
+ 	}
+-	for (si = 0; si < nsh && !risk; si++) {
++	for (si = 0; si < nsh && (!risk || collect); si++) {
+ 		if (sh[si]->overflow && nel > 0) {
+ 			*why = "a sheet of too many structural rules";
+ 			risk = true;
++			if (collect)	/* patch 405 */
++				*narrow = false;
+ 			break;
+ 		}
+-		for (q = 0; q < sh[si]->ncps && !risk; q++) {
++		for (q = 0; q < sh[si]->ncps && (!risk || collect); q++) {
+ 			const struct html_rl_struct_cp *cp = &sh[si]->cps[q];
+ 			if (cp->of_type && cp->tag != NULL) {
+ 				/* only the moved elements' own type */
+@@ -7607,7 +7686,7 @@
+ 					l0 = (long)k;
+ 				}
+ 			}
+-			for (k = 0; k < nel && !risk; k++) {
++			for (k = 0; k < nel && (!risk || collect); k++) {
+ 				if (positional) {
+ 					bool hit, g0 = false, gb = false, ga = false;
+ 					unsigned int gq;
+@@ -7670,6 +7749,23 @@
+ 					*why = "a structural rule matches a "
+ 						"sibling";
+ 					risk = true;
++					if (collect) {	/* patch 405 */
++						unsigned int h;
++						if (cp->unbounded || cp->sib_after)
++							*narrow = false;
++						for (h = 0; h < *nhits &&
++						     hits[h] != els[k].node; h++)
++							;
++						if (h == *nhits) {
++							if (*nhits >=
++							    HTML_RL_STRUCT_HITS_MAX)
++								*narrow = false;
++							else
++								hits[(*nhits)++] =
++									dom_node_ref(
++									els[k].node);
++						}
++					}
+ 				}
+ 			}
+ 		}
+@@ -8369,6 +8465,60 @@
+  * Was: a full box-tree rebuild. :has() reaching up and :empty on the
+  * parent are checked apart (patches 193/198/373). A parent whose box is
+  * not a plain block (a table cell) keeps the full rebuild. */
++static int html_rl_struct_declined(void);
++/* Patch 405: the structural check names the children a rule matches;
++ * when each matching compound is bounded and no sibling combinator
++ * follows it, a flip restyles only those children (and their
++ * descendants: a descendant or child combinator after the compound). Each
++ * is rebuilt alone by the container rebuild, the parent and its other
++ * children left as they are -- youtube appends <iframe>s to a <body> that
++ * holds frames and controls, where 404's whole-parent rebuild declines,
++ * and only the old last child flips. A matching child with no box, or not
++ * a block-level box of the parent, declines into the full rebuild. */
++static int html_rl_struct_hits_restyle(html_content *c, struct box *pbox,
++		dom_node **hits, unsigned int n, double t0)
++{
++	static unsigned long hits_n;
++	unsigned int i;
++	for (i = 0; i < n; i++) {
++		struct box *hb = box_for_node(hits[i]);
++		if (hb == NULL || hb->parent != pbox ||
++		    (hb->type != BOX_BLOCK && hb->type != BOX_FLEX &&
++		     hb->type != BOX_GRID)) {
++			macsurf_debug_log_writef("LIFE rebuild local: "
++				"structural change: a matching sibling is not "
++				"a block-level box of the parent");
++			return -1;
++		}
++		if (html_rl_flex_restyle(c, hits[i], hb, t0,
++				html_rl_class_same, hb->type == BOX_BLOCK) != 0)
++			return -1;
++	}
++	hits_n++;
++	macsurf_debug_log_writef("LIFE rebuild local: structural change: %u "
++		"matching sibling%s restyled alone in %ld us (%lu so far)", n,
++		n == 1 ? "" : "s", (long)(macos9_micros() - t0), hits_n);
++	return 0;
++}
++static void html_rl_struct_hits_release(dom_node **hits, unsigned int *n)
++{
++	unsigned int i;
++	for (i = 0; i < *n; i++)
++		dom_node_unref(hits[i]);
++	*n = 0;
++}
++
++/* at a placement's success: the matching siblings, if any (patch 405) */
++static int html_rl_struct_hits_finish(html_content *c, struct box *pbox,
++		dom_node **hits, unsigned int *n, double t0)
++{
++	int r = 0;
++	if (*n > 0)
++		r = html_rl_struct_hits_restyle(c, pbox, hits, *n, t0);
++	html_rl_struct_hits_release(hits, n);
++	return r == 0 ? 0 : html_rl_struct_declined();
++}
++
+ /* the decline line the census counts, when the subtree rebuild declined */
+ static int html_rl_struct_declined(void)
+ {
+@@ -8409,6 +8559,9 @@
+ 	unsigned int nrem = 0, nadd = 0, i, local_n = 0, nskip = 0;
+ 	bool skip_over = false;
+ 	bool struct_hit = false;		/* patch 404 */
++	dom_node *shits[HTML_RL_STRUCT_HITS_MAX];	/* patch 405 */
++	unsigned int nshits = 0;
++	bool snarrow = false;
+ 	struct box *b, *layout;
+ 	dom_node *n = NULL, *next;
+ 	bool full = false;
+@@ -8671,7 +8824,8 @@
+ 				&html_rl_childlist_rm_next,
+ 				html_rl_childlist_removal ? 1 : 0,
+ 				!html_rl_childlist_removal ||
+-				html_rl_childlist_rm_known);
++				html_rl_childlist_rm_known,
++				shits, &nshits, &snarrow);
+ 		for (i = 0; i < nskip; i++)
+ 			free(tags[i]);
+ 		if (srisk) {
+@@ -8700,6 +8854,13 @@
+ 				"box");
+ 		for (i = 0; i < nskip; i++)
+ 			dom_node_unref(skipped[i]);
++		if (struct_hit && snarrow && nshits > 0) {	/* patch 405 */
++			int r = html_rl_struct_hits_restyle(c, pbox, shits,
++					nshits, t0);
++			html_rl_struct_hits_release(shits, &nshits);
++			return r == 0 ? 0 : html_rl_struct_declined();
++		}
++		html_rl_struct_hits_release(shits, &nshits);
+ 		if (struct_hit)		/* patch 404 */
+ 			return html_rl_struct_parent_rebuild(c, pnode, pbox,
+ 					t0) == 0 ? 0 : html_rl_struct_declined();
+@@ -8776,7 +8937,8 @@
+ 				positional = false;
+ 		}
+ 		srisk = html_rl_block_struct_risk(c, pnode, tags, nt, false,
+-				&swhy, added, nadd, gaps, ng, positional);
++				&swhy, added, nadd, gaps, ng, positional,
++				shits, &nshits, &snarrow);
+ 		for (i = 0; i < nt; i++)
+ 			free(tags[i]);
+ 		if (srisk) {
+@@ -8827,7 +8989,8 @@
+ 
+ 	/* patch 404: every check passed but the structural one -- the
+ 	 * parent's subtree is built again instead of placing blocks */
+-	if (struct_hit) {
++	if (struct_hit && !(snarrow && nshits > 0)) {
++		html_rl_struct_hits_release(shits, &nshits);
+ 		for (i = 0; i < nadd; i++)
+ 			dom_node_unref(added[i]);
+ 		for (i = 0; i < nskip; i++)
+@@ -8835,6 +8998,8 @@
+ 		return html_rl_struct_parent_rebuild(c, pnode, pbox, t0) == 0 ?
+ 			0 : html_rl_struct_declined();
+ 	}
++	/* patch 405: narrow -- the blocks are placed as usual below, and
++	 * the matching siblings restyled alone at the end */
+ 
+ 	/* removals first */
+ 	for (i = 0; i < nrem; i++) {
+@@ -8891,7 +9056,7 @@
+ 			macsurf_debug_log_writef("LIFE rebuild local: "
+ 				"building a new block %s, full reconvert",
+ 				counts ? "takes part in counting" : "failed");
+-			return -1;	/* the full rebuild starts from the DOM */
++			{ html_rl_struct_hits_release(shits, &nshits); return -1; }	/* the full rebuild starts from the DOM */
+ 		}
+ 		nb = box_for_node(added[i]);
+ 		if (nb == NULL) {		/* display: none */
+@@ -8963,7 +9128,7 @@
+ 					macsurf_debug_log_writef("LIFE rebuild "
+ 						"local: no memory for a float's "
+ 						"container, full reconvert");
+-					return -1;
++					{ html_rl_struct_hits_release(shits, &nshits); return -1; }
+ 				}
+ 				ic->type = BOX_INLINE_CONTAINER;
+ 				html_rl_link_after(pbox, after, ic);
+@@ -8975,7 +9140,7 @@
+ 				macsurf_debug_log_writef("LIFE rebuild local: "
+ 					"new box did not normalise (type %d), "
+ 					"full reconvert", (int)nb->type);
+-				return -1;	/* the tree is whole */
++				{ html_rl_struct_hits_release(shits, &nshits); return -1; }	/* the tree is whole */
+ 			}
+ 			if (c->num_objects != objects_before) {
+ 				full = true;
+@@ -9000,7 +9165,7 @@
+ 			macsurf_debug_log_writef("LIFE rebuild local: new box "
+ 				"did not normalise (type %d), full reconvert",
+ 				(int)nb->type);
+-			return -1;	/* the tree is whole */
++			{ html_rl_struct_hits_release(shits, &nshits); return -1; }	/* the tree is whole */
+ 		}
+ 		if (nb->type != BOX_BLOCK) {	/* patch 377: placed whole */
+ 			full = true;
+@@ -9029,7 +9194,7 @@
+ 			why != NULL ? why : "?");
+ 		content__reformat(base_c, false, base_c->available_width,
+ 				base_c->available_height);
+-		return 0;
++		return html_rl_struct_hits_finish(c, pbox, shits, &nshits, t0);
+ 	}
+ 	layout = c->layout;
+ 	base_c->width = layout->x + layout->padding[LEFT] + layout->width +
+@@ -9048,9 +9213,10 @@
+ 		nadd, nrem, total, (long)(macos9_micros() - t0),
+ 		base_c->width, base_c->height, block_n);
+ 	guit->misc->schedule(0, html_relayout_notify, c);
+-	return 0;
++	return html_rl_struct_hits_finish(c, pbox, shits, &nshits, t0);
+ 
+ decline:
++	html_rl_struct_hits_release(shits, &nshits);	/* patch 405 */
+ 	for (i = 0; i < nadd; i++)
+ 		dom_node_unref(added[i]);
+ 	for (i = 0; i < nskip; i++)

@@ -358,6 +358,8 @@ JS-struct-scoped file:///app0:/testpages/JS-struct-scoped.html
 CSS-struct-scoped-ref file:///app0:/testpages/CSS-struct-scoped-ref.html
 JS-struct-dir file:///app0:/testpages/JS-struct-dir.html
 CSS-struct-dir-ref file:///app0:/testpages/CSS-struct-dir-ref.html
+JS-struct-hits file:///app0:/testpages/JS-struct-hits.html
+CSS-struct-hits-ref file:///app0:/testpages/CSS-struct-hits-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1764,8 +1766,9 @@ echo "  JS-mixed-siblings: rows differing from the parse-time build $k377r (0); 
 # row as the same steps at parse time; a <script> that takes a <p>'s
 # :first-child keeps the full rebuild, as does an <iframe> mid-page.
 # Patch 404: that :first-child match is now answered by rebuilding the
-# parent's subtree; the guard is counted where it fires (its structural
-# check line) and must be answered by either path, still row for row.
+# parent's subtree (405: or by restyling the matching sibling alone); the
+# guard is counted where it fires (its structural check line) and must be
+# answered by one of the paths, still row for row.
 k378r=$(fl_rows JS-late-append CSS-late-append-ref)
 k378s=$(fl_rows JS-late-append-struct CSS-late-append-struct-ref)
 k378n=$(grep -c "LIFE rebuild local: child list changed only in elements with no box" "$R/netsurf.log" || true)
@@ -1773,7 +1776,7 @@ k378a=$(grep -c "LIFE rebuild local: an iframe or image appended at the end, bui
 k378g=$(awk '/ page [0-9]+\/[0-9]+ JS-late-append-struct: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
 	grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
 k378h=$(awk '/ page [0-9]+\/[0-9]+ JS-late-append-struct: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
-	grep -c "LIFE rebuild local: structural change: the parent's subtree rebuilt\|LIFE rebuild local: declined (structural selectors or counters in page CSS)" || true)
+	grep -c "LIFE rebuild local: structural change: the parent's subtree rebuilt\|LIFE rebuild local: structural change: [0-9]* matching siblings\{0,1\} restyled alone\|LIFE rebuild local: declined (structural selectors or counters in page CSS)" || true)
 echo "  JS-late-append: rows differing from the parse-time build $k378r (0), :first-child page $k378s (0); ${k378n} child-list changes needing no rebuild (2 or more); ${k378a} iframes/images appended alone (2 or more); :first-child guard ${k378g} (1 or more), answered ${k378h} (1 or more)"
 [ "$k378r" = 0 ] && [ "$k378s" = 0 ] && [ "${k378n:-0}" -ge 2 ] &&
 	[ "${k378a:-0}" -ge 2 ] && [ "${k378g:-0}" -ge 1 ] && [ "${k378h:-0}" -ge 1 ] ||
@@ -1807,11 +1810,24 @@ k380w=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural range
 # Patch 404: the structural matches are answered by rebuilding the
 # parent's subtree, not the page (#box's new first child, #ps's new last
 # child; <body>'s two removed scripts) -- still row for row as the
-# parse-time build.
-k404s=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural change: the parent's subtree rebuilt" || true)
-echo "  JS-struct-dir: rows differing from the parse-time build $k380r (0); ${k380l} changes local on the page (5 or more); declines: positional ${k380p} (2 or more), whole range ${k380w} (1 or more); parent subtrees rebuilt ${k404s} (2 or more)"
+# parse-time build. Patch 405 answers #box's and #ps's by restyling the
+# flipped sibling alone; either answer counts.
+k404s=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural change: the parent's subtree rebuilt\|LIFE rebuild local: structural change: [0-9]* matching siblings\{0,1\} restyled alone" || true)
+echo "  JS-struct-dir: rows differing from the parse-time build $k380r (0); ${k380l} changes local on the page (5 or more); declines: positional ${k380p} (2 or more), whole range ${k380w} (1 or more); structural matches answered locally ${k404s} (2 or more)"
 [ "$k380r" = 0 ] && [ "${k380l:-0}" -ge 5 ] && [ "${k380p:-0}" -ge 2 ] &&
 	[ "${k380w:-0}" -ge 1 ] && [ "${k404s:-0}" -ge 2 ] || fail "structural check by direction"
+# Patch 405: a structural match on a bounded compound with no sibling
+# combinator after it restyles only the matching siblings -- in containers
+# holding an <iframe> and a text field, where 404's whole-parent rebuild
+# declines. Row for row as the parse-time build; the "+" case (an .item
+# inserted first, .item:first-child + .item) still takes the full rebuild
+# (patch 198's sibling check declines it before any narrowing).
+k405r=$(fl_rows JS-struct-hits CSS-struct-hits-ref)
+k405seg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-hits: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k405n=$(printf '%s\n' "$k405seg" | grep -c "LIFE rebuild local: structural change: [0-9]* matching siblings\{0,1\} restyled alone" || true)
+k405d=$(printf '%s\n' "$k405seg" | grep -c "LIFE rebuild local: declined (" || true)
+echo "  JS-struct-hits: rows differing from the parse-time build $k405r (0); matching siblings restyled alone ${k405n} (4 or more); sibling-combinator case declined ${k405d} (1 or more)"
+[ "$k405r" = 0 ] && [ "${k405n:-0}" -ge 4 ] && [ "${k405d:-0}" -ge 1 ] || fail "structural matches restyled alone"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
