@@ -11512,3 +11512,110 @@ Then the sibling-selector declines (7+7+5+5): "a sibling selector can match
 on the style attribute" and "page CSS needs conservative sibling check"
 both point at the 198/186 sibling analysis being too coarse on real
 sheets.
+
+## Patches 409-411 (2026-11-08): style changes on give-up sheets judged by their selectors; 384 gate pages; the simulator's engine log uncapped for the gate
+
+**The census's sibling declines** (r121-408): "sibling combinator may
+restyle on insert/remove" 9, **"a sibling selector can match on the
+style attribute" 7** (wpblog 3, oldreddit, stackoverflow, wpnews,
+youtube), "page CSS needs conservative sibling check" 4, "class change may
+move a sibling selector" 4. The style-attribute one is the most
+widespread, and style attribute writes are common.
+
+**Why it declined** (debug build, scratch only): every one came through
+`html_rl_style_sibling_risk`'s **state-2 branch**: a sheet patch 186's
+scan gave up on (a pseudo-class in a sibling rule's left compound), then
+patch 310's textual scan, "can this sheet select on the attribute at
+all", which **also declines on any backslash outside a string**:
+- oldreddit's, stackoverflow's and youtube's sheets have **no `[style`
+  at all**, only escaped class names (`.md\:flex`, Tailwind's
+  `.w-\[10px\]`).
+- wpblog's and wpnews' `[style*=...]` selectors sit in descendant or
+  `:not()` positions (`table[style*=border-top-color] tr:first-child`,
+  `img:not([style*="height:"])`), which the element's rebuild covers.
+  Only a `+` or `~` **after** the `[style` compound reaches a sibling
+  (patch 370's reasoning; `:has()` never matches here).
+
+**Patch 409** (html.c): `html_rl_style_sib_scan` /
+`html_rl_style_sel_risk` scan the selectors themselves.
+- **Skipped:** comments, strings, declaration blocks, and escapes outside
+  strings. At-rule blocks (`@media`...) are recursed. Preludes start
+  past white space and comments.
+- **A risk only for** a `+` or `~` after a `[style...]` selector in the
+  same complex selector.
+- **Conservative** (counted as a risk): a backslash, or a `|` not of `|=`,
+  inside `[...]` (an escape or a namespace could hide the name);
+  `@import` (imported rules are not in this text); a rule nested in
+  declarations; anything unterminated or nested deeper than 32.
+- **The state-2 branch is a risk only when both scans say so**, patch
+  310's and this one. A sheet with no `[style` and no backslash cannot
+  select on the attribute, and the selector scan's conservative exits
+  (`@import`, nesting) must not turn that "no" into a "yes". The first
+  version used the selector scan alone, and **the r122 A/B caught the
+  regression**: claude 0 -> 3 style declines (its sheets hit those exits),
+  so the census read 7 vs 7 although oldreddit, stackoverflow and youtube
+  had gone to 0. Sheets the 186 scan parsed keep their precise compound
+  check.
+- Four rounds of debug builds found the scan's own false positives on
+  real sheets, each fixed: `@media` after a comment banner, `|=` taken
+  for a namespace, Tailwind's escaped `\[` taken for a bracket, and its
+  escaped `\'` taken for a string. Final version, scratch build: **claude 0 (2 local),
+  oldreddit 0, stackoverflow 0, youtube 0, wpblog 0 (3 local)**. wpblog's
+  `[style`-bearing sheet passes the precise scan (descendant positions),
+  and its `@import`ing sheet has no `[style`, so the old scan never
+  flagged it (unchanged from before 409; imported rules stay unseen by
+  both, which predates this patch).
+
+**Patch 410** (frontends/vita/main.c): `VITA_NET_PAGES_MAX` **256 ->
+384** (the list was at 255 with 407's pair; 409 adds two pairs; +39 KB of
+static tables). This follows patches 93/139/187/209/274.
+
+**Patch 411** (frontends/vita/diag.c): the first gate409 failed
+JS-frames-local, "0 changes rebuilt locally (7 or more)", with the page
+rendering correctly (rows 0). Its log segment stopped after 1973 lines
+with no rebuild lines: **`engine log capped at 16777216 bytes` at 808.8 s
+of the main run's 886**, page 267 of 277. The four new pages, all earlier
+in the list, moved the cap point before it. The 16 MiB cap is right on the
+Vita (card, frame rate). In the host simulator only (`#ifndef __vita__`),
+`VITA_SIM_ENGINE_LOG_CAP` (MiB, 1-4096) overrides it. The gate's main
+autotest sets 256, and its timeout goes **900 -> 1200 s**: it finished
+at 886.5 s, 13.5 s from being killed. This latent gate fragility would have
+caught any unit that added pages.
+
+**Gate pages** (two pairs; the risk is page-wide, so they cannot share a
+page). Both include `.q:hover + .q` (forces state 2):
+- **JS-style-sib-local**: an escaped class and a descendant `[style]`
+  rule. Style changes are taken locally: **3 local, 0 declines, rows 0**.
+- **JS-style-sib-risk**: `[style*="display: none"] + p`. Hiding the div
+  still declines, and the `<p>` turns red: **1 decline, rows 0**.
+
+**Gates:** gate409 failed on the log cap (above). **gate409b exit 0**:
+JS-frames-local 8 local again, the style-sib checks as above, no cap
+(netsurf.log 18.7 MB). JS-style-attr takes 85 style changes locally.
+
+**Restage from pristine:** 493 applied plus the 2 known collisions;
+html.c, main.c and diag.c byte-identical. **gate409c** (first version)
+**and gate409d (final, restaged): exit 0**. JS-style-sib as above,
+JS-frames-local 8 local, no log cap.
+
+**ASan** (all 21 sites, both versions): **21/21 clean**.
+
+**Scorecards:** r122 (first version vs 408): 71.26 vs 72.88. It showed
+the claude regression above, plus one claude low read (41.4).
+**r123 (final vs 408): 69.82 vs 72.87**; the gap is one **github crash**
+(rc -11, 5.6 s into the load, during stylesheet loading:
+`html_convert_css_callback`, before Done). github then loaded **3/3 on
+each binary** and **6/6 under ASan, clean**. It is unattributed: the
+second such github sighting (the first was r112, the 395 arm), and patch
+409's code runs only on style attribute changes. With github at its
+rerun score, **~72.91 vs 72.87**. Next step for it: a long plain loop.
+
+**Census, back to back (r123):** style-sibling declines **7 -> 0**.
+BATCHCAUSE 94 vs 102 (local 36 vs 36: the converted changes were
+style-path declines, not all counted as batches).
+
+No sudo.
+
+**Next:** imported sheets: both scans read only the parent's text
+(pre-existing); "sibling combinator may restyle on
+insert/remove" (9, cnnlite 4); the boxed flex-item insert.
