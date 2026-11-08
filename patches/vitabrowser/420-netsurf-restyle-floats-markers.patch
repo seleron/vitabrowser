@@ -1,0 +1,98 @@
+# netsurf: a block restyled whole may hold floats and list markers (patch 420)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 419)
+#
+# The census's largest decline after 419, "restyled block holds floats or
+# list markers" (14 in r132; more since 417 sends attribute changes to the
+# restyle paths): rte's float columns (6), google's body and list items
+# (4), cnnlite's consent block of floats (2), archwiki's and google's
+# list items with markers (list-style-type: none), stackoverflow's block
+# holding a list.
+#
+# Patch 376 declined both: "an ancestor's float list may hold it" and "a
+# list marker (its item's numbering)". Neither holds in this engine:
+#  - a marker's number is worked out at layout (box_construct_marker:
+#    "numerical list counters get handled in layout"), not from any
+#    construction state a subtree rebuild would lose; html_rl_flex_restyle
+#    lays the page out whole after the rebuild. CSS counters still decline
+#    (374's guards, unchanged);
+#  - floats: html_rl_flex_restyle empties every ancestor's float_children
+#    before the old boxes are freed when the old subtree held floats; the
+#    full layout right after builds each list again
+#    (layout_block_context starts it empty).
+#  - Still declined: a list marker with an image (its object is not
+#    carried over by html_rl_relink_subtree, which walks children).
+#
+# Sites (scratch build): float/marker declines 14 -> 0 (rte 6, google 4,
+# cnnlite 2, archwiki, stackoverflow); block subtrees restyled rte 63 ->
+# 72, google 4 -> 12.
+#
+--- a/content/handlers/html/html.c	2026-11-08 19:39:45.223556914 +0000
++++ b/content/handlers/html/html.c	2026-11-08 20:16:06.205368445 +0000
+@@ -6649,6 +6649,21 @@
+ 
+ /* Patch 375: list markers in a subtree (369 kept the table restyle off
+  * them; objects are carried over now, markers still are not) */
++/* Patch 420: a list marker with an image (list-style-image): its object
++ * is not carried over by html_rl_relink_subtree, which walks children */
++static bool html_rl_marker_objects(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->list_marker != NULL &&
++		    (b->list_marker->object != NULL ||
++		     b->list_marker->background != NULL))
++			return true;
++		if (html_rl_marker_objects(b->children))
++			return true;
++	}
++	return false;
++}
++
+ static bool html_rl_subtree_markers(struct box *b)
+ {
+ 	for (; b != NULL; b = b->next) {
+@@ -12667,6 +12682,14 @@
+ 	 * boxes go (the page is laid out whole below: new images sized;
+ 	 * patch 382: they hold no controls any more) */
+ 	html_rl_relink_subtree(c, ob);
++	/* Patch 420: an ancestor's float list may hold floats of the old
++	 * boxes (376's reason to decline); the full layout below makes every
++	 * one again (layout_block_context starts each list empty) */
++	if (html_rl_subtree_floats(ob->children)) {
++		struct box *a;
++		for (a = pbox; a != NULL; a = a->parent)
++			a->float_children = NULL;
++	}
+ 	box_free(ob);
+ 	flex_n++;
+ 	if (is_block)		/* patch 376 */
+@@ -12725,13 +12748,22 @@
+ 		 * nested blocks, in its flex track) -- is built again whole,
+ 		 * as a flex or grid container is (372): cascaded afresh, its
+ 		 * objects carried over (375), the page laid out whole, so its
+-		 * siblings may be anything. Not one holding a float (an
+-		 * ancestor's float list may hold it) or a list marker (its
+-		 * item's numbering). */
+-		if (ob->list_marker != NULL ||
+-		    html_rl_subtree_floats(ob->children) ||
+-		    html_rl_subtree_markers(ob->children))
+-			RL_RNO("restyled block holds floats or list markers");
++		 * siblings may be anything.
++		 * Patch 420: floats and list markers too (rte's float
++		 * columns, google's and archwiki's list items -- 14 declines,
++		 * once 417 sent attribute changes here): a marker's number is
++		 * worked out at layout (box_construct_marker: "numerical list
++		 * counters get handled in layout"), not from construction
++		 * state, and the ancestors' float lists, which may hold the
++		 * old floats, are emptied before those boxes go
++		 * (html_rl_flex_restyle; the full layout after it builds
++		 * them again, layout_block_context). Not a marker with an
++		 * image: its object would not be carried over. */
++		if ((ob->list_marker != NULL &&
++		     (ob->list_marker->object != NULL ||
++		      ob->list_marker->background != NULL)) ||
++		    html_rl_marker_objects(ob->children))
++			RL_RNO("restyled block holds a list marker image");
+ 		return html_rl_flex_restyle(c, el, ob, t0, old_class, true);
+ 	}
+ 	for (b = pbox->children; b != NULL; b = b->next) {

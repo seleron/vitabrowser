@@ -384,6 +384,8 @@ JS-domparser-svg file:///app0:/testpages/JS-domparser-svg.html
 CSS-domparser-svg-ref file:///app0:/testpages/CSS-domparser-svg-ref.html
 JS-root-noop file:///app0:/testpages/JS-root-noop.html
 CSS-root-noop-ref file:///app0:/testpages/CSS-root-noop-ref.html
+JS-float-marker file:///app0:/testpages/JS-float-marker.html
+CSS-float-marker-ref file:///app0:/testpages/CSS-float-marker-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1767,8 +1769,10 @@ k376r=$(fl_rows JS-block-subtree CSS-block-subtree-ref)
 k376l=$(awk '/ page [0-9]+\/[0-9]+ JS-block-subtree: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
 	grep -c "LIFE rebuild local: block subtree restyled" || true)
 k376d=$(grep -c "LIFE rebuild local: declined (restyled block holds floats or list markers)" "$R/netsurf.log" || true)
-echo "  JS-block-subtree: rows differing from the parse-time build $k376r (0); ${k376l} block subtrees restyled on the page (5 or more); floats/markers declines ${k376d} (2 or more)"
-[ "$k376r" = 0 ] && [ "${k376l:-0}" -ge 5 ] && [ "${k376d:-0}" -ge 2 ] ||
+# (Patch 420: the list and the block holding a float are restyled alone
+# too now -- 7 subtrees, no float/marker declines.)
+echo "  JS-block-subtree: rows differing from the parse-time build $k376r (0); ${k376l} block subtrees restyled on the page (7 or more); floats/markers declines ${k376d} (0)"
+[ "$k376r" = 0 ] && [ "${k376l:-0}" -ge 7 ] && [ "${k376d:-1}" -eq 0 ] ||
 	fail "non-plain blocks restyled alone"
 # Patch 377: blocks inserted into or removed from a parent that also
 # holds flex/grid/table boxes, inline content or a <script> are placed
@@ -1981,6 +1985,15 @@ k419n=$(printf '%s\n' "$k419seg" | grep -c "root change restyles nothing" || tru
 k419d=$(printf '%s\n' "$k419seg" | grep -c "root change: declined (an element's style changes" || true)
 echo "  JS-root-noop: rows $k419r (0), root changes restyling nothing ${k419n} (2), declined ${k419d} (1)"
 [ "$k419r" = 0 ] && [ "${k419n:-0}" -eq 2 ] && [ "${k419d:-0}" -ge 1 ] || fail "root changes that restyle nothing"
+# Patch 420: blocks holding floats or list markers restyled whole (the
+# float block, two list items, a list: 4 or more), none declined for it.
+k420r=$(fl_rows JS-float-marker CSS-float-marker-ref)
+k420seg=$(awk '/ page [0-9]+\/[0-9]+ JS-float-marker: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k420l=$(printf '%s\n' "$k420seg" | grep -c "block subtree restyled, full layout\|block restyled" || true)
+k420d=$(printf '%s\n' "$k420seg" | grep -c "holds floats or list markers\|holds a list marker image" || true)
+k420f=$(printf '%s\n' "$k420seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-float-marker: rows $k420r (0), restyled ${k420l} (4 or more), float/marker declines ${k420d} (0), full rebuilds ${k420f} (0)"
+[ "$k420r" = 0 ] && [ "${k420l:-0}" -ge 4 ] && [ "${k420d:-1}" -eq 0 ] && [ "${k420f:-1}" -eq 0 ] || fail "blocks holding floats or list markers"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
