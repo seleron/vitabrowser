@@ -11690,3 +11690,84 @@ No sudo.
 **Next:** rte's, google's and oldreddit's remaining insert/remove
 declines (which preludes, and whether the risk is real); github's crash
 under the scorecard mix; the boxed flex-item insert.
+
+## Patch 413 (2026-11-08): the sibling-rule scan reads more of real sheets; a parsed :has() reaches 198's check (bug since 198)
+
+**github's crash, first.** Three full 21-site scorecard runs (the mix it
+crashed in twice) with the scratch SIGSEGV backtrace preload: **0
+crashes, 63 loads**. Still open; still not reproduced outside r112/r123.
+
+**What still made sheets "conservative" after 412.** A scratch debug
+build logged each prelude that sent a sheet to state 2, and the position
+where its parse failed:
+- a bare universal compound, `.x > *`: a compound of only `*` returned
+  -1 (rte, google);
+- Google Fonts' `/* latin-ext */ @font-face {`: the prelude start skipped
+  white space, not comments, so the at-rule was read as a selector and
+  its descriptors (`U+0100-024F;`) parsed as one (rte, oldreddit);
+- a plain pseudo-class in a sibling rule's left compound,
+  `.gb_Ac:first-child+.gb_qc`: any pseudo there declined (google);
+- `:nth-last-child(2) ~`, an nth-*() of An+B only (rte);
+- `:has(> article...)`: :has()'s argument could not open with `>` (rte).
+
+**The change** (html.c):
+- A bare `*` is a compound. The prelude start skips comments too.
+- **Only a functional pseudo-class** (`:not(.a)`, `:is(.b)`: arguments
+  that name classes the checks match on) in a left compound declines. A
+  plain one, or nth-*() of An+B only, is cached and ignored by matching,
+  which gives a broader match.
+- Matching ignores any pseudo-class. Before, it called the compound
+  non-matching, which **was reachable for right compounds** (`.a + .b:hover`,
+  `.a + .b:not(.c)`) and under-reported risk.
+- The insert/remove `+` checks decline when L has a pseudo-class and e or
+  its neighbour matches, because broad matches of the two cannot be
+  compared.
+- `:has()` may open with `>`; a leading `+`/`~` still declines.
+- **Bug since 198:** `has` is a selector pseudo (186), so 198's branch that
+  set `has_has` never ran. A parsed `:has()` compound **never reached
+  `has_cp`**, and a block inserted (not at the tail) under
+  `.x:has(...)` was placed locally without restyling `.x`. Fixed. SIBINS'
+  decline count moved 7 -> 9 with it, all 4 cases still passing.
+
+**Sites** (scratch build): **oldreddit 1 -> 0** insert/remove declines
+(cnnlite stays 0 from 412). What remains is real: rte `:has(~ ...)`,
+google `.mj3qce:has(.cDeo3)+.CHVz3d`, wpblog `:where(..)+:where(..)`,
+all sibling rules behind functional pseudo-classes.
+
+**A correction to 412's gate page.** `html_rl_parse_ident` reads `\:`
+fine; only a **hex** escape (`\3a`) fails. So JS-sib-unreadable's
+`.md\:flex` was never unreadable, and the style-sib pages were
+conservative only through `.q:hover + .q`, which 413 now reads (gate413's
+first run failed on exactly that). All six pages now use hex escapes:
+`.md\3a flex` (412's real case) and `.md\3a x + .y` (still state 2).
+
+**Gate.**
+- New pair **JS-sib-universal / CSS-sib-universal-ref**: `*`, a font-face
+  comment, `.a:first-child + .b`, `nth-child(2n+1) ~`, `:has(> .hx)`.
+- Its three inserts: into `.u`, **placed locally**; a second `.a` after
+  the first-child `.a`, **declines** (the `.b` loses its red); a `.hx`
+  ahead of `.hb`'s child, **declines** (198's check, newly reached; the
+  border appears). Rows 0.
+- (An append at the tail takes 381's path and was already right.)
+- **gate413c exit 0** (after gate413 and gate413b failed on the test pages
+  above).
+
+**Restage from pristine:** 495 applied plus the 2 known collisions,
+html.c byte-identical. **gate413d (restaged): exit 0**.
+
+**ASan** (all 21 sites): **21/21 clean**.
+
+**Scorecard r125**: 21 sites against `r79-360`, the 413 and 412 binaries
+back to back: **69.74 vs 69.82**. Both arms sit below r124's 72.9 (live
+content). The one difference, claude 75.8 vs 77.0, reran **77.0 / 77.0 in
+both arms, twice**: noise. No crash.
+
+**Census, back to back:** insert/remove sibling declines **6 -> 3**
+(google, oldreddit and youtube 1 -> 0 each; rte 2 and guardian 1 left).
+BATCHCAUSE **86 -> 82**, local full rebuilds 34 -> 30.
+
+No sudo.
+
+**Next:** sibling rules behind `:where()`/`:is()` with plain arguments
+(wpblog: expand them into their compounds); the boxed flex-item insert;
+github's crash (no longer reproducing; keep the preload ready).
