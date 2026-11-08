@@ -366,6 +366,8 @@ JS-style-sib-local file:///app0:/testpages/JS-style-sib-local.html
 CSS-style-sib-local-ref file:///app0:/testpages/CSS-style-sib-local-ref.html
 JS-style-sib-risk file:///app0:/testpages/JS-style-sib-risk.html
 CSS-style-sib-risk-ref file:///app0:/testpages/CSS-style-sib-risk-ref.html
+JS-sib-unreadable file:///app0:/testpages/JS-sib-unreadable.html
+CSS-sib-unreadable-ref file:///app0:/testpages/CSS-sib-unreadable-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1874,6 +1876,17 @@ k409rd=$(printf '%s\n' "$k409rseg" | grep -c "declined (a sibling selector can m
 echo "  JS-style-sib: local page rows $k409lr (0), style changes local ${k409l} (3 or more), style-sibling declines ${k409ld} (0); risk page rows $k409rr (0), declines ${k409rd} (1 or more)"
 [ "$k409lr" = 0 ] && [ "$k409rr" = 0 ] && [ "${k409l:-0}" -ge 3 ] && [ "${k409ld:-1}" -eq 0 ] &&
 	[ "${k409rd:-0}" -ge 1 ] || fail "style attribute changes on a sheet the sibling scan gave up on"
+# Patch 412: a selector the sibling parser cannot read but with no + ~
+# :empty :has() leaves the sheet precise -- JS-sib-unreadable's inserts
+# and removal are placed locally; the style-sib-risk page, whose sheet
+# keeps an unreadable "+" selector, still declines its block insert.
+k412r=$(fl_rows JS-sib-unreadable CSS-sib-unreadable-ref)
+k412seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-unreadable: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k412l=$(printf '%s\n' "$k412seg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
+k412d=$(printf '%s\n' "$k412seg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
+k412n=$(printf '%s\n' "$k409rseg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
+echo "  JS-sib-unreadable: rows $k412r (0), block changes local ${k412l} (3 or more), sibling declines ${k412d} (0); style-sib-risk block insert declined ${k412n} (1 or more)"
+[ "$k412r" = 0 ] && [ "${k412l:-0}" -ge 3 ] && [ "${k412d:-1}" -eq 0 ] && [ "${k412n:-0}" -ge 1 ] || fail "unreadable selectors without sibling syntax"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

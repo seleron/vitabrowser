@@ -1,0 +1,125 @@
+# netsurf: a selector the sibling parser cannot read, with no sibling syntax in it, no longer makes the whole sheet conservative (patch 412)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 411)
+#
+# The census's "sibling combinator may restyle on insert/remove" (9:
+# cnnlite 4, rte 2, google, oldreddit, wpblog). A debug build (scratch
+# only): every one came through html_rl_block_sibling_risk's state-2 exit
+# -- a "conservative" sheet declines every block insert or removal that is
+# not at the parent's tail. A sheet becomes state 2 when ONE selector
+# prelude fails to parse (an escaped class name, .md\:flex, among others)
+# anywhere in it.
+#
+#  - html_rl_prelude_sib_free: the failed prelude's text holds no sibling
+#    combinator (a + or ~ outside [...] and strings, escapes skipped; a +
+#    inside parentheses still counts), no :empty and no :has(.
+#  - html_rl_scan_sheet: such a prelude yields no rule and the sheet stays
+#    precise (its partial results freed). Every reader of the cache --
+#    186's class check, 198's insert/remove check, 370/409's style check,
+#    373's :empty check -- reads only those constructs.
+#
+# cnnlite (scratch build): 4 declines -> 0, its 4 block changes placed
+# locally. rte, google, oldreddit keep theirs (their unreadable preludes
+# hold sibling syntax, or the risk is real).
+#
+--- a/content/handlers/html/html.c	2026-11-08 07:24:20.007407939 +0000
++++ b/content/handlers/html/html.c	2026-11-08 07:42:42.735551058 +0000
+@@ -10337,6 +10337,63 @@
+ }
+ 
+ /* Full sheet scan. 0 = none, 1 = precise (lefts filled), 2 = decline. */
++/* Patch 412: a selector prelude [a, b) the sibling parser could not read
++ * adds no sibling risk when its text holds no sibling combinator (a + or
++ * ~ outside [...] and strings; escapes skipped), no :empty and no :has(:
++ * patch 186's class check, 198's insert/remove check, 370/409's style
++ * check and 373's :empty check all read only those. (Was: one such
++ * selector made the whole sheet "conservative" -- state 2 -- and every
++ * block insert or removal on the page declined: cnnlite, rte, google,
++ * oldreddit.) A + inside parentheses (:nth-child(2n+1)) still counts. */
++static bool html_rl_prelude_sib_free(const uint8_t *s, size_t a, size_t b)
++{
++	size_t i;
++	int br = 0;
++	uint8_t q = 0;
++
++	for (i = a; i < b; i++) {
++		uint8_t ch = s[i];
++		if (q != 0) {
++			if (ch == '\\' && i + 1 < b)
++				i++;
++			else if (ch == q)
++				q = 0;
++			continue;
++		}
++		if (ch == '\\') {
++			i++;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			q = ch;
++			continue;
++		}
++		if (br > 0) {
++			if (ch == ']')
++				br--;
++			continue;
++		}
++		if (ch == '[') {
++			br++;
++			continue;
++		}
++		if (ch == '+' || ch == '~')
++			return false;
++		if (ch == ':' && i + 1 < b) {
++			size_t j = i + 1;
++			if (s[j] == ':')
++				continue;
++			if (b - j >= 5 && strncasecmp((const char *)s + j,
++					"empty", 5) == 0)
++				return false;
++			if (b - j >= 4 && strncasecmp((const char *)s + j,
++					"has(", 4) == 0)
++				return false;
++		}
++	}
++	return q == 0 && br == 0;
++}
++
+ static int html_rl_scan_sheet(const uint8_t *s, size_t len,
+ 		struct html_rl_sib_compound **lefts, int *nlefts,
+ 		struct html_rl_sib_rule **rules, int *nrules,
+@@ -10419,6 +10476,34 @@
+ 				p.i = start;
+ 				r = html_rl_parse_prelude(&p, i, &l, &nl,
+ 						&ru, &nru, &em, &nem, &ha, &nha);
++				if (r == 2 && html_rl_prelude_sib_free(s, start, i)) {
++					/* patch 412: unreadable, but nothing in
++					 * it a sibling check reads: no rule from
++					 * it, the sheet stays precise */
++					for (k = 0; k < nl; k++)
++						html_rl_sib_compound_free(&l[k]);
++					free(l);
++					l = NULL;
++					nl = 0;
++					for (k = 0; k < nru; k++) {
++						html_rl_sib_compound_free(&ru[k].l);
++						html_rl_sib_compound_free(&ru[k].r);
++					}
++					free(ru);
++					ru = NULL;
++					nru = 0;
++					for (k = 0; k < nem; k++)
++						html_rl_sib_compound_free(&em[k]);
++					free(em);
++					em = NULL;
++					nem = 0;
++					for (k = 0; k < nha; k++)
++						html_rl_sib_compound_free(&ha[k]);
++					free(ha);
++					ha = NULL;
++					nha = 0;
++					r = 0;
++				}
+ 				if (r == 2) {
+ 					for (k = 0; k < *nlefts; k++)
+ 						html_rl_sib_compound_free(
