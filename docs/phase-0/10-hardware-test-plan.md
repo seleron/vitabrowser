@@ -11442,3 +11442,73 @@ No sudo.
 **Next:** "nearest box is not a block" (8), then the sibling-selector
 declines. And free page-list slots: several reference pages could share
 one run.
+
+## Patch 408 (2026-11-08): a flex or grid container's box-less child-list change, and inert attributes on it, need no rebuild
+
+**The census's next local cause: "nearest box is not a block" (8**:
+stackoverflow 4, wpblog, wpnews, youtube). The local path climbs from the
+changed node to the nearest block box and declines on the first box that
+is neither inline nor block. A debug build (scratch only) logged each
+decline:
+
+| change | n | where |
+|---|---|---|
+| child-list mark on a **flex `<body>`** | 4 | stackoverflow |
+| **inert attribute** (383's kind) on a flex `<button>` | 2 | wpblog's navigation |
+| another mark on a flex `<main>` | 1 | youtube |
+| class change on a `<span>` in a flex `<div>` | 1 | |
+
+In every case the changed node **is** the flex container (box type
+`BOX_FLEX`), and the walk declined on it before any local answer looked.
+
+**The change** (html.c):
+- **Inert attribute on any box.** The attribute mark
+  (`html_rl_attr_mark_node`) is only set for an inert attribute that
+  patch 310's gate let through (no sheet, the UA's included, can match on
+  it). On a box that is not a block and holds no object, control, frame or
+  list marker, neither builder nor layout reads it, so there is nothing
+  to rebuild. This is 383's no-op, now for any box type. Logged
+  `attribute on a box that is not a block, nothing to rebuild`.
+- **A flex or grid box's child list.** `html_rl_block_change` runs with
+  `html_rl_noop_only`. Patch 378's box-less no-op may answer, with its
+  structural and sibling checks (a `<script>` appended to a flex
+  `<body>`). A change in elements **with** a box declines: flex items need
+  `box_normalise_flex`, which the block placement does not do. Logged
+  `a flex or grid box's child list changed in elements with a box`.
+
+**stackoverflow, directly** (scratch build): "nearest box is not a
+block" **4 -> 0**, as **4 box-less no-ops** plus **3 declines for boxed
+flex-item changes** (correct, as above). wpblog's attribute case did not
+occur on that load (live), so the gate covers it.
+
+**Gate.** The network page list is full (255 of 256), so the cases went
+into the existing JS-leaf-insert pair: a flex container `#fx`, a
+`<script>` appended to it, and `aria-expanded` set on it (neither page has
+attribute selectors, so patch 310's gate lets it through). **gate408,
+exit 0 on the first run:** JS-leaf-insert rows 0 (and its 407 readings),
+**box-less no-op 1, inert attribute no-op 1** (1 or more each). The
+flex pages (JS-flex-restyle, JS-flex-buttons, STRMAX194, FLEX195) are
+unchanged.
+
+**Restage from pristine:** 490 applied plus the 2 known collisions,
+html.c byte-identical. **gate408b (restaged): exit 0**, the same
+readings.
+
+**ASan** (all 21 sites): **21/21 clean**.
+
+**Scorecard r121**: 21 sites against `r79-360`, the 408 and 407 binaries
+back to back: **73.15 vs 73.17**. No crash, and no site differs by 0.5 or
+more.
+
+**Census, back to back:** "nearest box is not a block" **6 -> 3**;
+local full rebuilds **36 -> 32**; BATCHCAUSE 94 -> 92 (stackoverflow 10
+-> 8).
+
+No sudo.
+
+**Next:** boxed child-list changes in flex containers: build the item
+and normalise it with `box_normalise_flex` (stackoverflow's remaining 3).
+Then the sibling-selector declines (7+7+5+5): "a sibling selector can match
+on the style attribute" and "page CSS needs conservative sibling check"
+both point at the 198/186 sibling analysis being too coarse on real
+sheets.
