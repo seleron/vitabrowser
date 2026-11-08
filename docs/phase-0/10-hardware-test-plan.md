@@ -12282,3 +12282,68 @@ No sudo.
 2. List items with bullet markers.
 3. bbc's block children / wpblog's iframes in "new content is not plain
    inline".
+
+## Patch 420 (2026-11-08): a block restyled whole may hold floats and list markers
+
+**The unit.** After 419 the largest decline is "restyled block holds
+floats or list markers" (14 in r132; more since 417 sends attribute
+changes to the restyle paths). A probe (scratch only) named them:
+- rte's float columns (6);
+- google's body (floats) and list items (4);
+- cnnlite's consent block of floats (2);
+- archwiki's and google's list items, whose markers have
+  `list-style-type: none`;
+- stackoverflow's block holding a list.
+
+**Why 376 declined, and why it need not.** Its two reasons do not hold in
+this engine:
+- *"a list marker (its item's numbering)"*: a marker's number is worked
+  out **at layout** (box_construct_marker: "numerical list counters get
+  handled in layout"), not from construction state a subtree rebuild
+  would lose. `html_rl_flex_restyle` lays the page out whole after every
+  rebuild. CSS counters still decline (374's guards, unchanged).
+- *"an ancestor's float list may hold it"*: true, so `html_rl_flex_restyle`
+  now **empties every ancestor's `float_children`** before the old boxes
+  are freed, when the old subtree held floats. The full layout right
+  after builds each list again (`layout_block_context` starts it empty).
+- Still declined: a list marker with an **image**, since
+  `html_rl_relink_subtree` walks children and would not carry its object.
+
+**Sites** (scratch build): float/marker declines **14 -> 0**. Block
+subtrees restyled: rte 63 -> 72, google 4 -> 12, cnnlite 1 -> 4.
+
+**Gate.**
+- New pair **JS-float-marker / CSS-float-marker-ref**: a block of floats,
+  a numbered list item, a bulleted item and a list each gain a class.
+  **4 restyled, 0 float/marker declines, 0 full rebuilds**, rows 0 (PNG
+  pixels: float placement and list numbers as at parse time).
+- 376's own check (JS-block-subtree) asserted its list and float block
+  keep the full rebuild. They are restyled alone now: **7 subtrees, 0
+  declines**, rows 0. Expectation updated.
+- **gate420b exit 0** (gate420 failed only on that assertion).
+
+**Restage from pristine:** 502 applied plus the 2 known collisions,
+html.c byte-identical. **gate420c (restaged): exit 0**.
+
+**ASan:** sweep **0 ASan errors in 21 loads**, but claude **timed out**
+(413 s; its log stalled during the first layout's page-map dump, before
+any subtree restyle ran). Rerun on its own, twice: **loaded, 41.6 s and
+44.3 s, clean**. A transient stall, not 420's code. `asan-autotest.sh
+main` **clean** (351 page dumps).
+
+**Scorecard r133**: 21 sites against `r79-360`, the 420 and 419 binaries
+back to back: **71.95 vs 70.37**. Nearly all of it is wpblog, 68.9 vs
+37.5. Reruns: 420 read 68.2 and 68.2; **419 read 68.9, then 37.5**, so
+wpblog flips on the old binary too: noise. claude 77.0/75.8 is the usual
+flip. No crash.
+
+**Census, back to back:** BATCHCAUSE **81 vs 84**; float/marker declines
+**14 -> 0**; block subtrees restyled 86 -> 93.
+
+No sudo.
+
+**Next:**
+1. "detached stylesheet pruned" (oldreddit 5).
+2. "restyled flex or grid box holds controls or frames" (google, rte,
+   stackoverflow, wikipedia, youtube).
+3. "nearest box is not a block" (6 sites).
