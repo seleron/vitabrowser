@@ -11270,3 +11270,89 @@ whose structural match flips, and a split of "unbounded" into
 "unbounded but local" (quotes, escapes, a namespace: its effect stays on
 the matching child) vs ":has()-like" (it can reach an ancestor), so
 youtube's unbounded matches can narrow too.
+
+## Patch 406 (2026-11-08): youtube's structural flips answered locally -- quoted attributes stay bounded, leaf boxes restyled in place
+
+**405's "Next".** After 405, youtube still took its 7 structural full
+rebuilds. A second scratch-only debug build logged the text of every
+**unbounded** structural compound youtube's sheets hold. There are three:
+- `:first-child` inside `:where(:has(:first-child))`: a real `:has()`,
+  which must stay unbounded (it can reach an ancestor).
+- **`.vEFDtd:last-child[data-expand-type="1"]`** and
+  **`.nn7x3d:last-child[data-expand-type="1"]`**: unbounded **only
+  because of the quotes** in the attribute value. The compound parser
+  gave up on any quote. They are really bounded by a class, so they can
+  never match an iframe.
+
+Together with 405's debug run (bounded bare `:last-child`-type compounds
+matching the previous `<iframe>`, the sibling to restyle being that
+iframe), that gives two pieces.
+
+**The change** (html.c):
+1. `html_rl_struct_parse_cp`: a quoted value inside `[...]` no longer
+   unbounds the compound (attributes are ignored: a broader match), and
+   the `[...]` skip honours quotes, so a `]` inside a value cannot end
+   it. A quote outside `[...]`, a backslash anywhere (an escape can hide a
+   name) or a `|` outside `[...]` (a namespace) still unbounds.
+2. `html_rl_leaf_restyle`: a matching child whose box has **no
+   children** (an `<iframe>`, an `<img>`; directly under the parent or in
+   its line) gets a **new computed style on the same box**. It follows
+   `html_reconvert_fast_style`'s recipe: `box_get_style` from the element's
+   CSS parent (the block whose children changed, not an anonymous line
+   box), swap `styles`/`style`/`custom_env`. The page is then laid out
+   whole. Nothing is freed: a frame's box (never freed, 371) and its
+   window stay. Declined into the full rebuild when:
+   - display, float or position change (construction decided those);
+   - a `::before`/`::after` box would be generated
+     (`html_rl_pseudo_generates` mirrors `box_construct_generate`: never
+     for a replaced element, else `content` not `normal` and `display`
+     not `none`. The first draft refused any pseudo *style*, and
+     youtube's universal `*::before` rule gives every element one: 14
+     false declines);
+   - either style counts (the existing `html_rl_style_counts`);
+   - a control, a clone, or a box without element styles.
+   Logged `..., leaf boxes in place` on 405's line, and `leaf restyle
+   declined (why)`.
+
+**youtube, directly** (scratch build of the final code, 3 loads):
+structural declines **7 -> 0-1**, **4 iframes restyled in place** per
+load, full rebuilds (BATCHCAUSE) **11-12**, against 14-16 for youtube in
+r116-r118. The other matches stop matching at all, because the quoted
+compounds are bounded by their class now.
+
+**Gate.** JS-struct-hits / CSS-struct-hits-ref gain two containers, each
+also holding an iframe:
+- `#c5`: block-level iframes under `#c5 > :last-child` (a bare
+  compound, youtube's shape). Appending an iframe flips the previous one,
+  which is **restyled in place**.
+- `#c6`: `.qa:last-child[data-k="1"]`. Appending a `.qa` restyles the old
+  last one **alone**. Before 406 the compound was unbounded, so not
+  narrow, and the iframe made it a full rebuild.
+
+**gate406, exit 0 on the first run:** rows 0, **7 restyled alone (6 or
+more), 1 leaf in place (1 or more)**, the `+` case declined.
+JS-struct-dir, -scoped, late-append and list-structural all pass.
+
+**Restage from pristine:** 488 applied plus the 2 known collisions,
+html.c byte-identical. **gate406b (restaged): exit 0**, the same
+readings as gate406.
+
+**ASan** (all 21 sites): **21/21 clean**.
+
+**Scorecard r119**: 21 sites against `r79-360`, the 406 and 405 binaries
+back to back (`score/r119-406`, `score/r119-405`): **72.84 vs 72.94**.
+No crash. claude reads 75.8 vs 77.0 (its usual flip) and stackoverflow
+-0.5 (live).
+
+**Census, back to back:** structural declines **15 -> 5**, with **5
+leaf boxes restyled in place** on the real sites (0 before). Full
+rebuilds (BATCHCAUSE) 97 vs 110 (youtube 13 vs 15). The direction is
+right, though the totals are inside the 95-116 noise band. The first of
+404-406 to move the structural cause on the scorecard sites.
+
+No sudo.
+
+**Next:** recount the census with 404-406 in. The structural cause
+should be down to the `:has()` compound and boxes that are not plain
+leaves; then the next local causes ("new element is not a plain block",
+"nearest box is not a block").
