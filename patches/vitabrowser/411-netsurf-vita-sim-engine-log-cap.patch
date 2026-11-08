@@ -1,0 +1,66 @@
+# netsurf: vita -- the host simulator's engine log cap can be raised (patch 411)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 410)
+#
+# frontends/vita/diag.c caps the engine log (netsurf.log) at 16 MiB per
+# boot -- right for the Vita (card, frame rate). The sim gate reads that
+# log of one long autotest run, and with patch 409's pages it capped at
+# 808 s of 886 (page 267 of 277): JS-frames-local's check lost its lines
+# and failed with the page rendering correctly. In the host simulator only
+# (#ifndef __vita__), VITA_SIM_ENGINE_LOG_CAP (MiB, 1-4096) overrides the
+# cap; tools/run-vita-sim.sh sets 256 for the main autotest. The Vita keeps
+# 16 MiB.
+#
+--- a/frontends/vita/diag.c	2026-11-08 06:05:46.489068109 +0000
++++ b/frontends/vita/diag.c	2026-11-08 06:05:46.532982756 +0000
+@@ -71,6 +71,24 @@
+  * suffer, and the start of a failure is what matters. */
+ #define ENGINE_LOG_CAP (16 * 1024 * 1024)
+ 
++/** Patch 411: the cap in force. In the host simulator, VITA_SIM_ENGINE_LOG_CAP
++ * (MiB, 1-4096) overrides it: the sim gate's checks read the engine log of
++ * one long autotest run, and at 16 MiB it capped mid-list (808 s of 886,
++ * patch 409's run) -- every check on a later page lost its lines. The Vita
++ * keeps 16 MiB. */
++static long engine_log_cap(void)
++{
++#ifndef __vita__
++	const char *e = getenv("VITA_SIM_ENGINE_LOG_CAP");
++	if (e != NULL) {
++		long mb = atol(e);
++		if (mb >= 1 && mb <= 4096)
++			return mb * 1024L * 1024L;
++	}
++#endif
++	return ENGINE_LOG_CAP;
++}
++
+ static uint64_t diag_t0_us;	/* patch 252: on the monotonic clock */
+ static bool diag_ready;
+ 
+@@ -678,7 +696,7 @@
+ 		/* Start afresh once the file has grown past a cap: the old
+ 		 * one is kept, once, as netsurf.old.log. */
+ 		struct stat st;
+-		if (stat(a2, &st) == 0 && st.st_size > ENGINE_LOG_CAP) {
++		if (stat(a2, &st) == 0 && st.st_size > engine_log_cap()) {
+ 			remove(VITA_DIAG_DIR "netsurf.old.log");
+ 			rename(a2, VITA_DIAG_DIR "netsurf.old.log");
+ 		}
+@@ -808,12 +826,12 @@
+ 	/* This boot's growth, not the file's size: the file is appended to
+ 	 * across boots, so once earlier sessions had filled it every later
+ 	 * boot capped at once and logged nothing (hardware run 14). */
+-	if (verbose_log && ftell(engine_log) - engine_start > ENGINE_LOG_CAP) {
+-		fprintf(engine_log, "==== engine log capped at %d bytes ====\n",
+-			ENGINE_LOG_CAP);
++	if (verbose_log && ftell(engine_log) - engine_start > engine_log_cap()) {
++		fprintf(engine_log, "==== engine log capped at %ld bytes ====\n",
++			engine_log_cap());
+ 		fflush(engine_log);
+ 		verbose_log = false;
+-		vita_diag_log("engine log: capped at %d bytes", ENGINE_LOG_CAP);
++		vita_diag_log("engine log: capped at %ld bytes", engine_log_cap());
+ 	}
+ }
+ 

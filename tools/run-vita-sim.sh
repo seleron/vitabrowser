@@ -362,6 +362,10 @@ JS-struct-hits file:///app0:/testpages/JS-struct-hits.html
 CSS-struct-hits-ref file:///app0:/testpages/CSS-struct-hits-ref.html
 JS-leaf-insert file:///app0:/testpages/JS-leaf-insert.html
 CSS-leaf-insert-ref file:///app0:/testpages/CSS-leaf-insert-ref.html
+JS-style-sib-local file:///app0:/testpages/JS-style-sib-local.html
+CSS-style-sib-local-ref file:///app0:/testpages/CSS-style-sib-local-ref.html
+JS-style-sib-risk file:///app0:/testpages/JS-style-sib-risk.html
+CSS-style-sib-risk-ref file:///app0:/testpages/CSS-style-sib-risk-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -586,9 +590,13 @@ else
 		--port "$NETLOG_PORT" --bind 127.0.0.1 --out "$OUT/net" --quiet \
 		--exit-when-done --timeout 1000 ) > "$OUT/netlog-receiver.log" 2>&1 &
 	RX=$!
+	# patch 411: the engine log is not capped mid-run (16 MiB capped it
+	# at page 267 of 277), and the run has room past 900 s (886 s with
+	# 277 pages)
 	( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
 		VITA_SETTLE_EXTRA_MS="${VITA_SETTLE_EXTRA_MS:-7000}" \
-		timeout 900 "$NS/nsvita-sim" )
+		VITA_SIM_ENGINE_LOG_CAP=256 \
+		timeout 1200 "$NS/nsvita-sim" )
 	wait $RX || true
 	kill $HTTPD 2>/dev/null || true
 # AUTOTEST RUN END
@@ -1850,6 +1858,22 @@ k408c=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: child list chang
 k408a=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: attribute on a box that is not a block, nothing to rebuild" || true)
 echo "  JS-leaf-insert (flex container): box-less child-list no-op ${k408c} (1 or more); inert attribute no-op ${k408a} (1 or more)"
 [ "${k408c:-0}" -ge 1 ] && [ "${k408a:-0}" -ge 1 ] || fail "flex container child list and inert attribute"
+# Patch 409: on a sheet patch 186 gives up on (.q:hover + .q), style
+# attribute changes decline only for a + or ~ after a [style] selector:
+# the escaped-class / descendant-[style] page takes them locally, the
+# [style*="display: none"] + p page still declines (its <p> turns red);
+# both row for row as their parse-time builds. (Patch 410: the page list
+# may hold 384.)
+k409lr=$(fl_rows JS-style-sib-local CSS-style-sib-local-ref)
+k409rr=$(fl_rows JS-style-sib-risk CSS-style-sib-risk-ref)
+k409lseg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-sib-local: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k409rseg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-sib-risk: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k409l=$(printf '%s\n' "$k409lseg" | grep -c "LIFE rebuild local: style attribute change, as a class change" || true)
+k409ld=$(printf '%s\n' "$k409lseg" | grep -c "declined (a sibling selector can match on the style attribute)" || true)
+k409rd=$(printf '%s\n' "$k409rseg" | grep -c "declined (a sibling selector can match on the style attribute)" || true)
+echo "  JS-style-sib: local page rows $k409lr (0), style changes local ${k409l} (3 or more), style-sibling declines ${k409ld} (0); risk page rows $k409rr (0), declines ${k409rd} (1 or more)"
+[ "$k409lr" = 0 ] && [ "$k409rr" = 0 ] && [ "${k409l:-0}" -ge 3 ] && [ "${k409ld:-1}" -eq 0 ] &&
+	[ "${k409rd:-0}" -ge 1 ] || fail "style attribute changes on a sheet the sibling scan gave up on"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

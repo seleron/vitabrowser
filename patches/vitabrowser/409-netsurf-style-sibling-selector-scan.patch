@@ -1,0 +1,223 @@
+# netsurf: a style attribute change on a sheet the sibling scan gave up on declines only for a + or ~ after [style] (patch 409)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 408)
+#
+# The census's "a sibling selector can match on the style attribute" (7:
+# wpblog 3, oldreddit, stackoverflow, wpnews, youtube). A debug build
+# (scratch only): every one came through html_rl_style_sibling_risk's
+# state-2 branch -- a sheet patch 186's scan gave up on (a pseudo-class in
+# a sibling rule's left compound), then patch 310's textual scan: "can
+# this sheet select on the attribute at all", which also declines on any
+# backslash outside a string. oldreddit's, stackoverflow's and youtube's
+# sheets have no [style at all -- only escaped class names (.md\:flex,
+# Tailwind's .w-\[10px\]); wpblog's and wpnews' [style*=...] selectors sit
+# in descendant or :not() positions, which the element's rebuild covers.
+#
+#  - html_rl_style_sib_scan / html_rl_style_sel_risk: the selectors
+#    themselves. Comments, strings and declaration blocks skipped, escapes
+#    skipped outside strings, at-rule blocks (@media...) recursed, preludes
+#    started past white space and comments. Risk only for a + or ~ after a
+#    [style...] selector in the same complex selector; conservatively for a
+#    backslash, or a '|' not of '|=', inside [...] (an escape or a
+#    namespace could hide the name), @import (imported rules are not in
+#    the text), a rule nested in declarations, anything unterminated or
+#    nested deeper than 32. (patch 370's reasoning: the rebuild re-selects
+#    the element and its subtree; :has() never matches here.)
+#  - html_rl_style_sibling_risk: the state-2 branch is a risk only when
+#    BOTH patch 310's scan and this one say so -- a sheet with no [style
+#    and no backslash cannot select on the attribute, and the selector
+#    scan's conservative exits (@import, nesting) must not turn that into a
+#    risk (the first version did, on claude: 0 -> 3 declines in the r122
+#    A/B). Sheets the 186 scan parsed keep the precise compound check.
+#
+--- a/content/handlers/html/html.c	2026-11-08 05:36:50.600649445 +0000
++++ b/content/handlers/html/html.c	2026-11-08 06:46:30.982605211 +0000
+@@ -11994,6 +11994,160 @@
+ 	return false;
+ }
+ 
++/* Patch 409: in a sheet whose sibling rules the patch-186 scan gave up
++ * on (state 2), can a style attribute change reach a sibling? Only
++ * through a + or ~ that FOLLOWS a [style...] attribute selector in the
++ * same complex selector (patch 370's reasoning: the rebuild re-selects
++ * the element and its subtree; :has() never matches here, patch 328).
++ * This scans the selectors themselves -- comments, strings and
++ * declaration blocks skipped -- where 310's textual scan asked whether
++ * the sheet can select on the attribute at all and declined on any
++ * backslash outside a string: escaped class names (.md\:flex) in every
++ * minified sheet (stackoverflow, youtube, oldreddit), and [style*=..]
++ * in descendant or :not() positions (wpblog, wpnews) declined every
++ * style change there. A risk (true), conservatively: [style] then + or
++ * ~ in its selector; a backslash or '|' inside [...] (an escape or a
++ * namespace could hide the name); @import (imported rules are not in
++ * this text); a rule nested in declarations; anything unterminated or
++ * nested deeper than 32. */
++static bool html_rl_style_sel_risk(const uint8_t *s, size_t a, size_t b)
++{
++	size_t i;
++	int br = 0;
++	bool seen = false;
++	uint8_t q = 0;
++
++	for (i = a; i < b; i++) {
++		uint8_t ch = s[i];
++		if (q != 0) {
++			if (ch == '\\' && i + 1 < b)
++				i++;
++			else if (ch == q)
++				q = 0;
++			continue;
++		}
++		if (br > 0) {
++			if (ch == '"' || ch == '\'')
++				q = ch;
++			else if (ch == '\\' ||
++				 (ch == '|' && !(i + 1 < b && s[i + 1] == '=')))
++				return true;	/* an escape; a namespace (not |=) */
++			else if (ch == ']')
++				br--;
++			continue;
++		}
++		if (ch == '\\') {
++			/* an escaped character in an identifier (Tailwind's
++			 * .w-\[10px\], .x-1\/2): not a bracket, not a
++			 * combinator */
++			i++;
++			continue;
++		}
++		if (ch == '[') {
++			size_t j = i + 1;
++			br++;
++			while (j < b && html_rl310_is_ws(s[j]))
++				j++;
++			if (j + 5 <= b && html_rl310_cieq(s + j, "style", 5) &&
++			    (j + 5 == b || !html_rl310_is_namech(s[j + 5])))
++				seen = true;
++		} else if (ch == ',') {
++			seen = false;	/* the next complex selector */
++		} else if ((ch == '+' || ch == '~') && seen) {
++			return true;
++		}
++	}
++	return br != 0 || q != 0;
++}
++
++static bool html_rl_style_sib_scan(const uint8_t *s, size_t len)
++{
++	unsigned char decl[33];
++	int depth = 0;
++	size_t i = 0, pstart = 0;
++	uint8_t q = 0;
++
++	decl[0] = 0;
++	while (i < len) {
++		uint8_t ch = s[i];
++		if (ch == '/' && i + 1 < len && s[i + 1] == '*') {
++			size_t e = i + 2;
++			while (e + 1 < len && !(s[e] == '*' && s[e + 1] == '/'))
++				e++;
++			if (e + 1 >= len)
++				return true;
++			i = e + 2;
++			continue;
++		}
++		if (ch == '\\') {
++			/* an escaped character outside a string (Tailwind's
++			 * .content-\[\'\'\]): not a quote, not a brace */
++			i += 2;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			q = ch;
++			for (i++; i < len && s[i] != q; i++)
++				if (s[i] == '\\')
++					i++;
++			if (i >= len)
++				return true;
++			i++;
++			continue;
++		}
++		if (decl[depth]) {
++			if (ch == '{')
++				return true;	/* a nested rule */
++			if (ch == '}') {
++				depth--;
++				pstart = i + 1;
++			}
++			i++;
++			continue;
++		}
++		if (ch == '@' && len - i >= 7 &&
++		    html_rl310_cieq(s + i + 1, "import", 6))
++			return true;
++		if (ch == ';') {
++			pstart = i + 1;
++		} else if (ch == '{') {
++			size_t p = pstart;
++			/* the prelude starts past white space and comments
++			 * (a minified sheet's banner before an @media) */
++			for (;;) {
++				while (p < i && html_rl310_is_ws(s[p]))
++					p++;
++				if (p + 1 < i && s[p] == '/' && s[p + 1] == '*') {
++					p += 2;
++					while (p + 1 < i &&
++					       !(s[p] == '*' && s[p + 1] == '/'))
++						p++;
++					p += 2;
++					continue;
++				}
++				break;
++			}
++			if (depth >= 32)
++				return true;
++			if (p < i && s[p] == '@') {
++				decl[++depth] = 0;	/* @media etc.: rules */
++			} else {
++				if (html_rl_style_sel_risk(s, p, i))
++					return true;
++				decl[++depth] = 1;
++			}
++			pstart = i + 1;
++		} else if (ch == '}') {
++			if (depth == 0)
++				return true;
++			depth--;
++			pstart = i + 1;
++		}
++		i++;
++	}
++	return depth != 0;
++}
++
+ static bool html_rl_style_sibling_risk(html_content *c)
+ {
+ 	unsigned int si;
+@@ -12010,15 +12164,23 @@
+ 		if (sh->state == 2) {
+ 			/* the scan gave up on this sheet's sibling rules (a
+ 			 * pseudo-class in a left compound, say): it is a risk
+-			 * only if the sheet can select on the attribute at all
+-			 * (patch 310's scan) */
++			 * only if a sibling combinator follows a [style...]
++			 * selector there (patch 409's selector scan; was patch
++			 * 310's "can select on the attribute at all") */
+ 			const uint8_t *data;
+ 			size_t size = 0;
+ 			data = content_get_source_data(
+ 					c->stylesheets[si].sheet, &size);
++			/* patch 409: the selectors themselves -- but only
++			 * where patch 310's scan already saw a risk (a sheet
++			 * with no [style and no backslash cannot select on
++			 * the attribute, whatever else it holds: the selector
++			 * scan's conservative exits -- @import, nesting --
++			 * must not turn that "no" into a "yes": claude) */
+ 			if (data == NULL || size == 0 ||
+-			    html_rl_sheet_scan_attr(data, size, "style", 5,
+-					html_rl_pseudos_for("style")))
++			    (html_rl_sheet_scan_attr(data, size, "style", 5,
++					html_rl_pseudos_for("style")) &&
++			     html_rl_style_sib_scan(data, size)))
+ 				return true;
+ 			continue;
+ 		}
