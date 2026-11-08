@@ -1,0 +1,81 @@
+# netsurf: a flex or grid container's box-less child-list change and inert attributes need no rebuild (patch 408)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 407)
+#
+# The census's "nearest box is not a block" (8: stackoverflow 4, wpblog,
+# wpnews, youtube). A debug build (scratch only): the change sat on a
+# flex container itself -- a child-list change on stackoverflow's flex
+# <body> (4), an inert attribute (patch 383's kind: aria-*, data-*, role)
+# on wpblog's navigation <button> (2), another mark on youtube's <main>,
+# a class change in an inline inside a flex <div>. The walk to the nearest
+# block box declined on the flex box before any local answer could look.
+#
+#  - An inert attribute mark (html_rl_attr_mark_node: patch 310's gate let
+#    it through -- no sheet, the UA's included, matches on it) on a box
+#    that is not a block and holds no object, control, frame or list
+#    marker: nothing to rebuild (383's no-op, any box type). Logged
+#    "attribute on a box that is not a block, nothing to rebuild".
+#  - A child-list mark on a flex or grid box: html_rl_block_change runs
+#    with html_rl_noop_only -- patch 378's box-less no-op may answer, with
+#    its structural and sibling checks; a change in elements with a box
+#    declines (flex items need box_normalise_flex, which the block
+#    placement does not do).
+#
+--- a/content/handlers/html/html.c	2026-11-08 04:41:00.072403225 +0000
++++ b/content/handlers/html/html.c	2026-11-08 04:59:44.551674392 +0000
+@@ -8410,6 +8410,11 @@
+  * SETATTRIBUTE / REMOVEATTRIBUTE that patch 310's gate let through), else
+  * NULL */
+ static dom_node *html_rl_attr_mark_node;
++/* Patch 408: html_rl_block_change entered for a flex or grid box's child
++ * list: only 378's box-less no-op may answer; a boxed change declines
++ * (flex items need box_normalise_flex, which the block placement does
++ * not do) */
++static bool html_rl_noop_only;
+ static dom_node *html_rl_childlist_rm_next;
+ 
+ /* Patch 378: elements a script appends at the end of a parent that this
+@@ -9112,6 +9117,9 @@
+ 			"rebuild", nskip);
+ 		return 0;
+ 	}
++	if (html_rl_noop_only)		/* patch 408 */
++		RL_BNO("a flex or grid box's child list changed in elements "
++			"with a box");
+ 	/* Patch 383: an attribute that patch 310's gate let through, on
+ 	 * this block itself, no box added or removed: no sheet can match on
+ 	 * it, it is not a hint, and the block's own box holds no object,
+@@ -12314,6 +12322,33 @@
+ 				element = n;
+ 				break;
+ 			}
++			/* Patch 408: the census's "nearest box is not a
++			 * block" (8): a flex container's own child list
++			 * (stackoverflow's flex <body>) or an inert attribute
++			 * on it (wpblog's navigation <button>: aria-*). */
++			if (b != NULL && b->type != BOX_INLINE && n == vnode &&
++			    (dom_node *) vnode == html_rl_attr_mark_node &&
++			    b->object == NULL && b->gadget == NULL &&
++			    !HTML_RL_FRAME(b) && b->list_marker == NULL) {
++				/* 383's no-op, on any box: no sheet can match
++				 * on the attribute (patch 310's gate), and
++				 * neither builder nor layout reads it */
++				dom_node_unref(n);
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"attribute on a box that is not a block, "
++					"nothing to rebuild");
++				return 0;
++			}
++			if (b != NULL && n == vnode &&
++			    (b->type == BOX_FLEX || b->type == BOX_GRID) &&
++			    (dom_node *) vnode == html_rl_childlist_parent) {
++				int r;
++				html_rl_noop_only = true;
++				r = html_rl_block_change(c, n, b, t0);
++				html_rl_noop_only = false;
++				dom_node_unref(n);
++				return r;
++			}
+ 			if (b != NULL && b->type != BOX_INLINE) {
+ 				dom_node_unref(n);	/* a table cell, ... */
+ 				RL_NO("nearest box is not a block");

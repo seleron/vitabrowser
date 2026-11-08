@@ -1844,6 +1844,12 @@ k407m=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: leaf element pla
 k407d=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: declined (" || true)
 echo "  JS-leaf-insert: rows differing from the parse-time build $k407r (0); leaves built alone ${k407a} (6 or more), moved into a line of their own ${k407m} (4 or more); next to inline text declined ${k407d} (1 or more)"
 [ "$k407r" = 0 ] && [ "${k407a:-0}" -ge 6 ] && [ "${k407m:-0}" -ge 4 ] && [ "${k407d:-0}" -ge 1 ] || fail "leaf elements inserted between blocks"
+# Patch 408: on the page's flex container, a <script> appended and an
+# inert attribute set need no rebuild (were: "nearest box is not a block").
+k408c=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: child list changed only in elements with no box" || true)
+k408a=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: attribute on a box that is not a block, nothing to rebuild" || true)
+echo "  JS-leaf-insert (flex container): box-less child-list no-op ${k408c} (1 or more); inert attribute no-op ${k408a} (1 or more)"
+[ "${k408c:-0}" -ge 1 ] && [ "${k408a:-0}" -ge 1 ] || fail "flex container child list and inert attribute"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
