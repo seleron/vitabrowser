@@ -1,0 +1,413 @@
+# netsurf: a class change whose added and removed names no stylesheet names restyles nothing (patch 414)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 413)
+#
+# The census's "restyled block's parent is not a block" (7): a debug build
+# (scratch only) showed six were class changes on <html> itself (cnnlite
+# 2, archwiki, wikipedia, jquery, wpnews; youtube too) -- the root has no
+# parent box, so each was a full rebuild -- for tokens like
+# userconsent-cntry-ie. A computed style depends on class only through
+# selectors; box construction reads no class (html.c's reads are
+# diagnostics and the load-time has-js class).
+#
+#  - The per-sheet sibling cache gains the sheet's class names: sorted
+#    lowercase FNV-1a hashes of every ".ident" outside comments and
+#    strings, escapes decoded (hex too: .md\3a hide is "md:hide"); a
+#    collision only declines. A sheet with [class...], @import (its rules
+#    are unseen) or unreadable source may name any class.
+#  - html_reconvert_local_change: a class change whose added and removed
+#    tokens no used sheet names (base sheets included) is answered with
+#    nothing restyled. Placed after the busy / detached-sheet prune
+#    checks. Not for patch 370's style changes "as a class change",
+#    whose old class is the current one (html_rl_style_as_class).
+#
+# Also (found by the ASan sweep, youtube SEGV): 198's :has ancestor walk
+# climbed to the Document node and matched it as an element
+# (dom_element_get_tag_name on a non-element). Unreached until 413 made
+# :has compounds reach has_cp -- 413 shipped it latent. match_static
+# answers "no match" for a non-element.
+#
+# Sites (scratch build): cnnlite's <html> change answered (BATCHCAUSE
+# 3 -> 2); wpnews 8 class changes answered with no restyle (were 8 local
+# restyles); youtube 2. archwiki, jquery, wikipedia keep theirs (their
+# <html> tokens, client-js and the like, are named).
+#
+--- a/content/handlers/html/html.c	2026-11-08 10:00:37.880078629 +0000
++++ b/content/handlers/html/html.c	2026-11-08 11:00:08.554739874 +0000
+@@ -11062,6 +11062,13 @@
+ 	int nempty;
+ 	struct html_rl_sib_compound *has_cp;
+ 	int nhas;
++	/* Patch 414: the class names the sheet's selectors can name, as
++	 * sorted lowercase FNV-1a hashes (a collision only declines).
++	 * cls_state 0 = not built, 1 = built, 2 = may match any class
++	 * ([class...], @import, unreadable). */
++	int cls_state;
++	uint32_t *cls;
++	int ncls;
+ };
+ static struct html_rl_sib_sheet html_rl_sib_cache[HTML_RL_SIB_CACHE_N];
+ static unsigned int html_rl_sib_cache_next;
+@@ -11095,6 +11102,7 @@
+ 	for (k = 0; k < e->nhas; k++)
+ 		html_rl_sib_compound_free(&e->has_cp[k]);
+ 	free(e->has_cp);
++	free(e->cls);	/* patch 414 */
+ 	memset(e, 0, sizeof(*e));
+ }
+ 
+@@ -11165,6 +11173,307 @@
+ 	return e;
+ }
+ 
++/* Patch 414: a class change whose added and removed class names no
++ * stylesheet names cannot restyle anything -- a computed style depends
++ * on class only through selectors (box construction reads no class:
++ * the html.c reads are diagnostics and the load-time has-js class).
++ * Six of the census's seven "restyled block's parent is not a block"
++ * were class changes on <html> itself (cnnlite 2, archwiki, wikipedia,
++ * jquery, wpnews): a root with no parent box, a full rebuild, for
++ * tokens such as userconsent-cntry-ie that no selector names. */
++static uint32_t html_rl_cls_hash_step(uint32_t h, uint8_t ch)
++{
++	if (ch >= 'A' && ch <= 'Z')
++		ch = (uint8_t)(ch - 'A' + 'a');
++	return (h ^ ch) * 16777619u;
++}
++
++static bool html_rl_cls_hex(uint8_t ch)
++{
++	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
++	       (ch >= 'A' && ch <= 'F');
++}
++
++/* Decode the identifier at st[*ip] (escapes resolved) into its hash.
++ * False if no identifier starts there. */
++static bool html_rl_cls_ident(const uint8_t *st, size_t len, size_t *ip,
++		uint32_t *out)
++{
++	size_t i = *ip;
++	uint32_t h = 2166136261u;
++	bool any = false;
++	while (i < len) {
++		uint8_t ch = st[i];
++		if (ch == '\\' && i + 1 < len && st[i + 1] != '\n') {
++			i++;
++			if (html_rl_cls_hex(st[i])) {
++				unsigned long cp = 0;
++				int nd = 0;
++				uint8_t u[4];
++				int nu, q;
++				while (i < len && nd < 6 &&
++				       html_rl_cls_hex(st[i])) {
++					uint8_t d = st[i];
++					cp = cp * 16 + (unsigned long)(
++						d <= '9' ? d - '0' :
++						(d | 0x20) - 'a' + 10);
++					i++;
++					nd++;
++				}
++				if (i < len && (st[i] == ' ' ||
++				    st[i] == '\t' || st[i] == '\n'))
++					i++;
++				if (cp == 0 || cp > 0x10FFFF)
++					cp = 0xFFFD;
++				if (cp < 0x80) {
++					u[0] = (uint8_t)cp;
++					nu = 1;
++				} else if (cp < 0x800) {
++					u[0] = (uint8_t)(0xC0 | (cp >> 6));
++					u[1] = (uint8_t)(0x80 | (cp & 0x3F));
++					nu = 2;
++				} else if (cp < 0x10000) {
++					u[0] = (uint8_t)(0xE0 | (cp >> 12));
++					u[1] = (uint8_t)(0x80 |
++						((cp >> 6) & 0x3F));
++					u[2] = (uint8_t)(0x80 | (cp & 0x3F));
++					nu = 3;
++				} else {
++					u[0] = (uint8_t)(0xF0 | (cp >> 18));
++					u[1] = (uint8_t)(0x80 |
++						((cp >> 12) & 0x3F));
++					u[2] = (uint8_t)(0x80 |
++						((cp >> 6) & 0x3F));
++					u[3] = (uint8_t)(0x80 | (cp & 0x3F));
++					nu = 4;
++				}
++				for (q = 0; q < nu; q++)
++					h = html_rl_cls_hash_step(h, u[q]);
++			} else {
++				h = html_rl_cls_hash_step(h, st[i]);
++				i++;
++			}
++			any = true;
++			continue;
++		}
++		if (!html_rl310_is_namech(ch))
++			break;
++		h = html_rl_cls_hash_step(h, ch);
++		any = true;
++		i++;
++	}
++	*ip = i;
++	*out = h;
++	return any;
++}
++
++static int html_rl_cls_cmp(const void *a, const void *b)
++{
++	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
++	return x < y ? -1 : x > y ? 1 : 0;
++}
++
++/* Build e's class-name set (cls_state 1), or mark it "any" (2). */
++static void html_rl_sheet_classes(struct html_rl_sib_sheet *e)
++{
++	const uint8_t *st = e->data;
++	size_t len = e->size, i = 0;
++	uint8_t quote = 0;
++	int cap = 0, n = 0, k, w;
++	uint32_t *v = NULL;
++	e->cls_state = 2;
++	while (i < len) {
++		uint8_t ch = st[i];
++		if (quote != 0) {
++			if (ch == '\\' && i + 1 < len)
++				i += 2;
++			else {
++				if (ch == quote || ch == '\n')
++					quote = 0;
++				i++;
++			}
++			continue;
++		}
++		if (ch == '/' && i + 1 < len && st[i + 1] == '*') {
++			for (i += 2; i + 1 < len &&
++			     !(st[i] == '*' && st[i + 1] == '/'); i++)
++				;
++			i += 2;
++			continue;
++		}
++		if (ch == '"' || ch == '\'') {
++			quote = ch;
++			i++;
++			continue;
++		}
++		if (ch == '\\') {
++			i += 2;
++			continue;
++		}
++		if (ch == '@') {
++			if (i + 7 <= len &&
++			    html_rl310_cieq(st + i + 1, "import", 6)) {
++				free(v);
++				return;		/* imported rules unseen */
++			}
++			i++;
++			continue;
++		}
++		if (ch == '[') {
++			size_t j = i + 1;
++			while (j < len && html_rl310_is_ws(st[j]))
++				j++;
++			if (j < len && st[j] == '*') {
++				if (j + 1 < len && st[j + 1] == '|')
++					j += 2;
++			} else {
++				size_t q = j;
++				while (q < len && html_rl310_is_namech(st[q]))
++					q++;
++				if (q > j && q < len && st[q] == '|' &&
++				    !(q + 1 < len && st[q + 1] == '='))
++					j = q + 1;
++			}
++			while (j < len && html_rl310_is_ws(st[j]))
++				j++;
++			if (j < len && (st[j] == '\\' ||
++			    (j + 5 <= len &&
++			     html_rl310_cieq(st + j, "class", 5) &&
++			     (j + 5 == len ||
++			      !html_rl310_is_namech(st[j + 5]))))) {
++				free(v);
++				return;		/* [class...] */
++			}
++			i++;
++			continue;
++		}
++		if (ch == '.') {
++			uint32_t h;
++			size_t j = i + 1;
++			if (html_rl_cls_ident(st, len, &j, &h)) {
++				if (n == cap) {
++					uint32_t *nv;
++					cap = cap ? cap * 2 : 256;
++					nv = realloc(v, (size_t)cap *
++							sizeof(*v));
++					if (nv == NULL) {
++						free(v);
++						return;
++					}
++					v = nv;
++				}
++				v[n++] = h;
++				i = j;
++				continue;
++			}
++			i++;
++			continue;
++		}
++		i++;
++	}
++	if (n > 1) {
++		qsort(v, (size_t)n, sizeof(*v), html_rl_cls_cmp);
++		for (k = 1, w = 1; k < n; k++)
++			if (v[k] != v[w - 1])
++				v[w++] = v[k];
++		n = w;
++	}
++	e->cls = v;
++	e->ncls = n;
++	e->cls_state = 1;
++}
++
++/* Is the class token tok[0..tl) one any used sheet may name? */
++static bool html_rl_class_named(html_content *c, const char *tok, size_t tl)
++{
++	unsigned int i;
++	uint32_t h = 2166136261u;
++	size_t q;
++	for (q = 0; q < tl; q++)
++		h = html_rl_cls_hash_step(h, (uint8_t)tok[q]);
++	for (i = 0; i < c->stylesheet_count; i++) {
++		struct html_rl_sib_sheet *e;
++		if (c->stylesheets[i].sheet == NULL ||
++		    c->stylesheets[i].unused)
++			continue;
++		e = html_rl_sib_sheet_for(c->stylesheets[i].sheet);
++		if (e == NULL)
++			return true;	/* unreadable: may name it */
++		if (e->cls_state == 0)
++			html_rl_sheet_classes(e);
++		if (e->cls_state != 1)
++			return true;
++		if (e->ncls > 0 && bsearch(&h, e->cls, (size_t)e->ncls,
++				sizeof(h), html_rl_cls_cmp) != NULL)
++			return true;
++	}
++	return false;
++}
++
++static bool html_rl_cls_ws(char ch)
++{
++	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
++	       ch == '\f';
++}
++
++/* Is tok[0..tl) one of list's whitespace-separated tokens? */
++static bool html_rl_cls_has(const char *list, const char *tok, size_t tl)
++{
++	const char *p = list;
++	while (*p != '\0') {
++		const char *a;
++		while (html_rl_cls_ws(*p))
++			p++;
++		a = p;
++		while (*p != '\0' && !html_rl_cls_ws(*p))
++			p++;
++		if ((size_t)(p - a) == tl && tl > 0 &&
++		    memcmp(a, tok, tl) == 0)
++			return true;
++	}
++	return false;
++}
++
++/* True if every token in `from` that is missing from `to` is named by no
++ * sheet. *ntok counts those tokens. */
++static bool html_rl_cls_diff_unnamed(html_content *c, const char *from,
++		const char *to, int *ntok)
++{
++	const char *p = from;
++	while (*p != '\0') {
++		const char *a;
++		while (html_rl_cls_ws(*p))
++			p++;
++		a = p;
++		while (*p != '\0' && !html_rl_cls_ws(*p))
++			p++;
++		if (p == a || html_rl_cls_has(to, a, (size_t)(p - a)))
++			continue;
++		(*ntok)++;
++		if (html_rl_class_named(c, a, (size_t)(p - a)))
++			return false;
++	}
++	return true;
++}
++
++/* Set while a style attribute change runs as a class change (370): its
++ * "old class" is the current one, and the change is not to the class. */
++static bool html_rl_style_as_class;
++
++/* 1 when the class change old_class -> (live class) on el restyles
++ * nothing: no added or removed token is named by any sheet. */
++static int html_rl_class_change_unnamed(html_content *c, dom_node *el,
++		const char *old_class, int *ntok)
++{
++	char *new_class = html_rl_sib_attr_value((dom_element *)el, "class",
++			NULL);
++	const char *nw = new_class != NULL ? new_class : "";
++	int r = html_rl_cls_diff_unnamed(c, old_class, nw, ntok) &&
++		html_rl_cls_diff_unnamed(c, nw, old_class, ntok) ? 1 : 0;
++	free(new_class);
++	return r;
++}
++
+ /* True if the class change old_class -> (live class) on el might restyle a
+  * following sibling through a '+'/'~' rule: any left compound whose match
+  * state differs between the two class sets (XOR). Conservative declines
+@@ -11283,7 +11592,15 @@
+ 		struct html_rl_sib_compound *cp)
+ {
+ 	struct html_rl_sib_compound tmp;
++	dom_node_type type;
+ 	bool m;
++	/* Patch 414: 198's :has ancestor walk climbs to the Document node,
++	 * which is no element (dom_element_get_tag_name read garbage: ASan
++	 * SEGV on youtube). Unreached until 413 made :has compounds reach
++	 * has_cp. A non-element matches no compound. */
++	if (dom_node_get_node_type(el, &type) != DOM_NO_ERR ||
++	    type != DOM_ELEMENT_NODE)
++		return false;
+ 	if (!html_rl_sib_compound_dup(&tmp, cp))
+ 		return true;
+ 	tmp.has_pseudo = false;
+@@ -12459,7 +12776,9 @@
+ 		return -1;
+ 	macsurf_debug_log_writef("LIFE rebuild local: style attribute "
+ 		"change, as a class change");
++	html_rl_style_as_class = true;	/* patch 414 */
+ 	r = html_reconvert_local_change(base_c, vnode, true, cs);
++	html_rl_style_as_class = false;
+ 	free(cs);
+ 	return r;
+ }
+@@ -12515,6 +12834,20 @@
+ 	 * whole). */
+ 	t0 = macos9_micros();
+ 
++	/* Patch 414: a class change no selector can see restyles nothing
++	 * (html_rl_class_change_unnamed above). */
++	if (class_change && old_class != NULL &&
++	    old_class != html_rl_class_same && !html_rl_style_as_class) {
++		int ntok = 0;
++		if (html_rl_class_change_unnamed(c, (dom_node *)vnode,
++				old_class, &ntok)) {
++			macsurf_debug_log_writef("LIFE rebuild local: class "
++				"change names no selector (%d tokens), "
++				"nothing restyled", ntok);
++			return 0;
++		}
++	}
++
+ 	/* Patch 300 - a change to a <title> element's text names
+ 	 * content the box tree never renders: results pages and
+ 	 * single-page apps write document.title constantly, and the

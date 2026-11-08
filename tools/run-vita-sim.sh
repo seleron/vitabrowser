@@ -370,6 +370,10 @@ JS-sib-unreadable file:///app0:/testpages/JS-sib-unreadable.html
 CSS-sib-unreadable-ref file:///app0:/testpages/CSS-sib-unreadable-ref.html
 JS-sib-universal file:///app0:/testpages/JS-sib-universal.html
 CSS-sib-universal-ref file:///app0:/testpages/CSS-sib-universal-ref.html
+JS-class-unnamed file:///app0:/testpages/JS-class-unnamed.html
+CSS-class-unnamed-ref file:///app0:/testpages/CSS-class-unnamed-ref.html
+JS-class-unnamed-attr file:///app0:/testpages/JS-class-unnamed-attr.html
+CSS-class-unnamed-attr-ref file:///app0:/testpages/CSS-class-unnamed-attr-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1899,6 +1903,17 @@ k413l=$(printf '%s\n' "$k413seg" | grep -c "LIFE rebuild local: blocks placed\|L
 k413d=$(printf '%s\n' "$k413seg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
 echo "  JS-sib-universal: rows $k413r (0), block changes local ${k413l} (1 or more), the .a and .hx inserts declined ${k413d} (2 or more)"
 [ "$k413r" = 0 ] && [ "${k413l:-0}" -ge 1 ] && [ "${k413d:-0}" -ge 2 ] || fail "universal, font-face comment, plain left pseudo, :has(> x)"
+# Patch 414: class changes whose tokens no selector names restyle nothing
+# (<html>, <body>, a div: 4); .dark on <html>, .md\3a hide and a [class*=]
+# class still restyle -- those three are never answered as no-ops.
+k414r=$(fl_rows JS-class-unnamed CSS-class-unnamed-ref)
+k414seg=$(awk '/ page [0-9]+\/[0-9]+ JS-class-unnamed: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k414n=$(printf '%s\n' "$k414seg" | grep -c "class change names no selector" || true)
+k414ar=$(fl_rows JS-class-unnamed-attr CSS-class-unnamed-attr-ref)
+k414aseg=$(awk '/ page [0-9]+\/[0-9]+ JS-class-unnamed-attr: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k414an=$(printf '%s\n' "$k414aseg" | grep -c "class change names no selector" || true)
+echo "  JS-class-unnamed: rows $k414r (0), class changes answered as no-ops ${k414n} (4); [class*=] page rows $k414ar (0), no-ops ${k414an} (0)"
+[ "$k414r" = 0 ] && [ "${k414n:-0}" -eq 4 ] && [ "$k414ar" = 0 ] && [ "${k414an:-1}" -eq 0 ] || fail "class changes no selector names"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
