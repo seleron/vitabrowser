@@ -1,0 +1,279 @@
+# netsurf: an attribute a sheet can select on is re-selected as a class change; inline <svg> is a replaced leaf for the local paths (patch 417)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 416)
+#
+# The census's "kind" batches (14 in r129): an attribute change a used
+# sheet can select on went straight to the full rebuild (patch 310/313's
+# kind gate). A probe (scratch only) named them across ten sites:
+# data-theme / data-*-theme / data-cjk-order on <html>, aria-expanded,
+# disabled, tabindex, title, href, name on an <input>, eid, data-fbar,
+# an ng-app-id on a <style>, data-loaded on a <script>.
+#
+#  - html_reconvert_local_attr_restyle: answered as patch 370 answers a
+#    style attribute -- the element and its subtree re-selected through
+#    the class-change paths (html_rl_style_as_class set, so 414's no-op
+#    does not take it) -- unless a sibling selector can match on the
+#    attribute: 409's selector scan, generalised from [style to any name
+#    (html_rl_attr_sel_risk / html_rl_attr_sib_scan /
+#    html_rl_attr_sibling_risk; the style wrappers stay). Not id (#id
+#    selectors are not found by the attribute scans). An element box
+#    construction never boxes (style, meta, link, title, base, head:
+#    415's list) renders nothing. A change on <html> still meets the
+#    root's "parent is not a block" decline.
+#  - macos9_reconvert.c: try_local_one calls it where it declined with
+#    the kind classifier; its declines are local declines.
+#  - Inline <svg> (a replaced box, children never converted: fixes195)
+#    joins the replaced-child list (364) and the leaf tags (407), and the
+#    subtree walks never descend into it (bbc's account buttons).
+#
+# Sites (scratch build, ten with kind batches): kind 12 -> 0; google 10
+# attribute changes re-selected, rte 67.
+#
+--- a/content/handlers/html/html.c	2026-11-08 15:30:45.940311009 +0000
++++ b/content/handlers/html/html.c	2026-11-08 16:16:32.278234340 +0000
+@@ -6343,7 +6343,9 @@
+ {
+ 	static const char *const ok[] = {
+ 		"img", "input", "button", "select", "option", "optgroup",
+-		"textarea", "label", "form", NULL
++		"textarea", "label", "form",
++		"svg",	/* patch 417: a replaced box, no object */
++		NULL
+ 	};
+ 	dom_string *name = NULL;
+ 	bool found = false;
+@@ -6375,6 +6377,21 @@
+  * elements as well */
+ static bool html_rl_tags_oc = false;
+ 
++/* Patch 417: an inline <svg> is one replaced box (SVG_INLINE, fixes195):
++ * box construction never converts its children (they are painted from
++ * the DOM, vb_inline_svg.c), so no check walks them either */
++static bool html_rl_is_svg(dom_node *n)
++{
++	dom_string *name = NULL;
++	bool is;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	is = dom_string_caseless_lwc_isequal(name, corestring_lwc_svg);
++	dom_string_unref(name);
++	return is;
++}
++
+ /* are all of element's descendant elements plain inline ones -- or, with
+  * blocks_too, plain inline, block or list ones (patch 176)? */
+ static bool html_rl_subtree_tags(dom_node *element, bool blocks_too)
+@@ -6382,6 +6399,8 @@
+ 	dom_node *n = NULL, *next;
+ 	unsigned int count = 0;
+ 
++	if (html_rl_is_svg(element))	/* patch 417: never converted */
++		return true;
+ 	if (dom_node_get_first_child(element, &n) != DOM_NO_ERR)
+ 		return false;
+ 	while (n != NULL) {
+@@ -6400,7 +6419,7 @@
+ 				dom_node_unref(n);
+ 				return false;
+ 			}
+-			down = true;
++			down = !html_rl_is_svg(n);	/* patch 417 */
+ 		}
+ 		next = NULL;
+ 		if (down && dom_node_get_first_child(n, &next) == DOM_NO_ERR &&
+@@ -8472,7 +8491,9 @@
+ static bool html_rl_leaf_tag(dom_node *n)
+ {
+ 	static const char *const tags[] = {
+-		"iframe", "img", "input", "textarea", "button", "select", NULL
++		"iframe", "img", "input", "textarea", "button", "select",
++		"svg",	/* patch 417 */
++		NULL
+ 	};
+ 	dom_string *name = NULL;
+ 	bool found = false;
+@@ -11930,8 +11951,9 @@
+ 	return true;
+ }
+ 
+-/* Set while a style attribute change runs as a class change (370): its
+- * "old class" is the current one, and the change is not to the class. */
++/* Set while a style attribute change runs as a class change (370), or
++ * any attribute a sheet can see (417): its "old class" is the current
++ * one, and the change is not to the class. */
+ static bool html_rl_style_as_class;
+ 
+ /* 1 when the class change old_class -> (live class) on el restyles
+@@ -12965,7 +12987,8 @@
+  * namespace could hide the name); @import (imported rules are not in
+  * this text); a rule nested in declarations; anything unterminated or
+  * nested deeper than 32. */
+-static bool html_rl_style_sel_risk(const uint8_t *s, size_t a, size_t b)
++static bool html_rl_attr_sel_risk(const uint8_t *s, size_t a, size_t b,
++		const char *name, size_t nlen)
+ {
+ 	size_t i;
+ 	int br = 0;
+@@ -13003,8 +13026,9 @@
+ 			br++;
+ 			while (j < b && html_rl310_is_ws(s[j]))
+ 				j++;
+-			if (j + 5 <= b && html_rl310_cieq(s + j, "style", 5) &&
+-			    (j + 5 == b || !html_rl310_is_namech(s[j + 5])))
++			if (j + nlen <= b && html_rl310_cieq(s + j, name, nlen) &&
++			    (j + nlen == b ||
++			     !html_rl310_is_namech(s[j + nlen])))
+ 				seen = true;
+ 		} else if (ch == ',') {
+ 			seen = false;	/* the next complex selector */
+@@ -13015,7 +13039,9 @@
+ 	return br != 0 || q != 0;
+ }
+ 
+-static bool html_rl_style_sib_scan(const uint8_t *s, size_t len)
++/* Patch 417: for any attribute name (was [style only) */
++static bool html_rl_attr_sib_scan(const uint8_t *s, size_t len,
++		const char *name, size_t nlen)
+ {
+ 	unsigned char decl[33];
+ 	int depth = 0;
+@@ -13087,7 +13113,7 @@
+ 			if (p < i && s[p] == '@') {
+ 				decl[++depth] = 0;	/* @media etc.: rules */
+ 			} else {
+-				if (html_rl_style_sel_risk(s, p, i))
++				if (html_rl_attr_sel_risk(s, p, i, name, nlen))
+ 					return true;
+ 				decl[++depth] = 1;
+ 			}
+@@ -13103,10 +13129,12 @@
+ 	return depth != 0;
+ }
+ 
+-static bool html_rl_style_sibling_risk(html_content *c)
++/* Patch 417: generalised from style to any attribute name (lowercase) */
++static bool html_rl_attr_sibling_risk(html_content *c, const char *name)
+ {
+ 	unsigned int si;
+ 	int k;
++	size_t nlen = strlen(name);
+ 
+ 	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
+ 		struct html_rl_sib_sheet *sh;
+@@ -13133,22 +13161,27 @@
+ 			 * scan's conservative exits -- @import, nesting --
+ 			 * must not turn that "no" into a "yes": claude) */
+ 			if (data == NULL || size == 0 ||
+-			    (html_rl_sheet_scan_attr(data, size, "style", 5,
+-					html_rl_pseudos_for("style")) &&
+-			     html_rl_style_sib_scan(data, size)))
++			    (html_rl_sheet_scan_attr(data, size, name, nlen,
++					html_rl_pseudos_for(name)) &&
++			     html_rl_attr_sib_scan(data, size, name, nlen)))
+ 				return true;
+ 			continue;
+ 		}
+ 		for (k = 0; k < sh->nlefts; k++)
+-			if (html_rl_cp_tests_attr(&sh->lefts[k], "style"))
++			if (html_rl_cp_tests_attr(&sh->lefts[k], name))
+ 				return true;
+ 		for (k = 0; k < sh->nrules; k++)
+-			if (html_rl_cp_tests_attr(&sh->rules[k].l, "style"))
++			if (html_rl_cp_tests_attr(&sh->rules[k].l, name))
+ 				return true;
+ 	}
+ 	return false;
+ }
+ 
++static bool html_rl_style_sibling_risk(html_content *c)
++{
++	return html_rl_attr_sibling_risk(c, "style");
++}
++
+ /* Patch 373: can a sibling rule see the change's block go empty or stop
+  * being empty? :empty on the block itself is cascaded again by its
+  * rebuild, and no ancestor of it can be empty; what reaches outside is a
+@@ -13254,6 +13287,63 @@
+ 	r = html_reconvert_local_change(base_c, vnode, true, cs);
+ 	html_rl_style_as_class = false;
+ 	free(cs);
++	return r;
++}
++
++/* Patch 417: an attribute a used sheet can select on (310 sent every one
++ * to the full rebuild through try_local's kind gate) is answered as 370
++ * answers a style attribute: the element and its subtree re-selected by
++ * the class-change paths, unless a sibling selector can match on the
++ * attribute (409's selector scan, for any name). The kind batches of the
++ * 21 sites were data-theme / data-*-theme on <html> (a root: still the
++ * full rebuild), aria-expanded, disabled, tabindex, title, href, eid, an
++ * ng-app-id on a <style>... An element box construction never gives a box
++ * (a <style>, <meta>, <link> ...) renders nothing. Not id: #id selectors
++ * are not found by the attribute scans. */
++int html_reconvert_local_attr_restyle(struct content *base_c, void *vnode,
++		const char *attr_name);
++int html_reconvert_local_attr_restyle(struct content *base_c, void *vnode,
++		const char *attr_name)
++{
++	html_content *c = (html_content *)base_c;
++	dom_string *cls = NULL;
++	char name[64], *cs;
++	size_t k;
++	int r;
++
++	if (c == NULL || vnode == NULL || attr_name == NULL ||
++	    attr_name[0] == '\0' || strlen(attr_name) >= sizeof(name) ||
++	    strcasecmp(attr_name, "id") == 0)
++		return -1;
++	for (k = 0; attr_name[k] != '\0'; k++)
++		name[k] = (char)tolower((unsigned char)attr_name[k]);
++	name[k] = '\0';
++	if (html_rl_attr_sibling_risk(c, name)) {
++		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
++			"sibling selector can match on the %s attribute)", name);
++		return -1;
++	}
++	if (box_for_node((dom_node *)vnode) == NULL &&
++	    html_rl_noop_never_boxed((dom_node *)vnode)) {
++		macsurf_debug_log_writef("LIFE rebuild local: %s attribute on "
++			"an element that renders nothing", name);
++		return 0;
++	}
++	if (dom_element_get_attribute((dom_node *)vnode, corestring_dom_class,
++			&cls) != DOM_NO_ERR)
++		return -1;
++	cs = cls != NULL ? strndup(dom_string_data(cls),
++			dom_string_byte_length(cls)) : strdup("");
++	if (cls != NULL)
++		dom_string_unref(cls);
++	if (cs == NULL)
++		return -1;
++	macsurf_debug_log_writef("LIFE rebuild local: %s attribute change, "
++		"as a class change", name);
++	html_rl_style_as_class = true;	/* not a class change (414) */
++	r = html_reconvert_local_change(base_c, vnode, true, cs);
++	html_rl_style_as_class = false;
++	free(cs);
+ 	return r;
+ }
+ 
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-08 15:39:14.244648109 +0000
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-08 16:16:32.285949740 +0000
+@@ -1343,8 +1343,14 @@
+ 		 * attribute: only the full rebuild is sound, exactly as
+ 		 * before this patch. Otherwise the local path below. */
+ 		if (!html_rl_attr_local_ok(c, node, attr_name)) {
+-			g_one_fail_kind = 1;
+-			return 0;
++			/* Patch 417 - re-selected as a class change is,
++			 * unless the attribute is id or a sibling selector
++			 * can see it; its declines are local declines now */
++			extern int html_reconvert_local_attr_restyle(
++					struct content *c, void *node,
++					const char *attr_name);
++			return html_reconvert_local_attr_restyle(c, node,
++					attr_name) == 0;
+ 		}
+ 		break;
+ 	default:

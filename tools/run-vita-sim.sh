@@ -378,6 +378,8 @@ JS-sheet-noop file:///app0:/testpages/JS-sheet-noop.html
 CSS-sheet-noop-ref file:///app0:/testpages/CSS-sheet-noop-ref.html
 JS-inline-mid file:///app0:/testpages/JS-inline-mid.html
 CSS-inline-mid-ref file:///app0:/testpages/CSS-inline-mid-ref.html
+JS-attr-restyle file:///app0:/testpages/JS-attr-restyle.html
+CSS-attr-restyle-ref file:///app0:/testpages/CSS-attr-restyle-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1943,6 +1945,18 @@ k416p=$(printf '%s\n' "$k416seg" | grep -c "leaf element placed in a line of its
 k416d=$(printf '%s\n' "$k416seg" | grep -c "declined (new element is not a plain block" || true)
 echo "  JS-inline-mid: rows $k416r (0), between blocks ${k416m} (2), lines of their own ${k416p} (2), appended ${k416e} (1), image span declined ${k416d} (1)"
 [ "$k416r" = 0 ] && [ "${k416m:-0}" -eq 2 ] && [ "${k416p:-0}" -ge 2 ] && [ "${k416e:-0}" -eq 1 ] && [ "${k416d:-0}" -ge 1 ] || fail "inline elements between blocks"
+# Patch 417: attributes a sheet can see, re-selected as a class change:
+# data-state, aria-pressed, data-x (3) restyled locally; an attribute on a
+# <style> renders nothing (1); data-y (a sibling rule) declines (1); the
+# id change keeps the kind decline -- two full rebuilds on the page.
+k417r=$(fl_rows JS-attr-restyle CSS-attr-restyle-ref)
+k417seg=$(awk '/ page [0-9]+\/[0-9]+ JS-attr-restyle: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k417a=$(printf '%s\n' "$k417seg" | grep -c "attribute change, as a class change" || true)
+k417n=$(printf '%s\n' "$k417seg" | grep -c "attribute on an element that renders nothing" || true)
+k417d=$(printf '%s\n' "$k417seg" | grep -c "declined (a sibling selector can match on the data-y attribute)" || true)
+k417f=$(printf '%s\n' "$k417seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-attr-restyle: rows $k417r (0), re-selected ${k417a} (3 or more), renders nothing ${k417n} (1), sibling decline ${k417d} (1), full rebuilds ${k417f} (2)"
+[ "$k417r" = 0 ] && [ "${k417a:-0}" -ge 3 ] && [ "${k417n:-0}" -eq 1 ] && [ "${k417d:-0}" -eq 1 ] && [ "${k417f:-0}" -eq 2 ] || fail "attributes a sheet can see"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
@@ -2204,8 +2218,13 @@ acl=$(awk '/page [0-9]*\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
 	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE BATCHCAUSE cause=' || true)
 acl_kind=$(printf '%s\n' "$acl" | grep -c 'cause=kind' || true)
 acl_local=$(printf '%s\n' "$acl" | grep -c 'cause=local' || true)
-echo "  JS-attr-local batch causes: kind=${acl_kind} local=${acl_local}"
-[ "$acl_kind" -ge 1 ] && [ "$acl_local" -ge 1 ] || o2_bad="$o2_bad js-attr-local-batchcause"
+# Patch 417: the data-flag change (a used sheet selects on it) is no
+# longer a kind decline: it is re-selected as a class change, locally.
+acl_flag=$(awk '/page [0-9]*\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -a -c 'data-flag attribute change, as a class change' || true)
+echo "  JS-attr-local batch causes: kind=${acl_kind} (0) local=${acl_local} (1 or more); data-flag re-selected ${acl_flag} (1)"
+[ "$acl_kind" -eq 0 ] && [ "$acl_local" -ge 1 ] && [ "${acl_flag:-0}" -ge 1 ] || o2_bad="$o2_bad js-attr-local-batchcause"
 # Patch 316 (doc 23 stage 1): the sheet census. Each committed full
 # reconvert of a nodeless batch logs which stylesheet entries marked it
 # ("LIFE SHEETCAUSE sheets=N", synchronous, inside the page's window).
@@ -2235,8 +2254,13 @@ sci_single=$(printf '%s\n' "$sci" | grep -c 'SHEETID single' || true)
 sci_multi=$(printf '%s\n' "$sci" | grep -c 'SHEETID multi' || true)
 sci_stale=$(printf '%s\n' "$sci" | grep -c 'SHEETID stale' || true)
 echo "  JS-sheet-census: ${scr:-no summary}; sheet causes single=${scc_one} multi=${scc_multi}; identity single=${sci_single} multi=${sci_multi} stale=${sci_stale}"
+# Patch 417: step 3's arming attribute (data-arm, which the sheet names)
+# is answered locally now, not by a kind full rebuild that held the first
+# edit's batch past the second edit: each edit may get its own batch (two
+# "single" identities, counters 3 and 4) instead of one "stale" one.
 [ "$scr" = "SHEETCENSUS: 3/3 passed" ] && [ "$scc_one" -ge 1 ] && [ "$scc_multi" -ge 1 ] && \
-	[ "$sci_single" -ge 1 ] && [ "$sci_multi" -ge 1 ] && [ "$sci_stale" -ge 1 ] || o2_bad="$o2_bad js-sheet-census"
+	[ "$sci_single" -ge 1 ] && [ "$sci_multi" -ge 1 ] && \
+	{ [ "$sci_stale" -ge 1 ] || [ "$sci_single" -ge 3 ]; } || o2_bad="$o2_bad js-sheet-census"
 # Patch 320 (doc 23 B0): a <style> edit's own precise mark is answered
 # with no rebuild while the <style> has no box, so each edit costs only
 # the sheet's batch. The page edits four sheets (textContent, CSSOM
