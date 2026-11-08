@@ -12223,3 +12223,62 @@ No sudo.
 2. List items with bullet markers.
 3. The remaining "new content is not plain inline" (bbc's block children,
    wpblog's iframes).
+
+## Patch 419 (2026-11-08): a class or attribute change on `<html>` that re-cascades to the same styles rebuilds nothing
+
+**The unit.** The root element's own box has no parent. So every class
+change on `<html>` whose tokens a sheet names (after 414), and every
+sheet-visible attribute on it (after 417), ended at "restyled block's
+parent is not a block": a full rebuild. 415's dry run had already
+classified them:
+- jquery's and wpnews's change no element's style;
+- youtube's changes only layout;
+- wikipedia's and archwiki's change box structure.
+
+**The change** (html.c): on the root's own box, `html_rl_block_restyle`
+runs 415's whole-document walk (now `html_rl_doc_noop`, with a label:
+"root change" here, "sheet change" for 415's batches, whose log lines are
+unchanged). It answers the change when no element's style differs and no
+box-less element would get a box. Otherwise the decline stands.
+
+**Why not colour changes too.** `css_computed_style_diff`'s COLOR_DIFF
+covers only the `color` property, and `css_computed_style_is_paint_only_diff`
+covers background/border/outline colours but **not** `color`. A theme
+switch changes both, so neither passes it. Committing paint-only root
+changes in place needs a combined comparator, i.e. a libcss export: a
+later unit.
+
+**Sites** (scratch build): jquery's and wpnews's root changes answered
+(their batches still end at other declines). youtube's and wikipedia's
+decline on a `<div>` whose style changes; archwiki's on a box-less
+`<div>` that would get a box.
+
+**Gate.**
+- New pair **JS-root-noop / CSS-root-noop-ref**. A `js-ready` class named
+  by a rule that matches nothing, and `data-theme="light"` with a rule
+  for "dark" only: **2 restyle nothing**. A `dark` class that restyles
+  the body: **declined** (1). Rows 0.
+- **gate419 exit 0 on the first run.**
+
+**Restage from pristine:** 501 applied plus the 2 known collisions,
+html.c byte-identical. **gate419c (restaged): exit 0**.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean** (349
+page dumps).
+
+**Scorecard r132**: 21 sites against `r79-360`, the 419 and 418 binaries
+back to back: **72.99 vs 71.76**. All of the difference is guardian, 62.1
+vs 36.6. Reruns: 419 read 61.4 and 62.2; **418 read 36.6, then 61.5**. So
+guardian's 36/62 flip is the live site on either binary: noise. No crash.
+
+**Census, back to back:** BATCHCAUSE **80 vs 82**; 2 root changes
+answered ("parent is not a block" 8 -> 6).
+
+No sudo.
+
+**Next:**
+1. A libcss paint comparator (colour + background/border/outline), then
+   committing paint-only root and sheet changes in place.
+2. List items with bullet markers.
+3. bbc's block children / wpblog's iframes in "new content is not plain
+   inline".
