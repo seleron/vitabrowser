@@ -11974,3 +11974,96 @@ No sudo.
    `<html>` changes.
 3. Sheet batches flushed while a sheet is still loading (14): defer them
    to the settle instead of a full rebuild that cannot apply the sheet.
+
+## Patch 416 (2026-11-08): plain inline elements between blocks built alone; `:has()` rules (never matched here) leave the sibling scan
+
+**The unit.** After 415 the top decline is "new element is not a plain
+block, list item or block of blocks" (14 in r128). A debug build (scratch
+only) logged what each new element held:
+
+| What the new element held | Where |
+|---|---|
+| A bare `<span>` inserted among result blocks (between blocks; sometimes after the last) | google, 7 |
+| Inline SVG | claude, bbc, cnnlite |
+| A `<video>` | youtube |
+| A `<table>` | wpblog |
+| A custom element | google |
+| A nested `<html>` element from an innerHTML quirk | claude's spinner |
+
+**The change** (html.c):
+- **Inline elements between blocks.** A plain inline element (an inline
+  tag whose descendants are all plain inline) inserted between blocks
+  takes 407's way. It is built alone, and its **run** of boxes (the inline
+  box, its contents, its inline end) moves from the line it was built
+  into to a line of its own after its earlier block. 407 moved one box
+  and declined on an inline end.
+- **Appended after a block** it takes 378's way: built alone, on a line of
+  its own at the end. It logs its own line; 378's iframe/image line is
+  unchanged.
+- **`:has()` leaves the sibling scan.** google's span batches then declined
+  one step later, at the sibling check. Its sheet is conservative through
+  `.mj3qce:has(.cDeo3)+.CHVz3d`. This libcss parses `:has()` but **never
+  matches it** (patch 328, `selector_never_matches_part`) and rejects it
+  inside `:not()` (fixes360b). So a selector with `:has(` directly in a
+  compound, or directly inside `:not(`, never applies:
+  `html_rl_prelude_drop_has` drops it before the sibling parser reads the
+  prelude. Inside a forgiving `:is()`/`:where()` list only that branch
+  would drop, so those are left alone. rte's `:has(~ ...)` and wpblog's
+  `:not(...:has(...+...))` go too.
+- **A hang in the first cut.** The new scan never stopped on a prelude
+  whose parentheses do not balance: google **hung**, a 307 s timeout and
+  not a crash. The six-site check first looked like a huge win (claude 0,
+  youtube 0 full rebuilds) until the logs showed the sims had died
+  mid-load. The prelude's end now always closes the last selector, the
+  copy is clamped at the end, and the gate page carries an unbalanced
+  `.zz:has(.q, .r {` rule.
+
+**A correction to 413.** Its entry said JS-sib-universal's `.hx` insert
+"declines (198's check, newly reached; the border appears)". The border
+**never** appears, since `:has()` never matches here; the rows matched
+because the reference lacks it too. 413's `has_has` fix made 198's check
+decline for rules that can never apply, and 414's crash fix in that walk
+stands. With 416 the `:has` rule is dropped and the `.hx` insert is
+placed locally (gate expectation updated: `.a` declines, 1).
+
+**Sites** (scratch build): google's span batches **answered locally (6)**,
+no sibling declines; rte's insert/remove sibling declines 2 -> 0.
+
+**Gate.**
+- New pair **JS-inline-mid / CSS-inline-mid-ref**: a `<span>` with a `<b>`
+  and an `<a>` placed between blocks (**2, lines of their own 2**), a span
+  appended after the last block (**1**), a span holding an `<img>`
+  **declined** (1). Its sheet carries three `:has()` rules and the
+  unbalanced one. Rows 0.
+- **gate416b exit 0** (gate416 failed only on 413's `.hx` expectation
+  above).
+
+**Restage from pristine:** 498 applied plus the 2 known collisions,
+html.c byte-identical. **gate416c (restaged): exit 0**.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean** (343
+page dumps).
+
+**Scorecard r129**: 21 sites against `r79-360`, the 416 and 415 binaries
+back to back: **73.05 vs 73.11**. claude 75.8/77.0 reran 75.8/77.0 and
+77.0/75.8 in the two arms: it flips. No crash.
+
+**Census, back to back:**
+- BATCHCAUSE **89 vs 100**, but the 415 arm's claude had **15** full
+  rebuilds (its reruns: 9 and 5; 416's: 5 and 5). **Without claude: 84 vs
+  85, flat.**
+- What 416 targets did fall: "new element is not a plain block" **20 ->
+  10**, sibling insert/remove declines 7 -> 3, conservative-sheet 7 -> 5,
+  class-sibling 7 -> 5.
+- 8 inline elements were placed.
+- The batches those declines no longer end still meet other declines
+  (google 10 vs 11).
+
+No sudo.
+
+**Next:**
+1. Inline SVG in new subtrees (claude, bbc, cnnlite): `svg` as a replaced
+   leaf, its children unwalked.
+2. "restyled block holds floats or list markers" (archwiki, cnnlite,
+   google, stackoverflow).
+3. Committing layout-only re-cascades in place (415's next step).
