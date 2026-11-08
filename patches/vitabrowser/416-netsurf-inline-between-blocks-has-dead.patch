@@ -1,0 +1,322 @@
+# netsurf: plain inline elements inserted between blocks are built alone; :has() rules (never matched here) leave the sibling scan (patch 416)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 415)
+#
+# The census's top decline after 415, "new element is not a plain block,
+# list item or block of blocks" (14). A debug build (scratch only) named
+# what each new element held: google 7x a bare <span> inserted among its
+# result blocks (between blocks, or after the last), inline SVG (claude,
+# bbc, cnnlite), a <video> (youtube), a <table> (wpblog), a custom element
+# (google).
+#
+#  - A plain inline element (an inline tag whose descendants are all
+#    plain inline) between blocks takes patch 407's way: built alone, and
+#    its run of boxes -- the inline box, its contents, its inline end --
+#    moved from the line it was built into to a line of its own after its
+#    earlier block (407 moved one box only). One appended after a block
+#    takes 378's way: built alone, a line of its own at the end (its own
+#    log line; 378's iframe/image line is unchanged).
+#  - google's span batches then declined at the sibling check: its sheet
+#    is conservative through ".mj3qce:has(.cDeo3)+.CHVz3d". libcss here
+#    parses :has() but never matches it (patch 328,
+#    selector_never_matches_part) and rejects it inside :not() (fixes360b),
+#    so a selector with :has( directly in a compound, or directly inside
+#    :not(, never applies: html_rl_prelude_drop_has drops it before the
+#    sibling parser reads the prelude (inside a forgiving :is()/:where()
+#    only that branch would drop: left alone). rte's ":has(~ ...)" and
+#    wpblog's ":not(...:has(...+...))" go too.
+#  - The first cut of that scan never stopped on a prelude whose
+#    parentheses do not balance (google hung, a 307 s timeout): the
+#    prelude's end now always closes the last selector, and the copy is
+#    clamped at the end.
+#
+# google (scratch build): its span batches answered locally (6), no
+# sibling declines; rte's insert/remove sibling declines 2 -> 0.
+#
+--- a/content/handlers/html/html.c	2026-11-08 13:46:25.350844983 +0000
++++ b/content/handlers/html/html.c	2026-11-08 14:40:35.108832263 +0000
+@@ -9264,22 +9264,56 @@
+ 						goto next_node;
+ 					}
+ 				}
++				/* Patch 416: a plain inline element (a <span>,
++				 * an <a>: every descendant plain inline) between
++				 * blocks -- google inserts bare <span>s among its
++				 * result blocks, the census's largest "new element
++				 * is not a plain block" -- takes 407's way: built
++				 * alone, its run of boxes (inline box, contents,
++				 * inline end) moved into a line of its own. */
++				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
++				    html_rl_inline_tag(n) &&
++				    html_rl_subtree_tags(n, false) &&
++				    html_rl_boxed_after(n) &&
++				    html_rl_block_neighbour(n, pbox, false) &&
++				    html_rl_block_neighbour(n, pbox, true)) {
++					full = true;
++					why = why != NULL ? why :
++						"an inline element between blocks";
++					leafmid[nadd] = true;
++					added[nadd++] = n;
++					dom_node_ref(n);
++					macsurf_debug_log_writef("LIFE rebuild "
++						"local: an inline element inserted "
++						"between blocks, built alone");
++					goto next_node;
++				}
+ 				/* Patch 378: an <iframe> or <img> appended at
+ 				 * the end of the parent (no later sibling has a
+ 				 * box) is built alone wherever it lands (an
+ 				 * inline one at the end of the last line), the
+ 				 * page laid out whole; a frame gets its record
+-				 * and its late load as in a full build (244) */
++				 * and its late load as in a full build (244).
++				 * Patch 416: a plain inline element after a
++				 * block, too -- a line of its own at the end. */
+ 				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
+-				    html_rl_late_tag(n) && !html_rl_boxed_after(n)) {
++				    !html_rl_boxed_after(n) &&
++				    (html_rl_late_tag(n) ||
++				     (html_rl_inline_tag(n) &&
++				      html_rl_subtree_tags(n, false) &&
++				      html_rl_block_neighbour(n, pbox, false)))) {
++					bool late = html_rl_late_tag(n);
+ 					full = true;
+-					why = why != NULL ? why :
+-						"an iframe or image appended";
++					why = why != NULL ? why : late ?
++						"an iframe or image appended" :
++						"an inline element appended";
+ 					added[nadd++] = n;
+ 					dom_node_ref(n);
+ 					macsurf_debug_log_writef("LIFE rebuild "
+-						"local: an iframe or image appended "
+-						"at the end, built alone");
++						"local: %s appended at the end, "
++						"built alone", late ?
++						"an iframe or image" :
++						"an inline element");
+ 					goto next_node;
+ 				}
+ 				if (nadd == HTML_RL_MAX_CHANGES ||
+@@ -9703,10 +9737,20 @@
+ 		 * a line at the END of pbox: moved into a line of its own
+ 		 * right after its earlier block */
+ 		if (leafmid[i] && nb->parent != pbox) {
+-			struct box *ic0 = nb->parent, *ic;
++			struct box *ic0 = nb->parent, *ic, *last = nb, *q;
++			bool run_ok = true;
++			/* Patch 416: an inline element's run -- its box,
++			 * its contents, its inline end, all in ic0 */
++			if (nb->type == BOX_INLINE && nb->inline_end != NULL) {
++				last = nb->inline_end;
++				for (q = nb; q != NULL && q != last; q = q->next)
++					;
++				run_ok = q == last && last->parent == ic0;
++			}
+ 			if (ic0 == NULL || ic0->type != BOX_INLINE_CONTAINER ||
+ 			    ic0->node != NULL || ic0->parent != pbox ||
+-			    (nb->next != NULL &&
++			    !run_ok ||
++			    (last == nb && nb->next != NULL &&
+ 			     nb->next->type == BOX_INLINE_END)) {
+ 				for (i++; i < nadd; i++)
+ 					dom_node_unref(added[i]);
+@@ -9715,15 +9759,9 @@
+ 					"moved, full reconvert");
+ 				{ html_rl_struct_hits_release(shits, &nshits); return -1; }	/* the full rebuild starts from the DOM */
+ 			}
+-			html_rl_unlink(nb);
+-			if (ic0->children == NULL) {
+-				html_rl_unlink(ic0);
+-				box_free(ic0);
+-			}
+ 			ic = box_create(NULL, NULL, false, NULL, NULL, NULL,
+ 					NULL, c->bctx);
+ 			if (ic == NULL) {
+-				box_free(nb);
+ 				for (i++; i < nadd; i++)
+ 					dom_node_unref(added[i]);
+ 				macsurf_debug_log_writef("LIFE rebuild local: "
+@@ -9732,8 +9770,25 @@
+ 				{ html_rl_struct_hits_release(shits, &nshits); return -1; }
+ 			}
+ 			ic->type = BOX_INLINE_CONTAINER;
++			/* move nb .. last, in order (patch 416: a run) */
++			{
++				struct box *prevm = NULL, *m = nb, *nx;
++				for (;;) {
++					bool end = m == last;
++					nx = m->next;
++					html_rl_unlink(m);
++					html_rl_link_after(ic, prevm, m);
++					prevm = m;
++					if (end)
++						break;
++					m = nx;
++				}
++			}
++			if (ic0->children == NULL) {
++				html_rl_unlink(ic0);
++				box_free(ic0);
++			}
+ 			html_rl_link_after(pbox, after, ic);
+-			html_rl_link_after(ic, NULL, nb);
+ 			html_rl_invalidate(ic);
+ 			if (c->num_objects != objects_before) {
+ 				full = true;
+@@ -10748,6 +10803,116 @@
+ 	return q == 0 && br == 0;
+ }
+ 
++/* Patch 416: libcss here parses :has() but never matches it (patch 328,
++ * selector_never_matches_part), and rejects it inside :not() (fixes360b).
++ * A selector of a prelude that holds :has( directly in a compound, or
++ * directly inside :not(, never applies: it is dropped before the sibling
++ * parser reads the prelude (inside a forgiving :is()/:where() list only
++ * that branch would drop, so those are left alone). google's
++ * ".mj3qce:has(.cDeo3)+.CHVz3d", rte's ":has(~ .blur-container ...)" and
++ * wpblog's ":not(.wp-block-cover:has(...+...))" made whole sheets
++ * conservative. 0: nothing dropped (read the prelude as it is); 1: *out
++ * (malloc'd, *outlen bytes, possibly 0 = nothing left) holds the kept
++ * selectors joined by commas; -1: no memory (read it as it is). */
++static int html_rl_prelude_drop_has(const uint8_t *s, size_t a, size_t b,
++		uint8_t **out, size_t *outlen)
++{
++	size_t i = a, part = a, o = 0;
++	int depth = 0, br = 0, dropped = 0;
++	uint8_t q = 0;
++	bool kill = false, not_fn[16];
++	uint8_t *buf = NULL;
++	memset(not_fn, 0, sizeof(not_fn));
++	for (;;) {
++		uint8_t ch = i < b ? s[i] : ',';
++		if (i < b && q != 0) {
++			if (ch == '\\' && i + 1 < b)
++				i++;
++			else if (ch == q)
++				q = 0;
++			i++;
++			continue;
++		}
++		if (i < b && ch == '\\') {
++			i += 2;
++			continue;
++		}
++		if (i < b && (ch == '"' || ch == '\'')) {
++			q = ch;
++			i++;
++			continue;
++		}
++		if (i < b && ch == '[') {
++			br++;
++			i++;
++			continue;
++		}
++		if (i < b && ch == ']') {
++			if (br > 0)
++				br--;
++			i++;
++			continue;
++		}
++		if (br > 0 && i < b) {
++			i++;
++			continue;
++		}
++		if (i < b && ch == ':' && !(i > a && s[i - 1] == ':') &&
++		    i + 5 <= b && strncasecmp((const char *)s + i + 1,
++				"has(", 4) == 0 &&
++		    (depth == 0 || (depth < 16 && not_fn[depth]))) {
++			kill = true;
++		}
++		if (i < b && ch == '(') {
++			depth++;
++			if (depth < 16)
++				not_fn[depth] = i >= a + 4 &&
++					strncasecmp((const char *)s + i - 4,
++						":not", 4) == 0;
++			i++;
++			continue;
++		}
++		if (i < b && ch == ')') {
++			if (depth > 0)
++				depth--;
++			i++;
++			continue;
++		}
++		/* the prelude's end always closes the last selector (its
++		 * parentheses may not balance) */
++		if (ch == ',' && (depth == 0 || i >= b)) {
++			if (kill) {
++				dropped++;
++			} else {
++				if (buf == NULL) {
++					buf = malloc(b - a + 1);
++					if (buf == NULL)
++						return -1;
++				}
++				size_t e = i < b ? i : b;
++				if (o > 0)
++					buf[o++] = ',';
++				if (e > part) {
++					memcpy(buf + o, s + part, e - part);
++					o += e - part;
++				}
++			}
++			kill = false;
++			if (i >= b)
++				break;
++			part = i + 1;
++		}
++		i++;
++	}
++	if (dropped == 0) {
++		free(buf);
++		return 0;
++	}
++	*out = buf;
++	*outlen = o;
++	return 1;
++}
++
+ static int html_rl_scan_sheet(const uint8_t *s, size_t len,
+ 		struct html_rl_sib_compound **lefts, int *nlefts,
+ 		struct html_rl_sib_rule **rules, int *nrules,
+@@ -10839,12 +11004,24 @@
+ 				struct html_rl_sib_compound *em = NULL;
+ 				struct html_rl_sib_compound *ha = NULL;
+ 				int nl = 0, nru = 0, nem = 0, nha = 0, r, k;
+-				p.s = s;
+-				p.len = len;
+-				p.i = start;
+-				r = html_rl_parse_prelude(&p, i, &l, &nl,
+-						&ru, &nru, &em, &nem, &ha, &nha);
+-				if (r == 2 && html_rl_prelude_sib_free(s, start, i)) {
++				uint8_t *fb = NULL;	/* patch 416 */
++				size_t fl = 0;
++				const uint8_t *ps = s;
++				size_t pa = start, pb = i;
++				if (html_rl_prelude_drop_has(s, start, i, &fb,
++						&fl) == 1) {
++					ps = fb != NULL ? fb :
++						(const uint8_t *)"";
++					pa = 0;
++					pb = fl;
++				}
++				p.s = ps;
++				p.len = pb;
++				p.i = pa;
++				r = pb > pa ? html_rl_parse_prelude(&p, pb, &l,
++						&nl, &ru, &nru, &em, &nem, &ha,
++						&nha) : 0;
++				if (r == 2 && html_rl_prelude_sib_free(ps, pa, pb)) {
+ 					/* patch 412: unreadable, but nothing in
+ 					 * it a sibling check reads: no rule from
+ 					 * it, the sheet stays precise */
+@@ -10872,6 +11049,7 @@
+ 					nha = 0;
+ 					r = 0;
+ 				}
++				free(fb);	/* patch 416: read */
+ 				if (r == 2) {
+ 					for (k = 0; k < *nlefts; k++)
+ 						html_rl_sib_compound_free(

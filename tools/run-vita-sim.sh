@@ -376,6 +376,8 @@ JS-class-unnamed-attr file:///app0:/testpages/JS-class-unnamed-attr.html
 CSS-class-unnamed-attr-ref file:///app0:/testpages/CSS-class-unnamed-attr-ref.html
 JS-sheet-noop file:///app0:/testpages/JS-sheet-noop.html
 CSS-sheet-noop-ref file:///app0:/testpages/CSS-sheet-noop-ref.html
+JS-inline-mid file:///app0:/testpages/JS-inline-mid.html
+CSS-inline-mid-ref file:///app0:/testpages/CSS-inline-mid-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1903,8 +1905,11 @@ k413r=$(fl_rows JS-sib-universal CSS-sib-universal-ref)
 k413seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-universal: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k413l=$(printf '%s\n' "$k413seg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
 k413d=$(printf '%s\n' "$k413seg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
-echo "  JS-sib-universal: rows $k413r (0), block changes local ${k413l} (1 or more), the .a and .hx inserts declined ${k413d} (2 or more)"
-[ "$k413r" = 0 ] && [ "${k413l:-0}" -ge 1 ] && [ "${k413d:-0}" -ge 2 ] || fail "universal, font-face comment, plain left pseudo, :has(> x)"
+# (Patch 416: :has() never matches in this libcss, so .hb:has(> .hx) is
+# dropped from the sibling scan -- the .hx insert is placed locally now;
+# its border never showed, in the parse-time page either.)
+echo "  JS-sib-universal: rows $k413r (0), block changes local ${k413l} (2 or more), the .a insert declined ${k413d} (1)"
+[ "$k413r" = 0 ] && [ "${k413l:-0}" -ge 2 ] && [ "${k413d:-0}" -eq 1 ] || fail "universal, font-face comment, plain left pseudo, :has(> x)"
 # Patch 414: class changes whose tokens no selector names restyle nothing
 # (<html>, <body>, a div: 4); .dark on <html>, .md\3a hide and a [class*=]
 # class still restyle -- those three are never answered as no-ops.
@@ -1927,6 +1932,17 @@ k415n=$(printf '%s\n' "$k415seg" | grep -c "sheet change restyles nothing" || tr
 k415d=$(printf '%s\n' "$k415seg" | grep -c "sheet change: declined (an element's style changes" || true)
 echo "  JS-sheet-noop: rows $k415r (0), sheet batches restyling nothing ${k415n} (2 or more), re-cascade declines ${k415d} (2 or more)"
 [ "$k415r" = 0 ] && [ "${k415n:-0}" -ge 2 ] && [ "${k415d:-0}" -ge 2 ] || fail "sheet batches that restyle nothing"
+# Patch 416: plain inline elements between blocks are built alone and
+# moved into a line of their own (2), one appended after a block gets a
+# line at the end (1); a span holding an image still declines (1).
+k416r=$(fl_rows JS-inline-mid CSS-inline-mid-ref)
+k416seg=$(awk '/ page [0-9]+\/[0-9]+ JS-inline-mid: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k416m=$(printf '%s\n' "$k416seg" | grep -c "an inline element inserted between blocks, built alone" || true)
+k416e=$(printf '%s\n' "$k416seg" | grep -c "an inline element appended at the end, built alone" || true)
+k416p=$(printf '%s\n' "$k416seg" | grep -c "leaf element placed in a line of its own" || true)
+k416d=$(printf '%s\n' "$k416seg" | grep -c "declined (new element is not a plain block" || true)
+echo "  JS-inline-mid: rows $k416r (0), between blocks ${k416m} (2), lines of their own ${k416p} (2), appended ${k416e} (1), image span declined ${k416d} (1)"
+[ "$k416r" = 0 ] && [ "${k416m:-0}" -eq 2 ] && [ "${k416p:-0}" -ge 2 ] && [ "${k416e:-0}" -eq 1 ] && [ "${k416d:-0}" -ge 1 ] || fail "inline elements between blocks"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
