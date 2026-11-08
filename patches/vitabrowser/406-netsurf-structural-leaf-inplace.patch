@@ -1,0 +1,231 @@
+# netsurf: structural flips on youtube's iframes answered locally -- quoted attributes bounded, leaf boxes restyled in place (patch 406)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 405)
+#
+# After 405, youtube's 7 structural full rebuilds remained. A debug build
+# (scratch only) logged them: 6 not narrow because an UNBOUNDED compound
+# matched -- .vEFDtd:last-child[data-expand-type="1"] and its twin,
+# unbounded only for the quotes in their attribute value; the 7th narrow,
+# but the sibling to restyle an <iframe> (a bare :last-child-type compound
+# on the previous one), whose box is never rebuilt (patch 371).
+#
+#  - html_rl_struct_parse_cp: a quoted value inside [...] no longer
+#    unbounds the compound (attributes are ignored: a broader match); the
+#    [...] skip honours quotes. A quote outside [...], a backslash anywhere
+#    or a '|' outside [...] (a namespace) still unbounds.
+#  - html_rl_leaf_restyle: a matching child whose box has no children (an
+#    <iframe>, an <img>; in a line too) gets a new computed style on the
+#    same box (as html_reconvert_fast_style), from its CSS parent (the
+#    block whose children changed), and the page is laid out whole.
+#    Nothing freed: the frame's box and window stay. Declined into the full
+#    rebuild when display/float/position change, when a ::before/::after
+#    box would be generated (html_rl_pseudo_generates mirrors
+#    box_construct_generate: never for a replaced element, else content
+#    not normal and display not none), when either style counts, for a
+#    control or a clone.
+# Logged "..., leaf boxes in place" on the 405 line; "leaf restyle
+# declined (why)".
+#
+--- a/content/handlers/html/html.c	2026-11-08 02:23:31.921371640 +0000
++++ b/content/handlers/html/html.c	2026-11-08 02:43:34.409703951 +0000
+@@ -7045,12 +7045,42 @@
+ 		struct html_rl_struct_cp *cp)
+ {
+ 	size_t i = a, j;
++	bool inbr = false;
++	uint8_t q = 0;
+ 
+-	for (j = a; j < b; j++)
+-		if (s[j] == '"' || s[j] == '\'' || s[j] == '\\' || s[j] == '|') {
++	/* Patch 406: a quoted attribute value ([data-x="1"]) no longer makes
++	 * the compound unbounded -- attributes are ignored anyway (a broader
++	 * match), and youtube's .vEFDtd:last-child[data-expand-type="1"] then
++	 * stays bounded by its class. A quote outside [...], a backslash
++	 * anywhere (an escape can hide a name) or a '|' outside [...] (a
++	 * namespace) still does. */
++	for (j = a; j < b; j++) {
++		uint8_t ch = s[j];
++		if (q != 0) {
++			if (ch == '\\') {
++				cp->unbounded = true;
++				return;
++			}
++			if (ch == q)
++				q = 0;
++			continue;
++		}
++		if (ch == '\\' || ((ch == '"' || ch == '\'' || ch == '|') &&
++				     !inbr)) {
+ 			cp->unbounded = true;
+ 			return;
+ 		}
++		if (ch == '"' || ch == '\'')
++			q = ch;
++		else if (ch == '[')
++			inbr = true;
++		else if (ch == ']')
++			inbr = false;
++	}
++	if (q != 0) {
++		cp->unbounded = true;
++		return;
++	}
+ 	if (i < b && s[i] == '*') {
+ 		i++;
+ 	} else if (i < b && html_rl_struct_ident_ch(s[i]) &&
+@@ -7093,8 +7123,18 @@
+ 			}
+ 			i = j;
+ 		} else if (c == '[') {
+-			while (i < b && s[i] != ']')
+-				i++;
++			uint8_t q2 = 0;		/* patch 406: over quoted values */
++			for (; i < b; i++) {
++				if (q2 != 0) {
++					if (s[i] == q2)
++						q2 = 0;
++					continue;
++				}
++				if (s[i] == '"' || s[i] == '\'')
++					q2 = s[i];
++				else if (s[i] == ']')
++					break;
++			}
+ 			if (i >= b) {
+ 				cp->unbounded = true;
+ 				return;
+@@ -8466,6 +8506,95 @@
+  * parent are checked apart (patches 193/198/373). A parent whose box is
+  * not a plain block (a table cell) keeps the full rebuild. */
+ static int html_rl_struct_declined(void);
++/* Patch 406: a matching child whose box has no children (an <iframe>,
++ * an <img>: youtube's flips are a bare :last-child on the previous
++ * <iframe>) is restyled where it is -- a new computed style on the same
++ * box, as html_reconvert_fast_style does, then the page laid out whole.
++ * Nothing is freed: a frame's box (never freed, patch 371) and its
++ * window stay. Declined -- into the full rebuild -- when the new style
++ * changes what construction decided (display, float, position), brings
++ * ::before/::after, or either style counts; a control, a clone, a box
++ * without element styles. */
++static bool html_rl_style_counts(const css_computed_style *st);
++/* would box construction make a ::before/::after box from this style?
++ * (box_construct_generate: never for a replaced element; else only when
++ * content is not normal and display is not none -- a universal
++ * *::before { box-sizing: ... } rule gives every element a pseudo style
++ * that generates nothing) */
++static bool html_rl_pseudo_generates(const struct box *box,
++		const css_computed_style *st)
++{
++	const css_computed_content_item *ci = NULL;
++	if (st == NULL || (box->flags & IS_REPLACED))
++		return false;
++	if (css_computed_content(st, &ci) == CSS_CONTENT_NORMAL)
++		return false;
++	if (css_computed_display(st, false) == CSS_DISPLAY_NONE)
++		return false;
++	return true;
++}
++static int html_rl_leaf_restyle(html_content *c, dom_node *node,
++		struct box *box, struct box *cssparent)
++{
++	css_select_results *ns;
++	css_custom_env *new_env = NULL, *use_parent_env = NULL;
++	const css_computed_style *use_parent = NULL, *use_root = NULL;
++	css_computed_style *st;
++	const char *why = NULL;
++
++	if (box->children != NULL || box->styles == NULL || box->style == NULL ||
++	    (box->flags & CLONE) || box->gadget != NULL || c->select_ctx == NULL ||
++	    box->type == BOX_CONTENTS)
++		why = "not a plain leaf box";
++	else if (html_rl_style_counts(box->style))
++		why = "it counts";
++	if (why != NULL) {
++		macsurf_debug_log_writef("LIFE rebuild local: leaf restyle "
++			"declined (%s)", why);
++		return -1;
++	}
++	nscss_reset_node_data(node);
++	/* the element's CSS parent: the block whose children changed, not
++	 * an anonymous line box between them */
++	if (cssparent != NULL && cssparent != c->layout) {
++		use_parent = cssparent->style;
++		use_parent_env = cssparent->custom_env;
++	}
++	use_root = c->layout->style;
++	ns = box_get_style(c, use_parent, use_root, node, use_parent_env,
++			&new_env);
++	if (ns == NULL || (st = ns->styles[CSS_PSEUDO_ELEMENT_NONE]) == NULL)
++		why = "no style";
++	else if (css_computed_display(st, false) !=
++		 css_computed_display(box->style, false) ||
++		 css_computed_float(st) != css_computed_float(box->style) ||
++		 css_computed_position(st) != css_computed_position(box->style))
++		why = "display, float or position changes";
++	else if (html_rl_pseudo_generates(box,
++			ns->styles[CSS_PSEUDO_ELEMENT_BEFORE]) ||
++		 html_rl_pseudo_generates(box,
++			ns->styles[CSS_PSEUDO_ELEMENT_AFTER]))
++		why = "generated content";
++	else if (html_rl_style_counts(st))
++		why = "it counts";
++	if (why != NULL) {
++		if (ns != NULL)
++			css_select_results_destroy(ns);
++		if (new_env != NULL)
++			css_custom_env_unref(new_env);
++		macsurf_debug_log_writef("LIFE rebuild local: leaf restyle "
++			"declined (%s)", why);
++		return -1;
++	}
++	if (box->custom_env != NULL)
++		css_custom_env_unref(box->custom_env);
++	box->custom_env = new_env;
++	css_select_results_destroy(box->styles);
++	box->styles = ns;
++	box->style = st;
++	return 0;
++}
++
+ /* Patch 405: the structural check names the children a rule matches;
+  * when each matching compound is bounded and no sibling combinator
+  * follows it, a flip restyles only those children (and their
+@@ -8479,9 +8608,19 @@
+ 		dom_node **hits, unsigned int n, double t0)
+ {
+ 	static unsigned long hits_n;
+-	unsigned int i;
++	unsigned int i, leaves = 0;
+ 	for (i = 0; i < n; i++) {
+ 		struct box *hb = box_for_node(hits[i]);
++		/* patch 406: a leaf -- restyled in place, in a line too */
++		if (hb != NULL && hb->children == NULL &&
++		    (hb->parent == pbox || (hb->parent != NULL &&
++		     hb->parent->type == BOX_INLINE_CONTAINER &&
++		     hb->parent->parent == pbox))) {
++			if (html_rl_leaf_restyle(c, hits[i], hb, pbox) != 0)
++				return -1;
++			leaves++;
++			continue;
++		}
+ 		if (hb == NULL || hb->parent != pbox ||
+ 		    (hb->type != BOX_BLOCK && hb->type != BOX_FLEX &&
+ 		     hb->type != BOX_GRID)) {
+@@ -8495,9 +8634,15 @@
+ 			return -1;
+ 	}
+ 	hits_n++;
++	if (leaves > 0) {	/* patch 406: the leaves' new styles, laid out */
++		html_rl_invalidate(pbox);
++		content__reformat(&c->base, false, c->base.available_width,
++				c->base.available_height);
++	}
+ 	macsurf_debug_log_writef("LIFE rebuild local: structural change: %u "
+-		"matching sibling%s restyled alone in %ld us (%lu so far)", n,
+-		n == 1 ? "" : "s", (long)(macos9_micros() - t0), hits_n);
++		"matching sibling%s restyled alone in %ld us (%lu so far)%s", n,
++		n == 1 ? "" : "s", (long)(macos9_micros() - t0), hits_n,
++		leaves > 0 ? ", leaf boxes in place" : "");
+ 	return 0;
+ }
+ static void html_rl_struct_hits_release(dom_node **hits, unsigned int *n)

@@ -1826,8 +1826,11 @@ k405r=$(fl_rows JS-struct-hits CSS-struct-hits-ref)
 k405seg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-hits: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k405n=$(printf '%s\n' "$k405seg" | grep -c "LIFE rebuild local: structural change: [0-9]* matching siblings\{0,1\} restyled alone" || true)
 k405d=$(printf '%s\n' "$k405seg" | grep -c "LIFE rebuild local: declined (" || true)
-echo "  JS-struct-hits: rows differing from the parse-time build $k405r (0); matching siblings restyled alone ${k405n} (4 or more); sibling-combinator case declined ${k405d} (1 or more)"
-[ "$k405r" = 0 ] && [ "${k405n:-0}" -ge 4 ] && [ "${k405d:-0}" -ge 1 ] || fail "structural matches restyled alone"
+k406l=$(printf '%s\n' "$k405seg" | grep -c "restyled alone in [0-9]* us ([0-9]* so far), leaf boxes in place" || true)
+# Patch 406: the <iframe> under #c5 > :last-child is restyled in place,
+# and the quoted-attribute compound stays bounded (restyled alone).
+echo "  JS-struct-hits: rows differing from the parse-time build $k405r (0); matching siblings restyled alone ${k405n} (6 or more); leaf boxes restyled in place ${k406l} (1 or more); sibling-combinator case declined ${k405d} (1 or more)"
+[ "$k405r" = 0 ] && [ "${k405n:-0}" -ge 6 ] && [ "${k406l:-0}" -ge 1 ] && [ "${k405d:-0}" -ge 1 ] || fail "structural matches restyled alone"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
