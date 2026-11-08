@@ -12347,3 +12347,58 @@ No sudo.
 2. "restyled flex or grid box holds controls or frames" (google, rte,
    stackoverflow, wikipedia, youtube).
 3. "nearest box is not a block" (6 sites).
+
+## Patch 421 (2026-11-08): a removed stylesheet whose loss changes no style no longer forces the full rebuild
+
+**The unit.** "detached stylesheet pruned" (8 in r132): a `<style>` or
+`<link>` that left the DOM is pruned up front (unit 387), and the change
+that found it declined into the full reconvert. oldreddit's web
+components drop `<style>`s from their fragments (document fragments,
+slots) as they render; bbc, google and mdn remove one each.
+
+**The change** (html.c):
+- `html_reconvert_local_change`: after a prune, 415's whole-document walk
+  (`html_rl_doc_noop`, labelled "sheet removal") re-cascades the document
+  with a fresh context made **without** the dead sheets. When every
+  element keeps the style its box holds, nothing the sheets did is lost,
+  and the change goes on locally. Otherwise the decline stands; units
+  388-390's pages, whose removed sheets matter, keep it.
+- `html_rl_doc_noop`: a prune no longer declines the walk itself, since its
+  fresh context already leaves the pruned sheets out.
+
+**Sites** (scratch build): **oldreddit 1 and mdn 1 removal answered**.
+The other five (oldreddit 3, bbc, google) really restyle and decline.
+
+**Gate.**
+- New pair **JS-style-detach-noop / CSS-style-detach-noop-ref**: a removed
+  `<style>` styling `.never-here`, then a class change: **1 removal
+  restyling nothing, 0 pruned declines, 0 full rebuilds**, rows 0.
+- JS-style-detach, NET-js-link-detach and NET-js-link-preload keep their
+  declines (2, 2, 1), rows 0.
+- **gate421 exit 0 on the first run.**
+
+**Restage from pristine:** 503 applied plus the 2 known collisions,
+html.c byte-identical. **gate421c (restaged): exit 0**.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean**.
+
+**Scorecard r134**: 21 sites against `r79-360`, the 421 and 420 binaries
+back to back: **73.04 vs 69.75**. All of the gap is the **420 arm's
+claude timing out** (7.5 s): the transient stall seen in 420's ASan
+sweep, on the baseline binary; 421's claude loaded (77.0).
+stackoverflow and ddglite are their usual spreads.
+
+**Census, back to back:**
+- pruned declines **6 -> 4**; **2 removals answered** as restyling
+  nothing.
+- BATCHCAUSE 78 vs 75, but the 420 arm lacks claude's batches (its
+  timeout): flat.
+
+No sudo.
+
+**Next:**
+1. "restyled flex or grid box holds controls or frames" (google, rte,
+   stackoverflow, wikipedia, youtube).
+2. "nearest box is not a block" (6 sites).
+3. "new content is not plain inline" (bbc's block children, wpblog's
+   iframes).
