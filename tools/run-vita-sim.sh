@@ -386,6 +386,8 @@ JS-root-noop file:///app0:/testpages/JS-root-noop.html
 CSS-root-noop-ref file:///app0:/testpages/CSS-root-noop-ref.html
 JS-float-marker file:///app0:/testpages/JS-float-marker.html
 CSS-float-marker-ref file:///app0:/testpages/CSS-float-marker-ref.html
+JS-style-detach-noop file:///app0:/testpages/JS-style-detach-noop.html
+CSS-style-detach-noop-ref file:///app0:/testpages/CSS-style-detach-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1994,6 +1996,17 @@ k420d=$(printf '%s\n' "$k420seg" | grep -c "holds floats or list markers\|holds 
 k420f=$(printf '%s\n' "$k420seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-float-marker: rows $k420r (0), restyled ${k420l} (4 or more), float/marker declines ${k420d} (0), full rebuilds ${k420f} (0)"
 [ "$k420r" = 0 ] && [ "${k420l:-0}" -ge 4 ] && [ "${k420d:-1}" -eq 0 ] && [ "${k420f:-1}" -eq 0 ] || fail "blocks holding floats or list markers"
+# Patch 421: a removed <style> whose rules match nothing: the re-cascade
+# without it keeps every style, so the class change after it is local
+# (no "detached stylesheet pruned" decline, no full rebuild). The 388-390
+# pages, whose removed sheets do matter, keep their declines above.
+k421r=$(fl_rows JS-style-detach-noop CSS-style-detach-noop-ref)
+k421seg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-detach-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k421n=$(printf '%s\n' "$k421seg" | grep -c "sheet removal restyles nothing" || true)
+k421d=$(printf '%s\n' "$k421seg" | grep -c "declined (detached stylesheet pruned)" || true)
+k421f=$(printf '%s\n' "$k421seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-style-detach-noop: rows $k421r (0), removals restyling nothing ${k421n} (1), pruned declines ${k421d} (0), full rebuilds ${k421f} (0)"
+[ "$k421r" = 0 ] && [ "${k421n:-0}" -ge 1 ] && [ "${k421d:-1}" -eq 0 ] && [ "${k421f:-1}" -eq 0 ] || fail "a removed sheet that matched nothing"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
