@@ -1,0 +1,203 @@
+# netsurf: a leaf element inserted between blocks is built alone in a line of its own (patch 407)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 406)
+#
+# The census after 404-406 (r119, 97 full rebuilds): the largest local
+# decline, "new element is not a plain block, list item or block of
+# blocks" (10: claude 4, google 2, rte 2, guardian, oldreddit). A debug
+# build (scratch only) logged the rejected elements: <img> (4), <textarea>
+# (3), <input>, <iframe> -- each inserted BETWEEN block-level boxes of the
+# parent (prev a block, next a block or a flex box) -- and a <div> holding
+# a whole document (<html> inside, from innerHTML: stays full). Patch 378
+# builds an <iframe>/<img> alone only when appended at the end, because
+# box_build_element puts an inline-level box in a line at the END of the
+# parent.
+#
+#  - html_rl_leaf_tag: iframe, img, input, textarea, button, select.
+#  - html_rl_block_neighbour: the nearest boxed sibling on each side is a
+#    block-level box directly in the parent (or none), with no text but
+#    white space between (else it belongs in that text's line).
+#  - html_rl_block_change: such a leaf, its children inline or controls
+#    (a <select>'s options, a <button>'s text), is accepted (leafmid),
+#    built alone; if built inline-level into the line at the end of the
+#    parent it is moved into a NEW line right after its earlier block (the
+#    old line freed if left empty; a following BOX_INLINE_END declines);
+#    block-level, it takes the existing placement. The page is laid out
+#    whole. Logged "a leaf element inserted between blocks, built alone"
+#    and "leaf element placed in a line of its own".
+#
+--- a/content/handlers/html/html.c	2026-11-08 03:32:07.327124288 +0000
++++ b/content/handlers/html/html.c	2026-11-08 03:52:24.000552663 +0000
+@@ -8462,6 +8462,72 @@
+ 	return after;
+ }
+ 
++/* Patch 407: a leaf element -- replaced, or a form control -- that may be
++ * inserted between blocks: built alone, then given a line of its own. */
++static bool html_rl_leaf_tag(dom_node *n)
++{
++	static const char *const tags[] = {
++		"iframe", "img", "input", "textarea", "button", "select", NULL
++	};
++	dom_string *name = NULL;
++	bool found = false;
++	int i;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	for (i = 0; tags[i] != NULL && !found; i++)
++		if (dom_string_byte_length(name) == strlen(tags[i]) &&
++		    strncasecmp(dom_string_data(name), tags[i],
++				strlen(tags[i])) == 0)
++			found = true;
++	dom_string_unref(name);
++	return found;
++}
++
++/* Patch 407: the nearest sibling of n on one side that has a box is a
++ * block-level box directly in pbox (or there is none), and no text other
++ * than white space lies between -- such text would sit in a line the new
++ * element must join instead. */
++static bool html_rl_block_neighbour(dom_node *n, struct box *pbox,
++		bool forward)
++{
++	dom_node *s = n, *t;
++	bool ok = true;
++
++	dom_node_ref(s);
++	for (;;) {
++		dom_node_type type;
++		struct box *b;
++		t = NULL;
++		if ((forward ? dom_node_get_next_sibling(s, &t) :
++		     dom_node_get_previous_sibling(s, &t)) != DOM_NO_ERR ||
++		    t == NULL)
++			break;
++		dom_node_unref(s);
++		s = t;
++		if (dom_node_get_node_type(s, &type) != DOM_NO_ERR) {
++			ok = false;
++			break;
++		}
++		if (type == DOM_TEXT_NODE) {
++			if (!html_rl_text_is_space(s)) {
++				ok = false;
++				break;
++			}
++			continue;
++		}
++		if (type != DOM_ELEMENT_NODE)
++			continue;
++		b = box_for_node(s);
++		if (b == NULL)
++			continue;
++		ok = b->parent == pbox && b->type != BOX_INLINE_CONTAINER;
++		break;
++	}
++	dom_node_unref(s);
++	return ok;
++}
++
+ /* Patch 381: does nothing but elements that never have a box follow n? */
+ static bool html_rl_at_tail(dom_node *n)
+ {
+@@ -8704,6 +8770,7 @@
+ 	unsigned int nrem = 0, nadd = 0, i, local_n = 0, nskip = 0;
+ 	bool skip_over = false;
+ 	bool struct_hit = false;		/* patch 404 */
++	bool leafmid[HTML_RL_MAX_CHANGES] = { false };	/* patch 407 */
+ 	dom_node *shits[HTML_RL_STRUCT_HITS_MAX];	/* patch 405 */
+ 	unsigned int nshits = 0;
+ 	bool snarrow = false;
+@@ -8865,6 +8932,37 @@
+ 					oc = html_rl_subtree_tags(n, true);
+ 					html_rl_tags_oc = false;
+ 				}
++				/* Patch 407: a leaf element (an <img>, an
++				 * <iframe>, a form control) inserted BETWEEN
++				 * blocks -- the census's "new element is not a
++				 * plain block": claude, google, rte, guardian --
++				 * is built alone and given a line of its own
++				 * after its earlier block, the page laid out
++				 * whole. Its children (a <select>'s options, a
++				 * <button>'s text) must be inline or controls. */
++				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
++				    html_rl_leaf_tag(n) && html_rl_boxed_after(n) &&
++				    html_rl_block_neighbour(n, pbox, false) &&
++				    html_rl_block_neighbour(n, pbox, true)) {
++					bool kids;
++					html_rl_tags_oc = true;
++					kids = html_rl_subtree_tags(n, false);
++					html_rl_tags_oc = false;
++					if (kids) {
++						full = true;
++						why = why != NULL ? why :
++							"a leaf element between "
++							"blocks";
++						leafmid[nadd] = true;
++						added[nadd++] = n;
++						dom_node_ref(n);
++						macsurf_debug_log_writef("LIFE "
++							"rebuild local: a leaf "
++							"element inserted between "
++							"blocks, built alone");
++						goto next_node;
++					}
++				}
+ 				/* Patch 378: an <iframe> or <img> appended at
+ 				 * the end of the parent (no later sibling has a
+ 				 * box) is built alone wherever it lands (an
+@@ -9297,6 +9395,53 @@
+ 			why = why != NULL ? why : "a float among the blocks";
+ 			continue;
+ 		}
++		/* Patch 407: a leaf between blocks, built (inline-level) into
++		 * a line at the END of pbox: moved into a line of its own
++		 * right after its earlier block */
++		if (leafmid[i] && nb->parent != pbox) {
++			struct box *ic0 = nb->parent, *ic;
++			if (ic0 == NULL || ic0->type != BOX_INLINE_CONTAINER ||
++			    ic0->node != NULL || ic0->parent != pbox ||
++			    (nb->next != NULL &&
++			     nb->next->type == BOX_INLINE_END)) {
++				for (i++; i < nadd; i++)
++					dom_node_unref(added[i]);
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"leaf element built where it cannot be "
++					"moved, full reconvert");
++				{ html_rl_struct_hits_release(shits, &nshits); return -1; }	/* the full rebuild starts from the DOM */
++			}
++			html_rl_unlink(nb);
++			if (ic0->children == NULL) {
++				html_rl_unlink(ic0);
++				box_free(ic0);
++			}
++			ic = box_create(NULL, NULL, false, NULL, NULL, NULL,
++					NULL, c->bctx);
++			if (ic == NULL) {
++				box_free(nb);
++				for (i++; i < nadd; i++)
++					dom_node_unref(added[i]);
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"no memory for a leaf's line, full "
++					"reconvert");
++				{ html_rl_struct_hits_release(shits, &nshits); return -1; }
++			}
++			ic->type = BOX_INLINE_CONTAINER;
++			html_rl_link_after(pbox, after, ic);
++			html_rl_link_after(ic, NULL, nb);
++			html_rl_invalidate(ic);
++			if (c->num_objects != objects_before) {
++				full = true;
++				why = why != NULL ? why :
++					"new block fetches objects";
++			}
++			full = true;
++			why = why != NULL ? why : "a leaf element between blocks";
++			macsurf_debug_log_writef("LIFE rebuild local: leaf element "
++				"placed in a line of its own");
++			continue;
++		}
+ 		if (nb->parent != pbox) {
+ 			full = true;		/* built somewhere unexpected */
+ 			why = why != NULL ? why : "new block not in its parent";

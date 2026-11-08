@@ -360,6 +360,8 @@ JS-struct-dir file:///app0:/testpages/JS-struct-dir.html
 CSS-struct-dir-ref file:///app0:/testpages/CSS-struct-dir-ref.html
 JS-struct-hits file:///app0:/testpages/JS-struct-hits.html
 CSS-struct-hits-ref file:///app0:/testpages/CSS-struct-hits-ref.html
+JS-leaf-insert file:///app0:/testpages/JS-leaf-insert.html
+CSS-leaf-insert-ref file:///app0:/testpages/CSS-leaf-insert-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1831,6 +1833,17 @@ k406l=$(printf '%s\n' "$k405seg" | grep -c "restyled alone in [0-9]* us ([0-9]* 
 # and the quoted-attribute compound stays bounded (restyled alone).
 echo "  JS-struct-hits: rows differing from the parse-time build $k405r (0); matching siblings restyled alone ${k405n} (6 or more); leaf boxes restyled in place ${k406l} (1 or more); sibling-combinator case declined ${k405d} (1 or more)"
 [ "$k405r" = 0 ] && [ "${k405n:-0}" -ge 6 ] && [ "${k406l:-0}" -ge 1 ] && [ "${k405d:-0}" -ge 1 ] || fail "structural matches restyled alone"
+# Patch 407: a leaf element (an image, an iframe, a form control) inserted
+# between blocks is built alone and given a line of its own; an image next
+# to inline text still takes the full rebuild. Row for row as the
+# parse-time build.
+k407r=$(fl_rows JS-leaf-insert CSS-leaf-insert-ref)
+k407seg=$(awk '/ page [0-9]+\/[0-9]+ JS-leaf-insert: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k407a=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: a leaf element inserted between blocks, built alone" || true)
+k407m=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: leaf element placed in a line of its own" || true)
+k407d=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: declined (" || true)
+echo "  JS-leaf-insert: rows differing from the parse-time build $k407r (0); leaves built alone ${k407a} (6 or more), moved into a line of their own ${k407m} (4 or more); next to inline text declined ${k407d} (1 or more)"
+[ "$k407r" = 0 ] && [ "${k407a:-0}" -ge 6 ] && [ "${k407m:-0}" -ge 4 ] && [ "${k407d:-0}" -ge 1 ] || fail "leaf elements inserted between blocks"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
