@@ -11619,3 +11619,74 @@ No sudo.
 **Next:** imported sheets: both scans read only the parent's text
 (pre-existing); "sibling combinator may restyle on
 insert/remove" (9, cnnlite 4); the boxed flex-item insert.
+
+## Patch 412 (2026-11-08): one unreadable selector no longer makes a whole sheet "conservative" (and github's intermittent crash, looked for)
+
+**github's intermittent crash, first** (409's open item: rc -11 during
+stylesheet loading, in r112 and r123). It never reproduces under gdb, so
+a small `LD_PRELOAD` handler (scratch: `segv.c`, `backtrace_symbols_fd`
+plus `/proc/self/maps` on SIGSEGV/SIGBUS/SIGABRT, written to
+`segv-trace.txt` in the run directory) was put on **40 plain github loads,
+4 in parallel**: **40/40 loaded, no crash**. That makes **52 clean loads**
+on the 409 binary, with the 6 plain and 6 ASan ones before, against 2
+crashes in the 4-site scorecard mix. It needs that mix's timing. It is
+**still open, with the tool ready**: a scorecard-mix loop under the
+preload is the next attempt.
+
+**The census's "sibling combinator may restyle on insert/remove" (9**:
+cnnlite 4, rte 2, google, oldreddit, wpblog). A debug build (scratch
+only) tagged each of `html_rl_block_sibling_risk`'s exits. **Every one
+was the state-2 exit**: a "conservative" sheet declines every block
+insert or removal not at the parent's tail. A sheet is state 2 when **one**
+selector prelude anywhere in it fails to parse (an escaped class name,
+`.md\:flex`, among others). Pseudo-classes are not the cause: the parser
+already ignores them as a broader match.
+
+**The change** (html.c):
+- `html_rl_prelude_sib_free`: the failed prelude's text holds no sibling
+  combinator (a `+` or `~` outside `[...]` and strings, escapes skipped;
+  a `+` inside parentheses, as in `:nth-child(2n+1)`, still counts), no
+  `:empty` and no `:has(`.
+- `html_rl_scan_sheet`: such a prelude yields no rule (its partial results
+  freed; the parser's own decline path already reset the caller's
+  arrays), and the sheet stays precise. Every reader of this cache reads
+  only those constructs: 186's class check, 198's insert/remove check,
+  370/409's style check, 373's `:empty` check.
+
+**The sites, directly** (scratch build): **cnnlite 4 declines -> 0**,
+its 4 block changes placed locally. rte (2), google (1) and oldreddit (1)
+keep theirs: their unreadable preludes hold sibling syntax, or the risk is
+real, so the rule keeps them conservative.
+
+**Gate.**
+- New pair **JS-sib-unreadable / CSS-sib-unreadable-ref**: only
+  `.md\:flex` unreadable. A paragraph inserted between blocks, a block
+  appended, a block removed: **rows 0, 3 placed locally, 0 sibling
+  declines**.
+- The negative is on JS-style-sib-risk. Both style-sib pages (and refs)
+  gain `.md\:x + .y`, unreadable **with** a `+`, which keeps their sheets
+  state 2 so 409's path stays the one tested. The risk page gains a block
+  insert, which **still declines (1)**.
+- BLOCKSIB 3/3, SIBINS 4/4 and the structural pages pass. **gate412,
+  exit 0 on the first run.**
+
+**Restage from pristine:** 494 applied plus the 2 known collisions,
+html.c byte-identical. **gate412b (restaged): exit 0**, the same
+readings.
+
+**ASan** (all 21 sites): **21/21 clean**.
+
+**Scorecard r124**: 21 sites against `r79-360`, the 412 and 409 binaries
+back to back: **72.93 vs 72.96**. No crash, github included. hackernews
++0.5 (live) and ddglite (its 74.8/76.0 flip) are the only differences.
+
+**Census, back to back:** insert/remove sibling declines **9 -> 7**,
+the drop on cnnlite (its full rebuilds **5 -> 3**). Local full rebuilds
+34 vs 35. The total, 102 vs 92, moves with other sites' live content,
+inside the 92-116 band of these runs.
+
+No sudo.
+
+**Next:** rte's, google's and oldreddit's remaining insert/remove
+declines (which preludes, and whether the risk is real); github's crash
+under the scorecard mix; the boxed flex-item insert.
