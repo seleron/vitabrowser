@@ -11771,3 +11771,91 @@ No sudo.
 **Next:** sibling rules behind `:where()`/`:is()` with plain arguments
 (wpblog: expand them into their compounds); the boxed flex-item insert;
 github's crash (no longer reproducing; keep the preload ready).
+
+## Patch 414 (2026-11-08): a class change no stylesheet can see restyles nothing
+
+**Which census unit, and why this one.** In r125 the biggest cause is
+`nonode` (26): sheet batches. Every single-sheet one was "unbounded"
+(too-many / no-source / at-rule / unanchored), and that is the
+re-cascade-in-place project unit 384 shelved, not one unit. Next was
+"restyled block's parent is not a block" (7). A debug build (scratch
+only) logged each declined element: **six of the seven were class
+changes on `<html>` itself** (cnnlite 2, archwiki, wikipedia, jquery,
+wpnews; youtube's as well). The root has no parent box, so each one took
+the full rebuild, for tokens such as `userconsent-cntry-ie`. (The
+remaining one is rte's `div.top-story-container` in a float.)
+
+**The change** (html.c). A computed style depends on class only through
+selectors. Box construction reads no class: html.c's class reads are the
+slider/fbcss diagnostics and the load-time has-js class.
+- The per-sheet sibling cache gains the sheet's **class names**: sorted
+  lowercase FNV-1a hashes of every `.ident` outside comments and strings,
+  escapes decoded (hex too: `.md\3a hide` is `md:hide`). A collision only
+  declines. A sheet with `[class...]`, with `@import` (its rules are
+  unseen) or with unreadable source may name **any** class.
+- `html_reconvert_local_change`: a class change whose added and removed
+  tokens no used sheet names (base sheets included) is answered with
+  **nothing restyled** (`LIFE rebuild local: class change names no
+  selector`). It sits after the busy and detached-sheet prune checks.
+- **Not for patch 370's style changes**, which run "as a class change"
+  with the current class as the old one. gate414's first run caught that:
+  JS-style-attr had **500 rows** wrong, its style changes dropped as
+  no-ops. `html_rl_style_as_class` now excludes them, and the scratch
+  site numbers were re-measured (rte's apparent 46 no-ops were all style
+  changes; it has 0).
+
+**A latent crash shipped in 413, fixed here.** The first chain's ASan
+sweep had **youtube SEGV** in `dom_string_byte_length` <- 
+`html_rl_sib_compound_matches` <- `html_rl_sib_match_static` <- 198's
+`:has` ancestor walk (`html_rl_block_sibling_risk`). The walk climbs
+past `<html>` to the Document node and matched it as an element
+(`dom_element_get_tag_name` on a non-element: the wrong vtable, garbage
+read). It was **unreached until 413** made `:has()` compounds reach
+`has_cp`. The plain build did not crash in r125 or the gates, but it is
+undefined behaviour. `html_rl_sib_match_static` now answers "no match"
+for a non-element. The chain was rerun on the fixed patch, with
+`tools/asan-autotest.sh main` added (JS-sib-universal's `.u` insert
+walks to the Document too).
+
+**Sites** (scratch build, fixed):
+- cnnlite: its `<html>` change answered (BATCHCAUSE 3 -> 2).
+- wpnews: **8 class changes answered with no restyle** (were 8 local
+  restyles).
+- youtube: 2.
+- archwiki, jquery and wikipedia keep theirs: their `<html>` tokens
+  (`client-js` and the like) are named.
+
+**Gate.**
+- New pair **JS-class-unnamed / CSS-class-unnamed-ref**: unnamed tokens
+  added and removed on `<html>` (twice), `<body>` and a div give **4
+  no-ops**. `.dark` on `<html>` (`html.dark body`) and `md:hide` (a hex
+  escape) still restyle. Rows 0.
+- **JS-class-unnamed-attr / -ref**: a sheet with `[class*="zz-"]` gives
+  **0 no-ops**, and the div turns red. Rows 0.
+- **gate414b exit 0**; JS-style-attr rows 0, 89 local.
+
+**Restage from pristine:** 496 applied plus the 2 known collisions,
+html.c byte-identical. **gate414d (restaged, with the `:has` fix): exit 0**.
+
+**ASan:** sweep (all 21 sites) **21/21 clean**, youtube included.
+`tools/asan-autotest.sh main`: **clean**, rc 0, interaction 52/52, 338
+page dumps.
+
+**Scorecard r127**: 21 sites against `r79-360`, the 414 and 413 binaries
+back to back: **71.61 vs 71.72**. guardian 36.0/36.7 (it flipped the
+other way in the first chain's r126, 36.7/36.0) and ddglite's 74.8/76.0
+are the differences: noise. No crash.
+
+**Census, back to back:**
+- **19 class changes answered as no-ops** (wpblog 8, wpnews 8, youtube 2,
+  cnnlite 1).
+- "restyled block's parent is not a block" **7 -> 4**.
+- BATCHCAUSE **94 -> 89**, local full rebuilds 32 -> 26. nonode moves
+  with sheets: 32/34.
+
+No sudo.
+
+**Next:** `<html>` changes whose tokens ARE named (`client-js`,
+wikipedia/archwiki/jquery): a root restyle in place rather than a full
+rebuild; sibling rules behind `:where()`/`:is()` (wpblog); the
+boxed flex-item insert.
