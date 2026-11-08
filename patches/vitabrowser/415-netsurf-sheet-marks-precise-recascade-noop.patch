@@ -1,0 +1,555 @@
+# netsurf: a sheet mark no longer makes its batch coarse; a sheet change that re-cascades to the same styles rebuilds nothing (patch 415)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 414)
+#
+# The census's largest cause, "nonode" (about 30 in a 21-site run): a
+# stylesheet arrived or changed after first layout (CSS-in-JS, per-module
+# CSS, late <link>s), its nodeless mark made the batch coarse -- dropping
+# every precise mark in it -- and the whole document was rebuilt.
+#
+# Measured first (scratch build only, doc 10): at every full rebuild on
+# the 21 scorecard sites, the whole document was re-cascaded against the
+# current sheets and compared with the styles the boxes held. Of 21 sheet
+# batches whose sheets had settled, 19 changed NO element's computed
+# style and two (claude) only layout properties; none changed box
+# structure. 14 more flushed while a sheet was still loading.
+#
+#  - css.c: the multi-sheet settle window's mark goes through a new
+#    macos9_js_mark_dom_dirty_sheets, so every sheet mark is known.
+#  - macos9_reconvert.c: a sheet mark sets the slot's `sheets` flag
+#    instead of making it coarse (multi stays set, so the single-mark fast
+#    paths never take it); a sheet-only slot adopts the first node mark
+#    as its primary. try_local answers the precise marks as always, then
+#    calls html_rl_sheet_batch_noop; its decline is fullcause reason 5,
+#    logged as the census's "nonode" with the sheet census (316/318/321)
+#    as before.
+#  - html.c, html_rl_sheet_batch_noop: settled sheets, no detached sheet
+#    to prune, then every element of the document re-cascaded with a
+#    fresh selection context; the first element whose own, ::before or
+#    ::after style differs from its box's (or a box-less element that
+#    would get a box: construction's tag skips -- style, title, meta,
+#    link, base, head -- and input type=hidden mirrored; children of
+#    replaced boxes and select/textarea gadgets not walked) declines. On
+#    success the fresh context replaces c->select_ctx and the page is
+#    redrawn (a new @font-face is looked up at paint).
+#
+--- a/content/handlers/html/html.c	2026-11-08 11:59:47.336929638 +0000
++++ b/content/handlers/html/html.c	2026-11-08 12:45:36.816799356 +0000
+@@ -8666,6 +8666,302 @@
+ 	return 0;
+ }
+ 
++/* ---- a sheet change that restyles nothing (patch 415) ----------------
++ *
++ * The census's largest cause is the coarse "nonode" batch: a stylesheet
++ * arrived or changed after first layout (CSS-in-JS, google's per-module
++ * CSS, late <link>s) and the whole document was rebuilt. A dry run
++ * (scratch build, every full rebuild on the 21 scorecard sites)
++ * re-cascaded the whole document at each such batch: of 21 batches whose
++ * sheets had settled, 19 changed NO element's computed style -- the new
++ * rules match nothing built yet -- and the other two (claude) changed only
++ * layout properties. Answered here: when the sheets have settled and a
++ * fresh selection context gives every element the style its box already
++ * holds, and gives no box-less element a box, nothing is rebuilt.
++ *
++ * What the walk mirrors from box construction (box_construct.c):
++ *  - an element's own style, ::before and ::after are all compared (a
++ *    pseudo style that generates nothing, old and new, is ignored);
++ *  - a box-less element is fine when its new display is none, or when
++ *    construction gives it no box by tag (style, title, meta, link, base,
++ *    head) or type (input type=hidden); otherwise it would get a box:
++ *    declined;
++ *  - the children of a replaced box (svg, img, object, iframe) and of a
++ *    select or textarea gadget are not converted, so not walked.
++ * The first difference stops the walk (declined: the full rebuild, as
++ * before). On success the fresh context replaces c->select_ctx -- the
++ * one html_css_refresh_selection_context made at the settle should be
++ * the same, this makes sure -- and the page is redrawn: a new @font-face
++ * is looked up at paint (html_macsurf_font_face_url). */
++static bool html_rl_sheets_settled(html_content *c)
++{
++	unsigned int i;
++	for (i = 0; i != c->stylesheet_count; i++) {
++		if (c->stylesheets[i].modified)
++			return false;
++		if (c->stylesheets[i].sheet != NULL &&
++		    content_get_status(c->stylesheets[i].sheet) !=
++				CONTENT_STATUS_DONE)
++			return false;
++	}
++	return true;
++}
++
++/* NULL when the two selections give the box the same styles */
++static const char *html_rl_noop_diff(struct box *box,
++		const css_select_results *o, const css_select_results *nw)
++{
++	int k;
++	if (o->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL ||
++	    nw->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL)
++		return "no style";
++	if (css_computed_style_diff(o->styles[CSS_PSEUDO_ELEMENT_NONE],
++			nw->styles[CSS_PSEUDO_ELEMENT_NONE]) !=
++			CSS_COMPUTED_STYLE_NO_DIFF)
++		return "an element's style changes";
++	for (k = CSS_PSEUDO_ELEMENT_BEFORE; k <= CSS_PSEUDO_ELEMENT_AFTER;
++			k++) {
++		const css_computed_style *pa = o->styles[k], *pb = nw->styles[k];
++		bool ga = html_rl_pseudo_generates(box, pa);
++		bool gb = html_rl_pseudo_generates(box, pb);
++		if (ga != gb)
++			return "a ::before or ::after appears or goes";
++		if (ga && css_computed_style_diff(pa, pb) !=
++				CSS_COMPUTED_STYLE_NO_DIFF)
++			return "a ::before or ::after changes";
++	}
++	return NULL;
++}
++
++/* construction gives this box-less element no box whatever its display */
++static bool html_rl_noop_never_boxed(dom_node *n)
++{
++	dom_string *nm = NULL, *ty = NULL;
++	bool r = false;
++	if (dom_node_get_node_name(n, &nm) != DOM_NO_ERR || nm == NULL)
++		return false;
++	if (dom_string_caseless_lwc_isequal(nm, corestring_lwc_style) ||
++	    dom_string_caseless_lwc_isequal(nm, corestring_lwc_title) ||
++	    dom_string_caseless_lwc_isequal(nm, corestring_lwc_meta) ||
++	    dom_string_caseless_lwc_isequal(nm, corestring_lwc_link) ||
++	    dom_string_caseless_lwc_isequal(nm, corestring_lwc_base) ||
++	    dom_string_caseless_lwc_isequal(nm, corestring_lwc_head)) {
++		r = true;
++	} else if (dom_string_caseless_lwc_isequal(nm, corestring_lwc_input) &&
++		   dom_element_get_attribute(n, corestring_dom_type, &ty) ==
++				DOM_NO_ERR && ty != NULL) {
++		r = dom_string_caseless_lwc_isequal(ty, corestring_lwc_hidden);
++		dom_string_unref(ty);
++	}
++	dom_string_unref(nm);
++	return r;
++}
++
++struct html_rl_noop_frame {
++	dom_node *n;
++	const css_computed_style *ps;
++	css_custom_env *pe;
++};
++
++int html_rl_sheet_batch_noop(struct content *base_c);
++int html_rl_sheet_batch_noop(struct content *base_c)
++{
++	extern double macos9_micros(void);
++	html_content *c = (html_content *)base_c;
++	css_select_ctx *ctx = NULL;
++	struct html_rl_noop_frame *st = NULL;
++	css_select_results **keep = NULL;
++	css_custom_env **envs = NULL;
++	int nst = 0, cst = 0, nkeep = 0, ckeep = 0, nel = 0, k;
++	const css_computed_style *root_new = NULL;
++	dom_node *root = NULL;
++	const char *why = NULL;
++	char tag[48];
++	double t0;
++	static unsigned long noop_n;
++
++	tag[0] = '\0';
++	if (c == NULL || c->document == NULL || c->layout == NULL ||
++	    c->select_ctx == NULL || c->aborted)
++		return -1;
++	if (c->reflowing || c->box_conversion_context != NULL ||
++	    macsurf_reconvert_in_progress != 0 || macos9_paint_gw != NULL ||
++	    base_c->locked)
++		why = "busy";
++	else if (base_c->status != CONTENT_STATUS_READY &&
++		 base_c->status != CONTENT_STATUS_DONE)
++		why = "not loaded";
++	else if (!html_rl_sheets_settled(c))
++		why = "a sheet is still loading or changing";
++	else if (html_css_prune_detached_sheets(c) > 0)	/* unit 387 */
++		why = "detached stylesheet pruned";
++	if (why != NULL) {
++		macsurf_debug_log_writef("LIFE rebuild local: sheet change: "
++			"declined (%s)", why);
++		return -1;
++	}
++	t0 = macos9_micros();
++	if (html_css_new_selection_context(c, &ctx) != NSERROR_OK ||
++	    ctx == NULL ||
++	    dom_document_get_document_element(c->document, &root) !=
++			DOM_NO_ERR || root == NULL) {
++		why = "no selection context";
++		goto out;
++	}
++	cst = 64;
++	ckeep = 256;
++	st = malloc(sizeof(*st) * cst);
++	keep = malloc(sizeof(*keep) * ckeep);
++	envs = malloc(sizeof(*envs) * ckeep);
++	if (st == NULL || keep == NULL || envs == NULL) {
++		dom_node_unref(root);
++		why = "no memory";
++		goto out;
++	}
++	st[nst].n = root;	/* the reference moves into the stack */
++	st[nst].ps = NULL;
++	st[nst].pe = NULL;
++	nst++;
++	while (nst > 0 && why == NULL) {
++		struct html_rl_noop_frame f = st[--nst];
++		css_select_results *ns;
++		css_custom_env *env = NULL;
++		struct box *box;
++		dom_node *ch = NULL;
++		dom_node_type type;
++		bool walk = true;
++
++		if (dom_node_get_node_type(f.n, &type) != DOM_NO_ERR ||
++		    type != DOM_ELEMENT_NODE) {
++			dom_node_unref(f.n);
++			continue;
++		}
++		nel++;
++		ns = box_get_style_with_select_ctx(c, ctx, f.ps,
++				f.n == root ? NULL : root_new, f.n, f.pe, &env);
++		if (ns == NULL || ns->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
++			if (ns != NULL)
++				css_select_results_destroy(ns);
++			if (env != NULL)
++				css_custom_env_unref(env);
++			why = "no style";
++		} else {
++			/* kept until the end: children inherit from it */
++			if (nkeep == ckeep) {
++				css_select_results **a;
++				css_custom_env **b;
++				ckeep *= 2;
++				a = realloc(keep, sizeof(*keep) * ckeep);
++				if (a != NULL)
++					keep = a;
++				b = realloc(envs, sizeof(*envs) * ckeep);
++				if (b != NULL)
++					envs = b;
++				if (a == NULL || b == NULL) {
++					ckeep /= 2;
++					css_select_results_destroy(ns);
++					if (env != NULL)
++						css_custom_env_unref(env);
++					ns = NULL;
++					why = "no memory";
++				}
++			}
++			if (ns != NULL) {
++				keep[nkeep] = ns;
++				envs[nkeep] = env;
++				nkeep++;
++			}
++		}
++		if (why == NULL && f.n == root)
++			root_new = ns->styles[CSS_PSEUDO_ELEMENT_NONE];
++		box = why == NULL ? box_for_node(f.n) : NULL;
++		if (why != NULL) {
++			/* fall through to the tag below */
++		} else if (box == NULL) {
++			walk = false;
++			if (css_computed_display(
++					ns->styles[CSS_PSEUDO_ELEMENT_NONE],
++					f.n == root) != CSS_DISPLAY_NONE &&
++			    !html_rl_noop_never_boxed(f.n))
++				why = "an element without a box would get one";
++		} else if (box->styles == NULL) {
++			why = "a box without its own styles";
++		} else {
++			why = html_rl_noop_diff(box, box->styles, ns);
++			if (box->flags & IS_REPLACED || box->object != NULL ||
++			    (box->gadget != NULL &&
++			     (box->gadget->type == GADGET_SELECT ||
++			      box->gadget->type == GADGET_TEXTAREA)))
++				walk = false;
++		}
++		if (why != NULL) {
++			dom_string *nm = NULL;
++			if (dom_node_get_node_name(f.n, &nm) == DOM_NO_ERR &&
++			    nm != NULL) {
++				snprintf(tag, sizeof(tag), "%.*s",
++					(int)dom_string_byte_length(nm),
++					dom_string_data(nm));
++				dom_string_unref(nm);
++			}
++			dom_node_unref(f.n);
++			break;
++		}
++		if (walk && dom_node_get_first_child(f.n, &ch) == DOM_NO_ERR) {
++			while (ch != NULL) {
++				dom_node *nx = NULL;
++				if (nst == cst) {
++					struct html_rl_noop_frame *a;
++					cst *= 2;
++					a = realloc(st, sizeof(*st) * cst);
++					if (a == NULL) {
++						cst /= 2;
++						dom_node_unref(ch);
++						why = "no memory";
++						break;
++					}
++					st = a;
++				}
++				st[nst].n = ch;
++				st[nst].ps =
++					ns->styles[CSS_PSEUDO_ELEMENT_NONE];
++				st[nst].pe = env;
++				nst++;
++				dom_node_get_next_sibling(ch, &nx);
++				ch = nx;
++			}
++		}
++		dom_node_unref(f.n);
++	}
++out:
++	while (nst > 0)
++		dom_node_unref(st[--nst].n);
++	for (k = 0; k < nkeep; k++) {
++		css_select_results_destroy(keep[k]);
++		if (envs[k] != NULL)
++			css_custom_env_unref(envs[k]);
++	}
++	free(keep);
++	free(envs);
++	free(st);
++	if (why != NULL) {
++		if (ctx != NULL)
++			css_select_ctx_destroy(ctx);
++		macsurf_debug_log_writef("LIFE rebuild local: sheet change: "
++			"declined (%s%s%s) after %d elements in %ld us", why,
++			tag[0] ? ", " : "", tag, nel,
++			(long)(macos9_micros() - t0));
++		return -1;
++	}
++	css_select_ctx_destroy(c->select_ctx);
++	c->select_ctx = ctx;
++	html__redraw_a_box(c, c->layout);
++	noop_n++;
++	macsurf_debug_log_writef("LIFE rebuild local: sheet change restyles "
++		"nothing (%d elements re-cascaded in %ld us, %lu so far)", nel,
++		(long)(macos9_micros() - t0), noop_n);
++	return 0;
++}
++
+ /* Patch 405: the structural check names the children a rule matches;
+  * when each matching compound is bounded and no sibling combinator
+  * follows it, a flip restyles only those children (and their
+--- a/content/handlers/html/css.c	2026-11-08 11:59:47.338405948 +0000
++++ b/content/handlers/html/css.c	2026-11-08 12:45:36.824963155 +0000
+@@ -52,6 +52,7 @@
+ #ifdef WITH_QUICKJS
+ /* javascript/quickjs/macos9_reconvert.c: schedule a (debounced) rebuild */
+ extern void macos9_js_mark_dom_dirty(struct content *c);
++extern void macos9_js_mark_dom_dirty_sheets(struct content *c);	/* 415 */
+ /* patch 318: the same, naming the one sheet entry it came from */
+ extern void macos9_js_mark_dom_dirty_sheet(struct content *c, int index,
+ 		unsigned int counter);
+@@ -101,7 +102,8 @@
+ 		macos9_js_mark_dom_dirty_sheet(&c->base, idx,
+ 				c->stylesheets[idx].mod_count);
+ 	else
+-		macos9_js_mark_dom_dirty(&c->base);
++		/* patch 415: still a sheet mark, with no single identity */
++		macos9_js_mark_dom_dirty_sheets(&c->base);
+ }
+ #endif
+ 
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-08 11:59:47.339792590 +0000
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-08 12:45:36.830788306 +0000
+@@ -216,6 +216,13 @@
+ 	int             sheet_idx;
+ 	unsigned int    sheet_ctr;
+ 	int             sheet_unid;
++	/* Patch 415 - the batch holds sheet marks (html_css_mark_sheets):
++	 * they no longer make the slot coarse. Its precise marks are
++	 * answered as always, then html_rl_sheet_batch_noop re-cascades the
++	 * document; a slot of sheet marks alone has node == NULL. multi is
++	 * kept set, as a coarse slot had it, so the single-mark fast paths
++	 * (style, inherited colour, cosmetic deferral) never take it. */
++	int             sheets;
+ };
+ 
+ /* fixes910 Phase 0 - implemented in content/handlers/html/html.c, where the real
+@@ -441,6 +448,7 @@
+ 	g_pending[i].multi = 0;
+ 	g_pending[i].coarse = 0;
+ 	g_pending[i].coarse_cause = 0;
++	g_pending[i].sheets = 0;	/* patch 415 */
+ 	g_pending[i].kind_mask = 0;
+ 	ms_diag_batch_freeze(g_pending[i].batch_id);
+ 	g_pending[i].batch_id = 0;
+@@ -485,6 +493,9 @@
+ 	int idx;
+ 	unsigned int ctr;
+ } g_sheet_mark;
++/* Patch 415 - set around both sheet-mark entries (identified or not) */
++static int g_mark_from_sheets;
++static long g_sheet_noop = 0;	/* sheet batches that restyled nothing */
+ 
+ /* Patch 318 - fold one nodeless mark's sheet identity into slot i.
+  * fresh: the slot was just (re)initialised. */
+@@ -587,6 +598,13 @@
+ 				g_pending[i].sheet_unid = 0;
+ 				if (node == NULL)
+ 					macos9_reconvert_sheet_note(i, 1);
++				/* Patch 415 - a sheet mark: not coarse */
++				g_pending[i].sheets = 0;
++				if (node == NULL && g_mark_from_sheets) {
++					g_pending[i].sheets = 1;
++					g_pending[i].coarse = 0;
++					g_pending[i].coarse_cause = 0;
++				}
+ 				return;
+ 			}
+ 			ms_diag_batch_add(g_pending[i].batch_id, kind,
+@@ -601,6 +619,30 @@
+ 			 * including into a slot already coarse */
+ 			if (node == NULL)
+ 				macos9_reconvert_sheet_note(i, 0);
++			/* Patch 415 - a sheet mark joins as a flag, not as a
++			 * loss of precision */
++			if (node == NULL && g_mark_from_sheets) {
++				g_pending[i].sheets = 1;
++				g_pending[i].multi = 1;
++				return;
++			}
++			/* Patch 415 - the first node mark into a slot of sheet
++			 * marks alone becomes its primary */
++			if (node != NULL && !g_pending[i].coarse &&
++			    g_pending[i].sheets && g_pending[i].node == NULL &&
++			    g_pending[i].extra_n == 0) {
++				g_pending[i].node = macsurf_reconvert_node_ref(node);
++				g_pending[i].kind = kind;
++				g_pending[i].old_class =
++					(kind == MACOS9_DOMMUT_SETATTR_CLASS &&
++					 old_class != NULL) ? strdup(old_class) :
++					NULL;
++				g_pending[i].attr_name =
++					macos9_reconvert_attr_dup(kind, attr_name);
++				macos9_reconvert_rm_set(&g_pending[i].rm_next,
++					&g_pending[i].rm_state, kind);
++				return;
++			}
+ 
+ 			/* Merge this mutation into what the slot already holds.
+ 			 * Same node AND same kind = the same logical edit
+@@ -717,6 +759,13 @@
+ 	g_pending[freeslot].sheet_unid = 0;
+ 	if (node == NULL)
+ 		macos9_reconvert_sheet_note(freeslot, 1);
++	/* Patch 415 - a sheet mark: not coarse */
++	g_pending[freeslot].sheets = 0;
++	if (node == NULL && g_mark_from_sheets) {
++		g_pending[freeslot].sheets = 1;
++		g_pending[freeslot].coarse = 0;
++		g_pending[freeslot].coarse_cause = 0;
++	}
+ 	{
+ 		struct ms_diag_provenance prov;
+ 		memset(&prov, 0, sizeof(prov));
+@@ -952,7 +1001,12 @@
+ static void
+ macos9_reconvert_fullcause_count(int i)
+ {
+-	if (g_pending[i].coarse) {
++	/* Patch 415 - a sheet batch whose re-cascade found a change is
++	 * still the census's sheet batch: the same "nonode" line and sheet
++	 * census as when its marks made the slot coarse (coarse_cause 0
++	 * names nonode below) */
++	if (g_pending[i].coarse ||
++	    (g_pending[i].sheets && g_fc_reason == 5)) {
+ 		/* Patch 313 - name each committed full reconvert's cause as
+ 		 * it happens. The patch-308 census only prints at the next
+ 		 * navigation reset, which can split one page's causes across
+@@ -1036,6 +1090,10 @@
+ 				g_fc_sheet0++;
+ 		}
+ 	} else {
++		/* patch 415: a sheet batch a precise mark sent to the full
++		 * rebuild consumes its sheet attribution all the same */
++		if (g_pending[i].sheets)
++			(void)html_css_census_batch_sheets(g_pending[i].c);
+ 		macsurf_debug_log_writef("LIFE BATCHCAUSE cause=%s",
+ 			g_fc_reason == 1 ? "kind" :
+ 			g_fc_reason == 2 ? "local" :
+@@ -1162,6 +1220,10 @@
+ 		macsurf_debug_log_writef("LIFE STYLETEXTCENSUS absorbed=%ld",
+ 			g_style_absorbed);
+ 	g_style_absorbed = 0;
++	if (g_sheet_noop != 0)		/* patch 415 */
++		macsurf_debug_log_writef("LIFE SHEETNOOPCENSUS answered=%ld",
++			g_sheet_noop);
++	g_sheet_noop = 0;
+ 	/* Patch 321 B1 - the reach census, its own line: bounded = the
+ 	 * edit's reach was small (per-event line above); unbounded = the
+ 	 * cause, by reason. */
+@@ -1319,10 +1381,23 @@
+ 	 * non-destructive, so the full reconvert sees a consistent tree. */
+ 	double budget;
+ 	double t0;
++	extern int html_rl_sheet_batch_noop(struct content *c);
+ 
+-	if (g_pending[i].coarse || g_pending[i].node == NULL)
++	if (g_pending[i].coarse)
+ 		return 0;
+ 	g_fc_reason = 0;
++	/* Patch 415 - sheet marks alone: the re-cascade decides */
++	if (g_pending[i].node == NULL) {
++		if (!g_pending[i].sheets)
++			return 0;
++		if (html_rl_sheet_batch_noop(c) != 0) {
++			g_fc_reason = 5;
++			return 0;
++		}
++		g_sheet_noop++;
++		return 1;
++	}
++	g_fc_reason = 0;
+ 	budget = html_content_full_us(c);
+ 	if (budget <= 0.0)
+ 		budget = 400000.0; /* no sample yet (backstop only: every
+@@ -1393,6 +1468,15 @@
+ 			return 0;
+ 		}
+ 	}
++	/* Patch 415 - the precise marks are answered (new elements built
++	 * against the settled sheets' context); now the sheets themselves */
++	if (g_pending[i].sheets) {
++		if (html_rl_sheet_batch_noop(c) != 0) {
++			g_fc_reason = 5;
++			return 0;
++		}
++		g_sheet_noop++;
++	}
+ 	return 1;
+ }
+ /* fixes1135 / patch 385 - does the batch's census hold any kind other
+@@ -1891,10 +1975,24 @@
+ 	g_sheet_mark.active = 1;
+ 	g_sheet_mark.idx = index;
+ 	g_sheet_mark.ctr = counter;
++	g_mark_from_sheets = 1;		/* patch 415 */
+ 	macos9_js_mark_dom_dirty_node(c, NULL, MACOS9_DOMMUT_UNKNOWN);
++	g_mark_from_sheets = 0;
+ 	g_sheet_mark.active = 0;
+ }
+ 
++/* Patch 415 - the multi-sheet settle window's mark (html_css_mark_sheets
++ * with more than one entry): the nodeless mark below, known to come
++ * from the sheets. */
++void macos9_js_mark_dom_dirty_sheets(struct content *c);
++void
++macos9_js_mark_dom_dirty_sheets(struct content *c)
++{
++	g_mark_from_sheets = 1;
++	macos9_js_mark_dom_dirty_node(c, NULL, MACOS9_DOMMUT_UNKNOWN);
++	g_mark_from_sheets = 0;
++}
++
+ void
+ macos9_js_mark_dom_dirty(struct content *c)
+ {

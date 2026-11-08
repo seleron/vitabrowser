@@ -374,6 +374,8 @@ JS-class-unnamed file:///app0:/testpages/JS-class-unnamed.html
 CSS-class-unnamed-ref file:///app0:/testpages/CSS-class-unnamed-ref.html
 JS-class-unnamed-attr file:///app0:/testpages/JS-class-unnamed-attr.html
 CSS-class-unnamed-attr-ref file:///app0:/testpages/CSS-class-unnamed-attr-ref.html
+JS-sheet-noop file:///app0:/testpages/JS-sheet-noop.html
+CSS-sheet-noop-ref file:///app0:/testpages/CSS-sheet-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1914,6 +1916,17 @@ k414aseg=$(awk '/ page [0-9]+\/[0-9]+ JS-class-unnamed-attr: navigate/ {on=1; ne
 k414an=$(printf '%s\n' "$k414aseg" | grep -c "class change names no selector" || true)
 echo "  JS-class-unnamed: rows $k414r (0), class changes answered as no-ops ${k414n} (4); [class*=] page rows $k414ar (0), no-ops ${k414an} (0)"
 [ "$k414r" = 0 ] && [ "${k414n:-0}" -eq 4 ] && [ "$k414ar" = 0 ] && [ "${k414an:-1}" -eq 0 ] || fail "class changes no selector names"
+# Patch 415: sheet marks no longer make the batch coarse. A sheet that
+# matches nothing, alone and beside a paragraph's new text, restyles
+# nothing (2); a class change with the still-pending sheet that styles it,
+# and a sheet that restyles the paragraphs, take the full rebuild (the
+# re-cascade declines, 2).
+k415r=$(fl_rows JS-sheet-noop CSS-sheet-noop-ref)
+k415seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sheet-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k415n=$(printf '%s\n' "$k415seg" | grep -c "sheet change restyles nothing" || true)
+k415d=$(printf '%s\n' "$k415seg" | grep -c "sheet change: declined (an element's style changes" || true)
+echo "  JS-sheet-noop: rows $k415r (0), sheet batches restyling nothing ${k415n} (2 or more), re-cascade declines ${k415d} (2 or more)"
+[ "$k415r" = 0 ] && [ "${k415n:-0}" -ge 2 ] && [ "${k415d:-0}" -ge 2 ] || fail "sheet batches that restyle nothing"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
