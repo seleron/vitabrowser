@@ -12163,3 +12163,63 @@ No sudo.
    restyle in place (the dry run: youtube's is layout-only).
 3. List items with markers: rebuild an `<li>` when its marker's number
    cannot change (bullets).
+
+## Patch 418 (2026-11-08): DOMParser's documentElement for an XML type is the markup's root element
+
+**The unit.** claude's five "new element is not a plain block" declines a
+load: its submit spinner, a `<div>` holding an `<html>` element holding
+an `<svg>`. **The `<html>` was ours.** fixes873's `DOMParser` parses into
+a detached `<html>` element (innerHTML) and returned that element as
+`documentElement` for every type. So
+`parseFromString(svgText, 'image/svg+xml').documentElement`, which
+claude appends, was an `<html>` wrapper, not the `<svg>`. That is a
+correctness bug as well as a census one: the page got a stray `<html>`
+element in its body.
+
+**The change** (macsurf_qjs.c, the DOMParser shim): for a type with no
+"html" in it, or with "xml" in it (image/svg+xml, text/xml,
+application/xml, application/xhtml+xml), `documentElement` is the parsed
+markup's first element. text/html keeps the `<html>` root, and body and
+the query methods are unchanged.
+
+**Sites** (scratch build): claude's new-element declines **5 -> 1-2**.
+Its spinner inserts are now built locally as blocks holding an `<svg>`
+(417's replaced leaf), 6 a load.
+
+**Gate.**
+- New pair **JS-domparser-svg / CSS-domparser-svg-ref**. The page checks
+  that the svg document's element is `svg` and a text/html one's is
+  `HTML`, and inserts the `<svg>` between blocks: **DOMPARSER 3/3**, rows
+  0, **placed locally (1), 0 full rebuilds**.
+- **gate418 exit 0 on the first run.**
+
+**A correction to 417.** Its entry calls the JS-attr-restyle panel "a
+geometric proof: the plot dumps do not record colour". The plot dumps do
+not, but the rows check (`fl_rows`, `png-rows-diff.py`) compares **PNG
+snapshots pixel by pixel**, so the colour restyles on those pages are
+verified too.
+
+**Restage from pristine:** 500 applied plus the 2 known collisions,
+macsurf_qjs.c byte-identical. **gate418c (restaged): exit 0**.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean** (347
+page dumps).
+
+**Scorecard r131**: 21 sites against `r79-360`, the 418 and 417 binaries
+back to back: **73.07 vs 73.03**. ddglite and claude are the usual
+flippers. No crash.
+
+**Census, back to back:**
+- BATCHCAUSE **82 vs 94**. claude went **3 vs 10**, its new-element
+  declines **1 vs 6**: the spinner fix itself, though claude's count
+  swings run to run.
+- Without claude: 79 vs 84.
+- New-element declines overall **7 vs 12**.
+
+No sudo.
+
+**Next:**
+1. Root (`<html>`) restyle in place for layout-only changes.
+2. List items with bullet markers.
+3. The remaining "new content is not plain inline" (bbc's block children,
+   wpblog's iframes).
