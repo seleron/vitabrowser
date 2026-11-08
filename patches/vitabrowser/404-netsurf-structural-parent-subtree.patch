@@ -1,0 +1,182 @@
+# netsurf: a structural match on a child-list change rebuilds the parent's subtree, not the page (patch 404)
+# Generated 2026-11-07
+# Base: seleron/vitabrowser (patch stack through 402)
+#
+# The r114 full-rebuild census (BATCHCAUSE, 21 sites): 107 full rebuilds;
+# the largest local-path cause, 12 of them (youtube 7, oldreddit 2,
+# stackoverflow, wpblog, wpnews), was "structural selectors or counters
+# in page CSS" with one reason throughout: "a structural rule matches a
+# sibling" (patch 379's scoped check finding a real match).
+#
+# A structural pseudo-class (:first-child, :nth-child(), :last-of-type,
+# ...) reads only an element's siblings and parent, so a child-list change
+# can restyle only the parent's children and their descendants -- the
+# parent's subtree. html_rl_block_change now answers the match by
+# rebuilding that subtree from the DOM with the container rebuild of
+# patches 372/376 (html_rl_flex_restyle: its guards -- controls, frames,
+# counting, objects, normalisation -- unchanged), the page laid out whole.
+#  - The structural check only sets struct_hit: the checks after it still
+#    run first and still decline into the full rebuild when a change can
+#    reach past the subtree (a sibling of the parent, an ancestor's :has(),
+#    :empty, a counting box). The rebuild happens where boxes would first
+#    change (or in place of patch 378's no-op).
+#  - A parent whose box is not a plain block (a table cell) keeps the full
+#    rebuild; a declined subtree rebuild logs the old census line.
+#  - html_rl_flex_restyle: html_rl_class_same says no class changed (its
+#    class-sibling check needs an old value).
+# Logged "LIFE rebuild local: structural change: the parent's subtree
+# rebuilt in N us (M so far)".
+#
+# Also fixed, reached for the first time by the above: patch 198's sibling-
+# rule scanner parses a nested :is()/:not()/:has() argument with no rule
+# list (html_rl_scan_pseudo_content), but html_rl_parse_prelude appended a
+# rule for any sibling combinator in it -- a NULL dereference in
+# html_rl_sib_rule_append (ASan; wpblog and wikipedia crashed 3/3 and
+# 2/3). With no list, the compounds are freed; the risk is still reported.
+#
+--- a/content/handlers/html/html.c	2026-11-07 23:08:50.421210511 +0000
++++ b/content/handlers/html/html.c	2026-11-08 00:11:48.312174564 +0000
+@@ -8351,6 +8351,51 @@
+ 	return tail;
+ }
+ 
++/* Patch 404: the class argument of html_rl_flex_restyle when no class
++ * changed (a child-list change): its class-sibling check does not apply. */
++static const char html_rl_class_same[] = "";
++static int html_rl_flex_restyle(html_content *c, dom_node *el,
++		struct box *ob, double t0, const char *old_class,
++		bool is_block);
++
++/* Patch 404: a child-list change whose structural check found a rule that
++ * reaches the parent's children ("a structural rule matches a sibling":
++ * :first-child, :nth-child(), :last-of-type, ... -- the r114 census: 12 of
++ * 107 full rebuilds on the 21 sites, youtube 7). Such a rule reads only an
++ * element's siblings and parent, so what it can restyle is the parent's
++ * children and their descendants: the parent's subtree, rebuilt from the
++ * DOM by the container rebuild of patches 372/376 (its guards: controls,
++ * frames, counting, objects, normalisation), and the page laid out whole.
++ * Was: a full box-tree rebuild. :has() reaching up and :empty on the
++ * parent are checked apart (patches 193/198/373). A parent whose box is
++ * not a plain block (a table cell) keeps the full rebuild. */
++/* the decline line the census counts, when the subtree rebuild declined */
++static int html_rl_struct_declined(void)
++{
++	macsurf_debug_log_writef("LIFE rebuild local: declined (structural "
++		"selectors or counters in page CSS)");
++	return -1;
++}
++static int html_rl_struct_parent_rebuild(html_content *c, dom_node *pnode,
++		struct box *pbox, double t0)
++{
++	extern double macos9_micros(void);
++	static unsigned long struct_n;
++	if (pbox->type != BOX_BLOCK) {
++		macsurf_debug_log_writef("LIFE rebuild local: structural "
++			"change: the parent is not a plain block");
++		return -1;
++	}
++	if (html_rl_flex_restyle(c, pnode, pbox, t0, html_rl_class_same,
++			true) != 0)
++		return -1;
++	struct_n++;
++	macsurf_debug_log_writef("LIFE rebuild local: structural change: "
++		"the parent's subtree rebuilt in %ld us (%lu so far)",
++		(long)(macos9_micros() - t0), struct_n);
++	return 0;
++}
++
+ static int html_rl_block_change(html_content *c, dom_node *pnode,
+ 		struct box *pbox, double t0)
+ {
+@@ -8363,6 +8408,7 @@
+ 	bool sib_tail = false;			/* patch 381 */
+ 	unsigned int nrem = 0, nadd = 0, i, local_n = 0, nskip = 0;
+ 	bool skip_over = false;
++	bool struct_hit = false;		/* patch 404 */
+ 	struct box *b, *layout;
+ 	dom_node *n = NULL, *next;
+ 	bool full = false;
+@@ -8631,7 +8677,11 @@
+ 		if (srisk) {
+ 			macsurf_debug_log_writef("LIFE rebuild local: "
+ 				"structural check: %s", swhy ? swhy : "?");
+-			RL_BNO("structural selectors or counters in page CSS");
++			/* patch 404: answered by rebuilding the parent's
++			 * subtree -- after the checks below, which can still
++			 * reach past it (a sibling of the parent, an
++			 * ancestor's :has()) and then decline as before */
++			struct_hit = true;
+ 		}
+ 		/* patch 381: an appended element went last; a removal whose
+ 		 * recorded place is the end left nothing after it -- the
+@@ -8650,6 +8700,9 @@
+ 				"box");
+ 		for (i = 0; i < nskip; i++)
+ 			dom_node_unref(skipped[i]);
++		if (struct_hit)		/* patch 404 */
++			return html_rl_struct_parent_rebuild(c, pnode, pbox,
++					t0) == 0 ? 0 : html_rl_struct_declined();
+ 		macsurf_debug_log_writef("LIFE rebuild local: child list "
+ 			"changed only in elements with no box (%u), nothing to "
+ 			"rebuild", nskip);
+@@ -8729,7 +8782,11 @@
+ 		if (srisk) {
+ 			macsurf_debug_log_writef("LIFE rebuild local: "
+ 				"structural check: %s", swhy ? swhy : "?");
+-			RL_BNO("structural selectors or counters in page CSS");
++			/* patch 404: answered by rebuilding the parent's
++			 * subtree -- after the checks below, which can still
++			 * reach past it (a sibling of the parent, an
++			 * ancestor's :has()) and then decline as before */
++			struct_hit = true;
+ 		}
+ 		for (i = 0; i < nrem; i++)
+ 			if (html_rl_box_counts(removed[i]))
+@@ -8768,6 +8825,17 @@
+ 			removed, nrem, sib_tail))
+ 		RL_BNO("sibling combinator may restyle on insert/remove");
+ 
++	/* patch 404: every check passed but the structural one -- the
++	 * parent's subtree is built again instead of placing blocks */
++	if (struct_hit) {
++		for (i = 0; i < nadd; i++)
++			dom_node_unref(added[i]);
++		for (i = 0; i < nskip; i++)
++			dom_node_unref(skipped[i]);
++		return html_rl_struct_parent_rebuild(c, pnode, pbox, t0) == 0 ?
++			0 : html_rl_struct_declined();
++	}
++
+ 	/* removals first */
+ 	for (i = 0; i < nrem; i++) {
+ 		struct layout_removed_block rb;
+@@ -9196,7 +9264,18 @@
+ 		int *nrules, char kind, struct html_rl_sib_compound *l,
+ 		struct html_rl_sib_compound *r)
+ {
+-	struct html_rl_sib_rule *nr = realloc(*rules,
++	struct html_rl_sib_rule *nr;
++	/* Patch 404: html_rl_scan_pseudo_content parses a nested argument
++	 * (:is(a + b), :not(.x ~ .y)) with no rule list -- a combinator in it
++	 * only marks the risk (found). The compounds handed over are freed,
++	 * not appended to a NULL list: wpblog's and wikipedia's sheets
++	 * SEGVed here once patch 404 let the sibling check run there. */
++	if (rules == NULL) {
++		html_rl_sib_compound_free(l);
++		html_rl_sib_compound_free(r);
++		return true;
++	}
++	nr = realloc(*rules,
+ 			(*nrules + 1) * sizeof(struct html_rl_sib_rule));
+ 	if (nr == NULL)
+ 		return false;
+@@ -11074,7 +11153,8 @@
+ 	if (ob->gadget != NULL || HTML_RL_FRAME(ob) ||
+ 	    html_rl_subtree_stateful(ob->children))
+ 		RL_FNO("restyled flex or grid box holds controls or frames");
+-	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
++	if (old_class != html_rl_class_same &&	/* patch 404 */
++	    html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
+ 		RL_FNO("class change may move a sibling selector");
+ 	if (html_rl_box_counts(ob))		/* patch 374 */
+ 		RL_FNO("the restyled flex or grid box takes part in counting");

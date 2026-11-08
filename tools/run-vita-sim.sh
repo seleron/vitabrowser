@@ -1763,15 +1763,20 @@ echo "  JS-mixed-siblings: rows differing from the parse-time build $k377r (0); 
 # rebuilds, "new element is not a plain block"). Both pages render row for
 # row as the same steps at parse time; a <script> that takes a <p>'s
 # :first-child keeps the full rebuild, as does an <iframe> mid-page.
+# Patch 404: that :first-child match is now answered by rebuilding the
+# parent's subtree; the guard is counted where it fires (its structural
+# check line) and must be answered by either path, still row for row.
 k378r=$(fl_rows JS-late-append CSS-late-append-ref)
 k378s=$(fl_rows JS-late-append-struct CSS-late-append-struct-ref)
 k378n=$(grep -c "LIFE rebuild local: child list changed only in elements with no box" "$R/netsurf.log" || true)
 k378a=$(grep -c "LIFE rebuild local: an iframe or image appended at the end, built alone" "$R/netsurf.log" || true)
 k378g=$(awk '/ page [0-9]+\/[0-9]+ JS-late-append-struct: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
-	grep -c "LIFE rebuild local: declined (structural selectors or counters in page CSS)" || true)
-echo "  JS-late-append: rows differing from the parse-time build $k378r (0), :first-child page $k378s (0); ${k378n} child-list changes needing no rebuild (2 or more); ${k378a} iframes/images appended alone (2 or more); :first-child guard ${k378g} (1 or more)"
+	grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
+k378h=$(awk '/ page [0-9]+\/[0-9]+ JS-late-append-struct: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: structural change: the parent's subtree rebuilt\|LIFE rebuild local: declined (structural selectors or counters in page CSS)" || true)
+echo "  JS-late-append: rows differing from the parse-time build $k378r (0), :first-child page $k378s (0); ${k378n} child-list changes needing no rebuild (2 or more); ${k378a} iframes/images appended alone (2 or more); :first-child guard ${k378g} (1 or more), answered ${k378h} (1 or more)"
 [ "$k378r" = 0 ] && [ "$k378s" = 0 ] && [ "${k378n:-0}" -ge 2 ] &&
-	[ "${k378a:-0}" -ge 2 ] && [ "${k378g:-0}" -ge 1 ] ||
+	[ "${k378a:-0}" -ge 2 ] && [ "${k378g:-0}" -ge 1 ] && [ "${k378h:-0}" -ge 1 ] ||
 	fail "late appends and boxless child-list changes"
 # Patch 379: the structural/counter check is scoped to the parent's
 # children (before: page-wide, patch 192). On a page with :nth-child,
@@ -1799,9 +1804,14 @@ k380seg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-dir: navigate/ {on=1; next} on &&
 k380l=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: blocks rebuilt\|LIFE rebuild local: blocks placed\|LIFE rebuild local: child list changed only" || true)
 k380p=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural range positional" || true)
 k380w=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural range whole" || true)
-echo "  JS-struct-dir: rows differing from the parse-time build $k380r (0); ${k380l} changes local on the page (5 or more); declines: positional ${k380p} (2 or more), whole range ${k380w} (1 or more)"
+# Patch 404: the structural matches are answered by rebuilding the
+# parent's subtree, not the page (#box's new first child, #ps's new last
+# child; <body>'s two removed scripts) -- still row for row as the
+# parse-time build.
+k404s=$(printf '%s\n' "$k380seg" | grep -c "LIFE rebuild local: structural change: the parent's subtree rebuilt" || true)
+echo "  JS-struct-dir: rows differing from the parse-time build $k380r (0); ${k380l} changes local on the page (5 or more); declines: positional ${k380p} (2 or more), whole range ${k380w} (1 or more); parent subtrees rebuilt ${k404s} (2 or more)"
 [ "$k380r" = 0 ] && [ "${k380l:-0}" -ge 5 ] && [ "${k380p:-0}" -ge 2 ] &&
-	[ "${k380w:-0}" -ge 1 ] || fail "structural check by direction"
+	[ "${k380w:-0}" -ge 1 ] && [ "${k404s:-0}" -ge 2 ] || fail "structural check by direction"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
