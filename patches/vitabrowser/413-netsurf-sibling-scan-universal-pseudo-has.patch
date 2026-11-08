@@ -1,0 +1,264 @@
+# netsurf: sibling-rule scan reads *, comments before @font-face, plain pseudo-classes in a left compound, nth-*(An+B), :has(> x); a parsed :has() reaches 198's check (patch 413)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 412)
+#
+# The remaining "sibling combinator may restyle on insert/remove" declines
+# after 412. A scratch debug build logged each prelude that still made a
+# sheet "conservative" (state 2: every block insert/remove declines):
+#
+#  - a bare universal compound, ".x > *": parse_compound returned -1 for
+#    a compound of only "*" (rte, google);
+#  - Google Fonts' "/* latin-ext */ @font-face {": the prelude start skipped
+#    white space but not comments, so the at-rule was taken for a selector
+#    and its descriptors ("U+0100-024F;") parsed as one (rte, oldreddit);
+#  - a plain pseudo-class in a sibling rule's LEFT compound,
+#    ".gb_Ac:first-child+.gb_qc": any pseudo there declined;
+#  - ":nth-last-child(2) ~" -- an nth-*() of An+B only;
+#  - ":has(> article...)": :has()'s argument could not open with ">".
+#
+# Changes (html.c):
+#  - parse_compound: a bare * is a compound.
+#  - scan_sheet: the prelude start skips comments as well as white space.
+#  - has_func_pseudo: only a FUNCTIONAL pseudo-class in a left compound
+#    declines (:not(.a) hides classes the checks match on); a plain one,
+#    or nth-*() whose argument is An+B only (no "of S"), is cached and
+#    IGNORED by matching -- a broader match. Matching (compound_matches)
+#    now ignores any pseudo-class instead of calling the compound
+#    non-matching: that was reachable for RIGHT compounds (.a + .b:hover,
+#    .a + .b:not(.c)) and under-reported risk.
+#  - insert/remove '+' checks: with a pseudo-class in L the broad matches
+#    of e and its neighbour cannot be compared (.a:first-child: prev may
+#    match, e not) -- decline when either matches.
+#  - scan_pseudo_content(rel): :has() may open with the child combinator;
+#    a leading + or ~ still declines.
+#  - BUG since 198: "has" is a selector pseudo (186), so 198's branch that
+#    set has_has never ran -- a parsed :has() compound never reached
+#    has_cp, and a block inserted (not at the tail) under .x:has(...) was
+#    placed locally without restyling .x. has_has is set on that path now.
+#
+# Sites (scratch build): oldreddit 1 -> 0 insert/remove declines (cnnlite
+# stays 0 from 412). rte (":has(~ ...)"), google
+# (".mj3qce:has(.cDeo3)+.CHVz3d") and wpblog (":where(..)+:where(..)") keep
+# theirs: real sibling rules behind functional pseudo-classes.
+#
+--- a/content/handlers/html/html.c	2026-11-08 08:13:43.935461805 +0000
++++ b/content/handlers/html/html.c	2026-11-08 09:13:56.627666568 +0000
+@@ -9592,8 +9592,9 @@
+  * idents) fails the parse and declines.
+  */
+ 
+-/* A parsed left compound. has_pseudo is never set on a cached compound:
+- * the scan declines instead. */
++/* A parsed compound. Since patch 413 a cached LEFT compound may carry a
++ * pseudo-class that takes no argument (a functional one still makes the
++ * scan decline); matching ignores it (a broader match). */
+ struct html_rl_sib_attr {
+ 	char *name;	/* lowercased */
+ 	char op;	/* 0, '=', '~', '|', '^', '$', '*' */
+@@ -9608,10 +9609,12 @@
+ 	struct html_rl_sib_attr *attrs;
+ 	int nattrs;
+ 	bool has_pel;
+-	/* Set while parsing; a left compound with a pseudo-class makes the
+-	 * sheet decline (dynamic state cannot be evaluated exactly). Never
+-	 * set on a cached compound. */
++	/* Any pseudo-class. Patch 413: only a functional one in a left
++	 * compound makes the sheet decline; a plain one (:first-child,
++	 * :hover) is cached and ignored by matching, the insert/remove '+'
++	 * checks declining when it could hide a difference. */
+ 	bool has_pseudo;
++	bool has_func_pseudo;	/* patch 413: a pseudo-class with (...) */
+ 	/* Patch 198: specific pseudo-classes for the insert/remove precise
+ 	 * decline. has_empty/has_has are set alongside has_pseudo when the
+ 	 * pseudo is :empty / :has(). */
+@@ -9880,8 +9883,13 @@
+ 		struct html_rl_sib_compound **has_cp, int *nhas);
+ 
+ /* Scan the inside of a selector-taking functional pseudo for a sibling
+- * combinator. 0 = none, 1 = found, -1 = parse error. Both decline. */
+-static int html_rl_scan_pseudo_content(struct html_rl_sel_parser *p)
++ * combinator. 0 = none, 1 = found, -1 = parse error. Both decline.
++ * Patch 413: rel (for :has) lets the argument open with the relative
++ * child combinator, :has(> a) -- rte's ":has(> article:nth-child(2))"
++ * made its sheet conservative. Any insert/remove below a :has compound
++ * already declines (198); a leading + or ~ still declines here. */
++static int html_rl_scan_pseudo_content(struct html_rl_sel_parser *p,
++		bool rel)
+ {
+ 	size_t open = p->i, depth = 0, j = p->i;
+ 	struct html_rl_sel_parser sub;
+@@ -9911,6 +9919,14 @@
+ 	sub.s = p->s;
+ 	sub.len = j;
+ 	sub.i = open + 1;
++	if (rel) {
++		while (sub.i < j && html_rl_is_ws(sub.s[sub.i]))
++			sub.i++;
++		if (sub.i < j && sub.s[sub.i] == '>')
++			sub.i++;
++		while (sub.i < j && html_rl_is_ws(sub.s[sub.i]))
++			sub.i++;
++	}
+ 	r = html_rl_parse_prelude(&sub, j, &l, &nl, NULL, NULL, NULL, NULL,
+ 			NULL, NULL);
+ 	for (k = 0; k < nl; k++)
+@@ -9927,10 +9943,12 @@
+ {
+ 	uint8_t c;
+ 	size_t start_i;
++	bool universal = false;	/* patch 413 */
+ 	memset(cp, 0, sizeof(*cp));
+ 	c = p->i < p->len ? p->s[p->i] : 0;
+ 	if (c == '*') {
+ 		p->i++;
++		universal = true;
+ 	} else if (html_rl_is_ident_start(c)) {
+ 		cp->tag = html_rl_parse_ident(p);
+ 		if (cp->tag == NULL)
+@@ -10106,11 +10124,25 @@
+ 					return -1;
+ 				}
+ 			} else if (p->i < p->len && p->s[p->i] == '(') {
++				/* patch 413: an nth-*() whose argument is only
++				 * An+B ("2", "2n+1", "odd") names no class, id
++				 * or attribute: a plain pseudo-class for the
++				 * sibling checks (positional risk is 379's) */
++				size_t pa = p->i;
++				bool nth = strncmp(name, "nth-", 4) == 0;
+ 				if (html_rl_is_sel_pseudo(name)) {
+-					int r = html_rl_scan_pseudo_content(p);
++					bool is_has = strcmp(name, "has") == 0;
++					int r = html_rl_scan_pseudo_content(p,
++							is_has);
+ 					free(name);
+ 					if (r != 0)
+ 						return 2;
++					/* patch 413: "has" is a selector pseudo,
++					 * so the branch below never recorded it:
++					 * a parsed :has() compound was missing
++					 * from 198's has_cp list */
++					if (is_has)
++						cp->has_has = true;
+ 				} else {
+ 					/* Patch 198: record :has() for the
+ 					 * precise insert/remove decline. */
+@@ -10121,6 +10153,23 @@
+ 				if (!html_rl_skip_parens(p))
+ 					return -1;
+ 				cp->has_pseudo = true;
++				if (nth) {
++					size_t q;
++					for (q = pa + 1; q + 1 < p->i; q++) {
++						uint8_t d = p->s[q];
++						if (!((d >= '0' && d <= '9') ||
++						      d == 'n' || d == 'N' ||
++						      d == '+' || d == '-' ||
++						      d == 'o' || d == 'd' ||
++						      d == 'e' || d == 'v' ||
++						      html_rl_is_ws(d)))
++							break;
++					}
++					if (q + 1 < p->i)
++						nth = false;
++				}
++				if (!nth)
++					cp->has_func_pseudo = true;
+ 			} else {
+ 				/* Patch 198: record :empty for the precise
+ 				 * insert/remove decline. */
+@@ -10133,9 +10182,11 @@
+ 		}
+ 		break;
+ 	}
++	/* patch 413: a bare * is a compound (it matches any element):
++	 * ".x > *" failed here and made the whole sheet conservative */
+ 	if (p->i == start_i && cp->tag == NULL && cp->id == NULL &&
+ 	    cp->nclasses == 0 && cp->nattrs == 0 && !cp->has_pel &&
+-	    !cp->has_pseudo)
++	    !cp->has_pseudo && !universal)
+ 		return -1;
+ 	return 0;
+ }
+@@ -10235,7 +10286,14 @@
+ 		}
+ 		c = p->s[p->i];
+ 		if (c == '+' || c == '~') {
+-			if (cp.has_pseudo) {
++			/* patch 413: only a FUNCTIONAL pseudo-class in a left
++			 * compound (:not(.a), :is(.b)) hides classes the
++			 * checks match on; a plain one (:first-child, :hover,
++			 * :checked) is ignored -- a broader match, so more
++			 * risk, never less (structural ones are patch 379's).
++			 * google's .gb_Ac:first-child+.gb_qc made its sheet
++			 * conservative. */
++			if (cp.has_func_pseudo) {
+ 				html_rl_sib_compound_free(&cp);
+ 				if (pend_kind)
+ 					goto decline_free_pend;
+@@ -10440,8 +10498,22 @@
+ 		}
+ 		if (ch == '{') {
+ 			size_t a = start;
+-			while (a < i && html_rl_is_ws(s[a]))
+-				a++;
++			/* patch 413: past white space AND comments -- Google
++			 * Fonts' "/* latin-ext * / @font-face {" was taken for a
++			 * selector, and its descriptors parsed as one */
++			for (;;) {
++				while (a < i && html_rl_is_ws(s[a]))
++					a++;
++				if (a + 1 < i && s[a] == '/' && s[a + 1] == '*') {
++					a += 2;
++					while (a + 1 < i &&
++					       !(s[a] == '*' && s[a + 1] == '/'))
++						a++;
++					a += 2;
++					continue;
++				}
++				break;
++			}
+ 			if (a < i && s[a] == '@') {
+ 				static const char *const group[] = {
+ 					"@media", "@supports", "@layer",
+@@ -10901,11 +10973,12 @@
+ 	 * false when pel is set). */
+ 	if (cp->has_pel)
+ 		return false;
+-	/* Should be unreachable: the scan declines instead of caching a
+-	 * compound with a pseudo-class. Treat as non-matching rather than
+-	 * risk an unsound local rebuild. */
+-	if (cp->has_pseudo)
+-		return false;
++	/* Patch 413: a pseudo-class (cached on a right compound always, on a
++	 * left one since 413 when it takes no argument) is IGNORED -- the
++	 * static parts decide, a broader match. (Was: "non-matching", which
++	 * under-reported risk for a right compound like .b:not(.x).) Where a
++	 * broad match on both sides of a comparison could hide a difference
++	 * (the insert/remove '+' checks), the caller declines instead. */
+ 	if (cp->tag != NULL) {
+ 		dom_string *tn = NULL;
+ 		bool ok = false;
+@@ -11237,7 +11310,11 @@
+ 							&rule->l);
+ 				bool m_e = html_rl_sib_match_live(e,
+ 						&rule->l);
+-				if (m_prev != m_e)
++				/* patch 413: with a pseudo-class in L the two
++				 * broad matches cannot be compared (.a:first-
++				 * child: prev may match, e not) */
++				if (m_prev != m_e ||
++				    (rule->l.has_pseudo && (m_prev || m_e)))
+ 					return true;
+ 			}
+ 		} else {
+@@ -11282,7 +11359,9 @@
+ 				bool m_prev = prev != NULL &&
+ 					html_rl_sib_match_live(prev,
+ 							&rule->l);
+-				if (m_e != m_prev)
++				/* patch 413: as on insert */
++				if (m_e != m_prev ||
++				    (rule->l.has_pseudo && (m_e || m_prev)))
+ 					return true;
+ 			}
+ 		} else {

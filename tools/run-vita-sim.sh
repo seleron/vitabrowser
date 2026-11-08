@@ -368,6 +368,8 @@ JS-style-sib-risk file:///app0:/testpages/JS-style-sib-risk.html
 CSS-style-sib-risk-ref file:///app0:/testpages/CSS-style-sib-risk-ref.html
 JS-sib-unreadable file:///app0:/testpages/JS-sib-unreadable.html
 CSS-sib-unreadable-ref file:///app0:/testpages/CSS-sib-unreadable-ref.html
+JS-sib-universal file:///app0:/testpages/JS-sib-universal.html
+CSS-sib-universal-ref file:///app0:/testpages/CSS-sib-universal-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1887,6 +1889,16 @@ k412d=$(printf '%s\n' "$k412seg" | grep -c "declined (sibling combinator may res
 k412n=$(printf '%s\n' "$k409rseg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
 echo "  JS-sib-unreadable: rows $k412r (0), block changes local ${k412l} (3 or more), sibling declines ${k412d} (0); style-sib-risk block insert declined ${k412n} (1 or more)"
 [ "$k412r" = 0 ] && [ "${k412l:-0}" -ge 3 ] && [ "${k412d:-1}" -eq 0 ] && [ "${k412n:-0}" -ge 1 ] || fail "unreadable selectors without sibling syntax"
+# Patch 413: a bare *, a comment before @font-face, a plain pseudo-class
+# in a left compound no longer make the sheet conservative -- the block
+# inserted into .u is placed locally -- while the .a inserted after the
+# first-child .a still declines (broad matches of both cannot be compared).
+k413r=$(fl_rows JS-sib-universal CSS-sib-universal-ref)
+k413seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-universal: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k413l=$(printf '%s\n' "$k413seg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
+k413d=$(printf '%s\n' "$k413seg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
+echo "  JS-sib-universal: rows $k413r (0), block changes local ${k413l} (1 or more), the .a and .hx inserts declined ${k413d} (2 or more)"
+[ "$k413r" = 0 ] && [ "${k413l:-0}" -ge 1 ] && [ "${k413d:-0}" -ge 2 ] || fail "universal, font-face comment, plain left pseudo, :has(> x)"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
