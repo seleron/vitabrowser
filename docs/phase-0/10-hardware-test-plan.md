@@ -11044,3 +11044,111 @@ No sudo.
 **Next:** units from the census. Patches are through 402; the open
 items are in the 395-402 "Next" lists (device-dependent ones wait for
 hardware).
+
+## Patch 404 (2026-11-08): a structural match on a child-list change rebuilds the parent's subtree, not the page; and a latent NULL dereference in the sibling-rule scanner
+
+**The census, recounted** (383's method: one `BATCHCAUSE` per committed
+full reconvert, and the local decline before each `local` one; r114-402
+sims, 21 sites): **107 full rebuilds** (r108-383: 98; run-to-run noise
+is 98-116). By cause: local 39, nonode 35 (sheet/nodeless batches: doc
+23, shelved by unit 384), two 17, kind 10, over 5, guard 1. The largest
+local decline: **"structural selectors or counters in page CSS", 12**
+(youtube 7, oldreddit 2, stackoverflow, wpblog, wpnews). Its one reason
+throughout: "a structural rule matches a sibling", patch 379's scoped
+check finding a real match. The rest of local: new element not a plain
+block 9, nearest box not a block 7, the restyled-block declines 6+6,
+sibling-selector declines 6+5+5+5. Census lines: `BATCHCAUSE` is the
+count; the per-site `html_reconvert_content rc=` line has only shown
+since unit 391's noise allowance.
+
+**Why the subtree is enough.** A structural pseudo-class (`:first-child`,
+`:nth-child()`, `:last-of-type`, ...) reads only an element's siblings
+and parent. A child-list change can therefore restyle the parent's
+children and their descendants, which is the parent's subtree, and
+nothing else through that rule.
+
+**The change** (html.c):
+- `html_rl_block_change`: the structural check (both of its sites, patch
+  378's box-less no-op and the insert/remove path) now only sets
+  `struct_hit`. The checks after it still run first: patch 378's
+  box-less sibling check, the removed-block counting check, and patch
+  198's `html_rl_block_sibling_risk` (sibling combinators, `:empty`,
+  `:has()`, which can reach a sibling of the parent or an ancestor). Any
+  of them still declines into the full rebuild. Only where boxes would
+  first change (or in place of 378's no-op) does `struct_hit` hand over to
+  `html_rl_struct_parent_rebuild`.
+- `html_rl_struct_parent_rebuild`: the parent's subtree is rebuilt from the
+  DOM by the container rebuild of 372/376 (`html_rl_flex_restyle`; its
+  guards are unchanged: controls, frames, counting, objects,
+  normalisation), and the page is laid out whole. A parent that is not a
+  plain block (a table cell) keeps the full rebuild. A declined subtree
+  rebuild logs the old census line. Logged: `structural change: the
+  parent's subtree rebuilt in N us (M so far)`.
+- `html_rl_flex_restyle`: `html_rl_class_same` says no class changed
+  (its class-sibling check needs an old value).
+
+**Gate.** JS-struct-dir (380) already holds three structural full
+rebuilds. Now: **rows differing 0**, **parent subtrees rebuilt 2**
+(`#box`'s new first child, `#ps`'s new last child). The third, `<body>`'s
+two scripts removed, stays a full rebuild because `<body>` holds iframes,
+which the container rebuild declines. That is the right answer. New
+assertion: 2 or more. JS-late-append-struct (378) counted its
+`:first-child` guard by the decline line; that match is now answered by
+the subtree. The check counts the guard where it fires (its `structural
+check` line) and requires it answered by either path: guard 1, answered
+1, rows 0.
+
+**Caught by the first scorecard A/B, before any commit:**
+**wikipedia and wpblog crashed with 404** (rc -11; plain loops 2/3 and
+3/3, the 402 binary 0/6). ASan: **SEGV in `html_rl_sib_rule_append`**
+(html.c) <- `html_rl_parse_prelude` <- `html_rl_scan_pseudo_content`
+(two nested levels) <- `html_rl_scan_sheet` <- `html_rl_block_sibling_risk`,
+called from 378's box-less sibling check. The bug is patch 198's own.
+`html_rl_scan_pseudo_content` parses a nested `:is()`/`:not()`/`:has()`
+argument with **no rule list** (it only needs to know whether a
+combinator is there; `found` already makes it report the risk), but
+`html_rl_parse_prelude` appended a rule for every sibling combinator in
+it: a NULL `rules`. Before 404 that check never ran on those sheets,
+because the structural decline came first. **Fix:** with no list,
+`html_rl_sib_rule_append` frees the two compounds it would have taken
+and returns success. The risk verdict is unchanged. After: ASan 4/4
+clean, plain 6/6 loaded on both sites. Any page whose CSS has a sibling
+combinator inside `:is()`/`:not()`/`:has()` was exposed to this whenever
+the sibling check scanned it.
+
+**Restage from pristine:** 486 applied plus the 2 known collisions,
+html.c byte-identical to the tested tree (both versions).
+
+**Gates:** gate404b (first version; one check updated, see Gate above)
+exit 0; gate404c (restaged) exit 0; **gate404d (final, with the scanner
+fix, restaged) exit 0**: JS-struct-dir rows 0 and parent subtrees
+rebuilt 2, JS-late-append guard 1 and answered 1, every other check as
+before.
+
+**Scorecard r116**: 21 sites against `r79-360`, the final 404 and the
+402 binaries back to back (`score/r116-404`, `score/r116-402`):
+**71.71 vs 71.76**. No crash. The only per-site difference is ddglite
+(74.8 vs 76.0; it flips between those two). (r115, the first version:
+62.19 vs 68.38, the two crashes above.)
+
+**Census, honestly small:** full rebuilds **98 vs 105** (local 37 vs
+40), within run-to-run noise. Structural declines 16 -> 11, and the
+subtree rebuild fired once. Why so few: the real sites' structural
+matches are mostly on `<body>` (youtube's iframes appended there), and
+`<body>` holds iframes and controls, which the container rebuild
+declines by design (patch 371: a frame's box is never freed). The guards
+that declined in r115: "holds controls or frames" 8, "not in a block" 2.
+404 helps ordinary pages: a striped list, a block's first or last child.
+The bigger result here is the scanner fix.
+
+No sudo. The new helper's local `extern` of `macos9_micros` repeats
+html_rl_block_change's own (house style: -Wnested-externs /
+-Wredundant-decls, as at the existing site).
+
+**Next:**
+1. The structural matches left on `<body>`: let the container rebuild
+   keep frames and controls (carry the iframe windows and form controls
+   over, as 375 does for objects and 382 for buttons). Then most of the 11
+   become subtree rebuilds.
+2. Then the census's next local causes: "new element is not a plain
+   block" (9), "nearest box is not a block" (7).
