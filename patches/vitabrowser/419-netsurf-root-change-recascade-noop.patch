@@ -1,0 +1,96 @@
+# netsurf: a class or attribute change on <html> that re-cascades to the same styles rebuilds nothing (patch 419)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 418)
+#
+# The root element's own box has no parent: every class change on <html>
+# whose tokens a sheet names (after 414), and every sheet-visible
+# attribute on it (after 417), ended at "restyled block's parent is not a
+# block" -- a full rebuild. 415's dry run had already classified them:
+# jquery's and wpnews's change no element's style, youtube's only layout,
+# wikipedia's and archwiki's box structure.
+#
+#  - html_rl_block_restyle: on the root's own box, 415's whole-document
+#    walk (now html_rl_doc_noop, with a label: "root change" here, "sheet
+#    change" for 415's batches, unchanged) answers the change when no
+#    element's style differs and no box-less element would get a box.
+#    Otherwise the decline stands.
+#
+# Sites (scratch build): jquery's and wpnews's root changes answered;
+# youtube's and wikipedia's decline on a <div> whose style changes,
+# archwiki's on a box-less <div> that would get a box.
+#
+--- a/content/handlers/html/html.c	2026-11-08 18:25:19.247850283 +0000
++++ b/content/handlers/html/html.c	2026-11-08 18:44:17.356893226 +0000
+@@ -8784,11 +8784,20 @@
+ 	css_custom_env *pe;
+ };
+ 
++/* Patch 419: the same walk for a change on the root element (a class or
++ * attribute on <html>: no parent box, so every one was the full rebuild);
++ * `what` names the change in the log. */
++static int html_rl_doc_noop(html_content *c, const char *what);
+ int html_rl_sheet_batch_noop(struct content *base_c);
+ int html_rl_sheet_batch_noop(struct content *base_c)
+ {
++	return html_rl_doc_noop((html_content *)base_c, "sheet change");
++}
++
++static int html_rl_doc_noop(html_content *c, const char *what)
++{
+ 	extern double macos9_micros(void);
+-	html_content *c = (html_content *)base_c;
++	struct content *base_c = &c->base;
+ 	css_select_ctx *ctx = NULL;
+ 	struct html_rl_noop_frame *st = NULL;
+ 	css_select_results **keep = NULL;
+@@ -8817,8 +8826,8 @@
+ 	else if (html_css_prune_detached_sheets(c) > 0)	/* unit 387 */
+ 		why = "detached stylesheet pruned";
+ 	if (why != NULL) {
+-		macsurf_debug_log_writef("LIFE rebuild local: sheet change: "
+-			"declined (%s)", why);
++		macsurf_debug_log_writef("LIFE rebuild local: %s: "
++			"declined (%s)", what, why);
+ 		return -1;
+ 	}
+ 	t0 = macos9_micros();
+@@ -8967,9 +8976,9 @@
+ 	if (why != NULL) {
+ 		if (ctx != NULL)
+ 			css_select_ctx_destroy(ctx);
+-		macsurf_debug_log_writef("LIFE rebuild local: sheet change: "
+-			"declined (%s%s%s) after %d elements in %ld us", why,
+-			tag[0] ? ", " : "", tag, nel,
++		macsurf_debug_log_writef("LIFE rebuild local: %s: "
++			"declined (%s%s%s) after %d elements in %ld us", what,
++			why, tag[0] ? ", " : "", tag, nel,
+ 			(long)(macos9_micros() - t0));
+ 		return -1;
+ 	}
+@@ -8977,9 +8986,9 @@
+ 	c->select_ctx = ctx;
+ 	html__redraw_a_box(c, c->layout);
+ 	noop_n++;
+-	macsurf_debug_log_writef("LIFE rebuild local: sheet change restyles "
+-		"nothing (%d elements re-cascaded in %ld us, %lu so far)", nel,
+-		(long)(macos9_micros() - t0), noop_n);
++	macsurf_debug_log_writef("LIFE rebuild local: %s restyles "
++		"nothing (%d elements re-cascaded in %ld us, %lu so far)", what,
++		nel, (long)(macos9_micros() - t0), noop_n);
+ 	return 0;
+ }
+ 
+@@ -12696,6 +12705,13 @@
+ 	 * table boxes or floats, are restyled the same way; only the local
+ 	 * placement below needs plain blocks, so the page is laid out whole
+ 	 * for them instead */
++	/* Patch 419: the root's own box (a class or attribute on <html>):
++	 * when the whole document re-cascades to the styles its boxes hold
++	 * (415's walk), nothing changes -- jquery's and wpnews's root class
++	 * tokens, named by some sheet but matching nothing new */
++	if (pbox == NULL && ob == c->layout &&
++	    html_rl_doc_noop(c, "root change") == 0)
++		return 0;
+ 	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
+ 			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID))
+ 		RL_RNO("restyled block's parent is not a block");

@@ -382,6 +382,8 @@ JS-attr-restyle file:///app0:/testpages/JS-attr-restyle.html
 CSS-attr-restyle-ref file:///app0:/testpages/CSS-attr-restyle-ref.html
 JS-domparser-svg file:///app0:/testpages/JS-domparser-svg.html
 CSS-domparser-svg-ref file:///app0:/testpages/CSS-domparser-svg-ref.html
+JS-root-noop file:///app0:/testpages/JS-root-noop.html
+CSS-root-noop-ref file:///app0:/testpages/CSS-root-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -1970,6 +1972,15 @@ k418l=$(printf '%s\n' "$k418seg" | grep -c "a leaf element inserted between bloc
 k418f=$(printf '%s\n' "$k418seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-domparser-svg: ${k418s:-no summary}; rows $k418r (0), svg placed locally ${k418l} (1), full rebuilds ${k418f} (0)"
 [ "$k418s" = "DOMPARSER: 3/3 passed" ] && [ "$k418r" = 0 ] && [ "${k418l:-0}" -ge 1 ] && [ "${k418f:-1}" -eq 0 ] || fail "DOMParser svg document element"
+# Patch 419: root changes that re-cascade to the same styles rebuild
+# nothing (js-ready, data-theme=light: 2); the dark class, which restyles
+# the body, declines into the full rebuild (1).
+k419r=$(fl_rows JS-root-noop CSS-root-noop-ref)
+k419seg=$(awk '/ page [0-9]+\/[0-9]+ JS-root-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k419n=$(printf '%s\n' "$k419seg" | grep -c "root change restyles nothing" || true)
+k419d=$(printf '%s\n' "$k419seg" | grep -c "root change: declined (an element's style changes" || true)
+echo "  JS-root-noop: rows $k419r (0), root changes restyling nothing ${k419n} (2), declined ${k419d} (1)"
+[ "$k419r" = 0 ] && [ "${k419n:-0}" -eq 2 ] && [ "${k419d:-0}" -ge 1 ] || fail "root changes that restyle nothing"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
