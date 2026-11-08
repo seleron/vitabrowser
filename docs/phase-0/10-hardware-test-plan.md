@@ -11152,3 +11152,121 @@ html_rl_block_change's own (house style: -Wnested-externs /
    become subtree rebuilds.
 2. Then the census's next local causes: "new element is not a plain
    block" (9), "nearest box is not a block" (7).
+
+## Patch 405 (2026-11-08): a structural match restyles only the matching siblings when that is enough
+
+**404's "Next" #1.** After 404, the structural matches on the 21 sites
+still declined into full rebuilds (r115: 10). The guard that stopped
+404's whole-parent rebuild was "holds controls or frames" (8), plus "not
+in a block" (2). youtube's typical case, from its log: an `<iframe>` is
+appended at the end of `<body>` (378 builds it alone), and the scoped
+check finds a structural rule matching one of the two siblings before it
+("structural range positional: from 4 forward, to 2 back"). Only the old
+last child flips. Rebuilding all of `<body>`, with its frames and controls,
+is both unnecessary and refused.
+
+**The change** (html.c):
+- `html_rl_struct_scan`: each structural compound records **`sib_after`**:
+  a sibling combinator (`+`, `~`) follows it. For a compound inside
+  `:not()`/`:is()`/`:where()` (patch 380 bounds it by the outer compound)
+  the test looks past the group: its `)`, the rest of the outer compound
+  over balanced groups, then the next significant character. Nested
+  deeper than one group is unknown, so set. A descendant or child
+  combinator after it (`li:last-child a`) keeps the effect inside the
+  matching child. (The first version set it for every compound inside a
+  functional pseudo. That refused youtube's `.tab:not(.x):not(:last-of-type)`
+  shape outright, and the gate page now has that case.)
+- `html_rl_block_struct_risk`: optional `hits/nhits/narrow`. Every child a
+  structural rule matches is collected (referenced, at most 8; the
+  matching loops no longer stop at the first match when collecting).
+  It is narrow when each matching compound is bounded and has no
+  `sib_after`, and no sheet overflowed, no list ran out, no allocation
+  failed. Unbounded compounds (inside `:has()` etc.) are never narrow.
+- `html_rl_block_change`: when narrow, the blocks are placed as usual and
+  the matching siblings are **restyled alone** at the success exits
+  (`html_rl_struct_hits_finish`), or in place of 378's no-op. Each goes
+  through the container rebuild of 372/376 (guards unchanged). A matching
+  child with no box (`display: none`), or not a block-level box of the
+  parent, declines into the full rebuild. When not narrow, 404's
+  parent-subtree route is used. The references are released on every
+  exit (the decline label, both success exits, the four direct
+  `return -1`s of the placement phase). Logged `structural change: N
+  matching sibling(s) restyled alone in N us`.
+
+**Gate.** New pair **JS-struct-hits / CSS-struct-hits-ref** (in the
+network list beside JS-struct-dir; 253 lines, under the frontend's 256).
+Three containers, each holding an `<iframe>` and a text field in their
+own blocks, so 404's whole-parent rebuild would decline. Narrow: two rows
+appended (the old last row loses `.row:last-child`, and its `<b>` through a
+descendant rule), the last removed (the new last regains it), a `<p>`
+appended after a `p:last-child`, a `.tab` appended under
+`.tab:not(.x):not(:last-child)` (youtube's shape). The negative: an `.item` inserted first
+where `.item:first-child + .item` (patch 198's sibling check declines it
+first, still a full rebuild). Result (first version): **rows 0, 4
+restyled alone, 1 declined**. The final version expects 4 or more
+restyled alone (5 steps narrow). Existing checks re-pointed, because 405
+now answers what 404 or the decline used to:
+- JS-struct-dir "structural matches answered locally" counts both 404's
+  and 405's line (2; local changes 6 -> 8).
+- JS-late-append-struct's `:first-child` guard counts as answered by
+  either path or the decline.
+- JS-struct-scoped (local 3 -> 4) and JS-list-structural (7 declines,
+  limit 4) still pass unchanged.
+
+The 405 gates: gate405 failed on the late-append answered count, and
+gate405b on the JS-struct-dir count (both counting lines 405 replaced;
+rows 0 throughout). Fixed. Then **gate405c exit 0**. Before the third run
+every structural assertion was computed from gate405b's reference log,
+so the last fix was known complete.
+
+**Restage from pristine:** 487 applied plus the 2 known collisions,
+html.c byte-identical to the tested tree (both versions). **gate405e (the
+final version, restaged): exit 0**. JS-struct-hits: rows 0, **5
+restyled alone** (the youtube-shaped `:not()` case included), the `+`
+case declined. JS-struct-dir, -scoped, late-append and list-structural
+all pass as in gate405c.
+
+**ASan** (`build-asan-sim.sh` + `asan_sweep.py`, all 21 sites, both
+versions): **21/21 clean** each. This was added to the chain after 404's
+first A/B found a latent crash this way.
+
+**Scorecards:** r117 (first version vs 404): 71.95 vs 71.92. **r118
+(final vs 404): 73.11 vs 73.00**, no crash; only google differs
+(+2.2, live). Census r118: BATCHCAUSE 106 vs 96, inside the 95-116 band
+these runs show back to back (r114-r117: 107, 95/101, 98/105, 98/101).
+0 sibling restyles on these sites, as explained below.
+
+**Census: no change on the 21 sites, and why.** The first 405's r117 A/B
+(71.95 vs 71.92, no crash) showed 0 sibling restyles on real sites, with
+13 structural declines left. A temporary debug build (scratch tree only)
+logged every matching compound on youtube: **bare `:last-child`-type
+compounds (no tag, no class) matching the previous `<iframe>`**. 119
+bounded and 14 **unbounded** matches. 6 of youtube's 7 cases were not
+narrow because an unbounded compound matched, so they went to 404's route,
+which refuses `<body>`'s frames. The 7th was narrow, but the sibling to
+restyle is an iframe, whose box is not rebuilt (patch 371). So no subtree
+or sibling rebuild helps youtube. Its cases need **an in-place restyle of
+a leaf box** (new computed style on the existing box: nothing freed, the
+frame window untouched). That is the next unit.
+
+**Why land it anyway: the long-list append.** A 500-row feed
+(`.row:last-child`, `.row:nth-child(odd)`), 10 appends 400 ms apart,
+in the sim:
+
+| binary | path | per append (median, min-max) |
+|---|---|---|
+| 404 | parent subtree rebuilt | **12.7 ms** (11.6-18.3) |
+| 405 | 1 matching sibling restyled alone | **1.66 ms** (1.35-1.86) |
+
+About 7.7x less work for every item an infinite-scroll feed, chat log or
+comment list adds under a `:last-child` rule, and no full rebuild in
+either. 404 already kept such lists off the full rebuild; 405 keeps the
+cost flat in the list's length.
+
+No sudo.
+
+**Next:** the in-place restyle of a leaf box (an `<iframe>` or `<img>`)
+whose structural match flips, and a split of "unbounded" into
+"unbounded but local" (quotes, escapes, a namespace: its effect stays on
+the matching child) vs ":has()-like" (it can reach an ancestor), so
+youtube's unbounded matches can narrow too.
