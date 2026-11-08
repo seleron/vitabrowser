@@ -11356,3 +11356,89 @@ No sudo.
 should be down to the `:has()` compound and boxes that are not plain
 leaves; then the next local causes ("new element is not a plain block",
 "nearest box is not a block").
+
+## Patch 407 (2026-11-08): a leaf element inserted between blocks is built alone, in a line of its own
+
+**The census after 404-406** (r119-406 sims, BATCHCAUSE method):
+**97 full rebuilds**: local 38, nonode 31, two 16, kind 7, over 4,
+guard 1. The structural decline is down to 5. Local declines, ranked: new
+element not a plain block 10, nearest box not a block 8, the sibling
+declines 7+7+5+5, structural 5, restyled block's parent not a block 5,
+controls/frames 4.
+
+**The top cause, from a debug build** (scratch only), on the five sites
+that showed it (claude 4, google 2, rte 2, guardian, oldreddit). It logged
+each rejected element and its neighbours' boxes:
+
+| new element | n | neighbours |
+|---|---|---|
+| `<img>` | 4 | after a block `<div>`, before a `<button>` block |
+| `<textarea>` | 3 | (in the first run) |
+| `<input>` | 1 | after a block, before a flex box |
+| `<iframe>` | 2 | after an `<aside>` block, before a block |
+| `<div>` holding `<html>` | 4 | a whole document set as innerHTML: stays full |
+
+Every leaf sat **between block-level boxes directly in the parent**.
+Patch 378 builds an `<iframe>`/`<img>` alone only when appended at the
+end, because `box_build_element` puts an inline-level box in a line at the
+**end** of the parent, which is right only for the last element.
+
+**The change** (html.c):
+- `html_rl_leaf_tag`: `iframe`, `img`, `input`, `textarea`, `button`,
+  `select`.
+- `html_rl_block_neighbour`: the nearest boxed sibling on each side is a
+  block-level box directly in the parent (or there is none), with no text
+  but white space between. Such text lives in a line the leaf would have
+  to join, so it declines (the gate's negative case).
+- `html_rl_block_change`: such a leaf, whose children are inline or
+  controls (a `<select>`'s options, a `<button>`'s text), is accepted
+  (`leafmid`) and built alone.
+  - Built **inline-level** into the line at the end of the parent: it is
+    moved into a **new line right after its earlier block**. The old line
+    is freed if that leaves it empty, as patch 365 places floats. A
+    `BOX_INLINE_END` after it declines (only inline elements with
+    converted children get one; leaves do not).
+  - Built **block-level**: the existing placement handles it.
+  - The page is laid out whole. Logged `a leaf element inserted between
+    blocks, built alone` and `leaf element placed in a line of its own`.
+
+**The real sites, directly** (scratch build): **5 leaf inserts taken
+locally** (google 1, rte 2, guardian 1, oldreddit 1). All block-level or
+`display:none` there, so none needed the line move. No crash. claude's 4
+remaining declines are the document-in-a-`<div>` case.
+
+**Gate.** New pair **JS-leaf-insert / CSS-leaf-insert-ref**. Inserted
+between blocks: an image (a generated 16x8 PNG data URI; the first
+hand-typed one had a bad zlib checksum, caught before use), a text field,
+a text area, a button, a select, an iframe, and a `display:block` image.
+The negative: an image inserted next to inline text. **gate407, exit 0
+on the first run: rows 0, 7 built alone (6 or more), 6 moved into a line
+of their own (4 or more), 1 declined (1 or more)**. Every other check
+unchanged. The network page list is now **255 of the frontend's 256**:
+the next pair needs a slot freed (or VITA_NET_PAGES_MAX raised, which is
+an engine change).
+
+**Restage from pristine:** 489 applied plus the 2 known collisions,
+html.c byte-identical. **gate407b (restaged): exit 0**, the same
+readings.
+
+**ASan** (all 21 sites): **21/21 clean**.
+
+**Scorecard r120**: 21 sites against `r79-360`, the 407 and 406 binaries
+back to back: 69.56 vs 73.03. **The gap is one claude timeout in the 407
+arm** (7.5 vs 75.8), plus google -3.0 and cnnlite -1.6. A rerun of those
+three on both binaries, twice each (`score/r120b-*`), reads **identical
+on both: claude 77.0, google 57.9, cnnlite 63.0** every time (claude has
+timed out before in a pre-patch arm, r115). With the reruns, both arms
+come to **~73.09**.
+
+**Census, back to back:** "new element is not a plain block" declines
+**10 -> 4** (what is left is claude's document-in-a-`<div>`). **7
+leaf inserts taken locally.** Full rebuilds (BATCHCAUSE) **87 vs 92**,
+local 34 vs 36.
+
+No sudo.
+
+**Next:** "nearest box is not a block" (8), then the sibling-selector
+declines. And free page-list slots: several reference pages could share
+one run.
