@@ -13220,3 +13220,79 @@ No sudo.
 3. The scorecard's settle should wait for ready, not a fixed 15 s. The
    census is noisy enough now (a few rebuilds per site, run to run) that
    a multi-run census would also help decide small units.
+
+## Patch 432 (2026-11-09): a sheet pruned while in flight no longer holds the sheet-change walk up (no measurable census effect)
+
+**Problem.** "detached stylesheet pruned" (8 in r144: oldreddit 4, bbc,
+github, google) is a sheet removal that patch 421's walk
+(`html_rl_doc_noop`) could not answer. Over four runs, its reasons were:
+- "a sheet is still loading or changing" 17
+- "an element without a box would get one" 6 (oldreddit's
+  `<auth-flow-login>` and `<shreddit-async-loader>` are shown once the
+  sheet hiding them goes)
+- "an element's style changes" 3
+
+A scratch probe logged the unsettled entries:
+- **oldreddit:** an **unused** entry, pruned while in flight. Unit 389
+  keeps its handle in the slot for the load callback, so it is out of the
+  cascade, yet `html_rl_sheets_settled` waited on it.
+- **bbc, google:** inline sheets reporting status 3 (`ERROR`).
+
+**Fix** (html.c).
+- `html_rl_sheets_settled` skips unused entries.
+- `html_rl_doc_noop` prunes **before** the settle check (it was after), so
+  a sheet detached in flight is already unused when the check runs.
+
+**Found on the way, and reverted.** `content_get_status()` answers
+`CONTENT_STATUS_ERROR` for a handle whose content does not exist yet
+(`content__get_status(NULL)`). bbc's and google's "ERROR" inline sheets
+were fetches **in flight**, not failures.
+- A first cut took ERROR as settled. It built a selection context from
+  such a handle, and **gate432 aborted** (exit 134) on
+  `nscss_get_stylesheet: Assertion 'c != NULL'`. That part was reverted.
+- **Open, noted, unchanged:** css.c's `html_css_mark_sheets` counts ERROR
+  as "not loading" the same way, so a sheet mark may treat an in-flight
+  sheet as settled.
+
+**Gate.**
+- New pair **NET-js-sheet-inflight / NET-css-sheet-inflight-ref**: a
+  `<link>` to a slow sheet (`/slow/`, 1 s) is added and then removed;
+  within that second, a `<style>` that styles nothing is removed from the
+  body and a paragraph's text changed. **"sheet removal restyles nothing"
+  2, still-loading declines 0, full rebuilds 0**, rows 0. The 431 binary
+  declines it ("still loading") and takes the full rebuild.
+- NET-js-link-detach 3/3 and NET-js-link-preload 3/3 unchanged.
+- **gate432b exit 0.**
+
+**Restage from pristine:** 514 applied plus the 2 known collisions,
+html.c byte-identical. **gate432c: exit 0**, mirror 379 identical,
+0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (376 dumps).
+
+**Scorecard r145** (432 vs 431 back to back): **73.21 vs 73.36**. Only
+ddglite 77.0 vs 74.8 and claude 77.0 vs 82.2 moved, both their known
+spread. No assertion in any load.
+
+**Census: no measurable effect.**
+- r145 read BATCHCAUSE 80 vs 71 and pruned 10 vs 6, driven by claude
+  11 vs 4 and oldreddit 8 vs 6.
+- Reruns, two per arm: claude 3 / 4 (432) vs 4 / 3 (431); oldreddit 5 / 6
+  vs 6 / 5. oldreddit's "still loading" declines remain on both binaries
+  (1-2 a load): sheets genuinely loading.
+- The in-flight case this patch fixes is real (the gate page) but rare on
+  these 21 sites. Kept as a correct, gated fix.
+
+No sudo.
+
+**Next:**
+1. "an element without a box would get one" on sheet removals
+   (oldreddit): build those elements as new blocks instead of the full
+   rebuild.
+2. "nearest box is not a block" / "block is not one line container of
+   plain content" (7 each).
+3. A **multi-run census**: the per-site count now moves by 2-7 run to run
+   (claude 11 vs 4 here), more than most units remove. Averaging 3 runs
+   per arm would let the census decide small units. Also the scorecard's
+   settle (wait for ready, not a fixed 15 s), and the
+   `html_css_mark_sheets` ERROR note above.
