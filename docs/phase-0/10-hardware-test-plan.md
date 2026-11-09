@@ -13296,3 +13296,73 @@ No sudo.
    per arm would let the census decide small units. Also the scorecard's
    settle (wait for ready, not a fixed 15 s), and the
    `html_css_mark_sheets` ERROR note above.
+
+## Patch 433 (2026-11-09): an inert attribute on a form control's box rebuilds nothing
+
+**Problem.** "nearest box is not a block" was 9 in r145. A scratch probe
+logged each case over two loads each of wpnews, wpblog, youtube and rte.
+`BOX_FLEX` is box type 14 and `BOX_INLINE_BLOCK` type 9.
+- **wpnews 4, wpblog 3:** an attribute mark on a `<button>` that is a flex
+  box. wordpress.org's navigation buttons toggle `aria-expanded`.
+  - The mark is set only for `html_rl_attr_inert`'s attributes, which no
+    sheet can match (patch 310's gate).
+  - Patch 408 answers such a mark on any box with "nothing to rebuild",
+    **except on a box holding a form control**.
+- **wpnews 4:** a child-list change inside an inline-block `<button>`.
+- **youtube 4:** a change on the flex `<main>` / `<c-wiz>` with no class,
+  attribute or child-list mark.
+
+**Fix** (html.c).
+- 408's no-op now admits a form control's box. `html_rl_attr_inert`'s
+  attributes (`data-*`, `aria-*`, `role`, `tabindex`, `slot`, `inert`...)
+  are none that the forms code reads (`value`, `name`, `type`, `checked`,
+  `disabled`...).
+- Objects, frames and list markers stay excluded.
+- The other two shapes are left for later.
+
+**Gate.**
+- New pair **JS-control-inert / CSS-control-inert-ref**: `aria-expanded`
+  and `data-state` on a flex `<button>`, `aria-pressed` on an inline-block
+  one, `role` on a text field. **2 no-ops**, 0 nearest-box declines,
+  0 full rebuilds, rows 0. JS-control-js and JS-control-restyle unchanged.
+- **The test page needed two fixes** (gate433 and gate433b failed only on
+  this check, both rows 0):
+  - The gate's autotest runs timer steps back to back, as **one batch**,
+    whatever the spacing.
+  - A batch of several inert attribute marks is answered whole (patch
+    383's batch no-op), on the old binary too, so the single mark's path
+    (the one that declined) was never reached.
+  - A layout read after each step (`document.body.offsetHeight`, a
+    synchronous flush) makes each its own batch. A probe confirmed it: 432
+    declines and takes the full rebuild, 433 answers 2 no-ops.
+- **gate433c exit 0.**
+
+**Restage from pristine:** 515 applied plus the 2 known collisions,
+html.c byte-identical. **gate433d: exit 0**, mirror 381 identical,
+0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (378 dumps).
+
+**Scorecard r146** (433 vs 432 back to back): **73.45 vs 73.45**.
+hackernews 54.5 vs 55.1 and ddglite 77.0 vs 76.0 are the usual spread. No
+assertion in any load.
+
+**Census:**
+- r146: BATCHCAUSE **70 -> 64**; nearest-box declines 6 -> 4; attribute
+  no-ops 3 -> 5.
+- **Three loads per arm**, as the census noise now requires:
+  - **wpnews:** 2 / 2 / 2 full rebuilds on 433 vs 3 / 3 / 3 on 432;
+    nearest-box declines 2 vs 4 per load.
+  - **wpblog:** 7 / 6 / 8 vs 8 / 7 / 8; nearest-box declines 0 vs 1-2.
+- A consistent, if small, win.
+
+No sudo.
+
+**Next:**
+1. The rest of "nearest box is not a block": the child list of an
+   inline-block `<button>` (wpnews), and youtube's flex `<main>` /
+   `<c-wiz>`.
+2. "block is not one line container of plain content" (7).
+3. Sheet removals that un-hide elements (oldreddit).
+4. Tools: a multi-run census, the scorecard's settle (wait for ready),
+   and the `html_css_mark_sheets` ERROR note (432).
