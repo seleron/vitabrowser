@@ -1,0 +1,101 @@
+# netsurf: a script's .checked / .value repaints the control from its element (patch 424)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 423)
+#
+# Found working 423: a script's checked or value after layout reached the
+# DOM only. The property shims set the attributes (macsurf_qjs.c), the
+# marks are render declines (no sheet selects on value or checked), and
+# the control's own copy -- what is painted: control->selected, the text
+# widget -- stayed as it was made, until some rebuild made the control
+# again.
+#
+#  - html_rl_control_attr_sync (html.c): for a value or checked mark on an
+#    element whose box holds its control, a checkbox or radio takes
+#    `selected` from the element, a text box, password or textarea its
+#    text through form_gadget_sync_with_dom's DOM-to-control half; the box
+#    is redrawn. Not before the first layout or during a rebuild.
+#  - macos9_js_mark_dom_dirty_node3: called for every SETATTRIBUTE /
+#    REMOVEATTRIBUTE mark, whatever the batch's answer later.
+#
+--- a/content/handlers/html/html.c	2026-11-09 02:56:53.832237663 +0000
++++ b/content/handlers/html/html.c	2026-11-09 03:15:04.380765545 +0000
+@@ -6680,6 +6680,60 @@
+  * button -- <button>, submit, reset -- has none but focus, which
+  * html_rl_release_box hands back: it is released with the old boxes and
+  * made again by the build, as 364 builds and 368 releases controls. */
++/* Patch 424: a script's .checked / .value (attributes here: the property
++ * shims set them) reached the DOM only. The control's own copy -- what is
++ * painted: control->selected, the text widget -- was set when the control
++ * was made, and the mark is a render decline (no sheet selects on value
++ * or checked), so the old state stayed on screen until some rebuild made
++ * the control again. At the mark, the control takes its state from the
++ * element (the text through form_gadget_sync_with_dom's DOM-to-control
++ * half) and its box is redrawn. Not before the first layout (construction
++ * reads the element then) or while a rebuild is under way. */
++int html_rl_control_attr_sync(struct content *base_c, void *vnode,
++		const char *attr_name);
++int html_rl_control_attr_sync(struct content *base_c, void *vnode,
++		const char *attr_name)
++{
++	html_content *c = (html_content *)base_c;
++	struct form_control *g;
++	struct box *b;
++	bool is_checked, is_value;
++
++	if (c == NULL || vnode == NULL || attr_name == NULL)
++		return 0;
++	is_checked = strcasecmp(attr_name, "checked") == 0;
++	is_value = strcasecmp(attr_name, "value") == 0;
++	if (!is_checked && !is_value)
++		return 0;
++	if (c->layout == NULL || c->reflowing ||
++	    c->box_conversion_context != NULL ||
++	    macsurf_reconvert_in_progress != 0)
++		return 0;
++	b = box_for_node((dom_node *)vnode);
++	if (b == NULL || b->gadget == NULL || b->gadget->node != vnode)
++		return 0;
++	g = b->gadget;
++	if (is_checked &&
++	    (g->type == GADGET_CHECKBOX || g->type == GADGET_RADIO)) {
++		bool checked;
++		if (dom_html_input_element_get_checked(
++				(dom_html_input_element *)vnode, &checked) !=
++				DOM_NO_ERR || checked == g->selected)
++			return 0;
++		g->selected = checked;
++	} else if (is_value &&
++		   (g->type == GADGET_TEXTBOX || g->type == GADGET_PASSWORD ||
++		    g->type == GADGET_TEXTAREA)) {
++		form_gadget_sync_with_dom(g);
++	} else {
++		return 0;
++	}
++	html__redraw_a_box(c, b);
++	macsurf_debug_log_writef("LIFE control %s synced from its element",
++			attr_name);
++	return 1;
++}
++
+ /* Patch 423: a control whose state a rebuild keeps -- a button (382),
+  * and now a text box, password, textarea, checkbox, radio or hidden
+  * input: their state is in the DOM (typed text synced by
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-09 02:56:53.833573803 +0000
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c	2026-11-09 03:15:04.389041984 +0000
+@@ -2061,6 +2061,16 @@
+ 	}
+ 	g_mut_total++;
+ 
++	/* Patch 424 - a script's value / checked: the control painted from
++	 * the element now (html.c), whatever the batch's answer */
++	if ((kind == MACOS9_DOMMUT_SETATTRIBUTE ||
++	     kind == MACOS9_DOMMUT_REMOVEATTRIBUTE) &&
++	    node != NULL && attr_name != NULL) {
++		extern int html_rl_control_attr_sync(struct content *c,
++				void *node, const char *attr_name);
++		(void) html_rl_control_attr_sync(c, node, attr_name);
++	}
++
+ 	/* fixes1024 - cadence control, decided by WHAT changed. */
+ 	if (macos9_reconvert_kind_is_cosmetic(kind)) {
+ 		if (g_reconvert_debounce_ms < RECONVERT_DEBOUNCE_MAX_MS) {

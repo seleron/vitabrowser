@@ -392,6 +392,8 @@ JS-flex-below file:///app0:/testpages/JS-flex-below.html
 CSS-flex-below-ref file:///app0:/testpages/CSS-flex-below-ref.html
 JS-control-restyle file:///app0:/testpages/JS-control-restyle.html
 CSS-control-restyle-ref file:///app0:/testpages/CSS-control-restyle-ref.html
+JS-control-js file:///app0:/testpages/JS-control-js.html
+CSS-control-js-ref file:///app0:/testpages/CSS-control-js-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -2038,6 +2040,15 @@ k423f=$(printf '%s\n' "$k423seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 # full rebuild -- not the restyles, which come after it.)
 echo "  JS-control-restyle: rows $k423r (0), restyled ${k423l} (3), controls declines ${k423d} (0), full rebuilds ${k423f} (1 at most)"
 [ "$k423r" = 0 ] && [ "${k423l:-0}" -ge 3 ] && [ "${k423d:-1}" -eq 0 ] && [ "${k423f:-2}" -le 1 ] || fail "stateful controls through a restyle"
+# Patch 424: a script's .checked / .value after layout repaints the control
+# from its element (checkbox, the radio pair, the text field): row for row
+# as the parse-time page, the syncs in the log, no full rebuild.
+k424r=$(fl_rows JS-control-js CSS-control-js-ref)
+k424seg=$(awk '/ page [0-9]+\/[0-9]+ JS-control-js: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k424s=$(printf '%s\n' "$k424seg" | grep -c "LIFE control [a-z]* synced from its element" || true)
+k424f=$(printf '%s\n' "$k424seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-control-js: rows $k424r (0), controls synced ${k424s} (3 or more), full rebuilds ${k424f} (0)"
+[ "$k424r" = 0 ] && [ "${k424s:-0}" -ge 3 ] && [ "${k424f:-1}" -eq 0 ] || fail "a script's checked and value repainted"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
