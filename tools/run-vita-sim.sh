@@ -396,6 +396,9 @@ JS-control-js file:///app0:/testpages/JS-control-js.html
 CSS-control-js-ref file:///app0:/testpages/CSS-control-js-ref.html
 JS-content-whole file:///app0:/testpages/JS-content-whole.html
 CSS-content-whole-ref file:///app0:/testpages/CSS-content-whole-ref.html
+JS-reflect-proto file:///app0:/testpages/JS-reflect-proto.html
+JS-style-noop file:///app0:/testpages/JS-style-noop.html
+CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -2070,6 +2073,24 @@ k425w=$(printf '%s\n' "$k425seg" | grep -c "new content is not plain inline, the
 k425f=$(printf '%s\n' "$k425seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-content-whole: rows $k425r (0), blocks built whole ${k425w} (3), full rebuilds ${k425f} (0)"
 [ "$k425r" = 0 ] && [ "${k425w:-0}" -ge 3 ] && [ "${k425f:-1}" -eq 0 ] || fail "non-inline new content built whole"
+# Patch 426: accessors read through the standard prototypes
+# (Reflect.get(Node.prototype, 'parentElement', el) and 23 more) equal the
+# direct reads and claude's ancestor walk ends; a microtask that loops
+# forever is stopped by the job deadline and the run goes on.
+k426p=$(ls "$R"/*-JS-reflect-proto.plot 2>/dev/null | head -1)
+k426s=$(sed -n 's/.*STR \(REFLECTPROTO: [0-9]*\/[0-9]* passed\).*/\1/p' "$k426p" 2>/dev/null | head -1)
+k426seg=$(awk '/ page [0-9]+\/[0-9]+ JS-reflect-proto: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k426i=$(printf '%s\n' "$k426seg" | grep -c "LIFE job exc: InternalError: interrupted" || true)
+echo "  JS-reflect-proto: ${k426s:-no summary}; endless microtask stopped ${k426i} (1)"
+[ "$k426s" = "REFLECTPROTO: 25/25 passed" ] && [ "${k426i:-0}" -ge 1 ] || fail "prototype accessors and the job deadline"
+# Patch 427: style attribute changes on an inline-block that leave its
+# style as it is need no rebuild (3); the color change still takes one.
+k427r=$(fl_rows JS-style-noop CSS-style-noop-ref)
+k427seg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k427n=$(printf '%s\n' "$k427seg" | grep -c "style attribute change leaves the style as it is" || true)
+k427f=$(printf '%s\n' "$k427seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-style-noop: rows $k427r (0), style changes needing no rebuild ${k427n} (3 or more), full rebuilds ${k427f} (1)"
+[ "$k427r" = 0 ] && [ "${k427n:-0}" -ge 3 ] && [ "${k427f:-0}" -eq 1 ] || fail "style changes that leave the style as it is"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

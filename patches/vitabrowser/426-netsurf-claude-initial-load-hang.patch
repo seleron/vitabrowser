@@ -1,0 +1,366 @@
+# netsurf: claude's initial-load hang -- prototype accessors read through Reflect.get, microtask deadline, unchanged attribute writes, no-op style changes (patch 426)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 425)
+#
+# claude.ai's sign-in page stalled on its initial load (log stopped right
+# after "WANTLOW __signInBooted", layout never made; 425 5/5 loads, 424
+# 2/5). Diagnosed in scratch builds (doc 10): the process spun at 100% in
+# ONE microtask (a SIGUSR1 backtrace preload -- ptrace_scope blocks gdb
+# attach); a time-based job interrupt logged its JS stack: function Ge in
+# signin-CM83ESyh.js, an ancestor walk
+#     for (t = Oe(e); t !== null; t = Oe(t)) ...
+#     Oe = e => Reflect.get(Node.prototype, "parentElement", e)
+# Node.prototype had no parentElement accessor: Reflect.get answered
+# undefined, undefined !== null, Oe(undefined) is undefined -- forever.
+#
+#  - vita_polyfill.js (last in the file): Node / Element / HTMLElement /
+#    Document prototypes get an accessor for each of 29 standard
+#    properties they have none of their own for, forwarding to the real
+#    one further along the receiver's chain (every forwarder skipped:
+#    two forwarders on a custom element's chain recursed; installed last:
+#    the sections above add a property only where none exists, and a
+#    forwarder there first made them skip Element.prototype.id /
+#    localName -- the gate's CUSTOMEL caught both).
+#  - macsurf_qjs.c: a microtask job runs under the timer deadline
+#    (fixes586's rule): an endless job throws InternalError instead of
+#    freezing the browser.
+#  - Past Ge, the page re-set the same attributes on its buttons, and an
+#    inline-block <span>'s empty style, every frame: ~395 full rebuilds a
+#    load, the page never settled (6 of 10 loads timed out).
+#    macsurf_qjs.c: setAttribute to the value already there, or
+#    removeAttribute of an absent one, marks no rebuild (the
+#    MutationObserver record stays, as in browsers). html.c: a style
+#    attribute change on a non-inline, non-block box that leaves the
+#    element's own style and pseudo styles as the box holds them changes
+#    nothing (html_rl_style_unchanged).
+#
+# claude (scratch build): 10/10 loaded, 3-8 full rebuilds a load.
+#
+--- a/content/handlers/html/html.c	2026-11-09 09:10:44.676310470 +0000
++++ b/content/handlers/html/html.c	2026-11-09 09:53:01.563064062 +0000
+@@ -12083,6 +12083,60 @@
+  * any attribute a sheet can see (417): its "old class" is the current
+  * one, and the change is not to the class. */
+ static bool html_rl_style_as_class;
++/* Patch 426: set while the change is the style attribute itself (370) */
++static bool html_rl_style_change;
++
++/* Patch 426: does the element's fresh selection give the style its box
++ * holds -- its own, ::before and ::after? (Its CSS parent is its DOM
++ * parent's box; none: not proven.) */
++static bool html_rl_style_unchanged(html_content *c, dom_node *n,
++		struct box *b)
++{
++	dom_node *par = NULL;
++	struct box *pb = NULL;
++	css_select_results *ns;
++	css_custom_env *env = NULL;
++	bool same = false;
++	int k;
++
++	if (b->styles == NULL || c->select_ctx == NULL || c->layout == NULL)
++		return false;
++	if (dom_node_get_parent_node(n, &par) == DOM_NO_ERR && par != NULL) {
++		pb = box_for_node(par);
++		dom_node_unref(par);
++	}
++	if (pb == NULL || pb->style == NULL)
++		return false;
++	/* the node's cached selection would answer with the old style
++	 * (as html_rl_leaf_restyle and html_reconvert_fast_style reset it) */
++	nscss_reset_node_data(n);
++	ns = box_get_style(c, pb == c->layout ? NULL : pb->style,
++			c->layout->style, n, pb == c->layout ? NULL :
++			pb->custom_env, &env);
++	if (ns == NULL)
++		return false;
++	if (ns->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL &&
++	    b->styles->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL &&
++	    css_computed_style_diff(b->styles->styles[CSS_PSEUDO_ELEMENT_NONE],
++			ns->styles[CSS_PSEUDO_ELEMENT_NONE]) ==
++			CSS_COMPUTED_STYLE_NO_DIFF) {
++		same = true;
++		for (k = CSS_PSEUDO_ELEMENT_BEFORE;
++		     k <= CSS_PSEUDO_ELEMENT_AFTER && same; k++) {
++			const css_computed_style *pa = b->styles->styles[k];
++			const css_computed_style *pn = ns->styles[k];
++			if ((pa == NULL) != (pn == NULL))
++				same = false;
++			else if (pa != NULL && css_computed_style_diff(pa, pn) !=
++					CSS_COMPUTED_STYLE_NO_DIFF)
++				same = false;
++		}
++	}
++	css_select_results_destroy(ns);
++	if (env != NULL)
++		css_custom_env_unref(env);
++	return same;
++}
+ 
+ /* 1 when the class change old_class -> (live class) on el restyles
+  * nothing: no added or removed token is named by any sheet. */
+@@ -13471,7 +13525,9 @@
+ 	macsurf_debug_log_writef("LIFE rebuild local: style attribute "
+ 		"change, as a class change");
+ 	html_rl_style_as_class = true;	/* patch 414 */
++	html_rl_style_change = true;	/* patch 426 */
+ 	r = html_reconvert_local_change(base_c, vnode, true, cs);
++	html_rl_style_change = false;
+ 	html_rl_style_as_class = false;
+ 	free(cs);
+ 	return r;
+@@ -13717,6 +13773,22 @@
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
++			/* Patch 426: a style attribute change on such a box
++			 * (claude's sign-in re-sets an inline-block <span>'s
++			 * empty style every frame: 239 full rebuilds a load,
++			 * the page never settled) that leaves its own style --
++			 * and its ::before / ::after -- as the box holds it
++			 * changes nothing: an inline style reaches only the
++			 * element, its children inherit its computed style */
++			if (class_change && n == vnode && b != NULL &&
++			    b->type != BOX_INLINE && html_rl_style_change &&
++			    html_rl_style_unchanged(c, n, b)) {
++				dom_node_unref(n);
++				macsurf_debug_log_writef("LIFE rebuild local: style "
++					"attribute change leaves the style as it "
++					"is, nothing to rebuild");
++				return 0;
++			}
+ 			if (class_change && n == vnode && b != NULL &&
+ 			    b->type != BOX_INLINE) {
+ 				dom_node_unref(n);
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c	2026-11-09 07:59:24.936806328 +0000
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c	2026-11-09 09:53:01.569748662 +0000
+@@ -6097,6 +6097,18 @@
+ static void qjs_queue_attribute_mutation(JSContext *ctx,
+ 		JSValueConst target, const char *name, const char *old_value);
+ 
++/* VitaBrowser patch 426: an attribute set to the value it already has
++ * (or an absent one removed) changes nothing a rebuild could show: the
++ * MutationObserver still gets its record, as in browsers, but no rebuild
++ * is marked. claude's sign-in re-set the same attributes on its buttons
++ * every frame -- each a full rebuild, the page never settled. */
++static int qjs_attr_same(dom_string *old_ds, const char *val)
++{
++	size_t l = strlen(val);
++	return old_ds != NULL && dom_string_byte_length(old_ds) == l &&
++		memcmp(dom_string_data(old_ds), val, l) == 0;
++}
++
+ static JSValue qjs_el_setAttribute_data(JSContext *ctx,
+ 		JSValueConst this_val, int argc, JSValueConst *argv,
+ 		int magic, JSValueConst *func_data)
+@@ -6136,6 +6148,8 @@
+ 		macsurf_dom_element_set_attribute(el, name_ds, val_ds);
+ 		qjs_queue_attribute_mutation(ctx, this_val, name_cstr,
+ 				old_ds ? dom_string_data(old_ds) : NULL);
++		if (gerr == DOM_NO_ERR && qjs_attr_same(old_ds, val_cstr))
++			attr_kind = -1;	/* patch 426: no change, no mark */
+ 		/* Patch 186 - a class change carries its pre-mutation value so
+ 		 * the local rebuild can compare old vs new class sets.
+ 		 * Patch 197 - libdom answers an ABSENT attribute with
+@@ -6149,7 +6163,9 @@
+ 		 * keeps NULL: truly unknown, still declined. The
+ 		 * MutationObserver old value above keeps the DOM
+ 		 * null-for-absent convention, untouched. */
+-		if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
++		if (attr_kind < 0)
++			;	/* patch 426 */
++		else if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 			qjs_mark_dom_dirty2(ctx, (void *) el, attr_kind,
+ 				old_ds != NULL ? dom_string_data(old_ds) :
+ 				(gerr == DOM_NO_ERR ? "" : NULL));
+@@ -8174,7 +8190,9 @@
+ 		qjs_mo_queue_for_heap(st->bind->child, QJS_MO_ATTR,
+ 				st->node, NULL, NULL, name_cstr,
+ 				old_ds != NULL ? dom_string_data(old_ds) : NULL);
+-		if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
++		if (gerr == DOM_NO_ERR && qjs_attr_same(old_ds, val_cstr))
++			;	/* patch 426: no change, no mark */
++		else if (attr_kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 			qjs_mark_dom_dirty2(st->bind->child->ctx,
+ 					(void *)st->node, attr_kind,
+ 					old_ds != NULL ?
+@@ -8331,7 +8349,9 @@
+ 		 * (the new value is implicitly empty).
+ 		 * Patch 197 - as in setAttribute, an absent class attribute
+ 		 * is the empty class set, not an unknown value. */
+-		if (rm_kind == MACOS9_DOMMUT_SETATTR_CLASS)
++		if (gerr == DOM_NO_ERR && old_ds == NULL)
++			;	/* patch 426: it was not there: no change */
++		else if (rm_kind == MACOS9_DOMMUT_SETATTR_CLASS)
+ 			qjs_mark_dom_dirty2(ctx, (void *) el, rm_kind,
+ 				old_ds != NULL ? dom_string_data(old_ds) :
+ 				(gerr == DOM_NO_ERR ? "" : NULL));
+@@ -24206,8 +24226,17 @@
+ 			while (JS_IsJobPending(h->rt) && jobs < QJS_MAX_JOBS_PER_PUMP) {
+ 				JSContext *jctx = NULL;
+ 				int r;
++				double jprev;
+ 				qjs_task_push(MACSURF_JS_TASK_MICROTASK);
++				/* VitaBrowser patch 426: a job is bounded as a
++				 * timer callback is (fixes586's rule, every JS entry
++				 * point): a microtask that loops forever ran
++				 * unbounded and froze the browser (claude's sign-in
++				 * walk, before first layout); now it throws
++				 * InternalError and the queue goes on */
++				jprev = qjs_deadline_push((double)QJS_TIMER_TIMEOUT_MS);
+ 				r = JS_ExecutePendingJob(h->rt, &jctx);
++				qjs_deadline_pop(jprev);
+ 				qjs_task_pop();
+ 				if (r < 0) {
+ 					/* Uncaught rejection / job threw: surface it, keep
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js	2026-11-09 07:59:24.935106442 +0000
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js	2026-11-09 09:53:01.578730977 +0000
+@@ -11034,4 +11034,72 @@
+ 			return null;
+ 		});
+ })();
++/* VitaBrowser patch 426: an accessor read through the standard
++ * prototype -- Reflect.get(Node.prototype, 'parentElement', el), as
++ * claude's sign-in bundle does (it bypasses instance overrides) --
++ * found no accessor on Node.prototype and answered undefined. Its
++ * ancestor walk, for (t = Oe(e); t !== null; t = Oe(t)), then never
++ * ended: undefined !== null, Oe(undefined) is undefined again -- one
++ * microtask spinning forever before first layout (the "initial-load
++ * hang", 5 in 5 loads on one build). Each standard prototype gets an
++ * accessor where it has none of its own, forwarding to the real
++ * property further along the receiver's own chain (itself skipped).
++ * LAST in this file: the sections above add a property only where none
++ * exists (acc), and a forwarder put there first made them skip --
++ * Element.prototype.id / localName, which a custom element's chain reads
++ * (CUSTOMEL 4/7). */
++(function () {
++	var protoProps = [
++		['Node', ['parentElement', 'parentNode', 'nextSibling',
++			'previousSibling', 'childNodes', 'firstChild',
++			'lastChild', 'ownerDocument', 'nodeType', 'nodeName',
++			'textContent', 'isConnected']],
++		['Element', ['localName', 'children', 'assignedSlot',
++			'tagName', 'id', 'className', 'firstElementChild',
++			'lastElementChild', 'nextElementSibling',
++			'previousElementSibling', 'shadowRoot']],
++		['HTMLElement', ['style']],
++		['Document', ['defaultView', 'activeElement',
++			'documentElement', 'body', 'head']]
++	];
++	/* every forwarder is skipped by every forwarder: a custom
++	 * element's chain passes HTMLElement.prototype AND
++	 * Node.prototype, and two forwarders calling each other ran
++	 * out of stack (CUSTOMEL) */
++	function fwd(dd) { return dd.get && PV(dd.get).__vbFwd; }
++	function forward(P, n) {
++		var get = function () {
++			var o = this, k, dd;
++			for (k = 0; o !== null && o !== undefined && k < 64; k++) {
++				dd = Object.getOwnPropertyDescriptor(o, n);
++				if (dd && !fwd(dd)) return dd.get ? dd.get.call(this) : dd.value;
++				o = Object.getPrototypeOf(o);
++			}
++			return undefined;
++		};
++		var set = function (v) {
++			var o = this, k, dd;
++			for (k = 0; o !== null && o !== undefined && k < 64; k++) {
++				dd = Object.getOwnPropertyDescriptor(o, n);
++				if (dd && !fwd(dd)) {
++					if (dd.set) { dd.set.call(this, v); return; }
++					break;
++				}
++				o = Object.getPrototypeOf(o);
++			}
++			Object.defineProperty(this, n, { value: v, writable: true,
++				configurable: true, enumerable: true });
++		};
++		PV(get).__vbFwd = true;
++		try { Object.defineProperty(P, n, { get: get, set: set, configurable: true }); } catch (e) { /* */ }
++	}
++	protoProps.forEach(function (pp) {
++		var C = g[pp[0]], P = C && C.prototype;
++		if (!P || P === Object.prototype) return;
++		pp[1].forEach(function (n) {
++			try { if (Object.getOwnPropertyDescriptor(P, n)) return; } catch (e) { return; }
++			forward(P, n);
++		});
++	});
++})();
+ })(this);
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc	2026-11-09 07:59:24.935765536 +0000
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc	2026-11-09 09:53:01.584333516 +0000
+@@ -11035,5 +11035,73 @@
+ "\t\t\treturn null;\n"
+ "\t\t});\n"
+ "})();\n"
++"/* VitaBrowser patch 426: an accessor read through the standard\n"
++" * prototype -- Reflect.get(Node.prototype, 'parentElement', el), as\n"
++" * claude's sign-in bundle does (it bypasses instance overrides) --\n"
++" * found no accessor on Node.prototype and answered undefined. Its\n"
++" * ancestor walk, for (t = Oe(e); t !== null; t = Oe(t)), then never\n"
++" * ended: undefined !== null, Oe(undefined) is undefined again -- one\n"
++" * microtask spinning forever before first layout (the \"initial-load\n"
++" * hang\", 5 in 5 loads on one build). Each standard prototype gets an\n"
++" * accessor where it has none of its own, forwarding to the real\n"
++" * property further along the receiver's own chain (itself skipped).\n"
++" * LAST in this file: the sections above add a property only where none\n"
++" * exists (acc), and a forwarder put there first made them skip --\n"
++" * Element.prototype.id / localName, which a custom element's chain reads\n"
++" * (CUSTOMEL 4/7). */\n"
++"(function () {\n"
++"\tvar protoProps = [\n"
++"\t\t['Node', ['parentElement', 'parentNode', 'nextSibling',\n"
++"\t\t\t'previousSibling', 'childNodes', 'firstChild',\n"
++"\t\t\t'lastChild', 'ownerDocument', 'nodeType', 'nodeName',\n"
++"\t\t\t'textContent', 'isConnected']],\n"
++"\t\t['Element', ['localName', 'children', 'assignedSlot',\n"
++"\t\t\t'tagName', 'id', 'className', 'firstElementChild',\n"
++"\t\t\t'lastElementChild', 'nextElementSibling',\n"
++"\t\t\t'previousElementSibling', 'shadowRoot']],\n"
++"\t\t['HTMLElement', ['style']],\n"
++"\t\t['Document', ['defaultView', 'activeElement',\n"
++"\t\t\t'documentElement', 'body', 'head']]\n"
++"\t];\n"
++"\t/* every forwarder is skipped by every forwarder: a custom\n"
++"\t * element's chain passes HTMLElement.prototype AND\n"
++"\t * Node.prototype, and two forwarders calling each other ran\n"
++"\t * out of stack (CUSTOMEL) */\n"
++"\tfunction fwd(dd) { return dd.get && PV(dd.get).__vbFwd; }\n"
++"\tfunction forward(P, n) {\n"
++"\t\tvar get = function () {\n"
++"\t\t\tvar o = this, k, dd;\n"
++"\t\t\tfor (k = 0; o !== null && o !== undefined && k < 64; k++) {\n"
++"\t\t\t\tdd = Object.getOwnPropertyDescriptor(o, n);\n"
++"\t\t\t\tif (dd && !fwd(dd)) return dd.get ? dd.get.call(this) : dd.value;\n"
++"\t\t\t\to = Object.getPrototypeOf(o);\n"
++"\t\t\t}\n"
++"\t\t\treturn undefined;\n"
++"\t\t};\n"
++"\t\tvar set = function (v) {\n"
++"\t\t\tvar o = this, k, dd;\n"
++"\t\t\tfor (k = 0; o !== null && o !== undefined && k < 64; k++) {\n"
++"\t\t\t\tdd = Object.getOwnPropertyDescriptor(o, n);\n"
++"\t\t\t\tif (dd && !fwd(dd)) {\n"
++"\t\t\t\t\tif (dd.set) { dd.set.call(this, v); return; }\n"
++"\t\t\t\t\tbreak;\n"
++"\t\t\t\t}\n"
++"\t\t\t\to = Object.getPrototypeOf(o);\n"
++"\t\t\t}\n"
++"\t\t\tObject.defineProperty(this, n, { value: v, writable: true,\n"
++"\t\t\t\tconfigurable: true, enumerable: true });\n"
++"\t\t};\n"
++"\t\tPV(get).__vbFwd = true;\n"
++"\t\ttry { Object.defineProperty(P, n, { get: get, set: set, configurable: true }); } catch (e) { /* */ }\n"
++"\t}\n"
++"\tprotoProps.forEach(function (pp) {\n"
++"\t\tvar C = g[pp[0]], P = C && C.prototype;\n"
++"\t\tif (!P || P === Object.prototype) return;\n"
++"\t\tpp[1].forEach(function (n) {\n"
++"\t\t\ttry { if (Object.getOwnPropertyDescriptor(P, n)) return; } catch (e) { return; }\n"
++"\t\t\tforward(P, n);\n"
++"\t\t});\n"
++"\t});\n"
++"})();\n"
+ "})(this);\n"
+ "\n"
