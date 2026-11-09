@@ -13156,3 +13156,67 @@ No sudo.
    plain content" (7 each).
 4. The scorecard's settle should wait for ready, not a fixed 15 s (from
    428).
+
+## Patch 431 (2026-11-09): hidden matching siblings no longer decline the structural restyle
+
+**Problem.** "structural selectors or counters in page CSS" topped r143
+(9). Behind 7 of them was "a matching sibling is not a block-level box of
+the parent" (youtube 2, guardian 2, cnnlite 2, wpnews 1). A scratch probe
+showed that **every one of those siblings had no box**: a `<script>`
+(guardian, wpnews), a `<style>` (youtube), a hidden `<div>` (cnnlite). A
+structural rule such as `:nth-child` matches them too, and patch 405's
+restyle of the matching siblings gave up on them.
+
+**Fix** (html.c, `html_rl_node_stays_none`).
+- A box-less matching sibling is selected afresh, its cached node data
+  reset first (as in 426's `html_rl_style_unchanged`).
+- Its CSS parent is the parent box (as in `html_rl_leaf_restyle`).
+- It is skipped when its new style is still `display:none`. One that
+  would get a box still declines.
+- In practice the insert path builds such an element first: a box-less
+  element in the changed range is treated as a new block, as the gate
+  page's `#g` shows.
+
+**Gate.**
+- New pair **JS-struct-hidden / CSS-struct-hidden-ref**, using
+  `#h > :nth-child(odd)`. Each container holds an iframe and a text field,
+  so the whole-parent rebuild is ruled out.
+  - A row inserted first in `#h` flips every sibling's parity, including
+    a `<script>`, a `<style>` and a hidden `<div>`. **7 siblings are
+    restyled alone, the hidden ones skipped.**
+  - A row inserted first in `#g` makes its hidden `.h2` shown
+    (`.h2:nth-child(odd) { display: block }`). The insert path builds it,
+    and the screenshot matches the reference.
+  - rows 0, 0 structural declines, 0 full rebuilds.
+- JS-struct-hits, JS-struct-dir and JS-block-oc2 unchanged.
+- **gate431 exit 0.**
+
+**Restage from pristine:** 513 applied plus the 2 known collisions,
+html.c byte-identical. **gate431b: exit 0**, mirror 377 identical,
+0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (374 dumps).
+
+**Scorecard r144** (431 vs 430 back to back): **73.14 vs 73.16**. No site
+moved by 0.5 or more. No assertion in any load.
+
+**Census:**
+- "structural selectors or counters" **8 -> 2**; "a matching sibling is
+  not a block-level box" **6 -> 0**; hidden siblings skipped 10 times
+  (cnnlite 6, guardian 2, youtube 1, wpnews 1).
+- Per site: guardian **6 -> 3**, cnnlite 1 -> 0.
+- BATCHCAUSE 75 vs 71 overall. The increases are on sites where 431
+  never ran: claude +2, oldreddit +2, bbc, github, google and wpblog +1
+  each, with 0 skips on any of them.
+- Reruns, two per arm: oldreddit 6 / 5 (431) vs 5 / 6 (430), claude 5 / 3
+  vs 4 / 4. That is live variation.
+
+No sudo.
+
+**Next:**
+1. "detached stylesheet pruned" (8 in r143).
+2. "nearest box is not a block" / "block is not one line container of
+   plain content" (7 each).
+3. The scorecard's settle should wait for ready, not a fixed 15 s. The
+   census is noisy enough now (a few rebuilds per site, run to run) that
+   a multi-run census would also help decide small units.
