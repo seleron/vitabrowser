@@ -12634,3 +12634,106 @@ No sudo.
 2. The changes on flex boxes themselves (the remaining nearest-box 4).
 3. A submit/button input's `value` (its label) set by script: same render
    decline, but a width change needs layout, not a redraw.
+
+## Patch 425 (2026-11-09): a block given content that is more than plain inline is built again whole
+
+**The unit.** After 424 the top decline is "new content is not plain
+inline elements" (10 in r137: bbc 4, wpblog 4, oldreddit, youtube). A
+probe (scratch only) named the content:
+- bbc: a `<div>` given an `<img>`;
+- wpblog: a `<div>` given an `<iframe>` and a `<script>`;
+- oldreddit: custom elements (`shreddit-app` and its `app-plugin-*`
+  children).
+
+The line rebuild (WS-C) takes plain inline content only.
+
+**The change** (html.c, `html_reconvert_local_change`): such a block (a
+BOX_BLOCK that is the element's own box) is built again whole through
+376's path (`html_rl_flex_restyle`): from the DOM, its objects carried
+over, the page laid out whole. Its own declines stand, so wpblog's
+`<iframe>` meets "holds controls or frames".
+
+**Sites** (scratch build): bbc **11 blocks built whole** (BATCHCAUSE
+8 -> 4), oldreddit 1; "new content is not plain inline" 9 -> 0 on the
+three. wpblog's four moved to the frames decline.
+
+**Gate.**
+- New pair **JS-content-whole / CSS-content-whole-ref**: blocks given text
+  with an image (a generated data: PNG), child blocks, a custom element.
+  **3 built whole, 0 full rebuilds**, rows 0.
+- Two expectations on 407/408's JS-leaf-insert page moved with it, rows
+  still 0:
+  - its "image next to inline text" step **declined**, and is built whole
+    now;
+  - with that step's full rebuild gone the timing shifts, and the page's
+    last step (`aria-expanded` on its flex container) arrives in a batch
+    of its own: a **render decline**, no rebuild either. 408's check now
+    counts both answers.
+- **gate425c exit 0** (gate425 and gate425b failed on those two).
+
+**A gate fix found on the way (tools only).** The chain's restaged gate
+failed **twice** on the network mirror. The mirror lost the run's last
+lines of `log.txt` and `autotest.done`, with 0 datagrams lost by
+sequence number, and the receiver's own log ended "timeout".
+`vita-netlog.py` is started 15 s late with `--timeout 1000`, so it quit
+about 1015 s after launch. The autotest now runs about 950 s of sim time
+with this page list (the gate pages added all session), and on a slower
+run its end came after the receiver's exit. Patch 411 raised the sim's
+own timeout to 1200 s but not the receiver's. It is **1300 s** now and
+still exits as soon as the run is done. (gate425c had passed it on the
+same binary, a faster run.)
+
+**A use-after-free the ASan autotest found, fixed here (css.c).** With
+the receiver fixed, the chain's **ASan autotest failed**: SEGV in
+`css__selector_hash_find` during a full rebuild on **NET-js-link-detach**
+(389's page), in the window where one removed `<link>` sheet had settled
+and another was still loading.
+- `html_css_prune_detached_sheets` released the settled sheet's content
+  (`hlcache_handle_release`), and the selection-context refresh after
+  the prune is **skipped while any sheet is still loading**. So
+  `c->select_ctx` kept the freed sheet, and the next rebuild selected
+  through it.
+- A 387/389 bug, timing-dependent. 425 made the page's earlier steps
+  local and faster, which moved it into the window.
+- The pruned sheet is now taken out of the live context before its
+  release, as the sheet-update path a few hundred lines up already did.
+
+**Restage from pristine:** 507 applied plus the 2 known collisions,
+html.c and css.c byte-identical. **gate425d (restaged): exit 0**, the
+mirror 364 identical, 0 differ.
+
+**ASan:** sweep **21/21 clean**; `asan-autotest.sh main` **clean** (361
+page dumps), NET-js-link-detach included.
+
+**Scorecard r138**: 21 sites against `r79-360`, the 425 and 424 binaries
+back to back: **68.56 vs 73.05**.
+- The gap is **claude timing out in the 425 arm** (7.5), plus guardian's
+  36/61 flip and stackoverflow 63/65.
+- Reruns, twice in both arms: guardian 37.0/36.8 and 36.8/36.8,
+  stackoverflow 65.1/64.5 and 64.6/64.9 (noise).
+- claude **timed out on 425 both times, and on 424 the second time.**
+  Loaded directly, twice per binary: **425 timed out 2/2, 424 1/2**.
+  Overall: 425 **5/5**, 424 **2/5**.
+- Every timeout, on either binary, stops at the **same place**: right
+  after `WANTLOW __signInBooted`, during the initial conversion (geomgate
+  "converting, layout=(nil)"), ~2100 log lines in, before any of 425's
+  code can run (0 blocks built whole). It is the same stall as the
+  claude timeouts in 420's, 422's and 424's ASan sweeps and in the 420
+  arm of the 421 chain.
+- So: **a hang in claude's initial load, on the baseline too**, not this
+  patch. Why it struck 425 more often in this sample is not known (live
+  site, timing); it needs its own unit, below.
+
+**Census, back to back:** BATCHCAUSE **72 vs 75**; "new content is not
+plain inline" **10 -> 0**; **22 blocks built whole**.
+
+No sudo.
+
+**Next:**
+0. **claude's initial-load hang** (above): reproduce on the baseline,
+   find what the conversion waits on after `__signInBooted`.
+1. The sibling family, now at the top: "page CSS needs conservative
+   sibling check", "class change may move a sibling selector",
+   "structural selectors or counters in page CSS" (8 each).
+2. "new element is not a plain block" (8).
+3. Frames in rebuilt subtrees (wpblog, rte).
