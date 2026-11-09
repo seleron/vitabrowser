@@ -390,6 +390,8 @@ JS-style-detach-noop file:///app0:/testpages/JS-style-detach-noop.html
 CSS-style-detach-noop-ref file:///app0:/testpages/CSS-style-detach-noop-ref.html
 JS-flex-below file:///app0:/testpages/JS-flex-below.html
 CSS-flex-below-ref file:///app0:/testpages/CSS-flex-below-ref.html
+JS-control-restyle file:///app0:/testpages/JS-control-restyle.html
+CSS-control-restyle-ref file:///app0:/testpages/CSS-control-restyle-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -2023,6 +2025,19 @@ k422f=$(printf '%s\n' "$k422seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 k422i=$(printf '%s\n' "$k422seg" | grep -c "no longer a block-level box here" || true)
 echo "  JS-flex-below: rows $k422r (0), containers rebuilt ${k422b} (2 or more), nearest-box declines ${k422d} (0), made-inline drops ${k422i} (1), full rebuilds ${k422f} (1)"
 [ "$k422r" = 0 ] && [ "${k422b:-0}" -ge 2 ] && [ "${k422d:-1}" -eq 0 ] && [ "${k422i:-0}" -ge 1 ] && [ "${k422f:-0}" -eq 1 ] || fail "changes below a flex or grid box"
+# Patch 423: containers holding stateful controls (a form's and orphan
+# ones) and a flex submit button restyle locally, the values kept (rows
+# as the parse-time page): 3 restyles, no controls declines, no full
+# rebuild.
+k423r=$(fl_rows JS-control-restyle CSS-control-restyle-ref)
+k423seg=$(awk '/ page [0-9]+\/[0-9]+ JS-control-restyle: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k423l=$(printf '%s\n' "$k423seg" | grep -c "flex or grid box restyled\|block subtree restyled" || true)
+k423d=$(printf '%s\n' "$k423seg" | grep -c "holds controls or frames" || true)
+k423f=$(printf '%s\n' "$k423seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+# (The first step sets the values: an input's own value mark may take one
+# full rebuild -- not the restyles, which come after it.)
+echo "  JS-control-restyle: rows $k423r (0), restyled ${k423l} (3), controls declines ${k423d} (0), full rebuilds ${k423f} (1 at most)"
+[ "$k423r" = 0 ] && [ "${k423l:-0}" -ge 3 ] && [ "${k423d:-1}" -eq 0 ] && [ "${k423f:-2}" -le 1 ] || fail "stateful controls through a restyle"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
@@ -2046,8 +2061,10 @@ k382r=$(fl_rows JS-flex-buttons CSS-flex-buttons-ref)
 k382seg=$(awk '/ page [0-9]+\/[0-9]+ JS-flex-buttons: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k382h=$(printf '%s\n' "$k382seg" | grep -c "LIFE rebuild local: restyled box's controls handed to the new boxes" || true)
 k382d=$(printf '%s\n' "$k382seg" | grep -c "LIFE rebuild local: declined (restyled flex or grid box holds controls or frames)" || true)
-echo "  JS-flex-buttons: rows differing from the parse-time build $k382r (0); ${k382h} rebuilds handing controls over (2 or more); stateful-control declines ${k382d} (1 or more)"
-[ "$k382r" = 0 ] && [ "${k382h:-0}" -ge 2 ] && [ "${k382d:-0}" -ge 1 ] ||
+# (Patch 423: the typed text field is rebuilt too now, its value read
+# back from the DOM -- no stateful-control decline.)
+echo "  JS-flex-buttons: rows differing from the parse-time build $k382r (0); ${k382h} rebuilds handing controls over (2 or more); stateful-control declines ${k382d} (0)"
+[ "$k382r" = 0 ] && [ "${k382h:-0}" -ge 2 ] && [ "${k382d:-1}" -eq 0 ] ||
 	fail "buttons handed to rebuilt boxes"
 # Patch 383: a child-list change on <head> needs no rebuild (a sheet that
 # arrives marks for itself), nor an inert attribute (data-*, aria-*,

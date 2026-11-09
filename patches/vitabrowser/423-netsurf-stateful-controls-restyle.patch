@@ -1,0 +1,197 @@
+# netsurf: text fields, checkboxes and radios survive a container's restyle; a control's old widget is freed; a reused checkbox takes its state from the DOM (patch 423)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 422)
+#
+# The census's "restyled flex or grid box holds controls or frames" (12 on
+# five sites in a probe, scratch only): text boxes, a password field and
+# a textarea (stackoverflow, wikipedia, google), checkboxes and radios,
+# a flex submit button restyling itself (google), a frame (rte).
+#
+# What a rebuild of a control needs, read from the code:
+#  - its state is in the DOM: typed text is synced to it
+#    (form_gadget_update_value -> form_gadget_sync_with_dom), checkedness
+#    is the element's (a click sets both, interaction.c);
+#  - a control owned by a <form> is found again by its element
+#    (html_forms_get_control_for_node); an orphan is made new.
+#
+#  - html_rl_gadget_rebuildable: buttons (382), text box, password,
+#    textarea, checkbox, radio, hidden. Not a select (its options would be
+#    added to a reused control again), a file input, an image input.
+#  - html_rl_flex_restyle: such a control on the box itself too (detached
+#    alone before the build); html_rl_subtree_stateful lets them through.
+#  - html_rl_detach_controls: a text field's selection or drag goes back
+#    to the page as focus does; only a form-owned control leaves the old
+#    box -- an orphan stays with it and is freed with it (box_free_box):
+#    detached, it leaked per rebuild (382's orphan buttons too).
+#  - box_textarea_create_textarea: a reused control's old widget and
+#    initial text are freed before the new ones (a widget leaked per
+#    rebuild -- the full reconvert too).
+#  - html_forms_get_control_for_node (forms.c): a checkbox or radio found
+#    again takes `selected` from the element, as a new control does. The
+#    gate's new page caught it: a script's .checked reaches the DOM only
+#    (its mark is a render decline), so a reused control painted the box
+#    unchecked after its container's restyle.
+#
+# Sites (scratch build): controls declines 12 -> 3 (rte's frame); google
+# BATCHCAUSE 10 -> 7.
+#
+--- a/content/handlers/html/html.c	2026-11-09 01:10:55.251133430 +0000
++++ b/content/handlers/html/html.c	2026-11-09 02:08:29.832000128 +0000
+@@ -6680,15 +6680,39 @@
+  * button -- <button>, submit, reset -- has none but focus, which
+  * html_rl_release_box hands back: it is released with the old boxes and
+  * made again by the build, as 364 builds and 368 releases controls. */
++/* Patch 423: a control whose state a rebuild keeps -- a button (382),
++ * and now a text box, password, textarea, checkbox, radio or hidden
++ * input: their state is in the DOM (typed text synced by
++ * form_gadget_sync_with_dom, checkedness by the element) and the build
++ * reads it back; a form-owned control is found again and its old widget
++ * freed (box_textarea_create_textarea), an orphan made again. Not a
++ * select (its options would be added to the control again), a file input
++ * or an image input (an object). */
++static bool html_rl_gadget_rebuildable(const struct form_control *g)
++{
++	switch (g->type) {
++	case GADGET_BUTTON:
++	case GADGET_SUBMIT:
++	case GADGET_RESET:
++	case GADGET_TEXTBOX:
++	case GADGET_PASSWORD:
++	case GADGET_TEXTAREA:
++	case GADGET_CHECKBOX:
++	case GADGET_RADIO:
++	case GADGET_HIDDEN:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ static bool html_rl_subtree_stateful(struct box *b)
+ {
+ 	for (; b != NULL; b = b->next) {
+ 		if (HTML_RL_FRAME(b))
+ 			return true;
+ 		if (b->gadget != NULL &&
+-		    b->gadget->type != GADGET_BUTTON &&
+-		    b->gadget->type != GADGET_SUBMIT &&
+-		    b->gadget->type != GADGET_RESET)
++		    !html_rl_gadget_rebuildable(b->gadget))
+ 			return true;
+ 		if (html_rl_subtree_stateful(b->children))
+ 			return true;
+@@ -6720,10 +6744,29 @@
+ 			}
+ 			if (c->visible_select_menu == b->gadget)
+ 				c->visible_select_menu = NULL;
+-			if (b->gadget->box == b)
+-				b->gadget->box = NULL;
+-			b->gadget = NULL;
+-			n++;
++			/* patch 423: a text field's selection or drag, too */
++			if ((c->drag_type == HTML_DRAG_TEXTAREA_SELECTION ||
++			     c->drag_type == HTML_DRAG_TEXTAREA_SCROLLBAR) &&
++			    c->drag_owner.textarea == b) {
++				c->drag_type = HTML_DRAG_NONE;
++				c->drag_owner.no_owner = true;
++			}
++			if (c->selection_type == HTML_SELECTION_TEXTAREA &&
++			    c->selection_owner.textarea == b) {
++				c->selection_type = HTML_SELECTION_NONE;
++				c->selection_owner.none = true;
++			}
++			/* patch 423: only a control the build will find again
++			 * (one owned by a <form>) leaves the old box; an orphan
++			 * is made new by the build, so the old box keeps it
++			 * and frees it with itself (box_free_box) -- detached,
++			 * it leaked once a rebuild */
++			if (b->gadget->form != NULL) {
++				if (b->gadget->box == b)
++					b->gadget->box = NULL;
++				b->gadget = NULL;
++				n++;
++			}
+ 		}
+ 		n += html_rl_detach_controls(c, b->children);
+ 	}
+@@ -12648,8 +12691,10 @@
+ 		RL_FNO("restyled flex or grid box is not in a block");
+ 	/* patch 375: objects are carried over (html_rl_relink_subtree);
+ 	 * patch 382: buttons too, released and made again */
+-	if (ob->gadget != NULL || HTML_RL_FRAME(ob) ||
+-	    html_rl_subtree_stateful(ob->children))
++	/* patch 423: a rebuildable control on the box itself, too (google's
++	 * flex submit buttons restyle themselves) */
++	if ((ob->gadget != NULL && !html_rl_gadget_rebuildable(ob->gadget)) ||
++	    HTML_RL_FRAME(ob) || html_rl_subtree_stateful(ob->children))
+ 		RL_FNO("restyled flex or grid box holds controls or frames");
+ 	if (old_class != html_rl_class_same &&	/* patch 404 */
+ 	    html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
+@@ -12668,7 +12713,14 @@
+ 	prev = ob->prev;
+ 	html_rl_unlink(ob);
+ 	html_rl_clear_backlinks(ob);
+-	/* patch 382: its buttons go to the new boxes */
++	/* patch 382: its buttons go to the new boxes (423: its own control
++	 * too -- detached alone: ob is unlinked, its next is not its) */
++	if (ob->gadget != NULL) {
++		struct box *keep = ob->next;
++		ob->next = NULL;
++		(void) html_rl_detach_controls(c, ob);
++		ob->next = keep;
++	}
+ 	if (html_rl_detach_controls(c, ob->children) > 0)
+ 		macsurf_debug_log_writef("LIFE rebuild local: restyled box's "
+ 			"controls handed to the new boxes");
+--- a/content/handlers/html/box_textarea.c	2026-11-09 01:10:55.251436697 +0000
++++ b/content/handlers/html/box_textarea.c	2026-11-09 02:08:29.838668768 +0000
+@@ -453,6 +453,20 @@
+ 	ta_setup.selected_bg = fstyle.foreground;
+ 	ta_setup.selected_text = colour_to_bw_furthest(ta_setup.selected_bg);
+ 
++	/* VitaBrowser patch 423: a control found again by its element (one
++	 * owned by a <form>: html_forms_get_control_for_node) keeps its old
++	 * widget and initial text from the box it had: a local rebuild of its
++	 * subtree, or the full reconvert, overwrote both -- a widget leaked
++	 * per rebuild. The typed text is in the DOM already
++	 * (form_gadget_update_value -> form_gadget_sync_with_dom), and read
++	 * above, so the old widget can go. */
++	if (gadget->data.text.ta != NULL) {
++		textarea_destroy(gadget->data.text.ta);
++		gadget->data.text.ta = NULL;
++	}
++	if (gadget->data.text.initial != NULL)
++		dom_string_unref(gadget->data.text.initial);
++
+ 	/* Hand reference to dom text over to gadget */
+ 	gadget->data.text.initial = dom_text;
+ 
+--- a/content/handlers/html/forms.c	2026-11-09 01:50:48.960916786 +0000
++++ b/content/handlers/html/forms.c	2026-11-09 02:08:29.841145208 +0000
+@@ -586,8 +586,25 @@
+ 	/* Step one, see if we already have a control */
+ 	for (f = forms; f != NULL; f = f->prev) {
+ 		for (ctl = f->controls; ctl != NULL; ctl = ctl->next) {
+-			if (ctl->node == node)
++			if (ctl->node == node) {
++				/* VitaBrowser patch 423: a checkbox or radio
++				 * found again for a new box takes its state from
++				 * the element, as a new control does (below,
++				 * parse_input_element): a script's .checked
++				 * reached the DOM only, and a local rebuild that
++				 * reuses the control painted it as it was made.
++				 * A click sets both (interaction.c), so the DOM
++				 * is the truth. */
++				if (ctl->type == GADGET_CHECKBOX ||
++				    ctl->type == GADGET_RADIO) {
++					bool checked;
++					if (dom_html_input_element_get_checked(
++						(dom_html_input_element *)node,
++						&checked) == DOM_NO_ERR)
++						ctl->selected = checked;
++				}
+ 				return ctl;
++			}
+ 		}
+ 	}
+ 
