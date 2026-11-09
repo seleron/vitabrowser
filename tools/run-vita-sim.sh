@@ -571,6 +571,8 @@ NET-js-link-click http://127.0.0.1:$HP/JS-link-click.html
 NET-js-block-oc-insert http://127.0.0.1:$HP/JS-block-oc-insert.html
 NET-js-frames-local http://127.0.0.1:$HP/JS-frames-local.html
 NET-css-frames-local-ref http://127.0.0.1:$HP/CSS-frames-local-ref.html
+NET-js-flex-frame http://127.0.0.1:$HP/JS-flex-frame.html
+NET-css-flex-frame-ref http://127.0.0.1:$HP/CSS-flex-frame-ref.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -2103,6 +2105,16 @@ k427bm=$(printf '%s\n' "$k427bseg" | grep -c "declined (class change moves a sib
 k427bf=$(printf '%s\n' "$k427bseg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-sib-func: rows $k427br (0), conservative declines ${k427bc} (0), precise class declines ${k427bm} (2 or more), full rebuilds after a decline ${k427bf} (2)"
 [ "$k427br" = 0 ] && [ "${k427bc:-1}" -eq 0 ] && [ "${k427bm:-0}" -ge 2 ] && [ "${k427bf:-0}" -eq 2 ] || fail ":not() / :is() / :where() in sibling rules"
+# Patch 428: a flex container holding a frame is restyled alone, the frame
+# carried over to its new box (twice: shown, then hidden), and the page
+# renders row for row as the same steps run at parse time.
+k428r=$(fl_rows NET-js-flex-frame NET-css-flex-frame-ref)
+k428seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-flex-frame: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k428h=$(printf '%s\n' "$k428seg" | grep -c "frames handed to the new boxes" || true)
+k428x=$(printf '%s\n' "$k428seg" | grep -c "flex or grid box restyled, full layout" || true)
+k428d=$(printf '%s\n' "$k428seg" | grep -c "declined (restyled flex or grid box holds controls or frames)" || true)
+echo "  NET-js-flex-frame: rows $k428r (0), container restyled alone ${k428x} (3 or more), frames handed over ${k428h} (2 or more), frame declines ${k428d} (0)"
+[ "$k428r" = 0 ] && [ "${k428x:-0}" -ge 3 ] && [ "${k428h:-0}" -ge 2 ] && [ "${k428d:-1}" -eq 0 ] || fail "frames carried over in a restyled flex container"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

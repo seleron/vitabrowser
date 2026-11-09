@@ -1,0 +1,220 @@
+# netsurf: frames carried over when a flex or grid container is restyled alone (patch 428)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 427)
+#
+# "structural selectors or counters in page CSS" was r140's second
+# decline (11); rte gave 5 of them, and 6 "restyled flex or grid box holds
+# controls or frames". Logged in a scratch build: rte's carousel (a flex
+# container patch 372 restyles alone on each slide) holds its video
+# frame -- an <iframe> box (IFRAME, window linked) -- and no local rebuild
+# frees a frame's box (patch 371: c->iframe's record and the window point
+# at it), so every slide took the full rebuild.
+#
+# A frame is carried over now (html_rl_frames_carry): box construction
+# gives the rebuilt <iframe> box a record of its own (box_iframe prepends
+# it to c->iframe); the records made since the build began are the new
+# tree's. Each old frame box's window goes to the new box of its element
+# (or to none: display:none now) through browser_window_iframe_rebox
+# (desktop/frames.c, new: html.c cannot see struct browser_window), and
+# the old box's records leave the list and are freed (talloc; a window
+# holds the record's values, not the record). The full layout that
+# follows places the window (layout.c, by box->iframe); fixes905's
+# re-link by element still runs on every reformat. A build that is given
+# up drops the records it made (html_rl_frames_drop_new). A frame on the
+# container's own box, and selects / file / image inputs, still decline.
+# html_rl_subtree_stateful (frames + controls) is now
+# html_rl_subtree_controls.
+#
+# rte (scratch, 2 loads): full rebuilds 8 -> 5, "holds controls or
+# frames" 6 -> 0, the structural decline 5 -> 0; 5 frames handed over a
+# load.
+#
+--- a/content/handlers/html/html.c	2026-11-09 11:55:19.696170760 +0000
++++ b/content/handlers/html/html.c	2026-11-09 12:15:46.092473839 +0000
+@@ -60,6 +60,7 @@
+ #include "netsurf/bitmap.h"
+ #include "javascript/js.h"
+ #include "desktop/gui_internal.h"
++#include "desktop/frames.h"	/* patch 428 */
+ 
+ #include "html/html.h"
+ 
+@@ -6560,6 +6561,67 @@
+  * way must never be freed by a local rebuild. */
+ #define HTML_RL_FRAME(b) ((b)->iframe != NULL || ((b)->flags & IFRAME) != 0)
+ 
++/* Patch 428: a subtree's frames go to its rebuilt boxes. Box construction
++ * gives each <iframe> box a record of its own (box_iframe prepends it to
++ * c->iframe); the old records point at boxes about to be freed, and each
++ * frame's window at its old box. The records made since `before` are the
++ * new tree's: an old box's window goes to the new box of its element (a
++ * window has the record's values, not the record), or to none, and the
++ * old box's records leave the list (talloc frees each). The layout that
++ * follows places the windows (layout.c, by box->iframe). */
++static unsigned int html_rl_frames_carry(html_content *c, struct box *b,
++		struct content_html_iframe *before)
++{
++	unsigned int n = 0;
++
++	for (; b != NULL; b = b->next) {
++		if ((b->iframe != NULL || (b->flags & IFRAME) != 0)) {
++			struct content_html_iframe *f, **pp;
++			struct box *nb = NULL;
++			for (f = c->iframe; f != NULL && f != before;
++			     f = f->next)
++				if (f->box != NULL && f->box != b &&
++				    f->box->node == b->node) {
++					nb = f->box;
++					break;
++				}
++			if (b->iframe != NULL) {
++				browser_window_iframe_rebox(b->iframe, nb);
++				if (nb != NULL)
++					nb->iframe = b->iframe;
++				b->iframe = NULL;
++			}
++			pp = &c->iframe;
++			while (*pp != NULL) {
++				f = *pp;
++				if (f->box == b) {
++					*pp = f->next;
++					talloc_free(f->name);	/* bctx's */
++					talloc_free(f);
++				} else
++					pp = &f->next;
++			}
++			b->flags &= ~IFRAME;
++			n++;
++		}
++		n += html_rl_frames_carry(c, b->children, before);
++	}
++	return n;
++}
++
++/* Patch 428: a local build that is given up -- its records go (their
++ * boxes are freed with the new tree); the old ones never left. */
++static void html_rl_frames_drop_new(html_content *c,
++		struct content_html_iframe *before)
++{
++	while (c->iframe != NULL && c->iframe != before) {
++		struct content_html_iframe *f = c->iframe;
++		c->iframe = f->next;
++		talloc_free(f->name);	/* bctx's */
++		talloc_free(f);
++	}
++}
++
+ /* Patch 371: does a box subtree hold an iframe's box? */
+ static bool html_rl_subtree_frames(struct box *b)
+ {
+@@ -6760,15 +6822,15 @@
+ 	}
+ }
+ 
+-static bool html_rl_subtree_stateful(struct box *b)
++/* Patch 428: does a subtree hold a control a rebuild cannot make again?
++ * (Was html_rl_subtree_stateful, frames too: they are carried over.) */
++static bool html_rl_subtree_controls(struct box *b)
+ {
+ 	for (; b != NULL; b = b->next) {
+-		if (HTML_RL_FRAME(b))
+-			return true;
+ 		if (b->gadget != NULL &&
+ 		    !html_rl_gadget_rebuildable(b->gadget))
+ 			return true;
+-		if (html_rl_subtree_stateful(b->children))
++		if (html_rl_subtree_controls(b->children))
+ 			return true;
+ 	}
+ 	return false;
+@@ -12947,6 +13009,7 @@
+ 	struct content *base_c = &c->base;
+ 	struct box *pbox = ob->parent, *prev, *nb;
+ 	unsigned int objects_before;
++	struct content_html_iframe *frames_before;	/* patch 428 */
+ 	bool ok;
+ 	static unsigned long flex_n;
+ 
+@@ -12960,8 +13023,10 @@
+ 	 * patch 382: buttons too, released and made again */
+ 	/* patch 423: a rebuildable control on the box itself, too (google's
+ 	 * flex submit buttons restyle themselves) */
++	/* patch 428: frames below it are carried over too
++	 * (html_rl_frames_carry) -- rte's carousel holds its video frame */
+ 	if ((ob->gadget != NULL && !html_rl_gadget_rebuildable(ob->gadget)) ||
+-	    HTML_RL_FRAME(ob) || html_rl_subtree_stateful(ob->children))
++	    HTML_RL_FRAME(ob) || html_rl_subtree_controls(ob->children))
+ 		RL_FNO("restyled flex or grid box holds controls or frames");
+ 	if (old_class != html_rl_class_same &&	/* patch 404 */
+ 	    html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
+@@ -12993,11 +13058,13 @@
+ 			"controls handed to the new boxes");
+ 	html_rl_invalidate(pbox);
+ 	objects_before = c->num_objects;
++	frames_before = c->iframe;	/* patch 428 */
+ 	(void) html_reconvert_reset_node_data_walk(el, 0);
+ 	box_counters_touched_reset();	/* patch 374 */
+ 	if (!box_build_element(c, el) || box_counters_touched()) {
+ 		nb = box_for_node(el);
+ 		html_rl_drop_new(c, nb, objects_before);	/* patch 374 */
++		html_rl_frames_drop_new(c, frames_before);	/* patch 428 */
+ 		dom_node_unref(el);
+ 		macsurf_debug_log_writef("LIFE rebuild local: restyled flex "
+ 			"or grid box failed to build%s, full reconvert",
+@@ -13010,6 +13077,7 @@
+ 		if (nb->parent != pbox || (nb->type != BOX_FLEX &&
+ 		    nb->type != BOX_GRID && nb->type != BOX_BLOCK)) {
+ 			html_rl_drop_new(c, nb, objects_before);	/* 374 */
++			html_rl_frames_drop_new(c, frames_before); /* 428 */
+ 			macsurf_debug_log_writef("LIFE rebuild local: restyled "
+ 				"flex or grid box is no longer a block-level "
+ 				"box here, full reconvert");
+@@ -13034,6 +13102,13 @@
+ 	 * boxes go (the page is laid out whole below: new images sized;
+ 	 * patch 382: they hold no controls any more) */
+ 	html_rl_relink_subtree(c, ob);
++	{	/* patch 428: its frames to the new boxes */
++		unsigned int nf = html_rl_frames_carry(c, ob->children,
++				frames_before);
++		if (nf > 0)
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"box's frames handed to the new boxes (%u)", nf);
++	}
+ 	/* Patch 420: an ancestor's float list may hold floats of the old
+ 	 * boxes (376's reason to decline); the full layout below makes every
+ 	 * one again (layout_block_context starts each list empty) */
+--- a/desktop/frames.c	2026-11-09 11:55:19.697733796 +0000
++++ b/desktop/frames.c	2026-11-09 12:15:46.101480208 +0000
+@@ -714,6 +714,14 @@
+ }
+ 
+ /* exported function documented in desktop/frames.h */
++void browser_window_iframe_rebox(struct browser_window *window,
++		struct box *box)
++{
++	if (window != NULL)
++		window->box = box;
++}
++
++/* exported function documented in desktop/frames.h */
+ void browser_window_recalculate_iframes(struct browser_window *bw)
+ {
+ 	struct browser_window *window;
+--- a/desktop/frames.h	2026-11-09 11:55:19.697811130 +0000
++++ b/desktop/frames.h	2026-11-09 12:15:46.106319424 +0000
+@@ -44,6 +44,15 @@
+ void browser_window_recalculate_iframes(struct browser_window *bw);
+ 
+ /**
++ * VitaBrowser patch 428: an iframe window's box, made again by a local
++ * rebuild of the parent's box tree (NULL: its element has none now). Laid
++ * out with the page, the new box places the window (layout.c).
++ */
++struct box;
++void browser_window_iframe_rebox(struct browser_window *window,
++		struct box *box);
++
++/**
+  * Invalidate an iframe causing a redraw.
+  *
+  * \param bw The browser window to invalidate
