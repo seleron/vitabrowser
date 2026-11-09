@@ -398,6 +398,8 @@ JS-content-whole file:///app0:/testpages/JS-content-whole.html
 CSS-content-whole-ref file:///app0:/testpages/CSS-content-whole-ref.html
 JS-reflect-proto file:///app0:/testpages/JS-reflect-proto.html
 JS-style-noop file:///app0:/testpages/JS-style-noop.html
+JS-sib-func file:///app0:/testpages/JS-sib-func.html
+CSS-sib-func-ref file:///app0:/testpages/CSS-sib-func-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2091,6 +2093,16 @@ k427n=$(printf '%s\n' "$k427seg" | grep -c "style attribute change leaves the st
 k427f=$(printf '%s\n' "$k427seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-style-noop: rows $k427r (0), style changes needing no rebuild ${k427n} (3 or more), full rebuilds ${k427f} (1)"
 [ "$k427r" = 0 ] && [ "${k427n:-0}" -ge 3 ] && [ "${k427f:-0}" -eq 1 ] || fail "style changes that leave the style as it is"
+# Patch 427 (unit 2): :not() / :is() / :where() in a left compound keep the
+# sheet precise: the insert and the #m class change are local; the .off and
+# .w class changes decline precisely (two full rebuilds), never conservatively.
+k427br=$(fl_rows JS-sib-func CSS-sib-func-ref)
+k427bseg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-func: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k427bc=$(printf '%s\n' "$k427bseg" | grep -c "declined (page CSS needs conservative sibling check)" || true)
+k427bm=$(printf '%s\n' "$k427bseg" | grep -c "declined (class change moves a sibling selector)" || true)
+k427bf=$(printf '%s\n' "$k427bseg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-sib-func: rows $k427br (0), conservative declines ${k427bc} (0), precise class declines ${k427bm} (2 or more), full rebuilds after a decline ${k427bf} (2)"
+[ "$k427br" = 0 ] && [ "${k427bc:-1}" -eq 0 ] && [ "${k427bm:-0}" -ge 2 ] && [ "${k427bf:-0}" -eq 2 ] || fail ":not() / :is() / :where() in sibling rules"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

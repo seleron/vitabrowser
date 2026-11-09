@@ -1,0 +1,256 @@
+# netsurf: the sibling scan reads :not() / :is() / :where() in a left compound (patch 427)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 426)
+#
+# The top of r139's decline list (10 + 10): "page CSS needs conservative
+# sibling check" and "class change may move a sibling selector" -- a sheet
+# whose sibling rule had a FUNCTIONAL pseudo-class in its left compound
+# (patch 413 kept declining those) was conservative as a whole: every
+# class change and block insert on the page took the full rebuild.
+# Logged in a scratch build: youtube's input:not(:checked) ~ ...,
+# .x:not(:empty) ~ ..., .y:is(:checked,:disabled) + ...; archwiki's
+# input:focus:not(:active) + ... and :not(.a .b) + ...; rte's
+# .p:not(.shaka-hidden) + ...; wordpress.org's :where(.a) + :where(.b)
+# and :is(.a .b .c) + ....
+#
+# An argument that is a comma list of compounds -- each the last of a
+# descendant / child chain -- is read into the compound's subs, and each
+# is a left compound of its own: a change can flip X:not(A) or X:is(A, B)
+# only by flipping X or one of them, so the class check (m_old != m_new
+# per left compound) and the attribute check over every left see it; the
+# pseudo itself is ignored like a plain one (a broader match). A chain's
+# ancestors are the right compound's ancestors too (the two are
+# siblings): a change to one rebuilds a subtree holding both. A sibling
+# combinator, :has() or an unreadable part inside still declines as 413.
+# :empty in an argument reaches the :empty checks.
+#
+# Conservative sibling declines on youtube / archwiki / rte / wpblog /
+# wpnews: 6 / 1 / 1 / 1 / 1 -> 0. Those batches mostly meet the next
+# decline now (structural selectors, a non-plain new element).
+#
+--- a/content/handlers/html/html.c	2026-11-09 10:42:42.855577728 +0000
++++ b/content/handlers/html/html.c	2026-11-09 11:04:00.496218362 +0000
+@@ -10120,6 +10120,13 @@
+ 	 * pseudo is :empty / :has(). */
+ 	bool has_empty;
+ 	bool has_has;
++	/* Patch 427: the compounds of a :not() / :is() / :where() argument
++	 * (the last of each part's descendant chain). A change can flip
++	 * X:not(A) or X:is(A, B) only by flipping X or one of them: each is
++	 * a left compound of its own (html_rl_sib_lefts_add), and the pseudo
++	 * is ignored like a plain one, so the sheet stays precise. */
++	struct html_rl_sib_compound *subs;
++	int nsubs;
+ };
+ /* Patch 198: a sibling-combinator rule: kind is '+' or '~', l is the left
+  * compound, r is the right compound. */
+@@ -10132,6 +10139,11 @@
+ static void html_rl_sib_compound_free(struct html_rl_sib_compound *cp)
+ {
+ 	int i;
++	for (i = 0; i < cp->nsubs; i++)	/* patch 427 */
++		html_rl_sib_compound_free(&cp->subs[i]);
++	free(cp->subs);
++	cp->subs = NULL;
++	cp->nsubs = 0;
+ 	free(cp->tag);
+ 	free(cp->id);
+ 	for (i = 0; i < cp->nclasses; i++)
+@@ -10156,6 +10168,19 @@
+ 	dst->has_pseudo = src->has_pseudo;
+ 	dst->has_empty = src->has_empty;
+ 	dst->has_has = src->has_has;
++	if (src->nsubs > 0) {	/* patch 427 */
++		dst->subs = calloc((size_t)src->nsubs, sizeof(*dst->subs));
++		if (dst->subs == NULL)
++			return false;
++		for (i = 0; i < src->nsubs; i++) {
++			if (!html_rl_sib_compound_dup(&dst->subs[i],
++					&src->subs[i])) {
++				html_rl_sib_compound_free(dst);
++				return false;
++			}
++			dst->nsubs++;
++		}
++	}
+ 	if (src->tag != NULL) {
+ 		dst->tag = strdup(src->tag);
+ 		if (dst->tag == NULL)
+@@ -10225,6 +10250,19 @@
+ 	return true;
+ }
+ 
++/* Patch 427: each compound of a :not() / :is() / :where() argument in a
++ * left compound is a left compound of its own (nested ones too). */
++static bool html_rl_sib_lefts_add(struct html_rl_sib_compound **arr,
++		int *narr, const struct html_rl_sib_compound *cp)
++{
++	int i;
++	for (i = 0; i < cp->nsubs; i++)
++		if (!html_rl_sib_compound_append(arr, narr, &cp->subs[i]) ||
++		    !html_rl_sib_lefts_add(arr, narr, &cp->subs[i]))
++			return false;
++	return true;
++}
++
+ /* Patch 198: append a rule, moving l and r into it (their contents are now
+  * owned by the rule; l and r are NOT freed on success). */
+ static bool html_rl_sib_rule_append(struct html_rl_sib_rule **rules,
+@@ -10439,6 +10477,120 @@
+ 
+ /* Parse one compound. 0 ok, 2 conservative decline, -1 parse error. */
+ static int html_rl_parse_compound(struct html_rl_sel_parser *p,
++		struct html_rl_sib_compound *cp);
++
++/* Patch 427: read a :not() / :is() / :where() argument at p->i (its '(')
++ * as a comma list into cp->subs, one compound a part (the last of a
++ * descendant / child chain). false (cp->subs left as it was, p unmoved)
++ * for anything else: a sibling combinator, :has(), an unreadable part --
++ * the pseudo is then the functional one 413 declines. */
++static bool html_rl_sel_args_read(struct html_rl_sel_parser *p,
++		struct html_rl_sib_compound *cp)
++{
++	struct html_rl_sel_parser sub;
++	struct html_rl_sib_compound *subs = NULL;
++	size_t j = p->i, depth = 0;
++	int n = 0, k;
++	bool ok = true;
++
++	while (j < p->len) {
++		uint8_t c = p->s[j];
++		if (c == '(')
++			depth++;
++		else if (c == ')') {
++			if (--depth == 0)
++				break;
++		} else if (c == '"' || c == '\'') {
++			uint8_t q = c;
++			j++;
++			while (j < p->len && p->s[j] != q && p->s[j] != '\n') {
++				if (p->s[j] == '\\')
++					j++;
++				j++;
++			}
++		} else if (c == '\\')
++			j++;
++		j++;
++	}
++	if (j >= p->len)
++		return false;
++	sub.s = p->s;
++	sub.len = j;
++	sub.i = p->i + 1;
++	for (;;) {
++		struct html_rl_sib_compound one, *ns;
++		html_rl_skip_ws(&sub);
++		if (sub.i >= j)
++			break;
++		/* A part may be a chain joined by descendant or child
++		 * combinators (wordpress.org's :is(.a .b .c) + x): its
++		 * ancestors are the right compound's too, so a change to one
++		 * rebuilds a subtree holding both; only its last compound --
++		 * the element itself -- is kept. A sibling combinator in it
++		 * is not read. */
++		for (;;) {
++			uint8_t c;
++			memset(&one, 0, sizeof(one));
++			if (html_rl_parse_compound(&sub, &one) != 0 ||
++			    one.has_func_pseudo || one.has_has ||
++			    one.has_pel) {
++				ok = false;
++				break;
++			}
++			html_rl_skip_ws(&sub);
++			if (sub.i >= j || sub.s[sub.i] == ',')
++				break;
++			c = sub.s[sub.i];
++			if (c == '+' || c == '~') {
++				ok = false;
++				break;
++			}
++			if (c == '>') {
++				sub.i++;
++				html_rl_skip_ws(&sub);
++			}
++			html_rl_sib_compound_free(&one);	/* an ancestor */
++		}
++		if (!ok) {
++			html_rl_sib_compound_free(&one);
++			break;
++		}
++		ns = realloc(subs, (size_t)(n + 1) * sizeof(*subs));
++		if (ns == NULL) {
++			html_rl_sib_compound_free(&one);
++			ok = false;
++			break;
++		}
++		subs = ns;
++		subs[n++] = one;	/* moved */
++		if (sub.i < j)
++			sub.i++;	/* the ',' */
++	}
++	if (!ok || n == 0) {
++		for (k = 0; k < n; k++)
++			html_rl_sib_compound_free(&subs[k]);
++		free(subs);
++		return false;
++	}
++	for (k = 0; k < n; k++) {
++		struct html_rl_sib_compound *ns = realloc(cp->subs,
++				(size_t)(cp->nsubs + 1) * sizeof(*ns));
++		if (ns == NULL) {
++			for (; k < n; k++)
++				html_rl_sib_compound_free(&subs[k]);
++			free(subs);
++			return false;	/* cp->subs freed with cp */
++		}
++		cp->subs = ns;
++		if (subs[k].has_empty)
++			cp->has_empty = true;	/* the :empty checks */
++		cp->subs[cp->nsubs++] = subs[k];	/* moved */
++	}
++	free(subs);
++	return true;
++}
++
++static int html_rl_parse_compound(struct html_rl_sel_parser *p,
+ 		struct html_rl_sib_compound *cp)
+ {
+ 	uint8_t c;
+@@ -10630,6 +10782,7 @@
+ 				 * sibling checks (positional risk is 379's) */
+ 				size_t pa = p->i;
+ 				bool nth = strncmp(name, "nth-", 4) == 0;
++				bool listed = false;	/* patch 427 */
+ 				if (html_rl_is_sel_pseudo(name)) {
+ 					bool is_has = strcmp(name, "has") == 0;
+ 					int r = html_rl_scan_pseudo_content(p,
+@@ -10637,6 +10790,9 @@
+ 					free(name);
+ 					if (r != 0)
+ 						return 2;
++					if (!is_has)
++						listed = html_rl_sel_args_read(p,
++								cp);
+ 					/* patch 413: "has" is a selector pseudo,
+ 					 * so the branch below never recorded it:
+ 					 * a parsed :has() compound was missing
+@@ -10653,6 +10809,8 @@
+ 				if (!html_rl_skip_parens(p))
+ 					return -1;
+ 				cp->has_pseudo = true;
++				if (listed)
++					continue;	/* patch 427 */
+ 				if (nth) {
+ 					size_t q;
+ 					for (q = pa + 1; q + 1 < p->i; q++) {
+@@ -10803,7 +10961,8 @@
+ 			/* A pseudo-element never matches an element, so it
+ 			 * cannot make a sibling's style depend on this class
+ 			 * change; keep it (the matcher returns false). */
+-			if (!html_rl_sib_compound_append(lefts, nlefts, &cp)) {
++			if (!html_rl_sib_compound_append(lefts, nlefts, &cp) ||
++			    !html_rl_sib_lefts_add(lefts, nlefts, &cp)) {
+ 				html_rl_sib_compound_free(&cp);
+ 				if (pend_kind)
+ 					goto decline_free_pend;
