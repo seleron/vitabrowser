@@ -406,6 +406,8 @@ JS-struct-hidden file:///app0:/testpages/JS-struct-hidden.html
 CSS-struct-hidden-ref file:///app0:/testpages/CSS-struct-hidden-ref.html
 JS-control-inert file:///app0:/testpages/JS-control-inert.html
 CSS-control-inert-ref file:///app0:/testpages/CSS-control-inert-ref.html
+JS-block-whole file:///app0:/testpages/JS-block-whole.html
+CSS-block-whole-ref file:///app0:/testpages/CSS-block-whole-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2171,6 +2173,16 @@ k433d=$(printf '%s\n' "$k433seg" | grep -c "declined (nearest box is not a block
 k433f=$(printf '%s\n' "$k433seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-control-inert: rows $k433r (0), inert attributes on controls needing no rebuild ${k433n} (2 or more), nearest-box declines ${k433d} (0), full rebuilds after a decline ${k433f} (0)"
 [ "$k433r" = 0 ] && [ "${k433n:-0}" -ge 2 ] && [ "${k433d:-1}" -eq 0 ] && [ "${k433f:-1}" -eq 0 ] || fail "inert attributes on form controls"
+# Patch 434: a change inside a block that is not one line of plain content
+# (a display:block <button>, an <li> with its marker) builds the block again
+# whole, the page renders row for row as at parse time.
+k434r=$(fl_rows JS-block-whole CSS-block-whole-ref)
+k434seg=$(awk '/ page [0-9]+\/[0-9]+ JS-block-whole: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k434w=$(printf '%s\n' "$k434seg" | grep -c "not one line of plain content, built again whole" || true)
+k434d=$(printf '%s\n' "$k434seg" | grep -c "declined (block is not one line container of plain content)" || true)
+k434f=$(printf '%s\n' "$k434seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-block-whole: rows $k434r (0), blocks built again whole ${k434w} (2 or more), one-line declines ${k434d} (0), full rebuilds after a decline ${k434f} (0)"
+[ "$k434r" = 0 ] && [ "${k434w:-0}" -ge 2 ] && [ "${k434d:-1}" -eq 0 ] && [ "${k434f:-1}" -eq 0 ] || fail "blocks that are not one line of plain content built again whole"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
