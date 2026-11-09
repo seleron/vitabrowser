@@ -12737,3 +12737,128 @@ No sudo.
    "structural selectors or counters in page CSS" (8 each).
 2. "new element is not a plain block" (8).
 3. Frames in rebuilt subtrees (wpblog, rte).
+
+## Patch 426 (2026-11-09): claude's initial-load hang -- prototype accessors read through Reflect.get, a microtask deadline, unchanged attribute writes, no-op style changes
+
+**The problem** (425's open item). claude.ai's sign-in page stalled on its
+initial load: the log stopped right after `WANTLOW __signInBooted`, with
+geomgate refusing geometry ("converting, layout=(nil)"). It happened on
+**425 5/5** loads and **424 2/5**, the same stall as the claude timeouts
+in 420's, 422's and 424's ASan sweeps.
+
+**Diagnosis** (scratch builds only):
+1. **Reproduced** by looping claude loads on the 425 binary (it stalls in
+   about one load in two or three).
+2. **Spinning, not blocked**: state R, utime +300 ticks in 3 s.
+3. **gdb could not attach** (`ptrace_scope` = 1; no sudo). A small
+   LD_PRELOAD (`usr1.c`) writes the stack on SIGUSR1 and goes on.
+   8 samples, all in `js_microtask_job` <- the pump (`qjs_task_pop`,
+   inlined) <- `vita_run`: JavaScript, a microtask.
+4. A job-count trigger never fired: there was no flood of jobs, but ONE
+   job that never returned (the main loop never got back to flush the
+   log). A **time-based** trigger did: any job running past 3 s was
+   interrupted, and the pump logged the exception's `.stack`:
+   `at Ge (https://assets-proxy.anthropic.com/claude-ai/v2/assets/v1/signin-CM83ESyh.js:2:8104)`.
+   With the interrupt, that load went on and **loaded**.
+5. **The blocking code**, from the bundle:
+   ```
+   function Ge(e){for(let t=Oe(e);t!==null;t=Oe(t))if(J.has(t)){...}return null}
+   var Oe=e=>Reflect.get(Node.prototype,"parentElement",e);
+   ```
+   `Node.prototype` had **no `parentElement` accessor**: the polyfill puts
+   it on the element, text and comment prototypes only. `Reflect.get`
+   answered `undefined`; `undefined !== null`, and `Oe(undefined)` is
+   `undefined` again. A synchronous endless loop in one microtask, before
+   first layout. It was intermittent because `Ge` runs only on some
+   custom-element connection orders.
+
+The bundle reads 15 such properties through the standard prototypes:
+Node's `parentElement`, `parentNode`, `nextSibling`, `childNodes`,
+`ownerDocument` and `nodeType`; Element's `localName`, `children` and
+`assignedSlot`; HTMLElement's `style`; Document's `defaultView`,
+`activeElement` and `documentElement`.
+
+**The fix, part 1** (vita_polyfill.js, macsurf_qjs.c):
+- The Node, Element, HTMLElement and Document prototypes get an accessor
+  for each of 29 standard properties they have none of their own for. It
+  forwards to the real one further along the receiver's chain.
+- **The gate caught two mistakes on the way**, both on JS-custom-elements:
+  - **CUSTOMEL 1/7**: two forwarders on a custom element's chain
+    (HTMLElement's and Node's) called each other until the stack ran out.
+    Every forwarder now skips every forwarder.
+  - **CUSTOMEL 4/7**: placed early, a forwarder made later sections, which
+    add a property only where none exists, skip their real
+    `Element.prototype.id` / `localName`. A custom element's chain
+    (instance -> class -> HTMLElement.prototype -> Element.prototype)
+    reads exactly those (a probe page showed the chains). The block is
+    now **last in the file**: CUSTOMEL 7/7.
+- **A microtask job now runs under the timer deadline** (fixes586's rule:
+  every JS entry point bounded). An endless job throws InternalError
+  after 8 s instead of freezing the browser.
+
+**Part 2: what the fix uncovered.** With `Ge` working, claude went further
+and **6 of 10 loads timed out differently**: about 60,000 log lines and
+~395 full rebuilds a load, the page never settling.
+- Each batch carried the **same attribute writes** on its `cds-button`s
+  (`data-cds-button-label` and others), plus an inline-block `<span>`'s
+  **empty style**, every frame.
+- Every one took the full rebuild ("class change on an element with a
+  non-inline, non-block box"; "a sibling selector can match on the
+  data-cds-button-label attribute").
+
+Fixes:
+- macsurf_qjs.c: **setAttribute to the value already there**, or
+  **removeAttribute of an absent attribute**, marks no rebuild. The
+  MutationObserver still gets its record, as in browsers.
+- html.c: a **style attribute change** on a non-inline, non-block box that
+  leaves the element's own style and `::before`/`::after` as its box holds
+  them changes nothing (`html_rl_style_unchanged`, the node's cached
+  selection reset first). An inline style reaches only the element, and
+  its children inherit its computed style.
+
+**claude, loaded directly ten times** (scratch build): **10/10 loaded**,
+3-8 full rebuilds a load. (Earlier in this unit: 425 hung 5/5; the first
+fix alone loaded 10/10 but had broken custom elements; with them right,
+4/6 and then 6/10 timed out on the rebuild loop.)
+
+**Gate.**
+- New page **JS-reflect-proto**: 25 checks that a property read through
+  the standard prototype equals the direct read, plus claude's walk ending
+  after 5 steps; **REFLECTPROTO 25/25**. Then an endless microtask is
+  **stopped** (1).
+- New pair **JS-style-noop / CSS-style-noop-ref**: `style=""` set and
+  removed on inline-block spans needs **no rebuild (3)**; a color change
+  takes **one**. Rows 0.
+- CUSTOMEL 7/7, JS-mutation 7/7, SELECTORS 89/89, and the attribute and
+  control pages pass.
+- **gate426d exit 0.**
+
+**Restage from pristine:** 508 applied plus the 2 known collisions, all
+four files byte-identical. **gate426e (restaged): exit 0**, the mirror
+367 identical, 0 differ.
+
+**ASan:** sweep **21/21 clean**, claude loaded in it (43.4 s; no timeout
+this time). `asan-autotest.sh main` **clean** (364 page dumps).
+
+**Scorecard r139**: 21 sites against `r79-360`, the 426 and 425 binaries
+back to back: **72.20 vs 71.94**. The one difference is claude, **82.2 vs
+77.0**, both loaded.
+- Reruns, three per arm: 426 read **82.2**, 77.0, 75.8; 425 read 75.8,
+  77.0, 75.8.
+- claude's 82.2 appears only on 426 (two loads of four). Its 75.8/77.0
+  flip is the usual spread.
+- **No claude timeout on 426 anywhere in this unit**: 4/4 scorecard loads,
+  10/10 direct loads, the ASan sweep. 425 loaded 4/4 in this sample; its
+  hang is intermittent (it was 5/5 and 2/5 before).
+
+**Census, back to back:** BATCHCAUSE 74 vs 75.
+
+No sudo.
+
+**Next:**
+1. The sibling family at the top of the declines: "page CSS needs
+   conservative sibling check", "class change may move a sibling
+   selector", "structural selectors or counters in page CSS".
+2. "new element is not a plain block".
+3. Real-sized attribute and class changes on inline-block / inline-flex
+   boxes (restyle them in place instead of the full rebuild).
