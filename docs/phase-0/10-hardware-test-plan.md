@@ -12484,3 +12484,89 @@ No sudo.
 2. "new content is not plain inline" (bbc's block children, wpblog's
    iframes).
 3. The changes on flex boxes themselves (the remaining nearest-box 4).
+
+## Patch 423 (2026-11-09): text fields, checkboxes and radios survive a container's restyle
+
+**The unit.** "restyled flex or grid box holds controls or frames": 12 on
+five sites in a probe (scratch only).
+- text boxes, a password field and a textarea (stackoverflow, wikipedia,
+  google);
+- checkboxes and radios;
+- a flex submit button restyling itself (google, 2);
+- a frame (rte).
+
+**What a control's rebuild needs**, read from the code before changing it:
+- its **state is in the DOM**. Typed text is synced to it
+  (`form_gadget_update_value` -> `form_gadget_sync_with_dom`), and
+  checkedness is the element's (a click sets both, interaction.c);
+- a control **owned by a `<form>`** is found again by its element
+  (`html_forms_get_control_for_node`); an **orphan** is made new;
+- `box_textarea_create_textarea` makes a new widget every build and
+  **overwrote** the old one (a leak per rebuild, full reconvert included).
+
+**The change** (html.c, box_textarea.c, forms.c):
+- `html_rl_gadget_rebuildable`: buttons (382), text box, password,
+  textarea, checkbox, radio, hidden. **Not** a select (its options would
+  be added to a reused control again), a file input, or an image input
+  (an object). Frames still decline.
+- `html_rl_flex_restyle`: such a control on the box itself too, detached
+  alone before the build.
+- `html_rl_detach_controls`: a text field's selection or drag goes back to
+  the page, as focus already did. **Only a form-owned control leaves the
+  old box**. An orphan stays with it and is freed with it
+  (`box_free_box`); detached, it leaked per rebuild, as 382's orphan
+  buttons did.
+- `box_textarea_create_textarea`: a reused control's old widget and
+  initial text are freed first.
+- `html_forms_get_control_for_node` (forms.c): a checkbox or radio **found
+  again takes `selected` from the element**, as a new control does.
+
+**What the gate caught.** The new page's first run passed (gate423), but
+only because the values were set at parse time and joined the first
+restyle's batch, whose full rebuild made fresh controls. With the values
+in a step of their own, the form's checkbox was painted **unchecked**
+after its container's restyle: **10 pixel rows**, found by decoding both
+snapshots. A script's `.checked` reaches the DOM only (its mark is a
+render decline, nothing rebuilt), and a reused control kept the
+`selected` it was made with. The forms.c resync fixed it: rows 0.
+A gap left as found: a script's `.checked` with **no** rebuild after it
+still paints the old state. That is the render decline, pre-existing.
+
+**Sites** (scratch build): controls declines **12 -> 3** (rte's frame
+remains); google BATCHCAUSE 10 -> 7.
+
+**Gate.**
+- New pair **JS-control-restyle / CSS-control-restyle-ref**: the values
+  set in a first step, then a form's flex row (text input, checkbox,
+  textarea), an orphan flex row (text input, checkbox) and a flex submit
+  button each gain a class: **3 restyles, 0 controls declines, 0 full
+  rebuilds**, rows 0.
+- 382's JS-flex-buttons: its typed text field is rebuilt too now (0
+  declines; 3 rebuilds handing controls over), rows 0.
+- Every form and submission check passes (FORMVAL, FORMNAMED, FORMTARGET,
+  FORMSHADOW, the FORMCHECK set vs Chromium).
+- **gate423c exit 0** (gate423 failed on the page's batching, gate423b on
+  the checkbox).
+
+**Restage from pristine:** 505 applied plus the 2 known collisions, all
+three files byte-identical. **gate423d (restaged): exit 0**.
+
+**ASan:** sweep **21/21 clean**. `asan-autotest.sh main` **clean** (357
+page dumps), and **`forms` clean** (10/10 submissions as Chromium); this
+chain added the forms pass, since the patch frees controls and widgets.
+
+**Scorecard r136**: 21 sites against `r79-360`, the 423 and 422 binaries
+back to back: **73.20 vs 73.23**. wpblog and claude are the usual
+flippers. No crash.
+
+**Census, back to back:** BATCHCAUSE **77 vs 89**; controls declines
+**16 -> 3** (rte's frames).
+
+No sudo.
+
+**Next:**
+1. A script's `.checked` / `.value` with no rebuild after it: repaint the
+   control (the render decline drops the mark).
+2. "new content is not plain inline" (bbc's block children, wpblog's
+   iframes).
+3. The remaining changes on flex boxes themselves.
