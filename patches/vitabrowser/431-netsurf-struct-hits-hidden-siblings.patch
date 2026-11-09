@@ -1,0 +1,87 @@
+# netsurf: hidden matching siblings no longer decline the structural restyle (patch 431)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 430)
+#
+# "structural selectors or counters in page CSS" topped r143 (9). Behind 7
+# of them: "a matching sibling is not a block-level box of the parent"
+# (youtube 2, guardian 2, cnnlite 2, wpnews 1). Logged in a scratch build,
+# every one of those siblings had NO box: a <script> (guardian, wpnews), a
+# <style> (youtube), a hidden <div> (cnnlite) -- a structural rule such as
+# :nth-child matches them too, and patch 405's restyle of the matching
+# siblings gave up on them.
+#
+# html_rl_node_stays_none: a box-less matching sibling is selected afresh
+# (its cached node data reset, as 426's html_rl_style_unchanged does; its
+# CSS parent the parent box, as html_rl_leaf_restyle) and skipped when its
+# new style is still display:none. One that would get a box now still
+# declines -- though the insert path builds such an element first (a
+# box-less element in the changed range is a new block), as the gate page's
+# #g shows.
+#
+--- a/content/handlers/html/html.c	2026-11-09 15:41:16.966835721 +0000
++++ b/content/handlers/html/html.c	2026-11-09 16:00:56.814043836 +0000
+@@ -9203,13 +9203,49 @@
+  * holds frames and controls, where 404's whole-parent rebuild declines,
+  * and only the old last child flips. A matching child with no box, or not
+  * a block-level box of the parent, declines into the full rebuild. */
++/* Patch 431: a matching sibling with no box -- a <script>, a <style>, a
++ * hidden <div> (guardian, wpnews, youtube, cnnlite: a structural rule like
++ * :nth-child matches them too) -- that its new style still hides has
++ * nothing to restyle. Selected afresh (its cached node data reset, as 426's
++ * html_rl_style_unchanged does), its CSS parent the parent box as in
++ * html_rl_leaf_restyle; anything else (it would get a box now) is not
++ * proven. */
++static bool html_rl_node_stays_none(html_content *c, dom_node *n,
++		struct box *pbox)
++{
++	css_select_results *ns;
++	css_custom_env *env = NULL;
++	bool none = false;
++
++	if (c->layout == NULL || pbox == NULL || c->select_ctx == NULL)
++		return false;
++	nscss_reset_node_data(n);
++	ns = box_get_style(c, pbox != c->layout ? pbox->style : NULL,
++			c->layout->style, n,
++			pbox != c->layout ? pbox->custom_env : NULL, &env);
++	if (ns == NULL)
++		return false;
++	if (ns->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL &&
++	    ns_computed_display(ns->styles[CSS_PSEUDO_ELEMENT_NONE], false) ==
++			CSS_DISPLAY_NONE)
++		none = true;
++	css_select_results_destroy(ns);
++	if (env != NULL)
++		css_custom_env_unref(env);
++	return none;
++}
++
+ static int html_rl_struct_hits_restyle(html_content *c, struct box *pbox,
+ 		dom_node **hits, unsigned int n, double t0)
+ {
+ 	static unsigned long hits_n;
+-	unsigned int i, leaves = 0;
++	unsigned int i, leaves = 0, hidden = 0;
+ 	for (i = 0; i < n; i++) {
+ 		struct box *hb = box_for_node(hits[i]);
++		if (hb == NULL && html_rl_node_stays_none(c, hits[i], pbox)) {
++			hidden++;	/* patch 431 */
++			continue;
++		}
+ 		/* patch 406: a leaf -- restyled in place, in a line too */
+ 		if (hb != NULL && hb->children == NULL &&
+ 		    (hb->parent == pbox || (hb->parent != NULL &&
+@@ -9239,9 +9275,10 @@
+ 				c->base.available_height);
+ 	}
+ 	macsurf_debug_log_writef("LIFE rebuild local: structural change: %u "
+-		"matching sibling%s restyled alone in %ld us (%lu so far)%s", n,
+-		n == 1 ? "" : "s", (long)(macos9_micros() - t0), hits_n,
+-		leaves > 0 ? ", leaf boxes in place" : "");
++		"matching sibling%s restyled alone in %ld us (%lu so far)%s%s",
++		n, n == 1 ? "" : "s", (long)(macos9_micros() - t0), hits_n,
++		leaves > 0 ? ", leaf boxes in place" : "",
++		hidden > 0 ? ", hidden ones still hidden" : "");	/* 431 */
+ 	return 0;
+ }
+ static void html_rl_struct_hits_release(dom_node **hits, unsigned int *n)

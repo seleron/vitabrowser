@@ -402,6 +402,8 @@ JS-sib-func file:///app0:/testpages/JS-sib-func.html
 CSS-sib-func-ref file:///app0:/testpages/CSS-sib-func-ref.html
 JS-block-oc2 file:///app0:/testpages/JS-block-oc2.html
 CSS-block-oc2-ref file:///app0:/testpages/CSS-block-oc2-ref.html
+JS-struct-hidden file:///app0:/testpages/JS-struct-hidden.html
+CSS-struct-hidden-ref file:///app0:/testpages/CSS-struct-hidden-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2137,6 +2139,15 @@ k430d=$(printf '%s\n' "$k430seg" | grep -c "declined (new element is not a plain
 k430f=$(printf '%s\n' "$k430seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-block-oc2: rows $k430r (0), blocks built locally ${k430l} (2 or more), not-plain declines ${k430d} (0), full rebuilds after a decline ${k430f} (0)"
 [ "$k430r" = 0 ] && [ "${k430l:-0}" -ge 2 ] && [ "${k430d:-1}" -eq 0 ] && [ "${k430f:-1}" -eq 0 ] || fail "new blocks holding a fieldset or custom elements built locally"
+# Patch 431: matching siblings with no box that stay hidden (a <script>, a
+# <style>, a hidden <div>) no longer decline the structural restyle.
+k431r=$(fl_rows JS-struct-hidden CSS-struct-hidden-ref)
+k431seg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-hidden: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k431h=$(printf '%s\n' "$k431seg" | grep -c "restyled alone in [0-9]* us ([0-9]* so far), hidden ones still hidden" || true)
+k431d=$(printf '%s\n' "$k431seg" | grep -c "declined (structural selectors or counters" || true)
+k431f=$(printf '%s\n' "$k431seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-struct-hidden: rows $k431r (0), hidden siblings skipped ${k431h} (1 or more), structural declines ${k431d} (0), full rebuilds after a decline ${k431f} (0)"
+[ "$k431r" = 0 ] && [ "${k431h:-0}" -ge 1 ] && [ "${k431d:-1}" -eq 0 ] && [ "${k431f:-1}" -eq 0 ] || fail "hidden matching siblings in a structural restyle"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
