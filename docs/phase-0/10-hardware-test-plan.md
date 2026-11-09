@@ -12933,3 +12933,95 @@ No sudo.
 2. "new element is not a plain block, list item or block of blocks"
    (youtube 3, wpblog 2).
 3. Class and attribute changes on inline-block boxes.
+
+## Patch 428 (2026-11-09): frames carried over when a flex or grid container is restyled alone
+
+**Problem.** "structural selectors or counters in page CSS" was r140's
+second decline (11). That census line is a catch-all, and the reasons
+logged just before it differ:
+- rte 5: the structural sibling is a flex container that "holds
+  controls or frames"
+- youtube / wpnews / guardian 4: "a matching sibling is not a
+  block-level box"
+- wikipedia and wpblog, 1 each: counting, and "not in a block"
+
+A scratch probe found rte's case: the carousel (the flex container that
+patch 372 restyles alone on each slide) holds its **video iframe**. No
+local rebuild frees a frame's box (patch 371), so every slide was a full
+rebuild. That also gave 6 of the 8 "holds controls or frames" declines.
+
+**Fix** (html.c, desktop/frames.c/h).
+- **`html_rl_frames_carry`:** box construction gives each rebuilt
+  `<iframe>` box a record of its own; `box_iframe` prepends it to
+  `c->iframe`, so the records made since the build began belong to the new
+  tree.
+- **The window moves to the new box:** each old frame box's window goes to
+  the new box of the same element (or to none, if it is display:none now)
+  through `browser_window_iframe_rebox`, a new setter in frames.c (html.c
+  cannot see `struct browser_window`).
+- **The old record is freed:** the old box's records leave the list and
+  are freed. A window copies the record's values and keeps no pointer to
+  it.
+- **Layout places it:** the full layout that follows places the window by
+  `box->iframe`. fixes905's re-link by element still runs on every
+  reformat.
+- **A given-up build** drops the records it made
+  (`html_rl_frames_drop_new`).
+- **Still declined:** a frame on the container's own box, and selects /
+  file / image inputs (`html_rl_subtree_controls`, which replaces
+  `html_rl_subtree_stateful`).
+
+**Gate.**
+- New pair **NET-js-flex-frame / NET-css-flex-frame-ref**, served over
+  HTTP like the other frame pages: a flex container holding an iframe gets
+  its class changed three times (gap, then the frame hidden, then shown
+  again). It is **restyled alone 3 times**, the frame **handed over 2
+  times**, 0 frame declines, rows 0.
+- JS-frames-local (371) and FRAMELOCAL 6/6 unchanged.
+- **gate428 exit 0.**
+
+**Restage from pristine:** 510 applied plus the 2 known collisions, all
+three files byte-identical. **gate428b: exit 0**, mirror 371 identical,
+0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean**.
+
+**Census, r141 back to back:**
+- BATCHCAUSE **80 -> 71**; rte 8 -> 5
+- "structural selectors or counters" **11 -> 5**
+- "holds controls or frames" **8 -> 0**
+- frames handed over: 10 (rte 5, wpblog 5)
+
+**Scorecard r141:** **72.30 vs 73.16**. claude 82.2 vs 77.0 and
+hackernews 56.5 vs 55.3 are the usual spread.
+
+**guardian 36.8 vs 61.4: a harness race, not a regression.** Its text
+score was 0.0, while the visual score matched (0.545).
+- Rerun on the scorecard harness: 428 read 62.2, 62.1, 62.1, 36.8, 62.1;
+  427 read 61.4 and 62.1.
+- In the 36.8 runs, `sim eval ... -> FAILED, content missing`. guardian's
+  main page only became ready at **15.21 s**, and the scorecard's
+  `settle 15000` cap expired at 15.15 s, so the text eval ran with no
+  content. In the good runs the page also became ready just after 15 s
+  (15.52 s), and the settle ran on.
+- The timing does not depend on the binary: 428's code runs only in a
+  local rebuild, after the page is ready.
+- The scorecard should wait for ready, not a fixed 15 s (a tools fix,
+  for later).
+
+**OPEN, unattributed:** one scorecard load of guardian on 428 aborted:
+`box_add_child: Assertion 'parent' failed` at 14.06 s, **during the
+page's first box conversion**, before it was ready. No local rebuild had
+run (0 such lines in the log), and 428's code runs only inside one.
+- It did not recur in 18 direct loads (6 on 428, 6 on 427, 6 under ASan,
+  all clean) or in 5 more scorecard loads.
+- No earlier run shows this assertion. Watch for it.
+
+No sudo.
+
+**Next:**
+1. The rest of "structural selectors or counters": "a matching sibling is
+   not a block-level box of the parent" (youtube 2, wpnews, guardian).
+2. "new element is not a plain block, list item or block of blocks"
+   (13).
+3. The scorecard's settle: wait for ready, not a fixed 15 s (tools only).
