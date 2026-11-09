@@ -579,6 +579,8 @@ NET-js-flex-frame http://127.0.0.1:$HP/JS-flex-frame.html
 NET-css-flex-frame-ref http://127.0.0.1:$HP/CSS-flex-frame-ref.html
 NET-js-block-frame http://127.0.0.1:$HP/JS-block-frame.html
 NET-css-block-frame-ref http://127.0.0.1:$HP/CSS-block-frame-ref.html
+NET-js-sheet-inflight http://127.0.0.1:$HP/NET-js-sheet-inflight.html
+NET-css-sheet-inflight-ref http://127.0.0.1:$HP/CSS-sheet-inflight-ref.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -2148,6 +2150,16 @@ k431d=$(printf '%s\n' "$k431seg" | grep -c "declined (structural selectors or co
 k431f=$(printf '%s\n' "$k431seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-struct-hidden: rows $k431r (0), hidden siblings skipped ${k431h} (1 or more), structural declines ${k431d} (0), full rebuilds after a decline ${k431f} (0)"
 [ "$k431r" = 0 ] && [ "${k431h:-0}" -ge 1 ] && [ "${k431d:-1}" -eq 0 ] && [ "${k431f:-1}" -eq 0 ] || fail "hidden matching siblings in a structural restyle"
+# Patch 432: a sheet pruned while in flight (or a failed one) no longer
+# holds the sheet-change walk up: the <style> removal restyles nothing and
+# no full rebuild follows.
+k432r=$(fl_rows NET-js-sheet-inflight NET-css-sheet-inflight-ref)
+k432seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-sheet-inflight: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k432n=$(printf '%s\n' "$k432seg" | grep -c "sheet removal restyles nothing" || true)
+k432w=$(printf '%s\n' "$k432seg" | grep -c "declined (a sheet is still loading or changing)" || true)
+k432f=$(printf '%s\n' "$k432seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  NET-js-sheet-inflight: rows $k432r (0), removals restyling nothing ${k432n} (1 or more), still-loading declines ${k432w} (0), full rebuilds after a decline ${k432f} (0)"
+[ "$k432r" = 0 ] && [ "${k432n:-0}" -ge 1 ] && [ "${k432w:-1}" -eq 0 ] && [ "${k432f:-1}" -eq 0 ] || fail "sheets pruned in flight or failed hold no sheet change up"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

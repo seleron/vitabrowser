@@ -1,0 +1,76 @@
+# netsurf: a sheet pruned while in flight no longer holds the sheet-change walk up (patch 432)
+# Generated 2026-11-09
+# Base: seleron/vitabrowser (patch stack through 431)
+#
+# "detached stylesheet pruned" (8 in r144: oldreddit 4, bbc, github,
+# google) is a sheet removal that patch 421's walk (html_rl_doc_noop)
+# could not answer. Over four runs its reasons were "a sheet is still
+# loading or changing" 17, "an element without a box would get one" 6,
+# "an element's style changes" 3. Logged in a scratch build, the
+# unsettled entries: oldreddit's an UNUSED one -- pruned while in flight
+# (unit 389 keeps its handle in the slot for the load callback), out of
+# the cascade, yet html_rl_sheets_settled waited on it; bbc's and
+# google's genuinely loading inline sheets.
+#
+#  - html_rl_sheets_settled skips unused entries.
+#  - html_rl_doc_noop prunes before the settle check (was after it), so a
+#    sheet detached in flight is unused by the time it is checked.
+#
+# NB, found on the way: content_get_status() answers CONTENT_STATUS_ERROR
+# for a handle whose content does not exist yet (content__get_status on
+# NULL) -- those "ERROR" inline sheets were fetches in flight. A first cut
+# took ERROR as settled; it built a selection context from such a handle
+# and the gate aborted in nscss_get_stylesheet's assert. Reverted;
+# css.c's html_css_mark_sheets counts ERROR as not loading the same way
+# (left as it is, noted in doc 10).
+#
+--- a/content/handlers/html/html.c	2026-11-09 16:54:45.020364193 +0000
++++ b/content/handlers/html/html.c	2026-11-09 17:24:52.864642600 +0000
+@@ -8909,10 +8909,22 @@
+  * one html_css_refresh_selection_context made at the settle should be
+  * the same, this makes sure -- and the page is redrawn: a new @font-face
+  * is looked up at paint (html_macsurf_font_face_url). */
++/* Patch 432: an unused entry -- one pruned while in flight (unit 389
++ * keeps its handle in the slot for the load callback) -- is out of the
++ * cascade whatever it does: it no longer holds the walk up (oldreddit's
++ * <style>s, removed from its web components' fragments before their
++ * x-ns-css content existed). A sheet still loading in the cascade does --
++ * NB: content_get_status() answers CONTENT_STATUS_ERROR for a handle whose
++ * content does not exist yet (content__get_status on NULL), so "ERROR"
++ * here is usually a fetch in flight, not a failure: a first cut that took
++ * ERROR as settled built a selection context from such a handle and
++ * tripped nscss_get_stylesheet's assert in the gate. */
+ static bool html_rl_sheets_settled(html_content *c)
+ {
+ 	unsigned int i;
+ 	for (i = 0; i != c->stylesheet_count; i++) {
++		if (c->stylesheets[i].unused)
++			continue;
+ 		if (c->stylesheets[i].modified)
+ 			return false;
+ 		if (c->stylesheets[i].sheet != NULL &&
+@@ -9013,19 +9025,18 @@
+ 	    macsurf_reconvert_in_progress != 0 || macos9_paint_gw != NULL ||
+ 	    base_c->locked)
+ 		why = "busy";
+-	else if (base_c->status != CONTENT_STATUS_READY &&
+-		 base_c->status != CONTENT_STATUS_DONE)
+-		why = "not loaded";
+-	else if (!html_rl_sheets_settled(c))
+-		why = "a sheet is still loading or changing";
+ 	else {
+ 		/* patch 421: a detached sheet is pruned first (unit 387);
+ 		 * the fresh context below is made without it, so the walk
+-		 * sees what its going changes (was: declined) */
++		 * sees what its going changes (was: declined). Patch 432:
++		 * before the settle check -- one pruned in flight is unused
++		 * now, and no longer holds the check up */
+ 		int pruned = html_css_prune_detached_sheets(c);
+ 		if (pruned > 0)
+ 			macsurf_debug_log_writef("LIFE rebuild local: %s: %d "
+ 				"detached sheet(s) pruned first", what, pruned);
++		if (!html_rl_sheets_settled(c))
++			why = "a sheet is still loading or changing";
+ 	}
+ 	if (why != NULL) {
+ 		macsurf_debug_log_writef("LIFE rebuild local: %s: "
