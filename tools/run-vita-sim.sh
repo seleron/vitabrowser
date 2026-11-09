@@ -404,6 +404,8 @@ JS-block-oc2 file:///app0:/testpages/JS-block-oc2.html
 CSS-block-oc2-ref file:///app0:/testpages/CSS-block-oc2-ref.html
 JS-struct-hidden file:///app0:/testpages/JS-struct-hidden.html
 CSS-struct-hidden-ref file:///app0:/testpages/CSS-struct-hidden-ref.html
+JS-control-inert file:///app0:/testpages/JS-control-inert.html
+CSS-control-inert-ref file:///app0:/testpages/CSS-control-inert-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2160,6 +2162,15 @@ k432w=$(printf '%s\n' "$k432seg" | grep -c "declined (a sheet is still loading o
 k432f=$(printf '%s\n' "$k432seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  NET-js-sheet-inflight: rows $k432r (0), removals restyling nothing ${k432n} (1 or more), still-loading declines ${k432w} (0), full rebuilds after a decline ${k432f} (0)"
 [ "$k432r" = 0 ] && [ "${k432n:-0}" -ge 1 ] && [ "${k432w:-1}" -eq 0 ] && [ "${k432f:-1}" -eq 0 ] || fail "sheets pruned in flight or failed hold no sheet change up"
+# Patch 433: an inert attribute (aria-*, data-*, role) on a form control's
+# box that is not a block rebuilds nothing.
+k433r=$(fl_rows JS-control-inert CSS-control-inert-ref)
+k433seg=$(awk '/ page [0-9]+\/[0-9]+ JS-control-inert: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k433n=$(printf '%s\n' "$k433seg" | grep -c "attribute on a box that is not a block, nothing to rebuild" || true)
+k433d=$(printf '%s\n' "$k433seg" | grep -c "declined (nearest box is not a block)" || true)
+k433f=$(printf '%s\n' "$k433seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-control-inert: rows $k433r (0), inert attributes on controls needing no rebuild ${k433n} (2 or more), nearest-box declines ${k433d} (0), full rebuilds after a decline ${k433f} (0)"
+[ "$k433r" = 0 ] && [ "${k433n:-0}" -ge 2 ] && [ "${k433d:-1}" -eq 0 ] && [ "${k433f:-1}" -eq 0 ] || fail "inert attributes on form controls"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
