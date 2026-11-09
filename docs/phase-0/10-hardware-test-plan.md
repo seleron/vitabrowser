@@ -12862,3 +12862,74 @@ No sudo.
 2. "new element is not a plain block".
 3. Real-sized attribute and class changes on inline-block / inline-flex
    boxes (restyle them in place instead of the full rebuild).
+
+## Patch 427 (2026-11-09): the sibling scan reads :not() / :is() / :where() in a left compound
+
+**Problem.** The top two declines in r139 were "page CSS needs
+conservative sibling check" and "class change may move a sibling selector"
+(10 + 10). A sheet whose sibling rule had a **functional pseudo-class in
+its left compound** was conservative as a whole (patch 413 still declined
+those). Every class change and block insert on the page then took the full
+rebuild.
+
+The selectors, logged in a scratch build:
+- youtube: `input:not(:checked) ~`, `.text-info:not(:empty) ~`,
+  `.x:is(:checked,:disabled) +`
+- archwiki: `input:focus:not(:active) +`, `...:not(.a .b) +`
+- rte: `.p:not(.shaka-hidden) +`
+- wordpress.org: `:where(.a) + :where(.b)`, `:is(.a .b .c) +`
+
+**Fix** (html.c).
+- An argument that is a comma list of compounds is read into the
+  compound's `subs`. Each part counts as the last compound of its
+  descendant / child chain.
+- Each sub is added as a left compound of its own. A change can flip
+  `X:not(A)` or `X:is(A, B)` only by flipping X or one of the A's, so the
+  class check (m_old != m_new per left) and the attribute check see it.
+- The pseudo itself is then ignored like a plain one, which only makes the
+  match broader.
+- A chain's ancestors are the right compound's ancestors too, because the
+  two are siblings, so a change to one rebuilds a subtree holding both.
+- Still declined as in 413: a sibling combinator, `:has()`, or an
+  unreadable part inside the argument.
+- `:empty` inside an argument reaches the `:empty` checks.
+
+**Gate.**
+- New pair **JS-sib-func / CSS-sib-func-ref** (`.x:not(.off) +`,
+  `:where(#wz .w) ~`, `:not(:checked) ~`, `:is(.q, [data-k]) +`):
+  - the insert and an unrelated class change are local
+  - `.off` and `.w` decline **precisely**, with 2 full rebuilds and
+    **0 conservative**
+  - rows 0
+- CSS-sibling-class: 21 precise, 0 conservative. JS-sib-unreadable,
+  JS-sib-universal and JS-sib-tail are unchanged. SELECTORS 89/89.
+- **gate427 exit 0.**
+
+**Restage from pristine:** 509 applied plus the 2 known collisions, html.c
+byte-identical. **gate427b: exit 0**, mirror 369 identical, 0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (366 dumps).
+
+**Scorecard r140** (21 sites against `r79-360`, 427 vs 426 back to back):
+**73.11 vs 73.22**.
+- Only two sites moved: claude 75.8 vs 77.0 and ddglite 74.8 vs 76.0.
+  Both are the usual spread.
+- ddglite reran 74.8 / 76.1 on 427 and 74.8 / 74.8 on 426. DuckDuckGo
+  serves two different pages (the titles differ), and its score is
+  visual-only because the reference is blocked.
+
+**Census:**
+- "conservative sibling check" **8 -> 0**; "may move a sibling selector"
+  **8 -> 0**.
+- BATCHCAUSE 76 vs 76: those batches now meet the next decline,
+  "structural selectors or counters in page CSS" or "new element is not a
+  plain block", which were hidden behind the sibling check before.
+
+No sudo.
+
+**Next:**
+1. "structural selectors or counters in page CSS" (youtube 3 now, rte,
+   wikipedia, the WordPress pages).
+2. "new element is not a plain block, list item or block of blocks"
+   (youtube 3, wpblog 2).
+3. Class and attribute changes on inline-block boxes.
