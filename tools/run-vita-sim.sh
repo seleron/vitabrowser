@@ -394,6 +394,8 @@ JS-control-restyle file:///app0:/testpages/JS-control-restyle.html
 CSS-control-restyle-ref file:///app0:/testpages/CSS-control-restyle-ref.html
 JS-control-js file:///app0:/testpages/JS-control-js.html
 CSS-control-js-ref file:///app0:/testpages/CSS-control-js-ref.html
+JS-content-whole file:///app0:/testpages/JS-content-whole.html
+CSS-content-whole-ref file:///app0:/testpages/CSS-content-whole-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -616,7 +618,12 @@ else
 	# (vita/diag.c catch_up), so the mirror must still come out complete.
 	( sleep "${NETLOG_LATE:-15}"; exec python3 "$ROOT/tools/vita-netlog.py" \
 		--port "$NETLOG_PORT" --bind 127.0.0.1 --out "$OUT/net" --quiet \
-		--exit-when-done --timeout 1000 ) > "$OUT/netlog-receiver.log" 2>&1 &
+		--exit-when-done --timeout 1300 ) > "$OUT/netlog-receiver.log" 2>&1 &
+	# (patch 425's gate: the receiver's timeout was 1000 s from its late
+	# start; the run below may take its full 1200 s -- ~950 s of autotest
+	# with this page list, more on a loaded machine -- and twice the
+	# mirror lost the run's last lines and autotest.done to the
+	# receiver's exit. It still exits as soon as the run is done.)
 	RX=$!
 	# patch 411: the engine log is not capped mid-run (16 MiB capped it
 	# at page 267 of 277), and the run has room past 900 s (886 s with
@@ -1880,12 +1887,18 @@ k407seg=$(awk '/ page [0-9]+\/[0-9]+ JS-leaf-insert: navigate/ {on=1; next} on &
 k407a=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: a leaf element inserted between blocks, built alone" || true)
 k407m=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: leaf element placed in a line of its own" || true)
 k407d=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: declined (" || true)
-echo "  JS-leaf-insert: rows differing from the parse-time build $k407r (0); leaves built alone ${k407a} (6 or more), moved into a line of their own ${k407m} (4 or more); next to inline text declined ${k407d} (1 or more)"
-[ "$k407r" = 0 ] && [ "${k407a:-0}" -ge 6 ] && [ "${k407m:-0}" -ge 4 ] && [ "${k407d:-0}" -ge 1 ] || fail "leaf elements inserted between blocks"
+# (Patch 425: the image next to inline text no longer declines -- its
+# block is built again whole.)
+k407w=$(printf '%s\n' "$k407seg" | grep -c "new content is not plain inline, the block built again whole" || true)
+echo "  JS-leaf-insert: rows differing from the parse-time build $k407r (0); leaves built alone ${k407a} (6 or more), moved into a line of their own ${k407m} (4 or more); next to inline text: block built whole ${k407w} (1 or more), declined ${k407d}"
+[ "$k407r" = 0 ] && [ "${k407a:-0}" -ge 6 ] && [ "${k407m:-0}" -ge 4 ] && [ "${k407w:-0}" -ge 1 ] || fail "leaf elements inserted between blocks"
 # Patch 408: on the page's flex container, a <script> appended and an
 # inert attribute set need no rebuild (were: "nearest box is not a block").
 k408c=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: child list changed only in elements with no box" || true)
-k408a=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: attribute on a box that is not a block, nothing to rebuild" || true)
+# (Patch 425: the earlier image step no longer takes a full rebuild, the
+# timing moves, and the aria-expanded mark arrives alone: a render
+# decline, no rebuild either -- both answers count.)
+k408a=$(printf '%s\n' "$k407seg" | grep -c "LIFE rebuild local: attribute on a box that is not a block, nothing to rebuild\|LIFE render decline slot=[0-9]* kind=1 " || true)
 echo "  JS-leaf-insert (flex container): box-less child-list no-op ${k408c} (1 or more); inert attribute no-op ${k408a} (1 or more)"
 [ "${k408c:-0}" -ge 1 ] && [ "${k408a:-0}" -ge 1 ] || fail "flex container child list and inert attribute"
 # Patch 409: on a sheet patch 186 gives up on (.q:hover + .q), style
@@ -2049,6 +2062,14 @@ k424s=$(printf '%s\n' "$k424seg" | grep -c "LIFE control [a-z]* synced from its 
 k424f=$(printf '%s\n' "$k424seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-control-js: rows $k424r (0), controls synced ${k424s} (3 or more), full rebuilds ${k424f} (0)"
 [ "$k424r" = 0 ] && [ "${k424s:-0}" -ge 3 ] && [ "${k424f:-1}" -eq 0 ] || fail "a script's checked and value repainted"
+# Patch 425: blocks given an image, child blocks, a custom element are
+# built again whole (3), no full rebuild, row for row as parse time.
+k425r=$(fl_rows JS-content-whole CSS-content-whole-ref)
+k425seg=$(awk '/ page [0-9]+\/[0-9]+ JS-content-whole: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k425w=$(printf '%s\n' "$k425seg" | grep -c "new content is not plain inline, the block built again whole" || true)
+k425f=$(printf '%s\n' "$k425seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-content-whole: rows $k425r (0), blocks built whole ${k425w} (3), full rebuilds ${k425f} (0)"
+[ "$k425r" = 0 ] && [ "${k425w:-0}" -ge 3 ] && [ "${k425f:-1}" -eq 0 ] || fail "non-inline new content built whole"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
