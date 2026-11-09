@@ -388,6 +388,8 @@ JS-float-marker file:///app0:/testpages/JS-float-marker.html
 CSS-float-marker-ref file:///app0:/testpages/CSS-float-marker-ref.html
 JS-style-detach-noop file:///app0:/testpages/JS-style-detach-noop.html
 CSS-style-detach-noop-ref file:///app0:/testpages/CSS-style-detach-noop-ref.html
+JS-flex-below file:///app0:/testpages/JS-flex-below.html
+CSS-flex-below-ref file:///app0:/testpages/CSS-flex-below-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
 JS-flex-buttons file:///app0:/testpages/JS-flex-buttons.html
@@ -2007,6 +2009,20 @@ k421d=$(printf '%s\n' "$k421seg" | grep -c "declined (detached stylesheet pruned
 k421f=$(printf '%s\n' "$k421seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-style-detach-noop: rows $k421r (0), removals restyling nothing ${k421n} (1), pruned declines ${k421d} (0), full rebuilds ${k421f} (0)"
 [ "$k421r" = 0 ] && [ "${k421n:-0}" -ge 1 ] && [ "${k421d:-1}" -eq 0 ] && [ "${k421f:-1}" -eq 0 ] || fail "a removed sheet that matched nothing"
+# Patch 422: changes below a flex or grid box (a hidden item shown, in a
+# flex and a grid container; the flex container's own text) rebuild the
+# container whole: 2 or more, no "nearest box" declines, no full rebuild.
+k422r=$(fl_rows JS-flex-below CSS-flex-below-ref)
+k422seg=$(awk '/ page [0-9]+\/[0-9]+ JS-flex-below: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k422b=$(printf '%s\n' "$k422seg" | grep -c "a change below a flex or grid box" || true)
+k422d=$(printf '%s\n' "$k422seg" | grep -c "declined (nearest box is not a block)" || true)
+k422f=$(printf '%s\n' "$k422seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+# The last step (a block made display:inline beside another block's
+# restyle) declines into the one full rebuild, its dropped inline run
+# freed whole (the tree stays sound for the batch's other marks).
+k422i=$(printf '%s\n' "$k422seg" | grep -c "no longer a block-level box here" || true)
+echo "  JS-flex-below: rows $k422r (0), containers rebuilt ${k422b} (2 or more), nearest-box declines ${k422d} (0), made-inline drops ${k422i} (1), full rebuilds ${k422f} (1)"
+[ "$k422r" = 0 ] && [ "${k422b:-0}" -ge 2 ] && [ "${k422d:-1}" -eq 0 ] && [ "${k422i:-0}" -ge 1 ] && [ "${k422f:-0}" -eq 1 ] || fail "changes below a flex or grid box"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

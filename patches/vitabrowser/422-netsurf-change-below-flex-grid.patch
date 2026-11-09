@@ -1,0 +1,94 @@
+# netsurf: a change below a flex or grid box rebuilds the box whole (patch 422)
+# Generated 2026-11-08
+# Base: seleron/vitabrowser (patch stack through 421)
+#
+# The census's "nearest box is not a block" (7 in r132): the local walk
+# climbs from the changed node to the nearest box, and a flex or grid box
+# (a probe, scratch only: google's div.MWnfue and div.mj3qce, python's
+# div.document, mdn's nav grid, youtube's main) ended it -- a class change
+# on an element with no box of its own, or text directly in the
+# container.
+#
+#  - html_reconvert_local_change: a change BELOW a flex or grid box (the
+#    walk reached it from a descendant) builds the box again whole through
+#    patch 372's container rebuild (html_rl_flex_restyle): the subtree
+#    cascaded afresh, its objects carried over, the page laid out whole;
+#    its own declines (controls, frames, counting, objects) stand. A
+#    descendant's class, text or child list reaches outside the box only
+#    through :has(), which never matches here (patch 328).
+#  - Changes on the flex box itself are unchanged (wpnews's and wpblog's
+#    navigation buttons, youtube's main).
+#
+#  - html_rl_drop_new (374): a dropped INLINE box took only itself; its
+#    INLINE_END (a separate box in the line) stayed in the tree pointing
+#    at it, and the next local layout of the same batch read freed memory
+#    (ASan sweep, rte: heap-use-after-free in layout_line,
+#    b->inline_end->height -- a restyled block that came back
+#    display:inline in html_rl_flex_restyle). The whole run is freed now,
+#    and the line if the build made it and it is empty. A 372/374 bug,
+#    reached more often since 417/420/422 send more to the restyle paths.
+#
+# Sites (scratch build): "nearest box is not a block" 10 -> 4; containers
+# rebuilt google 21, mdn 16, youtube 2, python 1.
+#
+--- a/content/handlers/html/html.c	2026-11-08 22:41:57.589872509 +0000
++++ b/content/handlers/html/html.c	2026-11-09 00:11:13.391526843 +0000
+@@ -12499,6 +12499,32 @@
+ 			"fetched objects, kept for the full reconvert");
+ 		return;
+ 	}
++	/* Patch 422: an inline element's boxes are a run in a line -- its
++	 * box, its contents, its inline end -- not a subtree: free the whole
++	 * run, and the line if the build made it and it is empty now. Freeing
++	 * the INLINE box alone left its INLINE_END in the tree, pointing at
++	 * it (ASan, rte: heap-use-after-free in layout_line, b->inline_end->
++	 * height, at the next local layout of the same batch -- a restyled
++	 * block that came back display:inline, html_rl_flex_restyle). */
++	if (nb->type == BOX_INLINE && nb->inline_end != NULL &&
++	    nb->parent != NULL && nb->inline_end->parent == nb->parent) {
++		struct box *ic = nb->parent, *end = nb->inline_end, *m = nb;
++		for (;;) {
++			struct box *nx = m->next;
++			bool last = m == end;
++			html_rl_unlink(m);
++			box_free(m);
++			if (last || nx == NULL)
++				break;
++			m = nx;
++		}
++		if (ic->children == NULL && ic->node == NULL &&
++		    ic->type == BOX_INLINE_CONTAINER) {
++			html_rl_unlink(ic);
++			box_free(ic);
++		}
++		return;
++	}
+ 	html_rl_unlink(nb);
+ 	box_free(nb);
+ }
+@@ -13632,6 +13658,25 @@
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
++			/* Patch 422: a change BELOW a flex or grid box -- an
++			 * element with no box of its own, or text, in google's,
++			 * python's and youtube's flex containers -- builds the
++			 * box again whole, as 372 does for its own class: the
++			 * subtree cascaded afresh, its objects carried over,
++			 * the page laid out whole. A descendant's class, text
++			 * or child list reaches outside the box only through
++			 * :has(), which never matches here (patch 328). */
++			if (b != NULL && n != vnode &&
++			    (b->type == BOX_FLEX || b->type == BOX_GRID)) {
++				int r;
++				macsurf_debug_log_writef("LIFE rebuild local: a "
++					"change below a flex or grid box, the box "
++					"built again whole");
++				r = html_rl_flex_restyle(c, n, b, t0,
++						html_rl_class_same, false);
++				dom_node_unref(n);
++				return r;
++			}
+ 			if (b != NULL && b->type != BOX_INLINE) {
+ 				dom_node_unref(n);	/* a table cell, ... */
+ 				RL_NO("nearest box is not a block");
