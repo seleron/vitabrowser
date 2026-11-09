@@ -13366,3 +13366,82 @@ No sudo.
 3. Sheet removals that un-hide elements (oldreddit).
 4. Tools: a multi-run census, the scorecard's settle (wait for ready),
    and the `html_css_mark_sheets` ERROR note (432).
+
+## Patch 434 (2026-11-09): a block that is not one line of plain content is built again whole -- FINAL UNIT, closes the run
+
+**Problem.** "block is not one line container of plain content" (7 in
+r145) declined any change inside a block whose content is not exactly
+one line container of plain inline content. A scratch probe logged each
+case over two loads each:
+- **wpblog 8:** a `<code>` block of **8 line containers**. A normal build
+  makes one; earlier local rebuilds gave lines of their own.
+- **guardian 4:** a `display:block` `<button>`, a control on the block's
+  own box.
+- **python 2:** an `<li>`, which carries a list marker.
+
+**Fix** (html.c).
+- Such a plain block box (no object, no frame) is **built again whole**,
+  as 422 does below a flex box:
+  `html_rl_flex_restyle(..., is_block = true)`.
+- That path cascades the block afresh from the DOM, hands controls over
+  (382/423), carries objects and frames (375/428), lets layout number
+  markers (420), and lays the page out whole.
+- It still declines counting, controls it cannot rebuild, and a parent
+  that is not a block.
+- A change inside the block reaches outside only through `:has()`, which
+  never matches here.
+
+**Gate.**
+- New pair **JS-block-whole / CSS-block-whole-ref**: the label of a
+  `display:block` `<button>`, the text of an `<li>` (the list stays
+  numbered), and the text of a block holding a float. Each step is
+  followed by a layout read, so it is flushed alone (see 433).
+  **2 blocks built again whole**, 0 one-line declines, 0 full rebuilds,
+  rows 0. A probe showed 433 taking 2 full rebuilds on the same page.
+- The list, control and late-append pages are unchanged.
+- **gate434 exit 0.**
+
+**Restage from pristine:** 516 applied plus the 2 known collisions,
+html.c byte-identical. **gate434b: exit 0**, mirror 383 identical,
+0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (380 dumps).
+
+**Scorecard r147** (434 vs 433 back to back): **73.33 vs 73.38**. Only
+ddglite moved (74.8 vs 76.0, its known live spread). No assertion in any
+load.
+
+**Census r147:** BATCHCAUSE **64 -> 61**; "block is not one line
+container of plain content" **7 -> 0**. No multi-load rerun: the run was
+closed before it, by the owner's directive.
+
+No sudo.
+
+### Run closed (2026-11-09)
+
+By the owner's directive (Signal, 2026-11-09), patch 434 is the **final
+unit**; the loop stops here.
+- **This session's units:** 412-434. Since 425: 426 (claude's
+  initial-load hang), 427 (`:not` / `:is` / `:where` sibling scan),
+  428 (frames in flex restyles), 429-430 (new blocks holding iframes /
+  fieldsets / custom elements), 431 (hidden structural hits), 432
+  (in-flight pruned sheets), 433 (inert attributes on control boxes),
+  434 (non-plain blocks built whole).
+- **Census over 426-434:** roughly 75-80 full rebuilds per 21-site run
+  down to 61.
+
+**Open items for the next run:**
+1. **Census noise:** per-site counts move by 2-7 run to run. Build a
+   multi-run census (three loads per arm) before judging small units.
+2. **The scorecard's settle:** wait for ready, not a fixed 15 s. guardian
+   reads text 0.0 when its page becomes ready just after the cap (428).
+3. **css.c's `html_css_mark_sheets`** counts `CONTENT_STATUS_ERROR` as not
+   loading, but that status also means "no content yet", i.e. in flight
+   (432).
+4. **guardian's `box_add_child: Assertion 'parent'`** during its first
+   conversion: one unreproduced abort (428).
+5. **Left declines:** the child list of an inline-block `<button>`
+   (wpnews), youtube's flex `<main>` / `<c-wiz>`, sheet removals that
+   un-hide elements (oldreddit), "detached stylesheet pruned", "new
+   element is not a plain block" (youtube `<video>`, `<c3-icon>` into a
+   flex box).
