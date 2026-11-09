@@ -13087,3 +13087,72 @@ No sudo.
 3. "a matching sibling is not a block-level box of the parent".
 4. The scorecard's settle should wait for ready, not a fixed 15 s (from
    428).
+
+## Patch 430 (2026-11-09): a new block holding a fieldset or custom elements is built alone
+
+**Problem.** After 429, nine "new element is not a plain block" declines
+were left. A scratch probe logged each new block's **rejected** descendant
+tags (skipping `<svg>` contents, which are never converted, and the tags
+364 already admits):
+- **cnnlite 2, rte 2:** a consent dialog (614 and 752 nodes) whose only
+  rejected tags are `<fieldset>` and `<legend>`. Patch 364 had left
+  fieldset out for "its legend painter".
+- **google 1:** a `<div>` holding `<g-dropdown-menu>`, `<g-popup>`,
+  `<g-menu>`, `<g-menu-item>`, `<g-ripple>`, all custom elements.
+- **youtube:** `<c3-icon>` inserted straight into a flex box (a different
+  path), and a `<div>` holding a `<video>`.
+
+**Fix** (html.c, `html_rl_oc_tag`).
+- **`<fieldset>` and `<legend>` admitted.** Box construction flags them
+  (`VB_FIELDSET` / `VB_LEGEND`, patches 222 and 228). The legend's place
+  and the border gap behind it are worked out from the boxes at layout
+  and paint time (`vb_legend_margins`, `vb_fieldset_legend`), so nothing
+  is kept that a local build could leave stale. The full layout that
+  follows does it.
+- **Custom elements admitted:** a name with a '-' that starts with a
+  letter. Box construction has no case for one (and none for shadow
+  trees); its page CSS decides its box, as in a full build.
+- **Still declined:** `<video>`, and a custom element inserted into a flex
+  box itself.
+
+**Gate.**
+- New pair **JS-block-oc2 / CSS-block-oc2-ref**: a block holding a
+  fieldset (legend, label, checkbox), and a block holding a
+  display:block `<x-menu>` of inline `<x-item>`s, inserted between
+  paragraphs, then a text change.
+  - **2 blocks built locally**, 0 not-plain declines, 0 full rebuilds,
+    rows 0. The legend on the border is checked pixel for pixel.
+- html-fieldset-legend FIELDSET222 5/5, JS-control-restyle, JS-control-js
+  and NET-js-block-frame unchanged.
+- **gate430 exit 0.**
+
+**Restage from pristine:** 512 applied plus the 2 known collisions,
+html.c byte-identical. **gate430b: exit 0**, mirror 375 identical,
+0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (372 dumps).
+
+**Scorecard r143** (430 vs 429 back to back): **73.45 vs 73.46**. No site
+moved by 0.5 or more. No assertion in any load.
+
+**Census:**
+- BATCHCAUSE **74 -> 72**
+- "new element is not a plain block" **8 -> 5**: cnnlite 2 -> 0,
+  google 1 -> 0. rte gave none in either arm this run.
+- Left: youtube 3 (`<c3-icon>` into a flex box, the `<video>` block) and
+  wpblog 2.
+
+r143's top declines now: "structural selectors or counters" 9, "detached
+stylesheet pruned" 8, "nearest box is not a block" 7, "block is not one
+line container of plain content" 7.
+
+No sudo.
+
+**Next:**
+1. "structural selectors or counters in page CSS" (9): the "a matching
+   sibling is not a block-level box" part.
+2. "detached stylesheet pruned" (8).
+3. "nearest box is not a block" / "block is not one line container of
+   plain content" (7 each).
+4. The scorecard's settle should wait for ready, not a fixed 15 s (from
+   428).
