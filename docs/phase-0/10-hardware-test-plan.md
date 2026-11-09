@@ -13025,3 +13025,65 @@ No sudo.
 2. "new element is not a plain block, list item or block of blocks"
    (13).
 3. The scorecard's settle: wait for ready, not a fixed 15 s (tools only).
+
+## Patch 429 (2026-11-09): a new block holding an iframe is built alone
+
+**Problem.** "new element is not a plain block, list item or block of
+blocks" was r141's top decline (11). A scratch probe logged each inserted
+element:
+- **6 were a `<div>` holding an `<iframe>`** (ad and embed slots inserted
+  between blocks): cnnlite 2 (`[DIV, IFRAME]` inside), guardian 2, rte 2.
+- The rest: youtube's `<c3-icon>` (an unknown element) inside a flex box,
+  google's `<div>` holding a `<g-dropdown-menu>`, and claude's `<div>` of
+  `<div>`s.
+
+**Fix** (html.c).
+- `html_rl_oc_tag` admits `iframe`. That is patch 364's list of what a new
+  block may hold: such a block is built alone and the page laid out whole.
+- A new frame box gets its record and its late load as in a full build
+  (`box_iframe`, patch 244), just as 378's appended and 407's inserted
+  frames already did. No old frame box is freed.
+- A new block that fails to build now also drops the frame records it
+  made (`html_rl_frames_drop_new`, from 428). Before, they pointed at the
+  freed boxes; 407's iframe leaves had the same gap.
+
+**Gate.**
+- New pair **NET-js-block-frame / NET-css-block-frame-ref**: a `<div>`
+  holding an `<iframe>`, and one holding it a level down, inserted between
+  paragraphs, then a text change.
+  - The frames are **named, with no src**. A same-origin frame made by a
+    script gets no window of its own (patch 244), while a named one gets
+    an empty window either way (patch 289), so the two pages end alike.
+  - **2 blocks built locally**, 0 not-plain declines, rows 0.
+- JS-late-append, JS-leaf-insert, JS-frames-local, NET-js-flex-frame and
+  FRAMELOCAL are unchanged.
+- **gate429 exit 0.**
+
+**Restage from pristine:** 511 applied plus the 2 known collisions, html.c
+byte-identical. **gate429b: exit 0**, mirror 373 identical, 0 differ.
+
+**ASan:** sweep **21/21 clean**. asan-autotest main **clean** (370 dumps).
+
+**Scorecard r142** (429 vs 428 back to back): **73.68 vs 73.44**. claude
+82.2 vs 75.8, hackernews and stackoverflow within 0.7: the usual spread.
+
+**Census:**
+- "new element is not a plain block" **14 -> 9**: bbc 2 -> 0, guardian
+  1 -> 0, claude 1 -> 0, google 2 -> 1.
+- BATCHCAUSE 75 vs 73. Every difference is live variation:
+  - google 10 vs 7, all `cause=nonode`. Reruns read 8 / 8 on 429 against
+    7 / 8 on 428, and 429's path never runs on google (0 frame blocks
+    built).
+  - claude's sibling and attribute declines differ run to run.
+- No assertion in any r142 load.
+
+No sudo.
+
+**Next:**
+1. The rest of "not a plain block": unknown elements such as youtube's
+   `<c3-icon>` and google's `<g-dropdown-menu>`. Custom elements display
+   inline, so these need checking for a plain-inline subtree.
+2. "block is not one line container of plain content" (7).
+3. "a matching sibling is not a block-level box of the parent".
+4. The scorecard's settle should wait for ready, not a fixed 15 s (from
+   428).
