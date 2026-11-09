@@ -12570,3 +12570,67 @@ No sudo.
 2. "new content is not plain inline" (bbc's block children, wpblog's
    iframes).
 3. The remaining changes on flex boxes themselves.
+
+## Patch 424 (2026-11-09): a script's `.checked` / `.value` repaints the control from its element
+
+**The unit.** This is the gap found while working 423, a correctness bug
+rather than a census cause. A script's `checked` or `value` set after
+layout reached the DOM only:
+- the property shims set the attributes (macsurf_qjs.c: "`checked` ... are
+  properties in the DOM but attributes here", `value` likewise);
+- the marks are render declines, since no sheet selects on value or
+  checked, so nothing rebuilt;
+- the control's own copy (what is painted: `control->selected`, the text
+  widget) stayed as it was made, until some rebuild happened to make the
+  control again.
+
+So a checkbox a script checked, a radio pair a script switched, or a text
+field a script filled showed the old state.
+
+**The change:**
+- `html_rl_control_attr_sync` (html.c): for a `value` or `checked` mark on
+  an element whose box holds its control, a checkbox or radio takes
+  `selected` from the element; a text box, password or textarea takes its
+  text through `form_gadget_sync_with_dom`'s DOM-to-control half. The box
+  is redrawn. Not before the first layout (construction reads the element
+  then) or while a rebuild is under way.
+- `macos9_js_mark_dom_dirty_node3`: called for every SETATTRIBUTE /
+  REMOVEATTRIBUTE mark, whatever the batch's answer later.
+
+**Gate.**
+- New pair **JS-control-js / CSS-control-js-ref**: after load, a script
+  checks a checkbox, switches a radio pair (the polyfill's group logic
+  unchecks the other) and sets a text field's value. **4 controls synced,
+  0 full rebuilds**, rows 0 against the page where the same script runs at
+  parse time.
+- The form checks pass (FORMVAL, FORMNAMED, FORMTARGET, FORMSHADOW,
+  FSHADOW2, js-form-submit, the FORMCHECK set vs Chromium).
+- **gate424 exit 0 on the first run.**
+- Not done: the page was not run on 423's binary to show the old state on
+  screen. The fix is read from the code path (render decline, `selected`
+  read at paint), and the sync lines prove the new path runs.
+
+**Restage from pristine:** 506 applied plus the 2 known collisions, both
+files byte-identical. **gate424d (restaged): exit 0**.
+
+**ASan:** sweep **0 ASan errors in 21 loads**, claude timing out again
+(424.7 s; rerun on its own: **2/2 loaded, clean**, 42.7 s and 39.7 s).
+`asan-autotest.sh main` and **`forms` clean** (10/10 submissions as
+Chromium).
+
+**Scorecard r137**: 21 sites against `r79-360`, the 424 and 423 binaries
+back to back: **72.93 vs 73.03**. stackoverflow and claude are their
+usual spreads. No crash.
+
+**Census:** BATCHCAUSE 79 vs 73, within these runs' band, since 424
+changes no batch's answer. **1 control synced** on the 21 sites: the bug
+is real but rare on these pages.
+
+No sudo.
+
+**Next:**
+1. "new content is not plain inline" (bbc's block children, wpblog's
+   iframes).
+2. The changes on flex boxes themselves (the remaining nearest-box 4).
+3. A submit/button input's `value` (its label) set by script: same render
+   decline, but a width change needs layout, not a redraw.
