@@ -12402,3 +12402,85 @@ No sudo.
 2. "nearest box is not a block" (6 sites).
 3. "new content is not plain inline" (bbc's block children, wpblog's
    iframes).
+
+## Patch 422 (2026-11-08): a change below a flex or grid box rebuilds the box whole
+
+**The unit.** First considered: "restyled flex or grid box holds controls
+or frames" (7). Shelved: a text input's editing widget is made again on
+every build (`box_textarea_create_textarea` -> `textarea_create` from
+the DOM value), and the old `data.text.ta` is overwritten, not
+destroyed. Carrying text inputs and textareas through a subtree rebuild
+would leak the widget and could lose typed text not yet synced to the
+DOM. That is why 382 kept to buttons. It needs its own unit, and frames
+need their window records.
+
+Taken instead: "nearest box is not a block" (7 in r132). The local walk
+climbs from the changed node to its nearest box, and a probe (scratch
+only) showed that box was mostly a **flex or grid** container: google's
+`div.MWnfue` and `div.mj3qce`, python's `div.document`, mdn's nav grid,
+youtube's `main`. The change was a class change on an element with no
+box of its own, or text directly in the container.
+
+**The change** (html.c, `html_reconvert_local_change`): a change
+**below** a flex or grid box (the walk reached it from a descendant)
+builds the box again whole through 372's container rebuild
+(`html_rl_flex_restyle`). The subtree is cascaded afresh, its objects
+carried over, and the page laid out whole; its own declines (controls,
+frames, counting, objects) stand. A descendant's class, text or child
+list reaches outside the box only through `:has()`, which never matches
+here (patch 328). Changes on the flex box itself are unchanged
+(wpnews's and wpblog's navigation buttons, youtube's `main`).
+
+**A use-after-free found by the first chain's ASan sweep, fixed here.**
+- **rte: heap-use-after-free in `layout_line`** (`b->inline_end->height`).
+  Freed by `html_rl_drop_new` (374) in `html_rl_flex_restyle`: a restyled
+  block came back `display:inline`, and its new INLINE box was dropped
+  alone.
+- Its INLINE_END, a separate box in the line, stayed in the tree. The next
+  local layout of the same batch, from another mark (here 417's attribute
+  restyle through 422's path), read freed memory.
+- A 372/374 bug, reached more often since 417, 420 and 422 send more
+  changes to the restyle paths.
+- `html_rl_drop_new` now frees the inline element's whole run, and the line
+  if the build made it and it is empty.
+- The first chain was stopped. rte under ASan with the fix: **4/4 clean**.
+- JS-flex-below gained the case: a block holding a block made
+  `display:inline`, in one task with another block's restyle. It declines
+  into **one full rebuild**, rows 0, and the ASan autotest runs it.
+
+**Sites** (scratch build): "nearest box is not a block" **10 -> 4**.
+Containers rebuilt: google 21, mdn 16 (its BATCHCAUSE 1 -> 0), youtube 2,
+python 1.
+
+**Gate.**
+- New pair **JS-flex-below / CSS-flex-below-ref**: a hidden flex item
+  shown by a class, a hidden grid item shown by a class, and the flex
+  container's own text changed: **3 containers rebuilt, 0 nearest-box
+  declines**. Plus the made-inline step: **1 drop, 1 full rebuild**. Rows 0.
+- gate422 exit 0, then **gate422c exit 0** with the fix and the new case
+  (gate422b failed only on that case's expected full-rebuild count).
+
+**Restage from pristine:** 504 applied plus the 2 known collisions,
+html.c byte-identical. **gate422d (restaged): exit 0**.
+
+**ASan:** sweep **0 ASan errors in 21 loads**, rte included. claude
+timed out again (421.6 s, as in 420's sweep); rerun on its own: **2/2
+loaded, clean** (44.5 s, 40.1 s). `asan-autotest.sh main` **clean**, with
+the made-inline case.
+
+**Scorecard r135**: 21 sites against `r79-360`, the 422 and 421 binaries
+back to back: **73.19 vs 73.20**, no site differing. No crash.
+
+**Census, back to back:** BATCHCAUSE **75 vs 77**; "nearest box is not a
+block" **11 -> 4**; **41 changes below a flex or grid box** answered by
+rebuilding the box.
+
+No sudo.
+
+**Next:**
+1. Stateful controls in subtree rebuilds: keep the gadget's textarea
+   widget across the build instead of making a new one (the
+   controls/frames decline, 7).
+2. "new content is not plain inline" (bbc's block children, wpblog's
+   iframes).
+3. The changes on flex boxes themselves (the remaining nearest-box 4).
