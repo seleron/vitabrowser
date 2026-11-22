@@ -13752,11 +13752,19 @@ pushed):
 targeted are at 0. The total is flat within one run (as in 415-417, the
 batches end at their next decline).
 
-**Not done this session:**
-- **No ASan sweep or asan-autotest.** 437-439 change box-tree building
-  and rebuilding, so run `tools/build-asan-sim.sh` +
-  `tools/scorecard/asan_sweep.py` before the next device hand-off.
-- **No 21-site scorecard A/B** (only the census on 7 sites).
+**ASan (run after the checkpoint, stack through 439):**
+`tools/build-asan-sim.sh` (netsurf instrumented; 437-439 change nothing
+else).
+- **Sweep 21/21 clean** (one load a site; guardian 41.8 s with the 435
+  ready wait).
+- **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 388 page
+  dumps (gate 388).
+- In that run the 437 walk stopped once, flex boxes were built again
+  whole 11 times and 439's flex fallback ran once, so the new paths ran
+  under ASan.
+
+**Not done this session:** a 21-site scorecard A/B (only the census, on 7
+sites).
 
 **Next, by the 439 census (per load, 7 sites):**
 1. "no inserted or removed block found" (~4.7; google 9 and youtube 3
