@@ -14192,8 +14192,16 @@ No sudo.
     parent.
 - **Census, the same 7 sites:** about 32 full rebuilds a load at 439,
   about 28 at 445, compared only within one run each.
-- **ASan:** clean through 443. **444 and 445 are not ASan-checked yet**,
-  and 443's own path did not fire under ASan timing.
+- **ASan through 445** (`tools/build-asan-sim.sh`, netsurf
+  instrumented):
+  - **sweep 21/21 clean**;
+  - **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 396 page
+    dumps (gate 396).
+  - In that run: 444's joining removal built whole 4 times; 445's
+    sibling parent rebuild 4 times; 440's block of blocks 11 times; 437's
+    walk stop once; 442's wait twice.
+  - **443's held-cascade answer again 0** under ASan timing (as at 443),
+    so it is still ASan-unverified.
 
 **Next:**
 1. "an element's style changes" on sheet changes and removals (google,
