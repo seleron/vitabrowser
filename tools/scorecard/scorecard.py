@@ -431,6 +431,10 @@ def main():
     if a.only:
         keep = set(a.only.split(","))
         sites = [s for s in sites if s[1] in keep]
+    # the simulator runs in each site's directory: a relative --out made
+    # its script path unreadable ("vitasim: cannot open script", every
+    # site a crash)
+    a.out = os.path.abspath(a.out)
     os.makedirs(a.out, exist_ok=True)
 
     refdir = a.reuse_ref or os.path.join(a.out, "ref")

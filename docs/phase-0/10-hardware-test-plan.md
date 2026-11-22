@@ -13763,8 +13763,27 @@ else).
   whole 11 times and 439's flex fallback ran once, so the new paths ran
   under ASan.
 
-**Not done this session:** a 21-site scorecard A/B (only the census, on 7
-sites).
+**Scorecard r148** (434, the run's start, vs 439; one fresh Chrome
+reference, `score/r148-439/ref`, both arms scored on it back to back;
+each arm's binary through a scratch WORK symlink):
+- **All: 82.7 vs 84.9.** Nearly all of it is **guardian, 36.9 vs 81.8**.
+  The 434 binary has no `ready` command, so the scorecard leaves it out
+  there, and that load hit the race 435 fixes: `sim eval ... FAILED,
+  content missing`, text 0. On 439, `ready after 5412 ms` past the
+  settle. That is a measurement fix, not rendering.
+- **Without guardian: 85.26 vs 85.03.** The -0.23 is google's single
+  75.3 on 439, which is live:
+  - rerun twice per arm, google read **80.5 on both binaries every
+    time**, and hackernews 88.6;
+  - ddglite flips 74.8 / 76.1 on either binary, its known spread.
+  - Every other site is identical to 0.5 or better.
+- **Rendering is flat**, as expected: 437-439 change what a script's
+  change costs, not what the page looks like. No crash or assertion in
+  any load (oldreddit "blocked" in both arms: its bot wall).
+- **Tools fix found on the way.** scorecard.py with a relative `--out`
+  gave every site "crash" (`vitasim: cannot open script`: the simulator
+  runs in each site's directory). `--out` is now made absolute, as in
+  census.py.
 
 **Next, by the 439 census (per load, 7 sites):**
 1. "no inserted or removed block found" (~4.7; google 9 and youtube 3
