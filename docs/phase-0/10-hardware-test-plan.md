@@ -13445,3 +13445,84 @@ unit**; the loop stops here.
    un-hide elements (oldreddit), "detached stylesheet pruned", "new
    element is not a plain block" (youtube `<video>`, `<c3-icon>` into a
    flex box).
+
+## Unit 435a (2026-11-22): a multi-run census -- tools/scorecard/census.py (tools only)
+
+**Why.** The run closed with this as open item 1. The per-site full-rebuild
+count moves by 2-7 from one load to the next on the same binary (claude 11
+vs 4 in r145). That is more than most units remove, so one load per arm
+cannot decide a small unit.
+
+**The tool** (`tools/scorecard/census.py`, simulator side only: no Chrome
+reference, no score):
+- `--arm NAME=PATH` names an `nsvita-sim` binary; repeat it per arm. Each
+  binary is copied into `DIR/bin/` first, so a rebuild during the run
+  cannot change an arm.
+- `--loads N` (default 3) loads every site N times in every arm,
+  **interleaved** (load 1 of every arm, then load 2, ...), so both arms
+  meet the same network. `--only`, `--jobs`, `--settle` and `--timeout`
+  are as in scorecard.py. Each running load holds its own slot, which is
+  its remote-control port.
+- It counts per load the committed full rebuilds (`LIFE BATCHCAUSE
+  cause=...`) and the local path's declines (`LIFE rebuild local: ...
+  declined (reason)`). A tag named at the end of a reason
+  (`an element's style changes, DIV`) is detail, and the reason groups
+  without it. It also collects assertions and crashes.
+- `DIR/census.md` lists:
+  - per site, each load's count and their mean, per arm, with the change
+    in the mean;
+  - the total's loads and mean per arm;
+  - the BATCHCAUSE causes and the decline reasons as a mean per load;
+  - every load that crashed, asserted or did not load.
+- `--report` re-reads an existing run's logs.
+- scorecard.py's `run_sim` takes the binary as a parameter (`sim=`, by
+  default the applytest one, as before).
+
+**First use.** 12 loads of guardian on one binary read **6 / 6 / 6 / 3 / 4 /
+6 / 5 / 6 / 6 / 2 / 5 / 5** (mean 5.0). One site's spread on one binary,
+2 to 6, is the noise the tool exists for.
+
+## Patch 435 (2026-11-22): the scorecard waits for the page to be ready, not a fixed 15 s
+
+**Problem.** The scorecard's script was `settle 15000`, then the text
+eval. guardian becomes ready (its content current, `READY`) at about
+15.2 s. In some loads the eval met no content (`sim eval: content
+missing, status -1`): text 0, score 36.8 instead of 62 (428).
+
+**Fix.**
+- `tools/vita-sim/vitasim.c` gains a script command, **`ready
+  [MAX_MS]`**. It waits until the page's content is current (READY or
+  DONE) and the page has drawn no frame for ~1 s, or until MAX_MS
+  (default 60000) has passed. The idle count carries over from the settle
+  before it, so a page that is already ready and quiet goes on at once.
+  It prints `vitasim: script: ready after N ms` or `ready timed out`.
+- Patch 435 (frontends/vita/main.c, VITA_HOST_SIM only) is the
+  frontend's half:
+  - `vitasim_page_ready()` answers whether the window's content exists
+    and is READY or DONE.
+  - `vitasim_command` records the window on every main-loop pass.
+  - vitasim.c declares the function weak, so a program that links the
+    harness without the frontend counts as always ready.
+- `scorecard.py` writes `settle 15000`, `ready 60000`, then the eval.
+  - The 15 s minimum stays, so scores stay comparable with earlier runs;
+    `ready` only adds the wait the race needed.
+  - A binary older than 435 exits 7 on an unknown command, so the script
+    leaves `ready` out for a binary without it (`sim_has_ready`). A/B runs
+    against old arms still work.
+  - `scores.json` records `ready_ms` (the wait after the settle, or
+    "timeout").
+
+**Check.** guardian, one load per arm, same moment:
+- **434:** `sim eval: ... -> FAILED`, `content missing, status -1`, 0
+  text chunks.
+- **435:** `ready after 5875 ms` past the settle, the eval ran, 91 text
+  chunks.
+
+**Gate.**
+- The gate's own scripts do not use `ready`, so their behaviour is
+  unchanged.
+- **gate435 exit 0**: restaged from pristine (517 applied plus the 2 known
+  collisions), stack through 435, with the census tool and the scorecard
+  change in the tree.
+
+No sudo.

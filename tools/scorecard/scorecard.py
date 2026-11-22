@@ -196,7 +196,28 @@ JSERR_RE = re.compile(r"(TypeError|ReferenceError|SyntaxError|RangeError|"
                       r"InternalError): [^\[|]{0,80}")
 
 
-def run_sim(outdir, name, url, slot, settle, timeout):
+# how long the script's "ready" may wait past the settle (patch 435)
+READY_MAX_MS = 60000
+_HAS_READY = {}
+
+
+def sim_has_ready(sim):
+    """Whether this nsvita-sim knows the script's "ready" (patch 435): an
+    older binary exits 7 on an unknown command, so A/B runs against one
+    leave it out."""
+    if sim not in _HAS_READY:
+        try:
+            with open(sim, "rb") as f:
+                _HAS_READY[sim] = b"script: ready after" in f.read()
+        except OSError:
+            _HAS_READY[sim] = False
+    return _HAS_READY[sim]
+
+
+def run_sim(outdir, name, url, slot, settle, timeout, sim=None):
+    """Load one site in the simulator (sim: the nsvita-sim binary, default
+    SIM) under outdir/sim/name and read its logs."""
+    sim = sim or SIM
     d = os.path.join(outdir, "sim", name)
     shutil.rmtree(d, ignore_errors=True)
     data = os.path.join(d, "ux0:data", "VitaBrowser")
@@ -213,15 +234,20 @@ def run_sim(outdir, name, url, slot, settle, timeout):
         f.write(SIM_EVAL_JS)
     script = os.path.join(d, "script.txt")
     with open(script, "w") as f:
-        f.write("settle %d\neval %s\nsettle 1500\nshot first\nquit\n"
-                % (settle, evaljs))
+        # settle: at least `settle` ms and ~1 s without a frame; ready: the
+        # page's content is also current (READY/DONE), up to READY_MAX_MS
+        # more. Without it guardian, ready ~15.2 s in, met a 15 s settle
+        # with no content: "sim eval: content missing", text 0 (patch 428).
+        ready = ("ready %d\n" % READY_MAX_MS) if sim_has_ready(sim) else ""
+        f.write("settle %d\n%seval %s\nsettle 1500\nshot first\nquit\n"
+                % (settle, ready, evaljs))
     env = dict(os.environ, VITA_SIM_SCRIPT=script, VITA_CSSGAP="1",
                VITA_SIM_OUT=os.path.join(d, "shots"),
                VITA_SIM_REMOTE_PORT=str(45300 + slot))
     t0 = time.time()
     with open(os.path.join(d, "out.log"), "w") as log:
         try:
-            p = subprocess.run([SIM, url], cwd=d, env=env, stdout=log,
+            p = subprocess.run([sim, url], cwd=d, env=env, stdout=log,
                                stderr=subprocess.STDOUT, timeout=timeout)
             rc = p.returncode
         except subprocess.TimeoutExpired:
@@ -244,6 +270,9 @@ def run_sim(outdir, name, url, slot, settle, timeout):
     except OSError:
         pass
     res["done_s"], res["title"] = done, title
+    m = re.search(r"vitasim: script: ready (after (\d+) ms|timed out)", out)
+    res["ready_ms"] = (int(m.group(2)) if m and m.group(2) else
+                       "timeout" if m else None)
     chunks, errs, gaps, jsgaps = {}, set(), set(), set()
     try:
         for line in open(os.path.join(data, "netsurf.log"), errors="replace"):

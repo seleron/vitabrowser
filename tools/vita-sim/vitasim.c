@@ -497,6 +497,9 @@ static void write_png(const char *path, const uint32_t *px)
  *
  * One command per line, run in order, one step per main-loop pass:
  *   settle [MIN_MS]   wait until no frame for ~1 s (and MIN_MS since start)
+ *   ready [MAX_MS]    wait until the page's content is current (READY or
+ *                     DONE: frontend vitasim_page_ready) and no frame for
+ *                     ~1 s, or MAX_MS (default 60000) has passed
  *   wait MS           wall-clock wait
  *   tap X Y           finger down and up at screen X,Y (a click)
  *   drag X0 Y0 X1 Y1  finger drag (a scroll)
@@ -515,6 +518,10 @@ static FILE *script_fp;
 static int script_touch, script_tx, script_ty;
 static char script_cmd[1100];
 static int script_cmd_ready;
+
+/* The frontend's answer (vita/main.c, patch 435). Weak: a test program
+ * linking this file without the frontend counts as always ready. */
+int vitasim_page_ready(void) __attribute__((weak));
 
 const char *vitasim_take_command(void);
 const char *vitasim_take_command(void)
@@ -612,6 +619,29 @@ static int script_step(SceCtrlData *pad)
 			have = 0;
 		if (now_ms() - t0 > 600000) {
 			fprintf(stderr, "vitasim: script: settle timed out\n");
+			have = 0;
+		}
+		return 1;
+	}
+	if (strncmp(line, "ready", 5) == 0) {
+		long max = atol(arg);
+		int ok;
+		if (max <= 0)
+			max = 60000;
+		/* idle carries over from the settle before it: a page already
+		 * ready and quiet goes on at once */
+		ok = vitasim_page_ready == NULL || vitasim_page_ready();
+		if (!ok)
+			idle = 0;
+		if (ok && idle >= SETTLE_POLLS) {
+			printf("vitasim: script: ready after %ld ms\n",
+			       now_ms() - t0);
+			fflush(stdout);
+			have = 0;
+		} else if (now_ms() - t0 >= max) {
+			printf("vitasim: script: ready timed out after %ld ms "
+			       "(content %s)\n", max, ok ? "ready" : "not ready");
+			fflush(stdout);
 			have = 0;
 		}
 		return 1;
