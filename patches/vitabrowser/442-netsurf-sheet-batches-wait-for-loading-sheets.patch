@@ -1,0 +1,228 @@
+# netsurf: a batch whose only obstacle is a stylesheet still loading waits for it (patch 442)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 441)
+#
+# "a sheet is still loading or changing" (sheet change and sheet removal,
+# ~6 a load on 7 sites: google, bbc, oldreddit) sent the batch to the full
+# rebuild: 415's whole-document re-cascade cannot be made from a sheet in
+# flight (html_css_new_selection_context asserts on one). That sheet marks
+# again when it is done (html_css_mark_sheets counts it into the same
+# window, 436), and the re-cascade then sees every sheet.
+#
+# When the batch declined only for that reason -- before anything in it
+# was answered (a batch of sheet marks alone, or its first mark), or after
+# its precise marks were answered (they stand; the slot drops them and
+# keeps only its sheet marks) -- macos9_reconvert_cb keeps the slot and
+# retries it every RECONVERT_SHEET_RETRY_MS (100) for at most
+# RECONVERT_SHEET_WAIT_MAX_MS (1500), then takes the full rebuild as
+# before. Later marks join the waiting slot. html_rl_doc_noop flags the
+# reason (html_rl_take_unsettled) and, while the batch may still wait
+# (html_rl_sheet_wait_ok), logs "waits (...)" instead of "declined (...)",
+# so the census counts only real declines. A synchronous flush (a script's
+# layout read) cannot wait and is unchanged.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9015,6 +9015,19 @@
+ 	return html_rl_doc_noop((html_content *)base_c, "sheet change");
+ }
+ 
++/* Patch 442 - set when html_rl_doc_noop declined because a sheet is still
++ * loading or changing; read and cleared by macos9_reconvert_try_local */
++static int html_rl_unsettled;
++/* set by macos9_reconvert_cb while the batch it tries may still wait */
++int html_rl_sheet_wait_ok;
++int html_rl_take_unsettled(void);
++int html_rl_take_unsettled(void)
++{
++	int v = html_rl_unsettled;
++	html_rl_unsettled = 0;
++	return v;
++}
++
+ static int html_rl_doc_noop(html_content *c, const char *what)
+ {
+ 	extern double macos9_micros(void);
+@@ -9049,12 +9062,19 @@
+ 		if (pruned > 0)
+ 			macsurf_debug_log_writef("LIFE rebuild local: %s: %d "
+ 				"detached sheet(s) pruned first", what, pruned);
+-		if (!html_rl_sheets_settled(c))
++		if (!html_rl_sheets_settled(c)) {
+ 			why = "a sheet is still loading or changing";
++			html_rl_unsettled = 1;	/* patch 442 */
++		}
+ 	}
+ 	if (why != NULL) {
+-		macsurf_debug_log_writef("LIFE rebuild local: %s: "
+-			"declined (%s)", what, why);
++		/* patch 442: not a decline while the batch may wait */
++		if (html_rl_unsettled && html_rl_sheet_wait_ok)
++			macsurf_debug_log_writef("LIFE rebuild local: %s: "
++				"waits (%s)", what, why);
++		else
++			macsurf_debug_log_writef("LIFE rebuild local: %s: "
++				"declined (%s)", what, why);
+ 		return -1;
+ 	}
+ 	t0 = macos9_micros();
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -223,6 +223,9 @@
+ 	 * kept set, as a coarse slot had it, so the single-mark fast paths
+ 	 * (style, inherited colour, cosmetic deferral) never take it. */
+ 	int             sheets;
++	/* Patch 442 - macos9_micros() when the batch first waited for an
++	 * unsettled sheet (0 = has not waited) */
++	double          sheet_wait_us;
+ };
+ 
+ /* fixes910 Phase 0 - implemented in content/handlers/html/html.c, where the real
+@@ -247,6 +250,11 @@
+ /* Patch 385 - past the cap, a class-only full rebuild waits this long
+  * after the last full rebuild (fixes1024's own debounce ceiling) */
+ #define RECONVERT_COSMETIC_DEFER_MS RECONVERT_DEBOUNCE_MAX_MS
++/* Patch 442 - a batch whose only obstacle is a stylesheet still loading or
++ * changing waits for it: retried this often, for at most this long since
++ * it first waited, before it takes the full rebuild as before. */
++#define RECONVERT_SHEET_RETRY_MS 100
++#define RECONVERT_SHEET_WAIT_MAX_MS 1500
+ static int g_consecutive_cosmetic = 0;
+ 
+ static int macos9_reconvert_kind_is_cosmetic(int kind)
+@@ -449,6 +457,7 @@
+ 	g_pending[i].coarse = 0;
+ 	g_pending[i].coarse_cause = 0;
+ 	g_pending[i].sheets = 0;	/* patch 415 */
++	g_pending[i].sheet_wait_us = 0;	/* patch 442 */
+ 	g_pending[i].kind_mask = 0;
+ 	ms_diag_batch_freeze(g_pending[i].batch_id);
+ 	g_pending[i].batch_id = 0;
+@@ -1371,6 +1380,11 @@
+ 	return html_reconvert_local(c, node) == 0;
+ }
+ 
++/* Patch 442 - set by macos9_reconvert_try_local when the batch declined
++ * only because a stylesheet is still loading or changing, before anything
++ * in it was answered */
++static int g_defer_unsettled;
++
+ static int macos9_reconvert_try_local(int i, struct content *c)
+ {
+ 	int j;
+@@ -1388,16 +1402,21 @@
+ 	double budget;
+ 	double t0;
+ 	extern int html_rl_sheet_batch_noop(struct content *c);
++	extern int html_rl_take_unsettled(void);	/* patch 442 */
+ 
++	g_defer_unsettled = 0;
+ 	if (g_pending[i].coarse)
+ 		return 0;
+ 	g_fc_reason = 0;
++	(void) html_rl_take_unsettled();
+ 	/* Patch 415 - sheet marks alone: the re-cascade decides */
+ 	if (g_pending[i].node == NULL) {
+ 		if (!g_pending[i].sheets)
+ 			return 0;
+ 		if (html_rl_sheet_batch_noop(c) != 0) {
+ 			g_fc_reason = 5;
++			/* patch 442: nothing answered yet -- may wait */
++			g_defer_unsettled = html_rl_take_unsettled();
+ 			return 0;
+ 		}
+ 		g_sheet_noop++;
+@@ -1416,6 +1435,9 @@
+ 			g_pending[i].attr_name, g_pending[i].rm_state,
+ 			g_pending[i].rm_next)) {
+ 		g_fc_reason = g_one_fail_kind ? 1 : 2;
++		/* patch 442: the first mark declined, the tree untouched
++		 * (declines are non-destructive) -- may wait */
++		g_defer_unsettled = html_rl_take_unsettled();
+ 		return 0;
+ 	}
+ 	/* Patch 301 - answer the extra precise marks in the order they
+@@ -1477,8 +1499,12 @@
+ 	/* Patch 415 - the precise marks are answered (new elements built
+ 	 * against the settled sheets' context); now the sheets themselves */
+ 	if (g_pending[i].sheets) {
++		(void) html_rl_take_unsettled();
+ 		if (html_rl_sheet_batch_noop(c) != 0) {
+ 			g_fc_reason = 5;
++			/* patch 442: the precise marks are answered and stand;
++			 * the sheet part alone may wait (2: drop the marks) */
++			g_defer_unsettled = html_rl_take_unsettled() ? 2 : 0;
+ 			return 0;
+ 		}
+ 		g_sheet_noop++;
+@@ -1852,7 +1878,17 @@
+ 			continue;
+ 		}
+ 		/* VitaBrowser: one text edit rebuilds just its block (WS-C) */
++		/* Patch 442: may this batch still wait for its sheets? */
++		{
++			extern int html_rl_sheet_wait_ok;
++			html_rl_sheet_wait_ok =
++				g_pending[i].sheet_wait_us == 0 ||
++				macos9_micros() - g_pending[i].sheet_wait_us <
++				RECONVERT_SHEET_WAIT_MAX_MS * 1000.0;
++		}
+ 		if (macos9_reconvert_try_local(i, c)) {
++			extern int html_rl_sheet_wait_ok;
++			html_rl_sheet_wait_ok = 0;
+ 			if (have_render_scope) ms_diag_render_leave(&render_scope,
+ 				MS_RRES_DONE, MS_SREASON_NONE);
+ 			macos9_reconvert_slot_clear(i);
+@@ -1860,6 +1896,52 @@
+ 			macos9_reconvert_census_dump();
+ 			continue;
+ 		}
++		/* Patch 442 - the batch declined only because a stylesheet is
++		 * still loading or changing (415's re-cascade cannot be made
++		 * from a sheet in flight), before anything in it was answered.
++		 * That sheet marks again when it is done (html_css_mark_sheets
++		 * counts it into the same window), and the re-cascade then sees
++		 * every sheet. The slot waits, retried every
++		 * RECONVERT_SHEET_RETRY_MS, for at most
++		 * RECONVERT_SHEET_WAIT_MAX_MS; then the full rebuild, as
++		 * before. Later marks join the waiting slot. */
++		{
++			extern int html_rl_sheet_wait_ok;
++			html_rl_sheet_wait_ok = 0;
++		}
++		if (g_defer_unsettled) {
++			double now_us = macos9_micros();
++			if (g_defer_unsettled == 2) {
++				/* its precise marks were answered locally (their
++				 * answers are complete): the slot keeps only its
++				 * sheet marks (node NULL, sheets set) */
++				macos9_reconvert_slot_drop_node(i);
++				macsurf_debug_log_writef("LIFE sheet wait: the "
++					"batch's marks answered, its sheet part "
++					"waits");
++			}
++			if (g_pending[i].sheet_wait_us == 0)
++				g_pending[i].sheet_wait_us = now_us;
++			if (now_us - g_pending[i].sheet_wait_us <
++			    RECONVERT_SHEET_WAIT_MAX_MS * 1000.0) {
++				macsurf_debug_log_writef("LIFE sheet wait: a "
++					"sheet is still loading or changing, "
++					"the batch waits (%ld ms so far)",
++					(long)((now_us -
++						g_pending[i].sheet_wait_us) /
++					       1000.0));
++				if (have_render_scope) ms_diag_render_leave(
++					&render_scope, MS_RRES_BUSY,
++					MS_SREASON_NOT_READY);
++				if (defer_ms == 0 ||
++				    RECONVERT_SHEET_RETRY_MS < defer_ms)
++					defer_ms = RECONVERT_SHEET_RETRY_MS;
++				continue;
++			}
++			macsurf_debug_log_writef("LIFE sheet wait: sheets still "
++				"unsettled after %d ms, full rebuild",
++				RECONVERT_SHEET_WAIT_MAX_MS);
++		}
+ 		/* Patch 385 - fixes1135's cap, as a deferral. The cap stays:
+ 		 * patch 312's task flush fires this callback ~16 ms after
+ 		 * every mutating task, which overrides fixes1024's escalating

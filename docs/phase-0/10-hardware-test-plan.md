@@ -13932,3 +13932,84 @@ No sudo.
     11 times; blocks of blocks built again whole (440) 11 times; head
     changes answered 4 times; 441's guard logged 0 times (no gate page
     triggers it).
+
+## Patch 442 (2026-11-22): a batch whose only obstacle is a stylesheet still loading waits for it (narrow effect)
+
+**Problem.** "a sheet is still loading or changing" was ~4-6 a load on
+the 7 census sites (440's census: google 11, bbc 6, oldreddit 2 over three
+loads), as "sheet change: ..." and "sheet removal: ...". It sent the batch
+to the full rebuild: 415's whole-document re-cascade cannot be made from a
+sheet in flight, because `html_css_new_selection_context` asserts on one.
+That sheet marks again when it is done (`html_css_mark_sheets` counts it
+into the same window, 436), and the re-cascade then sees every sheet.
+
+**Fix** (macos9_reconvert.c, html.c). When the batch declined only for
+that reason, `macos9_reconvert_cb` keeps the slot instead of rebuilding.
+- **When it can wait:** nothing in the batch was answered yet (a batch of
+  sheet marks alone, or its first mark declined), or its precise marks
+  were answered. Those answers stand, and the slot drops them
+  (`macos9_reconvert_slot_drop_node`) and keeps only its sheet marks.
+- **The wait:** it is retried every `RECONVERT_SHEET_RETRY_MS` (100) for
+  at most `RECONVERT_SHEET_WAIT_MAX_MS` (1500), then takes the full
+  rebuild as before. Later marks join the waiting slot.
+- **The log:** `html_rl_doc_noop` flags the reason
+  (`html_rl_take_unsettled`). While the batch may still wait
+  (`html_rl_sheet_wait_ok`), it logs `waits (...)` instead of `declined
+  (...)`, so the census counts only real declines. Running out logs
+  `sheets still unsettled after 1500 ms, full rebuild`.
+- **Unchanged:** a synchronous flush (a script's layout read) cannot
+  wait.
+
+**Gate.**
+- New pair **NET-js-sheet-wait / NET-css-sheet-wait-ref**. A `<link>` to
+  a slow sheet (`/slow/`, 1 s) is added and stays; within that second a
+  `<style>` that styles nothing gets new text and a paragraph's text
+  changes.
+- Result: **rows 0, the batch waited (~700 ms), then "sheet change
+  restyles nothing", 0 full rebuilds**. The 440 binary on the same page:
+  a still-loading decline and a full rebuild (BATCHCAUSE nonode).
+- A first cut waited only when nothing had been answered. This page's
+  batch also held the paragraph's text mark (answered first), so it did
+  not wait. Hence the drop-the-answered-marks case.
+
+**Census** (441 vs 442, 3 loads per arm, the same 7 sites; the 441 arm
+is `arms/440b`, built from the same sources):
+- **Only 1 batch waited in 21 loads.** "sheet change: still loading" read
+  2.3 -> 3.3 and "sheet removal: still loading" 2.0 -> 1.7 a load.
+- Those remaining declines are logged as `declined`, not `waits`: they
+  are **synchronous flushes** (google and bbc read layout from scripts),
+  which cannot wait.
+- Total 31.0 vs 30.3, noise. No crash or assertion in 42 loads.
+
+**Why most of it is still there, and the next step.**
+`html_css_refresh_selection_context` refreshes `c->select_ctx` only when
+every sheet has settled. So a full rebuild taken while a sheet is in
+flight usually cascades with the **same old sheets**, and is wasted. The
+exception is a sheet removal, whose prune does update the context.
+- So the synchronous "sheet change: still loading" declines could be
+  answered as no-ops.
+- But only when the boxes already reflect the current `c->select_ctx`. A
+  refresh that came before another sheet started loading leaves the boxes
+  behind it, and there a no-op would hold the refreshed rules back until
+  the new sheet lands.
+- That needs a selection-context generation counter: bumped at each
+  refresh and prune, and recorded when the boxes were last cascaded
+  whole. That is the next unit for this decline.
+- **gate442 exit 0**: restaged from pristine (524 applied plus the 2
+  known collisions), stack through 442. NET-js-sheet-wait: 2 waits, 1
+  sheet change restyling nothing, 0 full rebuilds. NET-js-sheet-inflight
+  is unchanged.
+
+No sudo.
+
+**Next, by the 442 census (per load, 7 sites):**
+1. Synchronous "sheet change: a sheet is still loading or changing"
+   (~3): answer as a no-op behind a selection-context generation check
+   (see 442).
+2. "sheet change / removal: an element's style changes" (~3-4): the
+   re-cascade-in-place project (restyle only the changed elements).
+3. "removal would join two lines" (~2, bbc).
+4. The sibling-selector family on github / wpnews / wpblog (`style`,
+   `aria-expanded` attributes, "page CSS needs conservative sibling
+   check").
+5. The trigger of 441's unmeasured inline-block (wpblog, live).

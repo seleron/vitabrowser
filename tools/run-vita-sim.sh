@@ -593,6 +593,8 @@ NET-js-block-frame http://127.0.0.1:$HP/JS-block-frame.html
 NET-css-block-frame-ref http://127.0.0.1:$HP/CSS-block-frame-ref.html
 NET-js-sheet-inflight http://127.0.0.1:$HP/NET-js-sheet-inflight.html
 NET-css-sheet-inflight-ref http://127.0.0.1:$HP/CSS-sheet-inflight-ref.html
+NET-js-sheet-wait http://127.0.0.1:$HP/NET-js-sheet-wait.html
+NET-css-sheet-wait-ref http://127.0.0.1:$HP/CSS-sheet-wait-ref.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -2172,6 +2174,17 @@ k432w=$(printf '%s\n' "$k432seg" | grep -c "declined (a sheet is still loading o
 k432f=$(printf '%s\n' "$k432seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  NET-js-sheet-inflight: rows $k432r (0), removals restyling nothing ${k432n} (1 or more), still-loading declines ${k432w} (0), full rebuilds after a decline ${k432f} (0)"
 [ "$k432r" = 0 ] && [ "${k432n:-0}" -ge 1 ] && [ "${k432w:-1}" -eq 0 ] && [ "${k432f:-1}" -eq 0 ] || fail "sheets pruned in flight or failed hold no sheet change up"
+# Patch 442: a sheet change while another sheet is in flight waits for the
+# sheets to settle (before: "a sheet is still loading or changing" and the
+# full rebuild); the slow sheet's mark joins it and the re-cascade finds no
+# style changed: no full rebuild of any cause in the page's window.
+k442r=$(fl_rows NET-js-sheet-wait NET-css-sheet-wait-ref)
+k442seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-sheet-wait: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k442w=$(printf '%s\n' "$k442seg" | grep -c "LIFE sheet wait: a sheet is still loading or changing, the batch waits" || true)
+k442n=$(printf '%s\n' "$k442seg" | grep -c "sheet change restyles nothing" || true)
+k442f=$(printf '%s\n' "$k442seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  NET-js-sheet-wait: rows $k442r (0), batches waiting for a sheet ${k442w} (1 or more), sheet changes restyling nothing ${k442n} (1 or more), full rebuilds ${k442f} (0)"
+[ "$k442r" = 0 ] && [ "${k442w:-0}" -ge 1 ] && [ "${k442n:-0}" -ge 1 ] && [ "${k442f:-1}" -eq 0 ] || fail "sheet changes wait for a sheet in flight"
 # Patch 433: an inert attribute (aria-*, data-*, role) on a form control's
 # box that is not a block rebuilds nothing.
 k433r=$(fl_rows JS-control-inert CSS-control-inert-ref)
