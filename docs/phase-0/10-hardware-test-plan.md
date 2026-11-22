@@ -14088,5 +14088,15 @@ No sudo.
 **Next** (after 443): "sheet change / removal: an element's style changes"
 (re-cascade in place: restyle only the changed elements), "removal would
 join two lines" (bbc), the sibling-selector family (github, wpnews,
-wpblog), the trigger of 441's unmeasured inline-block. ASan has not been
-rerun since 441: 442 and 443 change the flush and the cascade bookkeeping.
+wpblog), the trigger of 441's unmeasured inline-block.
+
+**ASan through 443** (`tools/build-asan-sim.sh`, netsurf instrumented):
+- **sweep 21/21 clean**;
+- **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 394 page
+  dumps (gate 394).
+- In that run: the 437 walk stopped once; 440 built blocks of blocks
+  whole 11 times; 442's wait ran twice.
+- **443's held-cascade answer did not fire** (0). NET-js-sheet-gen needs
+  the fast sheet to land inside the slow sheet's second, and under ASan's
+  slower timing it did not. So 443's path is ASan-unverified: the gate
+  and the census ran it uninstrumented only.
