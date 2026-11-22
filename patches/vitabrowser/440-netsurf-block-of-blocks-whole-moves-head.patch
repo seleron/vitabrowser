@@ -1,0 +1,217 @@
+# netsurf: a block of blocks with no block in or out built whole; a moved boxed child rebuilt; changes inside <head> render nothing (patch 440)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 439)
+#
+# "no inserted or removed block found" (3.3-4.7 a load on 7 sites)
+# declined into the full rebuild. A scratch probe over two loads each:
+#  - google 4: innerHTML on a <div> whose one child, a block, already has
+#    its box -- the change is below the children;
+#  - youtube 2: textContent inside <head> (a <title>), the walk climbed to
+#    <html>; 362's head no-op covers only <head>'s own child list.
+#
+# A block of blocks where no child gained or lost a box (not the root, no
+# object or frame on it) is built again whole: html_rl_block_whole, 434's
+# html_rl_flex_restyle(is_block), with 373's :empty sibling check. A change
+# inside a box-less <head> renders nothing (html_rl_in_boxless_head; not a
+# <base> or <meta>, which a build reads).
+#
+# Found on the way, a latent bug: a boxed child MOVED among its siblings
+# (insertBefore / appendChild of a child already there) adds and removes
+# no box, so 378's box-less no-op answered "child list changed only in
+# elements with no box, nothing to rebuild" and the boxes kept the old
+# order (wrong rows, unless a later full rebuild in the batch repaired
+# them). The no-op now first checks html_rl_boxes_in_order (the children's
+# boxes, in pbox or a line directly in it, in DOM order); a move builds
+# the block again whole (a flex box: 439's fallback).
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8791,6 +8791,9 @@
+ /* Patch 438 */
+ static int html_rl_flex_whole(html_content *c, dom_node *el, struct box *b,
+ 		double t0, const char *what);
++static int html_rl_block_whole(html_content *c, dom_node *el, struct box *b,
++		double t0);	/* patch 440 */
++static bool html_rl_boxes_in_order(dom_node *pnode, struct box *pbox);
+ 
+ /* Patch 404: a child-list change whose structural check found a rule that
+  * reaches the parent's children ("a structural rule matches a sibling":
+@@ -9680,6 +9683,23 @@
+ 	 * :first-child), or a sibling rule that sees the skipped elements
+ 	 * (198). Removed boxless elements are not known here; only a rule
+ 	 * with a tag-only left compound naming them could see one go. */
++	/* Patch 440: no element gained or lost a box, but one with a box
++	 * moved among the children (insertBefore / appendChild of a child
++	 * already there): the boxes keep the old order, and "nothing to
++	 * rebuild" painted them there. The parent is built again whole (a
++	 * flex box: 439's fallback below). */
++	if (nadd == 0 && nrem == 0 && pnode == html_rl_childlist_parent &&
++	    !skip_over && !html_rl_boxes_in_order(pnode, pbox)) {
++		if (!html_rl_noop_only && pbox->type == BOX_BLOCK &&
++		    pbox->parent != NULL && pbox->object == NULL &&
++		    !HTML_RL_FRAME(pbox)) {
++			html_rl_struct_hits_release(shits, &nshits);
++			for (i = 0; i < nskip; i++)
++				dom_node_unref(skipped[i]);
++			return html_rl_block_whole(c, pnode, pbox, t0);
++		}
++		RL_BNO("a child with a box moved");
++	}
+ 	if (nadd == 0 && nrem == 0 && pnode == html_rl_childlist_parent &&
+ 	    !skip_over) {
+ 		/* patch 379: scoped to this parent's children; counters do
+@@ -9775,6 +9795,18 @@
+ 			"block of blocks, nothing to rebuild");
+ 		return 0;
+ 	}
++	/* Patch 440: no block in or out (4.7 a load on the census sites):
++	 * the change is below the children, or a move among them -- the
++	 * block is built again whole. Not the root: its box has no parent
++	 * to rebuild it in. */
++	if (nadd == 0 && nrem == 0 && pbox->type == BOX_BLOCK &&
++	    pbox->parent != NULL && pbox->object == NULL &&
++	    !HTML_RL_FRAME(pbox)) {
++		html_rl_struct_hits_release(shits, &nshits);
++		for (i = 0; i < nskip; i++)
++			dom_node_unref(skipped[i]);
++		return html_rl_block_whole(c, pnode, pbox, t0);
++	}
+ 	if (nadd == 0 && nrem == 0)
+ 		RL_BNO("no inserted or removed block found");
+ 	/* patch 378: the skipped elements served the no-op only */
+@@ -13840,6 +13872,114 @@
+ 	return empty;
+ }
+ 
++/* Patch 440: is n, or an element above it, a <head> with no box? Not when n
++ * is a <base> or <meta> (the build reads them). */
++static bool html_rl_in_boxless_head(dom_node *n)
++{
++	dom_node *e = n, *p;
++	bool head = false, first = true;
++
++	dom_node_ref(e);
++	while (e != NULL && !head) {
++		dom_node_type type;
++		if (dom_node_get_node_type(e, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			dom_string *nm = NULL;
++			if (dom_node_get_node_name(e, &nm) == DOM_NO_ERR &&
++			    nm != NULL) {
++				const char *t = dom_string_data(nm);
++				if (first && (strcasecmp(t, "base") == 0 ||
++					      strcasecmp(t, "meta") == 0)) {
++					dom_string_unref(nm);
++					dom_node_unref(e);
++					return false;
++				}
++				head = strcasecmp(t, "head") == 0 &&
++					box_for_node(e) == NULL;
++				dom_string_unref(nm);
++			}
++			first = false;
++		}
++		p = NULL;
++		if (dom_node_get_parent_node(e, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(e);
++		e = p;
++	}
++	if (e != NULL)
++		dom_node_unref(e);
++	return head;
++}
++
++/* Patch 440: are the boxes of pnode's element children, where they sit
++ * directly in pbox or in a line directly in it, in the DOM's order? (A
++ * child whose box sits anywhere else -- a float carrier, a deeper level --
++ * answers no: the caller rebuilds, which is right either way.) */
++static bool html_rl_boxes_in_order(dom_node *pnode, struct box *pbox)
++{
++	dom_node *ch = NULL, *nx;
++	unsigned long last = 0;
++	bool first = true, ok = true;
++
++	if (dom_node_get_first_child(pnode, &ch) != DOM_NO_ERR)
++		return false;
++	while (ch != NULL && ok) {
++		dom_node_type type;
++		struct box *b, *top, *q;
++		if (dom_node_get_node_type(ch, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE &&
++		    (b = box_for_node(ch)) != NULL) {
++			unsigned long ti = 0, ii = 0, pos;
++			top = b->parent == pbox ? b :
++				(b->parent != NULL &&
++				 b->parent->parent == pbox) ? b->parent : NULL;
++			if (top == NULL) {
++				ok = false;
++				break;
++			}
++			for (q = pbox->children; q != NULL && q != top;
++			     q = q->next)
++				ti++;
++			if (top != b)
++				for (q = top->children; q != NULL && q != b;
++				     q = q->next)
++					ii++;
++			pos = (ti << 16) | (ii & 0xffff);
++			if (!first && pos <= last)
++				ok = false;
++			last = pos;
++			first = false;
++		}
++		nx = NULL;
++		if (dom_node_get_next_sibling(ch, &nx) != DOM_NO_ERR)
++			nx = NULL;
++		dom_node_unref(ch);
++		ch = nx;
++	}
++	if (ch != NULL)
++		dom_node_unref(ch);
++	return ok;
++}
++
++/* Patch 440: a block of blocks built again whole -- a change below it
++ * that left every child with its box and no box without its element
++ * (google's innerHTML on a <div> holding one boxed <div>; a boxed child
++ * moved): 434's whole-block rebuild, cascaded afresh from the DOM, the
++ * page laid out whole. Its own :empty is what reaches outside. */
++static int html_rl_block_whole(html_content *c, dom_node *el, struct box *b,
++		double t0)
++{
++	if ((b->children == NULL || html_rl_node_empty(el)) &&
++	    html_rl_empty_sibling_risk(c)) {
++		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
++			"sibling rule tests :empty)");
++		return -1;
++	}
++	macsurf_debug_log_writef("LIFE rebuild local: a block of blocks with "
++		"no block in or out, built again whole");
++	return html_rl_flex_restyle(c, el, b, t0, html_rl_class_same, true);
++}
++
+ /* Patch 438: a flex or grid box built again whole for a change in its own
+  * content -- boxed children in or out (408 declined them), text or
+  * innerHTML set on it (youtube's flex <main> / <c-wiz>) -- through 372's
+@@ -14102,6 +14242,20 @@
+ 		}
+ 	}
+ 
++	/* Patch 440: a change anywhere inside a <head> that has no box --
++	 * a <title>'s text, a <script>'s (youtube: textContent, the walk
++	 * climbed to <html> and declined "no inserted or removed block
++	 * found") -- renders nothing, as 362's child-list case says: no
++	 * selector reaches from <head> into <body> (:has() never matches,
++	 * patch 328), a <style>'s text is a sheet change of its own
++	 * (html_rl_style_text_absorb / the sheet mark). Not a <base> or
++	 * <meta>, which a build reads (URLs, refresh). */
++	if (html_rl_in_boxless_head((dom_node *) vnode)) {
++		macsurf_debug_log_writef("LIFE rebuild local: a change inside "
++			"<head>, nothing rendered");
++		return 0;
++	}
++
+ 	/* the nearest element with a block box: the one to rebuild */
+ 	n = vnode;
+ 	dom_node_ref(n);

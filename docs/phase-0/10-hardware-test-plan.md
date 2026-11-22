@@ -13796,3 +13796,75 @@ each arm's binary through a scratch WORK symlink):
 4. "removal would join two lines" (~2.7).
 
 No sudo was needed or run.
+
+## Patch 440 (2026-11-22): a block of blocks with no block in or out is built whole; a moved boxed child is rebuilt (latent bug); changes inside `<head>` render nothing
+
+**Problem.** "no inserted or removed block found" was **3.3 a load** on the
+7 census sites (439's census), the top local decline after 439. Two
+scratch-only probes over two loads each logged the mark kind and the
+block's DOM children:
+- **google 4:** `innerHTML` (mark kind 4) on a `<div>` whose one child, a
+  block, already has its box. The change is below the children; nothing
+  gained or lost a box at this level.
+- **youtube 2:** `textContent` (kind 3) inside `<head>` (a `<title>`).
+  The walk climbed to `<html>` (children `HEAD-`, `BODY+`). 362's head
+  no-op covers only a child-list change on `<head>` itself.
+
+**Fix** (html.c).
+- **`html_rl_block_whole`:** a block of blocks where no child gained or
+  lost a box is built again whole, through 434's
+  `html_rl_flex_restyle(is_block)`, with 373's `:empty` sibling check.
+  This excludes the root and a block with an object or frame on its own
+  box.
+- **`html_rl_in_boxless_head`:** a change on `<head>` or inside it, while
+  it has no box, renders nothing. Not for a `<base>` or `<meta>`, which a
+  build reads (URLs, refresh).
+
+**Latent bug found on the way (since patch 378).**
+- A boxed child **moved** among its siblings (`insertBefore` /
+  `appendChild` of a child already there) adds and removes no box.
+- 378's box-less no-op therefore answered `child list changed only in
+  elements with no box (0), nothing to rebuild`, and the boxes kept the
+  old order.
+- The new gate page showed **30 rows wrong** on a first cut of 440. On
+  the 439 binary it read rows 0 only because a later full rebuild in the
+  same page (the `<head>` decline) happened to repair it.
+- The no-op now first checks **`html_rl_boxes_in_order`**: the children's
+  boxes, directly in the parent box or in a line directly in it, must be
+  in DOM order. A move builds the block again whole (a flex box gets
+  439's fallback).
+
+**Gate.**
+- New pair **JS-block-blocks / CSS-block-blocks-ref**. Steps, each
+  flushed alone:
+  - the third block moved first;
+  - the `<title>`'s text;
+  - a head `<script>`'s text;
+  - the first block moved last.
+- Result: **rows 0, 2 blocks of blocks built again whole, 1 head change
+  answered, 0 moves taken as no-ops, 0 declines, 0 full rebuilds**. The
+  439 binary on the same page: 2 moves taken as no-ops, 2 declines and a
+  full rebuild.
+- **An existing check changed meaning.** NET-js-attr-local
+  (`js-attr-local-batchcause`) asserted that the page's load innerHTML
+  batch commits a local-cause full reconvert. Its ten `<div>`s are
+  written while the page parses, so their boxes exist before the flush;
+  that batch is now `#host` built again whole.
+  - **gate440 failed only on that check** (local=0 where 1 or more was
+    asserted).
+  - The check now asserts local=0 and the block-whole path taken, with
+    kind=0 and the data-flag re-select as before.
+
+**Census** (439 vs 440, 3 loads per arm, the same 7 sites):
+- "no inserted or removed block found" **3.3 -> 0** a load.
+- The new path: 5 blocks built whole, 3 head changes answered.
+- **youtube 6.3 -> 4.3** (6 / 7 / 6 vs 4 / 4 / 5). Total 32.0 vs 31.7.
+- google 5.7 -> 7.0 is noise: google read 6 / 4 / 8 on one binary in
+  438's census.
+- wpblog crashed in both arms (439 1 of 3, 440 2 of 3): patch 441, not
+  this one.
+- **gate440b exit 0**: restaged from pristine (522 applied plus the 2
+  known collisions), stack through 440, with the updated attr-local
+  check.
+
+No sudo.

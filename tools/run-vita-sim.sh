@@ -414,6 +414,8 @@ JS-flex-own file:///app0:/testpages/JS-flex-own.html
 CSS-flex-own-ref file:///app0:/testpages/CSS-flex-own-ref.html
 JS-media-new file:///app0:/testpages/JS-media-new.html
 CSS-media-new-ref file:///app0:/testpages/CSS-media-new-ref.html
+JS-block-blocks file:///app0:/testpages/JS-block-blocks.html
+CSS-block-blocks-ref file:///app0:/testpages/CSS-block-blocks-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2227,6 +2229,21 @@ k439d=$(printf '%s\n' "$k439seg" | grep -c "declined (new element is not a plain
 k439f=$(printf '%s\n' "$k439seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-media-new: rows $k439r (0), new blocks built alone ${k439b} (2), flex boxes built again whole ${k439w} (1), new-element declines ${k439d} (0), full rebuilds after a decline ${k439f} (0)"
 [ "$k439r" = 0 ] && [ "${k439b:-0}" -ge 2 ] && [ "${k439w:-0}" -ge 1 ] && [ "${k439d:-1}" -eq 0 ] && [ "${k439f:-1}" -eq 0 ] || fail "new media and list blocks, custom elements into flex boxes"
+# Patch 440: a boxed block moved among its siblings (twice) builds the
+# block of blocks again whole -- before, the box-less no-op answered it
+# "nothing to rebuild" and the boxes stayed in the old order (wrong rows
+# unless a later full rebuild repaired them) -- and a <head> <script>'s
+# text renders nothing (before: "no inserted or removed block found" and
+# the full rebuild). Each step flushed alone (see 433).
+k440r=$(fl_rows JS-block-blocks CSS-block-blocks-ref)
+k440seg=$(awk '/ page [0-9]+\/[0-9]+ JS-block-blocks: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k440w=$(printf '%s\n' "$k440seg" | grep -c "a block of blocks with no block in or out, built again whole" || true)
+k440h=$(printf '%s\n' "$k440seg" | grep -c "a change inside <head>, nothing rendered" || true)
+k440n=$(printf '%s\n' "$k440seg" | grep -c "child list changed only in elements with no box" || true)
+k440d=$(printf '%s\n' "$k440seg" | grep -c "declined (no inserted or removed block found)" || true)
+k440f=$(printf '%s\n' "$k440seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-block-blocks: rows $k440r (0), blocks of blocks built again whole ${k440w} (2), head changes answered ${k440h} (1 or more), moves taken as no-ops ${k440n} (0), no-block declines ${k440d} (0), full rebuilds after a decline ${k440f} (0)"
+[ "$k440r" = 0 ] && [ "${k440w:-0}" -ge 2 ] && [ "${k440h:-0}" -ge 1 ] && [ "${k440n:-1}" -eq 0 ] && [ "${k440d:-1}" -eq 0 ] && [ "${k440f:-1}" -eq 0 ] || fail "moved blocks and head changes"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
@@ -2495,8 +2512,15 @@ acl_local=$(printf '%s\n' "$acl" | grep -c 'cause=local' || true)
 acl_flag=$(awk '/page [0-9]*\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
 	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
 	on' "$R/netsurf.log" 2>/dev/null | grep -a -c 'data-flag attribute change, as a class change' || true)
-echo "  JS-attr-local batch causes: kind=${acl_kind} (0) local=${acl_local} (1 or more); data-flag re-selected ${acl_flag} (1)"
-[ "$acl_kind" -eq 0 ] && [ "$acl_local" -ge 1 ] && [ "${acl_flag:-0}" -ge 1 ] || o2_bad="$o2_bad js-attr-local-batchcause"
+# Patch 440: the load innerHTML batch (ten <div>s into #host, written while
+# the page parses, so their boxes exist before the flush) was "no inserted
+# or removed block found" and the local-cause full reconvert; #host is now
+# built again whole (a block of blocks with no block in or out).
+acl_whole=$(awk '/page [0-9]*\/[0-9]* NET-js-attr-local: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null | grep -a -c 'a block of blocks with no block in or out, built again whole' || true)
+echo "  JS-attr-local batch causes: kind=${acl_kind} (0) local=${acl_local} (0); block of blocks built again whole ${acl_whole} (1 or more); data-flag re-selected ${acl_flag} (1)"
+[ "$acl_kind" -eq 0 ] && [ "$acl_local" -eq 0 ] && [ "${acl_whole:-0}" -ge 1 ] && [ "${acl_flag:-0}" -ge 1 ] || o2_bad="$o2_bad js-attr-local-batchcause"
 # Patch 316 (doc 23 stage 1): the sheet census. Each committed full
 # reconvert of a nodeless batch logs which stylesheet entries marked it
 # ("LIFE SHEETCAUSE sheets=N", synchronous, inside the page's window).
