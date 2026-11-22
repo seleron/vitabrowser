@@ -1,0 +1,198 @@
+# netsurf: a sheet change while a sheet is in flight is answered against the cascade the boxes hold (patch 443)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 442)
+#
+# "sheet change: a sheet is still loading or changing" (3.3 a load on 5
+# sites, 442's census) took the full rebuild, mostly in synchronous flushes
+# (a script's layout read), which 442's wait cannot reach. But
+# html_css_refresh_selection_context refreshes c->select_ctx only once
+# every sheet has settled: a full rebuild in that window cascades the very
+# context the boxes were cascaded with, and computes the same styles.
+# google's case: an inline sheet done while another is in flight.
+#
+# A selection-context generation makes that checkable: rl_ctx_gen is
+# bumped (html_css_ctx_changed) at every change to c->select_ctx -- created,
+# refreshed, a sheet removed from it (re-processing, prune), swapped by
+# 415's no-op; a box build records the generation it started with
+# (rl_build_gen) and, done, the tree's (rl_boxes_gen) only if the context
+# did not change meanwhile; 415's no-op records it too; the inherited
+# colour path (fresh context) clears it. html_rl_doc_noop answers "sheet
+# change" with no rebuild when a sheet is unsettled, nothing was pruned
+# and rl_boxes_gen == rl_ctx_gen. The sheet in flight marks when it is
+# done, and that re-cascade sees every sheet. A removal or root change is
+# not answered this way (their own change is the point).
+#
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -189,6 +189,13 @@
+ 	struct html_stylesheet *stylesheets;
+ 	/**< Style selection context */
+ 	css_select_ctx *select_ctx;
++	/* VitaBrowser patch 443: the selection context's generation (bumped
++	 * at every change to select_ctx: html_css_ctx_changed), the one the
++	 * box build in progress started with, and the one the whole box tree
++	 * was last cascaded with (0 = none known) */
++	unsigned int rl_ctx_gen;
++	unsigned int rl_build_gen;
++	unsigned int rl_boxes_gen;
+ 	/**< Style selection media specification */
+ 	css_media media;
+ 	/** CSS length conversion context for document. */
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -184,4 +184,7 @@
+  * field and the SHEETREACHCENSUS reason counters). */
+ const char *html_css_reach_reason_name(int reason);
+ 
++/* VitaBrowser patch 443: c->select_ctx changed (css.c) */
++void html_css_ctx_changed(struct html_content *c);
++
+ #endif
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -67,6 +67,15 @@
+  * answer locally), >1 = sheet-multi, 0 = the nodeless mark came from
+  * somewhere other than a sheet. Instrumentation only: marks and
+  * reconverts are unchanged. */
++/* VitaBrowser patch 443: c->select_ctx changed -- a new generation. The
++ * box tree's recorded generation (rl_boxes_gen) no longer matches until a
++ * whole-tree cascade with this context records it. 0 is never used. */
++void html_css_ctx_changed(html_content *c)
++{
++	if (++c->rl_ctx_gen == 0)
++		c->rl_ctx_gen = 1;
++}
++
+ static void html_css_census_note(html_content *c, unsigned int i)
+ {
+ 	if (i < c->stylesheet_count)
+@@ -195,6 +204,7 @@
+ 		return;
+ 	css_select_ctx_destroy(c->select_ctx);
+ 	c->select_ctx = fresh;
++	html_css_ctx_changed(c);	/* patch 443 */
+ }
+ 
+ /* VitaBrowser patch 266: a sheet that finished while the page had no
+@@ -532,6 +542,7 @@
+ 					if (old != NULL)
+ 						(void)css_select_ctx_remove_sheet(
+ 							c->select_ctx, old);
++					html_css_ctx_changed(c); /* 443 */
+ 				}
+ 				break;
+ 			default:
+@@ -928,6 +939,7 @@
+ 					if (old != NULL)
+ 						(void)css_select_ctx_remove_sheet(
+ 							c->select_ctx, old);
++					html_css_ctx_changed(c); /* 443 */
+ 				}
+ 				hlcache_handle_release(hsheet->sheet);
+ 				hsheet->sheet = NULL;
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -407,6 +407,11 @@
+ 
+ 	NSLOG(netsurf, INFO, "DOM to box conversion complete (content %p)", c);
+ 	macsurf_debug_log_writef("fc: box_convert_done entered (success=%d)", (int)success);
++	/* patch 443: a whole tree built with one context generation (the
++	 * first conversion's slices can meet a sheet refresh: then unknown) */
++	c->rl_boxes_gen = (success && c->rl_build_gen != 0 &&
++			   c->rl_build_gen == c->rl_ctx_gen) ?
++			c->rl_ctx_gen : 0;
+ 	/* fixes848 (#167 perf investigation) - WORK-prefixed pipeline
+ 	 * checkpoint. A hardware log against a heavy Facebook page showed
+ 	 * NAV: content_ready fire and then nothing at all until the app
+@@ -1738,6 +1743,7 @@
+ 		content_set_error(&htmlc->base);
+ 		return;
+ 	}
++	html_css_ctx_changed(htmlc);	/* patch 443 */
+ 
+ 
+ 	/* fixes881 (Phase 0.7) - the `load` fire that used to sit HERE is gone.
+@@ -1780,6 +1786,7 @@
+ 			"WORK pipeline: dom_to_box START c=%p url=%s",
+ 			(void *) htmlc,
+ 			nsurl_access(content_get_url((struct content *) htmlc)));
++	htmlc->rl_build_gen = htmlc->rl_ctx_gen;	/* patch 443 */
+ 	error = dom_to_box(html, htmlc, html_box_convert_done, &htmlc->box_conversion_context);
+ 	macsurf_debug_log_writef("fc: dom_to_box returned err=%d", (int)error);
+ 	if (error != NSERROR_OK) {
+@@ -4340,6 +4347,10 @@
+ 	}
+ 	if (candidate_select_ctx != NULL)
+ 		css_select_ctx_destroy(candidate_select_ctx);
++	/* patch 443: committed styles came from a fresh context, not
++	 * c->select_ctx -- the tree's generation is unknown */
++	if (ok)
++		c->rl_boxes_gen = 0;
+ 	free(candidate);
+ 	free(stack);
+ 	return ok ? 0 : -1;
+@@ -4510,6 +4521,10 @@
+ 	content_status saved_status;
+ 
+ 	c->box_conversion_context = NULL;
++	/* patch 443: a whole tree built with one context generation */
++	c->rl_boxes_gen = (success && c->rl_build_gen != 0 &&
++			   c->rl_build_gen == c->rl_ctx_gen) ?
++			c->rl_ctx_gen : 0;
+ 	/* fixes895 - the box build finished (or failed); this brackets the dark
+ 	 * async span. A crash BEFORE this line was in dom_to_box; a crash AFTER it
+ 	 * is in free_old / imagemap / reformat / first-paint. */
+@@ -4872,6 +4887,8 @@
+ 	    c->base.active == 0 &&
+ 	    content__get_status(&c->base) != CONTENT_STATUS_LOADING) {
+ 		error = html_css_new_selection_context(c, &c->select_ctx);
++		if (error == NSERROR_OK)
++			html_css_ctx_changed(c);	/* patch 443 */
+ 		if (error != NSERROR_OK) {
+ 			/* creation failed (OOM etc.) - same transient defer as
+ 			 * every other precondition; the debounced retry tries
+@@ -5155,6 +5172,7 @@
+ 		} else
+ #endif
+ 		{
++			c->rl_build_gen = c->rl_ctx_gen;	/* patch 443 */
+ 			error = dom_to_box(html, c, html_reconvert_done,
+ 					&c->box_conversion_context);
+ 		}
+@@ -9063,6 +9081,25 @@
+ 			macsurf_debug_log_writef("LIFE rebuild local: %s: %d "
+ 				"detached sheet(s) pruned first", what, pruned);
+ 		if (!html_rl_sheets_settled(c)) {
++			/* Patch 443: c->select_ctx is refreshed only when every
++			 * sheet has settled (html_css_refresh_selection_context),
++			 * so a full rebuild now cascades the very context the
++			 * boxes were cascaded with -- when nothing was pruned
++			 * (a prune changes it) and the tree holds this context's
++			 * generation (rl_boxes_gen): the same styles. The sheet
++			 * still in flight marks when it is done; that re-cascade
++			 * sees it all. Not for a removal or the root (their own
++			 * changes are the point). */
++			if (pruned == 0 && strcmp(what, "sheet change") == 0 &&
++			    c->rl_boxes_gen != 0 &&
++			    c->rl_boxes_gen == c->rl_ctx_gen) {
++				macsurf_debug_log_writef("LIFE rebuild local: %s: "
++					"a sheet is still loading or changing, "
++					"the boxes hold the current cascade -- "
++					"nothing to rebuild until it settles",
++					what);
++				return 0;
++			}
+ 			why = "a sheet is still loading or changing";
+ 			html_rl_unsettled = 1;	/* patch 442 */
+ 		}
+@@ -9231,6 +9268,10 @@
+ 	}
+ 	css_select_ctx_destroy(c->select_ctx);
+ 	c->select_ctx = ctx;
++	/* patch 443: every element was re-cascaded with the new context and
++	 * kept its style -- the tree holds this generation */
++	html_css_ctx_changed(c);
++	c->rl_boxes_gen = c->rl_ctx_gen;
+ 	html__redraw_a_box(c, c->layout);
+ 	noop_n++;
+ 	macsurf_debug_log_writef("LIFE rebuild local: %s restyles "

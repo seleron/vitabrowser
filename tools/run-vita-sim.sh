@@ -595,6 +595,8 @@ NET-js-sheet-inflight http://127.0.0.1:$HP/NET-js-sheet-inflight.html
 NET-css-sheet-inflight-ref http://127.0.0.1:$HP/CSS-sheet-inflight-ref.html
 NET-js-sheet-wait http://127.0.0.1:$HP/NET-js-sheet-wait.html
 NET-css-sheet-wait-ref http://127.0.0.1:$HP/CSS-sheet-wait-ref.html
+NET-js-sheet-gen http://127.0.0.1:$HP/NET-js-sheet-gen.html
+NET-css-sheet-gen-ref http://127.0.0.1:$HP/CSS-sheet-gen-ref.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -2185,6 +2187,18 @@ k442n=$(printf '%s\n' "$k442seg" | grep -c "sheet change restyles nothing" || tr
 k442f=$(printf '%s\n' "$k442seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  NET-js-sheet-wait: rows $k442r (0), batches waiting for a sheet ${k442w} (1 or more), sheet changes restyling nothing ${k442n} (1 or more), full rebuilds ${k442f} (0)"
 [ "$k442r" = 0 ] && [ "${k442w:-0}" -ge 1 ] && [ "${k442n:-0}" -ge 1 ] && [ "${k442f:-1}" -eq 0 ] || fail "sheet changes wait for a sheet in flight"
+# Patch 443: a sheet that lands while another is in flight (then a layout
+# read: the synchronous flush, which cannot wait) is answered with no
+# rebuild -- the selection context is refreshed only once every sheet has
+# settled, and the box tree holds its generation; before: "a sheet is still
+# loading or changing" and the full rebuild.
+k443r=$(fl_rows NET-js-sheet-gen NET-css-sheet-gen-ref)
+k443seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-sheet-gen: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k443n=$(printf '%s\n' "$k443seg" | grep -c "the boxes hold the current cascade -- nothing to rebuild until it settles" || true)
+k443d=$(printf '%s\n' "$k443seg" | grep -c "declined (a sheet is still loading or changing)" || true)
+k443f=$(printf '%s\n' "$k443seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  NET-js-sheet-gen: rows $k443r (0), sheet changes answered against the held cascade ${k443n} (1 or more), still-loading declines ${k443d} (0), full rebuilds ${k443f} (0)"
+[ "$k443r" = 0 ] && [ "${k443n:-0}" -ge 1 ] && [ "${k443d:-1}" -eq 0 ] && [ "${k443f:-1}" -eq 0 ] || fail "sheet changes while a sheet is in flight, against the held cascade"
 # Patch 433: an inert attribute (aria-*, data-*, role) on a form control's
 # box that is not a block rebuilds nothing.
 k433r=$(fl_rows JS-control-inert CSS-control-inert-ref)

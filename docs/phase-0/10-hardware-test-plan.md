@@ -14013,3 +14013,80 @@ No sudo.
    `aria-expanded` attributes, "page CSS needs conservative sibling
    check").
 5. The trigger of 441's unmeasured inline-block (wpblog, live).
+
+## Patch 443 (2026-11-22): a sheet change while a sheet is in flight is answered against the cascade the boxes hold
+
+**Problem.** "sheet change: a sheet is still loading or changing" was
+**3.3 a load** on google, bbc, oldreddit, youtube and github (442's
+census). Most of it came in **synchronous flushes** (a script's layout
+read), which 442's wait cannot reach.
+- But `html_css_refresh_selection_context` refreshes `c->select_ctx` only
+  once every sheet has settled. So a full rebuild in that window cascades
+  the very context the boxes were cascaded with: the same styles, at the
+  cost of a whole rebuild.
+- google's real case: an inline sheet (`x-ns-css`) is done while another
+  is still in flight; its mark arrives with the context unrefreshed.
+
+**Fix** (css.c, css.h, private.h, html.c). A selection-context generation
+makes "the boxes hold the current context" checkable.
+- **`rl_ctx_gen`** is bumped (`html_css_ctx_changed`) at every change to
+  `c->select_ctx`:
+  - created (finish_conversion, the reconvert's lazy create);
+  - refreshed;
+  - a sheet removed from it (re-processing a changed sheet, unit 387's
+    prune);
+  - swapped by 415's whole-document no-op.
+- **`rl_build_gen` / `rl_boxes_gen`:** a box build records the generation
+  it started with. When done, it records the tree's generation only if
+  the context did not change meanwhile; otherwise the tree is unknown (0).
+  - The first conversion's slices can meet a sheet refresh, which leaves
+    the tree unknown.
+  - 415's no-op records it too: every element was re-cascaded with the
+    new context and kept its style.
+  - The inherited-colour path, which commits styles from a fresh
+    context, clears it.
+- **The answer:** `html_rl_doc_noop` answers a "sheet change" with no
+  rebuild when a sheet is unsettled, nothing was pruned, and
+  `rl_boxes_gen == rl_ctx_gen`. It logs `the boxes hold the current
+  cascade -- nothing to rebuild until it settles`.
+  - The sheet in flight marks when it is done, and that re-cascade sees
+    every sheet.
+  - A removal or a root change is not answered this way: their own change
+    is the point.
+  - A changed `<style>`'s text takes its old sheet out of the context,
+    which bumps the generation, so that batch still waits (442) or
+    rebuilds.
+
+**Gate.**
+- New pair **NET-js-sheet-gen / NET-css-sheet-gen-ref**. A `<link>` to a
+  slow sheet (1 s) stays. Inside that second a `<link>` to a fast sheet
+  lands, then a layout read (the synchronous flush), then a paragraph's
+  text changes. Neither sheet styles anything on the page.
+- Result: **rows 0, 1 sheet change answered against the held cascade, 0
+  still-loading declines, 0 full rebuilds**. The 442 binary on the same
+  page: the still-loading decline and a full rebuild (BATCHCAUSE nonode).
+- A first version of the page added a `<style>` instead. It produced no
+  sheet batch inside the slow sheet's second, so it missed the case; the
+  census's google shape (a sheet done while another is in flight) is what
+  the page now does.
+
+**Census** (442 vs 443, 3 loads per arm; google, bbc, oldreddit, youtube,
+github):
+- The new answer ran 3 times (google, each just after `done stylesheet
+  slot 57 'x-ns-css:89'`).
+- "sheet change: still loading" **3.3 -> 1.7** a load; "sheet removal:
+  still loading" 1.7 -> 1.0.
+- Total **24.7 vs 23.7** (google 6.3 -> 5.7, oldreddit 5.3 -> 5.0), inside
+  the noise but in the expected direction.
+- No crash or assertion in 30 loads.
+- **gate443 exit 0**: restaged from pristine (525 applied plus the 2
+  known collisions), stack through 443. NET-js-sheet-gen as above;
+  NET-js-sheet-wait and NET-js-sheet-inflight are unchanged.
+
+No sudo.
+
+**Next** (after 443): "sheet change / removal: an element's style changes"
+(re-cascade in place: restyle only the changed elements), "removal would
+join two lines" (bbc), the sibling-selector family (github, wpnews,
+wpblog), the trigger of 441's unmeasured inline-block. ASan has not been
+rerun since 441: 442 and 443 change the flush and the cascade bookkeeping.
