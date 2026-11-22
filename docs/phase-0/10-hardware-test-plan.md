@@ -13526,3 +13526,31 @@ missing, status -1`): text 0, score 36.8 instead of 62 (428).
   change in the tree.
 
 No sudo.
+
+## Patch 436 (2026-11-22): a sheet mark counts a sheet in flight as loading
+
+**Problem** (open item 3 of the closed run, found in 432).
+- `html_css_mark_sheets` (patch 318) gives a sheet mark one sheet's
+  identity only when no other entry is still loading.
+- It took `CONTENT_STATUS_ERROR` as settled. But `content_get_status()`
+  answers ERROR for a handle whose content does not exist yet, i.e. a
+  fetch in flight.
+- A sheet that really failed has no handle left: the callback's
+  `CONTENT_MSG_ERROR` case releases it and NULLs `s->sheet`.
+- So a mark could carry a single identity while another sheet was still
+  to mark into the same window.
+
+**Fix** (css.c):
+- Any status but DONE counts as loading.
+- An **unused** entry (pruned in flight, unit 389) is out of the cascade
+  and is not waited for, as in 432's settle check.
+
+**Effect.** The identity feeds only the census lines (`LIFE SHEETID` /
+`SHEETREACH`, patches 318/321). Rebuilds are unchanged, so there is no new
+gate page; the existing sheet pages (NET-js-sheet-inflight,
+NET-js-link-detach, JS-sheet-*) must stay as they were.
+
+**Gate.** **gate436 exit 0**: restaged from pristine (518 applied plus
+the 2 known collisions), stack through 436.
+
+No sudo.
