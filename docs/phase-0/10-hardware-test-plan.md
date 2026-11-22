@@ -13868,3 +13868,60 @@ block's DOM children:
   check.
 
 No sudo.
+
+## Patch 441 (2026-11-22): an inline-block that reaches line layout unmeasured is measured there (wpblog's intermittent layout_line abort)
+
+**Problem.** 440's census showed wpblog aborting:
+`layout.c:4975: layout_line: Assertion 'b->width != UNKNOWN_WIDTH'`.
+- **It predates this session.** A bisect of 4 loads per binary aborted on
+  434 2/4, 437 2/4, 438 1/4, 439 2/4 and 440 4/4. The r148 scorecard
+  loaded wpblog cleanly hours earlier, so the trigger is live content.
+- **Where it fires:** after the scorecard's text eval, after wpblog's o2
+  live-update poll (`admin-ajax.php?action=o2_read&method=poll`, an XHR)
+  delivers and a local rebuild lays the page out. The last log line is
+  always a `data:` SVG image fetch.
+- **gdb** (reproduced on the first or second try):
+  - The box is a `BOX_INLINE_BLOCK` with `max_width` UNKNOWN, in an
+    inline container also unmeasured, under a block whose min/max are
+    cached (1494). So the min/max pass never went down to it.
+  - Pass 1 of `layout_line` calls `layout_float` for an inline-block only
+    when its `max_width` is known, so its width stayed `UNKNOWN_WIDTH` into
+    pass 2, which asserts.
+- **Probes** (scratch only): no such box exists at the end of a local
+  rebuild, nor at the start of any reformat, in crashing loads. The
+  unmeasured box appears during the layout itself.
+  - `html_object_done`'s invalidation walks to the root, so it is not
+    the source on its own.
+  - **The trigger is not identified.**
+
+**Fix** (layout.c). Pass 1 now measures such a box, as
+`layout_minmax_line` would have (`layout_minmax_block`), before
+`layout_float`. It logs `LIFE layout: an inline-block with no min/max
+widths, measured in line layout`, so the census shows when it happens.
+The line's widths are right for this layout; any ancestor's shrink-to-fit
+width computed before it may be one layout stale.
+
+**Evidence.**
+- While the trigger was live (same run, 6 loads per arm): **unfixed 2 / 6
+  aborted, fixed 0 / 6**, the new line logged once.
+- Later runs (10 fixed loads; 6 + 6 A/B) met no trigger: no abort in
+  either arm, the line never logged.
+- No gate page: the trigger needs wpblog's live poll.
+- **gate441 exit 0**: restaged from pristine (523 applied plus the 2
+  known collisions), stack through 441. The new line logged 0 times in the
+  gate's 330 pages, so the guard changes nothing the gate can see.
+
+No sudo.
+
+### Checkpoint (2026-11-22, later): units 440-441
+
+- **440** (916121e) and **441** landed, each gated before its commit.
+- **Census after 440** (7 sites): the top local declines left are
+  "detached stylesheet pruned" (~4 a load; oldreddit, bbc, google), the
+  sheet-change declines ("an element's style changes" / "a sheet is still
+  loading or changing", ~4-5) and "removal would join two lines" (~2.7).
+- **Open:** the trigger of 441's unmeasured inline-block (wpblog, live).
+  The next time the new LIFE line shows in a census, probe there: log the
+  box's element and the operation that built it.
+- ASan has not been rerun since 439. 440 and 441 change box rebuilding
+  and layout, so run the sweep and asan-autotest before the next hand-off.
