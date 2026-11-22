@@ -489,8 +489,11 @@ static void write_png(const char *path, const uint32_t *px)
 /* The whole run's poll budget (~16 ms a poll), not a page's: the autotest
  * never advances `page`. 20000 (~5 min) held the ~260 s autotest until
  * patch 205 made each network page's bottom dump wait
- * VITA_SETTLE_EXTRA_MS; run-vita-sim.sh's `timeout 900` still bounds it. */
-#define MAX_POLLS 60000
+ * VITA_SETTLE_EXTRA_MS; run-vita-sim.sh's `timeout 900` still bounds it.
+ * 2026-11-22 (patch 437's gate): 60000 polls ran out at ~944 s, 5 pages
+ * short of the 328-line main autotest; 75000 (~1180 s) stays inside the
+ * main run's `timeout 1200`. */
+#define MAX_POLLS 75000
 
 
 /* ---- VITA_SIM_SCRIPT: a scripted session ------------------------------

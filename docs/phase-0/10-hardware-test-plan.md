@@ -13554,3 +13554,62 @@ NET-js-link-detach, JS-sheet-*) must stay as they were.
 the 2 known collisions), stack through 436.
 
 No sudo.
+
+## Patch 437 (2026-11-22): a conversion walk whose subtree a script removed stops cleanly (guardian's box_add_child assert)
+
+**Problem** (open item 4: guardian's one `box_add_child: Assertion
+'parent'` abort during its first conversion, 428).
+- **Not reproduced on guardian:** 12 more census loads (unit 435a) were
+  all clean.
+- **Reproduced by reading the walk:** the first box conversion builds 100
+  nodes a slice, and the main loop runs the page's timers between slices
+  (a reconvert runs whole, but a cold load does not).
+  - A script that removes the subtree the walk is inside leaves the walk
+    reading nodes whose parent chain ends at a parentless node, with no
+    box above them: **no containing block**.
+  - That is a NULL dereference in `box_construct_element`
+    (`props.containing_block->type`).
+  - It is also the containing-block assert in `box_construct_text`, and
+    `box_add_child`'s `parent` assert when an inline closes outside the
+    document (guardian's abort).
+  - On the climb it is `next_node`'s `parent != NULL` assert.
+- **Test page JS-detach-convert:** 300 `<span>`s, each holding 60 inline
+  children, and a 1 ms interval that removes five spans a tick.
+  - The 434 binary **segfaults on every load** (gdb:
+    box_construct.c:1526, `containing_block = 0x0`, an inline `<b>` in a
+    removed span).
+  - The race fired on 8 of 8 direct loads, at both one and five removals
+    a tick.
+
+**Fix** (box_construct.c). Where the walk should go on in the document is
+lost with the subtree, so the walk stops:
+- **The node builds nothing.** `box_construct_note_detached` sets
+  `ctx->walk_detached` and logs `LIFE box: conversion walk left the
+  document (element|text|inline end|climb)` once.
+- **The walk goes no further.** `next_node` returns NULL from then on, and
+  on a parentless node short of the root.
+- **An inline closing outside the document** puts its INLINE_END in the
+  line its box opened in.
+- **At completion**, `box_construct_close_inlines` gives every inline the
+  walk left open its INLINE_END, so the tree laid out until the rebuild is
+  whole. It skips an inline with no DOM children, which never gets one.
+- **A nodeless mark** (`macos9_js_mark_dom_dirty`) asks for the full
+  rebuild, which runs once the content is READY.
+
+**Gate.**
+- New pair **JS-detach-convert / CSS-detach-convert-ref** (the same DOM,
+  written statically): **rows 0, walks stopped outside the document 1**.
+  - The log shows the stop, then BATCHCAUSE nonode, the full rebuild.
+  - The page ends `detach removed 300`, and the paragraph after the spans
+    (never walked by the stopped walk) renders.
+- **Gate harness fix.** The first gate437 failed with exit 4: `vitasim:
+  timed out on page 0` at 944 s, on page 323 of 328.
+  - That was vitasim's **run-wide poll budget** (`MAX_POLLS 60000`, ~16
+    ms a poll), not this page: the new pair took ~17 s, as any pair does.
+  - The main autotest had been running close to that budget.
+  - `MAX_POLLS` is now **75000** (~1180 s), inside the main run's `timeout
+    1200`. This is a tools change only.
+- **gate437b exit 0**: restaged from pristine (519 applied plus the 2
+  known collisions), stack through 437.
+
+No sudo.

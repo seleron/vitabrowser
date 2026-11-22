@@ -1,0 +1,231 @@
+# netsurf: a conversion walk whose subtree a script removed stops cleanly (patch 437)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 436)
+#
+# The first box conversion builds 100 nodes a slice and the main loop runs
+# the page's timers between slices. A script that removes the subtree the
+# walk is inside left it reading nodes whose parent chain ends at a
+# parentless node, with no box above: no containing block. That was a NULL
+# dereference in box_construct_element (props.containing_block->type), the
+# containing-block assert in box_construct_text, box_add_child's `parent`
+# assert at an inline's close (guardian's one abort, 428) and next_node's
+# `parent != NULL` on the climb.
+#
+# Where the walk should go on is lost with the subtree, so the walk stops:
+# the node builds nothing (box_construct_note_detached sets
+# ctx->walk_detached and logs once), next_node returns NULL from then on,
+# an inline closing outside the document puts its INLINE_END in the line
+# its box opened in, and at completion box_construct_close_inlines gives
+# every inline the walk left open its INLINE_END, so the tree laid out
+# until the rebuild is whole. A nodeless mark (macos9_js_mark_dom_dirty)
+# asks for the full rebuild, which runs once the content is READY.
+#
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -209,6 +209,11 @@
+ 	 * list to choose which pair of opening/closing strings to emit
+ 	 * for the current nesting level. */
+ 	int32_t quote_depth;
++
++	/** VitaBrowser patch 437: a script removed the subtree the walk was
++	 * in between two of the first conversion's 100-node slices. The
++	 * walk stops there (box_construct_detached). */
++	bool walk_detached;
+ };
+ 
+ /**
+@@ -395,6 +400,72 @@
+ }
+ 
+ 
++#ifdef WITH_QUICKJS
++/* javascript/quickjs/macos9_reconvert.c: "something changed, no idea
++ * what" -- the full rebuild, once the content is READY */
++extern void macos9_js_mark_dom_dirty(struct content *c);
++#endif
++
++/**
++ * VitaBrowser patch 437: the walk met a node no longer in the document.
++ *
++ * The first conversion builds 100 nodes a slice; between slices the main
++ * loop runs the page's timers, and a script may remove the subtree the
++ * walk is inside. The walk then reads a node whose parent chain ends at a
++ * parentless node, with no box above it: no containing block, which was
++ * a NULL dereference (box_construct_element), an assert in
++ * box_construct_text, box_add_child's `parent` assert at an inline's
++ * close (guardian, 428) or next_node's `parent != NULL`. Where the walk
++ * should go on in the document is lost with the subtree, so it stops:
++ * convert_xml_to_box_inner completes the tree as it stands
++ * (box_construct_close_inlines) and asks for a full rebuild.
++ */
++static void box_construct_note_detached(struct box_construct_ctx *ctx,
++		const char *where)
++{
++	if (ctx->walk_detached)
++		return;
++	ctx->walk_detached = true;
++	macsurf_debug_log_writef("LIFE box: conversion walk left the "
++		"document (%s): the walk stops, a full rebuild follows", where);
++}
++
++/**
++ * Patch 437: give every inline box the walk opened but never closed its
++ * INLINE_END, at the end of the line it opened in, as
++ * box_construct_element_after would have (an inline with children it
++ * converted: CONVERT_CHILDREN), so the tree laid out until the rebuild is
++ * whole.
++ */
++static void box_construct_close_inlines(struct box_construct_ctx *ctx,
++		struct box *b)
++{
++	struct box *c;
++
++	for (c = b->children; c != NULL; c = c->next) {
++		bool kids = false;
++
++		if (c->type == BOX_INLINE && c->inline_end == NULL &&
++		    (c->flags & CONVERT_CHILDREN) && c->parent != NULL &&
++		    c->node != NULL &&
++		    dom_node_has_child_nodes(c->node, &kids) == DOM_NO_ERR &&
++		    kids) {
++			struct box *end = box_create(NULL, c->style, false,
++					c->href, c->target, c->title,
++					c->id == NULL ? NULL :
++					lwc_string_ref(c->id), ctx->bctx);
++			if (end != NULL) {
++				end->type = BOX_INLINE_END;
++				box_add_child(c->parent, end);
++				c->inline_end = end;
++				end->inline_end = c;
++			}
++		}
++		box_construct_close_inlines(ctx, c);
++	}
++}
++
++
+ /**
+  * Get the style for an element.
+  *
+@@ -1379,6 +1450,15 @@
+ 
+ 	box_extract_properties(ctx->n, &props);
+ 
++	/* Patch 437: no box above the node, up to a node with no parent --
++	 * it is no longer in the document (a script removed it, or an
++	 * ancestor, between two slices of the walk). Build nothing. */
++	if (props.node_is_root == false && props.containing_block == NULL) {
++		box_construct_note_detached(ctx, "element");
++		*convert_children = false;
++		return true;
++	}
++
+ 	if (props.containing_block != NULL) {
+ 		/* In case the containing block is a pre block, we clear
+ 		 * the PRE_STRIP flag since it is not used if we follow
+@@ -1931,6 +2011,17 @@
+ 				box->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
+ 		}
+ 
++		/* Patch 437: the element left the document while its children
++		 * were built (no containing block above it now): its
++		 * INLINE_END goes in the line its box opened in. */
++		if (props.inline_container == NULL &&
++		    props.containing_block == NULL) {
++			box_construct_note_detached(ctx, "inline end");
++			if (box->parent == NULL)
++				return;
++			props.inline_container = box->parent;
++		}
++
+ 		if (props.inline_container == NULL) {
+ 			/* Create inline container if we don't have one */
+ 			props.inline_container = box_create(NULL, NULL, false,
+@@ -1987,6 +2078,12 @@
+ 	bool has_children;
+ 	dom_exception err;
+ 
++	/* Patch 437: a walk that left the document goes no further */
++	if (ctx->walk_detached) {
++		dom_node_unref(n);
++		return NULL;
++	}
++
+ 	err = dom_node_has_child_nodes(n, &has_children);
+ 	if (err != DOM_NO_ERR) {
+ 		dom_node_unref(n);
+@@ -2025,7 +2122,14 @@
+ 					return NULL;
+ 				}
+ 
+-				assert(parent != NULL);
++				/* Patch 437: a parentless node short of the
++				 * root -- the walk left the document */
++				if (parent == NULL) {
++					box_construct_note_detached(ctx,
++						"climb");
++					dom_node_unref(n);
++					return NULL;
++				}
+ 
+ 				err = dom_node_get_next_sibling(parent,
+ 						&parent_next);
+@@ -2060,7 +2164,14 @@
+ 					return NULL;
+ 				}
+ 
+-				assert(parent != NULL);
++				/* Patch 437: a parentless node short of the
++				 * root -- the walk left the document */
++				if (parent == NULL) {
++					box_construct_note_detached(ctx,
++						"climb");
++					dom_node_unref(n);
++					return NULL;
++				}
+ 
+ 				err = dom_node_get_next_sibling(parent, &next);
+ 				if (err != DOM_NO_ERR) {
+@@ -2140,7 +2251,12 @@
+ 
+ 	box_extract_properties(ctx->n, &props);
+ 
+-	assert(props.containing_block != NULL);
++	/* Patch 437: as in box_construct_element -- a text node no longer
++	 * in the document (it was the assert below) builds nothing. */
++	if (props.containing_block == NULL) {
++		box_construct_note_detached(ctx, "text");
++		return true;
++	}
+ 
+ 	err = dom_characterdata_get_data(ctx->n, &content);
+ 	if (err != DOM_NO_ERR || content == NULL)
+@@ -2864,6 +2980,20 @@
+ 			/* Conversion complete */
+ 			struct box root;
+ 
++			/* Patch 437: the walk left the document and stopped:
++			 * close the inlines it left open, and rebuild the
++			 * page whole once it is READY (the rest of the
++			 * document was never walked). */
++			if (ctx->walk_detached) {
++				if (ctx->root_box != NULL)
++					box_construct_close_inlines(ctx,
++							ctx->root_box);
++#ifdef WITH_QUICKJS
++				macos9_js_mark_dom_dirty(
++					(struct content *)ctx->content);
++#endif
++			}
++
+ 			memset(&root, 0, sizeof(root));
+ 
+ 			root.type = BOX_BLOCK;
+@@ -3223,6 +3353,7 @@
+ 	ctx->bctx = c->bctx;
+ 	ctx->counters = NULL;	/* fixes134b: empty counter table */
+ 	ctx->quote_depth = 0;	/* fixes140a: quote nesting starts at 0 */
++	ctx->walk_detached = false;	/* patch 437 */
+ 
+ 	*box_conversion_context = ctx;
+ 

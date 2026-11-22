@@ -408,6 +408,8 @@ JS-control-inert file:///app0:/testpages/JS-control-inert.html
 CSS-control-inert-ref file:///app0:/testpages/CSS-control-inert-ref.html
 JS-block-whole file:///app0:/testpages/JS-block-whole.html
 CSS-block-whole-ref file:///app0:/testpages/CSS-block-whole-ref.html
+JS-detach-convert file:///app0:/testpages/JS-detach-convert.html
+CSS-detach-convert-ref file:///app0:/testpages/CSS-detach-convert-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2183,6 +2185,18 @@ k434d=$(printf '%s\n' "$k434seg" | grep -c "declined (block is not one line cont
 k434f=$(printf '%s\n' "$k434seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-block-whole: rows $k434r (0), blocks built again whole ${k434w} (2 or more), one-line declines ${k434d} (0), full rebuilds after a decline ${k434f} (0)"
 [ "$k434r" = 0 ] && [ "${k434w:-0}" -ge 2 ] && [ "${k434d:-1}" -eq 0 ] && [ "${k434f:-1}" -eq 0 ] || fail "blocks that are not one line of plain content built again whole"
+# Patch 437: a script removes inline subtrees while the first box
+# conversion walks them (the page's timers run between its 100-node
+# slices). The walk stops where it left the document (before: a NULL
+# dereference, or guardian's box_add_child 'parent' assert), closes the
+# inlines it left open and asks for a full rebuild; the page renders row
+# for row as the same DOM written statically. The race fired on 8 of 8
+# direct loads; the 434 binary segfaults on this page.
+k437r=$(fl_rows JS-detach-convert CSS-detach-convert-ref)
+k437seg=$(awk '/ page [0-9]+\/[0-9]+ JS-detach-convert: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k437s=$(printf '%s\n' "$k437seg" | grep -c "LIFE box: conversion walk left the document" || true)
+echo "  JS-detach-convert: rows $k437r (0), walks stopped outside the document ${k437s} (1 or more)"
+[ "$k437r" = 0 ] && [ "${k437s:-0}" -ge 1 ] || fail "a conversion walk whose subtree a script removed"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
