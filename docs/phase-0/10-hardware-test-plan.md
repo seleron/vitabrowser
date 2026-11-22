@@ -14219,10 +14219,58 @@ No sudo.
 4. Make NET-js-sheet-gen robust to ASan timing (a longer slow delay).
 5. The trigger of 441's unmeasured inline-block.
 
+## Patch 446 (2026-11-22, after the run close): a sibling rule that could see a child-list change rebuilds the parent block
+
+Shelved ungated at the run close, then gated and landed on the owner's
+request.
+
+**Problem.** Patch 198's check (`html_rl_block_sibling_risk`) declined an
+insert or removal into the full rebuild: "sibling combinator may restyle
+on insert/remove" and "sibling combinator may see an element with no box"
+(wpblog, ~1 a load each on the 7 census sites).
+
+**Fix** (html.c).
+- A `+` / `~` rule that could see the change reaches only the parent's
+  children and their descendants. `:has()` never matches here (patch
+  328). This is 445's argument, for an attribute, applied to child lists.
+- So the parent block is built again whole: 440's `html_rl_block_whole`,
+  with its `:empty` check.
+- `RL_BSIB` records the reason and leaves through `decline:`, which
+  releases what the walk holds. Only when the parent cannot be rebuilt
+  that way is the decline logged. A flex box's child list takes 439's
+  fallback.
+
+**Gate.** No new page; five existing checks asserted the old declines and
+now assert the parent rebuild.
+- 412's style-sib-risk block insert: 1 parent rebuild.
+- 413's JS-sib-universal `.a` insert: 1 parent rebuild.
+- 381's JS-sib-tail: the first insertion is a parent rebuild; the
+  `:empty` fill still declines.
+- 405's JS-struct-hits "+" case (`.item:first-child + .item`): 1 parent
+  rebuild, its frame handed over (428).
+- 198's NET-js-block-sibling-insert: **SIBINS 4/4 passed** (the page
+  checks the siblings' computed colours), 4 parent rebuilds, 0 full
+  rebuilds, against the 445 binary's 4 full rebuilds.
+- All rows 0.
+- **gate446 failed only on 405's check.** It asserted the "+" case
+  declines; it is now answered, with rows 0.
+- **gate446b exit 0**: restaged from pristine (528 applied plus the 2
+  known collisions), stack through 446.
+
+**Census** (445 vs 446, 3 loads per arm, 7 sites):
+- "sibling combinator may restyle on insert/remove" **1.0 -> 0** a load;
+  the parent rebuild ran 6 times.
+- "may see an element with no box" stays at 1.0: its parent is not
+  rebuilt that way (open: find out why).
+- Total 28.0 vs 28.7 (noise). No crash in 42 loads.
+- **Not ASan-checked** (ASan ran through 445).
+
+No sudo.
+
 ### Run closed (2026-11-22)
 
-By the owner's directive, the run closes after patch 445. Patch 446 is
-shelved ungated (open item 1).
+By the owner's directive, the run closes after patch 445. Patch 446 was
+shelved ungated, then gated and landed on request (its entry is above).
 
 **This run's units:** 435a, 435-445. Each was restaged from pristine and
 gated before its commit, and all are pushed.
@@ -14307,15 +14355,9 @@ gated before its commit, and all are pushed.
   still the last hand-off).
 
 **Open items and recommended next steps:**
-1. **Patch 446 WIP, shelved ungated:**
-   `~/vitabrowser-work/wip-446-childlist-sibling-parent/`. It does for
-   child-list sibling declines what 445 does for attributes; it has a
-   README, diff, gate-check diff and census.
-   - Page A/B all rows 0: NET-js-block-sibling-insert SIBINS 4/4 with 4
-     parent rebuilds and 0 full rebuilds (445: 4 full).
-   - Census: "restyle on insert/remove" 1.0 -> 0; "may see an element
-     with no box" 1.0 stays (find why its parent is not rebuilt).
-   - **Gate it first.**
+1. **Patch 446:** landed after the close (gate446b exit 0), not yet
+   ASan-checked. "may see an element with no box" (1.0 a load) is still
+   declined: find out why its parent is not rebuilt.
 2. **"an element's style changes"** (sheet change / removal / root
    change, ~4-5 a load: google, bbc, youtube, oldreddit), now the largest
    local group: re-cascade in place, restyling only the changed elements'

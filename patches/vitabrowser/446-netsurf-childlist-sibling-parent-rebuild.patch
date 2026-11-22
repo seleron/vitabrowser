@@ -1,0 +1,84 @@
+# netsurf: a sibling rule that could see a child-list change rebuilds the parent block (patch 446)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 445)
+#
+# "sibling combinator may restyle on insert/remove" and "sibling combinator
+# may see an element with no box" (patch 198's check, html_rl_block_sibling_
+# risk) declined an insert or removal into the full rebuild (wpblog). A + /
+# ~ rule that could see it reaches only the parent's children and their
+# descendants (:has() never matches here, patch 328), as 445 says for an
+# attribute: the parent block is built again whole (440's
+# html_rl_block_whole, with its :empty check). RL_BSIB records the reason and
+# leaves through decline:, which releases what the walk holds; only when
+# the parent cannot be rebuilt that way is the decline logged. A flex box's
+# child list takes 439's fallback.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9435,6 +9435,7 @@
+ 	bool full = false;
+ 	int delta, total = 0;
+ 	const char *why = NULL;
++	const char *sib_why = NULL;		/* patch 446 */
+ 	static unsigned long block_n;
+ 
+ /* patch 439: in 408's flex child-list mode a reason here is not a decline:
+@@ -9443,6 +9444,9 @@
+ 		"LIFE rebuild local: flex or grid child list not placed " \
+ 		"here (%s)" : "LIFE rebuild local: declined (%s)", (w)); \
+ 		goto decline; } while (0)
++/* patch 446: a sibling rule could see the change -- the parent is built
++ * again whole at decline: (logged there, as a decline only if it cannot) */
++#define RL_BSIB(w) do { sib_why = (w); goto decline; } while (0)
+ 
+ 	/* Patch 366: blocks in a table cell: the table lays the cell out
+ 	 * (its width, its row's height), so the page is laid out whole */
+@@ -9820,7 +9824,7 @@
+ 				html_rl_childlist_removal ? 1 : 0, true) :
+ 		    html_rl_block_sibling_risk(c, pnode, skipped, nskip,
+ 				NULL, 0, false))
+-			RL_BNO("sibling combinator may see an element with no "
++			RL_BSIB("sibling combinator may see an element with no "
+ 				"box");
+ 		for (i = 0; i < nskip; i++)
+ 			dom_node_unref(skipped[i]);
+@@ -9982,7 +9986,7 @@
+ 	}
+ 	if (html_rl_block_sibling_risk(c, pnode, added, nadd,
+ 			removed, nrem, sib_tail))
+-		RL_BNO("sibling combinator may restyle on insert/remove");
++		RL_BSIB("sibling combinator may restyle on insert/remove");
+ 
+ 	/* patch 404: every check passed but the structural one -- the
+ 	 * parent's subtree is built again instead of placing blocks */
+@@ -10296,10 +10300,29 @@
+ 	 * again whole, as boxed children do (438). Every reason here is
+ 	 * about placing boxes among its children, which that rebuild makes
+ 	 * afresh; its own :empty is html_rl_flex_whole's check. */
+-	if (html_rl_noop_only)
++	if (html_rl_noop_only) {
++		if (sib_why != NULL)
++			macsurf_debug_log_writef("LIFE rebuild local: flex or "
++				"grid child list not placed here (%s)", sib_why);
+ 		return html_rl_flex_whole(c, pnode, pbox, t0, "a flex or grid "
+ 			"box's child list the local path declined");
++	}
++	/* Patch 446: a + / ~ rule that could see the insert or removal (or a
++	 * box-less element among the children) reaches only the parent's
++	 * children and their descendants (:has() never matches, patch 328):
++	 * the parent block is built again whole (440), as 445 does for an
++	 * attribute (wpblog: 7 over three loads). */
++	if (sib_why != NULL) {
++		if (pbox->type == BOX_BLOCK && pbox->parent != NULL &&
++		    pbox->object == NULL && !HTML_RL_FRAME(pbox))
++			return html_rl_block_whole(c, pnode, pbox, t0,
++				"a sibling rule may see the child-list change: "
++				"the parent");
++		macsurf_debug_log_writef("LIFE rebuild local: declined (%s)",
++			sib_why);
++	}
+ 	return -1;
++#undef RL_BSIB
+ #undef RL_BNO
+ }
+ 

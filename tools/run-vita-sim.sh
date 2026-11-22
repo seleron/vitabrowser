@@ -1913,8 +1913,12 @@ k405d=$(printf '%s\n' "$k405seg" | grep -c "LIFE rebuild local: declined (" || t
 k406l=$(printf '%s\n' "$k405seg" | grep -c "restyled alone in [0-9]* us ([0-9]* so far), leaf boxes in place" || true)
 # Patch 406: the <iframe> under #c5 > :last-child is restyled in place,
 # and the quoted-attribute compound stays bounded (restyled alone).
-echo "  JS-struct-hits: rows differing from the parse-time build $k405r (0); matching siblings restyled alone ${k405n} (6 or more); leaf boxes restyled in place ${k406l} (1 or more); sibling-combinator case declined ${k405d} (1 or more)"
-[ "$k405r" = 0 ] && [ "${k405n:-0}" -ge 6 ] && [ "${k406l:-0}" -ge 1 ] && [ "${k405d:-0}" -ge 1 ] || fail "structural matches restyled alone"
+# Patch 446: the "+" case (an .item inserted first, .item:first-child +
+# .item) builds the parent again whole, its frame handed over (428),
+# instead of declining into the full rebuild.
+k405p=$(printf '%s\n' "$k405seg" | grep -c "a sibling rule may see the child-list change: the parent, built again whole" || true)
+echo "  JS-struct-hits: rows differing from the parse-time build $k405r (0); matching siblings restyled alone ${k405n} (6 or more); leaf boxes restyled in place ${k406l} (1 or more); sibling-combinator case: parent rebuilt ${k405p} (1 or more), declines ${k405d} (0)"
+[ "$k405r" = 0 ] && [ "${k405n:-0}" -ge 6 ] && [ "${k406l:-0}" -ge 1 ] && [ "${k405p:-0}" -ge 1 ] && [ "${k405d:-1}" -eq 0 ] || fail "structural matches restyled alone"
 # Patch 407: a leaf element (an image, an iframe, a form control) inserted
 # between blocks is built alone and given a line of its own; an image next
 # to inline text still takes the full rebuild. Row for row as the
@@ -1965,9 +1969,12 @@ k412r=$(fl_rows JS-sib-unreadable CSS-sib-unreadable-ref)
 k412seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-unreadable: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k412l=$(printf '%s\n' "$k412seg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
 k412d=$(printf '%s\n' "$k412seg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
-k412n=$(printf '%s\n' "$k409rseg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
-echo "  JS-sib-unreadable: rows $k412r (0), block changes local ${k412l} (3 or more), sibling declines ${k412d} (0); style-sib-risk block insert declined ${k412n} (1 or more)"
-[ "$k412r" = 0 ] && [ "${k412l:-0}" -ge 3 ] && [ "${k412d:-1}" -eq 0 ] && [ "${k412n:-0}" -ge 1 ] || fail "unreadable selectors without sibling syntax"
+# Patch 446: the style-sib-risk page's block insert (its sheet keeps an
+# unreadable "+" selector) builds the parent again whole instead
+k412n=$(printf '%s\n' "$k409rseg" | grep -c "child-list change: the parent, built again whole" || true)
+k412nd=$(printf '%s\n' "$k409rseg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
+echo "  JS-sib-unreadable: rows $k412r (0), block changes local ${k412l} (3 or more), sibling declines ${k412d} (0); style-sib-risk block insert: parent rebuilt ${k412n} (1 or more), declined ${k412nd} (0)"
+[ "$k412r" = 0 ] && [ "${k412l:-0}" -ge 3 ] && [ "${k412d:-1}" -eq 0 ] && [ "${k412n:-0}" -ge 1 ] && [ "${k412nd:-1}" -eq 0 ] || fail "unreadable selectors without sibling syntax"
 # Patch 413: a bare *, a comment before @font-face, a plain pseudo-class
 # in a left compound no longer make the sheet conservative -- the block
 # inserted into .u is placed locally -- while the .a inserted after the
@@ -1976,11 +1983,13 @@ k413r=$(fl_rows JS-sib-universal CSS-sib-universal-ref)
 k413seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-universal: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k413l=$(printf '%s\n' "$k413seg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
 k413d=$(printf '%s\n' "$k413seg" | grep -c "declined (sibling combinator may restyle on insert/remove)" || true)
+# Patch 446: the .a insert builds the parent again whole (was a decline)
+k413p=$(printf '%s\n' "$k413seg" | grep -c "child-list change: the parent, built again whole" || true)
 # (Patch 416: :has() never matches in this libcss, so .hb:has(> .hx) is
 # dropped from the sibling scan -- the .hx insert is placed locally now;
 # its border never showed, in the parse-time page either.)
-echo "  JS-sib-universal: rows $k413r (0), block changes local ${k413l} (2 or more), the .a insert declined ${k413d} (1)"
-[ "$k413r" = 0 ] && [ "${k413l:-0}" -ge 2 ] && [ "${k413d:-0}" -eq 1 ] || fail "universal, font-face comment, plain left pseudo, :has(> x)"
+echo "  JS-sib-universal: rows $k413r (0), block changes local ${k413l} (2 or more), the .a insert: parent rebuilt ${k413p} (1), declined ${k413d} (0)"
+[ "$k413r" = 0 ] && [ "${k413l:-0}" -ge 2 ] && [ "${k413p:-0}" -eq 1 ] && [ "${k413d:-1}" -eq 0 ] || fail "universal, font-face comment, plain left pseudo, :has(> x)"
 # Patch 414: class changes whose tokens no selector names restyle nothing
 # (<html>, <body>, a div: 4); .dark on <html>, .md\3a hide and a [class*=]
 # class still restyle -- those three are never answered as no-ops.
@@ -2303,7 +2312,9 @@ k381r=$(fl_rows JS-sib-tail CSS-sib-tail-ref)
 k381seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-tail: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k381t=$(printf '%s\n' "$k381seg" | grep -c "LIFE rebuild local: sibling check at the tail" || true)
 k381l=$(printf '%s\n' "$k381seg" | grep -c "LIFE rebuild local: blocks rebuilt\|LIFE rebuild local: child list changed only" || true)
-k381d=$(printf '%s\n' "$k381seg" | grep -c "declined (sibling combinator may restyle on insert/remove)\|declined (a sibling rule tests :empty)" || true)
+# Patch 446: the first insertion builds the parent again whole (it
+# declined); the :empty fill still declines -- both counted
+k381d=$(printf '%s\n' "$k381seg" | grep -c "declined (sibling combinator may restyle on insert/remove)\|declined (a sibling rule tests :empty)\|child-list change: the parent, built again whole" || true)
 echo "  JS-sib-tail: rows differing from the parse-time build $k381r (0); ${k381t} tail checks (3 or more), ${k381l} changes local (4 or more), ${k381d} declines (2 or more)"
 [ "$k381r" = 0 ] && [ "${k381t:-0}" -ge 3 ] && [ "${k381l:-0}" -ge 4 ] &&
 	[ "${k381d:-0}" -ge 2 ] || fail "sibling check at the tail"
@@ -2443,8 +2454,13 @@ echo "  JS-list-structural: ${lsr:-no summary}; ${lsd} structural/counter declin
 # path it would stay stale). The engine log must show the declines.
 sbp=$(ls "$R"/*NET-js-block-sibling-insert*.plot 2>/dev/null)
 sbr=$(sed -n 's/.*STR \(SIBINS: [0-9]*\/[0-9]* passed\).*/\1/p' $sbp 2>/dev/null | head -1)
-sbd=$(grep -c 'LIFE rebuild local: declined (sibling combinator may restyle on insert/remove)' "$R/netsurf.log" || true)
-echo "  JS-block-sibling-insert: ${sbr:-no summary}; ${sbd} insert/remove sibling declines"
+# Patch 446: those changes build the parent again whole now (the page's
+# own SIBINS assertions still check the siblings' computed colours);
+# sbd counts the parent rebuilds in the page's window, sbdd any decline
+sbd=$(awk '/ page [0-9]+\/[0-9]+ NET-js-block-sibling-insert: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c 'LIFE rebuild local: a sibling rule may see the child-list change: the parent, built again whole' || true)
+sbdd=$(grep -c 'LIFE rebuild local: declined (sibling combinator may restyle on insert/remove)' "$R/netsurf.log" || true)
+echo "  JS-block-sibling-insert: ${sbr:-no summary}; ${sbd} insert/remove sibling changes, parent built again whole (2 or more); ${sbdd} sibling declines anywhere"
 [ -n "$sbp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $sbp | sort -u | sed 's/^STR /  /'
 # :has() gaps (Patch 193): sibling-lead multi-part relative selectors match
 # descendants of following siblings; element.querySelectorAll(':scope')
