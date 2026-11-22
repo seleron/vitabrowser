@@ -13923,5 +13923,12 @@ No sudo.
 - **Open:** the trigger of 441's unmeasured inline-block (wpblog, live).
   The next time the new LIFE line shows in a census, probe there: log the
   box's element and the operation that built it.
-- ASan has not been rerun since 439. 440 and 441 change box rebuilding
-  and layout, so run the sweep and asan-autotest before the next hand-off.
+- **ASan through 441** (`tools/build-asan-sim.sh`, netsurf
+  instrumented):
+  - **sweep 21/21 clean**;
+  - **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 390 page
+    dumps (gate 390).
+  - In that run: the 437 walk stopped once; flex boxes built again whole
+    11 times; blocks of blocks built again whole (440) 11 times; head
+    changes answered 4 times; 441's guard logged 0 times (no gate page
+    triggers it).
