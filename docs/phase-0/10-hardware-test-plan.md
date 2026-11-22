@@ -13729,3 +13729,43 @@ local decline. A scratch-only probe logged each case over two loads each:
   JS-flex-own and JS-detach-convert are unchanged.
 
 No sudo.
+
+### Checkpoint (2026-11-22): units 435-439
+
+**Landed** (each restaged from pristine and gated before its commit, all
+pushed):
+- **435a + 435** (d1d4882): the multi-run census
+  (`tools/scorecard/census.py`), and the scorecard waiting for ready
+  (`ready` script command, `vitasim_page_ready`).
+- **436** (cae4da6): `html_css_mark_sheets` counts a sheet in flight
+  (ERROR status) as loading.
+- **437** (9de113c): a conversion walk whose subtree a script removed
+  stops cleanly. This was guardian's `box_add_child` assert; the 434
+  binary segfaults on the new gate page every load. It also raised the
+  gate harness's `MAX_POLLS` to 75000.
+- **438** (a622267): flex boxes and inline-blocks built again whole for
+  changes in their own content.
+- **439** (47ca7e4): new media and description-list blocks built alone;
+  flex child lists the local path cannot place build the box whole.
+
+**Census after 439** (3 loads per arm, 7 sites): the declines 438-439
+targeted are at 0. The total is flat within one run (as in 415-417, the
+batches end at their next decline).
+
+**Not done this session:**
+- **No ASan sweep or asan-autotest.** 437-439 change box-tree building
+  and rebuilding, so run `tools/build-asan-sim.sh` +
+  `tools/scorecard/asan_sweep.py` before the next device hand-off.
+- **No 21-site scorecard A/B** (only the census on 7 sites).
+
+**Next, by the 439 census (per load, 7 sites):**
+1. "no inserted or removed block found" (~4.7; google 9 and youtube 3
+   over three loads).
+2. "detached stylesheet pruned" (~4.0; oldreddit 7, bbc 3, google 2 over
+   three loads), with "sheet removal: an element without a box would get
+   one" (oldreddit: build those elements as new blocks).
+3. "sheet change: an element's style changes" / "a sheet is still loading
+   or changing" (~4 + ~5).
+4. "removal would join two lines" (~2.7).
+
+No sudo was needed or run.
