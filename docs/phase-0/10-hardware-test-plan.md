@@ -13482,6 +13482,11 @@ reference, no score):
 6 / 5 / 6 / 6 / 2 / 5 / 5** (mean 5.0). One site's spread on one binary,
 2 to 6, is the noise the tool exists for.
 
+**Gate.** Gated with patch 435 (**gate435 exit 0**, below); the gate does
+not run the tool.
+
+No sudo.
+
 ## Patch 435 (2026-11-22): the scorecard waits for the page to be ready, not a fixed 15 s
 
 **Problem.** The scorecard's script was `settle 15000`, then the text
@@ -14213,3 +14218,124 @@ No sudo.
    element with a non-inline, non-block box".
 4. Make NET-js-sheet-gen robust to ASan timing (a longer slow delay).
 5. The trigger of 441's unmeasured inline-block.
+
+### Run closed (2026-11-22)
+
+By the owner's directive, the run closes after patch 445. Patch 446 is
+shelved ungated (open item 1).
+
+**This run's units:** 435a, 435-445. Each was restaged from pristine and
+gated before its commit, and all are pushed.
+- **Tools:**
+  - **435a** `tools/scorecard/census.py`: a multi-run, interleaved census.
+  - **435** the scorecard waits for ready: guardian's 15 s race.
+  - scorecard `--out` made absolute.
+  - vitasim `MAX_POLLS` 60000 -> 75000.
+- **Crashes fixed:**
+  - **437** guardian's `box_add_child` assert. A script removing a subtree
+    between first-conversion slices; the 434 binary segfaults on
+    JS-detach-convert every load.
+  - **441** wpblog's `layout_line` `UNKNOWN_WIDTH` abort. About half of
+    all loads on every binary since 434 while its live trigger was
+    present.
+- **Latent bug fixed:** **440** a boxed child moved among its siblings
+  was taken as "nothing to rebuild", so its boxes stayed in the old order.
+- **Full-rebuild declines answered locally:**
+  - **438** flex boxes and inline-blocks, own content;
+  - **439** media and description-list blocks, flex child lists;
+  - **440** a block of blocks, `<head>` changes;
+  - **442** sheet batches wait for a loading sheet;
+  - **443** a sheet change during a load, against the held cascade
+    (select-ctx generation);
+  - **444** a removal joining two lines;
+  - **445** an attribute a sibling rule sees: the parent is rebuilt.
+- **436:** `html_css_mark_sheets` counts an in-flight (ERROR status) sheet
+  as loading. Census lines only.
+
+**Key numbers.**
+- **Scorecard r148** (434 vs 439, one Chrome reference): **82.7 vs 84.9**.
+  - guardian 36.9 -> 81.8 is 435's ready fix, a measurement fix.
+  - **Without guardian 85.26 vs 85.03, flat.** google's one-off 75.3
+    reran 80.5 on both binaries.
+  - No scorecard was run after 439: 440-445 change rebuild cost, not
+    rendering.
+- **Census** (7 sites: bbc, oldreddit, wpnews, wpblog, google, github,
+  youtube; 3 loads per arm; each A/B in one interleaved run):
+  - **~36 full rebuilds a load at 437 -> ~28 at 445**: 437 baseline 36.3;
+    445 arm 28.3 in 445's run; 445 arm 28.0 in 446's run.
+  - Cross-run drift on one binary is about 3 (438: 35.3 then 32.3), so
+    the honest claim is the per-unit A/Bs:
+    - 438: youtube 8/8/8 -> 7/7/7;
+    - 440: youtube 6.3 -> 4.3;
+    - 445: total 30.3 -> 28.3; wpnews 2/2/2 -> 1/1/1, bbc 4/4/4 ->
+      3/3/3;
+    - the rest flat within noise.
+- **Declines taken to 0 a load** (from):
+  - "nearest box is not a block" (3.3);
+  - "a flex or grid box's child list changed in elements with a box"
+    (2.3);
+  - "new element is not a plain block, list item or block of blocks"
+    (5.3);
+  - "no inserted or removed block found" (3.3);
+  - "removal would join two lines" (3.0);
+  - attribute-sibling declines on style / data-hydrated / role /
+    aria-hidden (aria-expanded 2.0 -> 1.0).
+- **Declines reduced:** "sheet change: a sheet is still loading or
+  changing" 3.3 -> 1.7.
+- **Pattern:** as in 415-417, removing one cause mostly moves a batch to
+  its next decline. The total falls when the last cause in a batch goes.
+- **ASan** (`build-asan-sim.sh`, netsurf instrumented), at 439, 441, 443
+  and 445:
+  - **sweep 21/21 clean** and **`asan-autotest.sh main` clean** every time
+    (388 / 390 / 394 / 396 page dumps, interaction 52/52).
+  - **Ran under ASan:** 437 (walk stop), 438 and 439 (flex whole, flex
+    fallback), 440 (block whole, head), 442 (wait), 444 (join), 445
+    (sibling parent).
+  - **Not yet run under ASan:** **441's guard** (no gate page triggers it)
+    and **443's held-cascade answer** (it loses its timing race under
+    ASan).
+- **Gate:**
+  - 12 new pages (JS-detach-convert, JS-flex-own, JS-media-new,
+    JS-block-blocks, JS-join-lines, NET-js-sheet-wait, NET-js-sheet-gen,
+    with their references).
+  - 7 existing checks rewritten where they asserted a decline this run
+    answers: attr-local, mixed-siblings, style-sib, attr-restyle, plus 446
+    WIP's (shelved).
+  - **The main autotest takes ~1025 s of vitasim's ~1180 s poll budget,
+    about 8 page pairs of headroom.**
+- **No device run** this run. The hardware has not seen 435-445 (run 42 is
+  still the last hand-off).
+
+**Open items and recommended next steps:**
+1. **Patch 446 WIP, shelved ungated:**
+   `~/vitabrowser-work/wip-446-childlist-sibling-parent/`. It does for
+   child-list sibling declines what 445 does for attributes; it has a
+   README, diff, gate-check diff and census.
+   - Page A/B all rows 0: NET-js-block-sibling-insert SIBINS 4/4 with 4
+     parent rebuilds and 0 full rebuilds (445: 4 full).
+   - Census: "restyle on insert/remove" 1.0 -> 0; "may see an element
+     with no box" 1.0 stays (find why its parent is not rebuilt).
+   - **Gate it first.**
+2. **"an element's style changes"** (sheet change / removal / root
+   change, ~4-5 a load: google, bbc, youtube, oldreddit), now the largest
+   local group: re-cascade in place, restyling only the changed elements'
+   boxes.
+3. **Class-change sibling declines** ("class change may move a sibling
+   selector", "page CSS needs conservative sibling check": github,
+   oldreddit): a parent rebuild as in 445 and 446.
+4. **"class change on an element with a non-inline, non-block box"**
+   (oldreddit, google, youtube).
+5. **441's trigger** (wpblog, live content): when the census shows its
+   LIFE line, probe the box's element and the operation that built it.
+6. **ASan coverage of 443:** make NET-js-sheet-gen timing-robust (a
+   longer slow delay than `/slow/`'s 1 s), then rerun asan-autotest.
+7. **Gate budget:** raise `MAX_POLLS` with the main run's `timeout 1200`
+   together, or split the main autotest, before adding more than about 8
+   page pairs.
+8. **Before a device hand-off:**
+   - a 21-site scorecard A/B 439 vs the head (r149);
+   - an ASan sweep of the head;
+   - the bulk device run (VPK through the head; autotest self-checks +
+     short manual list).
+
+No sudo was needed or run in this run.
