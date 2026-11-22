@@ -1,0 +1,126 @@
+# netsurf: flex boxes and inline-blocks built again whole for changes in their own content (patch 438)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 437)
+#
+# Three changes declined into the full rebuild:
+#  - "nearest box is not a block": the child list of an inline-block
+#    <button> (wpnews), and text or innerHTML set on a flex box itself
+#    (youtube's <main> / <c-wiz>: no class, attribute or child-list mark);
+#  - "a flex or grid box's child list changed in elements with a box"
+#    (patch 408 answered only box-less children).
+#
+# A flex or grid box whose own content changes is built again whole by
+# html_rl_flex_whole, through 372's container rebuild (cascaded afresh from
+# the DOM, controls handed over, objects and frames carried, the page laid
+# out whole). Its children are all rebuilt, so what a structural or
+# sibling rule sees among them is cascaded afresh; only its own :empty,
+# flipped by the change, reaches outside, and 373's check declines that
+# when a + / ~ rule tests :empty. An inline-block, inline-flex or
+# inline-grid box sits in its block's line as an inline does: the walk goes
+# on up to the block, whose path builds a line that is not plain inline
+# content again whole (425/434). Its own class is answered before.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8780,6 +8780,9 @@
+ static int html_rl_flex_restyle(html_content *c, dom_node *el,
+ 		struct box *ob, double t0, const char *old_class,
+ 		bool is_block);
++/* Patch 438 */
++static int html_rl_flex_whole(html_content *c, dom_node *el, struct box *b,
++		double t0, const char *what);
+ 
+ /* Patch 404: a child-list change whose structural check found a rule that
+  * reaches the parent's children ("a structural rule matches a sibling":
+@@ -9727,9 +9730,20 @@
+ 			"rebuild", nskip);
+ 		return 0;
+ 	}
+-	if (html_rl_noop_only)		/* patch 408 */
+-		RL_BNO("a flex or grid box's child list changed in elements "
+-			"with a box");
++	if (html_rl_noop_only) {	/* patch 408 */
++		/* Patch 438: boxed children in or out of a flex or grid box
++		 * (5 declines in r147): the box is built again whole, as a
++		 * change below it is (422) -- its children are all rebuilt,
++		 * so what a structural or sibling rule sees among them is
++		 * cascaded afresh; only its own :empty reaches outside */
++		html_rl_struct_hits_release(shits, &nshits);
++		for (i = 0; i < nadd; i++)
++			dom_node_unref(added[i]);
++		for (i = 0; i < nskip; i++)
++			dom_node_unref(skipped[i]);
++		return html_rl_flex_whole(c, pnode, pbox, t0, "a flex or grid "
++			"box's child list changed in elements with a box");
++	}
+ 	/* Patch 383: an attribute that patch 310's gate let through, on
+ 	 * this block itself, no box added or removed: no sheet can match on
+ 	 * it, it is not a hint, and the block's own box holds no object,
+@@ -13805,6 +13819,27 @@
+ 	return empty;
+ }
+ 
++/* Patch 438: a flex or grid box built again whole for a change in its own
++ * content -- boxed children in or out (408 declined them), text or
++ * innerHTML set on it (youtube's flex <main> / <c-wiz>) -- through 372's
++ * container rebuild: cascaded afresh from the DOM, controls handed over,
++ * objects and frames carried, the page laid out whole. What reaches
++ * outside the box is its own :empty, flipped by the change, which a
++ * + / ~ rule could see (373's check). */
++static int html_rl_flex_whole(html_content *c, dom_node *el, struct box *b,
++		double t0, const char *what)
++{
++	if ((b->children == NULL || html_rl_node_empty(el)) &&
++	    html_rl_empty_sibling_risk(c)) {
++		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
++			"sibling rule tests :empty)");
++		return -1;
++	}
++	macsurf_debug_log_writef("LIFE rebuild local: %s, the box built again "
++		"whole", what);
++	return html_rl_flex_restyle(c, el, b, t0, html_rl_class_same, false);
++}
++
+ int html_reconvert_local_style(struct content *base_c, void *vnode);
+ int html_reconvert_local_style(struct content *base_c, void *vnode)
+ {
+@@ -14150,6 +14185,20 @@
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
++			/* Patch 438: a change in a flex or grid box's own
++			 * content with no class, attribute or child-list mark
++			 * (text or innerHTML set on it: youtube's flex <main> /
++			 * <c-wiz>, 4 in 433's probe) builds it again whole */
++			if (b != NULL && n == vnode && !class_change &&
++			    (b->type == BOX_FLEX || b->type == BOX_GRID) &&
++			    (dom_node *) vnode != html_rl_attr_mark_node &&
++			    (dom_node *) vnode != html_rl_childlist_parent) {
++				int r = html_rl_flex_whole(c, n, b, t0,
++					"a flex or grid box's own content "
++					"changed");
++				dom_node_unref(n);
++				return r;
++			}
+ 			/* Patch 422: a change BELOW a flex or grid box -- an
+ 			 * element with no box of its own, or text, in google's,
+ 			 * python's and youtube's flex containers -- builds the
+@@ -14169,7 +14218,17 @@
+ 				dom_node_unref(n);
+ 				return r;
+ 			}
+-			if (b != NULL && b->type != BOX_INLINE) {
++			/* Patch 438: an inline-block, inline-flex or
++			 * inline-grid box (wpnews's <button>: its child list)
++			 * sits in its block's line as an inline does: the
++			 * change is the line's, and the walk goes on up to the
++			 * block, whose path builds a line that is not plain
++			 * inline content again whole (425/434). Its own class
++			 * was answered above. */
++			if (b != NULL && b->type != BOX_INLINE &&
++			    b->type != BOX_INLINE_BLOCK &&
++			    b->type != BOX_INLINE_FLEX &&
++			    b->type != BOX_INLINE_GRID) {
+ 				dom_node_unref(n);	/* a table cell, ... */
+ 				RL_NO("nearest box is not a block");
+ 			}

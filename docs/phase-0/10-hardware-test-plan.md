@@ -13613,3 +13613,68 @@ lost with the subtree, so the walk stops:
   known collisions), stack through 437.
 
 No sudo.
+
+## Patch 438 (2026-11-22): flex boxes and inline-blocks built again whole for changes in their own content
+
+**Problem** (open item 5 of the closed run, its first two declines). The
+437 baseline census (3 loads, 7 sites) shows, per load:
+- **"nearest box is not a block" 3.3**, from two shapes (433's probe):
+  - the child list of an inline-block `<button>` (wpnews);
+  - text or innerHTML set on a flex box itself (youtube's `<main>` /
+    `<c-wiz>`). That is a mark with no class, attribute or child-list
+    node; it reaches the walk as a plain local change.
+- **"a flex or grid box's child list changed in elements with a box"
+  2.3**: patch 408 answered only box-less children.
+
+**Fix** (html.c).
+- **`html_rl_flex_whole`:** a flex or grid box whose own content changes
+  is built again whole through 372's container rebuild
+  (`html_rl_flex_restyle`). That cascades it afresh from the DOM, hands
+  controls over, carries objects and frames, and lays the page out whole.
+  - Its children are all rebuilt, so what a structural or sibling rule
+    sees among them is cascaded afresh.
+  - Only its own `:empty`, flipped by the change, reaches outside. 373's
+    `html_rl_empty_sibling_risk` declines that case when a `+` / `~` rule
+    tests `:empty`.
+  - It is used for boxed children in or out (408's no-op-only path), and
+    for text or innerHTML on the box itself (n == vnode, no class,
+    attribute or child-list mark).
+- **Inline-block, inline-flex and inline-grid boxes** sit in their
+  block's line as an inline does. The walk now goes on up to the block,
+  whose path builds a line that is not plain inline content again whole
+  (425/434). A class change on the box itself is answered before this,
+  as it was.
+
+**Gate.**
+- New pair **JS-flex-own / CSS-flex-own-ref**. Four steps, each flushed
+  alone by a layout read (433):
+  - a `<span>` appended to an inline-block `<button>`;
+  - innerHTML on a flex `<main>`;
+  - a boxed `<div>` appended to a flex row;
+  - a flex row's text replaced.
+- Result: **rows 0, 4 local rebuilds, 0 declines, 0 full rebuilds**. The
+  437 binary on the same page: 2 "nearest box is not a block" declines
+  and 2 full rebuilds (rows 0 too: the full rebuild is correct, only
+  slow).
+
+**Census** (`tools/scorecard/census.py`, 437 vs 438, 3 loads per arm,
+interleaved; bbc, oldreddit, wpnews, wpblog, google, github, youtube):
+- **"nearest box is not a block" 3.3 -> 0**; **"a flex or grid box's child
+  list changed in elements with a box" 2.3 -> 0** (per load).
+- The new path ran 11 times over 9 loads (5 child lists, 6 own-content
+  changes).
+- **youtube 8 / 8 / 8 -> 7 / 7 / 7.**
+- The total is flat, **35.7 vs 35.3** (36 / 39 / 32 vs 35 / 34 / 37). As
+  in 415-417, the batches these changes were in mostly end at their next
+  decline ("no inserted or removed block found", sheet changes).
+- wpnews stays 2 / 2 / 2: its `<button>` declines are gone, its two full
+  rebuilds come from other causes.
+- No crash or assertion in 42 loads.
+
+No sudo.
+- **gate438 exit 0**: restaged from pristine (520 applied plus the 2
+  known collisions), stack through 438.
+  - JS-flex-own: rows 0, 3 flex boxes built again whole. The fourth
+    step, the inline-block, is logged by the block path as "new content
+    is not plain inline, the block built again whole".
+  - 0 declines, 0 full rebuilds. JS-detach-convert is unchanged.

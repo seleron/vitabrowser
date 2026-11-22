@@ -410,6 +410,8 @@ JS-block-whole file:///app0:/testpages/JS-block-whole.html
 CSS-block-whole-ref file:///app0:/testpages/CSS-block-whole-ref.html
 JS-detach-convert file:///app0:/testpages/JS-detach-convert.html
 CSS-detach-convert-ref file:///app0:/testpages/CSS-detach-convert-ref.html
+JS-flex-own file:///app0:/testpages/JS-flex-own.html
+CSS-flex-own-ref file:///app0:/testpages/CSS-flex-own-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2197,6 +2199,19 @@ k437seg=$(awk '/ page [0-9]+\/[0-9]+ JS-detach-convert: navigate/ {on=1; next} o
 k437s=$(printf '%s\n' "$k437seg" | grep -c "LIFE box: conversion walk left the document" || true)
 echo "  JS-detach-convert: rows $k437r (0), walks stopped outside the document ${k437s} (1 or more)"
 [ "$k437r" = 0 ] && [ "${k437s:-0}" -ge 1 ] || fail "a conversion walk whose subtree a script removed"
+# Patch 438: the child list of an inline-block <button> (its block built
+# again whole), innerHTML / text set on a flex box itself and a boxed
+# child appended to one (the flex box built again whole); before:
+# "nearest box is not a block" / "a flex or grid box's child list changed
+# in elements with a box" and the full rebuild. Each step is flushed alone
+# by a layout read (see 433).
+k438r=$(fl_rows JS-flex-own CSS-flex-own-ref)
+k438seg=$(awk '/ page [0-9]+\/[0-9]+ JS-flex-own: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k438w=$(printf '%s\n' "$k438seg" | grep -c "the box built again whole" || true)
+k438d=$(printf '%s\n' "$k438seg" | grep -c "declined (nearest box is not a block)\|declined (a flex or grid box's child list changed" || true)
+k438f=$(printf '%s\n' "$k438seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-flex-own: rows $k438r (0), flex boxes built again whole ${k438w} (3 or more), nearest-box / flex child-list declines ${k438d} (0), full rebuilds after a decline ${k438f} (0)"
+[ "$k438r" = 0 ] && [ "${k438w:-0}" -ge 3 ] && [ "${k438d:-1}" -eq 0 ] && [ "${k438f:-1}" -eq 0 ] || fail "flex boxes and inline-blocks built again whole"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
