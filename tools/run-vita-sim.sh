@@ -1951,9 +1951,12 @@ k409rseg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-sib-risk: navigate/ {on=1; next} 
 k409l=$(printf '%s\n' "$k409lseg" | grep -c "LIFE rebuild local: style attribute change, as a class change" || true)
 k409ld=$(printf '%s\n' "$k409lseg" | grep -c "declined (a sibling selector can match on the style attribute)" || true)
 k409rd=$(printf '%s\n' "$k409rseg" | grep -c "declined (a sibling selector can match on the style attribute)" || true)
-echo "  JS-style-sib: local page rows $k409lr (0), style changes local ${k409l} (3 or more), style-sibling declines ${k409ld} (0); risk page rows $k409rr (0), declines ${k409rd} (1 or more)"
+# Patch 445: the risk page's change (its <p> turns red through
+# [style*="display: none"] + p) builds the parent again whole instead
+k409rp=$(printf '%s\n' "$k409rseg" | grep -c "a sibling selector can match on the style attribute: the parent, built again whole" || true)
+echo "  JS-style-sib: local page rows $k409lr (0), style changes local ${k409l} (3 or more), style-sibling declines ${k409ld} (0); risk page rows $k409rr (0), parent rebuilt ${k409rp} (1 or more), declines ${k409rd} (0)"
 [ "$k409lr" = 0 ] && [ "$k409rr" = 0 ] && [ "${k409l:-0}" -ge 3 ] && [ "${k409ld:-1}" -eq 0 ] &&
-	[ "${k409rd:-0}" -ge 1 ] || fail "style attribute changes on a sheet the sibling scan gave up on"
+	[ "${k409rp:-0}" -ge 1 ] && [ "${k409rd:-1}" -eq 0 ] || fail "style attribute changes on a sheet the sibling scan gave up on"
 # Patch 412: a selector the sibling parser cannot read but with no + ~
 # :empty :has() leaves the sheet precise -- JS-sib-unreadable's inserts
 # and removal are placed locally; the style-sib-risk page, whose sheet
@@ -2020,9 +2023,12 @@ k417seg=$(awk '/ page [0-9]+\/[0-9]+ JS-attr-restyle: navigate/ {on=1; next} on 
 k417a=$(printf '%s\n' "$k417seg" | grep -c "attribute change, as a class change" || true)
 k417n=$(printf '%s\n' "$k417seg" | grep -c "attribute on an element that renders nothing" || true)
 k417d=$(printf '%s\n' "$k417seg" | grep -c "declined (a sibling selector can match on the data-y attribute)" || true)
+# Patch 445: data-y (a sibling rule) builds the parent again whole; only
+# the id change keeps its full rebuild
+k417p=$(printf '%s\n' "$k417seg" | grep -c "a sibling selector can match on the data-y attribute: the parent, built again whole" || true)
 k417f=$(printf '%s\n' "$k417seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
-echo "  JS-attr-restyle: rows $k417r (0), re-selected ${k417a} (3 or more), renders nothing ${k417n} (1), sibling decline ${k417d} (1), full rebuilds ${k417f} (2)"
-[ "$k417r" = 0 ] && [ "${k417a:-0}" -ge 3 ] && [ "${k417n:-0}" -eq 1 ] && [ "${k417d:-0}" -eq 1 ] && [ "${k417f:-0}" -eq 2 ] || fail "attributes a sheet can see"
+echo "  JS-attr-restyle: rows $k417r (0), re-selected ${k417a} (3 or more), renders nothing ${k417n} (1), sibling parent rebuilt ${k417p} (1), sibling declines ${k417d} (0), full rebuilds ${k417f} (1)"
+[ "$k417r" = 0 ] && [ "${k417a:-0}" -ge 3 ] && [ "${k417n:-0}" -eq 1 ] && [ "${k417p:-0}" -eq 1 ] && [ "${k417d:-1}" -eq 0 ] && [ "${k417f:-0}" -eq 1 ] || fail "attributes a sheet can see"
 # Patch 418: DOMParser's image/svg+xml document element is the <svg> (a
 # text/html one keeps <html>); appended between blocks it is placed
 # locally (417's replaced leaf), no full rebuild.

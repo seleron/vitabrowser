@@ -1,0 +1,76 @@
+# netsurf: a sibling selector on a changed attribute rebuilds the parent, not the page (patch 445)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 444)
+#
+# A style or other attribute change that a + / ~ rule can test (patch 370's
+# and 417's page-wide checks, html_rl_style_sibling_risk /
+# html_rl_attr_sibling_risk) declined into the full rebuild: github's
+# data-catalyst and style, wpnews's aria-expanded, data-hydrated, role,
+# aria-hidden (~4 a load on 7 sites). Such a rule reaches only the
+# element's later siblings and their descendants -- all in its parent's
+# subtree (:has() never matches here, patch 328). html_rl_sib_parent_rebuild
+# builds the parent's box again whole: a block (440's html_rl_block_whole),
+# a flex or grid box (438's html_rl_flex_whole), which re-selects the
+# element, its siblings and everything below them. A parent with no box, or
+# another kind of box, keeps the full rebuild.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -14079,6 +14079,37 @@
+ 	return html_rl_flex_restyle(c, el, b, t0, html_rl_class_same, false);
+ }
+ 
++/* Patch 445: a sibling selector can match on the changed attribute (or
++ * the style attribute) -- the page-wide check of 370/409/417 sent the change
++ * to the full rebuild. Such a rule (X[attr] + Y, X[attr] ~ Y Z) reaches only
++ * the element's later siblings and their descendants: all in its parent's
++ * subtree (:has() never matches here, patch 328). The parent's box is built
++ * again whole -- a block (440), a flex or grid box (438) -- which re-selects
++ * the element, its siblings and everything below them. A parent with no
++ * box, or any other box, keeps the full rebuild. */
++static int html_rl_sib_parent_rebuild(html_content *c, dom_node *el,
++		const char *name)
++{
++	extern double macos9_micros(void);
++	dom_node *p = NULL;
++	struct box *pb;
++	char what[96];
++	int r = -1;
++
++	if (dom_node_get_parent_node(el, &p) != DOM_NO_ERR || p == NULL)
++		return -1;
++	pb = box_for_node(p);
++	snprintf(what, sizeof what, "a sibling selector can match on the %s "
++		"attribute: the parent", name);
++	if (pb != NULL && pb->type == BOX_BLOCK && pb->parent != NULL &&
++	    pb->object == NULL && !HTML_RL_FRAME(pb))
++		r = html_rl_block_whole(c, p, pb, macos9_micros(), what);
++	else if (pb != NULL && (pb->type == BOX_FLEX || pb->type == BOX_GRID))
++		r = html_rl_flex_whole(c, p, pb, macos9_micros(), what);
++	dom_node_unref(p);
++	return r;
++}
++
+ int html_reconvert_local_style(struct content *base_c, void *vnode);
+ int html_reconvert_local_style(struct content *base_c, void *vnode)
+ {
+@@ -14090,6 +14121,9 @@
+ 	if (c == NULL || vnode == NULL)
+ 		return -1;
+ 	if (html_rl_style_sibling_risk(c)) {
++		if (html_rl_sib_parent_rebuild(c, (dom_node *)vnode,
++				"style") == 0)
++			return 0;	/* patch 445 */
+ 		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
+ 			"sibling selector can match on the style attribute)");
+ 		return -1;
+@@ -14143,6 +14177,9 @@
+ 		name[k] = (char)tolower((unsigned char)attr_name[k]);
+ 	name[k] = '\0';
+ 	if (html_rl_attr_sibling_risk(c, name)) {
++		if (html_rl_sib_parent_rebuild(c, (dom_node *)vnode,
++				name) == 0)
++			return 0;	/* patch 445 */
+ 		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
+ 			"sibling selector can match on the %s attribute)", name);
+ 		return -1;

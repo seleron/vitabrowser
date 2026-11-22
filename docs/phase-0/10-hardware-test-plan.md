@@ -14134,3 +14134,74 @@ struct hits). A flex box's child list takes 439's fallback.
 applied plus the 2 known collisions), with the updated 377 check.
 
 No sudo.
+
+## Patch 445 (2026-11-22): a sibling selector on a changed attribute rebuilds the parent, not the page
+
+**Problem.** A `style` or other attribute change that a `+` / `~` rule can
+test declined into the full rebuild. These are patch 370's and 417's
+page-wide checks, `html_rl_style_sibling_risk` and
+`html_rl_attr_sibling_risk`. In 444's census they were about 4 a load on
+the 7 sites: github's `data-catalyst` and `style`, wpnews's
+`aria-expanded`, plus `data-hydrated`, `role` and `aria-hidden`.
+
+**Fix** (html.c).
+- Such a rule (`X[attr] + Y`, `X[attr] ~ Y Z`) reaches only the element's
+  later siblings and their descendants, all in its parent's subtree.
+  `:has()` never matches here (patch 328).
+- **`html_rl_sib_parent_rebuild`** builds the parent's box again whole:
+  - a block through 440's `html_rl_block_whole`;
+  - a flex or grid box through 438's `html_rl_flex_whole`.
+- That re-selects the element, its siblings and everything below them. A
+  parent with no box, or another kind of box, keeps the full rebuild.
+
+**Gate.** No new page: two existing pages change meaning.
+- **409's JS-style-sib-risk:** its `<p>` turns red through
+  `[style*="display: none"] + p`, so the sibling effect is visible. It is
+  now a parent rebuild (1), with rows 0 and 0 style-sibling declines; it
+  used to decline into the full rebuild. The page's later block insert
+  still declines ("sibling combinator may restyle on insert/remove").
+- **417's JS-attr-restyle:** `data-y` (a sibling rule) is now a parent
+  rebuild. Rows 0, and the page's full rebuilds go 2 -> 1; the `id`
+  change keeps its own.
+- Both checks were updated to assert the new path and no decline.
+
+**Census** (444 vs 445, 3 loads per arm, 7 sites):
+- **Total 30.3 -> 28.3** (31 / 31 / 29 vs 26 / 29 / 30). The clearest
+  sites move on every load: **wpnews 2 / 2 / 2 -> 1 / 1 / 1** and **bbc
+  4 / 4 / 4 -> 3 / 3 / 3**.
+- Parent rebuilds: github `data-catalyst` 12 (blocks), wpnews
+  `aria-expanded` 3 (its flex parent: "the parent, the box built again
+  whole").
+- Attribute sibling declines: `aria-expanded` 2.0 -> 1.0 (a parent that is
+  neither block nor flex), `style`, `data-hydrated`, `role` and
+  `aria-hidden` -> 0.
+- No crash or assertion in 42 loads.
+- **gate445 exit 0**: restaged from pristine (527 applied plus the 2
+  known collisions), stack through 445, with the updated 409 / 417 checks.
+
+No sudo.
+
+### Checkpoint (2026-11-22, night): units 442-445
+
+- **Landed** (each gated before its commit, all pushed):
+  - **442:** sheet batches wait for loading sheets (narrow).
+  - **443:** select-ctx generation; a sheet change while a sheet loads is
+    answered against the held cascade.
+  - **444:** a removal joining two lines builds the block whole.
+  - **445:** a sibling selector on a changed attribute rebuilds the
+    parent.
+- **Census, the same 7 sites:** about 32 full rebuilds a load at 439,
+  about 28 at 445, compared only within one run each.
+- **ASan:** clean through 443. **444 and 445 are not ASan-checked yet**,
+  and 443's own path did not fire under ASan timing.
+
+**Next:**
+1. "an element's style changes" on sheet changes and removals (google,
+   bbc, youtube, oldreddit): the re-cascade-in-place project.
+2. Child-list sibling declines ("sibling combinator may restyle on
+   insert/remove" / "may see an element with no box", wpblog): the same
+   parent-subtree idea as 445, for inserts and removals.
+3. "class change may move a sibling selector" and "class change on an
+   element with a non-inline, non-block box".
+4. Make NET-js-sheet-gen robust to ASan timing (a longer slow delay).
+5. The trigger of 441's unmeasured inline-block.
