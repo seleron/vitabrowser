@@ -412,6 +412,8 @@ JS-detach-convert file:///app0:/testpages/JS-detach-convert.html
 CSS-detach-convert-ref file:///app0:/testpages/CSS-detach-convert-ref.html
 JS-flex-own file:///app0:/testpages/JS-flex-own.html
 CSS-flex-own-ref file:///app0:/testpages/CSS-flex-own-ref.html
+JS-media-new file:///app0:/testpages/JS-media-new.html
+CSS-media-new-ref file:///app0:/testpages/CSS-media-new-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2212,6 +2214,19 @@ k438d=$(printf '%s\n' "$k438seg" | grep -c "declined (nearest box is not a block
 k438f=$(printf '%s\n' "$k438seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-flex-own: rows $k438r (0), flex boxes built again whole ${k438w} (3 or more), nearest-box / flex child-list declines ${k438d} (0), full rebuilds after a decline ${k438f} (0)"
 [ "$k438r" = 0 ] && [ "${k438w:-0}" -ge 3 ] && [ "${k438d:-1}" -eq 0 ] && [ "${k438f:-1}" -eq 0 ] || fail "flex boxes and inline-blocks built again whole"
+# Patch 439: a <div> holding a <video> and one holding a <dl> inserted
+# between blocks are built alone (media tags as images, description lists
+# as lists), a custom element inserted into a flex box builds the box again
+# whole; before: "new element is not a plain block, list item or block of
+# blocks" and the full rebuild. Each step flushed alone (see 433).
+k439r=$(fl_rows JS-media-new CSS-media-new-ref)
+k439seg=$(awk '/ page [0-9]+\/[0-9]+ JS-media-new: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k439b=$(printf '%s\n' "$k439seg" | grep -c "LIFE rebuild local: blocks rebuilt (1 added" || true)
+k439w=$(printf '%s\n' "$k439seg" | grep -c "child list the local path declined, the box built again whole" || true)
+k439d=$(printf '%s\n' "$k439seg" | grep -c "declined (new element is not a plain block" || true)
+k439f=$(printf '%s\n' "$k439seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-media-new: rows $k439r (0), new blocks built alone ${k439b} (2), flex boxes built again whole ${k439w} (1), new-element declines ${k439d} (0), full rebuilds after a decline ${k439f} (0)"
+[ "$k439r" = 0 ] && [ "${k439b:-0}" -ge 2 ] && [ "${k439w:-0}" -ge 1 ] && [ "${k439d:-1}" -eq 0 ] && [ "${k439f:-1}" -eq 0 ] || fail "new media and list blocks, custom elements into flex boxes"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

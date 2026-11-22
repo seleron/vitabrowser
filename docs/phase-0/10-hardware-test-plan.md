@@ -13678,3 +13678,54 @@ No sudo.
     step, the inline-block, is logged by the block path as "new content
     is not plain inline, the block built again whole".
   - 0 declines, 0 full rebuilds. JS-detach-convert is unchanged.
+
+## Patch 439 (2026-11-22): new media and description-list blocks built alone; a flex child list the local path cannot place builds the box whole
+
+**Problem.** "new element is not a plain block, list item or block of
+blocks" was **5.3 a load** on the 7 census sites (438's census), the top
+local decline. A scratch-only probe logged each case over two loads each:
+- **youtube 4:** a `<div>` holding a `<video>` (and its `<source>`).
+- **youtube 4:** a `<c3-icon>` inserted into a flex box. That is 408's
+  flex child-list mode, where the placement declined before 438's whole
+  rebuild could run.
+- **wpblog 2:** a `<div>` holding a `<dl>`.
+
+**Fix** (html.c):
+- **Media tags.** `html_rl_oc_tag` admits `video`, `audio`, `source`,
+  `track` and `picture`. Box construction has no case for them (no
+  object), and the page CSS decides their boxes, as in a full build. The
+  new block is built alone and the page laid out whole, as for images
+  (364).
+- **Description lists.** `html_rl_list_tag` admits `dl`, `dt` and `dd`.
+  They are blocks, built alone and laid out whole as lists are (176).
+- **Flex child lists.** In 408's flex child-list mode, every reason
+  `html_rl_block_change` gives is about placing boxes among the box's
+  children, which a whole rebuild makes afresh. So its decline path builds
+  the box again whole (`html_rl_flex_whole`, 438, with its own `:empty`
+  check). `RL_BNO` logs those reasons as `flex or grid child list not
+  placed here (...)`, not as declines, so the census does not count them.
+
+**Gate.**
+- New pair **JS-media-new / CSS-media-new-ref**. Each step is flushed
+  alone:
+  - a `<div>` holding a `<video><source>` inserted between paragraphs;
+  - a `<div>` holding a `<dl>` inserted between paragraphs;
+  - a `<c3-icon>` inserted first in a flex row.
+- Result: **rows 0, 2 new blocks built alone, 1 flex box built again
+  whole, 0 declines, 0 full rebuilds**. The 438 binary on the same page:
+  2 declines and 2 full rebuilds.
+
+**Census** (438 vs 439, 3 loads per arm, the same 7 sites):
+- **"new element is not a plain block" 5.3 -> 0** a load. The flex
+  fallback ran 6 times. No crash or assertion in 42 loads.
+- The total is flat, **32.3 vs 32.3** (32 / 31 / 34 vs 35 / 29 / 33).
+  youtube 6.0 -> 5.7, bbc 5.3 -> 4.7; google +1.0, a site with no
+  new-element declines in either arm, which is noise.
+- **Census noise across runs.** The 438 arm read 35.3 in 438's census
+  and 32.3 here, on the same binary hours apart. Only arms loaded in the
+  same run, interleaved, compare.
+- **gate439 exit 0**: restaged from pristine (521 applied plus the 2
+  known collisions), stack through 439. JS-media-new as above;
+  JS-flex-own and JS-detach-convert are unchanged.
+
+No sudo.
