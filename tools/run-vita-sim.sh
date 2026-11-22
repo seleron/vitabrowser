@@ -416,6 +416,8 @@ JS-media-new file:///app0:/testpages/JS-media-new.html
 CSS-media-new-ref file:///app0:/testpages/CSS-media-new-ref.html
 JS-block-blocks file:///app0:/testpages/JS-block-blocks.html
 CSS-block-blocks-ref file:///app0:/testpages/CSS-block-blocks-ref.html
+JS-join-lines file:///app0:/testpages/JS-join-lines.html
+CSS-join-lines-ref file:///app0:/testpages/CSS-join-lines-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -1830,12 +1832,16 @@ k377r=$(fl_rows JS-mixed-siblings CSS-mixed-siblings-ref)
 k377l=$(awk '/ page [0-9]+\/[0-9]+ JS-mixed-siblings: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
 	grep -c "LIFE rebuild local: blocks rebuilt ([0-9]* added, [0-9]* removed), full layout (\(flex, grid or table\|inline content\) among the blocks)" || true)
 k377s=$(grep -c "LIFE rebuild local: declined (new block would split a line)" "$R/netsurf.log" || true)
-k377j=$(grep -c "LIFE rebuild local: declined (removal would join two lines)" "$R/netsurf.log" || true)
+# Patch 444: the removal that joins two lines is now built again whole
+# (k377j counts that, in this page's window; a join decline anywhere fails)
+k377j=$(awk '/ page [0-9]+\/[0-9]+ JS-mixed-siblings: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
+	grep -c "LIFE rebuild local: a removal joining two lines, built again whole" || true)
+k377jd=$(grep -c "LIFE rebuild local: declined (removal would join two lines)" "$R/netsurf.log" || true)
 k377e=$(grep -c "LIFE rebuild local: declined (inline content among the blocks lost an element)" "$R/netsurf.log" || true)
 k377f=$(grep -c "LIFE rebuild local: new box normalised as a \(flex or grid\|table\)" "$R/netsurf.log" || true)
-echo "  JS-mixed-siblings: rows differing from the parse-time build $k377r (0); ${k377l} block changes placed among mixed siblings (5 or more); declined: split ${k377s}, join ${k377j}, inline element lost ${k377e} (1 or more each); new flex boxes ${k377f} (1 or more)"
+echo "  JS-mixed-siblings: rows differing from the parse-time build $k377r (0); ${k377l} block changes placed among mixed siblings (5 or more); declined: split ${k377s}, inline element lost ${k377e} (1 or more each); joining removal built whole ${k377j} (1 or more), join declines ${k377jd} (0); new flex boxes ${k377f} (1 or more)"
 [ "$k377r" = 0 ] && [ "${k377l:-0}" -ge 5 ] && [ "${k377s:-0}" -ge 1 ] &&
-	[ "${k377j:-0}" -ge 1 ] && [ "${k377e:-0}" -ge 1 ] && [ "${k377f:-0}" -ge 1 ] ||
+	[ "${k377j:-0}" -ge 1 ] && [ "${k377jd:-1}" -eq 0 ] && [ "${k377e:-0}" -ge 1 ] && [ "${k377f:-0}" -ge 1 ] ||
 	fail "block changes among mixed siblings"
 # Patch 378: a child-list change that adds or removes no element with a
 # box (a <script> appended to <body> or <html>) needs no rebuild, and an
@@ -2271,6 +2277,16 @@ k440d=$(printf '%s\n' "$k440seg" | grep -c "declined (no inserted or removed blo
 k440f=$(printf '%s\n' "$k440seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-block-blocks: rows $k440r (0), blocks of blocks built again whole ${k440w} (2), head changes answered ${k440h} (1 or more), moves taken as no-ops ${k440n} (0), no-block declines ${k440d} (0), full rebuilds after a decline ${k440f} (0)"
 [ "$k440r" = 0 ] && [ "${k440w:-0}" -ge 2 ] && [ "${k440h:-0}" -ge 1 ] && [ "${k440n:-1}" -eq 0 ] && [ "${k440d:-1}" -eq 0 ] && [ "${k440f:-1}" -eq 0 ] || fail "moved blocks and head changes"
+# Patch 444: removing a block between two runs of inline content builds
+# the parent again whole (one line, as a full build makes); before:
+# "removal would join two lines" and the full rebuild.
+k444r=$(fl_rows JS-join-lines CSS-join-lines-ref)
+k444seg=$(awk '/ page [0-9]+\/[0-9]+ JS-join-lines: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k444w=$(printf '%s\n' "$k444seg" | grep -c "a removal joining two lines, built again whole" || true)
+k444d=$(printf '%s\n' "$k444seg" | grep -c "declined (removal would join two lines)" || true)
+k444f=$(printf '%s\n' "$k444seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
+echo "  JS-join-lines: rows $k444r (0), joining removals built again whole ${k444w} (2), join declines ${k444d} (0), full rebuilds after a decline ${k444f} (0)"
+[ "$k444r" = 0 ] && [ "${k444w:-0}" -ge 2 ] && [ "${k444d:-1}" -eq 0 ] && [ "${k444f:-1}" -eq 0 ] || fail "removals that join two lines"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

@@ -14100,3 +14100,37 @@ wpblog), the trigger of 441's unmeasured inline-block.
   the fast sheet to land inside the slow sheet's second, and under ASan's
   slower timing it did not. So 443's path is ASan-unverified: the gate
   and the census ran it uninstrumented only.
+
+## Patch 444 (2026-11-22): a removal that joins two lines builds the block again whole
+
+**Problem.** Removing a block that stood between two runs of inline
+content leaves them side by side. A full build makes one line container
+of them; the local path would keep two. So patch 377 declined ("removal
+would join two lines", **3.0 a load** on the 7 census sites, bbc) into the
+full rebuild.
+
+**Fix** (html.c). The parent is built again whole: 440's
+`html_rl_block_whole`, which now names its reason in the log (440's own
+line is unchanged). Nothing is held at that point (no added, skipped or
+struct hits). A flex box's child list takes 439's fallback.
+
+**Gate.**
+- New pair **JS-join-lines / CSS-join-lines-ref**: a block between two
+  text runs removed, then a block between a `<span>` run and text
+  removed, each flushed alone. Result: **rows 0, 2 joining removals built
+  whole, 0 join declines, 0 full rebuilds**. The 443 binary on the same
+  page: 2 declines, 2 full rebuilds.
+- **An existing check changed meaning.** 377's JS-mixed-siblings asserted
+  at least one "removal would join two lines" decline. **gate444 failed
+  only on that check** (rows 0). It now asserts the joining removal built
+  whole in that page's window, and no join decline anywhere.
+
+**Census** (443 vs 444, 3 loads per arm, 7 sites):
+- "removal would join two lines" **3.0 -> 0** a load; the new path ran 9
+  times.
+- Total 29.3 vs 28.7 (noise). No crash in 42 loads.
+
+**gate444b exit 0**: stack through 444, restaged from pristine (526
+applied plus the 2 known collisions), with the updated 377 check.
+
+No sudo.

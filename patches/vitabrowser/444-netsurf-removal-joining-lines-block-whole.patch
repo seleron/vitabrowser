@@ -1,0 +1,99 @@
+# netsurf: a removal that joins two lines builds the block again whole (patch 444)
+# Generated 2026-11-22
+# Base: seleron/vitabrowser (patch stack through 443)
+#
+# Removing a block that stood between two runs of inline content leaves
+# them side by side: a full build makes one line container of them, the
+# local path would keep two, so patch 377 declined ("removal would join two
+# lines", 3.0 a load on 7 sites, bbc) into the full rebuild. The parent is
+# now built again whole (440's html_rl_block_whole, which now names its
+# reason in the log; 440's own line is unchanged). Nothing is held at that
+# point (no added, skipped or struct hits). A flex box's child list takes
+# 439's fallback.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8810,7 +8810,7 @@
+ static int html_rl_flex_whole(html_content *c, dom_node *el, struct box *b,
+ 		double t0, const char *what);
+ static int html_rl_block_whole(html_content *c, dom_node *el, struct box *b,
+-		double t0);	/* patch 440 */
++		double t0, const char *what);	/* patch 440 (444: what) */
+ static bool html_rl_boxes_in_order(dom_node *pnode, struct box *pbox);
+ 
+ /* Patch 404: a child-list change whose structural check found a rule that
+@@ -9536,6 +9536,7 @@
+ 	 * this path would keep two */
+ 	{
+ 		struct box *prevk = NULL;
++		bool join = false;
+ 		for (b = pbox->children; b != NULL; b = b->next) {
+ 			unsigned int k;
+ 			bool gone = false;
+@@ -9544,10 +9545,24 @@
+ 					gone = true;
+ 			if (gone)
+ 				continue;
+-			if (html_rl_anon_ic(b) && html_rl_anon_ic(prevk))
+-				RL_BNO("removal would join two lines");
++			if (html_rl_anon_ic(b) && html_rl_anon_ic(prevk)) {
++				join = true;
++				break;
++			}
+ 			prevk = b;
+ 		}
++		/* Patch 444: the block is built again whole (440), which
++		 * makes the one line a full build makes (bbc: 2 a load).
++		 * Nothing is held here yet (no added, skipped or struct
++		 * hits). A flex box's child list takes 439's fallback. */
++		if (join) {
++			if (!html_rl_noop_only && pbox->type == BOX_BLOCK &&
++			    pbox->parent != NULL && pbox->object == NULL &&
++			    !HTML_RL_FRAME(pbox))
++				return html_rl_block_whole(c, pnode, pbox, t0,
++					"a removal joining two lines");
++			RL_BNO("removal would join two lines");
++		}
+ 	}
+ 	/* the elements: new ones have no box yet */
+ 	if (dom_node_get_first_child(pnode, &n) != DOM_NO_ERR)
+@@ -9757,7 +9772,8 @@
+ 			html_rl_struct_hits_release(shits, &nshits);
+ 			for (i = 0; i < nskip; i++)
+ 				dom_node_unref(skipped[i]);
+-			return html_rl_block_whole(c, pnode, pbox, t0);
++			return html_rl_block_whole(c, pnode, pbox, t0,
++				"a block of blocks with no block in or out");
+ 		}
+ 		RL_BNO("a child with a box moved");
+ 	}
+@@ -9866,7 +9882,8 @@
+ 		html_rl_struct_hits_release(shits, &nshits);
+ 		for (i = 0; i < nskip; i++)
+ 			dom_node_unref(skipped[i]);
+-		return html_rl_block_whole(c, pnode, pbox, t0);
++		return html_rl_block_whole(c, pnode, pbox, t0,
++				"a block of blocks with no block in or out");
+ 	}
+ 	if (nadd == 0 && nrem == 0)
+ 		RL_BNO("no inserted or removed block found");
+@@ -14028,7 +14045,7 @@
+  * moved): 434's whole-block rebuild, cascaded afresh from the DOM, the
+  * page laid out whole. Its own :empty is what reaches outside. */
+ static int html_rl_block_whole(html_content *c, dom_node *el, struct box *b,
+-		double t0)
++		double t0, const char *what)
+ {
+ 	if ((b->children == NULL || html_rl_node_empty(el)) &&
+ 	    html_rl_empty_sibling_risk(c)) {
+@@ -14036,8 +14053,8 @@
+ 			"sibling rule tests :empty)");
+ 		return -1;
+ 	}
+-	macsurf_debug_log_writef("LIFE rebuild local: a block of blocks with "
+-		"no block in or out, built again whole");
++	macsurf_debug_log_writef("LIFE rebuild local: %s, built again whole",
++		what);
+ 	return html_rl_flex_restyle(c, el, b, t0, html_rl_class_same, true);
+ }
+ 
