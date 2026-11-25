@@ -422,6 +422,8 @@ JS-sheet-inplace file:///app0:/testpages/JS-sheet-inplace.html
 CSS-sheet-inplace-ref file:///app0:/testpages/CSS-sheet-inplace-ref.html
 JS-class-sib-parent file:///app0:/testpages/JS-class-sib-parent.html
 CSS-class-sib-parent-ref file:///app0:/testpages/CSS-class-sib-parent-ref.html
+JS-empty-sib-parent file:///app0:/testpages/JS-empty-sib-parent.html
+CSS-empty-sib-parent-ref file:///app0:/testpages/CSS-empty-sib-parent-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2338,6 +2340,16 @@ k448d=$(printf '%s\n' "$k448seg" | grep -c "declined (class change may move a si
 k448f=$(printf '%s\n' "$k448seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-class-sib-parent: rows $k448r (0), parent rebuilds ${k448p} (2), class declines ${k448d} (0), full rebuilds ${k448f} (0)"
 [ "$k448r" = 0 ] && [ "${k448p:-0}" -ge 2 ] && [ "${k448d:-1}" -eq 0 ] && [ "${k448f:-1}" -eq 0 ] || fail "class changes a sibling rule sees; inline-block classes"
+# Patch 450: a change that flips a block's :empty where a + / ~ rule tests
+# :empty builds the parent again whole (a line emptied, an empty block
+# filled: blocks; a flex item emptied: the flex box) -- no full rebuild.
+k450r=$(fl_rows JS-empty-sib-parent CSS-empty-sib-parent-ref)
+k450seg=$(awk '/ page [0-9]+\/[0-9]+ JS-empty-sib-parent: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k450p=$(printf '%s\n' "$k450seg" | grep -c "a sibling rule tests :empty: the parent" || true)
+k450d=$(printf '%s\n' "$k450seg" | grep -c "declined (a sibling rule tests :empty)" || true)
+k450f=$(printf '%s\n' "$k450seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-empty-sib-parent: rows $k450r (0), parent rebuilds ${k450p} (3), :empty declines ${k450d} (0), full rebuilds ${k450f} (0)"
+[ "$k450r" = 0 ] && [ "${k450p:-0}" -ge 3 ] && [ "${k450d:-1}" -eq 0 ] && [ "${k450f:-1}" -eq 0 ] || fail "an :empty flip a sibling rule sees: the parent"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
@@ -2349,8 +2361,8 @@ k381seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-tail: navigate/ {on=1; next} on && /
 k381t=$(printf '%s\n' "$k381seg" | grep -c "LIFE rebuild local: sibling check at the tail" || true)
 k381l=$(printf '%s\n' "$k381seg" | grep -c "LIFE rebuild local: blocks rebuilt\|LIFE rebuild local: child list changed only" || true)
 # Patch 446: the first insertion builds the parent again whole (it
-# declined); the :empty fill still declines -- both counted
-k381d=$(printf '%s\n' "$k381seg" | grep -c "declined (sibling combinator may restyle on insert/remove)\|declined (a sibling rule tests :empty)\|child-list change: the parent, built again whole" || true)
+# declined); patch 450: so does the :empty fill -- both counted
+k381d=$(printf '%s\n' "$k381seg" | grep -c "declined (sibling combinator may restyle on insert/remove)\|declined (a sibling rule tests :empty)\|child-list change: the parent, built again whole\|tests :empty: the parent, built again whole" || true)
 echo "  JS-sib-tail: rows differing from the parse-time build $k381r (0); ${k381t} tail checks (3 or more), ${k381l} changes local (4 or more), ${k381d} declines (2 or more)"
 [ "$k381r" = 0 ] && [ "${k381t:-0}" -ge 3 ] && [ "${k381l:-0}" -ge 4 ] &&
 	[ "${k381d:-0}" -ge 2 ] || fail "sibling check at the tail"

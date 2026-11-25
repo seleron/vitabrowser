@@ -1,0 +1,125 @@
+# netsurf: an :empty flip a sibling rule could see rebuilds the parent (patch 450)
+# Generated 2026-11-25
+# Base: seleron/vitabrowser (patch stack through 449)
+#
+# "a sibling rule tests :empty" (patch 373's html_rl_empty_sibling_risk, at
+# 440's html_rl_block_whole, 438's html_rl_flex_whole and the two line-path
+# checks of 373: a line emptied, content arriving in an empty block) was
+# the census's largest local decline after 447/448 (4.0 a load on the 7
+# sites). A + / ~ rule whose left compound has :empty reaches only the
+# block's later siblings and their descendants, all inside its parent;
+# :has() never matches here (patch 328) and no ancestor can flip :empty
+# (each holds the block). So the parent is built again whole --
+# html_rl_parent_whole, factored out of 445's html_rl_sib_parent_rebuild:
+# a block (440) or a flex or grid box (438), one level only (a depth
+# guard) -- and only a parent that cannot be keeps the decline.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8806,6 +8806,9 @@
+ /* Patch 448: the parent of a class or attribute a sibling rule can see */
+ static int html_rl_sib_parent_rebuild(html_content *c, dom_node *el,
+ 		const char *name);
++static int html_rl_parent_whole(html_content *c, dom_node *el,
++		const char *what);	/* patch 450 */
++#define HTML_RL_EMPTY_PARENT "a sibling rule tests :empty: the parent"
+ static int html_rl_flex_restyle(html_content *c, dom_node *el,
+ 		struct box *ob, double t0, const char *old_class,
+ 		bool is_block);
+@@ -14171,6 +14174,10 @@
+ {
+ 	if ((b->children == NULL || html_rl_node_empty(el)) &&
+ 	    html_rl_empty_sibling_risk(c)) {
++		/* patch 450: an X:empty + / ~ rule reaches el's later
++		 * siblings, all in its parent: that is built whole instead */
++		if (html_rl_parent_whole(c, el, HTML_RL_EMPTY_PARENT) == 0)
++			return 0;
+ 		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
+ 			"sibling rule tests :empty)");
+ 		return -1;
+@@ -14192,6 +14199,8 @@
+ {
+ 	if ((b->children == NULL || html_rl_node_empty(el)) &&
+ 	    html_rl_empty_sibling_risk(c)) {
++		if (html_rl_parent_whole(c, el, HTML_RL_EMPTY_PARENT) == 0)
++			return 0;	/* patch 450 */
+ 		macsurf_debug_log_writef("LIFE rebuild local: declined (a "
+ 			"sibling rule tests :empty)");
+ 		return -1;
+@@ -14209,29 +14218,46 @@
+  * again whole -- a block (440), a flex or grid box (438) -- which re-selects
+  * the element, its siblings and everything below them. A parent with no
+  * box, or any other box, keeps the full rebuild. */
+-static int html_rl_sib_parent_rebuild(html_content *c, dom_node *el,
+-		const char *name)
++/* Patch 450: el's parent built again whole -- a block (440), a flex or
++ * grid box (438); -1 for a parent with no box or another kind of box.
++ * Used for what a sibling rule reaches from el (445, 448, 450). The
++ * parent holds el, so its own :empty cannot flip: one level only (the
++ * depth guard says so). */
++static int html_rl_parent_whole(html_content *c, dom_node *el,
++		const char *what)
+ {
+ 	extern double macos9_micros(void);
++	static int depth;
+ 	dom_node *p = NULL;
+ 	struct box *pb;
+-	char what[96];
+ 	int r = -1;
+ 
++	if (depth > 0)
++		return -1;
+ 	if (dom_node_get_parent_node(el, &p) != DOM_NO_ERR || p == NULL)
+ 		return -1;
+ 	pb = box_for_node(p);
+-	snprintf(what, sizeof what, "a sibling selector can match on the %s "
+-		"attribute: the parent", name);
++	depth++;
+ 	if (pb != NULL && pb->type == BOX_BLOCK && pb->parent != NULL &&
+ 	    pb->object == NULL && !HTML_RL_FRAME(pb))
+ 		r = html_rl_block_whole(c, p, pb, macos9_micros(), what);
+ 	else if (pb != NULL && (pb->type == BOX_FLEX || pb->type == BOX_GRID))
+ 		r = html_rl_flex_whole(c, p, pb, macos9_micros(), what);
++	depth--;
+ 	dom_node_unref(p);
+ 	return r;
+ }
+ 
++static int html_rl_sib_parent_rebuild(html_content *c, dom_node *el,
++		const char *name)
++{
++	char what[160];
++
++	snprintf(what, sizeof what, "a sibling selector can match on the %s "
++		"attribute: the parent", name);
++	return html_rl_parent_whole(c, el, what);
++}
++
+ int html_reconvert_local_style(struct content *base_c, void *vnode);
+ int html_reconvert_local_style(struct content *base_c, void *vnode)
+ {
+@@ -14741,7 +14767,12 @@
+ 		(void) gen;
+ 		if ((old_ic == NULL || html_rl_node_empty(element)) &&
+ 		    html_rl_empty_sibling_risk(c)) {
++			/* patch 450: the parent, built whole */
++			int pr = html_rl_parent_whole(c, element,
++					HTML_RL_EMPTY_PARENT);
+ 			dom_node_unref(element);
++			if (pr == 0)
++				return 0;
+ 			RL_NO("a sibling rule tests :empty");
+ 		}
+ 		if (dom_element_get_attribute(element, corestring_dom_class,
+@@ -14822,7 +14853,11 @@
+ 	/* Patch 373: a line emptied flips the block's :empty -- a sibling
+ 	 * rule can see that */
+ 	if (html_rl_node_empty(element) && html_rl_empty_sibling_risk(c)) {
++		/* patch 450: the parent, built whole */
++		int pr = html_rl_parent_whole(c, element, HTML_RL_EMPTY_PARENT);
+ 		dom_node_unref(element);
++		if (pr == 0)
++			return 0;
+ 		RL_NO("a sibling rule tests :empty");
+ 	}
+ 	/* Patch 367: a cell may hold blocks too (a floated <div>): the

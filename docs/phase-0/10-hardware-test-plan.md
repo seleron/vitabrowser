@@ -14646,3 +14646,44 @@ scratch WORK, `abwork-439` / `abwork-449`, back to back):
   This needs a property-level diff (libcss).
 
 No sudo.
+
+## Patch 450 (2026-11-25): an :empty flip a sibling rule could see rebuilds the parent
+
+**Problem.** "a sibling rule tests :empty" was the largest local decline
+after 447/448: **4.0 a load** on the 7 census sites (449's census). Patch
+373's `html_rl_empty_sibling_risk` declines when a page has a `+` / `~`
+rule whose left compound tests `:empty` and the change empties a block or
+fills an empty one. It is checked at four places: 440's
+`html_rl_block_whole`, 438's `html_rl_flex_whole`, and 373's two line-path
+checks (a line emptied, content arriving in an empty block).
+
+**Fix** (html.c).
+- Such a rule (`X:empty + Y`, `X:empty ~ Y Z`) reaches only the block's
+  later siblings and their descendants, all inside its parent. `:has()`
+  never matches here (patch 328), and no ancestor can flip `:empty`
+  because each one holds the block. This is 445's argument again.
+- So at all four places the parent is built again whole:
+  **`html_rl_parent_whole`**, factored out of 445's
+  `html_rl_sib_parent_rebuild` (a block: 440, a flex or grid box: 438).
+  It goes one level only, under a depth guard: the parent holds the block,
+  so its own `:empty` check cannot fire again.
+- Only a parent that cannot be rebuilt that way keeps the decline. The
+  checks all run before anything is changed, so a decline still leaves
+  the tree untouched.
+
+**Gate.**
+- New pair **JS-empty-sib-parent / CSS-empty-sib-parent-ref**, each step
+  flushed alone:
+  - a line emptied under `.x:empty + p` and `.x:empty ~ .t`;
+  - an empty block filled;
+  - a flex item emptied under `div:empty ~ div`.
+  In the mini run: **3 parent rebuilds (block, block, flex), 0 `:empty`
+  declines, 0 full rebuilds, rows 0**.
+- 381's JS-sib-tail: its `:empty` fill is a parent rebuild now (its frame
+  handed over). The check counts that as well as a decline.
+- 373's JS-gen-empty-sib still declines once, correctly: its parent takes
+  part in counting, so the parent rebuild declines ("the restyled flex or
+  grid box takes part in counting") and the change goes to the full
+  rebuild.
+- `restage-full.sh`: **532 applied plus the 2 known collisions**; its
+  sources equal applytest's.
