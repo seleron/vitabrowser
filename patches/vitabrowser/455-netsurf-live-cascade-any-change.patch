@@ -1,0 +1,78 @@
+# netsurf: any sheet, removal or root change during a load is walked against the live cascade (patch 455)
+# Generated 2026-11-26
+# Base: seleron/vitabrowser (patch stack through 454)
+#
+# "sheet change: a sheet is still loading or changing" (2.3 a load in the
+# 454 census: google, bbc, oldreddit) declined into the full rebuild unless
+# 443's no-walk answer applied (nothing pruned, the tree holding the
+# context's generation). But a full rebuild during a load cascades the live
+# c->select_ctx as it is (it is refreshed only once every sheet settled),
+# and html_rl_doc_noop's walk compares EVERY element's box against the
+# context it is given: so walking against the live context, its hits
+# restyled in place (447/451), is exactly that rebuild's result whatever
+# generation the tree holds. 453 did this for a removal when the tree held
+# the context's generation; 455 drops that condition (html_rl_removal_held
+# goes) and takes any change -- sheet change, removal, root -- unless a
+# sheet's text update is pending (its rules are in no context yet). 443's
+# answer stays first: it needs no walk. 442's NET-js-sheet-wait is now
+# answered at once instead of waiting.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9053,11 +9053,6 @@
+ /* Patch 442 - set when html_rl_doc_noop declined because a sheet is still
+  * loading or changing; read and cleared by macos9_reconvert_try_local */
+ static int html_rl_unsettled;
+-/* Patch 453 - set by html_reconvert_local_change around its prune: the
+- * box tree held the selection context's generation just before it (443's
+- * rl_boxes_gen), so the live context, minus the pruned sheet, is the
+- * cascade a full rebuild would use while another sheet is in flight */
+-static bool html_rl_removal_held;
+ /* set by macos9_reconvert_cb while the batch it tries may still wait */
+ int html_rl_sheet_wait_ok;
+ int html_rl_take_unsettled(void);
+@@ -9199,15 +9194,23 @@
+ 			/* Patch 453: a removal while another sheet is in
+ 			 * flight. c->select_ctx is refreshed only once every
+ 			 * sheet has settled, but the prune takes a settled
+-			 * sheet out of it (patch 425): so the live context is
+-			 * the held cascade minus the removed sheet -- what a
+-			 * full rebuild would cascade now -- when the tree held
+-			 * the context's generation before the prune. The walk
++			 * sheet out of it (patch 425): the live context is
++			 * what a full rebuild would cascade now. The walk
+ 			 * compares against that live context itself (no fresh
+ 			 * one, no swap); the sheet in flight marks when it is
+-			 * done, and that batch re-cascades it all. */
+-			else if (strcmp(what, "sheet removal") == 0 &&
+-			    html_rl_removal_held && c->select_ctx != NULL &&
++			 * done, and that batch re-cascades it all.
++			 * Patch 455: for any change, and whatever generation
++			 * the tree holds. A full rebuild during a load cascades
++			 * the live context as it is (it is refreshed only once
++			 * every sheet settled), and the walk compares EVERY
++			 * element's box against it: the hits are exactly what
++			 * that rebuild would change, wherever the tree's
++			 * styles came from (453 asked the tree to hold the
++			 * context's generation: not needed). Not with a sheet
++			 * whose text update is pending (its rules are in no
++			 * context yet). 443's answer above stays first: it
++			 * needs no walk. */
++			else if (c->select_ctx != NULL &&
+ 			    !html_rl_sheet_modified(c)) {
+ 				use_live = true;
+ 				macsurf_debug_log_writef("LIFE rebuild local: %s: "
+@@ -14539,13 +14542,9 @@
+ 	 * dead sheet. */
+ 	{
+ 		int pruned, rr = 0;
+-		/* patch 453: did the tree hold the context before the prune? */
+-		html_rl_removal_held = c->rl_boxes_gen != 0 &&
+-			c->rl_boxes_gen == c->rl_ctx_gen;
+ 		pruned = html_css_prune_detached_sheets(c);
+ 		if (pruned > 0)
+ 			rr = html_rl_doc_noop(c, "sheet removal");
+-		html_rl_removal_held = false;
+ 		/* Patch 421: unless the whole document, re-cascaded without
+ 		 * the dead sheets, keeps the styles its boxes hold (415's
+ 		 * walk): then nothing the sheets did is lost, and the change

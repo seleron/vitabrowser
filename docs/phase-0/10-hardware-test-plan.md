@@ -15099,3 +15099,49 @@ No sudo.
 run) -> 16.0 (454).
 
 No sudo.
+
+## Patch 455 (2026-11-26): any sheet, removal or root change during a load is walked against the live cascade
+
+**Problem.** "sheet change: a sheet is still loading or changing" was the
+largest local decline in the 454 census: **2.3 a load** (google 5 over
+three loads, bbc, oldreddit). Unless 443's no-walk answer applied (nothing
+pruned, the tree holding the context's generation), it went to the full
+rebuild. The 443 condition fails, for example, after a sheet settled (the
+live context refreshed) and another began loading before that refresh was
+re-cascaded.
+
+**Why the live walk is always right during a load.**
+- A full rebuild during a load cascades the live `c->select_ctx` as it
+  is: it is refreshed only once every sheet has settled (442's note).
+- `html_rl_doc_noop`'s walk compares **every** element's box against the
+  context it is given.
+- So walking against the live context and restyling its hits in place
+  (447/451) gives exactly that rebuild's result, whatever generation the
+  tree holds.
+- 453 did this for a removal and asked the tree to hold the context's
+  generation (`html_rl_removal_held`). That condition is not needed and
+  goes.
+
+**Fix** (html.c). During a load, any change (sheet change, removal, root
+change) walks against the live context, unless a sheet's text update is
+pending (`html_rl_sheet_modified`: its rules are in no context yet). 443's
+answer stays first, because it needs no walk. The log line is "<what>: a
+sheet is still loading, against the live cascade".
+
+**Gate.** No new page; one check changes meaning:
+- 442's NET-js-sheet-wait (a sheet change while a sheet is in flight)
+  waited for the sheets to settle; it is now **answered at once** by the
+  live walk ("restyles nothing", rows 0). The check counts a wait or a
+  live answer.
+- 443's NET-js-sheet-gen still takes 443's no-walk answer, and 453's
+  NET-js-removal-loading still restyles 3 elements in place against the
+  live cascade. Mini run: all three rows 0.
+- `restage-full.sh`: **537 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate455 exit 0** (stack through 455): NET-js-sheet-wait rows 0,
+  answered against the live cascade, 0 full rebuilds; NET-js-sheet-gen
+  rows 0, 443's answer, 0 still-loading declines; NET-js-removal-loading
+  rows 0, the live cascade, 0 full rebuilds; interaction 52/52 at the
+  Vita's pace.
+
+No sudo.

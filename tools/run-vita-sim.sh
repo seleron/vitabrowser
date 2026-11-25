@@ -2224,10 +2224,13 @@ echo "  NET-js-sheet-inflight: rows $k432r (0), removals restyling nothing ${k43
 # style changed: no full rebuild of any cause in the page's window.
 k442r=$(fl_rows NET-js-sheet-wait NET-css-sheet-wait-ref)
 k442seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-sheet-wait: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
-k442w=$(printf '%s\n' "$k442seg" | grep -c "LIFE sheet wait: a sheet is still loading or changing, the batch waits" || true)
+# patch 455: the batch is answered at once against the live cascade (a
+# full rebuild during the load would cascade that same context); either
+# that or 442's wait counts
+k442w=$(printf '%s\n' "$k442seg" | grep -c "LIFE sheet wait: a sheet is still loading or changing, the batch waits\|sheet change: a sheet is still loading, against the live cascade" || true)
 k442n=$(printf '%s\n' "$k442seg" | grep -c "sheet change restyles nothing" || true)
 k442f=$(printf '%s\n' "$k442seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
-echo "  NET-js-sheet-wait: rows $k442r (0), batches waiting for a sheet ${k442w} (1 or more), sheet changes restyling nothing ${k442n} (1 or more), full rebuilds ${k442f} (0)"
+echo "  NET-js-sheet-wait: rows $k442r (0), batches waiting for a sheet or answered against the live cascade ${k442w} (1 or more), sheet changes restyling nothing ${k442n} (1 or more), full rebuilds ${k442f} (0)"
 [ "$k442r" = 0 ] && [ "${k442w:-0}" -ge 1 ] && [ "${k442n:-0}" -ge 1 ] && [ "${k442f:-1}" -eq 0 ] || fail "sheet changes wait for a sheet in flight"
 # Patch 443: a sheet that lands while another is in flight (then a layout
 # read: the synchronous flush, which cannot wait) is answered with no
