@@ -15268,3 +15268,46 @@ enclosing rebuild ran twice under ASan.
 14.7 (456; 15.7 for 455 in that run).
 
 No sudo.
+
+## Patch 457 (2026-11-26): a new element no local shape builds rebuilds the parent
+
+**Problem.** "new element is not a plain block, list item or block of
+blocks" was the largest local decline in the 456 census: **2.0 a load**.
+It fires after every local shape for a new element has been tried:
+- 364, a block holding images or controls;
+- 407, a leaf between blocks;
+- 416, a plain inline element between blocks;
+- 378, a late append.
+
+Whatever is left (a `<table>`, an `<a>` holding a block, a custom element,
+an inline `<svg>`, a `<span>` holding an image) went to the full rebuild.
+
+**Fix** (html.c).
+- The parent block is built again whole from the DOM instead (440's
+  `html_rl_block_whole`). That builds the new element whatever it is, and
+  its own checks (controls, frames, `<object>`) still decline.
+- 454's `obj_why` now carries the rebuild's log text, and `obj_decl` the
+  decline kept when the parent cannot be rebuilt.
+- In 408's flex child-list mode the old decline line stays: 439's flex
+  rebuild follows it, and 439's checks count it.
+
+**Gate.**
+- New pair **JS-new-nonplain / CSS-new-nonplain-ref**, each inserted
+  between two blocks: a `<table>`; an `<a>` holding a `<div>`; a custom
+  `<x-card>`; an inline `<svg>`. Mini run: **2 parent rebuilds** (the 2nd
+  to 4th inserts came as one batch), **rows 0**, no full rebuild.
+  - The first reference differed by 11 rows. The only difference was the
+    link's colour: `href="#"` is the page itself, already visited when the
+    script inserts it, not yet while the reference parses. Both pages now
+    link a never-visited URL.
+- 416's JS-inline-mid: its image `<span>` (which declined) is now a
+  parent rebuild; the check counts either.
+- `restage-full.sh`: **539 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate457 exit 0** (stack through 457): JS-new-nonplain rows 0, 2
+  parent rebuilds, 0 not-plain declines, 0 full rebuilds; the related
+  pages unchanged (416 JS-inline-mid, 429 NET-js-block-frame, 430
+  JS-block-oc2, 439 JS-media-new: all rows 0); interaction 52/52 at the
+  Vita's pace.
+
+No sudo.

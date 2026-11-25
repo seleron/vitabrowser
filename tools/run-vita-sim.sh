@@ -428,6 +428,8 @@ JS-rm-objects file:///app0:/testpages/JS-rm-objects.html
 CSS-rm-objects-ref file:///app0:/testpages/CSS-rm-objects-ref.html
 JS-inline-block-inner file:///app0:/testpages/JS-inline-block-inner.html
 CSS-inline-block-inner-ref file:///app0:/testpages/CSS-inline-block-inner-ref.html
+JS-new-nonplain file:///app0:/testpages/JS-new-nonplain.html
+CSS-new-nonplain-ref file:///app0:/testpages/CSS-new-nonplain-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2036,8 +2038,9 @@ k416seg=$(awk '/ page [0-9]+\/[0-9]+ JS-inline-mid: navigate/ {on=1; next} on &&
 k416m=$(printf '%s\n' "$k416seg" | grep -c "an inline element inserted between blocks, built alone" || true)
 k416e=$(printf '%s\n' "$k416seg" | grep -c "an inline element appended at the end, built alone" || true)
 k416p=$(printf '%s\n' "$k416seg" | grep -c "leaf element placed in a line of its own" || true)
-k416d=$(printf '%s\n' "$k416seg" | grep -c "declined (new element is not a plain block" || true)
-echo "  JS-inline-mid: rows $k416r (0), between blocks ${k416m} (2), lines of their own ${k416p} (2), appended ${k416e} (1), image span declined ${k416d} (1)"
+# patch 457: the image span builds the parent again whole (was a decline)
+k416d=$(printf '%s\n' "$k416seg" | grep -c "declined (new element is not a plain block\|a new element that is not a plain block: the parent" || true)
+echo "  JS-inline-mid: rows $k416r (0), between blocks ${k416m} (2), lines of their own ${k416p} (2), appended ${k416e} (1), image span declined or its parent rebuilt ${k416d} (1)"
 [ "$k416r" = 0 ] && [ "${k416m:-0}" -eq 2 ] && [ "${k416p:-0}" -ge 2 ] && [ "${k416e:-0}" -eq 1 ] && [ "${k416d:-0}" -ge 1 ] || fail "inline elements between blocks"
 # Patch 417: attributes a sheet can see, re-selected as a class change:
 # data-state, aria-pressed, data-x (3) restyled locally; an attribute on a
@@ -2394,6 +2397,16 @@ k456d=$(printf '%s\n' "$k456seg" | grep -c "declined (restyled flex or grid box 
 k456f=$(printf '%s\n' "$k456seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-inline-block-inner: rows $k456r (0), enclosing blocks built again whole ${k456e} (2), not-in-a-block declines ${k456d} (0), full rebuilds ${k456f} (0)"
 [ "$k456r" = 0 ] && [ "${k456e:-0}" -ge 2 ] && [ "${k456d:-1}" -eq 0 ] && [ "${k456f:-1}" -eq 0 ] || fail "a box in an inline-level box: the enclosing block"
+# Patch 457: a new element none of the local shapes builds (a <table>, an
+# <a> holding a <div>, a custom element, an inline <svg>) builds the parent
+# again whole; no "not a plain block" decline, no full rebuild.
+k457r=$(fl_rows JS-new-nonplain CSS-new-nonplain-ref)
+k457seg=$(awk '/ page [0-9]+\/[0-9]+ JS-new-nonplain: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k457p=$(printf '%s\n' "$k457seg" | grep -c "a new element that is not a plain block: the parent" || true)
+k457d=$(printf '%s\n' "$k457seg" | grep -c "declined (new element is not a plain block" || true)
+k457f=$(printf '%s\n' "$k457seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-new-nonplain: rows $k457r (0), parent rebuilds ${k457p} (1 or more), not-plain declines ${k457d} (0), full rebuilds ${k457f} (0)"
+[ "$k457r" = 0 ] && [ "${k457p:-0}" -ge 1 ] && [ "${k457d:-1}" -eq 0 ] && [ "${k457f:-1}" -eq 0 ] || fail "a new element that is not a plain block: the parent"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
