@@ -424,6 +424,8 @@ JS-class-sib-parent file:///app0:/testpages/JS-class-sib-parent.html
 CSS-class-sib-parent-ref file:///app0:/testpages/CSS-class-sib-parent-ref.html
 JS-empty-sib-parent file:///app0:/testpages/JS-empty-sib-parent.html
 CSS-empty-sib-parent-ref file:///app0:/testpages/CSS-empty-sib-parent-ref.html
+JS-rm-objects file:///app0:/testpages/JS-rm-objects.html
+CSS-rm-objects-ref file:///app0:/testpages/CSS-rm-objects-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2366,6 +2368,17 @@ k450d=$(printf '%s\n' "$k450seg" | grep -c "declined (a sibling rule tests :empt
 k450f=$(printf '%s\n' "$k450seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-empty-sib-parent: rows $k450r (0), parent rebuilds ${k450p} (3), :empty declines ${k450d} (0), full rebuilds ${k450f} (0)"
 [ "$k450r" = 0 ] && [ "${k450p:-0}" -ge 3 ] && [ "${k450d:-1}" -eq 0 ] && [ "${k450f:-1}" -eq 0 ] || fail "an :empty flip a sibling rule sees: the parent"
+# Patch 454: removing a block that holds objects (an <img>, a background)
+# builds the parent again whole, its objects re-pointed or retired (375);
+# a removed frame keeps the full rebuild (371's JS-frames-local check).
+k454r=$(fl_rows JS-rm-objects CSS-rm-objects-ref)
+k454seg=$(awk '/ page [0-9]+\/[0-9]+ JS-rm-objects: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k454p=$(printf '%s\n' "$k454seg" | grep -c "a removed block holds objects: the parent" || true)
+k454o=$(printf '%s\n' "$k454seg" | grep -c "objects re-pointed [0-9]* (in flight [0-9]*), retired [1-9]" || true)
+k454d=$(printf '%s\n' "$k454seg" | grep -c "declined (removed block holds objects or frames)" || true)
+k454f=$(printf '%s\n' "$k454seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-rm-objects: rows $k454r (0), parent rebuilds ${k454p} (1 or more), with objects retired ${k454o} (1 or more), object declines ${k454d} (0), full rebuilds ${k454f} (0)"
+[ "$k454r" = 0 ] && [ "${k454p:-0}" -ge 1 ] && [ "${k454o:-0}" -ge 1 ] && [ "${k454d:-1}" -eq 0 ] && [ "${k454f:-1}" -eq 0 ] || fail "a removed block holding objects: the parent"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

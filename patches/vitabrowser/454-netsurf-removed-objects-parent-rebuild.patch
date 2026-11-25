@@ -1,0 +1,72 @@
+# netsurf: a removed block holding objects rebuilds the parent; a frame keeps the full rebuild (patch 454)
+# Generated 2026-11-26
+# Base: seleron/vitabrowser (patch stack through 453)
+#
+# "removed block holds objects or frames" (html_rl_block_change: 3.0 a load
+# in the 453 census, bbc 2, youtube 1) declined into the full rebuild: the
+# block placement frees the removed boxes, and objects (images, a
+# background pointing into the box) would keep pointing at them. The
+# subtree rebuild already carries objects (375: re-pointed when their
+# element stays, retired when it left), so a removed block holding objects
+# but no frame now leaves through decline: and the parent block is built
+# again whole (440's html_rl_block_whole; in 408's flex mode 438's flex
+# whole). A frame in the removed block keeps the decline and its message:
+# 428's carry would re-box a removed frame's window to nothing, which is
+# not what the full rebuild does (371).
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9600,6 +9600,7 @@
+ 	int delta, total = 0;
+ 	const char *why = NULL;
+ 	const char *sib_why = NULL;		/* patch 446 */
++	const char *obj_why = NULL;		/* patch 454 */
+ 	static unsigned long block_n;
+ 
+ /* patch 439: in 408's flex child-list mode a reason here is not a decline:
+@@ -9680,11 +9681,23 @@
+ 		if (parent != pnode) {
+ 			/* patch 368: form controls may go (released below) */
+ 			if (nrem == HTML_RL_MAX_CHANGES ||
+-			    html_rl_subtree_objects_or_frames(b->children) ||
+-			    b->object != NULL || HTML_RL_FRAME(b) ||
+-			    /* patch 374: a background too */
+-			    html_rl_objects_point_into(c, b))
++			    html_rl_subtree_frames(b->children) ||
++			    HTML_RL_FRAME(b))
+ 				RL_BNO("removed block holds objects or frames");
++			/* Patch 454: objects (images, a background pointing
++			 * into it) but no frame: the parent is built again
++			 * whole at decline: -- 375's relink re-points the
++			 * objects that stay and retires the removed ones, as
++			 * the full rebuild's relink does (bbc, youtube: 3.0 a
++			 * load). A frame keeps the full rebuild (371: no local
++			 * path frees a frame's box). */
++			if (html_rl_subtree_objects_or_frames(b->children) ||
++			    b->object != NULL ||
++			    /* patch 374: a background too */
++			    html_rl_objects_point_into(c, b)) {
++				obj_why = "a removed block holds objects";
++				goto decline;
++			}
+ 			/* a list item, or a block of blocks: the page is laid
+ 			 * out whole afterwards (markers renumbered, margins
+ 			 * collapsed through the nesting) */
+@@ -10471,6 +10484,17 @@
+ 		return html_rl_flex_whole(c, pnode, pbox, t0, "a flex or grid "
+ 			"box's child list the local path declined");
+ 	}
++	/* Patch 454: a removed block holding objects: the parent built again
++	 * whole, its objects relinked or retired (375) */
++	if (obj_why != NULL && sib_why == NULL) {
++		if (pbox->type == BOX_BLOCK && pbox->parent != NULL &&
++		    pbox->object == NULL && !HTML_RL_FRAME(pbox))
++			return html_rl_block_whole(c, pnode, pbox, t0,
++				"a removed block holds objects: the parent");
++		macsurf_debug_log_writef("LIFE rebuild local: declined (%s)",
++			"removed block holds objects or frames");
++		return -1;
++	}
+ 	/* Patch 446: a + / ~ rule that could see the insert or removal (or a
+ 	 * box-less element among the children) reaches only the parent's
+ 	 * children and their descendants (:has() never matches, patch 328):

@@ -15015,3 +15015,43 @@ local declines; then "sheet change: a sheet is still loading or changing"
 (2.0) and "sheet removal: an element without a box would get one" (1.0).
 
 No sudo.
+
+## Patch 454 (2026-11-26): a removed block holding objects rebuilds the parent; a frame keeps the full rebuild
+
+**Problem.** "removed block holds objects or frames" was the largest local
+decline after 453: **3.0 a load** in the 453 census (bbc 2, youtube 1).
+`html_rl_block_change` frees the removed boxes when it places the blocks.
+Objects (an `<img>`'s content, or a background pointing into the box)
+would keep pointing at those boxes, so it declined into the full rebuild.
+
+**Fix** (html.c).
+- 375's subtree rebuild already carries objects: it re-points the ones
+  whose element stays and retires the ones whose element left, as the full
+  rebuild's relink does.
+- So a removed block holding objects **but no frame** now leaves through
+  `decline:` (`obj_why`), and the parent block is built again whole (440's
+  `html_rl_block_whole`; in 408's flex mode, 438's flex whole).
+- `<object>` / `<embed>` still decline inside that rebuild (375's
+  relinkable check).
+- **A frame** in the removed block keeps the decline and its message: 428's
+  carry would re-box a removed frame's window to nothing, which is not
+  what the full rebuild does (371). 371's JS-frames-local check, which
+  counts that decline, is unchanged.
+
+**Gate.**
+- New pair **JS-rm-objects / CSS-rm-objects-ref**, each step flushed by a
+  layout read:
+  - a block holding an `<img>` removed;
+  - a block with a background image removed;
+  - a block of blocks holding an `<img>` removed.
+  Images above and below stay. The mini run's log: **2 parent rebuilds**
+  (the 2nd and 3rd removals came as one batch), objects re-pointed 3 /
+  retired 4, then re-pointed 2 / retired 4, **rows 0**, no full rebuild.
+- `restage-full.sh`: **536 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate454 exit 0** (stack through 454): JS-rm-objects rows 0, 2 parent
+  rebuilds with objects retired, 0 object declines, 0 full rebuilds;
+  JS-frames-local unchanged (the removed-block frame decline still 1, rows
+  0); interaction 52/52 at the Vita's pace.
+
+No sudo.
