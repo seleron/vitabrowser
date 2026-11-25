@@ -1,0 +1,164 @@
+# netsurf: a change that changes the root's own style restyles the root in place (patch 459)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 458)
+#
+# html_rl_doc_noop's walk declined whenever the root <html>'s own style
+# changed ("an element's style changes, HTML": bbc's sheet removals, most
+# of what is left of "detached stylesheet pruned"; root changes too), as
+# everything inherits from it. But the walk cascades the root's children
+# against its NEW style (root_new), so every element under it is still
+# compared, and those that change are hits (447). Only the root's box needs
+# the new style: taken in place -- out of keep[] and owned here, swapped in
+# after the context install and before the hits' restyles (they read
+# c->layout->style as the root's), unit_len_ctx.root_style repointed, as
+# html_reconvert_fast_style swaps a box's styles -- when construction would
+# decide the same (display, float, position), no ::before / ::after
+# changes (the diff says so) and nothing counts; then the page is laid out
+# whole (html_rl_root_relayout_now). Inherited changes still mostly reach
+# more than 8 elements and keep the full rebuild.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9063,6 +9063,20 @@
+ 	return v;
+ }
+ 
++/* Patch 459: the root restyled in place -- the page laid out whole once
++ * the walk's answer is done */
++static bool html_rl_root_relayout;
++static void html_rl_root_relayout_now(html_content *c)
++{
++	if (!html_rl_root_relayout)
++		return;
++	html_rl_root_relayout = false;
++	html_rl_invalidate(c->layout);
++	content__reformat(&c->base, false, c->base.available_width,
++			c->base.available_height);
++	html__redraw_a_box(c, c->layout);
++}
++
+ /* Patch 447: a sheet change restyles a few elements in place (below) */
+ static int html_rl_sheet_hit_restyle(html_content *c, dom_node *el);
+ #define HTML_RL_SHEET_HITS_MAX 8
+@@ -9134,6 +9148,11 @@
+ 	int nhits = 0;
+ 	bool can_hit = true;
+ 	bool use_live = false;		/* patch 453 */
++	/* Patch 459: the root's own new style, taken in place (owned here
++	 * once taken out of keep[]) */
++	css_select_results *root_ns = NULL;
++	css_custom_env *root_env = NULL;
++	struct box *root_box = NULL;
+ 	static unsigned long inplace_n;
+ 	const css_computed_style *root_new = NULL;
+ 	dom_node *root = NULL;
+@@ -9322,6 +9341,36 @@
+ 			     (box->gadget->type == GADGET_SELECT ||
+ 			      box->gadget->type == GADGET_TEXTAREA)))
+ 				walk = false;
++			/* Patch 459: the root's own style changes (bbc: a
++			 * removed sheet styled <html>). Its children are
++			 * cascaded against its NEW style below (root_new), so
++			 * every element under it is still compared; only the
++			 * root's box needs the new style, taken in place when
++			 * construction would decide the same (display, float,
++			 * position), no ::before / ::after changes (the diff
++			 * says so) and nothing counts. The walk goes on. */
++			if (why != NULL && f.n == root && box == c->layout &&
++			    strcmp(why, "an element's style changes") == 0 &&
++			    nkeep > 0 && keep[nkeep - 1] == ns &&
++			    css_computed_display(
++				ns->styles[CSS_PSEUDO_ELEMENT_NONE], true) ==
++			    css_computed_display(box->style, true) &&
++			    css_computed_float(
++				ns->styles[CSS_PSEUDO_ELEMENT_NONE]) ==
++			    css_computed_float(box->style) &&
++			    css_computed_position(
++				ns->styles[CSS_PSEUDO_ELEMENT_NONE]) ==
++			    css_computed_position(box->style) &&
++			    !html_rl_style_counts(
++				ns->styles[CSS_PSEUDO_ELEMENT_NONE]) &&
++			    !html_rl_style_counts(box->style)) {
++				root_ns = ns;
++				root_env = envs[nkeep - 1];
++				keep[nkeep - 1] = NULL;	/* owned here now */
++				envs[nkeep - 1] = NULL;
++				root_box = box;
++				why = NULL;
++			}
+ 			/* Patch 447: not the root (everything inherits from
+ 			 * it); its subtree is re-selected by the restyle, so
+ 			 * not walked */
+@@ -9380,13 +9429,21 @@
+ 	while (nst > 0)
+ 		dom_node_unref(st[--nst].n);
+ 	for (k = 0; k < nkeep; k++) {
+-		css_select_results_destroy(keep[k]);
++		if (keep[k] != NULL)	/* patch 459: the root's, taken */
++			css_select_results_destroy(keep[k]);
+ 		if (envs[k] != NULL)
+ 			css_custom_env_unref(envs[k]);
+ 	}
+ 	free(keep);
+ 	free(envs);
+ 	free(st);
++	if (why != NULL && root_ns != NULL) {	/* patch 459: not taken */
++		css_select_results_destroy(root_ns);
++		if (root_env != NULL)
++			css_custom_env_unref(root_env);
++		root_ns = NULL;
++		root_env = NULL;
++	}
+ 	if (why != NULL) {
+ 		if (ctx != NULL && !use_live)
+ 			css_select_ctx_destroy(ctx);
+@@ -9406,6 +9463,26 @@
+ 		 * generation */
+ 		html_css_ctx_changed(c);
+ 	}
++	/* Patch 459: the root's box takes its new style in place, before
++	 * the hits' restyles (they read c->layout->style as the root's), as
++	 * html_reconvert_fast_style swaps a box's styles; rem units read it
++	 * through unit_len_ctx.root_style */
++	if (root_ns != NULL && root_box != NULL) {
++		css_select_results *old = root_box->styles;
++		if (root_box->custom_env != NULL)
++			css_custom_env_unref(root_box->custom_env);
++		root_box->custom_env = root_env;
++		root_box->styles = root_ns;
++		root_box->style = root_ns->styles[CSS_PSEUDO_ELEMENT_NONE];
++		c->unit_len_ctx.root_style = root_box->style;
++		css_select_results_destroy(old);
++		root_ns = NULL;
++		root_env = NULL;
++		macsurf_debug_log_writef("LIFE rebuild local: %s: the root "
++			"restyled in place", what);
++		/* the page laid out whole after the hits (below) */
++		html_rl_root_relayout = true;
++	}
+ 	/* Patch 447: re-cascade in place. Every element outside the hits'
+ 	 * subtrees keeps its style under the new context (the walk); the
+ 	 * hits are restyled with their subtrees, against it. A hit's
+@@ -9417,12 +9494,14 @@
+ 		for (k = 0; k < nhits; k++)
+ 			dom_node_unref(hits[k]);
+ 		if (r != 0) {
++			html_rl_root_relayout = false;	/* the full rebuild */
+ 			macsurf_debug_log_writef("LIFE rebuild local: %s: "
+ 				"declined (an element restyled in place "
+ 				"declined)", what);
+ 			return -1;
+ 		}
+ 		c->rl_boxes_gen = c->rl_ctx_gen;
++		html_rl_root_relayout_now(c);	/* patch 459 */
+ 		if (strcmp(what, "sheet change") == 0)	/* the batch's census */
+ 			html_rl_inplace_last = nhits;
+ 		inplace_n++;
+@@ -9433,6 +9512,7 @@
+ 		return 0;
+ 	}
+ 	c->rl_boxes_gen = c->rl_ctx_gen;
++	html_rl_root_relayout_now(c);	/* patch 459 */
+ 	html__redraw_a_box(c, c->layout);
+ 	noop_n++;
+ 	macsurf_debug_log_writef("LIFE rebuild local: %s restyles "

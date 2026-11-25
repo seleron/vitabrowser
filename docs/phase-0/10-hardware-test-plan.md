@@ -15432,3 +15432,51 @@ JS-sheet-pending's with its text update pending, and 1 removal.
 (455) -> 14.7 (456) -> 14.0 (457) -> 11.7 (458).
 
 No sudo.
+
+## Patch 459 (2026-11-27): a change that changes the root's own style restyles the root in place
+
+**Problem.** "detached stylesheet pruned" (1.7 a load in the 458 census)
+came from two causes in the sheet-removal walk:
+- "an element's style changes, HTML" (bbc, 3 over three loads): the root
+  `<html>`'s own style changed;
+- "an element without a box would get one" (oldreddit, 2): a removed
+  sheet had hidden an element.
+
+The walk declined on any change to the root, as everything inherits from
+it; root changes (419) did the same.
+
+**Fix** (html.c, `html_rl_doc_noop`).
+- The walk cascades the root's children against the root's **new** style
+  (`root_new`), so every element under it is still compared. Those that
+  change are hits (447); more than 8 still declines.
+- Only the root's box needs its new style. It is taken in place when
+  construction would decide the same (display, float, position), no
+  `::before` / `::after` changes (the diff reports those apart) and
+  nothing counts:
+  - its selection result leaves `keep[]` and is owned by the walk;
+  - after the context install and before the hits' restyles (they read
+    `c->layout->style` as the root's), the box's styles are swapped and
+    `unit_len_ctx.root_style` repointed, as `html_reconvert_fast_style`
+    swaps a box's styles;
+  - the page is laid out whole and redrawn
+    (`html_rl_root_relayout_now`);
+  - on any decline the owned result is freed.
+- A root change in an inherited property mostly reaches more than 8
+  elements and keeps the full rebuild. The oldreddit cause is not
+  touched.
+
+**Gate.**
+- New pair **JS-root-restyle / CSS-root-restyle-ref**:
+  - the `<style>` giving `<html>` a background and padding is removed;
+  - a class on `<html>` changes its left padding.
+- Mini run: **the root restyled in place twice** (once for the removal,
+  once for the root change), nothing else restyled, **rows 0**.
+- 419's JS-root-noop and 388's JS-style-detach unchanged, rows 0.
+- `restage-full.sh`: **541 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate459 exit 0** (stack through 459): JS-root-restyle rows 0, 2
+  roots restyled in place, 0 root-style declines, 0 full rebuilds; 419's
+  JS-root-noop (2 no-ops, 1 in place) and 388's JS-style-detach
+  unchanged; interaction 52/52 at the Vita's pace.
+
+No sudo.

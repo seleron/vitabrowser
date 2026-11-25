@@ -432,6 +432,8 @@ JS-new-nonplain file:///app0:/testpages/JS-new-nonplain.html
 CSS-new-nonplain-ref file:///app0:/testpages/CSS-new-nonplain-ref.html
 JS-sheet-pending file:///app0:/testpages/JS-sheet-pending.html
 CSS-sheet-pending-ref file:///app0:/testpages/CSS-sheet-pending-ref.html
+JS-root-restyle file:///app0:/testpages/JS-root-restyle.html
+CSS-root-restyle-ref file:///app0:/testpages/CSS-root-restyle-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2419,6 +2421,16 @@ k458d=$(printf '%s\n' "$k458seg" | grep -c "sheet change: declined (a sheet is s
 k458f=$(printf '%s\n' "$k458seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-sheet-pending: rows $k458r (0), against the live cascade ${k458l} (1 or more), still-loading declines ${k458d} (0), full rebuilds ${k458f} (0)"
 [ "$k458r" = 0 ] && [ "${k458l:-0}" -ge 1 ] && [ "${k458d:-1}" -eq 0 ] && [ "${k458f:-1}" -eq 0 ] || fail "a sheet change while a text update is pending"
+# Patch 459: a sheet removal and a class on <html> that change only the
+# root's own (non-inherited) style restyle the root in place (2), the page
+# laid out whole; no root-style decline, no full rebuild.
+k459r=$(fl_rows JS-root-restyle CSS-root-restyle-ref)
+k459seg=$(awk '/ page [0-9]+\/[0-9]+ JS-root-restyle: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k459i=$(printf '%s\n' "$k459seg" | grep -c "the root restyled in place" || true)
+k459d=$(printf '%s\n' "$k459seg" | grep -c "declined (an element's style changes, HTML" || true)
+k459f=$(printf '%s\n' "$k459seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-root-restyle: rows $k459r (0), roots restyled in place ${k459i} (2), root-style declines ${k459d} (0), full rebuilds ${k459f} (0)"
+[ "$k459r" = 0 ] && [ "${k459i:-0}" -ge 2 ] && [ "${k459d:-1}" -eq 0 ] && [ "${k459f:-1}" -eq 0 ] || fail "the root restyled in place"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
