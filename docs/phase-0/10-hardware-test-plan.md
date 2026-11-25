@@ -15393,3 +15393,42 @@ census, the largest local decline.
   in place) unchanged; interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-27): ASan at 458, census 457 vs 458
+
+**ASan at 458:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 412 page dumps (gate 412), the log to page 356 of 356. The
+live-cascade walk ran 4 times under ASan: 3 sheet changes, including
+JS-sheet-pending's with its text update pending, and 1 removal.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 457 | 458 |
+|---|---|---|
+| bbc | 3 / 2 / 2 (2.3) | 2 / 2 / 2 (2.0) |
+| oldreddit | 3 / 2 / 2 (2.3) | 1 / 2 / 2 (1.7) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 3 / 2 / 3 (2.7) | 1 / 1 / 1 (1.0) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 3 / 2 / 2 (2.3) | 2 / 2 / 2 (2.0) |
+| **total** | 18 / 13 / 14 (**15.0**) | 11 / 12 / 12 (**11.7**) |
+
+- **Total 15.0 -> 11.7** a load: every 458 load is below every 457
+  load. **google 2.7 -> 1.0.** No crash or assertion in 42 loads.
+- "sheet change: a sheet is still loading or changing" **2.0 -> 0**: the
+  live-cascade walk ran 13 times (10 in the 457 arm), and no "still
+  loading" decline is left in either kind of change.
+- **No local decline is above 1.7 a load now.** "detached stylesheet
+  pruned" 1.7 (all "sheet removal: an element's style changes" on the
+  root, or "an element without a box would get one"); "restyled block's
+  parent holds more than blocks" 1.3; then single causes at 1.0 each: the
+  root `<html>` (style changes, not in a block), aria-expanded sibling,
+  structural selectors, "parent holds more than blocks", "block is not
+  one line container of plain content".
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> 25.0
+(449) -> 21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7
+(455) -> 14.7 (456) -> 14.0 (457) -> 11.7 (458).
+
+No sudo.
