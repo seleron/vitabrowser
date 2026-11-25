@@ -434,6 +434,8 @@ JS-sheet-pending file:///app0:/testpages/JS-sheet-pending.html
 CSS-sheet-pending-ref file:///app0:/testpages/CSS-sheet-pending-ref.html
 JS-root-restyle file:///app0:/testpages/JS-root-restyle.html
 CSS-root-restyle-ref file:///app0:/testpages/CSS-root-restyle-ref.html
+JS-restyle-mixed-parent file:///app0:/testpages/JS-restyle-mixed-parent.html
+CSS-restyle-mixed-parent-ref file:///app0:/testpages/CSS-restyle-mixed-parent-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2431,6 +2433,16 @@ k459d=$(printf '%s\n' "$k459seg" | grep -c "declined (an element's style changes
 k459f=$(printf '%s\n' "$k459seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-root-restyle: rows $k459r (0), roots restyled in place ${k459i} (2), root-style declines ${k459d} (0), full rebuilds ${k459f} (0)"
 [ "$k459r" = 0 ] && [ "${k459i:-0}" -ge 2 ] && [ "${k459d:-1}" -eq 0 ] && [ "${k459f:-1}" -eq 0 ] || fail "the root restyled in place"
+# Patch 460: a class change on a plain block whose parent holds loose text
+# or a list marker builds the block again whole where it is (2), no
+# "parent holds more than blocks" decline, no full rebuild.
+k460r=$(fl_rows JS-restyle-mixed-parent CSS-restyle-mixed-parent-ref)
+k460seg=$(awk '/ page [0-9]+\/[0-9]+ JS-restyle-mixed-parent: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k460w=$(printf '%s\n' "$k460seg" | grep -c "restyled block's parent holds more than blocks, the block built again whole" || true)
+k460d=$(printf '%s\n' "$k460seg" | grep -c "declined (restyled block's parent holds more than blocks)" || true)
+k460f=$(printf '%s\n' "$k460seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-restyle-mixed-parent: rows $k460r (0), blocks built again whole ${k460w} (2), mixed-parent declines ${k460d} (0), full rebuilds ${k460f} (0)"
+[ "$k460r" = 0 ] && [ "${k460w:-0}" -ge 2 ] && [ "${k460d:-1}" -eq 0 ] && [ "${k460f:-1}" -eq 0 ] || fail "a restyled block in a mixed parent built again whole"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

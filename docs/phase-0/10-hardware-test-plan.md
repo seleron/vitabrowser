@@ -15523,3 +15523,33 @@ onto the root box is ASan-clean.
 458 in that run).
 
 No sudo.
+
+## Patch 460 (2026-11-27): a restyled block whose parent holds more than blocks is built again whole
+
+**Problem.** "restyled block's parent holds more than blocks"
+(`html_rl_block_restyle`) was the largest local decline in the 459
+census: **2.0 a load**. It guarded the local placement, which takes the
+old block out and puts the new one in by its y position, and needs block
+siblings. A parent that also held loose inline text, anonymous boxes or a
+list marker sent the class change to the full rebuild.
+
+**Fix** (html.c). Such a parent now takes 376's way, which the same
+function already uses for non-plain blocks:
+- the block is built again whole where it is
+  (`html_rl_flex_restyle`, `is_block`);
+- the page is laid out whole, so its siblings may be anything;
+- that rebuild's own checks (controls, objects, counting, sibling risk)
+  still decline.
+
+**Gate.**
+- New pair **JS-restyle-mixed-parent / CSS-restyle-mixed-parent-ref**:
+  - `.hot` on a `<p>` between runs of loose text;
+  - `.hot` on a `<p>` inside a list item.
+- Mini run: **2 blocks built again whole, rows 0**, no full rebuild.
+- `restage-full.sh`: **542 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate460 exit 0** (stack through 460): JS-restyle-mixed-parent rows
+  0, 2 blocks built again whole, 0 mixed-parent declines, 0 full
+  rebuilds; interaction 52/52 at the Vita's pace.
+
+No sudo.
