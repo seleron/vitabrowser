@@ -15630,3 +15630,40 @@ root has a box.
   52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-28): ASan at 461, census 460 vs 461
+
+**ASan at 461:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 418 page dumps (gate 418), 0 AddressSanitizer errors in its
+stdout, the log to page 362 of 362. 461's outside-the-document answer ran
+5 times under ASan.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 460 | 461 |
+|---|---|---|
+| bbc | 1 / 1 / 1 (1.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 2 / 1 (1.3) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 3 / 2 / 2 (2.3) | 2 / 2 / 3 (2.3) |
+| **total** | 12 / 10 / 10 (**10.7**) | 9 / 10 / 10 (**9.7**) |
+
+- **Total 10.7 -> 9.7** a load. **bbc: no full rebuild in any load**
+  (1.0 -> 0). No crash or assertion in 42 loads.
+- "no block box above the change" **2.0 -> 0**; the outside-the-document
+  answer ran 3 times on the real sites.
+- **No local decline is above 1.0 a load now** (eight reasons at 0.7-1.0
+  each): oldreddit's hidden-element sheet removal, the aria-expanded
+  sibling, the root `<html>` not in a block, structural selectors,
+  "parent holds more than blocks", "block is not one line container of
+  plain content".
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> 25.0
+(449) -> 21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7
+(455) -> 14.7 (456) -> 14.0 (457) -> 11.7 (458) -> 12.0 (459) -> 10.0
+(460) -> 9.7 (461; 10.7 for 460 in that run).
+
+No sudo.
