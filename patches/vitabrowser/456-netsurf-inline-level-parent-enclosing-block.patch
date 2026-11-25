@@ -1,0 +1,86 @@
+# netsurf: a box built again whole inside an inline-level box rebuilds the enclosing block (patch 456)
+# Generated 2026-11-26
+# Base: seleron/vitabrowser (patch stack through 455)
+#
+# "restyled flex or grid box is not in a block" (html_rl_flex_restyle's
+# parent check: 2.3 a load in the 455 census -- google, wpblog, youtube)
+# declined into the full rebuild. A probe named the parents: a <div> block
+# in a <div> inline-block (box type 9) and a flex <div> in an inline-flex
+# (15) -- plus the root <html>, which keeps the decline. An inline-block,
+# inline-flex or inline-grid box sits in a line of its enclosing block
+# (438's argument), so html_rl_enclosing_whole builds the nearest block,
+# flex or grid box with an element above it again whole (440 / 438; a
+# table cell, or none, keeps the decline; one level, a depth guard). The
+# decline now names the restyled element, its box type and its parent's.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -13446,6 +13446,36 @@
+  * frames (others point at those boxes); one not directly in a block,
+  * cell, flex or grid box (a float's, an inline's); a sibling selector
+  * the class can move (patch 186); counters in page CSS. */
++/* Patch 456: the nearest block, flex or grid box with an element above an
++ * inline-level box, built again whole (440 / 438); -1 when there is none,
++ * it cannot be, or this is already such a rebuild (one level: the depth
++ * guard) */
++static int html_rl_enclosing_whole(html_content *c, struct box *b, double t0)
++{
++	static int depth;
++	int r = -1;
++
++	if (depth > 0)
++		return -1;
++	for (b = b->parent; b != NULL; b = b->parent)
++		if (b->node != NULL && (b->type == BOX_BLOCK ||
++		    b->type == BOX_FLEX || b->type == BOX_GRID ||
++		    b->type == BOX_TABLE_CELL))
++			break;
++	if (b == NULL || b->type == BOX_TABLE_CELL)
++		return -1;
++	depth++;
++	if (b->type == BOX_BLOCK && b->parent != NULL && b->object == NULL &&
++	    !HTML_RL_FRAME(b))
++		r = html_rl_block_whole(c, b->node, b, t0, "a box in an "
++			"inline-level box: the enclosing block");
++	else if (b->type == BOX_FLEX || b->type == BOX_GRID)
++		r = html_rl_flex_whole(c, b->node, b, t0, "a box in an "
++			"inline-level box: the enclosing box");
++	depth--;
++	return r;
++}
++
+ static int html_rl_flex_restyle(html_content *c, dom_node *el,
+ 		struct box *ob, double t0, const char *old_class,
+ 		bool is_block)
+@@ -13461,8 +13491,30 @@
+ 		"LIFE rebuild local: declined (%s)", (w)); return -1; } while (0)
+ 	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
+ 			     pbox->type != BOX_TABLE_CELL &&
+-			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID))
++			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID)) {
++		/* patch 456: name the parent the rebuild cannot take */
++		char *pt = (pbox != NULL && pbox->node != NULL) ?
++				html_rl_struct_tag(pbox->node) : NULL;
++		char *et = html_rl_struct_tag(el);
++		macsurf_debug_log_writef("LIFE rebuild local: restyled <%s> "
++			"box type %d in <%s> box type %d", et ? et : "?",
++			(int)ob->type, pt ? pt : "-",
++			pbox != NULL ? (int)pbox->type : -1);
++		free(pt);
++		free(et);
++		/* Patch 456: an inline-block, inline-flex or inline-grid
++		 * parent (google's and wpblog's <div> in an inline-block,
++		 * youtube's flex <div> in an inline-flex) sits in a line of
++		 * its enclosing block, as 438 says: that block is built
++		 * again whole, which rebuilds the line, the inline-level box
++		 * and everything in it from the DOM */
++		if (pbox != NULL && (pbox->type == BOX_INLINE_BLOCK ||
++		    pbox->type == BOX_INLINE_FLEX ||
++		    pbox->type == BOX_INLINE_GRID) &&
++		    html_rl_enclosing_whole(c, pbox, t0) == 0)
++			return 0;
+ 		RL_FNO("restyled flex or grid box is not in a block");
++	}
+ 	/* patch 375: objects are carried over (html_rl_relink_subtree);
+ 	 * patch 382: buttons too, released and made again */
+ 	/* patch 423: a rebuildable control on the box itself, too (google's

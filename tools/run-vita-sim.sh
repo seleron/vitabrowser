@@ -426,6 +426,8 @@ JS-empty-sib-parent file:///app0:/testpages/JS-empty-sib-parent.html
 CSS-empty-sib-parent-ref file:///app0:/testpages/CSS-empty-sib-parent-ref.html
 JS-rm-objects file:///app0:/testpages/JS-rm-objects.html
 CSS-rm-objects-ref file:///app0:/testpages/CSS-rm-objects-ref.html
+JS-inline-block-inner file:///app0:/testpages/JS-inline-block-inner.html
+CSS-inline-block-inner-ref file:///app0:/testpages/CSS-inline-block-inner-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2382,6 +2384,16 @@ k454d=$(printf '%s\n' "$k454seg" | grep -c "declined (removed block holds object
 k454f=$(printf '%s\n' "$k454seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-rm-objects: rows $k454r (0), parent rebuilds ${k454p} (1 or more), with objects retired ${k454o} (1 or more), object declines ${k454d} (0), full rebuilds ${k454f} (0)"
 [ "$k454r" = 0 ] && [ "${k454p:-0}" -ge 1 ] && [ "${k454o:-0}" -ge 1 ] && [ "${k454d:-1}" -eq 0 ] && [ "${k454f:-1}" -eq 0 ] || fail "a removed block holding objects: the parent"
+# Patch 456: a block or flex box built again whole inside an inline-block
+# or inline-flex box builds the enclosing block again whole (2), no full
+# rebuild.
+k456r=$(fl_rows JS-inline-block-inner CSS-inline-block-inner-ref)
+k456seg=$(awk '/ page [0-9]+\/[0-9]+ JS-inline-block-inner: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k456e=$(printf '%s\n' "$k456seg" | grep -c "a box in an inline-level box: the enclosing" || true)
+k456d=$(printf '%s\n' "$k456seg" | grep -c "declined (restyled flex or grid box is not in a block)" || true)
+k456f=$(printf '%s\n' "$k456seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-inline-block-inner: rows $k456r (0), enclosing blocks built again whole ${k456e} (2), not-in-a-block declines ${k456d} (0), full rebuilds ${k456f} (0)"
+[ "$k456r" = 0 ] && [ "${k456e:-0}" -ge 2 ] && [ "${k456d:-1}" -eq 0 ] && [ "${k456f:-1}" -eq 0 ] || fail "a box in an inline-level box: the enclosing block"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

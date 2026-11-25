@@ -15186,3 +15186,43 @@ the live-cascade walk ran for a sheet change and for a removal, and
 21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7 (455).
 
 No sudo.
+
+## Patch 456 (2026-11-26): a box built again whole inside an inline-level box rebuilds the enclosing block
+
+**Problem.** "restyled flex or grid box is not in a block" was the
+largest local decline in the 455 census: **2.3 a load** (google, wpblog,
+youtube). `html_rl_flex_restyle` (also 425/434's "the block built again
+whole") declines when the box's parent is not a block, table cell, flex or
+grid box. A probe (the decline now logs "restyled <x> box type N in <y>
+box type M"), run for 3 loads on the three sites, named the parents:
+- a `<div>` block in a `<div>` **inline-block** (box type 9): 3, after
+  `data-eqid` or new non-inline content;
+- a flex `<div>` in an **inline-flex** `<div>` (15): 1;
+- the root `<html>` (no parent box): 3, from 404's structural parent
+  rebuild. A whole-document change, it keeps the decline.
+
+**Fix** (html.c).
+- An inline-block, inline-flex or inline-grid box sits in a line of its
+  enclosing block (438's argument for their child lists).
+- So **`html_rl_enclosing_whole`** builds the nearest block, flex or grid
+  box with an element above it again whole (440 / 438). That rebuilds the
+  line, the inline-level box and everything in it from the DOM.
+- A table cell or no such box keeps the decline; one level only (a depth
+  guard).
+
+**Gate.**
+- New pair **JS-inline-block-inner / CSS-inline-block-inner-ref**:
+  - a block inside a `<div>` inline-block given content that is not plain
+    inline (two `<div>`s);
+  - a flex item inside a `<div>` inline-flex given a child.
+- Mini run: both shapes as on the sites (0 in 9, 14 in 15), **2 enclosing
+  blocks built again whole, rows 0**, no full rebuild.
+- A first cut used `<span class="ib">` inside `<p>`. That built
+  differently and never reached the path; the page uses `<div>` lines.
+- `restage-full.sh`: **538 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate456 exit 0** (stack through 456): JS-inline-block-inner rows 0,
+  2 enclosing blocks built again whole, 0 not-in-a-block declines, 0 full
+  rebuilds; interaction 52/52 at the Vita's pace.
+
+No sudo.
