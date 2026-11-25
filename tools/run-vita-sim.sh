@@ -605,6 +605,8 @@ NET-js-sheet-wait http://127.0.0.1:$HP/NET-js-sheet-wait.html
 NET-css-sheet-wait-ref http://127.0.0.1:$HP/CSS-sheet-wait-ref.html
 NET-js-sheet-gen http://127.0.0.1:$HP/NET-js-sheet-gen.html
 NET-css-sheet-gen-ref http://127.0.0.1:$HP/CSS-sheet-gen-ref.html
+NET-js-removal-loading http://127.0.0.1:$HP/NET-js-removal-loading.html
+NET-css-removal-loading-ref http://127.0.0.1:$HP/CSS-removal-loading-ref.html
 NET-js-charref http://127.0.0.1:$HP/JS-charref.html
 NET-css-calc-nested http://127.0.0.1:$HP/CSS-calc-nested.html
 NET-css-not-list http://127.0.0.1:$HP/CSS-not-list.html
@@ -2237,6 +2239,18 @@ k443d=$(printf '%s\n' "$k443seg" | grep -c "declined (a sheet is still loading o
 k443f=$(printf '%s\n' "$k443seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  NET-js-sheet-gen: rows $k443r (0), sheet changes answered against the held cascade ${k443n} (1 or more), still-loading declines ${k443d} (0), full rebuilds ${k443f} (0)"
 [ "$k443r" = 0 ] && [ "${k443n:-0}" -ge 1 ] && [ "${k443d:-1}" -eq 0 ] && [ "${k443f:-1}" -eq 0 ] || fail "sheet changes while a sheet is in flight, against the held cascade"
+# Patch 453: a <style> removed while another sheet is in flight is
+# answered against the live context (the held cascade minus the removed
+# sheet): its elements restyled in place, no "still loading" decline, no
+# full rebuild; rows as the static page with the sheet never there.
+k453r=$(fl_rows NET-js-removal-loading NET-css-removal-loading-ref)
+k453seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-removal-loading: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k453l=$(printf '%s\n' "$k453seg" | grep -c "sheet removal: a sheet is still loading, against the live cascade" || true)
+k453i=$(printf '%s\n' "$k453seg" | grep -c "sheet removal: [0-9]* element(s) restyled in place\|sheet removal restyles nothing" || true)
+k453d=$(printf '%s\n' "$k453seg" | grep -c "sheet removal: declined" || true)
+k453f=$(printf '%s\n' "$k453seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  NET-js-removal-loading: rows $k453r (0), against the live cascade ${k453l} (1), answered ${k453i} (1), removal declines ${k453d} (0), full rebuilds ${k453f} (0)"
+[ "$k453r" = 0 ] && [ "${k453l:-0}" -ge 1 ] && [ "${k453i:-0}" -ge 1 ] && [ "${k453d:-1}" -eq 0 ] && [ "${k453f:-1}" -eq 0 ] || fail "a sheet removed while another loads, against the live cascade"
 # Patch 433: an inert attribute (aria-*, data-*, role) on a form control's
 # box that is not a block rebuilds nothing.
 k433r=$(fl_rows JS-control-inert CSS-control-inert-ref)

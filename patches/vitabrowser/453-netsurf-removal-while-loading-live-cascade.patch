@@ -1,0 +1,155 @@
+# netsurf: a sheet removal while another sheet loads is answered against the live cascade (patch 453)
+# Generated 2026-11-25
+# Base: seleron/vitabrowser (patch stack through 452)
+#
+# "sheet removal: a sheet is still loading or changing" (2.3 a load in the
+# 452 census, most of what is left of "detached stylesheet pruned")
+# declined into the full rebuild: 415's walk builds a fresh selection
+# context only from settled sheets. But c->select_ctx is refreshed only once
+# every sheet has settled, and the prune takes a settled sheet out of it
+# (patch 425): so the live context is the held cascade minus the removed
+# sheet -- what a full rebuild would cascade now -- provided the box tree
+# held the context's generation just before the prune (443's rl_boxes_gen;
+# html_reconvert_local_change records it in html_rl_removal_held around
+# its prune) and no sheet has a pending text update
+# (html_rl_sheet_modified). Then html_rl_doc_noop walks against the live
+# context itself -- no fresh one, no swap, never destroyed -- and its hits
+# are restyled in place (447/451). The sheet in flight marks when it is
+# done, and that batch re-cascades everything.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8973,6 +8973,17 @@
+ 	return true;
+ }
+ 
++/* Patch 453: a sheet with a pending text update (its new rules not yet in
++ * any context) -- the live context does not hold the cascade then */
++static bool html_rl_sheet_modified(html_content *c)
++{
++	unsigned int i;
++	for (i = 0; i != c->stylesheet_count; i++)
++		if (!c->stylesheets[i].unused && c->stylesheets[i].modified)
++			return true;
++	return false;
++}
++
+ /* NULL when the two selections give the box the same styles */
+ static const char *html_rl_noop_diff(struct box *box,
+ 		const css_select_results *o, const css_select_results *nw)
+@@ -9042,6 +9053,11 @@
+ /* Patch 442 - set when html_rl_doc_noop declined because a sheet is still
+  * loading or changing; read and cleared by macos9_reconvert_try_local */
+ static int html_rl_unsettled;
++/* Patch 453 - set by html_reconvert_local_change around its prune: the
++ * box tree held the selection context's generation just before it (443's
++ * rl_boxes_gen), so the live context, minus the pruned sheet, is the
++ * cascade a full rebuild would use while another sheet is in flight */
++static bool html_rl_removal_held;
+ /* set by macos9_reconvert_cb while the batch it tries may still wait */
+ int html_rl_sheet_wait_ok;
+ int html_rl_take_unsettled(void);
+@@ -9133,6 +9149,7 @@
+ 	dom_node *hits[HTML_RL_SHEET_HITS_MAX];
+ 	int nhits = 0;
+ 	bool can_hit = true;
++	bool use_live = false;		/* patch 453 */
+ 	static unsigned long inplace_n;
+ 	const css_computed_style *root_new = NULL;
+ 	dom_node *root = NULL;
+@@ -9179,8 +9196,27 @@
+ 					what);
+ 				return 0;
+ 			}
+-			why = "a sheet is still loading or changing";
+-			html_rl_unsettled = 1;	/* patch 442 */
++			/* Patch 453: a removal while another sheet is in
++			 * flight. c->select_ctx is refreshed only once every
++			 * sheet has settled, but the prune takes a settled
++			 * sheet out of it (patch 425): so the live context is
++			 * the held cascade minus the removed sheet -- what a
++			 * full rebuild would cascade now -- when the tree held
++			 * the context's generation before the prune. The walk
++			 * compares against that live context itself (no fresh
++			 * one, no swap); the sheet in flight marks when it is
++			 * done, and that batch re-cascades it all. */
++			else if (strcmp(what, "sheet removal") == 0 &&
++			    html_rl_removal_held && c->select_ctx != NULL &&
++			    !html_rl_sheet_modified(c)) {
++				use_live = true;
++				macsurf_debug_log_writef("LIFE rebuild local: %s: "
++					"a sheet is still loading, against the live "
++					"cascade", what);
++			} else {
++				why = "a sheet is still loading or changing";
++				html_rl_unsettled = 1;	/* patch 442 */
++			}
+ 		}
+ 	}
+ 	if (why != NULL) {
+@@ -9194,8 +9230,11 @@
+ 		return -1;
+ 	}
+ 	t0 = macos9_micros();
+-	if (html_css_new_selection_context(c, &ctx) != NSERROR_OK ||
+-	    ctx == NULL ||
++	if (use_live)		/* patch 453: the live context, kept */
++		ctx = c->select_ctx;
++	else if (html_css_new_selection_context(c, &ctx) != NSERROR_OK)
++		ctx = NULL;
++	if (ctx == NULL ||
+ 	    dom_document_get_document_element(c->document, &root) !=
+ 			DOM_NO_ERR || root == NULL) {
+ 		why = "no selection context";
+@@ -9352,7 +9391,7 @@
+ 	free(envs);
+ 	free(st);
+ 	if (why != NULL) {
+-		if (ctx != NULL)
++		if (ctx != NULL && !use_live)
+ 			css_select_ctx_destroy(ctx);
+ 		for (k = 0; k < nhits; k++)
+ 			dom_node_unref(hits[k]);
+@@ -9362,11 +9401,14 @@
+ 			(long)(macos9_micros() - t0));
+ 		return -1;
+ 	}
+-	css_select_ctx_destroy(c->select_ctx);
+-	c->select_ctx = ctx;
+-	/* patch 443: every element was re-cascaded with the new context and
+-	 * kept its style -- the tree holds this generation */
+-	html_css_ctx_changed(c);
++	if (!use_live) {	/* patch 453: the live one stays as it is */
++		css_select_ctx_destroy(c->select_ctx);
++		c->select_ctx = ctx;
++		/* patch 443: every element was re-cascaded with the new
++		 * context and kept its style -- the tree holds this
++		 * generation */
++		html_css_ctx_changed(c);
++	}
+ 	/* Patch 447: re-cascade in place. Every element outside the hits'
+ 	 * subtrees keeps its style under the new context (the walk); the
+ 	 * hits are restyled with their subtrees, against it. A hit's
+@@ -14472,13 +14514,20 @@
+ 	 * prune + select-context refresh rebuilds the tree without the
+ 	 * dead sheet. */
+ 	{
+-		int pruned = html_css_prune_detached_sheets(c);
++		int pruned, rr = 0;
++		/* patch 453: did the tree hold the context before the prune? */
++		html_rl_removal_held = c->rl_boxes_gen != 0 &&
++			c->rl_boxes_gen == c->rl_ctx_gen;
++		pruned = html_css_prune_detached_sheets(c);
++		if (pruned > 0)
++			rr = html_rl_doc_noop(c, "sheet removal");
++		html_rl_removal_held = false;
+ 		/* Patch 421: unless the whole document, re-cascaded without
+ 		 * the dead sheets, keeps the styles its boxes hold (415's
+ 		 * walk): then nothing the sheets did is lost, and the change
+ 		 * goes on locally (oldreddit's web components drop <style>s
+ 		 * from their fragments as they render) */
+-		if (pruned > 0 && html_rl_doc_noop(c, "sheet removal") != 0)
++		if (pruned > 0 && rr != 0)
+ 			RL_NO("detached stylesheet pruned");
+ 	}
+ 	/* Patch 371: frames on the page are no reason by themselves (it was

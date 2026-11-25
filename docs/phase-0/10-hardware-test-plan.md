@@ -14897,3 +14897,54 @@ No sudo.
    a 415 sheet-noop walk takes 263 ms (1247 elements re-cascaded).
 
 No sudo.
+
+## Patch 453 (2026-11-25): a sheet removal while another sheet loads is answered against the live cascade
+
+**Problem.** "sheet removal: a sheet is still loading or changing" (2.3 a
+load in the 452 census) was most of what is left of "detached stylesheet
+pruned" (4.3). 415's walk builds a fresh selection context, and that is
+only safe once every sheet has settled. So a `<style>` or `<link>` removed
+while another sheet was in flight went to the full rebuild.
+
+**Why the live context is the answer.** `c->select_ctx` is refreshed only
+once every sheet has settled (`html_css_refresh_selection_context`; 443's
+note). The prune takes a *settled* removed sheet out of it at once (patch
+425). So during a load the live context is the cascade the tree was built
+with minus the removed sheet. That is exactly what a full rebuild would
+cascade now, because a full rebuild during a load uses the same live
+context. It holds when:
+- the box tree held the context's generation just before the prune (443's
+  `rl_boxes_gen`). `html_reconvert_local_change` records this in
+  `html_rl_removal_held` around its prune;
+- no sheet has a pending text update (`html_rl_sheet_modified`): the live
+  context would not hold its new rules.
+
+**Fix** (html.c).
+- In that case `html_rl_doc_noop` ("sheet removal") walks against the
+  live context itself: no fresh context, no swap, never destroyed. It
+  logs "a sheet is still loading, against the live cascade".
+- Hits are restyled in place (447/451); otherwise it is a no-op (421).
+- The sheet in flight marks when it is done, and that batch re-cascades
+  everything with it.
+
+**Gate.**
+- New pair **NET-js-removal-loading / NET-css-removal-loading-ref**: a
+  `<link>` to a `/slow/` sheet (1 s, it styles nothing) is added; 150 ms
+  later the `<style id="s1">` that colours two paragraphs (and boldens one
+  through `.r + p`) is removed, then a layout read. In the mini run: **the
+  live-cascade path, 3 elements restyled in place, rows 0**. The check
+  asserts that path, an answer, no removal decline, no full rebuild.
+- The reference keeps the slow sheet as a plain `<link>` and drops #s1.
+  (The first reference cut was wrong: the page comment names `<style
+  id="s1">`, and the generator matched the comment. 72 rows differed
+  until the reference was regenerated from the real element.)
+- 389's NET-js-link-detach (a settled sheet removed while its slow sibling
+  is in flight) already counts either answer.
+- `restage-full.sh`: **535 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate453 exit 0** (stack through 453): NET-js-removal-loading rows 0,
+  the live-cascade path once, answered, 0 removal declines, 0 full
+  rebuilds; NET-js-link-detach LINKDETACH 3/3; interaction 52/52 at the
+  Vita's pace.
+
+No sudo.
