@@ -15553,3 +15553,37 @@ function already uses for non-plain blocks:
   rebuilds; interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-27, evening): ASan at 460, census 459 vs 460
+
+**ASan at 460:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 416 page dumps (gate 416), the log to page 360 of 360. 460's
+whole-block rebuild ran **113 times** under ASan: the bundled pages hit
+the mixed-parent shape a lot.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 459 | 460 |
+|---|---|---|
+| bbc | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| oldreddit | 2 / 1 / 2 (1.7) | 1 / 1 / 1 (1.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 2 / 2 / 3 (2.3) | 2 / 2 / 2 (2.0) |
+| **total** | 12 / 10 / 12 (**11.3**) | 10 / 10 / 10 (**10.0**) |
+
+- **Total 11.3 -> 10.0** a load; every 460 load is at or below every 459
+  load. No crash or assertion in 42 loads.
+- 460's whole-block rebuild ran twice on the real sites. In this run the
+  459 arm showed **no** mixed-parent decline (2.0 a load in 459's own
+  run), so the census's evidence for 460 itself is modest: it is the
+  gate page and ASan's 113 runs.
+- **Largest local decline now: "no block box above the change" (2.0,
+  bbc: `data-hidden` attribute changes)**, then single causes at 1.0.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+11.7 (458) -> 12.0 (459) -> 10.0 (460; 11.3 for 459 in that run).
+
+No sudo.
