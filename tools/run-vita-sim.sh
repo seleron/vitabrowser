@@ -2061,13 +2061,15 @@ echo "  JS-domparser-svg: ${k418s:-no summary}; rows $k418r (0), svg placed loca
 [ "$k418s" = "DOMPARSER: 3/3 passed" ] && [ "$k418r" = 0 ] && [ "${k418l:-0}" -ge 1 ] && [ "${k418f:-1}" -eq 0 ] || fail "DOMParser svg document element"
 # Patch 419: root changes that re-cascade to the same styles rebuild
 # nothing (js-ready, data-theme=light: 2); the dark class, which restyles
-# the body, declines into the full rebuild (1).
+# the body, declined into the full rebuild (1); patch 451: it is restyled
+# in place (the body), no decline.
 k419r=$(fl_rows JS-root-noop CSS-root-noop-ref)
 k419seg=$(awk '/ page [0-9]+\/[0-9]+ JS-root-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k419n=$(printf '%s\n' "$k419seg" | grep -c "root change restyles nothing" || true)
 k419d=$(printf '%s\n' "$k419seg" | grep -c "root change: declined (an element's style changes" || true)
-echo "  JS-root-noop: rows $k419r (0), root changes restyling nothing ${k419n} (2), declined ${k419d} (1)"
-[ "$k419r" = 0 ] && [ "${k419n:-0}" -eq 2 ] && [ "${k419d:-0}" -ge 1 ] || fail "root changes that restyle nothing"
+k419i=$(printf '%s\n' "$k419seg" | grep -c "root change: [0-9]* element(s) restyled in place" || true)
+echo "  JS-root-noop: rows $k419r (0), root changes restyling nothing ${k419n} (2), restyled in place ${k419i} (1), declined ${k419d} (0)"
+[ "$k419r" = 0 ] && [ "${k419n:-0}" -eq 2 ] && [ "${k419i:-0}" -ge 1 ] && [ "${k419d:-1}" -eq 0 ] || fail "root changes that restyle nothing"
 # Patch 420: blocks holding floats or list markers restyled whole (the
 # float block, two list items, a list: 4 or more), none declined for it.
 k420r=$(fl_rows JS-float-marker CSS-float-marker-ref)
@@ -2426,9 +2428,10 @@ echo "  JS-object-rebuild: rows differing from the static final state $k386r (0)
 # red and the rows differ.)
 k388r=$(fl_rows JS-style-detach CSS-style-detach-ref)
 k388seg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-detach: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
-k388d=$(printf '%s\n' "$k388seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)" || true)
+# patch 451: a removal that restyles a few elements is answered in place
+k388d=$(printf '%s\n' "$k388seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)\|sheet removal: [0-9]* element(s) restyled in place" || true)
 k388p=$(printf '%s\n' "$k388seg" | grep -c "WORK reconvert: pruned" || true)
-echo "  JS-style-detach: rows differing from the static final state $k388r (0); ${k388d} local rebuilds declined on a pruned sheet (2 or more); full-reconvert prunes $k388p"
+echo "  JS-style-detach: rows differing from the static final state $k388r (0); ${k388d} pruned-sheet answers, declined or restyled in place (2 or more); full-reconvert prunes $k388p"
 [ "$k388r" = 0 ] && [ "${k388d:-0}" -ge 2 ] ||
 fail "a removed <style> stops cascading"
 # Patch 389: a <link> that leaves the DOM stops cascading too. The
@@ -2443,10 +2446,11 @@ fail "a removed <style> stops cascading"
 # drops both. Final state vs the static reference, row for row.
 k389r=$(fl_rows NET-js-link-detach CSS-link-detach-ref)
 k389seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-link-detach: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
-k389d=$(printf '%s\n' "$k389seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)" || true)
+# patch 451: a removal that restyles a few elements is answered in place
+k389d=$(printf '%s\n' "$k389seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)\|sheet removal: [0-9]* element(s) restyled in place" || true)
 k389p=$(printf '%s\n' "$k389seg" | grep -c "WORK reconvert: pruned" || true)
 k389s=$(sed -n 's/.*STR \(LINKDETACH: [0-9]*\/[0-9]* passed\).*/\1/p' "$(ls "$R"/*NET-js-link-detach*.plot 2>/dev/null | head -1)" 2>/dev/null | head -1)
-echo "  NET-js-link-detach: rows differing from the static final state $k389r (0); ${k389d} local rebuilds declined on a pruned sheet (1 or more); full-reconvert prunes $k389p; ${k389s:-no summary}"
+echo "  NET-js-link-detach: rows differing from the static final state $k389r (0); ${k389d} pruned-sheet answers, declined or restyled in place (1 or more); full-reconvert prunes $k389p; ${k389s:-no summary}"
 [ "$k389r" = 0 ] && [ "${k389d:-0}" -ge 1 ] && [ "$k389s" = "LINKDETACH: 3/3 passed" ] ||
 fail "a removed <link> stops cascading"
 # Unit 390: census -- a <link rel=preload as=stylesheet> never cascades:
@@ -2460,10 +2464,11 @@ fail "a removed <link> stops cascading"
 # Final state vs the static reference, row for row.
 k390r=$(fl_rows NET-js-link-preload CSS-link-preload-ref)
 k390seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-link-preload: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
-k390d=$(printf '%s\n' "$k390seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)" || true)
+# patch 451: a removal that restyles a few elements is answered in place
+k390d=$(printf '%s\n' "$k390seg" | grep -c "LIFE rebuild local: declined (detached stylesheet pruned)\|sheet removal: [0-9]* element(s) restyled in place" || true)
 k390p=$(printf '%s\n' "$k390seg" | grep -c "WORK reconvert: pruned" || true)
 k390s=$(sed -n 's/.*STR \(LINKPRELOAD: [0-9]*\/[0-9]* passed\).*/\1/p' "$(ls "$R"/*NET-js-link-preload*.plot 2>/dev/null | head -1)" 2>/dev/null | head -1)
-echo "  NET-js-link-preload: rows differing from the static final state $k390r (0); ${k390d} local rebuilds declined on a pruned sheet (1 or more); full-reconvert prunes $k390p; ${k390s:-no summary}"
+echo "  NET-js-link-preload: rows differing from the static final state $k390r (0); ${k390d} pruned-sheet answers, declined or restyled in place (1 or more); full-reconvert prunes $k390p; ${k390s:-no summary}"
 [ "$k390r" = 0 ] && [ "${k390d:-0}" -ge 1 ] && [ "$k390s" = "LINKPRELOAD: 3/3 passed" ] ||
 fail "a preload never cascades; the same-URL stylesheet does, and prunes"
 # Patch 371: a page with frames takes the local paths too (before: every

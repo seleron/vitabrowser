@@ -1,0 +1,119 @@
+# netsurf: a sheet removal or a root change that restyles a few elements is answered in place (patch 451)
+# Generated 2026-11-25
+# Base: seleron/vitabrowser (patch stack through 450)
+#
+# 447 restyled a sheet batch's changed elements in place but kept the
+# decline for a sheet removal ("detached stylesheet pruned": the prune at
+# the start of html_reconvert_local_change, 3.3 a load on the 7 census
+# sites) and a root change (419, in html_rl_block_restyle), because those
+# walks run inside a local change whose mark globals name the outer
+# change. Both callers are safe for the hits: the removal walk runs
+# before the outer change looks anything up, and the root change returns
+# at once after it. So the walk collects hits for all three, and
+# html_rl_hits_restyle saves the mark state (child-list parent, removal
+# place, append, attribute node, flex no-op mode, style-as-class, style
+# change, oc tags), clears it for the hits' own local changes, and puts
+# it back. SHEETINPLACE (the batch census) stays for sheet batches only.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9066,6 +9066,56 @@
+ /* Patch 447: a sheet change restyles a few elements in place (below) */
+ static int html_rl_sheet_hit_restyle(html_content *c, dom_node *el);
+ #define HTML_RL_SHEET_HITS_MAX 8
++/* (tentative definitions: defined with their users below) */
++static bool html_rl_style_as_class;
++static bool html_rl_style_change;
++
++/* Patch 451: restyle the hits with the local-change mark state of the
++ * change that is being answered (a sheet removal pruned at the start of
++ * html_reconvert_local_change, a root change in html_rl_block_restyle)
++ * saved and cleared: each hit's restyle is a local change of its own, and
++ * those globals name the outer change's node, kind and place. Restored
++ * after, whatever the result. At the top (a sheet batch) they are all
++ * clear already. */
++static int html_rl_hits_restyle(html_content *c, dom_node **hits, int nhits)
++{
++	dom_node *s_parent = html_rl_childlist_parent;
++	dom_node *s_attr = html_rl_attr_mark_node;
++	dom_node *s_rm_next = html_rl_childlist_rm_next;
++	bool s_removal = html_rl_childlist_removal;
++	bool s_rm_known = html_rl_childlist_rm_known;
++	bool s_append = html_rl_childlist_append;
++	bool s_noop_only = html_rl_noop_only;
++	bool s_as_class = html_rl_style_as_class;
++	bool s_style = html_rl_style_change;
++	bool s_oc = html_rl_tags_oc;
++	int k, r = 0;
++
++	html_rl_childlist_parent = NULL;
++	html_rl_attr_mark_node = NULL;
++	html_rl_childlist_rm_next = NULL;
++	html_rl_childlist_removal = false;
++	html_rl_childlist_rm_known = false;
++	html_rl_childlist_append = false;
++	html_rl_noop_only = false;
++	html_rl_style_as_class = false;
++	html_rl_style_change = false;
++	html_rl_tags_oc = false;
++	for (k = 0; k < nhits; k++)
++		if (r == 0 && html_rl_sheet_hit_restyle(c, hits[k]) != 0)
++			r = -1;
++	html_rl_childlist_parent = s_parent;
++	html_rl_attr_mark_node = s_attr;
++	html_rl_childlist_rm_next = s_rm_next;
++	html_rl_childlist_removal = s_removal;
++	html_rl_childlist_rm_known = s_rm_known;
++	html_rl_childlist_append = s_append;
++	html_rl_noop_only = s_noop_only;
++	html_rl_style_as_class = s_as_class;
++	html_rl_style_change = s_style;
++	html_rl_tags_oc = s_oc;
++	return r;
++}
+ 
+ static int html_rl_doc_noop(html_content *c, const char *what)
+ {
+@@ -9076,12 +9126,13 @@
+ 	css_select_results **keep = NULL;
+ 	css_custom_env **envs = NULL;
+ 	int nst = 0, cst = 0, nkeep = 0, ckeep = 0, nel = 0, k;
+-	/* Patch 447: the elements whose style the sheet change changes --
+-	 * only for a sheet batch, which runs at the top (a removal or the
+-	 * root runs inside a local change whose marks are set) */
++	/* Patch 447: the elements whose style the sheet change changes.
++	 * Patch 451: for a sheet removal and a root change too -- they run
++	 * inside a local change whose mark state is saved and cleared around
++	 * the hits' restyles (html_rl_hits_restyle) */
+ 	dom_node *hits[HTML_RL_SHEET_HITS_MAX];
+ 	int nhits = 0;
+-	bool can_hit = strcmp(what, "sheet change") == 0;
++	bool can_hit = true;
+ 	static unsigned long inplace_n;
+ 	const css_computed_style *root_new = NULL;
+ 	dom_node *root = NULL;
+@@ -9323,12 +9374,9 @@
+ 	 * context installed is the one it would refresh to: the sheets have
+ 	 * settled), and the tree does not hold this generation. */
+ 	if (nhits > 0) {
+-		int r = 0;
+-		for (k = 0; k < nhits; k++) {
+-			if (r == 0 && html_rl_sheet_hit_restyle(c, hits[k]) != 0)
+-				r = -1;
++		int r = html_rl_hits_restyle(c, hits, nhits);	/* patch 451 */
++		for (k = 0; k < nhits; k++)
+ 			dom_node_unref(hits[k]);
+-		}
+ 		if (r != 0) {
+ 			macsurf_debug_log_writef("LIFE rebuild local: %s: "
+ 				"declined (an element restyled in place "
+@@ -9336,7 +9384,8 @@
+ 			return -1;
+ 		}
+ 		c->rl_boxes_gen = c->rl_ctx_gen;
+-		html_rl_inplace_last = nhits;
++		if (strcmp(what, "sheet change") == 0)	/* the batch's census */
++			html_rl_inplace_last = nhits;
+ 		inplace_n++;
+ 		macsurf_debug_log_writef("LIFE rebuild local: %s: %d "
+ 			"element(s) restyled in place (%d elements "

@@ -14687,3 +14687,52 @@ checks (a line emptied, content arriving in an empty block).
   rebuild.
 - `restage-full.sh`: **532 applied plus the 2 known collisions**; its
   sources equal applytest's.
+
+## Patch 451 (2026-11-25): a sheet removal or a root change that restyles a few elements is answered in place
+
+**Problem.** 447 restyles a sheet batch's changed elements in place, but
+two cases kept the decline:
+- a **sheet removal**: the prune at the start of
+  `html_reconvert_local_change`, logged as "detached stylesheet pruned",
+  3.3 a load on the 7 census sites (449's census);
+- a **root change**: 419, in `html_rl_block_restyle` ("root change: an
+  element's style changes", 1.0 a load). A class on `<html>` that themes
+  the page's elements is the common case.
+
+Their walks run inside a local change whose mark globals name the outer
+change, and a hit's restyle is a local change of its own.
+
+**Fix** (html.c).
+- **Both callers are safe for the hits:**
+  - the removal walk runs before the outer change looks anything up;
+  - the root change returns at once after it (419's `return 0`).
+- The walk now collects hits for all three kinds of change.
+- **`html_rl_hits_restyle`** saves the mark state, clears it for the hits'
+  own local changes, and puts it back whatever the result. The state is:
+  the child-list parent, the removal flag, its known place and next
+  sibling, the append flag, the attribute node, 408's flex no-op mode,
+  414's style-as-class, 426's style change, and 364's oc tags.
+- SHEETINPLACE (447's batch census line) stays for sheet batches only. A
+  removal or root answer logs "sheet removal: N element(s) restyled in
+  place" / "root change: ...".
+
+**Gate.** No new page; four existing checks change meaning:
+- 419's JS-root-noop: the dark class restyles the body, so it is now
+  **restyled in place (1 element)**, where it used to decline. Its two
+  no-ops stay.
+- 388's JS-style-detach, 389's NET-js-link-detach and 390's
+  NET-js-link-preload: their removals are restyled in place (1 or 2
+  elements) instead of declining "detached stylesheet pruned". The checks
+  count either answer; rows 0, LINKDETACH 3/3 and LINKPRELOAD 3/3 prove
+  that the removed sheets stop cascading.
+- Mini runs of all four under ASan (the 451 sources): no ASan error.
+- `restage-full.sh`: **533 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate451 exit 0** (stack through 451): JS-root-noop 2 no-ops + 1
+  restyled in place, 0 declines; JS-style-detach 2, NET-js-link-detach 2,
+  NET-js-link-preload 1 pruned-sheet answers, all rows 0, **0
+  full-reconvert prunes** on those pages (the removals no longer need the
+  full rebuild); LINKDETACH 3/3, LINKPRELOAD 3/3; interaction 52/52 at the
+  Vita's pace.
+
+No sudo.
