@@ -15055,3 +15055,47 @@ would keep pointing at those boxes, so it declined into the full rebuild.
   0); interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-26, later): ASan at 454, census 453 vs 454
+
+**ASan at 454** (`build-asan-sim.sh`, netsurf instrumented):
+**`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 406 page dumps
+(gate 406); the log reaches page 350 of 350.
+- 454's path ran 4 times under ASan: JS-rm-objects twice, retiring
+  objects (re-pointed 3 / retired 4, then 2 / 4).
+- On JS-object-rebuild a removed block holding an `<object>` correctly
+  fell back: the parent rebuild declined on 375's relinkable check ("an
+  `<object>` or `<embed>` is in the restyled flex or grid box"), and the
+  full rebuild took it.
+- The sweep was not rerun (453's was clean an hour earlier).
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 453 | 454 |
+|---|---|---|
+| bbc | 3 / 2 / 3 (2.7) | 2 / 3 / 2 (2.3) |
+| oldreddit | 1 / 2 / 2 (1.7) | 2 / 2 / 1 (1.7) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 4 / 4 / 4 (4.0) | 4 / 4 / 4 (4.0) |
+| google | 4 / 4 / 4 (4.0) | 4 / 3 / 4 (3.7) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 4 / 3 / 3 (3.3) | 2 / 3 / 2 (2.3) |
+| **total** | 19 / 17 / 18 (**18.0**) | 16 / 17 / 15 (**16.0**) |
+
+- **Total 18.0 -> 16.0** a load; youtube 3.3 -> 2.3. No crash or
+  assertion in 42 loads.
+- "removed block holds objects or frames" **1.3 -> 0**; 454's parent
+  rebuild ran 5 times on the real sites. No frame case and no `<object>`
+  fallback occurred there.
+- **The largest local declines now:**
+  - "sheet change: a sheet is still loading or changing" (2.3);
+  - "restyled flex or grid box is not in a block" (2.0);
+  - "detached stylesheet pruned" (1.7);
+  - "new element is not a plain block, list item or block of blocks"
+    (1.7).
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 -> 25.0 (449) ->
+21.7 (451) -> 20.0 (452) -> 17.3 (453, flat against 452's 17.3 in that
+run) -> 16.0 (454).
+
+No sudo.
