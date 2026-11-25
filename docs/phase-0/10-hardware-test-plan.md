@@ -14855,3 +14855,45 @@ what it really read.
 No sudo.
 - `restage-full.sh`: **534 applied plus the 2 known collisions**; its
   sources equal applytest's.
+
+### State log (2026-11-25, night): census 451 vs 452
+
+| site | 451 | 452 |
+|---|---|---|
+| bbc | 3 / 4 / 2 (3.0) | 2 / 3 / 3 (2.7) |
+| oldreddit | 5 / 3 / 3 (3.7) | 3 / 3 / 3 (3.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 6 / 6 / 6 (6.0) | 5 / 5 / 4 (4.7) |
+| google | 5 / 6 / 5 (5.3) | 4 / 5 / 4 (4.3) |
+| github | 3 / 2 / 1 (2.0) | 1 / 1 / 1 (1.0) |
+| youtube | 4 / 4 / 5 (4.3) | 3 / 3 / 4 (3.3) |
+| **total** | 27 / 26 / 23 (**25.3**) | 19 / 21 / 20 (**20.0**) |
+
+- **Total 25.3 -> 20.0** a load: every 452 load is below every 451 load,
+  and every site but wpnews moves down. No crash or assertion in 42 loads.
+- **Cost-guard trips 8.3 -> 2.3** a load. In the 452 arm: 18 batches went
+  on past the budget and 7 tripped.
+- The batches that went on had little left. For example github: 829 ms
+  spent against a 784 ms budget, 1 mark left, about 92 ms expected; 309
+  would have paid a whole ~800 ms conversion on top of the 829 ms.
+  youtube: 69 ms spent against 68 ms, 10 marks left, about 14 ms expected.
+- As before, causes move: "detached stylesheet pruned" 3.0 -> 4.3 and
+  "restyled block's parent holds more than blocks" 0.3 -> 1.3, as batches
+  get further.
+- **Since 446 (one census each, the same 7 sites): 27.0 -> 25.0 (449) ->
+  21.7 (451) -> 20.0 (452).** Cross-run drift on one binary is about 1
+  (451: 21.7 in its own run, 25.3 here), so the claim is each run's A/B.
+- **Not rerun at 452:** ASan and the scorecard. 452 changes only when a
+  batch goes to the full rebuild, not what any rebuild does; the gate's
+  rows checks cover rendering.
+
+**Next:**
+1. "detached stylesheet pruned" (4.3; of which "sheet removal: a sheet is
+   still loading or changing" 2.3): a removal while another sheet loads.
+2. "restyled flex or grid box is not in a block" (2.7).
+3. "removed block holds objects or frames" (2.0).
+4. The expensive single answers behind the remaining trips. github's 445
+   parent rebuilds take ~125 ms each when the parent is a large block, and
+   a 415 sheet-noop walk takes 263 ms (1247 elements re-cascaded).
+
+No sudo.
