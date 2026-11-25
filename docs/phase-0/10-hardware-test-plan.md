@@ -15145,3 +15145,44 @@ sheet is still loading, against the live cascade".
   Vita's pace.
 
 No sudo.
+
+### State log (2026-11-26, evening): ASan at 455, census 454 vs 455
+
+**ASan at 455:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 406 page dumps (gate 406), the log to page 350 of 350. Under ASan
+the live-cascade walk ran for a sheet change and for a removal, and
+443's answer once.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 454 | 455 |
+|---|---|---|
+| bbc | 3 / 1 / 3 (2.3) | 2 / 3 / 2 (2.3) |
+| oldreddit | 4 / 3 / 2 (3.0) | 1 / 1 / 2 (1.3) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 4 / 4 / 3 (3.7) | 4 / 3 / 4 (3.7) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 2 / 3 / 3 (2.7) | 2 / 3 / 2 (2.3) |
+| **total** | 19 / 16 / 16 (**17.0**) | 14 / 15 / 15 (**14.7**) |
+
+- **Total 17.0 -> 14.7** a load: every 455 load is below every 454 load.
+  No crash or assertion in 42 loads.
+- The live-cascade walk ran 11 times (7 in the 454 arm: 453's removals
+  only); 442's waits 3 -> 0.
+- "detached stylesheet pruned" **3.0 -> 1.3**, oldreddit 3.0 -> 1.3.
+- "sheet change: a sheet is still loading or changing" **2.3 -> 1.7**.
+  What is left is the case 455 leaves out on purpose: a sheet whose text
+  update is pending (`html_rl_sheet_modified`), whose rules are in no
+  context yet.
+- **Largest local declines now:**
+  - "restyled flex or grid box is not in a block" (2.3);
+  - "new element is not a plain block, list item or block of blocks"
+    (1.7);
+  - the pending-text-update sheet change (1.7);
+  - "detached stylesheet pruned" (1.3).
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 -> 25.0 (449) ->
+21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7 (455).
+
+No sudo.
