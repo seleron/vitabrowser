@@ -14792,3 +14792,11 @@ sources as the commit, cmp-checked):
    box is not in a block" (2.0).
 
 No sudo.
+
+**Scorecard r150** (439 vs 451, the head; 21 sites, r148's reference
+reused, both arms back to back through scratch WORKs): **75.1 vs 75.3,
+flat.** Every site is identical except google +2.6 (its known live
+spread), hackernews +0.7 and stackoverflow -0.1. No crash; oldreddit
+blocked in both arms. With ASan clean at 451 (above), the hand-off
+prerequisites of the run-close list (item 8) hold at the head. The VPK
+and the device run wait for the owner.
