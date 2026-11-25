@@ -15587,3 +15587,46 @@ the mixed-parent shape a lot.
 11.7 (458) -> 12.0 (459) -> 10.0 (460; 11.3 for 459 in that run).
 
 No sudo.
+
+## Patch 461 (2026-11-27): a change on a node outside the document needs no rebuild
+
+**Problem.** "no block box above the change" was the largest local decline
+in the 460 census: **2.0 a load**, all on bbc, all `data-hidden`
+attribute changes. A probe binary (the decline naming the element, whether
+the walk reached the document, and whether the root has a box) ran 3 bbc
+loads: **every case was a node outside the document**.
+
+**The shape.** bbc sets `data-hidden` (and a class) on an element and
+removes it in the same task. The marks are answered once it is detached:
+- with no box, the walk up found none: "no block box above the change";
+- with its old box still there (the removal not yet answered), the class
+  path restyled it and declined into the full rebuild ("restyled element
+  is no longer a block").
+
+**Fix** (html.c). Nothing a change on a detached node does renders, and
+its box, if any, goes with the removal's own mark. So
+`html_reconvert_local_change` answers it with no rebuild before the walk
+(`html_rl_in_document`: do the node's ancestors reach the document?). The
+remaining "no block box above" decline names the element and whether the
+root has a box.
+
+**Gate.**
+- New pair **JS-detached-attr / CSS-detached-attr-ref**: a `<div>`'s
+  `data-hidden` and class changed and the `<div>` removed in one task;
+  then a class on a paragraph still in the document.
+- Mini run: **2 changes outside the document answered with no rebuild**,
+  the removal placed locally, the paragraph restyled, **rows 0**, no full
+  rebuild.
+- The first two versions of the page never reached the path:
+  - nodes created detached and changed before insertion;
+  - a node removed first, then changed.
+  A change to a node that is already detached is not marked at all; only
+  a change made in the document and answered after removal reaches the
+  local change.
+- `restage-full.sh`: **543 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate461 exit 0** (stack through 461): JS-detached-attr rows 0, 2
+  changes outside the document answered, 0 full rebuilds; interaction
+  52/52 at the Vita's pace.
+
+No sudo.

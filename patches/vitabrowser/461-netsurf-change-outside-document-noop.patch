@@ -1,0 +1,94 @@
+# netsurf: a change on a node outside the document needs no rebuild (patch 461)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 460)
+#
+# "no block box above the change" was the largest local decline in the 460
+# census (2.0 a load, bbc: data-hidden attribute changes). A probe showed
+# all of them on nodes outside the document: bbc sets data-hidden (and a
+# class) on an element and removes it in the same task, and the marks are
+# answered once it is detached. With no box the walk found none above it;
+# with its old box still there the restyle declined into the full rebuild.
+# Nothing a change on a detached node does renders, and its box, if any,
+# goes with the removal's own mark: html_reconvert_local_change now
+# answers it with no rebuild (html_rl_in_document) before the walk. The
+# remaining "no block box above" decline names the element and whether
+# the root has a box.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -14656,6 +14656,32 @@
+ 	return r;
+ }
+ 
++/* Patch 461: is the node in the document (its ancestors reach the
++ * document node)? */
++static bool html_rl_in_document(dom_node *node)
++{
++	dom_node *n = node, *p = NULL;
++	dom_node_type type;
++	bool in = false;
++
++	dom_node_ref(n);
++	while (n != NULL) {
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++		    type == DOM_DOCUMENT_NODE) {
++			in = true;
++			break;
++		}
++		p = NULL;
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	return in;
++}
++
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+ 		bool class_change, const char *old_class)
+ {
+@@ -14822,6 +14848,18 @@
+ 		return 0;
+ 	}
+ 
++	/* Patch 461: a change on a node that has left the document (bbc
++	 * sets data-hidden on an element and removes it in the same task;
++	 * the marks are answered once it is detached) renders nothing: its
++	 * box, if it still has one, goes with the removal's own mark. Was:
++	 * "no block box above the change" when it had no box, a restyle
++	 * that declined into the full rebuild when it had one. */
++	if (!html_rl_in_document((dom_node *)vnode)) {
++		macsurf_debug_log_writef("LIFE rebuild local: a change outside "
++			"the document, nothing to rebuild");
++		return 0;
++	}
++
+ 	/* the nearest element with a block box: the one to rebuild */
+ 	n = vnode;
+ 	dom_node_ref(n);
+@@ -14996,8 +15034,22 @@
+ 		dom_node_unref(n);
+ 		n = parent;
+ 	}
+-	if (element == NULL)
++	if (element == NULL) {
++		/* patch 461: name what the walk saw */
++		dom_element *de = NULL;
++		char *t = html_rl_struct_tag((dom_node *)vnode);
++		bool rootbox = false;
++		if (dom_document_get_document_element(c->document, &de) ==
++				DOM_NO_ERR && de != NULL) {
++			rootbox = box_for_node((dom_node *)de) != NULL;
++			dom_node_unref(de);
++		}
++		macsurf_debug_log_writef("LIFE rebuild local: no block box above "
++			"<%s>: root box %s", t ? t : "?",
++			rootbox ? "yes" : "no");
++		free(t);
+ 		RL_NO("no block box above the change");
++	}
+ 	block = box_for_node(element);
+ 	old_ic = block->children;
+ 

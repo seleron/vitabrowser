@@ -436,6 +436,8 @@ JS-root-restyle file:///app0:/testpages/JS-root-restyle.html
 CSS-root-restyle-ref file:///app0:/testpages/CSS-root-restyle-ref.html
 JS-restyle-mixed-parent file:///app0:/testpages/JS-restyle-mixed-parent.html
 CSS-restyle-mixed-parent-ref file:///app0:/testpages/CSS-restyle-mixed-parent-ref.html
+JS-detached-attr file:///app0:/testpages/JS-detached-attr.html
+CSS-detached-attr-ref file:///app0:/testpages/CSS-detached-attr-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2443,6 +2445,15 @@ k460d=$(printf '%s\n' "$k460seg" | grep -c "declined (restyled block's parent ho
 k460f=$(printf '%s\n' "$k460seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-restyle-mixed-parent: rows $k460r (0), blocks built again whole ${k460w} (2), mixed-parent declines ${k460d} (0), full rebuilds ${k460f} (0)"
 [ "$k460r" = 0 ] && [ "${k460w:-0}" -ge 2 ] && [ "${k460d:-1}" -eq 0 ] && [ "${k460f:-1}" -eq 0 ] || fail "a restyled block in a mixed parent built again whole"
+# Patch 461: marks on an element changed and removed in the same task are
+# answered once it is detached: nothing to rebuild (2), its removal placed
+# locally; no full rebuild.
+k461r=$(fl_rows JS-detached-attr CSS-detached-attr-ref)
+k461seg=$(awk '/ page [0-9]+\/[0-9]+ JS-detached-attr: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k461o=$(printf '%s\n' "$k461seg" | grep -c "a change outside the document, nothing to rebuild" || true)
+k461f=$(printf '%s\n' "$k461seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-detached-attr: rows $k461r (0), changes outside the document answered ${k461o} (1 or more), full rebuilds ${k461f} (0)"
+[ "$k461r" = 0 ] && [ "${k461o:-0}" -ge 1 ] && [ "${k461f:-1}" -eq 0 ] || fail "changes outside the document need no rebuild"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
