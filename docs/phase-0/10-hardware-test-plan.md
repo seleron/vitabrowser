@@ -14549,3 +14549,100 @@ Vita's-pace run keeps its own `timeout 1200`).
   together.
 
 No sudo.
+
+### State log (2026-11-25): census 446 vs 449, ASan at the head, scorecard r149
+
+**Census** (`census.py`, 7 sites, 3 loads per arm, one interleaved run;
+the 446 binary is 446's own census copy):
+
+| site | 446 | 449 |
+|---|---|---|
+| bbc | 2 / 3 / 5 (3.3) | 2 / 2 / 4 (2.7) |
+| oldreddit | 4 / 5 / 5 (4.7) | 4 / 4 / 4 (4.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 4 / 4 / 4 (4.0) | 5 / 5 / 4 (4.7) |
+| google | 5 / 4 / 5 (4.7) | 5 / 4 / 5 (4.7) |
+| github | 7 / 4 / 3 (4.7) | 3 / 4 / 3 (3.3) |
+| youtube | 4 / 5 / 5 (4.7) | 4 / 5 / 5 (4.7) |
+| **total** | 27 / 26 / 28 (**27.0**) | 24 / 25 / 26 (**25.0**) |
+
+- **Total 27.0 -> 25.0** a load; every 449 load is below every 446 load
+  but one (26 vs 26). No crash or assertion in 42 loads.
+- Declines taken to 0 a load: "class change may move a sibling selector"
+  and "page CSS needs conservative sibling check" (1.7 each: one event,
+  two lines), "class change on an element with a non-inline, non-block
+  box" (1.7). ("sheet removal: an element without a box would get one"
+  0.7 -> 0 too, but no unit here touches removals: noise.)
+- "sheet change: an element's style changes" **3.0 -> 1.0**; what is left
+  is the root: `HTML`, 3 over 21 loads.
+- In the 449 arm: 447's in-place re-cascade ran 6 times (8 elements),
+  448's class parent rebuild 3 times; no "more than 8".
+- New: "sheet change: an element restyled in place declined" 1.0 (the
+  hit's restyle declined "removed block holds objects or frames", then the
+  full rebuild, as before 447).
+- As in 415-417, causes move: "a sibling rule tests :empty" 2.7 -> 4.0,
+  "two" 3.0 -> 4.3 (a batch's next decline).
+- **Probes:** neither 447's sibling-parent line nor 449's inline-block
+  lines appeared (no "may see an element with no box" decline and no 441
+  guard line in these loads).
+
+**ASan at the head** (`tools/build-asan-sim.sh`, netsurf instrumented,
+stack through 449):
+- **sweep clean**: 63 loads (21 sites x 3), all loaded, 0 with an ASan
+  error.
+- **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 400 page
+  dumps (gate 400).
+- With the engine log uncapped (447's tools fix) the log is 21.6 MB and
+  its lines reach page 344 of 344. Under ASan: 447's in-place re-cascade
+  29 times, 448's class parent rebuild 19, 446's child-list parent
+  rebuild 10, 445's attribute parent rebuild 23 (the line also counts
+  448's), 444's join 4, 440's block of blocks 16, 448's inline-block line
+  rebuild 3, and **443's held-cascade answer once -- the first time under
+  ASan** (item 6: with the log uncapped NET-js-sheet-gen needed no
+  change). Still not run under ASan: 441's guard (no gate page triggers
+  it).
+
+**Scorecard r149** (439 vs 449, 21 sites; r148's Chrome reference
+`score/r148-439/ref` reused, not re-fetched; each arm's binary through a
+scratch WORK, `abwork-439` / `abwork-449`, back to back):
+- **All: 75.3 vs 75.4.** Every site is within 0.1 except stackoverflow
+  (64.8 -> 65.6). No crash; oldreddit "blocked" in both arms (its bot
+  wall).
+- **The absolute numbers are not comparable with r148** (84.9 for the
+  same 439 binary): the reference is 3 days old and the news and forum
+  sites' text has moved on (bbc text 0.28, hackernews 0.16, rte, guardian,
+  cnnlite, google, stackoverflow); the static sites score exactly as at
+  r148 (archwiki 88.6, wikipedia 88.0, jquery 88.6, example 89.4). Only
+  the A/B on one reference counts: **flat**, as expected -- 440-449 change
+  what a script's change costs, not what the page looks like.
+
+**Run-close open items, where they stand:**
+1. **Done:** ASan at 446 (autotest clean) and at the head (sweep + autotest
+   clean). "may see an element with no box": the decline now names its
+   parent; it did not occur in 3 + 21 fresh loads, so its cause is still
+   unknown.
+2. **Done (447):** re-cascade in place for sheet batches. Left: the root
+   (`HTML`, 1.0 a load), and sheet removals and root changes, which still
+   decline (they run inside a local change).
+3. **Done (448):** class sibling risk rebuilds the parent.
+4. **Done (448):** inline-block classes go up to their line.
+5. **Probe in (449);** it has not reported yet.
+6. **Done:** the asan-autotest log cap was the cause; 443 ran under ASan.
+7. **Done:** `MAX_POLLS` 100000, main run 1600 s.
+8. **Hand-off prep done** (r149 flat, ASan clean at the head). **No VPK
+   built**: per the brief, the bulk device run waits for the owner.
+
+**Next, by this census:**
+- **"a sibling rule tests :empty"** is now the largest local decline (4.0 a
+  load). It is `html_rl_block_whole` / `html_rl_flex_whole`'s check when
+  the rebuilt element is or becomes empty. An `X:empty + Y` rule reaches
+  only the element's later siblings, so the parent can be rebuilt instead,
+  as 445/448 do: one level, since the parent is never empty.
+- "detached stylesheet pruned" (3.3), "removed block holds objects or
+  frames" (2.3, plus 447's one in-place decline), "new element is not a
+  plain block" (2.3).
+- Root re-cascade: an `HTML` style change re-cascades everything; it
+  could be answered in place when only inherited-free properties change.
+  This needs a property-level diff (libcss).
+
+No sudo.
