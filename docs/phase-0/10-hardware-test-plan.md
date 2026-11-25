@@ -14736,3 +14736,59 @@ change, and a hit's restyle is a local change of its own.
   Vita's pace.
 
 No sudo.
+
+### State log (2026-11-25, later): census 449 vs 451, ASan at 451
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 449 | 451 |
+|---|---|---|
+| bbc | 2 / 3 / 3 (2.7) | 2 / 2 / 2 (2.0) |
+| oldreddit | 6 / 5 / 4 (5.0) | 3 / 3 / 3 (3.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 4 / 4 / 4 (4.0) | 4 / 4 / 4 (4.0) |
+| google | 6 / 4 / 6 (5.3) | 4 / 6 / 5 (5.0) |
+| github | 3 / 3 / 4 (3.3) | 2 / 2 / 3 (2.3) |
+| youtube | 5 / 5 / 5 (5.0) | 4 / 5 / 4 (4.3) |
+| **total** | 27 / 25 / 27 (**26.3**) | 20 / 23 / 22 (**21.7**) |
+
+- **Total 26.3 -> 21.7** a load: every 451 load is below every 449
+  load. No crash or assertion in 42 loads.
+- Taken to 0: "a sibling rule tests :empty" (3.7; 450's parent rebuild
+  ran 12 times), "root change: an element's style changes" (1.0; 451 in
+  place 3 times), "sheet removal: an element without a box would get one"
+  (1.3), "restyled block's parent is not a block" (1.0).
+- "detached stylesheet pruned" **5.0 -> 2.7**; 451's removal in place ran
+  3 times. **What is left is all "sheet removal: a sheet is still loading
+  or changing"** (5 of the 8): the walk waits for nothing there, unlike
+  443's held-cascade answer for a sheet change.
+- **Cost guard** ("guard", patch 309's budget) **5.7 -> 7.7**: youtube 9
+  -> 10, oldreddit 4 -> 6, github 1 -> 4 over three loads. These are
+  batches whose earlier local declines are now answered; they get further
+  and then cost more than the initial conversion. This is the "a batch
+  moves to its next decline" pattern again, and the next lead: what costs
+  so much locally (youtube's batches hold many marks).
+- The 449-vs-449 baseline moved (27.0 in 449's own run, 26.3 here), the
+  known cross-run drift; only the arms of one run are compared.
+
+**ASan at 451** (`build-asan-sim.sh`, netsurf instrumented, the same
+sources as the commit, cmp-checked):
+- **sweep clean**: 63 loads, all loaded, 0 with an ASan error.
+- **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 402 page
+  dumps (gate 402). The log is uncapped and reaches page 346 of 346.
+- Under ASan: 451's sheet-removal in place 5 times and root change 2;
+  450's `:empty` parent rebuild 5; 448's class parent rebuild 21; 447's
+  sheet batches 29; 443's held cascade once. 441's guard is still unhit.
+
+**Next:**
+1. The cost guard (7.7 a load): profile youtube's guarded batches (marks
+   per batch, local cost vs `html_content_full_us`).
+2. "sheet removal: a sheet is still loading or changing" (1.7): a
+   removal while another sheet is in flight. As in 443, the boxes may
+   hold the current cascade; the removal itself changes it, so this needs
+   a removal-aware answer (prune, then the in-place walk against the held
+   sheets).
+3. "removed block holds objects or frames" (3.0), "restyled flex or grid
+   box is not in a block" (2.0).
+
+No sudo.
