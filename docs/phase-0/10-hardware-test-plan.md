@@ -14948,3 +14948,70 @@ context. It holds when:
   Vita's pace.
 
 No sudo.
+
+### State log (2026-11-26): census 452 vs 453, ASan at 453, items 5-8
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 452 | 453 |
+|---|---|---|
+| bbc | 2 / 2 / 2 (2.0) | 3 / 2 / 2 (2.3) |
+| oldreddit | 2 / 2 / 1 (1.7) | 2 / 1 / 2 (1.7) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 4 / 4 / 4 (4.0) | 4 / 5 / 4 (4.3) |
+| google | 3 / 3 / 5 (3.7) | 4 / 3 / 4 (3.7) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 3 / 4 / 4 (3.7) | 3 / 3 / 4 (3.3) |
+| **total** | 17 / 17 / 18 (**17.3**) | 18 / 16 / 18 (**17.3**) |
+
+- **Total flat** (17.3 vs 17.3). No crash or assertion in 42 loads.
+- 453 did its job: "detached stylesheet pruned" **3.7 -> 2.0**, the
+  removals-while-loading **2 -> 0**, and the live-cascade answer ran 4
+  times. Those batches went on to their next decline (the 415-417
+  pattern), so the total did not move.
+- The 452 arm read 17.3 here against 20.0 in its own run hours earlier:
+  cross-run drift again (live content, time of day). Only one run's arms
+  are compared.
+
+**ASan at 453** (`build-asan-sim.sh`, netsurf instrumented):
+- **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 404 page
+  dumps (gate 404); the log reaches page 348 of 348.
+- Under ASan: 453's live-cascade answer once, 451's removal in place 6
+  times, 450's `:empty` parent 5, 452's guard tripped 11 (not continued:
+  ASan timing), and **443's held cascade once on NET-js-sheet-gen** (the
+  third ASan run in a row).
+- **Sweep clean:** 63 loads (21 sites x 3), all loaded, 0 with an ASan
+  error.
+
+**Run-close items (owner's list, 2026-11-26):**
+- **Item 5 (441's trigger):** the census LIFE line ("an inline-block with
+  no min/max widths, measured in line layout") **did not appear**: 0 in
+  both arms' 21 loads, and **0 in 10 dedicated wpblog loads** of the 453
+  binary (4.2 full rebuilds a load, no crash). Earlier today: 0 in 3 + 21
+  + 21 loads. The trigger came with wpblog's live content (its o2
+  live-update poll, data: SVGs), which has not produced it since. 449's
+  probe stays in to name the box and its block when it returns; 441's
+  guard keeps it from aborting meanwhile.
+- **Item 6 (443 under ASan):** **done, no page change.** The cause was
+  asan-autotest's capped engine log (447's tools fix), not
+  NET-js-sheet-gen's timing. 443's held cascade has now run under ASan in
+  three consecutive runs (449, 451, 453), each time on NET-js-sheet-gen.
+  A longer slow delay is not needed.
+- **Item 7 (gate budget):** **done in 447**: `MAX_POLLS` 100000, the main
+  run's `timeout 1600`, the receiver's `--timeout 1700`. gate453's main
+  autotest is 348 pages, about 1043 s of ~1570 s.
+- **Item 8 (hand-off prep):** r150 (439 vs 451) is flat, 75.1 vs 75.3.
+  452 and 453 change only when a batch goes to the full rebuild and which
+  cascade the removal walk compares against; the gate's rows checks cover
+  rendering. ASan at 453 is clean (the autotest and the sweep above).
+  **The device run** would be the first since run 42 (VPK through 402):
+  patches 403-453. **Not built:** the owner builds or asks for the VPK.
+  When it is asked for: restage from pristine, then build-vita.sh, then
+  the autotest self-checks plus the usual short manual list.
+
+**Next:** "removed block holds objects or frames" (3.0 a load) and
+"restyled flex or grid box is not in a block" (2.0) are now the largest
+local declines; then "sheet change: a sheet is still loading or changing"
+(2.0) and "sheet removal: an element without a box would get one" (1.0).
+
+No sudo.
