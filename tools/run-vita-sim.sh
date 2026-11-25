@@ -430,6 +430,8 @@ JS-inline-block-inner file:///app0:/testpages/JS-inline-block-inner.html
 CSS-inline-block-inner-ref file:///app0:/testpages/CSS-inline-block-inner-ref.html
 JS-new-nonplain file:///app0:/testpages/JS-new-nonplain.html
 CSS-new-nonplain-ref file:///app0:/testpages/CSS-new-nonplain-ref.html
+JS-sheet-pending file:///app0:/testpages/JS-sheet-pending.html
+CSS-sheet-pending-ref file:///app0:/testpages/CSS-sheet-pending-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2407,6 +2409,16 @@ k457d=$(printf '%s\n' "$k457seg" | grep -c "declined (new element is not a plain
 k457f=$(printf '%s\n' "$k457seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-new-nonplain: rows $k457r (0), parent rebuilds ${k457p} (1 or more), not-plain declines ${k457d} (0), full rebuilds ${k457f} (0)"
 [ "$k457r" = 0 ] && [ "${k457p:-0}" -ge 1 ] && [ "${k457d:-1}" -eq 0 ] && [ "${k457f:-1}" -eq 0 ] || fail "a new element that is not a plain block: the parent"
+# Patch 458: a sheet change while a <style>'s text update is pending is
+# walked against the live cascade (the full reconvert would cascade it as
+# it is), no still-loading decline, no full rebuild.
+k458r=$(fl_rows JS-sheet-pending CSS-sheet-pending-ref)
+k458seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sheet-pending: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k458l=$(printf '%s\n' "$k458seg" | grep -c "sheet change: a sheet is still loading, against the live cascade" || true)
+k458d=$(printf '%s\n' "$k458seg" | grep -c "sheet change: declined (a sheet is still loading" || true)
+k458f=$(printf '%s\n' "$k458seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-sheet-pending: rows $k458r (0), against the live cascade ${k458l} (1 or more), still-loading declines ${k458d} (0), full rebuilds ${k458f} (0)"
+[ "$k458r" = 0 ] && [ "${k458l:-0}" -ge 1 ] && [ "${k458d:-1}" -eq 0 ] && [ "${k458f:-1}" -eq 0 ] || fail "a sheet change while a text update is pending"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

@@ -15352,3 +15352,44 @@ parent rebuild ran 11 times under ASan.
 (455) -> 14.7 (456) -> 14.0 (457).
 
 No sudo.
+
+## Patch 458 (2026-11-26): a change while a `<style>`'s text update is pending is walked against the live cascade too
+
+**Problem.** 455 walked any change during a load against the live
+selection context, but left out a sheet whose text update is pending
+(`modified`), because its new rules are in no context yet. "sheet change:
+a sheet is still loading or changing" stayed at **2.0 a load** in the 457
+census, the largest local decline.
+
+**Why the live walk is right here too.**
+- A text change marks the sheet `modified` and schedules
+  `html_css_process_modified_styles`. That swaps in a new sheet, which
+  then loads and marks its own batch.
+- The **full reconvert** processes no pending update. It refreshes the
+  context only once every sheet has settled, and a modified sheet has not
+  (`html_css_sheets_settled`).
+- So the full reconvert cascades the live context as it is. That context
+  still holds the sheet's **old** version until
+  `html_css_process_modified_style` takes it out.
+- The walk against the live context is again exactly that rebuild's
+  result. 455's exclusion was over-cautious.
+
+**Fix** (html.c). The exclusion and `html_rl_sheet_modified` go.
+
+**Gate.**
+- New pair **JS-sheet-pending / CSS-sheet-pending-ref**:
+  - one task edits `#s1`'s text (left pending) and adds a new `<style>`,
+    then a layout read;
+  - a later task edits `#s2`'s text and sets a paragraph's class.
+- On the **457 binary** the first batch declined ("a sheet is still
+  loading or changing") into the full rebuild. On 458: **the live-cascade
+  walk, 2 elements restyled in place, then 1 when the edited sheet
+  landed, rows 0**, no full rebuild.
+- `restage-full.sh`: **540 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate458 exit 0** (stack through 458): JS-sheet-pending rows 0, the
+  live cascade, 0 still-loading declines, 0 full rebuilds;
+  NET-js-sheet-wait and JS-style-absorb (STYLEABS 4/4, 4 batches restyled
+  in place) unchanged; interaction 52/52 at the Vita's pace.
+
+No sudo.
