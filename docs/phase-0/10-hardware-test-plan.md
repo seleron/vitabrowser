@@ -15480,3 +15480,46 @@ it; root changes (419) did the same.
   unchanged; interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-27, later): ASan at 459, census 458 vs 459
+
+**ASan at 459:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 414 page dumps (gate 414), the log to page 358 of 358. Both
+root-in-place paths ran under ASan (a sheet removal and a root change)
+with no error: the style ownership taken out of `keep[]` and swapped
+onto the root box is ASan-clean.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 458 | 459 |
+|---|---|---|
+| bbc | 2 / 2 / 2 (2.0) | 1 / 1 / 0 (0.7) |
+| oldreddit | 2 / 1 / 2 (1.7) | 2 / 2 / 2 (2.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 3 / 3 / 3 (3.0) | 4 / 3 / 3 (3.3) |
+| **total** | 14 / 12 / 13 (**13.0**) | 13 / 12 / 11 (**12.0**) |
+
+- **Total 13.0 -> 12.0** (the loads only partly separate); **bbc 2.0 ->
+  0.7**. No crash or assertion in 42 loads.
+- The root was restyled in place 6 times; "an element's style changes,
+  HTML" declines **6 -> 0** (removals and sheet changes both).
+- "detached stylesheet pruned" **2.0 -> 0.7**. Left: oldreddit's "sheet
+  removal: an element without a box would get one".
+- As before, batches move on: "no block box above the change" 0 -> 1.3,
+  "restyled block's parent holds more than blocks" 1.3 -> 2.0.
+- **Largest local declines now:**
+  - "restyled block's parent holds more than blocks" (2.0);
+  - "no block box above the change" (1.3);
+  - five at 1.0 each: aria-expanded sibling, the root `<html>` not in a
+    block, structural selectors, "parent holds more than blocks", "block
+    is not one line container of plain content".
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> 25.0
+(449) -> 21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7
+(455) -> 14.7 (456) -> 14.0 (457) -> 11.7 (458) -> 12.0 (459; 13.0 for
+458 in that run).
+
+No sudo.
