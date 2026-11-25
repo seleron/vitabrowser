@@ -15226,3 +15226,45 @@ box type M"), run for 3 loads on the three sites, named the parents:
   rebuilds; interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-26, night): ASan at 456, census 455 vs 456
+
+**ASan at 456:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 408 page dumps (gate 408), the log to page 352 of 352. 456's
+enclosing rebuild ran twice under ASan.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 455 | 456 |
+|---|---|---|
+| bbc | 4 / 2 / 2 (2.7) | 2 / 2 / 2 (2.0) |
+| oldreddit | 2 / 2 / 1 (1.7) | 1 / 1 / 2 (1.3) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 4 / 4 / 3 (3.7) | 3 / 3 / 3 (3.0) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 4 (2.0) |
+| youtube | 2 / 3 / 2 (2.3) | 3 / 2 / 2 (2.3) |
+| **total** | 18 / 16 / 13 (**15.7**) | 14 / 13 / 17 (**14.7**) |
+
+- **Total 15.7 -> 14.7**, but the loads overlap (one github load of 4 in
+  the 456 arm). The decline counts are the clearer measure. No crash or
+  assertion in 42 loads.
+- "restyled flex or grid box is not in a block" **2.3 -> 1.0**. All 3
+  inline-block cases in the 456 arm were answered by the enclosing
+  rebuild. What is left is the root `<html>` (3 over three loads, from
+  404's structural parent rebuild), which keeps the full rebuild by
+  design.
+- **Largest local declines now:**
+  - "new element is not a plain block, list item or block of blocks"
+    (2.0);
+  - "detached stylesheet pruned" (1.7);
+  - "sheet change: a sheet is still loading or changing" (1.0: pending
+    text updates);
+  - "sheet change: an element's style changes" (1.0: the root);
+  - four reasons at 1.0 each.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 -> 25.0 (449) ->
+21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7 (455) ->
+14.7 (456; 15.7 for 455 in that run).
+
+No sudo.
