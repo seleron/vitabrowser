@@ -1,0 +1,384 @@
+# netsurf: a sheet change that restyles a few elements re-cascades in place (patch 447)
+# Generated 2026-11-25
+# Base: seleron/vitabrowser (patch stack through 446)
+#
+# "sheet change: an element's style changes" (the census's largest local
+# decline: google, bbc, youtube) sent the batch to the full rebuild: 415's
+# walk re-cascades the whole document with a fresh selection context and
+# stopped at the first element whose style, ::before or ::after differs.
+# For a sheet batch (it runs at the top, no mark state set; a removal or a
+# root change runs inside a local change and keeps the decline) the walk
+# now collects such elements -- at most 8, never the root -- and skips
+# their subtrees. Every element outside them is compared with the fresh
+# context, siblings included, so no sibling-selector check is needed. The
+# context is installed and each element is restyled with its subtree
+# through the class-change paths, as 370 answers a style attribute (its
+# "old class" the current one: html_rl_sheet_hit_restyle). A restyle that
+# declines leaves the batch to the full rebuild. More than 8: declined.
+# Such a batch logs "LIFE SHEETINPLACE elements=N" and the sheet census lines
+# a full rebuild of it would (316 SHEETCAUSE, 318 SHEETID, 321 SHEETREACH;
+# macos9_sheet_census_lines, html_rl_take_inplace), so doc 23's census
+# still sees every sheet batch that changes a style.
+# Also: 446's sibling-parent decline names the parent's tag and box type.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9045,6 +9045,21 @@
+ 	html_rl_unsettled = 0;
+ 	return v;
+ }
++/* Patch 447 - the number of elements the last sheet batch restyled in
++ * place (0: none, or it restyled nothing); read and cleared by
++ * macos9_reconvert_try_local for the sheet census */
++static int html_rl_inplace_last;
++int html_rl_take_inplace(void);
++int html_rl_take_inplace(void)
++{
++	int v = html_rl_inplace_last;
++	html_rl_inplace_last = 0;
++	return v;
++}
++
++/* Patch 447: a sheet change restyles a few elements in place (below) */
++static int html_rl_sheet_hit_restyle(html_content *c, dom_node *el);
++#define HTML_RL_SHEET_HITS_MAX 8
+ 
+ static int html_rl_doc_noop(html_content *c, const char *what)
+ {
+@@ -9055,6 +9070,13 @@
+ 	css_select_results **keep = NULL;
+ 	css_custom_env **envs = NULL;
+ 	int nst = 0, cst = 0, nkeep = 0, ckeep = 0, nel = 0, k;
++	/* Patch 447: the elements whose style the sheet change changes --
++	 * only for a sheet batch, which runs at the top (a removal or the
++	 * root runs inside a local change whose marks are set) */
++	dom_node *hits[HTML_RL_SHEET_HITS_MAX];
++	int nhits = 0;
++	bool can_hit = strcmp(what, "sheet change") == 0;
++	static unsigned long inplace_n;
+ 	const css_computed_style *root_new = NULL;
+ 	dom_node *root = NULL;
+ 	const char *why = NULL;
+@@ -9207,6 +9229,21 @@
+ 			     (box->gadget->type == GADGET_SELECT ||
+ 			      box->gadget->type == GADGET_TEXTAREA)))
+ 				walk = false;
++			/* Patch 447: not the root (everything inherits from
++			 * it); its subtree is re-selected by the restyle, so
++			 * not walked */
++			if (why != NULL && can_hit && f.n != root &&
++			    strcmp(why, "no style") != 0) {
++				if (nhits < HTML_RL_SHEET_HITS_MAX) {
++					dom_node_ref(f.n);
++					hits[nhits++] = f.n;
++					why = NULL;
++					walk = false;
++				} else {
++					why = "more than 8 elements' styles "
++						"change";
++				}
++			}
+ 		}
+ 		if (why != NULL) {
+ 			dom_string *nm = NULL;
+@@ -9260,6 +9297,8 @@
+ 	if (why != NULL) {
+ 		if (ctx != NULL)
+ 			css_select_ctx_destroy(ctx);
++		for (k = 0; k < nhits; k++)
++			dom_node_unref(hits[k]);
+ 		macsurf_debug_log_writef("LIFE rebuild local: %s: "
+ 			"declined (%s%s%s) after %d elements in %ld us", what,
+ 			why, tag[0] ? ", " : "", tag, nel,
+@@ -9271,6 +9310,34 @@
+ 	/* patch 443: every element was re-cascaded with the new context and
+ 	 * kept its style -- the tree holds this generation */
+ 	html_css_ctx_changed(c);
++	/* Patch 447: re-cascade in place. Every element outside the hits'
++	 * subtrees keeps its style under the new context (the walk); the
++	 * hits are restyled with their subtrees, against it. A hit's
++	 * restyle that declines leaves the batch to the full rebuild (the
++	 * context installed is the one it would refresh to: the sheets have
++	 * settled), and the tree does not hold this generation. */
++	if (nhits > 0) {
++		int r = 0;
++		for (k = 0; k < nhits; k++) {
++			if (r == 0 && html_rl_sheet_hit_restyle(c, hits[k]) != 0)
++				r = -1;
++			dom_node_unref(hits[k]);
++		}
++		if (r != 0) {
++			macsurf_debug_log_writef("LIFE rebuild local: %s: "
++				"declined (an element restyled in place "
++				"declined)", what);
++			return -1;
++		}
++		c->rl_boxes_gen = c->rl_ctx_gen;
++		html_rl_inplace_last = nhits;
++		inplace_n++;
++		macsurf_debug_log_writef("LIFE rebuild local: %s: %d "
++			"element(s) restyled in place (%d elements "
++			"re-cascaded, %ld us in all, %lu so far)", what, nhits,
++			nel, (long)(macos9_micros() - t0), inplace_n);
++		return 0;
++	}
+ 	c->rl_boxes_gen = c->rl_ctx_gen;
+ 	html__redraw_a_box(c, c->layout);
+ 	noop_n++;
+@@ -10318,8 +10385,18 @@
+ 			return html_rl_block_whole(c, pnode, pbox, t0,
+ 				"a sibling rule may see the child-list change: "
+ 				"the parent");
+-		macsurf_debug_log_writef("LIFE rebuild local: declined (%s)",
+-			sib_why);
++		{	/* patch 447: name the parent the rebuild cannot take */
++			char *ptag = html_rl_struct_tag(pnode);
++			macsurf_debug_log_writef("LIFE rebuild local: declined "
++				"(%s)", sib_why);
++			macsurf_debug_log_writef("LIFE rebuild local: sibling "
++				"parent <%s> box type %d%s%s%s", ptag ? ptag : "?",
++				(int)pbox->type,
++				pbox->parent == NULL ? ", no parent box" : "",
++				pbox->object != NULL ? ", an object" : "",
++				HTML_RL_FRAME(pbox) ? ", a frame" : "");
++			free(ptag);
++		}
+ 	}
+ 	return -1;
+ #undef RL_BSIB
+@@ -14229,6 +14306,36 @@
+ 	html_rl_style_as_class = false;
+ 	free(cs);
+ 	return r;
++}
++
++/* Patch 447: one element a sheet change restyles (html_rl_doc_noop's
++ * walk found its own style, or its ::before / ::after, changed under the
++ * fresh selection context, now c->select_ctx). Re-selected with its
++ * subtree by the class-change paths, as 370 answers a style attribute:
++ * its "old class" the current one, so no class-token check (414) or
++ * sibling check (186) sees a change. No sibling check is needed here:
++ * the walk compared every element outside the restyled subtrees with the
++ * fresh context, siblings included. */
++static int html_rl_sheet_hit_restyle(html_content *c, dom_node *el)
++{
++	dom_string *cls = NULL;
++	char *cs;
++	int r;
++
++	if (dom_element_get_attribute(el, corestring_dom_class, &cls) !=
++			DOM_NO_ERR)
++		return -1;
++	cs = cls != NULL ? strndup(dom_string_data(cls),
++			dom_string_byte_length(cls)) : strdup("");
++	if (cls != NULL)
++		dom_string_unref(cls);
++	if (cs == NULL)
++		return -1;
++	html_rl_style_as_class = true;	/* not a class change (414) */
++	r = html_reconvert_local_change(&c->base, el, true, cs);
++	html_rl_style_as_class = false;
++	free(cs);
++	return r;
+ }
+ 
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1002,6 +1002,76 @@
+  * decline. */
+ static int g_one_fail_kind = 0;
+ 
++/* Patch 447 - the sheet census lines of a sheet batch (patches 316, 318,
++ * 321): what the marks said and the edit's reach. Logged for a committed
++ * full reconvert of a nodeless batch (beside its BATCHCAUSE), and for a
++ * sheet batch restyled in place (html_rl_sheet_batch_noop's re-cascade
++ * found a few elements to restyle: beside "LIFE SHEETINPLACE"), so the
++ * census still sees every sheet batch that changes a style. */
++static void
++macos9_sheet_census_lines(int i, int sheets)
++{
++	/* patch 316: synchronous, beside BATCHCAUSE */
++	macsurf_debug_log_writef("LIFE SHEETCAUSE sheets=%d",
++		sheets);
++	/* patch 318: what the marks themselves said */
++	if (g_pending[i].sheet_state == 1 &&
++	    !g_pending[i].sheet_unid) {
++		int cur = html_css_sheet_mark_current(
++			g_pending[i].c, g_pending[i].sheet_idx,
++			g_pending[i].sheet_ctr);
++		macsurf_debug_log_writef(
++			"LIFE SHEETID %s idx=%d ctr=%u",
++			cur ? "single" : "stale",
++			g_pending[i].sheet_idx,
++			g_pending[i].sheet_ctr);
++		if (cur)
++			g_id_single++;
++		else
++			g_id_stale++;
++		/* Patch 321 B1: the reach census --
++		 * census only, no behaviour
++		 * change. Bounded: how small
++		 * the edit's reach is;
++		 * unbounded: the cause. */
++		{
++			struct html_css_reach_result rr;
++			html_css_sheet_reach_census(
++				g_pending[i].c,
++				g_pending[i].sheet_idx,
++				&rr);
++			if (rr.bounded) {
++				g_sr_bounded++;
++				macsurf_debug_log_writef(
++					"LIFE SHEETREACH bounded "
++					"changed=%d anchors=%d "
++					"roots=%d walked=%d",
++					(int)rr.changed,
++					(int)rr.anchors,
++					(int)rr.roots,
++					(int)rr.walked);
++			} else {
++				g_sr_unbounded++;
++				if (rr.reason >= 0 &&
++				    rr.reason <=
++				    HTML_CSS_REACH_NO_SOURCE)
++					g_sr_reasons[rr.reason]++;
++				macsurf_debug_log_writef(
++					"LIFE SHEETREACH unbounded "
++					"reason=%s",
++					html_css_reach_reason_name(
++						rr.reason));
++			}
++		}
++	} else if (g_pending[i].sheet_state != 0) {
++		macsurf_debug_log_writef("LIFE SHEETID multi");
++		g_id_multi++;
++	} else {
++		macsurf_debug_log_writef("LIFE SHEETID none");
++		g_id_none++;
++	}
++}
++
+ /* Patch 308 - doc-20 stage 0: name the cause of a batch's full
+  * reconvert. Called with the slot still intact, immediately after the
+  * flush site commits to html_reconvert_content and before it clears
+@@ -1032,65 +1102,7 @@
+ 			g_fc_over++;
+ 		} else {
+ 			g_fc_nonode++;
+-			/* patch 316: synchronous, beside BATCHCAUSE */
+-			macsurf_debug_log_writef("LIFE SHEETCAUSE sheets=%d",
+-				sheets);
+-			/* patch 318: what the marks themselves said */
+-			if (g_pending[i].sheet_state == 1 &&
+-			    !g_pending[i].sheet_unid) {
+-				int cur = html_css_sheet_mark_current(
+-					g_pending[i].c, g_pending[i].sheet_idx,
+-					g_pending[i].sheet_ctr);
+-				macsurf_debug_log_writef(
+-					"LIFE SHEETID %s idx=%d ctr=%u",
+-					cur ? "single" : "stale",
+-					g_pending[i].sheet_idx,
+-					g_pending[i].sheet_ctr);
+-				if (cur)
+-					g_id_single++;
+-				else
+-					g_id_stale++;
+-				/* Patch 321 B1: the reach census --
+-				 * census only, no behaviour
+-				 * change. Bounded: how small
+-				 * the edit's reach is;
+-				 * unbounded: the cause. */
+-				{
+-					struct html_css_reach_result rr;
+-					html_css_sheet_reach_census(
+-						g_pending[i].c,
+-						g_pending[i].sheet_idx,
+-						&rr);
+-					if (rr.bounded) {
+-						g_sr_bounded++;
+-						macsurf_debug_log_writef(
+-							"LIFE SHEETREACH bounded "
+-							"changed=%d anchors=%d "
+-							"roots=%d walked=%d",
+-							(int)rr.changed,
+-							(int)rr.anchors,
+-							(int)rr.roots,
+-							(int)rr.walked);
+-					} else {
+-						g_sr_unbounded++;
+-						if (rr.reason >= 0 &&
+-						    rr.reason <=
+-						    HTML_CSS_REACH_NO_SOURCE)
+-							g_sr_reasons[rr.reason]++;
+-						macsurf_debug_log_writef(
+-							"LIFE SHEETREACH unbounded "
+-							"reason=%s",
+-							html_css_reach_reason_name(
+-								rr.reason));
+-					}
+-				}
+-			} else if (g_pending[i].sheet_state != 0) {
+-				macsurf_debug_log_writef("LIFE SHEETID multi");
+-				g_id_multi++;
+-			} else {
+-				macsurf_debug_log_writef("LIFE SHEETID none");
+-				g_id_none++;
+-			}
++			macos9_sheet_census_lines(i, sheets);
+ 			if (sheets == 1)
+ 				g_fc_sheet1++;
+ 			else if (sheets > 1)
+@@ -1385,6 +1397,21 @@
+  * in it was answered */
+ static int g_defer_unsettled;
+ 
++/* Patch 447 - a sheet batch html_rl_sheet_batch_noop restyled in place
++ * (a few elements, no full rebuild) gets the sheet census lines a full
++ * one would have, after its own line; one that restyled nothing does not
++ * (as before 447). */
++static void macos9_sheet_inplace_census(int i, struct content *c)
++{
++	extern int html_rl_take_inplace(void);
++	int n = html_rl_take_inplace();
++
++	if (n <= 0)
++		return;
++	macsurf_debug_log_writef("LIFE SHEETINPLACE elements=%d", n);
++	macos9_sheet_census_lines(i, html_css_census_batch_sheets(c));
++}
++
+ static int macos9_reconvert_try_local(int i, struct content *c)
+ {
+ 	int j;
+@@ -1403,12 +1430,14 @@
+ 	double t0;
+ 	extern int html_rl_sheet_batch_noop(struct content *c);
+ 	extern int html_rl_take_unsettled(void);	/* patch 442 */
++	extern int html_rl_take_inplace(void);		/* patch 447 */
+ 
+ 	g_defer_unsettled = 0;
+ 	if (g_pending[i].coarse)
+ 		return 0;
+ 	g_fc_reason = 0;
+ 	(void) html_rl_take_unsettled();
++	(void) html_rl_take_inplace();
+ 	/* Patch 415 - sheet marks alone: the re-cascade decides */
+ 	if (g_pending[i].node == NULL) {
+ 		if (!g_pending[i].sheets)
+@@ -1420,6 +1449,7 @@
+ 			return 0;
+ 		}
+ 		g_sheet_noop++;
++		macos9_sheet_inplace_census(i, c);	/* patch 447 */
+ 		return 1;
+ 	}
+ 	g_fc_reason = 0;
+@@ -1508,6 +1538,7 @@
+ 			return 0;
+ 		}
+ 		g_sheet_noop++;
++		macos9_sheet_inplace_census(i, c);	/* patch 447 */
+ 	}
+ 	return 1;
+ }

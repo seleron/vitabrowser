@@ -418,6 +418,10 @@ JS-block-blocks file:///app0:/testpages/JS-block-blocks.html
 CSS-block-blocks-ref file:///app0:/testpages/CSS-block-blocks-ref.html
 JS-join-lines file:///app0:/testpages/JS-join-lines.html
 CSS-join-lines-ref file:///app0:/testpages/CSS-join-lines-ref.html
+JS-sheet-inplace file:///app0:/testpages/JS-sheet-inplace.html
+CSS-sheet-inplace-ref file:///app0:/testpages/CSS-sheet-inplace-ref.html
+JS-class-sib-parent file:///app0:/testpages/JS-class-sib-parent.html
+CSS-class-sib-parent-ref file:///app0:/testpages/CSS-class-sib-parent-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -651,12 +655,14 @@ else
 	# (vita/diag.c catch_up), so the mirror must still come out complete.
 	( sleep "${NETLOG_LATE:-15}"; exec python3 "$ROOT/tools/vita-netlog.py" \
 		--port "$NETLOG_PORT" --bind 127.0.0.1 --out "$OUT/net" --quiet \
-		--exit-when-done --timeout 1300 ) > "$OUT/netlog-receiver.log" 2>&1 &
+		--exit-when-done --timeout 1700 ) > "$OUT/netlog-receiver.log" 2>&1 &
 	# (patch 425's gate: the receiver's timeout was 1000 s from its late
 	# start; the run below may take its full 1200 s -- ~950 s of autotest
 	# with this page list, more on a loaded machine -- and twice the
 	# mirror lost the run's last lines and autotest.done to the
 	# receiver's exit. It still exits as soon as the run is done.)
+	# (patch 447: 1600 s for the run, 1700 for the receiver, with vitasim's
+	# MAX_POLLS 100000 -- the main autotest used ~1025 of the old ~1180.)
 	RX=$!
 	# patch 411: the engine log is not capped mid-run (16 MiB capped it
 	# at page 267 of 277), and the run has room past 900 s (886 s with
@@ -664,7 +670,7 @@ else
 	( cd "$OUT/run" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$OUT/snaps" \
 		VITA_SETTLE_EXTRA_MS="${VITA_SETTLE_EXTRA_MS:-7000}" \
 		VITA_SIM_ENGINE_LOG_CAP=256 \
-		timeout 1200 "$NS/nsvita-sim" )
+		timeout 1600 "$NS/nsvita-sim" )
 	wait $RX || true
 	kill $HTTPD 2>/dev/null || true
 # AUTOTEST RUN END
@@ -1659,15 +1665,16 @@ bsr=$(sed -n 's/.*STR \(BLOCKSIB: [0-9]*\/[0-9]* passed\).*/\1/p' $bsp 2>/dev/nu
 # tracks the engine's current wording. Without this the counter is
 # permanently 0 and the check can never pass (root cause B of the
 # 2026-10-02 cluster bisect).
-bsd=$(grep -c 'declined (class change may move a sibling selector)' "$R/netsurf.log" || true)
+# Patch 448: a sibling risk now rebuilds the parent; either answer counts.
+bsd=$(grep -c 'declined (class change may move a sibling selector)\|a sibling selector can match on the class attribute: the parent' "$R/netsurf.log" || true)
 echo "  JS-block-class-stall: ${bcr:-no summary}; ${bcl} blocks restyled locally"
 echo "  JS-block-class-sibling: ${bsr:-no summary}; ${bsd} declined for sibling combinators"
 # Precise sibling risk (Patch 186): unrelated sibling CSS stays local,
 # genuine +/~ risks decline and restyle siblings, :has(+ ...) declines.
 s186p=$(ls "$R"/*NET-css-sibling-class*.plot 2>/dev/null)
 s186r=$(sed -n 's/.*STR \(SIB186: [0-9]*\/[0-9]* passed\).*/\1/p' $s186p 2>/dev/null | head -1)
-s186d=$(grep -c 'declined (class change moves a sibling selector)' "$R/netsurf.log" || true)
-s186c=$(grep -c 'declined (page CSS needs conservative sibling check)' "$R/netsurf.log" || true)
+s186d=$(grep -c 'sibling risk (class change moves a sibling selector)' "$R/netsurf.log" || true)
+s186c=$(grep -c 'sibling risk (page CSS needs conservative sibling check)' "$R/netsurf.log" || true)
 echo "  CSS-sibling-class: ${s186r:-no summary}; ${s186d} precise declines, ${s186c} conservative declines"
 [ -n "$bcp" ] && grep -aho 'STR [0-9] [^"]*FAIL' $bcp | sort -u | sed 's/^STR /  /'
 # Lists and nested blocks (Patch 176): a list item or a block of blocks a
@@ -2004,14 +2011,15 @@ echo "  JS-class-unnamed: rows $k414r (0), class changes answered as no-ops ${k4
 # Patch 415: sheet marks no longer make the batch coarse. A sheet that
 # matches nothing, alone and beside a paragraph's new text, restyles
 # nothing (2); a class change with the still-pending sheet that styles it,
-# and a sheet that restyles the paragraphs, take the full rebuild (the
-# re-cascade declines, 2).
+# and a sheet that restyles the paragraphs, took the full rebuild (the
+# re-cascade declined, 2). Patch 447: those two are restyled in place.
 k415r=$(fl_rows JS-sheet-noop CSS-sheet-noop-ref)
 k415seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sheet-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k415n=$(printf '%s\n' "$k415seg" | grep -c "sheet change restyles nothing" || true)
 k415d=$(printf '%s\n' "$k415seg" | grep -c "sheet change: declined (an element's style changes" || true)
-echo "  JS-sheet-noop: rows $k415r (0), sheet batches restyling nothing ${k415n} (2 or more), re-cascade declines ${k415d} (2 or more)"
-[ "$k415r" = 0 ] && [ "${k415n:-0}" -ge 2 ] && [ "${k415d:-0}" -ge 2 ] || fail "sheet batches that restyle nothing"
+k415i=$(printf '%s\n' "$k415seg" | grep -c "sheet change: [0-9]* element(s) restyled in place" || true)
+echo "  JS-sheet-noop: rows $k415r (0), sheet batches restyling nothing ${k415n} (1 or more), restyled in place ${k415i} (1 or more), re-cascade declines ${k415d} (0)"
+[ "$k415r" = 0 ] && [ "${k415n:-0}" -ge 1 ] && [ "${k415i:-0}" -ge 1 ] && [ "${k415d:-1}" -eq 0 ] || fail "sheet batches that restyle nothing"
 # Patch 416: plain inline elements between blocks are built alone and
 # moved into a line of their own (2), one appended after a block gets a
 # line at the end (1); a span holding an image still declines (1).
@@ -2138,18 +2146,23 @@ k427r=$(fl_rows JS-style-noop CSS-style-noop-ref)
 k427seg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-noop: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k427n=$(printf '%s\n' "$k427seg" | grep -c "style attribute change leaves the style as it is" || true)
 k427f=$(printf '%s\n' "$k427seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
-echo "  JS-style-noop: rows $k427r (0), style changes needing no rebuild ${k427n} (3 or more), full rebuilds ${k427f} (1)"
-[ "$k427r" = 0 ] && [ "${k427n:-0}" -ge 3 ] && [ "${k427f:-0}" -eq 1 ] || fail "style changes that leave the style as it is"
+# patch 448: the colour change on the inline-block goes up to its line
+# (was: "non-inline, non-block box" and the full rebuild)
+echo "  JS-style-noop: rows $k427r (0), style changes needing no rebuild ${k427n} (3 or more), full rebuilds ${k427f} (0)"
+[ "$k427r" = 0 ] && [ "${k427n:-0}" -ge 3 ] && [ "${k427f:-1}" -eq 0 ] || fail "style changes that leave the style as it is"
 # Patch 427 (unit 2): :not() / :is() / :where() in a left compound keep the
 # sheet precise: the insert and the #m class change are local; the .off and
 # .w class changes decline precisely (two full rebuilds), never conservatively.
+# Patch 448: those two precise risks rebuild the parent instead (no full
+# rebuild).
 k427br=$(fl_rows JS-sib-func CSS-sib-func-ref)
 k427bseg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-func: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
-k427bc=$(printf '%s\n' "$k427bseg" | grep -c "declined (page CSS needs conservative sibling check)" || true)
-k427bm=$(printf '%s\n' "$k427bseg" | grep -c "declined (class change moves a sibling selector)" || true)
+k427bc=$(printf '%s\n' "$k427bseg" | grep -c "sibling risk (page CSS needs conservative sibling check)" || true)
+k427bm=$(printf '%s\n' "$k427bseg" | grep -c "sibling risk (class change moves a sibling selector)" || true)
+k427bp=$(printf '%s\n' "$k427bseg" | grep -c "a sibling selector can match on the class attribute: the parent" || true)
 k427bf=$(printf '%s\n' "$k427bseg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
-echo "  JS-sib-func: rows $k427br (0), conservative declines ${k427bc} (0), precise class declines ${k427bm} (2 or more), full rebuilds after a decline ${k427bf} (2)"
-[ "$k427br" = 0 ] && [ "${k427bc:-1}" -eq 0 ] && [ "${k427bm:-0}" -ge 2 ] && [ "${k427bf:-0}" -eq 2 ] || fail ":not() / :is() / :where() in sibling rules"
+echo "  JS-sib-func: rows $k427br (0), conservative risks ${k427bc} (0), precise class risks ${k427bm} (2 or more), parent rebuilds ${k427bp} (2 or more), full rebuilds after a decline ${k427bf} (0)"
+[ "$k427br" = 0 ] && [ "${k427bc:-1}" -eq 0 ] && [ "${k427bm:-0}" -ge 2 ] && [ "${k427bp:-0}" -ge 2 ] && [ "${k427bf:-1}" -eq 0 ] || fail ":not() / :is() / :where() in sibling rules"
 # Patch 428: a flex container holding a frame is restyled alone, the frame
 # carried over to its new box (twice: shown, then hidden), and the page
 # renders row for row as the same steps run at parse time.
@@ -2302,6 +2315,29 @@ k444d=$(printf '%s\n' "$k444seg" | grep -c "declined (removal would join two lin
 k444f=$(printf '%s\n' "$k444seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-join-lines: rows $k444r (0), joining removals built again whole ${k444w} (2), join declines ${k444d} (0), full rebuilds after a decline ${k444f} (0)"
 [ "$k444r" = 0 ] && [ "${k444w:-0}" -ge 2 ] && [ "${k444d:-1}" -eq 0 ] && [ "${k444f:-1}" -eq 0 ] || fail "removals that join two lines"
+# Patch 447: a sheet that restyles a few elements re-cascades in place:
+# the walk collects them (at most 8, their subtrees skipped), installs the
+# fresh context and restyles each through the class-change paths -- a
+# block, a sibling-rule target, an inline span, a block of blocks, a
+# ::before, flex items. Ten list items are more than 8: the full rebuild.
+k447r=$(fl_rows JS-sheet-inplace CSS-sheet-inplace-ref)
+k447seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sheet-inplace: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k447i=$(printf '%s\n' "$k447seg" | grep -c "sheet change: [0-9]* element(s) restyled in place" || true)
+k447e=$(printf '%s\n' "$k447seg" | sed -n 's/.*sheet change: \([0-9]*\) element(s) restyled in place.*/\1/p' | awk '{n+=$1} END {print n+0}')
+k447m=$(printf '%s\n' "$k447seg" | grep -c "declined (more than 8 elements' styles change" || true)
+k447d=$(printf '%s\n' "$k447seg" | grep -c "sheet change: declined (an element's style changes\|declined (an element restyled in place declined)" || true)
+echo "  JS-sheet-inplace: rows $k447r (0), batches restyled in place ${k447i} (3 or more) holding ${k447e} elements (5 or more), more-than-8 declines ${k447m} (1), other re-cascade declines ${k447d} (0)"
+[ "$k447r" = 0 ] && [ "${k447i:-0}" -ge 3 ] && [ "${k447e:-0}" -ge 5 ] && [ "${k447m:-0}" -ge 1 ] && [ "${k447d:-1}" -eq 0 ] || fail "sheet changes restyled in place"
+# Patch 448: a class change a sibling rule can see rebuilds the parent (a
+# block, a flex box: 2); class / attribute changes on an inline-block span
+# and a button go up to their line or block; no full rebuild.
+k448r=$(fl_rows JS-class-sib-parent CSS-class-sib-parent-ref)
+k448seg=$(awk '/ page [0-9]+\/[0-9]+ JS-class-sib-parent: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k448p=$(printf '%s\n' "$k448seg" | grep -c "a sibling selector can match on the class attribute: the parent" || true)
+k448d=$(printf '%s\n' "$k448seg" | grep -c "declined (class change may move a sibling selector)\|declined (class change on an element with a non-inline" || true)
+k448f=$(printf '%s\n' "$k448seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-class-sib-parent: rows $k448r (0), parent rebuilds ${k448p} (2), class declines ${k448d} (0), full rebuilds ${k448f} (0)"
+[ "$k448r" = 0 ] && [ "${k448p:-0}" -ge 2 ] && [ "${k448d:-1}" -eq 0 ] && [ "${k448f:-1}" -eq 0 ] || fail "class changes a sibling rule sees; inline-block classes"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
@@ -2635,14 +2671,17 @@ sab=$(awk '/page [0-9]*\/[0-9]* NET-js-style-absorb: navigate/ {on=1; next}
 sab_abs=$(printf '%s\n' "$sab" | grep -a -c 'LIFE STYLETEXT absorbed' || true)
 sab_full=$(printf '%s\n' "$sab" | grep -a -c 'LIFE BATCHCAUSE cause=' || true)
 sab_sheet=$(printf '%s\n' "$sab" | grep -a -c 'LIFE BATCHCAUSE cause=nonode' || true)
+# patch 447: a sheet batch restyled in place is not a full reconvert; it
+# logs SHEETINPLACE (and the sheet census lines) instead
+sab_inp=$(printf '%s\n' "$sab" | grep -a -c 'LIFE SHEETINPLACE' || true)
 # Patch 320 gate fix: the BOTTOM dump (tall page, 7 s bottom-settle
 # window; see the sheet-census note above).
 sap=$(ls "$R"/*NET-js-style-absorb-bottom.plot 2>/dev/null | head -1)
 sar=$(sed -n 's/.*STR \(STYLEABS: [0-9]*\/[0-9]* passed\).*/\1/p' "$sap" 2>/dev/null | head -1)
 sam=$(grep -c 'STR MIXED-AFTER' "$sap" 2>/dev/null || true)
-echo "  JS-style-absorb: ${sar:-no summary}; absorbed=${sab_abs} full=${sab_full} (sheet batches ${sab_sheet}); paragraph painted=${sam:-0}"
+echo "  JS-style-absorb: ${sar:-no summary}; absorbed=${sab_abs} full=${sab_full} (sheet batches ${sab_sheet}), restyled in place ${sab_inp}; paragraph painted=${sam:-0}"
 [ "$sar" = "STYLEABS: 4/4 passed" ] && [ "${sam:-0}" -ge 1 ] && [ "$sab_abs" -ge 4 ] && \
-	[ "$sab_full" -ge 1 ] && [ "$sab_full" -eq "$sab_sheet" ] || o2_bad="$o2_bad js-style-absorb"
+	[ $((sab_full + sab_inp)) -ge 1 ] && [ "$sab_full" -eq "$sab_sheet" ] || o2_bad="$o2_bad js-style-absorb"
 # Patch 321 (doc 23 B1): the reach census, census only. Every
 # single-identified current sheet batch logs "LIFE SHEETREACH bounded
 # changed=K anchors=A roots=R walked=N" or "... unbounded reason=<cause>";

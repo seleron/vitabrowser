@@ -45,7 +45,11 @@ main)
 		"$OUT/run/ux0:data/VitaBrowser/nettest.txt" > "$M/ux0:data/VitaBrowser/nettest.txt"
 	httpd --http "$HP" --https $((HP + 1)) "$T/leaf.pem" "$T/leaf.key" \
 		--https-bad $((HP + 2)) "$T/rogue.pem" "$T/rogue.key"
+	# Patch 447: the engine log uncapped as in the gate's main run (patch
+	# 411); at the default 16 MiB its lines stopped at page 289 of 340,
+	# so no later page's paths (443's NET-js-sheet-gen) left evidence.
 	( cd "$M" && VITA_SIM_AUTOTEST=1 VITA_SIM_SNAP="$M/snaps" VITA_SETTLE_EXTRA_MS=7000 \
+		VITA_SIM_ENGINE_LOG_CAP=256 \
 		VITA_SIM_REMOTE_PORT=45490 timeout 3600 "$SIM" > "$M/stdout.log" 2>&1 ); rc=$?
 	kill $H 2>/dev/null
 	asan_check "$M/stdout.log"

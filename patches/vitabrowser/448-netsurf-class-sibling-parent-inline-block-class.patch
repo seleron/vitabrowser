@@ -1,0 +1,116 @@
+# netsurf: a class a sibling rule can move rebuilds the parent; a class on an inline-block goes up to its line (patch 448)
+# Generated 2026-11-25
+# Base: seleron/vitabrowser (patch stack through 447)
+#
+# "class change may move a sibling selector" / "page CSS needs
+# conservative sibling check" (patch 186's html_rl_class_sibling_risk, in
+# the block and flex restyles: github, oldreddit) declined into the full
+# rebuild. Without :has() (never matched, patch 328) a selector sees an
+# element's ancestors and earlier siblings, so a class on el restyles only
+# el's subtree and its later siblings' subtrees, all inside the parent:
+# the parent is built again whole (445's html_rl_sib_parent_rebuild: a
+# block 440, a flex or grid box 438); one that cannot be keeps the full
+# rebuild. The risk lines say "sibling risk (...)" now, not "declined".
+# "class change on an element with a non-inline, non-block box"
+# (oldreddit, google, youtube: data-eqid, disabled, type on inline-block
+# controls): an inline-block, inline-flex or inline-grid box sits in its
+# block's line as an inline does (438), so the walk goes on up to the
+# block, whose path builds the line again whole (425/434). Other box types
+# still decline, naming the tag and box type.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8803,6 +8803,9 @@
+ /* Patch 404: the class argument of html_rl_flex_restyle when no class
+  * changed (a child-list change): its class-sibling check does not apply. */
+ static const char html_rl_class_same[] = "";
++/* Patch 448: the parent of a class or attribute a sibling rule can see */
++static int html_rl_sib_parent_rebuild(html_content *c, dom_node *el,
++		const char *name);
+ static int html_rl_flex_restyle(html_content *c, dom_node *el,
+ 		struct box *ob, double t0, const char *old_class,
+ 		bool is_block);
+@@ -12721,8 +12724,10 @@
+ 		if (e == NULL)
+ 			continue;
+ 		if (e->state == 2) {
+-			macsurf_debug_log_writef("LIFE rebuild local: declined "
+-				"(page CSS needs conservative sibling check)");
++			/* patch 448: a risk, not a decline (the caller rebuilds
++			 * the parent, or declines) */
++			macsurf_debug_log_writef("LIFE rebuild local: sibling "
++				"risk (page CSS needs conservative sibling check)");
+ 			risk = true;
+ 			break;
+ 		}
+@@ -12735,7 +12740,7 @@
+ 					&e->lefts[k], new_class);
+ 			if (m_old != m_new) {
+ 				macsurf_debug_log_writef("LIFE rebuild local: "
+-					"declined (class change moves a "
++					"sibling risk (class change moves a "
+ 					"sibling selector)");
+ 				risk = true;
+ 				break;
+@@ -13347,8 +13352,12 @@
+ 	    HTML_RL_FRAME(ob) || html_rl_subtree_controls(ob->children))
+ 		RL_FNO("restyled flex or grid box holds controls or frames");
+ 	if (old_class != html_rl_class_same &&	/* patch 404 */
+-	    html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
++	    html_rl_class_sibling_risk(c, (dom_element *)el, old_class)) {
++		/* patch 448: the parent, built again whole */
++		if (html_rl_sib_parent_rebuild(c, el, "class") == 0)
++			return 0;
+ 		RL_FNO("class change may move a sibling selector");
++	}
+ 	if (html_rl_box_counts(ob))		/* patch 374 */
+ 		RL_FNO("the restyled flex or grid box takes part in counting");
+ 	if (!html_rl_objects_relinkable(c, ob))	/* patch 375 */
+@@ -13538,8 +13547,21 @@
+ 	/* a class on this block could restyle its following siblings, but
+ 	 * only if a sibling selector's left compound actually matches the
+ 	 * element differently under the old vs new class (patch 186) */
+-	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class))
++	/* Patch 448: as 445 says for an attribute, a + / ~ rule the class
++	 * can move reaches only the element's later siblings and their
++	 * descendants -- without :has() (never matched, patch 328) a
++	 * selector sees an element's ancestors and earlier siblings, so a
++	 * class on el can restyle only el's subtree, its later siblings'
++	 * subtrees: all inside the parent. The parent is built again whole
++	 * (a block: 440, a flex or grid box: 438), which re-selects them
++	 * all; a parent that cannot be keeps the full rebuild. The same
++	 * holds where the scan gave up on a sheet (state 2: "page CSS
++	 * needs conservative sibling check"): github, oldreddit. */
++	if (html_rl_class_sibling_risk(c, (dom_element *)el, old_class)) {
++		if (html_rl_sib_parent_rebuild(c, el, "class") == 0)
++			return 0;
+ 		RL_RNO("class change may move a sibling selector");
++	}
+ 
+ 	/* out with the old box, as a removal */
+ 	prev = ob->prev;
+@@ -14551,8 +14573,23 @@
+ 					"is, nothing to rebuild");
+ 				return 0;
+ 			}
++			/* Patch 448: an inline-block, inline-flex or
++			 * inline-grid box sits in its block's line as an
++			 * inline does (438): the walk goes on up to the block,
++			 * whose path builds that line -- not plain inline
++			 * content -- again whole (425/434), re-selecting the
++			 * element (oldreddit, google, youtube: data-eqid,
++			 * disabled, type). Anything else names itself. */
+ 			if (class_change && n == vnode && b != NULL &&
+-			    b->type != BOX_INLINE) {
++			    b->type != BOX_INLINE &&
++			    b->type != BOX_INLINE_BLOCK &&
++			    b->type != BOX_INLINE_FLEX &&
++			    b->type != BOX_INLINE_GRID) {
++				char *t = html_rl_struct_tag(n);
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"class change on <%s>, box type %d",
++					t ? t : "?", (int)b->type);
++				free(t);
+ 				dom_node_unref(n);
+ 				RL_NO("class change on an element with a "
+ 				      "non-inline, non-block box");

@@ -14381,3 +14381,171 @@ gated before its commit, and all are pushed.
      short manual list).
 
 No sudo was needed or run in this run.
+
+## Unit 446a (2026-11-25): ASan through 446; "may see an element with no box" probe
+
+**ASan** (`tools/build-asan-sim.sh`, netsurf instrumented, stack through
+446):
+- **`asan-autotest.sh main` clean**: rc 0, interaction 52/52, 396 page
+  dumps (gate 396). 446's parent rebuild ("a sibling rule may see the
+  child-list change: the parent") ran 10 times; 445's 4, 444's 4, 440's 15.
+- **The sweep did not run at 446**: `asan_sweep.py` and `census.py` need
+  `WORK` set to the full `$HOME/vitabrowser-work` path (their default is a
+  placeholder) and the first attempt had `WORK` unset. It is run at the
+  head instead (asan449, a later entry).
+- **Finding: the ASan autotest's engine log was capped.** It ran without
+  `VITA_SIM_ENGINE_LOG_CAP=256` (the gate's main run has it since 411), so
+  at 16 MiB its `MS` lines stopped at page 289 of 340. ASan errors go to
+  stdout, so every "clean" verdict stands; but every "ran N times under
+  ASan" count since unit 398 is a lower bound, and **443's "never ran under
+  ASan" was this truncation**: NET-js-sheet-gen is page 330, its window
+  held no engine line at all. `asan-autotest.sh` now sets the cap (item 6
+  of the run-close list; no page change needed until a run with the cap
+  shows otherwise).
+
+**"may see an element with no box"** (1.0 a load on wpblog in 446's
+census): its decline now logs the parent's tag and box type ("sibling
+parent <x> box type N[, no parent box | an object | a frame]"), in patch
+447. Three fresh wpblog loads did not show the decline at all (live
+content); the line is there for the next census that does.
+
+No sudo.
+
+## Patch 447 (2026-11-25): a sheet change that restyles a few elements re-cascades in place
+
+**Problem.** "sheet change: an element's style changes" was the census's
+largest local decline (5.0 a load at 446 on the 7 sites: google's and
+youtube's `DIV`s, `YTM-BROWSE`, and `HTML`). 415's walk re-cascades the
+whole document with a fresh selection context and stopped at the first
+element whose style, `::before` or `::after` differs: the full rebuild.
+
+**Fix** (html.c, `html_rl_doc_noop`).
+- For a **sheet batch** only (`html_rl_sheet_batch_noop`, which runs at
+  the top of `macos9_reconvert_try_local` with no mark state set). A sheet
+  removal and a root change run inside a local change whose mark globals
+  are set, so they keep the decline.
+- Such an element (never the root, which everything inherits from)
+  becomes a **hit**: referenced, its subtree not walked. At most 8; more
+  declines ("more than 8 elements' styles change").
+- Every element outside the hits' subtrees is still compared with the
+  fresh context -- **siblings included**, so no sibling-selector analysis
+  is needed: a `+` / `~` effect shows up as a hit of its own.
+- After the walk the fresh context is installed (as 415 does), and each
+  hit is restyled with its subtree by the class-change paths, as 370
+  answers a style attribute (`html_rl_sheet_hit_restyle`: the "old
+  class" is the current one, `html_rl_style_as_class` set, so neither
+  414's token check nor 186's sibling check sees a change).
+- A hit whose restyle declines leaves the batch to the full rebuild
+  ("declined (an element restyled in place declined)"); the installed
+  context is the one the rebuild would refresh to (the sheets have
+  settled), and `rl_boxes_gen` is set only on success.
+- **Census kept:** such a batch logs `LIFE SHEETINPLACE elements=N` and
+  then the sheet census lines a full rebuild of it would have logged
+  (316's SHEETCAUSE, 318's SHEETID, 321's SHEETREACH), via
+  `macos9_sheet_census_lines` (factored out of
+  `macos9_reconvert_fullcause_count`) and `html_rl_take_inplace`.
+- 446's sibling-parent decline now also logs the parent's tag and box
+  type (unit 446a).
+
+**Gate.**
+- New pair **JS-sheet-inplace / CSS-sheet-inplace-ref**: seven `<style>`s
+  added 500 ms apart -- a block's colours, a sibling rule (`.t1 + p`), an
+  inline span, a block of blocks whose children inherit, a `::before` that
+  appears, two flex items, then ten list items (more than 8).
+- 415's JS-sheet-noop asserted two "an element's style changes"
+  declines; those two batches are restyled in place now (1 and 2
+  elements), and the check says so.
+- **gate447 failed only on five existing checks**, all of which assumed
+  the sheet batch goes to the full rebuild: 316 / 318 / 320 / 321's
+  census pages (js-sheet-census, js-style-absorb, js-sheet-scope,
+  -scope-unb, -scope-quirks) found no census lines, which were logged only
+  in a full rebuild -- every page's own assertions passed (3/3, 4/4,
+  5/5, 5/5, 3/3). Hence the census lines for in-place batches above; with
+  them the three scope pages' per-leg reach lines and census totals come
+  out exactly as before. Updated checks: 415 (restyled in place, no
+  decline), style-absorb (a full rebuild or an in-place batch).
+
+## Patch 448 (2026-11-25): a class a sibling rule can move rebuilds the parent; a class on an inline-block goes up to its line
+
+**Problem.**
+- "class change may move a sibling selector" / "page CSS needs
+  conservative sibling check" (patch 186's `html_rl_class_sibling_risk`,
+  in the block and flex restyles): github, oldreddit, about 2 a load each
+  on the 7 sites at 446. Into the full rebuild.
+- "class change on an element with a non-inline, non-block box"
+  (oldreddit, google, youtube: about 2 a load; `data-eqid`, `disabled`,
+  `type` on inline-block controls, through 417's attribute-as-class path).
+
+**Fix** (html.c).
+- **Sibling risk -> the parent.** Without `:has()` (never matched, patch
+  328) a selector sees an element's ancestors and earlier siblings, so a
+  class on an element can restyle only its own subtree and its later
+  siblings' subtrees: all inside its parent. This holds for any selector,
+  so also where the scan gave up on a sheet (state 2). Both call sites now
+  try 445's `html_rl_sib_parent_rebuild` (a block: 440, a flex or grid
+  box: 438); a parent that cannot be rebuilt that way keeps the decline.
+  The scan's own lines say "sibling risk (...)" now, not "declined (...)".
+- **Inline-block family.** An inline-block, inline-flex or inline-grid box
+  sits in its block's line as an inline does (438's argument for their
+  child lists): the walk goes on up to the block, whose path builds that
+  line again whole (425/434). Any other box type still declines, after a
+  line naming its tag and box type.
+
+**Gate.**
+- New pair **JS-class-sib-parent / CSS-class-sib-parent-ref**: `.on` on a
+  block before a `.on + p` paragraph; `.on` on a flex item before two
+  `.on ~ div` items; a class on an inline-block span; `disabled` on a
+  button (`button[disabled]` styled). Result: **rows 0, 2 parent rebuilds
+  (block, flex), 0 class declines, 0 full rebuilds**.
+- Checks that asserted the old declines: 427's JS-sib-func (2 precise
+  risks now 2 parent rebuilds, 0 full rebuilds, was 2), 427's
+  JS-style-noop (the inline-block's colour change now goes up to its line:
+  0 full rebuilds, was 1), 197's JS-block-class-sibling (counts a decline
+  or a parent rebuild, BLOCKSIB 3/3), 186's CSS-sibling-class (reads the
+  "sibling risk" lines).
+- **385's JS-class-churn** (fixes1135's cap defers class churn) relied on
+  the sibling rule to make its three class changes full rebuilds; they are
+  parent rebuilds now, so the cap was never reached (gate447b's only
+  failure; rows 0). Its two paragraphs now sit in an inline-block (page
+  and reference), a parent 448 cannot rebuild, so they stay class-only
+  full rebuilds and the third reaches the cap.
+
+## Patch 449 (2026-11-25): 441's guard names what it measured
+
+Patch 441 measures an inline-block that reaches line layout with no
+min/max widths (wpblog's intermittent `layout_line` abort); its trigger is
+unknown because the live content shows it only now and then. The guard's
+LIFE line is now followed by two that name the inline-block and its
+nearest element box: tag, id, class (80 characters), box type, size, max
+width, children. The LIFE rebuild lines just before them name the
+operation that built it. No behaviour change. (Item 5 of the run-close
+list: the probe is in; it reports the next time the census shows the
+line.)
+
+## Gate budget (2026-11-25, with 447): MAX_POLLS 100000, main run 1600 s
+
+Item 7 of the run-close list. vitasim's `MAX_POLLS` 75000 -> **100000**
+(~1570 s), the main autotest's `timeout 1200` -> **1600** and the netlog
+receiver's `--timeout 1300` -> **1700**, raised together
+(`tools/vita-sim/vitasim.c`, `tools/run-vita-sim.sh`). gate447c's main
+autotest: **344 pages in ~1039 s**, so about 530 s of headroom now (the
+Vita's-pace run keeps its own `timeout 1200`).
+
+## Gate for 447-449 (2026-11-25)
+
+- **gate447** (447 alone): failed only on the five census checks (above).
+- **gate447b** (447 with the census lines, 448, 449): failed only on 385's
+  JS-class-churn (above).
+- **gate447c exit 0**: the same stack with the reworked JS-class-churn
+  (1 class rebuild deferred past the cap, rows 0). 2 new page pairs,
+  interaction 52/52 at the Vita's pace. JS-sheet-inplace: 6 batches
+  restyled in place holding 7 elements, 1 more-than-8 decline, rows 0;
+  JS-class-sib-parent: 2 parent rebuilds, 0 full rebuilds, rows 0.
+- **Not restaged through `build-patched.sh`**: `restage-full.sh` applied
+  the stack to a scratch copy of pristine upstream (**531 applied plus the
+  2 known collisions**) and its sources equal applytest's, so the gated
+  tree is the patch stack.
+- The three units were gated together (one tree), so they are committed
+  together.
+
+No sudo.
