@@ -2605,12 +2605,31 @@ echo "  JS-dom-stall engine: ${ds_local} text changes rebuilt locally, ${ds_bloc
 # now built locally -- 373's empty-block route meets 376's subtree rebuild
 # -- so the guard trip is the only full reconvert left (total=1, local=0);
 # the page still reads back BATCHBURST 3/3 from its own DOM.
-bbl=$(awk '/page [0-9]*\/[0-9]* NET-js-batch-burst: navigate/ {on=1; next}
+# Patch 452: past the budget the guard decides on the marks LEFT (cost per
+# answered mark x marks left vs the budget; it trips at twice the budget
+# whatever is left). gate452 showed what this check really read: the
+# FULLCAUSE line in the burst's window is printed at the navigation reset
+# INTO it, so it is the previous page's census -- NET-js-dom-stall's, whose
+# batch trips the guard (1 answered, 17 left, expected ~740 ms against a
+# ~12 ms budget). The 120-mark burst itself is answered locally (cheap since
+# 376) and never reaches its budget. So: dom-stall's own window holds a
+# "tripped" decision, the census read in the burst's window says guard=1,
+# and the burst needs no full reconvert of its own.
+bbseg=$(awk '/page [0-9]*\/[0-9]* NET-js-batch-burst: navigate/ {on=1; next}
 	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
-	on' "$R/netsurf.log" 2>/dev/null | grep -a 'LIFE FULLCAUSE' | tail -1)
-echo "  JS-batch-burst census: ${bbl:-no FULLCAUSE}"
+	on' "$R/netsurf.log" 2>/dev/null)
+dsseg=$(awk '/page [0-9]*\/[0-9]* NET-js-dom-stall: navigate/ {on=1; next}
+	on && /page [0-9]*\/[0-9]* [^ ]*: navigate/ {on=0}
+	on' "$R/netsurf.log" 2>/dev/null)
+bbl=$(printf '%s\n' "$bbseg" | grep -a 'LIFE FULLCAUSE' | tail -1)
+bbt=$(printf '%s\n' "$dsseg" | grep -a -c 'LIFE guard: tripped' || true)
+bbf=$(printf '%s\n' "$bbseg" | grep -a -c 'LIFE BATCHCAUSE cause=' || true)
+bbc=$(grep -a -c 'LIFE guard: past the budget' "$R/netsurf.log" || true)
+echo "  JS-batch-burst census (JS-dom-stall's): ${bbl:-no FULLCAUSE}; dom-stall guard trips ${bbt} (1 or more), burst full reconverts ${bbf} (0); guard continued past the budget ${bbc} times in the run"
 case "$bbl" in
-	*"total=1 over=0 nonode=0 kind=0 local=0 two=0 guard=1"*) ;;
+	*"total=1 over=0 nonode=0 kind=0 local=0 two=0 guard=1"*)
+		[ "${bbt:-0}" -ge 1 ] && [ "${bbf:-1}" -eq 0 ] ||
+			o2_bad="$o2_bad js-batch-burst-census";;
 	*) o2_bad="$o2_bad js-batch-burst-census";;
 esac
 # Patch 313: on the attr-local page, the load innerHTML batch commits a

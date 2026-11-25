@@ -14800,3 +14800,58 @@ spread), hackernews +0.7 and stackoverflow -0.1. No crash; oldreddit
 blocked in both arms. With ASan clean at 451 (above), the hand-off
 prerequisites of the run-close list (item 8) hold at the head. The VPK
 and the device run wait for the owner.
+
+## Patch 452 (2026-11-25): the cost guard decides on the marks left, not the cost already spent
+
+**Problem.** The 451 census's cost-guard trips rose 5.7 -> 7.7 a load
+(youtube 10, oldreddit 6, github 4 over three loads). Patch 309's guard
+(`macos9_reconvert_try_local`) sends a batch to the full reconvert the
+moment its local answers have cost more than one full conversion (the
+budget, `html_content_full_us`: the initial box + cascade time). That cost
+is sunk: the full reconvert then pays the whole conversion **on top**,
+even when one cheap mark is left. The guarded batches in the 451 logs:
+- **github** (budget ~850 ms): 445's parent rebuilds at ~125 ms each for
+  `data-catalyst`, and a 485 ms structural parent subtree rebuild;
+- **youtube** (budget ~48 ms): one 41.7 ms structural restyle, then
+  cheap marks;
+- **oldreddit** (budget ~19 ms): runs of ~0.6 ms block rebuilds and 3 ms
+  join rebuilds.
+Layout is not the cost: youtube's layouts are about 1 ms.
+
+**Fix** (`macos9_reconvert.c`, `macos9_reconvert_guard_trips`).
+- Below the budget, nothing changes.
+- Past it, the batch goes on while the marks left are **expected** to cost
+  less than the budget (cost per answered mark so far x the marks left,
+  the deferred retry included), and trips otherwise.
+- Once it has spent **twice the budget** it trips whatever is left. So the
+  worst case stays near 309's (budget + full): about 2 x budget plus the
+  mark in hand.
+- A trip logs its numbers ("LIFE guard: tripped after N us (budget, N
+  answered, N left, expected N us)"); going on past the budget logs once a
+  batch ("LIFE guard: past the budget ... continuing").
+
+**Gate.** No new page; 309's check is rewritten because gate452 showed
+what it really read.
+- **gate452 failed only on it** (js-batch-burst-census). That check
+  asserted guard=1 in the NET-js-batch-burst window's FULLCAUSE line. But
+  FULLCAUSE prints at the navigation reset *into* a page, so the line in
+  that window is the **previous page's** census: NET-js-dom-stall's.
+  dom-stall's batch trips the guard, correctly under 452: 1 answered, 17
+  left, expected ~740 ms against a ~12 ms budget.
+- **The 120-mark burst itself has not tripped for a while.** It is
+  answered locally (145 local answers in its window, cheap since 376) and
+  never reaches its budget. The check passed on the mis-attributed line.
+- **New check:** dom-stall's own window holds a "tripped" decision, the
+  census read in the burst's window says guard=1, and the burst needs no
+  full reconvert of its own. The run's "continuing" count is reported
+  (gate452: once, on JS-canvas-2d: 41 answered, 6 left, expected 2.5 ms
+  against a 16.5 ms budget).
+- **gate452b exit 0** (the same engine, the rewritten check):
+  - interaction 52/52 at the Vita's pace;
+  - the guard tripped 10 times and continued once. Nine trips had an
+    expected remaining cost of 8.8x to 57x the budget; one tripped on the
+    2x cap with only 0.6x expected.
+
+No sudo.
+- `restage-full.sh`: **534 applied plus the 2 known collisions**; its
+  sources equal applytest's.

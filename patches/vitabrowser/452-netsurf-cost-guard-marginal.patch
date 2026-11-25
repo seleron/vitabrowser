@@ -1,0 +1,96 @@
+# netsurf: the cost guard decides on the marks left, not the cost already spent (patch 452)
+# Generated 2026-11-25
+# Base: seleron/vitabrowser (patch stack through 451)
+#
+# Patch 309's guard sent a batch to the full reconvert the moment its local
+# answers had cost more than one full conversion (the budget). That cost is
+# sunk: the full reconvert then pays the whole conversion on top, even when
+# one cheap mark is left. After 447-451 more batches get that far (the 451
+# census: 7.7 guard trips a load; youtube, oldreddit, github). Now, past
+# the budget, the batch goes on while the marks left are expected (cost per
+# answered mark so far, times the marks left) to cost less than the budget,
+# and trips otherwise -- or whatever is left once it has spent twice the
+# budget, so the worst case stays near 309's (about 2 x budget plus the
+# mark in hand). The trip logs its numbers ("LIFE guard: tripped after ...
+# us (budget, answered, left, expected)"); going on past the budget logs
+# once per batch ("... continuing").
+#
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1412,6 +1412,42 @@
+ 	macos9_sheet_census_lines(i, html_css_census_batch_sheets(c));
+ }
+ 
++/* Patch 452 - the cost guard's decision (309), at the moment the batch's
++ * local cost passes the budget (one full conversion). 309 tripped there:
++ * the full reconvert then paid the whole conversion on top of everything
++ * already spent -- a sunk cost -- even with one cheap mark left (the 451
++ * census: 7.7 guard trips a load, youtube/oldreddit/github). The marginal
++ * question is whether answering the REST locally is expected to cost less
++ * than the full reconvert it would take instead: the cost per answered
++ * mark so far, times the marks left, against the budget. A batch that has
++ * spent twice the budget trips whatever is left, so the worst case stays
++ * near 309's (budget + full): about 2 x budget plus the mark in hand. */
++static int g_guard_continued;	/* per batch: the "continuing" line once */
++static int macos9_reconvert_guard_trips(double spent, double budget,
++		int answered, int left)
++{
++	double expect;
++
++	if (spent <= budget)
++		return 0;
++	expect = answered > 0 ? spent / (double)answered * (double)left :
++			spent;
++	if (spent > 2.0 * budget || expect > budget) {
++		macsurf_debug_log_writef("LIFE guard: tripped after %ld us "
++			"(budget %ld us, %d answered, %d left, expected %ld us)",
++			(long)spent, (long)budget, answered, left, (long)expect);
++		return 1;
++	}
++	if (!g_guard_continued) {
++		g_guard_continued = 1;
++		macsurf_debug_log_writef("LIFE guard: past the budget after %ld "
++			"us (budget %ld us, %d answered), %d left expected %ld us: "
++			"continuing", (long)spent, (long)budget, answered, left,
++			(long)expect);
++	}
++	return 0;
++}
++
+ static int macos9_reconvert_try_local(int i, struct content *c)
+ {
+ 	int j;
+@@ -1433,6 +1469,7 @@
+ 	extern int html_rl_take_inplace(void);		/* patch 447 */
+ 
+ 	g_defer_unsettled = 0;
++	g_guard_continued = 0;		/* patch 452 */
+ 	if (g_pending[i].coarse)
+ 		return 0;
+ 	g_fc_reason = 0;
+@@ -1486,8 +1523,11 @@
+ 	 * answer is the rebuild, not a retry. */
+ 	for (j = 0; j < g_pending[i].extra_n; j++) {
+ 		/* Patch 309 - the guard is checked before each further mark;
+-		 * the primary's cost is already in the cumulative t0 above. */
+-		if (macos9_micros() - t0 > budget) {
++		 * the primary's cost is already in the cumulative t0 above.
++		 * Patch 452: on the marks left, not the cost already spent */
++		if (macos9_reconvert_guard_trips(macos9_micros() - t0, budget,
++				1 + j, g_pending[i].extra_n - j +
++				(deferred >= 0 ? 1 : 0))) {
+ 			g_fc_reason = 4;
+ 			return 0;
+ 		}
+@@ -1511,8 +1551,9 @@
+ 	}
+ 	if (deferred >= 0) {
+ 		/* Patch 309 - the retry is one more local answer; it counts
+-		 * against the same budget. */
+-		if (macos9_micros() - t0 > budget) {
++		 * against the same budget (452: as one mark left). */
++		if (macos9_reconvert_guard_trips(macos9_micros() - t0, budget,
++				1 + g_pending[i].extra_n, 1)) {
+ 			g_fc_reason = 4;
+ 			return 0;
+ 		}
