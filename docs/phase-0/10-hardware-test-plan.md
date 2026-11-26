@@ -17070,3 +17070,12 @@ mark of the batch 474's background decline used to end first.
 - `restage-full.sh`: **557 applied plus the 2 known collisions**.
 
 No sudo.
+
+## Device hand-off (2026-11-26, run 43): doc 25
+
+The 435-475 stack went to a real device: VPK run 43 built from
+`ca17596` (475), the full gate green 17:11Z. Test plan, VPK identity and
+site list in **doc 25** (`25-device-test-run43-2026-11-26.md`). Reference
+dumps were regenerated from the 475 stack the same day (the live gate's
+autotest stage had deleted the previous `reference/` set); staging archive
+`hwtest-2026-11-26-run43`.
