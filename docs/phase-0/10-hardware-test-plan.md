@@ -16413,3 +16413,75 @@ rebuild by design: coalescing there would rebuild nearly the page.
 Cost-guard trips (0-1.3 a load in recent runs) are timing noise on top.
 
 No sudo.
+
+### State log (2026-11-27): 21-site census, 451 vs 469 (head)
+
+`tools/scorecard/census.py` over all 21 sites of `sites.tsv`, 3 loads
+per arm, one interleaved run. Arms:
+- **451**: the r150 scorecard head;
+- **469**: head, 2.0 months of patch units later (452-469).
+
+The 7 census sites were the tuning set for 452-469. The other 14 are a
+check for regressions.
+
+| site | 451 | 469 |
+|---|---|---|
+| example | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| textfiles | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wikipedia | 4 / 4 / 4 (4.0) | 4 / 4 / 4 (4.0) |
+| archwiki | 2 / 2 / 2 (2.0) | 1 / 1 / 1 (1.0) |
+| cnnlite | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| bbc | 2 / 1 / 2 (1.7) | 0 / 0 / 0 (0.0) |
+| rte | 5 / 5 / 5 (5.0) | 4 / 4 / 4 (4.0) |
+| guardian | 3 / 2 / 5 (3.3) | 2 / 1 / 3 (2.0) |
+| hackernews | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) |
+| oldreddit | 3 / 4 / 4 (3.7) | 0 / 0 / 0 (0.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 0 / 0 / 0 (0.0) |
+| wpblog | 4 / 4 / 4 (4.0) | 1 / 1 / 1 (1.0) |
+| jquery | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| mdn | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| python | 1 / 1 / 1 (1.0) | 0 / 0 / 0 (0.0) |
+| ddglite | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| google | 4 / 4 / 5 (4.3) | 0 / 0 / 0 (0.0) |
+| github | 3 / 3 / 3 (3.0) | 1 / 0 / 2 (1.0) |
+| youtube | 5 / 5 / 4 (4.7) | 0 / 0 / 0 (0.0) |
+| claude | 2 / 7 / 7 (5.3) | 5 / 1 / 6 (4.0) |
+| **total** | 42 / 46 / 50 (**46.0**) | 21 / 15 / 24 (**20.0**) |
+
+- **46.0 -> 20.0 full rebuilds a load. No site is worse**: every delta
+  is zero or negative.
+- No crash, assertion or failed load in 126 loads.
+- **Outside the tuning set:**
+  - archwiki -1.0, rte -1.0, guardian -1.3, python -1.0;
+  - wikipedia, stackoverflow and jquery are flat;
+  - claude 5.3 -> 4.0 is noisy (1-7 a load in both arms).
+- BATCHCAUSE, 451 -> 469: two 12.7 -> 4.3, local 11.7 -> 6.7, guard
+  8.7 -> 4.0, over 7.0 -> 3.3, nonode 6.0 -> 1.7.
+
+**What is left (469 arm, top declines per site):**
+
+| site | full rebuilds a load | what they are |
+|---|---|---|
+| wikipedia | 4.0 | "restyled block's parent is not a block" 3 a load; "the restyled flex or grid box takes part in counting" 2; structural selectors or counters 1 |
+| rte | 4.0 | "an object (a background) is in the line" 2; "an id change: #id selectors are not scanned" (an id on a boxed element, 466 left it) 2; "restyled block's parent is not a block" 1.7 |
+| claude | 4.0 | guard 1.3, over 1.0; structural selectors or counters 1.7 |
+| guardian | 2.0 | over 1.0, nonode 0.7; a flex box holding controls or frames |
+| stackoverflow | 2.0 | guard only (2 a load) |
+| archwiki | 1.0 | counting flex box; "restyled block's parent is not a block" |
+| jquery | 1.0 | "restyled flex or grid box is not in a block" 2 a load (a "two" batch) |
+| github | 1.0 | guard 0.7, over 0.3 |
+| wpblog | 1.0 | over: too wide (`<body>`), by design |
+
+**Candidates for the next units**, by weight:
+1. **"Restyled block's parent is not a block"**: 5.7 a load across
+   wikipedia, rte and archwiki. 456 / 460 / 469 have answered the same
+   shape elsewhere.
+2. **A flex or grid box that takes part in counting**: 3.0 (wikipedia,
+   archwiki). 451's arm had 1.0; patches since reach further and stop
+   here.
+3. **rte:** a background object in the line (2.0), and an id change on a
+   boxed element (2.0).
+4. **jquery's** flex box not in a block (2.0).
+
+No sudo.
