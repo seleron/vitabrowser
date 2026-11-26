@@ -442,6 +442,8 @@ JS-unhide-removal file:///app0:/testpages/JS-unhide-removal.html
 CSS-unhide-removal-ref file:///app0:/testpages/CSS-unhide-removal-ref.html
 JS-over-coalesce file:///app0:/testpages/JS-over-coalesce.html
 CSS-over-coalesce-ref file:///app0:/testpages/CSS-over-coalesce-ref.html
+JS-sib-root-attr file:///app0:/testpages/JS-sib-root-attr.html
+CSS-sib-root-attr-ref file:///app0:/testpages/CSS-sib-root-attr-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2478,6 +2480,17 @@ k464w=$(printf '%s\n' "$k464seg" | grep -c "coalesced marks: their common block,
 k464f=$(printf '%s\n' "$k464seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-over-coalesce: rows $k464r (0), batches coalesced with the head mark kept ${k464c} (1), common blocks built again whole ${k464w} (1), full rebuilds ${k464f} (0)"
 [ "$k464r" = 0 ] && [ "${k464c:-0}" -ge 1 ] && [ "${k464w:-0}" -ge 1 ] && [ "${k464f:-1}" -eq 0 ] || fail "a batch of 129+ marks coalesced under their common block"
+# Patch 465: an attribute a sibling rule can see, on the root (data-r on
+# <html>) and on a last child (#last's data-t), reaches no later sibling:
+# answered locally; #mid's data-t (a <p> after it) still builds the parent
+# again whole (445); no full rebuild.
+k465r=$(fl_rows JS-sib-root-attr CSS-sib-root-attr-ref)
+k465seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-root-attr: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k465n=$(printf '%s\n' "$k465seg" | grep -c "but nothing with a box follows the element" || true)
+k465p=$(printf '%s\n' "$k465seg" | grep -c "a sibling selector can match on the data-t attribute: the parent, built again whole" || true)
+k465f=$(printf '%s\n' "$k465seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-sib-root-attr: rows $k465r (0), sibling risks reaching nothing ${k465n} (2), parent rebuilds ${k465p} (1), full rebuilds ${k465f} (0)"
+[ "$k465r" = 0 ] && [ "${k465n:-0}" -ge 2 ] && [ "${k465p:-0}" -ge 1 ] && [ "${k465f:-1}" -eq 0 ] || fail "a sibling-rule attribute on the root or a last child answered locally"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

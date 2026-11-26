@@ -15958,3 +15958,49 @@ refcount error that the default build cannot see.
 8.0 (463) -> 7.7 (464; 7.3 for 463 in that run, flat).
 
 No sudo.
+
+## Patch 465 (2026-11-27): an attribute a sibling rule can see, with nothing with a box after the element, is answered locally
+
+**Problem.** After 464, github's coalesced batch was rebuilt locally,
+but its later marks declined: "a sibling selector can match on the
+data-turbo-loaded attribute" (2.0 a load in the 464 census). Also
+aria-hidden and role (0.3 each in a github-only run).
+- 445 answers such a change by building the parent again whole. The root
+  has no parent box, so an attribute on `<html>` kept the full rebuild
+  (417's note: "data-theme on `<html>` (a root: still the full
+  rebuild)").
+
+**Fix** (html.c, `html_rl_sib_risk_reaches_nothing`).
+- A sibling rule (`X[attr] + Y`, `X[attr] ~ Y Z`) reaches only the
+  element's **later** siblings and their descendants.
+- When nothing with a box follows the element, it reaches nothing that
+  renders. That uses 381's tail test: only elements that never have a
+  box, or white space. It covers the root always (the document holds no
+  later element) and the last child of any parent.
+- The style or attribute change is then answered as one no sibling rule
+  can see: the element and its subtree re-selected by the class-change
+  paths (370 / 417). For the root that is 459's in-place restyle.
+- Logged: "a sibling selector can match on the X attribute, but nothing
+  with a box follows the element".
+
+**Measured** (github only, 3 loads per arm, one interleaved run):
+- github **1 / 1 / 1 (1.0) -> 0 / 0 / 0 (0.0)**;
+- the sibling-attribute declines go to 0;
+- answered this way, 3 times each: data-turbo-loaded, data-hydrated,
+  popover, style.
+- No crash.
+
+**Gate.**
+- New pair **JS-sib-root-attr / CSS-sib-root-attr-ref**:
+  - data-r on `<html>` (`[data-r] ~ p`; `html[data-r] .box` turns
+    green): reaches nothing;
+  - data-t on #wrap's last div (only a `<script>` after it): reaches
+    nothing;
+  - data-t on #mid (a `<p>` after it): still builds the parent again
+    whole (445).
+- Mini run and gate: **rows 0, 2 reaching nothing, 1 parent rebuild, 0
+  full rebuilds**.
+- **gate465 exit 0**; interaction 52/52.
+- `restage-full.sh`: **547 applied plus the 2 known collisions**.
+
+No sudo.
