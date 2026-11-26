@@ -15802,3 +15802,43 @@ sources equal applytest's.
   interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-26, night): ASan at 463, census 462 vs 463
+
+**ASan at 463:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 420 page dumps (gate 420), 0 AddressSanitizer errors, the log to
+page 364 of 364. The new caches (sampled validity hash, 256-entry sheet
+caches, the 310 attribute cache) ran throughout. The guard tripped 8
+times under ASan (an instrumented run is several times slower, its
+budgets are not comparable).
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 462 | 463 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 2 / 1 / 2 (1.7) | 1 / 0 / 2 (1.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| github | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| youtube | 2 / 2 / 2 (2.0) | 1 / 1 / 1 (1.0) |
+| **total** | 10 / 9 / 10 (**9.7**) | 8 / 7 / 9 (**8.0**) |
+
+- **Total 9.7 -> 8.0** a load. No crash or assertion in 42 loads.
+- **Cost-guard trips 3.7 -> 1.0** a load; **youtube's 6 -> 0** over
+  three loads, and youtube 2.0 -> 1.0.
+- "two" (two marks declining in sequence) 1.0 -> 2.0: batches that no
+  longer trip the guard reach a later decline, the usual pattern.
+- **What is left** (8.0 a load):
+  - local 3.0 (singles, none above 1.0);
+  - over 2.0 (batches past 128 marks, wpblog);
+  - two 2.0;
+  - guard 1.0.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> 25.0
+(449) -> 21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7
+(455) -> 14.7 (456) -> 14.0 (457) -> 11.7 (458) -> 12.0 (459) -> 10.0
+(460) -> 9.7 (461) -> 9.3 (462) -> 8.0 (463; 9.7 for 462 in that run).
+
+No sudo.
