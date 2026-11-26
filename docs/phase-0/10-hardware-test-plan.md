@@ -16811,3 +16811,48 @@ No sudo.
 - `restage-full.sh`: **554 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 472, 21-site census 471 vs 472
+
+**ASan at 472** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 438 page
+  dumps (gate 438), 0 AddressSanitizer errors.
+- Under it, the boxed-id paths ran 5 times.
+
+**Census** (all 21 sites, 3 loads per arm, one interleaved run):
+
+| site | 471 | 472 | 472's path ran |
+|---|---|---|---|
+| rte | 2 / 3 / 2 (2.3) | **2 / 1 / 1 (1.3)** | 15 |
+| claude | 6 / 5 / 6 (5.7) | **6 / 4 / 4 (4.7)** | 4 |
+| guardian | 2 / 2 / 2 (2.0) | 1 / 2 / 2 (1.7) | 0 |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) | 0 |
+| oldreddit | 1 / 0 / 0 (0.3) | 0 / 0 / 0 (0.0) | 0 |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) | 0 |
+| github | 2 / 0 / 2 (1.3) | 2 / 0 / 0 (0.7) | 0 |
+| the 14 others | 0 | 0 | 0 |
+| **total** | 16 / 13 / 15 (**14.7**) | 14 / 10 / 10 (**11.3**) | |
+
+- **472's gain: rte -1.0 and claude -1.0**, the two sites its path ran
+  on. The boxed-id decline went 2.7 -> 0.
+- **The rest is variation:** guardian, oldreddit and github are guard
+  trips (claude 9 -> 7, github 3 -> 2, oldreddit 1 -> 0) or single loads.
+  wikipedia scored 0 in **both** arms this run (2.0 for 471 in the last
+  one), a measure of the run-to-run spread.
+- No crash, assertion or failed load in 126 loads.
+
+**21-site history:** 46.0 (451) -> 20.3 (469) -> 18.3 (470) -> 17.3
+(471; 14.7 for 471 in this run) -> **11.3 (472)**.
+
+**Left** (472 arm):
+- **Guard trips 5.0** a load: stackoverflow 2, claude 2.3, github 0.7.
+- **Over 3.7**: claude, guardian, and wpblog's body-wide batch (464:
+  left as it is pending the owner's ruling).
+- **Declines:**
+  - an object (a background) in the line 2.0 (rte);
+  - a flex box holding controls or frames 1.0 (guardian);
+  - a structural change at the root with a boxed child 0.7;
+  - structural selectors or counters 0.7.
+
+No sudo.
