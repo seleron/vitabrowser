@@ -1,0 +1,89 @@
+# netsurf: a child-list change among more than blocks builds the parent again whole (patch 467)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 466)
+#
+# 380's block placement (html_rl_block_change) tracks the parent's child
+# boxes as blocks, floats, inline content, flex, grid and table boxes; any
+# other child box -- wpblog's anonymous table (type 3, the wrapper box
+# normalisation makes around a display: table-cell child among blocks) --
+# declined into the full rebuild ("parent holds more than blocks", 1.0 a
+# load). The box-level reason 460 answers for a restyle: the decline now
+# goes to decline:, where the parent block, if a plain block, is built
+# again whole (440) from the DOM -- every child made afresh, the page laid
+# out whole -- with that rebuild's own checks deciding, as 446 (sibling
+# risk) and 454 (removed objects) do. The child's box type is logged.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9790,6 +9790,9 @@
+ 	const char *why = NULL;
+ 	const char *sib_why = NULL;		/* patch 446 */
+ 	bool sib_boxless = false;		/* patch 466 */
++	const char *more_why = NULL;		/* patch 467 */
++	int more_type = -1;
++	bool more_anon = false;
+ 	const char *obj_why = NULL;		/* patch 454 */
+ 	const char *obj_decl = NULL;		/* patch 457: its decline */
+ 	static unsigned long block_n;
+@@ -9803,6 +9806,10 @@
+ /* patch 446: a sibling rule could see the change -- the parent is built
+  * again whole at decline: (logged there, as a decline only if it cannot) */
+ #define RL_BSIB(w) do { sib_why = (w); goto decline; } while (0)
++/* patch 467: a child box the placement here cannot track (an inline-level
++ * or anonymous box among the blocks) -- the parent is built again whole
++ * at decline:, as 446 and 454 do */
++#define RL_BMORE(w) do { more_why = (w); goto decline; } while (0)
+ 
+ 	/* Patch 366: blocks in a table cell: the table lays the cell out
+ 	 * (its width, its row's height), so the page is laid out whole */
+@@ -9863,8 +9870,13 @@
+ 			full = true;
+ 			why = why != NULL ? why :
+ 				"flex, grid or table among the blocks";
+-		} else if (b->type != BOX_BLOCK || b->node == NULL)
+-			RL_BNO("parent holds more than blocks");
++		} else if (b->type != BOX_BLOCK || b->node == NULL) {
++			/* patch 467: the parent built again whole at decline:
++			 * (logged there as a decline only if it cannot be) */
++			more_type = (int)b->type;
++			more_anon = b->node == NULL;
++			RL_BMORE("parent holds more than blocks");
++		}
+ 		if (dom_node_get_parent_node(b->node, &parent) != DOM_NO_ERR)
+ 			RL_BNO("dom error");
+ 		if (parent != NULL)
+@@ -10695,6 +10707,26 @@
+ 		return html_rl_flex_whole(c, pnode, pbox, t0, "a flex or grid "
+ 			"box's child list the local path declined");
+ 	}
++	/* Patch 467: a child box the block placement cannot track (wpblog:
++	 * 1.0 a load) -- the box-level reason 460 answers for a restyle. The
++	 * parent block is built again whole (440) from the DOM: every child,
++	 * whatever its box, is made afresh and the page laid out whole; that
++	 * rebuild's own checks (controls, objects, frames, counting, sibling
++	 * risk beyond the parent) decide. A parent that is not a plain block
++	 * keeps the decline. */
++	if (more_why != NULL && sib_why == NULL && obj_why == NULL) {
++		macsurf_debug_log_writef("LIFE rebuild local: the parent holds "
++			"more than blocks (a child box of type %d%s)", more_type,
++			more_anon ? ", anonymous" : "");
++		if (pbox->type == BOX_BLOCK && pbox->parent != NULL &&
++		    pbox->object == NULL && !HTML_RL_FRAME(pbox))
++			return html_rl_block_whole(c, pnode, pbox, t0,
++				"a child-list change among more than blocks: "
++				"the parent");
++		macsurf_debug_log_writef("LIFE rebuild local: declined (%s)",
++			more_why);
++		return -1;
++	}
+ 	/* Patch 454: a removed block holding objects: the parent built again
+ 	 * whole, its objects relinked or retired (375) */
+ 	if (obj_why != NULL && sib_why == NULL) {
+@@ -10744,6 +10776,7 @@
+ 		}
+ 	}
+ 	return -1;
++#undef RL_BMORE
+ #undef RL_BSIB
+ #undef RL_BNO
+ }

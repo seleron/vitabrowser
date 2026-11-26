@@ -16160,3 +16160,41 @@ libcss, libdom instrumented):
   siblings (1.0).
 
 No sudo.
+
+## Patch 467 (2026-11-27): a child-list change among more than blocks builds the parent again whole
+
+**Problem.** wpblog's "local" full rebuild, **1.0 a load** in the 466
+census: "declined (parent holds more than blocks)".
+- That decline is in 380's block placement (`html_rl_block_change`). It
+  tracks the parent's child boxes as blocks, floats, inline content, and
+  flex, grid or table boxes **with an element**.
+- Any other child box sent the change to the full rebuild.
+- The new log line names wpblog's box: **type 3 (`BOX_TABLE`),
+  anonymous**. Box normalisation makes that wrapper around a `display:
+  table-cell` child that sits among blocks.
+
+**Fix** (html.c). This is the box-level reason 460 answers for a restyle.
+- The decline now goes to `decline:` (`RL_BMORE`). There a plain-block
+  parent is built again whole (440) from the DOM: every child made
+  afresh, the page laid out whole. That rebuild's own checks decide, as
+  446 (sibling risk) and 454 (removed objects) already do there.
+- A parent that is not a plain block keeps the decline.
+- Logged: "the parent holds more than blocks (a child box of type N[,
+  anonymous])", then "a child-list change among more than blocks: the
+  parent, built again whole".
+
+**Measured** (wpblog only, 3 loads per arm, one interleaved run):
+- wpblog **2 / 2 / 2 (2.0) -> 1 / 1 / 1 (1.0)**: "local" 1.0 -> 0, the
+  parent built again whole in all 3 loads.
+- Left on wpblog: only the "over" batch, too wide (`<body>`), by design.
+
+**Gate.**
+- New pair **JS-mixed-anon / CSS-mixed-anon-ref**: in `#wrap`, blocks
+  and a `display: table-cell` `<span>`. One block is appended and
+  another removed.
+- Both marks build the parent again whole: **rows 0, 2 parent
+  rebuilds, 0 declines, 0 full rebuilds**.
+- **gate467 exit 0**; interaction 52/52.
+- `restage-full.sh`: **549 applied plus the 2 known collisions**.
+
+No sudo.

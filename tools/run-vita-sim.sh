@@ -446,6 +446,8 @@ JS-sib-root-attr file:///app0:/testpages/JS-sib-root-attr.html
 CSS-sib-root-attr-ref file:///app0:/testpages/CSS-sib-root-attr-ref.html
 JS-root-struct file:///app0:/testpages/JS-root-struct.html
 CSS-root-struct-ref file:///app0:/testpages/CSS-root-struct-ref.html
+JS-mixed-anon file:///app0:/testpages/JS-mixed-anon.html
+CSS-mixed-anon-ref file:///app0:/testpages/CSS-mixed-anon-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2504,6 +2506,16 @@ k466i=$(printf '%s\n' "$k466seg" | grep -c "id change on an element with no box,
 k466f=$(printf '%s\n' "$k466seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-root-struct: rows $k466r (0), root sibling changes restyled in place ${k466s} (1), box-less id changes re-cascaded ${k466i} (1), full rebuilds ${k466f} (0)"
 [ "$k466r" = 0 ] && [ "${k466s:-0}" -ge 1 ] && [ "${k466i:-0}" -ge 1 ] && [ "${k466f:-1}" -eq 0 ] || fail "the root's child list and a box-less id answered by the document walk"
+# Patch 467: an append and a removal in a parent holding an anonymous
+# table (a display: table-cell child among the blocks) build the parent
+# again whole; no "parent holds more than blocks" decline, no full rebuild.
+k467r=$(fl_rows JS-mixed-anon CSS-mixed-anon-ref)
+k467seg=$(awk '/ page [0-9]+\/[0-9]+ JS-mixed-anon: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k467w=$(printf '%s\n' "$k467seg" | grep -c "a child-list change among more than blocks: the parent, built again whole" || true)
+k467d=$(printf '%s\n' "$k467seg" | grep -c "declined (parent holds more than blocks)" || true)
+k467f=$(printf '%s\n' "$k467seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-mixed-anon: rows $k467r (0), parents built again whole ${k467w} (1 or more), declines ${k467d} (0), full rebuilds ${k467f} (0)"
+[ "$k467r" = 0 ] && [ "${k467w:-0}" -ge 1 ] && [ "${k467d:-1}" -eq 0 ] && [ "${k467f:-1}" -eq 0 ] || fail "a child-list change among more than blocks builds the parent again whole"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
