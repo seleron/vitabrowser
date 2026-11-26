@@ -448,6 +448,8 @@ JS-root-struct file:///app0:/testpages/JS-root-struct.html
 CSS-root-struct-ref file:///app0:/testpages/CSS-root-struct-ref.html
 JS-mixed-anon file:///app0:/testpages/JS-mixed-anon.html
 CSS-mixed-anon-ref file:///app0:/testpages/CSS-mixed-anon-ref.html
+JS-img-inert-attr file:///app0:/testpages/JS-img-inert-attr.html
+CSS-img-inert-attr-ref file:///app0:/testpages/CSS-img-inert-attr-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2280,10 +2282,12 @@ k453f=$(printf '%s\n' "$k453seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  NET-js-removal-loading: rows $k453r (0), against the live cascade ${k453l} (1), answered ${k453i} (1), removal declines ${k453d} (0), full rebuilds ${k453f} (0)"
 [ "$k453r" = 0 ] && [ "${k453l:-0}" -ge 1 ] && [ "${k453i:-0}" -ge 1 ] && [ "${k453d:-1}" -eq 0 ] && [ "${k453f:-1}" -eq 0 ] || fail "a sheet removed while another loads, against the live cascade"
 # Patch 433: an inert attribute (aria-*, data-*, role) on a form control's
-# box that is not a block rebuilds nothing.
+# box that is not a block rebuilds nothing. Patch 468: a control's box is
+# replaced, so html_reconvert_local_attr answers it first ("attribute on an
+# object's box") -- either line counts.
 k433r=$(fl_rows JS-control-inert CSS-control-inert-ref)
 k433seg=$(awk '/ page [0-9]+\/[0-9]+ JS-control-inert: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
-k433n=$(printf '%s\n' "$k433seg" | grep -c "attribute on a box that is not a block, nothing to rebuild" || true)
+k433n=$(printf '%s\n' "$k433seg" | grep -c "attribute on a box that is not a block, nothing to rebuild\|attribute on an object's box, nothing to rebuild" || true)
 k433d=$(printf '%s\n' "$k433seg" | grep -c "declined (nearest box is not a block)" || true)
 k433f=$(printf '%s\n' "$k433seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
 echo "  JS-control-inert: rows $k433r (0), inert attributes on controls needing no rebuild ${k433n} (2 or more), nearest-box declines ${k433d} (0), full rebuilds after a decline ${k433f} (0)"
@@ -2516,6 +2520,16 @@ k467d=$(printf '%s\n' "$k467seg" | grep -c "declined (parent holds more than blo
 k467f=$(printf '%s\n' "$k467seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-mixed-anon: rows $k467r (0), parents built again whole ${k467w} (1 or more), declines ${k467d} (0), full rebuilds ${k467f} (0)"
 [ "$k467r" = 0 ] && [ "${k467w:-0}" -ge 1 ] && [ "${k467d:-1}" -eq 0 ] && [ "${k467f:-1}" -eq 0 ] || fail "a child-list change among more than blocks builds the parent again whole"
+# Patch 468: inert attributes no sheet can see (data-atf, data-iml,
+# aria-hidden) on a display:block <img>, in a structural batch: nothing to
+# rebuild; no "not one line container" decline, no full rebuild.
+k468r=$(fl_rows JS-img-inert-attr CSS-img-inert-attr-ref)
+k468seg=$(awk '/ page [0-9]+\/[0-9]+ JS-img-inert-attr: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k468n=$(printf '%s\n' "$k468seg" | grep -c "attribute on an object's box, nothing to rebuild" || true)
+k468d=$(printf '%s\n' "$k468seg" | grep -c "declined (block is not one line container of plain content)" || true)
+k468f=$(printf '%s\n' "$k468seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-img-inert-attr: rows $k468r (0), inert attributes on the object's box ${k468n} (3), declines ${k468d} (0), full rebuilds ${k468f} (0)"
+[ "$k468r" = 0 ] && [ "${k468n:-0}" -ge 3 ] && [ "${k468d:-1}" -eq 0 ] && [ "${k468f:-1}" -eq 0 ] || fail "inert attributes on an object's box answered with nothing to rebuild"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

@@ -16240,3 +16240,50 @@ libcss, libdom instrumented):
   (1.0); one "two" batch (1.0).
 
 No sudo.
+
+## Patch 468 (2026-11-27): an inert attribute no sheet can see on an object's box, nothing to rebuild
+
+**Problem.** "declined (block is not one line container of plain
+content)", **2.0 a load in the 467 census, all youtube's**. It made
+youtube's 1.0 a load of "two" batches.
+- A probe that logged every failing mark: `data-atf` and `data-iml` set
+  on a `display: block` `<img>`, in batches with structural marks. (A
+  batch of unseen attributes alone is dropped before the local path:
+  313's render decline.)
+- The local path took the image's block box. It holds an object, so
+  434's whole-block rebuild leaves it out, and the change went to the
+  full rebuild.
+
+**Fix** (html.c, `html_reconvert_local_attr`).
+- 383's and 408's no-ops for inert attributes (`html_rl_attr_inert`:
+  `data-*`, `aria-*`, role, tabindex ...) leave object boxes out, for the
+  attributes an object reads (src, data, value).
+- None of those is inert: `data-` is not `<object>`'s `data`. Box
+  construction reads none of them either. With no sheet able to see the
+  attribute (310's gate let it through), the full rebuild builds the same
+  box.
+- Such a mark on an **object or replaced box** is now answered with
+  nothing to rebuild: "X attribute on an object's box, nothing to
+  rebuild".
+- The decline that remains now names its box ("not one line container:
+  `<x>` box type N ...").
+
+**Measured** (youtube only, 3 loads per arm, one interleaved run):
+- youtube **1 / 1 / 1 (1.0) -> 0 / 0 / 0 (0.0)**;
+- "block is not one line container" 2.0 -> 0;
+- data-atf and data-iml answered once each a load.
+
+**Gate.**
+- New pair **JS-img-inert-attr / CSS-img-inert-attr-ref**: data-atf,
+  data-iml and aria-hidden set on a `display: block` `<img>`, with a span
+  appended in the same task (a structural batch, as youtube's). Result:
+  rows 0, 3 inert attributes answered, 0 declines, 0 full rebuilds.
+- **gate468 FAILED** on 433's JS-control-inert check ("inert attributes
+  on form controls"). The behaviour was unchanged (rows 0, no full
+  rebuild), but a form control's box is replaced: 468 now answers it
+  first, with its own line, so 433's line count was 0. The check now
+  accepts either line.
+- **gate468b exit 0**; interaction 52/52.
+- `restage-full.sh`: **550 applied plus the 2 known collisions**.
+
+No sudo.

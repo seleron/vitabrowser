@@ -1,0 +1,64 @@
+# netsurf: an inert attribute no sheet can see on an object's box, nothing to rebuild (patch 468)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 467)
+#
+# youtube's "block is not one line container of plain content" (2.0 a
+# load, all its "two" batches): data-atf and data-iml set on a
+# display:block <img>, in batches with structural marks (a batch of unseen
+# attributes alone is dropped before the local path, 313). The local path
+# took the image's block box -- it holds an object, so 434's whole-block
+# rebuild leaves it out -- and declined into the full rebuild. 383's and
+# 408's no-ops for inert attributes (html_rl_attr_inert: data-*, aria-*,
+# role, tabindex ...) leave object boxes out for the attributes an object
+# reads (src, data, value); none of those is inert ("data-" is not
+# <object>'s data), and box construction reads none of them: with no sheet
+# able to see the attribute (310's gate let it through) the full rebuild
+# builds the same box. html_reconvert_local_attr now answers such a mark on
+# an object or replaced box with nothing to rebuild. The decline that
+# remains names its box ("not one line container: <x> box type N ...").
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -14166,6 +14166,25 @@
+ {
+ 	int r;
+ 
++	/* Patch 468: an inert attribute (data-*, aria-*, role ...) that no
++	 * sheet can see (310's gate let it through) on an element whose own
++	 * box is an object or replaced (youtube's display:block <img>:
++	 * data-atf, data-iml). 383's and 408's no-ops leave object boxes out
++	 * for the attributes an object reads (src, data, value); none of
++	 * those is inert ("data-" is not <object>'s data), and box
++	 * construction reads none of them either -- the full rebuild would
++	 * build the same box. Was: "block is not one line container of plain
++	 * content" into the full rebuild (youtube 2.0 a load). */
++	if (html_rl_attr_inert(attr_name)) {
++		struct box *ob = box_for_node((dom_node *)vnode);
++		if (ob != NULL && (ob->object != NULL ||
++		    (ob->flags & IS_REPLACED))) {
++			macsurf_debug_log_writef("LIFE rebuild local: %s "
++				"attribute on an object's box, nothing to "
++				"rebuild", attr_name);
++			return 0;
++		}
++	}
+ 	html_rl_attr_mark_node = html_rl_attr_inert(attr_name) ?
+ 		(dom_node *) vnode : NULL;
+ 	r = html_reconvert_local_change(base_c, vnode, false, NULL);
+@@ -15626,6 +15645,16 @@
+ 			dom_node_unref(element);
+ 			return r;
+ 		}
++		{	/* patch 468: name the box */
++			char *tg = html_rl_struct_tag(element);
++			macsurf_debug_log_writef("LIFE rebuild local: not one line "
++				"container: <%s> box type %d%s%s%s", tg ? tg : "?",
++				(int)block->type,
++				block->object != NULL ? ", an object" : "",
++				HTML_RL_FRAME(block) ? ", a frame" : "",
++				block->styles == NULL ? ", no styles" : "");
++			free(tg);
++		}
+ 		dom_node_unref(element);
+ 		RL_NO("block is not one line container of plain content");
+ 	}
