@@ -1846,8 +1846,11 @@ echo "  JS-counters-local: rows differing from the parse-time build $k374r (0); 
 # track is restyled alone, its entries moved to the new boxes.
 k374bgr=$(fl_rows JS-bg-objects CSS-bg-objects-ref)
 k374bgf=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the restyled flex or grid box)\|declined (restyled flex or grid box holds objects" "$R/netsurf.log" || true)
-k374bgl=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the line)" "$R/netsurf.log" || true)
-echo "  JS-bg-objects: rows differing from the parse-time build $k374bgr (0); flex declines on objects ${k374bgf} (0, patch 375); backgrounded line declined ${k374bgl} (1 or more)"
+# Patch 474: the backgrounded line's block is now built again whole (its
+# objects relinked, 375) instead of declining -- either counts; rows 0
+# says the background is still drawn
+k374bgl=$(grep -c "LIFE rebuild local: declined (an object (a background) is in the line)\|an object (a background) is in the line, the block built again whole" "$R/netsurf.log" || true)
+echo "  JS-bg-objects: rows differing from the parse-time build $k374bgr (0); flex declines on objects ${k374bgf} (0, patch 375); backgrounded line declined or its block rebuilt ${k374bgl} (1 or more)"
 [ "$k374bgr" = 0 ] && [ "${k374bgf:-0}" = 0 ] && [ "${k374bgl:-0}" -ge 1 ] ||
 	fail "local rebuilds keep the boxes objects point at"
 # Patch 375: a restyled flex, block or table holding images or background

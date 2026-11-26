@@ -16936,3 +16936,46 @@ in this run).
   1.0.
 
 No sudo.
+
+## Patch 474 (2026-11-27): a line holding an object's box (a CSS background) builds its block again whole
+
+**Problem.** "declined (an object (a background) is in the line)",
+**2.0 a load on the 21-site census, all rte**.
+- The line path rebuilds a block's inline content and frees the old
+  line's boxes.
+- An object entry would keep pointing at one of them (rte: a CSS
+  background on an inline in the line; the entry's load callback and
+  the full reconvert's relink read `o->box`, and rte crashed there once).
+  So 374 declined.
+
+**Fix** (html.c, the line path).
+- 434's whole-block rebuild (`html_rl_flex_restyle`) carries objects
+  over (375: `html_rl_relink_subtree`) and declines what it cannot carry
+  (counting, other controls, frames, a parent that is not a block).
+- When the block is a plain block box, it is now built again whole
+  there instead.
+- Logged: "an object (a background) is in the line, the block built
+  again whole".
+
+**Measured** (rte only, 3 loads per arm, one interleaved run):
+- **The decline went 2.0 -> 0.** The block was built again whole 15 times
+  (5 a load), with the objects re-pointed (`objects re-pointed N`) and no
+  crash.
+- **rte's total is flat at 1.0 a load.** The same batch now reaches its
+  next decline, "sheet change: an element's style changes" (cause nonode,
+  0 -> 1.0); before, the background decline ended it first ("two").
+  474 clears its own decline; the batch's full rebuild moves to that
+  next mark (the next unit).
+
+**Gate.**
+- **374's JS-bg-objects check updated before gating** (the 471 lesson).
+  It expected the backgrounded line to decline; now it counts that
+  decline or its block rebuilt. Rows 0 says the background is still
+  drawn.
+- Mini run: the backgrounded line's block built again whole, rows 0, no
+  full rebuild.
+- **gate474 exit 0** on the first run (JS-bg-objects: rows 0, 5
+  backgrounded-line rebuilds); interaction 52/52.
+- `restage-full.sh`: **556 applied plus the 2 known collisions**.
+
+No sudo.
