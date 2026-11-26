@@ -15916,3 +15916,45 @@ final build):
   whole, 0 full rebuilds; interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 464, census 463 vs 464
+
+**ASan at 464**, built with `--libs` (libwapcaplet, libparserutils,
+libhubbub, libcss, **libdom** instrumented). 464's crash was a libdom
+refcount error that the default build cannot see.
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 422 page
+  dumps (gate 422), 0 AddressSanitizer errors, the log to page 366 of
+  366.
+- Under it: JS-over-coalesce's batch coalesced with the head mark kept
+  (the shape that crashed) and its common block was built again whole;
+  one batch elsewhere was too wide.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 463 | 464 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 0 / 0 / 0 (0.0) | 0 / 1 / 0 (0.3) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| github | 2 / 1 / 1 (1.3) | 2 / 1 / 1 (1.3) |
+| youtube | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| **total** | 8 / 7 / 7 (**7.3**) | 8 / 8 / 7 (**7.7**) |
+
+- **Total flat** (oldreddit's single 1 is one load). No crash or
+  assertion in 42 loads.
+- **"over" 2.0 -> 1.0**: github's batch coalesced 3 times, its common
+  block built again whole each time. wpblog's is too wide (`<body>`), as
+  designed.
+- **github's total did not move**: the batch now reaches its next
+  decline, "a sibling selector can match on the data-turbo-loaded
+  attribute" (0 -> 2.0 a load), almost certainly on `<html>`. 445's parent
+  rebuild cannot take the root, but the root has no siblings a `+` / `~`
+  rule could reach. 464 pays off together with that fix: **the next unit
+  (465)**.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+8.0 (463) -> 7.7 (464; 7.3 for 463 in that run, flat).
+
+No sudo.
