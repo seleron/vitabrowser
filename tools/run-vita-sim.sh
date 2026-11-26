@@ -450,6 +450,8 @@ JS-mixed-anon file:///app0:/testpages/JS-mixed-anon.html
 CSS-mixed-anon-ref file:///app0:/testpages/CSS-mixed-anon-ref.html
 JS-img-inert-attr file:///app0:/testpages/JS-img-inert-attr.html
 CSS-img-inert-attr-ref file:///app0:/testpages/CSS-img-inert-attr-ref.html
+JS-sib-noparent file:///app0:/testpages/JS-sib-noparent.html
+CSS-sib-noparent-ref file:///app0:/testpages/CSS-sib-noparent-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2530,6 +2532,16 @@ k468d=$(printf '%s\n' "$k468seg" | grep -c "declined (block is not one line cont
 k468f=$(printf '%s\n' "$k468seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-img-inert-attr: rows $k468r (0), inert attributes on the object's box ${k468n} (3), declines ${k468d} (0), full rebuilds ${k468f} (0)"
 [ "$k468r" = 0 ] && [ "${k468n:-0}" -ge 3 ] && [ "${k468d:-1}" -eq 0 ] && [ "${k468f:-1}" -eq 0 ] || fail "inert attributes on an object's box answered with nothing to rebuild"
+# Patch 469: aria-expanded (a sibling rule opens the menu after it) on a
+# <button> whose parent <li> is display: contents in a flex <ul>: the
+# nearest flex box above the parent built again whole; no full rebuild.
+k469r=$(fl_rows JS-sib-noparent CSS-sib-noparent-ref)
+k469seg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-noparent: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k469w=$(printf '%s\n' "$k469seg" | grep -c "a sibling rule's reach: the nearest \(block\|flex or grid box\) above the parent" || true)
+k469d=$(printf '%s\n' "$k469seg" | grep -c "declined (a sibling selector can match on the aria-expanded attribute)" || true)
+k469f=$(printf '%s\n' "$k469seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-sib-noparent: rows $k469r (0), nearest box above the parent built again whole ${k469w} (1), declines ${k469d} (0), full rebuilds ${k469f} (0)"
+[ "$k469r" = 0 ] && [ "${k469w:-0}" -ge 1 ] && [ "${k469d:-1}" -eq 0 ] && [ "${k469f:-1}" -eq 0 ] || fail "a sibling-rule attribute under a parent with no box"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

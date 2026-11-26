@@ -16331,3 +16331,44 @@ libcss, libdom instrumented):
   445 tries cannot take it.
 
 No sudo.
+
+## Patch 469 (2026-11-27): a sibling rule's reach under a parent the rebuild cannot take -- the nearest block above
+
+**Problem.** wpnews's last full rebuild, **1.0 a load** in the 468
+census: "declined (a sibling selector can match on the aria-expanded
+attribute)", on a `<button>` with later siblings.
+- `html_rl_parent_whole` (445 / 448 / 450) builds the parent again whole
+  when it is a block or a flex / grid box. It declined **silently** on
+  anything else.
+- The new log line names wpnews's parent: an **`<li>` with no box** (box
+  type -1).
+
+**Fix** (html.c, `html_rl_parent_whole`).
+- What a sibling rule reaches (the element's later siblings and their
+  descendants) is in the parent's subtree.
+- So the nearest block, flex or grid box **above** the parent, built
+  again whole (440 / 438), covers it too.
+- The climb stops below `<body>` (464's too-wide test: that is nearly
+  the page).
+- Logged: "sibling parent `<x>` box type N: the nearest block above it",
+  then "a sibling rule's reach: the nearest block / flex or grid box
+  above the parent, ... built again whole".
+- 450's :empty case uses the same function and keeps its decline where
+  its own rebuild declines: JS-gen-empty-sib still logs "declined (a
+  sibling rule tests :empty)", and its check holds.
+
+**Measured** (wpnews only, 3 loads per arm, one interleaved run):
+- wpnews **1 / 1 / 1 (1.0) -> 0 / 0 / 0 (0.0)**;
+- the nearest flex box above the `<li>` built again whole, once a load.
+
+**Gate.**
+- New pair **JS-sib-noparent / CSS-sib-noparent-ref**: a flex `<ul>`, an
+  `<li>` with `display: contents` (a contents box, type 18), and a
+  `<button>` toggling `aria-expanded` with `[aria-expanded="true"] +
+  .menu` opening its menu.
+- The flex `<ul>` is built again whole: **rows 0, 0 declines, 0 full
+  rebuilds**.
+- **gate469 exit 0**; interaction 52/52.
+- `restage-full.sh`: **551 applied plus the 2 known collisions**.
+
+No sudo.
