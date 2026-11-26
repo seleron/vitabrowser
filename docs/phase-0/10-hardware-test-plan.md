@@ -16372,3 +16372,44 @@ attribute)", on a `<button>` with later siblings.
 - `restage-full.sh`: **551 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 469, census 468 vs 469
+
+**ASan at 469** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 432 page
+  dumps (gate 432), 0 AddressSanitizer errors, the log to page 376 of
+  376.
+- Under it, the new climb ("a sibling rule's reach: the nearest ... above
+  the parent") ran twice.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 468 | 469 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wpnews | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| google | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| github | 2 / 0 / 0 (0.7) | 0 / 0 / 0 (0.0) |
+| youtube | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| **total** | 4 / 2 / 2 (**2.7**) | 1 / 1 / 1 (**1.0**) |
+
+- **The real gain: wpnews -1.0.** The nearest flex box above the
+  `<li>` was built again whole once a load; the aria-expanded declines
+  went 1.0 -> 0.
+- **The noise:** github's -0.7 is the 468 arm's 2 cost-guard trips; the
+  469 arm had none.
+- No crash or assertion in 42 loads.
+- **No local-path decline is left on the 7 sites.**
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+6.0 (465) -> 4.3 (466) -> 3.3 (467) -> 2.7 (468) -> **1.0 (469)**.
+
+**The one full rebuild left a load:** wpblog's "over" batch (129+ marks).
+Its body marks meet only at `<body>`, which 464 leaves to the full
+rebuild by design: coalescing there would rebuild nearly the page.
+Cost-guard trips (0-1.3 a load in recent runs) are timing noise on top.
+
+No sudo.
