@@ -16899,3 +16899,40 @@ fresh line containers.
 
 No behaviour change outside the simulator. wpblog's body-wide "over"
 batch (464) is left as it is, pending the owner's ruling. No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 473 -- 441's guard covered; 21-site census 472 vs 473
+
+**ASan at 473** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 440 page
+  dumps (gate 440), 0 AddressSanitizer errors, the log to page 384 of
+  384.
+- **441's guard ran under ASan for the first time: 5 times** (the test
+  hook's inline-blocks on JS-unmeasured-ib and its reference), 0 errors.
+  **Every guard now has ASan coverage**, which closes the post-469
+  run-close item.
+
+**Census** (all 21 sites, 3 loads per arm, one interleaved run). 473 is
+a simulator-only test hook, so no behaviour change is expected.
+- **Confirmed:** the hook fired **0 times** and 441's guard **0 times**
+  in all 126 loads (no site carries `data-vb-unmeasured`).
+- **Total 11.7 -> 12.3**, all cost-guard trips and single loads:
+  - claude 4.3 -> 5.3 (guard 6 -> 8);
+  - oldreddit 0.0 -> 0.7 (guard 0 -> 2);
+  - github 1.3 -> 0.7 (guard 4 -> 2);
+  - guardian 2.0 -> 1.7;
+  - rte, stackoverflow and wpblog identical; the 14 others 0 in both.
+- No crash, assertion or failed load.
+
+**21-site history:** 46.0 (451) -> 20.3 (469) -> 18.3 (470) -> 17.3
+(471) -> 11.3 (472) -> **12.3 (473**, no behaviour change; 11.7 for 472
+in this run).
+
+**Open:**
+- wpblog's body-wide "over" batch (464): left as it is, pending the
+  owner's ruling.
+- What is left a load: guard trips 6.0 (stackoverflow 2, claude 2.7);
+  over 4.0 (claude, guardian, wpblog); rte's background object in a line
+  1.0.
+
+No sudo.
