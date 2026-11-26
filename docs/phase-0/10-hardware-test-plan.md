@@ -16198,3 +16198,45 @@ census: "declined (parent holds more than blocks)".
 - `restage-full.sh`: **549 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 467, census 466 vs 467
+
+**ASan at 467** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 428 page
+  dumps (gate 428), 0 AddressSanitizer errors, the log to page 372 of
+  372.
+- Under it, the new parent rebuild ("a child-list change among more than
+  blocks") ran 4 times.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 466 | 467 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 1 / 0 / 0 (0.3) | 0 / 1 / 0 (0.3) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 2 / 2 / 2 (2.0) | **1 / 1 / 1 (1.0)** |
+| google | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| github | 1 / 0 / 0 (0.3) | 0 / 0 / 0 (0.0) |
+| youtube | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| **total** | 6 / 4 / 4 (**4.7**) | 3 / 4 / 3 (**3.3**) |
+
+- **The real gain: wpblog -1.0.** The parent was built again whole in
+  all 3 loads (a child box of type 3, anonymous); "parent holds more
+  than blocks" 1.0 -> 0.
+- github's -0.3 and the guard trips (0.7 -> 0.3) are timing noise.
+- No crash or assertion in 42 loads.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+6.0 (465) -> 4.3 (466; 4.7 for 466 in this run) -> **3.3 (467)**.
+
+**Remaining full rebuilds a load:**
+- **wpblog 1.0**: its "over" batch, too wide (`<body>`), by design;
+- **wpnews 1.0** and **youtube 1.0**;
+- **oldreddit 0.3**: a single load.
+- Decline reasons left: block not one line container of plain content
+  (2.0); an aria-expanded sibling-rule attribute that has later siblings
+  (1.0); one "two" batch (1.0).
+
+No sudo.
