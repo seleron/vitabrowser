@@ -16688,3 +16688,75 @@ change may move a sibling selector" 2.0, "nearest box is not a block"
 - `restage-full.sh`: **553 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 471, 21-site census 470 vs 471
+
+**ASan at 471** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 436 page
+  dumps (gate 436), 0 AddressSanitizer errors, the log to page 380 of
+  380.
+- Under it, the new counting path ran 7 times.
+
+**Census** (all 21 sites, 3 loads per arm, one interleaved run):
+
+| site | 470 | 471 |
+|---|---|---|
+| example | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| textfiles | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wikipedia | 3 / 3 / 3 (3.0) | **3 / 0 / 3 (2.0)** |
+| archwiki | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** |
+| cnnlite | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| rte | 2 / 3 / 2 (2.3) | 3 / 3 / 2 (2.7) |
+| guardian | 2 / 2 / 1 (1.7) | 3 / 3 / 3 (3.0) |
+| hackernews | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) |
+| oldreddit | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wpnews | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 2 (1.3) |
+| jquery | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| mdn | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| python | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| ddglite | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| google | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| github | 2 / 0 / 2 (1.3) | 2 / 0 / 0 (0.7) |
+| youtube | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| claude | 5 / 4 / 4 (4.3) | 6 / 6 / 5 (5.7) |
+| **total** | 18 / 16 / 16 (**16.7**) | 20 / 15 / 17 (**17.3**) |
+
+**The total rose 0.7, but not from 471.**
+- **On the sites where 471 runs, it gains:**
+  - wikipedia -1.0: 8 counting rebuilds answered, full rebuilds 9 -> 6
+    over three loads;
+  - archwiki -1.0: 3 -> 0;
+  - "the restyled flex or grid box takes part in counting" 3.0 -> 0 a
+    load.
+- **guardian (+1.3), claude (+1.3), rte and wpblog (+0.3 each): 471's
+  path never ran there** (0 counting rebuilds or give-ups in all 12
+  loads). The rest of the patch is the `!counts` case, which is the old
+  code, so their deltas are the sites' own run-to-run variation:
+  - guardian scored 2.3 for 470 in the previous run, 1.7 in this one;
+    the 471 arm's extra batches decline on "a flex box holding controls
+    or frames", a check that runs before the counting one.
+  - claude swapped guard trips (8 -> 4) for "structural selectors or
+    counters in page CSS" declines (0 -> 8), from batches the 470 arm's
+    guard had cut short.
+  - Guard trips overall 6.0 -> 4.3 a load (github and claude); timing.
+- No crash, assertion or failed load in 126 loads.
+
+**21-site history:** 46.0 (451) -> 20.0 / 20.3 (469) -> 18.3 (470; 16.7
+for 470 in this run) -> **17.3 (471)**. The run-to-run spread of the
+whole census is now about ±2 a load (claude, guardian, guard trips).
+Single units of 1-2 a load need the per-site breakdown (does the unit's
+path run there?) to be read; the total alone cannot tell them from
+noise any more.
+
+**Left** (471 arm, top declines): structural selectors or counters in
+page CSS 2.7; an id change on a boxed element 2.7 (rte, claude); a
+structural change at the root with a boxed child 2.7; an object (a
+background) in the line 2.0 (rte); a flex box holding controls or frames
+2.0 (guardian); class change may move a sibling selector 1.3
+(wikipedia). Over 4.0, guard 4.3.
+
+No sudo.
