@@ -15698,3 +15698,51 @@ census).
   rebuilds; interaction 52/52 at the Vita's pace.
 
 No sudo.
+
+### State log (2026-11-28, later): ASan at 462, census 461 vs 462
+
+**ASan at 462:** `asan-autotest.sh main` **clean**: rc 0, interaction
+52/52, 420 page dumps (gate 420), 0 AddressSanitizer errors, the log to
+page 364 of 364. 462's parent hit ran twice under ASan.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 461 | 462 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 2 / 1 / 0 (1.0) | 1 / 1 / 1 (1.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| github | 2 / 1 / 1 (1.3) | 1 / 1 / 1 (1.0) |
+| youtube | 2 / 3 / 2 (2.3) | 2 / 2 / 3 (2.3) |
+| **total** | 11 / 10 / 8 (**9.7**) | 9 / 9 / 10 (**9.3**) |
+
+- **Flat** (9.7 vs 9.3, the loads overlap). In this run the 461 arm
+  showed no "would get one" decline at all (live content); 462's parent
+  hit ran once. No crash or assertion in 42 loads.
+- **What the remaining ~9 full rebuilds a load are**, by BATCHCAUSE:
+  - **guard 3.3**: almost all youtube (7 over three loads). 452's
+    marginal guard trips: the batch's expected remaining local cost is
+    above one full conversion.
+  - **local 3.0**: single local declines, none above 1.0 a load
+    (aria-expanded sibling, the root `<html>` not in a block, structural
+    selectors, "parent holds more than blocks", "block is not one line
+    container of plain content").
+  - **over 2.0**: batches with more than `RECONVERT_MAX_EXTRA` (128)
+    marks, which go to the full rebuild unconditionally (wpblog one a
+    load).
+  - **two 1.0**: two marks declining in sequence.
+- **Next**, by size:
+  - youtube's guard trips (profile the expensive single answers, as 452
+    noted);
+  - the "over" batches (128+ marks: answer what can be answered, or
+    coalesce marks under a common ancestor before counting);
+  - then the local singles.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> 25.0
+(449) -> 21.7 (451) -> 20.0 (452) -> 17.3 (453) -> 16.0 (454) -> 14.7
+(455) -> 14.7 (456) -> 14.0 (457) -> 11.7 (458) -> 12.0 (459) -> 10.0
+(460) -> 9.7 (461) -> 9.3 (462; 9.7 for 461 in that run).
+
+No sudo.
