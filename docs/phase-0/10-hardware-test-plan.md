@@ -15746,3 +15746,59 @@ page 364 of 364. 462's parent hit ran twice under ASan.
 (460) -> 9.7 (461) -> 9.3 (462; 9.7 for 461 in that run).
 
 No sudo.
+
+## Patch 463 (2026-11-26): the local path's sheet scans are cached, and cache fills are not a batch's cost
+
+**Problem.** The largest remaining cause in the 462 census was 452's cost
+guard on youtube: **7 trips over three loads**, typically "2 answered, 36
+left, expected 850 ms" after one ~42 ms answer. 452 judged the marks
+left, but one expensive early answer made the projection explode.
+
+**Profile.** A sampling profile (`tools/vita-sim/sprof.c`, LD_PRELOADed
+through `census.py`, one youtube load) of the local path
+(`macos9_reconvert_try_local`): **77% of its time was in the per-sheet
+scans, not in rebuilding**:
+- 36 of 78 samples in `html_rl_fnv1a`: 186's sibling cache and 379's
+  structural cache hashed the **whole sheet source** on every lookup, hits
+  included, to validate the entry;
+- 24 in `html_rl_struct_scan`: both caches held 32 sheets with
+  round-robin eviction, and youtube's components inject more `<style>`s,
+  so checks rescanned;
+- after the first fixes, 11 of 53 in `html_rl_sheet_scan_attr`: 310's
+  attribute scan re-read every sheet's text at every attribute mark (no
+  cache at all).
+
+**Fix** (html.c, `macos9_reconvert.c`).
+- A cache entry is valid for the same handle with the same data pointer
+  and size, checked by a hash of four 64-byte spans
+  (`html_rl_sample_hash`). A `<style>` whose text changes gets a new
+  sheet content, so a new handle. `html_rl_fnv1a` goes.
+- Both caches: 32 -> **256** sheets.
+- 310's answer is cached per (sheet, source, attribute name): 512
+  entries.
+- A sheet's first scan still happens in whichever batch first meets it.
+  That is a one-time cost the later checks reuse, so the scans that fill
+  a cache are timed into `html_rl_fill_us`, and the guard (309/452) leaves
+  them out of the batch's cost (reset per batch in
+  `macos9_reconvert_try_local`).
+
+**Measured** (youtube only, 3 loads per arm, one interleaved run):
+- first round (hash and cache size only): structural answers **~2.9 ->
+  ~0.5 ms** each; guard trips 8 -> 7 (the 42 ms answer remained: scans of
+  newly arrived sheets plus the uncached attribute scans);
+- second round (with the attribute cache and fills excluded): **youtube
+  2 / 3 / 2 (2.3) -> 1 / 1 / 1 (1.0)** full rebuilds a load, **guard trips
+  7 -> 0**.
+- JS-dom-stall still trips on real cost (36 ms net of fills, 1 answered,
+  17 left), so 452's gate check holds.
+
+**Gate.** No new page. A cost change, not a rendering one: the
+structural, sibling and attribute gate pages cover correctness.
+`restage-full.sh`: **545 applied plus the 2 known collisions**; its
+sources equal applytest's.
+- **gate463 exit 0** (stack through 463): every check passes; 452's
+  check still finds JS-dom-stall's guard trip and the burst with no full
+  reconvert; the guard continued past the budget 3 times in the run;
+  interaction 52/52 at the Vita's pace.
+
+No sudo.

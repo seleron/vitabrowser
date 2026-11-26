@@ -1,0 +1,256 @@
+# netsurf: the local path's sheet scans are cached, and cache fills are not a batch's cost (patch 463)
+# Generated 2026-11-26
+# Base: seleron/vitabrowser (patch stack through 462)
+#
+# The 462 census's largest remaining cause was 452's cost guard on youtube
+# (7 trips over three loads: "2 answered, 36 left", one ~42 ms answer). A
+# sampling profile (tools/vita-sim/sprof.c) of the local path put 77% of
+# its time in the per-sheet scans, not in rebuilding:
+# - 186's and 379's per-sheet analysis caches hashed the WHOLE sheet
+#   source (html_rl_fnv1a) on every lookup, hits included: now a hash of
+#   four 64-byte spans with the same handle, data pointer and size
+#   (html_rl_sample_hash; a <style> whose text changes gets a new sheet
+#   content); html_rl_fnv1a goes;
+# - both caches held 32 sheets with round-robin eviction -- youtube's
+#   components inject more, so every check rescanned: 256 now;
+# - 310's attribute scan (html_rl_sheet_refs_attr) re-read every sheet's
+#   text at every attribute mark: a 512-entry cache of its answer per
+#   (sheet, source, attribute name).
+# A sheet's first scan still happens in whichever batch first meets it --
+# a one-time cost the later checks reuse. The scans that fill a cache are
+# timed into html_rl_fill_us, and the guard (309/452) leaves them out of
+# the batch's cost (macos9_reconvert_try_local resets it per batch).
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7198,7 +7198,7 @@
+  * one inside a functional pseudo (:not(:first-child)) -- is unbounded:
+  * it matches any child. Counters are reported apart (the caller decides:
+  * an element with no box counts nothing). */
+-static uint32_t html_rl_fnv1a(const uint8_t *s, size_t len);
++static uint32_t html_rl_sample_hash(const uint8_t *s, size_t len);
+ static bool html_rl_box_counts(struct box *b);
+ static void html_rl_drop_new(html_content *c, struct box *nb,
+ 		unsigned int objects_before);
+@@ -7222,7 +7222,10 @@
+ 	 * than the matching one */
+ 	bool sib_after;
+ };
+-#define HTML_RL_STRUCT_CACHE_N 32
++/* Patch 463: 32 -> 256 -- youtube's components inject more <style>s than
++ * 32, and round-robin eviction then rescanned every sheet at every check
++ * (a sampling profile: 77% of the local path's time in the scans) */
++#define HTML_RL_STRUCT_CACHE_N 256
+ #define HTML_RL_STRUCT_CP_MAX 512
+ struct html_rl_struct_sheet {
+ 	struct hlcache_handle *sheet;
+@@ -7679,7 +7682,7 @@
+ 	data = content_get_source_data(sheet, &size);
+ 	if (data == NULL || size == 0)
+ 		return NULL;
+-	hash = html_rl_fnv1a(data, size);
++	hash = html_rl_sample_hash(data, size);	/* patch 463 */
+ 	for (k = 0; k < HTML_RL_STRUCT_CACHE_N; k++)
+ 		if (html_rl_struct_cache[k].sheet == sheet) {
+ 			e = &html_rl_struct_cache[k];
+@@ -7697,7 +7700,13 @@
+ 	e->data = data;
+ 	e->size = size;
+ 	e->hash = hash;
+-	html_rl_struct_scan(data, size, e);
++	{
++		extern double macos9_micros(void);
++		extern double html_rl_fill_us;	/* patch 463 */
++		double t = macos9_micros();
++		html_rl_struct_scan(data, size, e);
++		html_rl_fill_us += macos9_micros() - t;
++	}
+ 	return e;
+ }
+ 
+@@ -8258,24 +8267,72 @@
+ }
+ 
+ /* True if any used stylesheet can match on attribute `name`. */
++/* Patch 463: the scans of a sheet that fill a cache (186's sibling
++ * analysis, 379's structural one, 310's attribute answers) are one-time
++ * costs a later check reuses; the time they took in this batch is summed
++ * here, and the cost guard (309/452) leaves it out of the batch's cost */
++double html_rl_fill_us;
++
++/* Patch 463: 310's answer per (sheet, source, attribute name) -- it was
++ * recomputed over every sheet's whole text at every attribute mark
++ * (youtube: 11 of 53 local-path samples) */
++#define HTML_RL_ATTR_CACHE_N 512
++static struct {
++	struct hlcache_handle *sheet;
++	const uint8_t *data;
++	size_t size;
++	char name[40];
++	int refs;
++} html_rl_attr_cache[HTML_RL_ATTR_CACHE_N];
++static unsigned int html_rl_attr_cache_next;
++
+ static int html_rl_sheet_refs_attr(html_content *c, const char *name)
+ {
+-	unsigned int i;
++	extern double macos9_micros(void);
++	unsigned int i, k;
+ 	size_t namelen = strlen(name);
+ 	const char *const *pseudos = html_rl_pseudos_for(name);
+ 	for (i = 0; i < c->stylesheet_count; i++) {
+ 		const uint8_t *data;
+ 		size_t size = 0;
+-		if (c->stylesheets[i].sheet == NULL ||
+-		    c->stylesheets[i].unused)
++		struct hlcache_handle *sh = c->stylesheets[i].sheet;
++		int refs;
++		double t;
++		if (sh == NULL || c->stylesheets[i].unused)
+ 			continue;
+-		data = content_get_source_data(c->stylesheets[i].sheet,
+-				&size);
++		data = content_get_source_data(sh, &size);
+ 		/* A sheet we cannot read might reference it. */
+ 		if (data == NULL || size == 0)
+ 			return 1;
+-		if (html_rl_sheet_scan_attr(data, size, name, namelen,
+-				pseudos))
++		refs = -1;
++		if (namelen < sizeof(html_rl_attr_cache[0].name))
++			for (k = 0; k < HTML_RL_ATTR_CACHE_N; k++)
++				if (html_rl_attr_cache[k].sheet == sh &&
++				    html_rl_attr_cache[k].data == data &&
++				    html_rl_attr_cache[k].size == size &&
++				    strcmp(html_rl_attr_cache[k].name,
++					   name) == 0) {
++					refs = html_rl_attr_cache[k].refs;
++					break;
++				}
++		if (refs < 0) {
++			t = macos9_micros();
++			refs = html_rl_sheet_scan_attr(data, size, name,
++					namelen, pseudos) ? 1 : 0;
++			html_rl_fill_us += macos9_micros() - t;
++			if (namelen < sizeof(html_rl_attr_cache[0].name)) {
++				k = html_rl_attr_cache_next;
++				html_rl_attr_cache_next = (k + 1) %
++					HTML_RL_ATTR_CACHE_N;
++				html_rl_attr_cache[k].sheet = sh;
++				html_rl_attr_cache[k].data = data;
++				html_rl_attr_cache[k].size = size;
++				memcpy(html_rl_attr_cache[k].name, name,
++					namelen + 1);
++				html_rl_attr_cache[k].refs = refs;
++			}
++		}
++		if (refs)
+ 			return 1;
+ 	}
+ 	return 0;
+@@ -12451,7 +12508,7 @@
+  * sheet's source and return a stale `has=false`. The handle is kept alive
+  * by the document's stylesheet array while we hold it, and the hash makes
+  * a same-address different-content collision negligible. */
+-#define HTML_RL_SIB_CACHE_N 32
++#define HTML_RL_SIB_CACHE_N 256	/* patch 463, as above */
+ struct html_rl_sib_sheet {
+ 	struct hlcache_handle *sheet;
+ 	const uint8_t *data;
+@@ -12480,13 +12537,29 @@
+ static struct html_rl_sib_sheet html_rl_sib_cache[HTML_RL_SIB_CACHE_N];
+ static unsigned int html_rl_sib_cache_next;
+ 
+-static uint32_t html_rl_fnv1a(const uint8_t *s, size_t len)
+-{
+-	uint32_t h = 2166136261u;
+-	size_t i;
+-	for (i = 0; i < len; i++) {
+-		h ^= s[i];
+-		h *= 16777619u;
++
++/* Patch 463: a cache entry's validity check that does not read the whole
++ * sheet: the same handle with the same data pointer and size, and the
++ * same bytes at four 64-byte spans. html_rl_fnv1a over the whole source
++ * on every lookup -- hits included -- was the largest single cost of the
++ * local path on youtube (its sheets are hundreds of KB, checked per mark
++ * per sheet). A <style> whose text changes gets a new sheet content (a
++ * new handle), so in-place edits of one source are not the case guarded. */
++static uint32_t html_rl_sample_hash(const uint8_t *s, size_t len)
++{
++	uint32_t h = 2166136261u ^ (uint32_t)len;
++	size_t at[4], k, i, n;
++
++	at[0] = 0;
++	at[1] = len / 3;
++	at[2] = (len / 3) * 2;
++	at[3] = len > 64 ? len - 64 : 0;
++	for (k = 0; k < 4; k++) {
++		n = len - at[k] < 64 ? len - at[k] : 64;
++		for (i = 0; i < n; i++) {
++			h ^= s[at[k] + i];
++			h *= 16777619u;
++		}
+ 	}
+ 	return h;
+ }
+@@ -12525,7 +12598,7 @@
+ 	data = content_get_source_data(sheet, &size);
+ 	if (data == NULL || size == 0)
+ 		return NULL;
+-	hash = html_rl_fnv1a(data, size);
++	hash = html_rl_sample_hash(data, size);	/* patch 463 */
+ 	for (k = 0; k < HTML_RL_SIB_CACHE_N; k++) {
+ 		if (html_rl_sib_cache[k].sheet == sheet) {
+ 			e = &html_rl_sib_cache[k];
+@@ -12551,9 +12624,12 @@
+ 		struct html_rl_sib_compound *empty_cp = NULL;
+ 		struct html_rl_sib_compound *has_cp = NULL;
+ 		int nlefts = 0, nrules = 0, nempty = 0, nhas = 0, r;
++		extern double macos9_micros(void);
++		double t = macos9_micros();	/* patch 463 */
+ 		r = html_rl_scan_sheet(data, size, &lefts, &nlefts,
+ 				&rules, &nrules, &empty_cp, &nempty,
+ 				&has_cp, &nhas);
++		html_rl_fill_us += macos9_micros() - t;
+ 		if (r == 2) {
+ 			e->state = 2;
+ 		} else if (r == 1) {
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -1423,6 +1423,7 @@
+  * spent twice the budget trips whatever is left, so the worst case stays
+  * near 309's (budget + full): about 2 x budget plus the mark in hand. */
+ static int g_guard_continued;	/* per batch: the "continuing" line once */
++extern double html_rl_fill_us;	/* patch 463 (html.c) */
+ static int macos9_reconvert_guard_trips(double spent, double budget,
+ 		int answered, int left)
+ {
+@@ -1497,6 +1498,7 @@
+ 				    * initial conversion): the round-3
+ 				    * 5000-paragraph full reconvert. */
+ 	t0 = macos9_micros();
++	html_rl_fill_us = 0.0;	/* patch 463: cache fills are not this batch's cost */
+ 	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
+ 			g_pending[i].kind, g_pending[i].old_class,
+ 			g_pending[i].attr_name, g_pending[i].rm_state,
+@@ -1525,7 +1527,8 @@
+ 		/* Patch 309 - the guard is checked before each further mark;
+ 		 * the primary's cost is already in the cumulative t0 above.
+ 		 * Patch 452: on the marks left, not the cost already spent */
+-		if (macos9_reconvert_guard_trips(macos9_micros() - t0, budget,
++		if (macos9_reconvert_guard_trips(macos9_micros() - t0 -
++				html_rl_fill_us, budget,
+ 				1 + j, g_pending[i].extra_n - j +
+ 				(deferred >= 0 ? 1 : 0))) {
+ 			g_fc_reason = 4;
+@@ -1552,7 +1555,8 @@
+ 	if (deferred >= 0) {
+ 		/* Patch 309 - the retry is one more local answer; it counts
+ 		 * against the same budget (452: as one mark left). */
+-		if (macos9_reconvert_guard_trips(macos9_micros() - t0, budget,
++		if (macos9_reconvert_guard_trips(macos9_micros() - t0 -
++				html_rl_fill_us, budget,
+ 				1 + g_pending[i].extra_n, 1)) {
+ 			g_fc_reason = 4;
+ 			return 0;
