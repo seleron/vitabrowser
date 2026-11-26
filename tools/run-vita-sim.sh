@@ -458,6 +458,8 @@ JS-count-flex file:///app0:/testpages/JS-count-flex.html
 CSS-count-flex-ref file:///app0:/testpages/CSS-count-flex-ref.html
 JS-id-sib file:///app0:/testpages/JS-id-sib.html
 CSS-id-sib-ref file:///app0:/testpages/CSS-id-sib-ref.html
+JS-unmeasured-ib file:///app0:/testpages/JS-unmeasured-ib.html
+CSS-unmeasured-ib-ref file:///app0:/testpages/CSS-unmeasured-ib-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2591,6 +2593,16 @@ k472d=$(printf '%s\n' "$k472seg" | grep -c "declined (an id change" || true)
 k472f=$(printf '%s\n' "$k472seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-id-sib: rows $k472r (0), parent rebuilt for a sibling-watched id ${k472p} (1), declines ${k472d} (0), full rebuilds ${k472f} (0)"
 [ "$k472r" = 0 ] && [ "${k472p:-0}" -ge 1 ] && [ "${k472d:-1}" -eq 0 ] && [ "${k472f:-1}" -eq 0 ] || fail "an id a sibling rule watches, on a boxed element"
+# Patch 473: 441's guard, run on purpose -- the simulator's test hook
+# leaves inline-blocks carrying data-vb-unmeasured unmeasured; line layout
+# measures them (441) and names them (449). One at load, one appended.
+k473r=$(fl_rows JS-unmeasured-ib CSS-unmeasured-ib-ref)
+k473seg=$(awk '/ page [0-9]+\/[0-9]+ JS-unmeasured-ib: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k473h=$(printf '%s\n' "$k473seg" | grep -c "test hook: an inline-block left unmeasured" || true)
+k473g=$(printf '%s\n' "$k473seg" | grep -c "an inline-block with no min/max widths, measured in line layout" || true)
+k473p=$(printf '%s\n' "$k473seg" | grep -ci "LIFE layout: the inline-block: <span" || true)
+echo "  JS-unmeasured-ib: rows $k473r (0), hook left unmeasured ${k473h} (2 or more), 441's guard measured ${k473g} (2 or more), 449's probe named ${k473p} (2 or more)"
+[ "$k473r" = 0 ] && [ "${k473h:-0}" -ge 2 ] && [ "${k473g:-0}" -ge 2 ] && [ "${k473p:-0}" -ge 2 ] || fail "441's unmeasured inline-block guard, run by the test hook"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

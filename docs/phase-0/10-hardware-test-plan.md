@@ -16856,3 +16856,46 @@ libcss, libdom instrumented):
   - structural selectors or counters 0.7.
 
 No sudo.
+
+## Patch 473 (2026-11-27): a simulator-only test hook that runs 441's unmeasured inline-block guard
+
+**Problem** (run-close item, post-469).
+- 441 measures an inline-block that reaches line layout with no min/max
+  widths. Before 441 that asserted in pass 2 (wpblog, after a local
+  rebuild); 449 names the box.
+- The live trigger has not recurred in 70+ loads, so no gate page ran the
+  guard. It was **the only guard never run under ASan**.
+
+**No natural trigger.** A probe page of six local-rebuild shapes never
+left an inline-block unmeasured. The shapes: inline-blocks appended,
+restyled to and from inline-block, replaced by `innerHTML`, their text and
+their inner text changed, a width set. Those paths either invalidate
+correctly (`html_rl_invalidate` marks the box and its ancestors) or build
+fresh line containers.
+
+**Fix** (`content/handlers/html/layout.c`, a test hook).
+- In the simulator only, `layout_minmax_line` leaves a fresh inline-block
+  whose element carries `data-vb-unmeasured` unmeasured, as 441 found
+  one. Line layout then meets it with no min/max widths, and 441's guard
+  measures it with its real code.
+- It is compiled under `#ifdef VITA_HOST_SIM`, which `frontends/vita`'s
+  Makefile defines only for its sim target (`ifeq ($(VITA_HOST_SIM),YES)`).
+  **The device build never has it.**
+- Logged: "LIFE layout: test hook: an inline-block left unmeasured
+  (data-vb-unmeasured)", then 441's "measured in line layout" and 449's
+  two naming lines.
+
+**Gate.**
+- New pair **JS-unmeasured-ib / CSS-unmeasured-ib-ref**: one marked
+  inline-block in the page at load, and a second appended by script (a
+  local rebuild of its line).
+- Mini run and gate: **the hook left 2 unmeasured, 441's guard measured
+  2, 449's probe named both** (`<SPAN class="ib">` in `<P id="p1">` /
+  `<P id="p2">`); rows 0.
+- **gate473 exit 0** on the first run; interaction 52/52.
+- `restage-full.sh`: **555 applied plus the 2 known collisions**.
+- The ASan autotest runs the gate's page list, so the next one runs 441's
+  guard under ASan.
+
+No behaviour change outside the simulator. wpblog's body-wide "over"
+batch (464) is left as it is, pending the owner's ruling. No sudo.

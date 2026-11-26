@@ -1,0 +1,73 @@
+# netsurf: a simulator-only test hook that runs 441's unmeasured inline-block guard (patch 473)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 472)
+#
+# 441 measures an inline-block that reaches line layout with no min/max
+# widths (it asserted in pass 2 before: wpblog, after a local rebuild);
+# 449 names the box. The live trigger has not recurred in 70+ loads, so no
+# gate page ran the guard and it was the only guard never run under ASan.
+# A probe page of six local-rebuild shapes (inline-blocks appended,
+# restyled, replaced by innerHTML, their text changed) never left one
+# unmeasured: those paths invalidate correctly or build fresh lines. In
+# the simulator only (#ifdef VITA_HOST_SIM: frontends/vita's sim target;
+# the device build never has it), layout_minmax_line now leaves a fresh
+# inline-block whose element carries data-vb-unmeasured unmeasured, as
+# 441 found one, so line layout meets it and the guard runs: a gate page
+# (JS-unmeasured-ib) puts one in the page at load and appends a second.
+# Logged: "test hook: an inline-block left unmeasured (data-vb-unmeasured)",
+# then 441's and 449's lines.
+#
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -847,6 +847,26 @@
+ 	return b->style;
+ }
+ 
++#ifdef VITA_HOST_SIM
++/* patch 473: does this inline-block's element carry data-vb-unmeasured? */
++static bool vb473_unmeasured(struct box *b)
++{
++	static dom_string *name = NULL;
++	bool has = false;
++
++	if (b == NULL || b->node == NULL)
++		return false;
++	if (name == NULL &&
++	    dom_string_create((const uint8_t *)"data-vb-unmeasured", 18,
++			&name) != DOM_NO_ERR)
++		return false;
++	if (dom_element_has_attribute((dom_element *)b->node, name, &has) !=
++			DOM_NO_ERR)
++		return false;
++	return has;
++}
++#endif
++
+ /**
+  * Calculate minimum and maximum width of a line.
+  *
+@@ -923,6 +943,24 @@
+ 
+ 		if (b->type == BOX_INLINE_BLOCK || b->type == BOX_INLINE_FLEX ||
+ 				b->type == BOX_INLINE_GRID) {
++#ifdef VITA_HOST_SIM
++			/* VitaBrowser patch 473: a simulator-only test hook for
++			 * 441's guard, whose live trigger (wpblog) has not
++			 * recurred: a fresh inline-block carrying
++			 * data-vb-unmeasured is left unmeasured here, as 441
++			 * found one, so line layout meets it with no min/max
++			 * widths and the guard measures it (a gate page runs it
++			 * under ASan). Never built for the device. */
++			if (b->max_width == UNKNOWN_MAX_WIDTH &&
++			    vb473_unmeasured(b)) {
++				macsurf_debug_log_writef("LIFE layout: test hook: "
++					"an inline-block left unmeasured "
++					"(data-vb-unmeasured)");
++				if (b->flags & HAS_HEIGHT)
++					*line_has_height = true;
++				continue;
++			}
++#endif
+ 			layout_minmax_block(b, font_func, content);
+ 			if (min < b->min_width)
+ 				min = b->min_width;
