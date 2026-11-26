@@ -16287,3 +16287,47 @@ youtube's 1.0 a load of "two" batches.
 - `restage-full.sh`: **550 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 468, census 467 vs 468
+
+**ASan at 468** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 430 page
+  dumps (gate 430), 0 AddressSanitizer errors, the log to page 374 of
+  374.
+- Under it, the new no-op ("attribute on an object's box, nothing to
+  rebuild") ran 8 times.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 467 | 468 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 1 / 0 / 0 (0.3) | 0 / 1 / 1 (0.7) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| google | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| github | 2 / 0 / 0 (0.7) | 0 / 0 / 0 (0.0) |
+| youtube | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** |
+| **total** | 6 / 3 / 3 (**4.0**) | 2 / 3 / 3 (**2.7**) |
+
+- **The real gain: youtube -1.0.**
+  - Its "two" batches answered: "block is not one line container" 2.0
+    -> 0.
+  - Answered: data-atf and data-iml once each a load, and aria-label
+    twice a load (on object boxes).
+- **The noise:** oldreddit (+0.3) and github (-0.7) are cost-guard trips
+  only: 467 1 + 2, 468 2 + 0.
+- No crash or assertion in 42 loads.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+6.0 (465) -> 4.3 (466) -> 3.3 (467; 4.0 for 467 in this run) -> **2.7
+(468)**, guard noise included (0.7 a load in this run).
+
+**Remaining full rebuilds a load, apart from the guard:**
+- **wpblog 1.0**: its "over" batch, too wide (`<body>`), by design;
+- **wpnews 1.0**: "a sibling selector can match on the aria-expanded
+  attribute", on a `<button>` that has later siblings: the parent rebuild
+  445 tries cannot take it.
+
+No sudo.
