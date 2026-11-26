@@ -456,6 +456,8 @@ JS-restyle-odd-parent file:///app0:/testpages/JS-restyle-odd-parent.html
 CSS-restyle-odd-parent-ref file:///app0:/testpages/CSS-restyle-odd-parent-ref.html
 JS-count-flex file:///app0:/testpages/JS-count-flex.html
 CSS-count-flex-ref file:///app0:/testpages/CSS-count-flex-ref.html
+JS-id-sib file:///app0:/testpages/JS-id-sib.html
+CSS-id-sib-ref file:///app0:/testpages/CSS-id-sib-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2077,7 +2079,8 @@ echo "  JS-inline-mid: rows $k416r (0), between blocks ${k416m} (2), lines of th
 # Patch 417: attributes a sheet can see, re-selected as a class change:
 # data-state, aria-pressed, data-x (3) restyled locally; an attribute on a
 # <style> renders nothing (1); data-y (a sibling rule) declines (1); the
-# id change keeps the kind decline -- two full rebuilds on the page.
+# id change keeps the kind decline -- two full rebuilds on the page
+# (445: one; 472: none).
 k417r=$(fl_rows JS-attr-restyle CSS-attr-restyle-ref)
 k417seg=$(awk '/ page [0-9]+\/[0-9]+ JS-attr-restyle: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k417a=$(printf '%s\n' "$k417seg" | grep -c "attribute change, as a class change" || true)
@@ -2087,8 +2090,12 @@ k417d=$(printf '%s\n' "$k417seg" | grep -c "declined (a sibling selector can mat
 # the id change keeps its full rebuild
 k417p=$(printf '%s\n' "$k417seg" | grep -c "a sibling selector can match on the data-y attribute: the parent, built again whole" || true)
 k417f=$(printf '%s\n' "$k417seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
-echo "  JS-attr-restyle: rows $k417r (0), re-selected ${k417a} (3 or more), renders nothing ${k417n} (1), sibling parent rebuilt ${k417p} (1), sibling declines ${k417d} (0), full rebuilds ${k417f} (1)"
-[ "$k417r" = 0 ] && [ "${k417a:-0}" -ge 3 ] && [ "${k417n:-0}" -eq 1 ] && [ "${k417p:-0}" -eq 1 ] && [ "${k417d:-1}" -eq 0 ] && [ "${k417f:-0}" -eq 1 ] || fail "attributes a sheet can see"
+# Patch 472: the page's sheet has no sibling rule naming an id, so the
+# id change on a boxed element is re-selected locally too -- no full
+# rebuild on the page any more
+k417i=$(printf '%s\n' "$k417seg" | grep -c "id change on an element with a box, no sibling rule names an id" || true)
+echo "  JS-attr-restyle: rows $k417r (0), re-selected ${k417a} (3 or more), renders nothing ${k417n} (1), sibling parent rebuilt ${k417p} (1), sibling declines ${k417d} (0), boxed id changes local ${k417i} (1), full rebuilds ${k417f} (0)"
+[ "$k417r" = 0 ] && [ "${k417a:-0}" -ge 3 ] && [ "${k417n:-0}" -eq 1 ] && [ "${k417p:-0}" -eq 1 ] && [ "${k417d:-1}" -eq 0 ] && [ "${k417i:-0}" -ge 1 ] && [ "${k417f:-1}" -eq 0 ] || fail "attributes a sheet can see"
 # Patch 418: DOMParser's image/svg+xml document element is the <svg> (a
 # text/html one keeps <html>); appended between blocks it is placed
 # locally (417's replaced leaf), no full rebuild.
@@ -2575,6 +2582,15 @@ k471c=$(printf '%s\n' "$k471seg" | grep -c "restyled box's counting changed, ful
 k471d=$(printf '%s\n' "$k471seg" | grep -c "declined (the restyled flex or grid box takes part in counting)" || true)
 echo "  JS-count-flex: rows $k471r (0), counting unchanged rebuilt alone ${k471u} (1), counting changed given up ${k471c} (1), declines ${k471d} (0)"
 [ "$k471r" = 0 ] && [ "${k471u:-0}" -ge 1 ] && [ "${k471c:-0}" -ge 1 ] && [ "${k471d:-1}" -eq 0 ] || fail "a counting flex box restyled with its counting unchanged"
+# Patch 472: an id a sibling rule watches (#on + p) set on a boxed <div>:
+# the parent built again whole; no decline, no full rebuild.
+k472r=$(fl_rows JS-id-sib CSS-id-sib-ref)
+k472seg=$(awk '/ page [0-9]+\/[0-9]+ JS-id-sib: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k472p=$(printf '%s\n' "$k472seg" | grep -c "a sibling selector can match on the id attribute: the parent" || true)
+k472d=$(printf '%s\n' "$k472seg" | grep -c "declined (an id change" || true)
+k472f=$(printf '%s\n' "$k472seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-id-sib: rows $k472r (0), parent rebuilt for a sibling-watched id ${k472p} (1), declines ${k472d} (0), full rebuilds ${k472f} (0)"
+[ "$k472r" = 0 ] && [ "${k472p:-0}" -ge 1 ] && [ "${k472d:-1}" -eq 0 ] && [ "${k472f:-1}" -eq 0 ] || fail "an id a sibling rule watches, on a boxed element"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

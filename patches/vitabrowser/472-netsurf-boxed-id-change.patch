@@ -1,0 +1,88 @@
+# netsurf: an id change on an element with a box, re-selected like any attribute unless a sibling rule names an id (patch 472)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 471)
+#
+# "declined (an id change: #id selectors are not scanned)" -- 2.7 a load on
+# the 21-site census (rte, claude). 417 refused every id change (#id
+# selectors are not in the attribute scans); 466 answered one on an
+# element with no box by the whole-document walk. On an element with a
+# box an #id selector matching the old or the new id reaches the element,
+# its subtree and -- through a sibling rule (#x + Y, #x ~ Y Z) -- its
+# later siblings; :has() never matches here (328). The 186 sibling cache
+# records each left compound's id, so html_rl_id_sibling_risk asks whether
+# any sheet's sibling rule names an id (a sheet whose sibling scan gave up
+# counts as yes). With no such rule the change is re-selected as any
+# attribute is (417: as a class change; an [id] attribute selector still
+# meets 417's own sibling check); with one, the parent -- or the nearest
+# block above it -- is built again whole (445 / 469). Logged: "id change
+# on an element with a box, no sibling rule names an id" / "a sibling
+# selector can match on the id attribute: the parent ..." / "declined (an
+# id change a sibling rule may see)".
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -14752,6 +14752,36 @@
+ 	return depth != 0;
+ }
+ 
++/* Patch 472: could an id change reach a sibling? Only through a sibling
++ * rule whose left compound names an id (#x + Y, #x ~ Y Z): the 186 cache
++ * records each left compound's id. A sheet whose sibling scan gave up
++ * (state 2) is taken as a risk. ([id...] attribute selectors are 417's
++ * html_rl_attr_sibling_risk(c, "id").) */
++static bool html_rl_id_sibling_risk(html_content *c)
++{
++	unsigned int si;
++	int k;
++
++	for (si = STYLESHEET_START; si < c->stylesheet_count; si++) {
++		struct html_rl_sib_sheet *sh;
++		if (c->stylesheets[si].sheet == NULL ||
++		    c->stylesheets[si].unused)
++			continue;
++		sh = html_rl_sib_sheet_for(c->stylesheets[si].sheet);
++		if (sh == NULL)
++			continue;
++		if (sh->state == 2)
++			return true;
++		for (k = 0; k < sh->nlefts; k++)
++			if (sh->lefts[k].id != NULL)
++				return true;
++		for (k = 0; k < sh->nrules; k++)
++			if (sh->rules[k].l.id != NULL)
++				return true;
++	}
++	return false;
++}
++
+ /* Patch 417: generalised from style to any attribute name (lowercase) */
+ static bool html_rl_attr_sibling_risk(html_content *c, const char *name)
+ {
+@@ -15206,9 +15236,24 @@
+ 				"re-cascaded");
+ 			return html_rl_doc_noop(c, "id change") == 0 ? 0 : -1;
+ 		}
+-		macsurf_debug_log_writef("LIFE rebuild local: declined (an id "
+-			"change: #id selectors are not scanned)");
+-		return -1;
++		/* Patch 472: on an element with a box. An #id selector
++		 * matching the old or the new id reaches the element, its
++		 * subtree (re-selected below, as any attribute: 417) and,
++		 * through a sibling rule, its later siblings -- only where a
++		 * sibling rule's left compound names an id. Then the parent
++		 * (or the nearest block above it) is built again whole
++		 * (445 / 469). Was: every boxed id change declined (rte,
++		 * claude: 2.7 a load). */
++		if (html_rl_id_sibling_risk(c)) {
++			if (html_rl_sib_parent_rebuild(c, (dom_node *)vnode,
++					"id") == 0)
++				return 0;
++			macsurf_debug_log_writef("LIFE rebuild local: declined "
++				"(an id change a sibling rule may see)");
++			return -1;
++		}
++		macsurf_debug_log_writef("LIFE rebuild local: id change on an "
++			"element with a box, no sibling rule names an id");
+ 	}
+ 	for (k = 0; attr_name[k] != '\0'; k++)
+ 		name[k] = (char)tolower((unsigned char)attr_name[k]);

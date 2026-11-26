@@ -16760,3 +16760,54 @@ background) in the line 2.0 (rte); a flex box holding controls or frames
 (wikipedia). Over 4.0, guard 4.3.
 
 No sudo.
+
+## Patch 472 (2026-11-27): an id change on an element with a box, re-selected like any attribute unless a sibling rule names an id
+
+**Problem.** "declined (an id change: #id selectors are not scanned)",
+**2.7 a load** on the 21-site census (rte, claude).
+- 417 refused every id change, because `#id` selectors are not in the
+  attribute scans.
+- 466 answered one on an element with **no** box by the whole-document
+  walk; on a boxed element it kept the decline.
+
+**Fix** (html.c, `html_reconvert_local_attr_restyle`).
+- An `#id` selector matching the old or the new id reaches the element,
+  its subtree, and, through a sibling rule (`#x + Y`, `#x ~ Y Z`), its
+  later siblings. `:has()` never matches here (328).
+- The 186 sibling cache records each left compound's id.
+  `html_rl_id_sibling_risk` asks whether any sheet's sibling rule names an
+  id; a sheet whose sibling scan gave up counts as yes.
+- **No such rule:** the change is re-selected as any attribute is (417:
+  as a class change). An `[id]` attribute selector still meets 417's own
+  sibling check.
+- **Such a rule:** the parent, or the nearest block above it, is built
+  again whole (445 / 469).
+- Logged: "id change on an element with a box, no sibling rule names an
+  id" / "a sibling selector can match on the id attribute: the parent
+  ..." / "declined (an id change a sibling rule may see)".
+
+**Measured** (rte, claude; 3 loads per arm, one interleaved run):
+
+| site | 471 | 472 | the new path ran |
+|---|---|---|---|
+| rte | 2 / 2 / 2 (2.0) | **1 / 1 / 1 (1.0)** | 15 times, all with a sibling rule naming an id: parent built again whole |
+| claude | 6 / 5 / 7 (6.0) | **6 / 3 / 3 (4.0)** | twice; "local" full rebuilds 6 -> 0; guard 8 -> 8 |
+
+- The boxed-id decline went 2.0 -> 0; no crash.
+- On the same batches, "structural change at the root: a child with a
+  box changed" and "structural selectors or counters in page CSS" each
+  went 2.7 -> 0: they were later marks of batches the id decline had
+  ended first.
+
+**Gate.**
+- New pair **JS-id-sib / CSS-id-sib-ref**: `#on + p` watches an id; a
+  boxed `<div>` gains `id="on"`. The parent is built again whole: rows 0,
+  0 declines, 0 full rebuilds.
+- **JS-attr-restyle's check updated before gating** (the 471 lesson:
+  grep for every check that names the decline). Its sheet names no id in
+  a sibling rule, so its boxed id change is now re-selected locally: 1
+  boxed id change local, full rebuilds 1 -> 0.
+- **gate472 exit 0** on the first run; interaction 52/52.
+- `restage-full.sh`: **554 applied plus the 2 known collisions**.
+
+No sudo.
