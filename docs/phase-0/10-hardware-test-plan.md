@@ -16049,3 +16049,63 @@ libcss, libdom instrumented):
   more than blocks.
 
 No sudo.
+
+## Patch 466 (2026-11-27): the root's child list and a box-less element's id answered by the whole-document walk
+
+**Problem.** wpblog's "two" batch, **1.0 a load** in the 465 census. A
+probe that logged every failing mark showed one script action: a
+`<fieldset>` with no box made a child of `<html>` (before `<head>`), with
+its id set in the same task. Three marks declined:
+1. **The root's child list, seen by a structural rule.** 404 rebuilds
+   the parent's subtree, but the root's box has no parent to rebuild it
+   in ("restyled `<html>` box type 0 in `<->` ... not in a block").
+2. **The root's child list again, seen by a sibling rule.** 446 builds
+   the parent again whole: the same dead end ("no parent box").
+3. **The id.** 417 refused every id change, **silently**, because `#id`
+   selectors are not in the attribute scans. This was the second decline
+   that made the batch "two"; no log line named it.
+
+**Fix** (html.c). Each is answered by the whole-document walk
+(`html_rl_doc_noop`, 419 / 447 / 459). It re-cascades every element
+against the DOM as it is now, then:
+- restyles what changed (up to 8 elements, the root in place);
+- or declines when a rebuild is needed (an element that would get a
+  box).
+
+Scope:
+- `html_rl_struct_parent_rebuild` takes the walk for a root parent only
+  when every changed child has no box (new argument `boxless`). The walk
+  goes over the DOM, so a boxed child removed or added at the root keeps
+  the full rebuild.
+- 446's sibling decline takes it for the root, box-less case only.
+- **An id on an element with no box** takes the walk. An id on an
+  element **with** a box keeps the full rebuild (a `+` / `~` `#id` rule
+  could restyle every sibling), now logged: "declined (an id change:
+  #id selectors are not scanned)".
+- Logged: "structural change at the root ...", "a sibling rule may see
+  the root's child-list change ...", "id change on an element with no
+  box, the document re-cascaded".
+
+**Measured** (wpblog only, 3 loads per arm, one interleaved run):
+- wpblog **3 / 3 / 3 (3.0) -> 2 / 2 / 2 (2.0)**; "two" 1.0 -> 0.
+- Each walk ran once a load and restyled nothing (466 elements
+  re-cascaded, about 18 ms each).
+- No guard trip in 3 loads. A one-load probe run showed one on a later
+  72-mark batch, 5 ms over its budget: timing noise.
+- Left on wpblog: "local" 1.0 (a parent holding more than blocks) and
+  "over" 1.0 (too wide: `<body>`).
+
+**Gate.**
+- New pair **JS-root-struct / CSS-root-struct-ref**: in one task, a
+  `<template>` inserted before `<head>`, then its id set.
+  - Rules: `head:first-child + body .box`, `template + head + body
+    .tail`, `#tt + head + body .box2`.
+  - The root sibling change restyled 3 elements in place; the id walk
+    found nothing left to restyle.
+  - Rows 0, no full rebuild.
+- JS-attr-restyle unchanged: its boxed id change keeps its 1 full
+  rebuild.
+- **gate466 exit 0**; interaction 52/52.
+- `restage-full.sh`: **548 applied plus the 2 known collisions**.
+
+No sudo.

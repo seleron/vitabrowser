@@ -444,6 +444,8 @@ JS-over-coalesce file:///app0:/testpages/JS-over-coalesce.html
 CSS-over-coalesce-ref file:///app0:/testpages/CSS-over-coalesce-ref.html
 JS-sib-root-attr file:///app0:/testpages/JS-sib-root-attr.html
 CSS-sib-root-attr-ref file:///app0:/testpages/CSS-sib-root-attr-ref.html
+JS-root-struct file:///app0:/testpages/JS-root-struct.html
+CSS-root-struct-ref file:///app0:/testpages/CSS-root-struct-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2491,6 +2493,17 @@ k465p=$(printf '%s\n' "$k465seg" | grep -c "a sibling selector can match on the 
 k465f=$(printf '%s\n' "$k465seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-sib-root-attr: rows $k465r (0), sibling risks reaching nothing ${k465n} (2), parent rebuilds ${k465p} (1), full rebuilds ${k465f} (0)"
 [ "$k465r" = 0 ] && [ "${k465n:-0}" -ge 2 ] && [ "${k465p:-0}" -ge 1 ] && [ "${k465f:-1}" -eq 0 ] || fail "a sibling-rule attribute on the root or a last child answered locally"
+# Patch 466: a <template> inserted before <head> (a child-list change on
+# the root a sibling rule can see) and its id set in the same batch (an
+# id on an element with no box): both answered by the whole-document walk,
+# no full rebuild.
+k466r=$(fl_rows JS-root-struct CSS-root-struct-ref)
+k466seg=$(awk '/ page [0-9]+\/[0-9]+ JS-root-struct: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k466s=$(printf '%s\n' "$k466seg" | grep -c "sibling change at the root: [0-9]* element(s) restyled in place" || true)
+k466i=$(printf '%s\n' "$k466seg" | grep -c "id change on an element with no box, the document re-cascaded" || true)
+k466f=$(printf '%s\n' "$k466seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-root-struct: rows $k466r (0), root sibling changes restyled in place ${k466s} (1), box-less id changes re-cascaded ${k466i} (1), full rebuilds ${k466f} (0)"
+[ "$k466r" = 0 ] && [ "${k466s:-0}" -ge 1 ] && [ "${k466i:-0}" -ge 1 ] && [ "${k466f:-1}" -eq 0 ] || fail "the root's child list and a box-less id answered by the document walk"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

@@ -1,0 +1,154 @@
+# netsurf: the root's child list and a box-less element's id answered by the whole-document walk (patch 466)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 465)
+#
+# wpblog's "two" batch (1.0 a load): a <fieldset> with no box made a child
+# of <html>, before <head>, its id set in the same task. Three marks
+# declined:
+# - the root's child list, a structural rule seeing it: 404 rebuilds the
+#   parent's subtree, and the root's box has no parent to rebuild it in
+#   ("restyled <html> ... not in a block");
+# - the root's child list again, a sibling rule seeing it: 446 builds the
+#   parent again whole, the same dead end ("no parent box");
+# - the id: 417 refused every id change, silently (#id selectors are not
+#   in the attribute scans).
+# Each is now answered by the whole-document walk (html_rl_doc_noop,
+# 419 / 447 / 459), which re-cascades every element against the DOM as it
+# is now and restyles what changed (hits, the root in place) or declines
+# when a rebuild is needed (an element that would get a box). Only for
+# changes in elements with no box: the walk goes over the DOM, so a boxed
+# child removed or added at the root keeps the full rebuild (the 404 path
+# is told so, html_rl_struct_parent_rebuild's boxless). An id on an element
+# WITH a box keeps the full rebuild, now logged ("declined (an id change:
+# #id selectors are not scanned)").
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9723,10 +9723,34 @@
+ 	return -1;
+ }
+ static int html_rl_struct_parent_rebuild(html_content *c, dom_node *pnode,
+-		struct box *pbox, double t0)
++		struct box *pbox, double t0, bool boxless)
+ {
+ 	extern double macos9_micros(void);
+ 	static unsigned long struct_n;
++#define RL_ROOT_NO(w) do { macsurf_debug_log_writef("LIFE rebuild local: " \
++		"structural change at the root: declined (%s)", (w)); \
++		return -1; } while (0)
++	/* Patch 466: the root's child list (wpblog: an element with no box
++	 * added beside <body>, a structural rule seeing it). Its subtree is
++	 * the document and its box has no parent to rebuild it in; the
++	 * whole-document walk (419 / 447 / 459) re-cascades every element
++	 * against the DOM as it is now and restyles what changed (the hits,
++	 * the root in place) -- or declines as a rebuild would be needed.
++	 * Only when every changed child has no box (boxless): the walk goes
++	 * over the DOM, so a removed child's box would stay and a new one's
++	 * would be missing ("an element without a box would get one") */
++	if (pbox == c->layout && pbox->parent == NULL) {
++		if (!boxless)
++			RL_ROOT_NO("a child with a box changed");
++		if (html_rl_doc_noop(c, "structural change at the root") != 0)
++			return -1;
++		struct_n++;
++		macsurf_debug_log_writef("LIFE rebuild local: structural "
++			"change at the root: the document re-cascaded in %ld us "
++			"(%lu so far)", (long)(macos9_micros() - t0), struct_n);
++		return 0;
++	}
++#undef RL_ROOT_NO
+ 	if (pbox->type != BOX_BLOCK) {
+ 		macsurf_debug_log_writef("LIFE rebuild local: structural "
+ 			"change: the parent is not a plain block");
+@@ -9765,6 +9789,7 @@
+ 	int delta, total = 0;
+ 	const char *why = NULL;
+ 	const char *sib_why = NULL;		/* patch 446 */
++	bool sib_boxless = false;		/* patch 466 */
+ 	const char *obj_why = NULL;		/* patch 454 */
+ 	const char *obj_decl = NULL;		/* patch 457: its decline */
+ 	static unsigned long block_n;
+@@ -10182,8 +10207,11 @@
+ 				html_rl_childlist_removal ? 1 : 0, true) :
+ 		    html_rl_block_sibling_risk(c, pnode, skipped, nskip,
+ 				NULL, 0, false))
++		{
++			sib_boxless = true;	/* patch 466 */
+ 			RL_BSIB("sibling combinator may see an element with no "
+ 				"box");
++		}
+ 		for (i = 0; i < nskip; i++)
+ 			dom_node_unref(skipped[i]);
+ 		if (struct_hit && snarrow && nshits > 0) {	/* patch 405 */
+@@ -10195,7 +10223,8 @@
+ 		html_rl_struct_hits_release(shits, &nshits);
+ 		if (struct_hit)		/* patch 404 */
+ 			return html_rl_struct_parent_rebuild(c, pnode, pbox,
+-					t0) == 0 ? 0 : html_rl_struct_declined();
++					t0, true) == 0 ? 0 :
++					html_rl_struct_declined();
+ 		macsurf_debug_log_writef("LIFE rebuild local: child list "
+ 			"changed only in elements with no box (%u), nothing to "
+ 			"rebuild", nskip);
+@@ -10354,7 +10383,8 @@
+ 			dom_node_unref(added[i]);
+ 		for (i = 0; i < nskip; i++)
+ 			dom_node_unref(skipped[i]);
+-		return html_rl_struct_parent_rebuild(c, pnode, pbox, t0) == 0 ?
++		return html_rl_struct_parent_rebuild(c, pnode, pbox, t0,
++				false) == 0 ?
+ 			0 : html_rl_struct_declined();
+ 	}
+ 	/* patch 405: narrow -- the blocks are placed as usual below, and
+@@ -10687,6 +10717,19 @@
+ 			return html_rl_block_whole(c, pnode, pbox, t0,
+ 				"a sibling rule may see the child-list change: "
+ 				"the parent");
++		/* Patch 466: the root's child list, only elements with no
++		 * box changed (wpblog: the root's second mark) -- the
++		 * whole-document walk re-cascades every element, siblings
++		 * and their subtrees included, against the DOM as it is */
++		if (pbox == c->layout && pbox->parent == NULL &&
++		    sib_boxless) {
++			macsurf_debug_log_writef("LIFE rebuild local: a sibling "
++				"rule may see the root's child-list change (%s)",
++				sib_why);
++			if (html_rl_doc_noop(c, "sibling change at the root") ==
++					0)
++				return 0;
++		}
+ 		{	/* patch 447: name the parent the rebuild cannot take */
+ 			char *ptag = html_rl_struct_tag(pnode);
+ 			macsurf_debug_log_writef("LIFE rebuild local: declined "
+@@ -14713,9 +14756,29 @@
+ 	int r;
+ 
+ 	if (c == NULL || vnode == NULL || attr_name == NULL ||
+-	    attr_name[0] == '\0' || strlen(attr_name) >= sizeof(name) ||
+-	    strcasecmp(attr_name, "id") == 0)
++	    attr_name[0] == '\0' || strlen(attr_name) >= sizeof(name))
+ 		return -1;
++	if (strcasecmp(attr_name, "id") == 0) {
++		/* Patch 466: an id on an element with no box (wpblog: a
++		 * <fieldset> made a child of <html>, its id set in the same
++		 * batch). #id selectors are not in the attribute scans, so
++		 * what the id reaches is not known here -- but the
++		 * whole-document walk re-cascades every element against the
++		 * DOM as it is (its own style, its later siblings, its
++		 * subtree) and restyles what changed, or declines when the
++		 * element would get a box. An element with a box keeps the
++		 * full rebuild (its box's style is the walk's to change, but
++		 * a +/~ #id rule could restyle up to every sibling). */
++		if (box_for_node((dom_node *)vnode) == NULL) {
++			macsurf_debug_log_writef("LIFE rebuild local: id "
++				"change on an element with no box, the document "
++				"re-cascaded");
++			return html_rl_doc_noop(c, "id change") == 0 ? 0 : -1;
++		}
++		macsurf_debug_log_writef("LIFE rebuild local: declined (an id "
++			"change: #id selectors are not scanned)");
++		return -1;
++	}
+ 	for (k = 0; attr_name[k] != '\0'; k++)
+ 		name[k] = (char)tolower((unsigned char)attr_name[k]);
+ 	name[k] = '\0';
