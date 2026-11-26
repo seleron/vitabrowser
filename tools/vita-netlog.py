@@ -269,6 +269,13 @@ def main():
                 pkt, addr = s.recvfrom(65536)
             except socket.timeout:
                 continue
+            except ConnectionResetError:
+                # Windows: a reply to a port that has closed (the Vita
+                # relaunched, or a test sender exited) bounces back as ICMP
+                # port unreachable, which Windows reports as WinError 10054
+                # on the NEXT recvfrom. It killed the receiver; nothing is
+                # lost by going on.
+                continue
             p = parse(pkt)
             if p is None:
                 bad += 1

@@ -17133,3 +17133,32 @@ binary scored 12.0 and 14.3 in two runs.
 - wpblog 1 (its body-wide "over" batch: 464, pending the owner's ruling).
 
 No sudo.
+
+## Receiver fix (2026-11-27): vita-netlog.py survives WinError 10054
+
+**Problem** (a device test, today).
+- `receive-results.bat` died with `ConnectionResetError: [WinError 10054]`
+  in `s.recvfrom`.
+- On Windows, a UDP reply to a port that has closed comes back as ICMP
+  port unreachable. Windows reports that as WinError 10054 on the **next**
+  `recvfrom`, and the uncaught error ended the receiver. The reply here
+  went to a test sender that had exited; a Vita relaunch can do the same.
+- Python's `socket` has no `SIO_UDP_CONNRESET` (its `ioctl` takes three
+  other codes), so the error is caught in the loop instead (`continue`):
+  nothing is lost.
+- Tested on Windows: two hellos from senders that exited at once, both
+  received, the receiver still running (and the Vita's live session
+  picked up).
+
+**Setup notes from the same test**, for the next device run:
+- A click in the receiver's console starts a QuickEdit selection and
+  blocks the script at its next print. The launch folder appears but
+  stays **empty**, and the Vita's HUD says "net waiting for PC" (no
+  reply). Esc releases it.
+- With the PC wired (192.168.10.131) and the Vita on Wi-Fi, the
+  broadcast did reach the PC. `ux0:data/VitaBrowser/netlog.cfg` holding
+  the PC's address works as well (the Vita's `log.txt`: `sending to
+  192.168.10.131:45100 (netlog.cfg)`).
+
+**gate exit 0**, with the tools/vita-netlog.py change (the network mirror
+section runs it); interaction 52/52. No engine change. No sudo.
