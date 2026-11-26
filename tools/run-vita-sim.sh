@@ -460,6 +460,8 @@ JS-id-sib file:///app0:/testpages/JS-id-sib.html
 CSS-id-sib-ref file:///app0:/testpages/CSS-id-sib-ref.html
 JS-unmeasured-ib file:///app0:/testpages/JS-unmeasured-ib.html
 CSS-unmeasured-ib-ref file:///app0:/testpages/CSS-unmeasured-ib-ref.html
+JS-root-pos file:///app0:/testpages/JS-root-pos.html
+CSS-root-pos-ref file:///app0:/testpages/CSS-root-pos-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2606,6 +2608,16 @@ k473g=$(printf '%s\n' "$k473seg" | grep -c "an inline-block with no min/max widt
 k473p=$(printf '%s\n' "$k473seg" | grep -ci "LIFE layout: the inline-block: <span" || true)
 echo "  JS-unmeasured-ib: rows $k473r (0), hook left unmeasured ${k473h} (2 or more), 441's guard measured ${k473g} (2 or more), 449's probe named ${k473p} (2 or more)"
 [ "$k473r" = 0 ] && [ "${k473h:-0}" -ge 2 ] && [ "${k473g:-0}" -ge 2 ] && [ "${k473p:-0}" -ge 2 ] || fail "441's unmeasured inline-block guard, run by the test hook"
+# Patch 475: a sheet that makes <html> position: relative restyles the
+# root in place (static / relative are the same to box construction); no
+# root-style decline, no full rebuild.
+k475r=$(fl_rows JS-root-pos CSS-root-pos-ref)
+k475seg=$(awk '/ page [0-9]+\/[0-9]+ JS-root-pos: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k475i=$(printf '%s\n' "$k475seg" | grep -c "the root restyled in place" || true)
+k475d=$(printf '%s\n' "$k475seg" | grep -c "declined (an element's style changes, HTML" || true)
+k475f=$(printf '%s\n' "$k475seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-root-pos: rows $k475r (0), roots restyled in place ${k475i} (1), root-style declines ${k475d} (0), full rebuilds ${k475f} (0)"
+[ "$k475r" = 0 ] && [ "${k475i:-0}" -ge 1 ] && [ "${k475d:-1}" -eq 0 ] && [ "${k475f:-1}" -eq 0 ] || fail "the root made position: relative, restyled in place"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

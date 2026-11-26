@@ -17028,3 +17028,45 @@ sites at 0.0 in both arms are left out:
 - rte's "sheet change: an element's style changes" 1.0.
 
 No sudo.
+
+## Patch 475 (2026-11-27): the root restyled in place when its position changes between static, relative and sticky
+
+**Problem.** rte's last full rebuild, 1.0 a load after 474: "sheet
+change: declined (an element's style changes, HTML)". It was the next
+mark of the batch 474's background decline used to end first.
+- A probe of 459's in-place conditions: the root's display, float and
+  counting were unchanged, but **position went static -> relative**. A
+  late sheet, arriving while another still loads (455's live cascade),
+  makes `<html>` `position: relative`.
+
+**Fix** (html.c, 459's root condition in `html_rl_doc_noop`).
+- 459 restyles the root in place when construction would decide the
+  same, and required the same position.
+- Box construction reads position only for absolute and fixed
+  (`box_construct.c`, the one `css_computed_position` read: an absolutely
+  positioned box).
+- Static, relative and sticky act at layout: offsets, and the containing
+  block for absolutely positioned descendants. 459's in-place restyle
+  lays the page out whole afterwards.
+- The test is now `html_rl_pos_construct_same`: equal, or neither
+  absolute nor fixed.
+
+**Measured** (rte only, 3 loads per arm, one interleaved run):
+- rte **1 / 1 / 1 (1.0) -> 0 / 0 / 0 (0.0)**: the root restyled in place
+  once a load; no crash.
+- **rte had 5.0 full rebuilds a load at 451; it now has none.** 470
+  (floats and inline-blocks), 472 (boxed ids), 474 (background objects)
+  and 475 cleared it.
+
+**Gate.**
+- New pair **JS-root-pos / CSS-root-pos-ref**: a `<style>` appended that
+  makes `<html>` `position: relative` with a background; an absolutely
+  positioned child takes the relative root as its containing block.
+  Result: the root restyled in place, rows 0, no full rebuild.
+- Every check that counts the root-style decline expects 0 of them
+  (415, 419, 447, 459), so none needed changing. 459's JS-root-restyle
+  still passes (2 in place, 0 declines).
+- **gate475 exit 0** on the first run; interaction 52/52.
+- `restage-full.sh`: **557 applied plus the 2 known collisions**.
+
+No sudo.
