@@ -38,9 +38,15 @@ SHA256 (first 12 hex digits; full sums in `hwtest-2026-09-22/SHA256SUMS`):
   directly.
 - `autotest.done`: marker written when the autotest finishes.
 
-**Controls:** D-pad / left stick scroll · L / R previous / next page ·
-□ autotest · SELECT dump this page · △ memory probe · ○ toggle HUD ·
-START quit. The HUD (bottom bar) shows page n/15, first-frame ms, CPU/GPU ms
+Controls (verified against the 2026-11-26 head, `frontends/vita/main.c` + `input.h`):
+touch: tap = click, drag = scroll · left stick: pointer, CROSS clicks under it ·
+right stick / D-pad: scroll · L / R: back / forward · SQUARE: zoom 100/125/150/200 % ·
+TRIANGLE: enter a URL or text · CIRCLE: toggle HUD · START: home.
+The test functions are **SELECT combinations**: SELECT+SQUARE starts the autotest ·
+SELECT+CIRCLE dumps this page · SELECT+CROSS saves a screenshot (app, to the log) ·
+SELECT+TRIANGLE memory probe · SELECT+L2/R2 previous/next test page · SELECT+START quits.
+(The PS button + START system screenshot also works: `ux0:picture/SCREENSHOT/`.)
+The HUD (bottom bar) shows page n/15, first-frame ms, CPU/GPU ms
 of the last frame, and draw calls.
 
 ## The plan
@@ -89,7 +95,8 @@ Launch **VitaBrowser** (not ext-mem).
 
 ### Step 3 — Autotest (T2)
 
-On the L1 page, press **□ once** and **do not touch the Vita** until it says
+On the L1 page, press **SELECT+SQUARE** and **do not touch the Vita** until
+it says
 **AUTOTEST DONE**. It visits all 15 pages. A cyan message box shows
 `AUTOTEST page n/15`. Long pages scroll to the bottom by themselves. At the
 end it measures font metrics and memory. The simulator needs about 21 s;
@@ -101,9 +108,10 @@ expect longer on the Vita.
 
 ### Step 4 — Visual checks with screenshots (T3)
 
-Use **L / R** to visit each page. On each, take a **screenshot**: press the
-**PS button and START together**. They land in `ux0:picture/SCREENSHOT/`,
-and are pixel-exact, which matters for calibration. If screenshots don't
+Use **SELECT+L2/R2** to visit each page. On each, take a **screenshot**:
+**SELECT+CROSS** (app screenshot, to the log) or the **PS button and START
+together** (system, pixel-exact in `ux0:picture/SCREENSHOT/`, which matters
+for calibration). If screenshots don't
 work for this app, take phone photos instead and say so.
 
 Compare each with its reference in `reference-screenshots\` (NN matches
