@@ -440,6 +440,8 @@ JS-detached-attr file:///app0:/testpages/JS-detached-attr.html
 CSS-detached-attr-ref file:///app0:/testpages/CSS-detached-attr-ref.html
 JS-unhide-removal file:///app0:/testpages/JS-unhide-removal.html
 CSS-unhide-removal-ref file:///app0:/testpages/CSS-unhide-removal-ref.html
+JS-over-coalesce file:///app0:/testpages/JS-over-coalesce.html
+CSS-over-coalesce-ref file:///app0:/testpages/CSS-over-coalesce-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2465,6 +2467,17 @@ k462d=$(printf '%s\n' "$k462seg" | grep -c "declined (an element without a box w
 k462f=$(printf '%s\n' "$k462seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-unhide-removal: rows $k462r (0), parents restyled for a new box ${k462p} (2), would-get-one declines ${k462d} (0), full rebuilds ${k462f} (0)"
 [ "$k462r" = 0 ] && [ "${k462p:-0}" -ge 2 ] && [ "${k462d:-1}" -eq 0 ] && [ "${k462f:-1}" -eq 0 ] || fail "an element a removed sheet un-hides: its parent restyled"
+# Patch 464: a batch of 129+ distinct marks -- a <head> mark first, then
+# 140 removals and 20 class changes under #list -- coalesces its body marks
+# under #list (the head mark kept) and builds its block again whole; no
+# "over" full rebuild.
+k464r=$(fl_rows JS-over-coalesce CSS-over-coalesce-ref)
+k464seg=$(awk '/ page [0-9]+\/[0-9]+ JS-over-coalesce: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k464c=$(printf '%s\n' "$k464seg" | grep -c "LIFE over: [0-9]* marks coalesced under <div>.*, 1 in <head> kept" || true)
+k464w=$(printf '%s\n' "$k464seg" | grep -c "coalesced marks: their common block, built again whole" || true)
+k464f=$(printf '%s\n' "$k464seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-over-coalesce: rows $k464r (0), batches coalesced with the head mark kept ${k464c} (1), common blocks built again whole ${k464w} (1), full rebuilds ${k464f} (0)"
+[ "$k464r" = 0 ] && [ "${k464c:-0}" -ge 1 ] && [ "${k464w:-0}" -ge 1 ] && [ "${k464f:-1}" -eq 0 ] || fail "a batch of 129+ marks coalesced under their common block"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

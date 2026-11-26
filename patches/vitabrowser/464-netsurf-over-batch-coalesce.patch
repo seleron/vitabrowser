@@ -1,0 +1,511 @@
+# netsurf: a batch of more than 128 marks coalesces its body marks under their common ancestor (patch 464)
+# Generated 2026-11-26
+# Base: seleron/vitabrowser (patch stack through 463)
+#
+# A batch with more distinct marks than the extra[] ring holds (128) went
+# to the full rebuild unconditionally ("over": wpblog and github, 2.0 a
+# load in the 463 census). A probe showed every mark in the document,
+# github's body marks meeting at a <div> 4 levels deep or a <tbody> 29
+# deep, wpblog's only at <body>. On overflow (macos9_reconvert_coalesce)
+# the body marks are replaced by one mark on their lowest common ancestor
+# (html_rl_lca) when that is below <body> (html_rl_too_wide); an attribute,
+# class or style mark on the ancestor itself could reach its later
+# siblings through a + / ~ rule, so the ancestor then goes one level up.
+# Head marks stay ordinary extras (compacted in place, the old primary
+# appended after them). Later marks inside the subtree are covered; marks
+# outside it are ordinary extras again (the slot has room); a second
+# overflow coalesces everything then. The coalesced primary is answered by
+# html_rl_subtree_rebuild: the local path's prelude, the removed sheets
+# pruned, the nearest block, flex or grid box at or above the ancestor
+# built again whole (440 / 438) with its own checks, and only then the
+# sheet-removal walk (before, it met the batch's new elements without
+# boxes); the cost guard still decides. Logged: "LIFE over: N marks coalesced under <x> ..." / "too
+# wide to coalesce".
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -14789,6 +14789,251 @@
+ 	return in;
+ }
+ 
++/* Patch 464: the lowest common ancestor of two nodes (either may be NULL:
++ * the other is returned), a new reference; NULL when none */
++static int html_rl_depth(dom_node *n)
++{
++	int d = 0;
++	dom_node *p = NULL;
++	dom_node_ref(n);
++	while (n != NULL) {
++		d++;
++		p = NULL;
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	return d;
++}
++void *html_rl_lca(void *va, void *vb);
++void *html_rl_lca(void *va, void *vb)
++{
++	dom_node *a = va, *b = vb, *p;
++	int da, db;
++	if (a == NULL && b == NULL)
++		return NULL;
++	if (a == NULL) {
++		dom_node_ref(b);
++		return b;
++	}
++	if (b == NULL) {
++		dom_node_ref(a);
++		return a;
++	}
++	da = html_rl_depth(a);
++	db = html_rl_depth(b);
++	dom_node_ref(a);
++	dom_node_ref(b);
++	while (da > db) {
++		p = NULL;
++		dom_node_get_parent_node(a, &p);
++		dom_node_unref(a);
++		a = p;
++		da--;
++	}
++	while (db > da) {
++		p = NULL;
++		dom_node_get_parent_node(b, &p);
++		dom_node_unref(b);
++		b = p;
++		db--;
++	}
++	while (a != NULL && b != NULL && a != b) {
++		p = NULL;
++		dom_node_get_parent_node(a, &p);
++		dom_node_unref(a);
++		a = p;
++		p = NULL;
++		dom_node_get_parent_node(b, &p);
++		dom_node_unref(b);
++		b = p;
++	}
++	if (b != NULL)
++		dom_node_unref(b);
++	return a;	/* a == b, or NULL */
++}
++/* Patch 464: is the node <head> or inside it? */
++int html_rl_node_in_head(void *node);
++int html_rl_node_in_head(void *node)
++{
++	dom_node *n = node, *p;
++	int r = 0;
++	if (n == NULL)
++		return 0;
++	dom_node_ref(n);
++	while (n != NULL) {
++		char *t = html_rl_struct_tag(n);
++		if (t != NULL && strcmp(t, "head") == 0)
++			r = 1;
++		free(t);
++		if (r)
++			break;
++		p = NULL;
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	return r;
++}
++
++/* Patch 464: is node anc itself or inside it? */
++int html_rl_is_within(void *anc, void *node);
++int html_rl_is_within(void *anc, void *node)
++{
++	dom_node *n = node, *p;
++	int r = 0;
++	if (anc == NULL || n == NULL)
++		return 0;
++	dom_node_ref(n);
++	while (n != NULL) {
++		if (n == (dom_node *)anc) {
++			r = 1;
++			break;
++		}
++		p = NULL;
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	return r;
++}
++
++/* Patch 464: <body>, <html> or not an element (the document): too wide a
++ * subtree to coalesce marks under */
++int html_rl_too_wide(void *node);
++int html_rl_too_wide(void *node)
++{
++	dom_node_type type;
++	char *t;
++	int r;
++	if (node == NULL ||
++	    dom_node_get_node_type((dom_node *)node, &type) != DOM_NO_ERR ||
++	    type != DOM_ELEMENT_NODE)
++		return 1;
++	t = html_rl_struct_tag((dom_node *)node);
++	r = t == NULL || strcmp(t, "body") == 0 || strcmp(t, "html") == 0;
++	free(t);
++	return r;
++}
++
++/* Patch 464: a node's parent, a new reference (or NULL) */
++void *html_rl_parent_of(void *node);
++void *html_rl_parent_of(void *node)
++{
++	dom_node *p = NULL;
++	if (node == NULL ||
++	    dom_node_get_parent_node((dom_node *)node, &p) != DOM_NO_ERR)
++		return NULL;
++	return p;
++}
++
++/* Patch 464: a node's tag and its child count, for the log */
++void html_rl_node_describe(void *node, char *buf, size_t len);
++void html_rl_node_describe(void *node, char *buf, size_t len)
++{
++	char *t = node ? html_rl_struct_tag((dom_node *)node) : NULL;
++	dom_nodelist *kids = NULL;
++	uint32_t nk = 0;
++	if (node != NULL && dom_node_get_child_nodes((dom_node *)node,
++			&kids) == DOM_NO_ERR && kids != NULL) {
++		dom_nodelist_get_length(kids, &nk);
++		dom_nodelist_unref(kids);
++	}
++	snprintf(buf, len, "<%s> (%u child nodes, depth %d)", t ? t : "?",
++		(unsigned)nk, node ? html_rl_depth((dom_node *)node) : 0);
++	free(t);
++}
++
++
++/* Patch 464: the answer to a coalesced batch (macos9_reconvert: more than
++ * 128 distinct marks, their body marks under one element below <body>):
++ * the nearest block, flex or grid box at or above that element is built
++ * again whole from the DOM (440 / 438), which re-selects and rebuilds
++ * everything the marks touched -- any of them a + / ~ rule could reach
++ * from is inside it (an attribute mark on the element itself made the
++ * queue go one level up). The local path's prelude first: busy, loaded,
++ * find in page, pruned sheets, outside the document. */
++int html_rl_subtree_rebuild(struct content *base_c, void *vnode);
++int html_rl_subtree_rebuild(struct content *base_c, void *vnode)
++{
++	extern double macos9_micros(void);
++	html_content *c = (html_content *)base_c;
++	dom_node *n, *p;
++	struct box *b;
++	int r = -1, pruned;
++	double t0;
++
++#define RL_SNO(why) do { macsurf_debug_log_writef( \
++		"LIFE rebuild local: declined (%s)", (why)); return -1; } while (0)
++	if (c == NULL || vnode == NULL || c->layout == NULL ||
++	    c->document == NULL || c->aborted)
++		return -1;
++	if (c->reflowing || c->box_conversion_context != NULL ||
++	    macsurf_reconvert_in_progress != 0 || macos9_paint_gw != NULL ||
++	    base_c->locked)
++		RL_SNO("busy");
++	if (base_c->status != CONTENT_STATUS_READY &&
++	    base_c->status != CONTENT_STATUS_DONE)
++		RL_SNO("not loaded");
++	if (base_c->textsearch.context != NULL)
++		RL_SNO("find in page is open");
++	/* the sheets a batch removed are pruned first (the live context
++	 * loses them, patch 425); the sheet-removal walk comes AFTER the
++	 * subtree is rebuilt -- before, it met the batch's new elements in
++	 * the subtree, still without boxes, and declined (github) */
++	pruned = html_css_prune_detached_sheets(c);
++	if (!html_rl_in_document((dom_node *)vnode)) {
++		if (pruned > 0 && html_rl_doc_noop(c, "sheet removal") != 0)
++			RL_SNO("detached stylesheet pruned");
++		macsurf_debug_log_writef("LIFE rebuild local: coalesced marks "
++			"outside the document, nothing to rebuild");
++		return 0;
++	}
++	t0 = macos9_micros();
++	n = vnode;
++	dom_node_ref(n);
++	while (n != NULL) {
++		if (html_rl_too_wide(n)) {
++			dom_node_unref(n);
++			RL_SNO("coalesced marks reach the body");
++		}
++		b = box_for_node(n);
++		if (b != NULL && b->type == BOX_BLOCK && b->parent != NULL &&
++		    b->object == NULL && !HTML_RL_FRAME(b)) {
++			r = html_rl_block_whole(c, n, b, t0, "coalesced marks: "
++				"their common block");
++			dom_node_unref(n);
++			if (r == 0 && pruned > 0 &&
++			    html_rl_doc_noop(c, "sheet removal") != 0)
++				RL_SNO("detached stylesheet pruned");
++			return r;
++		}
++		if (b != NULL && (b->type == BOX_FLEX || b->type == BOX_GRID)) {
++			r = html_rl_flex_whole(c, n, b, t0, "coalesced marks: "
++				"their common flex or grid box");
++			dom_node_unref(n);
++			if (r == 0 && pruned > 0 &&
++			    html_rl_doc_noop(c, "sheet removal") != 0)
++				RL_SNO("detached stylesheet pruned");
++			return r;
++		}
++		p = NULL;
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	RL_SNO("coalesced marks: no block above them");
++#undef RL_SNO
++}
++
+ static int html_reconvert_local_change(struct content *base_c, void *vnode,
+ 		bool class_change, const char *old_class)
+ {
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -200,6 +200,10 @@
+ 		int   rm_state;
+ 	} extra[RECONVERT_MAX_EXTRA];
+ 	int             extra_n;
++	/* Patch 464 - the primary mark is the common ancestor of a batch's
++	 * body marks, coalesced when they overflowed extra[] (the head marks
++	 * stay extras); answered by html_rl_subtree_rebuild */
++	int             coalesced;
+ 	int             coarse;
+ 	/* Patch 308 - why the slot went coarse: 0 not coarse, 1 a mark
+ 	 * named no node, 2 more distinct marks than the extra ring holds.
+@@ -424,6 +428,7 @@
+ 	}
+ 	g_pending[i].rm_state = 0;
+ 	g_pending[i].kind = MACOS9_DOMMUT_UNKNOWN;
++	g_pending[i].coalesced = 0;	/* patch 464 */
+ 	/* Patch 301 - the extra marks' references and class values die
+ 	 * with the primary's, on every path that drops precision. */
+ 	while (g_pending[i].extra_n > 0) {
+@@ -561,6 +566,168 @@
+ 		*state = 2;
+ }
+ 
++/* Patch 464 - coalescing a batch that overflows extra[] (the 463 census:
++ * wpblog's and github's batches of 128+ distinct marks, "over", 2.0 a
++ * load). The body marks -- head marks render nothing and stay extras --
++ * are replaced by one mark on their lowest common ancestor, when that is
++ * below <body>; an attribute, class or style mark on the ancestor itself
++ * could reach its later siblings through a + / ~ rule, so the ancestor
++ * then goes one level up. The slot's primary becomes that element
++ * (`coalesced`), answered by html_rl_subtree_rebuild (its nearest block,
++ * flex or grid box built again whole). */
++extern void *html_rl_lca(void *, void *);
++extern int html_rl_node_in_head(void *);
++extern int html_rl_is_within(void *, void *);
++extern int html_rl_too_wide(void *);
++extern void *html_rl_parent_of(void *);
++extern void html_rl_node_describe(void *, char *, size_t);
++
++static int macos9_reconvert_attrish(int kind)
++{
++	return kind == MACOS9_DOMMUT_SETATTRIBUTE ||
++		kind == MACOS9_DOMMUT_REMOVEATTRIBUTE ||
++		kind == MACOS9_DOMMUT_SETATTR_CLASS ||
++		kind == MACOS9_DOMMUT_SETATTR_STYLE;
++}
++
++/* the ancestor one level up when an attribute-like mark sits on it; NULL
++ * (released) when too wide. Takes and returns a reference. */
++static void *macos9_reconvert_lca_fix(void *lca, void *node, int kind)
++{
++	if (lca != NULL && node == lca && macos9_reconvert_attrish(kind)) {
++		void *p = html_rl_parent_of(lca);
++		macsurf_reconvert_node_unref(lca);
++		lca = p;
++	}
++	if (lca != NULL && html_rl_too_wide(lca)) {
++		macsurf_reconvert_node_unref(lca);
++		lca = NULL;
++	}
++	return lca;
++}
++
++static void macos9_reconvert_extra_release(struct macos9_reconvert_extra *e)
++{
++	if (e->node != NULL)
++		macsurf_reconvert_node_unref(e->node);
++	e->node = NULL;
++	free(e->old_class);
++	e->old_class = NULL;
++	free(e->attr_name);
++	e->attr_name = NULL;
++	if (e->rm_next != NULL)
++		macsurf_reconvert_node_unref(e->rm_next);
++	e->rm_next = NULL;
++	e->rm_state = 0;
++}
++
++static int macos9_reconvert_coalesce(int i, void *node, int kind,
++		const char *old_class, const char *attr_name)
++{
++	void *lca = NULL, *l2;
++	int q, kept = 0, n_all = g_pending[i].extra_n + 2, attr_on = 0;
++	struct macos9_reconvert_extra prim;
++	char d[96];
++
++	if (g_pending[i].node == NULL || node == NULL)
++		return 0;
++	/* the common ancestor of every body mark, the new one included */
++	for (q = -2; q < g_pending[i].extra_n; q++) {
++		void *nn = q == -2 ? node : q == -1 ? g_pending[i].node :
++			g_pending[i].extra[q].node;
++		if (nn == NULL || html_rl_node_in_head(nn))
++			continue;
++		l2 = html_rl_lca(lca, nn);
++		if (lca != NULL)
++			macsurf_reconvert_node_unref(lca);
++		lca = l2;
++	}
++	if (lca == NULL)
++		return 0;
++	for (q = -2; q < g_pending[i].extra_n; q++) {
++		void *nn = q == -2 ? node : q == -1 ? g_pending[i].node :
++			g_pending[i].extra[q].node;
++		int kk = q == -2 ? kind : q == -1 ? g_pending[i].kind :
++			g_pending[i].extra[q].kind;
++		if (nn == lca && macos9_reconvert_attrish(kk))
++			attr_on = 1;
++	}
++	lca = macos9_reconvert_lca_fix(lca, attr_on ? lca : NULL,
++			MACOS9_DOMMUT_SETATTRIBUTE);
++	if (lca == NULL) {
++		macsurf_debug_log_writef("LIFE over: %d marks, too wide to "
++			"coalesce", n_all - 1);
++		return 0;
++	}
++	/* the primary as an extra, then keep only the head marks */
++	prim.node = g_pending[i].node;
++	prim.kind = g_pending[i].kind;
++	prim.old_class = g_pending[i].old_class;
++	prim.attr_name = g_pending[i].attr_name;
++	prim.rm_next = g_pending[i].rm_next;
++	prim.rm_state = g_pending[i].rm_state;
++	g_pending[i].node = NULL;
++	g_pending[i].old_class = NULL;
++	g_pending[i].attr_name = NULL;
++	g_pending[i].rm_next = NULL;
++	g_pending[i].rm_state = 0;
++	/* compact the extras in place (the write index never passes the read
++	 * index), then the old primary after them -- moving the primary in
++	 * first overwrote extra[0] before it was read */
++	for (q = 0; q < g_pending[i].extra_n; q++) {
++		struct macos9_reconvert_extra *e = &g_pending[i].extra[q];
++		if (e->node != NULL && html_rl_node_in_head(e->node)) {
++			if (kept != q)
++				g_pending[i].extra[kept] = *e;	/* moves */
++			kept++;
++		} else {
++			macos9_reconvert_extra_release(e);
++		}
++	}
++	if (prim.node != NULL && html_rl_node_in_head(prim.node) &&
++	    kept < RECONVERT_MAX_EXTRA)
++		g_pending[i].extra[kept++] = prim;	/* moves */
++	else
++		macos9_reconvert_extra_release(&prim);
++	g_pending[i].extra_n = kept;
++	if (html_rl_node_in_head(node) && kept < RECONVERT_MAX_EXTRA) {
++		struct macos9_reconvert_extra *e =
++			&g_pending[i].extra[g_pending[i].extra_n++];
++		e->node = macsurf_reconvert_node_ref(node);
++		e->kind = kind;
++		e->old_class = (kind == MACOS9_DOMMUT_SETATTR_CLASS &&
++			old_class != NULL) ? strdup(old_class) : NULL;
++		e->attr_name = macos9_reconvert_attr_dup(kind, attr_name);
++		macos9_reconvert_rm_set(&e->rm_next, &e->rm_state, kind);
++		kept++;
++	}
++	g_pending[i].node = lca;	/* the reference moves in */
++	g_pending[i].kind = MACOS9_DOMMUT_INNERHTML;
++	g_pending[i].coalesced = 1;
++	g_pending[i].multi = 1;
++	html_rl_node_describe(lca, d, sizeof d);
++	macsurf_debug_log_writef("LIFE over: %d marks coalesced under %s, %d "
++		"in <head> kept", n_all - 1, d, kept);
++	return 1;
++}
++
++/* a mark into a coalesced slot: 1 covered by the coalesced subtree, 0 an
++ * extra as usual -- a <head> mark, a mark outside the subtree (github: a
++ * later mark beside the coalesced <div> widened it to <body>, too wide,
++ * and the batch went to the full rebuild after all), or an attribute-like
++ * mark on the ancestor itself (its own sibling checks then apply). The
++ * slot has room again after coalescing; a second overflow coalesces
++ * everything it holds then, the coalesced primary included. */
++static int macos9_reconvert_coalesced_mark(int i, void *node, int kind)
++{
++	if (html_rl_node_in_head(node))
++		return 0;
++	if (html_rl_is_within(g_pending[i].node, node) &&
++	    !(node == g_pending[i].node && macos9_reconvert_attrish(kind)))
++		return 1;
++	return 0;
++}
++
+ static void
+ macos9_reconvert_pending_add3(struct content *c, void *node, int kind,
+ 		const char *old_class, const char *attr_name)
+@@ -685,6 +852,14 @@
+ 			 * distinct mark" (the pump's action choice, the
+ 			 * cosmetic and style fast paths) behaves exactly as
+ 			 * before; only try_local's precision changes. */
++			/* Patch 464: a coalesced slot covers its subtree */
++			if (g_pending[i].coalesced && node != NULL) {
++				int r = macos9_reconvert_coalesced_mark(i, node,
++						kind);
++				if (r == 1)
++					return;		/* covered */
++				/* r == 0: an extra as usual */
++			}
+ 			if (node != NULL && g_pending[i].node != NULL) {
+ 				int j;
+ 				for (j = 0; j < g_pending[i].extra_n; j++) {
+@@ -719,6 +894,11 @@
+ 				macsurf_debug_log_writef(
+ 					"LIFE reconvert: batch coarse, more than %d distinct marks",
+ 					RECONVERT_MAX_EXTRA + 1);
++				/* Patch 464: coalesce instead, when the
++				 * body marks meet below <body> */
++				if (macos9_reconvert_coalesce(i, node, kind,
++						old_class, attr_name))
++					return;
+ 				g_pending[i].coarse_cause = 2;
+ 			}
+ 			g_pending[i].multi = 1;
+@@ -1499,6 +1679,15 @@
+ 				    * 5000-paragraph full reconvert. */
+ 	t0 = macos9_micros();
+ 	html_rl_fill_us = 0.0;	/* patch 463: cache fills are not this batch's cost */
++	if (g_pending[i].coalesced) {	/* patch 464 */
++		extern int html_rl_subtree_rebuild(struct content *, void *);
++		g_one_fail_kind = 0;
++		if (html_rl_subtree_rebuild(c, g_pending[i].node) != 0) {
++			g_fc_reason = 2;
++			g_defer_unsettled = html_rl_take_unsettled();
++			return 0;
++		}
++	} else
+ 	if (!macos9_reconvert_try_local_one(c, g_pending[i].node,
+ 			g_pending[i].kind, g_pending[i].old_class,
+ 			g_pending[i].attr_name, g_pending[i].rm_state,

@@ -15842,3 +15842,77 @@ budgets are not comparable).
 (460) -> 9.7 (461) -> 9.3 (462) -> 8.0 (463; 9.7 for 462 in that run).
 
 No sudo.
+
+## Patch 464 (2026-11-26): a batch of more than 128 marks coalesces its body marks under their common ancestor
+
+**Problem.** A batch with more distinct marks than the reconvert slot's
+`extra[]` ring holds (128) went to the full rebuild unconditionally:
+"over", **2.0 a load** in the 463 census (wpblog and github, one each).
+
+**Probe** (a scratch binary logging what filled the slot):
+- every mark was in the document;
+- **wpblog:** 116 removals; its body marks meet only at `<body>` (169
+  children). Coalescing there would rebuild nearly the page, so it stays
+  a full rebuild ("too wide to coalesce");
+- **github:** appends, removals and attribute changes; its body marks
+  meet at a `<div>` 4 levels deep (25 children), or a `<tbody>` 29 deep.
+
+**Fix** (`macos9_reconvert.c`, html.c).
+- **On overflow** (`macos9_reconvert_coalesce`), the body marks are
+  replaced by one mark on their lowest common ancestor (`html_rl_lca`)
+  when it is below `<body>` (`html_rl_too_wide`). An attribute, class or
+  style mark on the ancestor itself could reach its later siblings through
+  a `+` / `~` rule, so the ancestor then goes one level up.
+- `<head>` marks stay ordinary extras. They are compacted in place, and
+  the old primary is appended after them.
+- **Later marks** inside the subtree are covered. Marks outside it are
+  ordinary extras again: the slot has room after coalescing. A second
+  overflow coalesces everything then.
+- The coalesced primary is answered by **`html_rl_subtree_rebuild`**:
+  1. the local path's prelude (busy, loaded, find in page, outside the
+     document);
+  2. the removed sheets pruned;
+  3. the nearest block, flex or grid box at or above the ancestor built
+     again whole (440 / 438), with its own checks;
+  4. only then the sheet-removal walk.
+  The cost guard still decides.
+- Logged: "LIFE over: N marks coalesced under <x> ..., K in <head>
+  kept" and "LIFE over: N marks, too wide to coalesce".
+
+**Three bugs found on the way:**
+1. **A crash** (github, every load, SIGSEGV; found with gdb). The
+   compaction moved the old primary into `extra[0]` before `extra[0]` had
+   been read. That entry was lost and the primary released twice: a
+   refcount underflow on a libdom node. ASan missed it, because libdom is
+   not instrumented in the default ASan build. The gate page now puts a
+   `<head>` mark first, which is that shape.
+2. **Widening** a coalesced ancestor to cover a later mark beside it
+   reached `<body>`, too wide, so the batch still went to the full
+   rebuild. Marks outside the subtree are now ordinary extras.
+3. **The sheet-removal walk ran before the subtree rebuild** and met the
+   batch's new elements, still without boxes ("detached stylesheet
+   pruned"). It now runs after.
+
+**Measured** (github only, 3 loads per arm, one interleaved run, the
+final build):
+- **"over" 1.0 -> 0**: "coalesced marks: their common block, built again
+  whole" every load;
+- github 2 / 1 / 1 (1.3) -> 1 / 1 / 1 (1.0);
+- the batch then reaches a later decline: a `data-turbo-loaded`
+  attribute a sibling rule can see (see Next).
+- wpblog unchanged (too wide: `<body>`).
+
+**Gate.**
+- New pair **JS-over-coalesce / CSS-over-coalesce-ref**: in one task, a
+  `<meta>` is added to `<head>` first, then each of 140 items in `#list`
+  loses its `<b>` (140 removals from 140 parents) and 20 gain a class.
+- Mini run: **129 marks coalesced under `#list` (depth 5), 1 in
+  `<head>` kept, its block built again whole in 1.5 ms, rows 0**, no full
+  rebuild.
+- `restage-full.sh`: **546 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate464 exit 0** (stack through 464): JS-over-coalesce rows 0, 1
+  batch coalesced with the head mark kept, 1 common block built again
+  whole, 0 full rebuilds; interaction 52/52 at the Vita's pace.
+
+No sudo.
