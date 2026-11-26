@@ -16979,3 +16979,52 @@ No sudo.
 - `restage-full.sh`: **556 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 474, 21-site census 473 vs 474
+
+**ASan at 474** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 440 page
+  dumps (gate 440), 0 AddressSanitizer errors.
+- Under it, the new whole-block rebuild ("an object (a background) is in
+  the line, the block built again whole") ran twice. That covers the
+  object relink on the path that crashed rte under 374.
+
+**Census** (all 21 sites, 3 loads per arm, one interleaved run). The 15
+sites at 0.0 in both arms are left out:
+
+| site | 473 | 474 | 474's path ran |
+|---|---|---|---|
+| rte | 1 / 1 / 2 (1.3) | 1 / 1 / 1 (1.0) | 15 |
+| guardian | 2 / 1 / 2 (1.7) | 2 / 1 / 1 (1.3) | 0 |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) | 0 |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) | 0 |
+| github | 0 / 2 / 2 (1.3) | 2 / 0 / 2 (1.3) | 0 |
+| claude | 4 / 5 / 7 (5.3) | 6 / 6 / 4 (5.3) | 0 |
+| **total** | 10 / 12 / 16 (**12.7**) | 14 / 11 / 11 (**12.0**) | |
+
+- **474 ran only on rte (15 times).**
+  - The background decline went 2.0 -> 0 a load.
+  - rte's own total: 1.3 -> 1.0 here (flat at 1.0 in the 3-load rte-only
+    run). Its batch now ends at the next mark, "sheet change: an
+    element's style changes", with cause nonode.
+- **The rest is variation:** guardian -0.3 is one load; claude's guard
+  trips fell 10 -> 6, with its total flat.
+- "Structural change at the root: a child with a box changed" and
+  "structural selectors or counters" rose to 1.7 each. These are later
+  marks reached once earlier declines are gone, on claude and guardian,
+  not 474's path.
+- No crash, assertion or failed load in 126 loads.
+
+**21-site history:** 46.0 (451) -> 20.3 (469) -> 18.3 (470) -> 17.3
+(471) -> 11.3 (472) -> 12.3 (473, no behaviour change) -> **12.0 (474)**.
+
+**Left** (474 arm):
+- guard trips 5.3 a load (stackoverflow 2, claude 2, github 1.3);
+- over 4.0 (claude, guardian, and wpblog's body-wide batch: 464, pending
+  the owner's ruling);
+- a structural change at the root with a boxed child 1.7;
+- structural selectors or counters 1.7;
+- rte's "sheet change: an element's style changes" 1.0.
+
+No sudo.
