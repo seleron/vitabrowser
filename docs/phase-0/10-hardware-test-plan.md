@@ -16109,3 +16109,54 @@ Scope:
 - `restage-full.sh`: **548 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 466, census 465 vs 466
+
+**ASan at 466** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 426 page
+  dumps (gate 426), 0 AddressSanitizer errors, the log to page 370 of
+  370.
+- Under it: the root sibling path ran twice and the box-less id path
+  twice. The structural-at-root path is hit only on wpblog, not on a gate
+  page.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 465 | 466 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 1 / 0 (0.3) |
+| oldreddit | 0 / 1 / 0 (0.3) | 0 / 0 / 0 (0.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 4 / 3 / 3 (3.3) | **2 / 2 / 2 (2.0)** |
+| google | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** |
+| github | 2 / 0 / 0 (0.7) | 0 / 0 / 0 (0.0) |
+| youtube | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| **total** | 9 / 7 / 6 (**7.3**) | 4 / 5 / 4 (**4.3**) |
+
+- **The real gains:**
+  - **wpblog** -1.0: its "two" batch answered (the 465 arm's extra 0.3
+    is one guard trip);
+  - **google** -1.0: its one "local" a load was the same silent `id`
+    decline, on an element with no box. 466 answers it ("id change on an
+    element with no box", 3 times, once a load).
+- **The noise:** the 465 arm tripped the cost guard 1.3 times a load
+  this run (github 2 trips, wpblog 1); it was 0 in the 465 census. Its
+  7.3 is therefore inflated. Against 465's own census (6.0), the gain is
+  about **-1.7**. bbc +0.3 and oldreddit -0.3 are single loads; bbc's is
+  a sheet change restyling more than 8 elements (447's cap), not a 466
+  path.
+- No crash or assertion in 42 loads.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+8.0 (463) -> 7.7 (464) -> 6.0 (465) -> **4.3 (466)**.
+
+**Remaining full rebuilds a load:**
+- wpblog 2.0: "local", a parent holding more than blocks; "over", too
+  wide (`<body>`);
+- wpnews 1.0 and youtube 1.0;
+- decline reasons left: block not one line container of plain content
+  (2.0); an aria-expanded sibling-rule attribute that has later
+  siblings (1.0).
+
+No sudo.
