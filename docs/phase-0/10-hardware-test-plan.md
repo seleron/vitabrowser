@@ -17079,3 +17079,49 @@ site list in **doc 25** (`25-device-test-run43-2026-11-26.md`). Reference
 dumps were regenerated from the 475 stack the same day (the live gate's
 autotest stage had deleted the previous `reference/` set); staging archive
 `hwtest-2026-11-26-run43`.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 475, 21-site census 474 vs 475
+
+**ASan at 475** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented): `asan-autotest.sh main` **clean**: rc 0,
+interaction 52/52, 442 page dumps (gate 442), 0 AddressSanitizer errors.
+
+**Census** (all 21 sites, 3 loads per arm, one interleaved run). The 13
+sites at 0.0 in both arms are left out:
+
+| site | 474 | 475 | root restyled in place (474 -> 475) |
+|---|---|---|---|
+| wikipedia | 3 / 0 / 3 (2.0) | 3 / 3 / 3 (3.0) | 0 -> 0 |
+| rte | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** | **0 -> 3** |
+| guardian | 2 / 2 / 2 (2.0) | 2 / 2 / 3 (2.3) | 4 -> 5 |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) | |
+| oldreddit | 0 / 0 / 0 (0.0) | 1 / 0 / 0 (0.3) | |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) | |
+| github | 2 / 2 / 0 (1.3) | 0 / 1 / 2 (1.0) | |
+| claude | 5 / 6 / 4 (5.0) | 5 / 5 / 6 (5.3) | |
+| **total** | 16 / 14 / 13 (**14.3**) | 14 / 14 / 17 (**15.0**) | |
+
+- **475's gain: rte -1.0**, its path running 3 times; rte is at 0.
+- **The rest is variation:**
+  - wikipedia's +1.0 is the 474 arm's zero load (3 / 0 / 3; it scored
+    3 / 3 / 3 in the 470 and 471 runs). 475's path did not run there.
+  - guardian +0.3 and oldreddit +0.3 are single loads.
+  - Guard trips 6.0 -> 4.7 (claude 8 -> 5, github 4 -> 2).
+- No crash, assertion or failed load in 126 loads.
+
+**21-site history:** 46.0 (451) -> 20.3 (469) -> 18.3 (470) -> 17.3
+(471) -> 11.3 (472) -> 12.3 (473) -> 12.0 (474; 14.3 for 474 in this run)
+-> **15.0 (475)**. The whole-census spread now dominates: the same 474
+binary scored 12.0 and 14.3 in two runs.
+
+**Per site now** (475 arm):
+- **0 on 13 sites**, rte among them;
+- wikipedia 3 ("class change may move a sibling selector", "nearest box
+  is not a block", the root);
+- claude 5 (guard, over, structural);
+- guardian 2.3 (over, a flex box holding controls or frames);
+- stackoverflow 2 (guard only);
+- github 1 (guard);
+- wpblog 1 (its body-wide "over" batch: 464, pending the owner's ruling).
+
+No sudo.
