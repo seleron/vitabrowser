@@ -16550,3 +16550,75 @@ interleaved run, the final build):
 - `restage-full.sh`: **552 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 470, 21-site census 469 vs 470
+
+**ASan at 470** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 434 page
+  dumps (gate 434), 0 AddressSanitizer errors, the log to page 378 of
+  378.
+- Under it, the new paths (cell block, float / inline-block enclosing
+  rebuild) ran 8 times.
+
+**Census** (all 21 sites of `sites.tsv`, 3 loads per arm, one
+interleaved run). From 470 on, the 21-site census is the one to run: its
+gains are on sites outside the old 7.
+
+| site | 469 | 470 |
+|---|---|---|
+| example | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| textfiles | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wikipedia | 4 / 4 / 4 (4.0) | **3 / 3 / 3 (3.0)** |
+| archwiki | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| cnnlite | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 1 (0.3) |
+| rte | 4 / 4 / 4 (4.0) | **3 / 2 / 3 (2.7)** |
+| guardian | 2 / 3 / 2 (2.3) | 2 / 3 / 2 (2.3) |
+| hackernews | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) |
+| oldreddit | 0 / 1 / 0 (0.3) | 1 / 0 / 0 (0.3) |
+| wpnews | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| wpblog | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| jquery | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** |
+| mdn | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| python | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| ddglite | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| google | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| github | 2 / 0 / 0 (0.7) | 0 / 0 / 0 (0.0) |
+| youtube | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| claude | 4 / 5 / 3 (4.0) | 4 / 6 / 7 (5.7) |
+| **total** | 21 / 22 / 18 (**20.3**) | 17 / 18 / 20 (**18.3**) |
+
+- **The real gains:**
+  - **wikipedia -1.0**;
+  - **rte -1.3**;
+  - **jquery -1.0**: its "restyled flex or grid box is not in a block"
+    went 2.0 -> 0, the float parent in `html_rl_flex_restyle`.
+- "Restyled block's parent is not a block" 6.0 -> 2.0, the root cases
+  left.
+- **The noise:**
+  - **claude +1.7 is cost-guard trips only** (3 -> 8 over three loads).
+    None of 470's paths ran on claude (0 enclosing or cell rebuilds in
+    every load). Its trips land 0.2-8% over a ~0.7 s budget in both arms.
+  - github's -0.7 is 469's 2 guard trips.
+  - bbc's +0.3 is one load.
+- No crash, assertion or failed load in 126 loads.
+
+**21-site history:** 46.0 (451) -> 20.0 / 20.3 (469, two runs) ->
+**18.3 (470)**. Guard trips are 4.0-5.0 a load of that: stackoverflow 2
+a load in every run, claude 1-3.
+
+**What is left:**
+- **Guard trips**, about 5 a load: stackoverflow and claude, batches that
+  pass their budget by a few percent.
+- **Over batches**, 3.7 a load: claude, guardian and wpblog, too wide.
+- **The decline reasons, each 2-3 a load:**
+  - a flex or grid box that takes part in counting (wikipedia,
+    archwiki);
+  - structural selectors or counters in page CSS;
+  - an object (a background) in the line (rte);
+  - an id change on a boxed element (rte);
+  - a structural change at the root with a boxed child (466 leaves it).
+
+No sudo.
