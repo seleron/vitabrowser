@@ -16485,3 +16485,68 @@ check for regressions.
 4. **jquery's** flex box not in a block (2.0).
 
 No sudo.
+
+## Patch 470 (2026-11-27): a restyled block whose parent is a cell, a float or an inline-block
+
+**Problem.** "declined (restyled block's parent is not a block)", **5.7
+a load** on the 21-site census (wikipedia, rte, archwiki).
+- `html_rl_block_restyle` takes a block whose parent box is a block, a
+  flex or grid box, or the root (through 419's walk), and declined on
+  anything else.
+- Logged now (the element and its parent box), a probe found four
+  shapes:
+
+| restyled element | its parent box | site |
+|---|---|---|
+| `<html>` (the root) | none: 419's walk declined first (more than 8 elements restyle, or an in-place restyle declined) | wikipedia, archwiki |
+| `<div>` | a table cell `<td>` (type 5) | wikipedia |
+| `<button>`, `<div>` | an anonymous float box (types 7 / 8): the element is itself floated | wikipedia, rte |
+| `<div>` | an inline-block `<app-video-basic>` (type 9) | rte |
+
+**Fix** (html.c).
+- **A block in a table cell** is built again whole where it is, as 434
+  does for a block that is not one line of plain content.
+  `html_rl_flex_restyle` takes a cell parent, and the page is laid out
+  whole (366).
+- **A floated block, or a block in an inline-block:** the nearest block,
+  flex or grid box above is built again whole (456's
+  `html_rl_enclosing_whole`). That builds the float or inline-block, its
+  line and everything in it from the DOM.
+- **`html_rl_flex_restyle`'s 456 branch takes float parents the same
+  way.** The first 3-site run showed wikipedia's `<button>` reaching the
+  float through 434's whole-block rebuild instead ("restyled flex or grid
+  box is not in a block", 0 -> 2.0).
+- **The root keeps the full rebuild**: the whole document's style does
+  change.
+
+**Measured** (wikipedia, rte, archwiki; 3 loads per arm, one
+interleaved run, the final build):
+- **9.0 -> 6.0 a load**: wikipedia 4.0 -> 3.0, rte 4.0 -> 2.0, archwiki
+  1.0 (flat);
+- "restyled block's parent is not a block" 6.0 -> 2.0 (the root cases
+  left);
+- 24 enclosing-block rebuilds, 3 cell blocks.
+
+**Gate.**
+- New pair **JS-restyle-odd-parent / CSS-restyle-odd-parent-ref**: class
+  changes on a block in a `<td>`, a floated block and a block in an
+  inline-block, plus a text change in a floated block with a `::before`.
+  Result: **rows 0, 1 cell block, 3 enclosing rebuilds, 0 declines, 0
+  full rebuilds**.
+- **gate470 FAILED** on 385's JS-class-churn check ("class churn past
+  the cap is deferred, not dropped"). Rows were 0, but 0 deferrals.
+  - That page kept its class changes full rebuilds by putting the
+    paragraph in an inline-block (for 448); 470 now answers that shape
+    locally.
+  - A counter cannot stand in: fixes1135's cap defers only on pages with
+    no structural rules or counters.
+  - The page now toggles **`<html>`'s class** five times. Each toggle
+    restyles ten paragraphs: more than 419's walk takes, and the root has
+    no parent box, so they stay full rebuilds. The first full rebuild
+    carries the load's mutation census (structural: the cap's count
+    restarts), so the fourth class-only rebuild is past the cap.
+  - Result: 1 deferred, rows 0.
+- **gate470b exit 0**; interaction 52/52.
+- `restage-full.sh`: **552 applied plus the 2 known collisions**.
+
+No sudo.

@@ -1,0 +1,87 @@
+# netsurf: a restyled block whose parent is a cell, a float or an inline-block (patch 470)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 469)
+#
+# "declined (restyled block's parent is not a block)" -- 5.7 a load on
+# the 21-site census (wikipedia, rte, archwiki): html_rl_block_restyle
+# takes a block whose parent box is a block, flex or grid box (or the
+# root, through 419's walk) and declined on anything else. Logged now
+# (the element and its parent box), a probe found:
+# - a <div> in a <td> (wikipedia): built again whole where it is, as 434
+#   does for a block that is not one line of plain content
+#   (html_rl_flex_restyle takes a cell parent; the page is laid out
+#   whole, 366);
+# - a floated block, its box in an anonymous float box (wikipedia's
+#   <button>, rte's <div>), and a block in an inline-block (rte's
+#   <app-video-basic>): the nearest block, flex or grid box above is
+#   built again whole (456's html_rl_enclosing_whole), which builds the
+#   float or the inline-block, its line and everything in it from the DOM.
+#   html_rl_flex_restyle's 456 branch takes a float parent the same way
+#   (wikipedia's <button>, reached by 434's whole-block rebuild).
+# The root (<html>, when 419's walk declines: more than 8 elements
+# restyle) keeps the full rebuild.
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -13781,9 +13781,15 @@
+ 		 * its enclosing block, as 438 says: that block is built
+ 		 * again whole, which rebuilds the line, the inline-level box
+ 		 * and everything in it from the DOM */
++		/* Patch 470: a floated box too (its box sits in an anonymous
++		 * float box: wikipedia's <button> reached here by 434's
++		 * whole-block rebuild) -- the enclosing block builds the
++		 * float again with its line */
+ 		if (pbox != NULL && (pbox->type == BOX_INLINE_BLOCK ||
+ 		    pbox->type == BOX_INLINE_FLEX ||
+-		    pbox->type == BOX_INLINE_GRID) &&
++		    pbox->type == BOX_INLINE_GRID ||
++		    pbox->type == BOX_FLOAT_LEFT ||
++		    pbox->type == BOX_FLOAT_RIGHT) &&
+ 		    html_rl_enclosing_whole(c, pbox, t0) == 0)
+ 			return 0;
+ 		RL_FNO("restyled flex or grid box is not in a block");
+@@ -13936,8 +13942,43 @@
+ 	    html_rl_doc_noop(c, "root change") == 0)
+ 		return 0;
+ 	if (pbox == NULL || (pbox->type != BOX_BLOCK &&
+-			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID))
++			     pbox->type != BOX_FLEX && pbox->type != BOX_GRID)) {
++		/* patch 470: name the parent */
++		char *et = html_rl_struct_tag(el);
++		char *pt = (pbox != NULL && pbox->node != NULL) ?
++				html_rl_struct_tag(pbox->node) : NULL;
++		macsurf_debug_log_writef("LIFE rebuild local: restyled <%s> "
++			"box type %d, its parent <%s> box type %d", et ? et :
++			"?", (int)ob->type, pt ? pt : "-",
++			pbox != NULL ? (int)pbox->type : -1);
++		free(et);
++		free(pt);
++		/* Patch 470: a block in a table cell (wikipedia's <div> in a
++		 * <td>) is built again whole where it is, as 434 does for a
++		 * block that is not one line of plain content --
++		 * html_rl_flex_restyle takes a cell parent, and the page is
++		 * laid out whole (366: the table lays the cell out). */
++		if (pbox != NULL && pbox->type == BOX_TABLE_CELL) {
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"block in a table cell, built again whole");
++			return html_rl_flex_restyle(c, el, ob, t0, old_class,
++					true);
++		}
++		/* Patch 470: a floated block (its box sits in an anonymous
++		 * float box: wikipedia's <button>, rte's <div>) or a block
++		 * in an inline-block (rte's <app-video-basic>): the nearest
++		 * block, flex or grid box above is built again whole (456),
++		 * which builds the float or the inline-block, its line and
++		 * everything in it from the DOM. */
++		if (pbox != NULL) {
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"block in a float or inline-level box, the "
++				"enclosing block built again whole");
++			if (html_rl_enclosing_whole(c, ob, t0) == 0)
++				return 0;
++		}
+ 		RL_RNO("restyled block's parent is not a block");
++	}
+ 	if (pbox->type != BOX_BLOCK) {
+ 		full = true;
+ 		why = "a flex or grid item";

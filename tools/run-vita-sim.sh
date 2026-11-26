@@ -452,6 +452,8 @@ JS-img-inert-attr file:///app0:/testpages/JS-img-inert-attr.html
 CSS-img-inert-attr-ref file:///app0:/testpages/CSS-img-inert-attr-ref.html
 JS-sib-noparent file:///app0:/testpages/JS-sib-noparent.html
 CSS-sib-noparent-ref file:///app0:/testpages/CSS-sib-noparent-ref.html
+JS-restyle-odd-parent file:///app0:/testpages/JS-restyle-odd-parent.html
+CSS-restyle-odd-parent-ref file:///app0:/testpages/CSS-restyle-odd-parent-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2542,6 +2544,19 @@ k469d=$(printf '%s\n' "$k469seg" | grep -c "declined (a sibling selector can mat
 k469f=$(printf '%s\n' "$k469seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-sib-noparent: rows $k469r (0), nearest box above the parent built again whole ${k469w} (1), declines ${k469d} (0), full rebuilds ${k469f} (0)"
 [ "$k469r" = 0 ] && [ "${k469w:-0}" -ge 1 ] && [ "${k469d:-1}" -eq 0 ] && [ "${k469f:-1}" -eq 0 ] || fail "a sibling-rule attribute under a parent with no box"
+# Patch 470: class changes on a block in a table cell, a floated block and
+# a block in an inline-block, and a text change in a floated block with a
+# ::before: built again whole where they are (the cell)
+# or with their enclosing block; no "restyled block's parent is not a
+# block" decline, no full rebuild.
+k470r=$(fl_rows JS-restyle-odd-parent CSS-restyle-odd-parent-ref)
+k470seg=$(awk '/ page [0-9]+\/[0-9]+ JS-restyle-odd-parent: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k470c=$(printf '%s\n' "$k470seg" | grep -c "restyled block in a table cell, built again whole" || true)
+k470e=$(printf '%s\n' "$k470seg" | grep -c "restyled block in a float or inline-level box, the enclosing block built again whole" || true)
+k470d=$(printf '%s\n' "$k470seg" | grep -c "declined (restyled block's parent is not a block)" || true)
+k470f=$(printf '%s\n' "$k470seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-restyle-odd-parent: rows $k470r (0), cell blocks ${k470c} (1), float / inline-block enclosing rebuilds ${k470e} (3), declines ${k470d} (0), full rebuilds ${k470f} (0)"
+[ "$k470r" = 0 ] && [ "${k470c:-0}" -ge 1 ] && [ "${k470e:-0}" -ge 3 ] && [ "${k470d:-1}" -eq 0 ] && [ "${k470f:-1}" -eq 0 ] || fail "a restyled block whose parent is a cell, a float or an inline-block"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the
