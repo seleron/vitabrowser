@@ -16004,3 +16004,48 @@ aria-hidden and role (0.3 each in a github-only run).
 - `restage-full.sh`: **547 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries instrumented) at 465, census 464 vs 465
+
+**ASan at 465** (`--libs`: libwapcaplet, libparserutils, libhubbub,
+libcss, libdom instrumented):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 424 page
+  dumps (gate 424), 0 AddressSanitizer errors, the log to page 368 of
+  368.
+- Under it, the new path ("nothing with a box follows the element") ran
+  4 times.
+
+**Census** (7 sites, 3 loads per arm, one interleaved run):
+
+| site | 464 | 465 |
+|---|---|---|
+| bbc | 0 / 0 / 0 (0.0) | 0 / 0 / 0 (0.0) |
+| oldreddit | 1 / 0 / 0 (0.3) | 0 / 0 / 0 (0.0) |
+| wpnews | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| wpblog | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| google | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| github | 1 / 1 / 1 (1.0) | **0 / 0 / 0 (0.0)** |
+| youtube | 1 / 1 / 1 (1.0) | 1 / 1 / 1 (1.0) |
+| **total** | 8 / 7 / 7 (**7.3**) | 6 / 6 / 6 (**6.0**) |
+
+- **github is at 0**, with 464 and 465 together: the oversized batch is
+  coalesced, then the root and last-child attributes are answered
+  locally.
+- The data-turbo-loaded declines **2.0 -> 0**. Answered 3 times each
+  (once a load): data-turbo-loaded, data-hydrated, popover, style.
+- oldreddit's -0.3 is one load (noise).
+- No crash or assertion in 42 loads.
+
+**Since 446** (one A/B per run, the same 7 sites): 27.0 (446) -> ... ->
+8.0 (463) -> 7.7 (464) -> **6.0 (465)**.
+
+**Remaining full rebuilds a load:**
+- wpblog 3.0: one too-wide "over" batch (`<body>`), plus "two" batches;
+- wpnews, google, youtube 1.0 each.
+- Decline reasons left, each 1.0-2.0 a load: block not one line
+  container of plain content; an aria-expanded sibling-rule attribute
+  that does have later siblings; a restyled flex or grid box not in a
+  block; structural selectors or counters in page CSS; a parent holding
+  more than blocks.
+
+No sudo.
