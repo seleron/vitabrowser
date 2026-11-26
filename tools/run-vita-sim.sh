@@ -454,6 +454,8 @@ JS-sib-noparent file:///app0:/testpages/JS-sib-noparent.html
 CSS-sib-noparent-ref file:///app0:/testpages/CSS-sib-noparent-ref.html
 JS-restyle-odd-parent file:///app0:/testpages/JS-restyle-odd-parent.html
 CSS-restyle-odd-parent-ref file:///app0:/testpages/CSS-restyle-odd-parent-ref.html
+JS-count-flex file:///app0:/testpages/JS-count-flex.html
+CSS-count-flex-ref file:///app0:/testpages/CSS-count-flex-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -1802,9 +1804,12 @@ echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fx
 ger=$(fl_rows JS-gen-empty CSS-gen-empty-ref)
 ges=$(fl_rows JS-gen-empty-sib CSS-gen-empty-sib-ref)
 gel=$(grep -c "LIFE rebuild local: \(a block with generated content\|content in an empty block\), the block built again" "$R/netsurf.log" || true)
-gee=$(grep -c "LIFE rebuild local: declined (a sibling rule tests :empty)" "$R/netsurf.log" || true)
+# Patch 471: the :empty rule's parent rebuild (450) now passes the
+# parent's counting when its counters enter it at 0 and its counting is
+# unchanged -- the decline or that rebuild both count; rows 0 decides.
+gee=$(grep -c "LIFE rebuild local: declined (a sibling rule tests :empty)\|a sibling rule tests :empty: the parent, built again whole" "$R/netsurf.log" || true)
 gec=$(grep -c "LIFE rebuild local: declined (the restyled block takes part in counting)" "$R/netsurf.log" || true)
-echo "  JS-gen-empty: rows differing from the parse-time build $ger (0), sibling/counter page $ges (0); ${gel} blocks built again (8 or more); declined: :empty sibling rule ${gee} (1 or more), counting block ${gec} (1 or more)"
+echo "  JS-gen-empty: rows differing from the parse-time build $ger (0), sibling/counter page $ges (0); ${gel} blocks built again (8 or more); :empty sibling rule declined or its parent rebuilt ${gee} (1 or more), counting block ${gec} (1 or more)"
 [ "$ger" = 0 ] && [ "$ges" = 0 ] && [ "${gel:-0}" -ge 8 ] &&
 	[ "${gee:-0}" -ge 1 ] && [ "${gec:-0}" -ge 1 ] ||
 	fail "generated-content and empty blocks built again"
@@ -1820,9 +1825,12 @@ k374l=$(awk '/ page [0-9]+\/[0-9]+ JS-counters-local: navigate/ {on=1; next} on 
 	grep -c "LIFE rebuild local: \(rebuilt and laid out\|flex or grid box restyled\|table restyled\|.*the block built again\)" || true)
 k374b=$(grep -c "LIFE rebuild local: declined (the restyled block takes part in counting)" "$R/netsurf.log" || true)
 k374n=$(grep -c "LIFE rebuild local: declined (the line takes part in counting)" "$R/netsurf.log" || true)
-k374f=$(grep -c "LIFE rebuild local: declined (the restyled flex or grid box takes part in counting)" "$R/netsurf.log" || true)
+# Patch 471: a counting flex box is now rebuilt alone when its counters
+# enter it at 0 and its counting is unchanged (or given up when it
+# changed): either line, or the decline, counts as the flex case handled
+k374f=$(grep -c "LIFE rebuild local: declined (the restyled flex or grid box takes part in counting)\|restyled box counts, its counting unchanged\|restyled box's counting changed, full reconvert" "$R/netsurf.log" || true)
 k374o=$(grep -c "LIFE rebuild local: declined (a counter shown in page CSS)\|could reach outside its \(table\|flex\)" "$R/netsurf.log" || true)
-echo "  JS-counters-local: rows differing from the parse-time build $k374r (0); ${k374l} changes built locally on the page (5 or more); counting declines: block ${k374b}, line ${k374n}, flex ${k374f} (1 or more each); page-wide counter declines ${k374o} (0)"
+echo "  JS-counters-local: rows differing from the parse-time build $k374r (0); ${k374l} changes built locally on the page (5 or more); counting declines: block ${k374b}, line ${k374n}, flex (declined or 471) ${k374f} (1 or more each); page-wide counter declines ${k374o} (0)"
 [ "$k374r" = 0 ] && [ "${k374l:-0}" -ge 5 ] && [ "${k374b:-0}" -ge 1 ] &&
 	[ "${k374n:-0}" -ge 1 ] && [ "${k374f:-0}" -ge 1 ] && [ "${k374o:-0}" = 0 ] ||
 	fail "counters across a local build"
@@ -2557,6 +2565,16 @@ k470d=$(printf '%s\n' "$k470seg" | grep -c "declined (restyled block's parent is
 k470f=$(printf '%s\n' "$k470seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-restyle-odd-parent: rows $k470r (0), cell blocks ${k470c} (1), float / inline-block enclosing rebuilds ${k470e} (3), declines ${k470d} (0), full rebuilds ${k470f} (0)"
 [ "$k470r" = 0 ] && [ "${k470c:-0}" -ge 1 ] && [ "${k470e:-0}" -ge 3 ] && [ "${k470d:-1}" -eq 0 ] && [ "${k470f:-1}" -eq 0 ] || fail "a restyled block whose parent is a cell, a float or an inline-block"
+# Patch 471: a counting flex box restyled -- a recolour (counting
+# unchanged, the counter its items show entering it at 0) rebuilt alone; doubled increments (counting
+# changed) given up into the full rebuild; the counter after it right.
+k471r=$(fl_rows JS-count-flex CSS-count-flex-ref)
+k471seg=$(awk '/ page [0-9]+\/[0-9]+ JS-count-flex: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k471u=$(printf '%s\n' "$k471seg" | grep -c "restyled box counts, its counting unchanged (shown counters enter it at 0)" || true)
+k471c=$(printf '%s\n' "$k471seg" | grep -c "restyled box's counting changed, full reconvert" || true)
+k471d=$(printf '%s\n' "$k471seg" | grep -c "declined (the restyled flex or grid box takes part in counting)" || true)
+echo "  JS-count-flex: rows $k471r (0), counting unchanged rebuilt alone ${k471u} (1), counting changed given up ${k471c} (1), declines ${k471d} (0)"
+[ "$k471r" = 0 ] && [ "${k471u:-0}" -ge 1 ] && [ "${k471c:-0}" -ge 1 ] && [ "${k471d:-1}" -eq 0 ] || fail "a counting flex box restyled with its counting unchanged"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

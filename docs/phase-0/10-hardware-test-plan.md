@@ -16622,3 +16622,69 @@ a load in every run, claude 1-3.
   - a structural change at the root with a boxed child (466 leaves it).
 
 No sudo.
+
+## Patch 471 (2026-11-27): a counting flex or grid box rebuilt alone when its counters enter it at 0 and its counting transfer is unchanged
+
+**Problem.** "declined (the restyled flex or grid box takes part in
+counting)", **3.0 a load** on the 21-site census (wikipedia, archwiki).
+- 374 declined any restyle of a subtree that counts, and gave up any
+  build that touched a counter: a build alone starts the builder's
+  counter table empty.
+- A probe: the restyled boxes were `<body>` and a large `<div>`.
+  wikipedia shows a counter in an `<a>::before` (reference numbers),
+  archwiki in an `<h2>::before` (section numbers).
+
+**Fix** (html.c, `html_rl_flex_restyle`). The builder's counter table is
+flat (box_construct.c: one value a name, in document order, no scopes;
+`counters()` reads it as `counter()` does). So a subtree built alone
+counts as in the whole build when:
+1. **Every counter it uses enters it at 0** (`html_rl_counts_from_zero`):
+   its resets, its increments and the counters its pseudo-elements show.
+   It replays the table over every box before the subtree, in the
+   builder's order: an element, its `::before`, its children, its
+   `::after`. Needed only when the subtree shows a counter.
+2. **What it does to each counter is the same after the build as
+   before** (`html_rl_cxfer`): per name, whether it resets it, and the
+   value after its last reset plus the increments after it (or the
+   increments alone). Compared over the union of the names the old and
+   new boxes use. Every counter after the subtree is then where it was.
+
+Otherwise it gives up into the full rebuild, as a failed build or
+normalise already does (374). Logged: "restyled box counts, its counting
+unchanged (shown counters enter it at 0)" / "restyled box's counting
+changed, full reconvert".
+
+**Three tries, measured each time** (wikipedia + archwiki, 3 loads per
+arm):
+
+| try | condition | result |
+|---|---|---|
+| 1 | "a counter shown nowhere in the subtree" | flat: the subtrees do show one |
+| 2 | "entering at 0", plus a per-box counting hash | flat: 9 give-ups. wikipedia's class changes show and hide elements that count nothing (4597 -> 4673 boxes), and the hash saw those as counting changes |
+| 3 | the per-name transfer (the final fix) | **4.0 -> 3.0**: archwiki 1.0 -> 0.0; 27 counting rebuilds answered (9 a load); "takes part in counting" 3.0 -> 0 |
+
+wikipedia stays at 3.0: its batches now reach later declines ("class
+change may move a sibling selector" 2.0, "nearest box is not a block"
+1.0).
+
+**Gate.**
+- New pair **JS-count-flex / CSS-count-flex-ref**: a flex `#list` with
+  `counter-reset: n`, items with `counter-increment: n` and
+  `::before { content: counter(n) }`, and a counter shown after the
+  list.
+  - Step one recolours `#list`: rebuilt alone.
+  - Step two doubles the increments: counting changed, given up, so the
+    counter after it reads 6.
+  - Rows 0.
+- **gate471 FAILED** on JS-gen-empty: the `:empty` sibling rule's parent
+  rebuild (450) now passes the parent's counting, so the expected decline
+  became a local rebuild (rows 0). The check now counts either.
+- **gate471b FAILED** on JS-counters-local's flex count: its counting
+  flex step is now built locally (rows 0). The check now counts the
+  decline or either 471 line.
+  - Every other counting check was searched before the third run; the
+    block, line, removed-block and page-wide checks are unaffected.
+- **gate471c exit 0**; interaction 52/52.
+- `restage-full.sh`: **553 applied plus the 2 known collisions**.
+
+No sudo.

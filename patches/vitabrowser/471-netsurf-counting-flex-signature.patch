@@ -1,0 +1,370 @@
+# netsurf: a counting flex or grid box rebuilt alone when its counters enter it at 0 and its counting transfer is unchanged (patch 471)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 470)
+#
+# "declined (the restyled flex or grid box takes part in counting)" --
+# 3.0 a load on the 21-site census (wikipedia, archwiki). 374 declined any
+# restyle of a subtree that counts (and gave up any build that touched a
+# counter): a build alone starts the builder's counter table empty. That
+# table is flat (box_construct.c: one value a name, in document order, no
+# scopes; counters() reads it as counter() does), so a subtree built alone
+# counts as in the whole build when
+# - every counter it uses (its resets, increments and the counters its
+#   pseudo-elements show) enters it at 0 (html_rl_counts_from_zero replays
+#   the table over every box before the subtree, in the builder's order:
+#   an element, its ::before, its children, its ::after) -- needed only
+#   when the subtree shows a counter; and
+# - what it does to each counter is the same after the build as before
+#   (html_rl_cxfer: per name, whether it resets it and the value after its
+#   last reset plus the increments after, or the increments alone), over
+#   the union of the names the old and new boxes use -- so every counter
+#   after it is where it was, whatever else changed in it (wikipedia's
+#   class changes show and hide elements that count nothing: a per-box
+#   hash, the first try, saw those as counting changes).
+# Otherwise it gives up into the full rebuild, as a failed build or
+# normalise already does (374). Logged: "restyled box counts, its counting
+# unchanged (shown counters enter it at 0)" / "restyled box's counting
+# changed, full reconvert".
+#
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -13548,6 +13548,241 @@
+ 	return false;
+ }
+ 
++/* Patch 471: does a pseudo-element of the box b or of one below it show
++ * a counter? (content: counter() / counters() -- the only way a counter
++ * value is drawn but for list markers, which layout numbers, 420) */
++static bool html_rl_tree_shows_counter(struct box *b, bool siblings)
++{
++	for (; b != NULL; b = siblings ? b->next : NULL) {
++		if (b->styles != NULL &&
++		    (html_rl_style_shows_counter(
++				b->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]) ||
++		     html_rl_style_shows_counter(
++				b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER])))
++			return true;
++		if (html_rl_tree_shows_counter(b->children, true))
++			return true;
++		if (!siblings)
++			break;
++	}
++	return false;
++}
++
++/* Patch 471: the counting of the box b and the boxes below it, in tree
++ * order, as a hash: every element box's (and its ::before / ::after's)
++ * counter-reset and counter-increment, name and value. Two subtrees with
++ * the same signature leave every counter after them where it was. */
++/* Patch 471: the counter names a subtree uses -- resets, increments and
++ * the counters its pseudo-elements show. False when there are more than
++ * HTML_RL_CNAMES_MAX. */
++#define HTML_RL_CNAMES_MAX 16
++struct html_rl_cnames {
++	lwc_string *n[HTML_RL_CNAMES_MAX];
++	int32_t v[HTML_RL_CNAMES_MAX];	/* the value entering the subtree */
++	int k;
++	bool over;
++};
++static void html_rl_cnames_add(struct html_rl_cnames *cn, lwc_string *name)
++{
++	bool same;
++	int i;
++
++	if (name == NULL)
++		return;
++	for (i = 0; i < cn->k; i++)
++		if (lwc_string_isequal(cn->n[i], name, &same) ==
++				lwc_error_ok && same)
++			return;
++	if (cn->k == HTML_RL_CNAMES_MAX) {
++		cn->over = true;
++		return;
++	}
++	cn->v[cn->k] = 0;
++	cn->n[cn->k++] = name;
++}
++static void html_rl_cnames_style(struct html_rl_cnames *cn,
++		const css_computed_style *st)
++{
++	const css_computed_counter *arr = NULL;
++	const css_computed_content_item *it = NULL;
++	int k;
++
++	if (st == NULL)
++		return;
++	if (css_computed_counter_reset(st, &arr) ==
++			CSS_COUNTER_RESET_NAMED && arr != NULL)
++		for (k = 0; arr[k].name != NULL; k++)
++			html_rl_cnames_add(cn, arr[k].name);
++	arr = NULL;
++	if (css_computed_counter_increment(st, &arr) ==
++			CSS_COUNTER_INCREMENT_NAMED && arr != NULL)
++		for (k = 0; arr[k].name != NULL; k++)
++			html_rl_cnames_add(cn, arr[k].name);
++	if (css_computed_content(st, &it) == CSS_CONTENT_SET && it != NULL)
++		for (k = 0; it[k].type != CSS_COMPUTED_CONTENT_NONE; k++) {
++			if (it[k].type == CSS_COMPUTED_CONTENT_COUNTER)
++				html_rl_cnames_add(cn, it[k].data.counter.name);
++			else if (it[k].type == CSS_COMPUTED_CONTENT_COUNTERS)
++				html_rl_cnames_add(cn,
++					it[k].data.counters.name);
++		}
++}
++static void html_rl_cnames_tree(struct html_rl_cnames *cn, struct box *b,
++		bool siblings)
++{
++	for (; b != NULL; b = siblings ? b->next : NULL) {
++		if (b->styles != NULL && b->type != BOX_INLINE_END) {
++			html_rl_cnames_style(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_NONE]);
++			html_rl_cnames_style(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]);
++			html_rl_cnames_style(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
++		}
++		html_rl_cnames_tree(cn, b->children, true);
++		if (!siblings)
++			break;
++	}
++}
++/* the builder's flat counter table (box_construct.c: one value a name,
++ * reset then increment, an element before its ::before, its children,
++ * then its ::after), for the names in cn only */
++static void html_rl_cnames_apply(struct html_rl_cnames *cn,
++		const css_computed_style *st)
++{
++	const css_computed_counter *arr = NULL;
++	bool same;
++	int k, i;
++
++	if (st == NULL)
++		return;
++	if (css_computed_counter_reset(st, &arr) ==
++			CSS_COUNTER_RESET_NAMED && arr != NULL)
++		for (k = 0; arr[k].name != NULL; k++)
++			for (i = 0; i < cn->k; i++)
++				if (lwc_string_isequal(cn->n[i], arr[k].name,
++						&same) == lwc_error_ok && same)
++					cn->v[i] = FIXTOINT(arr[k].value);
++	arr = NULL;
++	if (css_computed_counter_increment(st, &arr) ==
++			CSS_COUNTER_INCREMENT_NAMED && arr != NULL)
++		for (k = 0; arr[k].name != NULL; k++)
++			for (i = 0; i < cn->k; i++)
++				if (lwc_string_isequal(cn->n[i], arr[k].name,
++						&same) == lwc_error_ok && same)
++					cn->v[i] += FIXTOINT(arr[k].value);
++}
++/* true once the walk reached stop (nothing after it applied) */
++static bool html_rl_cnames_before(struct html_rl_cnames *cn, struct box *b,
++		struct box *stop)
++{
++	for (; b != NULL; b = b->next) {
++		if (b == stop)
++			return true;
++		if (b->styles != NULL && b->type == BOX_INLINE_END) {
++			html_rl_cnames_apply(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
++			continue;
++		}
++		if (b->styles != NULL) {
++			html_rl_cnames_apply(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_NONE]);
++			html_rl_cnames_apply(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]);
++		}
++		if (html_rl_cnames_before(cn, b->children, stop))
++			return true;
++		if (b->styles != NULL && b->type != BOX_INLINE)
++			html_rl_cnames_apply(cn,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
++	}
++	return false;
++}
++/* Patch 471: would the subtree at b, built alone (an empty counter
++ * table: every counter 0), count as it did in the whole build? Yes when
++ * every counter it uses enters it at 0. */
++static bool html_rl_counts_from_zero(html_content *c, struct box *b)
++{
++	struct html_rl_cnames cn;
++	int i;
++
++	memset(&cn, 0, sizeof(cn));
++	html_rl_cnames_tree(&cn, b, false);
++	if (cn.over)
++		return false;
++	if (cn.k == 0)
++		return true;
++	if (!html_rl_cnames_before(&cn, c->layout, b))
++		return false;		/* b not in the tree */
++	for (i = 0; i < cn.k; i++)
++		if (cn.v[i] != 0)
++			return false;
++	return true;
++}
++
++/* Patch 471: what a subtree does to each counter in cn, as the builder
++ * applies it (html_rl_cnames_before's order): whether it resets it, and
++ * the value after the last reset plus the increments after that (or the
++ * increments alone, added to whatever enters). Two subtrees with the same
++ * transfer for every name leave every counter after them where it was --
++ * whatever else changed in them (elements shown or hidden that count
++ * nothing). */
++struct html_rl_cxfer {
++	bool reset[HTML_RL_CNAMES_MAX];
++	int32_t val[HTML_RL_CNAMES_MAX];
++};
++static void html_rl_cxfer_apply(const struct html_rl_cnames *cn,
++		struct html_rl_cxfer *x, const css_computed_style *st)
++{
++	const css_computed_counter *arr = NULL;
++	bool same;
++	int k, i;
++
++	if (st == NULL)
++		return;
++	if (css_computed_counter_reset(st, &arr) ==
++			CSS_COUNTER_RESET_NAMED && arr != NULL)
++		for (k = 0; arr[k].name != NULL; k++)
++			for (i = 0; i < cn->k; i++)
++				if (lwc_string_isequal(cn->n[i], arr[k].name,
++						&same) == lwc_error_ok && same) {
++					x->reset[i] = true;
++					x->val[i] = FIXTOINT(arr[k].value);
++				}
++	arr = NULL;
++	if (css_computed_counter_increment(st, &arr) ==
++			CSS_COUNTER_INCREMENT_NAMED && arr != NULL)
++		for (k = 0; arr[k].name != NULL; k++)
++			for (i = 0; i < cn->k; i++)
++				if (lwc_string_isequal(cn->n[i], arr[k].name,
++						&same) == lwc_error_ok && same)
++					x->val[i] += FIXTOINT(arr[k].value);
++}
++static void html_rl_cxfer_walk(const struct html_rl_cnames *cn,
++		struct html_rl_cxfer *x, struct box *b, bool siblings)
++{
++	for (; b != NULL; b = siblings ? b->next : NULL) {
++		if (b->styles != NULL && b->type == BOX_INLINE_END) {
++			html_rl_cxfer_apply(cn, x,
++				b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
++		} else {
++			if (b->styles != NULL) {
++				html_rl_cxfer_apply(cn, x,
++					b->styles->styles[CSS_PSEUDO_ELEMENT_NONE]);
++				html_rl_cxfer_apply(cn, x,
++					b->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]);
++			}
++			html_rl_cxfer_walk(cn, x, b->children, true);
++			if (b->styles != NULL && b->type != BOX_INLINE)
++				html_rl_cxfer_apply(cn, x,
++					b->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
++		}
++		if (!siblings)
++			break;
++	}
++}
++
++
+ /* does the element box b, rebuilt with its subtree, take part in
+  * counting? (its own counting, what below it counted, its ::before /
+  * ::after's own counting; a pseudo-element showing a counter marked b) */
+@@ -13758,6 +13993,9 @@
+ 	unsigned int objects_before;
+ 	struct content_html_iframe *frames_before;	/* patch 428 */
+ 	bool ok;
++	bool counts = false;			/* patch 471 */
++	struct html_rl_cnames cnm;
++	struct html_rl_cxfer cx_old, cx_new;
+ 	static unsigned long flex_n;
+ 
+ #define RL_FNO(w) do { macsurf_debug_log_writef( \
+@@ -13810,8 +14048,26 @@
+ 			return 0;
+ 		RL_FNO("class change may move a sibling selector");
+ 	}
+-	if (html_rl_box_counts(ob))		/* patch 374 */
+-		RL_FNO("the restyled flex or grid box takes part in counting");
++	/* Patch 471: a subtree that counts is rebuilt alone when nothing in
++	 * it shows a counter and its counting comes out the same: the
++	 * rebuild restarts its counters from zero, which no one sees, and
++	 * every counter after it is where it was (the signature, compared
++	 * after the build; given up into the full rebuild otherwise).
++	 * Was: always declined (374) -- wikipedia, archwiki 3.0 a load. */
++	counts = html_rl_box_counts(ob);	/* patch 374 */
++	if (counts) {
++		if (html_rl_tree_shows_counter(ob, false) &&
++		    !html_rl_counts_from_zero(c, ob))
++			RL_FNO("the restyled flex or grid box takes part in "
++				"counting");
++		memset(&cnm, 0, sizeof(cnm));
++		memset(&cx_old, 0, sizeof(cx_old));
++		html_rl_cnames_tree(&cnm, ob, false);
++		if (cnm.over)
++			RL_FNO("the restyled flex or grid box takes part in "
++				"counting");
++		html_rl_cxfer_walk(&cnm, &cx_old, ob, false);
++	}
+ 	if (!html_rl_objects_relinkable(c, ob))	/* patch 375 */
+ 		RL_FNO("an <object> or <embed> is in the restyled flex or "
+ 			"grid box");
+@@ -13840,7 +14096,8 @@
+ 	frames_before = c->iframe;	/* patch 428 */
+ 	(void) html_reconvert_reset_node_data_walk(el, 0);
+ 	box_counters_touched_reset();	/* patch 374 */
+-	if (!box_build_element(c, el) || box_counters_touched()) {
++	if (!box_build_element(c, el) ||
++	    (box_counters_touched() && !counts)) {	/* patch 471 */
+ 		nb = box_for_node(el);
+ 		html_rl_drop_new(c, nb, objects_before);	/* patch 374 */
+ 		html_rl_frames_drop_new(c, frames_before);	/* patch 428 */
+@@ -13852,6 +14109,12 @@
+ 	}
+ 	nb = box_for_node(el);
+ 	dom_node_unref(el);
++	/* patch 471: a counting box gone (display: none) changes counting */
++	if (counts && nb == NULL) {
++		macsurf_debug_log_writef("LIFE rebuild local: restyled box's "
++			"counting changed, full reconvert");
++		return -1;
++	}
+ 	if (nb != NULL) {		/* else display: none -- a removal */
+ 		if (nb->parent != pbox || (nb->type != BOX_FLEX &&
+ 		    nb->type != BOX_GRID && nb->type != BOX_BLOCK)) {
+@@ -13876,6 +14139,35 @@
+ 			return -1;
+ 		}
+ 		html_rl_invalidate(nb);
++		/* patch 471: in place now -- its counting must come out the
++		 * same, and any counter it shows must enter it at 0, as the
++		 * build saw (given up as a failed normalise is: the tree is
++		 * whole, the full reconvert starts from the DOM) */
++		/* the names the new boxes use join the old ones (an old
++		 * transfer of a name it never touched: none) */
++		if (counts) {
++			int q;
++			bool changed;
++			html_rl_cnames_tree(&cnm, nb, false);
++			memset(&cx_new, 0, sizeof(cx_new));
++			html_rl_cxfer_walk(&cnm, &cx_new, nb, false);
++			changed = cnm.over ||
++				(html_rl_tree_shows_counter(nb, false) &&
++				 !html_rl_counts_from_zero(c, nb));
++			for (q = 0; q < cnm.k && !changed; q++)
++				if (cx_old.reset[q] != cx_new.reset[q] ||
++				    cx_old.val[q] != cx_new.val[q])
++					changed = true;
++			if (changed) {
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"restyled box's counting changed, full "
++					"reconvert");
++				return -1;
++			}
++			macsurf_debug_log_writef("LIFE rebuild local: restyled "
++				"box counts, its counting unchanged (shown "
++				"counters enter it at 0)");
++		}
+ 	}
+ 	/* patch 375: the old boxes' objects to the new ones, then the old
+ 	 * boxes go (the page is laid out whole below: new images sized;
