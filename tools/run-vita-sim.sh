@@ -438,6 +438,8 @@ JS-restyle-mixed-parent file:///app0:/testpages/JS-restyle-mixed-parent.html
 CSS-restyle-mixed-parent-ref file:///app0:/testpages/CSS-restyle-mixed-parent-ref.html
 JS-detached-attr file:///app0:/testpages/JS-detached-attr.html
 CSS-detached-attr-ref file:///app0:/testpages/CSS-detached-attr-ref.html
+JS-unhide-removal file:///app0:/testpages/JS-unhide-removal.html
+CSS-unhide-removal-ref file:///app0:/testpages/CSS-unhide-removal-ref.html
 CSS-style-noop-ref file:///app0:/testpages/CSS-style-noop-ref.html
 JS-sib-tail file:///app0:/testpages/JS-sib-tail.html
 CSS-sib-tail-ref file:///app0:/testpages/CSS-sib-tail-ref.html
@@ -2454,6 +2456,15 @@ k461o=$(printf '%s\n' "$k461seg" | grep -c "a change outside the document, nothi
 k461f=$(printf '%s\n' "$k461seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-detached-attr: rows $k461r (0), changes outside the document answered ${k461o} (1 or more), full rebuilds ${k461f} (0)"
 [ "$k461r" = 0 ] && [ "${k461o:-0}" -ge 1 ] && [ "${k461f:-1}" -eq 0 ] || fail "changes outside the document need no rebuild"
+# Patch 462: a sheet removal that un-hides a <div> and a <span> restyles
+# their parents in place (2), no "would get one" decline, no full rebuild.
+k462r=$(fl_rows JS-unhide-removal CSS-unhide-removal-ref)
+k462seg=$(awk '/ page [0-9]+\/[0-9]+ JS-unhide-removal: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k462p=$(printf '%s\n' "$k462seg" | grep -c "an element gets a box, its parent restyled" || true)
+k462d=$(printf '%s\n' "$k462seg" | grep -c "declined (an element without a box would get one" || true)
+k462f=$(printf '%s\n' "$k462seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
+echo "  JS-unhide-removal: rows $k462r (0), parents restyled for a new box ${k462p} (2), would-get-one declines ${k462d} (0), full rebuilds ${k462f} (0)"
+[ "$k462r" = 0 ] && [ "${k462p:-0}" -ge 2 ] && [ "${k462d:-1}" -eq 0 ] && [ "${k462f:-1}" -eq 0 ] || fail "an element a removed sheet un-hides: its parent restyled"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

@@ -15667,3 +15667,34 @@ stdout, the log to page 362 of 362. 461's outside-the-document answer ran
 (460) -> 9.7 (461; 10.7 for 460 in that run).
 
 No sudo.
+
+## Patch 462 (2026-11-28): an element that gets a box in the re-cascade makes its parent a hit
+
+**Problem.** "sheet removal: an element without a box would get one"
+(oldreddit: a `<div>` a removed sheet had hidden) stopped
+`html_rl_doc_noop`'s walk. With "detached stylesheet pruned", which it
+causes, it was the largest remaining local decline (1.0 a load in the 461
+census).
+
+**Fix** (html.c). Such an element is built by its parent's rebuild:
+- its parent becomes a hit of the walk (447), once, if it has a box and
+  is not the root;
+- the parent's restyle re-selects and builds its subtree from the DOM,
+  the new box with it;
+- hits that overlap it are restyled again, redundantly but correctly;
+- the cap of 8 hits still applies.
+
+**Gate.**
+- New pair **JS-unhide-removal / CSS-unhide-removal-ref**: the
+  `<style id="h">` hiding a `<div>` in a block and a `<span>` in a
+  paragraph is removed.
+- Mini run: **2 parents restyled for a new box** ("an element gets a box,
+  its parent restyled"), 2 elements restyled in place, **rows 0**, no full
+  rebuild.
+- `restage-full.sh`: **544 applied plus the 2 known collisions**; its
+  sources equal applytest's.
+- **gate462 exit 0** (stack through 462): JS-unhide-removal rows 0, 2
+  parents restyled for a new box, 0 would-get-one declines, 0 full
+  rebuilds; interaction 52/52 at the Vita's pace.
+
+No sudo.
