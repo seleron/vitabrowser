@@ -1,0 +1,79 @@
+# netsurf: free retired inline-extras tables only when no live document predates them (patch 483)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 482)
+#
+# Pairs with 483-libcss-inline-extras-retire.patch. html_create clears the
+# doc-global inline-extras table (fixes267) for every new document, and
+# libcss now retires it instead of freeing it under live environments
+# (make.wordpress.org: use-after-free in css__cp_env_find during a local
+# flex restyle). Each html_content records the generation it was created
+# in and joins a live list; html_destroy leaves the list and calls
+# css_inline_extras_release_before(oldest live generation), so a retired
+# table is freed once no document that could read it remains, and memory
+# does not grow per navigation.
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2039,6 +2039,10 @@
+ 
+ }
+ 
++/* VitaBrowser patch 483: live HTML documents, for freeing retired
++ * inline-extras tables (html_destroy) */
++static html_content *vb_live_docs = NULL;
++
+ /**
+  * Create a CONTENT_HTML.
+  *
+@@ -2182,6 +2186,12 @@
+ 
+ 	*c = (struct content *) html;
+ 
++	/* patch 483: this document reads the inline-extras table of the
++	 * generation it starts in (and any later one) */
++	html->vb_extras_gen = css_inline_extras_generation();
++	html->vb_live_next = vb_live_docs;
++	vb_live_docs = html;
++
+ #ifdef __MACOS9__
+ 	{
+ 		extern void macsurf_debug_log_writef(const char *fmt, ...);
+@@ -16344,6 +16354,24 @@
+ 	html_content *html = (html_content *) c;
+ 	struct form *f, *g;
+ 
++	/* patch 483: off the live list; free the inline-extras tables no
++	 * live document predates (their environments are gone with them) */
++	{
++		html_content **pp = &vb_live_docs;
++		uint32_t oldest = css_inline_extras_generation() + 1;
++		while (*pp != NULL) {
++			if (*pp == html) {
++				*pp = html->vb_live_next;
++				continue;
++			}
++			if ((*pp)->vb_extras_gen < oldest)
++				oldest = (*pp)->vb_extras_gen;
++			pp = &(*pp)->vb_live_next;
++		}
++		html->vb_live_next = NULL;
++		css_inline_extras_release_before(oldest);
++	}
++
+ #ifdef WITH_QUICKJS
+ 	guit->misc->schedule(-1, html_module_prefetch_poll, c);
+ #endif
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -95,6 +95,12 @@
+ typedef struct html_content {
+ 	struct content base;
+ 
++	/** VitaBrowser patch 483: the inline-extras generation this document
++	 * was created in (css_inline_extras_generation), and the live-document
++	 * list html_destroy scans to free retired tables no one can read */
++	uint32_t vb_extras_gen;
++	struct html_content *vb_live_next;
++
+ 	dom_hubbub_parser *parser; /**< Parser object handle */
+ 	/** VitaBrowser preload scanner (html.c): fetches started, and the
+ 	 * unscanned tail of the previous chunk (a tag split across two) */

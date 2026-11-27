@@ -17867,3 +17867,52 @@ No sudo.
 - **Next: patch 483**, the custom-property environment lifetime in local
   restyles. Its measure: the ASan wpblog replay clean, and wpblog 0
   crashes over several loads.
+
+## Patch 483 (2026-11-27): the inline-extras custom-property table is retired, not destroyed, while documents may read it
+
+**Problem.** make.wordpress.org (wpblog) crashed intermittently.
+- ASan with `quarantine_size_mb=1024` (so the free is not overwritten by
+  reuse): a **heap-use-after-free in `css__cp_env_find`**
+  (`cp_name_equal`) during a local flex restyle.
+- The name was freed by `css_inline_extras_clear` ->
+  `css__cp_entry_list_destroy`, called from **`html_create`**.
+- Computed styles' custom-property environments **borrow** the
+  inline-extras entries' names and token arrays (`css__cp_env_add`
+  stores the pointers).
+- `html_create` clears that document-wide table (fixes267) for **every**
+  new HTML document (an iframe's, or the next page) while the documents
+  styled from it are still alive and restyling.
+- My first reading at 481 (a borrowed `parent_box->custom_env`) was
+  wrong; the large quarantine showed the real free.
+
+**Fix.**
+- **libcss** (`483-libcss-inline-extras-retire.patch`):
+  - `css_inline_extras_clear` retires the table under the current
+    generation and starts the next.
+  - New `css_inline_extras_generation()` and
+    `css_inline_extras_release_before(gen)`.
+- **netsurf** (`483-netsurf-inline-extras-live-docs.patch`):
+  - Each `html_content` records its generation and joins a live-document
+    list.
+  - `html_destroy` leaves the list and releases the tables older than
+    the oldest live document. So a retired table is freed once no
+    document that could read it remains, and memory does not grow per
+    navigation.
+
+**Measured.**
+- **ASan wpblog replay: 2/2 loads clean** (0 reports, page Done). At 482
+  the same replay reported this UAF.
+- Plain build: the first 483 numbers (5/5 crashes) came from an
+  **incremental** build after a header change (`private.h`) and are not
+  valid.
+- After a **clean rebuild**: 1/3 crashed, and the crash is in
+  `content_broadcast` (a garbage callback): the image-load crash patch
+  482 was meant to fix (see the State log below).
+
+**Gate.**
+- **gate483 exit 0**: interaction 57/57 (both paces).
+- `restage-full.sh`: **566 applied plus the 2 known collisions**. The
+  restaged libcss `custom_properties.c` and `select.h` are identical to
+  applytest.
+
+No sudo.

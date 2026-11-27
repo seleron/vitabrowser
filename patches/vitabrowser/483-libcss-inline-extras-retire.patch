@@ -1,0 +1,99 @@
+# libcss: the inline-extras custom-property table is retired, not destroyed, while documents may still read it (patch 483)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 482)
+#
+# make.wordpress.org crashed intermittently (census 481/482: 0-3 of 3
+# loads). ASan, with a large quarantine so the free survives: a
+# heap-use-after-free in css__cp_env_find (cp_name_equal) during a local
+# flex restyle, on a name freed by css_inline_extras_clear ->
+# css__cp_entry_list_destroy, called from html_create. Computed styles'
+# custom-property environments BORROW the inline-extras entries' names and
+# token arrays (css__cp_env_add stores the pointers); html_create clears
+# the doc-global table for every new HTML document -- an iframe's, or the
+# next page -- while the documents styled from it are still alive and
+# restyling.
+#
+# css_inline_extras_clear now retires the table under the current
+# generation and starts the next; css_inline_extras_release_before(gen)
+# frees retired tables older than gen. The client (netsurf html.c, patch
+# 483) records each document's generation and releases what no live
+# document predates.
+--- a/src/parse/custom_properties.c
++++ b/src/parse/custom_properties.c
+@@ -719,10 +719,59 @@
+ 	return CSS_OK;
+ }
+ 
++/* VitaBrowser patch 483: the table is retired, not destroyed. Every
++ * environment built while it was current borrows its entries' names and
++ * token arrays (css__cp_env_add stores the pointers), and the clear runs
++ * at html_create -- for an iframe's document, or the next page, while the
++ * documents styled from it are still alive and restyling. Destroying it
++ * there left their environments reading freed names: make.wordpress.org
++ * crashed in css__cp_env_find during a local flex restyle (ASan, freed by
++ * css_inline_extras_clear from html_create). A retired table is freed by
++ * css_inline_extras_release_before once no live document predates it. */
++struct cp_retired {
++	css_cp_entry *head;
++	uint32_t generation;
++	struct cp_retired *next;
++};
++static struct cp_retired *g_inline_extras_retired = NULL;
++static uint32_t g_inline_extras_gen = 0;
++
+ void css_inline_extras_clear(void)
+ {
+-	css__cp_entry_list_destroy(g_inline_extras_head);
++	if (g_inline_extras_head != NULL) {
++		struct cp_retired *r = malloc(sizeof(*r));
++		if (r != NULL) {
++			r->head = g_inline_extras_head;
++			r->generation = g_inline_extras_gen;
++			r->next = g_inline_extras_retired;
++			g_inline_extras_retired = r;
++		}
++		/* (no memory for the record: the table leaks rather than
++		 * being freed under live environments) */
++	}
+ 	g_inline_extras_head = NULL;
++	g_inline_extras_gen++;
++}
++
++uint32_t css_inline_extras_generation(void)
++{
++	return g_inline_extras_gen;
++}
++
++void css_inline_extras_release_before(uint32_t generation)
++{
++	struct cp_retired **pp = &g_inline_extras_retired;
++
++	while (*pp != NULL) {
++		struct cp_retired *r = *pp;
++		if (r->generation < generation) {
++			*pp = r->next;
++			css__cp_entry_list_destroy(r->head);
++			free(r);
++		} else {
++			pp = &r->next;
++		}
++	}
+ }
+ 
+ static const css_cp_entry *find_inline_extras(lwc_string *name)
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -264,6 +264,13 @@
+ /* fixes267 - clear the doc-global inline-extras table. Call on
+  * new-document navigation to prevent cross-page bleed. */
+ void css_inline_extras_clear(void);
++/* VitaBrowser patch 483: css_inline_extras_clear RETIRES the table (computed
++ * styles' custom-property environments borrow its names and tokens) under
++ * the current generation and starts the next one. A document records the
++ * generation it was created in; once no live document is older than a
++ * retired table's generation, css_inline_extras_release_before frees it. */
++uint32_t css_inline_extras_generation(void);
++void css_inline_extras_release_before(uint32_t generation);
+ 
+ #ifdef __cplusplus
+ }
