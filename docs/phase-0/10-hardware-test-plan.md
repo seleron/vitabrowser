@@ -17564,3 +17564,77 @@ No sudo.
     shadow-tree event paths and drawing.
   - P1 items left (first paint, JS/malloc cost, subtree-rebuild size
     check).
+
+## Patch 480 (2026-11-27): a defined custom element's listeners are called (P2)
+
+**Problem.** Device run 43: 8 taps on old.reddit.com's login options
+("Continue with Phone Number", "Email me a one-time link") did nothing.
+- The page has **no radios or labels**. The options are `<auth-flow-link>`
+  web components; the inputs are `<faceplate-text-input>` (51 open shadow
+  roots on the page).
+- "Warning: button can not be activated" is only the engine's hover
+  status for any `<button type=button>` (interaction.c GADGET_BUTTON).
+  It does not block anything.
+
+**Simulator trace.**
+- A click on an option reached the document's capture listener on the
+  SPAN, then bubbled SPAN > DIV > DIV and **skipped every custom element**
+  (FACEPLATE-TRACKER, AUTH-FLOW-LINK, AUTH-FLOW-MODAL ...).
+- No `stopPropagation` was called (wrapped and checked).
+
+**Minimal repro.**
+
+| listener added | fires at 479? |
+|---|---|
+| on a plain element | yes |
+| on an element before `customElements.define` | yes |
+| after `define`, in a constructor, or in `connectedCallback` | **no** |
+
+**Cause.**
+- A built-in element's chain is tag prototype -> the bridge's element
+  class prototype (`addEventListener`, `removeEventListener` and ~140
+  more) -> `HTMLElement.prototype`.
+- A custom element's class chain is Class.prototype ->
+  `HTMLElement.prototype` -> `Element.prototype`, which skips the bridge
+  prototype. Its `addEventListener` was `EventTarget.prototype`'s
+  JS-only one: listeners stored, never registered with the engine's
+  dispatch.
+
+**Fix** (`vita_polyfill.js`).
+- The bridge prototype's own properties are copied onto
+  `HTMLElement.prototype` (only those it lacks).
+- Built-in elements still find the bridge's first (the same functions).
+  An upgraded or constructed custom element, which is the same bridge
+  wrapper re-parented, finds them next.
+
+**Results.**
+- old.reddit in the sim: the click now bubbles through all the custom
+  elements and the `<auth-flow-link>` host hears it.
+- **The option still does not switch the login step**, because events
+  do not enter shadow trees: `<auth-flow-link>`'s clickable element is
+  the `<a>` in its shadow root, and a listener there hears nothing.
+  - Shadow trees are also not drawn (patch 242's design). That is why
+    the username/password inputs are missing in the sim, with only
+    their light-DOM labels showing.
+- youtube's search entry point (also a custom element) is **unchanged**
+  at 480: a separate cause.
+
+**Gate.**
+- `JS-custom-elements.html` gains checks 8-9: a custom element hears a
+  click bubbling from a built-in child, both one made after `define`
+  with its listener in the constructor and an upgraded parsed one.
+  - Chromium **9/9**, 479 **7/9**, 480 **9/9**. The gate check is
+    CUSTOMEL 9.
+- **gate480 exit 0**: CUSTOMEL 9/9, SHADOW 7/7, FORMSHADOW 6/6, FSHADOW2
+  10/10, interaction 55/55 (both paces).
+- `restage-full.sh`: **562 applied plus the 2 known collisions**.
+
+**Next for old.reddit's login.** Shadow DOM support, in units:
+1. Events through shadow trees (a composed path: a slotted light node ->
+   its slot -> the shadow ancestors -> the host).
+2. Drawing shadow trees (box construction on the composed tree, `<slot>`
+   assignment).
+3. Form controls inside shadow trees.
+4. Shadow styles.
+
+No sudo.

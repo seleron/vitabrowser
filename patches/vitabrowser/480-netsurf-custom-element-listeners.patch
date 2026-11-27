@@ -1,0 +1,111 @@
+# netsurf: a defined custom element's addEventListener is the bridge's, so its listeners are called (patch 480)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 479)
+#
+# P2 (input on JS-heavy pages): device run 43 -- 8 taps on old.reddit.com's
+# login options ("Continue with Phone Number", "Email me a one-time link",
+# <auth-flow-link> web components), nothing happened. In the simulator a
+# click on the option bubbled SPAN > DIV > DIV and skipped every custom
+# element above it (FACEPLATE-TRACKER, AUTH-FLOW-LINK, AUTH-FLOW-MODAL ...):
+# no stopPropagation, the listeners were simply never called.
+#
+# A built-in element's prototype chain is tag prototype -> the bridge's
+# element class prototype (addEventListener, removeEventListener and ~140
+# more) -> HTMLElement.prototype. A custom element's class chain is
+# Class.prototype -> HTMLElement.prototype -> Element.prototype: it skips the
+# bridge prototype, so addEventListener resolved to EventTarget.prototype's
+# JS-only implementation -- listeners stored, never registered with the
+# engine's dispatch. A listener added BEFORE customElements.define (on the
+# plain wrapper) worked; one added in a constructor, connectedCallback or
+# after the upgrade never ran.
+#
+# Fix (vita_polyfill.js): the bridge prototype's own properties are copied
+# onto HTMLElement.prototype (where it has none of its own). Built-in
+# elements still find the bridge's first -- the same functions -- and an
+# upgraded or constructed custom element, the same bridge wrapper
+# re-parented, finds them next. JS-custom-elements.html checks 8-9
+# (Chromium 9/9; 479 7/9).
+#
+# Not fixed here: events do not enter shadow trees (a listener on an
+# element inside a shadow root, e.g. <auth-flow-link>'s shadow <a>, still
+# hears nothing), and shadow trees are not drawn (reddit's login inputs).
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6235,6 +6235,37 @@
+ 		try { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }
+ 		g.HTMLElement = HE;
+ 	})();
++	/* VitaBrowser patch 480: a custom element's class chain is
++	 * Class.prototype -> HTMLElement.prototype -> Element.prototype; a
++	 * built-in element's is tag prototype -> the BRIDGE's element class
++	 * prototype -> HTMLElement.prototype. That bridge prototype holds
++	 * addEventListener / removeEventListener and ~140 more, so a defined
++	 * custom element got EventTarget.prototype's JS-only addEventListener:
++	 * its listeners were kept and never called -- every click handler a
++	 * web component registers on itself (old.reddit's login options,
++	 * <auth-flow-link>; device run 43: 8 taps, nothing). Its own
++	 * properties are copied onto HTMLElement.prototype: built-in elements
++	 * still find the bridge's first (same functions), and an upgraded or
++	 * constructed custom element -- the same bridge wrapper, re-parented
++	 * -- finds them next. Redone on every run (the bridge reinstalls). */
++	(function () {
++		var HEP = g.HTMLElement && g.HTMLElement.prototype, bp;
++		try { bp = Object.getPrototypeOf(d.createElement('section')); } catch (e) { return; }
++		if (!HEP || !bp || bp === HEP) return;
++		/* the bridge class prototype is the one holding the listener API */
++		for (var p = bp; p && p !== HEP && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) { bp = p; break; }
++		}
++		if (!Object.prototype.hasOwnProperty.call(bp, 'addEventListener')) return;
++		Object.getOwnPropertyNames(bp).forEach(function (k) {
++			if (k === 'constructor' || Object.prototype.hasOwnProperty.call(HEP, k)) return;
++			try {
++				var desc = Object.getOwnPropertyDescriptor(bp, k);
++				desc.configurable = true;
++				Object.defineProperty(HEP, k, desc);
++			} catch (e) { /* a non-configurable one: leave it */ }
++		});
++	})();
+ 	/* patch 240: createElement runs a defined element's constructor. The
+ 	 * bridge installs document.createElement again after this file's
+ 	 * first run (qjs_dom_install runs twice per context, and this file
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6236,6 +6236,37 @@
+ "\t\ttry { Object.defineProperty(HE.prototype, 'constructor', { value: HE, writable: true, configurable: true }); } catch (e) { /* */ }\n"
+ "\t\tg.HTMLElement = HE;\n"
+ "\t})();\n"
++"\t/* VitaBrowser patch 480: a custom element's class chain is\n"
++"\t * Class.prototype -> HTMLElement.prototype -> Element.prototype; a\n"
++"\t * built-in element's is tag prototype -> the BRIDGE's element class\n"
++"\t * prototype -> HTMLElement.prototype. That bridge prototype holds\n"
++"\t * addEventListener / removeEventListener and ~140 more, so a defined\n"
++"\t * custom element got EventTarget.prototype's JS-only addEventListener:\n"
++"\t * its listeners were kept and never called -- every click handler a\n"
++"\t * web component registers on itself (old.reddit's login options,\n"
++"\t * <auth-flow-link>; device run 43: 8 taps, nothing). Its own\n"
++"\t * properties are copied onto HTMLElement.prototype: built-in elements\n"
++"\t * still find the bridge's first (same functions), and an upgraded or\n"
++"\t * constructed custom element -- the same bridge wrapper, re-parented\n"
++"\t * -- finds them next. Redone on every run (the bridge reinstalls). */\n"
++"\t(function () {\n"
++"\t\tvar HEP = g.HTMLElement && g.HTMLElement.prototype, bp;\n"
++"\t\ttry { bp = Object.getPrototypeOf(d.createElement('section')); } catch (e) { return; }\n"
++"\t\tif (!HEP || !bp || bp === HEP) return;\n"
++"\t\t/* the bridge class prototype is the one holding the listener API */\n"
++"\t\tfor (var p = bp; p && p !== HEP && p !== Object.prototype; p = Object.getPrototypeOf(p)) {\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) { bp = p; break; }\n"
++"\t\t}\n"
++"\t\tif (!Object.prototype.hasOwnProperty.call(bp, 'addEventListener')) return;\n"
++"\t\tObject.getOwnPropertyNames(bp).forEach(function (k) {\n"
++"\t\t\tif (k === 'constructor' || Object.prototype.hasOwnProperty.call(HEP, k)) return;\n"
++"\t\t\ttry {\n"
++"\t\t\t\tvar desc = Object.getOwnPropertyDescriptor(bp, k);\n"
++"\t\t\t\tdesc.configurable = true;\n"
++"\t\t\t\tObject.defineProperty(HEP, k, desc);\n"
++"\t\t\t} catch (e) { /* a non-configurable one: leave it */ }\n"
++"\t\t});\n"
++"\t})();\n"
+ "\t/* patch 240: createElement runs a defined element's constructor. The\n"
+ "\t * bridge installs document.createElement again after this file's\n"
+ "\t * first run (qjs_dom_install runs twice per context, and this file\n"

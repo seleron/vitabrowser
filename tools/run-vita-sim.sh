@@ -1602,7 +1602,7 @@ o2_bad=
 for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-computed-unboxed UNBOXED 7" "css-inline-outranks INLINE236 4" \
 	 "js-import-meta IMPORTMETA 4" "js-importmap IMPORTMAP 4" \
-	 "js-custom-elements CUSTOMEL 7" "js-perfobserver PERFOBS 2" \
+	 "js-custom-elements CUSTOMEL 9" "js-perfobserver PERFOBS 2" \
 	 "js-template-text TPLTEXT 4" "js-selector-list-long LONGLIST 4" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \
