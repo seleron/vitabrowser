@@ -17916,3 +17916,46 @@ No sudo.
   applytest.
 
 No sudo.
+
+### State log -- after patch 483 (2026-11-27), with a correction to patch 482
+
+- **ASan 483** (`--libs --net`, autotest): **clean**. Interaction 57/57,
+  447 page dumps, 0 reports.
+  - The wpblog ASan replay (large quarantine) was 2/2 clean; at 482 it
+    reported the custom-property UAF.
+- **wpblog crash count, plain 483 build: 2 of 6 loads crashed**
+  (baseline: clean-built 483 candidate 1 of 3).
+  - The crash is in `content_broadcast` calling a garbage callback (gdb:
+    0x20): the image-load user walk.
+- **21-site census, 482 vs 483: 13.3 vs 17.0 full rebuilds per load
+  (+3.7, past the ±2 band).**
+  - claude 3.0 -> 5.3, wpblog 2.7 -> 4.0 (both arms crashed 2/3; a
+    crashed load's count is partial), guardian 1.7 -> 2.3.
+  - Local declines 2.3 -> 4.3: "structural change at the root" 0.7 ->
+    2.3, "structural selectors or counters" 0.7 -> 2.3, "flex box holds
+    controls" 0 -> 1.3.
+  - **Reading: likely noise, not proven.** 483 changes only when retired
+    custom-property tables are *freed*; the visible table is emptied
+    exactly as before, so no style or rebuild decision should differ.
+    claude.ai's counts are timing-driven (3.7, 5.0, 2.7, 3.7 and 2.3 per
+    load in the last censuses; 6/6/3 at 479), and these declines have
+    swung by that much before.
+  - **To recheck in the 484 census.**
+
+**Correction to patch 482 (6e3e6ad).**
+- 482 did **not** fix the image-load crash. Its fix defers the
+  `content_user` free to the death-row, as the `__MACOS9__` build does.
+  But on this build `macos9_deathrow_add` is a **weak stub that runs the
+  teardown immediately** (`compat/macsurf_compat.c`): it defers nothing.
+- The broadcast walk's captured `next` can still be freed memory.
+- 482's clean ASan replays, and its "481 1/3 vs 482 0/3" plain-build
+  count, were **timing luck**: the census at 482 crashed 2/3, and 483
+  still crashes 2/6 in the same walk.
+- The census numbers in 482's State log (481 vs 482: 15.0 -> 13.0,
+  wpblog 2/3 crashes at 482) stand. Only the claim that 482 removed the
+  UAF is withdrawn.
+- 482's silencing of the unlinked node (`callback = NULL`) is harmless
+  and stays.
+- **Patch 484 (cut, gate pending)** is the real fix: the walk's next
+  user lives on the content (`bc_next`), and `content_remove_user` moves
+  it past a user it unlinks. It does not depend on the death-row.
