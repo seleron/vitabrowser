@@ -18268,3 +18268,9 @@ No sudo.
     nested template for the input still fails its attribute pairing.
   - **488 is held** until the fields render (the owner's bar). The lit
     lead is next.
+- **Census 486 vs 487 (completed): 14.3 vs 14.0 full rebuilds per load =
+  flat.** Guard 5.0 / 5.0; no crash, timeout or missing load in 126.
+  - claude -1.7 (timing).
+  - **oldreddit 0 -> 1.3**: as at 486, 487 lets more of old.reddit's
+    components run (now constructed inside shadow roots), so there is
+    more DOM activity. Expected, not a regression.
