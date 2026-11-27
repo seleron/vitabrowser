@@ -18,7 +18,7 @@ by eye. The visual checks are there for what files cannot show.
 |---|---|
 | `VitaBrowser.vpk` (title `VBRW00001`, default memory budget) | hand-off folder |
 | `VitaBrowser-ext.vpk` (title `VBRW00002`, `ATTRIBUTE2=12`: the extended 365 MiB budget) | hand-off folder |
-| 15 reference screenshots from the host simulator (same code, DejaVu font instead of PGF) | `reference-screenshots\` |
+| 18 reference screenshots from the host simulator (same code, DejaVu font instead of PGF) | `reference-screenshots\` |
 | exact `nsvita.elf` (for crash-dump symbols), SHA256 sums, the simulator's reference `log.txt` + plot dumps | `<WORK>/vitabrowser-work/hwtest-2026-09-22/` |
 
 SHA256 (first 12 hex digits; full sums in `hwtest-2026-09-22/SHA256SUMS`):
@@ -46,7 +46,7 @@ The test functions are **SELECT combinations**: SELECT+SQUARE starts the autotes
 SELECT+CIRCLE dumps this page · SELECT+CROSS saves a screenshot (app, to the log) ·
 SELECT+TRIANGLE memory probe · SELECT+L2/R2 previous/next test page · SELECT+START quits.
 (The PS button + START system screenshot also works: `ux0:picture/SCREENSHOT/`.)
-The HUD (bottom bar) shows page n/15, first-frame ms, CPU/GPU ms
+The HUD (bottom bar) shows page n/18, first-frame ms, CPU/GPU ms
 of the last frame, and draw calls.
 
 ## The plan
@@ -79,11 +79,13 @@ what you have**: a partial log is still useful.
 
 ### Step 2 — Boot (T1)
 
-Launch **VitaBrowser** (not ext-mem).
+Launch **VitaBrowser ext-mem** (`VitaBrowser-ext.vpk`, VBRW00002, the
+extended 288 MiB build — primary since run 44 per the 2026-11-27 directive;
+`VitaBrowser.vpk` is the fallback).
 
 - **Expected:** within a few seconds, a white page with "L1 heading", a grey
   block, a paragraph, a float and a small table; a dark HUD bar at the
-  bottom reading `1/15 L1-layout-basics | …`.
+  bottom reading `1/18 L1-layout-basics | …`.
 - **Record:** time from tapping the gate to the page (rough stopwatch), and
   what you see.
 - **If it fails:**
@@ -97,10 +99,11 @@ Launch **VitaBrowser** (not ext-mem).
 
 On the L1 page, press **SELECT+SQUARE** and **do not touch the Vita** until
 it says
-**AUTOTEST DONE**. It visits all 15 pages. A cyan message box shows
-`AUTOTEST page n/15`. Long pages scroll to the bottom by themselves. At the
+**AUTOTEST DONE**. It visits all 18 pages. A cyan message box shows
+`AUTOTEST page n/18`. Long pages scroll to the bottom by themselves. At the
 end it measures font metrics and memory. The simulator needs about 21 s;
-expect longer on the Vita.
+on the Vita allow about 8 minutes — press SELECT+SQUARE **once** and do not
+touch the Vita until it says DONE.
 
 - **Record:** did it reach DONE; total time (stopwatch); if it stalls,
   the page number and how long you waited (give it 2 minutes per page).
@@ -18654,3 +18657,26 @@ iteration.
 - **gate493 exit 0**: CHARCODE 8/8, interaction 57/57 (both paces).
 
 No sudo.
+
+### Device hand-off run 44 (2026-11-27 ~17:25Z): VPKs from 689d158, doc 26 test plan
+
+- Finalizer (deadline 17:00Z) built both VPKs from a scratch restage of
+  `689d158` (patch 493; `applied: 576 failed: 2` known warts) into
+  `~/vitabrowser-work/vpk-run44` — the live tree was in use (unit 494's
+  gate `run-vita-sim.sh` running, untracked WIP
+  `patches/quickjs/09-quickjs-array-concat-fast-copy.patch` +
+  `testpages/pages/JS-array-concat.html`). The WIP patch is NOT in the VPKs:
+  the scratch quickjs carries quickjs 01-08 only (09 had been mid-flight
+  applied to the live tree and was reversed out of the scratch copy).
+- Doc 26 (`26-device-test-run44-2026-11-27.md`) is the run-44 test plan:
+  primary = `VitaBrowser-ext.vpk` (VBRW00002, 288 MiB heap; SHA256
+  `44486636dd6f`), fallback `VitaBrowser.vpk` (`448814c92716`), 18-page
+  autotest (SELECT+SQUARE once, ~8 min), manual list bbc / github / google /
+  youtube / old.reddit / wpnews-wpblog. Hand-off folders updated; run-43
+  pair archived as `hwtest-2026-11-27-run43/`.
+- This doc's canonical steps updated for the run: launch **VitaBrowser
+  ext-mem** (step 2), **18** pages (HUD n/18, autotest n/18, 18 reference
+  screenshots), ~8 min autotest on device.
+- In-flight at close (NOT committed, next loop): unit 494 (Array.prototype
+  .concat fast copy) — WIP patch file + test page in the working tree, its
+  gate running.
