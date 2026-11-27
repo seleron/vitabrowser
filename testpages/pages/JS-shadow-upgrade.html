@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS shadow upgrade (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+p { margin: 2px 0; }
+</style>
+</head>
+<body>
+<div id="sum">SHADOWCE: 0/8 passed</div>
+<p id="r1" class="wait">1 waiting</p>
+<p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+<p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+<p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
+<div id="box"></div>
+<script>
+/* patch 487: custom elements inside shadow roots are upgraded, and a node
+ * in a connected host's shadow root is connected. The upgrade observer
+ * watched the document only, so an element lit stamped into a shadow root
+ * stayed plain: old.reddit.com's <faceplate-text-input> called
+ * this.helperText.associateForm() on it ("not a function"). Chromium-
+ * verified. */
+(function () {
+	var k = 0, N = 8;
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'SHADOWCE: ' + k + '/' + N + ' passed';
+		document.title = 'JS shadow upgrade (' + k + '/' + N + ')';
+	}
+	var log = [];
+	class XHelp extends HTMLElement {
+		connectedCallback() { log.push('help:' + (this.id || '?')); }
+		associate() { return 'ok'; }
+	}
+	customElements.define('x-help', XHelp);
+	class XInput extends HTMLElement {
+		constructor() {
+			super();
+			this.attachShadow({ mode: 'open' }).innerHTML = '<x-help id="h1"></x-help>';
+		}
+	}
+	customElements.define('x-input', XInput);
+	var a = document.createElement('x-input');
+	$('box').appendChild(a);
+	setTimeout(function () {
+		var h1 = a.shadowRoot.getElementById('h1');
+		t(1, h1 instanceof XHelp && typeof h1.associate === 'function',
+			'a custom element in a shadow root is upgraded: ' + (h1 instanceof XHelp));
+		t(2, log.indexOf('help:h1') >= 0, 'and connected (connectedCallback): ' + log.join(','));
+		t(3, h1.isConnected === true, 'a node in a connected host\'s shadow root isConnected: ' + h1.isConnected);
+		/* added to the shadow tree later, by markup */
+		var wrap = document.createElement('div');
+		a.shadowRoot.appendChild(wrap);
+		wrap.innerHTML = '<x-help id="h2"></x-help>';
+		/* defined after its element is already in a shadow root */
+		var b = document.createElement('div');
+		b.attachShadow({ mode: 'open' }).innerHTML = '<x-late id="l1"></x-late>';
+		$('box').appendChild(b);
+		class XLate extends HTMLElement { ping() { return 1; } }
+		customElements.define('x-late', XLate);
+		/* a host that is not connected: its shadow content is not either */
+		var c = document.createElement('x-input');
+		setTimeout(function () {
+			var h2 = a.shadowRoot.getElementById('h2');
+			t(4, h2 instanceof XHelp, 'one added to the shadow tree later is upgraded: ' + (h2 instanceof XHelp));
+			var l1 = b.shadowRoot.getElementById('l1');
+			t(5, l1 instanceof XLate, 'one defined after it is in a shadow root is upgraded on define: ' + (l1 instanceof XLate));
+			var ch = c.shadowRoot.getElementById('h1');
+			t(6, ch.isConnected === false && log.filter(function (x) { return x === 'help:h1'; }).length === 1,
+				'a detached host\'s shadow content is not connected: ' + ch.isConnected);
+			$('box').appendChild(c);
+			/* 8: a template cloned with importNode (lit's way) has its
+			 * custom elements constructed when the call returns */
+			var tpl = document.createElement('template');
+			tpl.innerHTML = '<div><x-help id="h3"></x-help></div>';
+			var copy = document.importNode(tpl.content, true);
+			var h3 = copy.querySelector('#h3');
+			t(8, h3 instanceof XHelp && typeof h3.associate === 'function',
+				'importNode constructs the custom elements in its copy at once: ' + (h3 instanceof XHelp));
+			setTimeout(function () {
+				t(7, log.filter(function (x) { return x === 'help:h1'; }).length === 2,
+					'and connects when the host does: ' + log.join(','));
+			}, 100);
+		}, 100);
+	}, 100);
+})();
+</script>
+</body>
+</html>

@@ -18198,3 +18198,49 @@ No sudo.
     shadow-including): written and gate-wired, `JS-shadow-upgrade.html`
     Chromium 7/7, built after this census.
   - Shadow drawing moves to **488**.
+
+## Patch 487 (2026-11-27): custom elements in shadow roots are upgraded; isConnected is shadow-including; importNode constructs
+
+**Problem.** old.reddit.com's login had 4 "not a function" a load at 486.
+- All 4 are `this.helperText?.associateForm(e)` in
+  `<faceplate-text-input>`'s `connectedCallback`.
+- `helperText` is a custom element in the component's shadow root, and it
+  was a plain element when that ran.
+
+**Fix** (`vita_polyfill.js`).
+- **Shadow roots are watched:** the upgrade observer watched the document
+  only. Each root `attachShadow` makes is now watched the same way
+  (`observeRoot`, from the 481 wrapper), swept when made and when a
+  definition arrives, and observed for `observedAttributes`.
+- **`connected()` is shadow-including.** A host that becomes connected
+  connects its shadow tree's custom elements.
+- **`isConnected` is shadow-including** (it answered false inside an
+  attached shadow root).
+- **`document.importNode` constructs the defined custom elements in its
+  copy before returning,** as browsers' upgrade reactions do.
+  - With the observer alone, `helperText` **was** upgraded, but a moment
+    too late. Lit clones every template with
+    `importNode(content, true)`, and the text input calls helperText's
+    methods right after an await, before any MutationObserver delivery.
+
+**Measured.**
+- `JS-shadow-upgrade.html` (SHADOWCE, 8 checks): upgraded in a shadow
+  root; connectedCallback; isConnected; added later; defined later;
+  detached host not connected; connects with its host; importNode
+  constructs.
+  - **Chromium 8/8, 486 "script not run", 487 8/8.**
+- **old.reddit at 487:** "not a function" 4 -> **0** (15 at 485), listener
+  throws 0.
+  - **2 `classMap()` errors reappear**, from components constructed for
+    the first time whose templates still hit lit's attribute pairing: the
+    next lit lead.
+  - `<auth-flow-manager>`'s shadow root now has its **`login` slot** (since
+    485/486). That is the slot whose absence blanked the page in the
+    parked drawing unit; shadow drawing (488) re-checks it.
+
+**Gate.**
+- **gate487 exit 0**: SHADOWCE 8/8, CUSTOMEL 9/9, SLOTAPI 8/8, interaction
+  57/57 (both paces).
+- `restage-full.sh`: **571 applied plus the 2 known collisions**.
+
+No sudo.

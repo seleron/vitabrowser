@@ -1,0 +1,402 @@
+# netsurf: custom elements in shadow roots are upgraded; isConnected is shadow-including; importNode constructs (patch 487)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 486)
+#
+# old.reddit.com's login: 4 "not a function" a load at 486, all
+# `this.helperText?.associateForm(e)` in <faceplate-text-input>'s
+# connectedCallback -- helperText is a custom element in the component's
+# shadow root, and it was a plain element when that ran.
+#
+# vita_polyfill.js:
+# - the custom-element upgrade observer watched the document only: each root
+#   attachShadow makes is now watched the same way (observeRoot, from the 481
+#   attachShadow wrapper), swept when it is made and when a definition
+#   arrives, and observed for observedAttributes too;
+# - connected() (connectedCallback) is shadow-including, and a host that
+#   becomes connected connects its shadow tree's custom elements;
+# - isConnected is shadow-including (a node in a connected host's shadow
+#   root answered false);
+# - document.importNode constructs the defined custom elements in its copy
+#   before returning, as browsers' upgrade reactions do: lit clones every
+#   template that way, and <faceplate-text-input> uses helperText's methods
+#   right after an await -- before any MutationObserver delivery (with the
+#   observer alone, helperText WAS upgraded, a moment too late).
+#
+# JS-shadow-upgrade.html: Chromium 8/8, 486 aborts, 487 8/8. old.reddit at
+# 487: "not a function" 4 -> 0 (15 at 485). Two classMap() errors appear:
+# components constructed for the first time whose templates still hit
+# lit's attribute pairing -- the next lit lead.
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6090,9 +6090,17 @@
+ 		/* (HTMLElement is installed per run, below) */
+ 		function lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }
+ 		function nameOf(C) { for (var k in defs) if (defs[k] === C) return k; return null; }
++		/* VitaBrowser patch 487: shadow-including -- an element in the
++		 * shadow root of a connected host is connected */
+ 		function connected(n) {
+-			var de = d.documentElement;
+-			return !!(de && (n === de || (de.contains && de.contains(n))));
++			var de = d.documentElement, r, k;
++			for (k = 0; n && de && k < 64; k++) {
++				if (n === de || (de.contains && de.contains(n))) return true;
++				for (r = n; r.parentNode; r = r.parentNode) { /* root */ }
++				if (r.nodeType === 11 && r.host) n = r.host;
++				else return false;
++			}
++			return false;
+ 		}
+ 		function attrCb(el, C, name, oldV, newV) {
+ 			var obs = C.observedAttributes;
+@@ -6157,8 +6165,48 @@
+ 				}
+ 			}
+ 		}
++		/* VitaBrowser patch 487: the shadow roots on the page. The upgrade
++		 * observer below watched the document only, so a custom element
++		 * stamped into a shadow root (lit renders there) was never
++		 * constructed: old.reddit.com's <faceplate-text-input> called
++		 * this.helperText.associateForm() on a plain element ("not a
++		 * function", 4 a load). Each root attachShadow makes is watched
++		 * the same way, and swept when a definition arrives. */
++		var roots = [];
++		function onMutations(ms) {
++			if (!Object.keys(defs).length) return;
++			ms.forEach(function (m) {
++				var i;
++				for (i = 0; m.removedNodes && i < m.removedNodes.length; i++)
++					gone(m.removedNodes[i]);
++				for (i = 0; m.addedNodes && i < m.addedNodes.length; i++) {
++					upgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);
++				}
++			});
++			/* a host that became connected: its shadow tree's custom
++			 * elements are connected now too (connectedCallback) */
++			roots.forEach(function (r) {
++				if (!PV(r).__vbRootConn && r.host && connected(r.host)) {
++					PV(r).__vbRootConn = true;
++					sweep(r);
++				}
++			});
++		}
++		function observeRoot(r) {
++			if (!r || PV(r).__vbCEObs) return;
++			PV(r).__vbCEObs = true;
++			roots.push(r);
++			sweep(r);
++			if (typeof g.MutationObserver === 'function') {
++				try { new MutationObserver(onMutations).observe(r, { childList: true, subtree: true }); } catch (e) { /* */ }
++				if (attrMO) {
++					try { attrMO.observe(r, { attributes: true, attributeOldValue: true, subtree: true }); } catch (e) { /* */ }
++				}
++			}
++		}
+ 		g.__vbCustomEl = { defs: defs, construct: construct,
+-				    building: building, nameOf: nameOf };
++				    building: building, nameOf: nameOf,
++				    observeRoot: observeRoot };
+ 		g.customElements = {
+ 			define: function (name, C) {
+ 				name = String(name).toLowerCase();
+@@ -6175,9 +6223,13 @@
+ 							});
+ 						});
+ 						attrMO.observe(d, { attributes: true, attributeOldValue: true, subtree: true });
++						roots.forEach(function (r) {
++							try { attrMO.observe(r, { attributes: true, attributeOldValue: true, subtree: true }); } catch (e) { /* */ }
++						});
+ 					} catch (e) { /* */ }
+ 				}
+ 				sweep(d);
++				roots.forEach(sweep);	/* patch 487 */
+ 				if (waits[name]) { waits[name].forEach(function (r) { r(C); }); delete waits[name]; }
+ 			},
+ 			get: function (name) { return defs[String(name).toLowerCase()]; },
+@@ -6189,19 +6241,40 @@
+ 			},
+ 			upgrade: function (root) { upgrade(root); sweep(root); }
+ 		};
++		/* VitaBrowser patch 487: importNode constructs the defined custom
++		 * elements in its copy before returning, as in browsers (upgrade
++		 * reactions run when the call returns) -- lit clones every template
++		 * with document.importNode(content, true), and a component's
++		 * connectedCallback may use a child's methods right after an await,
++		 * before any MutationObserver delivery (old.reddit.com's
++		 * <faceplate-text-input>: helperText.associateForm). Connecting
++		 * still happens on insertion. */
++		(function () {
++			var oi = d.importNode;
++			if (typeof oi !== 'function' || PV(oi).__vbCEImport) return;
++			var ni = function importNode(node, deep) {
++				var r = oi.apply(this, arguments), names, list, i, C;
++				try {
++					names = Object.keys(defs);
++					if (names.length && r) {
++						if (r.nodeType === 1 && (C = defs[lname(r)])) construct(r, C);
++						if (r.querySelectorAll) {
++							list = r.querySelectorAll(names.join(','));
++							for (i = 0; i < list.length; i++) {
++								C = defs[lname(list[i])];
++								if (C) construct(list[i], C);
++							}
++						}
++					}
++				} catch (e) { /* */ }
++				return r;
++			};
++			PV(ni).__vbCEImport = true;
++			try { Object.defineProperty(d, 'importNode', { value: ni, writable: true, configurable: true }); } catch (e) { /* */ }
++		})();
+ 		if (typeof g.MutationObserver === 'function') {
+ 			try {
+-				new MutationObserver(function (ms) {
+-					if (!Object.keys(defs).length) return;
+-					ms.forEach(function (m) {
+-						var i;
+-						for (i = 0; m.removedNodes && i < m.removedNodes.length; i++)
+-							gone(m.removedNodes[i]);
+-						for (i = 0; m.addedNodes && i < m.addedNodes.length; i++) {
+-							upgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);
+-						}
+-					});
+-				}).observe(d, { childList: true, subtree: true });
++				new MutationObserver(onMutations).observe(d, { childList: true, subtree: true });
+ 			} catch (e) { /* */ }
+ 		}
+ 	}
+@@ -6581,6 +6654,37 @@
+ 	} catch (x) { /* */ }
+ })();
+ 
++/* ---- patch 487: isConnected is shadow-including -----------------------
++ * A node inside an attached shadow root answered isConnected false (its
++ * parent chain ends at the root fragment); in browsers it is connected
++ * when its host is. Components check it before rendering and in their
++ * connectedCallback guards. */
++(function () {
++	var d = g.document;
++	if (!d) return;
++	function isConn() {
++		var n = this, r, k;
++		for (k = 0; n && k < 64; k++) {
++			for (r = n; r.parentNode; r = r.parentNode) { /* root */ }
++			if (r === d || r.nodeType === 9) return true;
++			if (r.nodeType === 11 && r.host) n = r.host;
++			else return false;
++		}
++		return false;
++	}
++	function install(start) {
++		for (var p = start; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
++			if (Object.prototype.hasOwnProperty.call(p, 'isConnected')) {
++				try { Object.defineProperty(p, 'isConnected', { get: isConn, configurable: true }); } catch (x) { /* */ }
++			}
++		}
++	}
++	try {
++		install(Object.getPrototypeOf(d.createElement('section')));
++		install(Object.getPrototypeOf(d.createTextNode('')));
++	} catch (x) { /* */ }
++})();
++
+ /* ---- patch 481: events into shadow trees --------------------------------
+  * Patch 242's shadow root is a document fragment the engine never draws,
+  * and the engine's event path is the light tree: a tap on a component's
+@@ -6687,6 +6791,10 @@
+ 			var r = oa.apply(this, arguments), h = this;
+ 			if (r && typeof r === 'object') PV(h).__vbSR = r;
+ 			TAP.forEach(function (t) { ensure(h, t); });
++			/* patch 487: custom elements in the root are upgraded */
++			if (r && g.__vbCustomEl && typeof g.__vbCustomEl.observeRoot === 'function') {
++				try { g.__vbCustomEl.observeRoot(r); } catch (x) { /* */ }
++			}
+ 			return r;
+ 		};
+ 		PV(na).__vbRelayWrap = true;
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6091,9 +6091,17 @@
+ "\t\t/* (HTMLElement is installed per run, below) */\n"
+ "\t\tfunction lname(n) { return String(n.localName || n.tagName || '').toLowerCase(); }\n"
+ "\t\tfunction nameOf(C) { for (var k in defs) if (defs[k] === C) return k; return null; }\n"
++"\t\t/* VitaBrowser patch 487: shadow-including -- an element in the\n"
++"\t\t * shadow root of a connected host is connected */\n"
+ "\t\tfunction connected(n) {\n"
+-"\t\t\tvar de = d.documentElement;\n"
+-"\t\t\treturn !!(de && (n === de || (de.contains && de.contains(n))));\n"
++"\t\t\tvar de = d.documentElement, r, k;\n"
++"\t\t\tfor (k = 0; n && de && k < 64; k++) {\n"
++"\t\t\t\tif (n === de || (de.contains && de.contains(n))) return true;\n"
++"\t\t\t\tfor (r = n; r.parentNode; r = r.parentNode) { /* root */ }\n"
++"\t\t\t\tif (r.nodeType === 11 && r.host) n = r.host;\n"
++"\t\t\t\telse return false;\n"
++"\t\t\t}\n"
++"\t\t\treturn false;\n"
+ "\t\t}\n"
+ "\t\tfunction attrCb(el, C, name, oldV, newV) {\n"
+ "\t\t\tvar obs = C.observedAttributes;\n"
+@@ -6158,8 +6166,48 @@
+ "\t\t\t\t}\n"
+ "\t\t\t}\n"
+ "\t\t}\n"
++"\t\t/* VitaBrowser patch 487: the shadow roots on the page. The upgrade\n"
++"\t\t * observer below watched the document only, so a custom element\n"
++"\t\t * stamped into a shadow root (lit renders there) was never\n"
++"\t\t * constructed: old.reddit.com's <faceplate-text-input> called\n"
++"\t\t * this.helperText.associateForm() on a plain element (\"not a\n"
++"\t\t * function\", 4 a load). Each root attachShadow makes is watched\n"
++"\t\t * the same way, and swept when a definition arrives. */\n"
++"\t\tvar roots = [];\n"
++"\t\tfunction onMutations(ms) {\n"
++"\t\t\tif (!Object.keys(defs).length) return;\n"
++"\t\t\tms.forEach(function (m) {\n"
++"\t\t\t\tvar i;\n"
++"\t\t\t\tfor (i = 0; m.removedNodes && i < m.removedNodes.length; i++)\n"
++"\t\t\t\t\tgone(m.removedNodes[i]);\n"
++"\t\t\t\tfor (i = 0; m.addedNodes && i < m.addedNodes.length; i++) {\n"
++"\t\t\t\t\tupgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);\n"
++"\t\t\t\t}\n"
++"\t\t\t});\n"
++"\t\t\t/* a host that became connected: its shadow tree's custom\n"
++"\t\t\t * elements are connected now too (connectedCallback) */\n"
++"\t\t\troots.forEach(function (r) {\n"
++"\t\t\t\tif (!PV(r).__vbRootConn && r.host && connected(r.host)) {\n"
++"\t\t\t\t\tPV(r).__vbRootConn = true;\n"
++"\t\t\t\t\tsweep(r);\n"
++"\t\t\t\t}\n"
++"\t\t\t});\n"
++"\t\t}\n"
++"\t\tfunction observeRoot(r) {\n"
++"\t\t\tif (!r || PV(r).__vbCEObs) return;\n"
++"\t\t\tPV(r).__vbCEObs = true;\n"
++"\t\t\troots.push(r);\n"
++"\t\t\tsweep(r);\n"
++"\t\t\tif (typeof g.MutationObserver === 'function') {\n"
++"\t\t\t\ttry { new MutationObserver(onMutations).observe(r, { childList: true, subtree: true }); } catch (e) { /* */ }\n"
++"\t\t\t\tif (attrMO) {\n"
++"\t\t\t\t\ttry { attrMO.observe(r, { attributes: true, attributeOldValue: true, subtree: true }); } catch (e) { /* */ }\n"
++"\t\t\t\t}\n"
++"\t\t\t}\n"
++"\t\t}\n"
+ "\t\tg.__vbCustomEl = { defs: defs, construct: construct,\n"
+-"\t\t\t\t    building: building, nameOf: nameOf };\n"
++"\t\t\t\t    building: building, nameOf: nameOf,\n"
++"\t\t\t\t    observeRoot: observeRoot };\n"
+ "\t\tg.customElements = {\n"
+ "\t\t\tdefine: function (name, C) {\n"
+ "\t\t\t\tname = String(name).toLowerCase();\n"
+@@ -6176,9 +6224,13 @@
+ "\t\t\t\t\t\t\t});\n"
+ "\t\t\t\t\t\t});\n"
+ "\t\t\t\t\t\tattrMO.observe(d, { attributes: true, attributeOldValue: true, subtree: true });\n"
++"\t\t\t\t\t\troots.forEach(function (r) {\n"
++"\t\t\t\t\t\t\ttry { attrMO.observe(r, { attributes: true, attributeOldValue: true, subtree: true }); } catch (e) { /* */ }\n"
++"\t\t\t\t\t\t});\n"
+ "\t\t\t\t\t} catch (e) { /* */ }\n"
+ "\t\t\t\t}\n"
+ "\t\t\t\tsweep(d);\n"
++"\t\t\t\troots.forEach(sweep);\t/* patch 487 */\n"
+ "\t\t\t\tif (waits[name]) { waits[name].forEach(function (r) { r(C); }); delete waits[name]; }\n"
+ "\t\t\t},\n"
+ "\t\t\tget: function (name) { return defs[String(name).toLowerCase()]; },\n"
+@@ -6190,19 +6242,40 @@
+ "\t\t\t},\n"
+ "\t\t\tupgrade: function (root) { upgrade(root); sweep(root); }\n"
+ "\t\t};\n"
++"\t\t/* VitaBrowser patch 487: importNode constructs the defined custom\n"
++"\t\t * elements in its copy before returning, as in browsers (upgrade\n"
++"\t\t * reactions run when the call returns) -- lit clones every template\n"
++"\t\t * with document.importNode(content, true), and a component's\n"
++"\t\t * connectedCallback may use a child's methods right after an await,\n"
++"\t\t * before any MutationObserver delivery (old.reddit.com's\n"
++"\t\t * <faceplate-text-input>: helperText.associateForm). Connecting\n"
++"\t\t * still happens on insertion. */\n"
++"\t\t(function () {\n"
++"\t\t\tvar oi = d.importNode;\n"
++"\t\t\tif (typeof oi !== 'function' || PV(oi).__vbCEImport) return;\n"
++"\t\t\tvar ni = function importNode(node, deep) {\n"
++"\t\t\t\tvar r = oi.apply(this, arguments), names, list, i, C;\n"
++"\t\t\t\ttry {\n"
++"\t\t\t\t\tnames = Object.keys(defs);\n"
++"\t\t\t\t\tif (names.length && r) {\n"
++"\t\t\t\t\t\tif (r.nodeType === 1 && (C = defs[lname(r)])) construct(r, C);\n"
++"\t\t\t\t\t\tif (r.querySelectorAll) {\n"
++"\t\t\t\t\t\t\tlist = r.querySelectorAll(names.join(','));\n"
++"\t\t\t\t\t\t\tfor (i = 0; i < list.length; i++) {\n"
++"\t\t\t\t\t\t\t\tC = defs[lname(list[i])];\n"
++"\t\t\t\t\t\t\t\tif (C) construct(list[i], C);\n"
++"\t\t\t\t\t\t\t}\n"
++"\t\t\t\t\t\t}\n"
++"\t\t\t\t\t}\n"
++"\t\t\t\t} catch (e) { /* */ }\n"
++"\t\t\t\treturn r;\n"
++"\t\t\t};\n"
++"\t\t\tPV(ni).__vbCEImport = true;\n"
++"\t\t\ttry { Object.defineProperty(d, 'importNode', { value: ni, writable: true, configurable: true }); } catch (e) { /* */ }\n"
++"\t\t})();\n"
+ "\t\tif (typeof g.MutationObserver === 'function') {\n"
+ "\t\t\ttry {\n"
+-"\t\t\t\tnew MutationObserver(function (ms) {\n"
+-"\t\t\t\t\tif (!Object.keys(defs).length) return;\n"
+-"\t\t\t\t\tms.forEach(function (m) {\n"
+-"\t\t\t\t\t\tvar i;\n"
+-"\t\t\t\t\t\tfor (i = 0; m.removedNodes && i < m.removedNodes.length; i++)\n"
+-"\t\t\t\t\t\t\tgone(m.removedNodes[i]);\n"
+-"\t\t\t\t\t\tfor (i = 0; m.addedNodes && i < m.addedNodes.length; i++) {\n"
+-"\t\t\t\t\t\t\tupgrade(m.addedNodes[i]); sweep(m.addedNodes[i]);\n"
+-"\t\t\t\t\t\t}\n"
+-"\t\t\t\t\t});\n"
+-"\t\t\t\t}).observe(d, { childList: true, subtree: true });\n"
++"\t\t\t\tnew MutationObserver(onMutations).observe(d, { childList: true, subtree: true });\n"
+ "\t\t\t} catch (e) { /* */ }\n"
+ "\t\t}\n"
+ "\t}\n"
+@@ -6582,6 +6655,37 @@
+ "\t} catch (x) { /* */ }\n"
+ "})();\n"
+ "\n"
++"/* ---- patch 487: isConnected is shadow-including -----------------------\n"
++" * A node inside an attached shadow root answered isConnected false (its\n"
++" * parent chain ends at the root fragment); in browsers it is connected\n"
++" * when its host is. Components check it before rendering and in their\n"
++" * connectedCallback guards. */\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d) return;\n"
++"\tfunction isConn() {\n"
++"\t\tvar n = this, r, k;\n"
++"\t\tfor (k = 0; n && k < 64; k++) {\n"
++"\t\t\tfor (r = n; r.parentNode; r = r.parentNode) { /* root */ }\n"
++"\t\t\tif (r === d || r.nodeType === 9) return true;\n"
++"\t\t\tif (r.nodeType === 11 && r.host) n = r.host;\n"
++"\t\t\telse return false;\n"
++"\t\t}\n"
++"\t\treturn false;\n"
++"\t}\n"
++"\tfunction install(start) {\n"
++"\t\tfor (var p = start; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'isConnected')) {\n"
++"\t\t\t\ttry { Object.defineProperty(p, 'isConnected', { get: isConn, configurable: true }); } catch (x) { /* */ }\n"
++"\t\t\t}\n"
++"\t\t}\n"
++"\t}\n"
++"\ttry {\n"
++"\t\tinstall(Object.getPrototypeOf(d.createElement('section')));\n"
++"\t\tinstall(Object.getPrototypeOf(d.createTextNode('')));\n"
++"\t} catch (x) { /* */ }\n"
++"})();\n"
++"\n"
+ "/* ---- patch 481: events into shadow trees --------------------------------\n"
+ " * Patch 242's shadow root is a document fragment the engine never draws,\n"
+ " * and the engine's event path is the light tree: a tap on a component's\n"
+@@ -6688,6 +6792,10 @@
+ "\t\t\tvar r = oa.apply(this, arguments), h = this;\n"
+ "\t\t\tif (r && typeof r === 'object') PV(h).__vbSR = r;\n"
+ "\t\t\tTAP.forEach(function (t) { ensure(h, t); });\n"
++"\t\t\t/* patch 487: custom elements in the root are upgraded */\n"
++"\t\t\tif (r && g.__vbCustomEl && typeof g.__vbCustomEl.observeRoot === 'function') {\n"
++"\t\t\t\ttry { g.__vbCustomEl.observeRoot(r); } catch (x) { /* */ }\n"
++"\t\t\t}\n"
+ "\t\t\treturn r;\n"
+ "\t\t};\n"
+ "\t\tPV(na).__vbRelayWrap = true;\n"
