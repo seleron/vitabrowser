@@ -18427,3 +18427,55 @@ sim run) at 488:
   - In the separate-tree test: re-created **95 -> 1**, bbc's revisit
     **87 -> 1** objects, revisit Done **3.4 -> 2.2 s**, peak heap **+1.3
     MiB (~1%)**.
+
+## Patch 489 (2026-11-27): the extended-memory VPK gets its own ELF with a 288 MiB heap -- and is the primary deliverable
+
+**Problem.**
+- `tools/build-vita.sh` packaged both VPKs from **one ELF**.
+- The extended VPK (`VitaBrowser-ext.vpk`, title id VBRW00002, "VitaBrowser
+  ext-mem", param.sfo ATTRIBUTE2=12) gets ~365 MiB of MAIN on 3.65 HENkaku
+  vs ~256 MiB for the default (measured, doc 09 section 6).
+- But `_newlib_heap_size_user` was a fixed **192 MiB** in that ELF: the
+  engine never saw the extra ~110 MiB.
+
+**Fix.**
+- `frontends/vita/main.c`: the heap is `VITA_HEAP_MB` MiB (default 192,
+  so the default VPK and the simulator are unchanged). The boot log names
+  it: `mem: newlib heap N MiB`.
+- `tools/build-vita.sh`: builds and packages the default VPK, keeps its ELF
+  as `nsvita-default.elf`, then recompiles `main.c` with
+  `VITA_HEAP_MB=288` (in the environment's CFLAGS) and relinks
+  `nsvita.elf` for `VitaBrowser-ext.vpk`. It prints each ELF's heap
+  symbol.
+- **Why 288:** run 43 (default VPK) had 32 MiB of user memory free after
+  init beside the 192 MiB heap; 288 keeps ~45 MiB free in the ext budget.
+  Textures come from CDRAM first (`bitmap.c`), not this heap.
+
+**Verified** (Vita build at 489, VPKs built locally, NOT handed off):
+- `nsvita-default.elf` `_newlib_heap_size_user` = **192 MiB**
+  (`VitaBrowser.vpk`).
+- `nsvita.elf` = **288 MiB** (`VitaBrowser-ext.vpk`). The value was read
+  from each ELF.
+- On the device: the boot log line `mem: newlib heap 288 MiB` confirms the
+  ext VPK.
+
+**Why it matters.** The 4-page sim session (bbc -> youtube -> github ->
+bbc) peaks at ~142 MiB of heap: ~74% of 192, ~49% of 288.
+
+**Gate.**
+- **gate489 exit 0**: interaction 57/57 (both paces); the sim logs `newlib
+  heap 192 MiB`.
+- `restage-full.sh`: **573 applied plus the 2 known collisions**.
+
+### Launch instructions from now on: use VitaBrowser ext-mem
+
+- **Install and launch `VitaBrowser-ext.vpk`** ("VitaBrowser ext-mem",
+  VBRW00002) for device runs. It is the primary deliverable (north star
+  item 4: ship with the extended budget).
+- `VitaBrowser.vpk` (VBRW00001) stays built for comparison only.
+- Both install side by side. The ext build needs 3.65 HENkaku (where
+  ATTRIBUTE2=12 was measured to work).
+- A device result log should show `mem: newlib heap 288 MiB` at boot;
+  `192` means the default VPK was launched.
+
+No sudo.

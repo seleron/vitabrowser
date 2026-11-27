@@ -140,21 +140,42 @@ done
 # HTTPS is verified against Mozilla's roots (tools/fetch-certs.sh).
 WORK="$WORK" "$ROOT/tools/fetch-certs.sh" >/dev/null
 EXTRA="$EXTRA $WORK/certs/ca-bundle.pem=res/ca-bundle.pem"
-# Two VPKs from one ELF: the default memory budget, and the extended one
-# (param.sfo ATTRIBUTE2=12, pre-phase-0 §1) under its own title id so both
-# can be installed side by side for the memory probe.
-( cd "$UP/netsurf" && rm -f nsvita.elf VitaBrowser.vpk VitaBrowser-ext.vpk && \
+# Two VPKs: the default memory budget, and the extended one (param.sfo
+# ATTRIBUTE2=12, pre-phase-0 §1) under its own title id so both can be
+# installed side by side. Patch 489: each has its OWN ELF. They shared one,
+# so the extended VPK got ~365 MiB of MAIN from the system but the engine's
+# newlib heap stayed 192 MiB -- the extra ~110 MiB went unused. The ext
+# ELF is the same build relinked after main.c is recompiled with a larger
+# heap (VITA_HEAP_MB, frontends/vita/main.c; passed in the environment's
+# CFLAGS, which the Makefile extends -- on the command line it would
+# replace them). Run 43's default VPK had
+# 32 MiB of user memory free after init beside the 192 MiB heap; 288 MiB
+# keeps ~45 MiB free in the ext budget. The ext VPK is the primary
+# deliverable (VitaBrowser-ext.vpk, "VitaBrowser ext-mem").
+EXT_HEAP_MB="${VITA_EXT_HEAP_MB:-288}"
+( cd "$UP/netsurf" && rm -f nsvita.elf nsvita-default.elf VitaBrowser.vpk VitaBrowser-ext.vpk && \
+  find build -path '*vita*' ! -path '*vita-sim*' -name frontends_vita_main.o -delete 2>/dev/null; \
   make TARGET=vita VITA_PREFIX="$VP" -j4 > "$WORK/applytest/vita-build-netsurf.log" 2>&1 && \
   make TARGET=vita VITA_PREFIX="$VP" package-vita VITA_EXTRA_FILES="$EXTRA" \
+    >> "$WORK/applytest/vita-build-netsurf.log" 2>&1 && \
+  mv nsvita.elf nsvita-default.elf && \
+  find build -path '*vita*' ! -path '*vita-sim*' -name frontends_vita_main.o -delete && \
+  CFLAGS="$CFLAGS -DVITA_HEAP_MB=$EXT_HEAP_MB" \
+    make TARGET=vita VITA_PREFIX="$VP" -j4 \
     >> "$WORK/applytest/vita-build-netsurf.log" 2>&1 && \
   make TARGET=vita VITA_PREFIX="$VP" package-vita VITA_EXTRA_FILES="$EXTRA" \
     VITA_TITLE_ID=VBRW00002 VITA_APP_NAME="VitaBrowser ext-mem" \
     VITA_SFO_FLAGS="-d ATTRIBUTE2=12" VITA_VPK=VitaBrowser-ext.vpk \
     >> "$WORK/applytest/vita-build-netsurf.log" 2>&1 ) \
-  && echo "  nsvita.elf + VitaBrowser.vpk + VitaBrowser-ext.vpk ok" \
+  && echo "  nsvita-default.elf + VitaBrowser.vpk, nsvita.elf (heap ${EXT_HEAP_MB} MiB) + VitaBrowser-ext.vpk ok" \
   || { echo "  netsurf FAILED"; \
        grep -oE '(error: |undefined reference to )[^[]*' \
          "$WORK/applytest/vita-build-netsurf.log" | sort -u | head -8; exit 1; }
 
 "$VITASDK/bin/arm-vita-eabi-readelf" -h "$UP/netsurf/nsvita.elf" | grep -E 'Class|Machine'
-ls -la "$UP/netsurf/nsvita.elf" "$UP/netsurf/VitaBrowser.vpk" "$UP/netsurf/VitaBrowser-ext.vpk"
+ls -la "$UP/netsurf/nsvita-default.elf" "$UP/netsurf/nsvita.elf" "$UP/netsurf/VitaBrowser.vpk" "$UP/netsurf/VitaBrowser-ext.vpk"
+# patch 489: each ELF carries its own heap size (the symbol's value)
+for e in nsvita-default.elf nsvita.elf; do
+	a=$("$VITASDK/bin/arm-vita-eabi-nm" "$UP/netsurf/$e" | awk '$3=="_newlib_heap_size_user" {print $1}')
+	echo "  $e _newlib_heap_size_user at 0x$a"
+done

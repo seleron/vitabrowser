@@ -1,0 +1,51 @@
+# netsurf: the extended-memory VPK gets its own ELF with a 288 MiB heap (patch 489)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 488)
+#
+# P1 (RAM headroom): tools/build-vita.sh packaged both VPKs from ONE ELF.
+# The extended VPK (param.sfo ATTRIBUTE2=12, VBRW00002 "VitaBrowser
+# ext-mem") gets ~365 MiB of MAIN on 3.65 HENkaku vs ~256 MiB (measured,
+# doc 09 section 6), but _newlib_heap_size_user was a fixed 192 MiB in that ELF:
+# the engine never saw the extra ~110 MiB.
+#
+# frontends/vita/main.c: the heap is VITA_HEAP_MB MiB (default 192, the
+# default VPK and the simulator unchanged), and the boot log names it
+# ("mem: newlib heap N MiB"). tools/build-vita.sh (in the repository, not
+# this patch) builds the default VPK, then recompiles main.c with
+# VITA_HEAP_MB=288 and relinks the ext ELF for VitaBrowser-ext.vpk. Run 43
+# (default VPK) had 32 MiB of user memory free after init beside the 192
+# MiB heap; 288 keeps ~45 MiB free in the ext budget. Textures come from
+# CDRAM first (bitmap.c), not this heap.
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -96,8 +96,19 @@
+ /* Memory layout, read by the vitaSDK runtime at start-up. The heap matches
+  * MacSurf's preferred 192 MB partition and fits the default 256 MiB MAIN
+  * budget (docs/phase-0/pre-phase-0-findings.md §1); layout recursion on
+- * deep documents wants more than the default main-thread stack. */
+-int _newlib_heap_size_user = 192 * 1024 * 1024;
++ * deep documents wants more than the default main-thread stack.
++ *
++ * VitaBrowser patch 489: VITA_HEAP_MB sets it per build. The extended
++ * VPK (param.sfo ATTRIBUTE2=12, ~365 MiB MAIN) was packaged from the same
++ * ELF, so its engine heap stayed 192 MiB and ~110 MiB went unused;
++ * tools/build-vita.sh now relinks the ext ELF with VITA_HEAP_MB=288 (run
++ * 43, default VPK: 32 MiB of user memory free after init beside the heap;
++ * 288 keeps ~45 MiB free in the ext budget). Textures come from CDRAM
++ * first (bitmap.c), not this heap. */
++#ifndef VITA_HEAP_MB
++#define VITA_HEAP_MB 192
++#endif
++int _newlib_heap_size_user = VITA_HEAP_MB * 1024 * 1024;
+ unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+ 
+ /** vita2d's per-frame vertex pool: every rect is a few vertices. */
+@@ -1510,6 +1521,8 @@
+ 	vita_diag_log("init: %s", vita_net_start());
+ 	vita_diag_net_start();
+ 	load_net_pages();
++	/* patch 489: which budget this build has (the ext VPK's is larger) */
++	vita_diag_log("mem: newlib heap %d MiB", VITA_HEAP_MB);
+ 	vita_diag_memory("boot");
+ 
+ 	{
