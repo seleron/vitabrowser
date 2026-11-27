@@ -18244,3 +18244,27 @@ No sudo.
 - `restage-full.sh`: **571 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log -- after patch 487 (2026-11-27)
+
+- **gate487 exit 0** (SHADOWCE 8/8, interaction 57/57 at both paces);
+  pushed 6f44064.
+- **ASan 487** (`--libs --net`, autotest): **clean**. Interaction 57/57,
+  450 page dumps, 0 reports.
+- **21-site census, 486 vs 487: in flight** (started ~14:18Z,
+  `score/c21-487`). Numbers to follow below.
+- **Shadow drawing (488) re-applied from the WIP and re-checked on
+  old.reddit.com.**
+  - The login page is **no longer blank**. The modal (heading, text, both
+    option pills, "OR", "Forgot password?", the eye icon, its scroll
+    container) draws through the shadow trees, since 485-487 give
+    `<auth-flow-manager>` its `login` slot.
+  - **The username/password fields are still not visible.** Inside each
+    `<faceplate-text-input>` shadow root, lit left the `<input>` part
+    empty (`<span class="input-container"><!--?lit$...--></span>`) and
+    the label part too (`without-label`). The fields do not exist in the
+    DOM, so this is not a drawing defect.
+  - It matches the 2 `classMap()` errors that reappeared at 487: lit's
+    nested template for the input still fails its attribute pairing.
+  - **488 is held** until the fields render (the owner's bar). The lit
+    lead is next.
