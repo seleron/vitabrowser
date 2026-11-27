@@ -18397,3 +18397,33 @@ the fix, 1.
 - `restage-full.sh`: **572 applied plus the 2 known collisions**.
 
 No sudo.
+
+### P1 performance pass begins (2026-11-27, owner reprioritization: load time + RAM first)
+
+**Baseline at 487** (`tools/scorecard/profile.py`, sim, 2 loads):
+
+| site | first Done | heap at Done | heap peak | llcache created / destroyed / refetched | box + cascade | JS compile |
+|---|---|---|---|---|---|---|
+| bbc | 3.3 / 3.1 s | 92.2 MiB | 96.3 MiB | 129 / 22 / 6 | 1075 / 1274 ms | 338 ms |
+| github (logged out) | 2.8 / 2.8 s | 47.4 / 48.7 MiB | same | 41 / 4 / 0 | 466 / 435 ms | 0 ms |
+
+- bbc's decoded images peak at **264 KB** in the sim (lazy images, 23
+  never rendered): bitmaps are not bbc's RAM.
+- The device's github (286 s) was a heavier, logged-in page than the
+  sim's.
+
+**Multi-page session** (`llsess.sh`: bbc -> youtube -> github -> bbc in one
+sim run) at 488:
+- **95 network objects re-created, 87 of them bbc's on the revisit**: the
+  device's churn.
+- 44 stale discards; the bbc revisit Done 3.4 s (first 3.3 s); session
+  heap peak 142.3 MiB.
+
+**Findings.**
+- **The extended VPK shared the default ELF:** the newlib heap was 192 MiB
+  in both. ~110 MiB of the ext VPK's MAIN went unused. **Patch 489.**
+- **The llcache budget was NetSurf's default 12 MiB.** The Vita frontend
+  never set it. **Patch 490:** heap / 8.
+  - In the separate-tree test: re-created **95 -> 1**, bbc's revisit
+    **87 -> 1** objects, revisit Done **3.4 -> 2.2 s**, peak heap **+1.3
+    MiB (~1%)**.
