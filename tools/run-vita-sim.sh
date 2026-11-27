@@ -550,6 +550,8 @@ NET-js-inline-rect http://127.0.0.1:$HP/JS-inline-rect.html
 NET-html-hidden-details http://127.0.0.1:$HP/HTML-hidden-details.html
 NET-css-flow-root http://127.0.0.1:$HP/CSS-flow-root.html
 NET-css-grid-autofill http://127.0.0.1:$HP/CSS-grid-autofill.html
+NET-js-img-shared-release http://127.0.0.1:$HP/JS-img-shared-release.html
+NET-css-img-shared-release-ref http://127.0.0.1:$HP/CSS-img-shared-release-ref.html
 NET-css-grid-named-var http://127.0.0.1:$HP/CSS-grid-named-var.html
 NET-css-grid-fr-minmax http://127.0.0.1:$HP/CSS-grid-fr-minmax.html
 NET-css-calc-negative http://127.0.0.1:$HP/CSS-calc-negative.html
@@ -2618,6 +2620,17 @@ k475d=$(printf '%s\n' "$k475seg" | grep -c "declined (an element's style changes
 k475f=$(printf '%s\n' "$k475seg" | grep -c "LIFE BATCHCAUSE cause=" || true)
 echo "  JS-root-pos: rows $k475r (0), roots restyled in place ${k475i} (1), root-style declines ${k475d} (0), full rebuilds ${k475f} (0)"
 [ "$k475r" = 0 ] && [ "${k475i:-0}" -ge 1 ] && [ "${k475d:-1}" -eq 0 ] && [ "${k475f:-1}" -eq 0 ] || fail "the root made position: relative, restyled in place"
+# Patch 478: two <img> share one slow URL and the first is removed while the
+# fetch is pending -- its handle leaves without aborting (and snapshotting)
+# the shared object: one llcache object for the URL (477: three), the
+# second image still drawn (rows 0). Its URL is its own (?shared478): an
+# image this page left fresh in llcache would load CSS-late-link's /slow/
+# image at once and finish that page before its late sheet (gate478).
+k478r=$(fl_rows NET-js-img-shared-release NET-css-img-shared-release-ref)
+k478seg=$(awk '/ page [0-9]+\/[0-9]+ NET-js-img-shared-release: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+k478o=$(printf '%s\n' "$k478seg" | grep -c "Created object .*/slow/lazyimg-01.png?shared478" || true)
+echo "  NET-js-img-shared-release: rows $k478r (0), llcache objects for the shared slow image ${k478o} (1)"
+[ "$k478r" = 0 ] && [ "${k478o:-0}" -eq 1 ] || fail "a shared fetch released without a snapshot copy"
 # Patch 381: on a sheet patch 198 cannot analyse (a pseudo-class in a
 # sibling rule's left compound), changes at the parent's tail -- appends
 # with only box-less tags after them, removals of the last -- skip the

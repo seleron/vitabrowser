@@ -17368,3 +17368,63 @@ stricter. Read guard-trip deltas against the conversion times in the
 same loads.
 
 No sudo.
+
+## Patch 478 (2026-11-27): a pending retrieval released from a shared object leaves without a snapshot copy
+
+**Problem.** youtube's Google logo SVG and youtube icon were created 5-7
+times a load while a copy was live: 45 over three simulator loads, 6 on
+the device's sign-in page; github's avatars too.
+- These were llcache **snapshots**. `hlcache_handle_release`, and
+  `hlcache_handle_abort`'s nascent path, release a handle whose
+  retrieval is still pending (`entry == NULL`), and both first called
+  `llcache_handle_abort`.
+- On an object other users share, `llcache_handle_abort` snapshots a full
+  copy (source data, headers, certificate chain) for that handle, so the
+  others' fetch can go on.
+- The handle was then released at once, but the copy stayed resident:
+  the census logs show no mid-load destroy of them.
+
+**Fix** (`content/llcache.c`, `content/llcache.h`,
+`content/hlcache.c`).
+- On those two paths the abort happens only when the handle is the
+  object's **sole** user (`llcache_handle_is_shared`, new).
+- A shared fetch goes on for its other users, and this handle just
+  leaves.
+- `hlcache_handle_abort` on a live entry (a user that stays) keeps its
+  snapshot semantics.
+
+**Measured** (simulator, 2 loads per arm, 477 vs 478):
+
+| site | arm | first Done | heap at Done | llcache created | destroyed before exit | same-page copies |
+|---|---|---|---|---|---|---|
+| youtube | 477 | 1.4 s | 117.1 / 117.9 MiB | 79 / 80 | 38 / 40 | 22 / 23 |
+| youtube | 478 | 1.4 s | 117.6 / 113.2 MiB | **64 / 64** | **24 / 24** | **8 / 8** |
+| bbc | 477 | 3.3 / 2.8 s | 91.9 / 91.6 MiB | 129 | 22 | 6 |
+| bbc | 478 | 2.9 / 2.8 s | 91.8 / 92.1 MiB | 129 | 22 | 6 |
+
+- **youtube: 15-16 fewer llcache objects a load.** The same-page copies
+  fall from 22-23 to 8, which are the built-in sheets only (recreated per
+  page, as normal); no SVG, icon or `data:` copies are left.
+- **Heap is about flat.** The copies were small (an SVG, a PNG icon), and
+  youtube's first Done comes at 1.4 s. 478's gain is churn removed rather
+  than resident heap.
+- **bbc is unchanged:** it made no such copies (0 in every profile).
+
+**Gate.**
+- New pair **NET-js-img-shared-release / NET-css-img-shared-release-ref**:
+  two `<img>` share one `/slow/` URL (served after 1 s), and 300 ms after
+  parsing the first is removed while the fetch is pending.
+  - 477: **3** llcache objects for that URL (the fetch plus 2 snapshots).
+  - 478: **1**. The second image still loads (rows 0).
+- **gate478 FAILED** on CSS-late-link (2/3), which was the new page's
+  doing. Both pages used `/slow/lazyimg-01.png`, so the new page (earlier
+  in the gate) left it fresh in llcache. CSS-late-link's image then loaded
+  at once, and its page finished before its late sheet: CSS-late-link
+  relies on its image arriving late. The new page now has a URL of its
+  own (`?shared478`); a mini run of both pages in gate order gave
+  LATELINK 3/3.
+- **gate478b exit 0**: CSS-late-link 3/3, the new page 1 object and rows
+  0; interaction 52/52.
+- `restage-full.sh`: **560 applied plus the 2 known collisions**.
+
+No sudo.

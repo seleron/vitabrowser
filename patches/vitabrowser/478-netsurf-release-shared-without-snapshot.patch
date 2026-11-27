@@ -1,0 +1,100 @@
+# netsurf: a pending retrieval released from a shared object leaves without a snapshot copy (patch 478)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 477)
+#
+# P1 (heap near full on the Vita): youtube's Google logo SVG and youtube
+# icon were created 5-7 times a load while a copy was live (45 over three
+# simulator loads; 6 on the device's sign-in page), github's avatars too.
+# The copies were llcache snapshots: hlcache_handle_release (and
+# hlcache_handle_abort) of a handle whose retrieval is still pending
+# aborted its low-level handle first, and llcache_handle_abort on an
+# object other users share snapshots a full copy -- source data, headers,
+# certificate chain -- for this handle so the others' fetch can go on.
+# The handle was then released at once, but the copy stayed resident (no
+# mid-load destroy in the census logs). On those two paths the abort now
+# happens only when the handle is the object's sole user
+# (llcache_handle_is_shared, new): a shared fetch goes on for its other
+# users and this handle just leaves. hlcache_handle_abort on a live entry
+# (a user that stays) keeps its snapshot semantics.
+#
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -232,6 +232,16 @@
+ nserror llcache_handle_abort(llcache_handle *handle);
+ 
+ /**
++ * Does another user share this handle's object? (VitaBrowser patch 478:
++ * a handle about to be released need not abort -- and snapshot -- a
++ * shared object.)
++ *
++ * \param handle  Handle to test
++ * eturn true if the object has users other than this handle's
++ */
++bool llcache_handle_is_shared(const llcache_handle *handle);
++
++/**
+  * Force a low-level cache handle into streaming mode
+  *
+  * \param handle  Handle to stream
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -4830,6 +4830,19 @@
+ 	return error;
+ }
+ 
++/* See llcache.h for documentation (patch 478) */
++bool llcache_handle_is_shared(const llcache_handle *handle)
++{
++	llcache_object_user *user;
++
++	if (handle == NULL || handle->object == NULL)
++		return false;
++	user = llcache_object_find_user(handle);
++	if (user == NULL)
++		return false;
++	return user->prev != NULL || user->next != NULL;
++}
++
+ /* See llcache.h for documentation */
+ nserror llcache_handle_abort(llcache_handle *handle)
+ {
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -1066,8 +1066,16 @@
+ 			if (ictx->handle == handle &&
+ 					ictx->migrate_target == false) {
+ 				/* This is the nascent context for us,
+-				 * so abort the fetch */
+-				llcache_handle_abort(ictx->llcache);
++				 * so abort the fetch. VitaBrowser patch 478:
++				 * only when no other user shares the low-level
++				 * object -- aborting a shared one snapshots a
++				 * full copy of its data for this handle, which
++				 * is released at once (youtube: its logo SVG
++				 * and icon copied 5-7 times a load, the copies
++				 * resident until exit). A shared fetch goes on
++				 * for its other users; this one just leaves. */
++				if (!llcache_handle_is_shared(ictx->llcache))
++					llcache_handle_abort(ictx->llcache);
+ 				llcache_handle_release(ictx->llcache);
+ 				/* Remove us from the ring */
+ 				RING_REMOVE(hlcache->retrieval_ctx_ring, ictx);
+@@ -1272,8 +1280,16 @@
+ 			if (ictx->handle == handle &&
+ 					ictx->migrate_target == false) {
+ 				/* This is the nascent context for us,
+-				 * so abort the fetch */
+-				llcache_handle_abort(ictx->llcache);
++				 * so abort the fetch. VitaBrowser patch 478:
++				 * only when no other user shares the low-level
++				 * object -- aborting a shared one snapshots a
++				 * full copy of its data for this handle, which
++				 * is released at once (youtube: its logo SVG
++				 * and icon copied 5-7 times a load, the copies
++				 * resident until exit). A shared fetch goes on
++				 * for its other users; this one just leaves. */
++				if (!llcache_handle_is_shared(ictx->llcache))
++					llcache_handle_abort(ictx->llcache);
+ 				llcache_handle_release(ictx->llcache);
+ 				/* Remove us from the ring */
+ 				RING_REMOVE(hlcache->retrieval_ctx_ring, ictx);
