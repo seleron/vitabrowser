@@ -17755,3 +17755,40 @@ nothing.
 and retargeting.
 
 No sudo.
+
+### State log -- after patch 481 (2026-11-27)
+
+- **ASan** (`--libs --net`): **clean**. Interaction 57/57, 447 page
+  dumps, 0 reports; the shadow-tap step 23 ran under ASan. This run also
+  covers 480.
+- **21-site census, 480 vs 481: 13.0 vs 14.0 full rebuilds per load**,
+  within noise.
+- **But wpblog (make.wordpress.org) crashed on all 3 loads with 481 and
+  on none with 480.**
+  - Replayed under the ASan 481 binary: a **heap-use-after-free in
+    `content_broadcast`** (`content.c:1294`).
+  - While a JPEG content broadcast "done" to its users, one user's
+    callback (`html_object_callback` -> `html_proceed_to_done` ->
+    `img_fire_cb` -> `img_release_stale` -> `hlcache_handle_release`)
+    removed **another** user of the same content.
+  - The Vita build freed that `content_user` at once (only the
+    `__MACOS9__` build deferred it to the death-row). So the walk's
+    captured `next` was freed memory.
+  - This is very likely the long-open **"wpblog intermittent crash"**.
+    481's real nested dispatch changed the timing so it hits on most
+    loads.
+  - Plain build, 3 loads each: 481 crashed 1/3, the fix (patch 482) 0/3.
+- **Patch 482 (next):** defer the free on every build and silence the
+  unlinked node (no callback), so the walk skips it.
+  - Under ASan the broadcast UAF is gone and wpblog reaches Done (18.4
+    s).
+- **A second, separate UAF** shows up on wpblog once the first is fixed:
+  libcss `css__cp_env_find` reads a freed custom-property environment
+  during `html_rl_flex_restyle` (local flex restyle) -> `box_get_style`.
+  - Likely cause: `box_construct` borrows `parent_box->custom_env`
+    without a reference, from the box `box_for_node` returns for the
+    parent, and the restyle has already freed that box's environment.
+  - It is an older local-rebuild bug, not caused by 481. It gets its own
+    unit after 482.
+- **old.reddit's options:** still need lit to render (its `classMap()`
+  template check fails in this engine).
