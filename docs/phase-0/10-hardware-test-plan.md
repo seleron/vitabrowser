@@ -17538,3 +17538,29 @@ no focus and no keyboard (log: pointer clicks at y 186 and 192).
 - **old.reddit login** (P2 item 3): next.
 
 No sudo.
+
+### State log -- after patch 479 (2026-11-27)
+
+- **Patch 479:** a textarea's `rows` is now its natural height (rows ×
+  line-height, which box-sizing leaves alone), and a tap on a text
+  field's border places the caret. google.com's search field is
+  520x48 as in Chromium, and a tap anywhere on it opens the keyboard.
+- **ASan** (`--libs --net`, `tools/asan-autotest.sh`): **clean**.
+  - Interaction 55/55, 445 page dumps, 0 ASan reports.
+  - The new IN-searchfield steps 19-21 (the tap on the field's border)
+    ran under ASan.
+- **21-site census, 478 vs 479, 3 loads per arm: 15.7 vs 17.0 full
+  rebuilds per load = within noise** (spread ±2).
+  - Guard trips account for +1.0 (7.0 -> 8.0, timing).
+  - The rest is single loads: oldreddit +1.0, claude +1.0, guardian
+    -0.3.
+  - **wpblog crashed on 479 L2**: the known intermittent wpblog crash
+    (478 vs 477 had one on each arm).
+- **Open:**
+  - The wpblog 464 body-wide 'over' batch is the owner's decision.
+  - The wpblog intermittent crash.
+  - P2: youtube search entry point (separate cause); old.reddit login
+    = custom-element listeners (patch 480, cut, gate pending), then
+    shadow-tree event paths and drawing.
+  - P1 items left (first paint, JS/malloc cost, subtree-rebuild size
+    check).
