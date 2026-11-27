@@ -17840,3 +17840,30 @@ this one.
 - `box_construct` borrows `parent_box->custom_env` without a reference.
 
 No sudo.
+
+### State log -- after patch 482 (2026-11-27)
+
+- **ASan** (`--libs --net`): **clean**. Interaction 57/57, 447 page
+  dumps, 0 reports.
+- **21-site census, 481 vs 482: 15.0 vs 13.0 full rebuilds per load**,
+  within noise (guard 6.3 -> 5.3).
+- **wpblog still crashes intermittently with 482.**
+  - This census: **481 0/3, 482 2/3**. The previous census had 481 at
+    3/3. Plain 3-load replays: 481 1/3, 482 0/3.
+  - So wpblog's crash rate swings run to run, and 482 did **not** end
+    it.
+- **What 482 did:** it removed one real use-after-free, the
+  `content_broadcast` user walk; ASan replay of the same load no longer
+  reports it.
+- **What is left: the second UAF**, which ASan finds on the 482 build on
+  the same page and is the likely cause of these crashes.
+  - libcss `css__cp_env_find` reads a freed custom-property environment
+    in `html_rl_flex_restyle` -> `box_construct_element` ->
+    `box_get_style`.
+  - `box_construct` takes `parent_box->custom_env` (from `box_for_node`
+    of the parent) **without a reference**. A local flex restyle that
+    has already released that box's environment leaves the child reading
+    freed memory.
+- **Next: patch 483**, the custom-property environment lifetime in local
+  restyles. Its measure: the ASan wpblog replay clean, and wpblog 0
+  crashes over several loads.
