@@ -18620,3 +18620,37 @@ No sudo.
 clearing the shared reference directory at the time.)
 
 No sudo.
+
+## Patch 493 (2026-11-27): "str".charCodeAt(i) read in place by the interpreter (QuickJS 08)
+
+**Problem.** Patch 492 found **17% of bbc.com's JS** in styled-components'
+djb2 hash, `for (r = t.length; r;) e = 33*e ^ t.charCodeAt(--r);`: one
+method call per character of the CSS text. The generic call (a C-function
+frame, the receiver's dup + ToString, the index's ToInt32) is most of each
+iteration.
+
+**Fix** (`patches/quickjs/08-quickjs-charcodeat-fast-path.patch`).
+- `OP_call_method` reads the character in place when there is exactly one
+  argument, the receiver is a **string primitive** (`JS_TAG_STRING`), the
+  index an **int**, and the callee the **built-in** `js_string_charCodeAt`.
+  The result is the same: the code unit, or NaN out of range.
+- A replaced `charCodeAt`, any other receiver (String object, **rope**) or
+  index type, or a tail call takes the normal path.
+
+**Measured** (sim):
+- 1M-char hash loop on a **flat** string: **61 -> 42 ms (-32%)**.
+- On a **rope** (a string built by `+=`, `JS_TAG_STRING_ROPE`): no change,
+  because the fast path does not apply. Rope access is a follow-up.
+- **bbc:** the hash function's samples **481 -> 314 (-35%)**; all JS
+  samples 2627 -> 2468 (-6%, fewer bytecode ops). Page Done 3.1 / 3.2 s is
+  host noise; the gain is in interpreted ops, which the Vita feels more.
+
+**Gate.**
+- `JS-charcodeat.html` (CHARCODE, 8 checks): in range; NaN out of range
+  and negative; non-int / missing / string index; surrogate halves; rope;
+  String object; the djb2 loop vs a reference; a replaced charCodeAt is
+  called.
+  - **Chromium 8/8, 492 8/8, 493 8/8.**
+- **gate493 exit 0**: CHARCODE 8/8, interaction 57/57 (both paces).
+
+No sudo.

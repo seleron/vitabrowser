@@ -1,0 +1,61 @@
+# quickjs: "str".charCodeAt(i) read in place by OP_call_method
+#
+# VitaBrowser patch 493: patch 492's per-function sampling found 17% of
+# bbc.com's JS in styled-components' djb2 hash,
+#   for (r = t.length; r;) e = 33*e ^ t.charCodeAt(--r);
+# one method call per character of the CSS text. The generic call (a
+# C-function frame, the receiver's dup + ToString, the index's ToInt32) is
+# most of each iteration. OP_call_method now reads the character in place
+# when there is exactly one argument, the receiver is a string primitive,
+# the index an int, and the callee the BUILT-IN charCodeAt
+# (js_string_charCodeAt): same result (the code unit, or NaN out of range).
+# A replaced charCodeAt, any other receiver or index type, or a tail call
+# takes the normal path.
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -17704,6 +17704,8 @@
+ }
+ 
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
++static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
++                                   int argc, JSValueConst *argv);
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags)
+@@ -18238,6 +18240,34 @@
+                 pc += 2;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                /* VitaBrowser: "str".charCodeAt(i) with the built-in
++                   charCodeAt, a string receiver and an int index is read
++                   in place -- the generic call (C-function frame, receiver
++                   dup and conversion, index conversion) was most of the
++                   cost of a per-character loop such as styled-components'
++                   djb2 hash (17% of bbc.com's JS). A replaced charCodeAt,
++                   another receiver or index type, or a tail call takes the
++                   normal path. */
++                if (call_argc == 1 && opcode == OP_call_method &&
++                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_STRING &&
++                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_INT &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
++                    JSObject *fp = JS_VALUE_GET_OBJ(call_argv[-1]);
++                    if (fp->class_id == JS_CLASS_C_FUNCTION &&
++                        fp->u.cfunc.c_function.generic == js_string_charCodeAt) {
++                        JSString *sp1 = JS_VALUE_GET_STRING(call_argv[-2]);
++                        int idx = JS_VALUE_GET_INT(call_argv[0]);
++                        if (idx >= 0 && idx < sp1->len)
++                            ret_val = js_int32(string_get(sp1, idx));
++                        else
++                            ret_val = JS_NAN;
++                        JS_FreeValue(ctx, call_argv[-1]);
++                        JS_FreeValue(ctx, call_argv[-2]);
++                        sp -= call_argc + 2;
++                        *sp++ = ret_val;
++                        BREAK;
++                    }
++                }
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
