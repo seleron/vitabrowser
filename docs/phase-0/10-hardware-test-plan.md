@@ -18116,3 +18116,17 @@ No sudo.
   restaged libdom files are identical to applytest.
 
 No sudo.
+
+### State log -- after patch 485 (2026-11-27)
+
+- **ASan 485** (`--libs --net`, autotest): **clean**. Interaction 57/57,
+  448 page dumps (the new ATTRNAME page among them), 0 reports.
+- **21-site census, 484 vs 485: 14.3 vs 15.7 full rebuilds per load
+  (+1.3, within ±2)**.
+  - claude +1.0 (timing-driven, as ruled at 484); guard 5.3 -> 6.0.
+  - **No crash, timeout or missing load in 126 loads.** wpblog has had 0
+    crashes since 484 (two censuses and 9 plain loads).
+- **Next: patch 486, slot assignment** (`assignedNodes` /
+  `assignedElements` / `assignedSlot`). The code and `JS-slot-api.html`
+  are written, Chromium 8/8; the build waited for this census. Then shadow
+  drawing (487, from the parked WIP), re-checked on old.reddit.
