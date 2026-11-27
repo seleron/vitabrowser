@@ -17316,3 +17316,55 @@ copy of the store. Expect the same order on the device against its
 - `restage-full.sh`: **559 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log (2026-11-27): ASan (engine libraries, mbedTLS and curl instrumented) at 477, 21-site census 476c vs 477
+
+**ASan at 477** (`--libs --net`: the engine libraries plus mbedTLS and
+curl):
+- `asan-autotest.sh main` **clean**: rc 0, interaction 52/52, 442 page
+  dumps (gate 442), 0 AddressSanitizer errors.
+- The shared store was in use: "CA store: 122 certificates parsed once
+  (0 skipped), shared by every connection".
+
+**Recap of 477** (bbc, simulator, against the rebuilt host curl):
+- heap at Done **102 -> 92 MiB**;
+- CPU parsing the CA store **2.7% -> 0**;
+- HTTPS pages and the rogue-certificate rejection green in gate477.
+
+**Census** (all 21 sites, 3 loads per arm, one interleaved run; 476c =
+476's code against the same rebuilt host curl):
+
+| site | 476c | 477 |
+|---|---|---|
+| wikipedia | 3 / 3 / 3 (3.0) | 3 / 3 / 3 (3.0) |
+| guardian | 2 / 3 / 3 (2.7) | 1 / 2 / 2 (1.7) |
+| stackoverflow | 2 / 2 / 2 (2.0) | 2 / 2 / 2 (2.0) |
+| oldreddit | 0 / 0 / 1 (0.3) | 1 / 0 / 0 (0.3) |
+| wpblog | 1 / 1 / 1 (1.0) | 3 / 4 / 3 (3.3) |
+| github | 2 / 2 / 0 (1.3) | 0 / 0 / 0 (0.0) |
+| claude | 5 / 6 / 7 (6.0) | 1 / 4 / 4 (3.0) |
+| the 14 others | 0 | 0 |
+| **total** | 15 / 17 / 17 (**16.3**) | 11 / 15 / 14 (**13.3**) |
+
+- **wpblog +2.3 is 477 working, read through the cost guard.**
+  - wpblog's main page builds its boxes in **110 ms under 477, against
+    545 ms under 476c**: 5x faster, its conversion no longer sharing the
+    CPU with a CA parse per connection.
+  - The guard's budget is that conversion time, so it is now an honest
+    ~110 ms, and local batches that cost just over it with 40-49 marks
+    left trip it (7 trips). A full rebuild at ~110 ms is then the cheaper
+    choice; under 476c the same batches ran under an inflated 545 ms
+    budget.
+  - The census counts full rebuilds, not their time: wpblog looks worse
+    while its loads are faster.
+- **claude -3.0, github -1.3, guardian -1.0**: fewer guard trips (claude
+  8 -> 6, github 4 -> 0) and fewer local declines. Single-unit
+  attribution is within the noise.
+- No crash, assertion or failed load in 126 loads.
+
+**Note for the census:** a budget that includes unrelated work during
+conversion (TLS, here) is inflated. Faster fetching makes the guard
+stricter. Read guard-trip deltas against the conversion times in the
+same loads.
+
+No sudo.
