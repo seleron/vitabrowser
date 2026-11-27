@@ -17428,3 +17428,35 @@ the device's sign-in page; github's avatars too.
 - `restage-full.sh`: **560 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log -- after patch 478 (2026-11-27)
+
+- **ASan** (`tools/build-asan-sim.sh --libs --net`, engine libraries plus
+  curl/mbedTLS instrumented; `tools/asan-autotest.sh`): **clean**.
+  - Interaction 52/52, 444 page dumps, 0 ASan reports.
+  - The new NET-js-img-shared-release page ran under ASan with 1 llcache
+    object for its image, so 478's path ran and was checked.
+- **21-site census, 477 vs 478, 3 loads per arm: 14.7 vs 15.0 full
+  rebuilds per load = flat** (spread ±2).
+  - The differences are guard trips (6.3 vs 7.0, timing noise) and
+    single loads on guardian/oldreddit/claude.
+  - 478 touches no rebuild path, so none was expected.
+  - **wpblog L3 crashed on both arms**: the known intermittent wpblog
+    crash, not new.
+  - The P2 probe runs (one sim at a time, 24 cores) overlapped part of
+    the census.
+- **478's effect** (from the unit's measurements):
+  - youtube makes about **15 fewer llcache objects a load** (79-80 ->
+    64).
+  - Same-URL copies within a load fall **22-23 -> 8**, and those 8 are
+    the built-in sheets only.
+  - **Heap is flat**: the copies were small SVG/PNG/`data:` images.
+  - bbc is unchanged (it made no such copies).
+- **Open:**
+  - The wpblog 464 body-wide 'over' batch is the owner's decision.
+  - The wpblog intermittent crash (both arms).
+  - The P1 items left: first meaningful paint; JS ~61% / malloc ~20% of
+    bbc's CPU; a size check before whole-subtree rebuilds (claude.ai/code
+    10.5 s).
+  - The netlog 4 MiB mirror cap.
+- **Next: P2 input**, starting with the google.com search box (patch 479).
