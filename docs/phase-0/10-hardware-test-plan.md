@@ -17162,3 +17162,12 @@ No sudo.
 
 **gate exit 0**, with the tools/vita-netlog.py change (the network mirror
 section runs it); interaction 52/52. No engine change. No sudo.
+
+## Device run 43 results (2026-11-27): see doc 25, "Results"
+
+- Autotest complete on the device: 27 plot dumps SAME against the 475
+  reference, 7 explained by environment; 0 datagrams lost; no crash.
+- On the open web, one claude.ai/code local rebuild took 10.5 s (6x the
+  full-conversion budget; the cost guard checks between marks only).
+- bbc and claude.ai/code first loads took 125.7 s and 446.3 s.
+- Open items 1-4 in doc 25.

@@ -114,3 +114,79 @@ should no longer do so:
 `~/Desktop/VitaBrowser-hwtest/results` — read the **fresh**
 `results\net-*` dir (the Vita's FTP caches stale files). A run is complete
 only when the user says so.
+
+## Results (2026-11-27)
+
+Two launches arrived over the network after the receiver was fixed
+(`tools/vita-netlog.py`, 357c51d). Datagrams lost: **0 of 9,976** and **0
+of 2,574**.
+
+### Launch 1 (`results\net-20261126-232950-b7c9e2d1`): autotest, then manual browsing
+
+**Autotest complete** (`autotest: done` at 1114 s): 4 passes x 18 pages,
+then 2 network pages. Every page settled in 2.5-5.4 s. **No assert, abort
+or crash** in the 6,152-line `log.txt`.
+
+**Plot dumps vs the 475 reference: 27 SAME, 7 other; all 7 are
+environment, none is a rendering fault.**
+
+| dump | difference | cause |
+|---|---|---|
+| 19 / 20 NET-http(s)-example, page and `-bottom` (4) | no reference | network pages have no simulator reference dump |
+| IN-history | 5 lines: `127.0.0.1:45181` vs `127.0.0.1:8080` | the remote page's port; the sim uses another port, since signal-cli holds 8080 there |
+| IN-home-recent | 151 lines | the device shows "From a phone or PC on the same Wi-Fi: http://192.168.10.23:8080/" (only with a LAN address); everything below shifts down |
+| IN-settings | 1 line: `6` vs `4` | "N blocked so far": ad and tracker hosts blocked this session |
+
+**Manual sites after the autotest** (load to Done):
+
+| page | load |
+|---|---|
+| bbc.com | **125.7 s** first load; 24.1 s (a video page), 45.0 s, 5.6 s after |
+| old.reddit.com | 14.1 s, 3.3 s (login redirect) |
+| news.ycombinator.com | 3.8, 3.5, 2.6 s |
+| economictimes (an article) | 23.2 s |
+| devnull.land, micjm.com | 2.6 s; 3.2 / 1.9 s |
+| google.com | 22.5 s, then Google's "sorry" page (its unusual-traffic check, not a browser fault) |
+| github.com | loaded |
+
+**This launch's engine log is incomplete.** The network copy of
+`netsurf.log` is capped at 4 MiB (diag.c's `ENGINE_NET_CAP`), and the
+autotest filled it by 1068 s, before the browsing. The card copy was
+overwritten by launch 2. So there is no engine view (local / full
+rebuilds) of bbc, reddit or github in this run.
+
+### Launch 2 (`results\net-20261127-002105-8df9f736`): youtube, claude.ai
+
+| page | load | local rebuilds | declined | full rebuilds |
+|---|---|---|---|---|
+| m.youtube.com (accounts.youtube.com, accounts.google.com sign-in) | 29.7 s, then 4.9 s | 281 + 298 | 1 ("inline content among the blocks lost an element") | 3 (2 cost guard, 1 local) |
+| claude.ai/code | **446.3 s** | 35 | 0 | 2 (cost guard) |
+
+- Local rebuilds were mostly 1-100 ms; a few reached 0.3-0.7 s
+  (structural, "7 matching siblings").
+- **One local rebuild on claude.ai/code took 10.5 s**, 6x the device's
+  ~1.7 s full-conversion budget. It was 446's sibling-rule parent built
+  again whole, its subtree counting (471: "counting unchanged").
+  - The cost guard checks between marks only, so a single huge subtree
+    rebuild cannot be stopped. It tripped after it, and the full rebuild
+    was paid on top.
+  - The simulator census loads claude.ai's home page, not /code, and never
+    ran this path there (largest local rebuild 0.19 s). Whether it is
+    device-only is unmeasured.
+- claude.ai's local rebuilds total 11.5 s of its 446 s; the rest is the
+  page's own work (scripts, network) and its 2 full rebuilds.
+
+### Open items from this run
+
+1. **A size or cost check before a whole-subtree rebuild** (446 / 469 /
+   471's parent rebuilds): decline into the full rebuild when the subtree
+   is most of the page, rather than finding out after the fact.
+2. **bbc's 125.7 s and claude.ai/code's 446 s first loads**, profiled in
+   the simulator: is it the engine or the page?
+3. **Engine-log coverage:** raise the 4 MiB mirror cap, or browse the
+   manual sites in a fresh launch, so the real-site part of a device run
+   keeps its engine log.
+4. **The headline checks by eye** (wpnews, oldreddit, bbc: no full-page
+   flicker on expand / collapse / hover): the owner's impression is not
+   recorded yet. wpnews, wpblog and youtube's main page were not in these
+   two launches' logs.
