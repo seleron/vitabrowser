@@ -17670,3 +17670,88 @@ No sudo.
   - Units 2-4 (drawing, form fields, styles) are planned after 481 is
     measured.
   - youtube's search entry point (a separate cause).
+
+## Patch 481 (2026-11-27): events enter shadow trees through slots, and a nested dispatchEvent really dispatches (P2, shadow DOM unit 1)
+
+**Problem.** Device run 43: taps on old.reddit.com's login options did
+nothing.
+- After 480 the tap's click reaches `<auth-flow-link>` (the host). But
+  its handler is on the `<a>` in its shadow root, and the engine's event
+  path is the light tree only: light child -> host.
+- The DOM's composed path is light child -> its assigned `<slot>` -> the
+  slot's shadow ancestors -> the shadow root -> host.
+
+**1. Relay on each shadow host** (`vita_polyfill.js`).
+- When an event from a light descendant reaches the host, a copy is
+  dispatched on the child's assigned slot (named slot = the child's
+  `slot` attribute, else the default slot). The copy bubbles through the
+  shadow tree, and its `preventDefault` / `stopPropagation` carry back to
+  the original.
+- Relays for the tap events (click, pointer/mouse down/up, touch
+  start/end) are added in `attachShadow`, usually the first thing a
+  constructor does. So they run before the host's own listeners, as in
+  Chromium.
+- Any other type is added the first time an element in a shadow tree
+  listens for it. Nested components chain.
+- `attachShadow` is wrapped on every prototype in an element's chain that
+  owns one (the global `Element.prototype` is that object here), and the
+  returned root is remembered (closed roots too).
+
+**2. Nested dispatch** (`macsurf_qjs.c`).
+- `el.dispatchEvent` called inside a listener of a **script-dispatched**
+  event fired only that node's own listeners, with no bubbling (the
+  `g_qjs_in_dispatch` guard). The relay's copy therefore went nowhere,
+  and so does any web component's `this.dispatchEvent(new CustomEvent(...,
+  {bubbles: true}))` from a click handler.
+- The listener callback has used `__msFireLocal` for elements since
+  fixes1008, so the native is reached from page code only. A nested
+  dispatch is now a real one, up to 16 deep (deeper falls back to local
+  firing).
+- The flag was also reset to 0 after a nested call instead of restored.
+- Real taps (engine dispatch) never set the flag; script dispatches did.
+- `stopPropagation` now leaves `__msStopProp` on the event, as
+  stopImmediate leaves `__msStopNow`, so the relay sees a stop.
+
+**Tests.**
+- `JS-shadow-events.html` (SHADOWEV, 9 checks):
+  - a slotted child's click reaches the shadow link;
+  - order child, shadow, host;
+  - preventDefault and stopPropagation inside the shadow;
+  - named-slot routing;
+  - the host's own event and an unslotted child stay out;
+  - nested components;
+  - a non-tap type once a shadow element listens.
+  - Results: **Chromium 9/9, 480 2/9, 481 9/9**. During development the
+    relay alone gave 2/9 (its copy was swallowed by the guard) and 6/9
+    (stopPropagation not observable).
+- `IN-shadow-taps.html` and interaction steps 22-23: a tap at (300,125) on
+  a component's slotted text must reach its shadow `<a>`'s handler, which
+  navigates to `IN-target.html?via=shadow`.
+  - Chromium (real click): via=shadow. Sim at 480: stays. Sim at 481:
+    via=shadow.
+
+**Gate.**
+- **gate481 exit 0**: SHADOWEV 9/9, CUSTOMEL 9/9, SHADOW 7/7, FORMSHADOW
+  6/6, FSHADOW2 10/10, interaction **57/57** (both paces).
+- `restage-full.sh`: **563 applied plus the 2 known collisions**.
+
+**old.reddit's options are still inert at 481**, for a new reason.
+- `<auth-flow-link>`'s shadow `<a>` holds **no `<slot>`**: lit never
+  rendered its content.
+- The page log has "Error: `classMap()` can only be used in the `class`
+  attribute and must be the only part in the attribute" (4 times).
+  - That is lit's template-preparation check. Lit parses its templates
+    through the engine's `<template>` / attribute walk, and something
+    there (attribute order or names) differs from browsers.
+- Also `TypeError: not a function` in a `faceplate-enter` listener and a
+  timer.
+- With no slot, the relay has nowhere to route: a lit-compatibility unit
+  is needed before reddit's options can work.
+- Also found: custom elements created by `innerHTML` inside a shadow root
+  are not upgraded (the polyfill's upgrade observer watches the document
+  only).
+
+**Not here:** events that start inside a shadow tree (it is not drawn),
+and retargeting.
+
+No sudo.

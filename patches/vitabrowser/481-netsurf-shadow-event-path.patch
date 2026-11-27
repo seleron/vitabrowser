@@ -1,0 +1,434 @@
+# netsurf: events enter shadow trees through slots, and a nested dispatchEvent really dispatches (patch 481)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 480)
+#
+# P2 (input on JS-heavy pages), shadow DOM unit 1: device run 43 -- taps on
+# old.reddit.com's login options (<auth-flow-link>, whose click handler is
+# on the <a> in its shadow root) did nothing. Patch 242's shadow root is a
+# fragment the engine never draws, and the engine's event path is the light
+# tree: an event from a host's light child went child -> host, never
+# through the child's assigned <slot> and the slot's shadow ancestors (the
+# DOM's composed path).
+#
+# 1. vita_polyfill.js: a relay on each shadow host. When an event from a
+#    light descendant reaches the host, a copy is dispatched on the
+#    assigned slot (named slot = the child's slot attribute, else the
+#    default slot); it bubbles slot -> shadow ancestors -> shadow root,
+#    and its preventDefault / stopPropagation carry back to the original.
+#    Relays for the tap events (click, pointer/mouse down/up, touch
+#    start/end) are added when attachShadow runs -- usually first in a
+#    component's constructor, so they run before the host's own listeners,
+#    as in a browser -- and any other type the first time an element in a
+#    shadow tree listens for it. Nested components chain. attachShadow is
+#    wrapped on every prototype in an element's chain that owns one, and
+#    the returned root is remembered (closed roots too).
+#
+# 2. macsurf_qjs.c: el.dispatchEvent from inside a listener of a
+#    script-dispatched event fired only that node's own listeners (the
+#    g_qjs_in_dispatch guard) -- no bubbling. The listener callback has used
+#    __msFireLocal for elements since fixes1008, so the native is reached
+#    from page code only: a nested dispatch is now a real one, up to 16
+#    deep (deeper falls back to local firing). Any web component that
+#    re-dispatches a bubbling event from a click handler was affected. The
+#    flag was also reset to 0 after a nested call instead of restored.
+#    stopPropagation now leaves __msStopProp on the event, as
+#    stopImmediatePropagation leaves __msStopNow, so the relay sees it.
+#
+# 3. interact.c: IN-shadow-taps.html (a component whose shadow <a> handler
+#    navigates) and a tap on its slotted text that must reach
+#    IN-target.html?via=shadow.
+#
+# Not here: events that START inside a shadow tree (not drawn yet),
+# retargeting (inside the shadow the copy's target is the slot), custom
+# elements created by innerHTML inside a shadow root are not upgraded.
+# old.reddit's options also need lit to render (its classMap() template
+# check fails in this engine, so <auth-flow-link>'s <a> holds no <slot>).
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6452,6 +6452,155 @@
+ 	});
+ })();
+ 
++/* ---- patch 481: events into shadow trees --------------------------------
++ * Patch 242's shadow root is a document fragment the engine never draws,
++ * and the engine's event path is the light tree: a tap on a component's
++ * slotted text bubbled light child -> host and never entered the shadow
++ * tree, where the component's handler usually listens (old.reddit.com's
++ * login options: <auth-flow-link>'s shadow <a>; device run 43, 8 taps,
++ * nothing). Per the DOM's composed path, an event from a host's light child
++ * passes that child's assigned <slot>, the slot's shadow ancestors and the
++ * shadow root before it reaches the host.
++ *
++ * A relay on the host does that: when an event from a light descendant
++ * reaches the host, a copy of it is dispatched on the assigned slot -- it
++ * bubbles slot -> shadow ancestors -> shadow root -- and its
++ * preventDefault / stopPropagation carry back to the original. Relays for
++ * the tap events are added when the shadow is attached (usually the first
++ * thing a component does, so they run before the host's own listeners, as
++ * in a browser); any other type the first time something inside a shadow
++ * tree listens for it. A host inside another shadow tree gets the outer
++ * host's relay too, so nested components chain. Not yet: events that
++ * START inside a shadow tree (it is not drawn, so a tap cannot), and
++ * retargeting (inside the shadow the copy's target is the slot). */
++(function () {
++	var d = g.document, EP = g.Element && g.Element.prototype;
++	if (!d || !EP || typeof EP.attachShadow !== 'function') return;
++	var TAP = ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup',
++		'touchstart', 'touchend'];
++	var INIT = ['bubbles', 'cancelable', 'composed', 'detail', 'view',
++		'screenX', 'screenY', 'clientX', 'clientY', 'button', 'buttons',
++		'ctrlKey', 'shiftKey', 'altKey', 'metaKey', 'relatedTarget',
++		'pointerId', 'pointerType', 'isPrimary', 'width', 'height',
++		'pressure', 'key', 'code', 'location', 'repeat', 'touches',
++		'targetTouches', 'changedTouches', 'inputType', 'data'];
++	/* the shadow root a node is in, or null */
++	function rootOf(n) {
++		for (var k = 0; n && k < 4096; k++) {
++			var p = n.parentNode;
++			if (!p) return (n.nodeType === 11 && n.host) ? n : null;
++			n = p;
++		}
++		return null;
++	}
++	/* the slot a host's child is assigned to: the first slot in the shadow
++	 * tree whose name is the child's slot attribute ('' = the default) */
++	function slotFor(sr, c) {
++		var name = (c.nodeType === 1 && c.getAttribute) ? (c.getAttribute('slot') || '') : '';
++		var l, i;
++		try { l = sr.querySelectorAll('slot'); } catch (x) { return null; }
++		for (i = 0; i < l.length; i++)
++			if ((l[i].getAttribute('name') || '') === name) return l[i];
++		return null;
++	}
++	function copyOf(e) {
++		var o = {}, i, k, v, C = e.constructor;
++		for (i = 0; i < INIT.length; i++) {
++			k = INIT[i];
++			try { v = e[k]; if (v !== undefined) o[k] = v; } catch (x) { /* */ }
++		}
++		try { if (typeof C === 'function') return new C(e.type, o); } catch (x) { /* */ }
++		try { return new g.Event(e.type, { bubbles: !!e.bubbles, cancelable: !!e.cancelable }); } catch (x) { return null; }
++	}
++	/* the host's shadow root: the one attachShadow returned (kept below,
++	 * closed roots too), patch 242's, or an open one */
++	function rootFor(host) {
++		var st = PV(host);
++		if (st.__vbSR) return st.__vbSR;
++		if (st.__vbShadow) return st.__vbShadow;
++		try { return host.shadowRoot || null; } catch (x) { return null; }
++	}
++	function relay(host, e) {
++		var sr = rootFor(host), t = e.target, c, k = 0;
++		if (!sr || !t || t === host) return;
++		/* the host's child the event came through; nothing if it came from
++		 * inside the shadow tree (a copy this relay sent, or a nested one) */
++		for (c = t; c && c.parentNode !== host && k < 4096; k++) {
++			if (c === sr) return;
++			c = c.parentNode;
++		}
++		if (!c || c.parentNode !== host) return;
++		var slot = slotFor(sr, c);
++		if (!slot) return;
++		var ev = copyOf(e);
++		if (!ev) return;
++		try { slot.dispatchEvent(ev); } catch (x) { /* a listener threw */ }
++		if (ev.defaultPrevented) { try { e.preventDefault(); } catch (x) { /* */ } }
++		/* the bridge's per-dispatch stopPropagation / stopImmediate leave
++		 * __msStopProp / __msStopNow on the event (macsurf_qjs.c) */
++		if (ev.__msStopProp || ev.__msStopNow || ev.cancelBubble === true) {
++			try { e.stopImmediatePropagation(); } catch (x) { /* */ }
++		}
++	}
++	function ensure(host, type) {
++		var st = PV(host), m = st.__vbRelay || (st.__vbRelay = {});
++		if (m[type]) return;
++		m[type] = function (e) { relay(host, e); };
++		try { host.addEventListener(type, m[type], false); } catch (x) { /* */ }
++	}
++	/* attachShadow is the bridge's own on the Element prototype in an
++	 * element's chain -- not g.Element.prototype, a different object -- so
++	 * every prototype that owns one is wrapped */
++	function wrapAttach(t) {
++		var oa = t.attachShadow;
++		if (typeof oa !== 'function' || PV(oa).__vbRelayWrap) return;
++		var na = function attachShadow(init) {
++			var r = oa.apply(this, arguments), h = this;
++			if (r && typeof r === 'object') PV(h).__vbSR = r;
++			TAP.forEach(function (t) { ensure(h, t); });
++			return r;
++		};
++		PV(na).__vbRelayWrap = true;
++		define(t, 'attachShadow', na);
++	}
++	try {
++		var owners = [EP], pe;
++		for (pe = Object.getPrototypeOf(d.createElement('div')); pe; pe = Object.getPrototypeOf(pe))
++			if (Object.prototype.hasOwnProperty.call(pe, 'attachShadow') && owners.indexOf(pe) < 0) owners.push(pe);
++		owners.forEach(function (t) {
++			if (Object.prototype.hasOwnProperty.call(t, 'attachShadow')) wrapAttach(t);
++		});
++	} catch (x) { /* */ }
++	/* a listener added inside a shadow tree: its host relays that type */
++	function hook(t) {
++		var add = t.addEventListener;
++		if (typeof add !== 'function' || PV(add).__vbShadowHook) return;
++		var nadd = function (type, l, o) {
++			var r = add.apply(this, arguments);
++			try {
++				if (this && this.nodeType && this.nodeType !== 9) {
++					var sr = rootOf(this);
++					if (sr && sr.host) ensure(sr.host, String(type));
++				}
++			} catch (x) { /* */ }
++			return r;
++		};
++		PV(nadd).__vbShadowHook = true;
++		nadd.__vitaWrapped = true;	/* the wrapper above: already done */
++		try {
++			Object.defineProperty(t, 'addEventListener', { value: nadd, writable: true, configurable: true });
++		} catch (x) { /* */ }
++	}
++	try {
++		var el = d.createElement('section'), p;
++		for (p = Object.getPrototypeOf(el); p; p = Object.getPrototypeOf(p))
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) hook(p);
++		var tx = d.createTextNode('');
++		for (p = Object.getPrototypeOf(tx); p; p = Object.getPrototypeOf(p))
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) hook(p);
++	} catch (x) { /* */ }
++})();
++
+ /* ---- DocumentFragment: the ParentNode queries ---------------------------
+  * A fragment (createDocumentFragment, template content, cloneNode of one)
+  * had no querySelector / querySelectorAll / getElementById / children. */
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6453,6 +6453,155 @@
+ "\t});\n"
+ "})();\n"
+ "\n"
++"/* ---- patch 481: events into shadow trees --------------------------------\n"
++" * Patch 242's shadow root is a document fragment the engine never draws,\n"
++" * and the engine's event path is the light tree: a tap on a component's\n"
++" * slotted text bubbled light child -> host and never entered the shadow\n"
++" * tree, where the component's handler usually listens (old.reddit.com's\n"
++" * login options: <auth-flow-link>'s shadow <a>; device run 43, 8 taps,\n"
++" * nothing). Per the DOM's composed path, an event from a host's light child\n"
++" * passes that child's assigned <slot>, the slot's shadow ancestors and the\n"
++" * shadow root before it reaches the host.\n"
++" *\n"
++" * A relay on the host does that: when an event from a light descendant\n"
++" * reaches the host, a copy of it is dispatched on the assigned slot -- it\n"
++" * bubbles slot -> shadow ancestors -> shadow root -- and its\n"
++" * preventDefault / stopPropagation carry back to the original. Relays for\n"
++" * the tap events are added when the shadow is attached (usually the first\n"
++" * thing a component does, so they run before the host's own listeners, as\n"
++" * in a browser); any other type the first time something inside a shadow\n"
++" * tree listens for it. A host inside another shadow tree gets the outer\n"
++" * host's relay too, so nested components chain. Not yet: events that\n"
++" * START inside a shadow tree (it is not drawn, so a tap cannot), and\n"
++" * retargeting (inside the shadow the copy's target is the slot). */\n"
++"(function () {\n"
++"\tvar d = g.document, EP = g.Element && g.Element.prototype;\n"
++"\tif (!d || !EP || typeof EP.attachShadow !== 'function') return;\n"
++"\tvar TAP = ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup',\n"
++"\t\t'touchstart', 'touchend'];\n"
++"\tvar INIT = ['bubbles', 'cancelable', 'composed', 'detail', 'view',\n"
++"\t\t'screenX', 'screenY', 'clientX', 'clientY', 'button', 'buttons',\n"
++"\t\t'ctrlKey', 'shiftKey', 'altKey', 'metaKey', 'relatedTarget',\n"
++"\t\t'pointerId', 'pointerType', 'isPrimary', 'width', 'height',\n"
++"\t\t'pressure', 'key', 'code', 'location', 'repeat', 'touches',\n"
++"\t\t'targetTouches', 'changedTouches', 'inputType', 'data'];\n"
++"\t/* the shadow root a node is in, or null */\n"
++"\tfunction rootOf(n) {\n"
++"\t\tfor (var k = 0; n && k < 4096; k++) {\n"
++"\t\t\tvar p = n.parentNode;\n"
++"\t\t\tif (!p) return (n.nodeType === 11 && n.host) ? n : null;\n"
++"\t\t\tn = p;\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\t/* the slot a host's child is assigned to: the first slot in the shadow\n"
++"\t * tree whose name is the child's slot attribute ('' = the default) */\n"
++"\tfunction slotFor(sr, c) {\n"
++"\t\tvar name = (c.nodeType === 1 && c.getAttribute) ? (c.getAttribute('slot') || '') : '';\n"
++"\t\tvar l, i;\n"
++"\t\ttry { l = sr.querySelectorAll('slot'); } catch (x) { return null; }\n"
++"\t\tfor (i = 0; i < l.length; i++)\n"
++"\t\t\tif ((l[i].getAttribute('name') || '') === name) return l[i];\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction copyOf(e) {\n"
++"\t\tvar o = {}, i, k, v, C = e.constructor;\n"
++"\t\tfor (i = 0; i < INIT.length; i++) {\n"
++"\t\t\tk = INIT[i];\n"
++"\t\t\ttry { v = e[k]; if (v !== undefined) o[k] = v; } catch (x) { /* */ }\n"
++"\t\t}\n"
++"\t\ttry { if (typeof C === 'function') return new C(e.type, o); } catch (x) { /* */ }\n"
++"\t\ttry { return new g.Event(e.type, { bubbles: !!e.bubbles, cancelable: !!e.cancelable }); } catch (x) { return null; }\n"
++"\t}\n"
++"\t/* the host's shadow root: the one attachShadow returned (kept below,\n"
++"\t * closed roots too), patch 242's, or an open one */\n"
++"\tfunction rootFor(host) {\n"
++"\t\tvar st = PV(host);\n"
++"\t\tif (st.__vbSR) return st.__vbSR;\n"
++"\t\tif (st.__vbShadow) return st.__vbShadow;\n"
++"\t\ttry { return host.shadowRoot || null; } catch (x) { return null; }\n"
++"\t}\n"
++"\tfunction relay(host, e) {\n"
++"\t\tvar sr = rootFor(host), t = e.target, c, k = 0;\n"
++"\t\tif (!sr || !t || t === host) return;\n"
++"\t\t/* the host's child the event came through; nothing if it came from\n"
++"\t\t * inside the shadow tree (a copy this relay sent, or a nested one) */\n"
++"\t\tfor (c = t; c && c.parentNode !== host && k < 4096; k++) {\n"
++"\t\t\tif (c === sr) return;\n"
++"\t\t\tc = c.parentNode;\n"
++"\t\t}\n"
++"\t\tif (!c || c.parentNode !== host) return;\n"
++"\t\tvar slot = slotFor(sr, c);\n"
++"\t\tif (!slot) return;\n"
++"\t\tvar ev = copyOf(e);\n"
++"\t\tif (!ev) return;\n"
++"\t\ttry { slot.dispatchEvent(ev); } catch (x) { /* a listener threw */ }\n"
++"\t\tif (ev.defaultPrevented) { try { e.preventDefault(); } catch (x) { /* */ } }\n"
++"\t\t/* the bridge's per-dispatch stopPropagation / stopImmediate leave\n"
++"\t\t * __msStopProp / __msStopNow on the event (macsurf_qjs.c) */\n"
++"\t\tif (ev.__msStopProp || ev.__msStopNow || ev.cancelBubble === true) {\n"
++"\t\t\ttry { e.stopImmediatePropagation(); } catch (x) { /* */ }\n"
++"\t\t}\n"
++"\t}\n"
++"\tfunction ensure(host, type) {\n"
++"\t\tvar st = PV(host), m = st.__vbRelay || (st.__vbRelay = {});\n"
++"\t\tif (m[type]) return;\n"
++"\t\tm[type] = function (e) { relay(host, e); };\n"
++"\t\ttry { host.addEventListener(type, m[type], false); } catch (x) { /* */ }\n"
++"\t}\n"
++"\t/* attachShadow is the bridge's own on the Element prototype in an\n"
++"\t * element's chain -- not g.Element.prototype, a different object -- so\n"
++"\t * every prototype that owns one is wrapped */\n"
++"\tfunction wrapAttach(t) {\n"
++"\t\tvar oa = t.attachShadow;\n"
++"\t\tif (typeof oa !== 'function' || PV(oa).__vbRelayWrap) return;\n"
++"\t\tvar na = function attachShadow(init) {\n"
++"\t\t\tvar r = oa.apply(this, arguments), h = this;\n"
++"\t\t\tif (r && typeof r === 'object') PV(h).__vbSR = r;\n"
++"\t\t\tTAP.forEach(function (t) { ensure(h, t); });\n"
++"\t\t\treturn r;\n"
++"\t\t};\n"
++"\t\tPV(na).__vbRelayWrap = true;\n"
++"\t\tdefine(t, 'attachShadow', na);\n"
++"\t}\n"
++"\ttry {\n"
++"\t\tvar owners = [EP], pe;\n"
++"\t\tfor (pe = Object.getPrototypeOf(d.createElement('div')); pe; pe = Object.getPrototypeOf(pe))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(pe, 'attachShadow') && owners.indexOf(pe) < 0) owners.push(pe);\n"
++"\t\towners.forEach(function (t) {\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(t, 'attachShadow')) wrapAttach(t);\n"
++"\t\t});\n"
++"\t} catch (x) { /* */ }\n"
++"\t/* a listener added inside a shadow tree: its host relays that type */\n"
++"\tfunction hook(t) {\n"
++"\t\tvar add = t.addEventListener;\n"
++"\t\tif (typeof add !== 'function' || PV(add).__vbShadowHook) return;\n"
++"\t\tvar nadd = function (type, l, o) {\n"
++"\t\t\tvar r = add.apply(this, arguments);\n"
++"\t\t\ttry {\n"
++"\t\t\t\tif (this && this.nodeType && this.nodeType !== 9) {\n"
++"\t\t\t\t\tvar sr = rootOf(this);\n"
++"\t\t\t\t\tif (sr && sr.host) ensure(sr.host, String(type));\n"
++"\t\t\t\t}\n"
++"\t\t\t} catch (x) { /* */ }\n"
++"\t\t\treturn r;\n"
++"\t\t};\n"
++"\t\tPV(nadd).__vbShadowHook = true;\n"
++"\t\tnadd.__vitaWrapped = true;\t/* the wrapper above: already done */\n"
++"\t\ttry {\n"
++"\t\t\tObject.defineProperty(t, 'addEventListener', { value: nadd, writable: true, configurable: true });\n"
++"\t\t} catch (x) { /* */ }\n"
++"\t}\n"
++"\ttry {\n"
++"\t\tvar el = d.createElement('section'), p;\n"
++"\t\tfor (p = Object.getPrototypeOf(el); p; p = Object.getPrototypeOf(p))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) hook(p);\n"
++"\t\tvar tx = d.createTextNode('');\n"
++"\t\tfor (p = Object.getPrototypeOf(tx); p; p = Object.getPrototypeOf(p))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) hook(p);\n"
++"\t} catch (x) { /* */ }\n"
++"})();\n"
++"\n"
+ "/* ---- DocumentFragment: the ParentNode queries ---------------------------\n"
+ " * A fragment (createDocumentFragment, template content, cloneNode of one)\n"
+ " * had no querySelector / querySelectorAll / getElementById / children. */\n"
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -9547,6 +9547,12 @@
+ 	if (JS_ToInt64(ctx, &p, func_data[0]) == 0 && p != 0) {
+ 		dom_event_stop_propagation((dom_event *)(size_t)p);
+ 	}
++	/* VitaBrowser patch 481: observable afterwards, as stopImmediate's
++	 * __msStopNow is -- the shadow relay (vita_polyfill.js) carries a
++	 * stop inside the shadow tree back to the event it copied */
++	if (JS_IsObject(this_val))
++		JS_SetPropertyStr(ctx, (JSValue)this_val, "__msStopProp",
++				JS_NewBool(ctx, 1));
+ 	return JS_UNDEFINED;
+ }
+ 
+@@ -11854,6 +11860,18 @@
+  * The type is taken from ev.type; a plain object works as well as a real
+  * Event, because that is what page code passes. */
+ static int g_qjs_in_dispatch = 0;
++/* VitaBrowser patch 481: the guard above made EVERY dispatchEvent a page
++ * calls from inside a listener of a script-dispatched event fire only that
++ * node's own listeners -- no bubbling, no capture -- though the listener
++ * callback has used __msFireLocal (not dispatchEvent) for elements since
++ * fixes1008, so this native is reached from page code only. A web
++ * component re-dispatching from a click handler (this.dispatchEvent(new
++ * CustomEvent(..., {bubbles: true}))) went nowhere, and so did the shadow
++ * relay (vita_polyfill.js). Now a nested dispatch is a real one, up to
++ * QJS_DISPATCH_DEPTH_MAX deep (a handler that re-dispatches to itself
++ * forever falls back to local firing there instead of exhausting the C
++ * stack). The flag was also reset to 0 after a nested call, not restored. */
++#define QJS_DISPATCH_DEPTH_MAX 16
+ 
+ static JSValue qjs_el_dispatch_event_data(JSContext *ctx,
+ 		JSValueConst this_val, int argc, JSValueConst *argv,
+@@ -11876,8 +11894,8 @@
+ 		return JS_NewBool(ctx, 1);
+ 	}
+ 
+-	/* Re-entrant (we are inside qjs_dom_listener_cb): fire locally. */
+-	if (g_qjs_in_dispatch) {
++	/* Too deeply re-entrant (patch 481): fire locally. */
++	if (g_qjs_in_dispatch >= QJS_DISPATCH_DEPTH_MAX) {
+ 		local = JS_GetPropertyStr(ctx, this_val, "__msFireLocal");
+ 		if (JS_IsFunction(ctx, local)) {
+ 			JSValue r = JS_Call(ctx, local, this_val, 1, argv);
+@@ -11924,9 +11942,9 @@
+ 	slot.prev = g_synth_ev_stack;
+ 	g_synth_ev_stack = &slot;
+ 
+-	g_qjs_in_dispatch = 1;
++	g_qjs_in_dispatch++;
+ 	(void)dom_event_target_dispatch_event(node, evt, &ok_flag);
+-	g_qjs_in_dispatch = 0;
++	g_qjs_in_dispatch--;
+ 
+ 	/* VitaBrowser patch 298 - leave the JS event at rest, as browsers
+ 	 * do (eventPhase NONE, no currentTarget). The listener callback
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -146,6 +146,13 @@
+ 	  300, 143, 0, 0, 0, C_EDITING, NULL, 0, "IN-searchfield" },
+ 	{ "text goes into the search field", A_TYPE, "vita", 0, 0, 0, 0, 0,
+ 	  C_EDITING, NULL, 0, NULL },
++	/* patch 481: a tap on a web component's slotted text reaches the
++	 * click handler on the <a> in its shadow root (IN-shadow-taps.html,
++	 * old.reddit.com's login options) */
++	{ "open IN-shadow-taps", A_OPEN, T "IN-shadow-taps.html",
++	  0, 0, 0, 0, 0, C_URL, "IN-shadow-taps.html", 0, NULL },
++	{ "tap reaches a shadow tree's link", A_TAP, NULL, 300, 125, 0, 0, 0,
++	  C_URL, "IN-target.html?via=shadow", 0, "IN-shadow-taps" },
+ 	{ "open IN-events", A_OPEN, T "IN-events.html", 0, 0, 0, 0, 0,
+ 	  C_URL, "IN-events.html", 0, NULL },
+ 	{ "tap a field that relayouts on focus", A_TAP, NULL, 300, 120, 0, 0,

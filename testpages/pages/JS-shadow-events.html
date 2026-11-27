@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS shadow events (script not run)</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 10px; }
+.wait { background: #fcc; }
+.pass { background: #cfc; }
+#sum { font-size: 20px; font-weight: bold; }
+p { margin: 2px 0; }
+</style>
+</head>
+<body>
+<div id="sum">SHADOWEV: 0/9 passed</div>
+<p id="r1" class="wait">1 waiting</p>
+<p id="r2" class="wait">2 waiting</p>
+<p id="r3" class="wait">3 waiting</p>
+<p id="r4" class="wait">4 waiting</p>
+<p id="r5" class="wait">5 waiting</p>
+<p id="r6" class="wait">6 waiting</p>
+<p id="r7" class="wait">7 waiting</p>
+<p id="r8" class="wait">8 waiting</p>
+<p id="r9" class="wait">9 waiting</p>
+<div id="box"></div>
+<script>
+/* patch 481: an event from a host's light child enters the shadow tree --
+ * it passes the child's assigned <slot>, the slot's shadow ancestors and
+ * the shadow root before the host (the DOM's composed path). The engine's
+ * event path was the light tree only: old.reddit.com's login options
+ * (<auth-flow-link>, whose handler is on the <a> in its shadow root) did
+ * nothing when tapped. Chromium-verified. */
+(function () {
+	var k = 0, N = 9;
+	function $(id) { return document.getElementById(id); }
+	function t(n, ok, text) {
+		var p = $('r' + n);
+		p.textContent = n + ' ' + text + (ok ? '' : ' FAIL');
+		if (!ok) return;
+		p.className = 'pass';
+		k++;
+		$('sum').textContent = 'SHADOWEV: ' + k + '/' + N + ' passed';
+		document.title = 'JS shadow events (' + k + '/' + N + ')';
+	}
+	function click(n) {
+		return n.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+	}
+	var log = [];
+	/* a component as lit builds one: the shadow root is attached in the
+	 * constructor, the host listens on itself, the shadow <a> wraps the
+	 * default slot, a second wrapper holds the named slot "b" */
+	class XLink extends HTMLElement {
+		constructor() {
+			super();
+			var r = this.attachShadow({ mode: 'open' });
+			r.innerHTML = '<a id="ia"><slot></slot></a><i id="ib"><slot name="b"></slot></i>';
+			this.addEventListener('click', function () { log.push('host'); });
+		}
+	}
+	customElements.define('x-link', XLink);
+	var h = document.createElement('x-link');
+	h.innerHTML = '<span id="c1">default</span><span id="c2" slot="b">named</span>' +
+		'<span id="c3" slot="nomatch">unslotted</span>';
+	$('box').appendChild(h);
+	var sr = h.shadowRoot, ia = sr.getElementById('ia'), ib = sr.getElementById('ib');
+	var mode = '';
+	ia.addEventListener('click', function (e) {
+		log.push('a');
+		if (mode === 'prevent') e.preventDefault();
+		if (mode === 'stop') e.stopPropagation();
+	});
+	ib.addEventListener('click', function () { log.push('b'); });
+	var c1 = h.querySelector('#c1'), c2 = h.querySelector('#c2'), c3 = h.querySelector('#c3');
+	c1.addEventListener('click', function () { log.push('child'); });
+	var docHeard = 0;
+	document.addEventListener('click', function () { docHeard++; });
+
+	log = []; click(c1);
+	t(1, log.indexOf('a') >= 0, 'a click on a slotted child reaches the shadow link: ' + log.join(','));
+	t(2, log.join(',') === 'child,a,host', 'in order child, shadow, host: ' + log.join(','));
+
+	log = []; mode = 'prevent';
+	var ret = click(c1);
+	t(3, ret === false, 'preventDefault inside the shadow cancels the event: ' + ret);
+
+	log = []; mode = 'stop'; docHeard = 0;
+	click(c1);
+	t(4, log.join(',') === 'child,a' && docHeard === 0,
+		'stopPropagation inside the shadow stops it there: ' + log.join(',') + ' doc ' + docHeard);
+	mode = '';
+
+	log = []; click(c2);
+	t(5, log.join(',') === 'b,host', 'a named slot routes to its own wrapper: ' + log.join(','));
+
+	log = []; click(h);
+	t(6, log.join(',') === 'host', 'an event on the host itself stays out: ' + log.join(','));
+
+	log = []; click(c3);
+	t(7, log.join(',') === 'host', 'an unslotted child does not enter: ' + log.join(','));
+
+	/* nested: the outer component slots its child into an inner component,
+	 * whose shadow <b> listens */
+	class XInner extends HTMLElement {
+		constructor() {
+			super();
+			this.attachShadow({ mode: 'open' }).innerHTML = '<b id="inb"><slot></slot></b>';
+		}
+	}
+	class XOuter extends HTMLElement {
+		constructor() {
+			super();
+			var inn = document.createElement('x-inner');
+			inn.id = 'inn';
+			inn.appendChild(document.createElement('slot'));
+			this.attachShadow({ mode: 'open' }).appendChild(inn);
+		}
+	}
+	customElements.define('x-inner', XInner);
+	customElements.define('x-outer', XOuter);
+	var o = document.createElement('x-outer');
+	o.innerHTML = '<span id="oc">nested</span>';
+	$('box').appendChild(o);
+	var inner = o.shadowRoot.getElementById('inn'), inb = inner.shadowRoot.getElementById('inb');
+	var nested = 0;
+	inb.addEventListener('click', function () { nested++; });
+	click(o.querySelector('#oc'));
+	t(8, nested === 1, 'through a component nested in another: ' + nested);
+
+	/* a type no tap brings: relayed once something in the shadow listens */
+	var custom = 0;
+	ia.addEventListener('x-ping', function () { custom++; });
+	c1.dispatchEvent(new CustomEvent('x-ping', { bubbles: true }));
+	t(9, custom === 1, 'any bubbling event type, once a shadow element listens: ' + custom);
+})();
+</script>
+</body>
+</html>
