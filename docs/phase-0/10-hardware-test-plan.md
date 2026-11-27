@@ -17959,3 +17959,47 @@ No sudo.
 - **Patch 484 (cut, gate pending)** is the real fix: the walk's next
   user lives on the content (`bc_next`), and `content_remove_user` moves
   it past a user it unlinks. It does not depend on the death-row.
+
+## Patch 484 (2026-11-27): the content broadcast walk moves past a user removed mid-walk
+
+**Problem.** make.wordpress.org (wpblog) crashed in `content_broadcast`
+calling a garbage callback (gdb, plain build: callback 0x20 in the user
+walk).
+- While a JPEG content broadcast "done", one user's callback
+  (`html_object_callback` -> `html_proceed_to_done` -> `img_fire_cb` ->
+  `img_release_stale` -> `hlcache_handle_release`) removed **another**
+  user of the same content, the walk's captured `next`.
+- `content_remove_user` freed that user at once.
+- Patch 482 tried to defer that free to the death-row, but on this build
+  `macos9_deathrow_add` is a weak stub that tears down immediately
+  (`compat/macsurf_compat.c`). See the correction in the 483 State log.
+
+**Fix** (`content/content.c`, `content/content_protected.h`).
+- The walk's next user lives on the content (`bc_next`). The walk reads
+  it after each callback, and `content_remove_user` moves it past a user
+  it unlinks.
+- `content_broadcast_error` walks the same way.
+- Both save and restore `bc_next` around their walk, so a nested walk
+  cannot leave the outer one a stale pointer. `content__init` clears it.
+- Any broadcast during a walk is already deferred
+  (`content_broadcast_active`), so `content_broadcast` walks never nest.
+
+**Measured** (make.wordpress.org, plain builds, 9 loads each):
+- **483 crashed 5/9, 484 crashed 0/9.**
+- ASan 484, wpblog replay with a large quarantine: **3/3 clean**.
+
+**Gate.**
+- **gate484 FAILED: interaction 50/57.** Steps 42-47 and 54 failed (the
+  LAN-listener URL push, the settings page and its settings, the
+  downloads page).
+  - The cause was in the environment: the main run logged
+    `remote: cannot listen on :45180, errno 98` (address in use) at
+    start. The listener that serves the pushed URL and `/settings` never
+    came up.
+  - Port 45180 was free afterwards, and no sim of mine was left running.
+- **gate484b exit 0**: interaction 57/57 (both paces); the listener
+  bound normally.
+- `restage-full.sh`: **567 applied plus the 2 known collisions**. The
+  sim was clean-built (struct layout changed).
+
+No sudo.

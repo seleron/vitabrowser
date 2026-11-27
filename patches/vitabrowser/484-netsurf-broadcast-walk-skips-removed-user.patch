@@ -1,0 +1,125 @@
+# netsurf: the content broadcast walk moves past a user removed mid-walk (patch 484)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 483)
+#
+# make.wordpress.org crashed in content_broadcast calling a garbage callback
+# (gdb, plain build: callback 0x20 at content.c's user walk; 483 plain: 2/6
+# loads). While a JPEG content broadcast "done", one user's callback
+# (html_object_callback -> html_proceed_to_done -> img_fire_cb ->
+# img_release_stale -> hlcache_handle_release) removed ANOTHER user of the
+# same content -- the walk's captured `next` -- and content_remove_user
+# freed it at once.
+#
+# Patch 482 tried to defer that free to the death-row, as the __MACOS9__
+# build does; but on this build macos9_deathrow_add is a weak stub that
+# tears down immediately (compat/macsurf_compat.c), so it deferred nothing
+# -- its clean ASan replays were timing luck.
+#
+# The walk's next user now lives on the content (bc_next): the walk reads
+# it after each callback, and content_remove_user moves it past a user it
+# unlinks. content_broadcast_error walks the same way; both save and
+# restore bc_next around their walk, so a nested walk cannot leave the
+# outer one a stale pointer. content__init clears it.
+--- a/content/content.c
++++ b/content/content.c
+@@ -294,6 +294,7 @@
+ 	c->sub_status[0] = 0;
+ 	c->locked = false;
+ 	c->broadcast_in_progress = false;
++	c->bc_next = NULL;	/* patch 484 */
+ 	c->broadcast_pending_count = 0;
+ 	c->total_size = 0;
+ 	c->http_code = 0;
+@@ -1052,6 +1053,9 @@
+ 
+ 	next = user->next;
+ 	user->next = next->next;   /* unlink synchronously so the list is consistent */
++	/* patch 484: the active walk's next user is this one: skip it */
++	if (c->bc_next == next)
++		c->bc_next = next->next;
+ 	/* VitaBrowser patch 482: the Vita build freed the node here at once. A
+ 	 * user removed from inside a content_broadcast callback -- an image's
+ 	 * load callback releasing a sibling handle on the same content
+@@ -1148,6 +1152,7 @@
+ void content_broadcast(struct content *c, content_msg msg,
+ 		       const union content_msg_data *data)
+ {
++	struct content_user *bc_saved;	/* patch 484 */
+ 	struct content_user *user, *next;
+ 	content_msg pending_msg;
+ 
+@@ -1293,7 +1298,16 @@
+ 	 * broadcast guard (that is broadcast_in_progress / Stage 3) - its only
+ 	 * job here is to keep the drain out until the walk unwinds. */
+ 	macos9_op_depth++;
+-	for (user = c->user_list->next; user != 0; user = next) {
++	/* VitaBrowser patch 484: the walk's next user lives on the content
++	 * (bc_next), not only in a local: a callback that removes that user
++	 * -- an image's load callback releasing a sibling handle on the same
++	 * content -- frees it at once on this build (macos9_deathrow_add is
++	 * a stub that tears down immediately, so 482's deferral deferred
++	 * nothing), and content_remove_user moves bc_next past it. Saved and
++	 * restored, so a nested walk (content_broadcast_error) cannot leave
++	 * this one a stale pointer. */
++	bc_saved = c->bc_next;
++	for (user = c->user_list->next; user != 0; user = c->bc_next) {
+ 		unsigned long ua = (unsigned long)(void *)user;
+ 		if (!macsurf_ptr_is_heap((const void *)(user))) {
+ 			macsurf_debug_log_writef(
+@@ -1312,10 +1326,12 @@
+ 				next = NULL; /* stop after this iteration */
+ 			}
+ 		}
++		c->bc_next = next;
+ 		if (user->callback != NULL) {
+ 			user->callback(c, msg, data, user->pw);
+ 		}
+ 	}
++	c->bc_next = bc_saved;
+ 	/* Stage 1 death-row (fixes565-577 arc): the walk is now off the stack,
+ 	 * so release the drain gate before the inline replay below.  The replay
+ 	 * issues a recursive content_broadcast, which brackets its own
+@@ -1359,7 +1375,7 @@
+ void
+ content_broadcast_error(struct content *c, nserror errorcode, const char *msg)
+ {
+-	struct content_user *user, *next;
++	struct content_user *user, *next, *bc_saved;
+ 	union content_msg_data data;
+ 
+ 	CONTENT_CHECK_VOID(c);
+@@ -1368,7 +1384,8 @@
+ 	data.errordata.errormsg = msg;
+ 
+ 	if (c->user_list == NULL) return;
+-	for (user = c->user_list->next; user != 0; user = next) {
++	bc_saved = c->bc_next;	/* patch 484: as in content_broadcast */
++	for (user = c->user_list->next; user != 0; user = c->bc_next) {
+ 		unsigned long ua = (unsigned long)(void *)user;
+ 		if (!macsurf_ptr_is_heap((const void *)(user))) break;
+ 		next = user->next;
+@@ -1376,10 +1393,12 @@
+ 			unsigned long na = (unsigned long)(void *)next;
+ 			if (!macsurf_ptr_is_heap((const void *)(next))) next = NULL;
+ 		}
++		c->bc_next = next;
+ 		if (user->callback != 0) {
+ 			user->callback(c, CONTENT_MSG_ERROR, &data, user->pw);
+ 		}
+ 	}
++	c->bc_next = bc_saved;
+ }
+ 
+ 
+--- a/content/content_protected.h
++++ b/content/content_protected.h
+@@ -312,6 +312,9 @@
+ 	bool broadcast_in_progress;
+ 	content_msg broadcast_pending[CONTENT_BROADCAST_PENDING_MAX];
+ 	int broadcast_pending_count;
++	/** VitaBrowser patch 484: the user the active walk visits next;
++	 * content_remove_user moves it past a user it unlinks (and frees) */
++	struct content_user *bc_next;
+ 
+ 	/**
+ 	 * Total data size, 0 if unknown.
