@@ -598,6 +598,7 @@ NET-js-slot-api http://127.0.0.1:$HP/JS-slot-api.html
 NET-js-shadow-upgrade http://127.0.0.1:$HP/JS-shadow-upgrade.html
 NET-js-innerhtml-leading http://127.0.0.1:$HP/JS-innerhtml-leading.html
 NET-js-charcodeat http://127.0.0.1:$HP/JS-charcodeat.html
+NET-js-array-concat http://127.0.0.1:$HP/JS-array-concat.html
 NET-js-perfobserver http://127.0.0.1:$HP/JS-perfobserver.html
 NET-js-template-text http://127.0.0.1:$HP/JS-template-text.html
 NET-js-selector-list-long http://127.0.0.1:$HP/JS-selector-list-long.html
@@ -1608,7 +1609,7 @@ o2_bad=
 for g in "js-innerhtml-raw IHRAW 6" "js-offsetparent OFFPARENT 8" \
 	 "js-computed-unboxed UNBOXED 7" "css-inline-outranks INLINE236 4" \
 	 "js-import-meta IMPORTMETA 4" "js-importmap IMPORTMAP 4" \
-	 "js-custom-elements CUSTOMEL 9" "js-shadow-events SHADOWEV 9" "js-attr-names ATTRNAME 7" "js-slot-api SLOTAPI 8" "js-shadow-upgrade SHADOWCE 8" "js-innerhtml-leading IHLEAD 6" "js-charcodeat CHARCODE 8" "js-perfobserver PERFOBS 2" \
+	 "js-custom-elements CUSTOMEL 9" "js-shadow-events SHADOWEV 9" "js-attr-names ATTRNAME 7" "js-slot-api SLOTAPI 8" "js-shadow-upgrade SHADOWCE 8" "js-innerhtml-leading IHLEAD 6" "js-charcodeat CHARCODE 8" "js-array-concat CONCAT 10" "js-perfobserver PERFOBS 2" \
 	 "js-template-text TPLTEXT 4" "js-selector-list-long LONGLIST 4" \
 	 "js-attach-shadow SHADOW 7" "css-late-link LATELINK 3" \
 	 "js-xorigin-frame XFRAME 9" "js-scratch-doc SCRATCHDOC 6" \

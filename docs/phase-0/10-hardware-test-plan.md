@@ -18680,3 +18680,60 @@ No sudo.
 - In-flight at close (NOT committed, next loop): unit 494 (Array.prototype
   .concat fast copy) — WIP patch file + test page in the working tree, its
   gate running.
+
+## Patch 494 (2026-11-27): Array concat / species / spreadable fast paths (QuickJS 09)
+
+**Problem.** Patch 492 put **23% of bbc.com's JS** in styled-components'
+`flatten()` (`tt`):
+`Array.prototype.concat.apply(Z, e.map(function (x) { return tt(x, ...); }))`.
+
+**Fix** (`patches/quickjs/09-quickjs-array-concat-fast-copy.patch`).
+Each fast path gives the same result as the generic one.
+1. **concat** copies a fast, hole-free array argument straight into a
+   still-fast result, sized once per argument. It used to do a property get
+   plus a property define per element.
+2. **JS_ArraySpeciesCreate** (concat and map) calls the plain-array
+   constructor directly when the constructor is this realm's Array and its
+   `[Symbol.species]` is still the built-in getter.
+3. **JS_isConcatSpreadable** answers `true` for a plain Array whose
+   prototype chain is exactly this realm's Array.prototype ->
+   Object.prototype, as long as no object has ever had a
+   `[Symbol.isConcatSpreadable]` property.
+   - The runtime flag is set at the only two places shape properties are
+     created.
+   - There is one runtime per page, so a page that defines the symbol turns
+     the fast path off only for itself.
+
+**Measured** (sim, 493 -> 494):
+
+| | 493 | 494 |
+|---|---|---|
+| flatten-shaped benchmark | 150 ms | 120 ms (**-20%**) |
+| `concat.apply` loop alone | 526 ms | 320 ms (**-39%**) |
+
+**On bbc it is small.** concat was only **~2% of bbc's JS** in a native
+profile (8 of 432 JS samples -> 5). Most of `tt`'s 23% is call overhead
+on one-line helpers (`e8`/`eE`/`eA`/`eR` type checks, `instanceof`, the
+map closure), which QuickJS does not inline.
+
+The 491/492 samplers count **bytecode ops**, so they cannot show native
+savings; measure native changes with sprof.
+
+Next levers:
+- JS call overhead;
+- the instanceof `Symbol.hasInstance` call;
+- malloc (~20% of bbc CPU).
+
+**Gate.**
+- `JS-array-concat.html` (CONCAT, 10 checks): plain arrays plus values; a
+  nested flatten with the seed untouched; holes; a spreadable array-like; a
+  non-spreadable array; length past the elements; a subclass; an empty
+  concat; prototype-less and proxied arrays; a flag set on
+  Array.prototype mid-page (check 10 runs before anything else defines the
+  symbol).
+  - **Chromium, 493 and 494: 10/10.**
+- **gate494 exit 0**: CONCAT 10/10, interaction 57/57 (both paces).
+
+**Not yet run on 492-494:** ASan, census.
+
+No sudo.

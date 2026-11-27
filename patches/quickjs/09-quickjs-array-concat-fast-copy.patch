@@ -1,0 +1,152 @@
+# quickjs: Array.prototype.concat copies plain dense arrays directly;
+# ArraySpeciesCreate skips the species getter for this realm's own Array;
+# plain arrays known spreadable until a page defines isConcatSpreadable
+#
+# VitaBrowser patch 494: patch 492's per-function sampling found 23% of
+# bbc.com's JS in styled-components' flatten(),
+#   Array.prototype.concat.apply(Z, e.map(function (x) { return tt(x); }))
+#
+# 1. The generic concat does a JS_TryGetPropertyInt64 and a
+#    JS_DefinePropertyValueInt64 per element. When the result is still a
+#    fast array without holes (its count equals the elements written so
+#    far), a spreadable argument that is a fast array whose length equals
+#    its count (no holes, no length past the elements) is copied value by
+#    value with add_fast_array_element, and a non-spreadable argument is
+#    appended the same way. Array-likes, holed arrays, a result that went
+#    slow, and species results that are not plain arrays take the generic
+#    path.
+# 2. JS_ArraySpeciesCreate (concat AND map): when the constructor is this
+#    realm's own Array and its [Symbol.species] is still the built-in getter
+#    (js_get_this), the plain-array constructor is called directly instead
+#    of the getter call plus the generic constructor call. Same object:
+#    Array.prototype is non-writable. A replaced species or constructor
+#    takes the generic path.
+# 3. JS_isConcatSpreadable: a runtime flag (vb_spreadable_seen) is set the
+#    first time any object gets a [Symbol.isConcatSpreadable] property (the
+#    only two places shape properties are created: add_shape_property and
+#    JS_NewObjectFrom). Until then a plain Array whose prototype chain is
+#    exactly this realm's Array.prototype -> Object.prototype is spreadable
+#    without the three failing lookups. Proxies, other realms and swapped
+#    prototypes take the generic path. One runtime per page (js_newheap),
+#    so a page that defines the symbol only turns this off for itself.
+# 4. The fast copy pre-sizes the result once per argument.
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -286,6 +286,11 @@
+ } JSValueLink;
+ 
+ struct JSRuntime {
++    /* VitaBrowser: set once any object ever gets a [Symbol.isConcatSpreadable]
++       property (add_shape_property, JS_NewObjectFrom); until then a plain
++       array with the realm's own prototype chain is spreadable without the
++       three-object lookup (JS_isConcatSpreadable). */
++    bool vb_spreadable_seen;
+     JSMallocFunctions mf;
+     JSMallocState malloc_state;
+     const char *rt_info;
+@@ -5695,6 +5700,8 @@
+        The object property at p->prop[sh->prop_count] is uninitialized */
+     prop = sh->prop;
+     pr = &prop[sh->prop_count++];
++    if (unlikely(atom == JS_ATOM_Symbol_isConcatSpreadable))
++        rt->vb_spreadable_seen = true;
+     pr->atom = JS_DupAtom(ctx, atom);
+     pr->flags = prop_flags;
+     /* add in hash table */
+@@ -6037,6 +6044,8 @@
+             hash = &prop_hash_end(sh)[-h - 1];
+             pr->hash_next = *hash;
+             *hash = i + 1;
++            if (unlikely(atom == JS_ATOM_Symbol_isConcatSpreadable))
++                rt->vb_spreadable_seen = true;
+             pr->atom = JS_DupAtom(ctx, atom);
+             pr->flags = JS_PROP_C_W_E;
+             p->prop[i].u.value = values[i];
+@@ -42670,6 +42679,26 @@
+             ctor = JS_UNDEFINED;
+         }
+     }
++    /* VitaBrowser: the constructor is this realm's own Array and its
++       [Symbol.species] is still the built-in getter (which returns Array):
++       the result is a plain array, so skip the getter call and the generic
++       constructor call (concat and map on plain arrays -- styled-components'
++       flatten, 23% of bbc.com's JS). Array.prototype is non-writable, so
++       new Array via new.target Array and via no new.target are the same. */
++    if (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_TAG(ctx->array_ctor) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(ctor) == JS_VALUE_GET_OBJ(ctx->array_ctor)) {
++        JSProperty *spr;
++        JSShapeProperty *sprs = find_own_property(&spr, JS_VALUE_GET_OBJ(ctor),
++                                                  JS_ATOM_Symbol_species);
++        if (sprs && (sprs->flags & JS_PROP_TMASK) == JS_PROP_GETSET &&
++            spr->u.getset.getter &&
++            spr->u.getset.getter->class_id == JS_CLASS_C_FUNCTION &&
++            spr->u.getset.getter->u.cfunc.c_function.getter == js_get_this) {
++            JS_FreeValue(ctx, ctor);
++            return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
++        }
++    }
+     if (JS_IsObject(ctor)) {
+         species = JS_GetProperty(ctx, ctor, JS_ATOM_Symbol_species);
+         JS_FreeValue(ctx, ctor);
+@@ -42700,6 +42729,18 @@
+ 
+     if (!JS_IsObject(obj))
+         return false;
++    /* VitaBrowser: no object has ever had a [Symbol.isConcatSpreadable]
++       property and this is a plain Array whose chain is exactly this realm's
++       Array.prototype -> Object.prototype (no proxy, no swapped prototype):
++       the lookup would find nothing, so the answer is IsArray = true. */
++    if (!ctx->rt->vb_spreadable_seen) {
++        JSObject *op = JS_VALUE_GET_OBJ(obj);
++        JSObject *ap = op->shape->proto;
++        if (op->class_id == JS_CLASS_ARRAY &&
++            ap == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
++            ap->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]))
++            return true;
++    }
+     val = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_isConcatSpreadable);
+     if (JS_IsException(val))
+         return -1;
+@@ -42820,6 +42861,39 @@
+         res = JS_isConcatSpreadable(ctx, e);
+         if (res < 0)
+             goto exception;
++        /* VitaBrowser: a plain dense array into a plain array still without
++           holes is copied directly -- the generic path did a property get
++           and a property define per element (styled-components' flatten,
++           Array.prototype.concat.apply over map() results: 23% of
++           bbc.com's JS). Same result; anything else (array-likes, holes,
++           subclasses, a result already slow) takes the generic path. */
++        if (js_is_fast_array(ctx, arr) &&
++            n == JS_VALUE_GET_OBJ(arr)->u.array.count) {
++            JSObject *ap = JS_VALUE_GET_OBJ(arr);
++            JSValue *src;
++            uint32_t cnt, j;
++            if (res && js_get_fast_array(ctx, unsafe_unconst(e), &src, &cnt) &&
++                JS_VALUE_GET_TAG(JS_VALUE_GET_OBJ(e)->prop[0].u.value) == JS_TAG_INT &&
++                (uint32_t)JS_VALUE_GET_INT(JS_VALUE_GET_OBJ(e)->prop[0].u.value) == cnt &&
++                n + cnt <= MAX_SAFE_INTEGER) {
++                if (n + cnt > ap->u.array.u1.size &&
++                    expand_fast_array(ctx, ap, n + cnt))
++                    goto exception;
++                for (j = 0; j < cnt; j++, n++) {
++                    if (add_fast_array_element(ctx, ap, js_dup(src[j]),
++                                               JS_PROP_THROW) < 0)
++                        goto exception;
++                }
++                continue;
++            }
++            if (!res && n < MAX_SAFE_INTEGER) {
++                if (add_fast_array_element(ctx, ap, js_dup(e),
++                                           JS_PROP_THROW) < 0)
++                    goto exception;
++                n++;
++                continue;
++            }
++        }
+         if (res) {
+             if (js_get_length64(ctx, &len, e))
+                 goto exception;
