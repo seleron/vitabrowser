@@ -1,0 +1,111 @@
+# netsurf: innerHTML keeps the text and comments before the first element (patch 488)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 487)
+#
+# This binding's fragment parser has no context element (fixes846): the
+# element and foreign-node innerHTML setters parse markup as a document,
+# then move <head>'s and <body>'s children into the element. In "before
+# html" the HTML parser DROPS leading whitespace and puts leading comments
+# beside <html> -- outside head and body -- so they were never moved.
+#
+# lit writes every child-part marker as <?lit$N$> (a bogus comment): a
+# template whose content begins with a part -- old.reddit.com's
+# <faceplate-text-input> passes ` ${prefix} ${labelTextWrapper()} ${input}
+# ${suffix} ` to its input container -- lost its leading markers, its parts
+# landed on the wrong nodes (classMap() threw inside update()) and the text
+# inputs rendered no <input> at all. Reproduced with real lit-html 3.2.1 in
+# the simulator: the same template rendered 0 inputs; with the fix, 1.
+#
+# A sentinel element is fed to the parser first, so it is in body before the
+# markup and leading text and comments land in <body> in order; the
+# sentinel is taken out before the children are moved (both setters). A
+# leading <style>/<script> now also stays in place, as fragment parsing for
+# an element context does.
+#
+# JS-innerhtml-leading.html: Chromium 6/6, 487 3/6, 488 6/6.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -6445,6 +6445,47 @@
+  * fragment -> <html> -> <body> and move THAT element's children, not the
+  * fragment's. Falls back to the fragment's own children if no <html>/
+  * <body> is found (e.g. a future context-aware parser is swapped in). */
++/* VitaBrowser patch 488: this binding's fragment parser has no context
++ * element (fixes846) -- it parses markup as a document, and in "before
++ * html" the HTML parser DROPS leading whitespace and puts leading comments
++ * beside <html>, outside head and body, so they were never moved into the
++ * element. lit writes every child-part marker as <?lit$N$> (a comment): a
++ * template whose content begins with a part, such as
++ * ` ${a} ${b} ${input} `, lost its leading markers, its parts landed on the
++ * wrong nodes (classMap() threw) and old.reddit.com's text inputs rendered
++ * no <input>. A sentinel element fed first puts the parser in body before
++ * the markup, so leading text and comments land in <body> in order; the
++ * sentinel is taken out before the children are moved. */
++#define QJS_FRAG_SENTINEL "<vb-frag-start></vb-frag-start>"
++static void qjs_frag_parse(dom_hubbub_parser *parser, const char *src,
++		size_t len)
++{
++	dom_hubbub_parser_parse_chunk(parser,
++			(const uint8_t *) QJS_FRAG_SENTINEL,
++			sizeof(QJS_FRAG_SENTINEL) - 1);
++	dom_hubbub_parser_parse_chunk(parser, (const uint8_t *) src, len);
++}
++static void qjs_frag_drop_sentinel(dom_node *parent)
++{
++	dom_node *c = NULL, *removed = NULL;
++	dom_string *nm = NULL;
++
++	if (parent == NULL)
++		return;
++	macsurf_dom_node_get_first_child(parent, &c);
++	if (c == NULL)
++		return;
++	if (dom_node_get_node_name(c, &nm) == DOM_NO_ERR && nm != NULL) {
++		if (strcasecmp(dom_string_data(nm), "vb-frag-start") == 0) {
++			macsurf_dom_node_remove_child(parent, c, &removed);
++			if (removed != NULL)
++				macsurf_dom_node_unref(removed);
++		}
++		dom_string_unref(nm);
++	}
++	macsurf_dom_node_unref(c);
++}
++
+ static JSValue qjs_el_set_inner_html_data(JSContext *ctx,
+ 		JSValueConst this_val, int argc, JSValueConst *argv,
+ 		int magic, JSValueConst *func_data)
+@@ -6480,8 +6521,7 @@
+ 		JS_FreeCString(ctx, html_src);
+ 		return JS_UNDEFINED;
+ 	}
+-	dom_hubbub_parser_parse_chunk(parser,
+-			(const uint8_t *) html_src, html_len);
++	qjs_frag_parse(parser, html_src, html_len);	/* patch 488 */
+ 	dom_hubbub_parser_completed(parser);
+ 	dom_hubbub_parser_destroy(parser);
+ 	/* fixes1015 - audit with the markup head while the string is alive. */
+@@ -6572,6 +6612,7 @@
+ 	 * needed). Re-fetch first_child each iteration since removing/
+ 	 * appending mutates src_parent's child list. */
+ 	child = NULL;
++	qjs_frag_drop_sentinel(src_parent);	/* patch 488 */
+ 	macsurf_dom_node_get_first_child(src_parent, &child);
+ 	while (child != NULL) {
+ 		append_result = NULL;
+@@ -7992,8 +8033,7 @@
+ 		JS_FreeCString(ctx, html_src);
+ 		return JS_UNDEFINED;
+ 	}
+-	dom_hubbub_parser_parse_chunk(parser,
+-			(const uint8_t *) html_src, html_len);
++	qjs_frag_parse(parser, html_src, html_len);	/* patch 488 */
+ 	dom_hubbub_parser_completed(parser);
+ 	dom_hubbub_parser_destroy(parser);
+ 	JS_FreeCString(ctx, html_src);
+@@ -8045,6 +8085,7 @@
+ 	}
+ 
+ 	child = NULL;
++	qjs_frag_drop_sentinel(src_parent);	/* patch 488 */
+ 	macsurf_dom_node_get_first_child(src_parent, &child);
+ 	while (child != NULL) {
+ 		append_result = NULL;

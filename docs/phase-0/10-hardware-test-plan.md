@@ -18347,3 +18347,53 @@ input appears** and focus goes to BODY.
 Tools used: `VITA_SIM_INJECT=<js>` for listener wrappers (scratch
 `ytinj*.js`). The engine truncates logged stacks: wrap the listener in an
 inject to get the full frame.
+
+## Patch 488 (2026-11-27): innerHTML keeps the text and comments before the first element
+
+**Problem.**
+- This binding's fragment parser has no context element (fixes846). The
+  element and foreign-node `innerHTML` setters parse markup as a document,
+  then move `<head>`'s and `<body>`'s children into the element.
+- In "before html" the HTML parser **drops leading whitespace** and puts
+  **leading comments beside `<html>`**, outside head and body, so they were
+  never moved.
+- Lit writes every child-part marker as `<?lit$N$>` (a bogus comment). A
+  template whose content **begins with a part** lost its leading markers,
+  and its parts landed on the wrong nodes.
+  - old.reddit.com's `<faceplate-text-input>` passes
+    `` ` ${prefix} ${labelTextWrapper()} ${input} ${suffix} ` `` to its
+    input container.
+  - Its `update()` threw the `classMap()` error (caught with an injected
+    method wrapper), and the text inputs rendered **no `<input>`**.
+
+**Reproduced with real lit-html 3.2.1** in the simulator (served
+locally): the component's `renderInput` template rendered 0 inputs; with
+the fix, 1.
+
+**Fix** (`macsurf_qjs.c`).
+- A sentinel element (`<vb-frag-start>`) is fed to the parser first, so it
+  is in body before the markup: leading text and comments land in
+  `<body>`, in order.
+- The sentinel is taken out before the children are moved, in both
+  setters.
+- A leading `<style>` / `<script>` now also stays in place, as fragment
+  parsing for an element context does.
+
+**Measured.**
+- `JS-innerhtml-leading.html` (IHLEAD, 6 checks): **Chromium 6/6, 487 3/6,
+  488 6/6.**
+- **old.reddit.com login, with 488 plus the parked shadow-drawing WIP**
+  (built in a separate tree, not landed):
+  - **the username and password fields render** ("Email Or Username \*",
+    "Password \*", input boxes, eye toggle);
+  - `classMap()` errors 0, "not a function" 0;
+  - a tap on the username field opens the keyboard.
+  - The drawing WIP stays parked per the owner's reprioritization (P1
+    performance first).
+
+**Gate.**
+- **gate488 exit 0**: IHLEAD 6/6, IHRAW 6/6, TPLTEXT 4/4, interaction 57/57
+  (both paces).
+- `restage-full.sh`: **572 applied plus the 2 known collisions**.
+
+No sudo.
