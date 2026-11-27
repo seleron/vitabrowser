@@ -18479,3 +18479,38 @@ bbc) peaks at ~142 MiB of heap: ~74% of 192, ~49% of 288.
   `192` means the default VPK was launched.
 
 No sudo.
+
+## Patch 490 (2026-11-27): the low-level cache budget scales with the heap
+
+**Problem.**
+- The Vita frontend never set `memory_cache_size`, so the cache ran on
+  NetSurf's default 12 MiB.
+- NetSurf splits that budget: about 3/4 to llcache (sources), 1/4 to the
+  decoded-image cache. So llcache had **9 MiB**.
+- A session re-fetched what it had just had. In the sim, bbc -> youtube
+  -> github -> bbc re-created **95** network objects, **87 of them bbc's on
+  the revisit**.
+- Run 43 on the device: 942 llcache adds, 909 reclaims, 901 frees in one
+  session.
+
+**Fix** (`frontends/vita/main.c`): `memory_cache_size` = heap / 8, set
+after `nsoption_init` and before `netsurf_init` (which reads it).
+- **24 MiB on the default VPK** (llcache 18 MiB; the gate's llcache logs
+  show `limit: 18874368`).
+- **36 MiB on the extended VPK** (288 MiB heap, patch 489): llcache 27 MiB.
+
+**Measured** (same 4-page session, sim):
+
+| | 488 (12 MiB) | 490 (24 MiB) |
+|---|---|---|
+| re-created network objects | 95 | **1** |
+| bbc objects re-fetched on the revisit | 87 | **1** |
+| llcache objects created | 367 | 272 |
+| bbc revisit Done | 3.4 s | **2.2 s** |
+| session heap peak | 142.3 MiB | 143.6 MiB (**+1%**) |
+
+**Gate.**
+- **gate490 exit 0**: interaction 57/57 (both paces).
+- `restage-full.sh`: **574 applied plus the 2 known collisions**.
+
+No sudo.
