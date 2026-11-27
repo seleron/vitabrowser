@@ -18274,3 +18274,39 @@ No sudo.
   - **oldreddit 0 -> 1.3**: as at 486, 487 lets more of old.reddit's
     components run (now constructed inside shadow roots), so there is
     more DOM activity. Expected, not a regression.
+
+### Patch 488 (shadow drawing) HELD again (2026-11-27 ~14:40Z): old.reddit renders, the fields do not exist
+
+**Rebased on 487 and re-tested;** the WIP is saved in
+`~/vitabrowser-work/wip-shadow-draw/v488/`: a 675-line netsurf diff,
+`JS-shadow-draw.html`, `IN-shadow-drawing.html` and the run-vita-sim
+wiring.
+- `JS-shadow-draw.html` **8/8**. `IN-shadow-drawing.html`: the tap on the
+  shadow input opens the keyboard.
+- **old.reddit.com login is no longer blank.** The modal draws through the
+  shadow trees: heading, text, both option pills, "OR", "Forgot
+  password?", the eye icon, the scroll container.
+
+**But the owner's bar (username/password fields visible) is not met, and
+not because of drawing.**
+- **The document holds no `<input>` at all**, light or shadow.
+- `<faceplate-text-input>`'s shadow root has only the `leadingIcon`,
+  `trailingIconButton` and `clearButton` slots. Its `input-container`
+  lit part is empty, and its label part is not rendered
+  (`without-label`).
+- Lit never renders the component's main branch (input + label slot), and
+  **no error points at it**.
+- The 2 `classMap()` errors at 487 are **not** this: they come from a
+  toast/alert component (`faceplate-toast`, `show-toast`).
+- Before 488 the light-DOM labels showed; with 488 they are hidden too
+  (no label slot). Either way the page cannot be filled in.
+
+**Next lead (deeper lit / component state, needs its own time).** Why does
+`<faceplate-text-input>` render its "no input" branch? Candidates:
+- a reactive property never set (an attribute the component reads before
+  upgrade, or `value` / `type` state);
+- a `when()` / `nothing` condition;
+- a template part placed on the wrong node (a node-index mismatch from a
+  parser difference).
+
+Compare its template's parsed tree with Chromium's. Then land 488.
