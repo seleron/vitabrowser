@@ -17460,3 +17460,81 @@ No sudo.
     10.5 s).
   - The netlog 4 MiB mirror cap.
 - **Next: P2 input**, starting with the google.com search box (patch 479).
+
+## Patch 479 (2026-11-27): a textarea's rows is its natural height, and a tap on its border places the caret (P2)
+
+**Problem.** Device run 43: seven clicks on google.com's search box gave
+no focus and no keyboard (log: pointer clicks at y 186 and 192).
+
+**Simulator reproduction.**
+- A tap at the field's centre already worked: the TEXTAREA got the
+  events, took focus, and the keyboard opened.
+- A tap 16 px lower, still inside Google's rounded box, went to a
+  wrapper DIV (`DIV.a4bIc`). Nothing focused: `activeElement` stayed
+  BODY.
+- Google's code never calls `focus()` there (checked with a wrapped
+  `focus`). In Chromium the TEXTAREA itself is 48 px tall and fills the
+  box, so it gets the tap directly. In the engine it was 24 px.
+
+**Cause 1** (`css/hints.c`, upstream NetSurf).
+- `<textarea rows=N>` became an **author height of N em**.
+- Google's field is `rows=1`, `line-height: 24px`, `border-width: 12px 0`
+  (transparent), `box-sizing: border-box`. Border-box took the 24 px of
+  borders out of that 16 px height, leaving no content: a 24 px field.
+- Chromium, measured on the same CSS:
+
+| case | Chromium | engine at 478 |
+|---|---|---|
+| `rows=1`, with or without border-box | 48 | 24 / 56 |
+| `rows=3` | 96 | 64 |
+
+- Browsers treat `rows` as the textarea's **natural** height: rows ×
+  line-height, default 2 rows. box-sizing does not touch it, and any
+  author height overrides it.
+- **Fix:** the hint is removed. Layout gives an auto-height textarea
+  that height (`vb_textarea_natural_height`) in `layout_block_context`
+  and in the float/inline-block path (which used a fixed 4 em).
+- 479 measured on the same cases: block, grid item and flex item are
+  each 64 px whether or not border-box is set, and `rows=3` is 112.
+  - That is Chromium's height plus 16 px, from our default.css
+    `textarea { overflow: scroll }` box scrollbar. Google sets
+    `overflow: hidden`, so this does not affect it. Left as is.
+- Google's field is now **520x48, as in Chromium**.
+
+**Cause 2** (`desktop/textarea.c` via `interaction.c`).
+- With the field the right size, a tap on its **bottom border** (y
+  197-209 of 161-209) still placed no caret.
+- `textarea_mouse_action` drops a point past its visible text area, so
+  the keyboard check (`vita_chrome_editing`) found no caret.
+- **Fix:** `html_mouse_action` clamps a press or click on the field's box
+  into the text area. A browser focuses a field tapped on its border.
+- Sim, Google, tap at y 201: focus, `activeElement` TEXTAREA,
+  "input: text field, opening the keyboard".
+
+**On-device coverage.**
+- New `testpages/pages/IN-searchfield.html`: Google's field as its CSS
+  builds it, at a fixed place (100-148, text area 112-136).
+- Interaction steps 19-21 (`vita/interact.c`): open the page; tap at
+  (300,143) on the bottom border, which must put the caret in the field
+  (`C_EDITING`); type text.
+  - 478: the field is 400x24, the tap misses it, BODY stays active.
+  - 479: the field is 400x48, the tap focuses it, the keyboard opens.
+
+**Gate.**
+- **gate479 exit 0**: interaction **55/55** (was 52), 55/55 at the
+  Vita's pace.
+- `restage-full.sh`: **561 applied plus the 2 known collisions**.
+
+**Not in this unit.**
+- **youtube** (separate cause, next unit). m.youtube's search box is a
+  fake entry point, `DIV.search-bar-entry-point-button`.
+  - In the sim the tap delivers pointerdown and click to it, but no
+    search input appears (the real input stays 0x0) and
+    `activeElement` goes to BODY.
+  - In Chromium from this machine youtube shows its EU consent page, so
+    there is no browser comparison yet.
+- **`cols`** keeps its width hint: the same flaw for widths, not hit
+  here.
+- **old.reddit login** (P2 item 3): next.
+
+No sudo.

@@ -1,0 +1,206 @@
+# netsurf: a textarea's rows is its natural height, and a tap on its border places the caret (patch 479)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 478)
+#
+# P2 (input on JS-heavy pages): device run 43 -- seven taps on google.com's
+# search box gave no focus and no keyboard. Two engine faults, one field:
+#
+# 1. css/hints.c mapped <textarea rows=N> to an AUTHOR height of N em.
+#    Google's field (rows=1, line-height 24px, transparent 12px top and
+#    bottom borders, box-sizing: border-box) then had border-box take the
+#    borders out of 16px: no content height, a 24px field where browsers
+#    draw 48px (Chromium measured: 48 with or without border-box; rows=3
+#    96). A tap on its lower half landed on the wrapper DIV. Browsers treat
+#    rows as the textarea's NATURAL height -- rows x line-height, default
+#    2 -- which box-sizing never touches and any author height overrides.
+#    The hint is gone; layout gives an auto-height textarea that height
+#    (vb_textarea_natural_height: layout_block_context and the
+#    float/inline-block path, which used a fixed 4em).
+#
+# 2. textarea_mouse_action drops a point past its visible text area, so a
+#    tap on the field's bottom or right border (inside the box the engine
+#    hit) placed no caret: html_mouse_action now clamps a press or click
+#    into the text area, as a browser focuses a field tapped on its border.
+#
+# The interaction pass gains IN-searchfield.html (Google's field, as its
+# CSS builds it) and a tap on its bottom border that must place the caret
+# (C_EDITING), then typed text. cols keeps its width hint (same flaw for
+# widths, not hit here).
+--- a/content/handlers/css/hints.c
++++ b/content/handlers/css/hints.c
+@@ -1200,22 +1200,11 @@
+ 	dom_string *attr = NULL;
+ 	dom_exception err;
+ 
+-	err = dom_element_get_attribute(node,
+-			corestring_dom_rows, &attr);
+-
+-	if (err == DOM_NO_ERR && attr != NULL) {
+-		if (parse_dimension(
+-				(const char *)dom_string_data(attr), false,
+-				&hint->data.length.value,
+-				&hint->data.length.unit)) {
+-			hint->prop = CSS_PROP_HEIGHT;
+-			hint->data.length.unit = CSS_UNIT_EM;
+-			hint->status = CSS_HEIGHT_SET;
+-			css_hint_advance(&hint);
+-		}
+-		dom_string_unref(attr);
+-	}
+-
++	/* VitaBrowser patch 479: rows is not an author height. It is the
++	 * textarea's natural height (rows x line-height, layout.c
++	 * vb_textarea_natural_height), which box-sizing does not shrink; as
++	 * height: N em, border-box took the borders out of it (Google's
++	 * search field: no content height at all). */
+ 	err = dom_element_get_attribute(node,
+ 			corestring_dom_cols, &attr);
+ 
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -4309,6 +4309,9 @@
+ }
+ 
+ 
++static int vb_textarea_natural_height(const css_unit_ctx *unit_len_ctx,
++		const struct box *box);	/* patch 479 */
++
+ /**
+  * Compute dimensions of box, margins, paddings, and borders for a floating
+  * element using shrink-to-fit. Also used for inline-blocks.
+@@ -4398,12 +4401,9 @@
+ 						box->style, unit_len_ctx,
+ 						size, unit));
+ 			}
+-			if (height == AUTO) {
+-				size = INTTOFIX(4);
+-				height = FIXTOINT(css_unit_len2device_px(
+-						box->style, unit_len_ctx,
+-						size, unit));
+-			}
++			if (height == AUTO)	/* patch 479: rows */
++				height = vb_textarea_natural_height(
++						unit_len_ctx, box);
+ 		}
+ 	} else if (width == AUTO) {
+ 		/* CSS 2.1 section 10.3.5 */
+@@ -4632,6 +4632,45 @@
+ 
+ 
+ /**
++ * VitaBrowser patch 479: a textarea's natural content height -- its rows
++ * (the attribute, as a browser parses it: a positive integer, else 2)
++ * times its line height. Browsers size an auto-height textarea this way,
++ * and box-sizing never touches it; NetSurf instead mapped rows=N to an
++ * author height of N em (css/hints.c), which border-box then shrank by
++ * the borders: Google's search field (rows=1, line-height 24px,
++ * transparent 12px top and bottom borders, border-box) came out 24px of
++ * border and no content, so a tap on the lower half of its 48px pill
++ * landed on the wrapper -- no focus, no keyboard (device run 43).
++ */
++static int vb_textarea_natural_height(
++		const css_unit_ctx *unit_len_ctx,
++		const struct box *box)
++{
++	int rows = 2;
++
++	if (box->node != NULL) {
++		dom_string *attr = NULL;
++
++		if (dom_element_get_attribute(box->node, corestring_dom_rows,
++				&attr) == DOM_NO_ERR && attr != NULL) {
++			const char *v = dom_string_data(attr);
++			char *end = NULL;
++			long n;
++
++			while (*v == ' ' || *v == '\t' || *v == '\n' ||
++					*v == '\r' || *v == '\f')
++				v++;
++			n = strtol(v, &end, 10);
++			if (end != v && n > 0)
++				rows = n > 1000 ? 1000 : (int) n;
++			dom_string_unref(attr);
++		}
++	}
++	return rows * line_height(unit_len_ctx, box->style);
++}
++
++
++/**
+  * Position a line of boxes in inline formatting context.
+  *
+  * \param  first   box at start of line
+@@ -6471,6 +6510,13 @@
+ 
+ 	if (block->height == AUTO) {
+ 		block->height = cy - block->padding[TOP];
++		/* patch 479: an auto-height textarea is its rows tall (its
++		 * text is the widget's to draw and scroll, not a line here) */
++		if (block->gadget != NULL &&
++				block->gadget->type == GADGET_TEXTAREA &&
++				block->style != NULL)
++			block->height = vb_textarea_natural_height(
++					&content->unit_len_ctx, block);
+ 		if (block->type == BOX_BLOCK)
+ 			layout_block_add_scrollbar(block, BOTTOM);
+ 	}
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1400,10 +1400,35 @@
+ 					   true);
+ 		}
+ 
+-		ta_status = textarea_mouse_action(mas->gadget.control->data.text.ta,
+-						  mouse,
+-						  x - mas->gadget.box_x,
+-						  y - mas->gadget.box_y);
++		{
++			/* VitaBrowser patch 479: a press or click on the
++			 * field's border (inside its box, outside its text
++			 * area) is a tap on the field, as in a browser:
++			 * clamp it in. textarea_mouse_action drops a point
++			 * past its visible area, so a tap on the bottom of
++			 * Google's search field (transparent 12px borders)
++			 * placed no caret and the keyboard never opened. */
++			int tx = x - mas->gadget.box_x;
++			int ty = y - mas->gadget.box_y;
++			if (mouse & (BROWSER_MOUSE_PRESS_1 |
++					BROWSER_MOUSE_CLICK_1)) {
++				int tw = 0, th = 0;
++				textarea_get_dimensions(
++					mas->gadget.control->data.text.ta,
++					&tw, &th);
++				if (tx < 0)
++					tx = 0;
++				if (ty < 0)
++					ty = 0;
++				if (tw > 0 && tx >= tw)
++					tx = tw - 1;
++				if (th > 0 && ty >= th)
++					ty = th - 1;
++			}
++			ta_status = textarea_mouse_action(
++					mas->gadget.control->data.text.ta,
++					mouse, tx, ty);
++		}
+ 
+ 		if (ta_status & TEXTAREA_MOUSE_EDITOR) {
+ 			mas->result.pointer = get_pointer_shape(mas->gadget.box, false);
+--- a/frontends/vita/interact.c
++++ b/frontends/vita/interact.c
+@@ -137,6 +137,15 @@
+ 	  C_EDITING, NULL, 0, NULL },
+ 	{ "tap the submit button", A_TAP, NULL, 200, 225, 0, 0, 0,
+ 	  C_URL, "IN-target.html?via=form&q=hello+vita", 0, "IN-form-sent" },
++	/* patch 479: google.com's search field (IN-searchfield.html) -- a
++	 * one-row border-box textarea with transparent 12px borders; the
++	 * tap is on its bottom border (y 136-148 of 100-148) */
++	{ "open IN-searchfield", A_OPEN, T "IN-searchfield.html",
++	  0, 0, 0, 0, 0, C_URL, "IN-searchfield.html", 0, NULL },
++	{ "tap on a search field's border puts the caret in it", A_TAP, NULL,
++	  300, 143, 0, 0, 0, C_EDITING, NULL, 0, "IN-searchfield" },
++	{ "text goes into the search field", A_TYPE, "vita", 0, 0, 0, 0, 0,
++	  C_EDITING, NULL, 0, NULL },
+ 	{ "open IN-events", A_OPEN, T "IN-events.html", 0, 0, 0, 0, 0,
+ 	  C_URL, "IN-events.html", 0, NULL },
+ 	{ "tap a field that relayouts on focus", A_TAP, NULL, 300, 120, 0, 0,
