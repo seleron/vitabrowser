@@ -1,0 +1,82 @@
+# netsurf: a content user removed during a broadcast is freed later and skipped, on every build (patch 482)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 481)
+#
+# make.wordpress.org (wpblog) crashed on 3/3 census loads with 481 (0/3
+# with 480); ASan: heap-use-after-free in content_broadcast
+# (content.c, the user walk). While a JPEG content broadcast "done", one
+# user's callback (html_object_callback -> html_proceed_to_done ->
+# img_fire_cb -> img_release_stale -> hlcache_handle_release) removed
+# ANOTHER user of the same content, and the Vita build freed that
+# content_user at once -- only the __MACOS9__ build deferred it to the
+# death-row (fixes600) -- so the walk's captured `next` was freed memory.
+# Very likely the long-open "wpblog intermittent crash"; 481's real nested
+# dispatch changed the timing so it hit on most loads.
+#
+# content_remove_user now defers the free on every build and silences the
+# unlinked node (callback = NULL), so a walk that still holds it skips it
+# and a handle already released is never called back. content_add_user
+# initialises dr_queued (malloc'd; the deferred free reads it).
+#
+# Plain build, wpblog 3 loads each: 481 1/3 crashed, 482 0/3. Under ASan
+# the broadcast UAF is gone (a separate libcss custom-property env UAF in
+# local flex restyles remains -- its own unit).
+--- a/content/content.c
++++ b/content/content.c
+@@ -509,7 +509,8 @@
+ 	content_destroy_now(c);
+ }
+ 
+-#ifdef __MACOS9__
++/* VitaBrowser patch 482: on every build now, not only __MACOS9__ (see
++ * content_remove_user). */
+ /* fixes600 - teardown for a deferred content_user free. content_remove_user is
+  * reached from inside a content_broadcast callback (via
+  * hlcache_handle_release), so freeing the content_user node synchronously there
+@@ -523,7 +524,6 @@
+ {
+ 	free(p);
+ }
+-#endif
+ 
+ /* exported interface documented in content/content.h */
+ void content_destroy(struct content *c)
+@@ -990,6 +990,7 @@
+ 		return false;
+ 	user->callback = callback;
+ 	user->pw = pw;
++	user->dr_queued = 0;	/* patch 482: malloc'd; the deferred free reads it */
+ 	user->next = c->user_list->next;
+ 	c->user_list->next = user;
+ 
+@@ -1051,7 +1052,19 @@
+ 
+ 	next = user->next;
+ 	user->next = next->next;   /* unlink synchronously so the list is consistent */
+-#ifdef __MACOS9__
++	/* VitaBrowser patch 482: the Vita build freed the node here at once. A
++	 * user removed from inside a content_broadcast callback -- an image's
++	 * load callback releasing a sibling handle on the same content
++	 * (html_object_callback -> img_release_stale -> hlcache_handle_release)
++	 * -- is the walk's captured `next`, so the walk read freed memory
++	 * (ASan: heap-use-after-free at content_broadcast; make.wordpress.org
++	 * crashed 3/3 loads once patch 481's real nested dispatch changed the
++	 * timing, and intermittently before -- the long-open "wpblog
++	 * intermittent crash"). The free is deferred on every build now, and
++	 * the node is silenced: the walk skips a user with no callback, so a
++	 * handle already released is never called back. */
++	next->callback = NULL;
++	next->pw = NULL;
+ 	/* fixes600 - defer the free (see content_user_deathrow_teardown). Unlinked
+ 	 * above, so it is out of the list; the death-row frees it once no walk is on
+ 	 * the stack. dr_queued gates against a double-enqueue. */
+@@ -1059,9 +1072,6 @@
+ 		next->dr_queued = 1;
+ 		macos9_deathrow_add(next, content_user_deathrow_teardown, c);
+ 	}
+-#else
+-	free(next);
+-#endif
+ }
+ 
+ 

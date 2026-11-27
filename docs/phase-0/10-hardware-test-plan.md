@@ -17792,3 +17792,51 @@ No sudo.
     unit after 482.
 - **old.reddit's options:** still need lit to render (its `classMap()`
   template check fails in this engine).
+
+## Patch 482 (2026-11-27): a content user removed during a broadcast is freed later and skipped, on every build
+
+**Problem.** make.wordpress.org (wpblog) crashed on 3/3 census loads with
+481 and 0/3 with 480.
+- ASan (481 binary, the same load): **heap-use-after-free in
+  `content_broadcast`**, the user walk.
+- While a JPEG content broadcast "done", one user's callback
+  (`html_object_callback` -> `html_proceed_to_done` -> `img_fire_cb` ->
+  `img_release_stale` -> `hlcache_handle_release`) removed **another**
+  user of the same content.
+- `content_remove_user` freed that `content_user` at once on the Vita
+  build. Only the `__MACOS9__` build deferred it to the death-row
+  (fixes600). So the walk's captured `next` was freed memory.
+- This is very likely the long-open **"wpblog intermittent crash"**.
+  481's real nested dispatch changed the timing so it hit on most loads.
+
+**Fix** (`content/content.c`).
+- The free is deferred to the death-row on every build.
+- The unlinked node is silenced (`callback = NULL`), so a walk still
+  holding it skips it and a released handle is never called back.
+- `content_add_user` initialises `dr_queued` (the node is malloc'd, and
+  the deferred free reads it).
+
+**Measured** (wpblog, 3 plain-build loads each): **481 crashed 1/3, 482
+0/3.** Under ASan the broadcast UAF is gone and the page reaches Done
+(18.4 s).
+
+**Gate.**
+- **gate482 FAILED** on one check: JS-class-churn "class churn past the
+  cap is deferred, not dropped" reported 0 deferrals (1 or more
+  expected).
+  - The rows were still 0 (rendered right), and 1 change was answered
+    locally.
+  - The page alone deferred 1 in **5/5 runs on both 481 and 482**. Under
+    the gate's load the third class change fell outside the cap window:
+    timing, not 482.
+- **gate482b exit 0**: JS-class-churn 1 deferred, interaction 57/57 (both
+  paces).
+- `restage-full.sh`: **564 applied plus the 2 known collisions**.
+
+**Remaining on wpblog** (its own unit next): a second UAF hidden behind
+this one.
+- libcss `css__cp_env_find` reads a freed custom-property environment
+  during `html_rl_flex_restyle` -> `box_get_style`.
+- `box_construct` borrows `parent_box->custom_env` without a reference.
+
+No sudo.
