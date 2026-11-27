@@ -1,0 +1,164 @@
+# netsurf: JS run time by script, sampled (patch 491)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 490)
+#
+# P1 (load time): the per-script table (g_perf_slot, LIFE JSTOP lines)
+# times compile and TOP-LEVEL run only. On bbc that is ~0.4 s, while the CPU
+# profile puts JS at ~69% of a ~3 s load (~2 s): the rest runs later --
+# timers, event listeners, promise jobs, observer callbacks -- and was
+# attributed to nothing.
+#
+# macsurf_qjs.c: the interrupt handler (every 10000 bytecode ops) samples the
+# script of the running function: JS_GetScriptOrModuleName on any live realm
+# of the runtime (it reads the runtime's current frame), up to 3 levels past
+# native frames. Counts per short script name; no atom references are held
+# (a script's filename atom lives as long as its functions, so a value
+# compare buckets it). macsurf_qjs_audit.c: emitted with the JS profile --
+# "LIFE JSSAMP total=N other=M" and the top 10 as
+# "LIFE JSSAMP<rank> <script> n=<samples> pct=<share>" -- and reset per
+# navigation. tools/scorecard/profile.py (repository) reports them.
+#
+# bbc in the simulator: 2636 samples (~26M ops); 13ad5orspgznk.js 59%,
+# 0y-nyl-getpga.js 16%, echo-2.6.0-avi.min.js 5%, <vita_polyfill> 5% --
+# the top script is nowhere in the JSTOP (top-level) rows: its time is all
+# callbacks.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -663,6 +663,80 @@
+ long macsurf_qjs_ncalls = 0;		/* incremented by quickjs.c */
+ long g_qjs_interrupts = 0;  /* exported for audit */	/* x10000 = bytecode ops    */
+ 
++/* VitaBrowser patch 491: WHICH script the JS run time is spent in. The
++ * per-script table (g_perf_slot, JSTOP lines) times compile and top-level
++ * run only; on bbc that is ~0.4 s, while the CPU profile puts ~2 s in JS:
++ * the rest runs later -- timers, event listeners, promise jobs, observer
++ * callbacks -- and was attributed to nothing. Each interrupt (every 10000
++ * bytecode ops, the handler below) samples the script of the running
++ * function (JS_GetScriptOrModuleName on any live realm: it reads the
++ * runtime's current frame). Emitted as JSSAMP lines with the JS profile
++ * (macsurf_qjs_audit.c). */
++#define QJS_SAMP_SLOTS 48
++struct qjs_samp_slot { char name[40]; JSAtom atom; long n; };
++struct qjs_samp_slot g_js_samp[QJS_SAMP_SLOTS];	/* exported for audit */
++long g_js_samp_total = 0;			/* exported for audit */
++long g_js_samp_other = 0;			/* exported for audit */
++static void qjs_short_name(const char *name, char *out, int cap);
++static void qjs_js_sample(JSRuntime *rt)
++{
++	/* no atom references are held: a script's filename atom lives as
++	 * long as its functions, so a value compare is enough to bucket */
++	static JSAtom last_atom = JS_ATOM_NULL;
++	static int last_slot = -1;
++	struct qjs_realm_owner *o;
++	JSContext *ctx = NULL;
++	JSAtom a = JS_ATOM_NULL;
++	int lvl, i;
++
++	for (o = g_qjs_realm_owners; o != NULL; o = o->next)
++		if (o->ctx != NULL && JS_GetRuntime(o->ctx) == rt) {
++			ctx = o->ctx;
++			break;
++		}
++	if (ctx == NULL)
++		return;
++	for (lvl = 0; lvl < 4 && a == JS_ATOM_NULL; lvl++)
++		a = JS_GetScriptOrModuleName(ctx, lvl);
++	g_js_samp_total++;
++	if (a == JS_ATOM_NULL) {
++		g_js_samp_other++;
++		return;
++	}
++	if (a == last_atom && last_slot >= 0 && g_js_samp[last_slot].n > 0 &&
++	    g_js_samp[last_slot].atom == a) {
++		g_js_samp[last_slot].n++;
++		JS_FreeAtom(ctx, a);
++		return;
++	}
++	for (i = 0; i < QJS_SAMP_SLOTS; i++)
++		if (g_js_samp[i].n > 0 && g_js_samp[i].atom == a)
++			break;
++	if (i == QJS_SAMP_SLOTS) {
++		for (i = 0; i < QJS_SAMP_SLOTS; i++)
++			if (g_js_samp[i].n == 0)
++				break;
++		if (i == QJS_SAMP_SLOTS) {
++			g_js_samp_other++;	/* table full */
++			JS_FreeAtom(ctx, a);
++			return;
++		}
++		{
++			const char *nm = JS_AtomToCString(ctx, a);
++			qjs_short_name(nm != NULL ? nm : "?",
++					g_js_samp[i].name,
++					(int)sizeof(g_js_samp[i].name));
++			if (nm != NULL)
++				JS_FreeCString(ctx, nm);
++		}
++		g_js_samp[i].atom = a;
++	}
++	g_js_samp[i].n++;
++	last_atom = a;
++	last_slot = i;
++	JS_FreeAtom(ctx, a);
++}
++
+ static int qjs_interrupt_handler(JSRuntime *rt, void *opaque)
+ {
+ 	static double hb_last = 0.0;
+@@ -671,6 +745,7 @@
+ 	(void)rt; (void)opaque;
+ 
+ 	g_qjs_interrupts++;
++	qjs_js_sample(rt);	/* patch 491 */
+ 
+ 	/* fixes690: QuickJS fires this handler every JS_INTERRUPT_COUNTER_INIT
+ 	 * (=10000) bytecode ops. macsurf_qjs_get_now() (Microseconds/mftb) is
+--- a/content/handlers/javascript/quickjs/macsurf_qjs_audit.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs_audit.c
+@@ -851,6 +851,46 @@
+ 			s->run_us, s->evals);
+ 	}
+ 
++	/* VitaBrowser patch 491: where the JS RUN time went, by script --
++	 * sampled every 10000 bytecode ops (qjs_js_sample, macsurf_qjs.c),
++	 * so timers, listeners and promise jobs count too, not only the
++	 * top-level run the JSTOP rows time. pct of all samples; "other" is
++	 * native frames / a full table. */
++	{
++		/* same tag and layout as macsurf_qjs.c (JSAtom: uint32_t) */
++		extern struct qjs_samp_slot { char name[40]; uint32_t atom;
++				long n; } g_js_samp[48];
++		extern long g_js_samp_total, g_js_samp_other;
++		int k, r, best;
++		char done[48];
++
++		memset(done, 0, sizeof(done));
++		macsurf_debug_log_writef("LIFE JSSAMP total=%ld other=%ld "
++				"(x10000 bytecode ops)", g_js_samp_total,
++				g_js_samp_other);
++		for (r = 0; r < 10; r++) {
++			best = -1;
++			for (k = 0; k < 48; k++)
++				if (!done[k] && g_js_samp[k].n > 0 &&
++				    (best < 0 || g_js_samp[k].n > g_js_samp[best].n))
++					best = k;
++			if (best < 0)
++				break;
++			done[best] = 1;
++			macsurf_debug_log_writef("LIFE JSSAMP%d %s n=%ld pct=%ld",
++					r + 1, g_js_samp[best].name,
++					g_js_samp[best].n,
++					g_js_samp_total > 0 ?
++					g_js_samp[best].n * 100 / g_js_samp_total : 0);
++		}
++		for (k = 0; k < 48; k++) {
++			g_js_samp[k].n = 0;
++			g_js_samp[k].name[0] = '\0';
++		}
++		g_js_samp_total = 0;
++		g_js_samp_other = 0;
++	}
++
+ 	/* Zero for the next navigation, exactly as the PERFACC accumulators do
+ 	 * - every hardware log we pull covers two or more loads, and carrying
+ 	 * one page's bundles into the next page's table would misattribute the

@@ -18514,3 +18514,75 @@ after `nsoption_init` and before `netsurf_init` (which reads it).
 - `restage-full.sh`: **574 applied plus the 2 known collisions**.
 
 No sudo.
+
+## Patch 491 (2026-11-27): JS run time by script, sampled
+
+**Problem.**
+- The per-script table (`g_perf_slot`, `LIFE JSTOP`) times compile and
+  **top-level** run only. On bbc that is ~0.4 s (JSPHASE compile 343 ms,
+  run 63 ms).
+- The CPU profile (`profile.py --sprof`, 489) puts **JS at 68.9%** of
+  bbc's samples (malloc 20.4%, fetch/TLS 2.6%, style/box/layout ~1% each):
+  ~2 s.
+- The rest runs later (timers, event listeners, promise jobs, observer
+  callbacks) and was attributed to nothing.
+
+**Fix.**
+- **`macsurf_qjs.c`:** the interrupt handler (every 10000 bytecode ops)
+  samples the script of the running function.
+  - It uses `JS_GetScriptOrModuleName` on any live realm of the runtime
+    (from the realm-owner registry), up to 3 levels past native frames.
+  - Counts are kept per short script name. No atom references are held: a
+    script's filename atom lives as long as its functions, so a value
+    compare buckets it.
+- **`macsurf_qjs_audit.c`:** emitted with the JS profile and reset per
+  navigation: `LIFE JSSAMP total=N other=M`, then the top 10 as
+  `LIFE JSSAMP<rank> <script> n=<samples> pct=<share>`.
+- **`tools/scorecard/profile.py`:** reports them ("JS run time by
+  script").
+
+**First reading, bbc (sim):** 2636 samples (~26M ops).
+
+| script | share |
+|---|---|
+| `13ad5orspgznk.js` | **59%** |
+| `0y-nyl-getpga.js` | 16% |
+| `echo-2.6.0-avi.min.js` | 5% |
+| `<vita_polyfill>` | 5% |
+
+- The top script is **nowhere in the JSTOP (top-level) rows**: its time is
+  all in callbacks.
+- **`13ad5orspgznk.js` is a styled-components runtime chunk** (Turbopack,
+  30 KB): the stylis CSS compiler and an `insertRule` sheet manager.
+- **`insertRule` itself is cheap** (an injected timing wrapper, 490):
+  - 558 calls on bbc, 48.8 KB of rules over 1.4 s;
+  - **17.5 ms native in total** (0.03 ms average, 0.2 ms worst).
+  - bbc's JS cost is stylis compiling CSS-in-JS **in the interpreter**,
+    not the CSSOM.
+- QuickJS is already built `-O2` for the Vita (`build-quickjs.sh`), so
+  there is no cheap flag win.
+
+**Gate.**
+- **gate491 exit 0**: interaction 57/57 (both paces); 1483 JSSAMP lines
+  across the gate's pages (the sampler ran everywhere without a fault).
+- `restage-full.sh`: **575 applied plus the 2 known collisions**.
+
+### Next loop -- first items (2026-11-27 ~16:05Z)
+
+1. **ASan + 21-site census** for 488-491. None ran this loop; each unit
+   was gated only.
+2. **Device run with `VitaBrowser-ext.vpk`** (489/490): confirm `mem:
+   newlib heap 288 MiB` at boot; bbc / github load times and heap vs run
+   43 (bbc 125.7 s, github 286 s).
+3. **bbc's JS:** the styled-components / stylis work in the interpreter.
+   - Measure ops per stylis call: per-function sampling (the same handler
+     with the function name), to see whether it is a hot loop such as
+     char codes, slicing or regexps.
+   - Check whether any of it repeats per render.
+   - Then interpreter-level options (QuickJS string fast paths) vs
+     reducing the work.
+4. **malloc 20% of CPU:** newlib's allocator on the Vita vs glibc on the
+   host. Measure on the device, and consider a faster allocator.
+5. **Parked:** shadow drawing (`~/vitabrowser-work/wip-shadow-draw/v488/`;
+   with 488, old.reddit's login fields render and take the keyboard),
+   YouTube's delegated tap, media `load()`.

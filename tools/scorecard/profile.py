@@ -53,6 +53,9 @@ DONE_RE = re.compile(r"gw status: Done \((\d+(?:\.\d+)?)s\)")
 MEM_RE = re.compile(r"mem\[([^\]]+)\]: host heap in use (\d+) KiB")
 LAYOUT_RE = re.compile(r"LIFE reformat #\d+: layout (\d+) ms")
 BOXCASC_RE = re.compile(r"box\+cascade DONE us=(\d+)")
+# patch 491: JS run time by script, sampled every 10000 bytecode ops
+JSSAMP_RE = re.compile(r"LIFE JSSAMP(\d+) (\S+) n=(\d+) pct=(\d+)")
+JSSAMP_TOTAL_RE = re.compile(r"LIFE JSSAMP total=(\d+)")
 JSPHASE_RE = re.compile(r"LIFE JSPHASE .*compile=(\d+)us run=(\d+)us "
                         r"gc=(\d+)us")
 CREATED_RE = re.compile(r"llcache\.c:\d+ : Created object \S+ \((.*)\)$")
@@ -112,7 +115,7 @@ def read_logs(d):
          "js_run_ms": 0.0, "js_gc_ms": 0.0, "full_rebuilds": 0,
          "local_rebuild_ms": 0.0, "llc_created": 0, "llc_destroyed": 0,
          "llc_refetched": 0, "refetched_urls": [], "llc_size_peak": 0,
-         "llc_limit": None}
+         "llc_limit": None, "jssamp": [], "jssamp_total": 0}
     try:
         for line in open(os.path.join(data, "log.txt"), errors="replace"):
             m = DONE_RE.search(line)
@@ -147,6 +150,21 @@ def read_logs(d):
             m = BOXCASC_RE.search(line)
             if m:
                 r["boxcascade_ms"] += int(m.group(1)) / 1000.0
+                continue
+            m = JSSAMP_TOTAL_RE.search(line)
+            if m:      # the main page's table is the largest
+                if int(m.group(1)) >= r["jssamp_total"]:
+                    r["jssamp_total"] = int(m.group(1))
+                    r["jssamp_cur"] = []
+                else:
+                    r["jssamp_cur"] = None
+                continue
+            m = JSSAMP_RE.search(line)
+            if m:
+                if r.get("jssamp_cur") is not None:
+                    r["jssamp_cur"].append((m.group(2), int(m.group(3)),
+                                            int(m.group(4))))
+                    r["jssamp"] = list(r["jssamp_cur"])
                 continue
             m = JSPHASE_RE.search(line)
             if m:      # cumulative per page: keep the largest
@@ -303,6 +321,12 @@ def main():
         if loads and loads[0].get("cpu"):
             md += ["", "Top leaf functions (L1):", ""]
             md += ["- %s: %d" % (f, c) for f, c in loads[0]["cpu"]["top"]]
+    if loads and loads[0].get("jssamp"):
+        md += ["", "JS run time by script (L1, %d samples x 10000 ops; "
+               "timers, listeners and promise jobs included):" %
+               loads[0]["jssamp_total"], ""]
+        md += ["- %s: %d%% (%d)" % (n, pct, c)
+               for n, c, pct in loads[0]["jssamp"][:8]]
     md += ["", "Refetched URLs (L1): " + (", ".join(loads[0]["refetched_urls"])
                                         if loads and loads[0]["refetched_urls"]
                                         else "none")]
