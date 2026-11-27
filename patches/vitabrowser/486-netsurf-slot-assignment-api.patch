@@ -1,0 +1,234 @@
+# netsurf: <slot>.assignedNodes / assignedElements and assignedSlot (patch 486)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 485)
+#
+# A <slot> had no assignedNodes / assignedElements and nothing had an
+# assignedSlot (an interface-census stub answered null): lit's
+# @queryAssignedElements and the components that read their slotted
+# children threw "not a function" -- old.reddit.com's login components (15
+# such errors a load at 485, and the faceplate-enter listener threw 3
+# times).
+#
+# vita_polyfill.js: a host's light child is assigned to the first <slot> in
+# its shadow tree whose name is its slot attribute (text, and elements
+# without one, to the default slot). assignedNodes({flatten}) follows a slot
+# assigned to a slot and gives an empty slot's fallback; assignedElements
+# keeps the elements; assignedSlot (elements and text) replaces the stub
+# (closed roots answer null). A real <slot>'s chain here is the bridge's
+# class prototype, not HTMLSlotElement's: the methods go there and on
+# HTMLElement.prototype / HTMLSlotElement.prototype. Not here: slotchange.
+#
+# JS-slot-api.html: Chromium 8/8, 485 aborts, 486 8/8. old.reddit at 486:
+# "not a function" 15 -> 4, rejections 15 -> 8, listener throws 3 -> 0.
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -6484,6 +6484,103 @@
+ 	} catch (x) { /* */ }
+ })();
+ 
++/* ---- patch 486: slot assignment -- assignedNodes / assignedElements ----
++ * A <slot> had no assignedNodes / assignedElements and no node had an
++ * assignedSlot: lit's @queryAssignedElements (and the components that read
++ * their slotted children) threw "not a function" -- old.reddit.com's login
++ * components, 11 rejections a load. A light child of a shadow host is
++ * assigned to the first <slot> in the shadow tree whose name is its slot
++ * attribute (text, and elements without one, to the default slot). A real
++ * <slot>'s prototype chain here is the bridge's, not HTMLSlotElement's, so
++ * the methods go on every element prototype (a non-slot answers []).
++ * Not here: slotchange events. */
++(function () {
++	var d = g.document;
++	if (!d) return;
++	function tagOf(n) { return n && n.nodeType === 1 && n.tagName ? String(n.tagName).toUpperCase() : ''; }
++	function rootOf(n) {
++		for (var k = 0; n && n.parentNode && k < 4096; k++) n = n.parentNode;
++		return n;
++	}
++	function shadowOf(host) {
++		var st = PV(host);
++		if (st.__vbSR) return st.__vbSR;
++		if (st.__vbShadow) return st.__vbShadow;
++		try { return host.shadowRoot || null; } catch (x) { return null; }
++	}
++	function slotNameOf(c) {
++		if (c.nodeType === 3) return '';
++		if (c.nodeType !== 1) return null;
++		var v = c.getAttribute && c.getAttribute('slot');
++		return v == null ? '' : String(v);
++	}
++	/* the slot child c of host is assigned to, or null */
++	function slotFor(host, c) {
++		var sr = shadowOf(host), name = slotNameOf(c), l, i;
++		if (!sr || name === null) return null;
++		try { l = sr.querySelectorAll('slot'); } catch (x) { return null; }
++		for (i = 0; i < l.length; i++) {
++			var n = l[i].getAttribute('name');
++			if ((n == null ? '' : String(n)) === name) return l[i];
++		}
++		return null;
++	}
++	function assigned(slot, flatten) {
++		var root = rootOf(slot), host = root && root.nodeType === 11 ? root.host : null;
++		var out = [], i, c;
++		if (host) {
++			for (c = host.firstChild; c; c = c.nextSibling)
++				if (slotFor(host, c) === slot) out.push(c);
++		}
++		if (!flatten) return out;
++		if (!out.length && host) {
++			for (c = slot.firstChild; c; c = c.nextSibling) out.push(c);
++		}
++		var flat = [];
++		for (i = 0; i < out.length; i++) {
++			if (tagOf(out[i]) === 'SLOT') flat = flat.concat(assigned(out[i], true));
++			else flat.push(out[i]);
++		}
++		return flat;
++	}
++	function assignedNodes(o) {
++		if (tagOf(this) !== 'SLOT') return [];
++		return assigned(this, !!(o && o.flatten));
++	}
++	function assignedElements(o) {
++		return assignedNodes.call(this, o).filter(function (n) { return n.nodeType === 1; });
++	}
++	function assignedSlotGet() {
++		var p = this.parentNode;
++		if (!p || p.nodeType !== 1) return null;
++		var sr = shadowOf(p);
++		/* closed roots stay hidden, as in browsers */
++		if (!sr || sr.mode === 'closed') return null;
++		return slotFor(p, this);
++	}
++	/* the bridge's element class prototype (the one holding the listener
++	 * API, shared by every tag), HTMLElement.prototype (custom elements)
++	 * and HTMLSlotElement.prototype */
++	var targets = [];
++	try {
++		for (var p = Object.getPrototypeOf(d.createElement('slot')); p && p !== Object.prototype; p = Object.getPrototypeOf(p))
++			if (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) { targets.push(p); break; }
++	} catch (x) { /* */ }
++	if (g.HTMLElement) targets.push(g.HTMLElement.prototype);
++	if (g.HTMLSlotElement && g.HTMLSlotElement.prototype) targets.push(g.HTMLSlotElement.prototype);
++	targets.forEach(function (t) {
++		if (!Object.prototype.hasOwnProperty.call(t, 'assignedNodes')) define(t, 'assignedNodes', assignedNodes);
++		if (!Object.prototype.hasOwnProperty.call(t, 'assignedElements')) define(t, 'assignedElements', assignedElements);
++		/* replaces the interface census's stub (always null) */
++		try { Object.defineProperty(t, 'assignedSlot', { get: assignedSlotGet, configurable: true }); } catch (x) { /* */ }
++	});
++	try {
++		/* a text node: its own first prototype */
++		Object.defineProperty(Object.getPrototypeOf(d.createTextNode('')), 'assignedSlot',
++			{ get: assignedSlotGet, configurable: true });
++	} catch (x) { /* */ }
++})();
++
+ /* ---- patch 481: events into shadow trees --------------------------------
+  * Patch 242's shadow root is a document fragment the engine never draws,
+  * and the engine's event path is the light tree: a tap on a component's
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -6485,6 +6485,103 @@
+ "\t} catch (x) { /* */ }\n"
+ "})();\n"
+ "\n"
++"/* ---- patch 486: slot assignment -- assignedNodes / assignedElements ----\n"
++" * A <slot> had no assignedNodes / assignedElements and no node had an\n"
++" * assignedSlot: lit's @queryAssignedElements (and the components that read\n"
++" * their slotted children) threw \"not a function\" -- old.reddit.com's login\n"
++" * components, 11 rejections a load. A light child of a shadow host is\n"
++" * assigned to the first <slot> in the shadow tree whose name is its slot\n"
++" * attribute (text, and elements without one, to the default slot). A real\n"
++" * <slot>'s prototype chain here is the bridge's, not HTMLSlotElement's, so\n"
++" * the methods go on every element prototype (a non-slot answers []).\n"
++" * Not here: slotchange events. */\n"
++"(function () {\n"
++"\tvar d = g.document;\n"
++"\tif (!d) return;\n"
++"\tfunction tagOf(n) { return n && n.nodeType === 1 && n.tagName ? String(n.tagName).toUpperCase() : ''; }\n"
++"\tfunction rootOf(n) {\n"
++"\t\tfor (var k = 0; n && n.parentNode && k < 4096; k++) n = n.parentNode;\n"
++"\t\treturn n;\n"
++"\t}\n"
++"\tfunction shadowOf(host) {\n"
++"\t\tvar st = PV(host);\n"
++"\t\tif (st.__vbSR) return st.__vbSR;\n"
++"\t\tif (st.__vbShadow) return st.__vbShadow;\n"
++"\t\ttry { return host.shadowRoot || null; } catch (x) { return null; }\n"
++"\t}\n"
++"\tfunction slotNameOf(c) {\n"
++"\t\tif (c.nodeType === 3) return '';\n"
++"\t\tif (c.nodeType !== 1) return null;\n"
++"\t\tvar v = c.getAttribute && c.getAttribute('slot');\n"
++"\t\treturn v == null ? '' : String(v);\n"
++"\t}\n"
++"\t/* the slot child c of host is assigned to, or null */\n"
++"\tfunction slotFor(host, c) {\n"
++"\t\tvar sr = shadowOf(host), name = slotNameOf(c), l, i;\n"
++"\t\tif (!sr || name === null) return null;\n"
++"\t\ttry { l = sr.querySelectorAll('slot'); } catch (x) { return null; }\n"
++"\t\tfor (i = 0; i < l.length; i++) {\n"
++"\t\t\tvar n = l[i].getAttribute('name');\n"
++"\t\t\tif ((n == null ? '' : String(n)) === name) return l[i];\n"
++"\t\t}\n"
++"\t\treturn null;\n"
++"\t}\n"
++"\tfunction assigned(slot, flatten) {\n"
++"\t\tvar root = rootOf(slot), host = root && root.nodeType === 11 ? root.host : null;\n"
++"\t\tvar out = [], i, c;\n"
++"\t\tif (host) {\n"
++"\t\t\tfor (c = host.firstChild; c; c = c.nextSibling)\n"
++"\t\t\t\tif (slotFor(host, c) === slot) out.push(c);\n"
++"\t\t}\n"
++"\t\tif (!flatten) return out;\n"
++"\t\tif (!out.length && host) {\n"
++"\t\t\tfor (c = slot.firstChild; c; c = c.nextSibling) out.push(c);\n"
++"\t\t}\n"
++"\t\tvar flat = [];\n"
++"\t\tfor (i = 0; i < out.length; i++) {\n"
++"\t\t\tif (tagOf(out[i]) === 'SLOT') flat = flat.concat(assigned(out[i], true));\n"
++"\t\t\telse flat.push(out[i]);\n"
++"\t\t}\n"
++"\t\treturn flat;\n"
++"\t}\n"
++"\tfunction assignedNodes(o) {\n"
++"\t\tif (tagOf(this) !== 'SLOT') return [];\n"
++"\t\treturn assigned(this, !!(o && o.flatten));\n"
++"\t}\n"
++"\tfunction assignedElements(o) {\n"
++"\t\treturn assignedNodes.call(this, o).filter(function (n) { return n.nodeType === 1; });\n"
++"\t}\n"
++"\tfunction assignedSlotGet() {\n"
++"\t\tvar p = this.parentNode;\n"
++"\t\tif (!p || p.nodeType !== 1) return null;\n"
++"\t\tvar sr = shadowOf(p);\n"
++"\t\t/* closed roots stay hidden, as in browsers */\n"
++"\t\tif (!sr || sr.mode === 'closed') return null;\n"
++"\t\treturn slotFor(p, this);\n"
++"\t}\n"
++"\t/* the bridge's element class prototype (the one holding the listener\n"
++"\t * API, shared by every tag), HTMLElement.prototype (custom elements)\n"
++"\t * and HTMLSlotElement.prototype */\n"
++"\tvar targets = [];\n"
++"\ttry {\n"
++"\t\tfor (var p = Object.getPrototypeOf(d.createElement('slot')); p && p !== Object.prototype; p = Object.getPrototypeOf(p))\n"
++"\t\t\tif (Object.prototype.hasOwnProperty.call(p, 'addEventListener')) { targets.push(p); break; }\n"
++"\t} catch (x) { /* */ }\n"
++"\tif (g.HTMLElement) targets.push(g.HTMLElement.prototype);\n"
++"\tif (g.HTMLSlotElement && g.HTMLSlotElement.prototype) targets.push(g.HTMLSlotElement.prototype);\n"
++"\ttargets.forEach(function (t) {\n"
++"\t\tif (!Object.prototype.hasOwnProperty.call(t, 'assignedNodes')) define(t, 'assignedNodes', assignedNodes);\n"
++"\t\tif (!Object.prototype.hasOwnProperty.call(t, 'assignedElements')) define(t, 'assignedElements', assignedElements);\n"
++"\t\t/* replaces the interface census's stub (always null) */\n"
++"\t\ttry { Object.defineProperty(t, 'assignedSlot', { get: assignedSlotGet, configurable: true }); } catch (x) { /* */ }\n"
++"\t});\n"
++"\ttry {\n"
++"\t\t/* a text node: its own first prototype */\n"
++"\t\tObject.defineProperty(Object.getPrototypeOf(d.createTextNode('')), 'assignedSlot',\n"
++"\t\t\t{ get: assignedSlotGet, configurable: true });\n"
++"\t} catch (x) { /* */ }\n"
++"})();\n"
++"\n"
+ "/* ---- patch 481: events into shadow trees --------------------------------\n"
+ " * Patch 242's shadow root is a document fragment the engine never draws,\n"
+ " * and the engine's event path is the light tree: a tap on a component's\n"

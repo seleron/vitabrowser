@@ -18130,3 +18130,44 @@ No sudo.
   `assignedElements` / `assignedSlot`). The code and `JS-slot-api.html`
   are written, Chromium 8/8; the build waited for this census. Then shadow
   drawing (487, from the parked WIP), re-checked on old.reddit.
+
+## Patch 486 (2026-11-27): slot assignment -- assignedNodes / assignedElements / assignedSlot
+
+**Problem.**
+- A `<slot>` had no `assignedNodes` / `assignedElements`, and
+  `assignedSlot` was an interface-census stub that always answered null.
+- Lit's `@queryAssignedElements`, and the components that read their
+  slotted children, threw "not a function". On old.reddit.com at 485:
+  15 such errors a load, and the `faceplate-enter` listener threw 3 times.
+
+**Fix** (`vita_polyfill.js`).
+- A host's light child is assigned to the first `<slot>` in its shadow
+  tree whose name matches its `slot` attribute. Text, and elements
+  without the attribute, go to the default slot.
+- `assignedNodes({flatten})` follows a slot assigned to a slot and gives
+  an empty slot's fallback. `assignedElements` keeps the elements.
+- `assignedSlot` (on elements and text) replaces the stub; closed roots
+  answer null.
+- A real `<slot>`'s chain here is the bridge's class prototype, not
+  `HTMLSlotElement`'s. The methods go there and on `HTMLElement.prototype`
+  / `HTMLSlotElement.prototype`.
+- The first build was 7/8: `assignedSlot` was skipped where the stub
+  already owned the name. It now replaces the stub.
+- Not here: `slotchange` events.
+
+**Measured.**
+- `JS-slot-api.html` (SLOTAPI, 8 checks): named / default / elements-only
+  / fallback flatten / first-of-a-name / assignedSlot / nested flatten /
+  a slot outside a shadow tree.
+  - **Chromium 8/8, 485 "script not run", 486 8/8.**
+- **old.reddit.com login at 486:** "not a function" 15 -> **4**,
+  unhandled rejections 15 -> **8**, listener throws 3 -> **0**.
+  - `<auth-flow-link>`'s `<a>` content is still an empty lit marker;
+    tracing the 4 remaining errors is the prep for 487 (shadow drawing).
+
+**Gate.**
+- **gate486 exit 0**: SLOTAPI 8/8, SHADOWEV 9/9, ATTRNAME 7/7, interaction
+  57/57 (both paces).
+- `restage-full.sh`: **570 applied plus the 2 known collisions**.
+
+No sudo.
