@@ -18028,3 +18028,48 @@ No sudo.
     upgrade.
   - youtube search entry point.
   - The wpblog 464 'over' batch is the owner's decision.
+
+### Shadow DOM unit 2 (drawing) PARKED, not landed (2026-11-27): lit cannot render here yet
+
+**What was built.** Composed-tree box construction, saved as WIP in
+`~/vitabrowser-work/wip-shadow-draw/`:
+- shadow roots registered with the engine (`__vbShadowAttach`);
+- a host's children are its shadow root's, a `<slot>` draws its assigned
+  light children (else its fallback), unassigned light children are not
+  drawn;
+- both construction walks and both parent climbs in
+  `box_extract_properties` go through the composed tree;
+- marks inside shadow trees are remapped to the host;
+- `slot { display: contents }`.
+
+**Its tests.**
+- `JS-shadow-draw.html`: **8/8 in the sim and in Chromium**, with matching
+  geometry.
+- `IN-shadow-drawing.html`: a tap on a shadow `<input>` takes the caret
+  (484: no; WIP: keyboard opens).
+
+**Why it did not land: old.reddit.com's login page went BLANK.**
+- The page's UI is slotted through `<auth-flow-manager>` as
+  `<span slot="login">`.
+- In this engine that host's shadow root has two **unnamed** slots and no
+  `slot="login"`. Lit never rendered the named slot.
+- Drawn correctly, everything under the span is unassigned, so nothing is
+  drawn.
+- (A guard for roots with no `<slot>` at all, which fall back to light
+  DOM, does not cover this case; the root has slots.)
+
+**Root cause of lit's failures** (the `classMap()` error at 481).
+- **Attribute names containing `$` are dropped.** `three$lit$` /
+  `a2$lit$` vanish from a parsed `<template>` and from `innerHTML`, while
+  plain attributes keep their order.
+- Lit marks each bound attribute in its template as `name$lit$` and pairs
+  them with the names it parsed from the template source. With them gone,
+  the pairing breaks: classMap() lands on the wrong attribute, and
+  templates render without their bound parts (no named slots).
+- HTML allows `$` in attribute names; the engine applies the XML Name
+  rule.
+
+**Plan.**
+1. **Patch 485: attribute names with `$`** (lit renders), measured on
+   old.reddit.
+2. Then shadow drawing as **486** from the WIP, re-checked on old.reddit.
