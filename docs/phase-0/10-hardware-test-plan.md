@@ -18171,3 +18171,30 @@ No sudo.
 - `restage-full.sh`: **570 applied plus the 2 known collisions**.
 
 No sudo.
+
+### State log -- after patch 486 (2026-11-27)
+
+- **ASan 486** (`--libs --net`, autotest): **clean**. Interaction 57/57,
+  449 page dumps, 0 reports.
+- **21-site census, 485 vs 486: 12.0 vs 15.0 full rebuilds per load
+  (+3.0, past the ±2 band); no crash, timeout or missing load in 126.**
+  - **Read against the spread: likely noise overall.** The same 485
+    binary scored 15.7 in the 484-vs-485 census and 12.0 here, so 486's
+    15.0 sits inside 485's own observed range.
+  - The difference is mostly guard trips (4.3 -> 5.7, timing) and claude
+    (2.0 -> 3.3, timing-driven, as ruled at 484).
+  - **oldreddit 0 -> 0.7 is plausibly real.** 486 lets old.reddit's lit
+    components run further (fewer exceptions), which means more DOM
+    activity. That is expected behaviour, not a regression; re-read it in
+    the 487 census.
+- **487 prep done: the 4 remaining "not a function" are one cause.**
+  - All 4 are `this.helperText?.associateForm(e)` in
+    `<faceplate-text-input>`'s `connectedCallback` (one per field).
+  - `helperText` is a custom element inside the component's shadow root
+    that was **never upgraded**: the polyfill's upgrade observer watched
+    the document only. Shadow-tree elements also answered
+    `isConnected === false`.
+  - **Patch 487** (custom elements in shadow roots; `isConnected`
+    shadow-including): written and gate-wired, `JS-shadow-upgrade.html`
+    Chromium 7/7, built after this census.
+  - Shadow drawing moves to **488**.
