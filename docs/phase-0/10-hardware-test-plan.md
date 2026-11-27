@@ -18073,3 +18073,46 @@ No sudo.
 1. **Patch 485: attribute names with `$`** (lit renders), measured on
    old.reddit.
 2. Then shadow drawing as **486** from the WIP, re-checked on old.reddit.
+
+## Patch 485 (2026-11-27): attribute names follow HTML's rule, so lit templates bind
+
+**Problem.**
+- libdom's `_dom_element_set_attr` checked names against the XML Name
+  production, which rejects `$`. The HTML parser therefore dropped such
+  attributes silently.
+- Lit marks every bound attribute in its templates as `name$lit$` and
+  pairs them, in order, with the names it parsed from the template
+  source. With them gone the pairing broke: `classMap()` threw ("can only
+  be used in the class attribute...") and templates rendered without their
+  bound parts.
+
+**Fix.**
+- **libdom** (`485-libdom-attribute-names-html.patch`):
+  `_dom_validate_attr_name` is the DOM standard's valid attribute local
+  name: non-empty, no ASCII whitespace, NUL, `/`, `=` or `>`. Element
+  names and namespaced attributes keep the XML check.
+- **netsurf** (`485-netsurf-setattribute-name-check.patch`): the bridge's
+  `setAttribute` swallowed libdom's refusal. The polyfill now throws
+  `InvalidCharacterError` for the names the DOM refuses.
+
+**Measured.**
+- `JS-attr-names.html` (ATTRNAME, 7 checks): parsed `$` attribute kept in
+  order; template content; template `innerHTML`; `setAttribute('data$v')`;
+  invalid names throw; lit's `$lit$` scan in order; removal by name.
+  - **Chromium 7/7, 484 "script not run"** (the first check aborts the
+    script), **485 7/7**.
+- old.reddit.com login, sim: lit's **`classMap()` errors 4 -> 0**.
+  `<auth-flow-link>`'s shadow `<a>` now carries its bound `class` and
+  `href="https://www.reddit.com/login/"`.
+- Its content part is still an empty lit marker (no `<slot>`). The page
+  now fails on `HTMLSlotElement.prototype.assignedElements` /
+  `assignedNodes` (`TypeError: not a function`, 11 rejections plus the
+  `faceplate-enter` listener; lit's `@queryAssignedElements`). That is
+  patch 486.
+
+**Gate.**
+- **gate485 exit 0**: ATTRNAME 7/7, interaction 57/57 (both paces).
+- `restage-full.sh`: **569 applied plus the 2 known collisions**. The
+  restaged libdom files are identical to applytest.
+
+No sudo.

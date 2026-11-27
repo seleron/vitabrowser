@@ -1,0 +1,82 @@
+# libdom: attribute names follow HTML's rule, not XML Name's (patch 485)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 484)
+#
+# _dom_element_set_attr validated the name with the XML Name production,
+# which rejects '$' (and much else HTML allows), so the HTML parser's
+# dom_element_set_attribute dropped such attributes silently. lit marks
+# every bound attribute in its templates as `name$lit$` and pairs them, in
+# order, with the names it parsed from the template source: with them gone
+# the pairing broke -- classMap() threw ("can only be used in the class
+# attribute and must be the only part in the attribute") and templates
+# rendered without their bound parts (old.reddit.com's login components:
+# no attributes on <auth-flow-link>'s <a>, no named <slot>s).
+#
+# _dom_validate_attr_name (new) is the DOM standard's "valid attribute local
+# name": non-empty, no ASCII whitespace, NUL, '/', '=' or '>'. Element names
+# and namespaced attributes (set_attribute_ns) keep the XML check.
+--- a/src/utils/validate.c
++++ b/src/utils/validate.c
+@@ -97,6 +97,38 @@
+  * \param name  The name need to be tested
+  * \return true if ::name is valid, false otherwise.
+  */
++/* VitaBrowser patch 485: attribute names as HTML and the DOM standard take
++ * them (a "valid attribute local name"): any non-empty string without
++ * ASCII whitespace, NUL, '/', '=' or '>'. The XML Name production below
++ * rejected '$', so the HTML parser's dom_element_set_attribute dropped
++ * every such attribute -- lit marks each bound attribute in its templates
++ * as `name$lit$`, and with those gone its parts no longer lined up:
++ * classMap() threw ("can only be used in the class attribute") and
++ * templates rendered without their bound parts, named <slot>s among them
++ * (old.reddit.com's login components). */
++bool _dom_validate_attr_name(dom_string *name)
++{
++	const uint8_t *s;
++	size_t i, slen;
++
++	if (name == NULL)
++		return false;
++	slen = dom_string_byte_length(name);
++	if (slen == 0)
++		return false;
++	s = (const uint8_t *) dom_string_data(name);
++	for (i = 0; i < slen; i++) {
++		switch (s[i]) {
++		case 0x00: case 0x09: case 0x0a: case 0x0c: case 0x0d:
++		case 0x20: case '/': case '=': case '>':
++			return false;
++		default:
++			break;
++		}
++	}
++	return true;
++}
++
+ bool _dom_validate_name(dom_string *name)
+ {
+ 	uint32_t ch;
+--- a/src/utils/validate.h
++++ b/src/utils/validate.h
+@@ -19,6 +19,9 @@
+ #include <dom/core/string.h>
+ 
+ bool _dom_validate_name(dom_string *name);
++/* VitaBrowser patch 485: an HTML attribute name (DOM "valid attribute
++ * local name"): non-empty, no ASCII whitespace, NUL, '/', '=' or '>' */
++bool _dom_validate_attr_name(dom_string *name);
+ bool _dom_validate_ncname(dom_string *name);
+ 
+ #endif
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -1643,7 +1643,8 @@
+ 	dom_node_internal *e = (dom_node_internal *) element;
+ 	dom_exception err;
+ 
+-	if (_dom_validate_name(name) == false)
++	/* VitaBrowser patch 485: the HTML rule, not XML Name ('$' etc.) */
++	if (_dom_validate_attr_name(name) == false)
+ 		return DOM_INVALID_CHARACTER_ERR;
+ 
+ 	/* Ensure element can be written */
