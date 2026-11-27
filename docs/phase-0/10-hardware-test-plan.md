@@ -18003,3 +18003,28 @@ walk).
   sim was clean-built (struct layout changed).
 
 No sudo.
+
+### State log -- after patch 484 (2026-11-27)
+
+- **ASan 484** (`--libs --net`, autotest): **clean**. Interaction 57/57,
+  447 page dumps, 0 reports. The wpblog ASan replays (large quarantine)
+  were 3/3 clean.
+- **wpblog crash count, plain builds, 9 loads each: 483 5/9, 484 0/9.**
+  The census below also had 0 crashes on either arm.
+- **21-site census, 483 vs 484: 12.7 vs 14.3 full rebuilds per load
+  (+1.7, within ±2)**. Guard trips 4.3 -> 5.3 (timing); per site at most
+  +0.7.
+  - **No crash, timeout or missing load in any of the 126 loads.**
+- **Ruling on 483's +3.7 (482 vs 483: 13.3 -> 17.0): noise.**
+  - The same 483 binary scored **17.0** there and **12.7** here.
+  - claude.ai went 5.3 -> 2.7 on the unchanged binary, and "structural
+    change at the root" 2.3 -> 0.3.
+  - One binary moving 4.3 between runs is run-to-run spread (claude.ai's
+    timing-driven batches), not 483.
+- **Open:**
+  - Shadow DOM unit 2 (drawing, patch 485) next.
+  - old.reddit options still need lit (`classMap()` template check).
+  - Custom elements made by `innerHTML` inside shadow roots do not
+    upgrade.
+  - youtube search entry point.
+  - The wpblog 464 'over' batch is the owner's decision.
