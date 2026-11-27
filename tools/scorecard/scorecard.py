@@ -214,7 +214,8 @@ def sim_has_ready(sim):
     return _HAS_READY[sim]
 
 
-def run_sim(outdir, name, url, slot, settle, timeout, sim=None):
+def run_sim(outdir, name, url, slot, settle, timeout, sim=None,
+            env_extra=None):
     """Load one site in the simulator (sim: the nsvita-sim binary, default
     SIM) under outdir/sim/name and read its logs."""
     sim = sim or SIM
@@ -244,6 +245,8 @@ def run_sim(outdir, name, url, slot, settle, timeout, sim=None):
     env = dict(os.environ, VITA_SIM_SCRIPT=script, VITA_CSSGAP="1",
                VITA_SIM_OUT=os.path.join(d, "shots"),
                VITA_SIM_REMOTE_PORT=str(45300 + slot))
+    if env_extra:           # profile.py: LD_PRELOAD=sprof.so, SPROF_OUT
+        env.update(env_extra)
     t0 = time.time()
     with open(os.path.join(d, "out.log"), "w") as log:
         try:

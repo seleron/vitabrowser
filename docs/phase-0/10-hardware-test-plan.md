@@ -17171,3 +17171,85 @@ section runs it); interaction 52/52. No engine change. No sudo.
   full-conversion budget; the cost guard checks between marks only).
 - bbc and claude.ai/code first loads took 125.7 s and 446.3 s.
 - Open items 1-4 in doc 25.
+
+## Patch 476 (2026-11-27): P1 item 1 -- the load profile (host heap + tools/scorecard/profile.py)
+
+P1 of the run-43 device feedback: heavy pages take minutes on the Vita
+(bbc 125.7 s, github 286 s, heap arena near 90 MiB), small ones 2-3 s on
+the same Wi-Fi.
+
+**Instrumentation.**
+- **Patch 476** (`frontends/vita/diag.c`): the simulator's `mem[<tag>]`
+  line reports the host heap (`mallinfo2`: arena in use plus mmapped
+  blocks) instead of "n/a". It is a relative proxy only: 64-bit pointers
+  and glibc overheads make it larger than the device's arena. The device
+  line is unchanged.
+- **`tools/scorecard/profile.py`** runs one site to completion (a 60 s
+  settle) and reports per load:
+  - first Done;
+  - heap at Done and its peak;
+  - llcache: created, destroyed before exit, created again for the same
+    URL, size peak;
+  - engine phases: layout, box + cascade, JS compile / run / gc, full
+    rebuilds, local rebuild ms;
+  - with `--sprof`, CPU samples bucketed by phase.
+- `scorecard.run_sim` gained `env_extra`, to preload sprof.
+
+**Baseline: bbc, simulator, 476** (2 loads; the full table is in
+`docs/phase-0/profile-bbc-476-baseline.md`):
+
+| | L1 | L2 |
+|---|---|---|
+| first Done | 3.7 s | 3.3 s |
+| host heap at Done / peak | 128 / 135 MiB | 130 / 135 MiB |
+| llcache created / destroyed before exit / created again | 129 / 22 / 6 | 129 / 22 / 6 |
+| llcache size peak | 6.2 MB (limit 9 MiB) | 6.2 MB |
+| box + cascade | 1405 ms | 1076 ms |
+| JS compile / run / gc | 385 / 65 / 3 ms | 324 / 55 / 2 ms |
+| layout | 56 ms | 55 ms |
+
+CPU samples by phase (L1, 1055 samples):
+
+| phase | share |
+|---|---|
+| JS | 61% (79% with JS anywhere in the stack) |
+| malloc | 21% (mostly QuickJS's allocator) |
+| fetch / TLS | 11% |
+| everything else | under 2% each |
+
+**Findings.**
+1. **TLS re-parses the CA store on every connection** (11.2% of samples:
+   `mbedtls_x509_crt_parse` under `ssl_cf_connect`).
+   - curl 8.22's mbedTLS backend parses `CAINFO` (and `CAPATH`) into a
+     fresh chain for each connection, and each live connection holds its
+     own copy.
+   - On the device it is the 190 KB `ca-bundle.pem` of 122 certificates:
+     the Vita's libcurl has no default CA path. In the simulator the
+     host's `/etc/ssl/certs` is parsed too, so 11% overstates the
+     device's share.
+   - A bbc load reaches 17 distinct HTTPS hosts (static.files.bbci.co.uk
+     alone serves 59 objects). On a 444 MHz CPU that is likely seconds
+     per heavy page, and megabytes of heap across live connections.
+     Next candidate unit.
+2. **Item 2's premise (document CSS evicted mid-load) does not hold in
+   either log.**
+   - llcache destroys only objects with no users, and a live page's
+     sheets hold users.
+   - The device's 942 / 909 / 901 are user add / remove / destroy events
+     (normal per-fetch churn), not evictions.
+   - **Device, launch 2:** the 26 CSS destroys are all built-in sheets
+     (`x-ns-css`, `resource:`, `app0:/res/`), released with their page.
+   - **Simulator, bbc:** 0 mid-load destroys and 0 same-page
+     re-creations, so there is nothing for item 2 to change on bbc.
+   - **What does repeat** is youtube's Google logo SVG and youtube icon,
+     created 5-7 times per load while a copy is live (45 over 3 loads; 6
+     times on the device's sign-in page), and github's avatars (9). These
+     are **llcache snapshots**: the request finds the object fresh, then
+     takes a copy of its data for a content type that cannot share one
+     object. Memory and a decode each, no network.
+   - guardian: 151 mid-load destroys of uncacheable responses.
+3. **Engine log coverage:** the device's netlog mirror stops at 4 MiB
+   (launch 1 lost its browsing). Open.
+
+**gate476 exit 0**; interaction 52/52. `restage-full.sh`: **558 applied
+plus the 2 known collisions**. No sudo.
