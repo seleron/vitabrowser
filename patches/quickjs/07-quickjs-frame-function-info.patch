@@ -1,0 +1,67 @@
+# quickjs: JS_GetFrameFunctionInfo -- which function is running, for a sampler
+#
+# VitaBrowser patch 492: the bridge's interrupt handler samples which script
+# the JS run time is spent in (patch 491, JS_GetScriptOrModuleName); on
+# bbc.com one styled-components chunk takes 59% of it, and the next question
+# is which FUNCTION in it. The function's name, script and definition line /
+# column live in its bytecode, which the public API does not expose.
+# JS_GetFrameFunctionInfo(rt, level, ...) copies them for the frame
+# `level` up the stack (JS_AtomGetStrRT, no references taken, no context
+# needed -- the interrupt handler has only the runtime). Read only.
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1298,6 +1298,14 @@
+ 
+ /* only exported for os.Worker() */
+ JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
++/* VitaBrowser: the function running n_stack_levels frames up -- its name,
++ * its script and where it is defined -- for a sampling profiler (read only,
++ * no references taken; safe from an interrupt handler). Returns 0, or -1
++ * when that frame is not a bytecode function. */
++JS_EXTERN int JS_GetFrameFunctionInfo(JSRuntime *rt, int n_stack_levels,
++                                      char *name, int name_size,
++                                      char *file, int file_size,
++                                      int *line, int *col);
+ /* only exported for os.Worker() */
+ JS_EXTERN JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+                                 const char *filename);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31061,6 +31061,35 @@
+ 
+ /* return JS_ATOM_NULL if the name cannot be found. Only works with
+    not striped bytecode functions. */
++int JS_GetFrameFunctionInfo(JSRuntime *rt, int n_stack_levels,
++                            char *name, int name_size,
++                            char *file, int file_size,
++                            int *line, int *col)
++{
++    JSStackFrame *sf;
++    JSFunctionBytecode *b;
++    JSObject *p;
++
++    sf = rt->current_stack_frame;
++    while (sf && n_stack_levels-- > 0)
++        sf = sf->prev_frame;
++    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!js_class_has_bytecode(p->class_id))
++        return -1;
++    b = p->u.func.function_bytecode;
++    if (name && name_size > 0)
++        JS_AtomGetStrRT(rt, name, name_size, b->func_name);
++    if (file && file_size > 0)
++        JS_AtomGetStrRT(rt, file, file_size, b->filename);
++    if (line)
++        *line = b->line_num;
++    if (col)
++        *col = b->col_num;
++    return 0;
++}
++
+ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
+ {
+     JSStackFrame *sf;

@@ -18586,3 +18586,37 @@ No sudo.
 5. **Parked:** shadow drawing (`~/vitabrowser-work/wip-shadow-draw/v488/`;
    with 488, old.reddit's login fields render and take the keyboard),
    YouTube's delegated tap, media `load()`.
+
+## Patch 492 (2026-11-27): JS run time by function, sampled (+ QuickJS 07)
+
+**What.** Patch 491 ranks scripts (on bbc one styled-components chunk is
+59% of the JS run time). This ranks **functions**.
+- `patches/quickjs/07-quickjs-frame-function-info.patch` adds
+  `JS_GetFrameFunctionInfo(rt, level, ...)`: the running function's name,
+  script and definition line:column, copied with `JS_AtomGetStrRT` (no
+  references, no context: the interrupt handler only has the runtime).
+- The bridge's interrupt handler (every 10000 bytecode ops) records it,
+  up to 3 frames past native ones, in a 64-slot space-saving top-K table.
+- Emitted with the JS profile as `LIFE JSFUNC<rank> <script>
+  <function>@<line>:<col> n= pct=`, reset per navigation.
+
+**bbc (sim) -- the hot path is styled-components:**
+
+| function | share of bbc's JS |
+|---|---|
+| `tt@1:21589`: `flatten()`, recursive, `Array.prototype.concat.apply` + `map` | **23%** |
+| anonymous `@1:9564`: its djb2 hash, `e = 33*e ^ t.charCodeAt(--r)` per character of the CSS text | **17%** |
+| `te@1:21148`: style object to CSS array | 4% |
+
+**Gate.**
+- **gate492 exit 0**: interaction 57/57 (both paces); 6192 JSFUNC lines
+  across the gate's pages.
+- `restage-full.sh`: **576 applied plus the 2 known collisions**.
+- `tools/fetch-quickjs.sh` re-imported QuickJS with 07 (host library
+  rebuilt).
+
+**ASan at 491** (covers 488-491; `--libs --net`): **clean**, interaction
+57/57, 451 page dumps, 0 reports. ("gate 0" in its summary: gate492 was
+clearing the shared reference directory at the time.)
+
+No sudo.

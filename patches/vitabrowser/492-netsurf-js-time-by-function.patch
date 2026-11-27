@@ -1,0 +1,129 @@
+# netsurf: JS run time by function, sampled (patch 492)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 491)
+#
+# Patch 491 ranks scripts: on bbc.com one styled-components chunk is 59% of
+# the JS run time. This ranks FUNCTIONS: each interrupt (every 10000
+# bytecode ops) also records the running function's name and definition
+# line:column (JS_GetFrameFunctionInfo, patches/quickjs/07), up to 3 frames
+# past native ones, in a 64-slot space-saving top-K table; emitted with the
+# JS profile as "LIFE JSFUNC<rank> <script> <function>@<line>:<col> n= pct="
+# and reset per navigation.
+#
+# bbc (sim): tt@1:21589 23% -- styled-components' flatten() (recursive,
+# Array.prototype.concat.apply + map); anonymous@1:9564 17% -- its djb2
+# string hash, e = 33*e ^ t.charCodeAt(--r) per character of the CSS text;
+# te@1:21148 4% -- style object to CSS array. Next: a charCodeAt fast path
+# in the interpreter, and flatten's allocation-heavy array building.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -678,6 +678,62 @@
+ long g_js_samp_total = 0;			/* exported for audit */
+ long g_js_samp_other = 0;			/* exported for audit */
+ static void qjs_short_name(const char *name, char *out, int cap);
++
++/* VitaBrowser patch 492: and WHICH FUNCTION -- the running function's name
++ * and definition line:column (JS_GetFrameFunctionInfo, patches/quickjs/07),
++ * so a hot script such as bbc's styled-components chunk (59% of its JS)
++ * resolves to the function to look at. Emitted as JSFUNC lines. */
++#define QJS_FSAMP_SLOTS 64
++struct qjs_fsamp_slot { char key[96]; long n; };
++struct qjs_fsamp_slot g_js_fsamp[QJS_FSAMP_SLOTS];	/* exported for audit */
++long g_js_fsamp_total = 0;				/* exported for audit */
++static void qjs_js_fsample(JSRuntime *rt)
++{
++	char fn[40], file[256], sn[40], key[96];
++	int line = 0, col = 0, lvl, i, empty = -1;
++
++	for (lvl = 0; lvl < 4; lvl++)
++		if (JS_GetFrameFunctionInfo(rt, lvl, fn, (int)sizeof(fn),
++				file, (int)sizeof(file), &line, &col) == 0)
++			break;
++	if (lvl == 4)
++		return;
++	g_js_fsamp_total++;
++	qjs_short_name(file, sn, (int)sizeof(sn));
++	snprintf(key, sizeof(key), "%s %s@%d:%d", sn,
++			fn[0] != '\0' ? fn : "(anon)", line, col);
++	for (i = 0; i < QJS_FSAMP_SLOTS; i++) {
++		if (g_js_fsamp[i].n == 0) {
++			if (empty < 0)
++				empty = i;
++			continue;
++		}
++		if (strcmp(g_js_fsamp[i].key, key) == 0) {
++			g_js_fsamp[i].n++;
++			return;
++		}
++	}
++	if (empty >= 0) {
++		snprintf(g_js_fsamp[empty].key, sizeof(g_js_fsamp[empty].key),
++				"%s", key);
++		g_js_fsamp[empty].n = 1;
++		return;
++	}
++	/* full: space-saving top-K -- the new function takes the smallest
++	 * slot with its count + 1, so a hot function first seen late still
++	 * surfaces (counts are then upper bounds, off by at most the
++	 * smallest count) */
++	{
++		int m = 0;
++		for (i = 1; i < QJS_FSAMP_SLOTS; i++)
++			if (g_js_fsamp[i].n < g_js_fsamp[m].n)
++				m = i;
++		snprintf(g_js_fsamp[m].key, sizeof(g_js_fsamp[m].key), "%s",
++				key);
++		g_js_fsamp[m].n++;
++	}
++}
++
+ static void qjs_js_sample(JSRuntime *rt)
+ {
+ 	/* no atom references are held: a script's filename atom lives as
+@@ -746,6 +802,7 @@
+ 
+ 	g_qjs_interrupts++;
+ 	qjs_js_sample(rt);	/* patch 491 */
++	qjs_js_fsample(rt);	/* patch 492 */
+ 
+ 	/* fixes690: QuickJS fires this handler every JS_INTERRUPT_COUNTER_INIT
+ 	 * (=10000) bytecode ops. macsurf_qjs_get_now() (Microseconds/mftb) is
+--- a/content/handlers/javascript/quickjs/macsurf_qjs_audit.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs_audit.c
+@@ -890,6 +890,36 @@
+ 		g_js_samp_total = 0;
+ 		g_js_samp_other = 0;
+ 	}
++	/* VitaBrowser patch 492: and by function (script name@line:col) */
++	{
++		extern struct qjs_fsamp_slot { char key[96]; long n; }
++				g_js_fsamp[64];
++		extern long g_js_fsamp_total;
++		int k, r, best;
++		char done[64];
++
++		memset(done, 0, sizeof(done));
++		for (r = 0; r < 12; r++) {
++			best = -1;
++			for (k = 0; k < 64; k++)
++				if (!done[k] && g_js_fsamp[k].n > 0 &&
++				    (best < 0 || g_js_fsamp[k].n > g_js_fsamp[best].n))
++					best = k;
++			if (best < 0)
++				break;
++			done[best] = 1;
++			macsurf_debug_log_writef("LIFE JSFUNC%d %s n=%ld pct=%ld",
++					r + 1, g_js_fsamp[best].key,
++					g_js_fsamp[best].n,
++					g_js_fsamp_total > 0 ?
++					g_js_fsamp[best].n * 100 / g_js_fsamp_total : 0);
++		}
++		for (k = 0; k < 64; k++) {
++			g_js_fsamp[k].n = 0;
++			g_js_fsamp[k].key[0] = '\0';
++		}
++		g_js_fsamp_total = 0;
++	}
+ 
+ 	/* Zero for the next navigation, exactly as the PERFACC accumulators do
+ 	 * - every hardware log we pull covers two or more loads, and carrying
