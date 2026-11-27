@@ -17638,3 +17638,35 @@ No sudo.
 4. Shadow styles.
 
 No sudo.
+
+### State log -- after patch 480 (2026-11-27)
+
+- **Patch 480 LANDED 20092f1** (gate480 exit 0: CUSTOMEL 9/9, SHADOW
+  7/7, FORMSHADOW 6/6, FSHADOW2 10/10, interaction 55/55).
+  - A defined custom element's own listeners are now called, which
+    affects every web-component site.
+- **ASan and census for 480 not run separately.** The ASan 481 autotest
+  and the 21-site census 480 vs 481 cover it. 480 is a JS-only change in
+  the polyfill.
+- **old.reddit.com login options: still inert.**
+  - Taps now reach the custom elements (`<auth-flow-link>` and its
+    ancestors hear the click).
+  - But events never **enter** the shadow tree, where the reacting link
+    (the `<a>` in `<auth-flow-link>`'s shadow root) lives. A listener
+    on that `<a>` heard nothing in the sim at 480.
+  - The only fetch after the taps was google.com's reCAPTCHA anchor
+    frame, loaded on its own timer, not by the tap.
+- **Shadow trees are not drawn at all** (patch 242's design). Reddit's
+  username/password fields are missing; only their light-DOM labels
+  show.
+- **"Warning: button can not be activated"** is cosmetic.
+  - It is the status text `interaction.c:1468` (GADGET_BUTTON) shows
+    over any script-driven `<button type=button>`, under the stick
+    pointer.
+  - It does not block the tap or its click event.
+- **Next:**
+  - Shadow DOM unit 1 (patch 481): events into shadow trees, so the tap
+    reaches the component's inner link and handlers.
+  - Units 2-4 (drawing, form fields, styles) are planned after 481 is
+    measured.
+  - youtube's search entry point (a separate cause).
