@@ -18310,3 +18310,40 @@ not because of drawing.**
   parser difference).
 
 Compare its template's parsed tree with Chromium's. Then land 488.
+
+### YouTube search box -- findings for the next loop (2026-11-27 ~15:00Z; no patch)
+
+At 487, a tap on m.youtube.com's search entry point (the "Search YouTube"
+pill, `DIV.search-bar-entry-point-button.search-bar` in
+`ytm-search-bar-entry-point-view-model`) delivers pointerdown, mousedown
+and click to that DIV (mousedown now fires; at 478 it did not). **No search
+input appears** and focus goes to BODY.
+
+**Ruled out / found.**
+- **No listener is registered on the entry-point elements themselves.** An
+  injected `addEventListener` wrapper logged listeners only on the real
+  search box's internals (`YT-SEARCHBOX` focusout, input paste, file-input
+  cancel, suggestions touchmove).
+  - So the tap must be handled by **delegation** (document / app root),
+    most likely YouTube's own tap gesture built from pointer/mouse down+up
+    (Polymer-style), dispatching on an ancestor.
+- **A capturing window `click` listener throws** `TypeError: not a
+  function` at `player base.js:4082:126`: the video preloader
+  (`g.tj("VIDEO")` then `b.load()`). **`HTMLMediaElement.load()` is
+  missing.**
+  - It does **not** block other listeners: the bridge's window
+    `dispatchEvent` catches per listener.
+  - It is still a real gap (also `play()` / `pause()` likely).
+
+**Next.**
+1. Log the document/window listeners for pointer*/mouse*/touch*/click and
+   which ones run on the tap. Find YouTube's delegated tap recogniser and
+   what it needs (event fields such as `pointerId`, `isPrimary`,
+   `button`, `detail`, timestamps; or touch events).
+2. Add `load()` / `play()` / `pause()` to media elements (a stub play()
+   returning a rejected promise is how browsers answer autoplay-blocked
+   media).
+
+Tools used: `VITA_SIM_INJECT=<js>` for listener wrappers (scratch
+`ytinj*.js`). The engine truncates logged stacks: wrap the listener in an
+inject to get the full frame.
