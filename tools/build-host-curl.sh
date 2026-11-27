@@ -22,7 +22,10 @@ MBED_SHA=4a11f1777bb95bf4ad96721cac945a26e04bf19f57d905f241fe77ebeddf46d8
 CURL=8.22.0
 CURL_SHA=f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
 
+# .ca-path-none: built with no default CA path, as the Vita's (patch 477);
+# a build without the marker is rebuilt once
 if [ -f "$PREFIX/lib/libcurl.a" ] && [ -f "$PREFIX/lib/libmbedtls.a" ] && \
+   [ -f "$PREFIX/.ca-path-none" ] && \
    grep -q "\"$CURL\"" "$PREFIX/include/curl/curlver.h" 2>/dev/null; then
 	echo "== host curl $CURL + mbedTLS $MBED: installed in $PREFIX =="
 	exit 0
@@ -61,6 +64,10 @@ rm -rf "$SRC/curl-$CURL"
 tar -xJf "$SRC/curl-$CURL.tar.xz" -C "$SRC"
 # vitaSDK's options, less the Vita-only ones (toolchain, fcntl, pipe2, the
 # vs0: default CA path): no IPv6, no threaded resolver, no libpsl, no zstd.
+# No default CA path either, as on the Vita (whose libcurl has a default
+# bundle, vs0:data/external/cert/CA_LIST.cer, and no path): cmake's
+# autodetected /etc/ssl/certs made every simulator TLS connection parse the
+# host's whole certificate directory, which the device never does (477).
 ( cd "$SRC/curl-$CURL" && mkdir build && cd build && \
   cmake .. -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$PREFIX" -DMBEDTLS_INCLUDE_DIR="$PREFIX/include" \
@@ -69,7 +76,8 @@ tar -xJf "$SRC/curl-$CURL.tar.xz" -C "$SRC"
     -DCURL_ZSTD=OFF -DCURL_BROTLI=OFF -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF \
     -DCURL_USE_LIBSSH2=OFF -DCURL_USE_GSSAPI=OFF -DCURL_DISABLE_LDAP=ON \
     -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF -DENABLE_CURL_MANUAL=OFF \
-    -DCURL_USE_MBEDTLS=ON -DCURL_USE_OPENSSL=OFF \
+    -DCURL_USE_MBEDTLS=ON -DCURL_USE_OPENSSL=OFF -DCURL_CA_PATH=none \
     -DCMAKE_DISABLE_FIND_PACKAGE_Threads=ON && \
   make -j4 && make install ) >> "$LOG" 2>&1 || { echo "  FAILED (see $LOG)"; exit 1; }
+touch "$PREFIX/.ca-path-none"
 echo "  ok"

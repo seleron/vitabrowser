@@ -1,0 +1,130 @@
+# netsurf: the CA store parsed once and shared by every TLS connection (patch 477)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 476)
+#
+# P1 (heavy pages slow, the heap near full on the Vita): 476's profile of
+# bbc showed TLS re-parsing the CA store on every connection. curl 8.22's
+# mbedTLS backend parses CURLOPT_CAINFO into a fresh chain per connection,
+# and each live connection holds its own parsed copy of all 122
+# certificates (ca-bundle.pem, 190 KB). The store is now parsed once at
+# fetcher init (fetch_curl_ca) and fetch_curl_mbedtls_sslctxfun points
+# every connection's config at it (mbedtls_ssl_conf_ca_chain, after curl's
+# own setup), so verification sees exactly the bundle as before.
+#
+# curl is handed the store's first certificate as CURLOPT_CAINFO_BLOB
+# instead of the file: a blob overrides the CA file in curl's mbedTLS
+# backend, so one certificate is parsed per connection. Unsetting the file
+# would not do: curl then re-applies its compiled-in default (the Vita's
+# libcurl: vs0:data/external/cert/CA_LIST.cer, a different store), parsed
+# per connection again. On any failure (the parse, the blob) curl keeps
+# its CA file and parses it per connection, as before. Freed after
+# curl_global_cleanup.
+#
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -307,6 +307,22 @@
+  * lock callbacks. */
+ static CURLSH *fetch_curl_share;
+ 
++#ifdef WITH_MBEDTLS
++/** VitaBrowser patch 477: the CA store, parsed once. curl's mbedTLS
++ * backend parses CURLOPT_CAINFO (and CAPATH) into a fresh chain for every
++ * connection, and every live connection holds its own copy -- 11% of a
++ * bbc load's CPU in the simulator (122 certificates base64-decoded and
++ * parsed per TLS handshake, 17 hosts on bbc), and the parsed copies are
++ * heap. Parsed here once; fetch_curl_mbedtls_sslctxfun points each
++ * connection's config at it. curl is handed one certificate as a CA blob
++ * instead of the file: a blob overrides the CA file in curl's mbedTLS
++ * backend, and an unset file would not do -- curl then re-applies its
++ * compiled-in default (the Vita's libcurl: vs0:data/external/cert/
++ * CA_LIST.cer, a different store), parsed per connection again. */
++static mbedtls_x509_crt fetch_curl_ca;
++static bool fetch_curl_ca_shared = false;
++#endif
++
+ /** Attach e to fetch_curl_share (duphandle does not copy CURLOPT_SHARE). */
+ static void fetch_curl_use_share(CURL *e)
+ {
+@@ -388,6 +404,14 @@
+ 			fetch_curl_share = NULL;
+ 
+ 		curl_global_cleanup();
++#ifdef WITH_MBEDTLS
++		/* patch 477: after curl's cleanup, when no connection can use
++		 * it any more */
++		if (fetch_curl_ca_shared) {
++			mbedtls_x509_crt_free(&fetch_curl_ca);
++			fetch_curl_ca_shared = false;
++		}
++#endif
+ 
+ 		NSLOG(netsurf, DEBUG, "Cleaning up SSL cert chain hashmap");
+ 		hashmap_destroy(curl_fetch_ssl_hashmap);
+@@ -1058,6 +1082,10 @@
+ 		f->mbed_vrfy_p = c->p_vrfy;
+ 	}
+ 	mbedtls_ssl_conf_verify(c, fetch_curl_mbedtls_verify, f);
++	/* patch 477: the one shared CA chain (curl parsed none: it was
++	 * given no CA file) */
++	if (fetch_curl_ca_shared)
++		mbedtls_ssl_conf_ca_chain(c, &fetch_curl_ca, NULL);
+ 	return CURLE_OK;
+ }
+ #endif /* WITH_MBEDTLS */
+@@ -2466,6 +2494,56 @@
+ 		      (vi && vi->ssl_version) ? vi->ssl_version : "?",
+ 		      curl_with_mbedtls ? "recorded (mbedTLS)" : "not recorded");
+ 	}
++	/* patch 477: the CA store parsed once (see fetch_curl_ca). On
++	 * failure curl keeps its CA file and parses it per connection, as
++	 * before. Clearing CAPATH also drops a host build's compiled-in
++	 * default (the simulator's /etc/ssl/certs): the simulator then
++	 * trusts exactly the device's bundle. */
++	if (curl_with_mbedtls && nsoption_charp(ca_bundle) &&
++	    strcmp(nsoption_charp(ca_bundle), "") != 0) {
++		int ret, n = 0;
++		const mbedtls_x509_crt *crt;
++
++		mbedtls_x509_crt_init(&fetch_curl_ca);
++		ret = mbedtls_x509_crt_parse_file(&fetch_curl_ca,
++				nsoption_charp(ca_bundle));
++		if (ret >= 0 && nsoption_charp(ca_path) &&
++		    strcmp(nsoption_charp(ca_path), "") != 0)
++			ret = mbedtls_x509_crt_parse_path(&fetch_curl_ca,
++					nsoption_charp(ca_path));
++		for (crt = &fetch_curl_ca; crt != NULL && crt->raw.len != 0;
++		     crt = crt->next)
++			n++;
++		if (ret >= 0 && n > 0) {
++			struct curl_blob one;
++
++			/* the first certificate, DER: curl parses it per
++			 * connection (one, not the store), and the hook then
++			 * replaces the chain with the whole shared store */
++			one.data = fetch_curl_ca.raw.p;
++			one.len = fetch_curl_ca.raw.len;
++			one.flags = CURL_BLOB_COPY;
++			code = curl_easy_setopt(fetch_blank_curl,
++					CURLOPT_CAINFO_BLOB, &one);
++			if (code == CURLE_OK) {
++				fetch_curl_ca_shared = true;
++				NSLOG(netsurf, INFO, "CA store: %d certificates "
++				      "parsed once (%d skipped), shared by every "
++				      "connection", n, ret);
++			} else {
++				mbedtls_x509_crt_free(&fetch_curl_ca);
++				NSLOG(netsurf, INFO, "CA store: CAINFO_BLOB "
++				      "refused (%d), curl parses %s per "
++				      "connection", (int)code,
++				      nsoption_charp(ca_bundle));
++			}
++		} else {
++			mbedtls_x509_crt_free(&fetch_curl_ca);
++			NSLOG(netsurf, INFO, "CA store: parse failed (%d), "
++			      "curl parses %s per connection", ret,
++			      nsoption_charp(ca_bundle));
++		}
++	}
+ #endif
+ 
+ 	/* cURL initialised okay, register the fetchers */

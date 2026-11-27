@@ -17253,3 +17253,66 @@ CPU samples by phase (L1, 1055 samples):
 
 **gate476 exit 0**; interaction 52/52. `restage-full.sh`: **558 applied
 plus the 2 known collisions**. No sudo.
+
+## Patch 477 (2026-11-27): the CA store parsed once and shared by every TLS connection
+
+**Problem** (476's profile of bbc).
+- curl 8.22's mbedTLS backend parses `CURLOPT_CAINFO` into a fresh chain
+  for every connection, and each live connection holds its own parsed
+  copy of all 122 certificates (`ca-bundle.pem`, 190 KB).
+- A bbc load reaches 17 HTTPS hosts.
+
+**Fix** (`content/fetchers/curl.c`).
+- The store is parsed once at fetcher init (`fetch_curl_ca`).
+  `fetch_curl_mbedtls_sslctxfun` points every connection's config at it
+  with `mbedtls_ssl_conf_ca_chain`, after curl's own setup, so
+  verification checks exactly the bundle as before.
+- **curl is handed the store's first certificate as
+  `CURLOPT_CAINFO_BLOB`**: a blob overrides the CA file in curl's mbedTLS
+  backend, so only that one certificate is parsed per connection.
+- An **unset** file would not do: curl then re-applies its compiled-in
+  default. That was found the first time round, when bbc's CA parse
+  stayed at 11%.
+  - In the simulator the default was the host's `/etc/ssl/certs`.
+  - On the Vita it is `vs0:data/external/cert/CA_LIST.cer`, the system's
+    own CA list. Parsed per connection, it would have been a different
+    store.
+- On any failure (the parse, the blob) curl keeps its CA file, as before.
+  The store is freed after `curl_global_cleanup`.
+
+**Simulator fidelity** (`tools/build-host-curl.sh`,
+`tools/build-asan-sim.sh --net`).
+- The host's libcurl is now built with `-DCURL_CA_PATH=none`. The Vita's
+  libcurl has a default bundle and **no** default CA path.
+- cmake had autodetected `/etc/ssl/certs`, so every simulator TLS
+  connection parsed the host's whole certificate directory, which the
+  device never does.
+- `build-host-curl.sh` rebuilds once (marker `.ca-path-none`).
+- 476's baseline (128 MiB, CA parse 11%) included that cost.
+
+**Measured** (bbc, 2 loads each, both against the rebuilt host curl;
+"476c" is 476's code):
+
+| | 476c | 477 |
+|---|---|---|
+| host heap at Done | 102.3 / 102.1 MiB | **92.4 / 91.8 MiB** |
+| heap peak | 105.9 MiB | **96.0 MiB** |
+| CPU parsing the CA store | 2.6-2.8% | **0%** |
+| mbedTLS, all of it | 5.3-5.5% | 3.1-3.2% |
+| CPU samples (whole load) | 832 / 825 | 785 / 791 |
+| first Done | 3.0 s | 2.9 s |
+
+**About 10 MiB (10%) less heap at Done**: each live connection's parsed
+copy of the store. Expect the same order on the device against its
+~90 MiB arena; smaller in bytes, since its pointers are 32-bit.
+
+**Gate.**
+- **gate477 exit 0**:
+  - JS fetch over HTTPS 5/5, streaming 7/7, fetch-stream 8/8, fetch
+    headers 3/3;
+  - the rogue certificate still rejected ("The certificate is self
+    signed").
+- interaction 52/52.
+- `restage-full.sh`: **559 applied plus the 2 known collisions**.
+
+No sudo.
