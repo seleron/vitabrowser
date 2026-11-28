@@ -20328,3 +20328,38 @@ and youtube as well.
   57/57 (both paces); no network page dropped.
 
 No sudo.
+
+## Run 45 re-staged at 511 (2026-11-28)
+
+Run 45 is re-staged from **d1fe8a2 (patch 511)**. It replaces the 509
+set, which is parked as `hwtest-2026-11-28-run45-superseded-509` (its sums
+still verify).
+
+**Build.**
+- `build-patched.sh`: 595 applied, only the known collisions failed.
+- `build-vita.sh` exit 0.
+- Heaps: `VitaBrowser.vpk` 192 MiB, `VitaBrowser-ext.vpk` 256 MiB (the
+  primary).
+
+**Checked in the device build.**
+- 509-511 are in, including libcss `css_custom_env_equal`.
+- The sim-only hook is absent.
+- No check or debug code.
+
+**Checksums:**
+
+```
+31fe3b3591f48b9686077f99e5e44aa34e35fc0e6ef9ad4f76e494f65e3f87d0  VitaBrowser.vpk
+fa28880ada275fa0533ef3e2905039509a786e2f9d08488e217e595020e63497  VitaBrowser-ext.vpk
+d7ab64efd52096d618ea31386cc6de09a104f8138b6de0e71db86cf1f16cf3d9  nsvita.elf
+```
+
+**Hand-off.**
+- `reference-dumps` = gate511c's 487 dumps.
+- `pages` = 531 git-tracked test pages, with the attr-scan and
+  style-inplace pairs new.
+- Both hand-off folders are updated, verified with `sha256sum -c` and
+  `diff -r`.
+
+**Device run unchanged:** autotest self-checks plus the short manual list
+from the run-45 entry.
