@@ -19082,3 +19082,35 @@ github since 495 (patches 496 + 497): **2.81 -> 1.74 s, -38%**.
   4/4, GRIDXSHEET340 4/4, interaction 57/57 (both paces).
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED again (2026-11-28): VPKs from 6dfa40c (patch 497)
+
+Run 45 now carries **497** too (it contains 494-497). The aae0f01 set was
+never handed over; it is parked as `hwtest-2026-11-28-run45-superseded-496`
+in `<WORK>` and in both hand-off folders.
+
+**Build.**
+- A fresh `tools/build-vita.sh`, with libcss's Vita build directory
+  deleted first (497 changes a header layout).
+- Checked in the outputs:
+  - Vita `libcss.a` has 497's index code and no check code;
+  - `css_rewrite.o` has 496's index builder;
+  - the ext ELF has 495's heap-span line;
+  - heaps are 192 / **256** MiB;
+  - both VPKs pass `unzip -t`.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `6dd9db27dcc98206…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `35937c4e129ee0a8…` |
+| `nsvita.elf` | `9874a04ad4b775fc…` |
+
+**Files.**
+- `reference-dumps` = gate497's autotest (466).
+- `pages` unchanged (511).
+- Verified on both sides as before: outgoing sums OK, new sums OK, parked
+  sums OK, `diff -r` of dumps and pages clean.
+
+The device procedure is unchanged. Extra to look for: **github,
+stackoverflow and theguardian.com load times** (sim main-thread CPU:
+github -38% since 495, guardian -73%, stackoverflow -15%).
