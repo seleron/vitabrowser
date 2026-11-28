@@ -20152,3 +20152,40 @@ version of the test page lost both its `::before` icons, the old one too.
   JS-cdp; interaction 57/57 (both paces); no network page dropped.
 
 No sudo.
+
+## Run 45 re-staged at 509 (2026-11-28)
+
+Run 45 is re-staged from **cfdbcad (patch 509)**. It replaces the 507 set,
+which carries 506's wikipedia assertion (patch 509 above) and must not
+be run.
+
+**Build.**
+- `build-patched.sh`: 592 applied, only the known collisions failed.
+- `build-vita.sh` exit 0.
+- Heaps: `VitaBrowser.vpk` 192 MiB, `VitaBrowser-ext.vpk` 256 MiB (the
+  primary).
+
+**Checked in the device build.**
+- 507-509 are in, including libdom's compare (130 instructions).
+- The sim-only hook (`data-vb-reformat-queued`) is absent.
+- No check or debug code.
+
+**Checksums:**
+
+```
+7551445004e273141c163a98300ef58f8d8885a7327bcefb3387b43d0e824478  VitaBrowser.vpk
+3401b5ca30c1b85de7de5d33b290ff2557e5a9a7bf75a516035be432ee7317eb  VitaBrowser-ext.vpk
+abb3e520e8171fb03560ed4a0514fe16ba3b30216a235e17c74d6daf64f34191  nsvita.elf
+```
+
+**Hand-off.**
+- Archive `~/vitabrowser-work/hwtest-2026-11-28-run45/`.
+- `reference-dumps` = gate509's dumps.
+- `pages` = the git-tracked test pages, with the cdp and kept-table pairs
+  new.
+- Both hand-off folders are updated. The 507 set is parked as
+  `hwtest-2026-11-28-run45-superseded-507` (its sums still verify).
+- Everything is verified with `sha256sum -c` and `diff -r`.
+
+**Device run unchanged:** autotest self-checks plus the short manual list
+from the run-45 entry.
