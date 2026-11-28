@@ -19435,3 +19435,77 @@ both hand-off folders.
 
 The device procedure and load-time checks are unchanged; add youtube to
 the list (500: CSS rewrite -36% in the sim).
+
+## ASan + census for 500 (2026-11-28)
+
+**ASan at 500** (`--libs --net`; the fast background pass instrumented,
+10 report sites): **clean**. Interaction 57/57, 453 page dumps, 0
+reports.
+
+**21-site census, 499 vs 500** (`score/c21-500`): **flat**, 15.0 -> 16.3
+full rebuilds per load, guard 4.7 / 4.7.
+
+**Open item, the intermittent oldreddit crash** (now seen on the 491,
+498 and 499 arms, recently always the first oldreddit load of a census
+run).
+- In `score/c21-500/499/L1/sim/oldreddit` the page had loaded ("Welcome
+  to Reddit").
+- The process died in the 1.5 s settle **right after the census's own
+  `text.js` evaluation** (the page-text extraction), before the
+  screenshot.
+- The ASan autotest never runs that evaluation, which may be why ASan has
+  never seen it.
+- Next: replay oldreddit under the ASan sim with the census script
+  (`script.txt` + `text.js` in that folder).
+
+## Patch 501 (2026-11-28): the selector hash's element, class and id tables grow (libcss, P1 load time)
+
+**Problem.** Every stylesheet's selector hash had **64 chains per table**
+for its whole life (`DEFAULT_SLOTS`).
+- The check build below saw class tables past **8,000 entries** on
+  stackoverflow and rte, and past 2,000 on github, oldreddit and youtube:
+  chains of dozens to over a hundred.
+- Every class of every element walked one of those chains to its first
+  match and on (`css__selector_hash_find_by_class`, `_iterate_classes`):
+  ~7% of stackoverflow's main thread at 499.
+
+**Fix** (`patches/vitabrowser/501-libcss-selector-hash-grows.patch`).
+- Each table counts its entries. Past two per chain it is rebuilt with
+  four times the chains (up to 65,536).
+- Entries move **with their stored bloom**. libcss's head removal leaves
+  the removed selector's bloom on the chain head, and regenerating it
+  would change that.
+- Entries are placed by `_insert_into_chain`'s own comparison, walking
+  each old chain in order. Every name's entries are in one old chain and
+  go to one new chain, so their order (all that find and iterate depend
+  on) is the same.
+- The nodes a rebuild may need are allocated first; out of memory, the
+  table stays as it is.
+
+**Exactness.** A `VITA_HASH_CHECK` build compared every name's
+(selector, bloom) sequence before and after each rebuild: **196 rebuilds,
+0 mismatches**, over the 21 census sites and the selector / CSSOM /
+cascade test pages.
+
+**Measured** (sim, sprof, 2 loads each, 500 -> 501):
+
+| site | CSS selection (samples) | lookups | main-thread CPU |
+|---|---|---|---|
+| github | 120 -> 96 (**-20%**) | class 17 -> 1.5, element 19 -> 3.5 | 1.69 -> 1.60 s (**-6%**) |
+| rte | 101 -> 81 (**-20%**) | class 39.5 -> 13.5 | 5.89 -> 5.78 s |
+| wikipedia | flat | already small | flat |
+
+- **stackoverflow could not be measured:** Cloudflare served its
+  challenge page ("Just a moment...") to both 500 and 501 loads after
+  today's many loads.
+- **A trap worth keeping:** a challenged load reads as a 60% "speedup",
+  so check the page title before trusting a profile.
+- stackoverflow's valid 500 loads had ~95 samples (~7%) in exactly these
+  lookups. Re-measure when it serves the real page.
+
+**Gate.**
+- `restage-full.sh`: **583 applied plus the 2 known collisions**.
+- **gate501 exit 0**: CSSOM 8/8, CSSOM190 2/2, the sheet-change /
+  live-cascade checks as expected, interaction 57/57 (both paces).
+
+No sudo.

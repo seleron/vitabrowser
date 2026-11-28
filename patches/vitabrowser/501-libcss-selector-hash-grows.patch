@@ -1,0 +1,323 @@
+# libcss: the selector hash's element, class and id tables grow (patch 501)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 500)
+#
+# Every stylesheet's selector hash had DEFAULT_SLOTS (64) chains per table
+# for its whole life. A sheet with thousands of class selectors -- the
+# simulator saw class tables past 8,000 entries on stackoverflow.com and
+# rte.ie, past 2,000 on github, oldreddit and youtube -- had chains of
+# dozens to over a hundred, and every class of every element walked one
+# to its first match and on (css__selector_hash_find_by_class,
+# _iterate_classes: ~7% of stackoverflow's page-load main-thread time).
+#
+# Each table now counts its entries and, past two per chain, is rebuilt
+# with four times the chains (up to 65,536). Entries move WITH their
+# stored bloom -- libcss's head removal leaves the removed selector's
+# bloom on the chain head, and regenerating it would change that -- and
+# are placed by _insert_into_chain's own comparison (ascending specificity,
+# then rule index, equal keys after), walking each old chain in order: the
+# entries of one name are all in one old chain and all go to one new
+# chain, so their order -- all find and iterate depend on -- is the same.
+# The nodes a rebuild may need are allocated first; out of memory, the
+# table stays as it is. Matches handed out by find / iterate live only for
+# one selection, and inserts never happen during one.
+#
+# Verified before landing: a VITA_HASH_CHECK build compared, after each
+# rebuild, every name's (selector, bloom) sequence before and after --
+# 196 rebuilds over the 21 census sites and the selector / CSSOM / cascade
+# test pages, 0 mismatches. The check code stays behind that flag.
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <libcss/hint.h>
+@@ -28,6 +29,7 @@
+ 	size_t n_slots;
+ 
+ 	hash_entry *slots;
++	size_t n_entries;	/* VitaBrowser patch 501 */
+ } hash_t;
+ 
+ struct css_selector_hash {
+@@ -50,6 +52,7 @@
+ 		const css_selector *selector);
+ static css_error _remove_from_chain(css_selector_hash *ctx, hash_entry *head,
+ 		const css_selector *selector);
++static void _maybe_grow(css_selector_hash *ctx, hash_t *t, int kind);
+ 
+ static css_error _iterate_elements(
+ 		const struct css_hash_selection_requirments *req,
+@@ -247,6 +250,10 @@
+ 
+ 		error = _insert_into_chain(hash, &hash->ids.slots[index],
+ 				selector);
++		if (error == CSS_OK) {
++			hash->ids.n_entries++;
++			_maybe_grow(hash, &hash->ids, 0);
++		}
+ 	} else if ((name = _class_name(selector)) != NULL) {
+ 		/* Named class */
+ 		mask = hash->classes.n_slots - 1;
+@@ -254,6 +261,10 @@
+ 
+ 		error = _insert_into_chain(hash, &hash->classes.slots[index],
+ 				selector);
++		if (error == CSS_OK) {
++			hash->classes.n_entries++;
++			_maybe_grow(hash, &hash->classes, 1);
++		}
+ 	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
+ 			lwc_string_data(selector->data.qname.name)[0] != '*') {
+ 		/* Named element */
+@@ -262,6 +273,10 @@
+ 
+ 		error = _insert_into_chain(hash, &hash->elements.slots[index],
+ 				selector);
++		if (error == CSS_OK) {
++			hash->elements.n_entries++;
++			_maybe_grow(hash, &hash->elements, 2);
++		}
+ 	} else {
+ 		/* Universal chain */
+ 		error = _insert_into_chain(hash, &hash->universal, selector);
+@@ -295,6 +310,8 @@
+ 
+ 		error = _remove_from_chain(hash, &hash->ids.slots[index],
+ 				selector);
++		if (error == CSS_OK && hash->ids.n_entries > 0)
++			hash->ids.n_entries--;
+ 	} else if ((name = _class_name(selector)) != NULL) {
+ 		/* Named class */
+ 		mask = hash->classes.n_slots - 1;
+@@ -302,6 +319,8 @@
+ 
+ 		error = _remove_from_chain(hash, &hash->classes.slots[index],
+ 				selector);
++		if (error == CSS_OK && hash->classes.n_entries > 0)
++			hash->classes.n_entries--;
+ 	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
+ 			lwc_string_data(selector->data.qname.name)[0] != '*') {
+ 		/* Named element */
+@@ -310,6 +329,8 @@
+ 
+ 		error = _remove_from_chain(hash, &hash->elements.slots[index],
+ 				selector);
++		if (error == CSS_OK && hash->elements.n_entries > 0)
++			hash->elements.n_entries--;
+ 	} else {
+ 		/* Universal chain */
+ 		error = _remove_from_chain(hash, &hash->universal, selector);
+@@ -846,6 +867,208 @@
+ 	return CSS_OK;
+ }
+ 
++/* VitaBrowser patch 501: the element, class and id tables grow.
++ *
++ * They had DEFAULT_SLOTS (64) chains for the life of a sheet, so a sheet
++ * with thousands of class selectors had chains dozens long, and every
++ * class of every element walked one to its first match and on
++ * (css__selector_hash_find_by_class, _iterate_classes: ~7% of
++ * stackoverflow.com's page-load main-thread time in the simulator).
++ * Past two entries per chain a table is rebuilt with four times the
++ * chains. Every entry moves WITH its stored bloom (a removed chain head
++ * leaves its bloom behind in libcss; regenerating would change that) and
++ * is placed by _insert_into_chain's own comparison, walking each old
++ * chain in order: the entries of one name -- all in one old chain, all in
++ * one new chain -- keep their order, which is all find / iterate depend
++ * on. The nodes it may need are allocated first; without memory the
++ * table stays as it is. Nothing holds a chain entry across an insert
++ * (matches handed out live for one selection). VITA_HASH_CHECK builds
++ * verify every name's sequence and blooms after each rebuild. */
++#define MAX_SLOTS ((size_t)1 << 16)
++
++static lwc_string *_entry_name(const css_selector *sel, int kind)
++{
++	if (kind == 0)
++		return _id_name(sel);
++	if (kind == 1)
++		return _class_name(sel);
++	return sel->data.qname.name;
++}
++
++/* place (sel, bloom) into chain head, using node if a node is needed;
++   returns true if node was used */
++static bool _place_entry(hash_entry *head, const css_selector *sel,
++		const css_bloom bloom[CSS_BLOOM_SIZE], hash_entry *node)
++{
++	hash_entry *search = head, *prev = NULL;
++
++	if (head->sel == NULL) {
++		head->sel = sel;
++		head->next = NULL;
++		memcpy(head->sel_chain_bloom, bloom,
++				sizeof(head->sel_chain_bloom));
++		return false;
++	}
++	/* the same order as _insert_into_chain */
++	do {
++		if (search->sel->specificity > sel->specificity)
++			break;
++		if (search->sel->specificity == sel->specificity &&
++				search->sel->rule->index > sel->rule->index)
++			break;
++		prev = search;
++		search = search->next;
++	} while (search != NULL);
++
++	if (prev == NULL) {
++		*node = *head;
++		head->next = node;
++		head->sel = sel;
++		memcpy(head->sel_chain_bloom, bloom,
++				sizeof(head->sel_chain_bloom));
++	} else {
++		node->sel = sel;
++		memcpy(node->sel_chain_bloom, bloom,
++				sizeof(node->sel_chain_bloom));
++		node->next = prev->next;
++		prev->next = node;
++	}
++	return true;
++}
++
++#ifdef VITA_HASH_CHECK
++/* every name's (sel, bloom) sequence, in chain order, as a flat list
++   sorted by name then rank */
++typedef struct { const void *name; size_t rank; const css_selector *sel;
++		css_bloom bloom[CSS_BLOOM_SIZE]; } hc_rec;
++static int hc_cmp(const void *a, const void *b)
++{
++	const hc_rec *x = a, *y = b;
++	if (x->name != y->name) return x->name < y->name ? -1 : 1;
++	return x->rank < y->rank ? -1 : x->rank > y->rank ? 1 : 0;
++}
++static hc_rec *hc_collect(const hash_t *t, int kind, size_t *count)
++{
++	size_t i, n = 0;
++	hc_rec *r = malloc((t->n_entries + 1) * 2 * sizeof(*r));
++	if (r == NULL) { *count = 0; return NULL; }
++	for (i = 0; i < t->n_slots; i++) {
++		const hash_entry *e;
++		if (t->slots[i].sel == NULL) continue;
++		for (e = &t->slots[i]; e != NULL; e = e->next) {
++			const hash_entry *f;
++			size_t rank = 0;
++			const void *nm = _entry_name(e->sel, kind)->insensitive;
++			for (f = &t->slots[i]; f != e; f = f->next)
++				if (_entry_name(f->sel, kind)->insensitive == nm)
++					rank++;
++			r[n].name = nm; r[n].rank = rank; r[n].sel = e->sel;
++			memcpy(r[n].bloom, e->sel_chain_bloom, sizeof(r[n].bloom));
++			n++;
++		}
++	}
++	qsort(r, n, sizeof(*r), hc_cmp);
++	*count = n;
++	return r;
++}
++#endif
++
++static void _maybe_grow(css_selector_hash *ctx, hash_t *t, int kind)
++{
++	size_t old_n = t->n_slots, new_n, i, spare_n = 0, used = 0;
++	hash_entry *ns, *old = t->slots, **spare;
++#ifdef VITA_HASH_CHECK
++	size_t hc_n0 = 0, hc_n1 = 0;
++	hc_rec *hc0, *hc1;
++#endif
++
++	if (t->n_entries <= old_n * 2 || old_n >= MAX_SLOTS)
++		return;
++	new_n = old_n * 4;
++	if (new_n > MAX_SLOTS)
++		new_n = MAX_SLOTS;
++	ns = calloc(new_n, sizeof(hash_entry));
++	if (ns == NULL)
++		return;
++	/* an old inline head may need a node in the new table */
++	for (i = 0; i < old_n; i++)
++		if (old[i].sel != NULL)
++			spare_n++;
++	spare = malloc((spare_n + 1) * sizeof(*spare));
++	if (spare == NULL) {
++		free(ns);
++		return;
++	}
++	for (i = 0; i < spare_n; i++) {
++		spare[i] = malloc(sizeof(hash_entry));
++		if (spare[i] == NULL) {
++			while (i > 0)
++				free(spare[--i]);
++			free(spare);
++			free(ns);
++			return;
++		}
++	}
++#ifdef VITA_HASH_CHECK
++	hc0 = hc_collect(t, kind, &hc_n0);
++#endif
++	for (i = 0; i < old_n; i++) {
++		hash_entry *e, *next;
++		bool inline_head = true;
++
++		if (old[i].sel == NULL)
++			continue;
++		for (e = &old[i]; e != NULL; e = next) {
++			hash_entry *node;
++			lwc_string *nm = _entry_name(e->sel, kind);
++			size_t idx = _hash_name(nm) & (new_n - 1);
++			/* copies: placing may overwrite e when e is the node */
++			const css_selector *sel = e->sel;
++			css_bloom bloom[CSS_BLOOM_SIZE];
++
++			memcpy(bloom, e->sel_chain_bloom, sizeof(bloom));
++			next = e->next;
++			node = inline_head ? spare[used] : e;
++			if (_place_entry(&ns[idx], sel, bloom, node)) {
++				if (inline_head) {
++					used++;
++					ctx->hash_size += sizeof(hash_entry);
++				}
++			} else if (!inline_head) {
++				free(e);
++				ctx->hash_size -= sizeof(hash_entry);
++			}
++			inline_head = false;
++		}
++	}
++	for (i = used; i < spare_n; i++)
++		free(spare[i]);
++	free(spare);
++	free(old);
++	t->slots = ns;
++	t->n_slots = new_n;
++	ctx->hash_size += (new_n - old_n) * sizeof(hash_entry);
++#ifdef VITA_HASH_CHECK
++	hc1 = hc_collect(t, kind, &hc_n1);
++	{
++		size_t k;
++		bool same = hc0 != NULL && hc1 != NULL && hc_n0 == hc_n1;
++		for (k = 0; same && k < hc_n0; k++)
++			if (hc0[k].name != hc1[k].name || hc0[k].rank != hc1[k].rank ||
++					hc0[k].sel != hc1[k].sel ||
++					memcmp(hc0[k].bloom, hc1[k].bloom,
++						sizeof(hc0[k].bloom)) != 0)
++				same = false;
++		fprintf(stderr, "HASHCHECK grow kind %d: %lu -> %lu chains, "
++				"%lu entries, %s\n", kind, (unsigned long)old_n,
++				(unsigned long)new_n, (unsigned long)t->n_entries,
++				same ? "same" : "MISMATCH");
++	}
++	free(hc0);
++	free(hc1);
++#endif
++}
++
+ /**
+  * Remove a selector from a hash chain
+  *
