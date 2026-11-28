@@ -352,6 +352,8 @@ JS-cdp file:///app0:/testpages/JS-cdp.html
 CSS-cdp-ref file:///app0:/testpages/CSS-cdp-ref.html
 JS-kept-table file:///app0:/testpages/JS-kept-table.html
 CSS-kept-table-ref file:///app0:/testpages/CSS-kept-table-ref.html
+JS-attr-scan file:///app0:/testpages/JS-attr-scan.html
+CSS-attr-scan-ref file:///app0:/testpages/CSS-attr-scan-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1908,6 +1910,20 @@ ktn=$(printf '%s\n' "$ktseg" | grep -c "LIFE rebuild local: kept box in a table,
 kth=$(printf '%s\n' "$ktseg" | grep -c "LIFE test hook: a reformat before the full reconvert" || true)
 echo "  JS-kept-table: rows differing from the parse-time build $ktr (0); kept box's table normalised ${ktn} (1 or more); reformat before the full reconvert ${kth} (1 or more)"
 [ "$ktr" = 0 ] && [ "${ktn:-0}" -ge 1 ] && [ "${kth:-0}" -ge 1 ] || fail "a kept box is normalised before the full reconvert"
+# Patch 510: the scan for "can a sheet select on this attribute" reads
+# escapes as CSS does (utility-class sheets), skips empty sheets, and finds
+# an attribute beside :hover / :active / :focus inert. data-quiet is inert,
+# data-other unreferenced (no restyle for either); data-live and the
+# escape-spelled data-esc restyle. Four steps render row for row as at
+# parse time.
+asr=$(fl_rows JS-attr-scan CSS-attr-scan-ref)
+asseg=$(awk '/ page [0-9]+\/[0-9]+ JS-attr-scan: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+asi=$(printf '%s\n' "$asseg" | grep -c "LIFE rebuild local: \[data-quiet\] in a sheet only beside :hover / :active / :focus" || true)
+asl=$(printf '%s\n' "$asseg" | grep -c "LIFE rebuild local: data-live attribute change, as a class change" || true)
+ase=$(printf '%s\n' "$asseg" | grep -c "LIFE rebuild local: data-esc attribute change, as a class change" || true)
+asq=$(printf '%s\n' "$asseg" | grep -c "LIFE rebuild local: data-quiet attribute change\|LIFE rebuild local: data-other attribute change" || true)
+echo "  JS-attr-scan: rows differing from the parse-time build $asr (0); inert beside a dynamic pseudo-class ${asi} (1 or more); live / escaped restyled ${asl} / ${ase} (1 / 1 or more); quiet ones restyled ${asq} (0)"
+[ "$asr" = 0 ] && [ "${asi:-0}" -ge 1 ] && [ "${asl:-0}" -ge 1 ] && [ "${ase:-0}" -ge 1 ] && [ "${asq:-1}" -eq 0 ] || fail "attribute scan: escapes, empty sheets, dynamic pseudo-classes"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

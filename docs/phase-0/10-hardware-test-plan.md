@@ -20189,3 +20189,58 @@ abb3e520e8171fb03560ed4a0514fe16ba3b30216a235e17c74d6daf64f34191  nsvita.elf
 
 **Device run unchanged:** autotest self-checks plus the short manual list
 from the run-45 entry.
+
+## Patch 510 (2026-11-28): the attribute-reference scan reads escapes, skips empty sheets, finds :hover / :focus companions inert
+
+**Found on old.reddit.com/r/vita, which now redirects to its login page**
+(the census site "oldreddit" is that page).
+- On about half its loads a script loop sets `tabindex` 1,094 times.
+- Each change was a subtree restyle and full layout: **15.2 s
+  main-thread time** against ~2 s on a quiet load.
+- `tabindex` counted as sheet-visible for two reasons:
+  - patch 310's scan (`html_rl_sheet_scan_attr`) answered "it might" for
+    every name at the first backslash outside a string. Here that was
+    `.focus-within\:bg-…` at byte 104,838 of a utility-class sheet;
+  - two empty `<style>`s counted as unreadable.
+
+**Fix: three exact refinements of the scan.**
+- **Escapes.** An escape outside a string is skipped as CSS reads it (up
+  to six hex digits and one whitespace, or the escaped character). So an
+  escaped `[` (`.w-\[20px\]`) is no attribute selector either.
+  - An attribute selector's own name is decoded and compared whole
+    (`html_rl_attr_name_at`).
+  - Still "it might": an escape beyond ASCII, or a namespace prefix with
+    an escape.
+  - The first version declined on any escape inside `[...]`, which still
+    made every name visible: the gate page's `[data-\65 sc]` showed it.
+- **Empty sheets.** A sheet with no source whose content is DONE is empty
+  and references nothing. A sheet still loading still might.
+- **Dynamic pseudo-classes.** An attribute whose compound also holds, as
+  its own member, `:hover`, `:active`, `:focus`, `:focus-visible` or
+  `:focus-within` is inert, because box selection never matches those
+  (`node_is_hover` / `_active` / `_focus` answer only for a dynamic
+  restyle's node). The same holds inside `:not()` / `:is()`.
+  `:not(:focus)` is no member, so that occurrence counts.
+
+**Measured.**
+- **old.reddit loop loads: 15.2 s -> 9.4 s main thread** in the sim. The
+  1,104 `tabindex` changes are now "nothing to rebuild"; what is left is
+  the loop's own script. Quiet loads stay ~2 s.
+- Attribute restyles elsewhere: claude 9 -> 5, youtube 24 -> 16, guardian
+  6 -> 1, stackoverflow 34 -> 32. CPU unchanged within noise.
+
+**Gate pages.** New `JS-attr-scan` / `CSS-attr-scan-ref`: a
+utility-class sheet, an empty `<style>`, `[data-quiet]` only beside
+`:hover` / `:focus`, `[data-live]`, an escape-spelled `[data-\65 sc]`, and
+an unreferenced attribute. 0 rows differ; the quiet two are not
+restyled.
+
+The attribute gate pages (370, 409, 417, 433, 468) give the same counts
+on 509 and 510.
+
+**Gate.**
+- `restage-full.sh`: **593 applied plus the 2 known collisions**.
+- **gate510 exit 0**: JS-attr-scan, JS-attr-restyle; interaction 57/57
+  (both paces); no network page dropped.
+
+No sudo.

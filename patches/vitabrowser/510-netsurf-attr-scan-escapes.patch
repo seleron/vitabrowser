@@ -1,0 +1,309 @@
+# netsurf: the attribute-reference scan reads escapes, skips empty sheets, finds :hover/:focus companions inert (patch 510)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 509)
+#
+# An attribute change is answered without a restyle when no sheet can
+# select on the attribute (patch 310's html_rl_sheet_scan_attr, a scan of
+# each sheet's text). Three exact refinements:
+#
+# - Escapes. Any backslash outside a string made the scan answer "it might"
+#   for every name, so on a utility-class sheet (.md\:flex,
+#   .focus-within\:bg-x, .w-\[20px\]) every attribute was sheet-visible.
+#   An escape is skipped as CSS reads it (up to six hex digits and one
+#   whitespace, or the escaped character), so an escaped '[' is no
+#   attribute selector either; an attribute selector's own name is read
+#   with its escapes decoded and compared whole (html_rl_attr_name_at).
+#   Still "it might": an escape beyond ASCII, a namespace prefix spelled
+#   with an escape.
+# - Empty sheets. A sheet with no source counted as unreadable; one whose
+#   content is DONE is empty and references nothing (still loading: still
+#   "it might").
+# - Dynamic pseudo-classes. An attribute whose compound also holds, as its
+#   own member, :hover, :active, :focus, :focus-visible or :focus-within
+#   cannot change a box's style: box selection never matches those
+#   (node_is_hover / _active / _focus answer only for the dyn_*_node a
+#   hover or focus restyle sets). In :not() / :is() the same holds.
+#   ":not(:focus)" is no member: that occurrence counts.
+#
+# old.reddit.com/r/vita (now its login page) runs, on about half its
+# loads, a script loop that sets tabindex 1,094 times: each was a subtree
+# restyle and full layout (one Tailwind escape at byte 104,838 of a sheet,
+# plus two empty <style>s). With 510 each is "nothing to rebuild": main
+# thread 15.2 s -> 9.4 s in the sim on those loads (the rest is the loop's
+# own script); the quiet loads stay ~2 s.
+#
+# Gate: JS-attr-scan / CSS-attr-scan-ref (four steps, row for row against
+# the same steps at parse time; the inert, unreferenced, live and
+# escape-spelled cases each logged). The attribute gate pages (370, 409,
+# 417, 433, 468) give the same counts on 509 and 510.
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -8367,6 +8367,180 @@
+ 	    ch == '\f';
+ }
+ 
++/* Patch 510: does the compound holding st[at] (an attribute selector's
++ * '[') also hold, as its own member, a dynamic pseudo-class -- :hover,
++ * :active, :focus, :focus-visible, :focus-within? Selection for boxes
++ * never matches one (node_is_hover / _active / _focus answer only for the
++ * dyn_*_node a hover or focus restyle sets, and libcss drops a rule with a
++ * pseudo-class it does not know), so that compound never matches while
++ * boxes are built, whatever the attribute: in a selector, in :is() /
++ * :where() (never), in :not() (always). Then the attribute cannot change
++ * a box's style through it. A dynamic pseudo-class inside a function of
++ * the compound (:not(:focus)) is no member: the occurrence counts. The
++ * compound runs, at its own nesting depth, to a combinator, whitespace, a
++ * comma, a brace, a semicolon, or the parenthesis that encloses it;
++ * brackets and parentheses inside it are skipped whole. */
++static int html_rl_attr_compound_dynamic(const uint8_t *st, size_t len,
++		size_t at)
++{
++	static const char *const dyn[] = { "hover", "active", "focus",
++		"focus-visible", "focus-within", NULL };
++	size_t a = at, b, k;
++	int depth;
++
++	/* back to the compound's start */
++	while (a > 0) {
++		uint8_t ch = st[a - 1];
++		if (ch == ']' || ch == ')') {
++			uint8_t open = ch == ']' ? '[' : '(';
++			depth = 1;
++			a--;
++			while (a > 0 && depth > 0) {
++				a--;
++				if (st[a] == ch)
++					depth++;
++				else if (st[a] == open)
++					depth--;
++			}
++			if (depth != 0)
++				return 0;
++			continue;
++		}
++		if (html_rl310_is_ws(ch) || ch == '>' || ch == '+' ||
++		    ch == '~' || ch == ',' || ch == '{' || ch == '}' ||
++		    ch == ';' || ch == '(' || ch == '/')
++			break;
++		a--;
++	}
++	/* on to its end */
++	b = at;
++	while (b < len) {
++		uint8_t ch = st[b];
++		if (ch == '[' || ch == '(') {
++			uint8_t close = ch == '[' ? ']' : ')';
++			uint8_t q = 0;
++			depth = 1;
++			b++;
++			while (b < len && depth > 0) {
++				if (q != 0) {
++					if (st[b] == '\\')
++						b++;
++					else if (st[b] == q)
++						q = 0;
++				} else if (st[b] == '"' || st[b] == '\'') {
++					q = st[b];
++				} else if (st[b] == ch) {
++					depth++;
++				} else if (st[b] == close) {
++					depth--;
++				}
++				b++;
++			}
++			if (depth != 0)
++				return 0;
++			continue;
++		}
++		if (html_rl310_is_ws(ch) || ch == '>' || ch == '+' ||
++		    ch == '~' || ch == ',' || ch == '{' || ch == '}' ||
++		    ch == ';' || ch == ')' || ch == '/')
++			break;
++		b++;
++	}
++	/* a ':' member of the compound itself (not '::', not inside a
++	 * function or a bracket) naming a dynamic pseudo-class */
++	for (k = a; k < b; k++) {
++		uint8_t ch = st[k];
++		int d;
++		if (ch == '[' || ch == '(') {
++			uint8_t close = ch == '[' ? ']' : ')';
++			depth = 1;
++			for (k++; k < b && depth > 0; k++) {
++				if (st[k] == ch)
++					depth++;
++				else if (st[k] == close)
++					depth--;
++			}
++			k--;
++			continue;
++		}
++		if (ch != ':' || (k + 1 < b && st[k + 1] == ':') ||
++		    (k > a && st[k - 1] == ':'))
++			continue;
++		for (d = 0; dyn[d] != NULL; d++) {
++			size_t tl = strlen(dyn[d]);
++			if (k + 1 + tl <= b &&
++			    html_rl310_cieq(st + k + 1, dyn[d], tl) &&
++			    (k + 1 + tl == b ||
++			     !html_rl310_is_namech(st[k + 1 + tl])))
++				return 1;
++		}
++	}
++	return 0;
++}
++
++/* Patch 510: occurrences an attribute scan found inert (their compound
++ * holds a dynamic pseudo-class), for the log */
++static unsigned int html_rl_attr_inert_seen;
++
++/* Patch 510: does the attribute selector name at st[j] read as `name`?
++ * Its escapes are decoded as CSS reads them (\65 or \e: one code point,
++ * up to six hex digits and one whitespace; \x: the character x) and the
++ * result compared, ignoring ASCII case, with the whole of `name`. Was: a
++ * plain byte compare, and any escape in a sheet answered "it might" for
++ * every name. Still "it might" (1): an escape to a code point beyond
++ * ASCII, and a namespace prefix spelled with an escape (the caller skips
++ * only plain prefixes). */
++static int html_rl_attr_name_at(const uint8_t *st, size_t len, size_t j,
++		const char *name, size_t namelen)
++{
++	size_t k = j, n = 0;
++	int match = 1;
++
++	while (k < len) {
++		unsigned long cp;
++		uint8_t ch = st[k];
++		if (ch == '\\') {
++			size_t h = 0;
++			cp = 0;
++			k++;
++			if (k >= len)
++				return 1;
++			while (k < len && h < 6 &&
++			       ((st[k] >= '0' && st[k] <= '9') ||
++				(st[k] >= 'a' && st[k] <= 'f') ||
++				(st[k] >= 'A' && st[k] <= 'F'))) {
++				cp = cp * 16 + (unsigned long)(st[k] <= '9' ?
++					st[k] - '0' : (st[k] | 0x20) - 'a' + 10);
++				k++;
++				h++;
++			}
++			if (h > 0) {
++				if (k < len && html_rl310_is_ws(st[k]))
++					k++;
++			} else {
++				cp = st[k];
++				k++;
++			}
++			if (cp == 0 || cp > 0x7f)
++				return 1;
++		} else if (html_rl310_is_namech(ch)) {
++			cp = ch;
++			k++;
++		} else {
++			break;
++		}
++		if (n >= namelen || !html_rl310_cieq(
++				(const uint8_t *) &(uint8_t){ (uint8_t) cp },
++				name + n, 1))
++			match = 0;
++		n++;
++	}
++	/* `prefix|name` whose prefix the caller did not skip */
++	if (k < len && st[k] == '|' && !(k + 1 < len && st[k + 1] == '='))
++		return 1;
++	return match && n == namelen;
++}
++
+ /* True if one stylesheet's source can match on `name`. */
+ static int html_rl_sheet_scan_attr(const uint8_t *st, size_t len,
+ 		const char *name, size_t namelen,
+@@ -8406,10 +8580,34 @@
+ 			i++;
+ 			continue;
+ 		}
+-		/* An escape outside a string could hide the name inside
+-		 * an identifier ([data-\78 ]): decline, don't guess. */
+-		if (ch == '\\')
+-			return 1;
++		/* Patch 510: an escape outside a string is skipped as CSS
++		 * reads it -- up to six hex digits and one whitespace, or
++		 * the one character it escapes -- so an escaped '[' or ':'
++		 * in a class name (Tailwind's .w-\[200px\], .md\:flex) is
++		 * no attribute selector. Was: any escape declined the whole
++		 * sheet, so on a utility-class sheet every attribute was
++		 * sheet-visible (old.reddit's login page: 1,094 tabindex
++		 * changes a load, each a subtree restyle). An attribute
++		 * selector's own name is read with its escapes decoded
++		 * ([data-\65 sc] is data-esc): html_rl_attr_name_at. */
++		if (ch == '\\') {
++			size_t h = 0;
++			i++;
++			while (i < len && h < 6 &&
++			       ((st[i] >= '0' && st[i] <= '9') ||
++				(st[i] >= 'a' && st[i] <= 'f') ||
++				(st[i] >= 'A' && st[i] <= 'F'))) {
++				i++;
++				h++;
++			}
++			if (h > 0) {
++				if (i < len && html_rl310_is_ws(st[i]))
++					i++;
++			} else if (i < len) {
++				i++;
++			}
++			continue;
++		}
+ 		if (ch == '[') {
+ 			size_t j = i + 1;
+ 			while (j < len && html_rl310_is_ws(st[j]))
+@@ -8427,11 +8625,12 @@
+ 			}
+ 			while (j < len && html_rl310_is_ws(st[j]))
+ 				j++;
+-			if (j + namelen <= len &&
+-			    html_rl310_cieq(st + j, name, namelen) &&
+-			    (j + namelen == len ||
+-			     !html_rl310_is_namech(st[j + namelen])))
+-				return 1;
++			if (html_rl_attr_name_at(st, len, j, name, namelen)) {
++				/* patch 510: not beside :hover / :focus ... */
++				if (!html_rl_attr_compound_dynamic(st, len, i))
++					return 1;
++				html_rl_attr_inert_seen++;
++			}
+ 			i++;
+ 			continue;
+ 		}
+@@ -8489,6 +8688,13 @@
+ 		if (sh == NULL || c->stylesheets[i].unused)
+ 			continue;
+ 		data = content_get_source_data(sh, &size);
++		/* Patch 510: a sheet done with no source is empty (an empty
++		 * <style>: old.reddit's login page has two among its
++		 * components) and references nothing; one with no source yet
++		 * (still loading, or no content: patch 432) might. */
++		if ((data == NULL || size == 0) &&
++		    content_get_status(sh) == CONTENT_STATUS_DONE)
++			continue;
+ 		/* A sheet we cannot read might reference it. */
+ 		if (data == NULL || size == 0)
+ 			return 1;
+@@ -8504,10 +8710,16 @@
+ 					break;
+ 				}
+ 		if (refs < 0) {
++			unsigned int inert0 = html_rl_attr_inert_seen;
+ 			t = macos9_micros();
+ 			refs = html_rl_sheet_scan_attr(data, size, name,
+ 					namelen, pseudos) ? 1 : 0;
+ 			html_rl_fill_us += macos9_micros() - t;
++			if (refs == 0 && html_rl_attr_inert_seen != inert0)
++				macsurf_debug_log_writef("LIFE rebuild local: "
++					"[%s] in a sheet only beside :hover / "
++					":active / :focus (%u), inert", name,
++					html_rl_attr_inert_seen - inert0);
+ 			if (namelen < sizeof(html_rl_attr_cache[0].name)) {
+ 				k = html_rl_attr_cache_next;
+ 				html_rl_attr_cache_next = (k + 1) %
