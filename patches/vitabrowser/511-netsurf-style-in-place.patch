@@ -1,0 +1,476 @@
+# netsurf: a style attribute change restyled in place (patch 511)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 510)
+#
+# Patch 370 answers a style attribute change as a class change: the
+# element's box and its whole subtree built again, the page laid out (a
+# flex <body>: the page). html_rl_style_in_place keeps the subtree when
+# the change can reach nothing below the element:
+#   - no used sheet selects on [style] but in a selector's subject
+#     compound (310's scan, html_rl_sheet_refs_attr_others; a sheet with no
+#     source is not in the selection context yet, and its arrival
+#     re-cascades everything);
+#   - the new style builds the same box (display, float, position,
+#     counting, background image, ::before / ::after; <body>'s background
+#     colour);
+#   - the custom-property environment defines what it did
+#     (css_custom_env_equal, 511-libcss-custom-env-equal.patch);
+#   - a blank style from the old and the new compare equal (every
+#     inherited property), and each element child selected again under the
+#     new style is as its box holds it (a box-less one stays box-less).
+# Then the box takes the new style -- with every box of its subtree that
+# shares the old one and owns no styles (text, anonymous boxes, inline
+# ends, generated content; never another element's box: libcss shares one
+# computed style among elements that compute alike, gate511b's section and
+# its paragraphs) -- and the page is laid out. A style that comes out the same is no change at all.
+# Otherwise the 370 path, as before.
+#
+# rte.ie: of 49 style attribute changes a load, 36 change nothing and 4
+# are restyled in place (were 49 subtree rebuilds); local-rebuild time
+# ~800 -> ~730 ms in the sim. stackoverflow's body.style changes: declined
+# on the loads measured (a sheet still loading); Cloudflare then blocked
+# further loads.
+#
+# Gate: JS-style-inplace / CSS-style-inplace-ref (six steps: in place,
+# no change, and the three declines, row for row against the same steps
+# at parse time). Checks that counted rebuilds now count in-place answers
+# as local (370 JS-style-attr, 375 JS-objects-relink, 376
+# JS-block-subtree); JS-counters-local and JS-flex-buttons take class
+# changes where a style change would now go in place, so 471's counting
+# flex rebuild and 382's control hand-over stay covered.
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -63,6 +63,7 @@
+ #include "desktop/frames.h"	/* patch 428 */
+ 
+ #include "html/html.h"
++#include "css/select.h"	/* patch 511: nscss_get_blank_style */
+ 
+ /* VitaBrowser: file-scope declarations for symbols MacSurf declared inside the
+  * functions that call them. Upstream builds with -Wnested-externs, so an
+@@ -8478,6 +8479,62 @@
+ 	return 0;
+ }
+ 
++/* Patch 511: is the compound holding st[at] (an attribute selector's '[')
++ * the selector's subject -- nothing after it but white space and then a
++ * comma or the rule's brace? (Inside a function, ')' follows: not the
++ * subject, counted.) Brackets and parentheses inside it are skipped as
++ * html_rl_attr_compound_dynamic skips them. */
++static int html_rl_attr_compound_subject(const uint8_t *st, size_t len,
++		size_t at)
++{
++	size_t b = at;
++	int depth;
++
++	while (b < len) {
++		uint8_t ch = st[b];
++		if (ch == '[' || ch == '(') {
++			uint8_t close = ch == '[' ? ']' : ')';
++			uint8_t q = 0;
++			depth = 1;
++			b++;
++			while (b < len && depth > 0) {
++				if (q != 0) {
++					if (st[b] == '\\')
++						b++;
++					else if (st[b] == q)
++						q = 0;
++				} else if (st[b] == '"' || st[b] == '\'') {
++					q = st[b];
++				} else if (st[b] == ch) {
++					depth++;
++				} else if (st[b] == close) {
++					depth--;
++				}
++				b++;
++			}
++			if (depth != 0)
++				return 0;
++			continue;
++		}
++		if (ch == '\\') {
++			b += 2;
++			continue;
++		}
++		if (html_rl310_is_ws(ch) || ch == '>' || ch == '+' ||
++		    ch == '~' || ch == ',' || ch == '{' || ch == '}' ||
++		    ch == ';' || ch == ')' || ch == '/')
++			break;
++		b++;
++	}
++	while (b < len && html_rl310_is_ws(st[b]))
++		b++;
++	return b < len && (st[b] == ',' || st[b] == '{');
++}
++
++/* Patch 511: html_rl_sheet_scan_attr's occurrences in a subject compound
++ * are left out while this is set (html_rl_sheet_refs_attr_others) */
++static bool html_rl_attr_subject_ok;
++
+ /* Patch 510: occurrences an attribute scan found inert (their compound
+  * holds a dynamic pseudo-class), for the log */
+ static unsigned int html_rl_attr_inert_seen;
+@@ -8627,7 +8684,9 @@
+ 				j++;
+ 			if (html_rl_attr_name_at(st, len, j, name, namelen)) {
+ 				/* patch 510: not beside :hover / :focus ... */
+-				if (!html_rl_attr_compound_dynamic(st, len, i))
++				if (!html_rl_attr_compound_dynamic(st, len, i) &&
++				    !(html_rl_attr_subject_ok &&	/* 511 */
++				      html_rl_attr_compound_subject(st, len, i)))
+ 					return 1;
+ 				html_rl_attr_inert_seen++;
+ 			}
+@@ -8673,11 +8732,36 @@
+ } html_rl_attr_cache[HTML_RL_ATTR_CACHE_N];
+ static unsigned int html_rl_attr_cache_next;
+ 
++static int html_rl_sheet_refs_attr_key(html_content *c, const char *name,
++		const char *key);
+ static int html_rl_sheet_refs_attr(html_content *c, const char *name)
+ {
++	return html_rl_sheet_refs_attr_key(c, name, name);
++}
++
++/* Patch 511: can a used sheet select on `name` other than in a selector's
++ * subject compound? (A subject [style] test reaches only the element
++ * whose attribute it reads.) Cached apart from 310's answer ('>' name). */
++static int html_rl_sheet_refs_attr_others(html_content *c, const char *name)
++{
++	char key[40];
++	int r;
++	if (strlen(name) + 2 > sizeof(key))
++		return html_rl_sheet_refs_attr(c, name);
++	key[0] = '>';
++	strcpy(key + 1, name);
++	html_rl_attr_subject_ok = true;
++	r = html_rl_sheet_refs_attr_key(c, name, key);
++	html_rl_attr_subject_ok = false;
++	return r;
++}
++
++static int html_rl_sheet_refs_attr_key(html_content *c, const char *name,
++		const char *key)
++{
+ 	extern double macos9_micros(void);
+ 	unsigned int i, k;
+-	size_t namelen = strlen(name);
++	size_t namelen = strlen(name), keylen = strlen(key);
+ 	const char *const *pseudos = html_rl_pseudos_for(name);
+ 	for (i = 0; i < c->stylesheet_count; i++) {
+ 		const uint8_t *data;
+@@ -8695,17 +8779,25 @@
+ 		if ((data == NULL || size == 0) &&
+ 		    content_get_status(sh) == CONTENT_STATUS_DONE)
+ 			continue;
++		/* Patch 511: for the in-place restyle, a sheet with no
++		 * source is not in the selection context the boxes hold nor
++		 * in the one the element is selected again with; when it
++		 * comes, its sheet mark re-cascades every element against
++		 * the DOM as it is then (rte: an inline sheet with no
++		 * content, 38 declines a load). */
++		if ((data == NULL || size == 0) && html_rl_attr_subject_ok)
++			continue;
+ 		/* A sheet we cannot read might reference it. */
+ 		if (data == NULL || size == 0)
+ 			return 1;
+ 		refs = -1;
+-		if (namelen < sizeof(html_rl_attr_cache[0].name))
++		if (keylen < sizeof(html_rl_attr_cache[0].name))
+ 			for (k = 0; k < HTML_RL_ATTR_CACHE_N; k++)
+ 				if (html_rl_attr_cache[k].sheet == sh &&
+ 				    html_rl_attr_cache[k].data == data &&
+ 				    html_rl_attr_cache[k].size == size &&
+ 				    strcmp(html_rl_attr_cache[k].name,
+-					   name) == 0) {
++					   key) == 0) {
+ 					refs = html_rl_attr_cache[k].refs;
+ 					break;
+ 				}
+@@ -8720,15 +8812,15 @@
+ 					"[%s] in a sheet only beside :hover / "
+ 					":active / :focus (%u), inert", name,
+ 					html_rl_attr_inert_seen - inert0);
+-			if (namelen < sizeof(html_rl_attr_cache[0].name)) {
++			if (keylen < sizeof(html_rl_attr_cache[0].name)) {
+ 				k = html_rl_attr_cache_next;
+ 				html_rl_attr_cache_next = (k + 1) %
+ 					HTML_RL_ATTR_CACHE_N;
+ 				html_rl_attr_cache[k].sheet = sh;
+ 				html_rl_attr_cache[k].data = data;
+ 				html_rl_attr_cache[k].size = size;
+-				memcpy(html_rl_attr_cache[k].name, name,
+-					namelen + 1);
++				memcpy(html_rl_attr_cache[k].name, key,
++					keylen + 1);
+ 				html_rl_attr_cache[k].refs = refs;
+ 			}
+ 		}
+@@ -15913,6 +16005,254 @@
+ 	return html_rl_parent_whole(c, el, what);
+ }
+ 
++/* Patch 511: a style attribute change answered in place. 370 answers one
++ * as a class change: the element's box and its whole subtree built again
++ * and the page laid out -- for a flex <body> that is the page
++ * (stackoverflow: body.style set twice a load, 85-91 ms each in the sim).
++ * The box keeps its subtree when the change can reach nothing below it:
++ *   - no used sheet selects on [style] (310's scan) but in a selector's
++ *     subject compound: no other element's match changes (the element's
++ *     own is in its new selection, below);
++ *   - the element's new style builds the same box: display, float,
++ *     position (475), counting (none, old or new), background image (a
++ *     fetch), its ::before / ::after as they were; <body>: its background
++ *     colour (box_body may take it for the canvas);
++ *   - the custom-property environment defines what it did
++ *     (css_custom_env_equal, libcss patch 511: children inherit it by
++ *     reference, so a grandchild's var() could change unseen); the box
++ *     keeps its own, the children's parent;
++ *   - what descendants inherit is the same: a blank style from the old
++ *     and from the new compare equal (every inherited property: text and
++ *     anonymous boxes take them), and each element child, selected again
++ *     under the new style, comes out as its box holds it (a child's own
++ *     `inherit` of a non-inherited property is seen there); a box-less
++ *     child stays box-less.
++ * A descendant's style is a function of its ancestors' styles and the
++ * DOM, so with the children unchanged nothing below them changes. Then
++ * the new style is taken by the box -- and by every box of its subtree
++ * that shares the old one and is not another element's (text, inline
++ * ends, ::before / ::after contents) -- and the page is laid out. Otherwise the 370 path, as
++ * before. Not the root (419 / 459), nor a replaced, object or control
++ * box, nor any box but a block, flex or grid one. */
++/* Only boxes that hold no styles of their own: text, anonymous boxes,
++ * inline ends, generated content. A box that owns its styles is another
++ * element's and is left with its subtree -- libcss shares one computed
++ * style among elements that compute alike (gate511b: a <section> and its
++ * <p>s, all `margin: 4px 10px`; re-pointing by pointer alone gave the
++ * paragraphs the section's new margin). The shared style stays alive for
++ * them: computed styles are reference counted. */
++static void html_rl_repoint_styles(struct box *b,
++		const css_select_results *o, const css_select_results *nw)
++{
++	for (; b != NULL; b = b->next) {
++		int k;
++		if (b->styles != NULL)
++			continue;
++		for (k = 0; k < CSS_PSEUDO_ELEMENT_COUNT; k++)
++			if (o->styles[k] != NULL && b->style == o->styles[k]) {
++				b->style = nw->styles[k];
++				break;
++			}
++		html_rl_repoint_styles(b->children, o, nw);
++	}
++}
++
++static bool html_rl_blank_same(html_content *c, const css_computed_style *a,
++		const css_computed_style *b)
++{
++	nscss_select_ctx ctx;
++	css_computed_style *sa, *sb;
++	bool same = false;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.ctx = c->select_ctx;
++	ctx.quirks = (c->quirks == DOM_DOCUMENT_QUIRKS_MODE_FULL);
++	ctx.base_url = c->base_url;
++	ctx.universal = c->universal;
++	ctx.root_style = c->layout != NULL ? c->layout->style : NULL;
++	sa = nscss_get_blank_style(&ctx, &c->unit_len_ctx, a);
++	sb = nscss_get_blank_style(&ctx, &c->unit_len_ctx, b);
++	if (sa != NULL && sb != NULL)
++		same = css_computed_style_diff(sa, sb) ==
++			CSS_COMPUTED_STYLE_NO_DIFF;
++	if (sa != NULL)
++		css_computed_style_destroy(sa);
++	if (sb != NULL)
++		css_computed_style_destroy(sb);
++	return same;
++}
++
++static int html_rl_style_in_place(html_content *c, dom_node *el)
++{
++	struct box *b = box_for_node(el), *pb;
++	dom_node *pn = NULL, *ch = NULL, *next;
++	css_select_results *ns = NULL;
++	css_custom_env *env = NULL;
++	const css_computed_style *os;
++	css_computed_style *nst;
++	const char *why = NULL, *diff;
++	lwc_string *ia = NULL, *ib = NULL;
++	uint8_t ka, kb;
++	double t0 = macos9_micros();
++	int k, nch = 0;
++
++	if (b == NULL || b == c->layout || b->styles == NULL ||
++	    b->style == NULL || c->select_ctx == NULL || c->layout == NULL ||
++	    (b->type != BOX_BLOCK && b->type != BOX_FLEX &&
++	     b->type != BOX_GRID) ||
++	    (b->flags & IS_REPLACED) || b->object != NULL ||
++	    b->gadget != NULL)
++		return -1;
++	if (html_rl_sheet_refs_attr_others(c, "style")) {
++		macsurf_debug_log_writef("LIFE rebuild local: style in place: "
++			"declined (a sheet selects on [style] other than in a "
++			"selector's subject)");
++		return -1;
++	}
++	if (dom_node_get_parent_node(el, &pn) != DOM_NO_ERR || pn == NULL)
++		return -1;
++	pb = box_for_node(pn);
++	dom_node_unref(pn);
++	if (pb == NULL || pb->style == NULL)
++		return -1;
++	ns = box_get_style_with_select_ctx(c, c->select_ctx, pb->style,
++			c->layout->style, el, pb->custom_env, &env);
++	if (ns == NULL || ns->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
++		why = "no style";
++		goto out;
++	}
++	os = b->style;
++	nst = ns->styles[CSS_PSEUDO_ELEMENT_NONE];
++	if (!css_custom_env_equal(env, b->custom_env)) {
++		why = "its custom properties change";
++		goto out;
++	}
++	diff = html_rl_noop_diff(b, b->styles, ns);
++	if (diff == NULL) {
++		macsurf_debug_log_writef("LIFE rebuild local: style attribute "
++			"change restyles nothing (the element's style is the "
++			"same)");
++		goto done_same;
++	}
++	if (strcmp(diff, "an element's style changes") != 0) {
++		why = diff;
++		goto out;
++	}
++	for (k = CSS_PSEUDO_ELEMENT_BEFORE; k <= CSS_PSEUDO_ELEMENT_AFTER;
++			k++) {
++		bool ga = html_rl_pseudo_generates(b, b->styles->styles[k]);
++		bool gb = html_rl_pseudo_generates(b, ns->styles[k]);
++		if (ga != gb || (ga && css_computed_style_diff(
++				b->styles->styles[k], ns->styles[k]) !=
++				CSS_COMPUTED_STYLE_NO_DIFF)) {
++			why = "a ::before or ::after changes";
++			goto out;
++		}
++	}
++	if (css_computed_display(os, false) != css_computed_display(nst, false) ||
++	    css_computed_float(os) != css_computed_float(nst) ||
++	    !html_rl_pos_construct_same(css_computed_position(os),
++			css_computed_position(nst)) ||
++	    html_rl_style_counts(os) || html_rl_style_counts(nst)) {
++		why = "how the box is built changes";
++		goto out;
++	}
++	ka = css_computed_background_image(os, &ia);
++	kb = css_computed_background_image(nst, &ib);
++	if (ka != kb || ia != ib) {
++		why = "its background image changes";
++		goto out;
++	}
++	if (b->node != NULL && b->parent == c->layout) {
++		css_color ca, cb;
++		css_computed_background_color(os, &ca);
++		css_computed_background_color(nst, &cb);
++		if (ca != cb) {
++			why = "<body>'s background colour changes";
++			goto out;
++		}
++	}
++	if (!html_rl_blank_same(c, os, nst)) {
++		why = "an inherited property changes";
++		goto out;
++	}
++	/* each element child, selected again under the new style */
++	if (dom_node_get_first_child(el, &ch) != DOM_NO_ERR)
++		ch = NULL;
++	while (ch != NULL && why == NULL) {
++		dom_node_type type;
++		if (dom_node_get_node_type(ch, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			struct box *cb = box_for_node(ch);
++			css_custom_env *cenv = NULL;
++			css_select_results *cs = box_get_style_with_select_ctx(c,
++					c->select_ctx, nst, c->layout->style, ch,
++					env, &cenv);
++			nch++;
++			if (cs == NULL ||
++			    cs->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
++				why = "a child has no style";
++			} else if (cb == NULL) {
++				if (css_computed_display(
++					cs->styles[CSS_PSEUDO_ELEMENT_NONE],
++					false) != CSS_DISPLAY_NONE &&
++				    !html_rl_noop_never_boxed(ch))
++					why = "a child without a box would get "
++						"one";
++			} else if (cb->styles == NULL ||
++				   html_rl_noop_diff(cb, cb->styles, cs) !=
++					NULL) {
++				why = "a child's style changes";
++			}
++			if (cs != NULL)
++				css_select_results_destroy(cs);
++			if (cenv != NULL)
++				css_custom_env_unref(cenv);
++		}
++		next = NULL;
++		if (dom_node_get_next_sibling(ch, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(ch);
++		ch = next;
++	}
++	if (ch != NULL)
++		dom_node_unref(ch);
++	if (why != NULL)
++		goto out;
++	/* in place: the box and the boxes sharing its styles take the new */
++	html_rl_repoint_styles(b->children, b->styles, ns);
++	{
++		css_select_results *old = b->styles;
++		b->styles = ns;
++		b->style = nst;
++		css_select_results_destroy(old);
++		ns = NULL;
++		if (env != NULL)	/* equal to its own, which it keeps */
++			css_custom_env_unref(env);
++		env = NULL;
++	}
++	html_rl_invalidate(b);
++	macsurf_debug_log_writef("LIFE rebuild local: style attribute change, "
++		"the box restyled in place (%d children unchanged) in %ld us",
++		nch, (long)(macos9_micros() - t0));
++	content__reformat(&c->base, false, c->base.available_width,
++			c->base.available_height);
++	return 0;
++done_same:
++	css_select_results_destroy(ns);
++	if (env != NULL)
++		css_custom_env_unref(env);
++	return 0;
++out:
++	if (ns != NULL)
++		css_select_results_destroy(ns);
++	if (env != NULL)
++		css_custom_env_unref(env);
++	macsurf_debug_log_writef("LIFE rebuild local: style in place: "
++		"declined (%s)", why);
++	return -1;
++}
++
+ int html_reconvert_local_style(struct content *base_c, void *vnode);
+ int html_reconvert_local_style(struct content *base_c, void *vnode)
+ {
+@@ -15941,6 +16281,11 @@
+ 		dom_string_unref(cls);
+ 	if (cs == NULL)
+ 		return -1;
++	/* patch 511: in place, when nothing below can change */
++	if (html_rl_style_in_place(c, (dom_node *)vnode) == 0) {
++		free(cs);
++		return 0;
++	}
+ 	macsurf_debug_log_writef("LIFE rebuild local: style attribute "
+ 		"change, as a class change");
+ 	html_rl_style_as_class = true;	/* patch 414 */

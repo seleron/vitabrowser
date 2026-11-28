@@ -354,6 +354,8 @@ JS-kept-table file:///app0:/testpages/JS-kept-table.html
 CSS-kept-table-ref file:///app0:/testpages/CSS-kept-table-ref.html
 JS-attr-scan file:///app0:/testpages/JS-attr-scan.html
 CSS-attr-scan-ref file:///app0:/testpages/CSS-attr-scan-ref.html
+JS-style-inplace file:///app0:/testpages/JS-style-inplace.html
+CSS-style-inplace-ref file:///app0:/testpages/CSS-style-inplace-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1812,7 +1814,8 @@ echo "  JS-table-cell-class: rows differing from the parse-time build $tkr (0); 
 # (before: always a full rebuild); the eleven-step page renders row for
 # row as the same steps run at parse time.
 sar=$(fl_rows JS-style-attr CSS-style-attr-ref)
-sal=$(grep -c "LIFE rebuild local: style attribute change, as a class change" "$R/netsurf.log" || true)
+# (Patch 511: in place, or no change at all, is local too)
+sal=$(grep -c "LIFE rebuild local: style attribute change, as a class change\|LIFE rebuild local: style attribute change, the box restyled in place\|LIFE rebuild local: style attribute change restyles nothing" "$R/netsurf.log" || true)
 echo "  JS-style-attr: rows differing from the parse-time build $sar (0); ${sal} style attribute changes taken locally (8 or more)"
 [ "$sar" = 0 ] && [ "${sal:-0}" -ge 8 ] || fail "style attribute changes taken locally"
 # Patch 372: a class or style change on a flex or grid container's own
@@ -1924,6 +1927,17 @@ ase=$(printf '%s\n' "$asseg" | grep -c "LIFE rebuild local: data-esc attribute c
 asq=$(printf '%s\n' "$asseg" | grep -c "LIFE rebuild local: data-quiet attribute change\|LIFE rebuild local: data-other attribute change" || true)
 echo "  JS-attr-scan: rows differing from the parse-time build $asr (0); inert beside a dynamic pseudo-class ${asi} (1 or more); live / escaped restyled ${asl} / ${ase} (1 / 1 or more); quiet ones restyled ${asq} (0)"
 [ "$asr" = 0 ] && [ "${asi:-0}" -ge 1 ] && [ "${asl:-0}" -ge 1 ] && [ "${ase:-0}" -ge 1 ] && [ "${asq:-1}" -eq 0 ] || fail "attribute scan: escapes, empty sheets, dynamic pseudo-classes"
+# Patch 511: a style attribute change that can reach nothing below the
+# element is taken by its box in place (a padding; a [style] subject
+# rule); one that changes an inherited property, the custom properties,
+# or a child's style keeps the rebuild. Six steps render row for row as
+# at parse time.
+sir=$(fl_rows JS-style-inplace CSS-style-inplace-ref)
+siseg=$(awk '/ page [0-9]+\/[0-9]+ JS-style-inplace: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+sip=$(printf '%s\n' "$siseg" | grep -c "LIFE rebuild local: style attribute change, the box restyled in place" || true)
+sid=$(printf '%s\n' "$siseg" | grep -c "LIFE rebuild local: style in place: declined (an inherited property changes)\|LIFE rebuild local: style in place: declined (its custom properties change)\|LIFE rebuild local: style in place: declined (a child's style changes)" || true)
+echo "  JS-style-inplace: rows differing from the parse-time build $sir (0); restyled in place ${sip} (2 or more); inherited / custom property / child declines ${sid} (3 or more)"
+[ "$sir" = 0 ] && [ "${sip:-0}" -ge 2 ] && [ "${sid:-0}" -ge 3 ] || fail "style attribute changes restyled in place"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render
@@ -1984,7 +1998,9 @@ echo "  JS-bg-objects: rows differing from the parse-time build $k374bgr (0); fl
 # parse time -- every image still drawn -- with four changes local.
 k375r=$(fl_rows JS-objects-relink CSS-objects-relink-ref)
 k375l=$(awk '/ page [0-9]+\/[0-9]+ JS-objects-relink: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
-	grep -c "LIFE rebuild local: \(flex or grid box restyled\|block restyled\|table restyled\)" || true)
+	grep -c "LIFE rebuild local: \(flex or grid box restyled\|block restyled\|table restyled\|style attribute change, the box restyled in place\)" || true)
+# (Patch 511: the first step's style change keeps the box and its objects
+# -- restyled in place, nothing to relink -- and counts as local.)
 k375o=$(grep -c "LIFE rebuild local: objects re-pointed [1-9]" "$R/netsurf.log" || true)
 echo "  JS-objects-relink: rows differing from the parse-time build $k375r (0); ${k375l} changes rebuilt locally on the page (4 or more); ${k375o} rebuilds re-pointed objects (2 or more)"
 [ "$k375r" = 0 ] && [ "${k375l:-0}" -ge 4 ] && [ "${k375o:-0}" -ge 2 ] ||
@@ -1996,7 +2012,9 @@ echo "  JS-objects-relink: rows differing from the parse-time build $k375r (0); 
 # time; a list and a block holding a float keep the full rebuild.
 k376r=$(fl_rows JS-block-subtree CSS-block-subtree-ref)
 k376l=$(awk '/ page [0-9]+\/[0-9]+ JS-block-subtree: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log" |
-	grep -c "LIFE rebuild local: block subtree restyled" || true)
+	grep -c "LIFE rebuild local: block subtree restyled\|LIFE rebuild local: style attribute change, the box restyled in place" || true)
+# (Patch 511: the style steps whose change reaches nothing below are
+# restyled in place -- local too; rows 0 says they lay out right.)
 k376d=$(grep -c "LIFE rebuild local: declined (restyled block holds floats or list markers)" "$R/netsurf.log" || true)
 # (Patch 420: the list and the block holding a float are restyled alone
 # too now -- 7 subtrees, no float/marker declines.)

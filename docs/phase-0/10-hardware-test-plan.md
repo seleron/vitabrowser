@@ -20244,3 +20244,87 @@ on 509 and 510.
   (both paces); no network page dropped.
 
 No sudo.
+
+## Patch 511 (2026-11-28): a style attribute change restyled in place
+
+**What changed.** Patch 370 answers a `style` attribute change as a class
+change: the element's box and its whole subtree are built again and the
+page is laid out (a flex `<body>`: the whole page).
+`html_rl_style_in_place` keeps the subtree when the change can reach
+nothing below the element:
+- **No used sheet selects on `[style]` but in a selector's subject
+  compound.** A subject `[style]` test reaches only the element itself,
+  which is selected again. The check is `html_rl_sheet_refs_attr_others`,
+  a mode of 310's scan, cached apart.
+  - A sheet with no source is passed over in this mode: it is not in the
+    selection context yet, and its arrival re-cascades everything. rte
+    had an inline sheet with no content: 38 declines a load.
+- **The new style builds the same box:** display, float, position (475),
+  counting (none, old or new), background image, `::before` / `::after`.
+  For `<body>`, its background colour too (`box_body` may take it for the
+  canvas).
+- **The custom properties define what they did.** New libcss API
+  `css_custom_env_equal`: same parent environment, same own bindings in
+  order (name, tokens by interned pointer, validity). Children inherit
+  the environment by reference, so a grandchild's `var()` could otherwise
+  change unseen. The box keeps its own environment.
+- **What descendants inherit is the same:** a blank style from the old
+  and from the new compare equal. Each element child, selected again under
+  the new style, comes out as its box holds it; a box-less child stays
+  box-less.
+- **A style that comes out unchanged** is no change at all.
+- Otherwise the 370 path, as before.
+
+**Re-pointing (gate511b).** The box takes the new style, and so does every
+box of its subtree that shares the old style and owns no styles of its own
+(text, anonymous boxes, inline ends, generated content).
+- **Never another element's box.** libcss shares one computed style among
+  elements that compute alike.
+- The first version re-pointed by pointer alone and gave
+  `JS-block-subtree`'s `<p>`s their `<section>`'s new `margin-left`: 34
+  rows wrong. The shared style stays alive for the others (computed styles
+  are reference counted).
+
+**Gate history.**
+- **gate511 failed** on `JS-objects-relink`'s count: a step now restyled
+  in place (correctly, rows 0). The gate stops reporting checks after the
+  first failure, which hid the next one.
+- **gate511b failed** on `JS-block-subtree`: rows 34, the re-pointing bug.
+- **Before gate511c**, all 13 gate pages that set `.style` were run on 510
+  and 511, and every rebuild reason whose count dropped was listed:
+  - checks now counting in-place answers as local: 370 `JS-style-attr`,
+    375 `JS-objects-relink`, 376 `JS-block-subtree`;
+  - steps turned into class changes, to keep their old paths covered:
+    `JS-counters-local` (471's counting flex rebuild) and
+    `JS-flex-buttons` (382's control hand-over).
+
+**Measured** (sim):
+- rte: of 49 style attribute changes, 36 change nothing and 4 are
+  restyled in place (were 49 subtree rebuilds). Local-rebuild time ~800 ->
+  ~730 ms; main-thread CPU flat.
+- youtube / guardian / bbc: 1 each now "restyles nothing".
+- stackoverflow's `body.style` changes declined on the loads measured (a
+  sheet with no source, before the sourceless-sheet rule); Cloudflare
+  then blocked further loads.
+
+**Found, not fixed (pre-existing; 510 too):** a script's `el.style.color`
+on a flex box does not repaint its children's text. That is the separate
+inherited-colour fast path (`html_reconvert_fast_inherited_color`). The
+gate page uses `font-weight` for the inherited case.
+
+**Gate pages.** New `JS-style-inplace` / `CSS-style-inplace-ref`: in place
+(a padding; a `[style*=height]` subject rule), the same value again, and
+the inherited / custom-property / child declines.
+
+**ASan** (`--libs --net`, with the fix): clean on JS-style-inplace,
+JS-block-subtree, JS-flex-buttons, JS-counters-local, JS-style-attr and
+JS-objects-relink (12 in-place restyles). Before the fix: clean on rte
+and youtube as well.
+
+**Gate.**
+- `restage-full.sh`: **595 applied plus the 2 known collisions**.
+- **gate511c exit 0**: JS-style-inplace, JS-block-subtree, JS-flex-buttons,
+  JS-counters-local, JS-objects-relink, JS-style-attr pass; interaction
+  57/57 (both paces); no network page dropped.
+
+No sudo.
