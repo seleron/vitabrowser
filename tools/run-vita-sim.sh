@@ -336,6 +336,8 @@ JS-style-attr file:///app0:/testpages/JS-style-attr.html
 CSS-style-attr-ref file:///app0:/testpages/CSS-style-attr-ref.html
 JS-flex-restyle file:///app0:/testpages/JS-flex-restyle.html
 CSS-flex-restyle-ref file:///app0:/testpages/CSS-flex-restyle-ref.html
+JS-flex-items file:///app0:/testpages/JS-flex-items.html
+CSS-flex-items-ref file:///app0:/testpages/CSS-flex-items-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1810,6 +1812,20 @@ fxi=$(grep -c "LIFE rebuild local: restyled flex or grid box is no longer a bloc
 echo "  JS-flex-restyle: rows differing from the parse-time build $fxr (0); ${fxl} flex/grid containers restyled alone (8 or more); objects carried over ${fxo} (1 or more); declined: made inline ${fxi} (1 or more)"
 [ "$fxr" = 0 ] && [ "${fxl:-0}" -ge 8 ] && [ "${fxo:-0}" -ge 1 ] &&
 	[ "${fxi:-0}" -ge 1 ] || fail "flex and grid containers restyled alone"
+# Patch 502: elements inserted into or removed from a block-level flex box
+# are placed alone, as blocks are, and the page laid out whole (before:
+# the box built again whole). Sixteen steps -- appends, inserts at the
+# start and middle, removals, a column box, a :nth-child rule (its
+# siblings restyled), a + sibling rule, an inline item, a moved item and a
+# run of text (those three: the box built again whole), a display:none
+# item, a wrapping box, order:-1, a nested flex item, a box emptied and
+# refilled -- render row for row as the same steps at parse time.
+fir=$(fl_rows JS-flex-items CSS-flex-items-ref)
+fip=$(grep -c "LIFE rebuild local: a flex box's items in or out" "$R/netsurf.log" || true)
+fiw=$(grep -c "LIFE rebuild local: a flex or grid box's child list the local path declined, the box built again whole" "$R/netsurf.log" || true)
+echo "  JS-flex-items: rows differing from the parse-time build $fir (0); ${fip} flex item changes placed alone (8 or more); fallbacks to the whole box ${fiw} (3 or more)"
+[ "$fir" = 0 ] && [ "${fip:-0}" -ge 8 ] && [ "${fiw:-0}" -ge 3 ] ||
+	fail "flex items placed alone"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render
@@ -2359,9 +2375,11 @@ k438r=$(fl_rows JS-flex-own CSS-flex-own-ref)
 k438seg=$(awk '/ page [0-9]+\/[0-9]+ JS-flex-own: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
 k438w=$(printf '%s\n' "$k438seg" | grep -c "the box built again whole" || true)
 k438d=$(printf '%s\n' "$k438seg" | grep -c "declined (nearest box is not a block)\|declined (a flex or grid box's child list changed" || true)
+# patch 502: the boxed <div> appended to the flex row is placed alone now
+k438p=$(printf '%s\n' "$k438seg" | grep -c "LIFE rebuild local: a flex box's items in or out" || true)
 k438f=$(printf '%s\n' "$k438seg" | grep -c "LIFE BATCHCAUSE cause=local" || true)
-echo "  JS-flex-own: rows $k438r (0), flex boxes built again whole ${k438w} (3 or more), nearest-box / flex child-list declines ${k438d} (0), full rebuilds after a decline ${k438f} (0)"
-[ "$k438r" = 0 ] && [ "${k438w:-0}" -ge 3 ] && [ "${k438d:-1}" -eq 0 ] && [ "${k438f:-1}" -eq 0 ] || fail "flex boxes and inline-blocks built again whole"
+echo "  JS-flex-own: rows $k438r (0), flex boxes built again whole ${k438w} (2 or more), flex item appended and placed alone ${k438p} (1 or more; patch 502), nearest-box / flex child-list declines ${k438d} (0), full rebuilds after a decline ${k438f} (0)"
+[ "$k438r" = 0 ] && [ "${k438w:-0}" -ge 2 ] && [ "${k438p:-0}" -ge 1 ] && [ "${k438d:-1}" -eq 0 ] && [ "${k438f:-1}" -eq 0 ] || fail "flex boxes and inline-blocks built again whole"
 # Patch 439: a <div> holding a <video> and one holding a <dl> inserted
 # between blocks are built alone (media tags as images, description lists
 # as lists), a custom element inserted into a flex box builds the box again

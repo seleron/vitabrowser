@@ -1,0 +1,129 @@
+# netsurf: items in or out of a block-level flex box are placed alone (patch 502)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 501)
+#
+# A child-list change on a flex or grid box with boxed children in or out
+# built the whole box again (patches 438/439, html_rl_flex_whole:
+# "a flex or grid box's child list changed in elements with a box"). On
+# stackoverflow.com, script inserts into large flex containers rebuilt
+# ~1,400 elements each time, ~90-200 ms per insert in the simulator,
+# ~0.6 s of a 5.2 s load's main thread.
+#
+# html_rl_block_change now places the items as it places blocks -- each
+# new one built alone (box_build_element) and linked after its earlier
+# sibling's box, removed ones unlinked -- and lays the page out whole,
+# when the placement is the plain one: a block-level BOX_FLEX with no
+# object, control, frame or marker; every child box under it an
+# element's (an implied flex item, i.e. a run of inline content, is
+# "more than blocks" and falls back, so no line can be split or joined);
+# no non-space text; an element child that keeps its box (its own :empty
+# cannot change). The leaf, inline, late and float placements are
+# skipped in this mode (such a new element falls back), and an item built
+# anywhere but straight under the flex box is a full reconvert, as the
+# block path's own surprises are. The structural (:nth-child) and
+# sibling-rule checks run as for blocks: matching siblings restyled
+# alone, or the box built again whole. Grid, inline-flex and the rest
+# keep the whole rebuild.
+#
+# Gate: JS-flex-items / CSS-flex-items-ref (sixteen steps, row for row
+# against the same steps at parse time).
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -9820,6 +9820,25 @@
+ 	const char *obj_why = NULL;		/* patch 454 */
+ 	const char *obj_decl = NULL;		/* patch 457: its decline */
+ 	static unsigned long block_n;
++	/* Patch 502: items in or out of a block-level flex box are placed
++	 * as blocks are here, the page laid out whole, instead of the box
++	 * built again whole (438/439: stackoverflow's flex containers,
++	 * ~1,400 elements re-selected per inserted item). Only when the
++	 * placement is the plain one: every child box under it an
++	 * element's (an implied flex item -- a run of inline content --
++	 * is "more than blocks" below, and falls back), no non-space text,
++	 * an element child that keeps its box (the box's own :empty cannot
++	 * change), and every new item built as a box straight under it --
++	 * the leaf, inline, late and float placements are skipped (a new
++	 * one of those falls back), one built elsewhere is a full
++	 * reconvert, as the block path's own surprises are. Grid,
++	 * inline-flex and a box with an object, control, frame or marker
++	 * keep the whole rebuild. */
++	bool flexok = html_rl_noop_only && pbox->type == BOX_FLEX &&
++		pbox->parent != NULL && pbox->object == NULL &&
++		pbox->gadget == NULL && !HTML_RL_FRAME(pbox) &&
++		pbox->list_marker == NULL;
++	unsigned int kept = 0;
+ 
+ /* patch 439: in 408's flex child-list mode a reason here is not a decline:
+  * the box is built again whole (see decline:) */
+@@ -9990,6 +10009,8 @@
+ 		}
+ 		if (type == DOM_ELEMENT_NODE) {
+ 			b = box_for_node(n);
++			if (b != NULL && b->parent == pbox)
++				kept++;		/* patch 502 */
+ 			if (b == NULL && html_rl_never_boxed(n)) {
+ 				/* patch 377: a <script> etc. -- no box, ever;
+ 				 * patch 378: kept for the no-op's check */
+@@ -10026,7 +10047,8 @@
+ 				 * after its earlier block, the page laid out
+ 				 * whole. Its children (a <select>'s options, a
+ 				 * <button>'s text) must be inline or controls. */
+-				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
++				if (!plain && !oc && !flexok &&
++				    nadd < HTML_RL_MAX_CHANGES &&
+ 				    html_rl_leaf_tag(n) && html_rl_boxed_after(n) &&
+ 				    html_rl_block_neighbour(n, pbox, false) &&
+ 				    html_rl_block_neighbour(n, pbox, true)) {
+@@ -10056,7 +10078,8 @@
+ 				 * is not a plain block" -- takes 407's way: built
+ 				 * alone, its run of boxes (inline box, contents,
+ 				 * inline end) moved into a line of its own. */
+-				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
++				if (!plain && !oc && !flexok &&
++				    nadd < HTML_RL_MAX_CHANGES &&
+ 				    html_rl_inline_tag(n) &&
+ 				    html_rl_subtree_tags(n, false) &&
+ 				    html_rl_boxed_after(n) &&
+@@ -10081,7 +10104,8 @@
+ 				 * and its late load as in a full build (244).
+ 				 * Patch 416: a plain inline element after a
+ 				 * block, too -- a line of its own at the end. */
+-				if (!plain && !oc && nadd < HTML_RL_MAX_CHANGES &&
++				if (!plain && !oc && !flexok &&
++				    nadd < HTML_RL_MAX_CHANGES &&
+ 				    !html_rl_boxed_after(n) &&
+ 				    (html_rl_late_tag(n) ||
+ 				     (html_rl_inline_tag(n) &&
+@@ -10266,7 +10290,14 @@
+ 			"rebuild", nskip);
+ 		return 0;
+ 	}
+-	if (html_rl_noop_only) {	/* patch 408 */
++	if (html_rl_noop_only && flexok && kept > 0 && (nadd > 0 || nrem > 0)) {
++		/* patch 502: placed below as blocks are, laid out whole */
++		full = true;
++		why = "flex items placed";
++		macsurf_debug_log_writef("LIFE rebuild local: a flex box's "
++			"items in or out (%u added, %u removed), placed alone",
++			nadd, nrem);
++	} else if (html_rl_noop_only) {	/* patch 408 */
+ 		/* Patch 438: boxed children in or out of a flex or grid box
+ 		 * (5 declines in r147): the box is built again whole, as a
+ 		 * change below it is (422) -- its children are all rebuilt,
+@@ -10492,6 +10523,16 @@
+ 			dom_node_unref(added[i]);
+ 			continue;
+ 		}
++		/* patch 502: a flex item must be built straight under its
++		 * flex box (an inline-level one lands in a line, a float in a
++		 * carrier: what normalisation wraps in an implied item) */
++		if (flexok && (nb->parent != pbox || leafmid[i])) {
++			for (; i < nadd; i++)
++				dom_node_unref(added[i]);
++			macsurf_debug_log_writef("LIFE rebuild local: flex item "
++				"built where it cannot be placed, full reconvert");
++			{ html_rl_struct_hits_release(shits, &nshits); return -1; }
++		}
+ 		/* Patch 365: a float is built into an inline container at
+ 		 * the END of pbox (box_construct appends one, or reuses a
+ 		 * last one): take its float box out, to place in DOM order

@@ -19545,3 +19545,98 @@ both hand-off folders.
 The device procedure and load-time checks are unchanged (claude.ai,
 github, theguardian.com, stackoverflow, youtube; rte.ie is a good extra
 for 501).
+
+## ASan + census for 501 (2026-11-28)
+
+**ASan at 501** (`--libs --net`; the selector-hash rebuild instrumented,
+51 report sites in `_maybe_grow`): **clean**. Interaction 57/57, 453 page
+dumps, 0 reports.
+
+**21-site census, 500 vs 501** (`score/c21-501`): 12.0 -> 15.7 full
+rebuilds per load. **Noise on the 500 side**, not a regression:
+- the 500 arm measured 16.3 in the previous census and 12.0 here;
+- 501's 15.7 is inside the historical 14.3-17.3;
+- its "local" count 4.7 matches earlier censuses, the 500 arm's 2.0 does
+  not;
+- 501 cannot change a rebuild decision (libcss merges chains by
+  specificity and rule index, not chain position).
+
+**oldreddit crash, more data.**
+- It crashed again on the **first arm's first oldreddit load** (500 L1).
+  That makes four censuses, recently always that same slot: something
+  about the first oldreddit load of a census run, not the build.
+- **Three replays under the ASan sim** of that load's exact census script
+  (`script.txt` + `text.js` from `score/c21-500/499/L1/sim/oldreddit`) got
+  past the critical window: page loaded, `text.js` ran, the 1.5 s settle
+  completed, **no crash and no ASan report**. (Their exit code 3 is a
+  script-path error at the later `shot` step: `shot` takes a name, not a
+  path.)
+
+## Patch 502 (2026-11-28): items in or out of a block-level flex box are placed alone
+
+**What.** A child-list change on a flex or grid box with boxed children
+in or out built the whole box again (438/439, `html_rl_flex_whole`).
+`html_rl_block_change` now places the items as it places blocks, and lays
+the page out whole:
+- each new one built alone (`box_build_element`) and linked after its
+  earlier sibling's box;
+- removed ones unlinked.
+
+It does so only when the placement is the plain one:
+- a block-level `BOX_FLEX` with no object, control, frame or marker;
+- every child box under it an element's. An implied flex item (a run of
+  inline content) is "more than blocks" and falls back, so no line can be
+  split or joined;
+- no non-space text;
+- an element child that keeps its box, so its own `:empty` cannot change.
+
+Other rules:
+- The leaf, inline, late and float placements are skipped in this mode.
+- An item built anywhere but straight under the flex box is a full
+  reconvert, as the block path's own surprises are.
+- The structural and sibling-rule checks run as for blocks.
+- Grid, inline-flex and the rest keep the whole rebuild.
+
+**Gate pages.** New `JS-flex-items` / `CSS-flex-items-ref`, sixteen
+steps:
+- appends, inserts at the start and middle, removals;
+- a column box with a gap;
+- `:nth-child` (siblings restyled alone) and a `+` rule (whole box);
+- an inline item, a moved item and a text run (all three: whole box);
+- a `display:none` item, a wrapping box, `order:-1`, a nested flex item,
+  a box emptied to one item and refilled.
+
+The page renders **0 rows different** from the same steps at parse time
+(also checked by eye), with 14 changes placed alone and 7 fallbacks.
+
+**`JS-flex-own` (438's check) updated.** Its "boxed `<div>` appended to a
+flex row" step is now placed alone; the check expects 2 whole-box
+rebuilds and 1 placed alone. The page still renders 0 rows different.
+gate502 failed on the old count; gate502b passed.
+
+**The diagnosis was wrong for stackoverflow.** Measured 501 vs 502, two
+real-page loads each:
+- the child-list whole-box rebuilds went **4 -> 0**, one change placed
+  alone;
+- **local-rebuild time was unchanged (~1,440 ms) and main-thread CPU
+  flat**.
+
+The ~660 ms of "flex or grid box restyled, full layout (its own class or
+style)" are, apart from the first, cheap one, **class / style changes on
+the big layout flex containers themselves** (`DIV.container`, `#content`)
+inside large mutation batches. Patch 372 answers those by rebuilding the
+container whole (~90 ms each in the sim). 502 is correct and general (any
+script that appends items to a flex row or list), but not the
+stackoverflow win it was picked for.
+
+**Next candidate:** a flex container's own class / style change
+restyled in place (the container re-selected, descendants only where a
+selector can depend on the change), as 459 does for the root.
+
+**Gate.**
+- `restage-full.sh`: **584 applied plus the 2 known collisions**.
+- The network page list is now at 379 of `VITA_NET_PAGES_MAX` 384.
+- **gate502b exit 0**: JS-flex-items, JS-flex-own, JS-media-new and
+  JS-flex-restyle pass; interaction 57/57 (both paces).
+
+No sudo.
