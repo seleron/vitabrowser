@@ -19337,3 +19337,64 @@ both hand-off folders.
 
 The device procedure and the load-time checks are unchanged (claude.ai,
 github, theguardian.com, stackoverflow; see the 498 re-stage note).
+
+## ASan + census for 499 (2026-11-28)
+
+**ASan at 499** (`--libs --net --js`: QuickJS instrumented too, 117
+report sites in `js_parse_skip_parens_token1`): **clean**. Interaction
+57/57, 453 page dumps, 0 reports.
+
+**21-site census, 498 vs 499** (`score/c21-499`): 14.7 -> 16.7 full
+rebuilds per load (+2.0). This is the edge of the noise band, not a
+change:
+- the 498 arm alone spans 11-17 across its three loads;
+- no site moved more than 0.7;
+- 499 changes only JS parsing.
+
+**Open item:** oldreddit crashed on its first load **on the 498 arm**.
+The same intermittent oldreddit crash appeared on the 491 arm in the
+491-vs-495 census, so it predates 492-499. ASan autotests stay clean; not
+reproduced yet.
+
+## Patch 500 (2026-11-28): the CSS rewrite passes reject a property name on its first character (P1 load time)
+
+**Problem.** `macsurf_css_rewrite` runs ~20 text passes over every sheet
+before libcss sees it.
+- Each pass calls `macsurf__match_prop_name` at every byte.
+- `strip_background_layers` (patch 352) did so for **eight** background
+  property names per byte, with a `strlen` each.
+- Sim at 499, the rewrite's share of the page-load main thread: **~17% of
+  github's, ~16% of youtube's** (sprof cross-site table), with
+  `strip_background_layers` and `match_prop_name` its largest parts.
+
+**Fix** (`patches/vitabrowser/500-netsurf-rewrite-name-match-fast.patch`).
+- `macsurf__match_prop_name` is `static inline` and tests the first
+  character first (case-insensitively, after the bounds test). It is the
+  AND of the same pure tests, so the answer is the same.
+- `strip_background_layers` skips a byte that is not `b`/`B` (every name
+  it looks for starts with one) and uses fixed name lengths; its loop is
+  otherwise unchanged.
+
+**Exactness.** A `VITA_REWRITE_CHECK` build keeps both pre-500 functions
+and compares every call: **334 million comparisons, 0 mismatches**.
+- Coverage: the 21 census sites and 12 background / grid / gradient CSS
+  test pages.
+- youtube 74M, guardian 56M, github 55M.
+
+**Measured** (sim, sprof, 2 loads each, 499 -> 500):
+
+| site | CSS rewrite samples | main-thread CPU |
+|---|---|---|
+| github | 85 -> 58 (**-32%**) | 1.84 -> 1.68 s (**-9%**) |
+| youtube | 98 -> 62 (**-36%**) | 2.50 -> 2.43 s |
+| guardian | 78 -> 54 (**-31%**) | within its noise |
+
+`strip_background_layers` went from ~20 samples to 0-2.
+
+**Gate.**
+- `restage-full.sh`: **582 applied plus the 2 known collisions**.
+- **gate500 exit 0**: interaction 57/57 (both paces); all 35 pass/fail
+  CSS pages pass, and the value checks (`css-bg-layers-svg` among them)
+  match.
+
+No sudo.

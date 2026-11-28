@@ -1,0 +1,237 @@
+# netsurf: the CSS rewrite passes reject a property name on its first character (patch 500)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 499)
+#
+# macsurf_css_rewrite runs ~20 text passes over every sheet before libcss
+# sees it, and each pass calls macsurf__match_prop_name at every byte;
+# strip_background_layers (patch 352) did so for EIGHT background
+# property names per byte, with a strlen each. Simulator at 499: the
+# rewrite was ~17% of github's and ~16% of youtube's page-load
+# main-thread time, strip_background_layers and match_prop_name its
+# largest parts.
+#
+# macsurf__match_prop_name is inline and tests the first character first
+# (case-insensitively, after the bounds test); it is the AND of the same
+# pure tests as before, so the same answer. strip_background_layers skips
+# a byte that is not b / B (every name it looks for starts with one) and
+# uses fixed name lengths; otherwise its loop is unchanged.
+# VITA_REWRITE_CHECK builds keep both pre-500 functions and compare every
+# call (match result; stripped output byte for byte).
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -198,11 +198,83 @@
+ 
+ 
+ /* fixes115 - case-insensitive 1-byte compare; checks word boundary so
+- * "grid-template-columns" doesn't match `xgrid-template-columns`. */
+-static int
++ * "grid-template-columns" doesn't match `xgrid-template-columns`.
++ *
++ * VitaBrowser patch 500: every rewrite pass calls this at every byte of a
++ * sheet (one pass, for eight background property names, at every byte),
++ * so it is inline and rejects on the first character before anything
++ * else. The result is the AND of the same pure tests as before, in a
++ * different order: the same answer. */
++#ifdef VITA_REWRITE_CHECK
++static unsigned long rw_checked, rw_mismatch;
++static void rw_check_report(void)
++{
++	fprintf(stderr, "REWRITECHECK checked %lu, mismatches %lu\n",
++			rw_checked, rw_mismatch);
++}
++static void rw_count(bool same)
++{
++	if (rw_checked++ == 0)
++		atexit(rw_check_report);
++	if (!same) {
++		rw_mismatch++;
++		fprintf(stderr, "REWRITECHECK mismatch #%lu\n", rw_mismatch);
++	}
++}
++static int macsurf__match_prop_name_ref(const char *buf, size_t len,
++		size_t pos, const char *name, size_t name_len);
++#endif
++static inline int
++macsurf__match_prop_name_fast(const char *buf, size_t len, size_t pos,
++		const char *name, size_t name_len)
++{
++	size_t i;
++	if (pos + name_len > len) return 0;
++	if (name_len > 0) {
++		char b = buf[pos], n = name[0];
++		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++		if (n >= 'A' && n <= 'Z') n = (char)(n - 'A' + 'a');
++		if (b != n) return 0;
++	}
++	if (pos > 0) {
++		char prev = buf[pos - 1];
++		if ((prev >= 'a' && prev <= 'z') ||
++				(prev >= 'A' && prev <= 'Z') ||
++				(prev >= '0' && prev <= '9') ||
++				prev == '-' || prev == '_') {
++			return 0;
++		}
++	}
++	for (i = 1; i < name_len; i++) {
++		char b = buf[pos + i];
++		char n = name[i];
++		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
++		if (n >= 'A' && n <= 'Z') n = (char)(n - 'A' + 'a');
++		if (b != n) return 0;
++	}
++	return 1;
++}
++
++static inline int
+ macsurf__match_prop_name(const char *buf, size_t len, size_t pos,
+ 		const char *name, size_t name_len)
+ {
++#ifdef VITA_REWRITE_CHECK
++	int a = macsurf__match_prop_name_fast(buf, len, pos, name, name_len);
++	rw_count(a == macsurf__match_prop_name_ref(buf, len, pos, name,
++			name_len));
++	return a;
++#else
++	return macsurf__match_prop_name_fast(buf, len, pos, name, name_len);
++#endif
++}
++
++#ifdef VITA_REWRITE_CHECK
++/* the pre-500 function, for the check build */
++static int
++macsurf__match_prop_name_ref(const char *buf, size_t len, size_t pos,
++		const char *name, size_t name_len)
++{
+ 	size_t i;
+ 	if (pos + name_len > len) return 0;
+ 	if (pos > 0) {
+@@ -223,6 +295,7 @@
+ 	}
+ 	return 1;
+ }
++#endif
+ 
+ 
+ /* fixes117 - extract up to MAX_TRACKS track-width tokens from a
+@@ -3207,9 +3280,112 @@
+  * per-layer longhands, blank everything after the first depth-0 comma
+  * (same size, spaces). The final layer's colour is lost, but the whole
+  * declaration was dropped before. NULL when nothing changed. */
++#ifdef VITA_REWRITE_CHECK
++static char *macsurf__strip_background_layers_ref(const char *data,
++		size_t in_size);
++#endif
++static char *macsurf__strip_background_layers_fast(const char *data,
++		size_t in_size);
++
+ static char *
+ macsurf__strip_background_layers(const char *data, size_t in_size)
+ {
++#ifdef VITA_REWRITE_CHECK
++	char *a = macsurf__strip_background_layers_fast(data, in_size);
++	char *b = macsurf__strip_background_layers_ref(data, in_size);
++	rw_count((a == NULL && b == NULL) ||
++			(a != NULL && b != NULL && memcmp(a, b, in_size + 1) == 0));
++	free(b);
++	return a;
++#else
++	return macsurf__strip_background_layers_fast(data, in_size);
++#endif
++}
++
++/* patch 500: every name below starts with "b", so a byte that is not
++ * b / B starts none of them; their lengths are fixed. Otherwise the
++ * pre-500 loop, unchanged. */
++static char *
++macsurf__strip_background_layers_fast(const char *data, size_t in_size)
++{
++	static const char *const names[] = {
++		"background", "background-image", "background-repeat",
++		"background-position", "background-size",
++		"background-attachment", "background-origin",
++		"background-clip", NULL };
++	static const size_t lens[] = { 10, 16, 17, 19, 15, 21, 17, 15, 0 };
++	char *out;
++	size_t i = 0;
++	int changed = 0;
++
++	if (!macsurf__has_ci(data, in_size, "background") ||
++			memchr(data, ',', in_size) == NULL)
++		return NULL;
++	out = (char *)malloc(in_size + 1);
++	if (out == NULL)
++		return NULL;
++	memcpy(out, data, in_size);
++	out[in_size] = '\0';
++	while (i < in_size) {
++		size_t j = 0, k, comma = 0;
++		int n, depth = 0;
++		bool quote = false;
++		char q = 0;
++
++		if (data[i] != 'b' && data[i] != 'B') {
++			i++;
++			continue;
++		}
++		for (n = 0; names[n] != NULL; n++) {
++			size_t l = lens[n];
++			if (macsurf__match_prop_name(data, in_size, i,
++					names[n], l)) {
++				j = i + l;
++				while (j < in_size && (data[j] == ' ' ||
++						data[j] == '\t' ||
++						data[j] == '\n' ||
++						data[j] == '\r')) j++;
++				if (j < in_size && data[j] == ':')
++					break;
++			}
++		}
++		if (names[n] == NULL) {
++			i++;
++			continue;
++		}
++		/* value: to the next depth-0 `;`, `}` or `!` */
++		for (k = j + 1; k < in_size; k++) {
++			char c = data[k];
++			if (quote) {
++				if (c == q) quote = false;
++				continue;
++			}
++			if (c == '"' || c == '\'') { quote = true; q = c; }
++			else if (c == '(') depth++;
++			else if (c == ')') { if (depth > 0) depth--; }
++			else if (depth == 0 && (c == ';' || c == '}' ||
++					c == '!')) break;
++			else if (depth == 0 && c == ',' && comma == 0)
++				comma = k;
++		}
++		if (comma != 0) {
++			memset(out + comma, ' ', k - comma);
++			changed++;
++		}
++		i = k;
++	}
++	if (!changed) {
++		free(out);
++		return NULL;
++	}
++	return out;
++}
++
++#ifdef VITA_REWRITE_CHECK
++/* the pre-500 pass, for the check build */
++static char *
++macsurf__strip_background_layers_ref(const char *data, size_t in_size)
++{
+ 	static const char *const names[] = {
+ 		"background", "background-image", "background-repeat",
+ 		"background-position", "background-size",
+@@ -3278,6 +3454,8 @@
+ 	return out;
+ }
+ 
++#endif
++
+ static char *
+ macsurf__strip_stacked_gradients(const char *data, size_t in_size)
+ {
