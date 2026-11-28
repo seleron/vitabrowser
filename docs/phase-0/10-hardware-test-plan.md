@@ -18994,3 +18994,37 @@ linearly by name (`cp_name_equal`, dash-normalising compares).
   shadowing), verified by a both-ways check build like 496's.
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED (2026-11-28 ~01:35Z): VPKs from aae0f01 (patch 496)
+
+Run 45 now carries **496** as well. Its VPKs from `e2c0d88` were never
+handed over; they are superseded and parked, not deleted.
+
+**Build.**
+- A fresh `tools/build-vita.sh` of the gated tree at `aae0f01`.
+- ELF heaps 192 / **256** MiB; the ext ELF has the heap-span line.
+- The device `css_rewrite.o` was rebuilt after the 496 edit, and its
+  `macsurf__gtc_register` now reaches `realloc`: the index builder is
+  inlined there.
+- Both VPKs pass `unzip -t`.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `0ad7dfeb20fcd8ff…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `17222782468d94f1…` |
+| `nsvita.elf` | `b74c7d200c311749…` |
+
+**Files.**
+- Archive: `<WORK>/hwtest-2026-11-28-run45/`, holding the gate496
+  reference dumps (466) and the same 511 pages. The e2c0d88 set is now
+  `<WORK>/hwtest-2026-11-28-run45-superseded-495/`.
+- Both hand-off folders: the e2c0d88 VPKs, ELF, sums and dumps moved into
+  `hwtest-2026-11-28-run45-superseded-495\`; the new set is in place
+  (`SHA256SUMS-run45.txt`, plus the top-level `SHA256SUMS` in
+  `C:\Users\seleron\VitaBrowser-hwtest\`).
+- Checked before the move (old sums, dumps vs the archive) and after
+  (`sha256sum -c`, `diff -r`): clean.
+
+The device procedure above is unchanged. Extra to look for:
+**github and theguardian.com load times** (496: sim main-thread CPU -20%
+and -69%).
