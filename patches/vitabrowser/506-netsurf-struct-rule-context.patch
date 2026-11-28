@@ -1,0 +1,184 @@
+# netsurf: a structural rule's parent / ancestor context is kept (patch 506)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 505)
+#
+# The structural-rule check (patches 379/380/405) kept only the compound
+# holding the pseudo-class: Google's ".P1ekSe-ZMv3u>div:nth-child(2)" and
+# "(3)" (its sign-in widget's sheet, on stackoverflow) counted as
+# div:nth-child(2) / (3) and hit every second and third <div> of every
+# parent -- stackoverflow's div.container under <body> among them.
+#
+# html_rl_struct_ctx keeps the compound left of it when the combinator is
+# ">" (its parent must match) or a descendant space (an ancestor must):
+# tag, id and classes only, a broader match than the rule's. A start, a
+# comma, a brace, + or ~ before it, or a context that does not parse to a
+# tag, id or class, leaves none. html_rl_block_struct_risk skips a compound
+# whose context pnode (">") or pnode and its ancestors (" ") cannot match,
+# read as the children are matched (tag, id, classes).
+#
+# Gate: JS-struct-ctx / CSS-struct-ctx-ref (five steps, row for row against
+# the same steps at parse time). Every existing structural gate page gives
+# the same counts on 505 and 506 (checked before gating).
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7231,7 +7231,15 @@
+ 	 * than one group, unknown: set): a flip restyles another element
+ 	 * than the matching one */
+ 	bool sib_after;
++	/* Patch 506: the compound's context -- 1: its parent must match ctx
++	 * ("A > B:nth-child(2)"), 2: an ancestor must ("A B:first-child");
++	 * 0: none known. Only ctx's tag, id and classes are kept (a broader
++	 * match than the rule's). */
++	int ctxkind;
++	struct html_rl_struct_cp *ctx;
+ };
++static void html_rl_struct_ctx(const uint8_t *s, size_t a,
++		struct html_rl_struct_cp *cp);	/* patch 506 */
+ /* Patch 463: 32 -> 256 -- youtube's components inject more <style>s than
+  * 32, and round-robin eviction then rescanned every sheet at every check
+  * (a sampling profile: 77% of the local path's time in the scans) */
+@@ -7274,6 +7282,10 @@
+ {
+ 	int i;
+ 
++	if (cp->ctx != NULL) {	/* patch 506 */
++		html_rl_struct_cp_free(cp->ctx);
++		free(cp->ctx);
++	}
+ 	free(cp->tag);
+ 	free(cp->id);
+ 	for (i = 0; i < cp->ncl; i++)
+@@ -7616,9 +7628,12 @@
+ 					if (a > 0 && s[a - 1] == '(')
+ 						html_rl_struct_outer_cp(s, len, a - 1,
+ 							&n[e->ncps]);
+-					else
++					else {
+ 						html_rl_struct_parse_cp(s, a, b,
+ 							&n[e->ncps]);
++						html_rl_struct_ctx(s, a,
++							&n[e->ncps]);	/* 506 */
++					}
+ 					{	/* patch 405 */
+ 						size_t q = b;
+ 						bool unknown = false;
+@@ -7748,6 +7763,56 @@
+ 	return false;
+ }
+ 
++/* Patch 506: the compound left of a structural compound that starts at a:
++ * "X > C" (a parent) or "X C" (an ancestor), kept as cp->ctx. Google's
++ * ".P1ekSe-ZMv3u>div:nth-child(2)" (its sign-in widget's sheet, on
++ * stackoverflow) was kept as div:nth-child(2) and hit every second <div>
++ * of every parent -- stackoverflow's <body> among them. A start, a comma,
++ * a brace, a + or a ~ before it, or a context that does not parse to a
++ * tag, id or class, leaves none. */
++static void html_rl_struct_ctx(const uint8_t *s, size_t a,
++		struct html_rl_struct_cp *cp)
++{
++	size_t e = a, x;
++	int kind = 2;
++	struct html_rl_struct_cp *c;
++
++	while (e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t' ||
++			 s[e - 1] == '\r' || s[e - 1] == '\n' ||
++			 s[e - 1] == '\f'))
++		e--;
++	if (e > 0 && s[e - 1] == '>') {
++		kind = 1;
++		e--;
++		while (e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t' ||
++				 s[e - 1] == '\r' || s[e - 1] == '\n' ||
++				 s[e - 1] == '\f'))
++			e--;
++	} else if (e == a) {
++		return;		/* no combinator: nothing before it */
++	}
++	if (e == 0)
++		return;
++	/* the context compound must end in a name, ']', ')' or '*' */
++	if (!(html_rl_struct_ident_ch(s[e - 1]) || s[e - 1] == ']' ||
++	      s[e - 1] == ')' || s[e - 1] == '*'))
++		return;
++	x = html_rl_struct_back(s, e);
++	if (x >= e)
++		return;
++	c = calloc(1, sizeof(*c));
++	if (c == NULL)
++		return;
++	html_rl_struct_parse_cp(s, x, e, c);
++	if (c->unbounded || (c->tag == NULL && c->id == NULL && c->ncl == 0)) {
++		html_rl_struct_cp_free(c);
++		free(c);
++		return;
++	}
++	cp->ctx = c;
++	cp->ctxkind = kind;
++}
++
+ static bool html_rl_struct_cp_matches(const struct html_rl_struct_cp *cp,
+ 		const struct html_rl_struct_el *e)
+ {
+@@ -7802,6 +7867,44 @@
+  * *narrow says whether restyling exactly those is enough: each matching
+  * compound bounded and followed by no sibling combinator, no sheet over
+  * its compound limit, the list not overflowed. */
++/* Patch 506: does pnode (kind 1), or pnode or an ancestor (kind 2), match
++ * cp's context compound? Matched as the children are (tag, id, classes) */
++static bool html_rl_struct_ctx_ok(dom_node *pnode,
++		const struct html_rl_struct_cp *cp)
++{
++	dom_node *n = pnode, *up;
++	bool ok = false;
++	int depth = 0;
++
++	dom_node_ref(n);
++	while (n != NULL && !ok && depth++ < 256) {
++		dom_node_type type;
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			struct html_rl_struct_el el;
++			memset(&el, 0, sizeof(el));
++			el.tag = html_rl_struct_tag(n);
++			el.id = html_rl_struct_attr(n, corestring_dom_id);
++			el.cls = html_rl_struct_attr(n, corestring_dom_class);
++			el.node = n;
++			ok = html_rl_struct_cp_matches(cp->ctx, &el);
++			free(el.tag);
++			free(el.id);
++			free(el.cls);
++		}
++		if (ok || cp->ctxkind == 1)
++			break;
++		up = NULL;
++		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR)
++			up = NULL;
++		dom_node_unref(n);
++		n = up;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	return ok || depth >= 256;	/* too deep: assume it may */
++}
++
+ #define HTML_RL_STRUCT_HITS_MAX 8
+ static struct box *html_rl_top_under(struct box *b,
+ 		const struct box *pbox);	/* patch 504 */
+@@ -7972,6 +8075,17 @@
+ 				if (!same)
+ 					continue;
+ 			}
++			/* Patch 506: the compound's parent / ancestor context
++			 * (html_rl_struct_ctx): a child of pnode cannot match it
++			 * unless pnode (">") or pnode or an ancestor (" ")
++			 * matches the context compound */
++			if (cp->ctxkind != 0 && cp->ctx != NULL &&
++			    !html_rl_struct_ctx_ok(pnode, cp)) {
++				macsurf_debug_log_writef("LIFE rebuild local: a "
++					"structural rule's context is not this "
++					"parent");
++				continue;
++			}
+ 			/* Patch 504: :only-child / :only-of-type match only a
+ 			 * parent's sole element child (of the type). A child's
+ 			 * match can flip only if the count was 1 before the

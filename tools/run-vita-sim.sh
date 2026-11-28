@@ -344,6 +344,8 @@ JS-only-child file:///app0:/testpages/JS-only-child.html
 CSS-only-child-ref file:///app0:/testpages/CSS-only-child-ref.html
 JS-sib-not file:///app0:/testpages/JS-sib-not.html
 CSS-sib-not-ref file:///app0:/testpages/CSS-sib-not-ref.html
+JS-struct-ctx file:///app0:/testpages/JS-struct-ctx.html
+CSS-struct-ctx-ref file:///app0:/testpages/CSS-struct-ctx-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1862,6 +1864,16 @@ snp=$(printf '%s\n' "$snseg" | grep -c "a sibling rule may see the child-list ch
 snl=$(printf '%s\n' "$snseg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
 echo "  JS-sib-not: rows differing from the parse-time build $snr (0); conservative-sheet checks ${snc} (0); real risks, parent rebuilt ${snp} (4 or more); placed locally ${snl} (2 or more)"
 [ "$snr" = 0 ] && [ "${snc:-1}" -eq 0 ] && [ "${snp:-0}" -ge 4 ] && [ "${snl:-0}" -ge 2 ] || fail "sibling combinators inside :not() / :is() / :where()"
+# Patch 506: a structural rule's parent (">") or ancestor (" ") context is
+# kept; a parent that cannot satisfy it has no hits, while the matching
+# boxes' flips are still restyled. Five steps render row for row as at
+# parse time.
+scr=$(fl_rows JS-struct-ctx CSS-struct-ctx-ref)
+scseg=$(awk '/ page [0-9]+\/[0-9]+ JS-struct-ctx: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+scx=$(printf '%s\n' "$scseg" | grep -c "LIFE rebuild local: a structural rule's context is not this parent" || true)
+sch=$(printf '%s\n' "$scseg" | grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
+echo "  JS-struct-ctx: rows differing from the parse-time build $scr (0); contexts ruled out ${scx} (2 or more); real flips found ${sch} (3 or more)"
+[ "$scr" = 0 ] && [ "${scx:-0}" -ge 2 ] && [ "${sch:-0}" -ge 3 ] || fail "structural rules' parent and ancestor context"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

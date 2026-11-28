@@ -19869,3 +19869,59 @@ The remaining `<body>` restyles are B (a `div:nth-child` rule hitting
   every gate since at least 501; not a check.)
 
 No sudo.
+
+## Patch 506 (2026-11-28): a structural rule's parent / ancestor context is kept (B)
+
+**The `:nth-child` rule, identified.** A scratch build (`arms/nthlog`)
+logged each `:nth-*` compound with its sheet context. It is Google's
+sign-in widget sheet, loaded on stackoverflow:
+
+```
+.P1ekSe-ZMv3u>div:nth-child(2)
+.P1ekSe-ZMv3u>div:nth-child(3)
+```
+
+The structural check kept only `div:nth-child(2)`, dropped the parent
+requirement, and hit every second and third `<div>` of every parent
+(stackoverflow's `div.container` under `<body>`).
+
+**Fix.**
+- `html_rl_struct_ctx` keeps the compound left of a `>` (the parent must
+  match) or of a descendant space (an ancestor must): tag, id and classes
+  only, a broader match than the rule's.
+- A start, comma, brace, `+` / `~`, or a context with no tag / id / class
+  leaves none.
+- `html_rl_block_struct_risk` skips a compound whose context cannot be
+  satisfied by pnode (`>`) or by pnode and its ancestors (` `).
+- An `:nth-child` formula check was set aside: a sibling's old index is
+  unknowable when new box-less elements (`<script>`s) may precede it.
+
+**Gate pages.** New `JS-struct-ctx` / `CSS-struct-ctx-ref`: inserts into
+`.g > div:nth-child(2)` boxes and `.h div:first-child` boxes, inside and
+outside their context, and a removal. **0 rows different**, 7 contexts
+ruled out, the 3 real flips restyled.
+
+Checked before gating: every existing structural gate page gives **the
+same counts on 505 and 506** (hits, siblings restyled, parent rebuilds,
+declines).
+
+**stackoverflow** (505 vs 506, 2 real-page loads each):
+- structural hits 10 -> 9 (the P1ekSe hits on `div.container` gone);
+- **`<body>` rebuilds not reduced**: 4 via a structural hit in both, plus
+  1 (505) vs 2 (506) via a `style` attribute on `<body>`;
+- 506 sees one more `body.style` change, in both loads: most likely a
+  timing knock-on, not a rendering change;
+- local-rebuild time ~926 -> ~1,088 ms, main-thread CPU 4.73 -> 4.55 s.
+
+**The 4 structural `<body>` rebuilds** are child-list changes on
+**`<html>`**: a typeless `*:nth-of-type(...)` rule counts `<body>` as
+moved, and the narrow answer restyles `<body>` alone (that is, all of
+it). That is patch 507.
+
+**Gate.**
+- `restage-full.sh`: **588 applied plus the 2 known collisions**.
+- **gate506 exit 0**: JS-struct-ctx, JS-struct-hits, JS-struct-dir,
+  JS-struct-scoped, JS-only-child and JS-sib-not pass; interaction 57/57
+  (both paces); no network page dropped.
+
+No sudo.
