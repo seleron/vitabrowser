@@ -19028,3 +19028,57 @@ handed over; they are superseded and parked, not deleted.
 The device procedure above is unchanged. Extra to look for:
 **github and theguardian.com load times** (496: sim main-thread CPU -20%
 and -69%).
+
+## Patch 497 (2026-11-28): custom-property environments look names up through a hash index (libcss, P1 load time)
+
+**Problem.** Each element's custom-property environment (fixes1268b/c)
+is a flat array of bindings. Every candidate is checked with a
+dash-normalising string compare (`cp_name_equal`).
+- `css__cp_env_add` scanned the array once per definition: quadratic for
+  the root variable blocks of github's Primer and theguardian.com.
+- `css__cp_env_find` scanned every ancestor level once per `var()`.
+- In the sim after 496, `cp_name_equal` under these two was **~18% of
+  github's main thread**, and `css__cp_env_add` ~11-13% of guardian's.
+
+**Fix** (`patches/vitabrowser/497-libcss-cp-env-name-index.patch`).
+- An environment with **8 or more** own bindings keeps an open-addressing
+  index over them by **normalised** name: FNV-1a after `cp_name_equal`'s
+  dash rule, regrown at half load.
+- A probe hit is still confirmed by `cp_name_equal`. An add only replaces
+  a name with an equal one, and nothing reorders or removes bindings, so
+  the index stays valid.
+- With no index (fewer bindings, or out of memory) the scan answers.
+- `cp_name_equal` returns at once for the same interned string.
+
+**Exactness.** A `VITA_CPENV_CHECK` build answered every add and find
+both ways: **0 mismatches in 12.8 million lookups**.
+- Coverage: the 21 census sites and 12 custom-property test pages.
+- stackoverflow 6.4M, oldreddit 2.9M, claude.ai 2.7M, guardian 436k.
+
+**Build note.** libcss is not rebuilt by the gate: it links the
+`applytest/prefix` install. Rebuild it with
+`make install PREFIX=$P` (CFLAGS as in `build-patched.sh`).
+- `make clean` without `PREFIX` fails silently (no `Makefile.top`).
+- `make` does not track CFLAGS.
+- So to drop a debug flag, delete
+  `libcss/build-x86_64-linux-gnu-x86_64-linux-gnu-release-lib-static`.
+  The first "release" relink here still carried the check code; caught by
+  `strings`.
+
+**Measured** (sim, sprof, 2 loads each, 496 -> 497):
+
+| site | main-thread CPU | CSS selection (samples) |
+|---|---|---|
+| github | 2.23 -> **1.74 s (-22%)** | 222 -> 110 |
+| stackoverflow | 6.18 -> **5.23 s (-15%)** | 642 -> 340 |
+| guardian | 3.05 -> **2.68 s (-12%)** | 136 -> 53 |
+| claude.ai | 12.8 -> 12.66 s (-1%) | 262 -> 127; its CPU is elsewhere |
+
+github since 495 (patches 496 + 497): **2.81 -> 1.74 s, -38%**.
+
+**Gate.**
+- `restage-full.sh`: **579 applied plus the 2 known collisions**.
+- **gate497 exit 0**: CALCNEST326 11/11, VARORDER329 9/9, GRIDNAMES336
+  4/4, GRIDXSHEET340 4/4, interaction 57/57 (both paces).
+
+No sudo.
