@@ -152,7 +152,14 @@ EXTRA="$EXTRA $WORK/certs/ca-bundle.pem=res/ca-bundle.pem"
 # 32 MiB of user memory free after init beside the 192 MiB heap; 288 MiB
 # keeps ~45 MiB free in the ext budget. The ext VPK is the primary
 # deliverable (VitaBrowser-ext.vpk, "VitaBrowser ext-mem").
-EXT_HEAP_MB="${VITA_EXT_HEAP_MB:-288}"
+# Patch 495 (run 44): 288 -> 256. The vitaSDK runtime takes the heap as ONE
+# memory block before main (_init_vita_heap, sceKernelAllocMemBlock) and
+# never clamps: all or nothing. Run 44's ext VPK sometimes died at launch
+# with no netlog at all = that block not granted. Run 44's engine heap
+# peaked ~22 MiB, so 256 is >10x headroom and a 32 MiB smaller
+# contiguous request. The boot log line "mem: runtime heap span" proves
+# what was granted.
+EXT_HEAP_MB="${VITA_EXT_HEAP_MB:-256}"
 ( cd "$UP/netsurf" && rm -f nsvita.elf nsvita-default.elf VitaBrowser.vpk VitaBrowser-ext.vpk && \
   find build -path '*vita*' ! -path '*vita-sim*' -name frontends_vita_main.o -delete 2>/dev/null; \
   make TARGET=vita VITA_PREFIX="$VP" -j4 > "$WORK/applytest/vita-build-netsurf.log" 2>&1 && \

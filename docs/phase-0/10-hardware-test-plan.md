@@ -80,7 +80,7 @@ what you have**: a partial log is still useful.
 ### Step 2 — Boot (T1)
 
 Launch **VitaBrowser ext-mem** (`VitaBrowser-ext.vpk`, VBRW00002, the
-extended 288 MiB build — primary since run 44 per the 2026-11-27 directive;
+extended build (256 MiB newlib heap since run 45, patch 495; 288 in run 44) — primary since run 44 per the 2026-11-27 directive;
 `VitaBrowser.vpk` is the fallback).
 
 - **Expected:** within a few seconds, a white page with "L1 heading", a grey
@@ -18735,5 +18735,109 @@ Next levers:
 - **gate494 exit 0**: CONCAT 10/10, interaction 57/57 (both paces).
 
 **Not yet run on 492-494:** ASan, census.
+
+No sudo.
+
+## Device run 44 results + patch 495 (2026-11-28): ext-mem launch crashes = the heap block not granted; ext heap 288 -> 256
+
+### Run 44 results
+
+Run 44 = `VitaBrowser-ext.vpk`, VBRW00002, 288 MiB heap, on the
+PCH-2000 (FW 3.65). What the user reported:
+1. the ext-mem app **sometimes crashes at launch**;
+2. `receive-results.bat` **"again not detecting the launch after the
+   crash"**;
+3. the autotest ran to its end, as part of the first launch.
+
+Result folders:
+
+| launch | build | boot free user | result |
+|---|---|---|---|
+| `net-20261127-211941-02441182` | ext, 288 | 59392 KiB | the autotest; **storage failed from 21.8 s**, see below |
+| `net-20261127-213052-b5bd5a84` | ext, 288 | 59392 KiB | short manual launch, 261 log lines, **wrote nothing**; clean but not a comparison |
+| the six run-43-era launches | default, 192 | 46080 KiB | 0 such errors |
+
+The storage failure in 211941:
+- every dump after `01-L1-layout-basics` failed (`dump: cannot open
+  ux0:data/VitaBrowser/NN.plot`, 34 dumps);
+- 4 `settings.txt` writes failed;
+- `ux0:download` failed with errno 13 and the downloads folder with
+  errno 5;
+- it hit reads too: `app0:/res/fonts/DejaVuSans-Bold.ttf` at 5.8 s
+  ("read failed, FreeType -1") and `home.html` at 556 s ("Internal
+  server error" = the file fetch failed).
+
+**Findings:**
+- **The squeezed-layout hypothesis does not hold.** Both ext launches
+  booted with the **same** memory: 59392 KiB of user memory free at boot
+  and 46080 KiB after init, with the 288 MiB heap in place. That is more
+  headroom than every 192 MiB default launch (46080 KiB at boot). The bad
+  and the clean ext launch cannot be told apart by memory.
+  - The storage failure is **n = 1**: the only ext launch that wrote
+    files. It covered reads and writes on app0 and ux0 alike, from one
+    point on.
+  - Open: a storage or driver fault, or something ext-mode
+    (ATTRIBUTE2=12) specific. One more ext autotest decides it; the run-45
+    hand-off asks for two.
+- **The launch crash is the heap allocation.** Read from the vitaSDK
+  runtime's disassembly (libc `sbrk.o`; the SDK ships no source):
+  - `_init_vita_heap` takes `_newlib_heap_size_user` as **one**
+    `sceKernelAllocMemBlock(type 0x0c20d060, user RW)` before main and
+    **never clamps**.
+  - If that block is refused, the heap base is 0 and every malloc fails.
+    The app dies before main's netlog starts and **sends nothing**:
+    exactly "crashes at launch, not detected".
+  - Its heap globals are file-static and `_get_vita_heap_size` returns
+    the requested size even on failure. The task's
+    `_vita_heap_start`/`_vita_heap_end` do not exist in this SDK
+    (`nm` of libc.a/libg.a).
+- Run 44's engine heap peaked **~22 MiB**.
+
+### Patch 495
+
+`patches/vitabrowser/495-netsurf-heap-span-boot-log.patch`:
+- **`tools/build-vita.sh`:** `VITA_EXT_HEAP_MB` defaults to **256**
+  (was 288). That is a 32 MiB smaller contiguous request and still >10x
+  run 44's peak. Verified in the ELFs: `nsvita-default.elf` 192 MiB,
+  `nsvita.elf` 256 MiB.
+- **Proof line** (`vita_diag_heap_span`, logged right after `mem:
+  newlib heap`):
+  - It asks the kernel for the block a live malloc pointer lives in
+    (`sceKernelGetMemBlockInfoByAddr`) and logs
+    `mem: runtime heap span N MiB at 0x... , type 0x... (requested M MiB)`.
+  - It appends ` -- MISMATCH` if N differs from M.
+  - A refused block never reaches this line; that case is the receiver's
+    new warning, below.
+  - Host simulator: `mem: runtime heap span: host simulator (...)`.
+  - The address is printed with `0x%08lx`, not `%p` (the newlib printf
+    note).
+- `restage-full.sh`: **577 applied plus the 2 known collisions**.
+- Device cross-build green: the new function and the kernel import are
+  linked; no new warnings.
+- **gate495 exit 0**, interaction 57/57 (both paces).
+
+### Receiver (VitaBrowser-hwtest, task 3, not a repo; in place)
+
+`vita-netlog.py` (the old copy kept as `.bak-run44`):
+- **Heartbeat:** `-- [hh:mm:ss] receiver alive on UDP ...; N launches
+  heard; last datagram N s ago` after 30 s with nothing printed
+  (`--heartbeat`). A frozen window (QuickEdit) shows as a clock that
+  stops.
+- **No-launch warning:** `!! no VitaBrowser launch seen in 60 s`
+  (`--no-launch-warn`), at start or 60 s after the last launch went
+  quiet.
+  - It says how the last launch ended (goodbye / after autotest.done /
+    none = crashed, PS button, or idle).
+  - It explains that a pre-netlog crash sends nothing, and says to
+    relaunch, then try the default VPK.
+  - `boot X is talking again` if an idle launch resumes (and re-arms the
+    warning).
+- Tested against a fake sender: start silence, launch, idle gap, resume,
+  goodbye, silence, a second launch. Every message fired once, where
+  expected.
+
+`receive-results.bat` (`.bak-run44`, CRLF kept): a 5-line banner
+explaining both. The repo's `tools/` copies are synced in a separate,
+gated commit.
 
 No sudo.

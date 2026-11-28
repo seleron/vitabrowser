@@ -1,0 +1,119 @@
+# netsurf: boot-log the newlib heap the runtime actually granted (patch 495)
+# Generated 2026-11-27
+# Base: seleron/vitabrowser (patch stack through 494)
+#
+# Run 44 (ext-mem VPK, 288 MiB newlib heap): the app sometimes died at
+# launch and the receiver saw nothing. The vitaSDK runtime's
+# _init_vita_heap (libc sbrk.o, read from its disassembly: the SDK ships no
+# source) allocates _newlib_heap_size_user as ONE sceKernelAllocMemBlock
+# (type 0x0c20d060, user RW) before main and never clamps -- it gets the
+# whole request or nothing (heap base 0, every malloc fails, death before
+# netlog starts). Its heap globals are file-static, and _get_vita_heap_size
+# returns the REQUESTED size even on failure, so neither proves anything.
+#
+# vita_diag_heap_span() asks the kernel about the block a live malloc
+# pointer sits in (sceKernelGetMemBlockInfoByAddr: mappedBase/mappedSize)
+# and logs "mem: runtime heap span N MiB at 0x... (requested M MiB)",
+# with " -- MISMATCH" if they differ, next to patch 489's "mem: newlib
+# heap" line. The ext build now asks for 256 MiB (tools/build-vita.sh).
+# Host simulator: logged as not applicable.
+--- a/frontends/vita/main.c
++++ b/frontends/vita/main.c
+@@ -104,7 +104,14 @@
+  * tools/build-vita.sh now relinks the ext ELF with VITA_HEAP_MB=288 (run
+  * 43, default VPK: 32 MiB of user memory free after init beside the heap;
+  * 288 keeps ~45 MiB free in the ext budget). Textures come from CDRAM
+- * first (bitmap.c), not this heap. */
++ * first (bitmap.c), not this heap.
++ *
++ * Patch 495: the ext build now asks for 256 (tools/build-vita.sh,
++ * VITA_EXT_HEAP_MB). The runtime allocates the heap as ONE block before
++ * main and never clamps -- all or nothing -- so an ext launch that cannot
++ * get a contiguous 288 MiB block dies before netlog starts (run 44's
++ * "crash at launch, not detected"). Run 44's peak engine heap was
++ * ~22 MiB; 256 is >10x that. Boot logs "mem: runtime heap span". */
+ #ifndef VITA_HEAP_MB
+ #define VITA_HEAP_MB 192
+ #endif
+@@ -1523,6 +1530,8 @@
+ 	load_net_pages();
+ 	/* patch 489: which budget this build has (the ext VPK's is larger) */
+ 	vita_diag_log("mem: newlib heap %d MiB", VITA_HEAP_MB);
++	/* patch 495: and what the runtime actually granted */
++	vita_diag_heap_span((unsigned int)_newlib_heap_size_user);
+ 	vita_diag_memory("boot");
+ 
+ 	{
+--- a/frontends/vita/diag.c
++++ b/frontends/vita/diag.c
+@@ -29,6 +29,7 @@
+ #include <stdarg.h>
+ #include <stdbool.h>
+ #include <stdio.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <malloc.h>	/* the device's mallinfo; the host's mallinfo2 (476) */
+@@ -311,6 +312,43 @@
+ #endif
+ }
+ 
++/* exported interface documented in vita/diag.h */
++void vita_diag_heap_span(unsigned int requested_bytes)
++{
++#ifdef __vita__
++	void *probe = malloc(16);
++	SceKernelMemBlockInfo bi;
++	int rc;
++
++	if (probe == NULL) {
++		vita_diag_log("mem: runtime heap NOT granted: malloc fails "
++			      "(requested %u MiB)", requested_bytes >> 20);
++		return;
++	}
++	memset(&bi, 0, sizeof(bi));
++	bi.size = sizeof(bi);
++	rc = sceKernelGetMemBlockInfoByAddr(probe, &bi);
++	if (rc < 0)
++		vita_diag_log("mem: runtime heap span unknown "
++			      "(sceKernelGetMemBlockInfoByAddr 0x%08x; "
++			      "requested %u MiB)", (unsigned int)rc,
++			      requested_bytes >> 20);
++	else
++		vita_diag_log("mem: runtime heap span %lu MiB at 0x%08lx, type "
++			      "0x%08x (requested %u MiB)%s",
++			      (unsigned long)(bi.mappedSize >> 20),
++			      (unsigned long)(uintptr_t)bi.mappedBase,
++			      (unsigned int)bi.type,
++			      requested_bytes >> 20,
++			      (unsigned long)bi.mappedSize == (unsigned long)requested_bytes ?
++			      "" : " -- MISMATCH");
++	free(probe);
++#else
++	vita_diag_log("mem: runtime heap span: host simulator (glibc heap; "
++		      "requested %u MiB not applied)", requested_bytes >> 20);
++#endif
++}
++
+ /** malloc 1 MiB chunks until failure; returns how many succeeded. */
+ static int probe_heap(void)
+ {
+--- a/frontends/vita/diag.h
++++ b/frontends/vita/diag.h
+@@ -69,6 +69,16 @@
+ /** Log free memory in every pool, tagged. */
+ void vita_diag_memory(const char *tag);
+ 
++/**
++ * Patch 495: log the newlib heap the runtime actually granted -- the
++ * kernel memory block a live malloc pointer sits in -- against the
++ * requested size. The vitaSDK runtime (_init_vita_heap) allocates the
++ * whole request as ONE block before main and never clamps: it either gets
++ * all of it or none (heap base 0, every malloc fails, the app dies before
++ * netlog starts). Host simulator: logged as not applicable.
++ */
++void vita_diag_heap_span(unsigned int requested_bytes);
++
+ /** Allocate-until-failure in each pool, log the totals, free it all. */
+ void vita_diag_mem_probe(void);
+ 
