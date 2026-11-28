@@ -19509,3 +19509,39 @@ cascade test pages.
   live-cascade checks as expected, interaction 57/57 (both paces).
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED (2026-11-28 ~07:25Z): VPKs from 996d771 (patch 501)
+
+Run 45 now carries **494-501**. The 43e10eb set was never handed over; it
+is parked as `hwtest-2026-11-28-run45-superseded-500` in `<WORK>` and
+both hand-off folders.
+
+**Tree.**
+- `restage-full.sh` showed no in-flight edits.
+- `tools/build-patched.sh` then re-staged `applytest` from the committed
+  patches: **583 applied plus the 2 known collisions**, prefix rebuilt
+  from scratch.
+
+**Build.** Checked in the outputs:
+- Vita `libcss.a` has 501's grow code;
+- 500's fast background pass, 499's QuickJS memo, 498's name generation,
+  497's index, 496's index builder and 495's heap-span line are in;
+- no check code (`CPENVCHECK` / `GTCCHECK` / `SKIPCHECK` /
+  `REWRITECHECK` / `HASHCHECK`);
+- heaps 192 / **256** MiB; both VPKs pass `unzip -t`.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `686f9a0dc39f9f0e…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `b3705489782744ba…` |
+| `nsvita.elf` | `d82f92b77da84cb5…` |
+
+**Files.**
+- `reference-dumps` = gate501's autotest (466).
+- `pages` unchanged (511).
+- Verified on both sides: outgoing sums OK, new and parked sums OK,
+  `diff -r` of dumps and pages clean.
+
+The device procedure and load-time checks are unchanged (claude.ai,
+github, theguardian.com, stackoverflow, youtube; rte.ie is a good extra
+for 501).
