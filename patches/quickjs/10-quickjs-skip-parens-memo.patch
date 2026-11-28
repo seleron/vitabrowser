@@ -1,0 +1,320 @@
+# quickjs: js_parse_skip_parens_token memoised within one parse
+#
+# VitaBrowser patch 499. An expression starting with '(' (and a few '['
+# / '{' cases) is scanned ahead to its matching close to see what follows
+# (an arrow, an assignment, a comma); the parser then rewinds and parses
+# the tokens for real, and every inner opener later asks the same question
+# about its own contents -- nested minified code was tokenised once per
+# nesting level. Simulator: ~10% of github.com's page-load main-thread
+# time (patch 498 tree) was in this function.
+#
+# A scan passes over every inner opener, its matching close and the token
+# after it, which is all an inner scan computes. Each opener whose close is
+# reached cleanly is recorded by its source position (a per-parse
+# open-addressing table on JSParseState, js_malloc_rt -- never throws --
+# freed when js_parse_program returns) with the bits its own scan would
+# report (';' and '...' directly inside, '=' anywhere inside) and the
+# token after its close ('of' mapped; line-break flag kept so both
+# no_line_terminator modes are answered). A lookup hit returns at once,
+# leaving the parse state as the full scan does (it rewinds).
+#
+# Exact under lexing context: every record keeps the recording function's
+# is_strict_mode (strict mode makes legacy octal escapes an error) and is
+# reused only under the same; a record whose region or following token
+# holds yield, await or a strict-mode reserved word (update_token_ident
+# lexes those by context) also keeps the function and its
+# in_function_body and is reused only under both. Errors, the end of input
+# and the 256-level limit leave no record. VITA_SKIP_CHECK builds also run
+# the scan on every hit and count disagreements.
+# Applied by tools/fetch-quickjs.sh.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22002,6 +22002,10 @@
+     JSFunctionDef *cur_func;
+     bool is_module; /* parsing a module */
+     bool allow_html_comments;
++    /* VitaBrowser: js_parse_skip_parens_token results by opener position
++       (see js_skip_memo_find); freed when js_parse_program returns */
++    struct JSSkipMemo *skip_memo;
++    uint32_t skip_memo_cap, skip_memo_n;
+ } JSParseState;
+ 
+ typedef struct JSOpCode {
+@@ -24637,15 +24641,187 @@
+ /* XXX: improve speed with early bailout */
+ /* XXX: no longer works if regexps are present. Could use previous
+    regexp parsing heuristics to handle most cases */
++/* VitaBrowser: js_parse_skip_parens_token, memoised within one parse.
++ *
++ * An expression that starts with '(' (and a few '[' / '{' cases) is
++ * scanned ahead to its matching close to see what follows (an arrow, an
++ * assignment, a comma), then the parser rewinds and parses those tokens
++ * for real. Every inner opener met later asks the same question about its
++ * own contents, so nested minified code was tokenised once per nesting
++ * level: github.com's bundles spent ~10% of the page load's main-thread
++ * time in this function in the simulator. A scan passes over every inner
++ * opener, its matching close and the token after it, which is all an
++ * inner scan computes; those results are recorded by the opener's source
++ * position and answered from here. Only an opener whose close the scan
++ * reached cleanly is recorded (never one cut off by an error, the end of
++ * input or the 256-level limit), with the bits its own scan would report:
++ * ';' and '...' directly inside it, '=' anywhere inside it. The token
++ * after the close is stored with the 'of' mapping and whether a line
++ * break preceded it, so both no_line_terminator modes are answered. A hit
++ * leaves the parse state as the full scan does (it rewinds to the start).
++ *
++ * Lexing depends on the function being parsed in two ways, so a record
++ * made while scanning across a nested function's text is only reused in
++ * the same lexing context: (1) strict mode (legacy octal escapes are an
++ * error there) -- every record keeps is_strict_mode and must match it;
++ * (2) whether yield, await and the strict-mode reserved words are
++ * identifiers or keywords (update_token_ident) -- a record whose region,
++ * or the token after its close, holds one of those keeps the function
++ * and its in_function_body as well and is reused only under both.
++ * VITA_SKIP_CHECK builds also run the scan on every hit and compare. */
++#define SKIP_CTX 0x40   /* internal: region lexes differently by context */
++typedef struct JSSkipMemo {
++    const uint8_t *key;
++    JSFunctionDef *fd;      /* recording function (SKIP_CTX records) */
++    int tok;
++    uint8_t bits, lf, strict, infb, ctx;
++} JSSkipMemo;
++
++/* the current token is an identifier or keyword that lexes differently
++   by function context (update_token_ident) */
++static bool js_skip_tok_ctx(JSParseState *s)
++{
++    JSAtom a;
++
++    if (s->token.val == TOK_IDENT)
++        a = s->token.u.ident.atom;
++    else if (s->token.val >= TOK_FIRST_KEYWORD &&
++             s->token.val <= TOK_LAST_KEYWORD)
++        a = s->token.u.ident.atom;
++    else
++        return false;
++    return (a > JS_ATOM_LAST_KEYWORD && a <= JS_ATOM_LAST_STRICT_KEYWORD) ||
++           a == JS_ATOM_yield || a == JS_ATOM_await;
++}
++
++static const JSSkipMemo *js_skip_memo_find(JSParseState *s, const uint8_t *key)
++{
++    uint32_t mask, k;
++
++    if (!s->skip_memo)
++        return NULL;
++    mask = s->skip_memo_cap - 1;
++    k = (uint32_t)(((uintptr_t)key * 2654435761u) >> 7) & mask;
++    while (s->skip_memo[k].key) {
++        const JSSkipMemo *e = &s->skip_memo[k];
++        if (e->key == key) {
++            JSFunctionDef *fd = s->cur_func;
++            if (e->strict != fd->is_strict_mode)
++                return NULL;
++            if (e->ctx && (e->fd != fd || e->infb != fd->in_function_body))
++                return NULL;
++            return e;
++        }
++        k = (k + 1) & mask;
++    }
++    return NULL;
++}
++
++static void js_skip_memo_put(JSParseState *s, const uint8_t *key, int tok,
++                             int bits, bool lf)
++{
++    JSFunctionDef *fd = s->cur_func;
++    uint32_t mask, k;
++
++    if (s->skip_memo_n * 2 >= s->skip_memo_cap) {
++        uint32_t ncap = s->skip_memo_cap ? s->skip_memo_cap * 2 : 1024, i;
++        JSSkipMemo *nm = js_malloc_rt(s->ctx->rt, ncap * sizeof(*nm));
++        if (!nm)
++            return;     /* no memory: record no more */
++        memset(nm, 0, ncap * sizeof(*nm));
++        for (i = 0; i < s->skip_memo_cap; i++) {
++            const JSSkipMemo *e = &s->skip_memo[i];
++            if (e->key) {
++                k = (uint32_t)(((uintptr_t)e->key * 2654435761u) >> 7) & (ncap - 1);
++                while (nm[k].key)
++                    k = (k + 1) & (ncap - 1);
++                nm[k] = *e;
++            }
++        }
++        js_free_rt(s->ctx->rt, s->skip_memo);
++        s->skip_memo = nm;
++        s->skip_memo_cap = ncap;
++    }
++    mask = s->skip_memo_cap - 1;
++    k = (uint32_t)(((uintptr_t)key * 2654435761u) >> 7) & mask;
++    while (s->skip_memo[k].key && s->skip_memo[k].key != key)
++        k = (k + 1) & mask;
++    if (!s->skip_memo[k].key)
++        s->skip_memo_n++;
++    s->skip_memo[k].key = key;
++    s->skip_memo[k].tok = tok;
++    s->skip_memo[k].bits = (uint8_t)(bits & 7);
++    s->skip_memo[k].lf = lf;
++    s->skip_memo[k].fd = fd;
++    s->skip_memo[k].strict = fd->is_strict_mode;
++    s->skip_memo[k].infb = fd->in_function_body;
++    s->skip_memo[k].ctx = (bits & SKIP_CTX) != 0;
++}
++
++static void js_skip_memo_free(JSParseState *s)
++{
++    js_free_rt(s->ctx->rt, s->skip_memo);
++    s->skip_memo = NULL;
++    s->skip_memo_cap = s->skip_memo_n = 0;
++}
++
++#ifdef VITA_SKIP_CHECK
++static unsigned long skip_checked, skip_mismatch;
++static void skip_check_report(void)
++{
++    fprintf(stderr, "SKIPCHECK checked %lu, mismatches %lu\n",
++            skip_checked, skip_mismatch);
++}
++#endif
++
++static int js_parse_skip_parens_token1(JSParseState *s, int *pbits, bool no_line_terminator);
++
+ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_terminator)
+ {
++    int v = s->token.val;
++
++    if (v == '(' || v == '[' || v == '{') {
++        const JSSkipMemo *e = js_skip_memo_find(s, s->token.ptr);
++        if (e) {
++            int tok = (no_line_terminator && e->lf) ? '\n' : e->tok;
++#ifdef VITA_SKIP_CHECK
++            int bits2 = 0, tok2;
++            tok2 = js_parse_skip_parens_token1(s, &bits2, no_line_terminator);
++            if (skip_checked++ == 0)
++                atexit(skip_check_report);
++            if (tok2 != tok || (pbits && bits2 != e->bits)) {
++                skip_mismatch++;
++                fprintf(stderr, "SKIPCHECK mismatch #%lu: tok %d vs %d, "
++                        "bits %d vs %d\n", skip_mismatch, tok, tok2,
++                        e->bits, bits2);
++            }
++#endif
++            if (pbits)
++                *pbits = e->bits;
++            return tok;
++        }
++    }
++    return js_parse_skip_parens_token1(s, pbits, no_line_terminator);
++}
++
++static int js_parse_skip_parens_token1(JSParseState *s, int *pbits, bool no_line_terminator)
++{
+     char state[256];
++    /* VitaBrowser memo: per level, the opener's position (NULL for a
++       template's '${') and the bits its own scan would report; a close
++       reached cleanly leaves its record pending until the next token */
++    const uint8_t *mptr[256];
++    uint8_t mbits[256];
++    const uint8_t *pend_ptr = NULL;
++    int pend_bits = 0;
+     size_t level = 0;
+     JSParsePos pos;
+     int last_tok, tok = TOK_EOF;
+     int c, tok_len, bits = 0;
+ 
+     /* protect from underflow */
++    mptr[level] = NULL;
++    mbits[level] = 0;
+     state[level++] = 0;
+ 
+     js_parse_get_pos(s, &pos);
+@@ -24657,18 +24833,29 @@
+         case '{':
+             if (level >= sizeof(state))
+                 goto done;
++            mptr[level] = s->token.ptr;
++            mbits[level] = 0;
+             state[level++] = s->token.val;
+             break;
+         case ')':
+             if (state[--level] != '(')
+                 goto done;
+-            break;
++            goto memo_close;
+         case ']':
+             if (state[--level] != '[')
+                 goto done;
++        memo_close:
++            /* level is now the popped opener's index */
++            mbits[level - 1] |= mbits[level] & (SKIP_HAS_ASSIGNMENT | SKIP_CTX);
++            pend_ptr = mptr[level];
++            pend_bits = mbits[level];
+             break;
+         case '}':
+             c = state[--level];
++            if (c == '{')
++                goto memo_close;
++            if (c == '`')
++                mbits[level - 1] |= mbits[level] & (SKIP_HAS_ASSIGNMENT | SKIP_CTX);
+             if (c == '`') {
+                 /* continue the parsing of the template */
+                 free_token(s, &s->token);
+@@ -24691,6 +24878,8 @@
+                    parsing the template */
+                 if (level >= sizeof(state))
+                     goto done;
++                mptr[level] = NULL;
++                mbits[level] = 0;
+                 state[level++] = '`';
+             }
+             break;
+@@ -24700,14 +24889,19 @@
+             if (level == 2) {
+                 bits |= SKIP_HAS_SEMI;
+             }
++            if (mptr[level - 1])
++                mbits[level - 1] |= SKIP_HAS_SEMI;
+             break;
+         case TOK_ELLIPSIS:
+             if (level == 2) {
+                 bits |= SKIP_HAS_ELLIPSIS;
+             }
++            if (mptr[level - 1])
++                mbits[level - 1] |= SKIP_HAS_ELLIPSIS;
+             break;
+         case '=':
+             bits |= SKIP_HAS_ASSIGNMENT;
++            mbits[level - 1] |= SKIP_HAS_ASSIGNMENT;
+             break;
+ 
+         case TOK_DIV_ASSIGN:
+@@ -24737,6 +24931,20 @@
+             /* XXX: should clear the exception generated by next_token() */
+             break;
+         }
++        if (pend_ptr) {
++            /* the token after a close is what the opener's own scan
++               returns: record it */
++            int t = s->token.val;
++            if (token_is_pseudo_keyword(s, JS_ATOM_of))
++                t = TOK_OF;
++            js_skip_memo_put(s, pend_ptr, t,
++                             pend_bits | (js_skip_tok_ctx(s) ? SKIP_CTX : 0),
++                             s->last_line_num != s->token.line_num);
++            pend_ptr = NULL;
++        }
++        /* this token is processed inside the innermost open region */
++        if (js_skip_tok_ctx(s))
++            mbits[level - 1] |= SKIP_CTX;
+         if (level <= 1) {
+             tok = s->token.val;
+             if (token_is_pseudo_keyword(s, JS_ATOM_of))
+@@ -37650,6 +37858,7 @@
+     fd->body_scope = fd->scope_level;
+ 
+     err = js_parse_program(s);
++    js_skip_memo_free(s);   /* VitaBrowser: skip_parens memo, parse only */
+     if (err) {
+     fail:
+         free_token(s, &s->token);

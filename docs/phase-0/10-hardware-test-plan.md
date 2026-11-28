@@ -19237,3 +19237,67 @@ main-thread CPU since 495:
 | github | -38% | 286 s |
 | theguardian.com | -73% | |
 | stackoverflow | -15% | |
+
+## ASan + census for 498 (2026-11-28)
+
+**ASan at 498** (`--libs --net`; libdom instrumented, the prefix carries
+498's name generation): **clean**. Interaction 57/57, 453 page dumps, 0
+reports.
+
+**21-site census, 497 vs 498** (`score/c21-498`): **flat**, 15.0 -> 15.7
+full rebuilds per load, **no crashes**.
+- claude.ai 3.0 -> 5.0. Its 497 arm alone spanned 2-5 per load.
+- With 498 its scripts also get further in the same window (less CPU in
+  the named-access check), so more DOM changes reach the rebuild path.
+
+## Patch 499 (2026-11-28): the arrow-function look-ahead is memoised within one parse (QuickJS 10, P1 load time)
+
+**Problem.** QuickJS's `js_parse_skip_parens_token` scans an expression
+that starts with `(` (and a few `[` / `{` cases) ahead to its matching
+close, to see what follows: an arrow, an assignment, a comma. The parser
+then rewinds and parses those tokens.
+- Every inner opener later asks the same about its own contents, so
+  nested minified code was tokenised once per nesting level.
+- Sim at 498: **~10-13% of github's main thread** was in this function.
+
+**Fix** (`patches/quickjs/10-quickjs-skip-parens-memo.patch`).
+- A scan records, for each opener whose close it reaches cleanly:
+  - the bits that opener's own scan reports (`;` and `...` directly
+    inside, `=` anywhere inside);
+  - the token after its close (`of` mapped, line-break flag kept);
+  - all keyed by source position.
+- The table is per parse (`JSParseState`, `js_malloc_rt`, freed when
+  `js_parse_program` returns). A lookup hit returns at once.
+- **Exact under lexing context:**
+  - every record keeps the recording function's `is_strict_mode` and must
+    match it (strict mode makes legacy octal escapes an error);
+  - a region, or following token, holding `yield`, `await` or a
+    strict-mode reserved word (`update_token_ident` lexes those by
+    context) also keeps the function and its `in_function_body`, and is
+    reused only under both.
+- Errors, the end of input and the 256-level limit leave no record.
+
+**Exactness.** A `VITA_SKIP_CHECK` build ran the full scan on every hit:
+**845,759 hits, 0 mismatches**. Coverage: the 21 census sites,
+claude.ai/code and the JS syntax test pages.
+
+**Measured** (sim, sprof, 2 loads each, 498 -> 499):
+
+| | 498 | 499 |
+|---|---|---|
+| github `skip_parens` samples | ~53 | ~21 (**-60%**) |
+| github `next_token` samples | 68 | 41 |
+| github compile samples | 146 | 126 (**-14%**) |
+| github main-thread CPU | 1.79 s | 1.70 s (**-5%**) |
+
+- bbc: `skip_parens` 28 -> 22, total within noise.
+- What remains is each outermost scan's one extra pass over its own
+  region, inherent in the look-ahead.
+
+**Gate.**
+- **gate499 exit 0**: interaction 57/57 (both paces), all 58 JS gate
+  pages pass.
+- The gate's `build-quickjs.sh host` found the patch-10 library current
+  (same stamp).
+
+No sudo.
