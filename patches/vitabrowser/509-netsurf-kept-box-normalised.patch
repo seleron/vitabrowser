@@ -1,0 +1,154 @@
+# netsurf: a box kept for the full reconvert is normalised (patch 509)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 508)
+#
+# The census at 507 found Wikipedia (en.m, PlayStation_Vita) asserting in
+# layout_minmax_table (cell->type == BOX_TABLE_CELL) on 2 of 3 loads;
+# bisected to patch 506 (502-505 0 of 12 loads, 506 3 of 3). 506 only
+# changed which path took a batch: the bug is patch 374's. A local builder
+# that gives up after its new boxes fetched an object keeps them where
+# box_build_element put them, for the full reconvert -- unnormalised, under
+# their DOM parent's box. Wikipedia's #toc is display: table; its
+# .toctitle flex box, rebuilt whole (a child list the flex path declined),
+# landed beside the table's anonymous row group, and when the toggle's SVG
+# arrived before the full reconvert ran (html_object_callback ->
+# html_reformat), layout read the flex box as a row group.
+#
+# html_rl_kept_normalise: the kept box's enclosing table (through row groups
+# and rows) is normalised again, as a full build makes it (the anonymous row
+# group, row and cell around it; normalised boxes come through unchanged);
+# anywhere else the new subtree itself is normalised.
+#
+# Simulator-only test hook (VITA_HOST_SIM, as patch 473's): a page whose
+# <html> carries data-vb-reformat-queued is laid out, every min/max width
+# measured again, just before macos9_reconvert asks for the full reconvert
+# -- the window an arriving object found. Gate: JS-kept-table /
+# CSS-kept-table-ref (without the fix the page asserts as Wikipedia did;
+# with it 0 rows differ). Wikipedia: 4 of 4 loads clean, the table
+# normalised once per load.
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -14256,6 +14256,99 @@
+ 	return html_rl_subtree_counts(b->children);
+ }
+ 
++#ifdef VITA_HOST_SIM
++/* Patch 509, simulator only: a test hook. When the local path declines,
++ * the full reconvert may not run at once (html_reconvert_content busy: a
++ * convert in flight, mid-layout; a sheet wait; the cosmetic deferral), and
++ * an object finishing meanwhile lays the page out first (what Wikipedia's
++ * #toc met). A page whose <html> carries data-vb-reformat-queued gets that
++ * reformat at once, just before the full reconvert is asked for
++ * (macos9_reconvert.c), every box's min/max width measured again, so a
++ * gate page meets the tree a kept box leaves every time. Never built for
++ * the device. */
++static void html_rl_sim_unmeasure(struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		b->max_width = UNKNOWN_MAX_WIDTH;
++		html_rl_sim_unmeasure(b->children);
++	}
++}
++
++void html_rl_sim_queued_reformat(struct content *cc)
++{
++	static dom_string *name = NULL;
++	html_content *c = (html_content *) cc;
++	bool has = false;
++
++	/* cc is the HTML content about to be reconverted */
++	if (cc == NULL || c->layout == NULL || c->layout->node == NULL)
++		return;
++	if (name == NULL && dom_string_create(
++			(const uint8_t *) "data-vb-reformat-queued", 23,
++			&name) != DOM_NO_ERR)
++		return;
++	if (dom_element_has_attribute((dom_element *) c->layout->node, name,
++			&has) != DOM_NO_ERR || !has)
++		return;
++	macsurf_debug_log_writef("LIFE test hook: a reformat before the "
++		"full reconvert (data-vb-reformat-queued)");
++	/* every width measured again, as objects arriving leave them
++	 * (html_object_done clears max_width up the object's ancestors) */
++	html_rl_sim_unmeasure(c->layout);
++	content__reformat(cc, false, cc->available_width,
++		cc->available_height);
++}
++#endif
++
++/* Patch 509: a new box kept for the full reconvert (patch 374) must lay
++ * out until that reconvert runs: html_reconvert_content only queues it, a
++ * sheet wait or the cosmetic deferral can hold it, and an object the new
++ * boxes fetched can finish meanwhile and reformat the page
++ * (html_object_callback -> html_reformat). box_build_element places the
++ * box under its DOM parent's box and normalises nothing: under a table,
++ * row group or row that is a block where layout reads a row group, row or
++ * cell -- Wikipedia's #toc (display: table): its .toctitle flex box,
++ * rebuilt whole and kept beside the table's anonymous row group, asserted
++ * in layout_minmax_table (cell->type == BOX_TABLE_CELL) when the toggle's
++ * SVG arrived. The enclosing table is normalised again, as a full build
++ * would make it (the anonymous row group, row and cell around the box;
++ * the boxes already normalised come through unchanged); anywhere else the
++ * new subtree itself is normalised. */
++static void html_rl_kept_normalise(html_content *c, struct box *nb)
++{
++	struct box *t = nb->parent;
++	bool ok = true;
++
++	while (t != NULL && (t->type == BOX_TABLE_ROW ||
++			t->type == BOX_TABLE_ROW_GROUP))
++		t = t->parent;
++	if (t != NULL && t->type == BOX_TABLE && t != nb) {
++		ok = box_normalise_table_ext(t, c->layout, c);
++		macsurf_debug_log_writef("LIFE rebuild local: kept box in a "
++			"table, the table normalised again%s",
++			ok ? "" : " (failed)");
++		return;
++	}
++	switch (nb->type) {
++	case BOX_BLOCK:
++	case BOX_INLINE_BLOCK:
++	case BOX_TABLE_CELL:
++		ok = box_normalise_block(nb, c->layout, c);
++		break;
++	case BOX_FLEX:
++	case BOX_GRID:
++		ok = box_normalise_flex_ext(nb, c->layout, c);
++		break;
++	case BOX_TABLE:
++		ok = box_normalise_table_ext(nb, c->layout, c);
++		break;
++	default:
++		return;
++	}
++	macsurf_debug_log_writef("LIFE rebuild local: kept box normalised%s",
++		ok ? "" : " (failed)");
++}
++
+ /* Patch 374: a local builder giving up after box_build_element ran. Its
+  * new box can be freed only if the build fetched no object: each object
+  * fetched is an entry in c->object_list pointing at a box of the new
+@@ -14272,6 +14365,7 @@
+ 	if (c->num_objects != objects_before) {
+ 		macsurf_debug_log_writef("LIFE rebuild local: the new boxes "
+ 			"fetched objects, kept for the full reconvert");
++		html_rl_kept_normalise(c, nb);	/* patch 509 */
+ 		return;
+ 	}
+ 	/* Patch 422: an inline element's boxes are a run in a line -- its
+--- a/content/handlers/javascript/quickjs/macos9_reconvert.c
++++ b/content/handlers/javascript/quickjs/macos9_reconvert.c
+@@ -2250,6 +2250,13 @@
+ 				continue;
+ 			}
+ 		}
++#ifdef VITA_HOST_SIM
++		{	/* patch 509: sim-only test hook (html.c) */
++			extern void html_rl_sim_queued_reformat(
++				struct content *cc);
++			html_rl_sim_queued_reformat(c);
++		}
++#endif
+ 		rc = html_reconvert_content(c);	/* 0 = queued, !=0 = busy */
+ 		macsurf_debug_log_writef(
+ 			"LIFE reconvert: html_reconvert_content rc=%d c=%p", rc,

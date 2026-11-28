@@ -20089,3 +20089,66 @@ node, detached nodes, a null argument (TypeError), cousins, and a
   network page dropped.
 
 No sudo.
+
+## Patch 509 (2026-11-28): a box kept for the full reconvert is normalised
+
+**The wikipedia assertion from the 503-507 census**:
+`layout_minmax_table: cell->type == BOX_TABLE_CELL`, on en.m PlayStation_Vita.
+Bisected to 506 (0 of 12 loads on 502-505, 3 of 3 on 506). 506 only
+changed which path took a batch; **the bug is patch 374's**.
+
+**gdb at the assertion.**
+- The table is `#toc` (`display: table`).
+- Beside its anonymous row group sits a bare `BOX_FLEX`: `.toctitle`,
+  holding `#mw-toc-heading`.
+- Layout reads every table child as a row group: the flex box's inline
+  container became a "row" and its inline-block a "cell".
+- Trigger, from the backtrace: `svg_convert` -> `content_set_done` ->
+  `html_object_callback` -> `content__reformat` -> `layout_document`.
+
+**How it happened.**
+1. The flex path declined `.toctitle`'s child list and built the box again
+   whole.
+2. `box_build_element` placed the new box under its DOM parent's box (the
+   table), unnormalised: "no longer a block-level box here, full
+   reconvert".
+3. Its build had fetched an object (an icon SVG), so `html_rl_drop_new`
+   kept it in the tree for the reconvert (patch 374: "the tree is whole").
+4. The full reconvert was only asked for, and the SVG finished first.
+
+**Fix.** `html_rl_kept_normalise`, called where a box is kept:
+- if the kept box's enclosing table (through row groups and rows) exists,
+  `box_normalise_table_ext` runs on it again. That adds the anonymous row
+  group, row and cell a full build makes; already-normalised boxes come
+  through unchanged;
+- otherwise the new subtree itself is normalised.
+
+**Test hook** (simulator only, `VITA_HOST_SIM`, as patch 473's). A page
+whose `<html>` carries `data-vb-reformat-queued` is laid out just before
+`macos9_reconvert` asks for the full reconvert, every min/max width
+measured again (as arriving objects leave them).
+- After `html_reconvert_content` the tree is already replaced, which is
+  why the hook sits before it.
+- diag.c hides lines starting "LIFE reconvert", hence "LIFE test hook".
+
+**Gate pages.** New `JS-kept-table` / `CSS-kept-table-ref`: `#toc`-like
+`display: table` with a flex title holding a background icon; a `<span>`
+with a new background icon is appended.
+- **Without the fix it asserts exactly as Wikipedia did**; with it, 0 rows
+  differ.
+- An element background re-fetches on the rebuild only from a fresh URL
+  (a cache hit adds no object).
+
+**Wikipedia with 509:** 4 of 4 loads clean, the table normalised once per
+load.
+
+**Found on the way, not fixed (pre-existing; 502 shows it too):** after
+this full reconvert, **`::before` background images are lost**. The first
+version of the test page lost both its `::before` icons, the old one too.
+
+**Gate.**
+- `restage-full.sh`: **592 applied plus the 2 known collisions**.
+- **gate509 exit 0**: JS-kept-table (0 rows, table normalised 1, hook 1),
+  JS-cdp; interaction 57/57 (both paces); no network page dropped.
+
+No sudo.

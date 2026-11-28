@@ -350,6 +350,8 @@ JS-nth-type file:///app0:/testpages/JS-nth-type.html
 CSS-nth-type-ref file:///app0:/testpages/CSS-nth-type-ref.html
 JS-cdp file:///app0:/testpages/JS-cdp.html
 CSS-cdp-ref file:///app0:/testpages/CSS-cdp-ref.html
+JS-kept-table file:///app0:/testpages/JS-kept-table.html
+CSS-kept-table-ref file:///app0:/testpages/CSS-kept-table-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1894,6 +1896,18 @@ echo "  JS-nth-type: rows differing from the parse-time build $ntr (0); typeless
 cdr=$(fl_rows JS-cdp CSS-cdp-ref)
 echo "  JS-cdp: rows differing from the written-in answers $cdr (0)"
 [ "$cdr" = 0 ] || fail "compareDocumentPosition answers"
+# Patch 509: a box a local builder keeps for the full reconvert (its new
+# boxes fetched an object) is normalised: under a display: table box, its
+# table again. The page's <html> carries data-vb-reformat-queued (sim-only
+# hook): it is laid out, every width measured again, just before the full
+# reconvert -- without the fix that asserted in layout_minmax_table, as
+# Wikipedia's #toc did.
+ktr=$(fl_rows JS-kept-table CSS-kept-table-ref)
+ktseg=$(awk '/ page [0-9]+\/[0-9]+ JS-kept-table: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+ktn=$(printf '%s\n' "$ktseg" | grep -c "LIFE rebuild local: kept box in a table, the table normalised again$" || true)
+kth=$(printf '%s\n' "$ktseg" | grep -c "LIFE test hook: a reformat before the full reconvert" || true)
+echo "  JS-kept-table: rows differing from the parse-time build $ktr (0); kept box's table normalised ${ktn} (1 or more); reformat before the full reconvert ${kth} (1 or more)"
+[ "$ktr" = 0 ] && [ "${ktn:-0}" -ge 1 ] && [ "${kth:-0}" -ge 1 ] || fail "a kept box is normalised before the full reconvert"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render
