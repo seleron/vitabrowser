@@ -19925,3 +19925,45 @@ it). That is patch 507.
   (both paces); no network page dropped.
 
 No sudo.
+
+## Patch 507 (2026-11-28): a typeless :*-of-type rule reaches only children of a tag that went in
+
+**What.** `html_rl_block_struct_risk` counted a typeless `:nth-of-type` /
+`:first-of-type` / `:last-of-type` compound (`of_type`, no tag) as able to
+flip every child in range. Such a rule counts each child among its own
+tag, so it can flip only a child whose tag went in or out.
+- The moved tags are known only when **nothing was removed**: a removed
+  element with no box leaves no tag. So the check applies to insertions
+  only.
+- (The older tagged-`:*-of-type` filter, patch 379, relies on the same
+  `moved[]` list. A box-less removal of the rule's own tag may be a
+  pre-existing gap there; not changed here.)
+
+**Gate pages.** New `JS-nth-type` / `CSS-nth-type-ref`:
+- a `<span>` among `<p>`s / `<div>`s (reaches none);
+- a `<p>` and a `<div>` inserted (their siblings flip);
+- a removal (old check).
+
+**0 rows different.** Every existing structural gate page gives the same
+counts on 506 and 507 (checked before gating).
+
+**stackoverflow: not measured.**
+- One clean 507 load still had 6 `<body>` rebuilds.
+- Another had 4, but that load's page set `body.style` 2 times instead
+  of the usual 19: page behaviour, not this patch.
+- The remaining `<body>` rebuilds mix:
+  - insertions before `<body>` in `<html>`, whose matching rule is not yet
+    confirmed (`arms/hit507` logs it);
+  - "structural range whole" batches (unknown positions: removals), where
+    507 rightly stays off;
+  - a `value` / `style` change inside a flex box.
+- Cloudflare then challenged every stackoverflow load ("Just a
+  moment...") after the day's many loads; measure again once it clears.
+
+**Gate.**
+- `restage-full.sh`: **589 applied plus the 2 known collisions**.
+- **gate507 exit 0**: JS-nth-type, JS-struct-ctx, JS-struct-dir and
+  JS-struct-hits pass; interaction 57/57 (both paces); no network page
+  dropped.
+
+No sudo.

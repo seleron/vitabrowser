@@ -346,6 +346,8 @@ JS-sib-not file:///app0:/testpages/JS-sib-not.html
 CSS-sib-not-ref file:///app0:/testpages/CSS-sib-not-ref.html
 JS-struct-ctx file:///app0:/testpages/JS-struct-ctx.html
 CSS-struct-ctx-ref file:///app0:/testpages/CSS-struct-ctx-ref.html
+JS-nth-type file:///app0:/testpages/JS-nth-type.html
+CSS-nth-type-ref file:///app0:/testpages/CSS-nth-type-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1874,6 +1876,16 @@ scx=$(printf '%s\n' "$scseg" | grep -c "LIFE rebuild local: a structural rule's 
 sch=$(printf '%s\n' "$scseg" | grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
 echo "  JS-struct-ctx: rows differing from the parse-time build $scr (0); contexts ruled out ${scx} (2 or more); real flips found ${sch} (3 or more)"
 [ "$scr" = 0 ] && [ "${scx:-0}" -ge 2 ] && [ "${sch:-0}" -ge 3 ] || fail "structural rules' parent and ancestor context"
+# Patch 507: on an insertion, a typeless :*-of-type rule can flip only a
+# child of a tag that went in; a <span> among <p>s and <div>s reaches none,
+# while new <p>s / <div>s and a removal still find their flips. Four steps
+# render row for row as at parse time.
+ntr=$(fl_rows JS-nth-type CSS-nth-type-ref)
+ntseg=$(awk '/ page [0-9]+\/[0-9]+ JS-nth-type: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+ntx=$(printf '%s\n' "$ntseg" | grep -c "LIFE rebuild local: a typeless :\*-of-type rule cannot reach" || true)
+nth=$(printf '%s\n' "$ntseg" | grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
+echo "  JS-nth-type: rows differing from the parse-time build $ntr (0); typeless :*-of-type ruled out ${ntx} (2 or more); real flips found ${nth} (3 or more)"
+[ "$ntr" = 0 ] && [ "${ntx:-0}" -ge 2 ] && [ "${nth:-0}" -ge 3 ] || fail "typeless :*-of-type rules on insertions"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

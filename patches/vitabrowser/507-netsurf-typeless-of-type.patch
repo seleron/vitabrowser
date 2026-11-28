@@ -1,0 +1,59 @@
+# netsurf: a typeless :*-of-type rule reaches only children of a tag that went in (patch 507)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 506)
+#
+# html_rl_block_struct_risk counted a typeless :nth-of-type /
+# :first-of-type / :last-of-type compound (of_type, no tag) as able to flip
+# every child in the change's range. Such a rule counts each child among
+# its own tag only, so it can flip only a child whose tag went in or out.
+# The moved tags are known only when nothing was removed (a removed element
+# with no box leaves no tag), so the check applies to insertions only.
+# Seen on stackoverflow: scripts append to <html>, and a "*:nth-of-type"
+# rule counted <body> as moved -- the narrow answer then restyled all of
+# <body>.
+#
+# Gate: JS-nth-type / CSS-nth-type-ref (four steps, row for row against the
+# same steps at parse time). Every existing structural gate page gives the
+# same counts on 506 and 507 (checked before gating).
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7906,6 +7906,7 @@
+ }
+ 
+ #define HTML_RL_STRUCT_HITS_MAX 8
++static bool html_rl_childlist_removal;	/* patch 507: defined below */
+ static struct box *html_rl_top_under(struct box *b,
+ 		const struct box *pbox);	/* patch 504 */
+ static bool html_rl_block_struct_risk(html_content *c, dom_node *pnode,
+@@ -8196,6 +8197,31 @@
+ 					if (!hit)
+ 						continue;
+ 				}
++				/* Patch 507: a typeless :nth-of-type / :first-
++				 * of-type / :last-of-type counts each child among
++				 * its own tag only: it can flip only for a child of
++				 * a tag that went in or out. Known only when nothing
++				 * left (a removed element with no box leaves no tag):
++				 * pure insertions. stackoverflow's scripts append to
++				 * <html>, and a "*:nth-of-type" rule counted <body>
++				 * as moved -- restyling all of it, 4 times a load. */
++				if (cp->of_type && cp->tag == NULL &&
++				    !html_rl_childlist_removal && nmoved > 0) {
++					bool same = false;
++					for (m = 0; m < nmoved && !same; m++)
++						same = moved[m] != NULL &&
++							els[k].tag != NULL &&
++							strcmp(moved[m],
++							       els[k].tag) == 0;
++					if (!same) {
++						macsurf_debug_log_writef("LIFE "
++							"rebuild local: a typeless "
++							":*-of-type rule cannot "
++							"reach <%s>", els[k].tag ?
++							els[k].tag : "?");
++						continue;
++					}
++				}
+ 				if (html_rl_struct_cp_matches(cp, &els[k])) {
+ 					*why = "a structural rule matches a "
+ 						"sibling";
