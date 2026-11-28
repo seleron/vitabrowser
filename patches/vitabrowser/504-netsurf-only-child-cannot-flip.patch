@@ -1,0 +1,77 @@
+# netsurf: an :only-* structural rule cannot flip a child of a parent with two or more children before and after (patch 504)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 503)
+#
+# html_rl_block_struct_risk counted a structural compound with
+# :only-child / :only-of-type (dir 4) as able to flip every child in the
+# change's range, whatever the parent's size. stackoverflow's
+# ".ProseMirror.s-prose div:only-child" (kept as its last compound,
+# div:only-child) hit all five <div> children of its 30-child <body> --
+# including div.container, nearly the whole page -- on each <iframe> it
+# inserts, so even the narrow answer (405) would restyle the page.
+#
+# A child's :only-* match flips only if the parent's element count (of the
+# type, for :only-of-type with a tag) was 1 before the change or is 1
+# after it. With two or more now, and two or more that were children
+# before, every child had another sibling then and has one now: no flip.
+# "Were children before" is known by a box under the parent's box (built by
+# an earlier conversion): a new element has none yet, and a new <script>
+# never does, so it is not counted (a single child plus a new <script> and
+# a new <div> still flips). A typeless :only-of-type keeps the old check.
+#
+# Gate: JS-only-child / CSS-only-child-ref (six steps, row for row against
+# the same steps at parse time).
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -7803,6 +7803,8 @@
+  * compound bounded and followed by no sibling combinator, no sheet over
+  * its compound limit, the list not overflowed. */
+ #define HTML_RL_STRUCT_HITS_MAX 8
++static struct box *html_rl_top_under(struct box *b,
++		const struct box *pbox);	/* patch 504 */
+ static bool html_rl_block_struct_risk(html_content *c, dom_node *pnode,
+ 		char **moved, unsigned int nmoved, bool counters_matter,
+ 		const char **why, dom_node **present, unsigned int npresent,
+@@ -7970,6 +7972,42 @@
+ 				if (!same)
+ 					continue;
+ 			}
++			/* Patch 504: :only-child / :only-of-type match only a
++			 * parent's sole element child (of the type). A child's
++			 * match can flip only if the count was 1 before the
++			 * change or is 1 after it. With two or more now, and two
++			 * or more that were children before -- known by a box
++			 * under the parent's box, built by an earlier conversion
++			 * (a new element has none yet; a new <script> never
++			 * does, so it is not counted) -- every child had another
++			 * before and has another now: no flip, no hit. This
++			 * answered "a structural rule matches a sibling" for
++			 * every element on stackoverflow's <body> (30 children)
++			 * from ".ProseMirror.s-prose div:only-child", on each
++			 * <iframe> it inserts. A typeless :only-of-type stays as
++			 * it was. */
++			if (cp->dir == 4 && (!cp->of_type || cp->tag != NULL)) {
++				unsigned int ncur = 0, nold = 0;
++				struct box *pbx = box_for_node(pnode);
++				for (k = 0; k < nel; k++) {
++					struct box *eb;
++					if (cp->of_type && (els[k].tag == NULL ||
++					    strcmp(els[k].tag, cp->tag) != 0))
++						continue;
++					ncur++;
++					eb = box_for_node(els[k].node);
++					if (pbx != NULL && eb != NULL &&
++					    html_rl_top_under(eb, pbx) != NULL)
++						nold++;
++				}
++				if (ncur >= 2 && nold >= 2) {
++					macsurf_debug_log_writef("LIFE rebuild "
++						"local: an :only-* rule cannot "
++						"flip here (%u children, %u "
++						"before)", ncur, nold);
++					continue;
++				}
++			}
+ 			/* first / last: only the child that is or was the
+ 			 * first or last (of the type) can flip, and only if
+ 			 * the change reaches it */

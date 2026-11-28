@@ -340,6 +340,8 @@ JS-flex-items file:///app0:/testpages/JS-flex-items.html
 CSS-flex-items-ref file:///app0:/testpages/CSS-flex-items-ref.html
 JS-flex-leaf file:///app0:/testpages/JS-flex-leaf.html
 CSS-flex-leaf-ref file:///app0:/testpages/CSS-flex-leaf-ref.html
+JS-only-child file:///app0:/testpages/JS-only-child.html
+CSS-only-child-ref file:///app0:/testpages/CSS-only-child-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1836,6 +1838,17 @@ flp=$(printf '%s\n' "$flseg" | grep -c "LIFE rebuild local: a flex box's items i
 flw=$(printf '%s\n' "$flseg" | grep -c "child list the local path declined, the box built again whole" || true)
 echo "  JS-flex-leaf: rows differing from the parse-time build $flr (0); leaf changes placed alone ${flp} (6 or more); the <input> to the whole box ${flw} (1 or more)"
 [ "$flr" = 0 ] && [ "${flp:-0}" -ge 6 ] && [ "${flw:-0}" -ge 1 ] || fail "flex leaf items placed alone"
+# Patch 504: an :only-child / :only-of-type rule cannot flip a child when
+# the parent has two or more children now and two or more with boxes from
+# before; the real flips (one child gaining a sibling, two losing one, a
+# new <script> + <div> into a single child) are still restyled. Six steps
+# render row for row as at parse time.
+ocr=$(fl_rows JS-only-child CSS-only-child-ref)
+ocseg=$(awk '/ page [0-9]+\/[0-9]+ JS-only-child: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+ocn=$(printf '%s\n' "$ocseg" | grep -c "LIFE rebuild local: an :only-\* rule cannot flip here" || true)
+ocf=$(printf '%s\n' "$ocseg" | grep -c "LIFE rebuild local: structural change: [0-9]* matching siblings\{0,1\} restyled alone\|LIFE rebuild local: structural change: the parent's subtree rebuilt" || true)
+echo "  JS-only-child: rows differing from the parse-time build $ocr (0); :only-* rules ruled out ${ocn} (2 or more); real flips restyled ${ocf} (3 or more)"
+[ "$ocr" = 0 ] && [ "${ocn:-0}" -ge 2 ] && [ "${ocf:-0}" -ge 3 ] || fail ":only-* rules that cannot flip"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

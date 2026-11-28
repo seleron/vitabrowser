@@ -19739,3 +19739,65 @@ a flex row), but stackoverflow needs trigger 2 dealt with first.
   JS-media-new pass; interaction 57/57 (both paces).
 
 No sudo.
+
+## stackoverflow's structural hits, identified (2026-11-28)
+
+A scratch build (`arms/structlog`, not committed) logged each structural
+compound that hit a `<body>` child on stackoverflow's `<iframe>` batches.
+
+| rule | hits | real flip? |
+|---|---|---|
+| `.ProseMirror.s-prose div:only-child` (primary.css), kept as its last compound `div:only-child` | 5 `<body>` children, **including `div.container`** (nearly the whole page) | **never**: 30+ children, and the rule needs a `.ProseMirror` ancestor |
+| a `div:nth-child(...)` rule (source not found: not in the three fetched sheets; the page itself answers curl with Cloudflare's challenge) | `div.container` when the insert precedes it | depends on its An+B |
+| `*:last-child` / `div:last-child` | the OneTrust consent box when an iframe is appended | **genuine**; the narrow answer restyles that one box |
+
+Since the narrow answer (405) would restyle `div.container`, stackoverflow
+needs, together:
+- **A**: `:only-*` decided by count;
+- **B**: `:nth-child` decided by its formula, only if still needed;
+- **C**: the sibling scanner reading `+` / `~` inside `:not()`.
+
+## Patch 504 (2026-11-28): an :only-* structural rule cannot flip a child of a parent with two or more children before and after (A)
+
+**What.** `html_rl_block_struct_risk` counted a `:only-child` /
+`:only-of-type` compound (dir 4) as able to flip every child in range.
+
+A child's `:only-*` match flips only if the parent's element count (of
+the type, for `:only-of-type` with a tag) was 1 before or is 1 after. So
+the compound is ruled out when **there are two or more now** and **two or
+more were children before**.
+- "Were children before" means a **box under the parent's box**, built by
+  an earlier conversion. A new element has no box yet.
+- A new `<script>` never has one, so it isn't counted. A first draft that
+  counted "not newly placed" children would have counted it, and got a
+  single child plus a new `<script>` + `<div>` wrong; the gate page covers
+  that case.
+- A typeless `:only-of-type` keeps the old check.
+
+**Gate pages.** New `JS-only-child` / `CSS-only-child-ref`, six steps:
+- 1 -> 2 (flip), 2 -> 1 (flip), 3 -> 4 (none);
+- a single child plus a new `<script>` and `<div>` (flip);
+- `p:only-of-type` with a `<div>` inserted (none), then a second `<p>`
+  (flip).
+
+**Result: 0 rows different**, 3 compounds ruled out, 4 real flips
+restyled. No other structural gate page uses `:only-*` (checked before
+gating).
+
+**stackoverflow** (503 vs 504):
+- **256 `:only-*` compounds ruled out a load**; the `.ProseMirror` rule
+  no longer hits `<body>`'s children.
+- The `<body>` rebuilds are unchanged (6, ~640 ms): the same batches
+  still stop at the conservative sheet (C) and the `:nth-child` /
+  `:last-child` hits.
+- Known follow-up: the skip logs one line per ruled-out compound (256 a
+  stackoverflow load), to be cut to one per check because the device
+  ships logs over the network.
+
+**Gate.**
+- `restage-full.sh`: **586 applied plus the 2 known collisions**.
+- Network page list 383 / 384.
+- **gate504 exit 0**: JS-only-child, JS-struct-scoped, JS-struct-dir,
+  JS-struct-hits and JS-late-append pass; interaction 57/57 (both paces).
+
+No sudo.
