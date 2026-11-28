@@ -19398,3 +19398,40 @@ and compares every call: **334 million comparisons, 0 mismatches**.
   match.
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED (2026-11-28 ~06:15Z): VPKs from 43e10eb (patch 500)
+
+Run 45 now carries **494-500**. The 4a47bde set was never handed over; it
+is parked as `hwtest-2026-11-28-run45-superseded-499` in `<WORK>` and
+both hand-off folders.
+
+**Tree.**
+- `restage-full.sh` showed no in-flight edits.
+- `tools/build-patched.sh` then re-staged `applytest` from the committed
+  patches: **582 applied plus the 2 known collisions**, prefix rebuilt
+  from scratch.
+
+**Build.** Checked in the outputs:
+- `css_rewrite.o` has 500's fast background pass and no check-build
+  `_ref` copies;
+- Vita QuickJS has 499's memo; libdom / ELF have 498's name generation;
+  libcss has 497's index; 496's index builder and 495's heap-span line
+  are in;
+- no check code (`CPENVCHECK` / `GTCCHECK` / `SKIPCHECK` /
+  `REWRITECHECK`);
+- heaps 192 / **256** MiB; both VPKs pass `unzip -t`.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `727dc70e87491114…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `f738c78d06894ed3…` |
+| `nsvita.elf` | `83f442b53e5833e7…` |
+
+**Files.**
+- `reference-dumps` = gate500's autotest (466).
+- `pages` unchanged (511).
+- Verified on both sides: outgoing sums OK, new and parked sums OK,
+  `diff -r` of dumps and pages clean.
+
+The device procedure and load-time checks are unchanged; add youtube to
+the list (500: CSS rewrite -36% in the sim).
