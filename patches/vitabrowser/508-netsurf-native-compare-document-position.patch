@@ -1,0 +1,133 @@
+# netsurf: native Node.prototype.compareDocumentPosition (patch 508)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 507)
+#
+# compareDocumentPosition was a JS stand-in on the element prototype built
+# on contains(): it answered FOLLOWING (4) both ways for two nodes neither
+# containing the other. jQuery's uniqueSort (Sizzle sortOrder) then took
+# its "disconnected" branch on every comparison -- ownerDocument reads
+# (each through the window's document accessor), contains() calls, -1 for
+# every pair -- and returned results out of document order. On rte.ie: 7
+# sorts of 3,600-4,179 nodes, 2.5 s of the load's 5.75-5.9 s main-thread
+# time in the sim.
+#
+# It is a C function on Node.prototype now, answering libdom's tree-order
+# compare (508-libdom-compare-document-position.patch). The realm's
+# document object (not an element-class wrapper) is matched by identity; a
+# non-object argument throws Chromium's TypeError; an object that is no
+# node of this realm is answered as disconnected (37).
+#
+# rte.ie main thread 5.9 -> 3.45 s in the sim (sorts 2.57 s -> 0.14 s;
+# comparator calls per sort 144k -> 38k, a consistent comparator).
+# Gate: JS-cdp / CSS-cdp-ref (every answer row for row against the answers
+# written in; 507 differs in 83 rows).
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -2765,6 +2765,8 @@
+  * depending on which bool won in a given TU. */
+ extern dom_exception macsurf_dom_node_clone_node(dom_node *node, int deep,
+ 		dom_node **result);
++extern dom_exception macsurf_dom_node_compare_position(dom_node *node,
++		dom_node *other, unsigned int *result);	/* patch 508 */
+ extern dom_exception macsurf_dom_node_contains(dom_node *node,
+ 		dom_node *other, int *contains);
+ extern dom_exception macsurf_dom_node_append_child(dom_node *parent,
+@@ -8703,6 +8705,58 @@
+ 	return contains ? JS_TRUE : JS_FALSE;
+ }
+ 
++/* Patch 508: node.compareDocumentPosition() in C. It was a JS function
++ * built on contains() that answered FOLLOWING (4) both ways for any two
++ * nodes neither containing the other, so a document-order sort could not
++ * order them: jQuery's uniqueSort (Sizzle sortOrder) then took its
++ * "disconnected" branch on every comparison -- ownerDocument reads,
++ * contains() calls, -1 for every pair -- and returned its results out of
++ * document order. On rte.ie that was 7 sorts of 3,600-4,179 nodes, 2.5 s of
++ * the load's 5.75 s main-thread time in the sim.
++ *
++ * The realm's document object is not an element-class wrapper: it is
++ * matched by identity and answered as the libdom document node. A
++ * non-object argument throws Chromium's TypeError; an object that is no
++ * node of this realm (another frame's document, a stand-in) is answered as
++ * disconnected, as is such a `this`. */
++static dom_node *qjs_cdp_node(JSContext *ctx, JSValueConst v)
++{
++	dom_node *n = qjs_get_node(v);
++	JSValue global, docv;
++	if (n != NULL || !JS_IsObject(v))
++		return n;
++	global = JS_GetGlobalObject(ctx);
++	docv = JS_GetPropertyStr(ctx, global, "document");
++	if (JS_IsObject(docv) &&
++	    JS_VALUE_GET_PTR(docv) == JS_VALUE_GET_PTR(v))
++		n = (dom_node *) qjs_document_for_ctx(ctx);
++	JS_FreeValue(ctx, docv);
++	JS_FreeValue(ctx, global);
++	return n;
++}
++
++static JSValue qjs_node_compare_position_data(JSContext *ctx,
++		JSValueConst this_val, int argc, JSValueConst *argv,
++		int magic, JSValueConst *func_data)
++{
++	dom_node *self, *other;
++	unsigned int r = 0;
++
++	(void) magic; (void) func_data;
++	if (argc < 1 || !JS_IsObject(argv[0]))
++		return JS_ThrowTypeError(ctx, "Failed to execute "
++			"'compareDocumentPosition' on 'Node': parameter 1 is "
++			"not of type 'Node'.");
++	if (JS_VALUE_GET_PTR(argv[0]) == JS_VALUE_GET_PTR(this_val))
++		return JS_NewInt32(ctx, 0);
++	other = qjs_cdp_node(ctx, argv[0]);
++	self = qjs_cdp_node(ctx, this_val);
++	if (self == NULL || other == NULL ||
++	    macsurf_dom_node_compare_position(self, other, &r) != DOM_NO_ERR)
++		return JS_NewInt32(ctx, 1 | 32 | 4);
++	return JS_NewInt32(ctx, (int32_t) r);
++}
++
+ static JSValue qjs_el_get_children_data(JSContext *ctx,
+ 		JSValueConst this_val, int argc, JSValueConst *argv,
+ 		int magic, JSValueConst *func_data)
+@@ -9420,11 +9474,7 @@
+ 				"for(j=0;j<out.length;j++)if(out[j].name===n)return out[j];"
+ 				"return null;};"
+ 			"return out;}});"
+-		"P.compareDocumentPosition=function(o){"
+-			"if(!o||o===this)return 0;"
+-			"if(this.contains&&this.contains(o))return 20;"
+-			"if(o.contains&&o.contains(this))return 10;"
+-			"return 4;};"
++		/* compareDocumentPosition: native on Node.prototype (patch 508) */
+ 		"P.isEqualNode=function(o){return o===this;};"
+ 		"P.isSameNode=function(o){return o===this;};"
+ 		/* fixes1009 - ELEMENT-SCOPED getElementsBy*.
+@@ -9637,6 +9687,8 @@
+ 	JS_SetPropertyStr(ctx, node_proto, "cloneNode", f);
+ 	f = JS_NewCFunctionData(ctx, qjs_el_contains_data, 1, 0, 0, NULL);
+ 	JS_SetPropertyStr(ctx, node_proto, "contains", f);
++	f = JS_NewCFunctionData(ctx, qjs_node_compare_position_data, 1, 0, 0, NULL);
++	JS_SetPropertyStr(ctx, node_proto, "compareDocumentPosition", f);	/* patch 508 */
+ 
+ 	fn = qjs_helper_fn(ctx, "__ms_h_nav", nav_src, "<node-nav>");
+ 	if (!JS_IsException(fn)) {
+--- a/content/handlers/javascript/quickjs/macsurf_dom_dispatch.c
++++ b/content/handlers/javascript/quickjs/macsurf_dom_dispatch.c
+@@ -617,3 +617,15 @@
+     *contains = c ? 1 : 0;
+     return exc;
+ }
++
++/* Patch 508: node.compareDocumentPosition(), libdom's tree-order compare
++ * (implemented by the same patch; it was DOM_NOT_SUPPORTED_ERR). */
++dom_exception macsurf_dom_node_compare_position(dom_node *node, dom_node *other,
++    unsigned int *result)
++{
++    uint16_t r = 0;
++    dom_exception exc;
++    exc = dom_node_compare_document_position(node, other, &r);
++    *result = r;
++    return exc;
++}

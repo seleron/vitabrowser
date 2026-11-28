@@ -1,0 +1,113 @@
+# libdom: node.compareDocumentPosition implemented (patch 508)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 507)
+#
+# _dom_node_compare_document_position returned DOM_NOT_SUPPORTED_ERR. It
+# is the DOM spec's tree-order comparison now, over the parent and sibling
+# pointers: lift the deeper node to the other's depth (an ancestor or a
+# descendant is CONTAINS|PRECEDING / CONTAINED_BY|FOLLOWING), climb both to
+# the children of the common ancestor, and walk siblings out from one in
+# both directions until the other is met. Nodes in different trees are
+# DISCONNECTED | IMPLEMENTATION_SPECIFIC with a consistent PRECEDING /
+# FOLLOWING (by address), as the spec allows.
+#
+# Used by the bridge's native Node.prototype.compareDocumentPosition
+# (508-netsurf-native-compare-document-position.patch).
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -1425,17 +1425,89 @@
+  *
+  * The result is a bitfield of dom_document_position values.
+  *
+- * We don't support this API now, so this function call should always
+- * return DOM_NOT_SUPPORTED_ERR.
++ * VitaBrowser patch 508: implemented.
+  */
+ dom_exception _dom_node_compare_document_position(dom_node_internal *node,
+ 		dom_node_internal *other, uint16_t *result)
+ {
+-	UNUSED(node);
+-	UNUSED(other);
+-	UNUSED(result);
++	/* VitaBrowser patch 508: implemented (was DOM_NOT_SUPPORTED_ERR).
++	 * The DOM spec's tree-order comparison over the parent and sibling
++	 * pointers: lift the deeper node to the other's depth, climb both to
++	 * the children of their common ancestor, then walk siblings from one
++	 * of them in both directions until the other is met. Nodes in
++	 * different trees are DISCONNECTED | IMPLEMENTATION_SPECIFIC with a
++	 * consistent PRECEDING / FOLLOWING (their addresses), as the spec
++	 * allows. Attributes are not placed (no parent): disconnected. */
++	dom_node_internal *a, *b, *f, *r;
++	unsigned int da = 0, db = 0;
+ 
+-	return DOM_NOT_SUPPORTED_ERR;
++	assert(node != NULL);
++	assert(other != NULL);
++	assert(result != NULL);
++
++	*result = 0;
++	if (node == other)
++		return DOM_NO_ERR;
++
++	for (a = node; a->parent != NULL; a = a->parent)
++		da++;
++	for (b = other; b->parent != NULL; b = b->parent)
++		db++;
++	if (a != b) {
++		*result = DOM_DOCUMENT_POSITION_DISCONNECTED |
++			DOM_DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
++			((uintptr_t) other < (uintptr_t) node ?
++				DOM_DOCUMENT_POSITION_PRECEDING :
++				DOM_DOCUMENT_POSITION_FOLLOWING);
++		return DOM_NO_ERR;
++	}
++
++	a = node;
++	b = other;
++	for (; da > db; da--)
++		a = a->parent;
++	for (; db > da; db--)
++		b = b->parent;
++	if (a == other) {
++		/* other is an ancestor of node */
++		*result = DOM_DOCUMENT_POSITION_CONTAINS |
++			DOM_DOCUMENT_POSITION_PRECEDING;
++		return DOM_NO_ERR;
++	}
++	if (b == node) {
++		/* other is a descendant of node */
++		*result = DOM_DOCUMENT_POSITION_CONTAINED_BY |
++			DOM_DOCUMENT_POSITION_FOLLOWING;
++		return DOM_NO_ERR;
++	}
++	while (a->parent != b->parent) {
++		a = a->parent;
++		b = b->parent;
++	}
++
++	/* a and b are siblings: walk out from a both ways */
++	f = a->next;
++	r = a->previous;
++	while (f != NULL || r != NULL) {
++		if (f == b) {
++			*result = DOM_DOCUMENT_POSITION_FOLLOWING;
++			return DOM_NO_ERR;
++		}
++		if (r == b) {
++			*result = DOM_DOCUMENT_POSITION_PRECEDING;
++			return DOM_NO_ERR;
++		}
++		if (f != NULL)
++			f = f->next;
++		if (r != NULL)
++			r = r->previous;
++	}
++
++	/* not reached in a well-formed tree */
++	*result = DOM_DOCUMENT_POSITION_DISCONNECTED |
++		DOM_DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
++		DOM_DOCUMENT_POSITION_FOLLOWING;
++	return DOM_NO_ERR;
+ }
+ 
+ /**

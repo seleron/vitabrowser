@@ -348,6 +348,8 @@ JS-struct-ctx file:///app0:/testpages/JS-struct-ctx.html
 CSS-struct-ctx-ref file:///app0:/testpages/CSS-struct-ctx-ref.html
 JS-nth-type file:///app0:/testpages/JS-nth-type.html
 CSS-nth-type-ref file:///app0:/testpages/CSS-nth-type-ref.html
+JS-cdp file:///app0:/testpages/JS-cdp.html
+CSS-cdp-ref file:///app0:/testpages/CSS-cdp-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1886,6 +1888,12 @@ ntx=$(printf '%s\n' "$ntseg" | grep -c "LIFE rebuild local: a typeless :\*-of-ty
 nth=$(printf '%s\n' "$ntseg" | grep -c "LIFE rebuild local: structural check: a structural rule matches a sibling" || true)
 echo "  JS-nth-type: rows differing from the parse-time build $ntr (0); typeless :*-of-type ruled out ${ntx} (2 or more); real flips found ${nth} (3 or more)"
 [ "$ntr" = 0 ] && [ "${ntx:-0}" -ge 2 ] && [ "${nth:-0}" -ge 3 ] || fail "typeless :*-of-type rules on insertions"
+# Patch 508: node.compareDocumentPosition() is libdom's tree-order compare
+# (siblings both ways, ancestors, the document, text, detached nodes, a
+# null argument, a 48-node sort); every answer renders as written in.
+cdr=$(fl_rows JS-cdp CSS-cdp-ref)
+echo "  JS-cdp: rows differing from the written-in answers $cdr (0)"
+[ "$cdr" = 0 ] || fail "compareDocumentPosition answers"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

@@ -20004,3 +20004,88 @@ untested 8ed78f1 (502) set.
 
 **Device run unchanged:** autotest self-checks plus the short manual list
 from the run-45 entry.
+
+## ASan + census for 503-507 (2026-11-28)
+
+**ASan.** `build-asan-sim.sh --libs --net`, then `asan-autotest.sh main`
+at 507:
+- rc 0, interaction 57/57, 466 page dumps;
+- **ASan clean**;
+- the new paths ran under ASan: 506's context skip 395x, 507's typeless
+  skip 11x, 504's `:only-*` skip 8x.
+
+**Census, 502 vs 507** (21 sites, 3 loads each). BATCHCAUSE total 13.7 ->
+15.0, within the ±2 noise.
+- "class change may move a sibling selector" 2.0 -> 0.0 (505).
+- **wikipedia: 507 asserted on 2 of 3 loads**:
+
+  ```
+  layout.c:534: layout_minmax_table: Assertion `cell->type == BOX_TABLE_CELL' failed.
+  ```
+
+  Bisected with real loads (3 per arm): 502-505 0 of 12; **506 3 of 3**;
+  507 2 of 3. The cause is a patch 374 bug that 506 exposed: patch 509
+  below. **The run-45 set staged at 507 carries it**: re-staged after 509.
+
+## Patch 508 (2026-11-28): native node.compareDocumentPosition
+
+**Found by profiling rte.ie at 507.**
+- Main thread 5.75-5.9 s; `js_array_sort` 2.5 s of it.
+- An injected `Array.prototype.sort` spy (`console.error` reaches the log;
+  `console.log` does not) named the comparator: jQuery's `uniqueSort`
+  (Sizzle `sortOrder`). 7 sorts of 3,600-4,179 nodes, ~150k comparisons
+  each.
+
+**The cause: our `compareDocumentPosition` was a JS stand-in** built on
+`contains()`.
+- For two nodes neither containing the other it answered FOLLOWING (4)
+  **both ways**.
+- `sortOrder` then took its "disconnected" branch on every comparison:
+  `ownerDocument` reads (each through the window's `document` accessor),
+  `contains()`, and -1 for every pair.
+- So it was slow, and **the results came out of document order**
+  (`[c,b,a]` sorted to `c,a,b`).
+- libdom's `_dom_node_compare_document_position` was a
+  `DOM_NOT_SUPPORTED_ERR` stub.
+
+**Fix.**
+- **libdom** (`508-libdom-compare-document-position.patch`): the spec's
+  tree-order compare over parent and sibling pointers. Lift the deeper node
+  to the same depth, climb both to the common ancestor's children, then
+  walk siblings out both ways.
+  - Different trees: DISCONNECTED | IMPLEMENTATION_SPECIFIC, with a
+    consistent PRECEDING / FOLLOWING by address.
+  - libdom is not rebuilt by the gate: rebuilt into the host prefix by
+    hand (`make install PREFIX=$P WARNFLAGS=-Wall`, CFLAGS as
+    `build-patched.sh`).
+- **netsurf** (`508-netsurf-native-compare-document-position.patch`): a C
+  function on `Node.prototype`; the JS stand-in is removed.
+  - The realm's `document` (not an element-class wrapper) is matched by
+    identity.
+  - A non-object argument throws Chromium's TypeError.
+  - Another realm's node is answered as disconnected (37).
+
+**rte.ie** (2 loads per arm, sim):
+
+| | 507 | 508 |
+|---|---|---|
+| main-thread CPU | 5.90 / 5.89 s | **3.40 / 3.50 s** |
+| sort time | ~2.57 s | 0.14 s |
+| comparator calls per big sort | 144k | 38k |
+
+- The comparator is consistent now.
+- wpblog, wpnews, jquery, oldreddit, guardian and bbc are unchanged (no
+  big sorts there).
+
+**Gate pages.** New `JS-cdp` / `CSS-cdp-ref`: the answers computed into
+the page, row for row against the same answers written in. They cover
+siblings both ways, child / parent, self, the document both ways, a text
+node, detached nodes, a null argument (TypeError), cousins, and a
+48-node shuffled sort. 507 differs in 83 rows; 508 in 0.
+
+**Gate.**
+- `restage-full.sh`: **591 applied plus the 2 known collisions**.
+- **gate508 exit 0**: JS-cdp 0 rows; interaction 57/57 (both paces); no
+  network page dropped.
+
+No sudo.
