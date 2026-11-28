@@ -19192,3 +19192,48 @@ libdom, like libcss, is not rebuilt by the gate. It was installed to the
 prefix with its host build directory deleted first.
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED (2026-11-28 ~03:40Z): VPKs from f050a40 (patch 498), tree re-staged from the committed stack
+
+Run 45 now carries **494-498**. The 6dfa40c set was never handed over; it
+is parked as `hwtest-2026-11-28-run45-superseded-497` in `<WORK>` and
+both hand-off folders.
+
+**Tree.**
+- `tools/build-patched.sh` re-staged `applytest` from the committed
+  patches: **581 applied plus the 2 known collisions**.
+- The prefix libraries were rebuilt from scratch (the wipe also cleared
+  every old Vita build directory).
+- `restage-full.sh` had shown no in-flight edits first, so gate498's
+  tree and this one hold the same code.
+
+**Build.** Checked in the outputs:
+- Vita libdom has 498's name generation; the ELF has
+  `__vitaDomNameGen`;
+- Vita libcss has 497's index;
+- `css_rewrite.o` has 496's index builder;
+- the ext ELF has 495's heap-span line;
+- no check code (`CPENVCHECK`/`GTCCHECK`) anywhere;
+- heaps 192 / **256** MiB; both VPKs pass `unzip -t`.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `7edf142c59fc27a5…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `26bab0fef040fd26…` |
+| `nsvita.elf` | `e92eba2fa16394cb…` |
+
+**Files.**
+- `reference-dumps` = gate498's autotest (466).
+- `pages` unchanged (511).
+- Verified on both sides: outgoing sums OK, new and parked sums OK,
+  `diff -r` of dumps and pages clean.
+
+The device procedure is unchanged. Load times to look for, with the sim
+main-thread CPU since 495:
+
+| site | sim change | run 43 on the device |
+|---|---|---|
+| claude.ai | -28% (498) | claude.ai/code 446 s |
+| github | -38% | 286 s |
+| theguardian.com | -73% | |
+| stackoverflow | -15% | |
