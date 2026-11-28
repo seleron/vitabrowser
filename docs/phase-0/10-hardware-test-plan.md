@@ -19674,3 +19674,68 @@ in `<WORK>` and both hand-off folders.
   `diff -r` of dumps and pages clean.
 
 The device procedure and load-time checks are unchanged.
+
+## ASan + census for 502 (2026-11-28)
+
+**ASan at 502** (`--libs --net`): **clean**. Interaction 57/57, 455 page
+dumps (502's pair included), 0 reports. 502's path ran **14 times under
+ASan**.
+
+**21-site census, 501 vs 502** (`score/c21-502`): **flat**, 15.3 -> 16.0
+full rebuilds per load. **No crashes**, oldreddit included.
+
+## The stackoverflow `<body>` rebuilds, traced (2026-11-28)
+
+A temporary build (never committed, `arms/rsty` and `arms/newel`) logged
+each whole-subtree restyle's element, trigger and box count.
+
+**The ~660 ms** of "flex or grid box restyled, full layout (its own class
+or style)" per stackoverflow load are **all `<body>`**: a flex box rebuilt
+whole, ~2,700-2,900 boxes, 90-200 ms each in the sim, 6 times a load.
+That log line is shared by every caller of `html_rl_flex_restyle`, which
+is what misled 502's diagnosis.
+
+The triggers stack (each fix exposes the next in the same batch):
+
+| # | trigger | rebuilds |
+|---|---|---|
+| 1 | a script inserts an `<iframe>` among `<body>`'s children ("new element is not a plain block": 502's flex mode skipped the leaf placement) | 3 |
+| 2 | a sibling-combinator risk over `<body>`'s children: one of stackoverflow's sheets is **conservative** (`html_rl_scan_sheet` returns 2), so every non-tail insert is a risk and the parent (`<body>`) is rebuilt (446) | - |
+| 3 | a structural rule (positional range) over `<body>`'s children | 2 |
+| 4 | a `style` attribute change on `<body>` | 1 |
+
+## Patch 503 (2026-11-28): leaf elements in or out of a block-level flex box are placed alone too
+
+**What.**
+- 502's flex mode now allows the leaf (407: between items) and late (378:
+  appended, iframes and images only) placements.
+- In a flex box the builder blockifies a replaced element, so its box
+  lands straight under the flex box, as in a full build, and it is placed
+  like any item.
+- One that lands in a line is still a full reconvert: 502's guard now
+  tests only where the box landed.
+- (A first version wrapped the leaf in an implied flex item, copying
+  normalisation's code. The log showed that path never ran, so it was
+  removed rather than shipped untested.)
+
+**Gate pages.** New `JS-flex-leaf` / `CSS-flex-leaf-ref`: an `<img>` and
+an `<iframe>` between items, each appended, two `<img>`s side by side, an
+`<input>` (the box built whole), and `<img>`s before and after whitespace.
+**0 rows different, 7 placed alone, 1 fallback.** 502's pairs,
+`JS-flex-own` and `JS-media-new` are unchanged.
+
+**Measured on stackoverflow** (502 vs 503, real-page loads):
+- 4 changes placed alone (was 1);
+- the **six `<body>` rebuilds and ~660 ms are unchanged**: the iframe
+  batches now reach trigger 2 and rebuild `<body>` there.
+
+503 is correct and general (any `<img>` / `<iframe>` a script inserts into
+a flex row), but stackoverflow needs trigger 2 dealt with first.
+
+**Gate.**
+- `restage-full.sh`: **585 applied plus the 2 known collisions**.
+- Network page list 381 / 384.
+- **gate503 exit 0**: JS-flex-leaf, JS-flex-items, JS-flex-own and
+  JS-media-new pass; interaction 57/57 (both paces).
+
+No sudo.

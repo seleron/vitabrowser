@@ -338,6 +338,8 @@ JS-flex-restyle file:///app0:/testpages/JS-flex-restyle.html
 CSS-flex-restyle-ref file:///app0:/testpages/CSS-flex-restyle-ref.html
 JS-flex-items file:///app0:/testpages/JS-flex-items.html
 CSS-flex-items-ref file:///app0:/testpages/CSS-flex-items-ref.html
+JS-flex-leaf file:///app0:/testpages/JS-flex-leaf.html
+CSS-flex-leaf-ref file:///app0:/testpages/CSS-flex-leaf-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1826,6 +1828,14 @@ fiw=$(grep -c "LIFE rebuild local: a flex or grid box's child list the local pat
 echo "  JS-flex-items: rows differing from the parse-time build $fir (0); ${fip} flex item changes placed alone (8 or more); fallbacks to the whole box ${fiw} (3 or more)"
 [ "$fir" = 0 ] && [ "${fip:-0}" -ge 8 ] && [ "${fiw:-0}" -ge 3 ] ||
 	fail "flex items placed alone"
+# Patch 503: an <img> or <iframe> into a flex box is placed alone too (the
+# builder blockifies it); eight steps render row for row as at parse time
+flr=$(fl_rows JS-flex-leaf CSS-flex-leaf-ref)
+flseg=$(awk '/ page [0-9]+\/[0-9]+ JS-flex-leaf: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+flp=$(printf '%s\n' "$flseg" | grep -c "LIFE rebuild local: a flex box's items in or out" || true)
+flw=$(printf '%s\n' "$flseg" | grep -c "child list the local path declined, the box built again whole" || true)
+echo "  JS-flex-leaf: rows differing from the parse-time build $flr (0); leaf changes placed alone ${flp} (6 or more); the <input> to the whole box ${flw} (1 or more)"
+[ "$flr" = 0 ] && [ "${flp:-0}" -ge 6 ] && [ "${flw:-0}" -ge 1 ] || fail "flex leaf items placed alone"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

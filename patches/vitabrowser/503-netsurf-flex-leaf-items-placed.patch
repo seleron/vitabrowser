@@ -1,0 +1,66 @@
+# netsurf: leaf elements in or out of a block-level flex box are placed alone too (patch 503)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 502)
+#
+# Patch 502 places items in or out of a block-level flex box alone, but
+# skipped the leaf (patch 407: between blocks) and late (patch 378:
+# appended at the end) placements, so a new <img> or <iframe> still built
+# the whole flex box again: stackoverflow inserts <iframe>s into its flex
+# <body>, ~2,900 boxes each time. In a flex box the builder blockifies a
+# replaced element -- its box lands straight under the flex box, as in a
+# full build -- so both placements are allowed in 502's flex mode (the
+# late one for iframes and images only), and the item is placed like any
+# other. One that lands in a line instead is still a full reconvert at
+# placement (502's guard, which now tests only where the box landed).
+#
+# Gate: JS-flex-leaf / CSS-flex-leaf-ref (an <img> and an <iframe> between
+# items, each appended at the end, two <img>s side by side, an <input>
+# appended -- the box built again whole -- and <img>s before and after
+# whitespace), row for row against the same steps at parse time.
+#
+# Measured on stackoverflow: the iframe batches now get past placement and
+# then meet a sibling-combinator rule over <body>'s children, which
+# rebuilds the parent (446) -- still <body> whole -- so this alone does not
+# change that page; see doc 10.
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -10047,7 +10047,14 @@
+ 				 * after its earlier block, the page laid out
+ 				 * whole. Its children (a <select>'s options, a
+ 				 * <button>'s text) must be inline or controls. */
+-				if (!plain && !oc && !flexok &&
++				/* Patch 503: in 502's flex mode too -- an <img> or
++				 * <iframe> in a flex box is blockified by the
++				 * builder, its box straight under the flex box as
++				 * in a full build (stackoverflow inserts <iframe>s
++				 * into its flex <body>: ~2,900 boxes rebuilt each
++				 * time). One that lands in a line instead is a full
++				 * reconvert at placement (502's guard). */
++				if (!plain && !oc &&
+ 				    nadd < HTML_RL_MAX_CHANGES &&
+ 				    html_rl_leaf_tag(n) && html_rl_boxed_after(n) &&
+ 				    html_rl_block_neighbour(n, pbox, false) &&
+@@ -10104,7 +10111,9 @@
+ 				 * and its late load as in a full build (244).
+ 				 * Patch 416: a plain inline element after a
+ 				 * block, too -- a line of its own at the end. */
+-				if (!plain && !oc && !flexok &&
++				if (!plain && !oc &&
++				    (!flexok || (html_rl_late_tag(n) &&
++						 html_rl_leaf_tag(n))) &&	/* 503 */
+ 				    nadd < HTML_RL_MAX_CHANGES &&
+ 				    !html_rl_boxed_after(n) &&
+ 				    (html_rl_late_tag(n) ||
+@@ -10525,8 +10534,10 @@
+ 		}
+ 		/* patch 502: a flex item must be built straight under its
+ 		 * flex box (an inline-level one lands in a line, a float in a
+-		 * carrier: what normalisation wraps in an implied item) */
+-		if (flexok && (nb->parent != pbox || leafmid[i])) {
++		 * carrier: what normalisation wraps in an implied item).
++		 * Patch 503: a leaf (leafmid) is placed like any item when
++		 * the builder blockified it straight under the box */
++		if (flexok && nb->parent != pbox) {
+ 			for (; i < nadd; i++)
+ 				dom_node_unref(added[i]);
+ 			macsurf_debug_log_writef("LIFE rebuild local: flex item "
