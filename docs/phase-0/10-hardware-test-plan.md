@@ -18841,3 +18841,82 @@ explaining both. The repo's `tools/` copies are synced in a separate,
 gated commit.
 
 No sudo.
+
+### Device hand-off run 45 (2026-11-28 ~00:20Z): VPKs from e2c0d88 (patch 495)
+
+**Build.**
+- A fresh `tools/build-vita.sh` of the gated tree at `e2c0d88`: patches
+  through 495, QuickJS 01-09.
+- Cross-build green. Only the tree's usual warning classes; none from
+  495's lines.
+- Both VPKs pass `unzip -t`. ELF heaps read back: `nsvita-default.elf`
+  **192 MiB**, `nsvita.elf` **256 MiB**. The ext ELF carries the `mem:
+  runtime heap span` line.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `592799c188d97df3…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `33ca54bad59b00ec…` |
+| `nsvita.elf` (ext, for crash-dump symbols) | `a4c1a201b6114eb3…` |
+
+**Files.**
+- Archive: `<WORK>/hwtest-2026-11-28-run45/`, holding:
+  - `SHA256SUMS`, the VPKs, the ELF;
+  - `reference-dumps/` (the gate495 autotest, 466 files);
+  - `pages/` (the tracked test pages, 511: run 44's plus
+    `JS-array-concat.html`).
+- `Desktop\VitaBrowser-hwtest\`:
+  - run 44's pair, ELF, sums and `pages\` moved to
+    `hwtest-2026-11-27-run44\`;
+  - its dumps parked as `reference-dumps-run44\`;
+  - new VPKs, ELF, `SHA256SUMS-run45.txt`, `pages\`, `reference-dumps\`.
+- `C:\Users\seleron\VitaBrowser-hwtest\`: the same swap.
+  - Its `reference-dumps` duplicated `reference-dumps-run44`, so it is
+    parked as `reference-dumps.bak-2026-11-28`.
+  - The top-level `SHA256SUMS` there was stale (it matched nothing
+    present); kept as `hwtest-2026-11-27-run44\SHA256SUMS.stale-top-level`.
+- Before each move, the outgoing files were checked against run 44's sums
+  and archive; after copying, `sha256sum -c` and `diff -r` against the
+  run-45 archive were clean.
+- `reference-screenshots\` (2026-09-23) is unchanged; run 44 did not
+  refresh it either.
+- The receiver (`vita-netlog.py`, `receive-results.bat`) is the new one
+  in Desktop's folder; the repo's `tools/` copies are synced and gated
+  (gate495r).
+
+**On the device** (the doc 26 procedure, with these changes):
+1. Start `receive-results.bat` first. A `-- [time] receiver alive` line
+   every 30 s of quiet shows it is alive. If that clock stops, the window
+   is frozen: press Esc.
+2. Launch **VitaBrowser ext-mem**. The boot log now shows **two** lines:
+   - `mem: newlib heap 256 MiB`
+   - `mem: runtime heap span 256 MiB at 0x..., type 0x... (requested 256 MiB)`
+
+   ` -- MISMATCH` on the second line, or `runtime heap NOT granted`, is a
+   finding.
+3. If a launch dies and the receiver prints `!! no VitaBrowser launch seen
+   in 60 s`: that is a pre-netlog crash (the heap block refused).
+   - **Count how many launch attempts it takes**, then try the default
+     VPK once.
+   - Keep any `ux0:data/psp2core-*.psp2dmp`.
+4. Run the autotest **twice** on ext-mem (two separate launches). Run 44's
+   storage failure (every ux0/app0 file op failing from 21.8 s) was the
+   only ext launch that wrote files. Two more decide whether it is
+   ext-specific.
+   - If it recurs, note the time it started.
+   - Then check that VitaShell can still read and write `ux0:data/` while
+     the app is closed.
+5. Then the doc 26 manual site list (bbc, github, google, youtube,
+   old.reddit, wpnews/wpblog).
+
+Since run 44 the VPKs add 494 (concat / species / spreadable fast paths;
+small on bbc) and 495 (heap 256 + the span line).
+
+**gate495r exit 0** with the new receiver in `tools/`: interaction 57/57
+(both paces). The mirror section ran it: complete mirror, goodbye, one
+heartbeat line (the gate runs it `--quiet`). No engine change. No sudo.
+
+Open from run 44's second ext launch (`213052`): the log stops at 126 s,
+mid-load of a substack article ("Fetching, Processing"), with no goodbye.
+It may be a crash or the PS button; nothing in the log tells them apart.
+Heap in use was ~22 MiB.

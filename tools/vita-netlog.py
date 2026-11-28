@@ -25,6 +25,14 @@ Usage:
 
 Windows asks once whether Python may receive on the network: allow it for
 private networks. Stdlib only (Python 3.8+). Protocol: vita/netlog.h.
+
+Liveness (device run 44): after --heartbeat seconds with nothing printed
+the receiver prints a "receiver alive" line with the time, so a frozen
+window (a click starts a QuickEdit selection; Esc releases it) shows as a
+clock that stops. With no launch heard for --no-launch-warn seconds -- at
+start, or after the last launch went quiet -- it says so loudly: a crash
+before the app's netlog starts (e.g. the ext-mem VPK not getting its heap
+before main) sends NOTHING, so silence is the only sign of it.
 """
 
 import argparse
@@ -36,6 +44,57 @@ import time
 import zlib
 
 PORT = 45100
+QUIET_S = 10    # a launch heard nothing from for this long is "quiet"
+
+
+class Stamped:
+    """stdout that remembers when it was last written to (heartbeats)."""
+
+    def __init__(self, f):
+        self.f = f
+        self.last = time.time()
+
+    def write(self, text):
+        self.last = time.time()
+        return self.f.write(text)
+
+    def flush(self):
+        return self.f.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.f, name)
+
+
+def clock(t=None):
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def no_launch_warning(warn_s, t_start, last_boot):
+    """The loud line when nothing has been heard for warn_s seconds."""
+    if last_boot is None:
+        head = ("no VitaBrowser launch seen in %d s (listening since %s)"
+                % (warn_s, clock(t_start)))
+        prev = []
+    else:
+        b = last_boot
+        how = ("after its goodbye" if b.bye else
+               "after autotest.done, without a goodbye" if
+               "autotest.done" in b.ends else
+               "WITHOUT a goodbye: it crashed or was closed with the PS "
+               "button (or is still open and idle -- then ignore this)")
+        head = "no new VitaBrowser launch seen in %d s" % warn_s
+        prev = ["the last launch, boot %s, went quiet at %s %s." % (
+            b.boot, clock(b.last), how)]
+    lines = [head] + prev + [
+        "If you launched VitaBrowser since: it may have crashed BEFORE its",
+        "netlog started. A crash that early sends nothing, so this window",
+        "cannot see it (run 44: the ext-mem VPK sometimes died at launch).",
+        "Next: relaunch it. If nothing arrives again, launch the default",
+        "\"VitaBrowser\" and note which one failed. Also check the Vita is",
+        "on this network (netlog.cfg) and Python may use it (firewall).",
+    ]
+    return "\n".join("!! " + (("[%s] " % clock()) if i == 0 else "  ") + l
+                     for i, l in enumerate(lines))
 
 
 def ranges_add(ranges, start, end):
@@ -236,7 +295,14 @@ def main():
                          "or gone quiet for 5 s after autotest.done")
     ap.add_argument("--timeout", type=float, default=0,
                     help="exit after this many seconds (0: never)")
+    ap.add_argument("--heartbeat", type=float, default=30,
+                    help="print a 'receiver alive' line after this many "
+                         "seconds with nothing printed (0: never)")
+    ap.add_argument("--no-launch-warn", type=float, default=60,
+                    help="warn when no launch has been heard for this many "
+                         "seconds (0: never)")
     a = ap.parse_args()
+    sys.stdout = Stamped(sys.stdout)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -255,12 +321,36 @@ def main():
     boots = {}
     t_start = time.time()
     bad = 0
+    last_boot = None        # the launch heard from most recently
+    warned_for = False      # the waiting spell already warned about
     try:
         while True:
             now = time.time()
             if a.timeout and now - t_start > a.timeout:
                 print("timeout", flush=True)
                 break
+            # Waiting for a launch: none yet, or the last one went quiet.
+            if last_boot is None:
+                waiting, since = True, t_start
+            else:
+                waiting = last_boot.bye or now - last_boot.last > QUIET_S
+                since = last_boot.last
+            key = last_boot.boot if last_boot else None
+            if (a.no_launch_warn and waiting and warned_for != key and
+                    now - since >= a.no_launch_warn):
+                warned_for = key
+                print(no_launch_warning(int(a.no_launch_warn), t_start,
+                                        last_boot), flush=True)
+            if a.heartbeat and now - sys.stdout.last >= a.heartbeat:
+                if last_boot is None:
+                    state = "no launch heard yet"
+                else:
+                    state = "%d launch%s heard; last datagram %d s ago " \
+                        "(boot %s)" % (len(boots), "" if len(boots) == 1
+                                       else "es", now - last_boot.last,
+                                       last_boot.boot)
+                print("-- [%s] receiver alive on UDP %s:%d; %s" % (
+                    clock(now), a.bind, a.port, state), flush=True)
             done = [b for b in boots.values() if "autotest.done" in b.ends]
             if a.exit_when_done and done and all(
                     b.bye or now - b.last > 5 for b in done):
@@ -288,7 +378,12 @@ def main():
                                        a.quiet)
                 print("== boot %s from %s: %s -> %s" % (
                     boot, addr[0], hello, b.dir), flush=True)
+            if warned_for == boot and now - b.last > QUIET_S:
+                print("-- [%s] boot %s is talking again (it was idle, not "
+                      "gone)" % (clock(now), boot), flush=True)
+                warned_for = False
             b.last = now
+            last_boot = b
             # A launch closed with the PS button sends no end markers, and
             # a receiver window closed with X never reaches its summary:
             # keep receiver.txt current every few seconds instead
