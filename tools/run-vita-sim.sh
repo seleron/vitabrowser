@@ -342,6 +342,8 @@ JS-flex-leaf file:///app0:/testpages/JS-flex-leaf.html
 CSS-flex-leaf-ref file:///app0:/testpages/CSS-flex-leaf-ref.html
 JS-only-child file:///app0:/testpages/JS-only-child.html
 CSS-only-child-ref file:///app0:/testpages/CSS-only-child-ref.html
+JS-sib-not file:///app0:/testpages/JS-sib-not.html
+CSS-sib-not-ref file:///app0:/testpages/CSS-sib-not-ref.html
 JS-gen-empty file:///app0:/testpages/JS-gen-empty.html
 CSS-gen-empty-ref file:///app0:/testpages/CSS-gen-empty-ref.html
 JS-gen-empty-sib file:///app0:/testpages/JS-gen-empty-sib.html
@@ -1849,6 +1851,17 @@ ocn=$(printf '%s\n' "$ocseg" | grep -c "LIFE rebuild local: an :only-\* rule can
 ocf=$(printf '%s\n' "$ocseg" | grep -c "LIFE rebuild local: structural change: [0-9]* matching siblings\{0,1\} restyled alone\|LIFE rebuild local: structural change: the parent's subtree rebuilt" || true)
 echo "  JS-only-child: rows differing from the parse-time build $ocr (0); :only-* rules ruled out ${ocn} (2 or more); real flips restyled ${ocf} (3 or more)"
 [ "$ocr" = 0 ] && [ "${ocn:-0}" -ge 2 ] && [ "${ocf:-0}" -ge 3 ] || fail ":only-* rules that cannot flip"
+# Patch 505: a sibling combinator inside :not() / :is() / :where() is read as
+# a rule of the sheet (it made the whole sheet conservative): its real risks
+# still rebuild the parent, and an unrelated insert is placed locally. Six
+# steps render row for row as at parse time.
+snr=$(fl_rows JS-sib-not CSS-sib-not-ref)
+snseg=$(awk '/ page [0-9]+\/[0-9]+ JS-sib-not: navigate/ {on=1; next} on && / page [0-9]+\/[0-9]+ [^ ]+: navigate/ {on=0} on' "$R/netsurf.log")
+snc=$(printf '%s\n' "$snseg" | grep -c "conservative sibling check" || true)
+snp=$(printf '%s\n' "$snseg" | grep -c "a sibling rule may see the child-list change: the parent, built again whole" || true)
+snl=$(printf '%s\n' "$snseg" | grep -c "LIFE rebuild local: blocks placed\|LIFE rebuild local: blocks rebuilt" || true)
+echo "  JS-sib-not: rows differing from the parse-time build $snr (0); conservative-sheet checks ${snc} (0); real risks, parent rebuilt ${snp} (4 or more); placed locally ${snl} (2 or more)"
+[ "$snr" = 0 ] && [ "${snc:-1}" -eq 0 ] && [ "${snp:-0}" -ge 4 ] && [ "${snl:-0}" -ge 2 ] || fail "sibling combinators inside :not() / :is() / :where()"
 # Patch 373: a change in a block with ::before/::after, or content
 # arriving in an empty block, builds the block again on its own (before:
 # a full rebuild, "block is not one line container"). Both pages render

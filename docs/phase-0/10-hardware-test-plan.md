@@ -19801,3 +19801,71 @@ gating).
   JS-struct-hits and JS-late-append pass; interaction 57/57 (both paces).
 
 No sudo.
+
+## Patch 505 (2026-11-28): sibling combinators inside :not() / :is() / :where() are read as sibling rules (C)
+
+**Problem.**
+- The sibling-rule scanner could not read a `+` / `~` inside a functional
+  pseudo-class.
+- One such selector made its whole sheet **conservative**, so every
+  insert or removal on the page was a sibling risk, answered by rebuilding
+  the parent.
+- stackoverflow's Stacks
+  `.s-btn:not(.s-btn--radio:checked+label)…:focus-visible` is live here:
+  patch 328 matches complex `:not()`, and the rewrite turns
+  `:focus-visible` into `:focus`.
+- It made stackoverflow's flex `<body>` be rebuilt whole on every
+  `<iframe>` insert.
+
+**Fix.**
+- `X:not(A + B)` depends on X's previous sibling exactly as `A + B`
+  does.
+- When the prelude being parsed collects rules, the wrapper
+  `html_rl_parse_prelude` (around the renamed `html_rl_parse_prelude1`)
+  points a scoped sink at fresh arrays.
+- `html_rl_parse_compound` parses such an argument as its own prelude
+  (`html_rl_inner_arg`) into the sink, then ignores the pseudo-class like
+  a plain one: a broader match, so more risk, never less.
+- The wrapper moves the sink's rules, left compounds and `:empty` /
+  `:has()` compounds into its caller's lists (the prelude then reports a
+  sibling combinator), and frees them on a decline.
+- An argument holding `:has()`, or one that does not parse, declines as
+  before. Scan-only calls see no sink.
+- The gate's network page list passed `VITA_NET_PAGES_MAX` with this
+  unit's pair (385). It is raised 384 -> 512 in `frontends/vita/main.c`
+  (static tables, ~152 KiB). gate505 failed on exactly that; gate505b is
+  the run with the raise.
+
+**Gate pages.** New `JS-sib-not` / `CSS-sib-not-ref`:
+- `.b:not(.a + .b)`, `.y:is(.x ~ .y)`, `.q:not(:is(.p + .q))` and the
+  Stacks shape;
+- the four real risks rebuild the parent;
+- an unrelated insert is placed alone (on 504 it rebuilt the parent: the
+  sheet was conservative).
+
+**0 rows different.** Checked before gating: 412's style-sib-risk page
+keeps its unreadable `+` selector, a hex escape that the identifier
+parser still rejects.
+
+**stackoverflow** (504 vs 505, 2 real-page loads each):
+
+| | 504 | 505 |
+|---|---|---|
+| conservative-sheet lines | 7-16 | **0** |
+| sibling-risk parent rebuilds | 5-7 | **0** |
+| local-rebuild time | ~1,386 ms | **~984 ms (-29%)** |
+| main-thread CPU | 4.98 s | **4.67 s (-6%)** |
+| `<body>` restyles | 6 | **5 (~556 ms)** |
+
+The remaining `<body>` restyles are B (a `div:nth-child` rule hitting
+`div.container`) and a `style` change on `<body>`.
+
+**Gate.**
+- `restage-full.sh`: **587 applied plus the 2 known collisions**.
+- **gate505b exit 0**: JS-sib-not, JS-sib-func, JS-sib-unreadable,
+  JS-sib-universal, JS-only-child and JS-struct-hits pass; interaction
+  57/57 (both paces); no network page dropped.
+- (`CSS-sibling-class: no summary` is an informational echo, the same in
+  every gate since at least 501; not a check.)
+
+No sudo.
