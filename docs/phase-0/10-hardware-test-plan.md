@@ -19640,3 +19640,37 @@ selector can depend on the change), as 459 does for the root.
   JS-flex-restyle pass; interaction 57/57 (both paces).
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED (2026-11-28 ~09:20Z): VPKs from 8ed78f1 (patch 502)
+
+Run 45 now carries **494-502**. The 996d771 set was never handed over; it
+is parked, with its `pages`, as `hwtest-2026-11-28-run45-superseded-501`
+in `<WORK>` and both hand-off folders.
+
+**Tree.**
+- `restage-full.sh` showed no in-flight edits.
+- `tools/build-patched.sh` then re-staged `applytest` from the committed
+  patches: **584 applied plus the 2 known collisions**, prefix rebuilt
+  from scratch.
+
+**Build.** Checked in the outputs:
+- the ELF carries 502's flex-item placement;
+- 495-501 are all in, as before;
+- no check code;
+- heaps 192 / **256** MiB; both VPKs pass `unzip -t`;
+- the ext VPK bundles the two new test pages.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `fdd41eecbee1e336…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `25170182a894733e…` |
+| `nsvita.elf` | `92236314b357402d…` |
+
+**Files.**
+- `reference-dumps` = gate502b's autotest (468: the flex-items pair's two
+  dumps added).
+- `pages` = 513 (`JS-flex-items.html`, `CSS-flex-items-ref.html` added).
+- Verified on both sides: outgoing sums OK, new and parked sums OK,
+  `diff -r` of dumps and pages clean.
+
+The device procedure and load-time checks are unchanged.
