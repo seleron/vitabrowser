@@ -18920,3 +18920,77 @@ Open from run 44's second ext launch (`213052`): the log stops at 126 s,
 mid-load of a substack article ("Fetching, Processing"), with no goodbye.
 It may be a crash or the PS button; nothing in the log tells them apart.
 Heap in use was ~22 MiB.
+
+## ASan + census for 492-495 (2026-11-28)
+
+**ASan at 495** (`build-asan-sim.sh --libs --net`, `asan-autotest.sh`):
+**clean**. Interaction 57/57, 453 page dumps (gate 453), 0 reports.
+
+**21-site census, 491 vs 495** (`score/c21-495`, 3 loads per arm).
+**Flat.**
+
+| | 491 | 495 |
+|---|---|---|
+| full rebuilds per load | 16.0 | 17.3 (+1.3) |
+| guard trips per load | 5.3 | 6.0 |
+
+- +1.3 is inside the census's ±2 per-load spread. The guard-trip change
+  is timing noise, as before.
+- Every other cause and decline reason is within 0.7.
+- **0 crashes on 495**. The one crash was on the 491 arm (oldreddit L3).
+
+## Patch 496 (2026-11-28): custom-property registration's @media print test from an index (P1 load time)
+
+**Problem.** Patch 340's `macsurf__gtc_register` records every sheet's
+top-level, non-print `--name: value` definitions, for `var()` in later
+sheets' grid track lists.
+- It asked patch 336's `macsurf__gtc_in_print` once per definition.
+- Each call scanned back to the sheet's start, and for every `@media` it
+  passed, forward to the definition again counting braces: definitions x
+  @media x sheet length, on every first conversion of a sheet.
+- Found by a fresh sprof profile at 495: github's unclassified 39% was
+  `nscss_rewrite_cached` -> `macsurf_css_rewrite`, and within it
+  `gtc_register` / `gtc_in_print`.
+
+**Fix.**
+- The sheet's `@media` blocks are indexed once per register call. The
+  index keeps the same naive brace match and the same "print" test over
+  the prelude.
+- Each definition takes the nearest preceding `@media` whose block is
+  still open, as before, by binary search and a walk back.
+- If the index cannot be allocated, the old scan answers.
+
+**Exactness.** A `VITA_GTC_CHECK` build answered every query both ways:
+**0 mismatches in ~79,000 queries**.
+- Coverage: all 21 census sites, MDN, and the two grid `var()` test pages.
+- guardian 52k queries, github 11k; sheets with up to 1279 `@media`.
+- The check code stays in the source, behind that flag.
+
+**Measured** (sim, sprof, 2 loads each, 495 -> 496):
+
+| | main-thread CPU | Done | register pass (samples) |
+|---|---|---|---|
+| github | 2.81 -> **2.24 s (-20%)** | 3.75 -> 3.15 s | 146 -> 4-5 |
+| guardian | 10.1 -> **3.1 s (-69%)** | 11.2 -> 3.9 s | 1770 -> 10-13 |
+
+Pure C, so a similar share should come off on the Vita (run 43: github
+286 s).
+
+**Gate.**
+- `restage-full.sh`: **578 applied plus the 2 known collisions**.
+- **gate496 exit 0**: GRIDNAMES336 4/4, GRIDXSHEET340 4/4, interaction
+  57/57 (both paces).
+
+**Next P1 unit (497), picked from the same profiles.** libcss's
+per-element custom-property environment is a flat array searched
+linearly by name (`cp_name_equal`, dash-normalising compares).
+- `css__cp_env_add` scans the element's array per definition, which is
+  quadratic for Primer's / guardian's root variable blocks.
+- `css__cp_env_find` scans each ancestor level once per `var()`.
+- With 496: CSS selection is ~41% of github's main thread;
+  `cp_name_equal` alone is 102 of 554 samples there and 64 of 773 on
+  guardian.
+- Plan: a hash index per environment (same normalisation, same
+  shadowing), verified by a both-ways check build like 496's.
+
+No sudo.

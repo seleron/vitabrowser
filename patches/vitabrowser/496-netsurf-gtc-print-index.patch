@@ -1,0 +1,164 @@
+# netsurf: custom-property registration's @media print test from an index (patch 496)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 495)
+#
+# Patch 340's macsurf__gtc_register (every sheet's top-level, non-print
+# `--name: value` definitions, for var() in later sheets' grid track
+# lists) asked patch 336's macsurf__gtc_in_print once per definition, and
+# each call scanned back to the sheet's start and, for every @media it
+# passed, forward to the definition again counting braces:
+# definitions x @media x sheet length on every first conversion of a
+# sheet. Simulator, main-thread CPU: github.com 2.8 s with ~20% there;
+# theguardian.com 10.2 s with 70% (~7 s) there.
+#
+# The sheet's @media blocks are indexed once per register call (the same
+# naive brace match, the same "print" test over the prelude) and each
+# definition takes the nearest preceding @media whose block is still open,
+# as before. If the index cannot be allocated, the old scan answers.
+# Verified exact before landing: a VITA_GTC_CHECK build answered every
+# query both ways -- 0 mismatches in ~79,000 queries over the 21 census
+# sites, MDN and the two grid var() test pages (guardian 52k, github 11k;
+# sheets with up to 1279 @media). The check code stays behind that flag.
+--- a/content/handlers/css/css_rewrite.c
++++ b/content/handlers/css/css_rewrite.c
+@@ -911,10 +911,106 @@
+ static int macsurf__gtc_reg_n;
+ static int macsurf__gtc_reg_next;
+ 
++/* VitaBrowser patch 496: macsurf__gtc_in_print, answered from an index.
++ *
++ * The register pass below asked macsurf__gtc_in_print for every
++ * `--name:` definition in a sheet, and each call scanned back to the
++ * sheet's start and, for every @media it passed, forward again to the
++ * definition counting braces: definitions x @media x sheet length.
++ * github.com's Primer sheets (thousands of custom properties, many
++ * @media) spent ~20% of the whole page load's main-thread time there in
++ * the simulator. The @media blocks are now indexed once per sheet -- the
++ * same naive brace match, the same "print" test over the prelude -- and
++ * each definition takes the nearest preceding @media whose block is still
++ * open, exactly as before. */
++struct macsurf_gtc_media {
++	size_t m;	/* the '@' of "@media" */
++	size_t a;	/* its '{' */
++	size_t b;	/* the matching '}', or SIZE_MAX if never closed */
++	bool print;	/* "print" in [m + 6, a) */
++};
++
++static struct macsurf_gtc_media *
++macsurf__gtc_media_index(const char *data, size_t size, size_t *count)
++{
++	struct macsurf_gtc_media *ix = NULL;
++	size_t n = 0, cap = 0, i;
++
++	for (i = 0; i + 6 <= size; i++) {
++		size_t a, b, k;
++		int depth;
++
++		if (data[i] != '@' || strncasecmp(data + i, "@media", 6) != 0)
++			continue;
++		a = i + 6;
++		while (a < size && data[a] != '{' && data[a] != ';')
++			a++;
++		if (a >= size || data[a] != '{')
++			continue;
++		if (n == cap) {
++			struct macsurf_gtc_media *nx;
++			cap = cap ? cap * 2 : 64;
++			nx = realloc(ix, cap * sizeof(*ix));
++			if (nx == NULL) {
++				free(ix);
++				return NULL;
++			}
++			ix = nx;
++		}
++		depth = 0;
++		for (b = a; b < size; b++) {
++			if (data[b] == '{') depth++;
++			else if (data[b] == '}') depth--;
++			if (depth == 0) break;
++		}
++		ix[n].m = i;
++		ix[n].a = a;
++		ix[n].b = b < size ? b : SIZE_MAX;
++		ix[n].print = false;
++		for (k = i + 6; k + 5 <= a; k++)
++			if (strncasecmp(data + k, "print", 5) == 0) {
++				ix[n].print = true;
++				break;
++			}
++		n++;
++	}
++	*count = n;
++	if (ix == NULL)
++		ix = malloc(sizeof(*ix));	/* none: an empty index */
++	return ix;
++}
++
++/* macsurf__gtc_in_print(data, pos) from the index */
++static bool
++macsurf__gtc_in_print_ix(const struct macsurf_gtc_media *ix, size_t n,
++		size_t pos)
++{
++	size_t lo = 0, hi = n;
++
++	/* the entries with m < pos are ix[0 .. lo) */
++	while (lo < hi) {
++		size_t mid = lo + (hi - lo) / 2;
++		if (ix[mid].m < pos) lo = mid + 1;
++		else hi = mid;
++	}
++	while (lo > 0) {
++		const struct macsurf_gtc_media *e = &ix[--lo];
++		if (e->a < pos && e->b >= pos)
++			return e->print;
++	}
++	return false;
++}
++
+ static void
+ macsurf__gtc_register(const char *data, size_t size)
+ {
+ 	size_t i;
++	size_t nmedia = 0;
++	struct macsurf_gtc_media *media =
++			macsurf__gtc_media_index(data, size, &nmedia);
++#ifdef VITA_GTC_CHECK
++	static unsigned long gtc_checked, gtc_mismatch;
++#endif
+ 
+ 	for (i = 0; i + 3 < size; i++) {
+ 		size_t ns = i, ne, j, e;
+@@ -946,7 +1042,19 @@
+ 		i = e;
+ 		if (nlen >= 64 || vlen >= 256 || vlen == 0)
+ 			continue;
+-		if (macsurf__gtc_in_print(data, ns))
++#ifdef VITA_GTC_CHECK
++		if (media != NULL) {
++			gtc_checked++;
++			if (macsurf__gtc_in_print_ix(media, nmedia, ns) !=
++					macsurf__gtc_in_print(data, ns)) {
++				gtc_mismatch++;
++				fprintf(stderr, "GTCCHECK mismatch at %lu\n",
++						(unsigned long)ns);
++			}
++		}
++#endif
++		if (media != NULL ? macsurf__gtc_in_print_ix(media, nmedia, ns) :
++				macsurf__gtc_in_print(data, ns))
+ 			continue;
+ 		for (k = 0; k < macsurf__gtc_reg_n; k++)
+ 			if (strlen(macsurf__gtc_reg[k].name) == nlen &&
+@@ -967,6 +1075,12 @@
+ 		memcpy(macsurf__gtc_reg[k].val, data + j + 1, vlen);
+ 		macsurf__gtc_reg[k].val[vlen] = '\0';
+ 	}
++#ifdef VITA_GTC_CHECK
++	fprintf(stderr, "GTCCHECK sheet %lu bytes, %lu @media, checked %lu, "
++			"mismatches %lu\n", (unsigned long)size,
++			(unsigned long)nmedia, gtc_checked, gtc_mismatch);
++#endif
++	free(media);
+ }
+ 
+ static bool
