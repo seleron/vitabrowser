@@ -19301,3 +19301,39 @@ claude.ai/code and the JS syntax test pages.
   (same stamp).
 
 No sudo.
+
+### Device hand-off run 45, RE-STAGED (2026-11-28 ~05:10Z): VPKs from 4a47bde (patch 499)
+
+Run 45 now carries **494-499**. The f050a40 set was never handed over; it
+is parked as `hwtest-2026-11-28-run45-superseded-498` in `<WORK>` and
+both hand-off folders.
+
+**Tree.**
+- `restage-full.sh` first showed no in-flight edits.
+- `tools/build-patched.sh` then re-staged `applytest` from the committed
+  patches: **581 applied plus the 2 known collisions**, prefix rebuilt
+  from scratch.
+- Vita QuickJS is built from `$WORK/quickjs` (patches 01-10).
+
+**Build.** Checked in the outputs:
+- Vita `libquickjs.a` has 499's `js_parse_skip_parens_token1`;
+- libdom / ELF have 498's name generation;
+- libcss has 497's index; `css_rewrite.o` has 496's index builder; the
+  ext ELF has 495's heap-span line;
+- no check code (`CPENVCHECK` / `GTCCHECK` / `SKIPCHECK`);
+- heaps 192 / **256** MiB; both VPKs pass `unzip -t`.
+
+| file | SHA256 |
+|---|---|
+| `VitaBrowser-ext.vpk` (VBRW00002, **primary**) | `bb2beb1fb4180991…` |
+| `VitaBrowser.vpk` (VBRW00001, fallback) | `4d766d95495f8486…` |
+| `nsvita.elf` | `64b4d8a6398f7409…` |
+
+**Files.**
+- `reference-dumps` = gate499's autotest (466).
+- `pages` unchanged (511).
+- Verified on both sides: outgoing sums OK, new and parked sums OK,
+  `diff -r` of dumps and pages clean.
+
+The device procedure and the load-time checks are unchanged (claude.ai,
+github, theguardian.com, stackoverflow; see the 498 re-stage note).
