@@ -1,0 +1,101 @@
+# libdom: a name generation beside the tree generation (patch 498)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 497)
+#
+# Patch 324's dom_tree_gen moves on every attach, detach, replace and
+# attribute change. The bridge's form named-access pre-check
+# (vita_polyfill.js anyNamed, patch 322) memoised on it, but its answer --
+# can any element carry this name -- depends only on which elements are in
+# the document and on their id and name attributes. On a page that changes
+# classes and styles constantly the memo missed: claude.ai, ~14,000 calls,
+# dom_tree_gen moving every 4-5 of them, each miss a getElementById plus a
+# whole-document querySelectorAll (~6.7 s of a 12.7 s load in the sim).
+#
+# dom_name_gen moves at the same three structural points, and in
+# __dom_dispatch_attr_modified_event only for an id or name attribute,
+# the document's id attribute name, or an attribute it cannot tell.
+# dom_tree_name_generation() reads it (macsurf_qjs.c __vitaDomNameGen).
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2164,6 +2164,27 @@
+ 	dom_tree_gen++;
+ }
+ 
++/* VitaBrowser patch 498: a second generation that moves only on what can
++ * change which NAMES elements carry -- a node attached, detached or
++ * replaced (the same three points as dom_tree_gen), or an id or name
++ * attribute set, changed or removed (__dom_dispatch_attr_modified_event,
++ * which also bumps it when it cannot tell the attribute). The bridge's
++ * "can any element carry this name" check (vita_polyfill.js anyNamed)
++ * depends on nothing else, and on claude.ai dom_tree_gen moved every 4-5
++ * of its ~14,000 calls (constant class / style churn), so its memo
++ * missed and each call ran a whole-document query. */
++static unsigned long dom_name_gen = 1;
++
++unsigned long dom_tree_name_generation(void)
++{
++	return dom_name_gen;
++}
++
++void _dom_tree_name_generation_bump(void)
++{
++	dom_name_gen++;
++}
++
+ dom_exception _dom_node_attach_range(dom_node_internal *first, 
+ 		dom_node_internal *last,
+ 		dom_node_internal *parent, 
+@@ -2175,6 +2196,7 @@
+ 	dom_node_internal *n;
+ 
+ 	_dom_tree_generation_bump();	/* patch 324 */
++	_dom_tree_name_generation_bump();	/* patch 498 */
+ 
+ 	first->previous = previous;
+ 	last->next = next;
+@@ -2225,6 +2247,7 @@
+ 	dom_exception err = DOM_NO_ERR;
+ 
+ 	_dom_tree_generation_bump();	/* patch 324 */
++	_dom_tree_name_generation_bump();	/* patch 498 */
+ 
+ 	if (first->previous != NULL)
+ 		first->previous->next = last->next;
+@@ -2275,6 +2298,7 @@
+ 	dom_node_internal *n;
+ 
+ 	_dom_tree_generation_bump();	/* patch 324 */
++	_dom_tree_name_generation_bump();	/* patch 498 */
+ 
+ 	if (replacement->type == DOM_DOCUMENT_FRAGMENT_NODE) {
+ 		first = replacement->first_child;
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -308,5 +308,6 @@
+ 
+ /* VitaBrowser patch 324: move the tree generation (node.c) */
+ void _dom_tree_generation_bump(void);
++void _dom_tree_name_generation_bump(void);	/* patch 498 */
+ 
+ #endif
+--- a/src/events/dispatch.c
++++ b/src/events/dispatch.c
+@@ -130,6 +130,18 @@
+ 	dom_exception err;
+ 
+ 	_dom_tree_generation_bump();	/* patch 324 */
++	/* patch 498: an id or name attribute (or one we cannot tell) */
++	{
++		const char *an = attr_name != NULL ? dom_string_data(attr_name) : NULL;
++		size_t al = attr_name != NULL ? dom_string_length(attr_name) : 0;
++		if (an == NULL ||
++				(al == 2 && (an[0] | 0x20) == 'i' && (an[1] | 0x20) == 'd') ||
++				(al == 4 && (an[0] | 0x20) == 'n' && (an[1] | 0x20) == 'a' &&
++				 (an[2] | 0x20) == 'm' && (an[3] | 0x20) == 'e') ||
++				(doc != NULL && doc->id_name != NULL &&
++				 dom_string_caseless_isequal(attr_name, doc->id_name)))
++			_dom_tree_name_generation_bump();
++	}
+ 
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)

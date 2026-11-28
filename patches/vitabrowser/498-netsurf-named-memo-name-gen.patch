@@ -1,0 +1,138 @@
+# netsurf: the form named-access pre-check memoises on the name generation (patch 498)
+# Generated 2026-11-28
+# Base: seleron/vitabrowser (patch stack through 497)
+#
+# vita_polyfill.js anyNamed (patch 322; memo from 324) answers "can any
+# element carry the name n" with getElementById plus a whole-document
+# querySelectorAll of the listed elements and <img>. Patch 305 asks it on
+# EVERY member read on a form (a control named "parentNode" shadows
+# form.parentNode, as in browsers), so DOM walks that pass a form ask it
+# constantly; claude.ai's sign-in page asked ~14,000 times per load
+# (parentNode, tagName, nodeType, localName) and 324's memo, keyed on the
+# whole-tree generation, missed on 3019 of them (class/style churn).
+#
+# The memo is now keyed on __vitaDomNameGen() (libdom's name generation:
+# attach, detach, replace, id / name attributes -- patch 498's libdom half),
+# falling back to __vitaDomGen. With __vitaNamedCheck set (a sim inject),
+# every memo hit is recomputed and disagreements counted: the
+# verification described in doc 10.
+--- a/content/handlers/javascript/quickjs/macsurf_qjs.c
++++ b/content/handlers/javascript/quickjs/macsurf_qjs.c
+@@ -4905,6 +4905,21 @@
+ 	return JS_NewFloat64(ctx, (double)dom_tree_generation());
+ }
+ 
++/* VitaBrowser patch 498: __vitaDomNameGen() -> libdom's NAME generation,
++ * which moves only on an attach, detach or replace, or an id / name
++ * attribute change (libdom core/node.c dom_name_gen). The form
++ * named-access pre-check (vita_polyfill.js anyNamed) keys its memo on it:
++ * its answer depends on which elements are in the document and on their
++ * ids and names, nothing else. */
++extern unsigned long dom_tree_name_generation(void);
++
++static JSValue qjs_dom_name_gen(JSContext *ctx, JSValueConst this_val,
++		int argc, JSValueConst *argv)
++{
++	(void)this_val; (void)argc; (void)argv;
++	return JS_NewFloat64(ctx, (double)dom_tree_name_generation());
++}
++
+ /* __vitaResourceTake() -> this realm's entries finished since the last
+  * call: [[url, initiatorType, startTime, responseEnd, size, status, type,
+  * Timing-Allow-Origin or null], ...],
+@@ -16173,6 +16188,7 @@
+ 	qjs_set_func(ctx, global, "__msRafTimeout", qjs_raf_timeout, 1);	/* patch 281 */
+ 	qjs_set_func(ctx, global, "__vitaResourceTake", qjs_rt_take, 0);	/* patch 282 */
+ 	qjs_set_func(ctx, global, "__vitaDomGen", qjs_dom_gen, 0);	/* patch 324 */
++	qjs_set_func(ctx, global, "__vitaDomNameGen", qjs_dom_name_gen, 0);	/* patch 498 */
+ 	qjs_set_func(ctx, global, "setInterval",   qjs_setinterval, 2);
+ 	qjs_set_func(ctx, global, "clearTimeout",  qjs_cleartimeout, 1);
+ 	qjs_set_func(ctx, global, "clearInterval", qjs_cleartimeout, 1);
+--- a/content/handlers/javascript/quickjs/vita_polyfill.js
++++ b/content/handlers/javascript/quickjs/vita_polyfill.js
+@@ -11081,12 +11081,25 @@
+ 			 * changes -- a MutationObserver delivery loop calling
+ 			 * root.contains on an observed form, per record -- are a
+ 			 * map hit, not a query */
+-			var gen = typeof g.__vitaDomGen === 'function' ? g.__vitaDomGen() : null,
+-				pv = gen !== null ? PV(doc) : null, memo = null, key = tags + '\n' + n, r = false;
++			/* patch 498: keyed on the NAME generation (attach, detach,
++			 * replace, id / name attributes), which is all the answer
++			 * depends on; the tree generation also moved on every class
++			 * and style change, so on a page that animates by attribute
++			 * (claude.ai: 3019 generations in 14,000 calls) the memo
++			 * missed and each call ran a whole-document query */
++			var gen = typeof g.__vitaDomNameGen === 'function' ? g.__vitaDomNameGen() :
++				typeof g.__vitaDomGen === 'function' ? g.__vitaDomGen() : null,
++				pv = gen !== null ? PV(doc) : null, memo = null, key = tags + '\n' + n, r = false,
++				hit = false, hitv;
+ 			if (pv) {
+ 				if (pv.namedGen !== gen) { pv.namedGen = gen; pv.namedMemo = new Map(); }
+ 				memo = pv.namedMemo;
+-				if (memo.has(key)) return memo.get(key);
++				if (memo.has(key)) {
++					/* sim measurement: __vitaNamedCheck recomputes every
++					 * hit and counts disagreements */
++					if (!g.__vitaNamedCheck) return memo.get(key);
++					hit = true; hitv = memo.get(key);
++				}
+ 			}
+ 			if (doc.getElementById(n)) r = true;
+ 			else {
+@@ -11094,6 +11107,12 @@
+ 				for (var i = 0; i < a.length && !r; i++)
+ 					if (a[i].getAttribute('name') === n) r = true;
+ 			}
++			if (hit) {
++				var ck = g.__vitaNamedCheck;
++				ck.hits = (ck.hits || 0) + 1;
++				if (hitv !== r) ck.mismatch = (ck.mismatch || 0) + 1;
++				return r;
++			}
+ 			if (memo) memo.set(key, r);
+ 			return r;
+ 		} catch (e) {
+--- a/content/handlers/javascript/quickjs/vita_polyfill.inc
++++ b/content/handlers/javascript/quickjs/vita_polyfill.inc
+@@ -11082,12 +11082,25 @@
+ "\t\t\t * changes -- a MutationObserver delivery loop calling\n"
+ "\t\t\t * root.contains on an observed form, per record -- are a\n"
+ "\t\t\t * map hit, not a query */\n"
+-"\t\t\tvar gen = typeof g.__vitaDomGen === 'function' ? g.__vitaDomGen() : null,\n"
+-"\t\t\t\tpv = gen !== null ? PV(doc) : null, memo = null, key = tags + '\\n' + n, r = false;\n"
++"\t\t\t/* patch 498: keyed on the NAME generation (attach, detach,\n"
++"\t\t\t * replace, id / name attributes), which is all the answer\n"
++"\t\t\t * depends on; the tree generation also moved on every class\n"
++"\t\t\t * and style change, so on a page that animates by attribute\n"
++"\t\t\t * (claude.ai: 3019 generations in 14,000 calls) the memo\n"
++"\t\t\t * missed and each call ran a whole-document query */\n"
++"\t\t\tvar gen = typeof g.__vitaDomNameGen === 'function' ? g.__vitaDomNameGen() :\n"
++"\t\t\t\ttypeof g.__vitaDomGen === 'function' ? g.__vitaDomGen() : null,\n"
++"\t\t\t\tpv = gen !== null ? PV(doc) : null, memo = null, key = tags + '\\n' + n, r = false,\n"
++"\t\t\t\thit = false, hitv;\n"
+ "\t\t\tif (pv) {\n"
+ "\t\t\t\tif (pv.namedGen !== gen) { pv.namedGen = gen; pv.namedMemo = new Map(); }\n"
+ "\t\t\t\tmemo = pv.namedMemo;\n"
+-"\t\t\t\tif (memo.has(key)) return memo.get(key);\n"
++"\t\t\t\tif (memo.has(key)) {\n"
++"\t\t\t\t\t/* sim measurement: __vitaNamedCheck recomputes every\n"
++"\t\t\t\t\t * hit and counts disagreements */\n"
++"\t\t\t\t\tif (!g.__vitaNamedCheck) return memo.get(key);\n"
++"\t\t\t\t\thit = true; hitv = memo.get(key);\n"
++"\t\t\t\t}\n"
+ "\t\t\t}\n"
+ "\t\t\tif (doc.getElementById(n)) r = true;\n"
+ "\t\t\telse {\n"
+@@ -11095,6 +11108,12 @@
+ "\t\t\t\tfor (var i = 0; i < a.length && !r; i++)\n"
+ "\t\t\t\t\tif (a[i].getAttribute('name') === n) r = true;\n"
+ "\t\t\t}\n"
++"\t\t\tif (hit) {\n"
++"\t\t\t\tvar ck = g.__vitaNamedCheck;\n"
++"\t\t\t\tck.hits = (ck.hits || 0) + 1;\n"
++"\t\t\t\tif (hitv !== r) ck.mismatch = (ck.mismatch || 0) + 1;\n"
++"\t\t\t\treturn r;\n"
++"\t\t\t}\n"
+ "\t\t\tif (memo) memo.set(key, r);\n"
+ "\t\t\treturn r;\n"
+ "\t\t} catch (e) {\n"

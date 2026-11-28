@@ -19114,3 +19114,81 @@ in `<WORK>` and in both hand-off folders.
 The device procedure is unchanged. Extra to look for: **github,
 stackoverflow and theguardian.com load times** (sim main-thread CPU:
 github -38% since 495, guardian -73%, stackoverflow -15%).
+
+## ASan + census for 496-497 (2026-11-28)
+
+**ASan at 497** (`--libs --net`): libcss instrumented (387 report sites
+in `css_select_style`) and the prefix carries 497's index. **Clean**:
+interaction 57/57, 453 page dumps, 0 reports.
+
+**21-site census, 495 vs 497** (`score/c21-497`, 3 loads per arm):
+
+| | 495 | 497 |
+|---|---|---|
+| full rebuilds per load | 17.0 | **14.3** (-2.7) |
+| guard trips per load | 6.0 | 4.7 |
+
+- The drop fits faster style selection leaving the rebuild-cost guard
+  more room. claude.ai 4.0 -> 2.3, stackoverflow and oldreddit -0.7.
+- **No crashes** on either arm.
+
+## Patch 498 (2026-11-28): the form named-access pre-check memoises on a name generation (libdom + netsurf, P1 load time)
+
+**Problem** (found by a 497 profile of claude.ai). On claude.ai, **~47%
+of the main thread** was in `document.querySelectorAll` and **~9%** in
+libdom's `getElementById` tree walk.
+
+An inject counted the calls:
+- **13,458 queries of one selector**,
+  `button,fieldset,input,object,output,select,textarea,img`: 5.3 s;
+- **13,487 `getElementById` calls over 29 names**: 1.3 s.
+
+The source is `vita_polyfill.js anyNamed` (patch 322):
+- It asks "can any element carry the name n?" on **every member read on
+  a form**. Patch 305 does that because, as in browsers, a control named
+  `parentNode` shadows `form.parentNode`.
+- The names asked were `parentNode` (3002x), `tagName`, `nodeType`,
+  `localName`.
+- 324's memo was keyed on libdom's tree generation. That moves on every
+  attribute change, and **3019 distinct generations in 14,000 calls**
+  (class/style churn) meant it almost never hit.
+
+**Fix.**
+- **libdom** (`498-libdom-name-generation.patch`): `dom_name_gen` moves
+  at the same three structural points as `dom_tree_gen` (attach, detach,
+  replace). In the attribute-modified dispatch it moves only for an id or
+  name attribute, the document's id attribute name, or an attribute it
+  cannot tell. Read through `dom_tree_name_generation()`.
+- **netsurf** (`498-netsurf-named-memo-name-gen.patch`):
+  - `__vitaDomNameGen()`;
+  - `anyNamed`'s memo keyed on it, falling back to `__vitaDomGen`;
+  - with `__vitaNamedCheck` set (a sim inject), every memo hit is
+    recomputed and disagreements counted.
+
+**Exactness.** Under that check: **0 mismatches**.
+- claude.ai: >= 22,000 hits.
+- The 21 census sites and 11 form test pages: stackoverflow >= 6,000,
+  google >= 1,000.
+
+**Measured** (sim, sprof, 2 loads each, 497 -> 498):
+
+| | 497 | 498 |
+|---|---|---|
+| claude.ai main-thread CPU | 12.26 s | **8.78 s (-28%)** |
+| `querySelectorAll` samples | ~1228 | ~20 |
+| `getElementById` samples | ~265 | ~6 |
+| github main-thread CPU | 1.78 s | 1.78 s |
+
+claude.ai keeps running JS for the whole window, so part of the freed
+time goes to its other work.
+
+**Gate.**
+- `restage-full.sh`: **581 applied plus the 2 known collisions**.
+- **gate498 exit 0**: FORMNAMED 7/7, FORMSHADOW 6/6, FSHADOW2 10/10,
+  FORMVAL 8/8, FORMTARGET 5/5, FORMWALK 5/5, submit 3/3, interaction
+  57/57 (both paces).
+
+libdom, like libcss, is not rebuilt by the gate. It was installed to the
+prefix with its host build directory deleted first.
+
+No sudo.
