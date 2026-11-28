@@ -19967,3 +19967,40 @@ counts on 506 and 507 (checked before gating).
   dropped.
 
 No sudo.
+
+## Run 45 re-staged at 507 (2026-11-28)
+
+Run 45 is re-staged from **0a4c2ac (patch 507)**. It replaces the
+untested 8ed78f1 (502) set.
+
+**Build.**
+- `build-patched.sh`: 589 applied, only the 2 known collisions failed.
+- `build-vita.sh` exit 0.
+- Heaps: `VitaBrowser.vpk` 192 MiB, `VitaBrowser-ext.vpk` 256 MiB (the
+  primary).
+
+**Device build checked unit by unit (492-507).**
+- Each unit's log strings or symbols are present.
+- 505's `html_rl_inner` sink is in `html.o`.
+- No check or scratch-log code in libcss, QuickJS or the ELF.
+- Both VPKs test clean.
+
+**Checksums:**
+
+```
+5fa4dde115895f30d79c3a77e3b9f079d996e90c369dceb9bfe830c622a87b6b  VitaBrowser.vpk
+95d1803fee9206b5fbfe19970034ff598249bcf0dc24e91ae972c6cf72910020  VitaBrowser-ext.vpk
+925b6b51bc3bedac75823e22fd33c6e42214dcc025bb85848c6b34c488eb527f  nsvita.elf
+```
+
+**Hand-off.**
+- Archive `~/vitabrowser-work/hwtest-2026-11-28-run45/`.
+- `reference-dumps` = gate507's 479 dumps.
+- `pages` = 523 git-tracked test pages: 10 new since 502 (the
+  flex-leaf, only-child, sib-not, struct-ctx and nth-type pairs).
+- Both hand-off folders are updated. The 502 set is parked as
+  `hwtest-2026-11-28-run45-superseded-502` (its sums still verify).
+- New sums, dumps and pages verified with `sha256sum -c` and `diff -r`.
+
+**Device run unchanged:** autotest self-checks plus the short manual list
+from the run-45 entry.
